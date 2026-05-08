@@ -1,0 +1,5 @@
+# cuda-oxide が要求する nightly に追従する。
+# Stage 0 issue で実機検証して確定する (設計メモ時点の暫定値)。
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy"]

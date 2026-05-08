@@ -1,0 +1,12 @@
+/target
+**/target
+/data
+**/*.bin
+**/*.psv
+**/*.pack
+**/*.nnue
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
+*.swp
