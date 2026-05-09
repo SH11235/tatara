@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/shogi-format",
+]
 
-# 各 crate / experiment / bin は Stage 1 以降で順次追加する。
+# 残り crate / experiment / bin は順次追加する。
 # 追加先候補:
-#   crates/shogi-format
 #   crates/shogi-features
 #   crates/gpu-runtime
 #   crates/gpu-kernels
