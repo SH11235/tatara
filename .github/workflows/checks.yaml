@@ -1,0 +1,58 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 同一 PR の続けざまの push は前の run をキャンセルする
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # rust-toolchain.toml の channel (nightly-2026-04-03) を honor。
+          # rustfmt は rust-toolchain.toml に含めていないのでここで明示確保。
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # workspace.members が [] のときは `cargo --workspace` が
+      #   "manifest is virtual, and the workspace has no members"
+      # で fail するので、crate が追加されるまで fmt/clippy/test を skip する。
+      # Stage 1 で `crates/shogi-format` 等を追加した時点で本ガードは通過する。
+      - name: detect empty workspace
+        id: ws
+        run: |
+          if grep -qE '^members\s*=\s*\[\s*\]' Cargo.toml; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::workspace has no members yet; fmt/clippy/test skipped"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: cargo fmt --check
+        if: steps.ws.outputs.empty == 'false'
+        run: cargo fmt --all -- --check
+
+      # GPU 依存 crate (gpu-runtime / gpu-kernels / experiments/001-cuda-oxide-kpabs)
+      # は CUDA toolkit + cuda-oxide が必要で GitHub-hosted runner では build できない。
+      # それらを workspace に追加するときは以下を有効化:
+      #   --exclude gpu-runtime --exclude gpu-kernels
+      # GPU 必須の checks は self-hosted runner の別 workflow に分離する想定。
+      - name: cargo clippy
+        if: steps.ws.outputs.empty == 'false'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        if: steps.ws.outputs.empty == 'false'
+        run: cargo test --workspace
