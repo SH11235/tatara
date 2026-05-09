@@ -29,14 +29,15 @@ GPU kernel は **cuda-oxide で書く**。NVCC / NVRTC は使わない。
 
 ## Consequences
 
-- **LLVM 21+** (NVPTX backend 付き、`llc-21` を `PATH` に) が build に必要 — 公式 README は `LLVM 21+` を要件とする (`llc-22` も discoverable)。Ubuntu 24.04 では `apt.llvm.org/llvm.sh` 経由で `llvm-21` + `clang-21` + `libclang-common-21-dev` を入れる
+- **LLVM 21+ (`llc-21`) が floor、`llc-22` 推奨** — pipeline は `llc-22` → `llc-21` の順で auto-discover する (`CUDA_OXIDE_LLC` で固定可)。cuda-oxide の `atomics` example README は LLVM 22 を「Atomic operations require llc-22 or newer for correct syncscope」と推奨。LLVM 21 でも smoke は通るが、本番 kernel で `memory_order` の正確性を求めるなら 22 に上げる。Ubuntu 24.04 では `apt.llvm.org/llvm.sh` で導入
 - **`clang` (vanilla 名)** が `cuda-bindings` の bindgen に必要 — `update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100`
 - nightly Rust (`rust-toolchain.toml` に pin) が必要 — cuda-oxide の `nightly-2026-04-03` に整合
 - runtime fusion (bullet-gpu の PointwiseIR) は失われる → ADR-0004 で代替策
-- **GPU 要件: cuda-oxide 公式は Ampere+ (sm_80+) のみ**。Turing (sm_75) と Pascal (sm_60/61) は **codegen が `--mcpu=sm_80` 固定** のため、`cargo oxide run` 直接では `CUDA_ERROR_INVALID_PTX` (driver error 218) になる
-  - **Workaround (Stage 0 で確認済み)**: cuda-oxide pipeline で生成された `.ll` を `llc-21 --mcpu=sm_75 -mattr=+ptx70` に流して PTX を再生成、`load_module_from_file` 用の `<example>.ptx` を差し替える方式で sm_75 GPU 実行可能。`scripts/build_for_sm75.sh` に自動化済み
-  - **適用範囲**: vecadd / atomics 程度の単純 kernel ならば LLVM IR に sm_80 専用 op (`cp.async`, `wgmma`, `tcgen05`, `tma.*`, `cluster.*`) が含まれず動作する。Stage 1 KP-abs (forward / grad scatter / adam) は適用範囲内見込み。Stage 2+ で fused / async copy / cluster ops を使うと workaround 不能の可能性
-  - 実機 sm_86 (sh11235) 検証は GPU 解放後の follow-up
+- **GPU 要件: cuda-oxide 公式は Ampere+ (sm_80+)**。Turing (sm_75) は **`CUDA_OXIDE_TARGET=sm_75` 環境変数で公式パスのまま動く** (Stage 0 で確認済み):
+  - `--arch=sm_75` flag は cuda-oxide 内部の `select_target()` (auto-detect) に override されてしまい、`Basic` フォールバックの `sm_80` が選ばれる。結果として PTX header は `.target sm_80` になり Turing で `CUDA_ERROR_INVALID_PTX` (driver error 218)
+  - 一方 `CUDA_OXIDE_TARGET=sm_75` (env var) は `mir-importer/src/pipeline.rs:9` の一級 override で `select_target()` をバイパスし、`llc -mcpu=sm_75` までそのまま流れる
+  - **適用範囲**: vecadd / atomics 程度の単純 kernel は OK。LLVM IR に sm_80+ 専用 op (`cp.async`, `wgmma`, `tcgen05`, `tma.*`, `cluster.*`) が含まれていると `llc` か CUDA driver 段階で失敗する。Stage 1 KP-abs (forward / grad scatter / adam_step / eval) は適用範囲内見込み。Stage 2+ で fused / async copy / cluster ops を使うと CUDA_OXIDE_TARGET でも回避不能になり sm_80+ 実機が必要
+- **sm_86 (Ampere) 実機検証は Stage 1 着手前の follow-up issue で実施**: 本マシンは sm_75 で sh11235 は当面 GPU 占有中のため Stage 0 では sm_75 確認のみ。sm_86 で同 example が公式パスで通ることを確認するまで「cuda-oxide が rshogi-nnue ターゲット環境で動く」最終保証は未到達
 - cuda-oxide が production-ready でないと判明した場合は abandon しやすいよう、
   experiments/00N で個別検証してから昇格させる方針 (ADR-0005)
 
@@ -45,6 +46,7 @@ GPU kernel は **cuda-oxide で書く**。NVCC / NVRTC は使わない。
 - cuda-oxide commit `6de0509` (NVlabs/cuda-oxide main, 2026-05-08) で動作確認
 - 環境: WSL2 Ubuntu 24.04, RTX 2070 SUPER (sm_75), CUDA 12.9, LLVM 21.1.8, rustc nightly-2026-04-03
 - `cargo oxide doctor`: 全項目 ✓
-- `vecadd` (sm_75 PTX swap): `✓ SUCCESS: All 1024 elements correct!`
-- `atomics` (sm_75 PTX swap): 20/20 tests passed (F32/F64/U64 atomicAdd 含む)
-- 詳細: `docs/setup.md`, `scripts/build_for_sm75.sh`
+- `CUDA_OXIDE_TARGET=sm_75 cargo oxide run vecadd`: `✓ SUCCESS: All 1024 elements correct!` (PTX header `.target sm_75`)
+- `CUDA_OXIDE_TARGET=sm_75 cargo oxide run atomics`: 20/20 tests passed (F32/F64/U64 atomicAdd 含む)
+- sm_86 実機での同手順検証は **未実施** (sh11235 解放後の follow-up issue で対応)
+- 詳細: `docs/setup.md`
