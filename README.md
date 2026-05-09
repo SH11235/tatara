@@ -27,10 +27,14 @@ NNUE 学習プロジェクト。GPU カーネルを Rust で書き、host から
 
 ## 環境
 
-- NVIDIA GPU (sm_86 / Ampere 想定。Hopper / Blackwell も後で検証)
+- NVIDIA GPU (公式要件: **Ampere+ / sm_80+**。Turing / sm_75 も
+  [docs/setup.md](docs/setup.md#sm_75-turing-workaround) の workaround で
+  smoke 動作確認済み — Stage 1 KP-abs 程度の単純 kernel まで)
 - CUDA Toolkit 12+
-- LLVM 22 (cuda-oxide の `llc-22` 要求)
+- LLVM 21+ (cuda-oxide の `llc-21` 要求、`llc-22` も自動 discover)
 - Rust nightly (`rust-toolchain.toml` に pin)
+
+セットアップ手順は **[docs/setup.md](docs/setup.md)** を参照。
 
 ## 関連リポジトリ
 
