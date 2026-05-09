@@ -78,7 +78,7 @@ cd ~/git-repos/cuda-oxide
 # → "=== SUCCESS: All 20 atomic tests passed! ==="
 ```
 
-### sub-Ampere GPU (sm_70/75) の場合: `CUDA_OXIDE_TARGET` 上書き
+### sub-Ampere GPU (例: sm_75 Turing) の場合: `CUDA_OXIDE_TARGET` 上書き
 
 `cargo oxide` 単独では auto-detect (cuda-oxide の `select_target()` 関数) が
 kernel features から target を選び、Basic フォールバックでは `sm_80` を選ぶ。
