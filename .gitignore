@@ -10,6 +10,11 @@
 **/*.pack
 **/*.nnue
 
+# crate test fixtures (上の **/*.{bin,psv,...} 除外を例外として個別許可)。
+# 追加は最小限にとどめ、ファイル名で明示する (誤って大容量データを git に
+# 入れないため)。
+!crates/shogi-format/tests/data/sample.psv
+
 # rshogi-nnue 自前の学習出力 — docs/data-layout.md
 /output
 **/output
