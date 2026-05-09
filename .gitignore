@@ -1,11 +1,24 @@
+# Rust build artifacts
 /target
 **/target
+**/*.rs.bk
+
+# 教師データ (大容量、E: 上の symlink 先) — docs/data-layout.md
 /data
 **/*.bin
 **/*.psv
 **/*.pack
 **/*.nnue
-**/*.rs.bk
+
+# rshogi-nnue 自前の学習出力 — docs/data-layout.md
+/output
+**/output
+/logs
+**/logs
+/checkpoints
+**/checkpoints
+
+# OS / editor
 .DS_Store
 .idea/
 .vscode/
