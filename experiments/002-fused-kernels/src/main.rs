@@ -9,10 +9,9 @@
 //!
 //! - **kernels** (`screlu_grad`, `loss_wdl`, `adamw_step`, `radam_step`,
 //!   `ranger_lookahead_lerp`, `sparse_ft_forward`, `sparse_ft_backward`) は
-//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-5 (#41)
-//!   までで `screlu_grad` + `loss_wdl` + `adamw_step` + `radam_step` +
-//!   `ranger_lookahead_lerp` の 5 件 landed (Ranger は radam_step + lerp の
-//!   2 kernel pair)
+//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-6 (#42)
+//!   までで pointwise 5 件 + `sparse_ft_forward` の合計 6 件 landed (sparse
+//!   backward は Stage 2-7 で追加予定)
 //! - **reference CPU** は `gpu-kernels` crate の `pointwise/` / `sparse/`
 //!   module に置く (Stage 1 の `progress/` と同列の慣行)
 //! - **GPU↔CPU smoke test** は本 file の `#[cfg(test)] mod gpu_cpu_equivalence_tests`
@@ -371,6 +370,60 @@ pub fn ranger_lookahead_lerp(
     }
 }
 
+/// Sparse feature transform forward (HalfKA_hm 用) — Stage 2-6 (#42)。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは Stage 1-5 で確立した cuda-oxide rustc-codegen-cuda
+/// backend の bin-entry 制約のため。GPU launch は `#[cfg(test)] mod
+/// gpu_cpu_equivalence_tests` から `cuda_launch!` macro 経由で行う。
+///
+/// アルゴリズムと bullet-shogi 上流 (`crates/compiler/src/tensor/operation/
+/// linear/sparse.rs::SparseMatmul::evaluate`) との対応 / divergence は
+/// reference CPU (`gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu`)
+/// の docstring および `ATTRIBUTION.md` の Stage 2-6 entry を参照。
+///
+/// 1 thread = 1 (batch_index, row_index) tuple、flat 1D で `tid = bi * rows + ri`、
+/// `bi = tid / rows`、`ri = tid % rows`。`weight` は **column-major** (`weight[idx
+/// * rows + ri]`)、atomics 不要 (各 thread は別 output cell に書く)。`-1`
+/// padding と `idx >= cols` の異常入力は silent skip (Stage 1-6 grad / bullet
+/// 上流 と同型 defensive pattern)。
+///
+/// 引数数 (7) は bullet 上流 evaluate と同型のため `clippy::too_many_arguments`
+/// を allow。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn sparse_ft_forward(
+    weight: &[f32],
+    indices: &[i32],
+    mut out: DisjointSlice<f32>,
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    nnz: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (rows as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (rows as usize);
+    let ri = tid.get() % (rows as usize);
+
+    let mut sum = 0.0_f32;
+    let base = bi * (nnz as usize);
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx = indices[base + (ni as usize)];
+        if idx >= 0 && (idx as u32) < cols {
+            sum += weight[(idx as usize) * (rows as usize) + ri];
+        }
+        ni += 1;
+    }
+    if let Some(o) = out.get_mut(tid) {
+        *o = sum;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host driver helpers (kernel module loader / launch utilities)
 // ---------------------------------------------------------------------------
@@ -479,7 +532,8 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     // `CUDA_ERROR_NOT_FOUND` を返す static failure になる (test では
     // `open_module` で気付ける)。kernel-list を build script から自動列挙する
     // refactor は Stage 2-8 wrap-up 候補。
-    let kernel_names = "screlu_grad,loss_wdl,adamw_step,radam_step,ranger_lookahead_lerp";
+    let kernel_names =
+        "screlu_grad,loss_wdl,adamw_step,radam_step,ranger_lookahead_lerp,sparse_ft_forward";
 
     run_or_err(
         &llvm_link,
@@ -577,8 +631,7 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn main() {
     println!(
         "exp-002-fused-kernels: Stage 2 fused kernel suite host driver \
-         (Stage 2-5: screlu_grad + loss_wdl + adamw_step + radam_step + \
-         ranger_lookahead_lerp landed)"
+         (Stage 2-6: pointwise 5 + sparse_ft_forward landed)"
     );
 }
 
@@ -1446,6 +1499,233 @@ mod gpu_cpu_equivalence_tests {
             let s_gpu = slow_dev.to_host_vec(&stream)?;
             assert_eq!(w_gpu, vec![10.0_f32, 20.0, 30.0, 40.0]);
             assert_eq!(s_gpu, vec![10.0_f32, 20.0, 30.0, 40.0]);
+        }
+        Ok(())
+    }
+
+    /// sparse_ft_forward: GPU と CPU reference の数値同等性。bullet 上流
+    /// (`linear/sparse.rs::tests::evaluate`) と同 shape (batch=2, rows=2,
+    /// cols=3, nnz=4) で 1 ケース完全一致を assert。1 thread = 1 (batch, row)
+    /// tuple、atomics 不要なので tolerance は 1e-7 (Stage 2-5
+    /// ranger_lookahead_lerp 同型、scatter/atomic 経路無し)。
+    /// 大きい shape の網羅は別 test (`*_larger_shape_matches_cpu` /
+    /// `*_multi_block_boundary_matches_cpu`) で行う。
+    #[test]
+    fn sparse_ft_forward_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+
+        // bullet 上流テストと同 shape (batch=2, rows=2, cols=3, nnz=4)
+        let weight = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let indices = vec![0_i32, 1, -1, -1, 2, 2, 1, 0];
+        let batch = 2_u32;
+        let rows = 2_u32;
+        let cols = 3_u32;
+        let nnz = 4_u32;
+        let total_out = (batch as usize) * (rows as usize);
+
+        // CPU reference
+        let mut out_cpu = vec![0.0_f32; total_out];
+        sparse_ft_forward_cpu(
+            &weight,
+            &indices,
+            &mut out_cpu,
+            batch as usize,
+            rows as usize,
+            cols as usize,
+            nnz as usize,
+        );
+        // bullet 上流 expected = [2, 4, 10, 14]
+        assert_eq!(out_cpu, vec![2.0_f32, 4.0, 10.0, 14.0]);
+
+        // GPU
+        let weight_dev = DeviceBuffer::from_host(&stream, &weight)?;
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, total_out)?;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(total_out, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(weight_dev),
+                slice(indices_dev),
+                slice_mut(out_dev),
+                batch,
+                rows,
+                cols,
+                nnz
+            ]
+        }?;
+        stream.synchronize()?;
+        let out_gpu = out_dev.to_host_vec(&stream)?;
+
+        for (i, (g, c)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            assert!(diff < 1e-7, "out[{i}]: gpu={g} cpu={c} diff={diff}");
+        }
+        Ok(())
+    }
+
+    /// sparse_ft_forward: 大きい shape (batch=8, rows=16, cols=64, nnz=12) +
+    /// 決定論的入力で GPU と CPU の bit-equivalent 近い一致を確認。padding と
+    /// out-of-range index も混ぜて defensive path を踏ませる。
+    #[test]
+    fn sparse_ft_forward_kernel_larger_shape_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 8_u32;
+        let rows = 16_u32;
+        let cols = 64_u32;
+        let nnz = 12_u32;
+
+        // 決定論的 weight (column-major、各 column 1 つ目を i*0.01、2 つ目以降は
+        // sin で値ばらけさせる)
+        let mut weight = Vec::with_capacity((rows * cols) as usize);
+        for col in 0..cols {
+            for row in 0..rows {
+                let v = ((col as f32) * 0.1) + ((row as f32) * 0.01);
+                weight.push(v);
+            }
+        }
+        // 決定論的 indices (一部 -1 padding、一部 cols 超過の defensive 入力)
+        let mut indices = Vec::with_capacity((batch * nnz) as usize);
+        for bi in 0..batch {
+            for ni in 0..nnz {
+                let raw = ((bi as i32) * 7 + (ni as i32) * 13) % 70 - 5;
+                // raw が -5..-1 なら -1 padding に丸める / 65 以上は超過 (cols=64)
+                let idx = if raw < 0 { -1_i32 } else { raw };
+                indices.push(idx);
+            }
+        }
+        let total_out = (batch as usize) * (rows as usize);
+
+        let mut out_cpu = vec![0.0_f32; total_out];
+        sparse_ft_forward_cpu(
+            &weight,
+            &indices,
+            &mut out_cpu,
+            batch as usize,
+            rows as usize,
+            cols as usize,
+            nnz as usize,
+        );
+
+        let weight_dev = DeviceBuffer::from_host(&stream, &weight)?;
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, total_out)?;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(total_out, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(weight_dev),
+                slice(indices_dev),
+                slice_mut(out_dev),
+                batch,
+                rows,
+                cols,
+                nnz
+            ]
+        }?;
+        stream.synchronize()?;
+        let out_gpu = out_dev.to_host_vec(&stream)?;
+
+        let tol = 1e-6_f32; // 12 加算でも f32 の round-off は 1e-6 内
+        for (i, (g, c)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            assert!(diff < tol, "out[{i}]: gpu={g} cpu={c} diff={diff}");
+        }
+        Ok(())
+    }
+
+    /// sparse_ft_forward: **multi-block boundary** を踏ませる shape での GPU↔CPU
+    /// 等価性。`batch * rows = 17 * 16 = 272 > BLOCK_DIM = 256` で 2 block 跨ぐ
+    /// (single-block でしか動かない GPU bug を catch するガード)。
+    #[test]
+    fn sparse_ft_forward_kernel_multi_block_boundary_matches_cpu()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+        // 17 * 16 = 272 > BLOCK_DIM (256)、必ず 2 block 跨ぐ
+        let batch = 17_u32;
+        let rows = 16_u32;
+        let cols = 64_u32;
+        let nnz = 8_u32;
+
+        let mut weight = Vec::with_capacity((rows * cols) as usize);
+        for col in 0..cols {
+            for row in 0..rows {
+                weight.push(((col as f32) * 0.1) + ((row as f32) * 0.01));
+            }
+        }
+        let mut indices = Vec::with_capacity((batch * nnz) as usize);
+        for bi in 0..batch {
+            for ni in 0..nnz {
+                let raw = ((bi as i32) * 5 + (ni as i32) * 11) % 70 - 5;
+                let idx = if raw < 0 { -1_i32 } else { raw };
+                indices.push(idx);
+            }
+        }
+        let total_out = (batch as usize) * (rows as usize);
+        assert!(total_out > 256, "test must cross BLOCK_DIM=256 boundary");
+
+        let mut out_cpu = vec![0.0_f32; total_out];
+        sparse_ft_forward_cpu(
+            &weight,
+            &indices,
+            &mut out_cpu,
+            batch as usize,
+            rows as usize,
+            cols as usize,
+            nnz as usize,
+        );
+
+        let weight_dev = DeviceBuffer::from_host(&stream, &weight)?;
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, total_out)?;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(total_out, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(weight_dev),
+                slice(indices_dev),
+                slice_mut(out_dev),
+                batch,
+                rows,
+                cols,
+                nnz
+            ]
+        }?;
+        stream.synchronize()?;
+        let out_gpu = out_dev.to_host_vec(&stream)?;
+
+        let tol = 1e-6_f32;
+        for (i, (g, c)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            assert!(diff < tol, "out[{i}]: gpu={g} cpu={c} diff={diff}");
         }
         Ok(())
     }
