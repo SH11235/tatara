@@ -5,5 +5,6 @@
 //! (numerical equivalence 検証用) を持つ。
 
 pub mod adam_step;
+pub mod eval;
 pub mod forward;
 pub mod grad;
