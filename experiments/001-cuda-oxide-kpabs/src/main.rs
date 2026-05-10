@@ -214,6 +214,56 @@ pub fn adam_step(
     }
 }
 
+/// Evaluation kernel (loss + histogram only)。validation/test 時に gradient
+/// 計算なしで loss と prediction 分布を取るために使う。Stage 1-6 grad の
+/// gradient scatter 部分を取り除いたサブセット。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは forward / grad / adam_step と同じ理由。GPU launch
+/// path は Stage 1-9 (#13) で host loop を組むときに ここから呼び出す。
+///
+/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_eval_loss_hist`) との
+/// 差分は reference CPU 実装 (`src/kernels/eval.rs::eval_cpu`) の docstring
+/// および `ATTRIBUTION.md` の Stage 1-8 entry を参照。
+///
+/// Atomics:
+/// - `loss_acc` (single f64 cell) → `DeviceAtomicF64::fetch_add` (`atomicrmw fadd double`)
+/// - `hist[bin]` (u64) → `DeviceAtomicU64::fetch_add` (`atomicrmw add i64`)
+///
+/// ordering は `Relaxed` (Stage 1-6 grad と同様、collection 用途で順序保証不要)。
+#[kernel]
+pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_pos: u32) {
+    let pos = thread::index_1d();
+    if pos.get() >= n_pos as usize {
+        return;
+    }
+
+    let p = preds[pos.get()];
+    let y = targets[pos.get()];
+    let err = p - y;
+
+    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell として確保済み。
+    let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+    loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
+
+    // i32::clamp は cuda-oxide が現状 lowering 未対応 (Stage 1-6 grad と同根、
+    // panic 経路の Debug::fmt を含むため)。bullet 上流の if-else を verbatim 移植。
+    #[allow(clippy::manual_clamp)]
+    let b = {
+        let mut b = (p * 8.0f32) as i32;
+        if b < 0 {
+            b = 0;
+        }
+        if b > 7 {
+            b = 7;
+        }
+        b
+    };
+    // SAFETY: `hist.len() == 8` を host 側 invariant とする。clamp [0,7] で範囲内。
+    let hist_atom = unsafe { &*(hist.as_ptr().add(b as usize) as *const DeviceAtomicU64) };
+    hist_atom.fetch_add(1u64, AtomicOrdering::Relaxed);
+}
+
 fn main() -> ExitCode {
     let path = match env::args_os().nth(1) {
         Some(p) => PathBuf::from(p),
