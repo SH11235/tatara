@@ -11,6 +11,40 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-5 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/trainer/src/optimiser/ranger.rs::build_ranger_op` (PointwiseIR
+  `ranger.rs:27-46`) + `RangerLookahead::update` (`ranger.rs:82-100`) →
+  `experiments/002-fused-kernels/src/main.rs::ranger_lookahead_lerp`
+  (`#[kernel]`) + `crates/gpu-kernels/src/pointwise/ranger_step.rs::
+  {ranger_lookahead_lerp_cpu, ranger_step_cpu}`。
+  - bullet 上流 Ranger は **RAdam + Lookahead** の 2 段構成。RAdam (Stage 2-4
+    `radam_step` を再利用) で fast params (`weights`) を更新しつつ、
+    `step % k == 0` のときだけ Lookahead lerp で **slow params (`s`) との SMA**
+    を取る host orchestration (bullet `RangerLookahead::update`)
+  - 言語移植: bullet PointwiseIR (`build_ranger_op`、`ranger.rs:27-46`) の
+    `pntwise.binary(alpha, w, Mul) + pntwise.binary(1-alpha, s, Mul) + Add` →
+    Rust `#[kernel] fn ranger_lookahead_lerp` の `alpha * w + (1 - alpha) * s` を
+    1 thread = 1 weight の単純 pointwise op に hand-fuse。`+` / `*` のみで
+    cuda-oxide 制限に当たらない (Stage 1-5 forward の `+ z` と同等)
+  - 同期動作: bullet `pntwise.write(w, ..., new_w); pntwise.write(s, ..., new_w)`
+    (`ranger.rs:43-44`) と同型に `weights[i] = slow[i] = new_w` で完全同期する。
+    test `ranger_lookahead_lerp_kernel_matches_cpu_reference` の post-condition
+    で `weights == slow` を assert
+  - host orchestration: `ranger_step_cpu` は bullet `RangerLookahead::update`
+    と同 sequence (`radam_step` 毎 step + `step % k == 0` のとき lerp)。Stage 3
+    trainer の RangerScheduler が GPU 上で同 sequence を組むときの reference
+  - **Stage 2-4 `radam_step` の再利用**: Ranger は RAdam の自然な拡張で、
+    本実装は RAdam kernel をそのまま再利用 + lookahead lerp kernel を別個に追加
+    する 2 kernel pair として構成。bullet `Ranger = WrapOptimiser<RangerLookahead<G,
+    RAdam<G>>, RangerParams>` (`ranger.rs:161`) と同設計
+  - **slow params の checkpoint**: bullet は `slow.bin` に書き出して resume
+    時に復元 + lookahead step counter を `step_ranger.txt` で persist する
+    (`ranger.rs:121-141, 147-159`)。本実装はそれら orchestration までは
+    含まず Stage 3 trainer integration で扱う想定
+  - cuda-oxide API: lerp kernel は `DisjointSlice<f32>::get_mut` Option destructuring
+    (Stage 1-5 / 2-1 / 2-3 / 2-4 と同型 silent skip pattern)、atomics 不要
+
 #### Stage 2-4 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/trainer/src/optimiser/radam.rs::RAdam::update` (host pre-compute) +
