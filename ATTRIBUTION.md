@@ -11,6 +11,44 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-4 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/trainer/src/optimiser/radam.rs::RAdam::update` (host pre-compute) +
+  `OP` template (`radam.rs:35-54` の `radamOp`) → `experiments/002-fused-kernels/
+  src/main.rs::radam_step` (`#[kernel]`) +
+  `crates/gpu-kernels/src/pointwise/radam_step.rs::radam_step_cpu` +
+  `radam_compute_step_size_denom`。
+  - bullet 上流 RAdam は **rectified Adam**: bias correction (`bc1 = 1 - beta1^t`)
+    + variance 補正係数 `sqrt((1-beta2_t)*p1*p2*p3)` を **`step_size` に統合**
+    し、kernel 側は `rate = lr * step_size` 1 個で受ける。学習初期で variance が
+    不安定なときは `denom = 0` で `1/sqrt(v)` の正規化を **off**、十分 accumulate
+    された後 (`n_sma > n_sma_threshold`、default 5.0) は `denom = 1` で通常
+    Adam-like update
+  - 言語移植: bullet C++ `__device__ __forceinline__ void radamOp` (`radam.rs:35-54`) +
+    上位 `radam` kernel (`size % 4 == 0` で `float4` vectorize) →
+    Rust `#[kernel] fn radam_step` (1 thread = 1 weight scalar、Stage 2-3
+    `adamw_step` と同型)。`float4` vectorize は本実装では見送り (Stage 2-8 候補)
+  - host pre-compute (`radam_compute_step_size_denom`、`radam.rs:198-218` 由来)
+    は数式同一: `n_sma_max = 2/(1-beta2) - 1`、`n_sma = n_sma_max - 2*step*beta2_t/(1-beta2_t)`、
+    `step_size = sqrt((1-beta2_t)*p1*p2*p3) / bc1` (n_sma > threshold 時) or
+    `1 / bc1` (otherwise)、`denom = (n_sma > threshold) as i32`
+  - **Stage 2-3 `adamw_step` (bias correction なし) との設計分離**: AdamW base
+    (decay + clip + Adam update) を共有しつつ、bias correction + denom switch
+    を加えた版が本 `radam_step`。Stage 2-5 `ranger_step` (#41) で本 RAdam +
+    lookahead lerp を加える設計連鎖
+  - **`adj_ptr` / `rate_ptr` / `step_size_ptr` / `denom_ptr` の host pre-compute
+    値渡し化**: bullet 上流は全て 1-element device buffer で渡す (`radam.rs:DECL`
+    参照) が、本実装は `f32` / `i32` 値渡しに簡素化 (Stage 2-3 `adamw_step` と
+    同 convention)。Stage 3 trainer integration で device-side scheduling が
+    必要になったら別 issue で device buffer 化
+  - cuda-oxide API: 4 buffer すべて `DisjointSlice<f32>::get_mut` Option 経路
+    (Stage 1-7 / 2-3 silent skip pattern)、clamp は `if-else` ladder
+    (Stage 1-7 / 2-3 と同 workaround)、`f32::sqrt` は `__nv_sqrtf` (libdevice)
+    に lowering、`if denom != 0` の i32→bool 比較は cuda-oxide で問題なく compile
+    される (Stage 1-6 grad の bin clamp `b < 0` 比較と同型)
+  - i32 を bool cast せず `!= 0` の比較で使う点は Rust の型安全性に揃えたが
+    意味は bullet `if (denom)` と同じ
+
 #### Stage 2-3 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/trainer/src/optimiser/adam.rs::AdamWParams::build` (上流 AdamW
