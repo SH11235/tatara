@@ -60,6 +60,28 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-8 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_eval_loss_hist`
+  → `experiments/001-cuda-oxide-kpabs/src/main.rs` の `#[kernel] fn eval`
+  + `experiments/001-cuda-oxide-kpabs/src/kernels/eval.rs` の
+  `eval_cpu` (numerical equivalence test 用 reference)。
+  - 言語移植: C++ `__global__` → Rust `#[kernel]`
+  - C++ `const float* preds / targets` / `double* loss_acc` / `unsigned long long* hist` →
+    Rust `&[f32]` / `&[f64]` / `&[u64]` (atomicAdd 経由で書く前提)
+  - C++ `atomicAdd(loss_acc, (double)err*(double)err)` → Rust
+    `DeviceAtomicF64::fetch_add(_, AtomicOrdering::Relaxed)`、IR で
+    `atomicrmw fadd ptr ..., double ... syncscope("device") monotonic` 確認
+  - C++ `atomicAdd(&hist[b], 1ULL)` → Rust `DeviceAtomicU64::fetch_add(1, Relaxed)`、
+    IR で `atomicrmw add ptr ..., i64 1 syncscope("device") monotonic` 確認
+  - C++ `(int)(p * 8.0f); if (b<0) b=0; if (b>7) b=7;` → kernel 側は Stage 1-6
+    と同じく verbatim if-else (`#[allow(clippy::manual_clamp)]`)、CPU reference は
+    `i32::clamp(0, 7)`
+  - 計算ロジックは `grad` の **gradient scatter / per_pos_norm を除いたサブセット** で、
+    eval 側 `eval_cpu` と grad 側 `grad_cpu` に同じ `(preds, targets, n_pos)` を渡せば
+    `loss_acc` / `hist` が完全一致する不変条件をテスト (`tests/eval_smoke.rs::
+    eval_output_matches_grad_loss_hist_subset`)
+
 #### Stage 1-7 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_adam_step`
