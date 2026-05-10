@@ -11,7 +11,7 @@ path / 進捗** を一覧する。各 kernel issue (Stage 2-1〜2-7) で landed 
 |---|---|---|---|---|---|---|---|
 | `fused_screlu_grad` | 2-3 | activation gradient (forward 経路と組合せ) | `crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU` | `pointwise/screlu_grad.rs` | `experiments/002-fused-kernels/src/main.rs::screlu_grad` | #37 | 実装済み (PR pending) |
 | `fused_loss_wdl` | 3-5 | sigmoid + WDL blend + scale | `crates/bullet_lib/src/value/loader.rs` (data-layer blend) + `dfo::Sigmoid` | `pointwise/loss_wdl.rs` | `experiments/002-fused-kernels/src/main.rs::loss_wdl` | #38 | 実装済み (PR pending) |
-| `fused_adamw_step` | 5 | AdamW (decay + clip 込み) | `crates/trainer/src/optimiser/adam.rs::AdamWParams` | `pointwise/adamw_step.rs` (TBD) | 同上 | #39 | 未実装 |
+| `fused_adamw_step` | 5 | AdamW (decay + clip 込み) | `crates/trainer/src/optimiser/adam.rs::AdamWParams` | `pointwise/adamw_step.rs` | `experiments/002-fused-kernels/src/main.rs::adamw_step` | #39 | 実装済み (PR pending) |
 | `fused_radam_step` | 5+host | RAdam (AdamW + bias correction + denom switch) | `crates/trainer/src/optimiser/radam.rs::RAdamParams` | `pointwise/radam_step.rs` (TBD) | 同上 | #40 | 未実装 |
 | `fused_ranger_step` | RAdam + lookahead | Ranger (RAdam + slow params lerp、k-step periodic) | `crates/trainer/src/optimiser/ranger.rs` | `pointwise/ranger_step.rs` (TBD) | 同上 | #41 | 未実装 |
 

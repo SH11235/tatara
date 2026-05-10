@@ -11,6 +11,43 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-3 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/trainer/src/optimiser/adam.rs::AdamWParams::build` (上流 AdamW
+  optimizer kernel、`adam.rs:34-50` の `OP` template) →
+  `experiments/002-fused-kernels/src/main.rs::adamw_step` (`#[kernel]`) +
+  `crates/gpu-kernels/src/pointwise/adamw_step.rs::adamw_step_cpu`。
+  - 言語移植: bullet C++ `__device__ __forceinline__ void adamOp` + 上位
+    `adamw` kernel (`size % 4 == 0` で `float4` vectorize) →
+    Rust `#[kernel] fn adamw_step` (1 thread = 1 weight scalar、Stage 1
+    `progress::adam_step` と同型)。`float4` vectorize は本実装では見送り
+    (Stage 2-8 で性能要件が出たら追加候補)
+  - update 式は upstream と同一: `p *= 1 - decay * lr; m = b1*m + (1-b1)*g;
+    v = b2*v + (1-b2)*g^2; p -= lr * m / (sqrt(v) + eps); p = clamp(p, min_w, max_w)`
+  - **bias correction なし**: bullet 上流 AdamW は意図的に bias correction
+    (`bc1 = 1 - beta1^t` 等) を含まない。Stage 1 `progress::adam_step` (= bullet
+    の旧 `KERNELS_SRC::k_adam_step` 由来、bias correction あり) とは別 convention
+    なので、`adamw_step_cpu` docstring に明示分離。Stage 2-4 (radam_step) で
+    bias correction を加えた版を別途用意する設計
+  - **grad reset**: bullet 上流は `gradients` を `const float*` で reset しない
+    が、本実装は Stage 1 `progress::adam_step` を踏襲して `grad[i] = 0` を
+    kernel 内で行う (host loop が次 batch の `atomicAdd` 累積に使う設計)
+  - cuda-oxide API: 4 buffer すべて `DisjointSlice<f32>::get_mut` Option 経路
+    (Stage 1-7 adam_step / Stage 2-1 screlu_grad と同型 silent skip pattern)、
+    clamp は `f32::clamp` lowering 失敗のため `if-else` ladder に展開
+    (Stage 1-7 と同 workaround)、`f32::sqrt` は `__nv_sqrtf` (libdevice) に
+    lowering される (Stage 1-7 動作確認済)
+  - lambda の関係: `decay = 0.0` で plain Adam (上流 `KERNELS_SRC::k_adam_step`
+    の bias-correction を取り除いた形)、`min_w = f32::MIN, max_w = f32::MAX` で
+    clip 無効化
+  - **`adj` / `rate` の host pre-compute 化**: bullet 上流は `adj_ptr` /
+    `rate_ptr` を 1-element device buffer で渡し kernel 内で `adj * rate` を
+    取る (`optimiser/adam.rs::DECL` 参照)。本実装は **`adj` を省略** + **`rate`
+    (lr) を `f32` 値渡し** に簡素化 (Stage 1 `progress::adam_step` 同型、
+    Issue #39 本文の `adj_ptr` / `rate_ptr` 仕様より狭い scope)。Stage 3 trainer
+    integration で device-side lr scheduling が必要になった時に `adj_ptr` /
+    `rate_ptr` 化を別 issue で扱う想定
+
 #### Stage 2-2 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/value/loader.rs::301-316` (data-layer WDL blend) +
