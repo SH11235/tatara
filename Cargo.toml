@@ -6,6 +6,7 @@ members = [
     "crates/gpu-kernels",
     "crates/gpu-runtime",
     "experiments/001-cuda-oxide-kpabs",
+    "experiments/002-fused-kernels",
     "bins/progress_kpabs_train",
 ]
 
