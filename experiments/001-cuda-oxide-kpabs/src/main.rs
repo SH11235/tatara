@@ -20,9 +20,50 @@ use std::mem::size_of;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use cuda_device::{DisjointSlice, kernel, thread};
 use shogi_format::PackedSfenValue;
 
 const PSV_SIZE: usize = size_of::<PackedSfenValue>();
+
+/// Forward kernel (KP-abs sigmoid prediction per position).
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは、cuda-oxide の rustc-codegen-cuda backend が
+/// **bin entry から到達可能な kernel** を PTX 化する設計だから (lib.rs 内
+/// kernel は `cargo oxide build <crate>` では PTX に出ない、本リポでは
+/// 経験的に未生成を確認)。GPU launch path は Stage 1-9 (#13) で host loop
+/// を組むときに ここから呼び出す。
+///
+/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_forward`) との差分は
+/// reference CPU 実装 (`src/kernels/forward.rs::forward_cpu`、lib path で
+/// `exp_001_cuda_oxide_kpabs::kernels::forward::forward_cpu`) の docstring
+/// および `ATTRIBUTION.md` の Stage 1-5 entry を参照。
+#[kernel]
+pub fn forward(
+    indices: &[i32],
+    weights: &[f32],
+    mut preds: DisjointSlice<f32>,
+    n_pos: u32,
+    max_inds: u32,
+) {
+    let pos = thread::index_1d();
+    if pos.get() >= n_pos as usize {
+        return;
+    }
+    let mut z = 0.0f32;
+    let base = pos.get() * (max_inds as usize);
+    let mut j: u32 = 0;
+    while j < max_inds {
+        let idx = indices[base + (j as usize)];
+        if idx >= 0 {
+            z += weights[idx as usize];
+        }
+        j += 1;
+    }
+    if let Some(p) = preds.get_mut(pos) {
+        *p = 1.0f32 / (1.0f32 + (-z).exp());
+    }
+}
 
 fn main() -> ExitCode {
     let path = match env::args_os().nth(1) {

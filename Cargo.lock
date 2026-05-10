@@ -93,6 +93,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-device"
+version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
+dependencies = [
+ "cuda-macros",
+]
+
+[[package]]
 name = "cuda-host"
 version = "0.1.0"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
@@ -126,6 +134,8 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 name = "exp-001-cuda-oxide-kpabs"
 version = "0.1.0"
 dependencies = [
+ "cuda-device",
+ "cuda-host",
  "shogi-format",
 ]
 
