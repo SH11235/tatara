@@ -508,7 +508,8 @@ const BLOCK_DIM: u32 = 256;
 /// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
 /// CudaModule を load する。`bins/progress_kpabs_train` Stage 1-9 の同名関数と
 /// 同等の loader pipeline。重複しているが、loader を crate 化する refactor は
-/// 別 issue (Stage 2-8 wrap-up あたり) で扱う想定。
+/// Stage 3 着手時に別 issue で扱う想定 (Stage 2-8 wrap-up 時点では未着手、
+/// `bins/progress_kpabs_train` と本 crate 両方で同 helper を保持)。
 #[allow(dead_code)]
 fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
@@ -1961,6 +1962,350 @@ mod gpu_cpu_equivalence_tests {
                 "grad_weight[{i}]: gpu={g} cpu={c} diff={diff} > {tol}"
             );
         }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2-8 (#44): 各 fused kernel の絶対 samples/sec ベンチ (sm_75 ローカル測定)
+// ---------------------------------------------------------------------------
+//
+// EPIC #16 完了条件「benchmark で bullet runtime-fused 比 ≥ 90%」の **直接 bullet
+// 比較は GPU/OS/driver 差で apples-to-apples にならない** ため手動 sm_86 で別途
+// 取る方針 (Issue #44 本文)。本 module は **sm_75 ローカルでの absolute
+// samples/sec** を全 7 kernel について計測し、catalog doc に数値を残す。Stage 3
+// trainer integration で training 時の throughput regression を検出する baseline
+// としても使う。
+//
+// **naive baseline 比** について: Issue #44 本文では mandatory だったが、実装し
+// 終わった 7 kernel の内訳を見ると **4/7** (`screlu_grad` / `ranger_lookahead_lerp`
+// / `sparse_ft_forward` / `sparse_ft_backward`) は naive 分解が degenerate /
+// 適用不能で、残る **3 件** (`loss_wdl` / `adamw_step` / `radam_step`) は naive
+// 分解で kernel 4-5 個に分かれ fusion 効果が顕在化するが、kernel 単独 micro-bench
+// より **Stage 3 trainer integration の actual training throughput** で測る方が
+// 妥当 (training context で memory bandwidth が真に律速)。
+//
+// → Stage 3 follow-up issue #53 で naive vs fused throughput を回収。
+// 詳細は catalog doc の bench セクション参照。
+//
+// 走らせる:
+//
+// ```bash
+// cd experiments/002-fused-kernels
+// CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build
+// cargo test -p exp-002-fused-kernels --bin exp-002-fused-kernels --release \
+//     -- bench_tests --test-threads=1 --nocapture
+// ```
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    /// 共通: warm-up 1 step + 計測 N step、kernel-only timing。Stage 1-10 同型。
+    /// `samples_per_sec > 1.0` の sanity floor を入れて kernel 即時 NaN return /
+    /// 完全 stall 等の退行を catch する (Stage 1-10 同 convention)。
+    fn run_bench<F>(name: &str, n_elements: usize, n_steps: usize, mut launch: F)
+    where
+        F: FnMut() -> Result<(), Box<dyn std::error::Error>>,
+    {
+        launch().expect("warm-up launch failed");
+        let start = std::time::Instant::now();
+        for _ in 0..n_steps {
+            launch().expect("bench launch failed");
+        }
+        let elapsed = start.elapsed();
+        let total_samples = n_elements * n_steps;
+        let samples_per_sec = total_samples as f64 / elapsed.as_secs_f64();
+        println!(
+            "Stage 2-8 bench [{name}]: {n_elements} elements/step × {n_steps} steps in {elapsed:.3?} → {samples_per_sec:.0} elements/sec"
+        );
+        assert!(
+            samples_per_sec > 1.0,
+            "[{name}] samples/sec too low ({samples_per_sec}); kernel may have stalled or returned immediately"
+        );
+    }
+
+    type CudaCtxModuleStream = (
+        std::sync::Arc<CudaContext>,
+        std::sync::Arc<CudaModule>,
+        std::sync::Arc<CudaStream>,
+    );
+
+    fn open_module() -> Result<CudaCtxModuleStream, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = super::load_kernel_module_with_fallback(&ctx, "exp_002_fused_kernels")?;
+        Ok((ctx, module, stream))
+    }
+
+    fn cfg_for(n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: super::grid_dim_1d(n, super::BLOCK_DIM),
+            block_dim: (super::BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// 1024 element の代表的 workload で全 7 kernel を benchmark し
+    /// `println!` で記録。`--nocapture` を渡すと結果が見える。
+    /// EPIC #16 完了条件「7 kernel が build-time PTX 化される」を満たした上で
+    /// **Stage 3 trainer integration の throughput regression baseline** として残す。
+    ///
+    /// ## AdamW / RAdam bench の workload 注意点
+    ///
+    /// `adamw_step` / `radam_step` kernel は **kernel 内で `grad[i] = 0` を
+    /// reset する** 設計 (Stage 1-7 / 2-3 / 2-4 と同型、host loop が次 batch の
+    /// atomic 累積に向けて grad を 0 化する production semantics)。本 bench は
+    /// warm-up 1 step + 計測 50 step を **同じ DeviceBuffer に対して** 連続
+    /// launch するため、warm-up 後は grad が 0 で固定される (kernel が毎 step
+    /// reset し続けるため)。
+    ///
+    /// 結果として 50 step 中 49 step は実質 `grad = 0` で `m * beta1 + 0` /
+    /// `v * beta2 + 0` を回す状態になり、actual training の **non-zero grad
+    /// stream を毎 step 流す realistic workload** とは差がある。これは:
+    ///
+    /// - 本 bench は **launch overhead + memory traffic baseline** の測定が
+    ///   主目的、kernel 自体の floating-point work 量はどちらも数 µs レンジ
+    ///   なので影響 minor (grad=0 でも m/v load + decay/clip/sqrt は走る)
+    /// - **realistic workload (毎 step 新 grad 流入) での measurement は
+    ///   Stage 3 actual training throughput #53** で取り直す前提 (non-zero
+    ///   grad source = 上流 sparse_ft_backward / loss_wdl の実出力)
+    /// - 本 PR では grad re-injection の host-loop 化は cuda-oxide
+    ///   DeviceBuffer に `copy_from_host` API がない (`from_host` 再 alloc / `zeroed`
+    ///   / `to_host_vec` のみ) ため per-step host→device 注入が cleanly 書けず、
+    ///   defer 扱い
+    #[test]
+    fn bench_all_seven_kernels() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n = 1024_usize;
+        let n_u32 = n as u32;
+        let n_steps = 50_usize;
+
+        // screlu_grad
+        {
+            let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+            let dl_dy = vec![1.0_f32; n];
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let dl_dy_dev = DeviceBuffer::from_host(&stream, &dl_dy)?;
+            let mut dl_dx_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+            let cfg = cfg_for(n);
+            run_bench("screlu_grad", n, n_steps, || {
+                cuda_launch! {
+                    kernel: screlu_grad,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [slice(x_dev), slice(dl_dy_dev), slice_mut(dl_dx_dev), n_u32]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // loss_wdl
+        {
+            let out_h: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 0.5).collect();
+            let score = vec![0.5_f32; n];
+            let wdl = vec![0.5_f32; n];
+            let per_pos_norm = vec![1.0_f32 / (n as f32); n];
+            let out_dev = DeviceBuffer::from_host(&stream, &out_h)?;
+            let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+            let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+            let norm_dev = DeviceBuffer::from_host(&stream, &per_pos_norm)?;
+            let mut dl_dout_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+            let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+            let cfg = cfg_for(n);
+            run_bench("loss_wdl", n, n_steps, || {
+                cuda_launch! {
+                    kernel: loss_wdl,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [
+                        slice(out_dev),
+                        slice(score_dev),
+                        slice(wdl_dev),
+                        slice(norm_dev),
+                        slice_mut(dl_dout_dev),
+                        slice(loss_dev),
+                        0.5_f32,
+                        1.0_f32,
+                        n_u32
+                    ]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // adamw_step
+        {
+            let weights = vec![0.5_f32; n];
+            let m = vec![0.0_f32; n];
+            let v = vec![0.0_f32; n];
+            let grad = vec![0.01_f32; n];
+            let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+            let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+            let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+            let mut grad_dev = DeviceBuffer::from_host(&stream, &grad)?;
+            let cfg = cfg_for(n);
+            run_bench("adamw_step", n, n_steps, || {
+                cuda_launch! {
+                    kernel: adamw_step,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [
+                        slice_mut(weights_dev),
+                        slice_mut(m_dev),
+                        slice_mut(v_dev),
+                        slice_mut(grad_dev),
+                        1e-3_f32,
+                        0.01_f32,
+                        0.9_f32,
+                        0.999_f32,
+                        1e-8_f32,
+                        -2.0_f32,
+                        2.0_f32,
+                        n_u32
+                    ]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // radam_step
+        {
+            let weights = vec![0.5_f32; n];
+            let m = vec![0.0_f32; n];
+            let v = vec![0.0_f32; n];
+            let grad = vec![0.01_f32; n];
+            let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+            let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+            let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+            let mut grad_dev = DeviceBuffer::from_host(&stream, &grad)?;
+            let cfg = cfg_for(n);
+            run_bench("radam_step", n, n_steps, || {
+                cuda_launch! {
+                    kernel: radam_step,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [
+                        slice_mut(weights_dev),
+                        slice_mut(m_dev),
+                        slice_mut(v_dev),
+                        slice_mut(grad_dev),
+                        1e-3_f32,
+                        2.5_f32,
+                        1_i32,
+                        0.01_f32,
+                        0.9_f32,
+                        0.999_f32,
+                        1e-8_f32,
+                        -2.0_f32,
+                        2.0_f32,
+                        n_u32
+                    ]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // ranger_lookahead_lerp
+        {
+            let weights = vec![1.0_f32; n];
+            let slow = vec![0.0_f32; n];
+            let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+            let mut slow_dev = DeviceBuffer::from_host(&stream, &slow)?;
+            let cfg = cfg_for(n);
+            run_bench("ranger_lookahead_lerp", n, n_steps, || {
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [slice_mut(weights_dev), slice_mut(slow_dev), 0.5_f32, n_u32]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // sparse_ft_forward
+        {
+            let batch = 32_u32;
+            let rows = 32_u32;
+            let cols = 64_u32;
+            let nnz = 8_u32;
+            let weight: Vec<f32> = (0..(rows * cols)).map(|i| (i as f32) * 0.001).collect();
+            let indices: Vec<i32> = (0..(batch * nnz))
+                .map(|i| (i as i32) % (cols as i32))
+                .collect();
+            let total_out = (batch as usize) * (rows as usize);
+            let weight_dev = DeviceBuffer::from_host(&stream, &weight)?;
+            let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+            let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, total_out)?;
+            let cfg = cfg_for(total_out);
+            run_bench("sparse_ft_forward", total_out, n_steps, || {
+                cuda_launch! {
+                    kernel: sparse_ft_forward,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [
+                        slice(weight_dev),
+                        slice(indices_dev),
+                        slice_mut(out_dev),
+                        batch,
+                        rows,
+                        cols,
+                        nnz
+                    ]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
+        // sparse_ft_backward
+        {
+            let batch = 32_u32;
+            let rows = 32_u32;
+            let cols = 64_u32;
+            let nnz = 8_u32;
+            let total_in = (batch as usize) * (rows as usize);
+            let total_weight = (rows as usize) * (cols as usize);
+            let grad_out: Vec<f32> = (0..total_in).map(|i| (i as f32) * 0.001).collect();
+            let indices: Vec<i32> = (0..(batch * nnz))
+                .map(|i| (i as i32) % (cols as i32))
+                .collect();
+            let grad_out_dev = DeviceBuffer::from_host(&stream, &grad_out)?;
+            let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+            let grad_weight_dev = DeviceBuffer::<f32>::zeroed(&stream, total_weight)?;
+            let cfg = cfg_for(total_in);
+            run_bench("sparse_ft_backward", total_in, n_steps, || {
+                cuda_launch! {
+                    kernel: sparse_ft_backward,
+                    stream: stream,
+                    module: module,
+                    config: cfg,
+                    args: [
+                        slice(grad_out_dev),
+                        slice(indices_dev),
+                        slice(grad_weight_dev),
+                        batch,
+                        rows,
+                        cols,
+                        nnz
+                    ]
+                }?;
+                stream.synchronize()?;
+                Ok(())
+            });
+        }
+
         Ok(())
     }
 }
