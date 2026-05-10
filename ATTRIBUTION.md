@@ -11,6 +11,41 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-6 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmul::evaluate`
+  → `experiments/002-fused-kernels/src/main.rs::sparse_ft_forward` (`#[kernel]`)
+  + `crates/gpu-kernels/src/sparse/sparse_ft_forward.rs::sparse_ft_forward_cpu`。
+  - 言語移植: bullet `evaluate` (`linear/sparse.rs:61-91`、generic `DValue` 経由) →
+    Rust `#[kernel] fn sparse_ft_forward` (1 thread = 1 (batch, row) tuple、
+    f32 固定)。bullet 上流は generic な dtype を受けるが、本実装は NNUE training の
+    hot path で f32 のみ扱う前提
+  - layout は **column-major weight** で完全一致: bullet `d.read(rows * idx + ri)` →
+    Rust `weight[(idx as usize) * rows + ri]`。bullet test (`linear/sparse.rs:243-253`、
+    batch=2/rows=2/cols=3/nnz=4、expected=[2,4,10,14]) と同 fixture を本実装の
+    `matches_bullet_upstream_evaluate_test` で 1:1 に再現
+  - **silent skip on `idx >= cols`**: bullet 上流 `if idx >= 0 && (idx as usize) <
+    cols` (`linear/sparse.rs:82`) と同型 defensive を `if idx >= 0 && (idx as u32)
+    < cols` で再現。`-1` padding と out-of-range の異常入力どちらも no-op
+  - thread 配置: bullet 上流は PointwiseIR の `tid()` で 1 thread = 1 row、batch
+    軸は別ループで unroll する想定 (上流側の launch grid 仕様)。本実装は
+    **flat 1D `tid = bi * rows + ri`** で batch 軸も込みで thread に展開
+    (Stage 1-5 forward / Stage 2-1 screlu_grad と同 idiom、1024 元レンジで
+    GPU↔CPU 等価性確認済)
+  - bullet は `nnz` ループを runtime fusion で吸収 (上流の PointwiseIR は per-row
+    で sum reduction を inline)。本実装は `nnz` を build-time 引数で受けて
+    kernel 内 while ループで素直に展開 (Stage 1-5 forward の `while j < max_inds`
+    と同 pattern、memory bandwidth bound なので unroll 差は小さい想定、Stage 2-8
+    で性能要件が出たら optimize 候補)
+  - cuda-oxide API: `+` / `*` / i32 比較のみで cuda-oxide 制限非該当 (Stage 1-5
+    forward と同等の単純 pointwise op)、`DisjointSlice<f32>::get_mut` Option
+    silent skip pattern (Stage 1-5 / 2-1 / 2-3 / 2-4 と同型)、atomics 不要
+  - **Stage 2-7 (backward, #43) は本 forward の column-major weight layout を
+    引き継ぐ** (bullet 上流も `SparseMatmulBwd::evaluate` で同 `rows * idx + ri`
+    indexing、`linear/sparse.rs:142`)。backward は `grad_weight` の同 cell に
+    複数 (bi, ni) が衝突するため `DeviceAtomicF32::fetch_add` で scatter する形
+    (Stage 1-6 grad の atomic scatter pattern と同型)
+
 #### Stage 2-5 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/trainer/src/optimiser/ranger.rs::build_ranger_op` (PointwiseIR
