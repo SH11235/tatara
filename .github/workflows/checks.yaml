@@ -44,20 +44,22 @@ jobs:
         if: steps.ws.outputs.empty == 'false'
         run: cargo fmt --all -- --check
 
-      # GPU 依存 crate (gpu-runtime と将来の gpu-kernels) は CUDA toolkit + LLVM 21+
-      # + cuda-oxide が必要で GitHub-hosted runner では build できない。
-      # それらは self-hosted runner の別 workflow で検証する想定。本 workflow からは exclude する。
+      # GPU 依存 crate (gpu-runtime / progress-kpabs-train) と experiments/001 は
+      # CUDA toolkit + LLVM 21+ + cuda-oxide が必要で GitHub-hosted runner では
+      # build できない。self-hosted runner の別 workflow で検証する想定で本
+      # workflow からは exclude する。
       #
       # Stage 1-5 (#9) で `exp-001-cuda-oxide-kpabs` も `cuda-host` を直接 dep
       # に取った (`#[kernel]` macro 展開で `cuda_host::CudaKernel` を要求)
       # ため、transitive で cuda-bindings の build script が `cuda.h` を要求して
-      # GitHub runner では build fail する。Stage 1-4 (#8) の PR #27 forward-comment
-      # で予告した通り exclude に追加。
+      # GitHub runner では build fail する。Stage 1-11 (#15) で同パターンを
+      # `bins/progress_kpabs_train` (= `progress-kpabs-train`) に昇格、本 workflow
+      # からも exclude する (gpu-kernels は CPU のみで CI に通る)。
       # 新しい GPU 依存 crate を追加するときも同様に --exclude リストを更新すること。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude progress-kpabs-train -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs
+        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude progress-kpabs-train

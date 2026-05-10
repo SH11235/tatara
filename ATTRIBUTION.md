@@ -60,6 +60,35 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-11 (2026-05-11)
+
+- experiments/001-cuda-oxide-kpabs を **archive 化** し、production target を
+  以下 2 crate に昇格:
+  - **`crates/gpu-kernels/`** — Stage 1-5..1-8 の reference CPU 実装
+    (`forward_cpu` / `grad_cpu` / `adam_step_cpu` / `eval_cpu`) を `progress`
+    モジュールに移動。GPU `#[kernel]` は cuda-oxide rustc-codegen-cuda backend の
+    "bin entry から到達可能な kernel のみ NVPTX IR 化" 制約のため引き続き bin
+    側 (= bins/progress_kpabs_train/src/main.rs) に inline 配置する
+  - **`bins/progress_kpabs_train/`** — Stage 1-9 で組み込んだ host loop driver
+    (`#[kernel]` × 4 + `GpuTrainer` + `train_one_epoch` + CLI) と host helper
+    (`Batch` / `GameIterator` / `progress_bin` / `Args`) を移動。reference
+    CPU は新 `gpu-kernels` crate を引き込んで参照する DRY 構成
+- experiments/001 は **そのまま残し** (Stage 1 進行中の試行錯誤履歴として参照可能)、
+  README に昇格先 link と archive 注意書きを追加
+- ファイル内容は `experiments/001-cuda-oxide-kpabs/` から **コピー** (新規実装
+  なし)。bullet-shogi 上流に対する関係は Stage 1-1..1-10 の各 entry がそのまま
+  有効。本 entry は workspace 構造変更のみ
+- workspace `Cargo.toml`: 新 member 2 つを `members` に追加、
+  `gpu-kernels = { path = ... }` を `[workspace.dependencies]` に追加
+- CI (`.github/workflows/checks.yaml`): `progress-kpabs-train` を `--exclude`
+  リストに追加 (cuda-bindings build に CUDA toolkit が必要、GitHub runner で
+  build 不能、experiments/001 と同じ理由)。`gpu-kernels` は CPU only なので CI
+  に通る
+- 動作確認: sm_75 RTX 2070 SUPER で `cargo run --release -p
+  progress-kpabs-train -- --data <sample.psv> --output /tmp/progress.bin
+  --games-per-step 4 --max-games 8` が `mean_loss=0.085017` の値を experiments/001
+  と完全一致で出力、`samples/sec ≈ 290k` を記録
+
 #### Stage 1-10 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - **新規ファイル** (bullet-shogi 由来ではない、本リポ自前):

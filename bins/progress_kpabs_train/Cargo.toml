@@ -1,0 +1,29 @@
+[package]
+name = "progress-kpabs-train"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "progress-kpabs-train"
+path = "src/main.rs"
+
+[dependencies]
+shogi-format = { workspace = true }
+shogi-features = { workspace = true }
+gpu-kernels = { workspace = true }
+gpu-runtime = { workspace = true }
+clap = { workspace = true }
+
+# cuda-oxide deps: device 側 API (#[kernel] / DisjointSlice / atomics) と host 側
+# launch (cuda_launch! macro)。`cuda-core` は macro 展開で参照されるため explicit dep。
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
