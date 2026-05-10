@@ -11,7 +11,12 @@ publish = false
 [lints]
 workspace = true
 
-# Stage 1 の experiment 受け皿。kernel + gpu-runtime は Issue #9〜 で順次足す。
-# 今は Stage 1-1 (shogi-format) への依存だけ — dummy main が PSV を読めれば OK。
 [dependencies]
 shogi-format = { workspace = true }
+
+# cuda-oxide の device 側 API (#[kernel] macro, DisjointSlice, thread::index_*)。
+# rev は Stage 0-1 で動作確認した 6de0509 (gpu-runtime と同じ)。
+# `cuda-host` は `#[kernel]` macro 展開先で `cuda_host::CudaKernel` trait を
+# 参照するため必須 (本 crate からは host launch しないが macro が要求)。
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }

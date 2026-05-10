@@ -23,6 +23,12 @@
 /checkpoints
 **/checkpoints
 
+# cuda-oxide が生成する NVPTX IR / PTX / cubin (kernel module 単位で
+# workspace root or 各 crate 配下に出る、Stage 1+ で増える)
+**/*.ll
+**/*.ptx
+**/*.cubin
+
 # OS / editor
 .DS_Store
 .idea/
