@@ -60,6 +60,40 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-10 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- **新規ファイル** (bullet-shogi 由来ではない、本リポ自前):
+  - `docs/experiments/001-stage1-10-numerical-equivalence.md` — Stage 1-10 の
+    検証手順とローカル実測値 (sm_75 RTX 2070 SUPER で 218k〜233k samples/sec)、
+    bullet-shogi 上流とのクロス検証 manual procedure、cuda-oxide rev `6de0509`
+    で遭遇した 4 件の不具合 / 制限 (`Ord::clamp` lowering 失敗 / `f32::max`
+    intrinsic 未対応 / libNVVM opaque pointer parse 失敗 / cargo-oxide の
+    `.ll` 出力先不整合) を一覧化
+  - `experiments/001-cuda-oxide-kpabs/src/main.rs::gpu_cpu_equivalence_tests`
+    (`#[cfg(test)]` mod) — Stage 1-5..1-8 の reference CPU 実装 (`*_cpu`) と
+    GPU kernel の出力を直接比較する 5 test:
+    - `forward_kernel_matches_cpu_reference` (16 pos × 8 inds × 64 weights、
+      pad 混在、tolerance 1e-5)
+    - `grad_kernel_matches_cpu_reference` (同 setup、grad scatter atomic ↔
+      CPU sequential add の round-off を 1e-5 で吸収、loss は f64 atomic で
+      1e-8、hist は完全一致)
+    - `eval_kernel_matches_cpu_reference` (24 pos、loss + hist 比較)
+    - `adam_step_kernel_matches_cpu_reference` (32 weights、1 step 後の
+      `weights/m/v/grad` 比較)
+    - `samples_per_sec_baseline_on_sample_psv` (sample.psv の 4 games × 8 pos
+      = 32 pos/batch × 50 steps の throughput を `println!` で記録)
+  - kernel symbol が `main.rs` の bin scope に定義されているため、
+    `tests/*.rs` (lib link only) からは届かず、`#[cfg(test)] mod` を main.rs
+    inline に置く形式を採用。`cargo test --bin exp-001-cuda-oxide-kpabs
+    --release -- --test-threads=1` で実行
+
+- **検証で確認した数値同等性** (sm_75 box 実測):
+  - 4 GPU kernel の出力は CPU reference と f32 で 1e-5 以内、f64 で 1e-8 以内、
+    u64 hist は完全一致
+  - bullet-shogi 上流とのクロス検証は manual procedure として doc 化
+    (両 CUDA 環境を両立させる前提が大きく自動化はせず、必要時に
+    `docs/experiments/001-stage1-10-numerical-equivalence.md` の手順で実施)
+
 #### Stage 1-9 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `examples/shogi_progress_kpabs_train_cuda.rs` の **host 側ロジック** (kernel
