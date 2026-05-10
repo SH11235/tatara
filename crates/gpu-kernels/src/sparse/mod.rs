@@ -8,9 +8,10 @@
 //! ## 提供する module (Stage 2-6〜2-7 で順次追加)
 //!
 //! - `sparse_ft_forward` — HalfKA_hm sparse feature transform forward (Stage 2-6 / #42) — **landed**
-//! - `sparse_ft_backward` — 同 backward、atomics scatter (Stage 2-7 / #43)
+//! - `sparse_ft_backward` — 同 backward、atomics scatter (Stage 2-7 / #43) — **landed**
 //!
 //! Stage 2-0 scaffold (#36) では module 自体は空。各 kernel 実装 PR で
 //! `pub mod <kernel_name>;` を 1 行ずつ追加していく運用。
 
+pub mod sparse_ft_backward;
 pub mod sparse_ft_forward;
