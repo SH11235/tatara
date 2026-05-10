@@ -60,6 +60,32 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-7 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_adam_step`
+  → `experiments/001-cuda-oxide-kpabs/src/main.rs` の `#[kernel] fn adam_step`
+  + `experiments/001-cuda-oxide-kpabs/src/kernels/adam_step.rs` の
+  `adam_step_cpu` (numerical equivalence test 用 reference)。
+  - 言語移植: C++ `__global__` → Rust `#[kernel]` (cuda-oxide `cuda_device`)
+  - C++ `float* weights / m / v / grad` (in-place 4 buffer) → Rust
+    `mut DisjointSlice<f32>` × 4。1 thread = 1 weight で aliasing なし、
+    grad のような scatter は発生しないので **atomics 不要** (Stage 1-6 と
+    異なる)。host 側で `len() == n` を保証し、`get_mut(i)` の Option を
+    全 4 で揃える `if let (Some, Some, Some, Some) = (...)` パターンで
+    silent skip 防御
+  - C++ `fmaxf(bc, 1e-30f)` → Rust 側 GPU kernel では verbatim な if-else
+    `if bc > 1e-30 { bc } else { 1e-30 }` を維持。Rust の `f32::max` は
+    内部で `std::intrinsics::maximum_number_nsz_f32` を呼び、cuda-oxide が
+    現状その intrinsic を未解決 (実機エラー: `Symbol
+    std__intrinsics__maximum_number_nsz_f32 not found`、`f32.rs:993` 由来)。
+    CPU reference (`adam_step_cpu`) は host 実行のみのため `f32::max` を使う
+  - C++ `sqrtf(v_hat)` → Rust `v_hat.sqrt()`。cuda-oxide は IR で
+    `call float @__nv_sqrtf(...)` に lowering する (libdevice 経由、
+    `.ll` 出力で確認済)
+  - C++ `int n` → Rust `u32`
+  - 計算式は表面的差異 (Option-returning DisjointSlice / max の if-else 表現)
+    を除き同一
+
 #### Stage 1-6 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_grad_loss_hist`
