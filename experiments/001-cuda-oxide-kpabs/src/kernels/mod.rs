@@ -5,3 +5,4 @@
 //! (numerical equivalence 検証用) を持つ。
 
 pub mod forward;
+pub mod grad;

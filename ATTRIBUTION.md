@@ -60,6 +60,37 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-6 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_grad_loss_hist`
+  → `experiments/001-cuda-oxide-kpabs/src/main.rs` の `#[kernel] fn grad`
+  + `experiments/001-cuda-oxide-kpabs/src/kernels/grad.rs` の
+  `grad_cpu` (numerical equivalence test 用 reference)。
+  - 言語移植: C++ `__global__` → Rust `#[kernel]` (cuda-oxide `cuda_device`)
+  - C++ `int` → Rust `u32` (n_pos / max_inds)、`int idx` は `i32` のまま (-1 padding 検出)
+  - C++ `float* grad` / `double* loss_acc` / `unsigned long long* hist` →
+    Rust `&[f32]` / `&[f64]` / `&[u64]` (atomicAdd 経由でのみ書く前提)
+  - C++ `atomicAdd(&grad[idx], gscale)` (f32) → Rust の
+    `unsafe { &*(grad.as_ptr().add(idx) as *const DeviceAtomicF32) }
+     .fetch_add(gscale, AtomicOrdering::Relaxed)` (cuda-oxide `cuda_device::atomic`)。
+    生成 IR は `atomicrmw fadd ... syncscope("device") monotonic` で確認済み
+    (sm_60+ の `atom.add.f32` に lowering される、本リポは sm_75 で動作)
+  - 同パターンで `loss_acc` (f64) と `hist[bin]` (u64) も `DeviceAtomicF64` /
+    `DeviceAtomicU64` に reinterpret cast して `fetch_add(_, Relaxed)`。
+    Relaxed 採用は collection 用途で順序保証不要 (bullet 上流 C++ `atomicAdd`
+    の暗黙 ordering と同等)
+  - C++ `int b = (int)(p * 8.0f); if (b<0) b=0; if (b>7) b=7;` →
+    Rust 側 GPU kernel では verbatim な if-else を維持
+    (`#[allow(clippy::manual_clamp)]`)。Rust の `i32::clamp` は内部で
+    `assert!(min <= max)` の panic 経路 (`Debug::fmt`) を持ち、cuda-oxide の
+    rustc-codegen-cuda backend が現状その lowering 未対応 (実機で再現確認)。
+    CPU reference (`grad_cpu`) は host 実行のみのため `i32::clamp` を使う
+  - 計算ロジックは上記の atomic API / clamp 表現の差異以外 **同一**。reference
+    CPU (`grad_cpu`) は同じ式を素直に書き写しただけで、複数 thread の並列
+    更新による浮動小数加算順序の差は生じるが (関連: associative でない f32
+    の加算)、host 単一 thread 実行では deterministic な値を返す
+  - 注: kernel 関数を main.rs に直接配置している理由は Stage 1-5 entry と同じ
+
 #### Stage 1-2 (2026-05-10, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/game/outputs.rs` の `ShogiProgressKPAbs` 周辺
