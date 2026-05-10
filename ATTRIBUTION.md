@@ -11,6 +11,39 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-7 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmulBwd::evaluate`
+  → `experiments/002-fused-kernels/src/main.rs::sparse_ft_backward` (`#[kernel]`)
+  + `crates/gpu-kernels/src/sparse/sparse_ft_backward.rs::sparse_ft_backward_cpu`。
+  - 言語移植: bullet `evaluate` (`linear/sparse.rs:118-150`、generic `DValue` 経由) →
+    Rust `#[kernel] fn sparse_ft_backward` (1 thread = 1 (batch, row) tuple、
+    f32 固定、Stage 2-6 forward と同 layout)
+  - **layout は forward と同型 column-major weight**: bullet `o.write(rows * idx +
+    ri, ...)` → Rust `grad_weight[(idx as usize) * rows + ri]`。bullet test
+    (`linear/sparse.rs::evaluate_bwd`、`:256-269`、batch=2/rows=3/cols=3/nnz=4、
+    grad_out=[0..5]、indices=[0,1,-1,-1,2,2,1,0]、expected=[3,5,7,3,5,7,6,8,10])
+    と同 fixture を本実装の `matches_bullet_upstream_evaluate_bwd_test` で 1:1 再現
+  - **silent skip on `idx >= cols`**: bullet 上流 `if idx >= 0 && (idx as usize)
+    < cols` (`linear/sparse.rs:140`) と同型 defensive を再現
+  - **accumulate semantics**: bullet `evaluate` (`:130-133` 冒頭で `o.write(idx,
+    zero)`) は test 用に zero clear するが、本 kernel は production semantics
+    (host が `device.memset(0)` で zero clear する責務、Stage 1-6 grad と同
+    convention) に揃える。CPU reference も accumulate (zero clear なし) で同型
+  - **atomic scatter**: 複数 (bi, ni) thread が同じ `(idx, ri)` cell に書き込む
+    ため `DeviceAtomicF32::fetch_add(_, AtomicOrdering::Relaxed)` で atomic
+    scatter (Stage 1-6 grad と完全同 pattern、`unsafe { &*(slice.as_ptr().add(...)
+    as *const DeviceAtomicF32) }` reinterpret cast)。`.ll` 上で
+    `atomicrmw fadd float ... syncscope("device") monotonic` が 1 箇所出る
+    ことを確認
+  - thread 配置: bullet 上流は PointwiseIR で per-row reduction、batch 軸別 unroll
+    想定。本実装は Stage 2-6 forward と同型 **flat 1D `tid = bi * rows + ri`** で
+    batch 軸も込み、atomic scatter で衝突を吸収
+  - `SparseMatmulBwdMulti` (bullet `:158-235` の複数 backward 集約) は本 PR 非対応、
+    Stage 3 trainer で必要になれば別 issue
+  - cuda-oxide API: `+` / `*` / i32 比較 + `DeviceAtomicF32::fetch_add` で
+    cuda-oxide 制限非該当 (Stage 1-6 grad と同 atomic scatter pattern)
+
 #### Stage 2-6 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmul::evaluate`

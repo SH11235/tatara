@@ -20,7 +20,7 @@ path / 進捗** を一覧する。各 kernel issue (Stage 2-1〜2-7) で landed 
 | Pattern | Op 数 | 用途 | 上流 (bullet) | reference CPU 配置 | GPU `#[kernel]` 配置 | Issue / PR | Status |
 |---|---|---|---|---|---|---|---|
 | `sparse_ft_forward` | matmul | HalfKA_hm sparse feature transform forward | `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmul` | `sparse/sparse_ft_forward.rs` | `experiments/002-fused-kernels/src/main.rs::sparse_ft_forward` | #42 | 実装済み (PR pending) |
-| `sparse_ft_backward` | atomic scatter | 同 backward | `linear/sparse.rs::SparseMatmulBwd(Multi)` | `sparse/sparse_ft_backward.rs` (TBD) | 同上 | #43 | 未実装 |
+| `sparse_ft_backward` | atomic scatter | 同 backward | `linear/sparse.rs::SparseMatmulBwd(Multi)` | `sparse/sparse_ft_backward.rs` | `experiments/002-fused-kernels/src/main.rs::sparse_ft_backward` | #43 | 実装済み (PR pending) |
 
 ## ベンチ (Stage 2-8 / #44)
 

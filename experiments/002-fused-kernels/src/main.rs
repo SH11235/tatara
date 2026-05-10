@@ -9,9 +9,9 @@
 //!
 //! - **kernels** (`screlu_grad`, `loss_wdl`, `adamw_step`, `radam_step`,
 //!   `ranger_lookahead_lerp`, `sparse_ft_forward`, `sparse_ft_backward`) は
-//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-6 (#42)
-//!   までで pointwise 5 件 + `sparse_ft_forward` の合計 6 件 landed (sparse
-//!   backward は Stage 2-7 で追加予定)
+//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-7 (#43)
+//!   までで pointwise 5 件 + sparse 2 件 (`forward` + `backward`) の合計 **7 件
+//!   landed** (Stage 2 fused kernel suite 完結)
 //! - **reference CPU** は `gpu-kernels` crate の `pointwise/` / `sparse/`
 //!   module に置く (Stage 1 の `progress/` と同列の慣行)
 //! - **GPU↔CPU smoke test** は本 file の `#[cfg(test)] mod gpu_cpu_equivalence_tests`
@@ -43,7 +43,7 @@
 
 use std::path::PathBuf;
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF64};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64};
 use cuda_device::{DisjointSlice, kernel, thread};
 
 #[allow(unused_imports)]
@@ -424,6 +424,73 @@ pub fn sparse_ft_forward(
     }
 }
 
+/// Sparse feature transform backward (HalfKA_hm 用、atomic scatter) — Stage
+/// 2-7 (#43)。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは Stage 1-5 で確立した cuda-oxide rustc-codegen-cuda
+/// backend の bin-entry 制約のため。GPU launch は `#[cfg(test)] mod
+/// gpu_cpu_equivalence_tests` から `cuda_launch!` macro 経由で行う。
+///
+/// アルゴリズムと bullet-shogi 上流 (`crates/compiler/src/tensor/operation/
+/// linear/sparse.rs::SparseMatmulBwd::evaluate`) との対応 / divergence は
+/// reference CPU (`gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu`)
+/// の docstring および `ATTRIBUTION.md` の Stage 2-7 entry を参照。
+///
+/// 1 thread = 1 (batch_index, row_index) tuple、flat 1D で `tid = bi * rows + ri`。
+/// **column-major weight layout** (Stage 2-6 forward と同型 `grad_weight[idx *
+/// rows + ri]`)。**accumulate semantics**: `grad_weight` は host が呼び出し前に
+/// 0 で初期化する責務 (Stage 1-6 grad と同 convention)。
+///
+/// 複数 (bi, ni) thread が同じ `(idx, ri)` cell に書き込むため
+/// **`DeviceAtomicF32::fetch_add` で atomic scatter** (Stage 1-6 grad と同
+/// pattern、`unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicF32) }
+/// .fetch_add(g, AtomicOrdering::Relaxed)`)。
+///
+/// 引数数 (7) は bullet 上流 evaluate と同型のため
+/// `clippy::too_many_arguments` を allow。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn sparse_ft_backward(
+    grad_out: &[f32],
+    indices: &[i32],
+    grad_weight: &[f32],
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    nnz: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (rows as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (rows as usize);
+    let ri = tid.get() % (rows as usize);
+
+    let g = grad_out[tid.get()];
+    let base = bi * (nnz as usize);
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx = indices[base + (ni as usize)];
+        if idx >= 0 && (idx as u32) < cols {
+            // SAFETY: `grad_weight.len() == rows * cols` を host 側 invariant とし、
+            // `idx < cols` で範囲内、`ri < rows` で範囲内 → `idx * rows + ri < rows * cols`。
+            // alignment: `f32` (4) は `DeviceAtomicF32` (`#[repr(transparent)]` over
+            // `UnsafeCell<f32>`) と同一。non-atomic 経路で同 memory に書く code path は
+            // 本 kernel/host loop には存在しない (Stage 1-6 grad と同型 SAFETY 条件)。
+            let cell = unsafe {
+                &*(grad_weight
+                    .as_ptr()
+                    .add((idx as usize) * (rows as usize) + ri)
+                    as *const DeviceAtomicF32)
+            };
+            cell.fetch_add(g, AtomicOrdering::Relaxed);
+        }
+        ni += 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host driver helpers (kernel module loader / launch utilities)
 // ---------------------------------------------------------------------------
@@ -532,8 +599,8 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     // `CUDA_ERROR_NOT_FOUND` を返す static failure になる (test では
     // `open_module` で気付ける)。kernel-list を build script から自動列挙する
     // refactor は Stage 2-8 wrap-up 候補。
-    let kernel_names =
-        "screlu_grad,loss_wdl,adamw_step,radam_step,ranger_lookahead_lerp,sparse_ft_forward";
+    let kernel_names = "screlu_grad,loss_wdl,adamw_step,radam_step,\
+                        ranger_lookahead_lerp,sparse_ft_forward,sparse_ft_backward";
 
     run_or_err(
         &llvm_link,
@@ -631,7 +698,7 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn main() {
     println!(
         "exp-002-fused-kernels: Stage 2 fused kernel suite host driver \
-         (Stage 2-6: pointwise 5 + sparse_ft_forward landed)"
+         (Stage 2-7 / EPIC #16 完結: pointwise 5 + sparse 2 = 7 kernel landed)"
     );
 }
 
@@ -1726,6 +1793,173 @@ mod gpu_cpu_equivalence_tests {
         for (i, (g, c)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
             let diff = (g - c).abs();
             assert!(diff < tol, "out[{i}]: gpu={g} cpu={c} diff={diff}");
+        }
+        Ok(())
+    }
+
+    /// sparse_ft_backward: bullet 上流 fixture (`linear/sparse.rs::tests::
+    /// evaluate_bwd`、`:256-269`、batch=2/rows=3/cols=3/nnz=4) と完全一致。
+    /// 期待値 [3,5,7,3,5,7,6,8,10] は bullet upstream test と同値。GPU 上で
+    /// `DeviceAtomicF32::fetch_add` の atomic scatter が正しく動作することの確認。
+    /// f32 atomic add は順序非決定だが、本 fixture の小規模 (8 indices、3
+    /// active row × 4 nnz scatter = 16 atomic adds) なら丸め誤差は 1e-7 以内。
+    #[test]
+    fn sparse_ft_backward_kernel_matches_bullet_upstream_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+
+        let grad_out = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let indices = vec![0_i32, 1, -1, -1, 2, 2, 1, 0];
+        let batch = 2_u32;
+        let rows = 3_u32;
+        let cols = 3_u32;
+        let nnz = 4_u32;
+        let total_weight = (rows as usize) * (cols as usize);
+
+        let mut grad_weight_cpu = vec![0.0_f32; total_weight];
+        sparse_ft_backward_cpu(
+            &grad_out,
+            &indices,
+            &mut grad_weight_cpu,
+            batch as usize,
+            rows as usize,
+            cols as usize,
+            nnz as usize,
+        );
+        // bullet 上流 expected
+        assert_eq!(
+            grad_weight_cpu,
+            vec![3.0_f32, 5.0, 7.0, 3.0, 5.0, 7.0, 6.0, 8.0, 10.0]
+        );
+
+        // GPU
+        let grad_out_dev = DeviceBuffer::from_host(&stream, &grad_out)?;
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let grad_weight_dev = DeviceBuffer::<f32>::zeroed(&stream, total_weight)?;
+        let total_threads = (batch as usize) * (rows as usize);
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(total_threads, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: sparse_ft_backward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(grad_out_dev),
+                slice(indices_dev),
+                slice(grad_weight_dev),
+                batch,
+                rows,
+                cols,
+                nnz
+            ]
+        }?;
+        stream.synchronize()?;
+        let grad_weight_gpu = grad_weight_dev.to_host_vec(&stream)?;
+
+        for (i, (g, c)) in grad_weight_gpu
+            .iter()
+            .zip(grad_weight_cpu.iter())
+            .enumerate()
+        {
+            let diff = (g - c).abs();
+            assert!(diff < 1e-7, "grad_weight[{i}]: gpu={g} cpu={c} diff={diff}");
+        }
+        Ok(())
+    }
+
+    /// sparse_ft_backward: 大 shape (multi-block boundary 跨ぎ + atomic scatter
+    /// 衝突多発) で GPU↔CPU 等価性。`batch * rows = 17 * 16 = 272 > BLOCK_DIM=256`
+    /// で 2 block 跨ぎ、`batch * nnz` の active scatter で同一 (idx, ri) cell に
+    /// 複数 thread が衝突。f32 atomic add の順序非決定性で多少の drift が出るため
+    /// tolerance 1e-5 (Stage 1-10 grad と同型)。
+    #[test]
+    fn sparse_ft_backward_kernel_multi_block_atomic_scatter_matches_cpu()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+        // 17 * 16 = 272 > BLOCK_DIM (256)、必ず 2 block 跨ぐ
+        let batch = 17_u32;
+        let rows = 16_u32;
+        let cols = 32_u32;
+        let nnz = 8_u32;
+        let total_weight = (rows as usize) * (cols as usize);
+
+        // 決定論的 grad_out (重複 index に対する累積を観察するため値の magnitude を分散)
+        let mut grad_out = Vec::with_capacity((batch * rows) as usize);
+        for i in 0..(batch * rows) {
+            grad_out.push(((i as f32) * 0.001).sin());
+        }
+        // 決定論的 indices (一部 padding、cols-1 周辺で重複 index を作る)
+        let mut indices = Vec::with_capacity((batch * nnz) as usize);
+        for bi in 0..batch {
+            for ni in 0..nnz {
+                let raw = ((bi as i32) * 3 + (ni as i32) * 7) % 40 - 5;
+                let idx = if raw < 0 { -1_i32 } else { raw % (cols as i32) };
+                indices.push(idx);
+            }
+        }
+        let total_threads = (batch as usize) * (rows as usize);
+        assert!(
+            total_threads > 256,
+            "test must cross BLOCK_DIM=256 boundary"
+        );
+
+        let mut grad_weight_cpu = vec![0.0_f32; total_weight];
+        sparse_ft_backward_cpu(
+            &grad_out,
+            &indices,
+            &mut grad_weight_cpu,
+            batch as usize,
+            rows as usize,
+            cols as usize,
+            nnz as usize,
+        );
+
+        let grad_out_dev = DeviceBuffer::from_host(&stream, &grad_out)?;
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let grad_weight_dev = DeviceBuffer::<f32>::zeroed(&stream, total_weight)?;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(total_threads, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: sparse_ft_backward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(grad_out_dev),
+                slice(indices_dev),
+                slice(grad_weight_dev),
+                batch,
+                rows,
+                cols,
+                nnz
+            ]
+        }?;
+        stream.synchronize()?;
+        let grad_weight_gpu = grad_weight_dev.to_host_vec(&stream)?;
+
+        // f32 atomic add の順序非決定で 1e-7 → 1e-5 に緩める (Stage 1-10 grad と同 tolerance)
+        let tol = 1e-5_f32;
+        for (i, (g, c)) in grad_weight_gpu
+            .iter()
+            .zip(grad_weight_cpu.iter())
+            .enumerate()
+        {
+            let diff = (g - c).abs();
+            assert!(
+                diff < tol,
+                "grad_weight[{i}]: gpu={g} cpu={c} diff={diff} > {tol}"
+            );
         }
         Ok(())
     }
