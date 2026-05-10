@@ -1,0 +1,18 @@
+[package]
+name = "gpu-kernels"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# 現状 progress kernel suite (forward/grad/adam_step/eval) は scalar f32/f64/i32/u64
+# 配列のみ扱い、`PackedSfenValue` 等 shogi-format 型に直接は依存しない。
+# Stage 2 で feature 抽出系の kernel CPU reference を加える際に shogi-format /
+# shogi-features を引き込む想定 (現時点では dep ゼロで十分)。

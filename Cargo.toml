@@ -3,16 +3,16 @@ resolver = "2"
 members = [
     "crates/shogi-format",
     "crates/shogi-features",
+    "crates/gpu-kernels",
     "crates/gpu-runtime",
     "experiments/001-cuda-oxide-kpabs",
+    "bins/progress_kpabs_train",
 ]
 
 # 残り crate / experiment / bin は順次追加する。
 # 追加先候補:
-#   crates/gpu-kernels
 #   crates/nnue-train
 #   crates/nnue-format
-#   bins/progress_kpabs_train
 #   bins/nnue_train
 #   bins/nnue_eval
 
@@ -26,6 +26,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 shogi-format = { path = "crates/shogi-format" }
 shogi-features = { path = "crates/shogi-features" }
+gpu-kernels = { path = "crates/gpu-kernels" }
 gpu-runtime = { path = "crates/gpu-runtime" }
 clap = { version = "4.5", features = ["derive"] }
 
