@@ -11,6 +11,36 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-2 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/bullet_lib/src/value/loader.rs::301-316` (data-layer WDL blend) +
+  `crates/compiler/src/tensor/operation/autograd/dfo.rs::Sigmoid` →
+  `experiments/002-fused-kernels/src/main.rs::loss_wdl` (`#[kernel]`) +
+  `crates/gpu-kernels/src/pointwise/loss_wdl.rs::loss_wdl_cpu`。
+  - 上流は **data layer で blend を pre-compute** (`results_chunk[i] =
+    blend * result + (1 - blend) * sigmoid(rscale * score)`、`loader.rs::315`)
+    し、kernel 側は pre-blended target に対する `output.sigmoid().squared_error
+    (target)` (`crates/trainer/src/model/builder.rs::505`) を runtime PointwiseIR で
+    fuse する 2 段構成。本実装は **kernel 内に WDL blend を畳み込む** ことで
+    data layer から sigmoid(score) と blend を消し、forward + backward + loss
+    accumulation を 1 kernel に圧縮 (op 数 8〜10、ADR-0004 Pattern table の
+    `fused_loss_wdl` に相当)
+  - 数値同値: bullet と本実装は同じ式 (sigmoid + blend + MSE + chain-rule grad)
+    を計算するが、`out * scale` を kernel 内で取る点で `out` の cp scale を
+    runtime 制御できる差分あり。bullet 上流は network architecture で `nnue2score`
+    を持って `out` が既に scale 済の cp 単位を持つ場合 (`scale = 1.0` 相当)、
+    本式の `* scale` 項が消えるだけで一致する
+  - chain rule で sigmoid(out * scale) の `out` 微分には `* scale` が乗る
+    (`d/du sigmoid(u) = p (1-p)`、`u = out * scale`)。`loss_wdl_cpu` docstring
+    に詳細記載
+  - cuda-oxide API: loss accumulator は f64 単一 cell の atomic add で
+    `unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) }.fetch_add(_, Relaxed)`
+    (Stage 1-6 grad / 1-8 eval の atomic 慣行を踏襲)。grad は 1 thread = 1 index
+    で排他的、atomic 不要 (DisjointSlice get_mut Option silent skip パターン、
+    Stage 1-5 forward と同型)
+  - NaN / Inf 挙動: bullet 上流と一致して NaN を伝搬する (SCReLU と異なり
+    握り潰さない)。`loss_wdl_cpu` docstring の "NaN / Inf 挙動" セクション参照
+
 #### Stage 2-1 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU` (forward /
