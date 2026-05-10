@@ -9,12 +9,13 @@
 //!
 //! - `screlu_grad` — SCReLU activation gradient (Stage 2-1 / #37) — **landed**
 //! - `loss_wdl` — sigmoid + WDL blend + scale (Stage 2-2 / #38) — **landed**
-//! - `adamw_step` — AdamW with decay + clip (Stage 2-3 / #39)
+//! - `adamw_step` — AdamW with decay + clip (Stage 2-3 / #39) — **landed**
 //! - `radam_step` — RAdam (AdamW + bias correction + denom switch) (Stage 2-4 / #40)
 //! - `ranger_step` — RAdam + lookahead lerp (Stage 2-5 / #41)
 //!
 //! Stage 2-0 scaffold (#36) では module 自体は空。各 kernel 実装 PR で
 //! `pub mod <kernel_name>;` を 1 行ずつ追加していく運用。
 
+pub mod adamw_step;
 pub mod loss_wdl;
 pub mod screlu_grad;
