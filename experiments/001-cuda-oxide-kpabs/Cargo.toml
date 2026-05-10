@@ -1,0 +1,17 @@
+[package]
+name = "exp-001-cuda-oxide-kpabs"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[lints]
+workspace = true
+
+# Stage 1 の experiment 受け皿。kernel + gpu-runtime は Issue #9〜 で順次足す。
+# 今は Stage 1-1 (shogi-format) への依存だけ — dummy main が PSV を読めれば OK。
+[dependencies]
+shogi-format = { workspace = true }

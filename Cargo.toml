@@ -4,6 +4,7 @@ members = [
     "crates/shogi-format",
     "crates/shogi-features",
     "crates/gpu-runtime",
+    "experiments/001-cuda-oxide-kpabs",
 ]
 
 # 残り crate / experiment / bin は順次追加する。
@@ -11,7 +12,6 @@ members = [
 #   crates/gpu-kernels
 #   crates/nnue-train
 #   crates/nnue-format
-#   experiments/001-cuda-oxide-kpabs
 #   bins/progress_kpabs_train
 #   bins/nnue_train
 #   bins/nnue_eval
