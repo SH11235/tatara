@@ -8,9 +8,11 @@
 //! ## 配置
 //!
 //! - **kernels** (`screlu_grad`, `loss_wdl`, `adamw_step`, `radam_step`,
-//!   `ranger_step`, `sparse_ft_forward`, `sparse_ft_backward`) は
-//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-4 (#40)
-//!   までで `screlu_grad` + `loss_wdl` + `adamw_step` + `radam_step` の 4 件 landed
+//!   `ranger_lookahead_lerp`, `sparse_ft_forward`, `sparse_ft_backward`) は
+//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-5 (#41)
+//!   までで `screlu_grad` + `loss_wdl` + `adamw_step` + `radam_step` +
+//!   `ranger_lookahead_lerp` の 5 件 landed (Ranger は radam_step + lerp の
+//!   2 kernel pair)
 //! - **reference CPU** は `gpu-kernels` crate の `pointwise/` / `sparse/`
 //!   module に置く (Stage 1 の `progress/` と同列の慣行)
 //! - **GPU↔CPU smoke test** は本 file の `#[cfg(test)] mod gpu_cpu_equivalence_tests`
@@ -319,6 +321,56 @@ pub fn radam_step(
     }
 }
 
+/// Ranger Lookahead lerp — Stage 2-5 (#41)。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは Stage 1-5 で確立した cuda-oxide rustc-codegen-cuda
+/// backend の bin-entry 制約のため。GPU launch は `#[cfg(test)] mod
+/// gpu_cpu_equivalence_tests` から `cuda_launch!` macro 経由で行う。
+///
+/// Ranger は **RAdam (Stage 2-4 `radam_step`) + Lookahead lerp (本 kernel)** の
+/// 2 kernel pair として host orchestration で組み立てる。本 kernel は
+/// `step % k == 0` のときのみ呼ばれる lerp 部分のみで、bullet 上流
+/// `optimiser/ranger.rs::build_ranger_op` (`:27-46`) の PointwiseIR を
+/// hand-fused 形に書き直したもの。
+///
+/// アルゴリズム:
+///
+/// ```text
+/// per element i:
+///     new_w = alpha * weights[i] + (1 - alpha) * slow[i]
+///     weights[i] = new_w
+///     slow[i]    = new_w        # weights / slow が同期
+/// ```
+///
+/// 1 thread = 1 weight、atomics 不要、`+` / `*` のみで cuda-oxide 制限に
+/// 当たらない (Stage 1-5 forward の `+ z` と同等の素直な pointwise op)。
+///
+/// 詳細は reference CPU (`gpu_kernels::pointwise::ranger_step::
+/// ranger_lookahead_lerp_cpu`) の docstring および `ATTRIBUTION.md` の
+/// Stage 2-5 entry を参照。
+#[kernel]
+pub fn ranger_lookahead_lerp(
+    mut weights: DisjointSlice<f32>,
+    mut slow: DisjointSlice<f32>,
+    alpha: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+
+    let one_minus_alpha = 1.0_f32 - alpha;
+    let w_opt = weights.get_mut(i);
+    let s_opt = slow.get_mut(i);
+    if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
+        let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
+        *w_ref = new_w;
+        *s_ref = new_w;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host driver helpers (kernel module loader / launch utilities)
 // ---------------------------------------------------------------------------
@@ -427,7 +479,7 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     // `CUDA_ERROR_NOT_FOUND` を返す static failure になる (test では
     // `open_module` で気付ける)。kernel-list を build script から自動列挙する
     // refactor は Stage 2-8 wrap-up 候補。
-    let kernel_names = "screlu_grad,loss_wdl,adamw_step,radam_step";
+    let kernel_names = "screlu_grad,loss_wdl,adamw_step,radam_step,ranger_lookahead_lerp";
 
     run_or_err(
         &llvm_link,
@@ -525,7 +577,8 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn main() {
     println!(
         "exp-002-fused-kernels: Stage 2 fused kernel suite host driver \
-         (Stage 2-4: screlu_grad + loss_wdl + adamw_step + radam_step landed)"
+         (Stage 2-5: screlu_grad + loss_wdl + adamw_step + radam_step + \
+         ranger_lookahead_lerp landed)"
     );
 }
 
@@ -1265,6 +1318,134 @@ mod gpu_cpu_equivalence_tests {
                 grad_gpu[i],
                 grad_cpu[i]
             );
+        }
+        Ok(())
+    }
+
+    /// ranger_lookahead_lerp: GPU と CPU reference の数値同等性。1 thread = 1
+    /// weight、atomics 不要、`+` / `*` のみの単純 pointwise なので tolerance は
+    /// 1e-7 (Stage 2-1 screlu_grad 同型、scatter/atomic 経路無し)。
+    #[test]
+    fn ranger_lookahead_lerp_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use gpu_kernels::pointwise::ranger_step::ranger_lookahead_lerp_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+        let n = 1024_usize;
+        let alpha = 0.5_f32;
+
+        // 決定論的 weights / slow を [-2, 2] にスパン (interior + 端点を踏む)
+        let mut weights = Vec::with_capacity(n);
+        let mut slow = Vec::with_capacity(n);
+        for i in 0..n {
+            let denom_t = if n > 1 { (n - 1) as f32 } else { 1.0 };
+            let t = (i as f32) / denom_t;
+            weights.push(-2.0_f32 + 4.0_f32 * t);
+            slow.push(2.0_f32 - 4.0_f32 * t);
+        }
+
+        // CPU reference
+        let mut weights_cpu = weights.clone();
+        let mut slow_cpu = slow.clone();
+        ranger_lookahead_lerp_cpu(&mut weights_cpu, &mut slow_cpu, alpha, n);
+
+        // GPU
+        let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut slow_dev = DeviceBuffer::from_host(&stream, &slow)?;
+        let n_u32 = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: ranger_lookahead_lerp,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [slice_mut(weights_dev), slice_mut(slow_dev), alpha, n_u32]
+        }?;
+        stream.synchronize()?;
+        let weights_gpu = weights_dev.to_host_vec(&stream)?;
+        let slow_gpu = slow_dev.to_host_vec(&stream)?;
+
+        let tol = 1e-7_f32;
+        for i in 0..n {
+            let dw = (weights_gpu[i] - weights_cpu[i]).abs();
+            let ds = (slow_gpu[i] - slow_cpu[i]).abs();
+            assert!(
+                dw < tol,
+                "weights[{i}]: gpu={} cpu={} diff={dw}",
+                weights_gpu[i],
+                weights_cpu[i]
+            );
+            assert!(
+                ds < tol,
+                "slow[{i}]: gpu={} cpu={} diff={ds}",
+                slow_gpu[i],
+                slow_cpu[i]
+            );
+            // post-condition: weights == slow (bullet 上流 build_ranger_op の
+            // pntwise.write(w/s, ..., new_w) と同型の同期)
+            assert_eq!(
+                weights_gpu[i], slow_gpu[i],
+                "post-lerp sync broken at i={i}"
+            );
+        }
+        Ok(())
+    }
+
+    /// ranger_lookahead_lerp: alpha の端点 (1.0 で weights 維持・slow 同期、
+    /// 0.0 で weights を slow に引き戻し) が GPU でも崩れないこと。
+    #[test]
+    fn ranger_lookahead_lerp_kernel_alpha_endpoints() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n = 4_usize;
+
+        // alpha = 1.0: weights 維持、slow を weights と同期
+        {
+            let mut weights_dev = DeviceBuffer::from_host(&stream, &[1.0_f32, 2.0, 3.0, 4.0])?;
+            let mut slow_dev = DeviceBuffer::from_host(&stream, &[10.0_f32, 20.0, 30.0, 40.0])?;
+            let cfg = LaunchConfig {
+                grid_dim: grid_dim_1d(n, BLOCK_DIM),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [slice_mut(weights_dev), slice_mut(slow_dev), 1.0_f32, n as u32]
+            }?;
+            stream.synchronize()?;
+            let w_gpu = weights_dev.to_host_vec(&stream)?;
+            let s_gpu = slow_dev.to_host_vec(&stream)?;
+            assert_eq!(w_gpu, vec![1.0_f32, 2.0, 3.0, 4.0]);
+            assert_eq!(s_gpu, vec![1.0_f32, 2.0, 3.0, 4.0]);
+        }
+
+        // alpha = 0.0: weights を slow に引き戻し
+        {
+            let mut weights_dev = DeviceBuffer::from_host(&stream, &[1.0_f32, 2.0, 3.0, 4.0])?;
+            let mut slow_dev = DeviceBuffer::from_host(&stream, &[10.0_f32, 20.0, 30.0, 40.0])?;
+            let cfg = LaunchConfig {
+                grid_dim: grid_dim_1d(n, BLOCK_DIM),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [slice_mut(weights_dev), slice_mut(slow_dev), 0.0_f32, n as u32]
+            }?;
+            stream.synchronize()?;
+            let w_gpu = weights_dev.to_host_vec(&stream)?;
+            let s_gpu = slow_dev.to_host_vec(&stream)?;
+            assert_eq!(w_gpu, vec![10.0_f32, 20.0, 30.0, 40.0]);
+            assert_eq!(s_gpu, vec![10.0_f32, 20.0, 30.0, 40.0]);
         }
         Ok(())
     }
