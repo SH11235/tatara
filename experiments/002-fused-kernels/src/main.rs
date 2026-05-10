@@ -9,8 +9,8 @@
 //!
 //! - **kernels** (`screlu_grad`, `loss_wdl`, `adamw_step`, `radam_step`,
 //!   `ranger_step`, `sparse_ft_forward`, `sparse_ft_backward`) は
-//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-2 (#38)
-//!   までで `screlu_grad` + `loss_wdl` + `adamw_step` の 3 件 landed
+//!   Stage 2-1〜2-7 で各 issue が本 file に inline で追加する。Stage 2-4 (#40)
+//!   までで `screlu_grad` + `loss_wdl` + `adamw_step` + `radam_step` の 4 件 landed
 //! - **reference CPU** は `gpu-kernels` crate の `pointwise/` / `sparse/`
 //!   module に置く (Stage 1 の `progress/` と同列の慣行)
 //! - **GPU↔CPU smoke test** は本 file の `#[cfg(test)] mod gpu_cpu_equivalence_tests`
@@ -234,6 +234,91 @@ pub fn adamw_step(
     }
 }
 
+/// Fused RAdam optimizer step (AdamW + bias correction + denom switch) — Stage
+/// 2-4 (#40)。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは Stage 1-5 で確立した cuda-oxide rustc-codegen-cuda
+/// backend の bin-entry 制約のため。GPU launch は `#[cfg(test)] mod
+/// gpu_cpu_equivalence_tests` から `cuda_launch!` macro 経由で行う。
+///
+/// アルゴリズム + bullet 上流 (`crates/trainer/src/optimiser/radam.rs::RAdam::
+/// update` + `OP` template) との対応 / divergence は reference CPU
+/// (`gpu_kernels::pointwise::radam_step::radam_step_cpu` +
+/// `radam_compute_step_size_denom`) の docstring および `ATTRIBUTION.md` の
+/// Stage 2-4 entry を参照。
+///
+/// `step_size` と `denom` は host (loader) 側で `radam_compute_step_size_denom`
+/// により step number から事前計算した scalar を `f32` / `i32` で値渡しする
+/// (Stage 2-3 `adamw_step` と同 convention、bullet 上流の 1-element device
+/// buffer は本リポでは見送り。ATTRIBUTION 参照)。
+///
+/// 1 thread = 1 weight、atomics 不要 (Stage 1 / Stage 2-3 と同型)。
+///
+/// 引数数 (14) は AdamW + RAdam 拡張のため `clippy::too_many_arguments` を allow。
+///
+/// ## cuda-oxide 制限
+///
+/// - `f32::clamp` / `f32::max` / `f32::min` lowering 失敗 → `if-else` ladder で
+///   展開 (Stage 1-7 / 2-1 / 2-3 と同 workaround)
+/// - `f32::sqrt` は `__nv_sqrtf` (libdevice) に lowering される
+/// - `denom != 0` 比較は cuda-oxide で問題なく compile される (Stage 1-6 grad の
+///   bin clamp `b < 0` 比較と同型)
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn radam_step(
+    mut weights: DisjointSlice<f32>,
+    mut m: DisjointSlice<f32>,
+    mut v: DisjointSlice<f32>,
+    mut grad: DisjointSlice<f32>,
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    min_w: f32,
+    max_w: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+
+    let g_opt = grad.get_mut(i);
+    let m_opt = m.get_mut(i);
+    let v_opt = v.get_mut(i);
+    let w_opt = weights.get_mut(i);
+    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
+        let g = *g_ref;
+        let rate = lr * step_size;
+        let mut p = *w_ref;
+        p *= 1.0_f32 - decay * rate;
+        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
+        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
+        *m_ref = mi;
+        *v_ref = vi;
+        let mut val = mi;
+        if denom != 0 {
+            val /= vi.sqrt() + eps;
+        }
+        p -= rate * val;
+        // f32::clamp(min_w, max_w) を if-else に展開 (Stage 1-7 / 2-3 と同 workaround)。
+        let p_clamped = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+        *w_ref = p_clamped;
+        *g_ref = 0.0_f32;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host driver helpers (kernel module loader / launch utilities)
 // ---------------------------------------------------------------------------
@@ -342,7 +427,7 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     // `CUDA_ERROR_NOT_FOUND` を返す static failure になる (test では
     // `open_module` で気付ける)。kernel-list を build script から自動列挙する
     // refactor は Stage 2-8 wrap-up 候補。
-    let kernel_names = "screlu_grad,loss_wdl,adamw_step";
+    let kernel_names = "screlu_grad,loss_wdl,adamw_step,radam_step";
 
     run_or_err(
         &llvm_link,
@@ -440,7 +525,7 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn main() {
     println!(
         "exp-002-fused-kernels: Stage 2 fused kernel suite host driver \
-         (Stage 2-3: screlu_grad + loss_wdl + adamw_step landed)"
+         (Stage 2-4: screlu_grad + loss_wdl + adamw_step + radam_step landed)"
     );
 }
 
@@ -917,6 +1002,270 @@ mod gpu_cpu_equivalence_tests {
         stream.synchronize()?;
         let weights_gpu = weights_dev.to_host_vec(&stream)?;
         assert_eq!(weights_gpu, vec![1.0_f32, -1.0, 0.5]);
+        Ok(())
+    }
+
+    /// radam_step: 1 step の GPU と CPU reference 数値同等性。AdamW (Stage 2-3)
+    /// に host pre-compute された `step_size` / `denom` を渡す形に拡張。1024 元、
+    /// step=1000 (`denom = 1` 領域) でテスト。tolerance 1e-6 (Stage 2-3 同型)。
+    #[test]
+    fn radam_step_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_step_cpu};
+
+        let (_ctx, module, stream) = open_module()?;
+        let n = 1024_usize;
+        let beta1 = 0.9_f32;
+        let beta2 = 0.999_f32;
+        let n_sma_threshold = 5.0_f32;
+        let step = 1000_u64;
+        let (step_size, denom) = radam_compute_step_size_denom(step, beta1, beta2, n_sma_threshold);
+        // step=1000 で variance 補正 ON (denom = 1) になっていること
+        assert_eq!(denom, 1, "expected denom=1 (variance-on) at step=1000");
+
+        // 決定論的 weights / m / v / grad
+        let mut weights = Vec::with_capacity(n);
+        let mut m = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(n);
+        let mut grad = Vec::with_capacity(n);
+        for i in 0..n {
+            let denom_t = if n > 1 { (n - 1) as f32 } else { 1.0 };
+            let t = (i as f32) / denom_t;
+            weights.push(-1.0_f32 + 2.0_f32 * t);
+            m.push(0.001_f32 * (i as f32 - 512.0));
+            v.push(0.0001_f32 * (i as f32) + 1e-6_f32);
+            grad.push(0.01_f32 * ((i as f32) - 256.0).sin());
+        }
+
+        let lr = 1e-3_f32;
+        let decay = 0.01_f32;
+        let eps = 1e-8_f32;
+        let min_w = -2.0_f32;
+        let max_w = 2.0_f32;
+
+        // CPU reference
+        let mut weights_cpu = weights.clone();
+        let mut m_cpu = m.clone();
+        let mut v_cpu = v.clone();
+        let mut grad_cpu = grad.clone();
+        radam_step_cpu(
+            &mut weights_cpu,
+            &mut m_cpu,
+            &mut v_cpu,
+            &mut grad_cpu,
+            lr,
+            step_size,
+            denom,
+            decay,
+            beta1,
+            beta2,
+            eps,
+            min_w,
+            max_w,
+            n,
+        );
+
+        // GPU
+        let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+        let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+        let mut grad_dev = DeviceBuffer::from_host(&stream, &grad)?;
+        let n_u32 = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: radam_step,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice_mut(weights_dev),
+                slice_mut(m_dev),
+                slice_mut(v_dev),
+                slice_mut(grad_dev),
+                lr,
+                step_size,
+                denom,
+                decay,
+                beta1,
+                beta2,
+                eps,
+                min_w,
+                max_w,
+                n_u32
+            ]
+        }?;
+        stream.synchronize()?;
+        let weights_gpu = weights_dev.to_host_vec(&stream)?;
+        let m_gpu = m_dev.to_host_vec(&stream)?;
+        let v_gpu = v_dev.to_host_vec(&stream)?;
+        let grad_gpu = grad_dev.to_host_vec(&stream)?;
+
+        let tol = 1e-6_f32;
+        for i in 0..n {
+            let dw = (weights_gpu[i] - weights_cpu[i]).abs();
+            let dm = (m_gpu[i] - m_cpu[i]).abs();
+            let dv = (v_gpu[i] - v_cpu[i]).abs();
+            let dg = (grad_gpu[i] - grad_cpu[i]).abs();
+            assert!(
+                dw < tol,
+                "weights[{i}]: gpu={} cpu={} diff={dw}",
+                weights_gpu[i],
+                weights_cpu[i]
+            );
+            assert!(
+                dm < tol,
+                "m[{i}]: gpu={} cpu={} diff={dm}",
+                m_gpu[i],
+                m_cpu[i]
+            );
+            assert!(
+                dv < tol,
+                "v[{i}]: gpu={} cpu={} diff={dv}",
+                v_gpu[i],
+                v_cpu[i]
+            );
+            assert!(
+                dg < tol,
+                "grad[{i}]: gpu={} cpu={} diff={dg}",
+                grad_gpu[i],
+                grad_cpu[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// radam_step: 学習初期 (`denom = 0`、variance off) 経路の GPU↔CPU 等価性。
+    /// denom=1 経路と同水準 (1024 元、`weights / m / v / grad` 全 buffer を CPU
+    /// reference と比較、tolerance 1e-6) のテスト。kernel 内 `if denom != 0`
+    /// 分岐が GPU でも CPU と同じ動作になることをガード。
+    #[test]
+    fn radam_step_kernel_denom_zero_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use gpu_kernels::pointwise::radam_step::radam_step_cpu;
+
+        let (_ctx, module, stream) = open_module()?;
+        let n = 1024_usize;
+
+        // 決定論的入力 (denom=1 経路と同じ生成式、grad / m / v に non-trivial な値)
+        let mut weights = Vec::with_capacity(n);
+        let mut m = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(n);
+        let mut grad = Vec::with_capacity(n);
+        for i in 0..n {
+            let denom_t = if n > 1 { (n - 1) as f32 } else { 1.0 };
+            let t = (i as f32) / denom_t;
+            weights.push(-1.0_f32 + 2.0_f32 * t);
+            m.push(0.001_f32 * (i as f32 - 512.0));
+            v.push(0.0001_f32 * (i as f32) + 1e-6_f32);
+            grad.push(0.01_f32 * ((i as f32) - 256.0).sin());
+        }
+
+        let lr = 1e-3_f32;
+        // step=1 相当の host pre-compute 値を直接渡す (denom=0、`1/sqrt(v)` off 経路)
+        let step_size = 10.0_f32;
+        let denom: i32 = 0;
+        let decay = 0.01_f32;
+        let beta1 = 0.9_f32;
+        let beta2 = 0.999_f32;
+        let eps = 1e-8_f32;
+        let min_w = -2.0_f32;
+        let max_w = 2.0_f32;
+
+        // CPU reference
+        let mut weights_cpu = weights.clone();
+        let mut m_cpu = m.clone();
+        let mut v_cpu = v.clone();
+        let mut grad_cpu = grad.clone();
+        radam_step_cpu(
+            &mut weights_cpu,
+            &mut m_cpu,
+            &mut v_cpu,
+            &mut grad_cpu,
+            lr,
+            step_size,
+            denom,
+            decay,
+            beta1,
+            beta2,
+            eps,
+            min_w,
+            max_w,
+            n,
+        );
+
+        // GPU
+        let mut weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+        let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+        let mut grad_dev = DeviceBuffer::from_host(&stream, &grad)?;
+        let n_u32 = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: radam_step,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice_mut(weights_dev),
+                slice_mut(m_dev),
+                slice_mut(v_dev),
+                slice_mut(grad_dev),
+                lr,
+                step_size,
+                denom,
+                decay,
+                beta1,
+                beta2,
+                eps,
+                min_w,
+                max_w,
+                n_u32
+            ]
+        }?;
+        stream.synchronize()?;
+        let weights_gpu = weights_dev.to_host_vec(&stream)?;
+        let m_gpu = m_dev.to_host_vec(&stream)?;
+        let v_gpu = v_dev.to_host_vec(&stream)?;
+        let grad_gpu = grad_dev.to_host_vec(&stream)?;
+
+        let tol = 1e-6_f32;
+        for i in 0..n {
+            let dw = (weights_gpu[i] - weights_cpu[i]).abs();
+            let dm = (m_gpu[i] - m_cpu[i]).abs();
+            let dv = (v_gpu[i] - v_cpu[i]).abs();
+            let dg = (grad_gpu[i] - grad_cpu[i]).abs();
+            assert!(
+                dw < tol,
+                "weights[{i}]: gpu={} cpu={} diff={dw}",
+                weights_gpu[i],
+                weights_cpu[i]
+            );
+            assert!(
+                dm < tol,
+                "m[{i}]: gpu={} cpu={} diff={dm}",
+                m_gpu[i],
+                m_cpu[i]
+            );
+            assert!(
+                dv < tol,
+                "v[{i}]: gpu={} cpu={} diff={dv}",
+                v_gpu[i],
+                v_cpu[i]
+            );
+            assert!(
+                dg < tol,
+                "grad[{i}]: gpu={} cpu={} diff={dg}",
+                grad_gpu[i],
+                grad_cpu[i]
+            );
+        }
         Ok(())
     }
 }
