@@ -48,14 +48,16 @@ jobs:
       # + cuda-oxide が必要で GitHub-hosted runner では build できない。
       # それらは self-hosted runner の別 workflow で検証する想定。本 workflow からは exclude する。
       #
-      # `experiments/001-cuda-oxide-kpabs` は現状 CPU-only (shogi-format への
-      # 依存だけ) なので本 workflow に含める。Issue #9 で gpu-runtime に依存し
-      # 始めた時点で下の --exclude に `--exclude exp-001-cuda-oxide-kpabs` を追加する。
+      # Stage 1-5 (#9) で `exp-001-cuda-oxide-kpabs` も `cuda-host` を直接 dep
+      # に取った (`#[kernel]` macro 展開で `cuda_host::CudaKernel` を要求)
+      # ため、transitive で cuda-bindings の build script が `cuda.h` を要求して
+      # GitHub runner では build fail する。Stage 1-4 (#8) の PR #27 forward-comment
+      # で予告した通り exclude に追加。
       # 新しい GPU 依存 crate を追加するときも同様に --exclude リストを更新すること。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime
+        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs

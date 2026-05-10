@@ -30,6 +30,36 @@
 - `crates/shogi-format/Cargo.toml` — workspace member として最小設定
 - `crates/shogi-format/tests/psv_smoke.rs` + `tests/data/sample.psv` (smoke_progress/smoke.bin の先頭 4000 bytes / 100 records)
 
+#### Stage 1-5 (2026-05-10, bullet-shogi commit `f275eb9`)
+
+- `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_forward`
+  → `experiments/001-cuda-oxide-kpabs/src/main.rs` の `#[kernel] fn forward`
+  + `experiments/001-cuda-oxide-kpabs/src/kernels/forward.rs` の
+  `forward_cpu` (numerical equivalence test 用 reference)。
+  - 言語移植: C++ `__global__` → Rust `#[kernel]` (cuda-oxide `cuda_device`)
+  - `int` → `u32` (符号要らない)、`float* preds` → `mut DisjointSlice<f32>`
+  - `for (int j; j<max_inds; ++j)` → `while j < max_inds` (cuda-oxide gemm 上流に倣う)
+  - `expf(-z)` → `(-z).exp()` (cuda-oxide が `__nv_expf` に lowering する)
+  - C++ `preds[pos] = ...` (上の `if (pos >= n_pos) return;` で bounds 保証
+    された unconditional write) → Rust `if let Some(p) = preds.get_mut(pos)
+    { *p = ... }`。cuda-oxide の `DisjointSlice<T>::get_mut(idx) -> Option`
+    は GPU soundness のため Option を返す API、`pos >= n_pos` 早期 return
+    と組み合わせると `preds.len() == n_pos` で必ず Some が返り挙動同一。
+    `preds.len() < n_pos` の異常入力に対しては C++ は OOB write (UB)、
+    Rust は silent skip という **defensive な差分** あり
+  - 計算ロジックは上記 5 点の表面的差分以外 **同一**。reference CPU
+    (`forward_cpu`) も GPU kernel と同じ式を素直に書き写しただけで、
+    `preds.len() == n_pos` を満たす入力に対し同出力 (浮動小数誤差範囲内) を返す
+  - 注: kernel 関数を main.rs に直接配置しているのは、cuda-oxide の
+    rustc-codegen-cuda backend が **bin entry から到達可能な #[kernel]
+    関数のみ NVPTX IR 化** する設計のため (本リポ内検証で lib.rs 内
+    kernel は `cargo oxide build` で `.ll` 出力されないことを確認)。
+    `.ll` 生成の正しい invocation は **`cd experiments/001-cuda-oxide-kpabs
+    && cargo-oxide build`** (cwd を crate dir にする)。workspace root から
+    `cargo-oxide build exp-001-cuda-oxide-kpabs` を呼ぶと cargo-oxide 上流
+    実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
+    standalone path に落ちず IR 出力が silently no-op になる
+
 #### Stage 1-2 (2026-05-10, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/game/outputs.rs` の `ShogiProgressKPAbs` 周辺
