@@ -390,7 +390,7 @@ fn load_kernel_module_with_fallback(
 ///
 /// 1. **`llvm-link-21 <ll> libdevice.10.bc → linked.bc`** で `__nv_sqrtf` 等の
 ///    libdevice intrinsic を IR レベルで取り込み
-/// 2. **`opt-21 --passes='internalize,globaldce,nvvm-reflect'
+/// 2. **`opt-21 --passes='nvvm-reflect,internalize,globaldce'
 ///    --internalize-public-api-list=<kernel symbols> linked.bc → opt.bc`** で:
 ///    - kernel 以外の libdevice 関数を `internal` にして dead-code-elim 対象化
 ///    - `__nvvm_reflect()` 呼び出しを 0/1 const に置換 (libdevice 内 `__CUDA_FTZ`
@@ -947,5 +947,395 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1-10: GPU ↔ CPU reference 数値同等性テスト + samples/sec ベンチ
+// ---------------------------------------------------------------------------
+//
+// 本 module は **GPU 必須**。CI ではないローカル sm_75 box でのみ走る想定で、
+// `#[cfg(test)]` で main.rs 内に置くことで kernel symbol (forward / grad /
+// adam_step / eval) に直接 path 解決できる (lib.rs 経由では bin のみに
+// 存在する `#[kernel]` に届かないため、tests/*.rs では呼び出せない)。
+//
+// 走らせる:
+//
+// ```bash
+// cd experiments/001-cuda-oxide-kpabs
+// CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build  # .ll 生成
+// cargo test -p exp-001-cuda-oxide-kpabs --bin exp-001-cuda-oxide-kpabs --release \
+//     -- --test-threads=1
+// ```
+//
+// `--test-threads=1` は CudaContext を複数 test 間で共有しないため (各 test が
+// 独自に context を作る前提)。`--release` 推奨だが debug build でも動く。
+//
+// CI からは `cargo clippy --workspace --exclude exp-001-cuda-oxide-kpabs ...` の
+// 通り本 crate ごと exclude されているので影響なし。
+#[cfg(test)]
+mod gpu_cpu_equivalence_tests {
+    use super::*;
+    use exp_001_cuda_oxide_kpabs::kernels::adam_step::adam_step_cpu;
+    use exp_001_cuda_oxide_kpabs::kernels::eval::eval_cpu;
+    use exp_001_cuda_oxide_kpabs::kernels::forward::forward_cpu;
+    use exp_001_cuda_oxide_kpabs::kernels::grad::grad_cpu;
+
+    /// f32 atomic 加算は順序非決定で、特に scatter 経路の `grad[idx]` に対する
+    /// 多 thread 加算は CPU reference (single-thread, in-order) と完全一致しない。
+    /// f32 add の round-off は ~1e-7 のオーダーで、本 test の小規模 batch
+    /// (≤ 32 positions、≤ 80 indices) なら 1e-5 以内に収まる。
+    const FLOAT_TOL: f32 = 1e-5;
+    const F64_TOL: f64 = 1e-8;
+
+    /// 決定論的な小規模 batch を組む。
+    ///
+    /// `n_pos` 個の position、`max_inds` 個の active index per position、
+    /// `n_weights` 個の weight。`indices[pos*max_inds + j]` は `(pos+j) % n_weights`
+    /// を入れ (一部 padding `-1` も混ぜる)、targets は `pos as f32 / n_pos as f32`、
+    /// per_pos_norm は 1.0 で固定する。
+    ///
+    /// 戻り値は `(indices, weights, targets, per_pos_norm)`。
+    fn build_fixed_inputs(
+        n_pos: usize,
+        max_inds: usize,
+        n_weights: usize,
+    ) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut indices = Vec::with_capacity(n_pos * max_inds);
+        for pos in 0..n_pos {
+            for j in 0..max_inds {
+                if j == max_inds - 1 && pos % 3 == 0 {
+                    indices.push(-1); // 一部 padding
+                } else {
+                    indices.push(((pos + j) % n_weights) as i32);
+                }
+            }
+        }
+        let weights: Vec<f32> = (0..n_weights).map(|i| (i as f32 * 0.01) - 0.5).collect();
+        let targets: Vec<f32> = (0..n_pos)
+            .map(|i| (i as f32) / (n_pos.max(1) as f32))
+            .collect();
+        let per_pos_norm: Vec<f32> = vec![1.0_f32; n_pos];
+        (indices, weights, targets, per_pos_norm)
+    }
+
+    type CudaCtxModuleStream = (
+        std::sync::Arc<CudaContext>,
+        std::sync::Arc<CudaModule>,
+        std::sync::Arc<CudaStream>,
+    );
+
+    /// `tests/host_smoke.rs` 同様、kernel module を loader 経由で読み込む。
+    fn open_module() -> Result<CudaCtxModuleStream, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = load_kernel_module_with_fallback(&ctx, "exp_001_cuda_oxide_kpabs")?;
+        Ok((ctx, module, stream))
+    }
+
+    #[test]
+    fn forward_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n_pos = 16;
+        let max_inds = 8;
+        let n_weights = 64;
+        let (indices, weights, _targets, _norm) = build_fixed_inputs(n_pos, max_inds, n_weights);
+
+        // CPU reference
+        let preds_cpu = forward_cpu(&indices, &weights, n_pos, max_inds);
+
+        // GPU
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let weights_dev = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&stream, n_pos)?;
+        let n_pos_u32 = n_pos as u32;
+        let max_inds_u32 = max_inds as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: forward,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [slice(indices_dev), slice(weights_dev), slice_mut(preds_dev), n_pos_u32, max_inds_u32]
+        }?;
+        stream.synchronize()?;
+        let preds_gpu = preds_dev.to_host_vec(&stream)?;
+
+        assert_eq!(preds_cpu.len(), preds_gpu.len());
+        for (i, (g, c)) in preds_gpu.iter().zip(preds_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            assert!(
+                diff < FLOAT_TOL,
+                "preds[{i}]: gpu={g} cpu={c} diff={diff} > {FLOAT_TOL}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grad_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n_pos = 16;
+        let max_inds = 8;
+        let n_weights = 64;
+        let (indices, weights, targets, per_pos_norm) =
+            build_fixed_inputs(n_pos, max_inds, n_weights);
+        // GPU は forward を先に走らせて preds を作る (grad は preds を入力に取る)。
+        let preds_cpu = forward_cpu(&indices, &weights, n_pos, max_inds);
+
+        // CPU reference: grad/loss/hist
+        let mut grad_cpu_out = vec![0.0_f32; n_weights];
+        let mut loss_cpu = 0.0_f64;
+        let mut hist_cpu = [0_u64; 8];
+        grad_cpu(
+            &indices,
+            &preds_cpu,
+            &targets,
+            &per_pos_norm,
+            &mut grad_cpu_out,
+            &mut loss_cpu,
+            &mut hist_cpu,
+            n_pos,
+            max_inds,
+        );
+
+        // GPU: 同じ preds を host から流し込む (kernel の forward path 経由でなく、
+        // CPU と入力を厳密に一致させるため direct upload)
+        let indices_dev = DeviceBuffer::from_host(&stream, &indices)?;
+        let preds_dev = DeviceBuffer::from_host(&stream, &preds_cpu)?;
+        let targets_dev = DeviceBuffer::from_host(&stream, &targets)?;
+        let norm_dev = DeviceBuffer::from_host(&stream, &per_pos_norm)?;
+        let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, n_weights)?;
+        let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        let hist_dev = DeviceBuffer::<u64>::zeroed(&stream, 8)?;
+        let n_pos_u32 = n_pos as u32;
+        let max_inds_u32 = max_inds as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: grad,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice(indices_dev), slice(preds_dev), slice(targets_dev),
+                slice(norm_dev), slice(grad_dev), slice(loss_dev), slice(hist_dev),
+                n_pos_u32, max_inds_u32
+            ]
+        }?;
+        stream.synchronize()?;
+        let grad_gpu = grad_dev.to_host_vec(&stream)?;
+        let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+        let hist_gpu = hist_dev.to_host_vec(&stream)?;
+
+        // grad: 多 thread atomic で順序非決定だが、本 test は max_inds=8、n_pos=16
+        // で衝突が少なく f32 add の round-off は十分小さい。
+        for (i, (g, c)) in grad_gpu.iter().zip(grad_cpu_out.iter()).enumerate() {
+            let diff = (g - c).abs();
+            assert!(diff < FLOAT_TOL, "grad[{i}]: gpu={g} cpu={c} diff={diff}");
+        }
+        // loss: f64 atomic で精度十分
+        assert!(
+            (loss_gpu - loss_cpu).abs() < F64_TOL,
+            "loss: gpu={loss_gpu} cpu={loss_cpu} diff={}",
+            (loss_gpu - loss_cpu).abs()
+        );
+        // hist: u64 atomic で完全一致
+        assert_eq!(&hist_gpu[..], &hist_cpu[..], "hist mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn eval_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n_pos = 24;
+        let preds_host: Vec<f32> = (0..n_pos).map(|i| (i as f32) / (n_pos as f32)).collect();
+        let targets_host: Vec<f32> = (0..n_pos)
+            .map(|i| ((i + 3) as f32) / (n_pos as f32))
+            .collect();
+
+        let mut loss_cpu = 0.0_f64;
+        let mut hist_cpu = [0_u64; 8];
+        eval_cpu(
+            &preds_host,
+            &targets_host,
+            &mut loss_cpu,
+            &mut hist_cpu,
+            n_pos,
+        );
+
+        let preds_dev = DeviceBuffer::from_host(&stream, &preds_host)?;
+        let targets_dev = DeviceBuffer::from_host(&stream, &targets_host)?;
+        let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        let hist_dev = DeviceBuffer::<u64>::zeroed(&stream, 8)?;
+        let n_pos_u32 = n_pos as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: eval,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [slice(preds_dev), slice(targets_dev), slice(loss_dev), slice(hist_dev), n_pos_u32]
+        }?;
+        stream.synchronize()?;
+        let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+        let hist_gpu = hist_dev.to_host_vec(&stream)?;
+
+        assert!(
+            (loss_gpu - loss_cpu).abs() < F64_TOL,
+            "loss: gpu={loss_gpu} cpu={loss_cpu}"
+        );
+        assert_eq!(&hist_gpu[..], &hist_cpu[..], "hist mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn adam_step_kernel_matches_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n = 32;
+        let weights_host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        let m_host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        let v_host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.0001).collect();
+        let grad_host: Vec<f32> = (0..n)
+            .map(|i| if i % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        let lr = 0.001_f32;
+        let beta1 = ADAM_BETA1;
+        let beta2 = ADAM_BETA2;
+        let eps = ADAM_EPS;
+        let bc1 = 1.0_f32 - beta1; // step 1
+        let bc2 = 1.0_f32 - beta2;
+
+        // CPU reference
+        let mut w_cpu = weights_host.clone();
+        let mut m_cpu = m_host.clone();
+        let mut v_cpu = v_host.clone();
+        let mut g_cpu = grad_host.clone();
+        adam_step_cpu(
+            &mut w_cpu, &mut m_cpu, &mut v_cpu, &mut g_cpu, lr, beta1, beta2, eps, bc1, bc2, n,
+        );
+
+        // GPU
+        let mut w_dev = DeviceBuffer::from_host(&stream, &weights_host)?;
+        let mut m_dev = DeviceBuffer::from_host(&stream, &m_host)?;
+        let mut v_dev = DeviceBuffer::from_host(&stream, &v_host)?;
+        let mut g_dev = DeviceBuffer::from_host(&stream, &grad_host)?;
+        let n_u32 = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: grid_dim_1d(n, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: adam_step,
+            stream: stream,
+            module: module,
+            config: cfg,
+            args: [
+                slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                lr, beta1, beta2, eps, bc1, bc2, n_u32
+            ]
+        }?;
+        stream.synchronize()?;
+        let w_gpu = w_dev.to_host_vec(&stream)?;
+        let m_gpu = m_dev.to_host_vec(&stream)?;
+        let v_gpu = v_dev.to_host_vec(&stream)?;
+        let g_gpu = g_dev.to_host_vec(&stream)?;
+
+        for i in 0..n {
+            let dw = (w_gpu[i] - w_cpu[i]).abs();
+            let dm = (m_gpu[i] - m_cpu[i]).abs();
+            let dv = (v_gpu[i] - v_cpu[i]).abs();
+            let dg = (g_gpu[i] - g_cpu[i]).abs();
+            assert!(
+                dw < FLOAT_TOL,
+                "w[{i}]: gpu={} cpu={} diff={dw}",
+                w_gpu[i],
+                w_cpu[i]
+            );
+            assert!(
+                dm < FLOAT_TOL,
+                "m[{i}]: gpu={} cpu={} diff={dm}",
+                m_gpu[i],
+                m_cpu[i]
+            );
+            assert!(
+                dv < FLOAT_TOL,
+                "v[{i}]: gpu={} cpu={} diff={dv}",
+                v_gpu[i],
+                v_cpu[i]
+            );
+            assert!(
+                dg < FLOAT_TOL,
+                "g[{i}]: gpu={} cpu={} diff={dg}",
+                g_gpu[i],
+                g_cpu[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// 最小ベンチ: sample.psv の先頭ゲームから 4 games × 8 pos = 32 pos の batch を
+    /// 組み、warm-up 1 step + 計測 50 steps の `samples/sec` を `println!` で記録。
+    /// Stage 1-10 の手動検証用 baseline。`> 1.0` だけ assert する loose check で
+    /// 環境差を吸収。安定した PR-to-PR perf tracking には別 `--bench` workflow
+    /// (criterion 等) が必要 (Stage 2+ 想定)。
+    #[test]
+    fn samples_per_sec_baseline_on_sample_psv() -> Result<(), Box<dyn std::error::Error>> {
+        let (ctx, _module, _stream) = open_module()?;
+        let mut trainer = GpuTrainer::new(&ctx, None)?;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/shogi-format/tests/data/sample.psv");
+        let cursor = PackCursor::open(&path)?;
+        let mut gi = GameIterator::new(cursor);
+        let game = gi.next_game()?.expect("at least 1 game");
+        if game.len() < 8 {
+            // sample.psv の game が短すぎる場合は skip
+            return Ok(());
+        }
+
+        let mut batch = Batch::new();
+        let mut scratch = Vec::with_capacity(96);
+        // 同じ game を 4 回 push して 1 batch (4 games) にする
+        for _ in 0..4 {
+            batch.push_game(&game[..8], &mut scratch);
+        }
+        batch.finalize();
+
+        // warm-up 1 step
+        trainer.step(&batch, 1e-3)?;
+
+        let n_steps: usize = 50;
+        let n_pos_per_step = batch.n_positions;
+        let start = std::time::Instant::now();
+        for _ in 0..n_steps {
+            trainer.step(&batch, 1e-3)?;
+        }
+        let elapsed = start.elapsed();
+        let total_samples = n_pos_per_step * n_steps;
+        let samples_per_sec = total_samples as f64 / elapsed.as_secs_f64();
+        println!(
+            "Stage 1-10 baseline: {} positions/batch × {} steps in {:.3?} → {:.0} samples/sec",
+            n_pos_per_step, n_steps, elapsed, samples_per_sec
+        );
+        // 環境依存なので閾値は緩く: 1 sample/sec 以上ならまず動いている (大体 sm_75
+        // の本 box では 4 games × 8 positions = 32 / step が ~1ms 以下の見込み)
+        assert!(
+            samples_per_sec > 1.0,
+            "samples/sec too low: {samples_per_sec}"
+        );
+        Ok(())
     }
 }
