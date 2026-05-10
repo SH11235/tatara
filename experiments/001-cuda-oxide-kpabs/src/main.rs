@@ -1,30 +1,66 @@
-//! experiments/001-cuda-oxide-kpabs の dummy entry point。
+//! experiments/001-cuda-oxide-kpabs binary entry point。
 //!
-//! 本 binary は scaffold (Issue #8) — PSV を 1 batch 読み込み、先頭数 record の
-//! 主要フィールド (score / game_ply / game_result) を print するだけ。
-//! GPU は触らない (Issue #9 以降で kernel + host loop を増築していく)。
+//! Stage 1-9 (#13) で本 file は kernel 定義 (`#[kernel]`) と host loop driver を
+//! 統合する。host loop は PSV file 群 → batch → forward → grad → adam_step を
+//! 駆動し、最終 weight を YaneuraOu 互換 progress.bin に出力する。
+//!
+//! ## 設計
+//!
+//! - **kernels** (forward / grad / adam_step / eval) は本 file の inline `#[kernel]`。
+//!   cuda-oxide rustc-codegen-cuda backend が bin entry 経由で到達可能な
+//!   `#[kernel]` のみ NVPTX IR 化するため、main.rs に置く必要がある (Stage 1-5
+//!   で確立)
+//! - **GpuTrainer** は本 file。device buffer (weights / m / v / grad / loss_acc /
+//!   hist + scratch) を所有し、`step` / `eval_forward` で 1 batch 分の
+//!   forward → grad/eval → (training なら) adam_step を launch する
+//! - **host helper** (Batch builder / PSV reader / progress.bin I/O / CLI) は
+//!   GPU 非依存なので `lib.rs` の `host` module に置く。CI runner では本 crate
+//!   が `--exclude` されるため build されないが、host helper は `cargo test
+//!   -p exp-001-cuda-oxide-kpabs` で単体テスト可能
 //!
 //! ## 使い方
 //!
 //! ```bash
-//! # 引数なし: shogi-format crate の test fixture (sample.psv, 100 records) を読む
-//! cargo run -p exp-001-cuda-oxide-kpabs
+//! # 1 epoch の動作確認 (smoke):
+//! cargo run -p exp-001-cuda-oxide-kpabs -- \
+//!     --data crates/shogi-format/tests/data/sample.psv \
+//!     --output /tmp/progress.bin \
+//!     --games-per-step 4 --max-games 8 --lr 1e-3
 //!
-//! # 引数あり: 任意の PSV file path を渡す
-//! cargo run -p exp-001-cuda-oxide-kpabs -- /path/to/data.psv
+//! # 実データで:
+//! cargo run --release -p exp-001-cuda-oxide-kpabs -- \
+//!     --data /mnt/e/rshogi-nnue/data/some.bin \
+//!     --output progress.bin --epochs 1
 //! ```
+//!
+//! 事前に `cargo-oxide build` で kernel `.ll` を生成しておく必要がある:
+//!
+//! ```bash
+//! cd experiments/001-cuda-oxide-kpabs && \
+//! CUDA_OXIDE_TARGET=sm_75 \
+//!     /mnt/e/cuda-oxide-target/release/cargo-oxide build
+//! ```
+//!
+//! 出力先 (workspace root の `exp_001_cuda_oxide_kpabs.ll`) は `KernelLoader`
+//! が自動で probe する (CARGO_MANIFEST_DIR と workspace root の両方)。
 
-use std::env;
-use std::fs;
-use std::mem::size_of;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
+use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, kernel, thread};
-use shogi_format::PackedSfenValue;
-
-const PSV_SIZE: usize = size_of::<PackedSfenValue>();
+use cuda_host::cuda_launch;
+use exp_001_cuda_oxide_kpabs::host::{
+    ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MAX_INDS_PER_POS,
+    batch::Batch,
+    cli::Args,
+    games::{GameIterator, PackCursor},
+    progress_bin::{read_progress_bin, write_progress_bin},
+};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
 
 /// Forward kernel (KP-abs sigmoid prediction per position).
 ///
@@ -264,63 +300,652 @@ pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_po
     hist_atom.fetch_add(1u64, AtomicOrdering::Relaxed);
 }
 
-fn main() -> ExitCode {
-    let path = match env::args_os().nth(1) {
-        Some(p) => PathBuf::from(p),
-        None => default_sample_path(),
-    };
+// ---------------------------------------------------------------------------
+// Host driver (GpuTrainer + main)
+// ---------------------------------------------------------------------------
 
-    // 表示用に `..` を畳んで見やすくする (失敗したら raw のまま)
-    let display_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-    println!("reading PSV from: {}", display_path.display());
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: failed to read {}: {e}", path.display());
-            return ExitCode::from(2);
-        }
-    };
-
-    if bytes.len() % PSV_SIZE != 0 {
-        eprintln!(
-            "error: file size {} is not a multiple of PSV record size {PSV_SIZE}",
-            bytes.len()
-        );
-        return ExitCode::from(2);
-    }
-
-    let count = bytes.len() / PSV_SIZE;
-    println!("file size: {} bytes / {count} records", bytes.len());
-
-    // SAFETY: `PackedSfenValue` は `#[repr(C)] struct { data: [u8; 40] }` で
-    // alignment は 1。`Vec<u8>` の as_ptr() は alignment 1 を満たし、上の
-    // size 検査 (`bytes.len() % PSV_SIZE == 0`) で N records 分のメモリが
-    // 連続して読み出し可能。同パターンは shogi-format/tests/psv_smoke.rs
-    // の `read_one_batch_of_psv_records` で invariant を verifying 済み。
-    let records: &[PackedSfenValue] =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, count) };
-
-    let take = count.min(5);
-    for (i, psv) in records.iter().take(take).enumerate() {
-        println!(
-            "[{i}] score={:>6} ply={:>4} game_result={:>2} ({:?})",
-            psv.score(),
-            psv.game_ply(),
-            psv.game_result(),
-            psv.result()
-        );
-    }
-    if count > take {
-        println!("... ({} more records)", count - take);
-    }
-
-    ExitCode::SUCCESS
+/// 1 D launch の grid 数を計算する (= ceil(n / block)、n=0 は block=1 個 launch)。
+fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
+    let blocks = ((n as u32).max(1)).div_ceil(block);
+    (blocks, 1, 1)
 }
 
-/// 引数省略時に読む、shogi-format crate の test fixture。
+const BLOCK_DIM: u32 = 256;
+
+/// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
+/// CudaModule を load する。
 ///
-/// experiments/001-cuda-oxide-kpabs/ → ../../crates/shogi-format/tests/data/sample.psv
-fn default_sample_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/shogi-format/tests/data/sample.psv")
+/// ## 探索順序
+///
+/// `<name>.cubin` → `<name>.ptx` → `<name>.ll` の順で、CARGO_MANIFEST_DIR と
+/// workspace root の両方を見る。cargo-oxide rev `6de0509` は cwd 依存で `.ll` を
+/// 後者に書くことがある (実機確認済)。
+///
+/// ## .ll → .ptx の変換
+///
+/// `cuda_host::ltoir::build_cubin_from_ll` (libNVVM 経由) は本リポの cuda-oxide
+/// が出力する opaque pointer 形式の NVVM IR を parse できない (実機エラー:
+/// `libnvvm error 9: parse expected type`、IR の `define void @grad(ptr ...)`
+/// 行で reject される)。代わりに **`llc-21`** で素直に NVPTX backend を回す。
+/// `__nv_sqrtf` 等 libdevice intrinsic は `.extern .func` 宣言として残るが、
+/// CUDA driver の JIT linker が module load 時に libdevice と link する。
+fn load_kernel_module_with_fallback(
+    ctx: &std::sync::Arc<CudaContext>,
+    name: &str,
+) -> Result<std::sync::Arc<CudaModule>, Box<dyn std::error::Error>> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.clone());
+
+    // `.ll` を最優先で probe する: kernel source を更新したら必ず `cargo-oxide build`
+    // で `.ll` が再生成されるが、`.ptx`/`.cubin` は前回の build から残ったものが
+    // 古いまま居座ることがある。`.ll` を見つけたら `compile_ll_to_ptx_via_llc` 内の
+    // mtime キャッシュで `.ptx` 鮮度を判断できる。`.ll` が無い場合のみ既製 `.ptx` /
+    // `.cubin` (例: 別ツールで事前生成したもの) を fallback で受ける。
+    let probe = |dir: &PathBuf| {
+        for ext in ["ll", "cubin", "ptx"] {
+            let p = dir.join(format!("{name}.{ext}"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
+    };
+
+    let path = probe(&manifest_dir)
+        .or_else(|| probe(&workspace_root))
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!(
+                "kernel artifact `{name}.{{cubin,ptx,ll}}` not found in {} or {}.\n\
+                 先に cargo-oxide build を実行してください:\n  \
+                 cd {} && CUDA_OXIDE_TARGET=sm_75 cargo-oxide build",
+                manifest_dir.display(),
+                workspace_root.display(),
+                manifest_dir.display(),
+            )
+            .into()
+        })?;
+
+    let to_load = if path.extension().and_then(|s| s.to_str()) == Some("ll") {
+        compile_ll_to_ptx_via_llc(&path)?
+    } else {
+        path
+    };
+
+    let module = ctx.load_module_from_file(
+        to_load
+            .to_str()
+            .ok_or("kernel artifact path not valid UTF-8")?,
+    )?;
+    Ok(module)
+}
+
+/// `.ll` を libdevice と link、不要 symbol を internalize/dce、nvvm-reflect で
+/// `__nvvm_reflect` を畳み込んで `.ptx` に変換して返す。
+///
+/// パイプライン (NVCC の `compileToCubin` と同等):
+///
+/// 1. **`llvm-link-21 <ll> libdevice.10.bc → linked.bc`** で `__nv_sqrtf` 等の
+///    libdevice intrinsic を IR レベルで取り込み
+/// 2. **`opt-21 --passes='internalize,globaldce,nvvm-reflect'
+///    --internalize-public-api-list=<kernel symbols> linked.bc → opt.bc`** で:
+///    - kernel 以外の libdevice 関数を `internal` にして dead-code-elim 対象化
+///    - `__nvvm_reflect()` 呼び出しを 0/1 const に置換 (libdevice 内 `__CUDA_FTZ`
+///      等の query を解決)
+///    - `globaldce` で未参照の libdevice 関数を削除
+/// 3. **`llc-21 --mtriple=nvptx64-nvidia-cuda --mcpu=<arch> -O2 opt.bc → .ptx`**
+///    で NVPTX backend が PTX 生成
+///
+/// 結果の `.ptx` は `.extern .func` 宣言を含まず、`ptxas` / driver JIT が完結する。
+///
+/// **なぜ `cuda-host::build_cubin_from_ll` (libNVVM 経由) を使わないか**: 本リポの
+/// cuda-oxide rev `6de0509` が出力する NVVM IR は opaque pointer 形式 (`define
+/// void @grad(ptr ...)`) で、libNVVM は古い LLVM 版を内蔵していて opaque
+/// pointer を parse できず `nvvmCompileProgram error 9: parse expected type`
+/// で reject される (実機確認、`exp_001_cuda_oxide_kpabs.ll:11` 由来)。
+/// `llvm-link-21 + opt-21 + llc-21` の組合せは LLVM 21 series 以降の opaque
+/// pointer をネイティブ扱いするため成功する。
+fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let stem = ll_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("ll path has no stem")?;
+    let dir = ll_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let linked_bc = dir.join(format!("{stem}.linked.bc"));
+    let opt_bc = dir.join(format!("{stem}.opt.bc"));
+    let ptx_path = dir.join(format!("{stem}.ptx"));
+
+    // cache: skip rebuild if .ptx is newer than .ll
+    if let (Ok(ll_meta), Ok(ptx_meta)) = (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
+        && let (Ok(ll_mtime), Ok(ptx_mtime)) = (ll_meta.modified(), ptx_meta.modified())
+        && ptx_mtime > ll_mtime
+    {
+        return Ok(ptx_path);
+    }
+
+    let arch = std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_75".to_string());
+    let llvm_link = std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| "llvm-link-21".to_string());
+    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| "opt-21".to_string());
+    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
+    let libdevice = find_libdevice_bc()?;
+
+    // 本実験の kernel 名 (Stage 1-5..1-8)。`@<name>` として `.ll` 側に出ている
+    // ものをそのまま渡す。順番は問わない。
+    let kernel_names = "grad,forward,adam_step,eval";
+
+    // Step 1: llvm-link <ll> libdevice → linked.bc
+    run_or_err(
+        &llvm_link,
+        &[
+            ll_path.as_os_str(),
+            libdevice.as_os_str(),
+            "-o".as_ref(),
+            linked_bc.as_os_str(),
+        ],
+    )?;
+
+    // Step 2: opt --passes='nvvm-reflect,internalize,globaldce'
+    // pass 順序は NVCC の compileToCubin 慣例 (reflect 先 → 定数畳み込み →
+    // internalize → DCE) に合わせる。reflect が `__nvvm_reflect()` を 0/1 に
+    // 畳み込んだ後で internalize/DCE を回すと、libdevice 内 dead branch が
+    // 確実に削除される。
+    let api = format!("--internalize-public-api-list={kernel_names}");
+    run_or_err(
+        &opt_bin,
+        &[
+            "--passes=nvvm-reflect,internalize,globaldce".as_ref(),
+            api.as_ref(),
+            linked_bc.as_os_str(),
+            "-o".as_ref(),
+            opt_bc.as_os_str(),
+        ],
+    )?;
+
+    // Step 3: llc -mcpu=<arch> -O2 opt.bc → .ptx
+    let mcpu = format!("--mcpu={arch}");
+    run_or_err(
+        &llc_bin,
+        &[
+            "--mtriple=nvptx64-nvidia-cuda".as_ref(),
+            mcpu.as_ref(),
+            "-O2".as_ref(),
+            "-o".as_ref(),
+            ptx_path.as_os_str(),
+            opt_bc.as_os_str(),
+        ],
+    )?;
+
+    Ok(ptx_path)
+}
+
+/// `Command::new` + `args` + `status` を 1 行にまとめる helper。
+fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = std::process::Command::new(bin)
+        .args(args)
+        .status()
+        .map_err(|e| {
+            format!(
+                "failed to spawn {bin}: {e}. \
+                 Stage 1-9 は llvm-link-21 / opt-21 / llc-21 を要求します \
+                 (libNVVM が opaque pointer IR を parse できないため)。\
+                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で別 binary を指定可。"
+            )
+        })?;
+    if !status.success() {
+        return Err(format!("{bin} failed with status {status}").into());
+    }
+    Ok(())
+}
+
+/// `libdevice.10.bc` を CUDA Toolkit から探す (cuda-oxide の `find_libdevice` と同等)。
+fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(p) = std::env::var("CUDA_OXIDE_LIBDEVICE") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let mut tried = Vec::new();
+    let roots: Vec<PathBuf> = std::env::var("CUDA_HOME")
+        .ok()
+        .into_iter()
+        .chain(std::env::var("CUDA_PATH").ok())
+        .map(PathBuf::from)
+        .chain([
+            PathBuf::from("/usr/local/cuda"),
+            PathBuf::from("/usr/local/cuda-13.2"),
+            PathBuf::from("/usr/local/cuda-12.9"),
+            PathBuf::from("/opt/cuda"),
+        ])
+        .collect();
+    for root in roots {
+        let candidate = root.join("nvvm/libdevice/libdevice.10.bc");
+        tried.push(candidate.display().to_string());
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "libdevice.10.bc not found. CUDA_OXIDE_LIBDEVICE か CUDA_HOME を設定するか、\
+         CUDA Toolkit を入れてください。Tried:\n  {}",
+        tried.join("\n  ")
+    )
+    .into())
+}
+
+/// GPU 上で 4 kernel を順次起動する trainer。bullet-shogi 上流の `GpuTrainer`
+/// 相当だが本リポでは cuda-oxide の `cuda_launch!` macro を使うため kernel
+/// シンボルを直接渡せる (NVRTC 経由ではない)。
+///
+/// device buffer は内部所有:
+/// - `weights / m / v / grad`: `DeviceBuffer<f32>` (size = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS)
+/// - `loss_acc`: `DeviceBuffer<f64>` (size = 1)
+/// - `hist`: `DeviceBuffer<u64>` (size = 8)
+///
+/// 入力 (indices / targets / per_pos_norm / preds) は `step` / `eval_forward` 内で
+/// `DeviceBuffer::from_host` / `zeroed` する。bullet-shogi 上流のような scratch
+/// reuse は cuda-oxide の `DeviceBuffer<T>::from_host` が新規 allocation のみ
+/// 提供するため一旦見送り、Stage 1-10 (#14) の perf 計測時に
+/// `Stream::memcpy_h2d` 直接呼び出しで再利用化する想定 (TODO)。
+struct GpuTrainer {
+    stream: std::sync::Arc<CudaStream>,
+    module: std::sync::Arc<CudaModule>,
+
+    weights: DeviceBuffer<f32>,
+    m: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    grad: DeviceBuffer<f32>,
+    loss_acc: DeviceBuffer<f64>,
+    hist: DeviceBuffer<u64>,
+
+    /// Adam の `beta^t` 累積値 (`bc1 = 1 - beta1_pow` を kernel に渡す)。
+    beta1_pow: f32,
+    beta2_pow: f32,
+}
+
+impl GpuTrainer {
+    /// CUDA context を作成し、kernel module を load し、device buffer を確保する。
+    fn new(
+        ctx: &std::sync::Arc<CudaContext>,
+        init_weights: Option<&[f32]>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = ctx.default_stream();
+        let module = load_kernel_module_with_fallback(ctx, "exp_001_cuda_oxide_kpabs")?;
+
+        let n = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
+        let weights = match init_weights {
+            Some(init) => {
+                if init.len() != n {
+                    return Err(
+                        format!("init_weights length {} != expected {}", init.len(), n).into(),
+                    );
+                }
+                DeviceBuffer::from_host(&stream, init)?
+            }
+            None => DeviceBuffer::<f32>::zeroed(&stream, n)?,
+        };
+        let m = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+        let v = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+        let grad = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+        let loss_acc = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        let hist = DeviceBuffer::<u64>::zeroed(&stream, 8)?;
+
+        Ok(Self {
+            stream,
+            module,
+            weights,
+            m,
+            v,
+            grad,
+            loss_acc,
+            hist,
+            beta1_pow: 1.0,
+            beta2_pow: 1.0,
+        })
+    }
+
+    /// `loss_acc` / `hist` を 0 に reset する (epoch 開始時 / log 区間切り替え時)。
+    fn zero_loss_hist(&mut self) -> gpu_runtime::Result<()> {
+        // `DeviceBuffer<T>::zeroed` で作り直すのが一番素直 (memset より移植性が高い)。
+        self.loss_acc = DeviceBuffer::<f64>::zeroed(&self.stream, 1)?;
+        self.hist = DeviceBuffer::<u64>::zeroed(&self.stream, 8)?;
+        Ok(())
+    }
+
+    /// 1 step (= 1 batch 分の forward → grad/loss/hist accumulate → adam_step) を実行する。
+    fn step(&mut self, batch: &Batch, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
+        let n_pos = batch.n_positions;
+        if n_pos == 0 {
+            return Ok(());
+        }
+
+        // 入力 buffer は per-step に新規 alloc。Stage 1-10 で perf 計測時に
+        // `Stream::memcpy_h2d` で再利用化する想定 (TODO)。
+        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
+        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
+        let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
+        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
+
+        let n_pos_u32 = n_pos as u32;
+        let max_inds_u32 = MAX_INDS_PER_POS as u32;
+        let grid_pos = grid_dim_1d(n_pos, BLOCK_DIM);
+
+        let cfg_pos = LaunchConfig {
+            grid_dim: grid_pos,
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Forward: preds[pos] = sigmoid(Σ weights[idx[base+j]])
+        cuda_launch! {
+            kernel: forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(indices_dev),
+                slice(self.weights),
+                slice_mut(preds_dev),
+                n_pos_u32,
+                max_inds_u32
+            ]
+        }?;
+
+        // Backward: gscale → grad[idx] (atomic) + loss_acc + hist
+        cuda_launch! {
+            kernel: grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(indices_dev),
+                slice(preds_dev),
+                slice(targets_dev),
+                slice(norm_dev),
+                slice(self.grad),
+                slice(self.loss_acc),
+                slice(self.hist),
+                n_pos_u32,
+                max_inds_u32
+            ]
+        }?;
+
+        // Adam step
+        self.beta1_pow *= ADAM_BETA1;
+        self.beta2_pow *= ADAM_BETA2;
+        let bc1 = 1.0_f32 - self.beta1_pow;
+        let bc2 = 1.0_f32 - self.beta2_pow;
+        let beta1 = ADAM_BETA1;
+        let beta2 = ADAM_BETA2;
+        let eps = ADAM_EPS;
+        let n_w = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
+        let n_w_u32 = n_w as u32;
+        let cfg_w = LaunchConfig {
+            grid_dim: grid_dim_1d(n_w, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_launch! {
+            kernel: adam_step,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_w,
+            args: [
+                slice_mut(self.weights),
+                slice_mut(self.m),
+                slice_mut(self.v),
+                slice_mut(self.grad),
+                lr,
+                beta1,
+                beta2,
+                eps,
+                bc1,
+                bc2,
+                n_w_u32
+            ]
+        }?;
+
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// 評価 path: forward → eval kernel (loss + histogram のみ、weight 不変)。
+    #[allow(dead_code)]
+    fn eval_forward(&mut self, batch: &Batch) -> Result<(), Box<dyn std::error::Error>> {
+        let n_pos = batch.n_positions;
+        if n_pos == 0 {
+            return Ok(());
+        }
+
+        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
+        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
+        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
+
+        let n_pos_u32 = n_pos as u32;
+        let max_inds_u32 = MAX_INDS_PER_POS as u32;
+        let cfg_pos = LaunchConfig {
+            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        cuda_launch! {
+            kernel: forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(indices_dev),
+                slice(self.weights),
+                slice_mut(preds_dev),
+                n_pos_u32,
+                max_inds_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: eval,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(preds_dev),
+                slice(targets_dev),
+                slice(self.loss_acc),
+                slice(self.hist),
+                n_pos_u32
+            ]
+        }?;
+
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    fn read_loss_hist(&self) -> gpu_runtime::Result<(f64, [u64; 8])> {
+        let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
+        let hist_vec = self.hist.to_host_vec(&self.stream)?;
+        let mut hist_arr = [0_u64; 8];
+        hist_arr.copy_from_slice(&hist_vec[..8]);
+        Ok((loss_vec[0], hist_arr))
+    }
+
+    fn read_weights(&self) -> gpu_runtime::Result<Vec<f32>> {
+        self.weights.to_host_vec(&self.stream).map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Training driver
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct EpochStats {
+    samples: usize,
+    games: usize,
+    steps: usize,
+    mean_loss: f64,
+    bucket_hist: [u64; 8],
+}
+
+/// 1 file 内の game を順次読んで batch を組み、`step` を呼ぶ。
+fn train_one_epoch(
+    trainer: &mut GpuTrainer,
+    data_files: &[PathBuf],
+    args: &Args,
+    lr: f32,
+    epoch: usize,
+) -> Result<EpochStats, Box<dyn std::error::Error>> {
+    trainer.zero_loss_hist()?;
+
+    let max_games = if args.max_games > 0 {
+        Some(args.max_games)
+    } else {
+        None
+    };
+
+    let mut batch = Batch::new();
+    let mut scratch: Vec<usize> = Vec::with_capacity(96);
+    let mut samples_total = 0_usize;
+    let mut games_total = 0_usize;
+    let mut steps = 0_usize;
+    let start = Instant::now();
+
+    'outer: for path in data_files {
+        let cursor = PackCursor::open(path)?;
+        let mut gi = GameIterator::new(cursor);
+        while let Some(game) = gi.next_game()? {
+            if game.is_empty() {
+                continue;
+            }
+            if let Some(limit) = max_games
+                && games_total + batch.n_games >= limit
+            {
+                break 'outer;
+            }
+            batch.push_game(&game, &mut scratch);
+            if batch.n_games >= args.games_per_step {
+                batch.finalize();
+                games_total += batch.n_games;
+                samples_total += batch.n_positions;
+                trainer.step(&batch, lr)?;
+                steps += 1;
+                batch.clear();
+
+                if args.log_interval_steps > 0 && steps % args.log_interval_steps == 0 {
+                    let (loss_sum, _) = trainer.read_loss_hist()?;
+                    let avg = if samples_total > 0 {
+                        loss_sum / samples_total as f64
+                    } else {
+                        0.0
+                    };
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let games_per_sec = games_total as f64 / elapsed.max(1e-9);
+                    println!(
+                        "epoch {} steps {} games {} samples {} avg_loss {:.6} games/s {:.0}",
+                        epoch, steps, games_total, samples_total, avg, games_per_sec
+                    );
+                }
+            }
+        }
+    }
+    // 残り (n_games < games_per_step) も 1 step として処理。
+    if batch.n_games > 0 {
+        batch.finalize();
+        games_total += batch.n_games;
+        samples_total += batch.n_positions;
+        trainer.step(&batch, lr)?;
+        steps += 1;
+    }
+
+    let (loss_sum, hist) = trainer.read_loss_hist()?;
+    let mean_loss = if samples_total > 0 {
+        loss_sum / samples_total as f64
+    } else {
+        0.0
+    };
+    Ok(EpochStats {
+        samples: samples_total,
+        games: games_total,
+        steps,
+        mean_loss,
+        bucket_hist: hist,
+    })
+}
+
+fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.epochs == 0 {
+        return Err("--epochs must be >= 1".into());
+    }
+    if args.games_per_step == 0 {
+        return Err("--games-per-step must be >= 1".into());
+    }
+
+    let data_paths = args.data_paths();
+    if data_paths.is_empty() {
+        return Err(
+            "--data is required (comma-separated PSV files). 引数省略は scaffold 時のみ".into(),
+        );
+    }
+    for p in &data_paths {
+        if !p.exists() {
+            return Err(format!("data file not found: {}", p.display()).into());
+        }
+    }
+
+    let init_weights = args
+        .init_from
+        .as_deref()
+        .map(read_progress_bin)
+        .transpose()?;
+
+    let ctx = CudaContext::new(args.device)?;
+    println!(
+        "CUDA device {} ready, kernel module loading...",
+        args.device
+    );
+    let mut trainer = GpuTrainer::new(&ctx, init_weights.as_deref())?;
+    println!(
+        "GpuTrainer ready: {} weights, batch={} games, lr={} (effective={})",
+        SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
+        args.games_per_step,
+        args.lr,
+        args.effective_lr()
+    );
+
+    let lr = args.effective_lr();
+    let mut last_stats: EpochStats = EpochStats::default();
+    for epoch in 1..=args.epochs {
+        let stats = train_one_epoch(&mut trainer, &data_paths, &args, lr, epoch)?;
+        println!(
+            "EPOCH {} DONE: games={} samples={} steps={} mean_loss={:.6} hist={:?}",
+            epoch, stats.games, stats.samples, stats.steps, stats.mean_loss, stats.bucket_hist
+        );
+        last_stats = stats;
+    }
+    let _ = last_stats; // 後続で使う予定なら拡張、現状は EOI 用に保持
+
+    let weights = trainer.read_weights()?;
+    write_progress_bin(&args.output, &weights)?;
+    println!(
+        "wrote progress.bin: {} ({} weights, {} bytes)",
+        args.output.display(),
+        weights.len(),
+        weights.len() * std::mem::size_of::<f64>()
+    );
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    match run_training(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

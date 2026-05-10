@@ -25,6 +25,9 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 shogi-format = { path = "crates/shogi-format" }
+shogi-features = { path = "crates/shogi-features" }
+gpu-runtime = { path = "crates/gpu-runtime" }
+clap = { version = "4.5", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

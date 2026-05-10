@@ -60,6 +60,55 @@
     実装 (`crates/cargo-oxide/src/backend.rs`) の workspace-root 探索が
     standalone path に落ちず IR 出力が silently no-op になる
 
+#### Stage 1-9 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `examples/shogi_progress_kpabs_train_cuda.rs` の **host 側ロジック** (kernel
+  以外、約 900 行) を以下の単位で `experiments/001-cuda-oxide-kpabs/` に移植。
+  bullet-shogi の multi-thread prefetch / pack interleaving / 学習 epoch
+  per-checkpoint / val split は Stage 1-9 の受け入れ条件 (1 epoch 完走 +
+  progress.bin 出力) に対し過剰なため意図的に削除し、最小実装に絞った。
+
+  - `src/host/games.rs::PackCursor` / `GameIterator` ←→ 上流 `PackCursor` /
+    `GameIterator`。PSV ファイルを 1 record ずつ読み、`game_ply` の減少を
+    境界として 1 ゲーム単位に切り出す。bullet 上流の `Vec<u8>` バッファ + size
+    検証 path も同等
+  - `src/host/batch.rs::Batch` ←→ 上流 `Batch`。`push_game` で 1 ゲーム分の
+    flat indices / targets / per_pos_norm を埋め、`finalize` で per_pos_norm
+    に `1/n_games` を乗じて batch averaging を完成。target は `i / (game_len - 1)`
+    の game-relative ラベル (上流と同式)。`MAX_INDS_PER_POS = 80` も同値
+  - `src/host/progress_bin.rs::write_progress_bin` / `read_progress_bin` ←→
+    上流の同名関数。YaneuraOu 互換の f64 LE × `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`
+    形式 (= 1,003,104 bytes)。f32 ↔ f64 cast は wire format 通り
+  - `src/host/cli.rs::Args` ←→ 上流 `Args` の核サブセット (`--data` `--output`
+    `--init-from` `--games-per-step` `--max-games` `--epochs` `--lr` `--lr-scale`
+    `--log-interval-steps` `--device`)。prefetch / val split 関連 flag は削除
+  - `src/main.rs::GpuTrainer` ←→ 上流 `GpuTrainer`。`step` で
+    forward → grad/loss/hist → adam_step を順次 `cuda_launch!` で起動、
+    `eval_forward` は forward → eval kernel。device buffer 確保は cuda-oxide
+    `DeviceBuffer<T>` ベースで bullet の `RawBuf` (raw `malloc/memset`) は不要
+  - `src/main.rs::train_one_epoch` ←→ 上流 `train_one_epoch`。multi-thread
+    prefetch を **single-threaded** に簡素化 (mpsc / JoinHandle なし)、log /
+    epoch 集計はそのまま
+
+- **kernel artifact loader** (`load_kernel_module_with_fallback` /
+  `compile_ll_to_ptx_via_llc`) は新規 (上流の NVRTC は Rust kernel に使えない)。
+  cuda-oxide が出力する opaque pointer NVVM IR (`define void @grad(ptr ...)`)
+  は libNVVM が parse できない (実機エラー: `nvvmCompileProgram error 9:
+  parse expected type`、`exp_001_cuda_oxide_kpabs.ll:11` 由来) ため、本 PR は
+  **`llvm-link-21 + opt-21 (passes='internalize,globaldce,nvvm-reflect') +
+  llc-21`** の 3 段 pipeline で `.ll → .ptx` を生成する。kernel symbol を
+  `--internalize-public-api-list=grad,forward,adam_step,eval` で保存し、
+  libdevice の未使用関数を `globaldce` で除去、`__nvvm_reflect()` を `nvvm-reflect`
+  pass で 0/1 に畳み込む。NVCC の `compileToCubin` 相当だが driver 側の JIT
+  にも対応した形で生成。`.ptx` には `.extern .func` が残らず ptxas 単体で完結
+
+- 環境前提: WSL2 sm_75 box (RTX 2070 SUPER)、CUDA 12.9、LLVM 21.1.8 (clang-21
+  / llvm-link-21 / opt-21 / llc-21)、`/usr/local/cuda-12.9/nvvm/libdevice/
+  libdevice.10.bc`。Stage 1-1〜1-8 と同じ。実行確認: `cargo run -p
+  exp-001-cuda-oxide-kpabs -- --data <sample.psv> --output <progress.bin>
+  --games-per-step 4 --max-games 8` で 1 epoch 完走 + 1003104 bytes
+  progress.bin 出力済 (受け入れ条件達成)
+
 #### Stage 1-8 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `examples/shogi_progress_kpabs_train_cuda.rs::KERNELS_SRC::k_eval_loss_hist`
