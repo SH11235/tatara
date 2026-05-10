@@ -156,6 +156,64 @@ pub fn grad(
     hist_atom.fetch_add(1u64, AtomicOrdering::Relaxed);
 }
 
+/// Adam optimizer step kernel (1 thread = 1 weight)。
+///
+/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
+/// inline 定義しているのは forward / grad と同じ理由。GPU launch path は
+/// Stage 1-9 (#13) で host loop を組むときに ここから呼び出す。
+///
+/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_adam_step`) との差分は
+/// reference CPU 実装 (`src/kernels/adam_step.rs::adam_step_cpu`) の docstring
+/// および `ATTRIBUTION.md` の Stage 1-7 entry を参照。
+///
+/// 引数数 (11) は bullet 上流 `k_adam_step` と 1:1 対応のため
+/// `too_many_arguments` を allow する。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn adam_step(
+    mut weights: DisjointSlice<f32>,
+    mut m: DisjointSlice<f32>,
+    mut v: DisjointSlice<f32>,
+    mut grad: DisjointSlice<f32>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    bc1: f32,
+    bc2: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+
+    // 4 buffer すべて i 番目に対し 1 thread が排他的にアクセスするため atomics 不要。
+    // get_mut が None になるのは host 側 invariant 違反 (len < n) のときのみで、
+    // forward kernel の defensive pattern と同じく該当 thread は silent skip する。
+    let g_opt = grad.get_mut(i);
+    let m_opt = m.get_mut(i);
+    let v_opt = v.get_mut(i);
+    let w_opt = weights.get_mut(i);
+    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
+        let g = *g_ref;
+        let mi = beta1 * *m_ref + (1.0f32 - beta1) * g;
+        let vi = beta2 * *v_ref + (1.0f32 - beta2) * g * g;
+        *m_ref = mi;
+        *v_ref = vi;
+        // f32::max は cuda-oxide が `std::intrinsics::maximum_number_nsz_f32` を解決できず
+        // ('Symbol ... not found') lowering 失敗するため、bullet 上流 C++ `fmaxf(bc, 1e-30f)`
+        // を if-else で verbatim 移植する。CPU reference (adam_step_cpu) は host 実行で
+        // f32::max を使用する。
+        let bc1_safe = if bc1 > 1e-30f32 { bc1 } else { 1e-30f32 };
+        let bc2_safe = if bc2 > 1e-30f32 { bc2 } else { 1e-30f32 };
+        let m_hat = mi / bc1_safe;
+        let v_hat = vi / bc2_safe;
+        *w_ref -= lr * m_hat / (v_hat.sqrt() + eps);
+        *g_ref = 0.0f32;
+    }
+}
+
 fn main() -> ExitCode {
     let path = match env::args_os().nth(1) {
         Some(p) => PathBuf::from(p),
