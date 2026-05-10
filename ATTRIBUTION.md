@@ -11,6 +11,33 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 2-1 (2026-05-11, bullet-shogi commit `f275eb9`)
+
+- `crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU` (forward /
+  backward) → fused gradient kernel として
+  `experiments/002-fused-kernels/src/main.rs::screlu_grad` (`#[kernel]`) +
+  `crates/gpu-kernels/src/pointwise/screlu_grad.rs::screlu_grad_cpu`
+  (numerical equivalence test 用 reference)。
+  - 上流は forward (`clamp(x, 0, 1)^2`) と backward (`2 * sqrt(y) *
+    IsPositive(1 - sqrt(y))`) を別 op として PointwiseIR で組み合わせる
+    runtime fusion 形式。本実装は **forward の input `x` を直接受け取る形に
+    hand-fuse** して、`a = clamp(x, 0, 1); dydx = if 0<a<1 { 2a } else { 0 };
+    dl_dx = dl_dy * dydx` の 1 fused kernel に圧縮 (op 数 2-3、ADR-0004
+    Pattern table の `fused_screlu_grad` に相当)
+  - 数値同値: bullet `2 * sqrt(y) * IsPositive(1 - sqrt(y))` と本実装
+    `2 * a * (a > 0 && a < 1)` は数学的に同一 (a = sqrt(y) なので)。`sqrt`
+    を経由しない分 round-off は本実装のほうが小さい (`a*a` と `sqrt(a*a)`
+    の 2 回の中間丸めを避けられる、interior 値で `2 * a` を直接出せる)
+  - cuda-oxide 制限: GPU kernel 側は `f32::clamp` を使えない (内部で
+    `f32::max` を呼び lowering 失敗、Stage 1-7 で確認済) ため `if-else`
+    ladder で展開 (`x < 0 ? 0 : x > 1 ? 1 : x`)。CPU reference は host 実行で
+    `f32::clamp` 使用
+  - 注: kernel 関数を `experiments/002-fused-kernels/src/main.rs` に直接
+    配置しているのは Stage 1-5 と同じ理由 (cuda-oxide rustc-codegen-cuda
+    backend は bin entry から到達可能な `#[kernel]` のみ NVPTX IR 化する)。
+    reference CPU は `crates/gpu-kernels/src/pointwise/screlu_grad.rs` (Stage 1
+    の `progress/` と同列の慣行)
+
 #### Stage 1-1 (2026-05-10, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/shogi/types.rs` → `crates/shogi-format/src/types.rs`
