@@ -2,18 +2,20 @@
 
 rshogi-nnue は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
 に据えるため、host (LLVM 21+, できれば LLVM 22) と GPU (sm_80+ 公式) の両方を
-整える。本リポは **WSL2 Ubuntu 24.04 + RTX 2070 SUPER (sm_75 Turing, 8 GB)** で
-動作確認しており、Turing GPU でも 1 つの環境変数 (`CUDA_OXIDE_TARGET=sm_75`)
-で Stage 0-1 の smoke test まで通る。
+整える。本リポは **Native Ubuntu 22.04 (jammy) + LLVM 22 + RTX 3080 Ti
+(sm_86 Ampere, 12 GB)** を Stage 0 検証の primary 環境とし (2026-05-11)、加えて
+**WSL2 Ubuntu 24.04 (noble) + LLVM 21 + RTX 2070 SUPER (sm_75 Turing, 8 GB)**
+でも `CUDA_OXIDE_TARGET=sm_75` で Stage 0-1 smoke test まで通ることを確認している
+(2026-05-09)。
 
 ## システム要件
 
 | 項目 | 要件 | 備考 |
 |---|---|---|
-| OS | Linux (Ubuntu 24.04 確認) | WSL2 含む |
+| OS | Linux (Ubuntu 22.04 jammy / 24.04 noble の両方で確認) | WSL2 含む |
 | CUDA Toolkit | 12.x (12.9 で確認) | nvcc, libNVVM, nvJitLink |
-| LLVM | **21+ (floor)、22 推奨** | Ubuntu 24.04 noble は標準 apt が LLVM 20 まで → apt.llvm.org 追加。`llc-22` が PATH にあれば cuda-oxide が優先する |
-| Clang | **clang-21** + `libclang-common-21-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
+| LLVM | **21+ (floor)、22 推奨** | apt.llvm.org が jammy / noble の両方に LLVM 20/21/22 を提供。`llc-22` が PATH にあれば cuda-oxide が優先する |
+| Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
 | Rust | nightly-2026-04-03 (cuda-oxide pinned) | `rust-toolchain.toml` で固定 |
 | GPU | **公式: Ampere+ (sm_80+)**。Turing (sm_75) も `CUDA_OXIDE_TARGET=sm_75` で動作 | RTX 30/40/50, A100, H100, B200 等 |
 
@@ -127,14 +129,36 @@ grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
 # (no output = OK)
 ```
 
-### 動作確認 (2026-05-09)
+### 動作確認
 
-- 環境: WSL2 Ubuntu 24.04, RTX 2070 SUPER (sm_75), CUDA 12.9, LLVM 21.1.8,
+cuda-oxide commit `6de0509` (NVlabs/cuda-oxide main, 2026-05-08) を 2 環境で動作確認。
+`(noble, jammy)` × `(LLVM 21, 22)` × `(sm_75 hack, sm_86 公式)` の対角ペアが全て pass。
+
+#### 2026-05-11 — sm_86 公式パス (Native Ubuntu 22.04 jammy + LLVM 22 + RTX 3080 Ti) — primary ✅
+
+- 環境: Ubuntu 22.04.5 LTS (jammy) Native, RTX 3080 Ti (sm_86, 12 GB),
+  CUDA toolkit 12.9 / driver 580.126.09, LLVM 22.1.6 (`llc-22`), clang 22.1.6,
+  rustc nightly 1.96.0 (55e86c996 2026-04-02)
+- `cargo oxide doctor`: 全 11 項目 ✓
+- `cargo oxide run vecadd` (override **なし**): `✓ SUCCESS: All 1024 elements correct!`
+  - 生成 PTX header: `.version 7.0` / `.target sm_80` / `.address_size 64`
+  - `select_target()` Basic フォールバックで `sm_80`、sm_86 driver が forward-compat で JIT
+- `cargo oxide run atomics` (override なし): 20/20 tests passed
+  - F32 fetch_add (Test 14): 256/256 ✓
+  - F64 fetch_add (Test 15): 256/256 ✓
+  - U64 fetch_add (Test 8): 256 unique values ✓
+  - core::sync::atomic (Test 20): 256/256 ✓
+- 生成 PTX の sm_80+ 専用 op (`cp.async`, `wgmma`, `tcgen05`, `tma.*`, `cluster.*`)
+  混入チェック: vecadd / atomics 両方 0 件 → Stage 1 KP-abs と同範囲
+
+#### 2026-05-09 — sm_75 hack (WSL2 Ubuntu 24.04 noble + LLVM 21 + RTX 2070 SUPER)
+
+- 環境: WSL2 Ubuntu 24.04 (noble), RTX 2070 SUPER (sm_75), CUDA 12.9, LLVM 21.1.8,
   rustc nightly-2026-04-03
-- cuda-oxide commit `6de0509` (NVlabs/cuda-oxide main, 2026-05-08)
+- `cargo oxide doctor`: 全項目 ✓
 - vecadd  (`CUDA_OXIDE_TARGET=sm_75`): `✓ SUCCESS: All 1024 elements correct!`
+  (PTX header `.target sm_75`)
 - atomics (`CUDA_OXIDE_TARGET=sm_75`): 20/20 tests passed
-- 公式 sm_86 (Ampere) 実機検証は GPU 解放後の follow-up issue で再実施
 
 ## サポート GPU マトリクス
 
@@ -142,9 +166,9 @@ grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
 |---|---|---|---|---|
 | Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | 未検証 (LLVM IR 互換性も要確認) |
 | Volta | sm_70 | V100, Titan V | ✗ | 動く可能性 (未検証) |
-| Turing | sm_75 | **RTX 2070 SUPER** (本リポ確認), GTX 16xx, T4 | ✗ | ✅ 確認済み |
+| Turing | sm_75 | **RTX 2070 SUPER** (本リポ確認 2026-05-09), GTX 16xx, T4 | ✗ | ✅ 確認済み |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
-| Ampere | sm_86 | RTX 30xx, A40, A10 | ✅ | n/a |
+| Ampere | sm_86 | **RTX 3080 Ti** (本リポ確認 2026-05-11), RTX 30xx, A40, A10 | ✅ 確認済み | n/a |
 | Ada | sm_89 | RTX 40xx | ✅ | n/a |
 | Hopper | sm_90 | H100, H200 | ✅ | n/a |
 | Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ | n/a |

@@ -27,11 +27,17 @@ NNUE 学習プロジェクト。GPU カーネルを Rust で書き、host から
 
 ## 環境
 
-- NVIDIA GPU (公式要件: **Ampere+ / sm_80+**。Turing / sm_75 は
-  `CUDA_OXIDE_TARGET=sm_75` を渡せば公式パスで動作確認済み — Stage 1 KP-abs
-  程度の単純 kernel まで。詳細は [docs/setup.md](docs/setup.md))
-- CUDA Toolkit 12+
+- NVIDIA GPU
+  - 公式要件: **Ampere+ / sm_80+** — Stage 0 で **RTX 3080 Ti (sm_86)** /
+    Ubuntu 22.04 jammy / LLVM 22.1.6 を primary に動作確認 (2026-05-11)
+  - Turing (sm_75) は `CUDA_OXIDE_TARGET=sm_75` を渡せば公式パスで動作 —
+    Stage 1 KP-abs 程度の単純 kernel まで (RTX 2070 SUPER + WSL2 noble +
+    LLVM 21.1.8 で確認、2026-05-09)
+  - 詳細は [docs/setup.md](docs/setup.md)
+- CUDA Toolkit 12+ (12.9 で確認)
 - LLVM 21+ (`llc-21` floor、`llc-22` 推奨 — atomics の syncscope 完全性に必要)
+  - **LLVM 22.1.6** (Native Linux Ubuntu 22.04) と **LLVM 21.1.8**
+    (WSL2 Ubuntu 24.04) の両方で smoke 通過確認済
 - Rust nightly (`rust-toolchain.toml` に pin)
 
 セットアップ手順は **[docs/setup.md](docs/setup.md)** を参照。
