@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "shogi-features"
+version = "0.1.0"
+dependencies = [
+ "shogi-format",
+]
+
+[[package]]
 name = "shogi-format"
 version = "0.1.0"

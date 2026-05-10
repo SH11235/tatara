@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/shogi-format",
+    "crates/shogi-features",
 ]
 
 # 残り crate / experiment / bin は順次追加する。
 # 追加先候補:
-#   crates/shogi-features
 #   crates/gpu-runtime
 #   crates/gpu-kernels
 #   crates/nnue-train
@@ -22,6 +22,9 @@ license = "MIT"
 repository = "https://github.com/SH11235/rshogi-nnue"
 authors = ["SH11235"]
 rust-version = "1.85"
+
+[workspace.dependencies]
+shogi-format = { path = "crates/shogi-format" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
