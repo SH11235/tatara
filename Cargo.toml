@@ -3,11 +3,11 @@ resolver = "2"
 members = [
     "crates/shogi-format",
     "crates/shogi-features",
+    "crates/gpu-runtime",
 ]
 
 # 残り crate / experiment / bin は順次追加する。
 # 追加先候補:
-#   crates/gpu-runtime
 #   crates/gpu-kernels
 #   crates/nnue-train
 #   crates/nnue-format
