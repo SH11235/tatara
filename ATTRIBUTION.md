@@ -63,6 +63,9 @@
 - Use: GPU kernel を build-time に PTX 化 (host 側 wrapper も含む)
 - License: Apache-2.0
 - Dependency style: `Cargo.toml` の git dep + rev pin (vendor せず)
+- 採用 rev: **`6de0509`** (NVlabs/cuda-oxide main, 2026-05-08)
+  Stage 0-1 で動作確認、Stage 1-3 (#7) で `crates/gpu-runtime` から
+  `cuda-core` / `cuda-host` を取り込み
 
 ## Pliron (Apache-2.0)
 

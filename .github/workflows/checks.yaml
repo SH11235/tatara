@@ -44,15 +44,14 @@ jobs:
         if: steps.ws.outputs.empty == 'false'
         run: cargo fmt --all -- --check
 
-      # GPU 依存 crate (gpu-runtime / gpu-kernels / experiments/001-cuda-oxide-kpabs)
-      # は CUDA toolkit + cuda-oxide が必要で GitHub-hosted runner では build できない。
-      # それらを workspace に追加するときは以下を有効化:
-      #   --exclude gpu-runtime --exclude gpu-kernels
-      # GPU 必須の checks は self-hosted runner の別 workflow に分離する想定。
+      # GPU 依存 crate (gpu-runtime / 将来の gpu-kernels / experiments/001-cuda-oxide-kpabs)
+      # は CUDA toolkit + LLVM 21+ + cuda-oxide が必要で GitHub-hosted runner では build できない。
+      # それらは self-hosted runner の別 workflow で検証する想定。本 workflow からは exclude する。
+      # 新しい GPU 依存 crate を追加するときは下の --exclude リストを更新すること。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude gpu-runtime
