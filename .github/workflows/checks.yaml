@@ -55,11 +55,13 @@ jobs:
       # GitHub runner では build fail する。Stage 1-11 (#15) で同パターンを
       # `bins/progress_kpabs_train` (= `progress-kpabs-train`) に昇格、本 workflow
       # からも exclude する (gpu-kernels は CPU のみで CI に通る)。
+      # Stage 2-0 (#36) で `experiments/002-fused-kernels` (= `exp-002-fused-kernels`)
+      # を Stage 2 fused kernel suite の受け皿として追加、同じ理由で exclude する。
       # 新しい GPU 依存 crate を追加するときも同様に --exclude リストを更新すること。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude progress-kpabs-train -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude progress-kpabs-train
+        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train
