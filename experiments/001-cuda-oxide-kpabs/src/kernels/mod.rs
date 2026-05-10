@@ -4,5 +4,6 @@
 //! で実装する。本 module は kernel 定義 (device side) と reference CPU 実装
 //! (numerical equivalence 検証用) を持つ。
 
+pub mod adam_step;
 pub mod forward;
 pub mod grad;
