@@ -11,6 +11,66 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-5 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/nnue-train/src/dataloader.rs` (新規 ~360 行): PSV file →
+  HalfKA_hm sparse batch (`Batch { stm_indices, nstm_indices, score, wdl,
+  per_pos_norm, n_positions }`) + `PsvFileLoader` (single-thread stream
+  reader) + `PrefetchedLoader` (background thread + mpsc sync_channel
+  prefetch wrapper) + 9 件の test。
+  - **弱い vendor 参照** (bullet `value/dataloader.rs` / `value/loader.rs`):
+    bullet 上流の `ValueDataLoader<I, O, D, W>` (`bullet_compiler::TValue` /
+    `OutputBuckets` / `LoadableDataType` / `WdlScheduler` 等 trait 群 depend) は
+    本リポでは **取り込まず**、Stage 1 `bins/progress_kpabs_train/src/host/
+    batch.rs` 流儀の直接 struct 実装 + minimum prefetch wrapper に簡素化
+    (Stage 1-1 / 3-1 / 3-4 と同じ bullet trait 削除ポリシー)
+  - **data-layer WDL blend pre-compute を行わない**: bullet `loader.rs:301-315`
+    の `blend * result + (1-blend) * sigmoid(rscale * score)` を data layer で
+    やる方式は本リポでは **採用せず**、Stage 2-2 `fused_loss_wdl` kernel が
+    GPU 側で blend を fuse する設計 (Stage 2-2 ATTRIBUTION 参照) に合わせて、
+    本 dataloader は **`score` (raw cp) と `wdl` (game result {0, 0.5, 1}) を
+    別 buffer に保持** する
+  - **sparse layout は bullet と同型 `-1` padding**: STM/NSTM 各 `[batch_size,
+    max_active]` flat (`bi * max_active + j`)、`map_features` で fill しきれ
+    なかった slot は `-1` padding (Stage 2-6 `sparse_ft_forward` の silent
+    skip semantics と整合)
+  - **map_features (symmetric) のみ使用**: bullet `map_features_split` の
+    asymmetric STM/NSTM Option emit は ShogiHalfKA_hm では不要 (HalfKA_hm は
+    両視点同時 emit)、本リポは `ShogiHalfKA_hm::map_features` で symmetric fill
+  - **multi-thread prefetch は minimum wrapper**: `std::thread::spawn` +
+    `std::sync::mpsc::sync_channel(prefetch_depth.max(1))` で background loader
+    が batch を 1 つ先まで先読み、main thread が `next_batch()` で取得。bullet の
+    多段 thread pool / batched prefetch / hand_count dense input 等は本リポ
+    scope 外 (Stage 3-8 trainer integration で必要になれば別 issue で拡張)
+  - **`Batch.reset()` の alloc 再利用は single-thread loader (`fill_batch`)
+    経路のみ**: Codex review #61 指摘で明示化。`PrefetchedLoader` 経路では
+    mpsc channel が所有権ごと main thread に batch を送るため background 側で
+    `reset` 再利用不可、毎ループ `Batch::with_capacity` を呼ぶ simplification を
+    採用。ring buffer 的な return path は Stage 3-7/3-8 で必要時に追加
+  - **`Batch.reset()` の alloc 再利用は `PsvFileLoader::fill_batch` 内部のみ**:
+    `PrefetchedLoader` の background loop は channel 経由 send=move のため毎
+    iteration `Batch::with_capacity` を新規 alloc する設計 (Codex review #61 で
+    設計メモと実装不一致を指摘、docstring に「reuse は fill_batch 経由のみ、
+    prefetch 内部は send move で alloc 残る」と訂正明記)。alloc が trainer
+    ホットパスでボトルネックになった段階で `Clone` 経由 send / `Arc<Batch>` 化 /
+    double-buffer 化等を Stage 3-7/3-8 で検討する follow-up とする (本 PR は
+    正しさ優先、性能 follow-up)
+  - **`PackedSfenValue::result()` (enum 経由) を使い、{0.0, 0.5, 1.0} に正規化**:
+    bullet `loader::GameResult::{Loss=0, Draw=1, Win=2}` 慣行に揃え、bullet
+    `loader.rs:312` の `f32::from(pos.result() as u8) / 2.0` と同型。
+    **注意 (Codex review #61 で修正)**: `PackedSfenValue::game_result()` は
+    **raw i8** で PSV wire 形式の `{-1=Loss, 0=Draw, +1=Win}` を返す。本 PR 初版は
+    これを `.max(0) / 2.0` で正規化しており、Draw → 0.0、Win → 0.5 に
+    **誤マップする数値バグ**だった。sample.psv は偶然 Draw を含まない fixture
+    で test がすり抜けたが、実 PSV では Win 局面が Draw として fused_loss_wdl
+    kernel に渡り、学習が壊れる。amend で `pos.result() as u8 / 2.0`
+    (`packed_sfen.rs:473`、`GameResult` enum) 経由に修正、回帰防止 test
+    (`fill_batch_wdl_covers_loss_and_win_with_correct_values`) を追加
+  - test 内訳: Batch init/state 2 + `PsvFileLoader` stream/eof 2 + fill_batch
+    sparse 検証 (index 範囲 + wdl 範囲 + EOF partial) 3 + push reject /
+    reset 1 + PrefetchedLoader 2 = 計 9 件、sample.psv (`shogi-format/tests/
+    data/sample.psv`、100 records / 4000 bytes) を共用 fixture とする
+
 #### Stage 3-4 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/trainer/schedule/lr.rs` (215 行) +

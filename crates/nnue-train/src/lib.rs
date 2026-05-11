@@ -15,16 +15,18 @@
 //! - `schedule` (Stage 3-4, #60): learning-rate / wdl scheduler。bullet-shogi
 //!   `crates/bullet_lib/src/trainer/schedule/{lr,wdl}.rs` (commit `f275eb9`)
 //!   から vendor、`ansi` color formatter 依存は `Display` impl に置換
+//! - `dataloader` (Stage 3-5, #61): PSV file → HalfKA_hm sparse batch + prefetch。
+//!   `Batch { stm_indices, nstm_indices, score, wdl, per_pos_norm, n_positions }`
+//!   と `PsvFileLoader` / `PrefetchedLoader` を提供。Stage 2-2 fused_loss_wdl
+//!   の kernel 入力 interface (`score`/`wdl` 別 buffer) と整合
 //!
 //! ## 提供予定 module
 //!
-//! - `dataloader` (Stage 3-5, #61): PSV file → HalfKA_hm sparse batch + prefetch
-//!   ring。bullet-shogi `crates/bullet_lib/src/value/{dataloader,loader}.rs`
-//!   を vendor
 //! - `optimizer` (Stage 3-6, #62): Ranger / RAdam host state + Stage 2
 //!   pointwise kernel の launch helper (host orchestration)。kernel 本体は
 //!   Stage 2-3〜2-5 で landed 済 (`crates/gpu-kernels::pointwise`)
 //! - `trainer` (Stage 3-8, #65): main training loop (forward → loss_wdl →
 //!   backward → optimizer step)。`bins/nnue_train::main` から呼ばれる
 
+pub mod dataloader;
 pub mod schedule;
