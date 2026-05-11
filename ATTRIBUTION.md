@@ -11,6 +11,31 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-2 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/nnue-format/src/header.rs` (新規 200 行強): NNUE binary 先頭の
+  固定長 22 bytes header (`NnueHeader { net_id, fv_scale, qa, qb }`) の
+  serialise / deserialise + 8 件の test。
+  - **弱い vendor 参照**: bullet 上流 `crates/bullet_lib/src/value/save.rs::save_quantised`
+    (`save.rs:78-111`) では header 概念が `ModelWeights::write_to_byte_buffer` に
+    分散しており、`NnueHeader` のような明示 struct は存在しない。本実装は
+    rshogi (将棋エンジン) 互換性のため **本リポ独自の minimal header layout**
+    を確定する形 (Stage 3-9 #64 自己対局検証で rshogi 側 loader と整合性検証の
+    上で調整可能)。bullet 上流からは「header に `net_id` / `fv_scale` / `qa` / `qb`
+    を置く方針」のみ参照、binary layout 自体は本 PR で新規確定
+  - layout: net_id 16 bytes (UTF-8 + NUL padding) + fv_scale 2 LE + qa 2 LE +
+    qb 2 LE = **22 bytes 固定**。LE 採用は Stage 1
+    `bins/progress_kpabs_train/src/host/progress_bin.rs` (YaneuraOu 互換 f64 LE)
+    の慣行を踏襲
+  - 既定値: `fv_scale = 16` (YaneuraOu typical)、`qa = qb = 64` (placeholder、
+    Stage 3-3 `halfka_psqt` で actual quantisation 値が確定したら trainer から
+    上書きする想定)
+  - test 内訳: default 値 / round-trip (default + non-empty id + 15 bytes 最大 id) /
+    write reject (16 bytes 超過) / write byte-level layout / read NUL padding /
+    read NUL なし (16 bytes 全部 id) の 8 件
+  - 後続: Stage 3-3 (#59) で weight 本体の前段として本 header を呼び出し、
+    Stage 3-9 (#64) で rshogi 側 loader との互換性を検証
+
 #### Stage 3-1 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/bullet_lib/src/game/inputs/shogi_halfka.rs` の **ShogiHalfKA_hm 関連部分のみ**
