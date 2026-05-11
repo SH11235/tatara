@@ -10,11 +10,14 @@
 //! と同方針)。host 側ロジックのみで構成し、`gpu-runtime` / `cuda-host` 等
 //! GPU build chain には依存しない。
 //!
+//! ## 提供 module
+//!
+//! - `schedule` (Stage 3-4, #60): learning-rate / wdl scheduler。bullet-shogi
+//!   `crates/bullet_lib/src/trainer/schedule/{lr,wdl}.rs` (commit `f275eb9`)
+//!   から vendor、`ansi` color formatter 依存は `Display` impl に置換
+//!
 //! ## 提供予定 module
 //!
-//! - `schedule` (Stage 3-4, #60): learning-rate / wdl scheduler。
-//!   bullet-shogi `crates/bullet_lib/src/trainer/schedule/{lr,wdl}.rs`
-//!   (commit `f275eb9`) を vendor
 //! - `dataloader` (Stage 3-5, #61): PSV file → HalfKA_hm sparse batch + prefetch
 //!   ring。bullet-shogi `crates/bullet_lib/src/value/{dataloader,loader}.rs`
 //!   を vendor
@@ -23,5 +26,5 @@
 //!   Stage 2-3〜2-5 で landed 済 (`crates/gpu-kernels::pointwise`)
 //! - `trainer` (Stage 3-8, #65): main training loop (forward → loss_wdl →
 //!   backward → optimizer step)。`bins/nnue_train::main` から呼ばれる
-//!
-//! scaffold (Stage 3-0, #56) 段階では module を持たず、後続 issue で追加。
+
+pub mod schedule;
