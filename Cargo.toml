@@ -5,17 +5,17 @@ members = [
     "crates/shogi-features",
     "crates/gpu-kernels",
     "crates/gpu-runtime",
+    "crates/nnue-format",
+    "crates/nnue-train",
     "experiments/001-cuda-oxide-kpabs",
     "experiments/002-fused-kernels",
     "bins/progress_kpabs_train",
+    "bins/nnue_train",
 ]
 
-# 残り crate / experiment / bin は順次追加する。
+# 残り bin は順次追加する。
 # 追加先候補:
-#   crates/nnue-train
-#   crates/nnue-format
-#   bins/nnue_train
-#   bins/nnue_eval
+#   bins/nnue_eval (Stage 3-9 #64 で簡易 eval ツールとして同梱予定)
 
 [workspace.package]
 edition = "2024"
@@ -29,6 +29,8 @@ shogi-format = { path = "crates/shogi-format" }
 shogi-features = { path = "crates/shogi-features" }
 gpu-kernels = { path = "crates/gpu-kernels" }
 gpu-runtime = { path = "crates/gpu-runtime" }
+nnue-format = { path = "crates/nnue-format" }
+nnue-train = { path = "crates/nnue-train" }
 clap = { version = "4.5", features = ["derive"] }
 
 [workspace.lints.rust]
