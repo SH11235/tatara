@@ -1,0 +1,523 @@
+//! HalfKA_hm (Half-Mirror) 特徴量。
+//!
+//! bullet-shogi (commit `f275eb9`) の
+//! `crates/bullet_lib/src/game/inputs/shogi_halfka.rs` から `ShogiHalfKA_hm`
+//! 部分のみを vendor。Stage 3 (EPIC #17) の NNUE 1536-16-32 trainer の入力
+//! 特徴量として使用する (`bins/nnue_train` の sparse_ft_forward / dataloader
+//! が呼ぶ)。
+//!
+//! ## 仕様
+//!
+//! - キングバケット: 45 (Half-Mirror、5 筋 × 9 段)
+//! - 駒入力数: 1629 (盤上駒 + 手駒、敵王を先手王平面に畳んだ後の上限)
+//! - 総入力次元: `45 * 1629 = 73_305`
+//! - 最大 active 特徴数: 40 (盤上駒 + 手駒 = 合法局面の駒総数固定 40)
+//! - nnue-pytorch 互換 hash: `FEATURE_HASH_HM_V2 = 0x7f134cb8` (HalfKA_hm_v2)
+//!
+//! 仕様詳細は bullet 上流ファイル先頭の doc コメント参照。
+//!
+//! ## bullet 上流からの差分
+//!
+//! - bullet `impl SparseInputType for ShogiHalfKA_hm` を削除し、`num_inputs` /
+//!   `max_active` / `map_features` / `shorthand` / `description` を inherent
+//!   method として実装 (Stage 1-1 `PackedSfenValue` / Stage 1-2
+//!   `ShogiProgressKPAbs` と同流儀)。bullet trait `SparseInputType` の interface
+//!   を再現する必要は無い (Stage 3-5 dataloader は inherent method を直接呼ぶ)
+//! - bullet `ShogiBoard::from_packed_sfen(pos)` 呼び出しは本リポの
+//!   `PackedSfenValue::decode()` に統一 (Stage 1-2 `progress_kpabs.rs` と同 idiom)
+//! - `crate::shogi::*` import を `shogi_format::*` に書き換え
+//! - bullet 上流の Non-Mirror 版 (`ShogiHalfKA`、`PIECE_INPUTS_NONMIRROR` 等、
+//!   約 250 行) は本 Stage 3 で使用しないため scope creep 回避で **取り込まない**。
+//!   将来 NNUE Non-Mirror モデルが必要になった場合は別 issue で追加する
+//! - 本リポ命名規約に揃えた alias 定数 (`SHOGI_HALFKA_HM_NUM_FEATURES` /
+//!   `SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES`) を Issue #57 受け入れ条件に応じて追加。
+//!   bullet 上流命名 (`HALFKA_HM_DIMENSIONS` / `MAX_ACTIVE_FEATURES`) も互換のため
+//!   保持し、両方を公開する
+//! - 新規 API: `collect_active_indices(pos) -> Vec<(usize, usize)>`。bullet
+//!   `map_features` の callback を Vec 化したもの (Stage 1-2
+//!   `ShogiProgressKPAbs::collect_active_indices` 同型)。dataloader / smoke
+//!   test 用
+
+use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END};
+use shogi_format::types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square};
+use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
+
+// =============================================================================
+// 定数 (bullet 上流命名)
+// =============================================================================
+
+/// nnue-pytorch 互換の特徴量 hash 値 (HalfKA_hm_v2)。
+pub const FEATURE_HASH_HM_V2: u32 = 0x7f134cb8;
+
+/// キングバケット数 (Half-Mirror: 5 筋 × 9 段)。
+pub const NUM_KING_BUCKETS: usize = 45;
+
+/// 駒入力数 (BonaPiece の最大値、敵王を先手王平面に畳んだ後)。
+pub const PIECE_INPUTS: usize = 1629;
+
+/// HalfKA_hm の総入力次元 (`NUM_KING_BUCKETS * PIECE_INPUTS = 73_305`)。
+pub const HALFKA_HM_DIMENSIONS: usize = NUM_KING_BUCKETS * PIECE_INPUTS;
+
+/// 最大 active 特徴数 (盤上駒 + 手駒 = 40、合法局面で固定)。
+pub const MAX_ACTIVE_FEATURES: usize = 40;
+
+// =============================================================================
+// 定数 (本リポ命名 alias、Issue #57 受け入れ条件)
+// =============================================================================
+
+/// HalfKA_hm の総入力次元 (`HALFKA_HM_DIMENSIONS` の本リポ命名 alias)。
+pub const SHOGI_HALFKA_HM_NUM_FEATURES: usize = HALFKA_HM_DIMENSIONS;
+
+/// HalfKA_hm の最大 active 特徴数 (`MAX_ACTIVE_FEATURES` の本リポ命名 alias)。
+pub const SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES: usize = MAX_ACTIVE_FEATURES;
+
+// =============================================================================
+// ShogiHalfKA_hm 特徴量型
+// =============================================================================
+
+/// ShogiHalfKA_hm 特徴量。
+///
+/// YaneuraOu / nnue-pytorch 互換の HalfKA_hm 特徴量。
+/// coalesce 済みモデル専用 (Factorization の重みは Base 側に畳み込み済み)。
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiHalfKA_hm;
+
+impl ShogiHalfKA_hm {
+    /// 特徴量の総次元数 (`HALFKA_HM_DIMENSIONS = 73_305`)。
+    pub const fn num_inputs(&self) -> usize {
+        HALFKA_HM_DIMENSIONS
+    }
+
+    /// 同時に active になる最大特徴数 (盤上駒 + 手駒 = 40)。
+    pub const fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES
+    }
+
+    /// 特徴量インデックスを callback 形式で列挙。
+    ///
+    /// 各駒について `(stm_idx, nstm_idx)` の 2 視点を `f` に渡す。
+    /// 片玉 / 詰将棋データ (玉位置が `Square::NONE`) は何も emit しない。
+    pub fn map_features<F: FnMut(usize, usize)>(&self, pos: &PackedSfenValue, f: F) {
+        let board = pos.decode();
+        map_halfka_features(&board, f);
+    }
+
+    /// 特徴量インデックスを `Vec<(stm_idx, nstm_idx)>` として収集。
+    ///
+    /// dataloader / smoke test 用の便利 API (`map_features` の Vec 化)。
+    /// 容量は `MAX_ACTIVE_FEATURES` で事前確保する。
+    pub fn collect_active_indices(&self, pos: &PackedSfenValue) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(MAX_ACTIVE_FEATURES);
+        self.map_features(pos, |stm, nstm| out.push((stm, nstm)));
+        out
+    }
+
+    /// 短縮名 (nnue-pytorch 互換)。
+    pub fn shorthand() -> &'static str {
+        "shogi-73305x45hm"
+    }
+
+    /// 説明文。
+    pub fn description() -> &'static str {
+        "Shogi HalfKA_hm: 45 king buckets (half-mirrored), 1629 piece inputs"
+    }
+}
+
+// =============================================================================
+// HalfKA_hm 特徴量計算 (bullet 上流ロジック)
+// =============================================================================
+
+/// HalfKA_hm 特徴量インデックスを列挙。
+///
+/// stm (side-to-move) 視点と nstm (not-side-to-move) 視点の両方を返す。
+/// 片玉 / 詰将棋データ (玉位置が `Square::NONE`) の場合は何もしない。
+fn map_halfka_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
+    let stm = board.side_to_move;
+    let nstm = stm.opponent();
+
+    // 玉位置の妥当性チェック (Square::NONE = 81 は「玉なし」)。
+    let stm_king_sq = board.king_square(stm);
+    let nstm_king_sq = board.king_square(nstm);
+    if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
+        return;
+    }
+
+    // STM 視点での king bucket / half-mirror flag。
+    let stm_kb = king_bucket(stm_king_sq, stm);
+    let stm_hm = is_hm_mirror(stm_king_sq, stm);
+
+    // NSTM 視点での king bucket / half-mirror flag。
+    let nstm_kb = king_bucket(nstm_king_sq, nstm);
+    let nstm_hm = is_hm_mirror(nstm_king_sq, nstm);
+
+    // 盤上の駒 (玉以外)。
+    for &pt in &BOARD_PIECE_TYPES {
+        for color in [Color::Black, Color::White] {
+            for sq in board.pieces(color, pt) {
+                let piece = Piece::new(color, pt);
+                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+                let stm_packed = pack_bonapiece(stm_bp, stm_hm);
+                let stm_idx = halfka_index(stm_kb, stm_packed);
+
+                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+                let nstm_packed = pack_bonapiece(nstm_bp, nstm_hm);
+                let nstm_idx = halfka_index(nstm_kb, nstm_packed);
+
+                f(stm_idx, nstm_idx);
+            }
+        }
+    }
+
+    // 両方の玉の特徴量 (自玉 / 敵玉 を STM / NSTM 両視点で)。
+    {
+        let stm_king_sq_idx = if stm == Color::Black {
+            stm_king_sq.index()
+        } else {
+            stm_king_sq.inverse().index()
+        };
+        let stm_friend_king_bp = king_bonapiece(stm_king_sq_idx, true);
+        let stm_friend_packed = pack_bonapiece(stm_friend_king_bp, stm_hm);
+        let stm_friend_idx = halfka_index(stm_kb, stm_friend_packed);
+
+        let nstm_king_sq_for_stm = if stm == Color::Black {
+            nstm_king_sq.index()
+        } else {
+            nstm_king_sq.inverse().index()
+        };
+        let stm_enemy_king_bp = king_bonapiece(nstm_king_sq_for_stm, false);
+        let stm_enemy_packed = pack_bonapiece(stm_enemy_king_bp, stm_hm);
+        let stm_enemy_idx = halfka_index(stm_kb, stm_enemy_packed);
+
+        let nstm_king_sq_idx = if nstm == Color::Black {
+            nstm_king_sq.index()
+        } else {
+            nstm_king_sq.inverse().index()
+        };
+        let nstm_friend_king_bp = king_bonapiece(nstm_king_sq_idx, true);
+        let nstm_friend_packed = pack_bonapiece(nstm_friend_king_bp, nstm_hm);
+        let nstm_friend_idx = halfka_index(nstm_kb, nstm_friend_packed);
+
+        let stm_king_sq_for_nstm = if nstm == Color::Black {
+            stm_king_sq.index()
+        } else {
+            stm_king_sq.inverse().index()
+        };
+        let nstm_enemy_king_bp = king_bonapiece(stm_king_sq_for_nstm, false);
+        let nstm_enemy_packed = pack_bonapiece(nstm_enemy_king_bp, nstm_hm);
+        let nstm_enemy_idx = halfka_index(nstm_kb, nstm_enemy_packed);
+
+        f(stm_friend_idx, nstm_friend_idx);
+        f(stm_enemy_idx, nstm_enemy_idx);
+    }
+
+    // 手駒の特徴量。
+    for owner in [Color::Black, Color::White] {
+        for &pt in &HAND_PIECE_TYPES {
+            let count = board.hand(owner).count(pt);
+            if count == 0 {
+                continue;
+            }
+
+            for i in 1..=count {
+                let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                if stm_bp != BonaPiece::ZERO {
+                    let stm_packed = pack_bonapiece(stm_bp, stm_hm);
+                    let stm_idx = halfka_index(stm_kb, stm_packed);
+
+                    let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                    let nstm_packed = pack_bonapiece(nstm_bp, nstm_hm);
+                    let nstm_idx = halfka_index(nstm_kb, nstm_packed);
+
+                    f(stm_idx, nstm_idx);
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// キングバケット計算
+// =============================================================================
+
+/// キングバケットを計算 (Half-Mirror)。
+///
+/// 玉位置を 45 バケット (5 筋 × 9 段) に圧縮。
+/// 6 筋以降 (file >= 5) は左右反転して 1-5 筋にマッピング。
+///
+/// 計算式: `bucket = file_m * NUM_RANKS + rank` (file-major)。
+#[inline]
+pub(crate) fn king_bucket(ksq: Square, perspective: Color) -> usize {
+    // 視点に応じてマスを変換 (後手視点では盤面を 180 度回転)。
+    let sq = if perspective == Color::Black {
+        ksq
+    } else {
+        ksq.inverse()
+    };
+
+    let file = sq.file() as usize;
+    let rank = sq.rank() as usize;
+
+    // Half-mirror: 6 筋以降は反転 (5,6,7,8 → 3,2,1,0)。
+    let file_m = if file >= 5 { 8 - file } else { file };
+
+    file_m * 9 + rank
+}
+
+/// Half-Mirror が必要かどうかを判定 (玉ファイルが 5 以上)。
+#[inline]
+pub(crate) fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
+    let sq = if perspective == Color::Black {
+        ksq
+    } else {
+        ksq.inverse()
+    };
+    sq.file() as usize >= 5
+}
+
+// =============================================================================
+// BonaPiece パッキング
+// =============================================================================
+
+/// BonaPiece を HalfKA_hm 用にパック。
+///
+/// 1. 手駒 (`< FE_HAND_END`): そのまま
+/// 2. 盤上駒 (`>= FE_HAND_END`): `hm_mirror` のときマス目を file-mirror
+/// 3. 敵王 (`>= E_KING`): -81 して f_king 平面に揃える
+#[inline]
+pub(crate) fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
+    let mut pp = bp.value() as usize;
+
+    if hm_mirror && pp >= FE_HAND_END {
+        // 盤上駒の layout: `FE_HAND_END + piece_index * 81 + sq`。
+        let rel = pp - FE_HAND_END;
+        let piece_index = rel / 81;
+        let sq = rel % 81;
+
+        // file のみミラー (1 筋 ↔ 9 筋)、rank はそのまま。
+        let file = sq / 9;
+        let rank = sq % 9;
+        let mirrored_file = 8 - file;
+        let mirrored_sq = mirrored_file * 9 + rank;
+
+        pp = FE_HAND_END + piece_index * 81 + mirrored_sq;
+    }
+
+    // 敵王を先手王平面にパック。
+    if pp >= E_KING as usize {
+        pp -= 81;
+    }
+
+    pp
+}
+
+/// 玉の BonaPiece を生成 (HalfKA_hm では両玉を特徴量に含める)。
+#[inline]
+pub(crate) fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
+    let base = if is_friend { F_KING } else { E_KING };
+    BonaPiece::new((base as usize + sq_index) as u16)
+}
+
+/// HalfKA_hm の特徴インデックスを計算 (`kb * PIECE_INPUTS + packed_bp`)。
+#[inline]
+pub(crate) fn halfka_index(kb: usize, packed_bp: usize) -> usize {
+    kb * PIECE_INPUTS + packed_bp
+}
+
+// =============================================================================
+// テスト (bullet 上流の ShogiHalfKA_hm tests を移植)
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shogi_format::types::PieceType;
+
+    #[test]
+    fn test_dimensions() {
+        let input = ShogiHalfKA_hm;
+        assert_eq!(input.num_inputs(), 73_305);
+        assert_eq!(input.max_active(), 40);
+    }
+
+    #[test]
+    fn test_alias_constants_match_bullet() {
+        assert_eq!(SHOGI_HALFKA_HM_NUM_FEATURES, HALFKA_HM_DIMENSIONS);
+        assert_eq!(SHOGI_HALFKA_HM_NUM_FEATURES, 73_305);
+        assert_eq!(SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, MAX_ACTIVE_FEATURES);
+        assert_eq!(SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, 40);
+    }
+
+    #[test]
+    fn test_shorthand_and_description() {
+        assert_eq!(ShogiHalfKA_hm::shorthand(), "shogi-73305x45hm");
+        assert!(ShogiHalfKA_hm::description().starts_with("Shogi HalfKA_hm: 45 king buckets"));
+    }
+
+    #[test]
+    fn test_king_bucket_black_perspective() {
+        // 計算式: bucket = file_m * 9 + rank (筋優先順序)。
+
+        // 5九 (file=4, rank=8): bucket = 4*9 + 8 = 44
+        let sq_59 = Square::new(4, 8);
+        assert_eq!(king_bucket(sq_59, Color::Black), 44);
+
+        // 1九 (file=0, rank=8): bucket = 0*9 + 8 = 8
+        let sq_19 = Square::new(0, 8);
+        assert_eq!(king_bucket(sq_19, Color::Black), 8);
+
+        // 9九 (file=8, mirror to 0, rank=8): bucket = 0*9 + 8 = 8
+        let sq_99 = Square::new(8, 8);
+        assert_eq!(king_bucket(sq_99, Color::Black), 8);
+
+        // 6九 (file=5, mirror to 3, rank=8): bucket = 3*9 + 8 = 35
+        let sq_69 = Square::new(5, 8);
+        assert_eq!(king_bucket(sq_69, Color::Black), 35);
+
+        // 5一 (file=4, rank=0): bucket = 4*9 + 0 = 36
+        let sq_51 = Square::new(4, 0);
+        assert_eq!(king_bucket(sq_51, Color::Black), 36);
+
+        // 1一 (file=0, rank=0): bucket = 0*9 + 0 = 0
+        let sq_11 = Square::new(0, 0);
+        assert_eq!(king_bucket(sq_11, Color::Black), 0);
+    }
+
+    #[test]
+    fn test_is_hm_mirror() {
+        // file 1-5 (index 0-4): mirror 不要
+        assert!(!is_hm_mirror(Square::new(0, 0), Color::Black));
+        assert!(!is_hm_mirror(Square::new(4, 8), Color::Black));
+
+        // file 6-9 (index 5-8): mirror 必要
+        assert!(is_hm_mirror(Square::new(5, 0), Color::Black));
+        assert!(is_hm_mirror(Square::new(8, 8), Color::Black));
+    }
+
+    #[test]
+    fn test_pack_bonapiece_hand_no_mirror() {
+        // 手駒はミラーしない。
+        let bp = BonaPiece::new(50);
+        assert_eq!(pack_bonapiece(bp, true), 50);
+        assert_eq!(pack_bonapiece(bp, false), 50);
+    }
+
+    #[test]
+    fn test_pack_bonapiece_board_mirror() {
+        // 盤上駒のミラー。
+        // f_pawn (90) + sq の場合:
+
+        // sq=0 (1一): file=0, rank=0
+        // ミラー後: file=8 (9筋), rank=0 → sq = 8*9+0 = 72
+        let sq = 0;
+        let bp = BonaPiece::new((90 + sq) as u16);
+        assert_eq!(pack_bonapiece(bp, false), 90 + sq);
+        assert_eq!(pack_bonapiece(bp, true), 90 + 72);
+
+        // sq=9 (2一): file=1, rank=0
+        // ミラー後: file=7 (8筋), rank=0 → sq = 7*9+0 = 63
+        let sq = 9;
+        let bp = BonaPiece::new((90 + sq) as u16);
+        assert_eq!(pack_bonapiece(bp, false), 90 + sq);
+        assert_eq!(pack_bonapiece(bp, true), 90 + 63);
+    }
+
+    #[test]
+    fn test_pack_bonapiece_enemy_king() {
+        // 敵王のパック: e_king - 81 で先手王平面に揃う。
+        let bp = BonaPiece::new(E_KING);
+        assert_eq!(pack_bonapiece(bp, false), E_KING as usize - 81);
+    }
+
+    #[test]
+    fn test_halfka_index() {
+        // kb=0, bp=0 → index=0
+        assert_eq!(halfka_index(0, 0), 0);
+
+        // kb=1, bp=0 → index=PIECE_INPUTS
+        assert_eq!(halfka_index(1, 0), PIECE_INPUTS);
+
+        // kb=44, bp=0 → index=44 * PIECE_INPUTS
+        assert_eq!(halfka_index(44, 0), 44 * PIECE_INPUTS);
+    }
+
+    #[test]
+    fn test_king_bonapiece() {
+        // 自玉 (sq_index=0)
+        let bp = king_bonapiece(0, true);
+        assert_eq!(bp.value(), F_KING);
+
+        // 敵玉 (sq_index=0)
+        let bp = king_bonapiece(0, false);
+        assert_eq!(bp.value(), E_KING);
+    }
+
+    #[test]
+    fn test_map_features_count() {
+        // ダミー局面: 両玉 + 各陣 9 枚の歩。
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+
+        for file in 0..9 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+
+        let mut count = 0;
+        map_halfka_features(&board, |_, _| count += 1);
+
+        // 歩 18 枚 + 両玉 2 = 20 (簡易 floor)。
+        assert!(count >= 20);
+    }
+
+    #[test]
+    fn test_map_features_sq_nb_guard() {
+        // 片玉データ (white_king_sq = Square::NONE)。
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::NONE,
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+
+        let mut count = 0;
+        map_halfka_features(&board, |_, _| count += 1);
+
+        // 片玉データはスキップされる。
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_map_halfka_features_kings_only() {
+        // 板上駒なし、両玉のみ → 玉特徴量 2 個 (自玉 + 敵玉) のみ emit。
+        // index 範囲も HALFKA_HM_DIMENSIONS 内に収まることを確認。
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+
+        let mut active = Vec::new();
+        map_halfka_features(&board, |stm, nstm| active.push((stm, nstm)));
+        assert_eq!(
+            active.len(),
+            2,
+            "両玉のみの局面では 2 active features (自玉 + 敵玉)"
+        );
+
+        for &(stm, nstm) in &active {
+            assert!(stm < HALFKA_HM_DIMENSIONS);
+            assert!(nstm < HALFKA_HM_DIMENSIONS);
+        }
+    }
+}

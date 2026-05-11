@@ -11,6 +11,48 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-1 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/bullet_lib/src/game/inputs/shogi_halfka.rs` の **ShogiHalfKA_hm 関連部分のみ**
+  → `crates/shogi-features/src/halfka_hm.rs`。Stage 3 (EPIC #17) の NNUE
+  1536-16-32 trainer 入力特徴量として、Stage 3-5 dataloader / Stage 3-7
+  sparse_ft_forward から呼ばれる。
+  - **vendor scope**: bullet 上流 715 行のうち `ShogiHalfKA_hm` 系のみ
+    (定数 `FEATURE_HASH_HM_V2` / `NUM_KING_BUCKETS` / `PIECE_INPUTS` /
+    `HALFKA_HM_DIMENSIONS` / `MAX_ACTIVE_FEATURES`、struct `ShogiHalfKA_hm`、
+    `map_halfka_features` / `king_bucket` / `is_hm_mirror` / `pack_bonapiece` /
+    `king_bonapiece` / `halfka_index` の 6 helper、tests は bullet 上流の
+    `ShogiHalfKA_hm` 関連 11 件を移植 (うち `test_shorthand` は static method
+    化に伴い `test_shorthand_and_description` として内容拡張) + 本 PR 純粋追加
+    2 件 (`test_alias_constants_match_bullet`、`test_map_halfka_features_kings_only`)
+    で **計 13 件**)。Non-Mirror 版 (`ShogiHalfKA` / `PIECE_INPUTS_NONMIRROR`
+    等、約 250 行) は
+    本 Stage 3 で使用しないため **取り込まず**、必要になった時に別 issue で
+    追加する scope creep 回避 (Stage 2-8 教訓踏襲)
+  - **bullet trait 依存の除去**: bullet `impl SparseInputType for ShogiHalfKA_hm`
+    を削除し、`num_inputs` / `max_active` / `map_features` / `shorthand` /
+    `description` を **inherent method** として書き直し (Stage 1-1
+    `PackedSfenValue` / Stage 1-2 `ShogiProgressKPAbs` と同流儀)。`SparseInputType`
+    interface は本リポでは使わず (Stage 3-5 dataloader が直接 inherent method を呼ぶ)
+  - **API path 修正**: `crate::shogi::*` → `shogi_format::*` 系に書き換え。
+    bullet `ShogiBoard::from_packed_sfen(pos)` 呼び出しは本リポの
+    `PackedSfenValue::decode()` に統一 (Stage 1-2 `progress_kpabs.rs` と同 idiom)
+  - **新規追加 API** (bullet 由来ではない、本リポ独自):
+    - `ShogiHalfKA_hm::collect_active_indices(pos) -> Vec<(usize, usize)>`:
+      `map_features` callback を Vec 化 (Stage 1-2 同型、dataloader / smoke test
+      用便利 API、容量は `MAX_ACTIVE_FEATURES` 事前確保)
+    - 公開 const alias `SHOGI_HALFKA_HM_NUM_FEATURES` /
+      `SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES`: Issue #57 受け入れ条件 + 本リポ命名規約
+      (`SHOGI_*_NUM_*`、Stage 1-2 `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS` 同型) に
+      揃えた alias。bullet 上流命名 (`HALFKA_HM_DIMENSIONS` / `MAX_ACTIVE_FEATURES`) も
+      互換のため保持し、両方を公開
+  - **数値計算 path は upstream と完全一致**: `map_halfka_features` の駒列挙 / 玉
+    特徴量 / 手駒 BonaPiece の 3 セクション、`king_bucket` / `pack_bonapiece` /
+    `halfka_index` の helper、いずれも upstream と byte 一致。test 13 件
+    (上流 11 件移植 + 本 PR 追加 2 件) で数値挙動を担保
+  - **`cargo fmt` 適用** + doc コメント日本語化 + rshogi-nnue 文脈に合わせた
+    仕様要約を module docstring に追加
+
 #### Stage 2-7 (2026-05-11, bullet-shogi commit `f275eb9`)
 
 - `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmulBwd::evaluate`
