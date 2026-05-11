@@ -19,14 +19,17 @@
 //!   `Batch { stm_indices, nstm_indices, score, wdl, per_pos_norm, n_positions }`
 //!   と `PsvFileLoader` / `PrefetchedLoader` を提供。Stage 2-2 fused_loss_wdl
 //!   の kernel 入力 interface (`score`/`wdl` 別 buffer) と整合
+//! - `optimizer` (Stage 3-6, #62): Ranger (RAdam + Lookahead) の host-side state
+//!   (`RAdamHostState` / `RangerHostState`) + パラメータ + checkpoint
+//!   serialise。GPU `#[kernel]` 本体は bin 側 (`bins/nnue_train`) に inline 配置、
+//!   本 module は CPU-only state + `radam_compute_step_size_denom` host helper
+//!   経由で kernel 引数を pre-compute
 //!
 //! ## 提供予定 module
 //!
-//! - `optimizer` (Stage 3-6, #62): Ranger / RAdam host state + Stage 2
-//!   pointwise kernel の launch helper (host orchestration)。kernel 本体は
-//!   Stage 2-3〜2-5 で landed 済 (`crates/gpu-kernels::pointwise`)
 //! - `trainer` (Stage 3-8, #65): main training loop (forward → loss_wdl →
 //!   backward → optimizer step)。`bins/nnue_train::main` から呼ばれる
 
 pub mod dataloader;
+pub mod optimizer;
 pub mod schedule;
