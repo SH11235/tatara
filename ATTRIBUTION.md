@@ -11,6 +11,63 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-6 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/nnue-train/src/optimizer.rs` (新規 ~400 行): Ranger (RAdam +
+  Lookahead) の **host-side state** + パラメータ + checkpoint serialise +
+  12 件の test。
+  - **bullet 上流参照** (`crates/trainer/src/optimiser/{radam,ranger}.rs`):
+    `RAdam::update` (`radam.rs:198-218` の host pre-compute) と
+    `RangerLookahead::update` (`ranger.rs:82-100` の step counter + lerp 起動
+    条件) の host 側 control path を本リポ独自 struct に再構築。bullet trait
+    `OptimiserState<G: Gpu>` / `WrapOptimiser<Inner, Params>` は **取り込まず**
+    (Stage 1-1 / 3-1 / 3-4 / 3-5 と同 trait 削除ポリシー)
+  - **device buffer は持たない (CPU-only crate 維持)**: bullet `Buffer<G>` は
+    本リポでは `Vec<f32>` (host)。device 側は Stage 3-7 で
+    `bins/nnue_train/src/main.rs::GpuTrainer` が `DeviceBuffer<f32>` に
+    host-to-device コピー (Stage 1-9 `GpuTrainer` pattern と同流儀)
+  - **kernel `build_ranger_op` は不要**: bullet 上流の `PointwiseIR` で kernel
+    構築する dynamic build は Stage 2-5 で landed した GPU `#[kernel] fn
+    ranger_lookahead_lerp` (bin entry inline) で置き換え済。本 module は
+    `radam_compute_step_size_denom` (Stage 2-4 で `gpu-kernels` に landed) を
+    `pub use` re-export して trainer に直接呼ばせる
+  - **checkpoint format は本 PR で確定** (bullet 2 file 構成 `slow.bin` +
+    `step_ranger.txt` を 1 binary に集約、Stage 1 progress.bin 慣行):
+    - 0..4 magic `b"RNGR"`
+    - 4..8 version u32 LE (1)
+    - 8..16 step u64 LE
+    - 16..24 n_params u64 LE
+    - 24.. momentum / velocity / slow_params 各 f32 LE × n_params
+  - **bullet `RangerLookahead::new` の slow_params 0-init を訂正**:
+    bullet は `slow_params = Buffer::from_host(.., vec![0.0; size])` で 0 init
+    だが、初期 weight が非零の場合 lerp 初回で `alpha * w + (1-alpha) * 0 =
+    alpha * w` と weight を半減させてしまう。本リポは `new_with_initial_weights
+    (&[f32])` で **明示的に初期 weight を slow にコピー** する API も提供し、
+    `new_zeroed(n)` (bullet 互換) と両方公開
+  - **MSRV 1.85 罠回避**: bullet `step.is_multiple_of(self.k)` (1.87 stable) は
+    `step % (k as u64) == 0` 直書き (Stage 2-5 / 3-3 で踏破済の規約踏襲)
+  - **Codex review #62 で追加対応 (本 PR 内 amend)**:
+    1. `load_from_reader` に `expected_n_params: Option<usize>` 引数追加、checkpoint
+       内 `n_params` と照合し不一致なら `InvalidData` reject (Stage 3-7 trainer 安全策)
+    2. `u64 → usize` cast を `try_into()` 経由に変更、32-bit target / 破損ファイルでの
+       overflow を `InvalidData` で reject
+    3. `RangerHostState::reset` が `slow_params` を 0 fill する挙動は bullet 上流
+       `RangerLookahead::reset` (slow 不変) と **意図的 divergence**。docstring +
+       `reset_zeros_slow_params_diverging_from_bullet` test で明示化、`new_with_initial_weights`
+       後に reset 呼ぶと初期化が失われる旨と回避方法 (radam のみ手動 reset / 新規 `new_with_initial_weights`
+       で再構築) を doc 記載
+    4. `save_to_writer` の sequential `write_all` × n_params (large N で system call 多発)
+       は呼び出し側 `BufWriter` wrap 推奨を docstring に明記
+  - **kernel launch は本 module には置かない**: GPU `#[kernel]` 本体は cuda-oxide
+    bin-entry inline 制約のため本 crate (CPU-only) では持てず、Stage 3-7
+    `bins/nnue_train/src/main.rs::GpuTrainer` が `cuda_launch!` で起動する。
+    本 module は host state + step counter + `should_lookahead(k)` 判定 + I/O
+    の責務分離 (Stage 1-9 と同流儀)
+  - test 12 件: `RangerParams::default` bullet 一致 1 + `RAdamHostState`
+    advance/compute/reset 3 + `RangerHostState` new/should_lookahead/reset 3
+    + checkpoint round-trip 1 + reject (magic / version / dim mismatch) 3 +
+    zero-size state edge 1
+
 #### Stage 3-5 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/nnue-train/src/dataloader.rs` (新規 ~360 行): PSV file →
