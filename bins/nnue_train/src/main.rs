@@ -74,6 +74,8 @@ use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+#[allow(unused_imports)]
+use nnue_train::optimizer::radam_compute_step_size_denom;
 
 // ===========================================================================
 // STATED kernels — Stage 2 (PR #46-#52) で landed、本 bin に inline copy
@@ -979,6 +981,65 @@ pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) 
     }
 }
 
+/// Extract a 2D slice — `dst[bi][oi] = src[bi*src_stride + src_offset + oi]`。
+/// 1 thread = 1 dst cell。l1_total (B×16) → l1_main (B×15) / l1_skip (B×1) 抽出に使用。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn slice_extract_2d(
+    src: &[f32],
+    mut dst: DisjointSlice<f32>,
+    batch: u32,
+    src_stride: u32,
+    src_offset: u32,
+    out_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    if let Some(o) = dst.get_mut(tid) {
+        *o = src[bi * (src_stride as usize) + (src_offset as usize) + oi];
+    }
+}
+
+/// Scatter a 2D slice — `dst[bi*dst_stride + dst_offset + ii] = src[bi*in_dim + ii]`。
+/// 1 thread = 1 src cell、`get_unchecked_mut` で任意 dst index に書き込む (escape hatch)。
+/// host が dst を呼出前に 0 (or 適切値) で初期化する責務。
+///
+/// 用途: backward で dl1_main (B×15) + dl1_skip (B×1) を dl1_total (B×16) に書き戻す
+/// (2 回 call、`dst_offset` で位置切替)。
+///
+/// SAFETY: 各 thread が unique (bi, ii) → unique dst_idx に書き込み。複数 call で
+/// `dst_offset` を変えれば disjoint な dst 範囲を書く。`dst_idx < dst.len()` は host
+/// invariant (`dst.len() == batch * dst_stride`、`dst_offset + in_dim <= dst_stride`)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn slice_scatter_2d(
+    src: &[f32],
+    mut dst: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    dst_stride: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (in_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (in_dim as usize);
+    let ii = tid.get() % (in_dim as usize);
+    let val = src[tid.get()];
+    let dst_idx = bi * (dst_stride as usize) + (dst_offset as usize) + ii;
+    // SAFETY: see docstring above. Each thread writes to a unique dst_idx, and host ensures bounds.
+    unsafe {
+        *dst.get_unchecked_mut(dst_idx) = val;
+    }
+}
+
 // ===========================================================================
 // Host driver helpers (kernel module loader / launch utilities)
 //
@@ -1081,7 +1142,7 @@ fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // Stage 3-7 全 24 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
+    // Stage 3-7 全 26 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
     // internalize-public-api-list で残す (kernel-list hazard、Stage 2-2 で確立)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,screlu_grad,\
                        adamw_step,radam_step,ranger_lookahead_lerp,\
@@ -1090,7 +1151,8 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_fwd_bucket,dense_mm_bwd_input_bucket,\
                        dense_mm_bwd_weight_bucket,bias_grad_bucket,\
                        crelu_fwd,crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
-                       concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add";
+                       concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
+                       slice_extract_2d,slice_scatter_2d";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -1189,12 +1251,1148 @@ fn find_libdevice_bc() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 }
 
 // ===========================================================================
-// GpuTrainer (Stage 3-7 continued で実装予定。本セッション cutoff のため placeholder)
+// v102 architecture constants (bullet `shogi_layerstack.rs:1831-1834, 2097-2101` 由来)
 // ===========================================================================
 
-fn main() {
+const FT_IN: usize = 73_305; // `HALFKA_HM_DIMENSIONS` (shogi-features::halfka_hm)
+const FT_OUT: usize = 1536; // per-perspective FT output dim
+const MAX_ACTIVE: usize = 40; // `MAX_ACTIVE_FEATURES` (nnz per perspective per position)
+const COMBINED_DIM: usize = FT_OUT; // pairwise (1536 → 768) × 2 perspectives concat = 1536
+const L1_OUT: usize = 16;
+const L1_EFFECTIVE: usize = L1_OUT - 1; // = 15 (skip 1 dim、bullet:1433)
+const L1_SKIP: usize = L1_OUT - L1_EFFECTIVE; // = 1
+const L2_IN: usize = L1_EFFECTIVE * 2; // = 30 (l1_sqr.concat(l1_main))、bullet:1434
+const L2_OUT: usize = 32;
+const NUM_BUCKETS: usize = 9; // progress8kpabs
+
+// scale 定数 (bullet shogi_layerstack.rs:2241, 2260)
+const FT_POST_SCALE: f32 = 127.0 / 128.0;
+const L1_SQR_SCALE: f32 = 127.0 / 128.0;
+
+// Ranger optimizer params (bullet `RangerParams::default()`、v102 で decay=0 override)
+const BETA1: f32 = 0.99;
+const BETA2: f32 = 0.999;
+const EPS: f32 = 1e-8;
+const MIN_W: f32 = -1.98;
+const MAX_W: f32 = 1.98;
+const RANGER_ALPHA: f32 = 0.5;
+const RANGER_K: u64 = 6;
+const DECAY: f32 = 0.0; // v102 weight-decay 0.0
+const N_SMA_THRESHOLD: f32 = 5.0;
+
+// loss_wdl params (v102 doc: scale=290, wdl=0.0)
+const WDL_LAMBDA: f32 = 0.0;
+const LOSS_SCALE: f32 = 1.0 / 290.0;
+
+// ===========================================================================
+// GpuTrainer (v102 LayerStack 1536-16-32 + progress8kpabs 9 buckets)
+//
+// 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
+// Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
+// Stage 3-7 段階では smoke 動作 (NaN check) のみ、Stage 3-8 trainer integrate で
+// `crates/nnue-train::trainer` loop と統合する。
+// ===========================================================================
+
+#[allow(dead_code)] // 一部 field は Stage 3-8 で host state 直接更新時に使う
+struct GpuTrainer {
+    stream: std::sync::Arc<CudaStream>,
+    module: std::sync::Arc<CudaModule>,
+
+    // FT (single, shared across perspectives)
+    ft_w: DeviceBuffer<f32>,
+    ft_w_m: DeviceBuffer<f32>,
+    ft_w_v: DeviceBuffer<f32>,
+    ft_w_slow: DeviceBuffer<f32>,
+    ft_w_grad: DeviceBuffer<f32>,
+    ft_b: DeviceBuffer<f32>,
+    ft_b_m: DeviceBuffer<f32>,
+    ft_b_v: DeviceBuffer<f32>,
+    ft_b_slow: DeviceBuffer<f32>,
+    ft_b_grad: DeviceBuffer<f32>,
+
+    // L1 per-bucket delta
+    l1_w: DeviceBuffer<f32>,
+    l1_w_m: DeviceBuffer<f32>,
+    l1_w_v: DeviceBuffer<f32>,
+    l1_w_slow: DeviceBuffer<f32>,
+    l1_w_grad: DeviceBuffer<f32>,
+    l1_b: DeviceBuffer<f32>,
+    l1_b_m: DeviceBuffer<f32>,
+    l1_b_v: DeviceBuffer<f32>,
+    l1_b_slow: DeviceBuffer<f32>,
+    l1_b_grad: DeviceBuffer<f32>,
+
+    // L1f shared factorized
+    l1f_w: DeviceBuffer<f32>,
+    l1f_w_m: DeviceBuffer<f32>,
+    l1f_w_v: DeviceBuffer<f32>,
+    l1f_w_slow: DeviceBuffer<f32>,
+    l1f_w_grad: DeviceBuffer<f32>,
+    l1f_b: DeviceBuffer<f32>,
+    l1f_b_m: DeviceBuffer<f32>,
+    l1f_b_v: DeviceBuffer<f32>,
+    l1f_b_slow: DeviceBuffer<f32>,
+    l1f_b_grad: DeviceBuffer<f32>,
+
+    // L2 per-bucket
+    l2_w: DeviceBuffer<f32>,
+    l2_w_m: DeviceBuffer<f32>,
+    l2_w_v: DeviceBuffer<f32>,
+    l2_w_slow: DeviceBuffer<f32>,
+    l2_w_grad: DeviceBuffer<f32>,
+    l2_b: DeviceBuffer<f32>,
+    l2_b_m: DeviceBuffer<f32>,
+    l2_b_v: DeviceBuffer<f32>,
+    l2_b_slow: DeviceBuffer<f32>,
+    l2_b_grad: DeviceBuffer<f32>,
+
+    // L3 per-bucket output
+    l3_w: DeviceBuffer<f32>,
+    l3_w_m: DeviceBuffer<f32>,
+    l3_w_v: DeviceBuffer<f32>,
+    l3_w_slow: DeviceBuffer<f32>,
+    l3_w_grad: DeviceBuffer<f32>,
+    l3_b: DeviceBuffer<f32>,
+    l3_b_m: DeviceBuffer<f32>,
+    l3_b_v: DeviceBuffer<f32>,
+    l3_b_slow: DeviceBuffer<f32>,
+    l3_b_grad: DeviceBuffer<f32>,
+
+    // loss + step
+    loss_acc: DeviceBuffer<f64>,
+    step_count: u64,
+}
+
+/// Smoke / Stage 3-8 trainer 用の 1 batch 入力データ。
+#[allow(dead_code)]
+struct BatchData {
+    n_pos: usize,
+    stm_indices: Vec<i32>, // (n_pos × MAX_ACTIVE)、-1 padding 可
+    nstm_indices: Vec<i32>,
+    bucket_idx: Vec<i32>, // (n_pos)、progress8kpabs の 0-8
+    score: Vec<f32>, // (n_pos)、target eval cp の元
+    wdl: Vec<f32>, // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    per_pos_norm: Vec<f32>, // (n_pos)、bullet loss normalisation
+}
+
+impl BatchData {
+    /// 決定論的な smoke 用 dummy batch。bucket_idx=0、small random sparse indices。
+    fn smoke_dummy(n_pos: usize) -> Self {
+        let mut stm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
+        let mut nstm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
+        // 各 position に MAX_ACTIVE 個 (実 HalfKA_hm の典型局面と同等) の deterministic indices
+        // を入れる。range [0, FT_IN) で seed-based に分散。
+        let mut s: u64 = 0xdead_beef;
+        for b in 0..n_pos {
+            for k in 0..MAX_ACTIVE {
+                // xorshift
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let idx = (s as usize % FT_IN) as i32;
+                stm_indices[b * MAX_ACTIVE + k] = idx;
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let idx2 = (s as usize % FT_IN) as i32;
+                nstm_indices[b * MAX_ACTIVE + k] = idx2;
+            }
+        }
+        Self {
+            n_pos,
+            stm_indices,
+            nstm_indices,
+            bucket_idx: vec![0_i32; n_pos],
+            score: vec![0.0_f32; n_pos],
+            wdl: vec![0.5_f32; n_pos],
+            per_pos_norm: vec![1.0_f32; n_pos],
+        }
+    }
+}
+
+/// `LaunchConfig` builder for 1D launch with `BLOCK_DIM` per block.
+fn cfg_1d(n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: grid_dim_1d(n, BLOCK_DIM),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Deterministic xorshift init for weights (small random in `[-scale, scale]`)。
+fn xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
+    let mut s = seed.max(1);
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        // [0, 1) → [-1, 1) → × scale
+        let u = (s >> 11) as f32 / ((1u64 << 53) as f32);
+        let r = (u * 2.0 - 1.0) * scale;
+        v.push(r);
+    }
+    v
+}
+
+impl GpuTrainer {
+    /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state を確保。
+    fn new(
+        ctx: &std::sync::Arc<CudaContext>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = ctx.default_stream();
+        let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
+
+        // 各 weight group の element 数
+        let ft_w_n = FT_IN * FT_OUT;
+        let ft_b_n = FT_OUT;
+        let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
+        let l1_b_n = NUM_BUCKETS * L1_OUT;
+        let l1f_w_n = FT_OUT * L1_OUT;
+        let l1f_b_n = L1_OUT;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l2_b_n = NUM_BUCKETS * L2_OUT;
+        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l3_b_n = NUM_BUCKETS;
+
+        // Weight init: small random for non-degenerate forward (smoke 用、Stage 3-8 で
+        // proper init: ft は bullet `init_with_effective_input_size(32)`、l1 は Zeroed 等)
+        let init_scale = 0.01_f32;
+        let ft_w_init = xorshift_init(0x100_u64, ft_w_n, init_scale);
+        let l1_w_init = xorshift_init(0x101_u64, l1_w_n, init_scale);
+        let l1f_w_init = xorshift_init(0x102_u64, l1f_w_n, init_scale);
+        let l2_w_init = xorshift_init(0x103_u64, l2_w_n, init_scale);
+        let l3_w_init = xorshift_init(0x104_u64, l3_w_n, init_scale);
+
+        Ok(Self {
+            stream: stream.clone(),
+            module,
+            // FT
+            ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
+            ft_w_m: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_w_v: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_w_slow: DeviceBuffer::from_host(&stream, &ft_w_init)?,
+            ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_b: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            // L1
+            l1_w: DeviceBuffer::from_host(&stream, &l1_w_init)?,
+            l1_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
+            l1_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
+            l1_w_slow: DeviceBuffer::from_host(&stream, &l1_w_init)?,
+            l1_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
+            l1_b: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            // L1f
+            l1f_w: DeviceBuffer::from_host(&stream, &l1f_w_init)?,
+            l1f_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
+            l1f_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
+            l1f_w_slow: DeviceBuffer::from_host(&stream, &l1f_w_init)?,
+            l1f_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
+            l1f_b: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            l1f_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            l1f_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            l1f_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            l1f_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            // L2
+            l2_w: DeviceBuffer::from_host(&stream, &l2_w_init)?,
+            l2_w_m: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
+            l2_w_v: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
+            l2_w_slow: DeviceBuffer::from_host(&stream, &l2_w_init)?,
+            l2_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
+            l2_b: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b_m: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b_v: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            // L3
+            l3_w: DeviceBuffer::from_host(&stream, &l3_w_init)?,
+            l3_w_m: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
+            l3_w_v: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
+            l3_w_slow: DeviceBuffer::from_host(&stream, &l3_w_init)?,
+            l3_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
+            l3_b: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b_m: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            // loss + step
+            loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            step_count: 0,
+        })
+    }
+
+    /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
+    fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let groups: [(&DeviceBuffer<f32>, &str); 10] = [
+            (&self.ft_w, "ft_w"),
+            (&self.ft_b, "ft_b"),
+            (&self.l1_w, "l1_w"),
+            (&self.l1_b, "l1_b"),
+            (&self.l1f_w, "l1f_w"),
+            (&self.l1f_b, "l1f_b"),
+            (&self.l2_w, "l2_w"),
+            (&self.l2_b, "l2_b"),
+            (&self.l3_w, "l3_w"),
+            (&self.l3_b, "l3_b"),
+        ];
+        for (buf, name) in groups {
+            let v = buf.to_host_vec(&self.stream)?;
+            for (i, &x) in v.iter().enumerate() {
+                if !x.is_finite() {
+                    return Err(format!(
+                        "{name}[{i}] = {x} is not finite (NaN or Inf)、smoke fail"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 1 batch 分の forward → loss_wdl → backward → Ranger step を実行。
+    /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
+    ///
+    /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
+    /// 24 kernel で再現。Backward path (~16 step): forward 逆順、`*_grad` buffer は本 method
+    /// 内で 0 init してから atomic accumulate。Optimizer: 10 weight groups × `radam_step`
+    /// (+ 周期 `ranger_lookahead_lerp`)。
+    fn step(&mut self, batch: &BatchData, lr: f32) -> Result<f64, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if b == 0 {
+            return Ok(0.0);
+        }
+        let b_u32 = b as u32;
+
+        // 入力 buffer を host → device
+        let stm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.stm_indices)?;
+        let nstm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.nstm_indices)?;
+        let bucket_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.bucket_idx)?;
+        let score_dev = DeviceBuffer::from_host(&self.stream, &batch.score)?;
+        let wdl_dev = DeviceBuffer::from_host(&self.stream, &batch.wdl)?;
+        let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
+
+        // loss_acc reset
+        self.loss_acc = DeviceBuffer::<f64>::zeroed(&self.stream, 1)?;
+
+        // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
+        let mut ft_stm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        let mut ft_nstm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(self.ft_w),
+                slice(stm_idx_dev),
+                slice_mut(ft_stm_out),
+                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(self.ft_w),
+                slice(nstm_idx_dev),
+                slice_mut(ft_nstm_out),
+                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+            ]
+        }?;
+
+        // -- Forward step 3: ft_post_perspective_fwd → combined (B × FT_OUT) --
+        let mut combined = DeviceBuffer::<f32>::zeroed(&self.stream, b * COMBINED_DIM)?;
+        cuda_launch! {
+            kernel: ft_post_perspective_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * COMBINED_DIM),
+            args: [
+                slice(ft_stm_out),
+                slice(ft_nstm_out),
+                slice(self.ft_b),
+                slice_mut(combined),
+                b_u32, FT_OUT as u32, FT_POST_SCALE
+            ]
+        }?;
+
+        // -- Forward step 4: dense_mm_fwd_bucket L1 → l1_bucket (B × L1_OUT) --
+        let mut l1_bucket = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT),
+            args: [
+                slice(combined),
+                slice(self.l1_w),
+                slice(self.l1_b),
+                slice(bucket_idx_dev),
+                slice_mut(l1_bucket),
+                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Forward step 5: dense_mm_fwd L1f shared → l1f_out (B × L1_OUT) --
+        let mut l1f_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT),
+            args: [
+                slice(combined),
+                slice(self.l1f_w),
+                slice(self.l1f_b),
+                slice_mut(l1f_out),
+                b_u32, FT_OUT as u32, L1_OUT as u32
+            ]
+        }?;
+
+        // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × L1_OUT) --
+        let mut l1_total = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
+        cuda_launch! {
+            kernel: elementwise_add,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT),
+            args: [
+                slice(l1_bucket),
+                slice(l1f_out),
+                slice_mut(l1_total),
+                (b * L1_OUT) as u32
+            ]
+        }?;
+
+        // -- Forward step 7: slice l1_total → l1_main (B × 15) + l1_skip (B × 1) --
+        let mut l1_main = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        let mut l1_skip = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_SKIP)?;
+        cuda_launch! {
+            kernel: slice_extract_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(l1_total),
+                slice_mut(l1_main),
+                b_u32, L1_OUT as u32, 0_u32, L1_EFFECTIVE as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: slice_extract_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_SKIP),
+            args: [
+                slice(l1_total),
+                slice_mut(l1_skip),
+                b_u32, L1_OUT as u32, L1_EFFECTIVE as u32, L1_SKIP as u32
+            ]
+        }?;
+
+        // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × 15) --
+        let mut l1_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        cuda_launch! {
+            kernel: abs_pow2_scale_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(l1_main),
+                slice_mut(l1_sqr),
+                L1_SQR_SCALE,
+                (b * L1_EFFECTIVE) as u32
+            ]
+        }?;
+
+        // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × 30) --
+        let mut l2_pre = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
+        cuda_launch! {
+            kernel: concat_l1sqr_main_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_IN),
+            args: [
+                slice(l1_sqr),
+                slice(l1_main),
+                slice_mut(l2_pre),
+                b_u32, L1_EFFECTIVE as u32, L1_EFFECTIVE as u32
+            ]
+        }?;
+
+        // -- Forward step 10: l2_input = CReLU(l2_pre) (B × 30) --
+        let mut l2_input = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
+        cuda_launch! {
+            kernel: crelu_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_IN),
+            args: [
+                slice(l2_pre),
+                slice_mut(l2_input),
+                (b * L2_IN) as u32
+            ]
+        }?;
+
+        // -- Forward step 11: L2 per-bucket dense → l2_out (B × 32) --
+        let mut l2_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT),
+            args: [
+                slice(l2_input),
+                slice(self.l2_w),
+                slice(self.l2_b),
+                slice(bucket_idx_dev),
+                slice_mut(l2_out),
+                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Forward step 12: l2_acted = CReLU(l2_out) (B × 32) --
+        let mut l2_acted = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
+        cuda_launch! {
+            kernel: crelu_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT),
+            args: [
+                slice(l2_out),
+                slice_mut(l2_acted),
+                (b * L2_OUT) as u32
+            ]
+        }?;
+
+        // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
+        let mut l3_out = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(l2_acted),
+                slice(self.l3_w),
+                slice(self.l3_b),
+                slice(bucket_idx_dev),
+                slice_mut(l3_out),
+                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
+        let mut net_output = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
+        cuda_launch! {
+            kernel: elementwise_add,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(l3_out),
+                slice(l1_skip),
+                slice_mut(net_output),
+                b_u32
+            ]
+        }?;
+
+        // -- Forward step 15: loss_wdl → dy_net_output + loss_acc --
+        let mut dy_net_output = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
+        cuda_launch! {
+            kernel: loss_wdl,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(net_output),
+                slice(score_dev),
+                slice(wdl_dev),
+                slice(norm_dev),
+                slice_mut(dy_net_output),
+                slice(self.loss_acc),
+                WDL_LAMBDA, LOSS_SCALE, b_u32
+            ]
+        }?;
+
+        // ===== BACKWARD =====
+        // 全 *_grad buffer を 0 で reset (atomic accumulate semantic に従う kernel が
+        // 多い、また overwrite kernel も in-place 安全のため統一)
+        let ft_w_n = FT_IN * FT_OUT;
+        let ft_b_n = FT_OUT;
+        let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
+        let l1_b_n = NUM_BUCKETS * L1_OUT;
+        let l1f_w_n = FT_OUT * L1_OUT;
+        let l1f_b_n = L1_OUT;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l2_b_n = NUM_BUCKETS * L2_OUT;
+        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l3_b_n = NUM_BUCKETS;
+        self.ft_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_w_n)?;
+        self.ft_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_b_n)?;
+        self.l1_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
+        self.l1_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
+        self.l1f_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        self.l2_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
+        self.l2_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
+        self.l3_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
+        self.l3_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l3_b_n)?;
+
+        // -- Backward 14 reverse: dy_net_output が dl3_out と dl1_skip 両方の grad --
+        // (elementwise_add 逆: dl3_out = dy, dl1_skip = dy、両者同じ buffer を直接渡せばよい)
+
+        // -- Backward 13 reverse: L3 per-bucket dense grad --
+        let mut dl2_acted = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT),
+            args: [
+                slice(dy_net_output),
+                slice(self.l3_w),
+                slice(bucket_idx_dev),
+                slice_mut(dl2_acted),
+                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * 1 * L2_OUT),
+            args: [
+                slice(l2_acted),
+                slice(dy_net_output),
+                slice(bucket_idx_dev),
+                slice(self.l3_w_grad),
+                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * 1),
+            args: [
+                slice(dy_net_output),
+                slice(bucket_idx_dev),
+                slice(self.l3_b_grad),
+                b_u32, 1_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Backward 12 reverse: crelu_grad on l2_out --
+        let mut dl2_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
+        cuda_launch! {
+            kernel: crelu_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT),
+            args: [
+                slice(l2_out),
+                slice(dl2_acted),
+                slice_mut(dl2_out),
+                (b * L2_OUT) as u32
+            ]
+        }?;
+
+        // -- Backward 11 reverse: L2 per-bucket dense grad --
+        let mut dl2_input = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_IN),
+            args: [
+                slice(dl2_out),
+                slice(self.l2_w),
+                slice(bucket_idx_dev),
+                slice_mut(dl2_input),
+                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT * L2_IN),
+            args: [
+                slice(l2_input),
+                slice(dl2_out),
+                slice(bucket_idx_dev),
+                slice(self.l2_w_grad),
+                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_OUT),
+            args: [
+                slice(dl2_out),
+                slice(bucket_idx_dev),
+                slice(self.l2_b_grad),
+                b_u32, L2_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Backward 10 reverse: crelu_grad on l2_pre --
+        let mut dl2_pre = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
+        cuda_launch! {
+            kernel: crelu_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L2_IN),
+            args: [
+                slice(l2_pre),
+                slice(dl2_input),
+                slice_mut(dl2_pre),
+                (b * L2_IN) as u32
+            ]
+        }?;
+
+        // -- Backward 9 reverse: split dl2_pre → dl1_sqr (15) + dl1_main_from_concat (15) --
+        let mut dl1_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        let mut dl1_main_from_concat = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        cuda_launch! {
+            kernel: concat_l1sqr_main_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(dl2_pre),
+                slice_mut(dl1_sqr),
+                slice_mut(dl1_main_from_concat),
+                b_u32, L1_EFFECTIVE as u32
+            ]
+        }?;
+
+        // -- Backward 8 reverse: abs_pow2_scale_grad (l1_sqr 経由の grad) --
+        let mut dl1_main_from_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        cuda_launch! {
+            kernel: abs_pow2_scale_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(l1_main),
+                slice(dl1_sqr),
+                slice_mut(dl1_main_from_sqr),
+                L1_SQR_SCALE,
+                (b * L1_EFFECTIVE) as u32
+            ]
+        }?;
+
+        // -- Combine dl1_main = dl1_main_from_concat + dl1_main_from_sqr --
+        let mut dl1_main = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
+        cuda_launch! {
+            kernel: elementwise_add,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(dl1_main_from_concat),
+                slice(dl1_main_from_sqr),
+                slice_mut(dl1_main),
+                (b * L1_EFFECTIVE) as u32
+            ]
+        }?;
+
+        // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) + dl1_skip=dy_net_output (offset 15) --
+        let mut dl1_total = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
+        cuda_launch! {
+            kernel: slice_scatter_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_EFFECTIVE),
+            args: [
+                slice(dl1_main),
+                slice_mut(dl1_total),
+                b_u32, L1_EFFECTIVE as u32, L1_OUT as u32, 0_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: slice_scatter_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_SKIP),
+            args: [
+                slice(dy_net_output),
+                slice_mut(dl1_total),
+                b_u32, L1_SKIP as u32, L1_OUT as u32, L1_EFFECTIVE as u32
+            ]
+        }?;
+
+        // -- Backward 6 reverse: dl1_total を l1_bucket と l1f_out 両方の grad に流す --
+        // (elementwise_add 逆: dl1_bucket = dl1_total, dl1f = dl1_total)
+        // 直接 dl1_total を両 dense_mm_bwd に渡す
+
+        // -- Backward 5 reverse: L1f shared dense grad --
+        let mut dcombined_from_l1f = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dl1_total),
+                slice(self.l1f_w),
+                slice_mut(dcombined_from_l1f),
+                b_u32, FT_OUT as u32, L1_OUT as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(FT_OUT * L1_OUT),
+            args: [
+                slice(combined),
+                slice(dl1_total),
+                slice_mut(self.l1f_w_grad),
+                b_u32, FT_OUT as u32, L1_OUT as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT),
+            args: [
+                slice(dl1_total),
+                slice(self.l1f_b_grad),
+                b_u32, L1_OUT as u32
+            ]
+        }?;
+
+        // -- Backward 4 reverse: L1 per-bucket dense grad --
+        let mut dcombined_from_l1 = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dl1_total),
+                slice(self.l1_w),
+                slice(bucket_idx_dev),
+                slice_mut(dcombined_from_l1),
+                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT * FT_OUT),
+            args: [
+                slice(combined),
+                slice(dl1_total),
+                slice(bucket_idx_dev),
+                slice(self.l1_w_grad),
+                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad_bucket,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * L1_OUT),
+            args: [
+                slice(dl1_total),
+                slice(bucket_idx_dev),
+                slice(self.l1_b_grad),
+                b_u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // -- Combine dcombined = dcombined_from_l1 + dcombined_from_l1f --
+        let mut dcombined = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        cuda_launch! {
+            kernel: elementwise_add,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dcombined_from_l1),
+                slice(dcombined_from_l1f),
+                slice_mut(dcombined),
+                (b * FT_OUT) as u32
+            ]
+        }?;
+
+        // -- Backward 3 reverse: ft_post_perspective_grad × 2 (stm, nstm) --
+        let mut dft_stm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        let mut dft_nstm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        // stm: d_combined_offset = 0
+        cuda_launch! {
+            kernel: ft_post_perspective_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dcombined),
+                slice(ft_stm_out),
+                slice(self.ft_b),
+                slice_mut(dft_stm_out),
+                slice(self.ft_b_grad),
+                b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE
+            ]
+        }?;
+        // nstm: d_combined_offset = FT_OUT/2 = 768
+        cuda_launch! {
+            kernel: ft_post_perspective_grad,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dcombined),
+                slice(ft_nstm_out),
+                slice(self.ft_b),
+                slice_mut(dft_nstm_out),
+                slice(self.ft_b_grad),
+                b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE
+            ]
+        }?;
+
+        // -- Backward 1+2 reverse: sparse_ft_backward × 2 (atomic accumulate ft_w_grad) --
+        cuda_launch! {
+            kernel: sparse_ft_backward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dft_stm_out),
+                slice(stm_idx_dev),
+                slice(self.ft_w_grad),
+                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: sparse_ft_backward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * FT_OUT),
+            args: [
+                slice(dft_nstm_out),
+                slice(nstm_idx_dev),
+                slice(self.ft_w_grad),
+                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+            ]
+        }?;
+
+        // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
+        self.step_count += 1;
+        let (step_size, denom) = radam_compute_step_size_denom(
+            self.step_count, BETA1, BETA2, N_SMA_THRESHOLD
+        );
+
+        // 10 weight groups × radam_step
+        // FT
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+            args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                   slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, ft_w_n as u32]
+        }?;
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
+            args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
+                   slice_mut(self.ft_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, ft_b_n as u32]
+        }?;
+        // L1
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l1_w_n),
+            args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
+                   slice_mut(self.l1_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l1_w_n as u32]
+        }?;
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
+            args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
+                   slice_mut(self.l1_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l1_b_n as u32]
+        }?;
+        // L1f
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l1f_w_n),
+            args: [slice_mut(self.l1f_w), slice_mut(self.l1f_w_m), slice_mut(self.l1f_w_v),
+                   slice_mut(self.l1f_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l1f_w_n as u32]
+        }?;
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
+            args: [slice_mut(self.l1f_b), slice_mut(self.l1f_b_m), slice_mut(self.l1f_b_v),
+                   slice_mut(self.l1f_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l1f_b_n as u32]
+        }?;
+        // L2
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l2_w_n),
+            args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
+                   slice_mut(self.l2_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l2_w_n as u32]
+        }?;
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
+            args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
+                   slice_mut(self.l2_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l2_b_n as u32]
+        }?;
+        // L3
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l3_w_n),
+            args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
+                   slice_mut(self.l3_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l3_w_n as u32]
+        }?;
+        cuda_launch! {
+            kernel: radam_step,
+            stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
+            args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
+                   slice_mut(self.l3_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   MIN_W, MAX_W, l3_b_n as u32]
+        }?;
+
+        // Lookahead lerp every K steps
+        if self.step_count % RANGER_K == 0 {
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
+                args: [slice_mut(self.ft_b), slice_mut(self.ft_b_slow), RANGER_ALPHA, ft_b_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l1_w_n),
+                args: [slice_mut(self.l1_w), slice_mut(self.l1_w_slow), RANGER_ALPHA, l1_w_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
+                args: [slice_mut(self.l1_b), slice_mut(self.l1_b_slow), RANGER_ALPHA, l1_b_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l1f_w_n),
+                args: [slice_mut(self.l1f_w), slice_mut(self.l1f_w_slow), RANGER_ALPHA, l1f_w_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
+                args: [slice_mut(self.l1f_b), slice_mut(self.l1f_b_slow), RANGER_ALPHA, l1f_b_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l2_w_n),
+                args: [slice_mut(self.l2_w), slice_mut(self.l2_w_slow), RANGER_ALPHA, l2_w_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
+                args: [slice_mut(self.l2_b), slice_mut(self.l2_b_slow), RANGER_ALPHA, l2_b_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l3_w_n),
+                args: [slice_mut(self.l3_w), slice_mut(self.l3_w_slow), RANGER_ALPHA, l3_w_n as u32]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp,
+                stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
+                args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n as u32]
+            }?;
+        }
+
+        self.stream.synchronize()?;
+
+        // Read loss
+        let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
+        Ok(loss_vec[0])
+    }
+}
+
+// step() 実装は別 impl block (file 分割回避のため同 file 内)。
+// 続いて smoke main() を main.rs 末尾に追加。
+
+fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    println!("[smoke] CUDA context created, loading kernel module...");
+    let mut trainer = GpuTrainer::new(&ctx)?;
     println!(
-        "nnue-train: Stage 3-7 partial — 24 kernels + host loader landed, \
-         GpuTrainer + forward/backward/step + smoke pending"
+        "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
+        (FT_IN * FT_OUT
+            + FT_OUT
+            + NUM_BUCKETS * L1_OUT * FT_OUT
+            + NUM_BUCKETS * L1_OUT
+            + FT_OUT * L1_OUT
+            + L1_OUT
+            + NUM_BUCKETS * L2_OUT * L2_IN
+            + NUM_BUCKETS * L2_OUT
+            + NUM_BUCKETS * L2_OUT
+            + NUM_BUCKETS) as f64
+            / 1.0e6
     );
+
+    trainer.assert_all_weights_finite()?;
+    println!("[smoke] step 0: init weights all finite ✓");
+
+    // 1 batch smoke: forward + backward + Ranger step
+    let batch = BatchData::smoke_dummy(4);
+    let lr = 1e-3_f32;
+    let loss = trainer.step(&batch, lr)?;
+    println!("[smoke] step 1: loss = {:.6e}", loss);
+    if !loss.is_finite() {
+        return Err(format!("step 1 loss = {loss} is not finite").into());
+    }
+    trainer.assert_all_weights_finite()?;
+    println!("[smoke] step 1: all weights finite ✓");
+
+    // もう 1 batch 回す (Ranger lookahead が k=6 周期、smoke では未到達だが多 step で挙動確認)
+    let loss2 = trainer.step(&batch, lr)?;
+    println!("[smoke] step 2: loss = {:.6e}", loss2);
+    if !loss2.is_finite() {
+        return Err(format!("step 2 loss = {loss2} is not finite").into());
+    }
+    trainer.assert_all_weights_finite()?;
+    println!("[smoke] step 2: all weights finite ✓");
+
+    println!("[smoke] PASSED — Stage 3-7 GpuTrainer skeleton OK (v102 arch full forward+backward+step)");
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
+    match smoke_test() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
 }
