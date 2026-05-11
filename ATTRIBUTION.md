@@ -11,6 +11,44 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-4 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/bullet_lib/src/trainer/schedule/lr.rs` (215 行) +
+  `crates/bullet_lib/src/trainer/schedule/wdl.rs` (141 行) を
+  `crates/nnue-train/src/schedule.rs` (新規) に集約 vendor。Stage 3-8 trainer
+  loop で `superbatch / batch` index ごとに `LrScheduler::lr` /
+  `WdlScheduler::blend` を呼び、Stage 2 `adamw_step` / `radam_step` /
+  `fused_loss_wdl` kernel の `lr` / `lambda` 引数として渡す host-side state。
+  - **vendor scope**: bullet の lr 系 (ConstantLR / DropLR / StepLR /
+    LinearDecayLR / CosineDecayLR / ExponentialDecayLR / Warmup<LR> /
+    Sequence<F, S>) + wdl 系 (ConstantWDL / LinearWDL / Warmup<WDL> /
+    Sequence<F, S> / WdlSchedulerEnum) を **全て移植**
+  - **bullet trait の `colourful(&self) -> String` 削除 → `std::fmt::Display`
+    impl に置換**: bullet は `bullet_trainer::run::logger::ansi(value, color_code)`
+    で terminal 用 ANSI 色付き string を返す。本リポでは外部 dep を持たず、
+    `Display` impl で plain string を返す形に統一 (Stage 1-1 / 3-1 と同じ
+    bullet 外部 dep 削除ポリシー、CLI 側で色付けが必要なら別途 wrap)
+  - **計算 path (`lr` / `blend`) は bullet 上流と byte 一致**: `saturating_sub` /
+    `(max - 1).max(1)` 等の defense / `superbatch == 1 && batch < warmup_batches`
+    の warmup condition / `Sequence` の `max - midpoint` 正規化、全て移植元と一致
+  - 構造体命名は bullet 上流の `Warmup<LR>` / `Sequence<F, S>` が lr.rs と wdl.rs
+    で同名衝突するため、本リポでは `WarmupLR<LR>` / `SequenceLR<F, S>` /
+    `WarmupWDL<W>` / `SequenceWDL<F, S>` と接尾辞で分離。bullet 上流は別 module
+    namespace で衝突回避していたが、本リポは単一 module 集約方針 (`schedule.rs`)
+    のため命名で区別
+  - **trait bound `+ Display`**: bullet 上流 trait は `Clone + Debug + Send +
+    Sync` のみ、本リポは `Display` を追加して `format!("{lr}")` で plain
+    string 取得可能に
+  - **`LrScheduler` trait に `'static` を新規追加**: bullet 上流 (`lr.rs:7`) の
+    `LrScheduler` は `'static` を持たず、`WdlScheduler` (`wdl.rs:7`) のみ
+    `+ 'static` を持つ。本 PR は両 trait を揃えて `+ 'static` を要求 (Stage 3-8
+    trainer state で `Arc` 共有 / thread spawn する想定、borrow を持つ
+    scheduler は許さない設計)。WdlScheduler の `'static` は上流から保持。
+    Codex review で「保持」誤記を指摘され訂正
+  - test 14 件 (lr 系 8 件 + wdl 系 6 件、hand-calc fixture で bullet 上流値と
+    数値一致確認: warmup interp / sequence midpoint 切替 / linear taper /
+    cosine progress=0.5 / exponential mid-factor 等)
+
 #### Stage 3-3 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/nnue-format/src/halfka_psqt.rs` (新規、約 430 行): HalfKA_hm + PSQT
