@@ -9,10 +9,12 @@
 //!
 //! - `header` (Stage 3-2, #58): NNUE binary の先頭 22 bytes 固定長 metadata
 //!   (`NnueHeader`: net_id / fv_scale / qa / qb) の (de)serialise
-//! - `halfka_psqt` (Stage 3-3, #59): HalfKA_hm 1536-16-32 weight の
-//!   quantised save / float load。bullet-shogi `crates/bullet_lib/src/value/
-//!   save.rs` (commit `f275eb9`) を vendor、rshogi loader と互換確保
+//! - `halfka_psqt` (Stage 3-3, #59): HalfKA_hm + PSQT NNUE binary (FT + L1 +
+//!   PSQT) の `save_quantised` / `load`、bullet 上流 `crates/trainer/src/
+//!   model/save.rs::QuantTarget` の量子化ロジックを移植
 
+pub mod halfka_psqt;
 pub mod header;
 
+pub use halfka_psqt::{FT_OUT_DIM, HalfKAPsqtNet, L1_OUT_DIM, NUM_FEATURES, QuantTarget};
 pub use header::{DEFAULT_FV_SCALE, DEFAULT_QA, DEFAULT_QB, HEADER_BYTES, NET_ID_LEN, NnueHeader};
