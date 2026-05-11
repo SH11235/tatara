@@ -3,6 +3,9 @@
 **/target
 **/*.rs.bk
 
+# Claude Code runtime state (transient)
+.claude/scheduled_tasks.lock
+
 # 教師データ (大容量、E: 上の symlink 先) — docs/data-layout.md
 /data
 **/*.bin
