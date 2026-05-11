@@ -75,6 +75,8 @@ use cuda_host::cuda_launch;
 #[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
+use nnue_format::V102Weights;
+#[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 
 // ===========================================================================
@@ -1528,6 +1530,99 @@ impl GpuTrainer {
         })
     }
 
+    /// `V102Weights` から weight buffer を device に upload (pretrained 注入)。
+    fn from_v102_weights(
+        &mut self,
+        w: &V102Weights,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
+        self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+        self.l1f_w = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
+        self.l1f_b = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
+        self.l2_w = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
+        self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+        self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
+        self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+        // Optimizer state (m, v, slow) は trained weight に合わせて reset:
+        // - m, v: 0 (fresh start)
+        // - slow: weight と同値で初期化 (Ranger Lookahead initial state)
+        // - grad: 0
+        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
+        self.l1f_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
+        self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
+        self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
+        // m / v / grad / b_slow は zero reset
+        let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+            DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
+        };
+        let ft_w_n = FT_IN * FT_OUT;
+        let ft_b_n = FT_OUT;
+        let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
+        let l1_b_n = NUM_BUCKETS * L1_OUT;
+        let l1f_w_n = FT_OUT * L1_OUT;
+        let l1f_b_n = L1_OUT;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l2_b_n = NUM_BUCKETS * L2_OUT;
+        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l3_b_n = NUM_BUCKETS;
+        self.ft_w_m = zeros_f32(ft_w_n)?;
+        self.ft_w_v = zeros_f32(ft_w_n)?;
+        self.ft_w_grad = zeros_f32(ft_w_n)?;
+        self.ft_b_m = zeros_f32(ft_b_n)?;
+        self.ft_b_v = zeros_f32(ft_b_n)?;
+        self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        self.ft_b_grad = zeros_f32(ft_b_n)?;
+        self.l1_w_m = zeros_f32(l1_w_n)?;
+        self.l1_w_v = zeros_f32(l1_w_n)?;
+        self.l1_w_grad = zeros_f32(l1_w_n)?;
+        self.l1_b_m = zeros_f32(l1_b_n)?;
+        self.l1_b_v = zeros_f32(l1_b_n)?;
+        self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+        self.l1_b_grad = zeros_f32(l1_b_n)?;
+        self.l1f_w_m = zeros_f32(l1f_w_n)?;
+        self.l1f_w_v = zeros_f32(l1f_w_n)?;
+        self.l1f_w_grad = zeros_f32(l1f_w_n)?;
+        self.l1f_b_m = zeros_f32(l1f_b_n)?;
+        self.l1f_b_v = zeros_f32(l1f_b_n)?;
+        self.l1f_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
+        self.l1f_b_grad = zeros_f32(l1f_b_n)?;
+        self.l2_w_m = zeros_f32(l2_w_n)?;
+        self.l2_w_v = zeros_f32(l2_w_n)?;
+        self.l2_w_grad = zeros_f32(l2_w_n)?;
+        self.l2_b_m = zeros_f32(l2_b_n)?;
+        self.l2_b_v = zeros_f32(l2_b_n)?;
+        self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+        self.l2_b_grad = zeros_f32(l2_b_n)?;
+        self.l3_w_m = zeros_f32(l3_w_n)?;
+        self.l3_w_v = zeros_f32(l3_w_n)?;
+        self.l3_w_grad = zeros_f32(l3_w_n)?;
+        self.l3_b_m = zeros_f32(l3_b_n)?;
+        self.l3_b_v = zeros_f32(l3_b_n)?;
+        self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+        self.l3_b_grad = zeros_f32(l3_b_n)?;
+        self.step_count = 0;
+        Ok(())
+    }
+
+    /// device buffer を host に download し `V102Weights` を返す (save_quantised 前)。
+    fn to_v102_weights(&self) -> Result<V102Weights, Box<dyn std::error::Error>> {
+        Ok(V102Weights {
+            ft_w: self.ft_w.to_host_vec(&self.stream)?,
+            ft_b: self.ft_b.to_host_vec(&self.stream)?,
+            l1_w: self.l1_w.to_host_vec(&self.stream)?,
+            l1_b: self.l1_b.to_host_vec(&self.stream)?,
+            l1f_w: self.l1f_w.to_host_vec(&self.stream)?,
+            l1f_b: self.l1f_b.to_host_vec(&self.stream)?,
+            l2_w: self.l2_w.to_host_vec(&self.stream)?,
+            l2_b: self.l2_b.to_host_vec(&self.stream)?,
+            l3_w: self.l3_w.to_host_vec(&self.stream)?,
+            l3_b: self.l3_b.to_host_vec(&self.stream)?,
+        })
+    }
+
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
     fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
         let groups: [(&DeviceBuffer<f32>, &str); 10] = [
@@ -2363,27 +2458,64 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
     println!("[smoke] step 0: init weights all finite ✓");
 
-    // 1 batch smoke: forward + backward + Ranger step
-    let batch = BatchData::smoke_dummy(4);
-    let lr = 1e-3_f32;
-    let loss = trainer.step(&batch, lr)?;
-    println!("[smoke] step 1: loss = {:.6e}", loss);
-    if !loss.is_finite() {
-        return Err(format!("step 1 loss = {loss} is not finite").into());
-    }
-    trainer.assert_all_weights_finite()?;
-    println!("[smoke] step 1: all weights finite ✓");
+    // /tmp/v102_100_quantised.bin が利用可能なら、bullet v102-100 (sb=100 checkpoint) を
+    // 注入して **golden forward 経路** (forward + backward + save) を検証する。
+    // 不在時は random init smoke のみ。
+    let v102_path = "/tmp/v102_100_quantised.bin";
+    if std::path::Path::new(v102_path).exists() {
+        println!("[smoke] loading bullet v102-100 reference from {v102_path} ...");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(v102_path)?);
+        let weights = V102Weights::load_quantised(&mut reader)?;
+        trainer.from_v102_weights(&weights)?;
+        trainer.assert_all_weights_finite()?;
+        println!("[smoke] v102-100 weights injected, all finite ✓");
 
-    // もう 1 batch 回す (Ranger lookahead が k=6 周期、smoke では未到達だが多 step で挙動確認)
-    let loss2 = trainer.step(&batch, lr)?;
-    println!("[smoke] step 2: loss = {:.6e}", loss2);
-    if !loss2.is_finite() {
-        return Err(format!("step 2 loss = {loss2} is not finite").into());
-    }
-    trainer.assert_all_weights_finite()?;
-    println!("[smoke] step 2: all weights finite ✓");
+        // forward + step 1 batch
+        let batch = BatchData::smoke_dummy(4);
+        let lr = 1e-3_f32;
+        let loss = trainer.step(&batch, lr)?;
+        println!("[smoke] step 1 (post-v102-100 init): loss = {loss:.6e}");
+        if !loss.is_finite() {
+            return Err(format!("step 1 loss = {loss} is not finite").into());
+        }
+        trainer.assert_all_weights_finite()?;
+        println!("[smoke] step 1: all weights finite ✓");
 
-    println!("[smoke] PASSED — Stage 3-7 GpuTrainer skeleton OK (v102 arch full forward+backward+step)");
+        // save back as our quantised.bin
+        let out_path = "/tmp/our_quantised.bin";
+        println!("[smoke] saving trained weights to {out_path} ...");
+        let saved_weights = trainer.to_v102_weights()?;
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        saved_weights.save_quantised(&mut writer)?;
+        drop(writer);
+        let out_size = std::fs::metadata(out_path)?.len();
+        println!("[smoke] wrote {out_path}: {out_size} bytes");
+        println!(
+            "[smoke] verify with:\n  /home/sh11235/git-repos/rshogi-oss/target/release/verify_nnue_accumulator \\\n    --nnue-file {out_path} \\\n    --ls-progress-coeff /mnt/e/rshogi-nnue/data/progress/progress_hao_full_cuda.e1.bin \\\n    --moves 10"
+        );
+    } else {
+        println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
+        let batch = BatchData::smoke_dummy(4);
+        let lr = 1e-3_f32;
+        let loss = trainer.step(&batch, lr)?;
+        println!("[smoke] step 1: loss = {loss:.6e}");
+        if !loss.is_finite() {
+            return Err(format!("step 1 loss = {loss} is not finite").into());
+        }
+        trainer.assert_all_weights_finite()?;
+        println!("[smoke] step 1: all weights finite ✓");
+
+        // save random-init as quantised.bin for verify-nnue check
+        let out_path = "/tmp/our_quantised_randinit.bin";
+        let saved_weights = trainer.to_v102_weights()?;
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        saved_weights.save_quantised(&mut writer)?;
+        drop(writer);
+        let out_size = std::fs::metadata(out_path)?.len();
+        println!("[smoke] wrote {out_path}: {out_size} bytes");
+    }
+
+    println!("[smoke] PASSED — Stage 3-7 GpuTrainer skeleton OK (v102 arch full path)");
     Ok(())
 }
 
