@@ -15,6 +15,8 @@
 
 pub mod halfka_psqt;
 pub mod header;
+pub mod v102_layerstack;
 
 pub use halfka_psqt::{FT_OUT_DIM, HalfKAPsqtNet, L1_OUT_DIM, NUM_FEATURES, QuantTarget};
 pub use header::{DEFAULT_FV_SCALE, DEFAULT_QA, DEFAULT_QB, HEADER_BYTES, NET_ID_LEN, NnueHeader};
+pub use v102_layerstack::V102Weights;
