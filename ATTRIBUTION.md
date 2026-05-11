@@ -11,6 +11,53 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-3 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- `crates/nnue-format/src/halfka_psqt.rs` (新規、約 430 行): HalfKA_hm + PSQT
+  NNUE binary (FT + L1 + PSQT) の `save_quantised` / `load` + 量子化 helper +
+  12 件の test (本 PR 内 amend で 10 → 12 に追加、Codex / Claude review 指摘の
+  edge case 対応)。
+  - **bullet 上流移植**: `crates/trainer/src/model/save.rs::QuantTarget` +
+    `quantise` 関数 (`model/save.rs:153-211`、約 60 行) を本リポ `QuantTarget`
+    enum + `quantise` / `dequantise` method として移植。i8 / i16 / i32 ×
+    multiplier の量子化スキーム、`round_or_trunc`、範囲超過時 `InvalidData`
+    return は bullet 上流と同型。`SavedFormat` / `ModelWeights` の trait 機構
+    (`SavedFormat::transform`, `SavedFormat::quantise<T: Quant>` 等) は本リポ
+    では使わず、`HalfKAPsqtNet` 構造体の field を direct quantise する形に簡素化
+    (Stage 1-1 / Stage 3-1 と同じ bullet trait 削除ポリシー)
+  - **新規 layout 確定** (本 PR 独自): NNUE binary は header (Stage 3-2) +
+    ft_weights i16 LE + ft_bias i16 LE + l1_weights i8 LE + l1_bias i32 LE +
+    psqt i32 LE の 5 ブロック。量子化 multiplier は `header.qa` / `qb` /
+    `qa*qb` を使う。Stage 3-9 (#64) で rshogi 側 loader と互換性検証の上で調整
+  - **scope minimum (本 PR)**: Issue #59 body の `FT + L1 + PSQT` を文字通り
+    実装。NNUE 1536-16-32 full arch (FT + 3 linear stack [16, 32, 1] + PSQT、
+    bullet `examples/shogi_layerstack.rs` の `layer_sizes = [(16, true),
+    (32, true), (1, false)]`) は Stage 3-7 / 3-8 (`bins/nnue_train` 統合) で
+    本 layout を拡張する想定 (`HalfKAPsqtNet` を `enum NnueLayout { Minimal,
+    LayerStack {...} }` 化など)。本 PR docstring に明記
+  - `compute_psqt_material_values` 等の HalfKA_hm 特化 PSQT 初期化
+    (`shogi_layerstack.rs:1194-`) は本 PR scope 外 (trainer 側 init で扱う、
+    Stage 3-7 / 3-8 で組み込む想定)
+  - **PSQT multiplier の bullet 互換修正 (Codex review 指摘で本 PR 内 amend)**:
+    旧実装は psqt multiplier に `qa` のみを使っていたが、bullet 上流
+    `shogi_layerstack.rs:1555-1570` の LayerStack PSQT は `qa * qb` を使う。
+    YaneuraOu / nnue-pytorch 互換のため amend で `qa * qb` に修正
+  - **PSQT shape の本 PR scope 限定**: bullet LayerStack の PSQT は
+    `output_buckets (9) × num_features` の 2D weight + 9 個 bias 構造だが、
+    本 PR は **single bucket (`psqt: Vec<f32>` 長さ `num_features`、bias なし)**
+    に限定 (Issue #59 minimum scope)。multi-bucket 化は Stage 3-7 / 3-8 で
+    NNUE 1536-16-32 full arch 拡張時に対応する想定 (`HalfKAPsqtNet` enum 化など)
+  - test 内訳: `validate` 2 件 / `QuantTarget` 4 件 (i16/i8/i32 round-trip +
+    範囲超過 reject) / `HalfKAPsqtNet::save_quantised` round-trip 2 件 (default
+    + non-default qa/qb) / dim mismatch reject 1 件 / `NUM_FEATURES` 整合 1 件
+    + **本 PR amend 追加 2 件** (`dequantise_rejects_unaligned_len` /
+    `load_rejects_truncated_input`、Codex / Claude review 指摘) = 計 12 件。
+    production 73_305 × 1536 は test には重すぎるため、mini net (num_features=4,
+    ft_out_dim=2, l1_out_dim=1) で round-trip 検証
+  - byte-exact 一致確認は本 PR の test では行わず、Stage 3-9 (#64) で bullet
+    `cargo run --example shogi_layerstack` 出力との 1:1 比較を docstring に
+    手順記載
+
 #### Stage 3-2 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/nnue-format/src/header.rs` (新規 200 行強): NNUE binary 先頭の
