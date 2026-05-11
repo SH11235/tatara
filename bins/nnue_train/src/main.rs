@@ -1531,7 +1531,7 @@ impl GpuTrainer {
     }
 
     /// `V102Weights` から weight buffer を device に upload (pretrained 注入)。
-    fn from_v102_weights(
+    fn load_v102_weights(
         &mut self,
         w: &V102Weights,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1965,7 +1965,7 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_weight_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * 1 * L2_OUT),
+            config: cfg_1d(b * L2_OUT),
             args: [
                 slice(l2_acted),
                 slice(dy_net_output),
@@ -1978,7 +1978,7 @@ impl GpuTrainer {
             kernel: bias_grad_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * 1),
+            config: cfg_1d(b),
             args: [
                 slice(dy_net_output),
                 slice(bucket_idx_dev),
@@ -2466,7 +2466,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] loading bullet v102-100 reference from {v102_path} ...");
         let mut reader = std::io::BufReader::new(std::fs::File::open(v102_path)?);
         let weights = V102Weights::load_quantised(&mut reader)?;
-        trainer.from_v102_weights(&weights)?;
+        trainer.load_v102_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
         println!("[smoke] v102-100 weights injected, all finite ✓");
 
