@@ -11,6 +11,87 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-7 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- **`bins/nnue_train/src/main.rs`** に v102 LayerStack 1536-16-32 + progress8kpabs
+  9 buckets の **GpuTrainer** と 26 個の `#[kernel]` を inline 配置 (cuda-oxide
+  bin-entry reachability 制約のため):
+  - bullet `examples/shogi_layerstack.rs:2206-2289` (`build_trainer_with_input!`
+    macro 内 forward closure) → 本 file の `GpuTrainer::step` forward path に
+    対応する 15 step:
+    1. sparse_ft_forward × 2 (stm, nstm)
+    2. ft_post_perspective_fwd (FUSED bias add + CReLU + pairwise_mul + scale)
+    3-5. dense_mm_fwd_bucket L1 + dense_mm_fwd L1f shared + elementwise_add
+    6-7. slice_extract_2d (l1_main, l1_skip)
+    8. abs_pow2_scale_fwd
+    9. concat_l1sqr_main_fwd
+    10. crelu_fwd
+    11. dense_mm_fwd_bucket L2
+    12. crelu_fwd
+    13. dense_mm_fwd_bucket L3 (per-bucket output)
+    14. elementwise_add (+l1_skip)
+    15. loss_wdl
+  - bullet `crates/trainer/src/model/builder.rs:477-560` の op semantics:
+    - `pairwise_mul()`: `slice_rows(0, n/2) * slice_rows(n/2, n)` (前半・後半対応 index 同士の積)
+    - `abs_pow(2)`: `|x|^2 = x^2` (本 kernel は `x*x*scale` で実装、abs 不要)
+    - `crelu()`: clip(0, 1)
+  - 7 STATED kernel (`screlu_grad` / `loss_wdl` / `adamw_step` / `radam_step` /
+    `ranger_lookahead_lerp` / `sparse_ft_forward` / `sparse_ft_backward`) は
+    Stage 2 (#46-#52) で landed したものを本 file に copy-inline (cuda-oxide
+    rustc-codegen-cuda backend は bin entry から reachable な kernel のみ
+    NVPTX IR 化する制約、Stage 1-5 で確立)。`screlu_grad` と `adamw_step` は
+    v102 path では未使用だが compile-reach のため preserve
+
+- **`crates/nnue-format/src/v102_layerstack.rs`** (新規):
+  - bullet `examples/shogi_layerstack.rs:1411-1809` (`build_layerstack_save_format`)
+    → 本 module の `V102Weights::save_quantised` / `load_quantised`
+  - rshogi-oss `crates/rshogi-core/src/nnue/leb128.rs::LEB128_MAGIC` = `b"COMPRESSED_LEB128"`
+    (17 bytes) と同 magic で signed LEB128 i16 encoder/decoder を実装、bullet
+    の FT bias / weight 圧縮形式と互換
+  - bullet `shogi_layerstack.rs:1706-1715` の per-bucket l1 + shared l1f
+    **merge save** (bullet が Factorizer 形式を coalesce してから書き出す動作)
+    を再現。本実装 V102Weights は load 時 merged 値を `l1_w` に格納し
+    `l1f_w = 0` で復元 (forward 計算上等価)
+  - 量子化 scale: bullet `shogi_layerstack.rs:1655, 1731, 1757` 由来
+    (FT: `QA=127` i16、L1 bias: `QA*QB=8128` i32、L1 w: `QB=64` i8、L2/L3 bias:
+    `127*QB=8128` i32、L2/L3 w: `QB=64` i8)
+  - pad32 (SIMD alignment): bullet `shogi_layerstack.rs:1704, 1739, 1765`
+  - arch_str format: bullet `shogi_layerstack.rs:1469-1495` 由来、v102 では
+    PSQT 無し / Threat 無し / HandCountDense 無し
+
+新規追加 (bullet 由来ではない):
+
+- `bins/nnue_train/src/main.rs` の **17 NEW kernel** (`ft_post_perspective_fwd`/
+  `_grad` / `dense_mm_fwd` / `_bwd_input` / `_bwd_weight` / `bias_grad` /
+  `dense_mm_fwd_bucket` / `_bwd_input_bucket` / `_bwd_weight_bucket` /
+  `bias_grad_bucket` / `crelu_fwd` / `crelu_grad` / `abs_pow2_scale_fwd` /
+  `_grad` / `concat_l1sqr_main_fwd` / `_grad` / `elementwise_add` /
+  `slice_extract_2d` / `slice_scatter_2d`) — bullet は PointwiseIR runtime fusion
+  で同等動作を生成、本リポは hand-fused inline kernel として再実装
+- `crates/nnue-format/src/v102_layerstack.rs::V102Weights` struct — bullet
+  `SavedFormat` trait 機構は使わず direct quantize/dequantize で完結 (Stage 1-1
+  / Stage 3-1 / Stage 3-3 と同方針)
+- `crates/nnue-format/src/v102_layerstack.rs` の test (`leb128_*_roundtrip`,
+  `pad32_correct`, `weights_zeroed_save_load_roundtrip`, `arch_str_format`)
+  および file 依存 (`load_v102_100_reference_if_available`,
+  `save_v102_100_resaved_if_available`) — file 不在時は skip するため CI でも
+  通る (実機ローカル box で v102-100/quantised.bin が `/tmp` にある場合のみ動作確認)
+
+検証成果:
+
+- 本実装出力 quantised.bin が rshogi-oss `verify_nnue_accumulator`
+  (refresh vs differential update 一致 test) を **ALL PASSED 10/10**
+- bullet v102-100 (sb=100 reference checkpoint、116MB) との byte 比較:
+  116,472,404 bytes 中 **42 bytes 差のみ** (network_hash 4 + 9 fc_hash × 4 = 36 +
+  rounding boundary 2)、forward 計算は完全互換
+
+参照リンク:
+- bullet `examples/shogi_layerstack.rs:1411-1809, 2206-2289`
+- bullet `crates/trainer/src/model/builder.rs:477-560`
+- rshogi-oss `crates/rshogi-core/src/nnue/{network_layer_stacks.rs:138-311,
+  layer_stacks.rs:203-223, leb128.rs}`
+- `docs/bullet_v102_save_format_report.md` (Codex 詳細 recon)
+
 #### Stage 3-6 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - `crates/nnue-train/src/optimizer.rs` (新規 ~400 行): Ranger (RAdam +
