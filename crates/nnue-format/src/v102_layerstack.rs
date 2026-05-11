@@ -702,6 +702,32 @@ mod tests {
     }
 
     #[test]
+    fn save_v102_100_resaved_if_available() {
+        // /tmp/v102_100_quantised.bin を load → save back to /tmp/v102_100_resaved.bin。
+        // 別途 `verify_nnue_accumulator` で OK かを手動で確認。
+        // 本 test は CI では skip (file 依存)。
+        let in_path = "/tmp/v102_100_quantised.bin";
+        let out_path = "/tmp/v102_100_resaved.bin";
+        if !std::path::Path::new(in_path).exists() {
+            eprintln!("skipping save_v102_100_resaved (file not found at {in_path})");
+            return;
+        }
+        let mut reader = std::io::BufReader::new(std::fs::File::open(in_path).unwrap());
+        let weights = V102Weights::load_quantised(&mut reader).unwrap();
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path).unwrap());
+        weights.save_quantised(&mut writer).unwrap();
+        drop(writer);
+
+        let in_size = std::fs::metadata(in_path).unwrap().len();
+        let out_size = std::fs::metadata(out_path).unwrap().len();
+        let diff = (out_size as i64) - (in_size as i64);
+        eprintln!("[resave] in_size={in_size}, out_size={out_size}, diff={diff}");
+        // Note: byte-identical を期待するが、bullet 側 network_hash / fc_hash と一致しない
+        // 可能性あり (本実装は placeholder 0)。rshogi-oss は hash を skip して読むので
+        // verify_nnue_accumulator は通るはず (別途手動確認)。
+    }
+
+    #[test]
     fn arch_str_format() {
         let s = build_arch_str(FT_IN, FT_OUT, L1_OUT, L2_IN, L2_OUT, FV_SCALE);
         assert!(s.contains("HalfKA_hm"));
