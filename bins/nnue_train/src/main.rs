@@ -402,7 +402,7 @@ pub fn ft_post_perspective_fwd(
     mut combined: DisjointSlice<f32>,
     batch: u32,
     ft_dim: u32, // = 1536 (per-perspective input dim)
-    scale: f32, // = 127.0/128.0
+    scale: f32,  // = 127.0/128.0
 ) {
     let tid = thread::index_1d();
     let total = (batch as usize) * (ft_dim as usize);
@@ -482,11 +482,11 @@ pub fn ft_post_perspective_fwd(
 #[allow(clippy::manual_clamp)]
 #[kernel]
 pub fn ft_post_perspective_grad(
-    d_combined: &[f32], // (batch × combined_dim)
-    ft_out: &[f32], // perspective's sparse_ft_forward output (batch × ft_dim)
-    bias: &[f32], // shared FT bias (ft_dim)
+    d_combined: &[f32],                  // (batch × combined_dim)
+    ft_out: &[f32],                      // perspective's sparse_ft_forward output (batch × ft_dim)
+    bias: &[f32],                        // shared FT bias (ft_dim)
     mut grad_ft_out: DisjointSlice<f32>, // perspective's dft output (batch × ft_dim)
-    grad_bias: &[f32], // shared, atomic accumulate (ft_dim)
+    grad_bias: &[f32],                   // shared, atomic accumulate (ft_dim)
     batch: u32,
     ft_dim: u32,
     d_combined_offset: u32, // 0 (stm) or ft_dim/2 (nstm)
@@ -510,9 +510,8 @@ pub fn ft_post_perspective_grad(
     };
 
     // d_combined の対応 output cell を読む
-    let dy = d_combined[bi * (d_combined_stride as usize)
-        + (d_combined_offset as usize)
-        + pair_idx];
+    let dy =
+        d_combined[bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx];
 
     let ft_base = bi * (ft_dim as usize);
     let xa = ft_out[ft_base + pair_idx] + bias[pair_idx];
@@ -582,8 +581,7 @@ pub fn dense_mm_fwd(
     let mut sum = bias[oi];
     let mut k: u32 = 0;
     while k < in_dim {
-        sum += x[bi * (in_dim as usize) + (k as usize)]
-            * w[(k as usize) * (out_dim as usize) + oi];
+        sum += x[bi * (in_dim as usize) + (k as usize)] * w[(k as usize) * (out_dim as usize) + oi];
         k += 1;
     }
     if let Some(o) = y.get_mut(tid) {
@@ -613,8 +611,8 @@ pub fn dense_mm_bwd_input(
     let mut sum = 0.0_f32;
     let mut o: u32 = 0;
     while o < out_dim {
-        sum += dy[bi * (out_dim as usize) + (o as usize)]
-            * w[ii * (out_dim as usize) + (o as usize)];
+        sum +=
+            dy[bi * (out_dim as usize) + (o as usize)] * w[ii * (out_dim as usize) + (o as usize)];
         o += 1;
     }
     if let Some(d) = dx.get_mut(tid) {
@@ -644,8 +642,8 @@ pub fn dense_mm_bwd_weight(
     let mut sum = 0.0_f32;
     let mut b: u32 = 0;
     while b < batch {
-        sum += x[(b as usize) * (in_dim as usize) + ii]
-            * dy[(b as usize) * (out_dim as usize) + oi];
+        sum +=
+            x[(b as usize) * (in_dim as usize) + ii] * dy[(b as usize) * (out_dim as usize) + oi];
         b += 1;
     }
     if let Some(g) = grad_w.get_mut(tid) {
@@ -658,12 +656,7 @@ pub fn dense_mm_bwd_weight(
 /// 1 thread = 1 (batch, out) cell、各 oi が batch 数の atomic 寄与を受ける。
 /// host が呼出前に `grad_bias` を 0 で初期化する責務 (accumulate semantics)。
 #[kernel]
-pub fn bias_grad(
-    dy: &[f32],
-    grad_bias: &[f32],
-    batch: u32,
-    out_dim: u32,
-) {
+pub fn bias_grad(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
     let tid = thread::index_1d();
     let total = (batch as usize) * (out_dim as usize);
     if tid.get() >= total {
@@ -757,9 +750,8 @@ pub fn dense_mm_bwd_input_bucket(
     let mut sum = 0.0_f32;
     let mut o: u32 = 0;
     while o < out_dim {
-        let w_idx = buc_u * (out_dim as usize) * (in_dim as usize)
-            + (o as usize) * (in_dim as usize)
-            + ii;
+        let w_idx =
+            buc_u * (out_dim as usize) * (in_dim as usize) + (o as usize) * (in_dim as usize) + ii;
         sum += dy[bi * (out_dim as usize) + (o as usize)] * w[w_idx];
         o += 1;
     }
@@ -801,9 +793,7 @@ pub fn dense_mm_bwd_weight_bucket(
     let buc_u = buc as usize;
     let xv = x[bi * (in_dim as usize) + ii];
     let dyv = dy[bi * (out_dim as usize) + oi];
-    let w_idx = buc_u * (out_dim as usize) * (in_dim as usize)
-        + oi * (in_dim as usize)
-        + ii;
+    let w_idx = buc_u * (out_dim as usize) * (in_dim as usize) + oi * (in_dim as usize) + ii;
     // SAFETY: w_idx < num_buckets * out_dim * in_dim, host が grad_w.len() = same 確保。
     let cell = unsafe { &*(grad_w.as_ptr().add(w_idx) as *const DeviceAtomicF32) };
     cell.fetch_add(xv * dyv, AtomicOrdering::Relaxed);
@@ -894,13 +884,7 @@ pub fn abs_pow2_scale_fwd(x: &[f32], mut y: DisjointSlice<f32>, scale: f32, n: u
 
 /// abs_pow(2) * scale gradient — `dx[i] = 2 * x[i] * scale * dy[i]`。
 #[kernel]
-pub fn abs_pow2_scale_grad(
-    x: &[f32],
-    dy: &[f32],
-    mut dx: DisjointSlice<f32>,
-    scale: f32,
-    n: u32,
-) {
+pub fn abs_pow2_scale_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, scale: f32, n: u32) {
     let i = thread::index_1d();
     if i.get() >= n as usize {
         return;
@@ -1136,8 +1120,7 @@ fn compile_ll_to_ptx_via_llc(
     let ptx_path = dir.join(format!("{stem}.ptx"));
 
     // cache: skip rebuild if .ptx is newer than .ll
-    if let (Ok(ll_meta), Ok(ptx_meta)) =
-        (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
+    if let (Ok(ll_meta), Ok(ptx_meta)) = (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
         && let (Ok(ll_mtime), Ok(ptx_mtime)) = (ll_meta.modified(), ptx_meta.modified())
         && ptx_mtime > ll_mtime
     {
@@ -1377,9 +1360,9 @@ struct BatchData {
     n_pos: usize,
     stm_indices: Vec<i32>, // (n_pos × MAX_ACTIVE)、-1 padding 可
     nstm_indices: Vec<i32>,
-    bucket_idx: Vec<i32>, // (n_pos)、progress8kpabs の 0-8
-    score: Vec<f32>, // (n_pos)、target eval cp の元
-    wdl: Vec<f32>, // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    bucket_idx: Vec<i32>,   // (n_pos)、progress8kpabs の 0-8
+    score: Vec<f32>,        // (n_pos)、target eval cp の元
+    wdl: Vec<f32>,          // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
     per_pos_norm: Vec<f32>, // (n_pos)、bullet loss normalisation
 }
 
@@ -1445,9 +1428,7 @@ fn xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
 
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state を確保。
-    fn new(
-        ctx: &std::sync::Arc<CudaContext>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
@@ -1549,10 +1530,7 @@ impl GpuTrainer {
     /// を呼ぶ。bullet `radam_step.rs::radam_compute_step_size_denom` は step >= 1 で
     /// 安全動作 (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` に
     /// なる、本 helper も `step >= 1` 前提)。本実装は step=0 で呼ばないため OK。
-    fn load_v102_weights(
-        &mut self,
-        w: &V102Weights,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn load_v102_weights(&mut self, w: &V102Weights) -> Result<(), Box<dyn std::error::Error>> {
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -2308,9 +2286,8 @@ impl GpuTrainer {
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
         self.step_count += 1;
-        let (step_size, denom) = radam_compute_step_size_denom(
-            self.step_count, BETA1, BETA2, N_SMA_THRESHOLD
-        );
+        let (step_size, denom) =
+            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
 
         // 10 weight groups × radam_step
         // FT

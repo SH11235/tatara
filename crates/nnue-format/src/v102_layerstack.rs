@@ -233,7 +233,14 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///  fv_scale=<fv_scale>`
 ///
 /// (実際は 1 行連結、ここでは可読性のため改行)
-pub fn build_arch_str(input_size: usize, ft_out: usize, l1_out: usize, l2_in: usize, l2_out: usize, fv_scale: i32) -> String {
+pub fn build_arch_str(
+    input_size: usize,
+    ft_out: usize,
+    l1_out: usize,
+    l2_in: usize,
+    l2_out: usize,
+    fv_scale: i32,
+) -> String {
     format!(
         "Features=HalfKA_hm(Friend)[{}->{}x2],\
          Network=AffineTransform[1<-{}](\
@@ -245,13 +252,13 @@ pub fn build_arch_str(input_size: usize, ft_out: usize, l1_out: usize, l2_in: us
          fv_scale={}",
         input_size,
         ft_out,
-        l2_out,         // Output input
-        l2_out,         // L2 output / L3 input
-        l2_out,         // L2 output
-        l2_in,          // L2 input
-        l2_in,          // dual activation output
-        l1_out,         // L1 output
-        ft_out * 2,     // L1 input (dual perspective)
+        l2_out,     // Output input
+        l2_out,     // L2 output / L3 input
+        l2_out,     // L2 output
+        l2_in,      // L2 input
+        l2_in,      // dual activation output
+        l1_out,     // L1 output
+        ft_out * 2, // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
         fv_scale,
@@ -389,7 +396,11 @@ impl V102Weights {
         let ft_b_i16: Vec<i16> = self
             .ft_b
             .iter()
-            .map(|&v| (qa_f * v as f64).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+            .map(|&v| {
+                (qa_f * v as f64)
+                    .round()
+                    .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+            })
             .collect();
         write_leb128_tensor_i16(writer, &ft_b_i16)?;
 
@@ -400,7 +411,11 @@ impl V102Weights {
         let ft_w_i16: Vec<i16> = self
             .ft_w
             .iter()
-            .map(|&v| (qa_f * v as f64).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+            .map(|&v| {
+                (qa_f * v as f64)
+                    .round()
+                    .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+            })
             .collect();
         write_leb128_tensor_i16(writer, &ft_w_i16)?;
 
@@ -515,7 +530,10 @@ impl V102Weights {
         reader.read_exact(&mut arch_bytes)?;
         let arch_str = String::from_utf8_lossy(&arch_bytes);
         // PSQT / Threat / HandCount を含む arch は本実装でサポートしない (v102 標準形のみ)
-        if arch_str.contains("PSQT=") || arch_str.contains("Threat=") || arch_str.contains("HandCount") {
+        if arch_str.contains("PSQT=")
+            || arch_str.contains("Threat=")
+            || arch_str.contains("HandCount")
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("unsupported arch (only plain LayerStack supported): {arch_str}"),
@@ -734,7 +752,10 @@ mod tests {
         let max_l1 = weights.l1_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         let max_l2 = weights.l2_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         let max_l3 = weights.l3_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
-        eprintln!("[v102-100 load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)", weights.ft_w.len());
+        eprintln!(
+            "[v102-100 load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)",
+            weights.ft_w.len()
+        );
         eprintln!("[v102-100 load] FT weight max abs: {max_ft:.6}");
         eprintln!("[v102-100 load] L1 weight max abs: {max_l1:.6}");
         eprintln!("[v102-100 load] L2 weight max abs: {max_l2:.6}");
@@ -747,8 +768,14 @@ mod tests {
         assert!(max_l3 <= 2.0, "L3 max abs {max_l3} > 2.0");
 
         // 全 0 でないこと (trained model)
-        assert!(max_ft > 0.001, "FT weights are all near 0 — likely format mismatch");
-        assert!(max_l1 > 0.001, "L1 weights are all near 0 — likely format mismatch");
+        assert!(
+            max_ft > 0.001,
+            "FT weights are all near 0 — likely format mismatch"
+        );
+        assert!(
+            max_l1 > 0.001,
+            "L1 weights are all near 0 — likely format mismatch"
+        );
     }
 
     #[test]
@@ -781,7 +808,11 @@ mod tests {
         // の本数は実 weight 分布次第だが、典型的に 0-5 bytes、安全 margin で 100 まで OK)
         let in_bytes = std::fs::read(in_path).unwrap();
         let out_bytes = std::fs::read(out_path).unwrap();
-        let byte_diff_count = in_bytes.iter().zip(out_bytes.iter()).filter(|(a, b)| a != b).count();
+        let byte_diff_count = in_bytes
+            .iter()
+            .zip(out_bytes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         eprintln!("[resave] byte_diff_count={byte_diff_count}");
         assert!(
             byte_diff_count < 100,
