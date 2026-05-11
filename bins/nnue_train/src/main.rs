@@ -467,6 +467,12 @@ pub fn ft_post_perspective_fwd(
 /// は stm/nstm 共有のため、gradient は両方の和)。host は `grad_bias` を 1 回 zero 初期化、
 /// 2 call で atomic accumulate される (Stage 2-7 sparse_ft_backward 同 convention)。
 ///
+/// **stream synchronization**: 本 kernel は default stream で 2 connected launch
+/// (stm 用 + nstm 用) として実行される。cuda-oxide の default stream は serialized
+/// 実行 (各 launch は前の launch 完了後に開始) のため、`grad_bias` への atomic
+/// accumulate は 2 call 間で race condition を起こさない。明示的な
+/// `cudaStreamSynchronize` は host loop 末尾の `self.stream.synchronize()` で 1 回のみ。
+///
 /// 1 thread = 1 (batch, ft_dim_index) cell of this perspective's `grad_ft_out`。
 /// tid in `[0, batch * ft_dim)`、tid IS the cell to write。
 ///
@@ -1531,6 +1537,18 @@ impl GpuTrainer {
     }
 
     /// `V102Weights` から weight buffer を device に upload (pretrained 注入)。
+    ///
+    /// Optimizer state reset:
+    /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
+    /// - `slow`: weight と同値 (Ranger Lookahead 初期 slow = weight、bullet 慣行)
+    /// - `grad`: 0
+    /// - `step_count`: 0 (1-indexed、次 step は 1)
+    ///
+    /// 注: `step_count = 0` 状態で `step()` を呼ぶと `self.step_count += 1` → 1 に
+    /// なってから `radam_compute_step_size_denom(1, BETA1, BETA2, N_SMA_THRESHOLD)`
+    /// を呼ぶ。bullet `radam_step.rs::radam_compute_step_size_denom` は step >= 1 で
+    /// 安全動作 (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` に
+    /// なる、本 helper も `step >= 1` 前提)。本実装は step=0 で呼ばないため OK。
     fn load_v102_weights(
         &mut self,
         w: &V102Weights,

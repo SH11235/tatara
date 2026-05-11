@@ -258,16 +258,66 @@ pub fn build_arch_str(input_size: usize, ft_out: usize, l1_out: usize, l2_in: us
     )
 }
 
-/// nnue-pytorch 互換 hash. bullet `examples/shogi_layerstack.rs:1057-1080` の
-/// `compute_layerstack_fc_hash` 移植 (FC layer 部分のみ簡略実装、本来は L1/L2/L3 で
-/// 連鎖)。実態は arch hash の **正確性は engine 側で検証されない** (rshogi-oss は
-/// `buf4` を読み飛ばすだけ、`network_layer_stacks.rs:193`)。整合性のため deterministic
-/// な値を生成するが、bullet と byte-完全一致する必要は (round-trip 以外で) ない。
+/// nnue-pytorch 互換 hash 計算。bullet `examples/shogi_layerstack.rs:1057-1080`
+/// `compute_layerstack_fc_hash` を移植。
 ///
-/// **TODO**: bullet 互換の完全 hash を実装 (Stage 3-9 自己対局で必要なら)。
-pub const FT_HASH: u32 = 0x7f134cb8 ^ (FT_OUT as u32 * 2); // FEATURE_HASH_HM_V2 ^ (ft_out*2)、bullet:1517
+/// **注**: bullet の関数 signature は `compute_layerstack_fc_hash(l1_out, l2_in, l2_out)`
+/// と命名されているが、**第 1 引数は実際には FT_OUT (= 1536)** であり、命名が
+/// 誤解を招く (bullet:1437 で `compute_layerstack_fc_hash(ft_out, l2_in, l2_out)`
+/// と呼ばれている)。本実装は引数名を `ft_out` に統一してこの混乱を避ける。
+///
+/// rshogi-oss `network_layer_stacks.rs:193, 215` は本 hash を読み飛ばすが、bullet
+/// 出力との byte 完全互換のために本リポでも computed value を使う (Stage 3-9
+/// 自己対局検証で network_hash の sanity を bullet と揃える目的)。
+pub fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
+    // InputSlice hash (FT output × 2 dual perspective を XOR)
+    let mut prev_hash: u32 = 0xEC42E90D;
+    prev_hash ^= (ft_out * 2) as u32;
 
-pub const FC_HASH: u32 = 0; // placeholder、rshogi-oss が skip するので 0 で OK
+    // bullet `shogi_layerstack.rs:1066` の layer_sizes (第 1 element は ft_out で
+    // bullet の関数内 parameter 名 `l1_out` を踏襲、has_relu=true)、
+    // 第 2 element は l2_out (has_relu=true)、第 3 element は 1 (has_relu=false)
+    let layer_sizes = [(ft_out, true), (l2_out, true), (1_usize, false)];
+    for (out_features, has_relu) in layer_sizes {
+        let mut layer_hash: u32 = 0xCC03DAE4;
+        layer_hash = layer_hash.wrapping_add(out_features as u32);
+        layer_hash ^= prev_hash >> 1;
+        layer_hash ^= prev_hash << 31;
+        if has_relu {
+            layer_hash = layer_hash.wrapping_add(0x538D24C7);
+        }
+        prev_hash = layer_hash;
+    }
+    prev_hash
+}
+
+/// FT hash: `FEATURE_HASH_HM_V2 ^ (ft_out * 2)`、bullet `shogi_layerstack.rs:1517` 由来。
+pub const FT_HASH: u32 = 0x7f134cb8 ^ (FT_OUT as u32 * 2);
+
+/// per-bucket fc_hash。bullet `compute_layerstack_fc_hash(FT_OUT, L2_IN, L2_OUT)` 相当。
+/// (ft_out=1536, l2_in=30, l2_out=32) 固定値、本実装で const 展開済。
+pub const FC_HASH: u32 = {
+    // bullet `compute_layerstack_fc_hash` の loop を unroll 済 (const 関数で展開)
+    let mut prev: u32 = 0xEC42E90D ^ ((FT_OUT * 2) as u32);
+    // Layer 1 (has_relu = true、out = FT_OUT)
+    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(FT_OUT as u32);
+    lh ^= prev >> 1;
+    lh ^= prev << 31;
+    lh = lh.wrapping_add(0x538D24C7);
+    prev = lh;
+    // Layer 2 (has_relu = true、out = L2_OUT)
+    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(L2_OUT as u32);
+    lh ^= prev >> 1;
+    lh ^= prev << 31;
+    lh = lh.wrapping_add(0x538D24C7);
+    prev = lh;
+    // Output layer (has_relu = false、out = 1)
+    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(1);
+    lh ^= prev >> 1;
+    lh ^= prev << 31;
+    prev = lh;
+    prev
+};
 
 pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 
@@ -722,9 +772,31 @@ mod tests {
         let out_size = std::fs::metadata(out_path).unwrap().len();
         let diff = (out_size as i64) - (in_size as i64);
         eprintln!("[resave] in_size={in_size}, out_size={out_size}, diff={diff}");
-        // Note: byte-identical を期待するが、bullet 側 network_hash / fc_hash と一致しない
-        // 可能性あり (本実装は placeholder 0)。rshogi-oss は hash を skip して読むので
-        // verify_nnue_accumulator は通るはず (別途手動確認)。
+        // Byte size は完全一致を期待 (layout regression detect)。
+        // 値の byte 差は network_hash + 9 fc_hash + rounding boundary で最大 ~50 bytes、
+        // size diff は 0 のはず。layout に regression があれば size が大きく変わる。
+        assert_eq!(diff, 0, "size diff {diff} != 0 — layout regression?");
+
+        // bullet との byte 差は最大 100 bytes 程度を許容範囲とする (rounding boundary
+        // の本数は実 weight 分布次第だが、典型的に 0-5 bytes、安全 margin で 100 まで OK)
+        let in_bytes = std::fs::read(in_path).unwrap();
+        let out_bytes = std::fs::read(out_path).unwrap();
+        let byte_diff_count = in_bytes.iter().zip(out_bytes.iter()).filter(|(a, b)| a != b).count();
+        eprintln!("[resave] byte_diff_count={byte_diff_count}");
+        assert!(
+            byte_diff_count < 100,
+            "byte diff count {byte_diff_count} >= 100 — format regression suspected"
+        );
+    }
+
+    #[test]
+    fn fc_hash_matches_bullet_formula() {
+        // FC_HASH const と compute_fc_hash 関数の結果が一致 (const 展開の sanity)
+        // 引数: bullet :1437 `compute_layerstack_fc_hash(ft_out, l2_in, l2_out)` に倣う
+        assert_eq!(FC_HASH, compute_fc_hash(FT_OUT, L2_IN, L2_OUT));
+        // bullet v102 (ft_out=1536, l2_in=30, l2_out=32) で computed value が
+        // 0 (placeholder) でないことを確認
+        assert_ne!(FC_HASH, 0, "FC_HASH should be computed, not placeholder");
     }
 
     #[test]
