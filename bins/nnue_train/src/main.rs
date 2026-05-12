@@ -1,6 +1,6 @@
 //! `bins/nnue_train` binary entry point — bullet-shogi v102 互換 NNUE trainer。
 //!
-//! Stage 3-7 (#63) で本 file は **v102 LayerStack arch** の `#[kernel]` 群 (24 個)
+//! Stage 3-7 (#63) で本 file は **v102 LayerStack arch** の `#[kernel]` 群 (26 個)
 //! と host loop driver (GpuTrainer) を統合する。Stage 3-8 (#65) で CLI + trainer
 //! integrate、Stage 3-9 (#64) で自己対局検証 (rshogi-oss engine 2 個) で完結する
 //! 予定。
@@ -22,7 +22,7 @@
 //! - **L3 (per-bucket)**: weight (9×32) + bias (9) → select(bucket) → 1
 //! - **net_output**: l3_out + l1_skip → 1 scalar
 //!
-//! ## kernel 一覧 (24 個、bin entry reachability のため全て本 file に inline)
+//! ## kernel 一覧 (26 個、bin entry reachability のため全て本 file に inline)
 //!
 //! ### STATED (Stage 2 #46-#52 で landed、本 bin に inline copy)
 //! 1. `screlu_grad` — v102 では未使用、compile-reach のため preserve
@@ -42,7 +42,7 @@
 //! 13. `bias_grad` — generic atomic accumulate
 //! 14. `dense_mm_fwd_bucket` — per-bucket dense matmul + bias + select
 //! 15. `dense_mm_bwd_input_bucket` — per-bucket input grad
-//! 16. `dense_mm_bwd_weight_bucket` — per-bucket weight grad (atomic, multi-b → same bucket)
+//! 16. `dense_mm_bwd_weight_bucket` — per-bucket weight grad (1 thread = 1 (bucket,o,i) cell + batch loop、atomic 不要)
 //! 17. `bias_grad_bucket` — per-bucket bias grad (atomic per (bucket, o))
 //! 18. `crelu_fwd` — clip 0-1
 //! 19. `crelu_grad` — 1 if 0<x<1 else 0
@@ -51,6 +51,8 @@
 //! 22. `concat_l1sqr_main_fwd` — concat 15+15 → 30
 //! 23. `concat_l1sqr_main_grad` — split 30 → 15+15
 //! 24. `elementwise_add` — a+b → c (forward + grad-copy 両用)
+//! 25. `slice_extract_2d` — 2D row 範囲を切り出し (l1_main / l1_skip の slice_rows)
+//! 26. `slice_scatter_2d` — 2D row 範囲へ書き戻し (l1_main / l1_skip slice の backward)
 //!
 //! ## cuda-oxide 制限への対応 (Stage 1-5〜2-7 で確立)
 //!
@@ -60,13 +62,13 @@
 //! - atomic add パターン: `unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicX) }
 //!   .fetch_add(_, AtomicOrdering::Relaxed)`
 //!
-//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す):
+//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 26 個):
 //! `sparse_ft_forward,sparse_ft_backward,loss_wdl,screlu_grad,adamw_step,radam_step,
 //! ranger_lookahead_lerp,ft_post_perspective_fwd,ft_post_perspective_grad,dense_mm_fwd,
 //! dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,dense_mm_fwd_bucket,
 //! dense_mm_bwd_input_bucket,dense_mm_bwd_weight_bucket,bias_grad_bucket,crelu_fwd,
 //! crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,concat_l1sqr_main_fwd,
-//! concat_l1sqr_main_grad,elementwise_add`
+//! concat_l1sqr_main_grad,elementwise_add,slice_extract_2d,slice_scatter_2d`
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -768,43 +770,54 @@ pub fn dense_mm_bwd_input_bucket(
     }
 }
 
-/// Per-bucket dense matmul backward (wrt weight, atomic accumulate)。
-/// `grad_w[bucket][o][i] += sum_{b ∈ bucket} x[b][i] * dy[b][o]`。
-/// 1 thread = 1 (batch, out_index, in_index) tuple、bucket 内で多 thread が同 weight cell に
-/// 書き込むため atomic。host が呼出前に `grad_w` を 0 初期化。
+/// Per-bucket dense matmul backward (wrt weight)。
+/// `grad_w[bucket][o][i] = sum_{b: bucket_idx[b]==bucket} x[b][i] * dy[b][o]` (overwrite、atomics 不要)。
+///
+/// 1 thread = 1 (bucket, out_index, in_index) weight cell。batch を inner loop で回し、
+/// `bucket_idx[b]` が自分の bucket の position だけ accumulate する。non-bucket 版
+/// `dense_mm_bwd_weight` と同じ「1 cell = 1 thread + batch loop」形なので atomic scatter
+/// は不要 (旧実装は 1 thread = 1 (batch, out, in) で同 weight cell へ多 thread atomic add
+/// していた → bucket 偏りで contention 大、Stage 3-quality #77 で本形に変更)。
+/// Layout: `grad_w` row-major (num_buckets * out_dim × in_dim) — bucket-major、その中 out-major
+/// (= `dense_mm_fwd_bucket` の weight layout と一致、`tid == grad_w index`)。
+/// out-of-range bucket (`bucket_idx[b] < 0` 等) の position はどの bucket cell にも match
+/// しないので無視される (旧実装の silent skip と同じ)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket(
     x: &[f32],
     dy: &[f32],
     bucket_idx: &[i32],
-    grad_w: &[f32],
+    mut grad_w: DisjointSlice<f32>,
     batch: u32,
     in_dim: u32,
     out_dim: u32,
     num_buckets: u32,
 ) {
     let tid = thread::index_1d();
-    let per_batch = (out_dim as usize) * (in_dim as usize);
-    let total = (batch as usize) * per_batch;
+    let per_bucket = (out_dim as usize) * (in_dim as usize);
+    let total = (num_buckets as usize) * per_bucket;
     if tid.get() >= total {
         return;
     }
-    let bi = tid.get() / per_batch;
-    let rem = tid.get() % per_batch;
+    let buc_u = tid.get() / per_bucket;
+    let rem = tid.get() % per_bucket;
     let oi = rem / (in_dim as usize);
     let ii = rem % (in_dim as usize);
-    let buc = bucket_idx[bi];
-    if buc < 0 || (buc as u32) >= num_buckets {
-        return;
+    // num_buckets は小さい (= 9) ので buc_u as i32 は wrap しない。負の bucket_idx は match しない。
+    let target_buc = buc_u as i32;
+    let mut sum = 0.0_f32;
+    let mut b: u32 = 0;
+    while b < batch {
+        let bb = b as usize;
+        if bucket_idx[bb] == target_buc {
+            sum += x[bb * (in_dim as usize) + ii] * dy[bb * (out_dim as usize) + oi];
+        }
+        b += 1;
     }
-    let buc_u = buc as usize;
-    let xv = x[bi * (in_dim as usize) + ii];
-    let dyv = dy[bi * (out_dim as usize) + oi];
-    let w_idx = buc_u * (out_dim as usize) * (in_dim as usize) + oi * (in_dim as usize) + ii;
-    // SAFETY: w_idx < num_buckets * out_dim * in_dim, host が grad_w.len() = same 確保。
-    let cell = unsafe { &*(grad_w.as_ptr().add(w_idx) as *const DeviceAtomicF32) };
-    cell.fetch_add(xv * dyv, AtomicOrdering::Relaxed);
+    if let Some(g) = grad_w.get_mut(tid) {
+        *g = sum;
+    }
 }
 
 /// Per-bucket bias gradient (atomic accumulate)。
@@ -1045,7 +1058,7 @@ pub fn slice_scatter_2d(
 //
 // Stage 1-9 (`bins/progress_kpabs_train::main.rs:308-539`) / Stage 2 EPIC #16
 // (`experiments/002-fused-kernels/src/main.rs:500-697`) の慣行を踏襲。
-// `kernel_names` のみ 24 個に拡張。
+// `kernel_names` のみ 26 個に拡張。
 // ===========================================================================
 
 #[allow(dead_code)]
@@ -1111,7 +1124,7 @@ fn load_kernel_module_with_fallback(
 }
 
 /// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。Stage 1-9 / Stage 2 と
-/// 同 pipeline、`kernel_names` のみ Stage 3-7 全 24 kernel を内 internalize。
+/// 同 pipeline、`kernel_names` のみ Stage 3-7 全 26 kernel を内 internalize。
 #[allow(dead_code)]
 fn compile_ll_to_ptx_via_llc(
     ll_path: &std::path::PathBuf,
@@ -1268,16 +1281,22 @@ const NUM_BUCKETS: usize = 9; // progress8kpabs
 const FT_POST_SCALE: f32 = 127.0 / 128.0;
 const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
-// Ranger optimizer params (bullet `RangerParams::default()`、v102 で decay=0 override)
-const BETA1: f32 = 0.99;
-const BETA2: f32 = 0.999;
-const EPS: f32 = 1e-8;
-const MIN_W: f32 = -1.98;
-const MAX_W: f32 = 1.98;
-const RANGER_ALPHA: f32 = 0.5;
-const RANGER_K: u64 = 6;
-const DECAY: f32 = 0.0; // v102 weight-decay 0.0
-const N_SMA_THRESHOLD: f32 = 5.0;
+// Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
+// `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する
+// (Stage 3-quality #86: 旧 main.rs での const 二重定義を解消)。
+const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
+    nnue_train::optimizer::RangerParams::DEFAULT;
+const BETA1: f32 = RANGER_DEFAULTS.beta1;
+const BETA2: f32 = RANGER_DEFAULTS.beta2;
+const EPS: f32 = RANGER_DEFAULTS.eps;
+const MIN_W: f32 = RANGER_DEFAULTS.min_weight;
+const MAX_W: f32 = RANGER_DEFAULTS.max_weight;
+const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
+const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
+const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
+// v102 は weight-decay を 0.0 に override する (`RangerParams::DEFAULT.decay` = 0.01 は
+// bullet の汎用 default、本 trainer は recipe どおり 0.0 を使う、memory project_v102_recipe.md)。
+const DECAY: f32 = 0.0;
 
 // loss_wdl params (v102 doc: scale=290, wdl=0.0)
 const WDL_LAMBDA: f32 = 0.0;
@@ -1704,8 +1723,10 @@ impl GpuTrainer {
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
-    /// 24 kernel で再現。Backward path (~16 step): forward 逆順、`*_grad` buffer は本 method
-    /// 内で 0 init してから atomic accumulate。Optimizer: 10 weight groups × `radam_step`
+    /// 本 file の `#[kernel]` 群で再現。Backward path (~16 step): forward 逆順、`*_grad`
+    /// buffer は本 method 内で 0 init してから kernel が書き込む (per-bucket weight grad
+    /// `dense_mm_bwd_weight_bucket` は 1 cell = 1 thread の overwrite、FT / L1f / bias の
+    /// grad は atomic accumulate)。Optimizer: 10 weight groups × `radam_step`
     /// (+ 周期 `ranger_lookahead_lerp`)。
     fn step(
         &mut self,
@@ -2020,12 +2041,13 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_weight_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            // L3: in_dim=L2_OUT, out_dim=1 → grid = num_buckets * out_dim(=1) * in_dim
+            config: cfg_1d(NUM_BUCKETS * L2_OUT),
             args: [
                 slice(l2_acted),
                 slice(dy_net_output),
                 slice(bucket_idx_dev),
-                slice(self.l3_w_grad),
+                slice_mut(self.l3_w_grad),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2076,12 +2098,13 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_weight_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT * L2_IN),
+            // L2: in_dim=L2_IN, out_dim=L2_OUT → grid = num_buckets * out_dim * in_dim
+            config: cfg_1d(NUM_BUCKETS * L2_OUT * L2_IN),
             args: [
                 slice(l2_input),
                 slice(dl2_out),
                 slice(bucket_idx_dev),
-                slice(self.l2_w_grad),
+                slice_mut(self.l2_w_grad),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2246,12 +2269,13 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_weight_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT * FT_OUT),
+            // L1: in_dim=FT_OUT, out_dim=L1_OUT → grid = num_buckets * out_dim * in_dim
+            config: cfg_1d(NUM_BUCKETS * L1_OUT * FT_OUT),
             args: [
                 slice(combined),
                 slice(dl1_total),
                 slice(bucket_idx_dev),
-                slice(self.l1_w_grad),
+                slice_mut(self.l1_w_grad),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2481,9 +2505,12 @@ impl GpuTrainer {
 
         self.stream.synchronize()?;
 
-        // Read loss
+        // Read loss (`loss_acc` は 1-cell f64 buffer。空なら異常 → error にして無防備 index を避ける)
         let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
-        Ok(loss_vec[0])
+        loss_vec
+            .first()
+            .copied()
+            .ok_or_else(|| -> Box<dyn std::error::Error> { "loss_acc buffer is empty".into() })
     }
 }
 

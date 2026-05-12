@@ -276,16 +276,19 @@ pub fn build_arch_str(
 /// rshogi-oss `network_layer_stacks.rs:193, 215` は本 hash を読み飛ばすが、bullet
 /// 出力との byte 完全互換のために本リポでも computed value を使う (Stage 3-9
 /// 自己対局検証で network_hash の sanity を bullet と揃える目的)。
-pub fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
+pub const fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
     // InputSlice hash (FT output × 2 dual perspective を XOR)
     let mut prev_hash: u32 = 0xEC42E90D;
     prev_hash ^= (ft_out * 2) as u32;
 
     // bullet `shogi_layerstack.rs:1066` の layer_sizes (第 1 element は ft_out で
     // bullet の関数内 parameter 名 `l1_out` を踏襲、has_relu=true)、
-    // 第 2 element は l2_out (has_relu=true)、第 3 element は 1 (has_relu=false)
+    // 第 2 element は l2_out (has_relu=true)、第 3 element は 1 (has_relu=false)。
+    // const fn なので `for` イテレータは使えず index ベースの `while` で回す。
     let layer_sizes = [(ft_out, true), (l2_out, true), (1_usize, false)];
-    for (out_features, has_relu) in layer_sizes {
+    let mut i = 0;
+    while i < layer_sizes.len() {
+        let (out_features, has_relu) = layer_sizes[i];
         let mut layer_hash: u32 = 0xCC03DAE4;
         layer_hash = layer_hash.wrapping_add(out_features as u32);
         layer_hash ^= prev_hash >> 1;
@@ -294,6 +297,7 @@ pub fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
             layer_hash = layer_hash.wrapping_add(0x538D24C7);
         }
         prev_hash = layer_hash;
+        i += 1;
     }
     prev_hash
 }
@@ -302,29 +306,10 @@ pub fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
 pub const FT_HASH: u32 = 0x7f134cb8 ^ (FT_OUT as u32 * 2);
 
 /// per-bucket fc_hash。bullet `compute_layerstack_fc_hash(FT_OUT, L2_IN, L2_OUT)` 相当。
-/// (ft_out=1536, l2_in=30, l2_out=32) 固定値、本実装で const 展開済。
-pub const FC_HASH: u32 = {
-    // bullet `compute_layerstack_fc_hash` の loop を unroll 済 (const 関数で展開)
-    let mut prev: u32 = 0xEC42E90D ^ ((FT_OUT * 2) as u32);
-    // Layer 1 (has_relu = true、out = FT_OUT)
-    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(FT_OUT as u32);
-    lh ^= prev >> 1;
-    lh ^= prev << 31;
-    lh = lh.wrapping_add(0x538D24C7);
-    prev = lh;
-    // Layer 2 (has_relu = true、out = L2_OUT)
-    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(L2_OUT as u32);
-    lh ^= prev >> 1;
-    lh ^= prev << 31;
-    lh = lh.wrapping_add(0x538D24C7);
-    prev = lh;
-    // Output layer (has_relu = false、out = 1)
-    let mut lh: u32 = 0xCC03DAE4u32.wrapping_add(1);
-    lh ^= prev >> 1;
-    lh ^= prev << 31;
-    prev = lh;
-    prev
-};
+/// (ft_out=1536, l2_in=30, l2_out=32) 固定値を `compute_fc_hash` (const fn) で評価
+/// (Stage 3-quality #86: 旧実装はここに loop を手 unroll した別 const 式を持っていたが、
+/// `compute_fc_hash` を const fn 化して単一ソースにまとめた)。
+pub const FC_HASH: u32 = compute_fc_hash(FT_OUT, L2_IN, L2_OUT);
 
 pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 
@@ -501,6 +486,13 @@ impl V102Weights {
     /// 都合上、本実装では l1_w (per-bucket delta) と l1f_w (shared) を完全分離して保持
     /// したいが、merge された状態しか取れない場合は **l1_w に merged 値をそのまま入れ、
     /// l1f_w / l1f_b を 0 にする** 方針で復元 (forward 計算は等価)。
+    ///
+    /// **継続学習時の注意**: forward は等価でも、l1f が「shared factorized 部」として
+    /// 持つ意味は失われている (全部 l1_w に畳まれた)。bullet で per-bucket l1 と shared
+    /// l1f を別々に学習し続ける場合と勾配の流れ方が変わるため、`load_quantised` で得た
+    /// V102Weights から continue-training すると bullet の v102 学習軌跡とは厳密一致しない。
+    /// 検証 (Stage 3-9 #64) で「pretrained 注入 → 1 step → save が byte 互換か」を見る用途、
+    /// あるいは l1f を再び factorize し直す前提なら問題ない。
     pub fn load_quantised<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buf4 = [0u8; 4];
 

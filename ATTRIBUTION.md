@@ -11,6 +11,31 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-quality / perf-P2 (2026-05-12)
+
+bullet からの新規 vendor は無し。3-observer code review (2026-05-12) 指摘の品質修正
+(#86) + perf P2 (#77、EPIC #75) のみ:
+
+- `bins/nnue_train/src/main.rs::dense_mm_bwd_weight_bucket` を「1 thread = 1 (bucket,
+  out, in) weight cell + batch inner loop」形に書き換え (atomic scatter 撤廃)。bullet
+  上流で同等の per-bucket weight grad を runtime-fused でどう生成するかは変わらないが、
+  本リポの hand-fused 実装としては non-bucket 版 `dense_mm_bwd_weight` と同流儀に統一
+- `crates/nnue-train/src/optimizer.rs::RangerParams::DEFAULT` (const) を追加。bullet
+  `RangerParams::default()` の値を single source of truth とし、`bins/nnue_train` の
+  Ranger const (BETA1/BETA2/EPS/MIN_W/MAX_W/RANGER_ALPHA/RANGER_K/N_SMA_THRESHOLD) は
+  これを参照 (旧 main.rs の二重定義を解消、bullet 由来値との対応が 1 箇所で追える)
+- `crates/nnue-format/src/v102_layerstack.rs::compute_fc_hash` を `const fn` 化し、
+  `FC_HASH` const を `compute_fc_hash(...)` 評価に置換 (旧実装の手 unroll した別 const
+  式を削除、bullet `compute_layerstack_fc_hash` との対応が 1 箇所)
+- `crates/shogi-format/src/packed_sfen.rs::sfen()` の `unsafe` 生ポインタ cast に
+  詳細 SAFETY コメント補強 (`#[repr(C)]` layout / align=1 / `[u8;N]` の bit pattern /
+  lifetime)、`unsafe impl Send/Sync` のコメントも `// SAFETY:` 形式に
+- doc 修正: `bins/nnue_train` の kernel 数コメント 24 → 26 (`slice_extract_2d` /
+  `slice_scatter_2d` を NEW list に追記)、`dense_mm_bwd_weight_bucket` の説明を
+  「atomic」から新実装に更新、`load_quantised` の docstring に「continue-training 時
+  l1f を畳んだ影響で bullet の学習軌跡とは厳密一致しない」注を追記、`GpuTrainer::step`
+  の末尾 `loss_vec[0]` 無防備 index を `.first().copied().ok_or(...)` に
+
 #### Stage 3-8 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - **`crates/nnue-train/src/trainer.rs`** (新規): superbatch training loop driver。
