@@ -68,6 +68,10 @@
 //! crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,concat_l1sqr_main_fwd,
 //! concat_l1sqr_main_grad,elementwise_add`
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64};
 use cuda_device::{DisjointSlice, kernel, thread};
 #[allow(unused_imports)]
@@ -76,8 +80,12 @@ use cuda_host::cuda_launch;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
 use nnue_format::V102Weights;
+use nnue_train::dataloader::Batch;
 #[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
+use nnue_train::schedule::{ConstantWDL, StepLR};
+use nnue_train::trainer::{TrainerBackend, TrainingConfig};
+use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 // ===========================================================================
 // STATED kernels — Stage 2 (PR #46-#52) で landed、本 bin に inline copy
@@ -1399,6 +1407,51 @@ impl BatchData {
             per_pos_norm: vec![1.0_f32; n_pos],
         }
     }
+
+    /// `nnue-train` dataloader の `Batch` + per-position bucket から `BatchData`
+    /// を作る (Stage 3-8 trainer integrate)。
+    ///
+    /// `Batch` は `batch_size * max_active` 容量を持つが有効件数は `n_positions`
+    /// なので、sparse index は先頭 `n_positions * MAX_ACTIVE` 要素だけ切り出す。
+    /// `Batch::max_active` は HalfKA_hm の `MAX_ACTIVE_FEATURES` (= `MAX_ACTIVE`
+    /// = 40) を前提とする。
+    ///
+    /// `per_pos_norm` は **`1.0 / n_pos`** にする: `loss_wdl` kernel は per-position
+    /// gradient に `per_pos_norm` を掛けて backward に流すため、これで weight
+    /// gradient が batch 平均になり (atomic accumulate 後)、learning rate が
+    /// batch size に依存しなくなる (bullet の `mean` reduction と同じ意味)。
+    /// 報告 loss は `loss_acc` (= `Σ err²`) を position 数で割って平均にする
+    /// (kernel 側は `loss_acc` を norm で割らずに raw `err²` を足す)。
+    fn from_batch(batch: &Batch, bucket_idx: &[i32]) -> Self {
+        let n_pos = batch.n_positions;
+        assert_eq!(
+            bucket_idx.len(),
+            n_pos,
+            "bucket_idx len ({}) must equal batch.n_positions ({})",
+            bucket_idx.len(),
+            n_pos
+        );
+        assert_eq!(
+            batch.max_active, MAX_ACTIVE,
+            "Batch::max_active ({}) must equal MAX_ACTIVE ({})",
+            batch.max_active, MAX_ACTIVE
+        );
+        let span = n_pos * MAX_ACTIVE;
+        let norm = if n_pos == 0 {
+            0.0
+        } else {
+            1.0_f32 / n_pos as f32
+        };
+        Self {
+            n_pos,
+            stm_indices: batch.stm_indices[..span].to_vec(),
+            nstm_indices: batch.nstm_indices[..span].to_vec(),
+            bucket_idx: bucket_idx.to_vec(),
+            score: batch.score[..n_pos].to_vec(),
+            wdl: batch.wdl[..n_pos].to_vec(),
+            per_pos_norm: vec![norm; n_pos],
+        }
+    }
 }
 
 /// `LaunchConfig` builder for 1D launch with `BLOCK_DIM` per block.
@@ -1654,7 +1707,13 @@ impl GpuTrainer {
     /// 24 kernel で再現。Backward path (~16 step): forward 逆順、`*_grad` buffer は本 method
     /// 内で 0 init してから atomic accumulate。Optimizer: 10 weight groups × `radam_step`
     /// (+ 周期 `ranger_lookahead_lerp`)。
-    fn step(&mut self, batch: &BatchData, lr: f32) -> Result<f64, Box<dyn std::error::Error>> {
+    fn step(
+        &mut self,
+        batch: &BatchData,
+        lr: f32,
+        wdl_lambda: f32,
+        loss_scale: f32,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
             return Ok(0.0);
@@ -1911,7 +1970,7 @@ impl GpuTrainer {
                 slice(norm_dev),
                 slice_mut(dy_net_output),
                 slice(self.loss_acc),
-                WDL_LAMBDA, LOSS_SCALE, b_u32
+                wdl_lambda, loss_scale, b_u32
             ]
         }?;
 
@@ -2429,7 +2488,257 @@ impl GpuTrainer {
 }
 
 // step() 実装は別 impl block (file 分割回避のため同 file 内)。
-// 続いて smoke main() を main.rs 末尾に追加。
+
+// ===========================================================================
+// TrainerBackend impl — `nnue-train::trainer::run` から 1 batch ずつ呼ばれる
+// ===========================================================================
+
+impl TrainerBackend for GpuTrainer {
+    fn train_step(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        lr: f32,
+        wdl_lambda: f32,
+        loss_scale: f32,
+    ) -> std::io::Result<f64> {
+        let data = BatchData::from_batch(batch, bucket_idx);
+        self.step(&data, lr, wdl_lambda, loss_scale)
+            .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
+    }
+
+    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
+        let weights = self.to_v102_weights().map_err(|e| {
+            std::io::Error::other(format!("GpuTrainer::to_v102_weights failed: {e}"))
+        })?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+        weights.save_quantised(&mut writer)?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// CLI (clap) — Stage 3-8 (#65)、bullet `examples/shogi_layerstack.rs` の引数群を
+// v102 recipe (memory project_v102_recipe.md) に合わせて受ける
+// ===========================================================================
+
+/// bullet-shogi v102 互換 HalfKA_hm 1536-16-32 LayerStack NNUE trainer。
+///
+/// `--data <PSV>` を指定すると training loop を回す。省略すると GPU smoke test
+/// (`GpuTrainer` の forward/backward path 確認、Stage 3-7 由来) を実行する。
+#[derive(Parser, Debug)]
+#[command(name = "nnue-train", about = "rshogi NNUE trainer (v102 LayerStack)")]
+struct Cli {
+    /// 教師データ PSV ファイル (`PackedSfenValue` × N、各 40 bytes)。省略時は GPU smoke test。
+    #[arg(long)]
+    data: Option<PathBuf>,
+
+    /// checkpoint 出力先 directory (`{net_id}-{superbatch}.bin` を書き出す)。
+    #[arg(long, default_value = "checkpoints")]
+    output: PathBuf,
+
+    /// network id (checkpoint file 名に使う)。
+    #[arg(long, default_value = "rshogi")]
+    net_id: String,
+
+    /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
+    /// v102 recipe は 400 (memory project_v102_recipe.md)。
+    #[arg(long, default_value_t = 10)]
+    superbatches: usize,
+
+    /// 1 superbatch あたりの batch 数 (v102 recipe = 6104)。
+    #[arg(long, default_value_t = 6104)]
+    batches_per_superbatch: usize,
+
+    /// 1 batch あたりの position 数。default 16384 は本リポ既定、v102 recipe は 65536。
+    #[arg(long, default_value_t = 16384)]
+    batch_size: usize,
+
+    /// 初期 learning rate。
+    #[arg(long, default_value_t = 8.75e-4)]
+    lr: f32,
+
+    /// LR gamma (`lr_step` superbatch ごとに gamma 倍)。
+    #[arg(long, default_value_t = 0.995)]
+    lr_gamma: f32,
+
+    /// LR step (gamma 倍する superbatch 間隔)。
+    #[arg(long, default_value_t = 1)]
+    lr_step: usize,
+
+    /// WDL blend lambda (constant)。
+    #[arg(long, default_value_t = 0.0)]
+    wdl: f32,
+
+    /// sigmoid score scale (`loss_scale = 1 / scale`)。
+    #[arg(long, default_value_t = 290.0)]
+    scale: f32,
+
+    /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
+    #[arg(long, default_value_t = 20)]
+    save_rate: usize,
+
+    /// progress8kpabs 係数ファイル (YaneuraOu 互換 `progress.bin`、f64 LE × 81*FE_OLD_END)。
+    /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
+    #[arg(long)]
+    progress_coeff: Option<PathBuf>,
+
+    /// `|score| >= score_drop_abs` の position を loss から除外する (bullet `--score-drop-abs`)。
+    #[arg(long)]
+    score_drop_abs: Option<i32>,
+
+    /// 学習開始前に量子化 v102 NNUE binary から weight を注入する (pretrained start)。
+    #[arg(long)]
+    init_from: Option<PathBuf>,
+
+    // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---
+    /// (受けるが未配線) win-rate-model loss。指定時 warning を出す (loss は sigmoid-MSE のまま)。
+    #[arg(long)]
+    win_rate_model: bool,
+    /// (受けるが未配線) WRM in-scaling。
+    #[arg(long, default_value_t = 340.0)]
+    wrm_in_scaling: f32,
+    /// (受けるが未配線) WRM nnue2score。
+    #[arg(long, default_value_t = 600.0)]
+    wrm_nnue2score: f32,
+    /// optimizer 名 ("ranger" のみ実装)。
+    #[arg(long, default_value = "ranger")]
+    optimizer: String,
+    /// weight decay (kernel は 0.0 固定、非 0 指定で warning)。
+    #[arg(long, default_value_t = 0.0)]
+    weight_decay: f32,
+    /// (受けるが未使用) dataloader thread 数。本実装は single-thread sequential read。
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
+    /// bucket mode ("progress8kpabs" のみ実装)。
+    #[arg(long, default_value = "progress8kpabs")]
+    bucket_mode: String,
+    /// (受けるが未実装) epoch ごとに file shuffle する。本実装は逐次 read + EOF wrap。
+    #[arg(long)]
+    epoch_file_shuffle: bool,
+    /// (受けるが未使用) file shuffle seed。
+    #[arg(long, default_value_t = 0)]
+    file_shuffle_seed: u64,
+}
+
+fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let data = cli.data.as_ref().expect("run_training called with --data");
+
+    // --- 未実装フラグの validation / warning ---
+    if cli.bucket_mode != "progress8kpabs" {
+        return Err(format!(
+            "--bucket-mode '{}' is not implemented (only 'progress8kpabs')",
+            cli.bucket_mode
+        )
+        .into());
+    }
+    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
+        return Err(format!(
+            "--optimizer '{}' is not implemented (only 'ranger')",
+            cli.optimizer
+        )
+        .into());
+    }
+    // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss_scale しか見ない)。
+    if !(cli.lr.is_finite() && cli.lr > 0.0) {
+        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
+    }
+    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
+        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
+    }
+    if !(cli.scale.is_finite() && cli.scale > 0.0) {
+        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
+    }
+    if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
+        return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
+    }
+    if cli.weight_decay != 0.0 {
+        eprintln!(
+            "[train] warning: --weight-decay {} ignored; the Ranger kernel uses weight-decay 0.0 (v102)",
+            cli.weight_decay
+        );
+    }
+    if cli.win_rate_model {
+        eprintln!(
+            "[train] warning: --win-rate-model is not yet wired into the loss kernel; \
+             using sigmoid-MSE with --scale {} (--wrm-in-scaling {} / --wrm-nnue2score {} ignored)",
+            cli.scale, cli.wrm_in_scaling, cli.wrm_nnue2score
+        );
+    }
+    if cli.epoch_file_shuffle {
+        eprintln!(
+            "[train] warning: --epoch-file-shuffle is not implemented; reading {} sequentially and wrapping at EOF (--file-shuffle-seed {} ignored)",
+            data.display(),
+            cli.file_shuffle_seed
+        );
+    }
+    let _ = cli.threads; // dataloader は single-thread sequential read
+
+    std::fs::create_dir_all(&cli.output)?;
+
+    // progress8kpabs weights (process-global; 未指定なら zero → 全 bucket 4)
+    let progress = match &cli.progress_coeff {
+        Some(p) => {
+            println!("[train] loading progress8kpabs coeff: {}", p.display());
+            ShogiProgressKPAbs::load_from_bin(p).map_err(|e| -> Box<dyn std::error::Error> {
+                format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+            })?
+        }
+        None => {
+            eprintln!(
+                "[train] note: --progress-coeff not given; all positions map to bucket 4 (sigmoid(0) = 0.5)"
+            );
+            ShogiProgressKPAbs
+        }
+    };
+
+    let ctx = CudaContext::new(0)?;
+    println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
+    let mut trainer = GpuTrainer::new(&ctx)?;
+    if let Some(init) = &cli.init_from {
+        println!(
+            "[train] injecting pretrained weights from {}",
+            init.display()
+        );
+        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+        let weights = V102Weights::load_quantised(&mut reader)?;
+        trainer.load_v102_weights(&weights)?;
+    }
+
+    let lr_scheduler = StepLR {
+        start: cli.lr,
+        gamma: cli.lr_gamma,
+        step: cli.lr_step.max(1),
+    };
+    let wdl_scheduler = ConstantWDL { value: cli.wdl };
+    let cfg = TrainingConfig {
+        net_id: cli.net_id.clone(),
+        output_dir: cli.output.clone(),
+        start_superbatch: 1,
+        end_superbatch: cli.superbatches,
+        batches_per_superbatch: cli.batches_per_superbatch,
+        batch_size: cli.batch_size,
+        save_rate: cli.save_rate,
+        loss_scale: 1.0 / cli.scale,
+        score_drop_abs: cli.score_drop_abs,
+    };
+
+    nnue_train::trainer::run(
+        &mut trainer,
+        data,
+        &progress,
+        &lr_scheduler,
+        &wdl_scheduler,
+        &cfg,
+    )?;
+    Ok(())
+}
 
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
@@ -2468,7 +2777,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // forward + step 1 batch
         let batch = BatchData::smoke_dummy(4);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr)?;
+        let loss = trainer.step(&batch, lr, WDL_LAMBDA, LOSS_SCALE)?;
         println!("[smoke] step 1 (post-v102-100 init): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -2492,7 +2801,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(4);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr)?;
+        let loss = trainer.step(&batch, lr, WDL_LAMBDA, LOSS_SCALE)?;
         println!("[smoke] step 1: loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -2515,7 +2824,13 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> std::process::ExitCode {
-    match smoke_test() {
+    let cli = Cli::parse();
+    let result = if cli.data.is_some() {
+        run_training(&cli)
+    } else {
+        smoke_test()
+    };
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
