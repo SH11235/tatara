@@ -11,6 +11,78 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3-8 (2026-05-12, bullet-shogi commit `f275eb9`)
+
+- **`crates/nnue-train/src/trainer.rs`** (新規): superbatch training loop driver。
+  - bullet `crates/bullet_lib/src/value.rs::ValueTrainerInner::train_custom`
+    相当の loop を `TrainerBackend` trait 越しに駆動 (per superbatch:
+    `LrScheduler::lr` / `WdlScheduler::blend` → PSV batch + per-position bucket
+    → `TrainerBackend::train_step` → loss 集計; per `save_rate` superbatch:
+    `TrainerBackend::save_checkpoint`)。Stage 1 `bins/progress_kpabs_train::
+    train_one_epoch` 流儀の直書き loop で、bullet `bullet_core::Trainer` /
+    `DataLoader` trait / `LoggingConfig` には依存しない (Stage 1-1 / 3-1 / 3-4
+    と同じ bullet trait 削除ポリシー)。GPU step 本体は trait 越しに bin 側
+    (`bins/nnue_train::GpuTrainer`) が担い、本 module は CPU-only に保つ
+    (Stage 3-0 規約)
+  - per-position output bucket は progress8kpabs (`ShogiProgressKPAbs::bucket`、
+    `crates/shogi-features/src/progress_kpabs.rs`、Stage 3-1 で bullet
+    `crates/bullet_lib/src/game/outputs.rs::ShogiProgressKPAbs` を vendor 済)
+  - bullet `examples/shogi_layerstack.rs:1469-1495` の `display_step_log` 相当の
+    progress log (`superbatch X/Y | loss | pos/s | lr | wdl | ETA`)
+  - bullet `--score-drop-abs` (`5c4871c`: `|score| >= t` の per-position loss
+    weight を 0 にする) は本実装では「batch に push しない (skip)」で近似
+    (loss/gradient へ寄与しない点は同じ、batch slot 割当・順序は厳密一致しない)
+  - bullet `--epoch-file-shuffle` は本 stage では未実装 (CLI フラグは受けるが
+    no-op、`PsvFileLoader` を逐次 read + EOF で同 file を開き直して次 epoch)
+
+- **`bins/nnue_train/src/main.rs`** に CLI 統合 (Stage 3-7 で landed した
+  `GpuTrainer` を `nnue_train::trainer::run` で駆動):
+  - bullet `examples/shogi_layerstack.rs` の CLI 引数群を v102 recipe (memory
+    `project_v102_recipe.md`) に合わせて `clap` で受ける (`--data` / `--output` /
+    `--net-id` / `--superbatches` / `--batches-per-superbatch` / `--batch-size` /
+    `--lr` / `--lr-gamma` / `--lr-step` / `--wdl` / `--scale` / `--save-rate` /
+    `--progress-coeff` / `--score-drop-abs` / `--init-from`、および互換のため
+    受けるが本 stage 未配線の `--win-rate-model` / `--wrm-in-scaling` /
+    `--wrm-nnue2score` / `--optimizer` / `--weight-decay` / `--threads` /
+    `--bucket-mode` / `--epoch-file-shuffle` / `--file-shuffle-seed`)
+  - `--data` 省略時は Stage 3-7 の GPU smoke test を実行する (後方互換)
+  - `GpuTrainer::step` は Stage 3-7 の固定 const `WDL_LAMBDA` / `LOSS_SCALE`
+    を引数 (`wdl_lambda` / `loss_scale`) に変更し、CLI の `--wdl` / `--scale`
+    から渡せるようにした (smoke test は引き続き const を渡す)
+  - `BatchData::from_batch` で dataloader `Batch` + per-position bucket を
+    `GpuTrainer::step` 入力に変換。`per_pos_norm = 1/n_pos` で weight gradient を
+    batch 平均にし (bullet の `mean` reduction と同義、`loss_wdl` kernel が
+    per-position gradient に `per_pos_norm` を掛ける)、learning rate を batch
+    size 非依存にする
+
+新規追加 (bullet 由来ではない):
+
+- `crates/nnue-train/src/trainer.rs` の `TrainerBackend` trait / `TrainingConfig`
+  struct (+`validate`: superbatch 範囲 / batch 構成 / save_rate / loss_scale /
+  score_drop_abs `>= 1` を reject) / `EpochStream` (PSV を EOF で開き直す stream +
+  score-drop skip + per-position bucket 計算 + 空 file / 全 drop の無限ループ検出
+  `MAX_BARREN_PASSES`) / `format_hms` — bullet 上流に対応する独立 API は無い
+  (loop の組み立てのみ bullet `ValueTrainerInner` を参照)
+- `crates/nnue-train/src/trainer.rs` の test 4 件 (`run_drives_superbatches_and_
+  writes_checkpoints` / `empty_data_file_errors_instead_of_looping_forever` /
+  `config_validate_rejects_bad_ranges` / `format_hms_renders_expected_buckets`、
+  mock `TrainerBackend` で GPU 非依存に検証) — `crates/nnue-train` の test は
+  本 PR 後 計 44 件 (= 既存 40 + trainer 4)
+- `bins/nnue_train/src/main.rs` の `Cli` struct / `run_training` (`--bucket-mode` /
+  `--optimizer` の対応値チェック + `--lr` / `--lr-gamma` / `--scale` / `--wdl` の
+  finite / 範囲チェックで NaN・不正値を kernel に流さない) / `impl TrainerBackend
+  for GpuTrainer` / `BatchData::from_batch`
+
+検証成果:
+
+- ローカル sm_75 (RTX 2070 SUPER) で `sample.psv` (100 records) を入力に
+  `--superbatches 30 --batches-per-superbatch 8 --batch-size 100 --lr 1.0` で
+  完走、loss が `0.114 → 0.092 → 0.032 → 0.013 → … → 0.006` と (初期 transient 後)
+  単調減少することを確認 (`--progress-coeff` 指定版でも同様に減少)。出力
+  checkpoint `.bin` が `rshogi-oss/target/release/verify_nnue_accumulator
+  --ls-progress-coeff progress.bin --moves 10` で **Total: 10, Pass: 10, ALL
+  PASSED**。`--data` 省略時の Stage 3-7 GPU smoke test も引き続き PASS
+
 #### Stage 3-7 (2026-05-12, bullet-shogi commit `f275eb9`)
 
 - **`bins/nnue_train/src/main.rs`** に v102 LayerStack 1536-16-32 + progress8kpabs

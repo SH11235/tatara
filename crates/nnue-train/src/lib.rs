@@ -25,11 +25,14 @@
 //!   本 module は CPU-only state + `radam_compute_step_size_denom` host helper
 //!   経由で kernel 引数を pre-compute
 //!
-//! ## 提供予定 module
-//!
-//! - `trainer` (Stage 3-8, #65): main training loop (forward → loss_wdl →
-//!   backward → optimizer step)。`bins/nnue_train::main` から呼ばれる
+//! - `trainer` (Stage 3-8, #65): superbatch training loop driver
+//!   (`TrainerBackend` trait + `TrainingConfig` + `run`)。1 batch 分の GPU step
+//!   は `bins/nnue_train::GpuTrainer` (= `TrainerBackend` impl) が担い、本
+//!   module は superbatch loop / scheduler 呼び出し / PSV stream (epoch wrap +
+//!   score-drop + per-position bucket) / progress log を提供。`bins/nnue_train::
+//!   main` の CLI から `run(...)` を呼ぶ
 
 pub mod dataloader;
 pub mod optimizer;
 pub mod schedule;
+pub mod trainer;
