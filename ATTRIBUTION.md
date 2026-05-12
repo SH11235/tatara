@@ -11,6 +11,14 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3 #78 — GpuTrainer perf P4: 中間/grad buffer 永続化 (2026-05-13、bullet 新規 vendor 無し)
+
+EPIC #75 のサブ issue。`bins/nnue_train/src/main.rs` のみ (bullet 由来コードの変更/追加なし、純粋に性能改善のリファクタ):
+
+- **`GpuTrainer::step_impl` の per-step `DeviceBuffer::*::zeroed` を撤廃**: forward/backward の中間 activation (~30 個、`ft_stm_out`/`combined`/`l1_*`/`l2_*`/`l3_out`/`net_output`/`d*` 等) と grad buffer (10 個、`ft_w_grad` だけで ~450MB) を毎 step `DeviceBuffer::zeroed()` で再確保 → `cudaMalloc`/`cudaFree` が stream を stall させていた (nsys 計測 #76 で malloc/free ≈ step の 23%)。中間 activation を `GpuTrainer` 上の永続 `GpuWorkspace` (新規 struct、`GpuTrainer::new` で `batch_size` 分を確保、より大きな batch が来たら grow-only で再 alloc) に移し、grad / `loss_acc` は再 alloc せず `cuMemsetD8Async(0)` (`cuda_core::memory::memset_d8_async` 経由の generic host helper `memset_zero::<T>`) で in-place reset。
+- **設計判断**: forward の各 activation は読まれる前に kernel が全 cell を上書きするため memset 不要 (workspace が現 batch より大きい末尾は後続 kernel も `b` で bound するので read されない)。例外は `dl1_total` (`slice_scatter_2d` の host 契約「dst を 0 初期化」を守るため毎 step memset)。入力 H2D buffer (`stm_idx_dev` 等) は per-step `DeviceBuffer::from_host` のまま (永続化は Issue #81 / P5 の範囲)。kernel は追加/削除/改名なし (memset は host-side API、`#[kernel]` ではない) → `compile_ll_to_ptx_via_llc` の `kernel_names` / kernel 数コメントは不変。
+- **副作用**: `NNUE_TRAIN_STEP_PROFILE` の `teardown` tick (= per-step buffer の `Drop` = `cuMemFree`) が ~0 に落ちる (drop されるのは入力 H2D buffer のみになるため、期待動作)。数値は不変 (GPU smoke + verify-nnue ALL PASSED、sample.psv 学習 loss 単調減少)。
+
 #### Stage 3 review follow-up (2026-05-13、bullet 新規 vendor 無し)
 
 PR #92 (#84) / PR #91 (#76) の Codex review (P2) 指摘 2 件への follow-up。`bins/nnue_train/src/main.rs` のみ:

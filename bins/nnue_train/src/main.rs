@@ -1378,6 +1378,8 @@ const DECAY: f32 = 0.0;
 // smoke 用 loss params (v102 doc: scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600)。
 // trainer 経路では CLI から `LossKind` を組み立てるのでここは smoke 専用。
 const WDL_LAMBDA: f32 = 0.0;
+/// smoke で使う固定 batch position 数 (`GpuTrainer::new` の workspace 初期 batch にも使う)。
+const SMOKE_BATCH: usize = 4;
 const SMOKE_LOSS_SIGMOID: LossKind = LossKind::Sigmoid { scale: 1.0 / 290.0 };
 const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     nnue2score: 600.0,
@@ -1458,9 +1460,126 @@ struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
+    // 中間 activation / activation-grad の永続 workspace (Issue #78、batch_size 固定前提
+    // で `new` 時に確保。`step_impl` が requires より大きい batch を渡したら拡張)。
+    ws: GpuWorkspace,
+
     // loss + step
     loss_acc: DeviceBuffer<f64>,
     step_count: u64,
+}
+
+/// `GpuTrainer::step_impl` の forward / backward で使う中間 activation と
+/// activation-gradient buffer を **1 step ごとに再 alloc せず永続化** するための
+/// workspace (Issue #78)。
+///
+/// 各 buffer は `len_batch` 個の position 分のサイズで確保され、`step_impl` が
+/// より大きな batch を渡してきたら [`GpuWorkspace::ensure_batch`] で grow-only に
+/// 再 alloc する (典型的には batch_size 固定 + 末尾の partial batch なので拡張は
+/// 起きないか 1 回のみ)。`len_batch == 0` は「まだ未確保」を表す番兵 (実際には
+/// `GpuTrainer::new` で `batch_size` 分を確保するので step 時には常に > 0)。
+///
+/// **メモリ覚書**: forward path は DAG で各 activation は読まれる前に kernel が
+/// 全 cell を上書きするため memset 不要。`ws_batch` が現 batch `b` より大きい場合の
+/// 末尾 `[b*dim .. ws_batch*dim)` は kernel が触らないが、後続 kernel も `b` で
+/// bound するので read されない。例外は `dl1_total`: `slice_scatter_2d` の host
+/// 契約 (「dst を 0 初期化」) を守るため `step_impl` で毎 step memset する。
+/// grad buffer (`GpuTrainer::*_grad`) と `loss_acc` は atomic accumulate semantics
+/// なので `step_impl` で毎 step memset する (元実装の `DeviceBuffer::zeroed` 再 alloc を
+/// memset_async 0 に置換、`cudaMalloc`/`cudaFree` の stream stall を回避)。
+struct GpuWorkspace {
+    /// この workspace が確保している batch (= position) 数。0 = 未確保。
+    len_batch: usize,
+
+    // -- forward activations --
+    ft_stm_out: DeviceBuffer<f32>,    // b × FT_OUT
+    ft_nstm_out: DeviceBuffer<f32>,   // b × FT_OUT
+    combined: DeviceBuffer<f32>,      // b × COMBINED_DIM
+    l1_bucket: DeviceBuffer<f32>,     // b × L1_OUT
+    l1f_out: DeviceBuffer<f32>,       // b × L1_OUT
+    l1_total: DeviceBuffer<f32>,      // b × L1_OUT
+    l1_main: DeviceBuffer<f32>,       // b × L1_EFFECTIVE
+    l1_skip: DeviceBuffer<f32>,       // b × L1_SKIP
+    l1_sqr: DeviceBuffer<f32>,        // b × L1_EFFECTIVE
+    l2_pre: DeviceBuffer<f32>,        // b × L2_IN
+    l2_input: DeviceBuffer<f32>,      // b × L2_IN
+    l2_out: DeviceBuffer<f32>,        // b × L2_OUT
+    l2_acted: DeviceBuffer<f32>,      // b × L2_OUT
+    l3_out: DeviceBuffer<f32>,        // b
+    net_output: DeviceBuffer<f32>,    // b
+    dy_net_output: DeviceBuffer<f32>, // b (loss kernel が書き込む dnet)
+
+    // -- backward activation-grads --
+    dl2_acted: DeviceBuffer<f32>,            // b × L2_OUT
+    dl2_out: DeviceBuffer<f32>,              // b × L2_OUT
+    dl2_input: DeviceBuffer<f32>,            // b × L2_IN
+    dl2_pre: DeviceBuffer<f32>,              // b × L2_IN
+    dl1_sqr: DeviceBuffer<f32>,              // b × L1_EFFECTIVE
+    dl1_main_from_concat: DeviceBuffer<f32>, // b × L1_EFFECTIVE
+    dl1_main_from_sqr: DeviceBuffer<f32>,    // b × L1_EFFECTIVE
+    dl1_main: DeviceBuffer<f32>,             // b × L1_EFFECTIVE
+    dl1_total: DeviceBuffer<f32>,            // b × L1_OUT (毎 step memset、slice_scatter 契約)
+    dcombined_from_l1f: DeviceBuffer<f32>,   // b × FT_OUT
+    dcombined_from_l1: DeviceBuffer<f32>,    // b × FT_OUT
+    dcombined: DeviceBuffer<f32>,            // b × FT_OUT
+    dft_stm_out: DeviceBuffer<f32>,          // b × FT_OUT
+    dft_nstm_out: DeviceBuffer<f32>,         // b × FT_OUT
+}
+
+impl GpuWorkspace {
+    /// `batch` 個の position 分の全 buffer を確保する (`GpuTrainer::new` から呼ぶ)。
+    fn new(stream: &CudaStream, batch: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+            DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
+        };
+        Ok(Self {
+            len_batch: batch,
+            ft_stm_out: z(batch * FT_OUT)?,
+            ft_nstm_out: z(batch * FT_OUT)?,
+            combined: z(batch * COMBINED_DIM)?,
+            l1_bucket: z(batch * L1_OUT)?,
+            l1f_out: z(batch * L1_OUT)?,
+            l1_total: z(batch * L1_OUT)?,
+            l1_main: z(batch * L1_EFFECTIVE)?,
+            l1_skip: z(batch * L1_SKIP)?,
+            l1_sqr: z(batch * L1_EFFECTIVE)?,
+            l2_pre: z(batch * L2_IN)?,
+            l2_input: z(batch * L2_IN)?,
+            l2_out: z(batch * L2_OUT)?,
+            l2_acted: z(batch * L2_OUT)?,
+            l3_out: z(batch)?,
+            net_output: z(batch)?,
+            dy_net_output: z(batch)?,
+            dl2_acted: z(batch * L2_OUT)?,
+            dl2_out: z(batch * L2_OUT)?,
+            dl2_input: z(batch * L2_IN)?,
+            dl2_pre: z(batch * L2_IN)?,
+            dl1_sqr: z(batch * L1_EFFECTIVE)?,
+            dl1_main_from_concat: z(batch * L1_EFFECTIVE)?,
+            dl1_main_from_sqr: z(batch * L1_EFFECTIVE)?,
+            dl1_main: z(batch * L1_EFFECTIVE)?,
+            dl1_total: z(batch * L1_OUT)?,
+            dcombined_from_l1f: z(batch * FT_OUT)?,
+            dcombined_from_l1: z(batch * FT_OUT)?,
+            dcombined: z(batch * FT_OUT)?,
+            dft_stm_out: z(batch * FT_OUT)?,
+            dft_nstm_out: z(batch * FT_OUT)?,
+        })
+    }
+
+    /// `batch` 以上の容量を保証する (grow-only)。現 `len_batch` が足りていれば no-op、
+    /// 足りなければ全 buffer を `batch` 分で再 alloc して `len_batch` を更新する
+    /// (典型的には batch_size 固定なので一度も走らないか、起動時の確保で十分)。
+    fn ensure_batch(
+        &mut self,
+        stream: &CudaStream,
+        batch: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if batch > self.len_batch {
+            *self = Self::new(stream, batch)?;
+        }
+        Ok(())
+    }
 }
 
 /// Smoke / Stage 3-8 trainer 用の 1 batch 入力データ。
@@ -1580,9 +1699,33 @@ fn xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
     v
 }
 
+/// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
+/// 再 alloc を伴わず既存 buffer を in-place で reset するため (Issue #78、grad /
+/// `loss_acc` の毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
+fn memset_zero<T>(
+    stream: &CudaStream,
+    buf: &DeviceBuffer<T>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = buf.num_bytes();
+    if bytes > 0 {
+        // SAFETY: `buf.cu_deviceptr()` は本 `DeviceBuffer` が確保した `bytes` byte の
+        // 有効 device ptr、`stream` は同 context (`buf` も `stream` も `GpuTrainer` が
+        // 同 context から作る)。`cuMemsetD8Async` は overlap を要求しない。0 fill は
+        // f32/f64 ともに数値 0.0 を表すバイトパターン (全 0) なので型に依らず正しい。
+        unsafe {
+            cuda_core::memory::memset_d8_async(buf.cu_deviceptr(), 0, bytes, stream.cu_stream())?;
+        }
+    }
+    Ok(())
+}
+
 impl GpuTrainer {
-    /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state を確保。
-    fn new(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
+    /// 中間 activation workspace (`batch_size` 分、Issue #78) を確保。
+    fn new(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch_size: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
@@ -1668,6 +1811,9 @@ impl GpuTrainer {
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            // 中間 activation workspace (Issue #78、`batch_size` 分。最低 1 で確保して
+            // `len_batch == 0` (未確保) を作らない — smoke は batch=4 等を渡す)。
+            ws: GpuWorkspace::new(&stream, batch_size.max(1))?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             step_count: 0,
@@ -1817,11 +1963,12 @@ impl GpuTrainer {
     ///
     /// 実体は [`GpuTrainer::step_impl`]。本 method は `NNUE_TRAIN_STEP_PROFILE`
     /// プロファイル時の前後 sync と **teardown tick** だけを担う。`step_impl` が
-    /// return すると per-step device buffer (入力 / 中間 activation / 一部 grad) の
-    /// `Drop` (= `cuMemFree`) がそこで走るので、最後の `prof_tick!` を `step_impl`
-    /// の **外** で打つことで free 時間も breakdown に含める (nsys では free が step の
-    /// ~2 割を占める — Issue #76 計測。Issue #78 で workspace 永続化すれば per-step
-    /// alloc/free 自体が消える)。
+    /// return すると per-step device buffer の `Drop` (= `cuMemFree`) がそこで走るので、
+    /// 最後の `prof_tick!` を `step_impl` の **外** で打つことで free 時間も breakdown に
+    /// 含める。Issue #78 で中間 activation / grad buffer を `GpuTrainer` 上の workspace に
+    /// 永続化したため、`step_impl` で drop されるのは入力 H2D buffer (`stm_idx_dev` 等、
+    /// position 数に比例した小さい buffer) だけになり、teardown tick は ~0 に落ちる (期待動作)。
+    /// 入力 H2D の永続化は Issue #81 (P5、pinned + 2-stream) の範囲なので本 issue では未対応。
     fn step(
         &mut self,
         batch: &BatchData,
@@ -1856,10 +2003,15 @@ impl GpuTrainer {
     /// [`LossKind::Wrm`] なら `loss_wrm` (bullet win-rate-model、v102 厳密再現) を起動する。
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
-    /// 本 file の `#[kernel]` 群で再現。Backward path (~16 step): forward 逆順、`*_grad`
-    /// buffer は本 method 内で 0 init してから kernel が書き込む (per-bucket weight grad
-    /// `dense_mm_bwd_weight_bucket` は 1 cell = 1 thread の overwrite、FT / L1f / bias の
-    /// grad は atomic accumulate)。Optimizer: 10 weight groups × `radam_step`
+    /// 本 file の `#[kernel]` 群で再現。中間 activation は `GpuTrainer` 上の永続 workspace
+    /// (`self.ws.*`、Issue #78) を使い回す — forward の各 activation は読まれる前に kernel が
+    /// 全 cell を上書きするので memset 不要。Backward path (~16 step): forward 逆順、`*_grad`
+    /// buffer は本 method 冒頭で `memset_async(0)` で reset してから kernel が書き込む
+    /// (per-bucket weight grad `dense_mm_bwd_weight_bucket` は 1 cell = 1 thread の overwrite、
+    /// FT / L1f / bias の grad は atomic accumulate なので reset 必須。`dl1_total` も
+    /// `slice_scatter_2d` の host 契約を守るため reset)。`loss_acc` も同様に毎 step memset。
+    /// 入力 H2D buffer (`stm_idx_dev` 等) だけは per-step `DeviceBuffer::from_host` のまま
+    /// (永続化は Issue #81 / P5 の範囲)。Optimizer: 10 weight groups × `radam_step`
     /// (+ 周期 `ranger_lookahead_lerp`)。
     ///
     /// `profile_step` / `prof_t0` は呼び出し元 ([`GpuTrainer::step`]) が管理し、本 method
@@ -1880,6 +2032,10 @@ impl GpuTrainer {
             return Ok(0.0);
         }
         let b_u32 = b as u32;
+
+        // 中間 activation workspace を batch `b` 以上に拡張 (grow-only、Issue #78)。
+        // batch_size 固定なら起動時の `GpuWorkspace::new` で足りているので no-op。
+        self.ws.ensure_batch(&self.stream, b)?;
 
         macro_rules! prof_tick {
             ($label:expr) => {
@@ -1904,13 +2060,13 @@ impl GpuTrainer {
         let wdl_dev = DeviceBuffer::from_host(&self.stream, &batch.wdl)?;
         let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
 
-        // loss_acc reset
-        self.loss_acc = DeviceBuffer::<f64>::zeroed(&self.stream, 1)?;
+        // loss_acc reset (accumulate semantics、再 alloc せず memset、Issue #78)
+        memset_zero(&self.stream, &self.loss_acc)?;
         prof_tick!("h2d+reset");
 
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
-        let mut ft_stm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
-        let mut ft_nstm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
+        // 中間 activation は workspace (`self.ws.*`) を使い回す (Issue #78、再 alloc 無し)。
+        // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
         cuda_launch! {
             kernel: sparse_ft_forward,
             stream: self.stream,
@@ -1919,7 +2075,7 @@ impl GpuTrainer {
             args: [
                 slice(self.ft_w),
                 slice(stm_idx_dev),
-                slice_mut(ft_stm_out),
+                slice_mut(self.ws.ft_stm_out),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
             ]
         }?;
@@ -1931,86 +2087,80 @@ impl GpuTrainer {
             args: [
                 slice(self.ft_w),
                 slice(nstm_idx_dev),
-                slice_mut(ft_nstm_out),
+                slice_mut(self.ws.ft_nstm_out),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
             ]
         }?;
 
         // -- Forward step 3: ft_post_perspective_fwd → combined (B × FT_OUT) --
-        let mut combined = DeviceBuffer::<f32>::zeroed(&self.stream, b * COMBINED_DIM)?;
         cuda_launch! {
             kernel: ft_post_perspective_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * COMBINED_DIM),
             args: [
-                slice(ft_stm_out),
-                slice(ft_nstm_out),
+                slice(self.ws.ft_stm_out),
+                slice(self.ws.ft_nstm_out),
                 slice(self.ft_b),
-                slice_mut(combined),
+                slice_mut(self.ws.combined),
                 b_u32, FT_OUT as u32, FT_POST_SCALE
             ]
         }?;
 
         // -- Forward step 4: dense_mm_fwd_bucket L1 → l1_bucket (B × L1_OUT) --
-        let mut l1_bucket = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_OUT),
             args: [
-                slice(combined),
+                slice(self.ws.combined),
                 slice(self.l1_w),
                 slice(self.l1_b),
                 slice(bucket_idx_dev),
-                slice_mut(l1_bucket),
+                slice_mut(self.ws.l1_bucket),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
         // -- Forward step 5: dense_mm_fwd L1f shared → l1f_out (B × L1_OUT) --
-        let mut l1f_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
         cuda_launch! {
             kernel: dense_mm_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_OUT),
             args: [
-                slice(combined),
+                slice(self.ws.combined),
                 slice(self.l1f_w),
                 slice(self.l1f_b),
-                slice_mut(l1f_out),
+                slice_mut(self.ws.l1f_out),
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
 
         // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × L1_OUT) --
-        let mut l1_total = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
         cuda_launch! {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_OUT),
             args: [
-                slice(l1_bucket),
-                slice(l1f_out),
-                slice_mut(l1_total),
+                slice(self.ws.l1_bucket),
+                slice(self.ws.l1f_out),
+                slice_mut(self.ws.l1_total),
                 (b * L1_OUT) as u32
             ]
         }?;
 
         // -- Forward step 7: slice l1_total → l1_main (B × 15) + l1_skip (B × 1) --
-        let mut l1_main = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
-        let mut l1_skip = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_SKIP)?;
         cuda_launch! {
             kernel: slice_extract_2d,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(l1_total),
-                slice_mut(l1_main),
+                slice(self.ws.l1_total),
+                slice_mut(self.ws.l1_main),
                 b_u32, L1_OUT as u32, 0_u32, L1_EFFECTIVE as u32
             ]
         }?;
@@ -2020,115 +2170,108 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * L1_SKIP),
             args: [
-                slice(l1_total),
-                slice_mut(l1_skip),
+                slice(self.ws.l1_total),
+                slice_mut(self.ws.l1_skip),
                 b_u32, L1_OUT as u32, L1_EFFECTIVE as u32, L1_SKIP as u32
             ]
         }?;
 
         // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × 15) --
-        let mut l1_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
         cuda_launch! {
             kernel: abs_pow2_scale_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(l1_main),
-                slice_mut(l1_sqr),
+                slice(self.ws.l1_main),
+                slice_mut(self.ws.l1_sqr),
                 L1_SQR_SCALE,
                 (b * L1_EFFECTIVE) as u32
             ]
         }?;
 
         // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × 30) --
-        let mut l2_pre = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
         cuda_launch! {
             kernel: concat_l1sqr_main_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_IN),
             args: [
-                slice(l1_sqr),
-                slice(l1_main),
-                slice_mut(l2_pre),
+                slice(self.ws.l1_sqr),
+                slice(self.ws.l1_main),
+                slice_mut(self.ws.l2_pre),
                 b_u32, L1_EFFECTIVE as u32, L1_EFFECTIVE as u32
             ]
         }?;
 
         // -- Forward step 10: l2_input = CReLU(l2_pre) (B × 30) --
-        let mut l2_input = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
         cuda_launch! {
             kernel: crelu_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_IN),
             args: [
-                slice(l2_pre),
-                slice_mut(l2_input),
+                slice(self.ws.l2_pre),
+                slice_mut(self.ws.l2_input),
                 (b * L2_IN) as u32
             ]
         }?;
 
         // -- Forward step 11: L2 per-bucket dense → l2_out (B × 32) --
-        let mut l2_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_OUT),
             args: [
-                slice(l2_input),
+                slice(self.ws.l2_input),
                 slice(self.l2_w),
                 slice(self.l2_b),
                 slice(bucket_idx_dev),
-                slice_mut(l2_out),
+                slice_mut(self.ws.l2_out),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
         // -- Forward step 12: l2_acted = CReLU(l2_out) (B × 32) --
-        let mut l2_acted = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
         cuda_launch! {
             kernel: crelu_fwd,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_OUT),
             args: [
-                slice(l2_out),
-                slice_mut(l2_acted),
+                slice(self.ws.l2_out),
+                slice_mut(self.ws.l2_acted),
                 (b * L2_OUT) as u32
             ]
         }?;
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
-        let mut l3_out = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b),
             args: [
-                slice(l2_acted),
+                slice(self.ws.l2_acted),
                 slice(self.l3_w),
                 slice(self.l3_b),
                 slice(bucket_idx_dev),
-                slice_mut(l3_out),
+                slice_mut(self.ws.l3_out),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
 
         // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
-        let mut net_output = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
         cuda_launch! {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b),
             args: [
-                slice(l3_out),
-                slice(l1_skip),
-                slice_mut(net_output),
+                slice(self.ws.l3_out),
+                slice(self.ws.l1_skip),
+                slice_mut(self.ws.net_output),
                 b_u32
             ]
         }?;
@@ -2136,7 +2279,6 @@ impl GpuTrainer {
         // -- Forward step 15: loss kernel → dy_net_output + loss_acc --
         // `LossKind::Sigmoid` → `loss_wdl` (plain sigmoid-MSE)、`LossKind::Wrm` →
         // `loss_wrm` (bullet win-rate-model、v102 厳密再現)。
-        let mut dy_net_output = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
         match loss {
             LossKind::Sigmoid { scale } => {
                 cuda_launch! {
@@ -2145,11 +2287,11 @@ impl GpuTrainer {
                     module: self.module,
                     config: cfg_1d(b),
                     args: [
-                        slice(net_output),
+                        slice(self.ws.net_output),
                         slice(score_dev),
                         slice(wdl_dev),
                         slice(norm_dev),
-                        slice_mut(dy_net_output),
+                        slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda, scale, b_u32
                     ]
@@ -2165,11 +2307,11 @@ impl GpuTrainer {
                     module: self.module,
                     config: cfg_1d(b),
                     args: [
-                        slice(net_output),
+                        slice(self.ws.net_output),
                         slice(score_dev),
                         slice(wdl_dev),
                         slice(norm_dev),
-                        slice_mut(dy_net_output),
+                        slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda, nnue2score, in_scaling, b_u32
                     ]
@@ -2180,7 +2322,10 @@ impl GpuTrainer {
 
         // ===== BACKWARD =====
         // 全 *_grad buffer を 0 で reset (atomic accumulate semantic に従う kernel が
-        // 多い、また overwrite kernel も in-place 安全のため統一)
+        // 多い、また overwrite kernel も in-place 安全のため統一)。再 alloc せず
+        // `memset_async(0)` で既存 buffer を reset (Issue #78、`ft_w_grad` だけで ~450MB
+        // の `cudaMalloc`/`cudaFree` を毎 step 走らせていたのを撤廃)。
+        // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
         let ft_w_n = FT_IN * FT_OUT;
         let ft_b_n = FT_OUT;
         let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
@@ -2191,32 +2336,32 @@ impl GpuTrainer {
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
-        self.ft_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_w_n)?;
-        self.ft_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_b_n)?;
-        self.l1_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
-        self.l1_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
-        self.l1f_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
-        self.l1f_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
-        self.l2_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
-        self.l2_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
-        self.l3_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
-        self.l3_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l3_b_n)?;
+        memset_zero(&self.stream, &self.ft_w_grad)?;
+        memset_zero(&self.stream, &self.ft_b_grad)?;
+        memset_zero(&self.stream, &self.l1_w_grad)?;
+        memset_zero(&self.stream, &self.l1_b_grad)?;
+        memset_zero(&self.stream, &self.l1f_w_grad)?;
+        memset_zero(&self.stream, &self.l1f_b_grad)?;
+        memset_zero(&self.stream, &self.l2_w_grad)?;
+        memset_zero(&self.stream, &self.l2_b_grad)?;
+        memset_zero(&self.stream, &self.l3_w_grad)?;
+        memset_zero(&self.stream, &self.l3_b_grad)?;
+        memset_zero(&self.stream, &self.ws.dl1_total)?;
 
         // -- Backward 14 reverse: dy_net_output が dl3_out と dl1_skip 両方の grad --
         // (elementwise_add 逆: dl3_out = dy, dl1_skip = dy、両者同じ buffer を直接渡せばよい)
 
         // -- Backward 13 reverse: L3 per-bucket dense grad --
-        let mut dl2_acted = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
         cuda_launch! {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_OUT),
             args: [
-                slice(dy_net_output),
+                slice(self.ws.dy_net_output),
                 slice(self.l3_w),
                 slice(bucket_idx_dev),
-                slice_mut(dl2_acted),
+                slice_mut(self.ws.dl2_acted),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2227,8 +2372,8 @@ impl GpuTrainer {
             // L3: in_dim=L2_OUT, out_dim=1 → grid = num_buckets * out_dim(=1) * in_dim
             config: cfg_1d(NUM_BUCKETS * L2_OUT),
             args: [
-                slice(l2_acted),
-                slice(dy_net_output),
+                slice(self.ws.l2_acted),
+                slice(self.ws.dy_net_output),
                 slice(bucket_idx_dev),
                 slice_mut(self.l3_w_grad),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
@@ -2240,7 +2385,7 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b),
             args: [
-                slice(dy_net_output),
+                slice(self.ws.dy_net_output),
                 slice(bucket_idx_dev),
                 slice(self.l3_b_grad),
                 b_u32, 1_u32, NUM_BUCKETS as u32
@@ -2248,32 +2393,30 @@ impl GpuTrainer {
         }?;
 
         // -- Backward 12 reverse: crelu_grad on l2_out --
-        let mut dl2_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_OUT)?;
         cuda_launch! {
             kernel: crelu_grad,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_OUT),
             args: [
-                slice(l2_out),
-                slice(dl2_acted),
-                slice_mut(dl2_out),
+                slice(self.ws.l2_out),
+                slice(self.ws.dl2_acted),
+                slice_mut(self.ws.dl2_out),
                 (b * L2_OUT) as u32
             ]
         }?;
 
         // -- Backward 11 reverse: L2 per-bucket dense grad --
-        let mut dl2_input = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
         cuda_launch! {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_IN),
             args: [
-                slice(dl2_out),
+                slice(self.ws.dl2_out),
                 slice(self.l2_w),
                 slice(bucket_idx_dev),
-                slice_mut(dl2_input),
+                slice_mut(self.ws.dl2_input),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2284,8 +2427,8 @@ impl GpuTrainer {
             // L2: in_dim=L2_IN, out_dim=L2_OUT → grid = num_buckets * out_dim * in_dim
             config: cfg_1d(NUM_BUCKETS * L2_OUT * L2_IN),
             args: [
-                slice(l2_input),
-                slice(dl2_out),
+                slice(self.ws.l2_input),
+                slice(self.ws.dl2_out),
                 slice(bucket_idx_dev),
                 slice_mut(self.l2_w_grad),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
@@ -2297,7 +2440,7 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * L2_OUT),
             args: [
-                slice(dl2_out),
+                slice(self.ws.dl2_out),
                 slice(bucket_idx_dev),
                 slice(self.l2_b_grad),
                 b_u32, L2_OUT as u32, NUM_BUCKETS as u32
@@ -2305,77 +2448,71 @@ impl GpuTrainer {
         }?;
 
         // -- Backward 10 reverse: crelu_grad on l2_pre --
-        let mut dl2_pre = DeviceBuffer::<f32>::zeroed(&self.stream, b * L2_IN)?;
         cuda_launch! {
             kernel: crelu_grad,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L2_IN),
             args: [
-                slice(l2_pre),
-                slice(dl2_input),
-                slice_mut(dl2_pre),
+                slice(self.ws.l2_pre),
+                slice(self.ws.dl2_input),
+                slice_mut(self.ws.dl2_pre),
                 (b * L2_IN) as u32
             ]
         }?;
 
         // -- Backward 9 reverse: split dl2_pre → dl1_sqr (15) + dl1_main_from_concat (15) --
-        let mut dl1_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
-        let mut dl1_main_from_concat = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
         cuda_launch! {
             kernel: concat_l1sqr_main_grad,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(dl2_pre),
-                slice_mut(dl1_sqr),
-                slice_mut(dl1_main_from_concat),
+                slice(self.ws.dl2_pre),
+                slice_mut(self.ws.dl1_sqr),
+                slice_mut(self.ws.dl1_main_from_concat),
                 b_u32, L1_EFFECTIVE as u32
             ]
         }?;
 
         // -- Backward 8 reverse: abs_pow2_scale_grad (l1_sqr 経由の grad) --
-        let mut dl1_main_from_sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
         cuda_launch! {
             kernel: abs_pow2_scale_grad,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(l1_main),
-                slice(dl1_sqr),
-                slice_mut(dl1_main_from_sqr),
+                slice(self.ws.l1_main),
+                slice(self.ws.dl1_sqr),
+                slice_mut(self.ws.dl1_main_from_sqr),
                 L1_SQR_SCALE,
                 (b * L1_EFFECTIVE) as u32
             ]
         }?;
 
         // -- Combine dl1_main = dl1_main_from_concat + dl1_main_from_sqr --
-        let mut dl1_main = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_EFFECTIVE)?;
         cuda_launch! {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(dl1_main_from_concat),
-                slice(dl1_main_from_sqr),
-                slice_mut(dl1_main),
+                slice(self.ws.dl1_main_from_concat),
+                slice(self.ws.dl1_main_from_sqr),
+                slice_mut(self.ws.dl1_main),
                 (b * L1_EFFECTIVE) as u32
             ]
         }?;
 
         // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) + dl1_skip=dy_net_output (offset 15) --
-        let mut dl1_total = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_OUT)?;
         cuda_launch! {
             kernel: slice_scatter_2d,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_EFFECTIVE),
             args: [
-                slice(dl1_main),
-                slice_mut(dl1_total),
+                slice(self.ws.dl1_main),
+                slice_mut(self.ws.dl1_total),
                 b_u32, L1_EFFECTIVE as u32, L1_OUT as u32, 0_u32
             ]
         }?;
@@ -2385,8 +2522,8 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * L1_SKIP),
             args: [
-                slice(dy_net_output),
-                slice_mut(dl1_total),
+                slice(self.ws.dy_net_output),
+                slice_mut(self.ws.dl1_total),
                 b_u32, L1_SKIP as u32, L1_OUT as u32, L1_EFFECTIVE as u32
             ]
         }?;
@@ -2396,16 +2533,15 @@ impl GpuTrainer {
         // 直接 dl1_total を両 dense_mm_bwd に渡す
 
         // -- Backward 5 reverse: L1f shared dense grad --
-        let mut dcombined_from_l1f = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
         cuda_launch! {
             kernel: dense_mm_bwd_input,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dl1_total),
+                slice(self.ws.dl1_total),
                 slice(self.l1f_w),
-                slice_mut(dcombined_from_l1f),
+                slice_mut(self.ws.dcombined_from_l1f),
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
@@ -2415,8 +2551,8 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(FT_OUT * L1_OUT),
             args: [
-                slice(combined),
-                slice(dl1_total),
+                slice(self.ws.combined),
+                slice(self.ws.dl1_total),
                 slice_mut(self.l1f_w_grad),
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
@@ -2427,24 +2563,23 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * L1_OUT),
             args: [
-                slice(dl1_total),
+                slice(self.ws.dl1_total),
                 slice(self.l1f_b_grad),
                 b_u32, L1_OUT as u32
             ]
         }?;
 
         // -- Backward 4 reverse: L1 per-bucket dense grad --
-        let mut dcombined_from_l1 = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
         cuda_launch! {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dl1_total),
+                slice(self.ws.dl1_total),
                 slice(self.l1_w),
                 slice(bucket_idx_dev),
-                slice_mut(dcombined_from_l1),
+                slice_mut(self.ws.dcombined_from_l1),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2455,8 +2590,8 @@ impl GpuTrainer {
             // L1: in_dim=FT_OUT, out_dim=L1_OUT → grid = num_buckets * out_dim * in_dim
             config: cfg_1d(NUM_BUCKETS * L1_OUT * FT_OUT),
             args: [
-                slice(combined),
-                slice(dl1_total),
+                slice(self.ws.combined),
+                slice(self.ws.dl1_total),
                 slice(bucket_idx_dev),
                 slice_mut(self.l1_w_grad),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
@@ -2468,7 +2603,7 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * L1_OUT),
             args: [
-                slice(dl1_total),
+                slice(self.ws.dl1_total),
                 slice(bucket_idx_dev),
                 slice(self.l1_b_grad),
                 b_u32, L1_OUT as u32, NUM_BUCKETS as u32
@@ -2476,23 +2611,20 @@ impl GpuTrainer {
         }?;
 
         // -- Combine dcombined = dcombined_from_l1 + dcombined_from_l1f --
-        let mut dcombined = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
         cuda_launch! {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dcombined_from_l1),
-                slice(dcombined_from_l1f),
-                slice_mut(dcombined),
+                slice(self.ws.dcombined_from_l1),
+                slice(self.ws.dcombined_from_l1f),
+                slice_mut(self.ws.dcombined),
                 (b * FT_OUT) as u32
             ]
         }?;
 
         // -- Backward 3 reverse: ft_post_perspective_grad × 2 (stm, nstm) --
-        let mut dft_stm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
-        let mut dft_nstm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
         // stm: d_combined_offset = 0
         cuda_launch! {
             kernel: ft_post_perspective_grad,
@@ -2500,10 +2632,10 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dcombined),
-                slice(ft_stm_out),
+                slice(self.ws.dcombined),
+                slice(self.ws.ft_stm_out),
                 slice(self.ft_b),
-                slice_mut(dft_stm_out),
+                slice_mut(self.ws.dft_stm_out),
                 slice(self.ft_b_grad),
                 b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE
             ]
@@ -2515,10 +2647,10 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dcombined),
-                slice(ft_nstm_out),
+                slice(self.ws.dcombined),
+                slice(self.ws.ft_nstm_out),
                 slice(self.ft_b),
-                slice_mut(dft_nstm_out),
+                slice_mut(self.ws.dft_nstm_out),
                 slice(self.ft_b_grad),
                 b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE
             ]
@@ -2531,7 +2663,7 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dft_stm_out),
+                slice(self.ws.dft_stm_out),
                 slice(stm_idx_dev),
                 slice(self.ft_w_grad),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
@@ -2543,7 +2675,7 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_1d(b * FT_OUT),
             args: [
-                slice(dft_nstm_out),
+                slice(self.ws.dft_nstm_out),
                 slice(nstm_idx_dev),
                 slice(self.ft_w_grad),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
@@ -2939,7 +3071,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
-    let mut trainer = GpuTrainer::new(&ctx)?;
+    // workspace を batch_size 分で確保 (Issue #78、partial 末尾 batch は grow-only で対応)。
+    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size)?;
     if let Some(init) = &cli.init_from {
         println!(
             "[train] injecting pretrained weights from {}",
@@ -2982,7 +3115,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
-    let mut trainer = GpuTrainer::new(&ctx)?;
+    // workspace を smoke の固定 batch 分で確保 (Issue #78)。
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (FT_IN * FT_OUT
@@ -3014,7 +3148,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] v102-100 weights injected, all finite ✓");
 
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
-        let batch = BatchData::smoke_dummy(4);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
@@ -3039,7 +3173,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
-        let batch = BatchData::smoke_dummy(4);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let loss_wrm = trainer.step(&batch, 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
@@ -3049,7 +3183,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 2: all weights finite ✓");
     } else {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
-        let batch = BatchData::smoke_dummy(4);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
