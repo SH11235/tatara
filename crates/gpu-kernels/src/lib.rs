@@ -19,6 +19,12 @@
 //! - `sparse`: Stage 2 (EPIC #16) で整備する sparse FT kernel suite の
 //!   reference CPU 置き場。Stage 2-0 scaffold (#36) では空 module、Stage 2-6〜2-7
 //!   で sparse_ft_forward / sparse_ft_backward が追加される
+//! - `layerstack`: Stage 3-7 (#63) で `bins/nnue_train` に追加した v102 LayerStack
+//!   arch 用 ~19 kernel (`ft_post_perspective` / `dense_mm` (+ bucket) / `crelu` /
+//!   `abs_pow2_scale` / `concat_l1sqr_main` / `elementwise` / `slice2d`) の
+//!   reference CPU。Issue #85 で追加、`bins/nnue_train` の
+//!   `gpu_cpu_equivalence_tests` が使う。kernel ↔ CPU ref 対応表は
+//!   [`layerstack`] module doc 参照
 //!
 //! ## 将来の拡張
 //!
@@ -26,6 +32,7 @@
 //! 同 crate に追加していく。GPU kernel は呼び出し側 bin / experiment crate
 //! ごとに `#[kernel]` を inline 定義する慣行を維持する (cuda-oxide 制約)。
 
+pub mod layerstack;
 pub mod pointwise;
 pub mod progress;
 pub mod sparse;
