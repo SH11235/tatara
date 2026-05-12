@@ -81,19 +81,27 @@ pub struct RangerParams {
     pub n_sma_threshold: f32,
 }
 
+impl RangerParams {
+    /// bullet 上流 `RangerParams::default()` と同値の `const` 定数。`Default` impl は
+    /// これを返す。`bins/nnue_train::GpuTrainer` のように `const` 文脈で個々の field を
+    /// 参照したい側 (kernel launch 引数) はこれを single source of truth として使う
+    /// (Stage 3-quality #86: const 二重定義の解消)。
+    pub const DEFAULT: Self = Self {
+        decay: 0.01,
+        beta1: 0.99,
+        beta2: 0.999,
+        eps: 1e-8,
+        min_weight: -1.98,
+        max_weight: 1.98,
+        alpha: 0.5,
+        k: 6,
+        n_sma_threshold: 5.0,
+    };
+}
+
 impl Default for RangerParams {
     fn default() -> Self {
-        Self {
-            decay: 0.01,
-            beta1: 0.99,
-            beta2: 0.999,
-            eps: 1e-8,
-            min_weight: -1.98,
-            max_weight: 1.98,
-            alpha: 0.5,
-            k: 6,
-            n_sma_threshold: 5.0,
-        }
+        Self::DEFAULT
     }
 }
 

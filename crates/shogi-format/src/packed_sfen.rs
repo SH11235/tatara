@@ -146,14 +146,21 @@ impl Default for PackedSfenValue {
     }
 }
 
-// Safety: PackedSfenValue is a plain byte array
+// SAFETY: `PackedSfenValue` は `[u8; 40]` 1 個だけを持つ POD (内部可変性・生ポインタ無し)
+// なので thread 間で安全に送受信・共有できる。
 unsafe impl Send for PackedSfenValue {}
 unsafe impl Sync for PackedSfenValue {}
 
 impl PackedSfenValue {
-    /// PackedSfen 部分への参照を取得
+    /// PackedSfen 部分 (先頭 32 bytes) への参照を取得。
     pub fn sfen(&self) -> &PackedSfen {
-        // Safety: PackedSfen は [u8; 32] と同じレイアウト
+        // SAFETY:
+        // - `PackedSfen` は `#[repr(C)]` で唯一の field が `[u8; 32]` → サイズ 32 bytes、
+        //   align = 1。`PackedSfenValue` (`#[repr(C)]`、field は `[u8; 40]`) の先頭 32 bytes が
+        //   ちょうど `PackedSfen` の中身に対応する (PSV wire 形式の bytes 0-31)。
+        // - `self.data.as_ptr()` は offset 0 を指し、`PackedSfen` の align=1 を満たす。
+        // - `[u8; N]` には不正ビットパターンが無いので、任意のバイト列が valid な `PackedSfen`。
+        // - 返す参照のライフタイムは `&self` に縛られる (data は `self` が所有)。
         unsafe { &*(self.data.as_ptr() as *const PackedSfen) }
     }
 
