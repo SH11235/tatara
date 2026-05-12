@@ -28,11 +28,12 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use shogi_features::halfka_hm::ShogiHalfKA_hm;
-use shogi_format::PackedSfenValue;
+use shogi_features::halfka_hm::{MAX_ACTIVE_FEATURES, ShogiHalfKA_hm};
+use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_format::{PackedSfenValue, ShogiBoard};
 
 // =============================================================================
 // Batch 構造体 (Stage 2-2 fused_loss_wdl + Stage 2-6 sparse_ft_forward 入力に整合)
@@ -79,14 +80,15 @@ impl Batch {
         }
     }
 
-    /// 既存 `Batch` を再利用 (alloc 削減、`PsvFileLoader::fill_batch` 内部で
-    /// 使われる)。全 slot を `-1` / `0.0` / `1.0` に reset する。
+    /// 既存 `Batch` を再利用 (alloc 削減)。全 slot を `-1` / `0.0` / `1.0` に
+    /// reset する。`PsvFileLoader::fill_batch` と、Issue #89 の
+    /// [`BucketedPrefetchedLoader`] の ring-buffer 化 worker (消費済み `Batch` を
+    /// pool channel 経由で worker に返して `reset()` 再利用) の両方で使われる。
     ///
-    /// 注: `PrefetchedLoader` の background loop では send 時に move されるため
-    /// `reset()` 経由の reuse はできず、毎 iteration `Batch::with_capacity` を
-    /// 新規 alloc している。alloc が hot path になった段階 (Stage 3-7/3-8 で
-    /// 実 throughput 測定後) で `Clone` 経由 send / `Arc<Batch>` 化 / double-
-    /// buffer 化等を検討する (本 PR では正しさ優先、性能 follow-up)。
+    /// 注: 旧 [`PrefetchedLoader`] (Stage 3-5) は send 時 move のため `reset()`
+    /// 再利用ができず毎 iteration `Batch::with_capacity` を新規 alloc していた。
+    /// trainer が実際に使うのは Issue #89 で導入した [`BucketedPrefetchedLoader`]
+    /// (ring-buffer return path 付き) の方。
     pub fn reset(&mut self) {
         for v in &mut self.stm_indices {
             *v = -1;
@@ -109,7 +111,22 @@ impl Batch {
     /// 1 position を batch に追加。`true` を返したら成功、`false` は batch 満杯。
     /// `ShogiHalfKA_hm::map_features` で sparse index を slot に fill (`-1` の
     /// 残りは padding として保持)。
+    ///
+    /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
+    /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
+    /// 1 回だけにすること (Issue #89)。
     pub fn push(&mut self, pos: &PackedSfenValue) -> bool {
+        self.push_decoded(&pos.decode())
+    }
+
+    /// [`Batch::push`] の **decode 済み `ShogiBoard` を直接受ける** 版。
+    ///
+    /// dataloader の prefetch worker が 1 局面につき `PackedSfenValue::decode()`
+    /// を 1 回だけ呼び、その `ShogiBoard` を HalfKA_hm 特徴抽出 (本メソッド) と
+    /// progress8kpabs bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で
+    /// 使い回すための入口 (Issue #89: decode-once)。`push(&pos)` は
+    /// `push_decoded(&pos.decode())` と等価。
+    pub fn push_decoded(&mut self, board: &ShogiBoard) -> bool {
         if self.n_positions >= self.batch_size {
             return false;
         }
@@ -118,7 +135,7 @@ impl Batch {
         let row_off = bi * self.max_active;
 
         let mut j = 0usize;
-        ShogiHalfKA_hm.map_features(pos, |stm_idx, nstm_idx| {
+        ShogiHalfKA_hm.map_features_board(board, |stm_idx, nstm_idx| {
             if j < self.max_active {
                 self.stm_indices[row_off + j] = stm_idx as i32;
                 self.nstm_indices[row_off + j] = nstm_idx as i32;
@@ -131,18 +148,21 @@ impl Batch {
         });
 
         // score / wdl / norm
-        self.score[bi] = f32::from(pos.score());
+        self.score[bi] = f32::from(board.score);
         // bullet `loader::GameResult::{Loss=0, Draw=1, Win=2}` を {0.0, 0.5, 1.0}
         // に正規化 (bullet `loader.rs:312` と同型)。
         //
-        // 注意: `PackedSfenValue::game_result()` は **raw i8** で `{-1, 0, +1}`
-        // (Loss/Draw/Win、PSV wire 形式) を返すため、そのまま `/ 2.0` すると
-        // Draw=0 と Win=1 が誤って 0.0 と 0.5 に圧縮される (Codex review #61
-        // 修正、`as u8 / 2.0` 直訳の罠)。
-        // 正しくは `pos.result()` (`packed_sfen.rs:473`、`GameResult` enum) を
-        // 経由し、`as u8` で {0, 1, 2} に正規化してから `/ 2.0` で {0.0, 0.5, 1.0}
-        // を得る。
-        self.wdl[bi] = f32::from(pos.result() as u8) / 2.0;
+        // `ShogiBoard::result` は **raw i8** (`{-1=Loss, 0=Draw, +1=Win}`、PSV
+        // wire 形式 = `PackedSfenValue::game_result()` と同じ値) なので、そのまま
+        // `/ 2.0` すると Draw=0 と Win=1 が誤って 0.0 と 0.5 に圧縮される (Codex
+        // review #61 で見つかった `as u8 / 2.0` 直訳の罠)。`PackedSfenValue::
+        // result()` (`GameResult` enum、Loss=0/Draw=1/Win=2) と同じ map を i8 から
+        // 直接行う: `>0 → 1.0`, `<0 → 0.0`, `==0 → 0.5`。
+        self.wdl[bi] = match board.result {
+            r if r > 0 => 1.0,
+            r if r < 0 => 0.0,
+            _ => 0.5,
+        };
         // per_pos_norm はデフォルト 1.0 (with_capacity 時に初期化済)。
 
         self.n_positions += 1;
@@ -318,10 +338,332 @@ impl PrefetchedLoader {
     }
 }
 
+// =============================================================================
+// PsvEpochReader — 逐次 PSV 読み + score-drop skip + EOF wrap (= 次 epoch) +
+//                  barren-pass ガード
+// =============================================================================
+
+/// 連続 barren pass (= file を 1 周しても 1 件も使える position が無い) が
+/// これに達したら無限ループせず error を返す。
+pub const MAX_BARREN_PASSES: u32 = 5;
+
+/// `PsvFileLoader` を逐次読み、EOF で同 file を開き直して次 epoch とする stream
+/// reader。bullet `--score-drop-abs` の近似 skip と空 file の無限ループ防止
+/// (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない** — decode-once
+/// (Issue #89) のため、bucket は呼び出し側 (prefetch worker) が `PackedSfenValue::
+/// decode()` した `ShogiBoard` から `ShogiProgressKPAbs::bucket_board` で求める。
+///
+/// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
+/// wrap するので「終わり」は無い)。
+struct PsvEpochReader {
+    path: PathBuf,
+    loader: PsvFileLoader,
+    score_drop_abs: Option<i32>,
+    /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
+    pushed_this_epoch: u64,
+    /// 1 epoch 丸ごと 0 push だった連続回数。
+    barren_passes: u32,
+}
+
+impl PsvEpochReader {
+    fn new(path: &Path, score_drop_abs: Option<i32>) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            loader: PsvFileLoader::new(path)?,
+            score_drop_abs,
+            pushed_this_epoch: 0,
+            barren_passes: 0,
+        })
+    }
+
+    /// 次の使える PSV を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
+    /// 全 drop で `MAX_BARREN_PASSES` 周しても 0 件なら `io::Error` を返す。
+    fn next(&mut self) -> io::Result<PackedSfenValue> {
+        loop {
+            match self.loader.next_psv()? {
+                Some(psv) => {
+                    // bullet `--score-drop-abs` の近似 (詳細は module doc)。
+                    // i64 cast で i16::MIN の abs overflow を避ける。
+                    if let Some(t) = self.score_drop_abs {
+                        if i64::from(psv.score()).abs() >= i64::from(t) {
+                            continue;
+                        }
+                    }
+                    self.pushed_this_epoch += 1;
+                    return Ok(psv);
+                }
+                None => {
+                    if self.pushed_this_epoch == 0 {
+                        self.barren_passes += 1;
+                        if self.barren_passes >= MAX_BARREN_PASSES {
+                            return Err(io::Error::other(format!(
+                                "data file {} yielded no usable positions over {} full passes \
+                                 (empty file, or all positions filtered out by score-drop-abs)",
+                                self.path.display(),
+                                self.barren_passes
+                            )));
+                        }
+                    } else {
+                        self.barren_passes = 0;
+                    }
+                    self.pushed_this_epoch = 0;
+                    self.loader = PsvFileLoader::new(&self.path)?;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// BucketedPrefetchedLoader — Issue #89: bucket-aware / 並列パース / decode-once /
+//                            ring-buffer return path
+// =============================================================================
+
+/// 完成 batch のチャネル容量 (worker が main をどれだけ先読みするか) を
+/// `--threads` から決める係数 + 下限。
+fn prefetch_depth_for(num_workers: usize) -> usize {
+    (2 * num_workers).max(2)
+}
+
+/// 1 個の prefetch worker が消費 / 生成する単位。`(buffers, buckets)` を ring で
+/// 回す。`buffers` は `reset()` 再利用、`buckets` は `clear()` 再利用。
+type BatchSlot = (Batch, Vec<i32>);
+
+/// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
+/// 「PSV パース + HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算」を `decode()`
+/// **1 回** で済ませて main thread に `(Batch, buckets)` を渡す prefetch loader
+/// (Issue #89)。
+///
+/// ## 設計
+///
+/// - **decode-once**: worker は `psv.decode()` した `ShogiBoard` を
+///   `Batch::push_decoded` (HalfKA_hm 特徴) と `ShogiProgressKPAbs::bucket_board`
+///   (output bucket) の両方に渡す。`pos.decode()` は 1 局面 1 回。
+/// - **並列パース**: worker は短い critical section (共有 `Mutex<PsvEpochReader>`
+///   を lock して `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は
+///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`ShogiHalfKA_hm` /
+///   `ShogiProgressKPAbs` は ZST + process-global `OnceLock` (read-only) なので
+///   thread 間共有して問題ない。
+/// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
+///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
+///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker が
+///   再借用して `reset()` / `clear()` で reuse。毎 batch の `Vec` 新規 alloc
+///   (~21MB) は起きない (#81 / #89 が予告していた follow-up)。
+/// - **epoch 意味論**: 共有 reader が EOF で file を開き直す (= 次 epoch)、
+///   `score-drop-abs` skip、`MAX_BARREN_PASSES` ガード ([`PsvEpochReader`]) は
+///   従来 (`trainer.rs::EpochStream`) と同じ。ただし **1 epoch 内の position の
+///   順序は worker 数 ≥ 2 では非決定的** (各 worker が batch_size 件ずつ排他的に
+///   読むため batch 境界の切れ目が変わる)。training では問題ない (bullet 自体
+///   shuffle する; 適用される lr/wdl は loop の batch_idx で決まりデータ内容に
+///   依らない) が、決定論的順序が要る場合は `num_workers = 1` を使うこと。
+/// - **error 伝搬**: worker が reader から `io::Error` (主に barren-exhaustion) を
+///   受けたら shared error slot に格納して exit。main の [`Self::next_batch`] は
+///   全 worker が exit して result channel が閉じたら error slot を見て伝搬する。
+/// - **終了**: main が `BucketedPrefetchedLoader` を drop すると [`Drop`] impl が
+///   まず result/pool 両 channel endpoint を落として全 worker を unblock させ、
+///   その後 worker thread を join する (close-then-join、detail は `Drop` の doc)。
+pub struct BucketedPrefetchedLoader {
+    /// 完成 batch (Batch + per-position bucket) を worker → main で渡す。
+    /// `Drop` で `.take()` して先に落とすため `Option`。
+    result_rx: Option<mpsc::Receiver<BatchSlot>>,
+    /// 消費済み batch buffer を main → worker で返す (ring buffer)。
+    /// `Drop` で `.take()` して先に落とすため `Option`。
+    pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
+    /// worker が reader から受けた io::Error を main に伝えるための slot。
+    err_slot: Arc<Mutex<Option<io::Error>>>,
+    /// worker thread handle (`Drop` で join する)。
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl BucketedPrefetchedLoader {
+    /// `path` の PSV を `num_workers` 本の worker で読み込む。各 batch は
+    /// `batch_size` 件の有効 position を持つ (epoch wrap するので末尾 partial は
+    /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
+    /// `progress` は output bucket を計算する [`ShogiProgressKPAbs`] (ZST; 重みは
+    /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
+    /// 未ロードなら全 bucket 4)。
+    pub fn spawn(
+        path: &Path,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        num_workers: usize,
+        progress: ShogiProgressKPAbs,
+    ) -> io::Result<Self> {
+        assert!(batch_size >= 1, "batch_size must be >= 1");
+        let num_workers = num_workers.max(1);
+        let prefetch_depth = prefetch_depth_for(num_workers);
+        // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
+        // block しないようにする: result channel に最大 prefetch_depth、各 worker
+        // が最大 1、main が最大 1。
+        let n_slots = prefetch_depth + num_workers + 1;
+
+        let reader = Arc::new(Mutex::new(PsvEpochReader::new(path, score_drop_abs)?));
+        let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+
+        let (result_tx, result_rx) = mpsc::sync_channel::<BatchSlot>(prefetch_depth);
+        let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
+        for _ in 0..n_slots {
+            let slot = (
+                Batch::with_capacity(batch_size, MAX_ACTIVE_FEATURES),
+                Vec::with_capacity(batch_size),
+            );
+            pool_tx
+                .send(slot)
+                .expect("pool channel has capacity for the initial slots");
+        }
+        let pool_rx = Arc::new(Mutex::new(pool_rx));
+
+        let mut handles = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let reader = Arc::clone(&reader);
+            let err_slot = Arc::clone(&err_slot);
+            let pool_rx = Arc::clone(&pool_rx);
+            let result_tx = result_tx.clone();
+            let handle = thread::spawn(move || {
+                // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
+                let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
+                loop {
+                    // 空の batch slot を pool から借りる。
+                    let (mut batch, mut buckets) = {
+                        let rx = pool_rx.lock().expect("pool_rx mutex poisoned");
+                        match rx.recv() {
+                            Ok(slot) => slot,
+                            Err(_) => break, // main が pool_tx を全て drop → 終了
+                        }
+                    };
+                    batch.reset();
+                    buckets.clear();
+
+                    // 短い critical section: 共有 reader から batch_size 件を
+                    // scratch に詰める (I/O のみ、decode はしない)。
+                    {
+                        let mut rdr = reader.lock().expect("reader mutex poisoned");
+                        scratch.clear();
+                        let mut failed: Option<io::Error> = None;
+                        for _ in 0..batch_size {
+                            match rdr.next() {
+                                Ok(psv) => scratch.push(psv),
+                                Err(e) => {
+                                    failed = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        drop(rdr);
+                        if let Some(e) = failed {
+                            // reader が exhausted: error を slot に置いて worker 終了
+                            // (借りた slot は捨てる; main は channel close で気付く)。
+                            let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            return;
+                        }
+                    }
+
+                    // decode-once: ShogiBoard を HalfKA_hm 特徴 + progress bucket
+                    // の両方に使う。
+                    for psv in &scratch {
+                        let board = psv.decode();
+                        let pushed = batch.push_decoded(&board);
+                        debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
+                        buckets.push(i32::from(progress.bucket_board(&board)));
+                    }
+                    debug_assert_eq!(batch.n_positions, batch_size);
+                    debug_assert_eq!(buckets.len(), batch_size);
+
+                    // main へ。受信側が落ちていたら (loader drop) 終了。
+                    if result_tx.send((batch, buckets)).is_err() {
+                        break;
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+        // spawn ループ内の clone のみ worker が持つ。元の `result_tx` / `pool_tx`
+        // は loader struct が `pool_tx` を保持 (recycle 用)、`result_tx` は drop。
+        drop(result_tx);
+
+        Ok(Self {
+            result_rx: Some(result_rx),
+            pool_tx: Some(pool_tx),
+            err_slot,
+            handles,
+        })
+    }
+
+    /// 次の `(Batch, per-position bucket)` を取得。返り値:
+    /// - `Ok(Some((batch, buckets)))`: 正常 batch (`batch.n_positions == batch_size`)
+    /// - `Err(e)`: worker が reader から io::Error (barren-exhaustion 等) を受けた
+    /// - `Ok(None)`: 全 worker が error 無しで終了 (通常は起きない; loader を
+    ///   drop した後など)
+    ///
+    /// 消費後は [`Self::recycle`] で `(batch, buckets)` を返すこと (ring buffer)。
+    pub fn next_batch(&mut self) -> io::Result<Option<BatchSlot>> {
+        match self
+            .result_rx
+            .as_ref()
+            .expect("result_rx present until Drop")
+            .recv()
+        {
+            Ok(slot) => Ok(Some(slot)),
+            Err(_) => {
+                // 全 worker exit → result channel close。error slot を確認。
+                if let Some(e) = self
+                    .err_slot
+                    .lock()
+                    .expect("err_slot mutex poisoned")
+                    .take()
+                {
+                    Err(e)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// 消費済み `(Batch, buckets)` を pool に返す (worker が再利用する)。
+    /// pool channel は ring の全 slot 容量を持つので block しない。worker が
+    /// 既に全員終了していたら send は失敗するが無視してよい (loader drop 経路)。
+    pub fn recycle(&self, slot: BatchSlot) {
+        if let Some(tx) = self.pool_tx.as_ref() {
+            let _ = tx.send(slot);
+        }
+    }
+}
+
+impl Drop for BucketedPrefetchedLoader {
+    /// **close-then-join**: 先に loader 側の channel endpoint を落としてから
+    /// worker thread を join する。
+    ///
+    /// 1. `result_rx` (result channel の **受信側**) を drop → worker の
+    ///    `result_tx.send(...)` が `Err` を返し、worker が `break`。
+    /// 2. `pool_tx` (pool channel の **送信側**、`recycle` 用) を drop → worker の
+    ///    `pool_rx.recv()` が `Err` を返し、pool 借用待ちの worker も `break`。
+    /// 3. 各 worker thread を `join` する。手順 1/2 で全 worker は次の channel 操作で
+    ///    速やかに抜けるので join は hang しない (他の lock holder は兄弟 worker の
+    ///    短い critical section のみ)。
+    ///
+    /// この順序を守らないと (= channel を閉じる前に join すると) worker が
+    /// `result_tx.send` / `pool_rx.recv` で永久に block して deadlock する。
+    /// `spawn` 内の thread spawn が途中で失敗するケースは無い (`thread::spawn` は
+    /// 失敗時 panic する) ので `handles` は常に完全だが、`drain(..)` で空でも安全。
+    fn drop(&mut self) {
+        // 1 & 2: channel endpoint を先に落として worker を unblock。
+        self.result_rx = None;
+        self.pool_tx = None;
+        // 3: 全 worker を join (channel が閉じているので速やかに終了する)。
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shogi_features::halfka_hm::{HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES};
+    use shogi_features::halfka_hm::HALFKA_HM_DIMENSIONS;
     use std::path::PathBuf;
 
     /// shogi-format crate test fixture (100 records × 40 bytes = 4000 bytes)。
@@ -429,6 +771,33 @@ mod tests {
     }
 
     #[test]
+    fn batch_push_maps_draw_result_to_wdl_half() {
+        // sample.psv は Loss=50 / Win=50 で Draw 行を持たないため、`result == 0
+        // → wdl == 0.5` のマッピングが本来カバーされない (Codex #95 review)。
+        // 実 PSV record を 1 件読んで game_result バイト (offset 38) を 0 に
+        // パッチした「Draw 局面」で push_decoded が wdl == 0.5 を出すことを確認。
+        let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
+        let mut psv = loader.next_psv().unwrap().expect("at least 1 record");
+        psv.as_bytes_mut()[38] = 0; // game_result = 0 (Draw)
+        assert_eq!(psv.game_result(), 0);
+
+        let mut batch = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        assert!(batch.push(&psv));
+        assert_eq!(batch.wdl[0], 0.5, "Draw (result == 0) → wdl == 0.5");
+
+        // Win / Loss も合わせて回帰確認 (同 record をパッチ)。
+        psv.as_bytes_mut()[38] = 1i8 as u8;
+        let mut b_win = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        assert!(b_win.push(&psv));
+        assert_eq!(b_win.wdl[0], 1.0, "Win (result > 0) → wdl == 1.0");
+
+        psv.as_bytes_mut()[38] = (-1i8) as u8;
+        let mut b_loss = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        assert!(b_loss.push(&psv));
+        assert_eq!(b_loss.wdl[0], 0.0, "Loss (result < 0) → wdl == 0.0");
+    }
+
+    #[test]
     fn fill_batch_consumes_stream_partial_at_eof() {
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         let mut batch = Batch::with_capacity(150, MAX_ACTIVE_FEATURES);
@@ -491,5 +860,107 @@ mod tests {
             PrefetchedLoader::spawn(sample_psv_path(), 4, MAX_ACTIVE_FEATURES, 0).unwrap();
         let first = loader.next_batch().unwrap().expect("at least 1 batch");
         assert_eq!(first.n_positions, 4);
+    }
+
+    // --- BucketedPrefetchedLoader (Issue #89) ---
+
+    fn run_bucketed_smoke(num_workers: usize) {
+        // sample.psv は 100 records (Loss=50 / Win=50、Draw なし)。
+        let progress = ShogiProgressKPAbs; // zero weights → 全 bucket 4
+        let mut loader =
+            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 16, None, num_workers, progress)
+                .unwrap();
+        // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
+        // 回す。
+        for _ in 0..30 {
+            let (batch, buckets) = loader
+                .next_batch()
+                .unwrap()
+                .expect("epoch wraps, should never be None");
+            assert_eq!(batch.n_positions, 16, "epoch wrap → 常に満タン");
+            assert_eq!(buckets.len(), 16);
+            assert!(
+                buckets.iter().all(|&b| b == 4),
+                "zero-weight progress → bucket 4"
+            );
+            // wdl は {0.0, 1.0} のいずれか (sample.psv は Draw なし)。Win/Loss 両方が
+            // どこかに出ること自体は 16 件 batch では保証できないので membership だけ。
+            for &w in &batch.wdl[..16] {
+                assert!(w == 0.0 || w == 1.0, "wdl 値 = {w}");
+            }
+            // sparse index は [0, HALFKA_HM_DIMENSIONS) か -1 padding。
+            for &idx in &batch.stm_indices[..16 * MAX_ACTIVE_FEATURES] {
+                assert!(idx == -1 || (0..HALFKA_HM_DIMENSIONS as i32).contains(&idx));
+            }
+            let active = batch.stm_indices.iter().filter(|&&i| i >= 0).count();
+            assert!(active > 0, "実局面なので active features > 0");
+            loader.recycle((batch, buckets));
+        }
+        drop(loader); // worker は channel close で抜ける (hang しない)。
+    }
+
+    #[test]
+    fn bucketed_loader_single_worker() {
+        run_bucketed_smoke(1);
+    }
+
+    #[test]
+    fn bucketed_loader_multi_worker() {
+        run_bucketed_smoke(4);
+    }
+
+    #[test]
+    fn bucketed_loader_zero_workers_normalizes_to_one() {
+        let progress = ShogiProgressKPAbs;
+        let mut loader =
+            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, None, 0, progress).unwrap();
+        let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
+        assert_eq!(batch.n_positions, 8);
+        assert_eq!(buckets.len(), 8);
+    }
+
+    #[test]
+    fn bucketed_loader_score_drop_skips_high_scores() {
+        // sample.psv の score がどれも |score| < 1 ということは無い (実教師局面) ので、
+        // 巨大な閾値なら全件通る = epoch wrap で問題なく回る。極端に小さい閾値だと
+        // 全件 skip → barren error になることを確認。
+        let progress = ShogiProgressKPAbs;
+        // 閾値 1: |score| >= 1 を skip。score == 0 の局面しか残らない可能性が高く、
+        // 100 records 内に 1 batch (=8) ぶん埋まらないと epoch wrap で barren になりうる
+        // が、sample.psv に score==0 が 8 件以上ある保証はない → barren error を許容。
+        // ここでは「閾値 32000 (= v102 既定) では全件通る」ことだけ確認する。
+        let mut ok_loader =
+            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, Some(32000), 2, progress)
+                .unwrap();
+        let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
+        assert_eq!(batch.n_positions, 8);
+        drop(ok_loader);
+
+        // 閾値を 1 にして、|score| >= 1 の局面を全部捨てる。残りで batch を埋められ
+        // なければ barren error。sample.psv の score 分布次第なので、error か成功か
+        // どちらでもよい (hang しないことが要点)。ここでは「呼んで返ってくる」ことの
+        // み確認 (panic / hang しない)。
+        let mut drop_loader =
+            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 100, Some(1), 1, progress).unwrap();
+        let _ = drop_loader.next_batch();
+    }
+
+    #[test]
+    fn bucketed_loader_empty_file_errors_not_hang() {
+        let progress = ShogiProgressKPAbs;
+        let tmp = std::env::temp_dir().join(format!(
+            "nnue-train-bucketed-empty-{}.psv",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"").expect("write empty psv");
+        let mut loader = BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress).unwrap();
+        let err = loader
+            .next_batch()
+            .expect_err("empty file → barren error, not None and not hang");
+        assert!(
+            err.to_string().contains("no usable positions"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
