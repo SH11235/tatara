@@ -18,8 +18,15 @@
 //!         loss += backend.train_step(batch, buckets, lr, wdl, loss_kind)
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
-//!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")
+//!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb)  # raw f32 + Ranger state (resume 用、Issue #88)
+//!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
+//!
+//! `start_superbatch != 1` で呼ぶと resume になる: lr/wdl scheduler は superbatch
+//! index 駆動 (`StepLR` は `(sb-1)/step`) なので `start_superbatch` を渡せば lr が
+//! 自動で正しい値に戻る (weight + optimizer state の復元自体は backend 側、
+//! `bins/nnue_train --resume` が `GpuTrainer::load_raw_checkpoint` 経由で行う)。
 //!
 //! per-position の output bucket は progress8kpabs (`ShogiProgressKPAbs::bucket`、
 //! YaneuraOu 互換 `progress.bin` の重み付き和 → sigmoid → `floor(p * 8)` を
@@ -160,6 +167,20 @@ pub trait TrainerBackend {
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す
     /// (Stage 3-3 `nnue-format` の `save_quantised` 相当を backend 側で実行)。
     fn save_checkpoint(&mut self, path: &Path) -> io::Result<()>;
+
+    /// resume 用 **raw f32 checkpoint** を `path` に書き出す (Issue #88)。
+    ///
+    /// 量子化 `.bin` ([`TrainerBackend::save_checkpoint`]) と違い、全 weight group の
+    /// raw f32 値に加えて optimizer state (Ranger の `m` / `v` / `slow`) と step counter、
+    /// および現在の `superbatch` 番号を保存する。これを `--resume` で読み戻すと
+    /// optimizer state ごと学習を再開できる (`--init-from` は weight だけ注入し
+    /// optimizer state を reset するため真の resume にはならない)。
+    ///
+    /// backend 側 (`bins/nnue_train::GpuTrainer`) は device → host download → file 書き出し
+    /// (`.tmp` へ書いてから `rename` で atomic に置換) を行う。`crates/nnue-train` は
+    /// GPU 非依存なので、本 trait は **path / superbatch 番号だけ** を受け取り device IO は
+    /// backend 任せ (Stage 3-0 規約)。
+    fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> io::Result<()>;
 }
 
 // =============================================================================
@@ -187,6 +208,12 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
     pub save_rate: usize,
+    /// `Some(n)` のとき、新しい raw checkpoint (`{net_id}-{sb}.ckpt`) を書いた後、
+    /// 直近 `n` 個より古い raw checkpoint を削除する (Issue #88、`--keep-checkpoints`)。
+    /// `None` は全 raw checkpoint を保持 (default; raw state は ~1.8GB/個 なので
+    /// save-rate × superbatches が大きい長期ランでは明示指定推奨)。量子化 `.bin`
+    /// (~116MB) は本設定に関わらず常に全保持する (推論 artifact なので保守的に)。
+    pub keep_raw_checkpoints: Option<usize>,
     /// どの loss kernel で学習するか (sigmoid-MSE / bullet WRM) + 固定パラメータ。
     pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (bullet `--score-drop-abs`)。
@@ -218,6 +245,11 @@ impl TrainingConfig {
         }
         if self.save_rate == 0 {
             return Err(io::Error::other("save_rate must be >= 1"));
+        }
+        if let Some(0) = self.keep_raw_checkpoints {
+            return Err(io::Error::other(
+                "keep_raw_checkpoints must be >= 1 when set (0 would delete every raw checkpoint)",
+            ));
         }
         self.loss.validate()?;
         if let Some(t) = self.score_drop_abs {
@@ -344,6 +376,15 @@ where
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path)?;
             println!("[train] checkpoint saved: {}", path.display());
+
+            // resume 用 raw checkpoint (Issue #88): weight raw f32 + Ranger state + step + sb。
+            let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));
+            backend.save_resume_checkpoint(&raw_path, sb)?;
+            println!("[train] resume checkpoint saved: {}", raw_path.display());
+
+            if let Some(keep) = cfg.keep_raw_checkpoints {
+                prune_old_raw_checkpoints(&cfg.output_dir, &cfg.net_id, keep);
+            }
         }
     }
 
@@ -353,6 +394,67 @@ where
         cfg.end_superbatch + 1 - cfg.start_superbatch,
     );
     Ok(())
+}
+
+/// `{net_id}-{sb}.ckpt` 形式の raw checkpoint のうち、superbatch 番号 (`sb`) の
+/// 大きい順に `keep` 個だけ残し、それより古いものを削除する (Issue #88、
+/// `--keep-checkpoints`)。量子化 `.bin` には触らない (推論 artifact なので全保持)。
+///
+/// 削除失敗 (権限・他プロセス) は警告のみで `run` を止めない (training 続行優先)。
+/// `keep == 0` は呼ばれない想定 (`TrainingConfig::validate` で reject 済) だが、
+/// 万一渡されても全削除はしない (no-op で警告)。
+fn prune_old_raw_checkpoints(output_dir: &Path, net_id: &str, keep: usize) {
+    if keep == 0 {
+        eprintln!(
+            "[train] warning: keep_raw_checkpoints=0 ignored (would delete all raw checkpoints)"
+        );
+        return;
+    }
+    let prefix = format!("{net_id}-");
+    let entries = match std::fs::read_dir(output_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "[train] warning: cannot read {} to prune raw checkpoints: {e}",
+                output_dir.display()
+            );
+            return;
+        }
+    };
+    // (superbatch 番号, パス) を収集。`{net_id}-<digits>.ckpt` だけ対象。
+    let mut found: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(num_str) = rest.strip_suffix(".ckpt") else {
+            continue;
+        };
+        if let Ok(sb) = num_str.parse::<usize>() {
+            found.push((sb, path));
+        }
+    }
+    if found.len() <= keep {
+        return;
+    }
+    // superbatch 降順 → 先頭 `keep` 個を残し、残りを削除。
+    found.sort_by_key(|(sb, _)| std::cmp::Reverse(*sb));
+    for (sb, path) in found.into_iter().skip(keep) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!(
+                "[train] pruned old raw checkpoint: {} (sb {sb})",
+                path.display()
+            ),
+            Err(e) => eprintln!(
+                "[train] warning: failed to prune {} (sb {sb}): {e}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// 秒数を `1h23m45s` / `12m05s` / `42s` 形式に整形する (`??` if not finite)。
@@ -391,6 +493,8 @@ mod tests {
     struct MockBackend {
         steps: usize,
         saves: Vec<PathBuf>,
+        /// raw resume checkpoint の保存呼び出し (path, superbatch)。
+        resume_saves: Vec<(PathBuf, usize)>,
         last_buckets: Vec<i32>,
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
@@ -401,6 +505,7 @@ mod tests {
             Self {
                 steps: 0,
                 saves: Vec::new(),
+                resume_saves: Vec::new(),
                 last_buckets: Vec::new(),
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
@@ -445,6 +550,11 @@ mod tests {
             self.saves.push(path.to_path_buf());
             Ok(())
         }
+
+        fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> io::Result<()> {
+            self.resume_saves.push((path.to_path_buf(), superbatch));
+            Ok(())
+        }
     }
 
     fn base_cfg() -> TrainingConfig {
@@ -456,6 +566,7 @@ mod tests {
             batches_per_superbatch: 2,
             batch_size: 8,
             save_rate: 2,
+            keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
             threads: 2,
@@ -492,6 +603,20 @@ mod tests {
                 PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-3.bin"),
             ]
         );
+        // raw resume checkpoint は同 superbatch で `{net_id}-{sb}.ckpt` に保存される。
+        assert_eq!(
+            backend.resume_saves,
+            vec![
+                (
+                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-2.ckpt"),
+                    2
+                ),
+                (
+                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-3.ckpt"),
+                    3
+                ),
+            ]
+        );
         // 各 superbatch で lr が gamma 倍 (StepLR step=1, gamma=0.9)。batch 内は一定。
         // (lr は train_step 呼び出し順 = run の loop 順で決まり、dataloader の worker
         // 順序には依らない。)
@@ -517,6 +642,164 @@ mod tests {
         // threads>=2: 並列パース。順序は非決定的でも step 回数 / checkpoint / bucket /
         // lr schedule は不変。
         run_drives_superbatches_with_threads(4);
+    }
+
+    #[test]
+    fn run_with_start_superbatch_offset_resumes_loop_and_lr_schedule() {
+        // Issue #88: `start_superbatch != 1` (resume) で回したとき:
+        //  - 正しい step 回数 (start..=end の superbatch 数 × batches/sb)
+        //  - checkpoint / resume-checkpoint が start..=end の番号で命名される
+        //  - lr schedule が offset を反映する (StepLR sb=3 = start * gamma^2)
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            start_superbatch: 3,
+            end_superbatch: 5,
+            save_rate: 2, // sb 4 (4 % 2 == 0) と sb 5 (== end) で save
+            threads: 1,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new();
+        run(&mut backend, &sample_psv_path(), &progress, &lr, &wdl, &cfg).expect("run ok");
+
+        // 3 superbatch (3,4,5) × 2 batch = 6 step。
+        assert_eq!(backend.steps, 6);
+        // save_rate=2 → sb 4, sb 5。番号は start_superbatch offset を反映。
+        assert_eq!(
+            backend.saves,
+            vec![
+                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-4.bin"),
+                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-5.bin"),
+            ]
+        );
+        assert_eq!(
+            backend.resume_saves,
+            vec![
+                (
+                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-4.ckpt"),
+                    4
+                ),
+                (
+                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-5.ckpt"),
+                    5
+                ),
+            ]
+        );
+        // lr schedule: sb 3 (1st batch) = start * gamma^((3-1)/1) = start * gamma^2。
+        // StepLR は `start * gamma^((sb-1)/step)` (resume 時は sb を渡せば自動で正しい lr)。
+        let expected_sb3 = 1.0e-3 * 0.9_f32 * 0.9_f32;
+        assert!(
+            (backend.seen_lr[0] - expected_sb3).abs() < 1e-9,
+            "sb3 lr = {} expected {expected_sb3}",
+            backend.seen_lr[0]
+        );
+        // sb 5 (5th step = 1st batch of sb 5) = start * gamma^4。
+        let expected_sb5 = 1.0e-3 * 0.9_f32.powi(4);
+        assert!(
+            (backend.seen_lr[4] - expected_sb5).abs() < 1e-9,
+            "sb5 lr = {} expected {expected_sb5}",
+            backend.seen_lr[4]
+        );
+    }
+
+    #[test]
+    fn keep_raw_checkpoints_prunes_oldest() {
+        // Issue #88: `--keep-checkpoints N` 相当。end_superbatch=6, save_rate=1 で
+        // 6 個の .ckpt が書かれるが keep=2 なら直近 2 個 (sb 5, 6) だけ残る。
+        // (MockBackend は実 file を書かないので、テスト用に空 file を実 dir に置いて
+        //  prune ロジックを exercise する。)
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-trainer-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir tmp");
+
+        // 既存 .ckpt と .bin を散らかしておく (`.bin` は prune 対象外であることを確認)。
+        for sb in 1..=4usize {
+            std::fs::write(dir.join(format!("net-{sb}.ckpt")), b"x").unwrap();
+            std::fs::write(dir.join(format!("net-{sb}.bin")), b"x").unwrap();
+        }
+        // 別 net_id の .ckpt は触られないこと。
+        std::fs::write(dir.join("other-1.ckpt"), b"x").unwrap();
+        // 数値でない名前は無視されること。
+        std::fs::write(dir.join("net-foo.ckpt"), b"x").unwrap();
+
+        prune_old_raw_checkpoints(&dir, "net", 2);
+
+        // sb 3, 4 だけ残る (sb 1, 2 削除)。
+        assert!(
+            !dir.join("net-1.ckpt").exists(),
+            "net-1.ckpt should be pruned"
+        );
+        assert!(
+            !dir.join("net-2.ckpt").exists(),
+            "net-2.ckpt should be pruned"
+        );
+        assert!(dir.join("net-3.ckpt").exists(), "net-3.ckpt should be kept");
+        assert!(dir.join("net-4.ckpt").exists(), "net-4.ckpt should be kept");
+        // .bin は全部残る。
+        for sb in 1..=4usize {
+            assert!(
+                dir.join(format!("net-{sb}.bin")).exists(),
+                "net-{sb}.bin kept"
+            );
+        }
+        // 別 net_id / 非数値名は無傷。
+        assert!(dir.join("other-1.ckpt").exists());
+        assert!(dir.join("net-foo.ckpt").exists());
+
+        // keep >= 個数 のときは何も消さない。
+        prune_old_raw_checkpoints(&dir, "net", 10);
+        assert!(dir.join("net-3.ckpt").exists());
+        assert!(dir.join("net-4.ckpt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_raw_checkpoints_sorts_numerically_not_lexically() {
+        // Issue #88 regression: superbatch 番号は parse 済 `usize` で降順 sort される。
+        // 9, 10, 11 を keep=2 で prune したとき、数値 sort なら最古の 9 が消え 10/11 が残る。
+        // lexical (string) sort に regress すると "10" < "11" < "9" となり 11 を誤って消す。
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-trainer-prune-numeric-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir tmp");
+
+        for sb in [9usize, 10, 11] {
+            std::fs::write(dir.join(format!("net-{sb}.ckpt")), b"x").unwrap();
+        }
+
+        prune_old_raw_checkpoints(&dir, "net", 2);
+
+        assert!(
+            !dir.join("net-9.ckpt").exists(),
+            "net-9.ckpt should be pruned (smallest superbatch by numeric sort)"
+        );
+        assert!(
+            dir.join("net-10.ckpt").exists(),
+            "net-10.ckpt should be kept (lexical sort would wrongly prune it)"
+        );
+        assert!(
+            dir.join("net-11.ckpt").exists(),
+            "net-11.ckpt should be kept (newest)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -599,6 +882,22 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                keep_raw_checkpoints: Some(0),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                keep_raw_checkpoints: Some(3),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
         );
         assert!(
             TrainingConfig {

@@ -1356,6 +1356,82 @@ const L2_IN: usize = L1_EFFECTIVE * 2; // = 30 (l1_sqr.concat(l1_main))、bullet
 const L2_OUT: usize = 32;
 const NUM_BUCKETS: usize = 9; // progress8kpabs
 
+// ===========================================================================
+// raw checkpoint format (Issue #88、`--resume` 用)
+// ===========================================================================
+
+/// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
+/// `crates/nnue-train::optimizer` の `b"RNGR"` (RangerHostState single-file format) とは
+/// 別物 — こちらは weight group raw f32 + Ranger state + step + superbatch を 1 file に
+/// まとめた self-contained format (`RNGR` は optimizer state だけ、weight は持たない)。
+const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
+
+/// raw checkpoint format version (本 PR は 1、後続変更で increment)。
+const RAW_CKPT_VERSION: u32 = 1;
+
+/// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
+type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// `io::ErrorKind::InvalidData` の `Box<dyn Error>` を作る短縮 helper (raw checkpoint
+/// の magic/version/dim 検証で使う、`RangerHostState::load_from_reader` と同方針)。
+fn invalid_data(msg: String) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+}
+
+/// f32 slice を little-endian で `w` に書き出す (`bytemuck` 不使用、依存を増やさない)。
+fn write_f32_slice<W: std::io::Write>(w: &mut W, data: &[f32]) -> std::io::Result<()> {
+    // 4 byte ずつの write_all は遅いので、一旦 byte Vec に詰めてから 1 回で書く
+    // (`raw_ckpt_groups` 最大 113M f32 = ~450MB、呼び出し側は BufWriter で wrap 済だが
+    //  chunk write の方が更に system call が減る)。
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for &x in data {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    w.write_all(&bytes)
+}
+
+/// `r.read_exact(buf)` を呼び、`UnexpectedEof` (= file が途中で切れている、破損 / 部分書き)
+/// を `InvalidData` + context message に正規化する。raw checkpoint の robustness contract
+/// 「malformed input は全部 `InvalidData`、panic しない」を満たすため、`load_raw_checkpoint`
+/// 内の全 `read_exact` はこの helper 経由で呼ぶ (`what` は読もうとしていた field の説明)。
+fn read_exact_or_invalid<R: std::io::Read>(
+    r: &mut R,
+    buf: &mut [u8],
+    what: &str,
+) -> std::io::Result<()> {
+    r.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("raw checkpoint truncated while reading {what}"),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// little-endian f32 を `n` 個読む (`RangerHostState::load_from_reader` の `read_f32_vec`
+/// と同型だが本 module 内ローカル版、`io::Result` を返す)。`what` は短読み (破損 file) 時の
+/// context message に使う (`UnexpectedEof` → `InvalidData` に正規化、`read_exact_or_invalid` 経由)。
+fn read_f32_vec_io<R: std::io::Read>(r: &mut R, n: usize, what: &str) -> std::io::Result<Vec<f32>> {
+    let mut bytes = vec![
+        0u8;
+        n.checked_mul(4).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("f32 vec len {n} overflows byte count"),
+            )
+        })?
+    ];
+    read_exact_or_invalid(r, &mut bytes, what)?;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
 // scale 定数 (bullet shogi_layerstack.rs:2241, 2260)
 const FT_POST_SCALE: f32 = 127.0 / 128.0;
 const L1_SQR_SCALE: f32 = 127.0 / 128.0;
@@ -1930,6 +2006,321 @@ impl GpuTrainer {
             l3_w: self.l3_w.to_host_vec(&self.stream)?,
             l3_b: self.l3_b.to_host_vec(&self.stream)?,
         })
+    }
+
+    /// 各 weight group の `(name, expected_len, &w, &m, &v, &slow)` を v102 固定順で返す
+    /// (raw checkpoint の save/load で iterate するための immutable view)。`grad` は
+    /// resume に不要なので含めない。順序 = ft_w, ft_b, l1_w, l1_b, l1f_w, l1f_b, l2_w,
+    /// l2_b, l3_w, l3_b ([`V102Weights`] と同順、raw checkpoint format の group 順)。
+    #[allow(clippy::type_complexity)]
+    fn raw_ckpt_groups(
+        &self,
+    ) -> [(
+        &'static str,
+        usize,
+        &DeviceBuffer<f32>,
+        &DeviceBuffer<f32>,
+        &DeviceBuffer<f32>,
+        &DeviceBuffer<f32>,
+    ); 10] {
+        let ft_w_n = FT_IN * FT_OUT;
+        let ft_b_n = FT_OUT;
+        let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
+        let l1_b_n = NUM_BUCKETS * L1_OUT;
+        let l1f_w_n = FT_OUT * L1_OUT;
+        let l1f_b_n = L1_OUT;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l2_b_n = NUM_BUCKETS * L2_OUT;
+        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l3_b_n = NUM_BUCKETS;
+        [
+            (
+                "ft_w",
+                ft_w_n,
+                &self.ft_w,
+                &self.ft_w_m,
+                &self.ft_w_v,
+                &self.ft_w_slow,
+            ),
+            (
+                "ft_b",
+                ft_b_n,
+                &self.ft_b,
+                &self.ft_b_m,
+                &self.ft_b_v,
+                &self.ft_b_slow,
+            ),
+            (
+                "l1_w",
+                l1_w_n,
+                &self.l1_w,
+                &self.l1_w_m,
+                &self.l1_w_v,
+                &self.l1_w_slow,
+            ),
+            (
+                "l1_b",
+                l1_b_n,
+                &self.l1_b,
+                &self.l1_b_m,
+                &self.l1_b_v,
+                &self.l1_b_slow,
+            ),
+            (
+                "l1f_w",
+                l1f_w_n,
+                &self.l1f_w,
+                &self.l1f_w_m,
+                &self.l1f_w_v,
+                &self.l1f_w_slow,
+            ),
+            (
+                "l1f_b",
+                l1f_b_n,
+                &self.l1f_b,
+                &self.l1f_b_m,
+                &self.l1f_b_v,
+                &self.l1f_b_slow,
+            ),
+            (
+                "l2_w",
+                l2_w_n,
+                &self.l2_w,
+                &self.l2_w_m,
+                &self.l2_w_v,
+                &self.l2_w_slow,
+            ),
+            (
+                "l2_b",
+                l2_b_n,
+                &self.l2_b,
+                &self.l2_b_m,
+                &self.l2_b_v,
+                &self.l2_b_slow,
+            ),
+            (
+                "l3_w",
+                l3_w_n,
+                &self.l3_w,
+                &self.l3_w_m,
+                &self.l3_w_v,
+                &self.l3_w_slow,
+            ),
+            (
+                "l3_b",
+                l3_b_n,
+                &self.l3_b,
+                &self.l3_b_m,
+                &self.l3_b_v,
+                &self.l3_b_slow,
+            ),
+        ]
+    }
+
+    /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す (Issue #88)。
+    ///
+    /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_v102_weights` → `save_quantised`)
+    /// は推論用 final artifact なので別途従来どおり保存される。本 method はそれとは別の
+    /// `*.ckpt` file に、全 10 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
+    /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
+    /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
+    ///
+    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`]):
+    /// ```text
+    /// 0..4     magic   b"RNRC"
+    /// 4..8     version u32 (1)
+    /// 8..16    superbatch u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
+    /// 16..24   step_count u64  (Ranger lookahead step counter)
+    /// 24..32   num_groups u64  (= 10、固定だが将来検証用)
+    /// then for each of 10 groups (順序 = `raw_ckpt_groups()` = ft_w, ft_b, l1_w, l1_b,
+    ///   l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b):
+    ///   len u64
+    ///   w[f32 × len]
+    ///   m[f32 × len]
+    ///   v[f32 × len]
+    ///   slow[f32 × len]
+    /// ```
+    ///
+    /// device → host download (`DeviceBuffer::to_host_vec`) → `<path>.tmp` へ `BufWriter`
+    /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
+    /// crash しても `<path>` は前回の完全な checkpoint のまま)。
+    fn save_raw_checkpoint(
+        &self,
+        path: &Path,
+        superbatch: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".tmp");
+            std::path::PathBuf::from(p)
+        };
+
+        // write+flush 本体を closure に括り、`fs::rename` 前の error path で
+        // 中途半端な `<path>.tmp` を best-effort で消す (device→host download / write /
+        // flush 失敗で残骸を残さない、Issue #88 review)。
+        let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
+            let groups = self.raw_ckpt_groups();
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+            w.write_all(&RAW_CKPT_MAGIC)?;
+            w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
+            w.write_all(&(superbatch as u64).to_le_bytes())?;
+            w.write_all(&self.step_count.to_le_bytes())?;
+            w.write_all(&(groups.len() as u64).to_le_bytes())?;
+
+            for (name, expected_len, w_buf, m_buf, v_buf, slow_buf) in groups {
+                // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。
+                let w_host = w_buf.to_host_vec(&self.stream)?;
+                let m_host = m_buf.to_host_vec(&self.stream)?;
+                let v_host = v_buf.to_host_vec(&self.stream)?;
+                let slow_host = slow_buf.to_host_vec(&self.stream)?;
+                for (label, got) in [
+                    ("w", w_host.len()),
+                    ("m", m_host.len()),
+                    ("v", v_host.len()),
+                    ("slow", slow_host.len()),
+                ] {
+                    if got != expected_len {
+                        return Err(format!(
+                            "raw checkpoint: group {name} {label} buffer len {got} != expected {expected_len}"
+                        )
+                        .into());
+                    }
+                }
+                w.write_all(&(expected_len as u64).to_le_bytes())?;
+                write_f32_slice(&mut w, &w_host)?;
+                write_f32_slice(&mut w, &m_host)?;
+                write_f32_slice(&mut w, &v_host)?;
+                write_f32_slice(&mut w, &slow_host)?;
+            }
+            w.flush()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// `--resume` で raw checkpoint を読み戻す (Issue #88)。返り値は checkpoint に
+    /// 記録された **完了 superbatch 番号** (caller は通常その +1 から resume する)。
+    ///
+    /// magic / version 不一致、group 数 / 各 group の len が v102 arch と不一致、または
+    /// `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
+    /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針、
+    /// Codex convention #62)。読み込んだ raw f32 を host → device upload し、
+    /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
+    fn load_raw_checkpoint(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+
+        let mut magic = [0u8; 4];
+        read_exact_or_invalid(&mut r, &mut magic, "magic")?;
+        if magic != RAW_CKPT_MAGIC {
+            return Err(invalid_data(format!(
+                "raw checkpoint magic mismatch: got {magic:?}, want {RAW_CKPT_MAGIC:?}"
+            )));
+        }
+        let mut buf4 = [0u8; 4];
+        read_exact_or_invalid(&mut r, &mut buf4, "version")?;
+        let version = u32::from_le_bytes(buf4);
+        if version != RAW_CKPT_VERSION {
+            return Err(invalid_data(format!(
+                "raw checkpoint version mismatch: got {version}, want {RAW_CKPT_VERSION}"
+            )));
+        }
+        let mut buf8 = [0u8; 8];
+        read_exact_or_invalid(&mut r, &mut buf8, "superbatch")?;
+        let superbatch_u64 = u64::from_le_bytes(buf8);
+        let superbatch: usize = superbatch_u64.try_into().map_err(|_| {
+            invalid_data(format!(
+                "raw checkpoint superbatch {superbatch_u64} exceeds usize::MAX"
+            ))
+        })?;
+        read_exact_or_invalid(&mut r, &mut buf8, "step_count")?;
+        let step_count = u64::from_le_bytes(buf8);
+        read_exact_or_invalid(&mut r, &mut buf8, "num_groups")?;
+        let num_groups_u64 = u64::from_le_bytes(buf8);
+
+        let expected_groups: [(&'static str, usize); 10] = {
+            let g = self.raw_ckpt_groups();
+            [
+                (g[0].0, g[0].1),
+                (g[1].0, g[1].1),
+                (g[2].0, g[2].1),
+                (g[3].0, g[3].1),
+                (g[4].0, g[4].1),
+                (g[5].0, g[5].1),
+                (g[6].0, g[6].1),
+                (g[7].0, g[7].1),
+                (g[8].0, g[8].1),
+                (g[9].0, g[9].1),
+            ]
+        };
+        if num_groups_u64 != expected_groups.len() as u64 {
+            return Err(invalid_data(format!(
+                "raw checkpoint num_groups {num_groups_u64} != expected {}",
+                expected_groups.len()
+            )));
+        }
+
+        // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
+        // upload して途中 fail だと中途半端な state になるため)。
+        let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(10);
+        for (name, expected_len) in expected_groups {
+            read_exact_or_invalid(&mut r, &mut buf8, &format!("group {name} len"))?;
+            let len_u64 = u64::from_le_bytes(buf8);
+            let len: usize = len_u64.try_into().map_err(|_| {
+                invalid_data(format!(
+                    "raw checkpoint group {name} len {len_u64} exceeds usize::MAX"
+                ))
+            })?;
+            if len != expected_len {
+                return Err(invalid_data(format!(
+                    "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} (v102 arch)"
+                )));
+            }
+            let w_host = read_f32_vec_io(&mut r, len, &format!("group {name} w"))?;
+            let m_host = read_f32_vec_io(&mut r, len, &format!("group {name} m"))?;
+            let v_host = read_f32_vec_io(&mut r, len, &format!("group {name} v"))?;
+            let slow_host = read_f32_vec_io(&mut r, len, &format!("group {name} slow"))?;
+            loaded.push((w_host, m_host, v_host, slow_host));
+        }
+        // EOF 確認 (trailing garbage は許容するが、足りないのは上で read_exact が弾く)。
+
+        // host → device upload。order は `raw_ckpt_groups` (= ft_w, ft_b, ..., l3_b)。
+        macro_rules! up {
+            ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
+                let (w, m, v, s) = &loaded[$idx];
+                self.$w = DeviceBuffer::from_host(&self.stream, w)?;
+                self.$m = DeviceBuffer::from_host(&self.stream, m)?;
+                self.$v = DeviceBuffer::from_host(&self.stream, v)?;
+                self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+            }};
+        }
+        up!(0, ft_w, ft_w_m, ft_w_v, ft_w_slow);
+        up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
+        up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
+        up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
+        up!(4, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
+        up!(5, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
+        up!(6, l2_w, l2_w_m, l2_w_v, l2_w_slow);
+        up!(7, l2_b, l2_b_m, l2_b_v, l2_b_slow);
+        up!(8, l3_w, l3_w_m, l3_w_v, l3_w_slow);
+        up!(9, l3_b, l3_b_m, l3_b_v, l3_b_slow);
+
+        self.step_count = step_count;
+        Ok(superbatch)
     }
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
@@ -2869,6 +3260,18 @@ impl TrainerBackend for GpuTrainer {
         writer.flush()?;
         Ok(())
     }
+
+    fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> std::io::Result<()> {
+        self.save_raw_checkpoint(path, superbatch).map_err(|e| {
+            // 既に io::Error なら kind を保つ、それ以外は other で包む。
+            match e.downcast::<std::io::Error>() {
+                Ok(io_err) => *io_err,
+                Err(other) => std::io::Error::other(format!(
+                    "GpuTrainer::save_raw_checkpoint failed: {other}"
+                )),
+            }
+        })
+    }
 }
 
 // ===========================================================================
@@ -2943,8 +3346,30 @@ struct Cli {
     score_drop_abs: Option<i32>,
 
     /// 学習開始前に量子化 v102 NNUE binary から weight を注入する (pretrained start)。
+    /// optimizer state (Ranger m/v/slow/step) は **reset** される — 真の resume には
+    /// `--resume` を使うこと (`--init-from` と `--resume` は排他)。
     #[arg(long)]
     init_from: Option<PathBuf>,
+
+    /// raw checkpoint (`{net_id}-{sb}.ckpt`) から weight + Ranger optimizer state
+    /// (m/v/slow/step) を復元して学習を再開する (Issue #88、真の resume)。`--init-from`
+    /// とは排他 (`--init-from` は weight のみ注入し optimizer を reset するため)。
+    /// `--start-superbatch` 未指定なら checkpoint に記録された superbatch の +1 から再開。
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
+    /// 学習を開始する superbatch 番号 (1-indexed, inclusive)。未指定時:
+    /// `--resume` あり → checkpoint の superbatch +1、なし → 1。`1 <= N <= --superbatches`
+    /// の範囲外ならエラー (resume で過去 sb をやり直す目的で明示指定も可)。
+    #[arg(long)]
+    start_superbatch: Option<usize>,
+
+    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (Issue #88、ディスク節約)。
+    /// 未指定なら全保持 (raw state は ~1.8GB/個 なので save-rate × superbatches が
+    /// 大きい長期ランでは指定推奨; 例 save-rate 20 / 400sb = 20 個 ≈ 36GB)。量子化
+    /// `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
+    #[arg(long)]
+    keep_checkpoints: Option<usize>,
 
     /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm` kernel
     /// (prediction / target 双方に nodchip 流 WRM) を使い、未指定なら `loss_wdl`
@@ -3059,6 +3484,17 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.threads == 0 {
         return Err("--threads must be >= 1".into());
     }
+    if cli.init_from.is_some() && cli.resume.is_some() {
+        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
+    }
+    if cli.superbatches == 0 {
+        return Err("--superbatches must be >= 1".into());
+    }
+    if let Some(0) = cli.keep_checkpoints {
+        return Err(
+            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
+        );
+    }
 
     std::fs::create_dir_all(&cli.output)?;
 
@@ -3082,14 +3518,50 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
     // workspace を batch_size 分で確保 (Issue #78、partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(&ctx, cli.batch_size)?;
-    if let Some(init) = &cli.init_from {
+    // resume / init-from の処理 → resumed_superbatch を決める。
+    let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
         println!(
-            "[train] injecting pretrained weights from {}",
+            "[train] injecting pretrained weights from {} (optimizer state reset)",
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
         let weights = V102Weights::load_quantised(&mut reader)?;
         trainer.load_v102_weights(&weights)?;
+        None
+    } else if let Some(ckpt) = &cli.resume {
+        let sb = trainer.load_raw_checkpoint(ckpt)?;
+        println!(
+            "[train] resuming from {} at superbatch {}",
+            ckpt.display(),
+            sb + 1
+        );
+        Some(sb)
+    } else {
+        None
+    };
+
+    // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
+    let start_superbatch = match cli.start_superbatch {
+        Some(n) => n,
+        None => match resumed_superbatch {
+            Some(sb) => sb + 1,
+            None => 1,
+        },
+    };
+    if start_superbatch == 0 {
+        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
+    }
+    if start_superbatch > cli.superbatches {
+        return Err(format!(
+            "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
+            cli.superbatches
+        )
+        .into());
+    }
+    if cli.resume.is_some() && cli.start_superbatch.is_some() {
+        println!(
+            "[train] (--start-superbatch {start_superbatch} overrides the resumed checkpoint's superbatch+1)"
+        );
     }
 
     let lr_scheduler = StepLR {
@@ -3101,11 +3573,12 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
         output_dir: cli.output.clone(),
-        start_superbatch: 1,
+        start_superbatch,
         end_superbatch: cli.superbatches,
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
+        keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
         threads: cli.threads,
@@ -3239,6 +3712,74 @@ fn main() -> std::process::ExitCode {
             eprintln!("error: {e}");
             std::process::ExitCode::from(1)
         }
+    }
+}
+
+// ===========================================================================
+// raw checkpoint format helper tests (Issue #88、GPU 不要)
+// ===========================================================================
+#[cfg(test)]
+mod raw_ckpt_format_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn write_then_read_f32_slice_round_trips() {
+        let data: Vec<f32> = vec![0.0, 1.0, -1.0, 3.5, f32::MIN_POSITIVE, -42.25, 1e9];
+        let mut buf = Vec::new();
+        write_f32_slice(&mut buf, &data).unwrap();
+        assert_eq!(buf.len(), data.len() * 4);
+        let back = read_f32_vec_io(&mut Cursor::new(&buf), data.len(), "test").unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn empty_f32_slice_round_trips() {
+        let mut buf = Vec::new();
+        write_f32_slice(&mut buf, &[]).unwrap();
+        assert!(buf.is_empty());
+        let back = read_f32_vec_io(&mut Cursor::new(&buf), 0, "test").unwrap();
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn read_f32_vec_errors_on_short_input() {
+        // 破損 / 部分書き checkpoint の短読みは `UnexpectedEof` ではなく context 付き
+        // `InvalidData` に正規化される (robustness contract: malformed input は全部 InvalidData)。
+        let buf = vec![0u8; 6]; // 1.5 f32 worth
+        let err = read_f32_vec_io(&mut Cursor::new(&buf), 2, "group ft_w w")
+            .expect_err("must error on short read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("truncated") && err.to_string().contains("group ft_w w"),
+            "error message should describe the truncated field: {err}"
+        );
+    }
+
+    #[test]
+    fn read_exact_or_invalid_maps_eof_to_invalid_data() {
+        let buf = vec![0u8; 2];
+        let mut out = [0u8; 8];
+        let err = read_exact_or_invalid(&mut Cursor::new(&buf), &mut out, "superbatch")
+            .expect_err("must error on short read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"));
+        assert!(err.to_string().contains("superbatch"));
+    }
+
+    #[test]
+    fn raw_ckpt_constants_are_stable() {
+        // format identity が変わると古い checkpoint を resume できなくなるので pin。
+        assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
+        assert_eq!(RAW_CKPT_VERSION, 1);
+    }
+
+    #[test]
+    fn invalid_data_helper_makes_invalid_data_error() {
+        let e = invalid_data("boom".to_string());
+        let io_err = e.downcast::<std::io::Error>().expect("is io::Error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(io_err.to_string().contains("boom"));
     }
 }
 
