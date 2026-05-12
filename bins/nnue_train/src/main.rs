@@ -1741,6 +1741,31 @@ impl GpuTrainer {
         }
         let b_u32 = b as u32;
 
+        // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
+        // `synchronize()` + 経過時間を stderr に出す (粗い forward / backward /
+        // optimizer breakdown 用、Issue #76)。未設定なら追加の sync ゼロ。
+        // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
+        // 取れないため、この粗い event timing が代替手段。
+        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
+        if profile_step {
+            self.stream.synchronize()?;
+        }
+        let mut prof_t0 = std::time::Instant::now();
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(prof_t0).as_secs_f64() * 1000.0
+                    );
+                    prof_t0 = now;
+                }
+            };
+        }
+
         // 入力 buffer を host → device
         let stm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.stm_indices)?;
         let nstm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.nstm_indices)?;
@@ -1751,6 +1776,7 @@ impl GpuTrainer {
 
         // loss_acc reset
         self.loss_acc = DeviceBuffer::<f64>::zeroed(&self.stream, 1)?;
+        prof_tick!("h2d+reset");
 
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         let mut ft_stm_out = DeviceBuffer::<f32>::zeroed(&self.stream, b * FT_OUT)?;
@@ -1994,6 +2020,7 @@ impl GpuTrainer {
                 wdl_lambda, loss_scale, b_u32
             ]
         }?;
+        prof_tick!("forward");
 
         // ===== BACKWARD =====
         // 全 *_grad buffer を 0 で reset (atomic accumulate semantic に従う kernel が
@@ -2366,6 +2393,7 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
             ]
         }?;
+        prof_tick!("backward");
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
         self.step_count += 1;
@@ -2502,6 +2530,8 @@ impl GpuTrainer {
                 args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n as u32]
             }?;
         }
+        prof_tick!("optimizer");
+        let _ = prof_t0; // 最後の prof_tick が代入した値をここで「読む」(unused_assignments 回避)
 
         self.stream.synchronize()?;
 
