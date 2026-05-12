@@ -15,7 +15,7 @@
 //!         wdl = wdl_scheduler.blend(batch_idx, sb, end_superbatch)
 //!         fill Batch + per-position bucket from the PSV stream
 //!           (EOF → 同 file を開き直す = 次 epoch)
-//!         loss += backend.train_step(batch, buckets, lr, wdl, loss_scale)
+//!         loss += backend.train_step(batch, buckets, lr, wdl, loss_kind)
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")
@@ -54,6 +54,78 @@ use crate::dataloader::{Batch, PsvFileLoader};
 use crate::schedule::{LrScheduler, WdlScheduler};
 
 // =============================================================================
+// LossKind — どの loss kernel で 1 step を回すか
+// =============================================================================
+
+/// training step で使う loss の種別と固定パラメータ。
+///
+/// バックエンド ([`TrainerBackend::train_step`]) はこの enum で分岐して対応する
+/// loss kernel (`bins/nnue_train` の `loss_wdl` / `loss_wrm`) を起動する。GPU には
+/// 触らない (CPU-only crate に置ける、Stage 3-0 規約)。
+///
+/// - [`LossKind::Sigmoid`] — 旧来の plain sigmoid-MSE (`p = sigmoid(out * scale)`,
+///   target = `lambda*wdl + (1-lambda)*sigmoid(score * scale)`)。net_output が
+///   cp 単位 (`out ≈ cp`) で収束する。`bins/nnue_train` の `loss_wdl` kernel に対応。
+/// - [`LossKind::Wrm`] — bullet win-rate-model loss (nodchip 流、v102 recipe
+///   `--win-rate-model --wrm-in-scaling 340 --wrm-nnue2score 600`)。prediction /
+///   target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score` (O(1)) で
+///   収束し、`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。
+///   `bins/nnue_train` の `loss_wrm` kernel に対応 (CPU reference は
+///   `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`)。target 側 in_scaling (380) と
+///   offset (270) は bullet ハードコード、prediction 側 in_scaling は `--wrm-in-scaling`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LossKind {
+    /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 は `1/290`)。
+    Sigmoid { scale: f32 },
+    /// bullet win-rate-model loss。`nnue2score = --wrm-nnue2score` (600)、
+    /// `in_scaling = --wrm-in-scaling` (340、prediction 側のみ)。
+    Wrm { nnue2score: f32, in_scaling: f32 },
+}
+
+impl LossKind {
+    /// CLI / config から渡されたパラメータが loss kernel に流せる値か検証する。
+    fn validate(&self) -> io::Result<()> {
+        match *self {
+            LossKind::Sigmoid { scale } => {
+                if !scale.is_finite() || scale <= 0.0 {
+                    return Err(io::Error::other(format!(
+                        "loss scale must be finite and > 0 (got {scale})"
+                    )));
+                }
+            }
+            LossKind::Wrm {
+                nnue2score,
+                in_scaling,
+            } => {
+                if !nnue2score.is_finite() || nnue2score <= 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm nnue2score must be finite and > 0 (got {nnue2score})"
+                    )));
+                }
+                if !in_scaling.is_finite() || in_scaling <= 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm in_scaling must be finite and > 0 (got {in_scaling})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for LossKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            LossKind::Sigmoid { scale } => write!(f, "sigmoid-MSE(scale={scale:.6})"),
+            LossKind::Wrm {
+                nnue2score,
+                in_scaling,
+            } => write!(f, "wrm(nnue2score={nnue2score}, in_scaling={in_scaling})"),
+        }
+    }
+}
+
+// =============================================================================
 // TrainerBackend — 1 batch 分の forward → loss → backward → optimizer step
 // =============================================================================
 
@@ -62,22 +134,22 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
 /// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
-    /// 1 batch 分 (forward → `loss_wdl` → backward → Ranger step) を実行し、
+    /// 1 batch 分 (forward → loss kernel → backward → Ranger step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
     ///
     /// - `batch`: HalfKA_hm sparse + score/wdl/norm (`batch.n_positions` が有効件数)
     /// - `bucket_idx`: `batch.n_positions` 個の output bucket index (`0..=8`)
     /// - `lr`: learning rate (`LrScheduler` 由来)
-    /// - `wdl_lambda`: WDL blend lambda (`WdlScheduler` 由来、`loss_wdl` kernel の `lambda`)
-    /// - `loss_scale`: sigmoid scale (`1.0 / --scale`、`loss_wdl` kernel の `scale`)
+    /// - `wdl_lambda`: WDL blend lambda (`WdlScheduler` 由来、loss kernel の `lambda`)
+    /// - `loss`: どの loss kernel を起動するか (sigmoid-MSE / WRM) + 固定パラメータ
     fn train_step(
         &mut self,
         batch: &Batch,
         bucket_idx: &[i32],
         lr: f32,
         wdl_lambda: f32,
-        loss_scale: f32,
+        loss: LossKind,
     ) -> io::Result<f64>;
 
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す
@@ -110,8 +182,8 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
     pub save_rate: usize,
-    /// sigmoid loss scale (`1.0 / --scale`、v102 は `1/290`)。
-    pub loss_scale: f32,
+    /// どの loss kernel で学習するか (sigmoid-MSE / bullet WRM) + 固定パラメータ。
+    pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (bullet `--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
 }
@@ -138,12 +210,7 @@ impl TrainingConfig {
         if self.save_rate == 0 {
             return Err(io::Error::other("save_rate must be >= 1"));
         }
-        if !self.loss_scale.is_finite() || self.loss_scale <= 0.0 {
-            return Err(io::Error::other(format!(
-                "loss_scale must be finite and > 0 (got {})",
-                self.loss_scale
-            )));
-        }
+        self.loss.validate()?;
         if let Some(t) = self.score_drop_abs {
             if t < 1 {
                 return Err(io::Error::other(format!(
@@ -263,14 +330,14 @@ where
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss-scale {:.6} | score-drop-abs {:?}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
         cfg.end_superbatch,
         cfg.batches_per_superbatch,
         cfg.batch_size,
-        cfg.loss_scale,
+        cfg.loss,
         cfg.score_drop_abs,
     );
 
@@ -296,7 +363,7 @@ where
                 buckets.push(bucket);
             }
 
-            sb_loss += backend.train_step(&batch, &buckets, lr, wdl, cfg.loss_scale)?;
+            sb_loss += backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
             sb_positions += batch.n_positions as u64;
         }
 
@@ -404,7 +471,7 @@ mod tests {
             bucket_idx: &[i32],
             lr: f32,
             wdl_lambda: f32,
-            loss_scale: f32,
+            loss: LossKind,
         ) -> io::Result<f64> {
             assert_eq!(
                 bucket_idx.len(),
@@ -413,7 +480,10 @@ mod tests {
             );
             assert!(batch.n_positions <= batch.batch_size);
             assert!(lr > 0.0, "lr should be positive");
-            assert!(loss_scale > 0.0, "loss_scale should be positive");
+            assert!(
+                loss.validate().is_ok(),
+                "loss params should be valid: {loss}"
+            );
             assert!(wdl_lambda.is_finite());
             assert!(
                 bucket_idx.iter().all(|&b| (0..9).contains(&b)),
@@ -442,7 +512,7 @@ mod tests {
             batches_per_superbatch: 2,
             batch_size: 8,
             save_rate: 2,
-            loss_scale: 1.0 / 290.0,
+            loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
         }
     }
@@ -568,7 +638,7 @@ mod tests {
         );
         assert!(
             TrainingConfig {
-                loss_scale: 0.0,
+                loss: LossKind::Sigmoid { scale: 0.0 },
                 ..base_cfg()
             }
             .validate()
@@ -576,7 +646,40 @@ mod tests {
         );
         assert!(
             TrainingConfig {
-                loss_scale: f32::NAN,
+                loss: LossKind::Sigmoid { scale: f32::NAN },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 0.0,
+                    in_scaling: 340.0
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: -1.0
+                },
                 ..base_cfg()
             }
             .validate()

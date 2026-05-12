@@ -22,11 +22,11 @@
 //! - **L3 (per-bucket)**: weight (9×32) + bias (9) → select(bucket) → 1
 //! - **net_output**: l3_out + l1_skip → 1 scalar
 //!
-//! ## kernel 一覧 (26 個、bin entry reachability のため全て本 file に inline)
+//! ## kernel 一覧 (27 個、bin entry reachability のため全て本 file に inline)
 //!
 //! ### STATED (Stage 2 #46-#52 で landed、本 bin に inline copy)
 //! 1. `screlu_grad` — v102 では未使用、compile-reach のため preserve
-//! 2. `loss_wdl` — 損失 + dy_net_output 勾配
+//! 2. `loss_wdl` — sigmoid-MSE 損失 + dy_net_output 勾配 (`out ≈ cp` で収束)
 //! 3. `adamw_step` — v102 では未使用、preserve
 //! 4. `radam_step` — Ranger 1/2 (RAdam step)
 //! 5. `ranger_lookahead_lerp` — Ranger 2/2 (Lookahead lerp)
@@ -54,6 +54,11 @@
 //! 25. `slice_extract_2d` — 2D row 範囲を切り出し (l1_main / l1_skip の slice_rows)
 //! 26. `slice_scatter_2d` — 2D row 範囲へ書き戻し (l1_main / l1_skip slice の backward)
 //!
+//! ### NEW (Stage 3 #84 で bullet v102 厳密再現のため追加)
+//! 27. `loss_wrm` — bullet win-rate-model 損失 + dy_net_output 勾配 (`out ≈ cp / nnue2score`
+//!     で収束、`--win-rate-model` 指定時に `loss_wdl` の代わりに使う。CPU reference は
+//!     `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`)
+//!
 //! ## cuda-oxide 制限への対応 (Stage 1-5〜2-7 で確立)
 //!
 //! - `f32::clamp` / `f32::max` / `f32::min` lowering 失敗 → `if-else` ladder で展開
@@ -62,8 +67,8 @@
 //! - atomic add パターン: `unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicX) }
 //!   .fetch_add(_, AtomicOrdering::Relaxed)`
 //!
-//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 26 個):
-//! `sparse_ft_forward,sparse_ft_backward,loss_wdl,screlu_grad,adamw_step,radam_step,
+//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 27 個):
+//! `sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,adamw_step,radam_step,
 //! ranger_lookahead_lerp,ft_post_perspective_fwd,ft_post_perspective_grad,dense_mm_fwd,
 //! dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,dense_mm_fwd_bucket,
 //! dense_mm_bwd_input_bucket,dense_mm_bwd_weight_bucket,bias_grad_bucket,crelu_fwd,
@@ -86,7 +91,7 @@ use nnue_train::dataloader::Batch;
 #[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
-use nnue_train::trainer::{TrainerBackend, TrainingConfig};
+use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 // ===========================================================================
@@ -156,6 +161,78 @@ pub fn loss_wdl(
     }
 
     // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (Stage 1-6 / Stage 2-2 と同型)。
+    let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+    loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
+}
+
+/// bullet win-rate-model (WRM) loss kernel — Stage 3 (#84) inline。
+///
+/// bullet `examples/shogi_layerstack.rs:2177-2188` (`loss_fn_wrm`、`--win-rate-model`
+/// + `--wrm-in-scaling` 指定時に選ばれる loss closure) + `crates/bullet_lib/src/value/
+/// loader.rs:300-316` (data-layer の WRM target + WDL blend) を NNUE 専用に hand-fuse。
+/// CPU reference は `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`。
+///
+/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、prediction /
+/// target 双方に nodchip 流 WRM を適用するため net_output は `out ≈ cp / nnue2score`
+/// (O(1)) で収束し、`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`、
+/// bullet の `out ≈ cp/600` スケール前提) と整合する。bullet v102 を厳密再現するには
+/// この kernel を使う。
+///
+/// - target: `pt = (score - 270)/380`、`pmt = (-score - 270)/380`、`target_wrm =
+///   0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、`target = lambda*wdl + (1-lambda)*target_wrm`。
+///   in_scaling=380 と offset=270 は bullet ハードコード (`--wrm-in-scaling` ではない)。
+/// - prediction: `scorenet = out * nnue2score`、`q = sigmoid((scorenet - 270)/in_scaling)`、
+///   `qm = sigmoid((-scorenet - 270)/in_scaling)`、`qf = 0.5*(1 + q - qm)`。`in_scaling`
+///   (= `--wrm-in-scaling` = 340) は **prediction 側のみ**、`nnue2score` (= `--wrm-nnue2score`
+///   = 600)。
+/// - `err = qf - target`、`loss_acc += err^2` (norm 無し、caller が position 数で割る)。
+/// - chain rule: `dq/dout = q(1-q) * nnue2score/in_scaling`、`dqm/dout = -qm(1-qm) *
+///   nnue2score/in_scaling`、`dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q) + qm(1-qm))`、
+///   `dL/dout = 2*err * dqf/dout` → `2` と `0.5` が打ち消し合い `g = err *
+///   (nnue2score/in_scaling) * (q(1-q) + qm(1-qm)) * per_pos_norm`。
+///
+/// 1 thread = 1 position。`dl_dout` は排他更新 (atomics 不要)、`loss_acc` は f64 単一
+/// cell の `DeviceAtomicF64::fetch_add` (`loss_wdl` と同型)。`f32::exp` は libdevice
+/// (`__nv_expf`) に lowering OK。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn loss_wrm(
+    out: &[f32],
+    score: &[f32],
+    wdl: &[f32],
+    per_pos_norm: &[f32],
+    mut dl_dout: DisjointSlice<f32>,
+    loss_acc: &[f64],
+    lambda: f32,
+    nnue2score: f32,
+    in_scaling: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    // --- target (bullet loader WRM target、in_scaling=380 / offset=270 はハードコード) ---
+    let s = score[i.get()];
+    let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - 270.0_f32) / 380.0_f32)).exp());
+    let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - 270.0_f32) / 380.0_f32)).exp());
+    let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
+    let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
+
+    // --- prediction (bullet loss_fn_wrm: WRM applied to net output) ---
+    let scorenet = out[i.get()] * nnue2score;
+    let q = 1.0_f32 / (1.0_f32 + (-((scorenet - 270.0_f32) / in_scaling)).exp());
+    let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - 270.0_f32) / in_scaling)).exp());
+    let qf = 0.5_f32 * (1.0_f32 + q - qm);
+
+    let err = qf - target;
+    let norm = per_pos_norm[i.get()];
+
+    if let Some(g) = dl_dout.get_mut(i) {
+        *g = err * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm)) * norm;
+    }
+
+    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (`loss_wdl` と同型)。
     let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 }
@@ -1154,9 +1231,9 @@ fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // Stage 3-7 全 26 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
+    // Stage 3-7 + #84 で 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
     // internalize-public-api-list で残す (kernel-list hazard、Stage 2-2 で確立)。
-    let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,screlu_grad,\
+    let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
                        adamw_step,radam_step,ranger_lookahead_lerp,\
                        ft_post_perspective_fwd,ft_post_perspective_grad,\
                        dense_mm_fwd,dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,\
@@ -1298,9 +1375,14 @@ const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 // bullet の汎用 default、本 trainer は recipe どおり 0.0 を使う、memory project_v102_recipe.md)。
 const DECAY: f32 = 0.0;
 
-// loss_wdl params (v102 doc: scale=290, wdl=0.0)
+// smoke 用 loss params (v102 doc: scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600)。
+// trainer 経路では CLI から `LossKind` を組み立てるのでここは smoke 専用。
 const WDL_LAMBDA: f32 = 0.0;
-const LOSS_SCALE: f32 = 1.0 / 290.0;
+const SMOKE_LOSS_SIGMOID: LossKind = LossKind::Sigmoid { scale: 1.0 / 290.0 };
+const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
+    nnue2score: 600.0,
+    in_scaling: 340.0,
+};
 
 // ===========================================================================
 // GpuTrainer (v102 LayerStack 1536-16-32 + progress8kpabs 9 buckets)
@@ -1525,6 +1607,9 @@ impl GpuTrainer {
         let l2_w_init = xorshift_init(0x103_u64, l2_w_n, init_scale);
         let l3_w_init = xorshift_init(0x104_u64, l3_w_n, init_scale);
 
+        // Ranger Lookahead の slow weight は **0 初期化** (bullet `RangerLookahead::new`
+        // = `vec![0.0; size]` と同じ、Issue #84/#L6)。初回 lerp (`step % k == 0`) で
+        // `weights = alpha*weights + (1-alpha)*0 = alpha*weights` になる挙動も bullet と一致。
         Ok(Self {
             stream: stream.clone(),
             module,
@@ -1532,7 +1617,7 @@ impl GpuTrainer {
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
             ft_w_m: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_v: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
-            ft_w_slow: DeviceBuffer::from_host(&stream, &ft_w_init)?,
+            ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_b: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
@@ -1543,7 +1628,7 @@ impl GpuTrainer {
             l1_w: DeviceBuffer::from_host(&stream, &l1_w_init)?,
             l1_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
             l1_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
-            l1_w_slow: DeviceBuffer::from_host(&stream, &l1_w_init)?,
+            l1_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
             l1_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
             l1_b: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
             l1_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
@@ -1554,7 +1639,7 @@ impl GpuTrainer {
             l1f_w: DeviceBuffer::from_host(&stream, &l1f_w_init)?,
             l1f_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
             l1f_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_w_slow: DeviceBuffer::from_host(&stream, &l1f_w_init)?,
+            l1f_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
             l1f_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
             l1f_b: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
             l1f_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
@@ -1565,7 +1650,7 @@ impl GpuTrainer {
             l2_w: DeviceBuffer::from_host(&stream, &l2_w_init)?,
             l2_w_m: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
             l2_w_v: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
-            l2_w_slow: DeviceBuffer::from_host(&stream, &l2_w_init)?,
+            l2_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
             l2_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
             l2_b: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
             l2_b_m: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
@@ -1576,7 +1661,7 @@ impl GpuTrainer {
             l3_w: DeviceBuffer::from_host(&stream, &l3_w_init)?,
             l3_w_m: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
             l3_w_v: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
-            l3_w_slow: DeviceBuffer::from_host(&stream, &l3_w_init)?,
+            l3_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
             l3_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
             l3_b: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_m: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
@@ -1593,7 +1678,7 @@ impl GpuTrainer {
     ///
     /// Optimizer state reset:
     /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
-    /// - `slow`: weight と同値 (Ranger Lookahead 初期 slow = weight、bullet 慣行)
+    /// - `slow`: **0** (bullet `RangerLookahead::new` = `vec![0.0; size]` と同じ、Issue #84/#L6)
     /// - `grad`: 0
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
@@ -1613,16 +1698,11 @@ impl GpuTrainer {
         self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
         self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
         self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
-        // Optimizer state (m, v, slow) は trained weight に合わせて reset:
-        // - m, v: 0 (fresh start)
-        // - slow: weight と同値で初期化 (Ranger Lookahead initial state)
+        // Optimizer state (m, v, slow, grad) は fresh start で全部 0 reset:
+        // - m, v: 0 (Ranger 1st/2nd moment)
+        // - slow: 0 (bullet `RangerLookahead::new` と同じ、Issue #84/#L6。初回 lerp で
+        //   `weights = alpha*weights` になる挙動も bullet と一致)
         // - grad: 0
-        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
-        self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
-        self.l1f_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
-        self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
-        self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
-        // m / v / grad / b_slow は zero reset
         let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
         };
@@ -1638,38 +1718,43 @@ impl GpuTrainer {
         let l3_b_n = NUM_BUCKETS;
         self.ft_w_m = zeros_f32(ft_w_n)?;
         self.ft_w_v = zeros_f32(ft_w_n)?;
+        self.ft_w_slow = zeros_f32(ft_w_n)?;
         self.ft_w_grad = zeros_f32(ft_w_n)?;
         self.ft_b_m = zeros_f32(ft_b_n)?;
         self.ft_b_v = zeros_f32(ft_b_n)?;
-        self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        self.ft_b_slow = zeros_f32(ft_b_n)?;
         self.ft_b_grad = zeros_f32(ft_b_n)?;
         self.l1_w_m = zeros_f32(l1_w_n)?;
         self.l1_w_v = zeros_f32(l1_w_n)?;
+        self.l1_w_slow = zeros_f32(l1_w_n)?;
         self.l1_w_grad = zeros_f32(l1_w_n)?;
         self.l1_b_m = zeros_f32(l1_b_n)?;
         self.l1_b_v = zeros_f32(l1_b_n)?;
-        self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+        self.l1_b_slow = zeros_f32(l1_b_n)?;
         self.l1_b_grad = zeros_f32(l1_b_n)?;
         self.l1f_w_m = zeros_f32(l1f_w_n)?;
         self.l1f_w_v = zeros_f32(l1f_w_n)?;
+        self.l1f_w_slow = zeros_f32(l1f_w_n)?;
         self.l1f_w_grad = zeros_f32(l1f_w_n)?;
         self.l1f_b_m = zeros_f32(l1f_b_n)?;
         self.l1f_b_v = zeros_f32(l1f_b_n)?;
-        self.l1f_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
+        self.l1f_b_slow = zeros_f32(l1f_b_n)?;
         self.l1f_b_grad = zeros_f32(l1f_b_n)?;
         self.l2_w_m = zeros_f32(l2_w_n)?;
         self.l2_w_v = zeros_f32(l2_w_n)?;
+        self.l2_w_slow = zeros_f32(l2_w_n)?;
         self.l2_w_grad = zeros_f32(l2_w_n)?;
         self.l2_b_m = zeros_f32(l2_b_n)?;
         self.l2_b_v = zeros_f32(l2_b_n)?;
-        self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+        self.l2_b_slow = zeros_f32(l2_b_n)?;
         self.l2_b_grad = zeros_f32(l2_b_n)?;
         self.l3_w_m = zeros_f32(l3_w_n)?;
         self.l3_w_v = zeros_f32(l3_w_n)?;
+        self.l3_w_slow = zeros_f32(l3_w_n)?;
         self.l3_w_grad = zeros_f32(l3_w_n)?;
         self.l3_b_m = zeros_f32(l3_b_n)?;
         self.l3_b_v = zeros_f32(l3_b_n)?;
-        self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+        self.l3_b_slow = zeros_f32(l3_b_n)?;
         self.l3_b_grad = zeros_f32(l3_b_n)?;
         self.step_count = 0;
         Ok(())
@@ -1719,8 +1804,11 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// 1 batch 分の forward → loss_wdl → backward → Ranger step を実行。
+    /// 1 batch 分の forward → loss kernel → backward → Ranger step を実行。
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
+    ///
+    /// `loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
+    /// [`LossKind::Wrm`] なら `loss_wrm` (bullet win-rate-model、v102 厳密再現) を起動する。
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
     /// 本 file の `#[kernel]` 群で再現。Backward path (~16 step): forward 逆順、`*_grad`
@@ -1733,7 +1821,7 @@ impl GpuTrainer {
         batch: &BatchData,
         lr: f32,
         wdl_lambda: f32,
-        loss_scale: f32,
+        loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
@@ -2003,23 +2091,49 @@ impl GpuTrainer {
             ]
         }?;
 
-        // -- Forward step 15: loss_wdl → dy_net_output + loss_acc --
+        // -- Forward step 15: loss kernel → dy_net_output + loss_acc --
+        // `LossKind::Sigmoid` → `loss_wdl` (plain sigmoid-MSE)、`LossKind::Wrm` →
+        // `loss_wrm` (bullet win-rate-model、v102 厳密再現)。
         let mut dy_net_output = DeviceBuffer::<f32>::zeroed(&self.stream, b)?;
-        cuda_launch! {
-            kernel: loss_wdl,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b),
-            args: [
-                slice(net_output),
-                slice(score_dev),
-                slice(wdl_dev),
-                slice(norm_dev),
-                slice_mut(dy_net_output),
-                slice(self.loss_acc),
-                wdl_lambda, loss_scale, b_u32
-            ]
-        }?;
+        match loss {
+            LossKind::Sigmoid { scale } => {
+                cuda_launch! {
+                    kernel: loss_wdl,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(net_output),
+                        slice(score_dev),
+                        slice(wdl_dev),
+                        slice(norm_dev),
+                        slice_mut(dy_net_output),
+                        slice(self.loss_acc),
+                        wdl_lambda, scale, b_u32
+                    ]
+                }?;
+            }
+            LossKind::Wrm {
+                nnue2score,
+                in_scaling,
+            } => {
+                cuda_launch! {
+                    kernel: loss_wrm,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(net_output),
+                        slice(score_dev),
+                        slice(wdl_dev),
+                        slice(norm_dev),
+                        slice_mut(dy_net_output),
+                        slice(self.loss_acc),
+                        wdl_lambda, nnue2score, in_scaling, b_u32
+                    ]
+                }?;
+            }
+        }
         prof_tick!("forward");
 
         // ===== BACKWARD =====
@@ -2557,10 +2671,10 @@ impl TrainerBackend for GpuTrainer {
         bucket_idx: &[i32],
         lr: f32,
         wdl_lambda: f32,
-        loss_scale: f32,
+        loss: LossKind,
     ) -> std::io::Result<f64> {
         let data = BatchData::from_batch(batch, bucket_idx);
-        self.step(&data, lr, wdl_lambda, loss_scale)
+        self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
     }
 
@@ -2633,7 +2747,8 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     wdl: f32,
 
-    /// sigmoid score scale (`loss_scale = 1 / scale`)。
+    /// sigmoid loss の score scale (`loss_scale = 1 / scale`)。`--win-rate-model` 指定時は
+    /// 使わない (WRM loss は in_scaling=380/340 を使う)。
     #[arg(long, default_value_t = 290.0)]
     scale: f32,
 
@@ -2654,16 +2769,22 @@ struct Cli {
     #[arg(long)]
     init_from: Option<PathBuf>,
 
-    // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---
-    /// (受けるが未配線) win-rate-model loss。指定時 warning を出す (loss は sigmoid-MSE のまま)。
+    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm` kernel
+    /// (prediction / target 双方に nodchip 流 WRM) を使い、未指定なら `loss_wdl`
+    /// (plain sigmoid-MSE + `--scale`)。net_output のスケールが `out ≈ cp/--wrm-nnue2score`
+    /// になり量子化 (`QA=127/QB=64/FV_SCALE=28`) と整合するので bullet v102 互換 net を
+    /// 学習するには必須。
     #[arg(long)]
     win_rate_model: bool,
-    /// (受けるが未配線) WRM in-scaling。
+    /// WRM prediction 側の in-scaling (nodchip default 340)。target 側は bullet ハードコード
+    /// の 380。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 340.0)]
     wrm_in_scaling: f32,
-    /// (受けるが未配線) WRM nnue2score。
+    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、nodchip default 600)。
+    /// `--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 600.0)]
     wrm_nnue2score: f32,
+    // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
     optimizer: String,
@@ -2702,30 +2823,48 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss_scale しか見ない)。
+    // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss params のみ見る)。
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
         return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
     }
     if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
         return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
     }
-    if !(cli.scale.is_finite() && cli.scale > 0.0) {
-        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
-    }
     if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
         return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
     }
+    // loss kernel の選択: --win-rate-model → loss_wrm (bullet v102)、未指定 → loss_wdl。
+    let loss = if cli.win_rate_model {
+        if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
+            return Err(format!(
+                "--wrm-in-scaling must be finite and > 0 (got {})",
+                cli.wrm_in_scaling
+            )
+            .into());
+        }
+        if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
+            return Err(format!(
+                "--wrm-nnue2score must be finite and > 0 (got {})",
+                cli.wrm_nnue2score
+            )
+            .into());
+        }
+        LossKind::Wrm {
+            nnue2score: cli.wrm_nnue2score,
+            in_scaling: cli.wrm_in_scaling,
+        }
+    } else {
+        if !(cli.scale.is_finite() && cli.scale > 0.0) {
+            return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
+        }
+        LossKind::Sigmoid {
+            scale: 1.0 / cli.scale,
+        }
+    };
     if cli.weight_decay != 0.0 {
         eprintln!(
             "[train] warning: --weight-decay {} ignored; the Ranger kernel uses weight-decay 0.0 (v102)",
             cli.weight_decay
-        );
-    }
-    if cli.win_rate_model {
-        eprintln!(
-            "[train] warning: --win-rate-model is not yet wired into the loss kernel; \
-             using sigmoid-MSE with --scale {} (--wrm-in-scaling {} / --wrm-nnue2score {} ignored)",
-            cli.scale, cli.wrm_in_scaling, cli.wrm_nnue2score
         );
     }
     if cli.epoch_file_shuffle {
@@ -2782,7 +2921,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
-        loss_scale: 1.0 / cli.scale,
+        loss,
         score_drop_abs: cli.score_drop_abs,
     };
 
@@ -2831,11 +2970,11 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         trainer.assert_all_weights_finite()?;
         println!("[smoke] v102-100 weights injected, all finite ✓");
 
-        // forward + step 1 batch
+        // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(4);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr, WDL_LAMBDA, LOSS_SCALE)?;
-        println!("[smoke] step 1 (post-v102-100 init): loss = {loss:.6e}");
+        let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
         }
@@ -2854,17 +2993,37 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[smoke] verify with:\n  /home/sh11235/git-repos/rshogi-oss/target/release/verify_nnue_accumulator \\\n    --nnue-file {out_path} \\\n    --ls-progress-coeff /mnt/e/rshogi-nnue/data/progress/progress_hao_full_cuda.e1.bin \\\n    --moves 10"
         );
+
+        // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
+        // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
+        let batch = BatchData::smoke_dummy(4);
+        let loss_wrm = trainer.step(&batch, 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
+        if !loss_wrm.is_finite() {
+            return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
+        }
+        trainer.assert_all_weights_finite()?;
+        println!("[smoke] step 2: all weights finite ✓");
     } else {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(4);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr, WDL_LAMBDA, LOSS_SCALE)?;
-        println!("[smoke] step 1: loss = {loss:.6e}");
+        let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
         }
         trainer.assert_all_weights_finite()?;
         println!("[smoke] step 1: all weights finite ✓");
+
+        // step 2: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
+        let loss_wrm = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
+        if !loss_wrm.is_finite() {
+            return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
+        }
+        trainer.assert_all_weights_finite()?;
+        println!("[smoke] step 2: all weights finite ✓");
 
         // save random-init as quantised.bin for verify-nnue check
         let out_path = "/tmp/our_quantised_randinit.bin";

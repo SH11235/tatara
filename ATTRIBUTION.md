@@ -11,6 +11,42 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3 #84 — loss_wrm (bullet win-rate-model loss、2026-05-13、bullet-shogi commit `488d81b`)
+
+3-observer code review (2026-05-12) の L1/L2/L6 指摘に対応。v102 recipe
+(`--win-rate-model --wrm-in-scaling 340 --wrm-nnue2score 600 --scale 290 --wdl 0.0`)
+を厳密再現するための WRM 損失 + lookahead slow=0 初期化:
+
+- **`crates/gpu-kernels/src/pointwise/loss_wrm.rs`** (新規): `loss_wrm_cpu` reference 実装。
+  bullet `examples/shogi_layerstack.rs:2177-2188` の `loss_fn_wrm` (`--win-rate-model` +
+  `--wrm-in-scaling` 指定時に選ばれる loss closure) + `crates/bullet_lib/src/value/
+  loader.rs:300-316` (data-layer の WRM target `0.5*(1 + sigmoid((score-270)/380) -
+  sigmoid((-score-270)/380))` + WDL blend `blend*result + (1-blend)*score`) を NNUE 専用に
+  hand-fuse。target 側 in_scaling (380) / offset (270) は bullet ハードコード、prediction 側
+  in_scaling は `--wrm-in-scaling` (340) — この非対称も bullet どおり。`loss_wdl` (sigmoid-MSE)
+  と違い prediction / target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score`
+  (`= cp/600`、O(1)) で収束し、`crates/nnue-format` の量子化 (`QA=127/QB=64/FV_SCALE=28`、
+  bullet の `out ≈ cp/600` スケール前提) と整合する。gradient (`dl_dout = err *
+  (nnue2score/in_scaling) * (q(1-q) + qm(1-qm)) * per_pos_norm`、`2` と `0.5` が打ち消し合う形)
+  は chain rule から導出し finite-difference テストで照合。`gpu_kernels::pointwise::mod` に登録
+- **`bins/nnue_train/src/main.rs::loss_wrm`** (新規 `#[kernel]`): 上記 `loss_wrm_cpu` の GPU 版
+  (Stage 1-5 で確立した「`#[kernel]` は bin entry に inline」制約)。`f32::exp` は libdevice
+  (`__nv_expf`) に lowering。`kernel_names` list (`compile_ll_to_ptx_via_llc`) と module doc の
+  kernel 数も 26 → 27 に更新
+- **`crates/nnue-train/src/trainer.rs::LossKind`** (新規 enum、CPU-only): `Sigmoid { scale }`
+  (旧来 `loss_wdl`、`out ≈ cp`) / `Wrm { nnue2score, in_scaling }` (bullet WRM、`out ≈ cp/600`)。
+  `TrainerBackend::train_step` / `TrainingConfig` の `loss_scale: f32` を `loss: LossKind` に変更
+  (kernel 選択を bin 側 `GpuTrainer::step` の `match` に委譲、Stage 3-0 規約: crate は GPU 非依存)
+- **CLI 配線**: `--win-rate-model` 指定時に `loss_wrm` 経路 (`--wrm-in-scaling` / `--wrm-nnue2score`
+  を `LossKind::Wrm` に)、未指定なら従来 `loss_wdl` + `--scale` (`LossKind::Sigmoid`)。
+  Stage 3-8 の「`--win-rate-model` は受けるが未配線で warning」を撤廃
+- **lookahead `slow` 初期化を 0 に変更** (`GpuTrainer::new` / `load_v102_weights` の `*_slow`
+  buffer)。bullet `crates/trainer/src/optimiser/ranger.rs::RangerLookahead::new`
+  (`slow_params: Buffer::from_host(device, &TValue::F32(vec![0.0; size]))?`) と同じで、
+  初回 lerp (`step % k == 0`) で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` に
+  なる挙動も bullet と一致 (Stage 3-6 で「意図的 divergence」として weight 初期化していたのを
+  v102 厳密再現のため bullet に揃えた)
+
 #### Stage 3-quality / perf-P2 (2026-05-12)
 
 bullet からの新規 vendor は無し。3-observer code review (2026-05-12) 指摘の品質修正
