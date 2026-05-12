@@ -11,6 +11,13 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3 review follow-up (2026-05-13、bullet 新規 vendor 無し)
+
+PR #92 (#84) / PR #91 (#76) の Codex review (P2) 指摘 2 件への follow-up。`bins/nnue_train/src/main.rs` のみ:
+
+- **`GpuTrainer::load_v102_weights` の lookahead `slow` 初期化**: PR #92 で `--init-from` 経路も `slow = 0` にしたが、`--init-from` は量子化済 NNUE の continue-training (bullet checkpoint resume = `slow.bin` 付き、ではない) なので、初回 lookahead lerp (`new_w = alpha*fast + (1-alpha)*slow`) で読み込んだ重みが ~alpha 倍に縮む不具合があった。`load_v102_weights` の `slow` を **loaded weights と同値**に戻し (初回 lerp が `new_w = alpha*fast + (1-alpha)*w_loaded` で、fine-tuning は lr 小さく `fast ≈ w_loaded` なので 0 でなく読み込んだ重みの方へ寄せる anchor になる)、`GpuTrainer::new` (from-scratch) は bullet `RangerLookahead::new` どおり `slow = 0` のまま (v102 厳密再現用) という分担に。
+- **`GpuTrainer::step` を `step` (薄い wrapper) + `step_impl` (実体) に分割**: PR #91 の `NNUE_TRAIN_STEP_PROFILE` breakdown は最後の `prof_tick!` が `step()` 関数内で打たれるため、per-step `DeviceBuffer` ローカル (入力 / 中間 activation / 一部 grad) の `Drop` (= `cuMemFree`) が `}` でしか走らず breakdown に含まれていなかった (nsys では free が step の ~2 割)。`step_impl` を別関数にして return 時にローカルを drop させ、wrapper 側で `teardown` tick を打つことで free 時間も計上する (Issue #78 で workspace 永続化すれば per-step alloc/free 自体が消える)。
+
 #### Stage 3 #84 — loss_wrm (bullet win-rate-model loss、2026-05-13、bullet-shogi commit `488d81b`)
 
 3-observer code review (2026-05-12) の L1/L2/L6 指摘に対応。v102 recipe
