@@ -103,6 +103,17 @@ impl ShogiHalfKA_hm {
         map_halfka_features(&board, f);
     }
 
+    /// `map_features` の **decode 済み `ShogiBoard` を直接受ける** 版。
+    ///
+    /// dataloader が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ呼んで
+    /// その `ShogiBoard` を HalfKA_hm 特徴抽出と progress8kpabs bucket 計算の
+    /// 両方で使い回せるようにするための入口 (Issue #89: decode-once)。`map_features`
+    /// と完全に同じインデックスを emit する (`map_features` は `pos.decode()` 経由で
+    /// 本メソッドを呼ぶのと等価)。
+    pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, f: F) {
+        map_halfka_features(board, f);
+    }
+
     /// 特徴量インデックスを `Vec<(stm_idx, nstm_idx)>` として収集。
     ///
     /// dataloader / smoke test 用の便利 API (`map_features` の Vec 化)。
@@ -516,6 +527,89 @@ mod tests {
         );
 
         for &(stm, nstm) in &active {
+            assert!(stm < HALFKA_HM_DIMENSIONS);
+            assert!(nstm < HALFKA_HM_DIMENSIONS);
+        }
+    }
+
+    /// shogi-format crate の `tests/data/sample.psv` (100 records × 40 bytes) を
+    /// `PackedSfenValue` の slice として読み込む (`tests/progress_kpabs_smoke.rs`
+    /// と同じ fixture を共有)。
+    fn sample_psv_records() -> Vec<PackedSfenValue> {
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let bytes =
+            std::fs::read(&path).expect("sample.psv が読めない (../shogi-format/tests/data/)");
+        assert_eq!(bytes.len() % 40, 0);
+        assert_eq!(std::mem::size_of::<PackedSfenValue>(), 40);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (不正ビットパターン無し、align = 1)。bytes 長は 40 の倍数。
+        let recs: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+        recs.to_vec()
+    }
+
+    #[test]
+    fn test_map_features_board_matches_map_features_on_real_psv() {
+        // 実 PSV (`sample.psv` 100 records) を decode して、legacy delegating path
+        // (`ShogiHalfKA_hm::map_features(&psv)` = 内部で `psv.decode()` → board path)
+        // と board path (`map_features_board(&psv.decode())`) が **完全に同じ
+        // インデックス列** を emit することを確認 (Issue #89 decode-once helper の
+        // 不変条件 + legacy path の回帰検出)。
+        let records = sample_psv_records();
+        let mut nonempty = 0usize;
+        for (i, psv) in records.iter().enumerate() {
+            let board = psv.decode();
+            let mut via_legacy = Vec::new();
+            ShogiHalfKA_hm.map_features(psv, |stm, nstm| via_legacy.push((stm, nstm)));
+            let mut via_board = Vec::new();
+            ShogiHalfKA_hm.map_features_board(&board, |stm, nstm| via_board.push((stm, nstm)));
+            assert_eq!(
+                via_legacy, via_board,
+                "record {i}: legacy path (map_features) と board path (map_features_board) が不一致"
+            );
+            // collect_active_indices (= map_features の Vec 化) とも一致。
+            assert_eq!(ShogiHalfKA_hm.collect_active_indices(psv), via_board);
+            if !via_board.is_empty() {
+                nonempty += 1;
+            }
+        }
+        assert!(
+            nonempty > 0,
+            "sample.psv は実局面なので active features を持つ record があるはず"
+        );
+    }
+
+    #[test]
+    fn test_map_features_board_matches_map_features_with_hand_pieces() {
+        // 手駒ありの局面でも legacy/board 両 path が一致し、両 perspective
+        // (stm / nstm) の index が emit されることを確認。
+        let mut board = ShogiBoard {
+            side_to_move: Color::White,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+        for file in 0..9 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+        board.black_hand.add(PieceType::Rook, 1);
+        board.white_hand.add(PieceType::Gold, 2);
+
+        let mut via_legacy = Vec::new();
+        map_halfka_features(&board, |stm, nstm| via_legacy.push((stm, nstm)));
+        let mut via_board = Vec::new();
+        ShogiHalfKA_hm.map_features_board(&board, |stm, nstm| via_board.push((stm, nstm)));
+        assert_eq!(via_legacy, via_board);
+        assert!(!via_board.is_empty());
+        // stm / nstm はそれぞれ独立した index 平面 (両視点が出ること自体は
+        // pair emit なので self-evident だが、両方が valid 範囲内であることを確認)。
+        for &(stm, nstm) in &via_board {
             assert!(stm < HALFKA_HM_DIMENSIONS);
             assert!(nstm < HALFKA_HM_DIMENSIONS);
         }

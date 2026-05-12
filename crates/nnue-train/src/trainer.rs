@@ -34,9 +34,16 @@
 //!   `LoggingConfig` 等) は使わず、Stage 1 `bins/progress_kpabs_train::
 //!   train_one_epoch` 流儀の直書き loop に簡素化 (Stage 1-1 / 3-1 / 3-4 と同じ
 //!   bullet trait 削除ポリシー)。
-//! - PSV stream は `PsvFileLoader` を逐次読み、EOF で同 file を開き直して次
-//!   epoch とする。bullet の `--epoch-file-shuffle` (epoch ごと file shuffle) は
-//!   本 stage では未実装 — CLI フラグは受けても no-op。
+//! - PSV stream は [`crate::dataloader::BucketedPrefetchedLoader`] (Issue #89)
+//!   経由で読む: `--threads` 本の worker が PSV パース + HalfKA_hm sparse 抽出 +
+//!   progress8kpabs bucket 計算を `PackedSfenValue::decode()` 1 回で済ませて
+//!   `(Batch, per-position bucket)` を先読み供給する。EOF で同 file を開き直して
+//!   次 epoch とする / `--score-drop-abs` skip / 空 file の `MAX_BARREN_PASSES`
+//!   ガードは loader 内の `PsvEpochReader` が担う (旧 `EpochStream` を移設)。
+//!   bullet の `--epoch-file-shuffle` (epoch ごと file shuffle) は本 stage では
+//!   未実装 — CLI フラグは受けても no-op。**worker 数 ≥ 2 では 1 epoch 内の
+//!   position の順序が非決定的になる** (`BucketedPrefetchedLoader` doc 参照;
+//!   training では問題ない)。
 //! - bullet `--score-drop-abs` (`5c4871c`: `|score| >= t` の position の
 //!   per-position loss weight を 0 にする) は本実装では **batch に push しない
 //!   (skip)** で近似する。loss/gradient へ寄与しない点は同じだが、batch の
@@ -46,11 +53,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use shogi_features::halfka_hm::MAX_ACTIVE_FEATURES;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_format::PackedSfenValue;
 
-use crate::dataloader::{Batch, PsvFileLoader};
+use crate::dataloader::{Batch, BucketedPrefetchedLoader};
 use crate::schedule::{LrScheduler, WdlScheduler};
 
 // =============================================================================
@@ -186,6 +191,10 @@ pub struct TrainingConfig {
     pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (bullet `--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
+    /// dataloader の prefetch worker 数 (`--threads`、Issue #89)。`0` は `1` 扱い。
+    /// `1` で従来の決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
+    /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
+    pub threads: usize,
 }
 
 impl TrainingConfig {
@@ -223,82 +232,6 @@ impl TrainingConfig {
 }
 
 // =============================================================================
-// EpochStream — PSV を逐次読み、EOF で開き直して次 epoch にする stream
-// =============================================================================
-
-/// `PsvFileLoader` を逐次読み、EOF に当たったら同 file を開き直す (= 次 epoch)。
-/// `score-drop-abs` の skip と per-position bucket 計算もここで行う。
-struct EpochStream<'a> {
-    path: &'a Path,
-    loader: PsvFileLoader,
-    progress: &'a ShogiProgressKPAbs,
-    score_drop_abs: Option<i32>,
-    /// 直近の reopen 以降に実際に push した (= drop されなかった) position 数。
-    pushed_this_epoch: u64,
-    /// 1 epoch 丸ごと 0 push だった (= file を 1 周しても 1 件も使えなかった)
-    /// 連続回数。空 file / 全 drop の無限ループ検出用。
-    barren_passes: u32,
-}
-
-/// 連続 `barren_passes` がこれに達したら「使える position が無い」と判断して
-/// 無限ループせず error を返す。
-const MAX_BARREN_PASSES: u32 = 5;
-
-impl<'a> EpochStream<'a> {
-    fn new(
-        path: &'a Path,
-        progress: &'a ShogiProgressKPAbs,
-        score_drop_abs: Option<i32>,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            path,
-            loader: PsvFileLoader::new(path)?,
-            progress,
-            score_drop_abs,
-            pushed_this_epoch: 0,
-            barren_passes: 0,
-        })
-    }
-
-    /// 次の使える PSV (+ その output bucket) を返す。EOF なら file を開き直す。
-    fn next(&mut self) -> io::Result<(PackedSfenValue, i32)> {
-        loop {
-            match self.loader.next_psv()? {
-                Some(psv) => {
-                    // bullet `--score-drop-abs` の近似 (詳細は module doc)。
-                    // i64 cast で i16::MIN の abs overflow を避ける。
-                    if let Some(t) = self.score_drop_abs {
-                        if i64::from(psv.score()).abs() >= i64::from(t) {
-                            continue;
-                        }
-                    }
-                    self.pushed_this_epoch += 1;
-                    let bucket = i32::from(self.progress.bucket(&psv));
-                    return Ok((psv, bucket));
-                }
-                None => {
-                    if self.pushed_this_epoch == 0 {
-                        self.barren_passes += 1;
-                        if self.barren_passes >= MAX_BARREN_PASSES {
-                            return Err(io::Error::other(format!(
-                                "data file {} yielded no usable positions over {} full passes \
-                                 (empty file, or all positions filtered out by score-drop-abs)",
-                                self.path.display(),
-                                self.barren_passes
-                            )));
-                        }
-                    } else {
-                        self.barren_passes = 0;
-                    }
-                    self.pushed_this_epoch = 0;
-                    self.loader = PsvFileLoader::new(self.path)?;
-                }
-            }
-        }
-    }
-}
-
-// =============================================================================
 // run — superbatch loop
 // =============================================================================
 
@@ -306,9 +239,15 @@ impl<'a> EpochStream<'a> {
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
 /// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
-/// - `progress`: progress8kpabs 重み (`--progress-coeff` 未指定なら zero-weight default → 全 bucket 4)
+/// - `progress`: progress8kpabs 重み (`--progress-coeff` 未指定なら zero-weight default → 全 bucket 4)。
+///   重みは process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
-/// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs)
+/// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
+///
+/// PSV stream は [`BucketedPrefetchedLoader`] (Issue #89) で `cfg.threads` 本の
+/// worker から `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer
+/// 再利用される。worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる
+/// 点に注意 (training では問題ない)。
 pub fn run<B, L, W>(
     backend: &mut B,
     data_path: &Path,
@@ -324,13 +263,17 @@ where
 {
     cfg.validate()?;
 
-    let mut stream = EpochStream::new(data_path, progress, cfg.score_drop_abs)?;
-    let mut batch = Batch::with_capacity(cfg.batch_size, MAX_ACTIVE_FEATURES);
-    let mut buckets: Vec<i32> = Vec::with_capacity(cfg.batch_size);
+    let mut loader = BucketedPrefetchedLoader::spawn(
+        data_path,
+        cfg.batch_size,
+        cfg.score_drop_abs,
+        cfg.threads,
+        *progress,
+    )?;
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -339,6 +282,7 @@ where
         cfg.batch_size,
         cfg.loss,
         cfg.score_drop_abs,
+        cfg.threads.max(1),
     );
 
     let positions_per_sb =
@@ -354,17 +298,17 @@ where
             let lr = lr_scheduler.lr(batch_idx, sb);
             let wdl = wdl_scheduler.blend(batch_idx, sb, cfg.end_superbatch);
 
-            batch.reset();
-            buckets.clear();
-            while batch.n_positions < cfg.batch_size {
-                let (psv, bucket) = stream.next()?;
-                let pushed = batch.push(&psv);
-                debug_assert!(pushed, "Batch::push refused below batch_size");
-                buckets.push(bucket);
-            }
+            let (batch, buckets) = loader.next_batch()?.ok_or_else(|| {
+                io::Error::other(
+                    "dataloader stopped supplying batches unexpectedly (workers exited without an error)",
+                )
+            })?;
+            let n_pos = batch.n_positions;
 
-            sb_loss += backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
-            sb_positions += batch.n_positions as u64;
+            let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
+            loader.recycle((batch, buckets));
+            sb_loss += loss;
+            sb_positions += n_pos as u64;
         }
 
         let sb_secs = sb_start.elapsed().as_secs_f64().max(1e-9);
@@ -514,11 +458,11 @@ mod tests {
             save_rate: 2,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
+            threads: 2,
         }
     }
 
-    #[test]
-    fn run_drives_superbatches_and_writes_checkpoints() {
+    fn run_drives_superbatches_with_threads(threads: usize) {
         let progress = ShogiProgressKPAbs; // zero weights → p = sigmoid(0) = 0.5 → bucket 4
         let lr = StepLR {
             start: 1.0e-3,
@@ -526,7 +470,10 @@ mod tests {
             step: 1,
         };
         let wdl = ConstantWDL { value: 0.0 };
-        let cfg = base_cfg();
+        let cfg = TrainingConfig {
+            threads,
+            ..base_cfg()
+        };
         let mut backend = MockBackend::new();
 
         run(&mut backend, &sample_psv_path(), &progress, &lr, &wdl, &cfg).expect("run ok");
@@ -546,6 +493,8 @@ mod tests {
             ]
         );
         // 各 superbatch で lr が gamma 倍 (StepLR step=1, gamma=0.9)。batch 内は一定。
+        // (lr は train_step 呼び出し順 = run の loop 順で決まり、dataloader の worker
+        // 順序には依らない。)
         assert!((backend.seen_lr[0] - 1.0e-3).abs() < 1e-9);
         assert!((backend.seen_lr[2] - 1.0e-3 * 0.9).abs() < 1e-9); // 2nd superbatch, 1st batch
         // zero-weight progress → 全 position が bucket 4。
@@ -558,9 +507,23 @@ mod tests {
     }
 
     #[test]
+    fn run_drives_superbatches_and_writes_checkpoints_single_worker() {
+        // threads=1: 決定論的逐次 read 相当のパス。
+        run_drives_superbatches_with_threads(1);
+    }
+
+    #[test]
+    fn run_drives_superbatches_and_writes_checkpoints_multi_worker() {
+        // threads>=2: 並列パース。順序は非決定的でも step 回数 / checkpoint / bucket /
+        // lr schedule は不変。
+        run_drives_superbatches_with_threads(4);
+    }
+
+    #[test]
     fn empty_data_file_errors_instead_of_looping_forever() {
-        // 空 file は `next_psv` が即 EOF → epoch wrap が無限ループする危険があるが、
-        // `MAX_BARREN_PASSES` ガードで error にして抜ける。
+        // 空 file は即 EOF → epoch wrap が無限ループする危険があるが、dataloader 内の
+        // `PsvEpochReader` の `MAX_BARREN_PASSES` ガードで error にして抜け、worker が
+        // error slot 経由で run に伝える。
         let progress = ShogiProgressKPAbs;
         let lr = StepLR {
             start: 1.0e-3,
@@ -571,6 +534,7 @@ mod tests {
         let cfg = TrainingConfig {
             end_superbatch: 1,
             batches_per_superbatch: 1,
+            threads: 1,
             ..base_cfg()
         };
 

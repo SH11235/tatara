@@ -2966,13 +2966,18 @@ struct Cli {
     /// weight decay (kernel は 0.0 固定、非 0 指定で warning)。
     #[arg(long, default_value_t = 0.0)]
     weight_decay: f32,
-    /// (受けるが未使用) dataloader thread 数。本実装は single-thread sequential read。
+    /// dataloader prefetch worker 数 (Issue #89)。各 worker が PSV パース +
+    /// HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算を `decode()` 1 回で済ませて
+    /// 先読み供給する。`1` で従来の決定論的逐次 read 相当、`>= 2` で並列パース
+    /// (1 epoch 内の position 順序は非決定的; training では問題ない)。
     #[arg(long, default_value_t = 16)]
     threads: usize,
     /// bucket mode ("progress8kpabs" のみ実装)。
     #[arg(long, default_value = "progress8kpabs")]
     bucket_mode: String,
-    /// (受けるが未実装) epoch ごとに file shuffle する。本実装は逐次 read + EOF wrap。
+    /// (受けるが未実装) epoch ごとに file shuffle する。本実装は逐次 read + EOF wrap
+    /// (worker 数 >= 2 では各 worker が排他的に chunk を読むため batch 境界は epoch ごと
+    /// 不変ではないが、明示的 file-level shuffle は別 issue)。
     #[arg(long)]
     epoch_file_shuffle: bool,
     /// (受けるが未使用) file shuffle seed。
@@ -3044,12 +3049,14 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.epoch_file_shuffle {
         eprintln!(
-            "[train] warning: --epoch-file-shuffle is not implemented; reading {} sequentially and wrapping at EOF (--file-shuffle-seed {} ignored)",
+            "[train] warning: --epoch-file-shuffle is not implemented; reading {} sequentially and wrapping at EOF (--file-shuffle-seed {} ignored). With --threads >= 2 each worker reads a disjoint chunk per batch, so batch boundaries are not identical across epochs, but no explicit file-level shuffle is performed.",
             data.display(),
             cli.file_shuffle_seed
         );
     }
-    let _ = cli.threads; // dataloader は single-thread sequential read
+    if cli.threads == 0 {
+        return Err("--threads must be >= 1".into());
+    }
 
     std::fs::create_dir_all(&cli.output)?;
 
@@ -3099,6 +3106,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         save_rate: cli.save_rate,
         loss,
         score_drop_abs: cli.score_drop_abs,
+        threads: cli.threads,
     };
 
     nnue_train::trainer::run(
