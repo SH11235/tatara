@@ -1674,11 +1674,19 @@ impl GpuTrainer {
         })
     }
 
-    /// `V102Weights` から weight buffer を device に upload (pretrained 注入)。
+    /// `V102Weights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
     ///
     /// Optimizer state reset:
     /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
-    /// - `slow`: **0** (bullet `RangerLookahead::new` = `vec![0.0; size]` と同じ、Issue #84/#L6)
+    /// - `slow`: **loaded weights と同値** (warm-start anchor。`GpuTrainer::new` (from-scratch)
+    ///   は bullet `RangerLookahead::new` どおり `slow = 0` だが、`--init-from` は量子化済 NNUE
+    ///   の continue-training/fine-tuning であって bullet checkpoint resume (`slow.bin` 付き)
+    ///   ではない。`slow = 0` のままだと初回 lookahead lerp で `new_w = alpha*fast + (1-alpha)*0
+    ///   = alpha*fast` となり読み込んだ重みが全て ~alpha 倍に縮む。`slow = w_loaded` にすると
+    ///   初回 lerp は `new_w = alpha*fast + (1-alpha)*w_loaded` で、fine-tuning は lr が小さく
+    ///   `fast ≈ w_loaded` なので **0 ではなく読み込んだ重みの方へ寄せる** anchor になる
+    ///   (true な bullet resume なら `slow.bin` を読むべきだが、量子化 NNUE には optimizer
+    ///   state が無いので next-best な default) — PR #92 review (Codex P2) 指摘)
     /// - `grad`: 0
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
@@ -1698,10 +1706,10 @@ impl GpuTrainer {
         self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
         self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
         self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
-        // Optimizer state (m, v, slow, grad) は fresh start で全部 0 reset:
-        // - m, v: 0 (Ranger 1st/2nd moment)
-        // - slow: 0 (bullet `RangerLookahead::new` と同じ、Issue #84/#L6。初回 lerp で
-        //   `weights = alpha*weights` になる挙動も bullet と一致)
+        // Optimizer state reset:
+        // - m, v: 0 (fresh start)
+        // - slow: loaded weights と同値 (warm-start anchor: 初回 lookahead lerp が
+        //   0 でなく読み込んだ重みの方へ寄る。`slow = 0` だと alpha 倍に縮む — PR #92 review 指摘)
         // - grad: 0
         let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
@@ -1718,43 +1726,43 @@ impl GpuTrainer {
         let l3_b_n = NUM_BUCKETS;
         self.ft_w_m = zeros_f32(ft_w_n)?;
         self.ft_w_v = zeros_f32(ft_w_n)?;
-        self.ft_w_slow = zeros_f32(ft_w_n)?;
+        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_w_grad = zeros_f32(ft_w_n)?;
         self.ft_b_m = zeros_f32(ft_b_n)?;
         self.ft_b_v = zeros_f32(ft_b_n)?;
-        self.ft_b_slow = zeros_f32(ft_b_n)?;
+        self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.ft_b_grad = zeros_f32(ft_b_n)?;
         self.l1_w_m = zeros_f32(l1_w_n)?;
         self.l1_w_v = zeros_f32(l1_w_n)?;
-        self.l1_w_slow = zeros_f32(l1_w_n)?;
+        self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
         self.l1_w_grad = zeros_f32(l1_w_n)?;
         self.l1_b_m = zeros_f32(l1_b_n)?;
         self.l1_b_v = zeros_f32(l1_b_n)?;
-        self.l1_b_slow = zeros_f32(l1_b_n)?;
+        self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
         self.l1_b_grad = zeros_f32(l1_b_n)?;
         self.l1f_w_m = zeros_f32(l1f_w_n)?;
         self.l1f_w_v = zeros_f32(l1f_w_n)?;
-        self.l1f_w_slow = zeros_f32(l1f_w_n)?;
+        self.l1f_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
         self.l1f_w_grad = zeros_f32(l1f_w_n)?;
         self.l1f_b_m = zeros_f32(l1f_b_n)?;
         self.l1f_b_v = zeros_f32(l1f_b_n)?;
-        self.l1f_b_slow = zeros_f32(l1f_b_n)?;
+        self.l1f_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
         self.l1f_b_grad = zeros_f32(l1f_b_n)?;
         self.l2_w_m = zeros_f32(l2_w_n)?;
         self.l2_w_v = zeros_f32(l2_w_n)?;
-        self.l2_w_slow = zeros_f32(l2_w_n)?;
+        self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
         self.l2_w_grad = zeros_f32(l2_w_n)?;
         self.l2_b_m = zeros_f32(l2_b_n)?;
         self.l2_b_v = zeros_f32(l2_b_n)?;
-        self.l2_b_slow = zeros_f32(l2_b_n)?;
+        self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
         self.l2_b_grad = zeros_f32(l2_b_n)?;
         self.l3_w_m = zeros_f32(l3_w_n)?;
         self.l3_w_v = zeros_f32(l3_w_n)?;
-        self.l3_w_slow = zeros_f32(l3_w_n)?;
+        self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
         self.l3_w_grad = zeros_f32(l3_w_n)?;
         self.l3_b_m = zeros_f32(l3_b_n)?;
         self.l3_b_v = zeros_f32(l3_b_n)?;
-        self.l3_b_slow = zeros_f32(l3_b_n)?;
+        self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
         self.l3_b_grad = zeros_f32(l3_b_n)?;
         self.step_count = 0;
         Ok(())
@@ -1807,7 +1815,44 @@ impl GpuTrainer {
     /// 1 batch 分の forward → loss kernel → backward → Ranger step を実行。
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
     ///
-    /// `loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
+    /// 実体は [`GpuTrainer::step_impl`]。本 method は `NNUE_TRAIN_STEP_PROFILE`
+    /// プロファイル時の前後 sync と **teardown tick** だけを担う。`step_impl` が
+    /// return すると per-step device buffer (入力 / 中間 activation / 一部 grad) の
+    /// `Drop` (= `cuMemFree`) がそこで走るので、最後の `prof_tick!` を `step_impl`
+    /// の **外** で打つことで free 時間も breakdown に含める (nsys では free が step の
+    /// ~2 割を占める — Issue #76 計測。Issue #78 で workspace 永続化すれば per-step
+    /// alloc/free 自体が消える)。
+    fn step(
+        &mut self,
+        batch: &BatchData,
+        lr: f32,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
+        // `synchronize()` + 経過時間を stderr に出す (粗い h2d / forward / backward /
+        // optimizer / teardown breakdown 用、Issue #76)。未設定なら追加の sync ゼロ。
+        // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
+        // 取れないため、この粗い event timing が代替手段。
+        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
+        if profile_step {
+            self.stream.synchronize()?;
+        }
+        let mut prof_t0 = std::time::Instant::now();
+        let result = self.step_impl(batch, lr, wdl_lambda, loss, profile_step, &mut prof_t0)?;
+        // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
+        if profile_step {
+            self.stream.synchronize()?;
+            eprintln!(
+                "[step-profile] {:<10} {:8.3} ms",
+                "teardown",
+                prof_t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(result)
+    }
+
+    /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
     /// [`LossKind::Wrm`] なら `loss_wrm` (bullet win-rate-model、v102 厳密再現) を起動する。
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
@@ -1816,12 +1861,19 @@ impl GpuTrainer {
     /// `dense_mm_bwd_weight_bucket` は 1 cell = 1 thread の overwrite、FT / L1f / bias の
     /// grad は atomic accumulate)。Optimizer: 10 weight groups × `radam_step`
     /// (+ 周期 `ranger_lookahead_lerp`)。
-    fn step(
+    ///
+    /// `profile_step` / `prof_t0` は呼び出し元 ([`GpuTrainer::step`]) が管理し、本 method
+    /// 内の `prof_tick!` が各 phase 境界で `*prof_t0` を更新する (戻った後に呼び出し元が
+    /// teardown tick で読む)。
+    #[allow(clippy::too_many_arguments)]
+    fn step_impl(
         &mut self,
         batch: &BatchData,
         lr: f32,
         wdl_lambda: f32,
         loss: LossKind,
+        profile_step: bool,
+        prof_t0: &mut std::time::Instant,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
@@ -1829,16 +1881,6 @@ impl GpuTrainer {
         }
         let b_u32 = b as u32;
 
-        // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
-        // `synchronize()` + 経過時間を stderr に出す (粗い forward / backward /
-        // optimizer breakdown 用、Issue #76)。未設定なら追加の sync ゼロ。
-        // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
-        // 取れないため、この粗い event timing が代替手段。
-        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
-        if profile_step {
-            self.stream.synchronize()?;
-        }
-        let mut prof_t0 = std::time::Instant::now();
         macro_rules! prof_tick {
             ($label:expr) => {
                 if profile_step {
@@ -1847,9 +1889,9 @@ impl GpuTrainer {
                     eprintln!(
                         "[step-profile] {:<10} {:8.3} ms",
                         $label,
-                        now.duration_since(prof_t0).as_secs_f64() * 1000.0
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
                     );
-                    prof_t0 = now;
+                    *prof_t0 = now;
                 }
             };
         }
@@ -2645,11 +2687,12 @@ impl GpuTrainer {
             }?;
         }
         prof_tick!("optimizer");
-        let _ = prof_t0; // 最後の prof_tick が代入した値をここで「読む」(unused_assignments 回避)
 
         self.stream.synchronize()?;
 
-        // Read loss (`loss_acc` は 1-cell f64 buffer。空なら異常 → error にして無防備 index を避ける)
+        // Read loss (`loss_acc` は 1-cell f64 buffer。空なら異常 → error にして無防備 index を避ける)。
+        // この後 step_impl が return すると per-step buffer が drop され、呼び出し元 `step` が
+        // teardown tick を打つ (`*prof_t0` は上の `prof_tick!("optimizer")` が最後に更新した値)。
         let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
         loss_vec
             .first()
@@ -2658,7 +2701,7 @@ impl GpuTrainer {
     }
 }
 
-// step() 実装は別 impl block (file 分割回避のため同 file 内)。
+// step() / step_impl() 実装は別 impl block (file 分割回避のため同 file 内)。
 
 // ===========================================================================
 // TrainerBackend impl — `nnue-train::trainer::run` から 1 batch ずつ呼ばれる
