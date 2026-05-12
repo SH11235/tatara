@@ -11,6 +11,17 @@
 
 ### 取り込み済 file (時系列で追記)
 
+#### Stage 3 #89 — dataloader を bucket-aware prefetch / 並列パース / decode-once (2026-05-13、bullet 新規 vendor 無し)
+
+EPIC #75 / #81 関連 (perf)。bullet 由来コードの変更/追加なし、本リポ実装の構造変更:
+
+- **decode-once**: `crates/shogi-features` に decode 済み `ShogiBoard` を直接受ける入口を追加 — `ShogiHalfKA_hm::map_features_board` / `ShogiProgressKPAbs::{for_each_active_index_board, progress_board, bucket_board}`。従来 1 局面で `PackedSfenValue::decode()` が 2 回 (`map_features` 内 1 回 + `bucket`/`for_each_active_index` 内 1 回) 走っていたのを、dataloader が `psv.decode()` を 1 回呼んでその `ShogiBoard` を HalfKA_hm 特徴抽出と progress8kpabs bucket 計算の両方に渡す形に。既存 `map_features` / `progress` / `bucket` / `push` は board 版へ委譲 (挙動完全互換、不変条件テスト追加)。`crates/nnue-train::dataloader::Batch::push_decoded` も追加。
+- **bucket-aware 並列パース prefetch**: `crates/nnue-train::dataloader::BucketedPrefetchedLoader` (新規)。`--threads` 本の worker が共有 `Mutex<PsvEpochReader>` から短い critical section で生 PSV を `batch_size` 件取り (I/O は逐次)、その外で `decode()` + HalfKA_hm sparse 抽出 + progress bucket 計算を並列実行し `(Batch, per-position bucket Vec)` を main に渡す。`ShogiHalfKA_hm` / `ShogiProgressKPAbs` は ZST + process-global `OnceLock` (read-only) なので thread 間共有可。`trainer.rs::EpochStream` の逐次 read + `--score-drop-abs` skip + EOF wrap (= 次 epoch) + `MAX_BARREN_PASSES` ガードは `dataloader::PsvEpochReader` に移設して loader 内に格納 (挙動同等、bucket 計算だけ worker 側に分離)。**worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的** (各 worker が batch_size 件ずつ排他的に読むため batch 境界が変わる; training では問題ない — bullet 自体 shuffle、適用される lr/wdl は loop の batch_idx で決まりデータ内容に依らない)。`num_workers = 1` で従来の決定論的逐次 read 相当。
+- **ring-buffer return path**: `Batch` / per-position bucket `Vec` を起動時に `prefetch_depth + num_workers + 1` 個確保した std `mpsc::sync_channel` pool から借り、main が `train_step` 後 `BucketedPrefetchedLoader::recycle` で返す → worker が `Batch::reset()` / `Vec::clear()` で reuse。毎 batch の `Vec` 新規 alloc (#81 が指摘していた ~21MB) は起きない。`Batch::reset` の docstring (Stage 3-5 が予告していた follow-up) を更新。
+- **`crates/nnue-train::trainer::run`** を新 loader に差し替え (`TrainingConfig` に `threads` フィールド追加)。`bins/nnue_train/src/main.rs` は `--threads` を実際に配線 (旧 `let _ = cli.threads;` no-op 撤廃)、`--epoch-file-shuffle` は引き続き no-op (out of scope; warning 文言更新)。`nnue-train` は `gpu-runtime`-free を維持 (prefetch threading は本 crate 内、std `thread`/`mpsc`/`Arc<Mutex>` のみ)。`crates/nnue-train` は CPU-only / kernel 追加なしのため `nnue_train.ll` の `kernel_names` / kernel 数 (27) は不変。
+- **テスト変更**: `trainer.rs` の `run_drives_...` を threads=1 / threads=4 の 2 本に分割 (step 回数 / checkpoint / bucket / lr schedule は不変を確認)、`empty_data_file_errors_...` は loader 内 `PsvEpochReader` の barren ガード経由で error が伝搬することを確認。`dataloader.rs` に `BucketedPrefetchedLoader` の 1/4 worker streaming + recycle + 空 file error + score-drop skip テスト追加。`halfka_hm.rs` / `progress_kpabs.rs` に board 版 == 従来版 の不変条件テスト追加。
+- **検証** (ローカル sm_75 / 8GB / WSL2): CPU 全 crate test ok、workspace clippy / fmt クリーン、GPU smoke `PASSED`、sample.psv 学習 (`--threads 1` / `--threads 4` 双方) loss 単調減少、`verify_nnue_accumulator` ALL PASSED、`NNUE_TRAIN_STEP_PROFILE` breakdown 維持。`#76` の GPU-bound vs dataloader-bound 再計測は out of scope。
+
 #### Stage 3 #78 — GpuTrainer perf P4: 中間/grad buffer 永続化 (2026-05-13、bullet 新規 vendor 無し)
 
 EPIC #75 のサブ issue。`bins/nnue_train/src/main.rs` のみ (bullet 由来コードの変更/追加なし、純粋に性能改善のリファクタ):
