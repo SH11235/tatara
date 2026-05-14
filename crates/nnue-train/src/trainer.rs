@@ -156,6 +156,20 @@ pub trait TrainerBackend {
         loss: LossKind,
     ) -> io::Result<f64>;
 
+    /// backend が前 step の loss を pipeline 経由で遅延報告する場合 (例えば pinned
+    /// host ring を使った async loss readback) に、内部に滞留している未報告分の
+    /// `Σ err²` を drain して返す。default 実装は `0.0` を返す (同期 readback 実装
+    /// 向け)。
+    ///
+    /// caller (本 crate の [`run`]) は **superbatch 末尾** で呼び出すこと。背景:
+    /// async pipeline では `train_step` の N 番目の呼出が `step N-1` の loss を
+    /// 返し、最後の batch (`step N_per_sb - 1`) の loss は呼出されないまま残る。
+    /// `flush_pending_loss` を sb 末で 1 回呼んでこの残量を sb_loss に加算することで、
+    /// 1 sb の loss 集計が正確になる。
+    fn flush_pending_loss(&mut self) -> io::Result<f64> {
+        Ok(0.0)
+    }
+
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
     fn save_checkpoint(&mut self, path: &Path) -> io::Result<()>;
@@ -334,6 +348,11 @@ where
             sb_loss += loss;
             sb_positions += n_pos as u64;
         }
+        // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
+        // 等) の場合、sb 内最後 batch の loss が未報告のまま残る。`flush_pending_loss`
+        // で drain して sb_loss に加算することで、1 sb の loss 集計が正確になる
+        // (同期 readback の default 実装は `0.0` を返すので no-op)。
+        sb_loss += backend.flush_pending_loss()?;
 
         let sb_secs = sb_start.elapsed().as_secs_f64().max(1e-9);
         let mean_loss = if sb_positions == 0 {

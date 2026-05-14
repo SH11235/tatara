@@ -3261,10 +3261,11 @@ impl Drop for CublasHandle {
 /// pinned host (`cuMemHostAlloc`) なので driver は staging copy 無しで直接 DMA、
 /// 8 byte D2H + event record は host work と完全並行。
 ///
-/// 既知 limitation: step 0 の placeholder 0.0 と、最終 step の loss が trainer に
-/// 渡らないことで per-sb loss は 1 step 分 shift する (sb1 は step 0 の loss が落ち、
-/// 末尾 sb は最終 step の loss が次の reporting に到達しない)。1 sb = 200 step なので
-/// reported mean loss への影響は < 1/200 × loss 変動幅、訓練軌跡そのものは不変。
+/// 末尾 step の loss は [`AsyncLossRing::flush_pending_loss`] で drain する。
+/// [`crate::TrainerBackend::flush_pending_loss`] 経由で本 ring の `flush_pending_loss`
+/// が superbatch 末で 1 回呼ばれ、未報告分が `sb_loss` に加算される。これにより
+/// pipeline 化しても per-sb loss 集計は正確 (`sum(L_0..L_{N-1})`、warmup placeholder
+/// 0 は sum に影響なし)。
 struct AsyncLossRing {
     pinned: [*mut f64; 2],
     events: [CudaEvent; 2],
@@ -3340,15 +3341,27 @@ impl AsyncLossRing {
         Ok(returned)
     }
 
-    /// 終了処理: 最後の event を sync して pending な D2H が完了するのを待つ。
-    /// 学習終了時 (Drop でも実質同等だが、明示の方が分かりやすい) に呼ぶ。
-    #[allow(dead_code)]
-    fn drain(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.primed {
+    /// pipeline 末尾の drain: 最後に queue した step (= step - 1) の event を sync
+    /// して pinned[(step - 1) % 2] の loss を返す。未呼出 (warmup 直後など primed
+    /// = false) なら 0.0 を返す。
+    ///
+    /// `primed` を `false` に戻し `step` も 0 にリセットする。これにより次回 call
+    /// は warmup として 0.0 を返し、その次の call から再び lag-1 の正常 pipeline が
+    /// 始まる。caller (sb 末尾の trainer) は本 fn の返り値を sb_loss に加算する。
+    fn flush_pending_loss(&mut self) -> Result<f64, Box<dyn std::error::Error>> {
+        let returned = if self.primed {
             let last = (self.step + 1) % 2;
             self.events[last].synchronize()?;
-        }
-        Ok(())
+            // SAFETY: event sync 完了 = D2H 完了、pinned[last] に書き込まれた f64 を読む。
+            unsafe { *self.pinned[last] }
+        } else {
+            0.0
+        };
+        // 次回 sb は warmup から再開する (step も reset することで step % 2 計算が
+        // 一貫し、pinned/event 再利用に矛盾無し)。
+        self.primed = false;
+        self.step = 0;
+        Ok(returned)
     }
 }
 
@@ -4997,6 +5010,14 @@ impl TrainerBackend for GpuTrainer {
         let data = BatchData::from_batch_ref(batch, bucket_idx);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
+    }
+
+    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+        self.loss_ring.flush_pending_loss().map_err(|e| {
+            std::io::Error::other(format!(
+                "GpuTrainer::loss_ring.flush_pending_loss failed: {e}"
+            ))
+        })
     }
 
     fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
