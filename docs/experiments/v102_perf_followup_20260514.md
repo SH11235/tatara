@@ -223,6 +223,69 @@ occupancy 不変 (max threads/SM = 1536 で cap)。
    環境でも、PTX inspection だけで spill / 占有 register / bounds check の有無を確認
    できる。今後の最適化サイクルに組み込む価値あり。
 
+## 系統的 bounds check 監査 — 2026-05-14 追補
+
+phase D の raw-ptr 化が効いたので、全 hot kernel の PTX に `setp.ge.` がいくつ
+あるか集計して、bounds check density × 実行時間 で優先順位を決定:
+
+| kernel | setp.ge 数 | 時間 (profile-on) |
+|---|---:|---:|
+| dense_mm_fwd_bucket_tiled_l1 | 15 | 7.4 ms |
+| ft_post_perspective_fwd | 11 | 1.5 ms |
+| dense_mm_bwd_weight_bucket_tiled_l1 | 10 | 3.0 ms |
+| dense_mm_fwd_tiled_l1f | 9 | 1.8 ms |
+| dense_mm_bwd_weight_tiled (L1f bwd) | 8 | 8.5 ms |
+| dense_mm_bwd_input_tiled (L1f) | 7 | 4.3 ms |
+| ft_post_perspective_grad | 7 | 3.9 ms |
+| sparse_ft_forward | 6 | 28 ms |
+| sparse_ft_backward | 5 | dead (4-phase に置換済) |
+| radam_step | 5 | 4.5 ms (× 10 group) |
+| loss_wrm | 5 | <1 ms |
+| gather_and_sum_per_feature_overwrite | 5 | (b8d2abf で raw-ptr 化済) |
+| gather_and_sum_per_feature_add | 5 | (b8d2abf で raw-ptr 化済) |
+
+### raw-ptr 個別検証結果
+
+| kernel | setp 数 before → after | 時間 before → after | pos/s 影響 | 判定 |
+|---|---|---|---:|---|
+| **sparse_ft_forward** | 6 → 4 (in-loop 2 除去) | 28 → 26.5 ms | **+2.9%** | **commit f5c2c1f** |
+| dense_mm_fwd_bucket_tiled_l1 | 15 → 15 (不変) | 7.4 → 7.2 ms | -0.03% (noise) | **revert** |
+| ft_post_perspective_grad | 7 → 7 (不変) | 3.9 → 3.9 ms | noise | **revert** |
+
+### 学び (raw-ptr 化が効く / 効かない条件の判別)
+
+**raw-ptr が効く (LLVM が proves できず実 setp が in-loop に残る)**:
+- **間接 indexing**: `arr[other_arr[i]]` のパターン (sparse_ft_forward の
+  `weight[idx*rows+ri]`、gather_and_sum_per_feature の `grad_out[bi*ft_out+ri]`)
+- 値が境界条件を満たすことを Rust の型システム / 直前の if が「直接」表現していない
+  ケース (`idx < cols` だけでは `idx*rows < weight.len()` を LLVM に伝わらない)
+
+**raw-ptr が効かない (LLVM が surrounding `if` を見て勝手に proves)**:
+- **tid + 定数からの直接 indexing**: `x[bi * in_dim + kk]` を `if bb < batch_u &&
+  kk < in_dim_u { ... }` でガードしている dense_mm 系
+- 値が複数の bound から derive される積構造 (`bi * in_dim + kk` は `bi < batch && kk
+  < in_dim` から `< batch * in_dim = x.len()` が proves 可能)
+
+### 結論: bounds-check 系統最適化は完了
+
+raw-ptr による setp 除去の余地は **間接 indexing kernel = sparse_ft_forward + phase D**
+(gather_and_sum) で出尽くし。直接 indexing kernel への raw-ptr 化は perf neutral で
+unsafe を増やすだけ。
+
+dense matmul の更なる最適化には structural change (cuBLAS bind, tensor core, vector
+load) が必要だが、cuda-oxide で実装するには boilerplate 大 (`*const float4` の raw ptr
+cast + alignment 保証等)。
+
+## 最終結果
+
+| 計測 | mean pos/s | vs baseline | vs bullet | phase D | fwd_ft |
+|---|---:|---:|---:|---:|---:|
+| baseline f2e3d34 | 669,894 | — | 96.9% | 29.14 ms | 28.0 ms |
+| phase D raw-ptr (b8d2abf) | 711,750 | +6.1% | 103.0% | **22.20 ms** | 28.0 ms |
+| **+ sparse_ft raw-ptr (f5c2c1f)** | **731,701** | **+9.2%** | **105.8%** | 22.20 ms | **26.5 ms** |
+
+loss 軌跡は全段で baseline と一致 (sb5 差 ≤ 4e-5)。400 sb 推定時間: 33h → ~31h。
+
 ## commit hash anchor
 
 - `f2e3d34` — EPIC #75 v102 perf 292K → 665K (perf sprint baseline)
@@ -231,3 +294,5 @@ occupancy 不変 (max threads/SM = 1536 で cap)。
 - `0a071b1` — phase D に phD_stm / phD_nstm 独立 prof_tick 追加
 - `b31dce8` — phase D v2 試作の negative 結果記録 (revert 済)
 - **`b8d2abf`** — **phase D gather kernel の bounds check を raw-ptr 化 (+6.1% pos/s, bullet 超え)**
+- `16a8d34` — 仮説検証セッション doc 追補 (H1/H2 REFUTED、H4 confirmed)
+- **`f5c2c1f`** — **sparse_ft_forward の inner loop bounds check を raw-ptr 化 (+2.9% pos/s)**
