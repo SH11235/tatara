@@ -2761,6 +2761,10 @@ struct GpuTrainer {
     /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
     /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
     loss_ring: AsyncLossRing,
+    /// L1f weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
+    /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
+    /// in-order に走る)。
+    cublas: CublasHandle,
     step_count: u64,
 }
 
@@ -3106,6 +3110,144 @@ fn copy_host_to_device_async_f32(
     Ok(())
 }
 
+// ===========================================================================
+// cuBLAS FFI — `dense_mm_bwd_weight_tiled` (L1f weight bwd) を `cublasSgemm_v2`
+// に置換。CUDA Toolkit 12.x の dynamic link で取得 (`build.rs` で
+// `cargo:rustc-link-lib=dylib=cublas`)。
+// ===========================================================================
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct cublasContext {
+    _opaque: [u8; 0],
+}
+#[allow(non_camel_case_types)]
+type cublasHandle_t = *mut cublasContext;
+#[allow(non_camel_case_types)]
+type cublasStatus_t = std::os::raw::c_int;
+#[allow(non_camel_case_types)]
+type cublasOperation_t = std::os::raw::c_int;
+
+const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
+const CUBLAS_OP_N: cublasOperation_t = 0;
+const CUBLAS_OP_T: cublasOperation_t = 1;
+
+#[link(name = "cublas", kind = "dylib")]
+unsafe extern "C" {
+    fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
+    fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
+    fn cublasSetStream_v2(
+        handle: cublasHandle_t,
+        stream_id: cuda_core::sys::CUstream,
+    ) -> cublasStatus_t;
+    fn cublasSgemm_v2(
+        handle: cublasHandle_t,
+        transa: cublasOperation_t,
+        transb: cublasOperation_t,
+        m: std::os::raw::c_int,
+        n: std::os::raw::c_int,
+        k: std::os::raw::c_int,
+        alpha: *const f32,
+        a: *const f32,
+        lda: std::os::raw::c_int,
+        b: *const f32,
+        ldb: std::os::raw::c_int,
+        beta: *const f32,
+        c: *mut f32,
+        ldc: std::os::raw::c_int,
+    ) -> cublasStatus_t;
+}
+
+/// RAII wrapper for `cublasHandle_t`。Create 失敗 / Set stream 失敗 / Destroy 失敗を
+/// `Result` で返す。CUDA stream に bind して以後の Sgemm を同 stream で in-order 実行。
+struct CublasHandle {
+    handle: cublasHandle_t,
+}
+
+unsafe impl Send for CublasHandle {}
+
+impl CublasHandle {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut handle: cublasHandle_t = std::ptr::null_mut();
+        // SAFETY: cublasCreate_v2 は &mut handle に新規 handle を書き、CUBLAS_STATUS_SUCCESS
+        // 以外を返したら handle は invalid (read 禁止)。失敗時は早期 return。
+        let status = unsafe { cublasCreate_v2(&mut handle as *mut _) };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasCreate_v2 failed: status={status}").into());
+        }
+        // SAFETY: handle is valid (above), stream.cu_stream() returns the wrapped CUstream。
+        let status =
+            unsafe { cublasSetStream_v2(handle, stream.cu_stream() as cuda_core::sys::CUstream) };
+        if status != CUBLAS_STATUS_SUCCESS {
+            // SAFETY: handle is valid (cleanup before erroring).
+            unsafe {
+                cublasDestroy_v2(handle);
+            }
+            return Err(format!("cublasSetStream_v2 failed: status={status}").into());
+        }
+        Ok(Self { handle })
+    }
+
+    /// row-major C[M, N] = X^T @ Y、X[K, M] row-major、Y[K, N] row-major (X^T Y の reduce
+    /// 軸は K)。col-major cuBLAS で計算するため転置 trick を使う:
+    /// cublas は C_cm[N, M] = Y_cm[N, K] @ (X_cm[M, K])^T を計算、行列要素は同 memory。
+    /// 詳細は call 元コメント参照。`alpha=1`, `beta=0` (overwrite)。
+    ///
+    /// SAFETY: 全 device pointer は cudaMalloc 由来 + 各 buffer 長 == 仕様分、stream は
+    /// `cublasSetStream_v2` で bind 済の同一 stream を再利用。caller が形状不変条件
+    /// (X.len() >= k*m、Y.len() >= k*n、C.len() >= m*n) を保証。
+    unsafe fn sgemm_xt_y_rowmajor(
+        &self,
+        m: i32,
+        n: i32,
+        k: i32,
+        x_ptr: *const f32, // row-major [k, m]
+        y_ptr: *const f32, // row-major [k, n]
+        c_ptr: *mut f32,   // row-major [m, n]
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // col-major cuBLAS で row-major C_rm = X_rm^T @ Y_rm を出すには:
+        //   cublas C_cm[N, M] = Y_cm[N, K] @ (X_cm[M, K])^T と計算 (Y は trans=N、X は trans=T)
+        //   Y_cm[n, k] = Y_rm[k, n] (同 memory)、X_cm[m, k] = X_rm[k, m] (同 memory)。
+        //   結果 C_cm[n, m] = sum_k Y_rm[k, n] * X_rm[k, m] = C_rm[m, n] (同 memory)。
+        // 引数: A=Y, B=X, transA=N, transB=T, m=N, n=M, k=K, lda=N, ldb=M, ldc=N。
+        let status = unsafe {
+            cublasSgemm_v2(
+                self.handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_T,
+                n, // m for cublas = n (out_dim)
+                m, // n for cublas = m (in_dim)
+                k,
+                &alpha,
+                y_ptr,
+                n,
+                x_ptr,
+                m,
+                &beta,
+                c_ptr,
+                n,
+            )
+        };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasSgemm_v2 failed: status={status}").into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CublasHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: handle is valid (created in new()).
+            unsafe {
+                cublasDestroy_v2(self.handle);
+            }
+        }
+    }
+}
+
 /// `step()` 末尾の `loss_acc.to_host_vec` (内部で `stream.synchronize`) を排除し
 /// host が次 batch の launch を即発行できるようにする ring。
 ///
@@ -3315,6 +3457,7 @@ impl GpuTrainer {
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
+            cublas: CublasHandle::new(&stream)?,
             step_count: 0,
         })
     }
@@ -4432,26 +4575,26 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
-        // L1f weight backward は in_dim=FT_OUT(1536), out_dim=L1_OUT(16), batch=multiple of 16
-        // を満たすので shared-mem tiled 版 (~30x 少ない unique memory traffic) を使う。
-        // block=256, grid=FT_OUT/16=96.
-        debug_assert!(FT_OUT.is_multiple_of(16) && L1_OUT == 16);
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_tiled,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((FT_OUT / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.combined),
-                slice(self.ws.dl1_total),
-                slice_mut(self.l1f_w_grad),
-                b_u32, FT_OUT as u32, L1_OUT as u32
-            ]
-        }?;
+        // L1f weight backward: row-major grad_w[FT_OUT, L1_OUT] = combined^T @ dl1_total。
+        // combined[batch, FT_OUT] row-major、dl1_total[batch, L1_OUT] row-major。元 kernel
+        // (`dense_mm_bwd_weight_tiled`) は 1 block / 16x16 W tile + shared-mem tiled で 50-60%
+        // peak、cuBLAS Sgemm に置換すると tensor pipeline + split-K の最適化で更に速くなる
+        // (M=16 と細いが K=65536 が大きいので reduce-bound)。
+        //
+        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc、長さは arch 固定で
+        // `combined.len() == b*FT_OUT`、`dl1_total.len() == b*L1_OUT`、`l1f_w_grad.len() ==
+        // FT_OUT*L1_OUT`、`self.stream` 上で同 stream 内 in-order 実行 (cublas は前 kernel
+        // 完了後に走る、結果は後続 kernel が観測する)。
+        unsafe {
+            self.cublas.sgemm_xt_y_rowmajor(
+                FT_OUT as i32, // m = in_dim
+                L1_OUT as i32, // n = out_dim
+                b_u32 as i32,  // k = batch
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.ws.dl1_total.cu_deviceptr() as *const f32,
+                self.l1f_w_grad.cu_deviceptr() as *mut f32,
+            )?;
+        }
         // L1f bias backward: shared-mem reduce で global atomic を 1M → ~16K に削減。
         const _: () = assert!(L1_OUT == 16);
         cuda_launch! {
