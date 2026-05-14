@@ -35,6 +35,9 @@
 **/*.cubin
 **/*.bc
 
+# local 計測ログ / 仮説検証メモ (commit せず手元で保管)
+/docs/experiments/
+
 # OS / editor
 .DS_Store
 .idea/
