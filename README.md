@@ -56,7 +56,11 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 - [Architecture overview](docs/00-overview.md) — design + リポ構成 + fused kernel
   戦略
 - [Setup guide](docs/setup.md) — CUDA / LLVM / rustup のインストール、サポート
-  GPU マトリクス
+  GPU マトリクス、CUDA toolkit root 解決
+- [Training quickstart](docs/training-quickstart.md) — PSV データ準備 + 主要
+  CLI option + 400 sb full run + resume / checkpoint 運用
+- [Performance guide](docs/performance.md) — GPU 機種別 throughput 目安 +
+  `NNUE_TRAIN_STEP_PROFILE` での自己診断手順
 - [Data layout](docs/data-layout.md) — PSV / progress.bin / .nnue / checkpoint
   の配置・命名規約
 - [ADR (Architecture Decision Records)](docs/01-decisions/) — 設計判断とその
