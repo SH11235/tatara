@@ -327,6 +327,14 @@ where
         (cfg.batches_per_superbatch as u64).saturating_mul(cfg.batch_size as u64);
     let run_start = Instant::now();
 
+    // backend の async H2D で `train_step` が返って直ぐ `loader.recycle` すると、
+    // queue 済 H2D copy のソース (`batch.stm_indices` 等の pageable `Vec`) を worker
+    // thread が reset / 再充填してしまう。これを防ぐため **1 step 遅延 recycle**:
+    // 直前 batch を `prev_pending` に保持し、次 `train_step` が queue 済 H2D を消化
+    // した時点で recycle する (次 step の event sync が直前 batch の full pipeline
+    // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
+    let mut prev_pending: Option<(Batch, Vec<i32>)> = None;
+
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
@@ -344,7 +352,12 @@ where
             let n_pos = batch.n_positions;
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
-            loader.recycle((batch, buckets));
+            // 直前 batch を recycle: その H2D は今 `train_step` 呼出内の event sync で
+            // 完了済 (lag-1 pipeline)。very first batch は prev_pending=None で no-op。
+            if let Some(prev) = prev_pending.take() {
+                loader.recycle(prev);
+            }
+            prev_pending = Some((batch, buckets));
             sb_loss += loss;
             sb_positions += n_pos as u64;
         }
@@ -396,6 +409,12 @@ where
                 prune_old_raw_checkpoints(&cfg.output_dir, &cfg.net_id, keep);
             }
         }
+    }
+
+    // 最後に残った batch を recycle: 直前 sb 末の `flush_pending_loss` 内 event sync で
+    // 当該 batch の H2D は完了済、loader に返しても安全。
+    if let Some(prev) = prev_pending.take() {
+        loader.recycle(prev);
     }
 
     println!(
