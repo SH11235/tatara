@@ -173,11 +173,11 @@ pub fn loss_wdl(
 /// loader.rs:300-316` (data-layer の WRM target + WDL blend) を NNUE 専用に hand-fuse。
 /// CPU reference は `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`。
 ///
-/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、prediction /
-/// target 双方に nodchip 流 WRM を適用するため net_output は `out ≈ cp / nnue2score`
-/// (O(1)) で収束し、`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`、
-/// bullet の `out ≈ cp/600` スケール前提) と整合する。bullet v102 を厳密再現するには
-/// この kernel を使う。
+/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、
+/// prediction / target 双方に WRM を適用するため net_output は
+/// `out ≈ cp / nnue2score` (O(1)) で収束し、`crates/nnue-format` の量子化
+/// (`QA=127 / QB=64 / FV_SCALE=28`、bullet の `out ≈ cp/600` スケール前提)
+/// と整合する。bullet v102 を厳密再現するにはこの kernel を使う。
 ///
 /// - target: `pt = (score - 270)/380`、`pmt = (-score - 270)/380`、`target_wrm =
 ///   0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、`target = lambda*wdl + (1-lambda)*target_wrm`。
@@ -5158,19 +5158,19 @@ struct Cli {
     #[arg(long)]
     keep_checkpoints: Option<usize>,
 
-    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm` kernel
-    /// (prediction / target 双方に nodchip 流 WRM) を使い、未指定なら `loss_wdl`
-    /// (plain sigmoid-MSE + `--scale`)。net_output のスケールが `out ≈ cp/--wrm-nnue2score`
-    /// になり量子化 (`QA=127/QB=64/FV_SCALE=28`) と整合するので bullet v102 互換 net を
-    /// 学習するには必須。
+    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm`
+    /// kernel (prediction / target 双方に WRM を適用) を使い、未指定なら
+    /// `loss_wdl` (plain sigmoid-MSE + `--scale`)。net_output のスケールが
+    /// `out ≈ cp/--wrm-nnue2score` になり量子化 (`QA=127/QB=64/FV_SCALE=28`)
+    /// と整合するので bullet v102 互換 net を学習するには必須。
     #[arg(long)]
     win_rate_model: bool,
-    /// WRM prediction 側の in-scaling (nodchip default 340)。target 側は bullet ハードコード
-    /// の 380。`--win-rate-model` 指定時のみ使う。
+    /// WRM prediction 側の in-scaling (bullet recipe 既定値 340)。target 側は
+    /// bullet ハードコードの 380。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 340.0)]
     wrm_in_scaling: f32,
-    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、nodchip default 600)。
-    /// `--win-rate-model` 指定時のみ使う。
+    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、bullet
+    /// recipe 既定値 600)。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 600.0)]
     wrm_nnue2score: f32,
     // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---

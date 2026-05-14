@@ -69,11 +69,12 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 /// - [`LossKind::Sigmoid`] — plain sigmoid-MSE (`p = sigmoid(out * scale)`,
 ///   target = `lambda*wdl + (1-lambda)*sigmoid(score * scale)`)。net_output が
 ///   cp 単位 (`out ≈ cp`) で収束する。
-/// - [`LossKind::Wrm`] — bullet win-rate-model loss (nodchip 流の WRM)。prediction
-///   / target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score`
-///   (O(1)) で収束し、量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と scale が整合する。
-///   target 側 `in_scaling` (380) と offset (270) は bullet ハードコード値、
-///   prediction 側 `in_scaling` は `--wrm-in-scaling` 経由で本 enum field から渡る。
+/// - [`LossKind::Wrm`] — bullet `loss_fn_wrm` を移植した win-rate-model loss。
+///   prediction / target 双方に WRM を適用するため net_output が
+///   `out ≈ cp / nnue2score` (O(1)) で収束し、量子化 (`QA=127 / QB=64 /
+///   FV_SCALE=28`) と scale が整合する。target 側 `in_scaling` (380) と
+///   offset (270) は bullet ハードコード値、prediction 側 `in_scaling` は
+///   `--wrm-in-scaling` 経由で本 enum field から渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
     /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 recipe は `1/290`)。

@@ -11,7 +11,7 @@
 //! - `adamw_step` — AdamW with decay + clip
 //! - `radam_step` — RAdam (AdamW + bias correction + denom switch)
 //! - `ranger_step` — RAdam + lookahead lerp
-//! - `loss_wrm` — win-rate-model loss (v102 nodchip / bullet 系)
+//! - `loss_wrm` — win-rate-model loss (bullet `loss_fn_wrm` を移植)
 
 pub mod adamw_step;
 pub mod loss_wdl;
