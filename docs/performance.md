@@ -102,20 +102,6 @@ batch 1 以降の steady-state を見る。
    GPU other load 競合の可能性。`nvidia-smi` で GPU 使用率と温度確認、別
    process が GPU を占有していないか調べる。
 
-## 現状未採用の最適化 (前提条件メモ)
-
-以下の最適化は計測上の改善余地が小さい / 構造改修コストが大きいため現状未採用。
-着手前提を残す:
-
-- **Pinned H2D wrapper**: host CPU は async loss readback の後 GPU と well
-  overlap しており、追加で pinned 化しても measurement noise 内 (+1% 未満)。
-- **bias_grad shared-mem 化 (L2/L3)**: 独立 `prof_tick` 計測で bias_grad 合計が
-  step 全体 (~83 ms) の 0.2% 未満、改善余地不足。
-- **CUDA Graph capture**: `ctx.default_stream()` (NULL CUstream) は
-  `cuStreamBeginCapture_v2` が拒否する。unblock には stream 全面切替 +
-  AsyncLossRing 縮退 + cuBLAS capture 互換性検証 + scalar arg 対応の
-  refactor が必要。
-
 ## 関連
 
 - [docs/training-quickstart.md](training-quickstart.md) — 学習を回す手順

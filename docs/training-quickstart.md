@@ -23,14 +23,14 @@ RTX 3080 Ti で ~1.5 時間。
 
 ```bash
 target/release/progress-kpabs-train \
-  --data /path/to/DLSuisho15b_aoba_deduped_shuffled.bin \
-  --output output/progress/progress_hao_full_cuda.bin \
+  --data <path/to/shuffled-psv.bin> \
+  --output output/progress/<run-name>.bin \
   --games-per-step 1024 --epochs 5
 ```
 
-epoch ごとに `progress_hao_full_cuda.e<N>.bin` が出るので、`nnue-train` に
-渡すのは最終 epoch (例: `e5.bin`) で良い。中間 epoch (`e1.bin`) を渡せば
-学習進行度の感覚を弱くしただけの bucket になる (NNUE 学習の進行と独立)。
+epoch ごとに `<run-name>.e<N>.bin` が出るので、`nnue-train` に渡すのは最終
+epoch (例: `e5.bin`) で良い。中間 epoch (`e1.bin`) を渡せば学習進行度の
+感覚を弱くしただけの bucket になる (NNUE 学習の進行と独立)。
 
 ## Step 2: nnue-train で本体を学習 (400 sb full run)
 
@@ -39,9 +39,9 @@ bullet-shogi v102 recipe (400 superbatches × 6104 batches × 65536 positions
 
 ```bash
 target/release/nnue-train \
-  --data /path/to/DLSuisho15b_aoba_deduped_shuffled.bin \
-  --progress-coeff output/progress/progress_hao_full_cuda.e5.bin \
-  --output checkpoints/v102_main --net-id v102_main \
+  --data <path/to/shuffled-psv.bin> \
+  --progress-coeff <path/to/progress.e5.bin> \
+  --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
   --save-rate 20 --keep-checkpoints 4 \
