@@ -135,4 +135,3 @@ target/release/nnue-train --data <PSV> --progress-coeff <progress.bin> \
 - [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) セットアップ
 - [docs/data-layout.md](data-layout.md) — PSV / progress.bin / .nnue 命名・配置
 - [docs/performance.md](performance.md) — pos/s 期待値 + step profile 診断
-- [docs/00-overview.md](00-overview.md) — リポ全体の構成

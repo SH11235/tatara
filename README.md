@@ -49,12 +49,10 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | `crates/nnue-format/` | NNUE 重みファイル binary IO (header / halfka_psqt / v102 layerstack) |
 | `bins/nnue_train/` | NNUE 本番 trainer (GPU `#[kernel]` 定義はここに inline) |
 | `bins/progress_kpabs_train/` | KP-abs progress trainer (eval 用) |
-| `docs/` | overview / ADR / setup / data layout / kernel catalog |
+| `docs/` | ADR / setup / data layout / kernel catalog |
 
 ## ドキュメント
 
-- [Architecture overview](docs/00-overview.md) — design + リポ構成 + fused kernel
-  戦略
 - [Setup guide](docs/setup.md) — CUDA / LLVM / rustup のインストール、サポート
   GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.md) — PSV データ準備 + 主要

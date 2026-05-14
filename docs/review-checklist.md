@@ -109,12 +109,12 @@ ls docs/decisions/ | grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$'
 
 ### 2.4 directory tree の現状反映
 
-`README.md` / `docs/00-overview.md` の repo ツリー記述が現状と合っているか。
+`README.md` の repo ツリー / 構成テーブル記述が現状と合っているか。
 削除済 directory や架空の予定 directory が残っていないか。
 
 ```bash
 # tree 記述に出てくる directory が実在するか
-for d in $(rg -oE '^[│├└\s─]+([a-z_-]+)/' README.md docs/00-overview.md \
+for d in $(rg -oE '^[│├└\s─]+([a-z_-]+)/' README.md \
             | sed -E 's/.*[│├└\s─]+([a-z_-]+)\/$/\1/' | sort -u); do
   [ -d "$d" ] || echo "MISSING: $d"
 done
