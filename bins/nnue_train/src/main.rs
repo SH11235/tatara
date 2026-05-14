@@ -1266,7 +1266,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
     let in_ok = global_ii < in_dim_u;
     let out_ok = global_oi < out_dim_u;
 
-    // split-K: 各 block が batch slice を担当。num_splits=1 で従来形 (全 batch スキャン)。
+    // split-K: 各 block が batch slice を担当。num_splits=1 で 1 block が全 batch を scan。
     let positions_per_split = batch_u.div_ceil(num_splits);
     let split_b_start = block_split * positions_per_split;
     if split_b_start >= batch_u {
@@ -3727,7 +3727,7 @@ impl GpuTrainer {
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_v102_weights` → `save_quantised`)
-    /// は推論用 final artifact なので別途従来どおり保存される。本 method はそれとは別の
+    /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
     /// `*.ckpt` file に、全 10 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
