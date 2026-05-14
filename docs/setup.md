@@ -191,7 +191,7 @@ WSL2 環境では `/` (ext4) は **C: ドライブ上の sparse vhdx** が実体
 
 ## 関連
 
-- [cuda-oxide adoption ADR](01-decisions/2026-05-09-cuda-oxide-adoption.md) —
+- [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
   採用判断と Consequences
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)

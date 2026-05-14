@@ -95,7 +95,7 @@ rg -n -e '^\s*作成:\s*[0-9]{4}-[0-9]{2}' \
 ADR の `**Date**: YYYY-MM-DD` field は意味の一部なので OK。それ以外で日付
 header は不要 (git log で確認可能)。
 
-### 2.3 ADR (`docs/01-decisions/`) のルール
+### 2.3 ADR (`docs/decisions/`) のルール
 
 - ファイル名: `YYYY-MM-DD-<slug>.md` 形式
 - 連番 (`0NNN-...`) はリジェクト (並行 PR 衝突)
@@ -105,7 +105,7 @@ header は不要 (git log で確認可能)。
   削除時は他の ADR / doc からのリンク切れを修正する)
 
 ```bash
-ls docs/01-decisions/ | grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$'
+ls docs/decisions/ | grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$'
 # 出力ゼロを期待 (= 全 ADR が date-based slug)
 ```
 

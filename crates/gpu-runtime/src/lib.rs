@@ -1,6 +1,6 @@
 //! cuda-oxide host 側 API の薄い wrapper。
 //!
-//! GPU カーネルは cuda-oxide で書く (docs/01-decisions/ 参照)。`cuda-core` と
+//! GPU カーネルは cuda-oxide で書く (docs/decisions/ 参照)。`cuda-core` と
 //! `cuda-host` の主要 type を再 export しつつ、`Error` で `DriverError` /
 //! `LtoirError` を `thiserror` 経由でラップする。
 //!

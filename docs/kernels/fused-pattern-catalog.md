@@ -1,6 +1,6 @@
 # Fused kernel pattern catalog
 
-[fused kernel strategy ADR](../01-decisions/2026-05-09-fused-kernel-strategy.md)
+[fused kernel strategy ADR](../decisions/2026-05-09-fused-kernel-strategy.md)
 で「runtime fusion を build-time hand-fused kernel で代替する」と決めた fused
 kernel の **責務 / op 数 / 配置ファイル** を一覧する。
 upstream (bullet) のどの関数を hand-fuse したかは各 kernel のソースコメント
