@@ -448,7 +448,7 @@ pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
     let block_dim_u = thread::blockDim_x() as usize;
     let n_u = n as usize;
 
-    let chunk = (n_u + block_dim_u - 1) / block_dim_u;
+    let chunk = n_u.div_ceil(block_dim_u);
     let start = tid * chunk;
     let end_candidate = start + chunk;
     let end = if end_candidate < n_u {
@@ -1244,7 +1244,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
     let out_ok = global_oi < out_dim_u;
 
     // split-K: 各 block が batch slice を担当。num_splits=1 で従来形 (全 batch スキャン)。
-    let positions_per_split = (batch_u + num_splits - 1) / num_splits;
+    let positions_per_split = batch_u.div_ceil(num_splits);
     let split_b_start = block_split * positions_per_split;
     if split_b_start >= batch_u {
         return;
@@ -1589,10 +1589,11 @@ pub fn dense_mm_fwd_tiled_l1f(
         k_tile += 1;
     }
 
-    if bi_ok && oi_ok {
-        if let Some(o) = y.get_mut(thread::index_1d()) {
-            *o = acc;
-        }
+    if bi_ok
+        && oi_ok
+        && let Some(o) = y.get_mut(thread::index_1d())
+    {
+        *o = acc;
     }
 }
 
@@ -1844,7 +1845,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
     // 各 block が均等な batch slice を担当 (端数は block 0 に寄せず ceil で配分し overflow check)。
     // ceil(batch / num_splits)、cuda-oxide は usize の `min()` / `div_ceil` で drop_in_place を
     // 出してしまうので素朴な式で書く。
-    let positions_per_block = (batch_u + num_splits - 1) / num_splits;
+    let positions_per_block = batch_u.div_ceil(num_splits);
     let b_start = block_split * positions_per_block;
     if b_start >= batch_u {
         return;
@@ -1985,7 +1986,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
         return;
     }
 
-    let positions_per_block = (batch_u + num_splits - 1) / num_splits;
+    let positions_per_block = batch_u.div_ceil(num_splits);
     let b_start = block_split * positions_per_block;
     if b_start >= batch_u {
         return;
@@ -3441,10 +3442,10 @@ impl GpuTrainer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let tmp_path = {
             let mut p = path.as_os_str().to_os_string();
@@ -4098,7 +4099,7 @@ impl GpuTrainer {
         // 元 kernel は 288 cells × scan batch で並列度小。split-K + 9 bucket register
         // accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`) に切替。
         // num_splits=64 → 64 blocks × 32 threads = 2048 threads ≈ 26 / SM (sm_86)。
-        debug_assert!(L2_OUT == 32 && NUM_BUCKETS == 9);
+        const _: () = assert!(L2_OUT == 32 && NUM_BUCKETS == 9);
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l3,
             stream: self.stream,
@@ -4161,7 +4162,7 @@ impl GpuTrainer {
         }?;
         // L2 weight bwd: in_dim=L2_IN=30, out_dim=L2_OUT=32, num_buckets=9。
         // split-K + 9 bucket register accumulator (block_dim = 32 × 30 = 960、grid = 64 splits)。
-        debug_assert!(L2_IN == 30 && L2_OUT == 32 && NUM_BUCKETS == 9);
+        const _: () = assert!(L2_IN == 30 && L2_OUT == 32 && NUM_BUCKETS == 9);
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l2,
             stream: self.stream,
@@ -4322,7 +4323,7 @@ impl GpuTrainer {
             ]
         }?;
         // L1f bias backward: shared-mem reduce で global atomic を 1M → ~16K に削減。
-        debug_assert!(L1_OUT == 16);
+        const _: () = assert!(L1_OUT == 16);
         cuda_launch! {
             kernel: bias_grad_shared_l1f,
             stream: self.stream,
@@ -4445,11 +4446,13 @@ impl GpuTrainer {
         // 新: phase A (count) → B (prefix sum) → C (scatter) → D (per-feature gather+sum)。
         // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
         let total_pairs = (b * MAX_ACTIVE) as u32;
-        let mut iter_idx: u32 = 0;
-        for (gout, idx_dev) in [
+        for (iter_idx, (gout, idx_dev)) in [
             (&self.ws.dft_stm_out, &self.ws.stm_idx_dev),
             (&self.ws.dft_nstm_out, &self.ws.nstm_idx_dev),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             // A: feat_counts ← 0
             memset_zero(&self.stream, &self.ws.feat_counts)?;
             memset_zero(&self.stream, &self.ws.feat_write_ctr)?;
@@ -4536,7 +4539,6 @@ impl GpuTrainer {
                 }?;
                 prof_tick!("phD_nstm");
             }
-            iter_idx += 1;
             let _ = total_pairs; // unused yet
         }
         prof_tick!("bwd_ftbwd");
@@ -4624,7 +4626,7 @@ impl GpuTrainer {
         }?;
 
         // Lookahead lerp every K steps
-        if self.step_count % RANGER_K == 0 {
+        if self.step_count.is_multiple_of(RANGER_K) {
             cuda_launch! {
                 kernel: ranger_lookahead_lerp,
                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
@@ -4712,10 +4714,10 @@ impl TrainerBackend for GpuTrainer {
         let weights = self.to_v102_weights().map_err(|e| {
             std::io::Error::other(format!("GpuTrainer::to_v102_weights failed: {e}"))
         })?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
         weights.save_quantised(&mut writer)?;

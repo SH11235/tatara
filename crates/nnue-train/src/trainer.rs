@@ -252,12 +252,12 @@ impl TrainingConfig {
             ));
         }
         self.loss.validate()?;
-        if let Some(t) = self.score_drop_abs {
-            if t < 1 {
-                return Err(io::Error::other(format!(
-                    "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
-                )));
-            }
+        if let Some(t) = self.score_drop_abs
+            && t < 1
+        {
+            return Err(io::Error::other(format!(
+                "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
+            )));
         }
         Ok(())
     }

@@ -148,8 +148,7 @@ impl QuantTarget {
     /// `bytes` を量子化前の f32 列にデコード。LE 読み出し → 多項倍除算。
     pub fn dequantise(self, bytes: &[u8]) -> io::Result<Vec<f32>> {
         let elem = self.elem_bytes();
-        // MSRV 1.85: `usize::is_multiple_of` は 1.87 stable のため直書き (Stage 2-5 踏破済)。
-        if bytes.len() % elem != 0 {
+        if !bytes.len().is_multiple_of(elem) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(

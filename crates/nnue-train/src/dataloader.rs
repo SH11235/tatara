@@ -384,10 +384,10 @@ impl PsvEpochReader {
                 Some(psv) => {
                     // bullet `--score-drop-abs` の近似 (詳細は module doc)。
                     // i64 cast で i16::MIN の abs overflow を避ける。
-                    if let Some(t) = self.score_drop_abs {
-                        if i64::from(psv.score()).abs() >= i64::from(t) {
-                            continue;
-                        }
+                    if let Some(t) = self.score_drop_abs
+                        && i64::from(psv.score()).abs() >= i64::from(t)
+                    {
+                        continue;
                     }
                     self.pushed_this_epoch += 1;
                     return Ok(psv);
