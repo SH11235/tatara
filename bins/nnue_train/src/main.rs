@@ -406,8 +406,7 @@ pub fn sparse_ft_forward(
     while ni < nnz {
         let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
-            sum +=
-                unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
+            sum += unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
         }
         ni += 1;
     }
@@ -635,9 +634,8 @@ pub fn gather_and_sum_per_feature_add(
 
     // atomicAdd で stm の結果に加算。
     if sum != 0.0_f32 {
-        let cell = unsafe {
-            &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32)
-        };
+        let cell =
+            unsafe { &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32) };
         cell.fetch_add(sum, AtomicOrdering::Relaxed);
     }
 }
@@ -1642,11 +1640,7 @@ pub fn dense_mm_fwd_bucket_tiled_l1(
     unsafe {
         if tid_local < 16 {
             let bb = b_start + tid_local;
-            BUC_TILE[tid_local] = if bb < batch_u {
-                bucket_idx[bb]
-            } else {
-                -1_i32
-            };
+            BUC_TILE[tid_local] = if bb < batch_u { bucket_idx[bb] } else { -1_i32 };
         }
     }
     thread::sync_threads();
@@ -1849,7 +1843,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
 
     // 各 block が均等な batch slice を担当 (端数は block 0 に寄せず ceil で配分し overflow check)。
     // ceil(batch / num_splits)、cuda-oxide は usize の `min()` / `div_ceil` で drop_in_place を
-     // 出してしまうので素朴な式で書く。
+    // 出してしまうので素朴な式で書く。
     let positions_per_block = (batch_u + num_splits - 1) / num_splits;
     let b_start = block_split * positions_per_block;
     if b_start >= batch_u {
@@ -2808,8 +2802,8 @@ struct GpuWorkspace {
     dft_nstm_out: DeviceBuffer<f32>,         // b × FT_OUT
 
     // -- inverse-index sparse_ft_backward scratch (FT_IN+1 / max 2.5M) --
-    feat_counts: DeviceBuffer<u32>,    // FT_IN: per-feature histogram (atomic build)
-    feat_offsets: DeviceBuffer<u32>,   // FT_IN + 1: exclusive prefix sum
+    feat_counts: DeviceBuffer<u32>, // FT_IN: per-feature histogram (atomic build)
+    feat_offsets: DeviceBuffer<u32>, // FT_IN + 1: exclusive prefix sum
     feat_write_ctr: DeviceBuffer<u32>, // FT_IN: scatter atomic counter
     feat_positions: DeviceBuffer<u32>, // up to batch * MAX_ACTIVE: sorted positions
 
@@ -5940,7 +5934,15 @@ mod gpu_cpu_equivalence_tests {
             let bucket_idx = bucket_idx_with_padding(batch, nb);
             let mut y_cpu = vec![0.0_f32; batch * out_dim];
             dense_mm_fwd_bucket_cpu(
-                &x, &w, &bias, &bucket_idx, &mut y_cpu, batch, in_dim, out_dim, nb,
+                &x,
+                &w,
+                &bias,
+                &bucket_idx,
+                &mut y_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
             );
 
             let x_dev = DeviceBuffer::from_host(&stream, &x)?;
@@ -6075,7 +6077,14 @@ mod gpu_cpu_equivalence_tests {
             let bucket_idx = bucket_idx_with_padding(batch, nb);
             let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
             dense_mm_bwd_weight_bucket_cpu(
-                &x, &dy, &bucket_idx, &mut dw_cpu, batch, in_dim, out_dim, nb,
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
             );
 
             let x_dev = DeviceBuffer::from_host(&stream, &x)?;
@@ -6120,7 +6129,14 @@ mod gpu_cpu_equivalence_tests {
             let bucket_idx = bucket_idx_with_padding(batch, nb);
             let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
             dense_mm_bwd_weight_bucket_cpu(
-                &x, &dy, &bucket_idx, &mut dw_cpu, batch, in_dim, out_dim, nb,
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
             );
 
             let x_dev = DeviceBuffer::from_host(&stream, &x)?;
@@ -6164,7 +6180,14 @@ mod gpu_cpu_equivalence_tests {
             let bucket_idx = bucket_idx_with_padding(batch, nb);
             let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
             dense_mm_bwd_weight_bucket_cpu(
-                &x, &dy, &bucket_idx, &mut dw_cpu, batch, in_dim, out_dim, nb,
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
             );
 
             let x_dev = DeviceBuffer::from_host(&stream, &x)?;
