@@ -375,14 +375,14 @@ pub fn ranger_lookahead_lerp(
 ///
 /// 1 thread = 4 連続 row (output cells)、column-major weight (`weight[idx * rows + ri]`)、
 /// atomics 不要 (各 thread は別 4 output cell に書く)。`-1` padding と `idx >= cols`
-/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する、grid は
-/// `cfg_1d(batch * rows / 4)`。
+/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する (`FT_OUT = 1536`
+/// で arch 上 invariant)、grid は `cfg_1d(batch * rows / 4)`。
 ///
-/// 4 scalar weight read + 4 scalar store 形 (cuda-oxide / llc-22 では align(16)
-/// struct でも LSV は v4 load へ集約できず、struct 経由は逆に local alloca + spill
-/// が出るため scalar 形に統一)。1-row-per-thread と比較した win 源泉:
-/// - 4× 少ない thread → 4× 少ない launch overhead + setp/iter amortization
-/// - per-warp の memory transaction は同じ (warp 32 × 4 = 128 row span)、coalesce 維持
+/// inner loop は 4 連続 scalar weight read + 4 scalar partial-sum 更新形 (LLVM/NVPTX
+/// backend は `f32` pointer の 4-byte alignment 推論止まりで `ld.global.v4.f32` へ
+/// 集約しない、`#[repr(C, align(16))]` struct cast 経由でも SROA が align を保持せず
+/// scalar load + local-mem spill になる)。warp coalesce は 32 thread × 4 row = 128
+/// 連続 row が同 idx の cache line をまたいで読まれる pattern で維持される。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward(
@@ -3164,6 +3164,9 @@ struct CublasHandle {
     handle: cublasHandle_t,
 }
 
+// SAFETY: `cublasHandle_t` は CUDA driver が tracking する opaque handle。cuBLAS API は
+// driver thread safety guarantees に従い handle を別 thread から呼び出してよい
+// (`cublasSetStream_v2` が thread-affinity を切り替えるとき内部 lock を取る)。
 unsafe impl Send for CublasHandle {}
 
 impl CublasHandle {
@@ -3257,6 +3260,11 @@ impl Drop for CublasHandle {
 ///
 /// pinned host (`cuMemHostAlloc`) なので driver は staging copy 無しで直接 DMA、
 /// 8 byte D2H + event record は host work と完全並行。
+///
+/// 既知 limitation: step 0 の placeholder 0.0 と、最終 step の loss が trainer に
+/// 渡らないことで per-sb loss は 1 step 分 shift する (sb1 は step 0 の loss が落ち、
+/// 末尾 sb は最終 step の loss が次の reporting に到達しない)。1 sb = 200 step なので
+/// reported mean loss への影響は < 1/200 × loss 変動幅、訓練軌跡そのものは不変。
 struct AsyncLossRing {
     pinned: [*mut f64; 2],
     events: [CudaEvent; 2],
@@ -3346,11 +3354,19 @@ impl AsyncLossRing {
 
 impl Drop for AsyncLossRing {
     fn drop(&mut self) {
+        // pinned cell を free する前に未完了の async D2H を待つ。さもなければ in-flight な
+        // memcpy_dtoh_async が解放後 host memory に書き戻して UB になる。primed = false の
+        // 場合は record されていない event なので skip。失敗は無視 (Drop 中の error 報告は
+        // 実用上困難、driver が in-flight copy を tracking する debug-build 動作と等価)。
+        if self.primed {
+            for event in self.events.iter() {
+                let _ = event.synchronize();
+            }
+        }
         for slot in self.pinned.iter() {
             if !slot.is_null() {
                 // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放する。
-                // Drop 順は CudaEvent が ctx を保持しているため、ここで host メモリ free
-                // のみ。失敗時は無視 (Drop 中の error 報告は実用上困難)。
+                // 上の event sync で in-flight D2H が完了済。
                 unsafe {
                     cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
                 }
@@ -4575,16 +4591,16 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
-        // L1f weight backward: row-major grad_w[FT_OUT, L1_OUT] = combined^T @ dl1_total。
-        // combined[batch, FT_OUT] row-major、dl1_total[batch, L1_OUT] row-major。元 kernel
-        // (`dense_mm_bwd_weight_tiled`) は 1 block / 16x16 W tile + shared-mem tiled で 50-60%
-        // peak、cuBLAS Sgemm に置換すると tensor pipeline + split-K の最適化で更に速くなる
-        // (M=16 と細いが K=65536 が大きいので reduce-bound)。
+        // L1f weight backward: row-major `grad_w[FT_OUT, L1_OUT] = combined^T @ dl1_total`。
+        // combined[batch, FT_OUT] row-major、dl1_total[batch, L1_OUT] row-major、reduce 軸は
+        // batch = 65536。M = 16 と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
+        // split-K + tensor pipeline 最適化が効きやすい。
         //
-        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc、長さは arch 固定で
-        // `combined.len() == b*FT_OUT`、`dl1_total.len() == b*L1_OUT`、`l1f_w_grad.len() ==
-        // FT_OUT*L1_OUT`、`self.stream` 上で同 stream 内 in-order 実行 (cublas は前 kernel
-        // 完了後に走る、結果は後続 kernel が観測する)。
+        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc 由来、長さは arch 上
+        // invariant (`combined.len() == b*FT_OUT`、`dl1_total.len() == b*L1_OUT`、
+        // `l1f_w_grad.len() == FT_OUT*L1_OUT`)、`self.cublas` は `self.stream` に bind 済で
+        // 同 stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、結果は後続 kernel
+        // が観測する)。
         unsafe {
             self.cublas.sgemm_xt_y_rowmajor(
                 FT_OUT as i32, // m = in_dim
