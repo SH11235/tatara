@@ -39,9 +39,8 @@ pub use cuda_host::{LtoirError, cuda_launch};
 /// **NOTE**: cuda-oxide 内部実装は呼び出し元 crate の `CARGO_MANIFEST_DIR`
 /// (run-time 解決) を起点に `<name>.cubin` / `.ptx` / `.ll` を順に探索する
 /// ため、本 helper を呼んだ「呼び出し元 crate の dir」が起点になる
-/// (`gpu-runtime` 自身ではない)。Stage 1 の experiments/001 や Stage 2 の
-/// `gpu-kernels` のように、kernel artifact を自 crate に同梱するケースでは
-/// そのまま使える。任意 path から PTX を読みたい場合は
+/// (`gpu-runtime` 自身ではない)。kernel artifact を呼び出し元 crate に同梱する
+/// 構成ではそのまま使える。任意 path から PTX を読みたい場合は
 /// `CudaContext::load_module_from_file(path)` を直接使うこと。
 pub use cuda_host::load_kernel_module;
 

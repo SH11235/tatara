@@ -1,11 +1,10 @@
 //! Fused RAdam optimizer step (AdamW + bias correction + denom switch) の
 //! reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn radam_step`) は **`experiments/002-fused-kernels/
-//! src/main.rs` に inline 定義** されている (Stage 1-5 で確立した「`#[kernel]`
-//! は bin entry に inline」制約)。本 module の `radam_step_cpu` +
-//! `radam_compute_step_size_denom` は GPU と同じロジックを host で素直に書き写し
-//! たもので、Stage 2-4 (#40) GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn radam_step` は bin entry (`bins/nnue_train/src/main.rs`)
+//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
+//! 制約)。本 module の `radam_step_cpu` + `radam_compute_step_size_denom` は GPU と
+//! 同じロジックを host で書き写したもので、GPU↔CPU 数値同等性テストの reference 用。
 //!
 //! ## アルゴリズム (bullet 上流 `optimiser/radam.rs::RAdam::update` + `OP` に等価)
 //!

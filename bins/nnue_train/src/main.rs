@@ -82,14 +82,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
-#[allow(unused_imports)]
 use cuda_host::cuda_launch;
-#[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
-#[allow(unused_imports)]
 use nnue_format::V102Weights;
 use nnue_train::dataloader::Batch;
-#[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
 use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig};
@@ -2332,25 +2328,18 @@ pub fn slice_scatter_2d(
 
 // ===========================================================================
 // Host driver helpers (kernel module loader / launch utilities)
-//
-// Stage 1-9 (`bins/progress_kpabs_train::main.rs:308-539`) / Stage 2 EPIC #16
-// (`experiments/002-fused-kernels/src/main.rs:500-697`) の慣行を踏襲。
-// `kernel_names` のみ 27 個に拡張 (Stage 3-7 で 26 + Stage 3 #84 で `loss_wrm`)。
 // ===========================================================================
 
-#[allow(dead_code)]
 const BLOCK_DIM: u32 = 256;
 
 /// 1 D launch の grid 数を計算 (= ceil(n / block)、n=0 は block=1 個 launch)。
-#[allow(dead_code)]
 fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
     let blocks = ((n as u32).max(1)).div_ceil(block);
     (blocks, 1, 1)
 }
 
 /// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
-/// CudaModule を load。Stage 1-9 / Stage 2 と同 fallback 順 (`.ll` → `.cubin` → `.ptx`)。
-#[allow(dead_code)]
+/// CudaModule を load。fallback 順: `.ll` → `.cubin` → `.ptx`。
 fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
@@ -2400,10 +2389,9 @@ fn load_kernel_module_with_fallback(
     Ok(module)
 }
 
-/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。Stage 1-9 / Stage 2 と
-/// 同 pipeline、`kernel_names` のみ全 27 kernel (Stage 3-7 の 26 + #84 の `loss_wrm`)
-/// を内 internalize。
-#[allow(dead_code)]
+/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。`kernel_names` のみ
+/// public symbol として保持、それ以外は internalize する (opt の `--internalize`
+/// pass)。
 fn compile_ll_to_ptx_via_llc(
     ll_path: &std::path::PathBuf,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -2672,7 +2660,6 @@ const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
 // `crates/nnue-train::trainer` loop と統合する。
 // ===========================================================================
 
-#[allow(dead_code)] // 一部 field は Stage 3-8 で host state 直接更新時に使う
 struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -2884,7 +2871,6 @@ impl GpuWorkspace {
 /// Smoke / Stage 3-8 trainer 用の 1 batch 入力データ。
 /// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
 /// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
-#[allow(dead_code)]
 struct BatchData<'a> {
     n_pos: usize,
     stm_indices: &'a [i32], // (n_pos × MAX_ACTIVE)、-1 padding 可
@@ -2904,6 +2890,14 @@ struct BatchDataOwned {
     bucket_idx: Vec<i32>,
     score: Vec<f32>,
     wdl: Vec<f32>,
+}
+
+/// 1 step 分のハイパーパラメータ。scheduler 経由で per-batch に変化する値を束ねる。
+#[derive(Clone, Copy)]
+struct StepHyperParams {
+    lr: f32,
+    wdl_lambda: f32,
+    loss: LossKind,
 }
 
 impl BatchDataOwned {
@@ -3649,28 +3643,21 @@ impl GpuTrainer {
     /// プロファイル時の前後 sync と **teardown tick** だけを担う。`step_impl` が
     /// return すると per-step device buffer の `Drop` (= `cuMemFree`) がそこで走るので、
     /// 最後の `prof_tick!` を `step_impl` の **外** で打つことで free 時間も breakdown に
-    /// 含める。Issue #78 で中間 activation / grad buffer を `GpuTrainer` 上の workspace に
-    /// 永続化したため、`step_impl` で drop されるのは入力 H2D buffer (`stm_idx_dev` 等、
-    /// position 数に比例した小さい buffer) だけになり、teardown tick は ~0 に落ちる (期待動作)。
-    /// 入力 H2D の永続化は Issue #81 (P5、pinned + 2-stream) の範囲なので本 issue では未対応。
+    /// 含める。
     fn step(
         &mut self,
         batch: &BatchData,
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
+        params: StepHyperParams,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
         // `synchronize()` + 経過時間を stderr に出す (粗い h2d / forward / backward /
-        // optimizer / teardown breakdown 用、Issue #76)。未設定なら追加の sync ゼロ。
-        // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
-        // 取れないため、この粗い event timing が代替手段。
+        // optimizer / teardown breakdown 用)。未設定なら追加の sync ゼロ。
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         if profile_step {
             self.stream.synchronize()?;
         }
         let mut prof_t0 = std::time::Instant::now();
-        let result = self.step_impl(batch, lr, wdl_lambda, loss, profile_step, &mut prof_t0)?;
+        let result = self.step_impl(batch, params, profile_step, &mut prof_t0)?;
         // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
         if profile_step {
             self.stream.synchronize()?;
@@ -3701,16 +3688,18 @@ impl GpuTrainer {
     /// `profile_step` / `prof_t0` は呼び出し元 ([`GpuTrainer::step`]) が管理し、本 method
     /// 内の `prof_tick!` が各 phase 境界で `*prof_t0` を更新する (戻った後に呼び出し元が
     /// teardown tick で読む)。
-    #[allow(clippy::too_many_arguments)]
     fn step_impl(
         &mut self,
         batch: &BatchData,
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
+        params: StepHyperParams,
         profile_step: bool,
         prof_t0: &mut std::time::Instant,
     ) -> Result<f64, Box<dyn std::error::Error>> {
+        let StepHyperParams {
+            lr,
+            wdl_lambda,
+            loss,
+        } = params;
         let b = batch.n_pos;
         if b == 0 {
             return Ok(0.0);
@@ -4706,7 +4695,12 @@ impl TrainerBackend for GpuTrainer {
         loss: LossKind,
     ) -> std::io::Result<f64> {
         let data = BatchData::from_batch_ref(batch, bucket_idx);
-        self.step(&data, lr, wdl_lambda, loss)
+        let params = StepHyperParams {
+            lr,
+            wdl_lambda,
+            loss,
+        };
+        self.step(&data, params)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
     }
 
@@ -5110,7 +5104,14 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        let loss = trainer.step(
+            &batch.as_ref(),
+            StepHyperParams {
+                lr,
+                wdl_lambda: WDL_LAMBDA,
+                loss: SMOKE_LOSS_SIGMOID,
+            },
+        )?;
         println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -5134,7 +5135,14 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
-        let loss_wrm = trainer.step(&batch.as_ref(), 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        let loss_wrm = trainer.step(
+            &batch.as_ref(),
+            StepHyperParams {
+                lr: 1e-3_f32,
+                wdl_lambda: WDL_LAMBDA,
+                loss: SMOKE_LOSS_WRM,
+            },
+        )?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -5145,7 +5153,14 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        let loss = trainer.step(
+            &batch.as_ref(),
+            StepHyperParams {
+                lr,
+                wdl_lambda: WDL_LAMBDA,
+                loss: SMOKE_LOSS_SIGMOID,
+            },
+        )?;
         println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -5153,8 +5168,15 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         trainer.assert_all_weights_finite()?;
         println!("[smoke] step 1: all weights finite ✓");
 
-        // step 2: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
-        let loss_wrm = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        // step 2: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
+        let loss_wrm = trainer.step(
+            &batch.as_ref(),
+            StepHyperParams {
+                lr,
+                wdl_lambda: WDL_LAMBDA,
+                loss: SMOKE_LOSS_WRM,
+            },
+        )?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -5261,14 +5283,14 @@ mod raw_ckpt_format_tests {
 }
 
 // ===========================================================================
-// GPU ↔ CPU reference 数値同等性テスト (Issue #85)
+// GPU ↔ CPU reference 数値同等性テスト。
 //
-// 本 module は **GPU 必須**。CI ではないローカル sm_75 box でのみ走る想定で、
-// `#[cfg(test)]` を本 main.rs 内に置くことで kernel symbol (上の `#[kernel]` 群) に
-// 直接 path 解決できる (Stage 1-10 / Stage 2 (`experiments/002-fused-kernels`) と
-// 同パターン、tests/*.rs では bin の `#[kernel]` に届かない)。`nnue-trainer` は
-// 既に workspace `--exclude` で CI から外れているので CI には影響しない (が typecheck
-// は通る必要がある — `cargo test -p nnue-trainer --release --no-run`)。
+// 本 module は **GPU 必須**。CI 非対応 (GitHub-hosted runner に CUDA 無し)、
+// ローカル GPU box でのみ走る想定。`#[cfg(test)]` を main.rs 内に直接置くことで
+// kernel symbol (上の `#[kernel]` 群) に path 解決できる (tests/*.rs では bin の
+// `#[kernel]` に届かないため)。`nnue-trainer` は workspace `--exclude` で CI から
+// 外しているので CI には影響しない (typecheck は通す:
+// `cargo test -p nnue-trainer --release --no-run`)。
 //
 // 走らせる:
 //

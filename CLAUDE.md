@@ -42,16 +42,28 @@ off で tolerance を満たさず fail するが、release では本番経路と
   に含める
 - negative result も commit を残す (revert commit + Issue 追記の 2 操作)
 - main への直接 push 禁止、必ず PR 経由
-- PR merge は CI green 必須、`--squash --delete-branch` で main に merge (repo
-  既存運用に追従、`Issue #XX (#NN)` 形式 squash commit が main に残る)
+- PR merge は CI green 必須、`--squash --delete-branch` で main に merge
 - `git push --force` は main / merge 済 branch に絶対しない、`--no-verify`
   禁止 (CI を skip して push しない)
 
+## コードコメント規約
+
+コード内コメント (`.rs` / `Cargo.toml` / `.yaml` / `.sh` 等) は **初見の Rust
+開発者がそのファイル単独で読んで意味が通る** ものに限る。以下は禁止:
+
+- 作業ログ (「削除済」「追加した」「今回」「N → M に変更」)
+- local context 依存の用語 (「Stage X」「PR #N で」「Issue #N の」)
+- migration history (「ここから昇格」「以前は…にあった」)
+
+これらの情報は git log / PR description / `docs/` 配下に置く。コード内に書いて
+よいのは:
+- 非自明な不変条件 (例:「caller が `n_pos * MAX_ACTIVE` を保証する」)
+- 言語仕様で表せない constraint の理由 (例:「cuda-oxide が `f32::clamp` を
+  lower できないため if-else 展開」)
+- コードを読んでも分からない外部参照 (例:「YaneuraOu progress.bin 形式に追従」)
+
 ## 作業前 checklist
 
-- リポ上のコンテキストは [memory](https://docs.anthropic.com) に保存されない
-  user-private 情報、`docs/experiments/` に公開済の計測ログ + 仮説検証経緯、
-  `docs/01-decisions/` の ADR を参照
-- v102 perf 関連の最新状態は Issue #99 と PR #98 の本文 (再現コマンド + 環境を含む)
+- 計測ログ + 仮説検証経緯は `docs/experiments/`、設計判断は `docs/01-decisions/`
 - cuda-oxide / nightly toolchain の構成は壊さない、host 側 unsafe は妥当性を
   コメントで明記する

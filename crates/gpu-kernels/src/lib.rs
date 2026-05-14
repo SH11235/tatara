@@ -1,10 +1,9 @@
 //! `gpu-kernels` crate — GPU kernel の reference CPU 実装ライブラリ。
 //!
-//! Stage 1-11 で `experiments/001-cuda-oxide-kpabs/src/kernels/` から昇格。
 //! GPU 側の `#[kernel]` 定義は **bin entry (例: `bins/progress_kpabs_train/
 //! src/main.rs`) に inline 配置する制約** が cuda-oxide の rustc-codegen-cuda
-//! backend にあるため (Stage 1-5 で確立)、本 crate には reference CPU 実装
-//! のみを置く。GPU との数値同等性テストは bin 側が本 crate を引き込む形で行う。
+//! backend にあるため、本 crate には reference CPU 実装のみを置く。GPU との数値
+//! 同等性テストは bin 側が本 crate を引き込む形で行う。
 //!
 //! ## 提供するもの
 //!

@@ -1,10 +1,9 @@
 //! Fused AdamW optimizer step (decay + clip 込み) の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn adamw_step`) は **`experiments/002-fused-kernels/
-//! src/main.rs` に inline 定義** されている (Stage 1-5 で確立した「`#[kernel]`
-//! は bin entry に inline」制約)。本 module の `adamw_step_cpu` は GPU と
-//! 同じ更新式を host で素直に書き写したもので、Stage 2-3 (#39) GPU↔CPU 数値
-//! 同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn adamw_step` は bin entry (`bins/nnue_train/src/main.rs`)
+//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
+//! 制約)。本 module の `adamw_step_cpu` は GPU と同じ更新式を host で書き写した
+//! もので、GPU↔CPU 数値同等性テストの reference 用。
 //!
 //! ## アルゴリズム (bullet 上流 `optimiser/adam.rs::AdamWParams::build` に等価)
 //!
