@@ -22,7 +22,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/SH11235/rshogi-nnue"
 authors = ["SH11235"]
-rust-version = "1.85"
+rust-version = "1.96"
 
 [workspace.dependencies]
 shogi-format = { path = "crates/shogi-format" }

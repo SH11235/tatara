@@ -117,7 +117,7 @@ pub fn ranger_step_cpu(
     // step == 0 で true、panic しない) と数値同型に揃えるため + CPU で
     // `step % 0` が panic するため両方の defensive。Stage 3 trainer は
     // `RangerParams` で `k >= 1` が保証されるが本 fn 単体での堅牢性を確保。
-    if k != 0 && step % k == 0 {
+    if k != 0 && step.is_multiple_of(k) {
         ranger_lookahead_lerp_cpu(weights, slow, alpha, n);
     }
 }

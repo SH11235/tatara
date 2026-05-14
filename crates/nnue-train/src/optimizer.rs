@@ -220,7 +220,7 @@ impl RangerHostState {
     /// 直書き (Stage 2-5 / 3-3 で確立済規約)。
     pub fn should_lookahead(&self, k: usize) -> bool {
         let step = self.radam.step;
-        step > 0 && k > 0 && step % (k as u64) == 0
+        step > 0 && k > 0 && step.is_multiple_of(k as u64)
     }
 
     /// state 全体を zero clear (`radam` reset + **slow_params も 0 fill**)。
@@ -346,13 +346,13 @@ impl RangerHostState {
             )
         })?;
 
-        if let Some(expected) = expected_n_params {
-            if n != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("RangerHostState n_params mismatch: got {n}, want {expected}"),
-                ));
-            }
+        if let Some(expected) = expected_n_params
+            && n != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("RangerHostState n_params mismatch: got {n}, want {expected}"),
+            ));
         }
 
         let momentum = read_f32_vec(r, n)?;
