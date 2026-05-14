@@ -394,13 +394,20 @@ pub fn sparse_ft_forward(
     let bi = tid.get() / (rows as usize);
     let ri = tid.get() % (rows as usize);
 
+    // raw pointer 版 (inner loop の 2 bounds check / iter = 80 / thread を除去)。
+    // unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1` padding 含めて
+    // 確保)、weight.len() == cols * rows (FT 重み、arch 固定)。`if idx >= 0 && (idx as u32)
+    // < cols` のロジックチェックは値検査として保持。
+    let indices_ptr = indices.as_ptr();
+    let weight_ptr = weight.as_ptr();
     let mut sum = 0.0_f32;
     let base = bi * (nnz as usize);
     let mut ni: u32 = 0;
     while ni < nnz {
-        let idx = indices[base + (ni as usize)];
+        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
-            sum += weight[(idx as usize) * (rows as usize) + ri];
+            sum +=
+                unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
         }
         ni += 1;
     }
