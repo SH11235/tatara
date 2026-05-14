@@ -79,12 +79,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+#[allow(unused_imports)]
+use cuda_core::IntoResult as _;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
-#[allow(unused_imports)]
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
 use nnue_format::V102Weights;
 use nnue_train::dataloader::Batch;
@@ -372,9 +373,16 @@ pub fn ranger_lookahead_lerp(
 
 /// Sparse feature transform forward (HalfKA_hm 用)。
 ///
-/// 1 thread = 1 (batch, row)、column-major weight (`weight[idx * rows + ri]`)、
-/// atomics 不要 (各 thread は別 output cell に書く)。`-1` padding と `idx >= cols`
-/// の異常入力は silent skip。
+/// 1 thread = 4 連続 row (output cells)、column-major weight (`weight[idx * rows + ri]`)、
+/// atomics 不要 (各 thread は別 4 output cell に書く)。`-1` padding と `idx >= cols`
+/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する (`FT_OUT = 1536`
+/// で arch 上 invariant)、grid は `cfg_1d(batch * rows / 4)`。
+///
+/// inner loop は 4 連続 scalar weight read + 4 scalar partial-sum 更新形 (LLVM/NVPTX
+/// backend は `f32` pointer の 4-byte alignment 推論止まりで `ld.global.v4.f32` へ
+/// 集約しない、`#[repr(C, align(16))]` struct cast 経由でも SROA が align を保持せず
+/// scalar load + local-mem spill になる)。warp coalesce は 32 thread × 4 row = 128
+/// 連続 row が同 idx の cache line をまたいで読まれる pattern で維持される。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward(
@@ -387,31 +395,49 @@ pub fn sparse_ft_forward(
     nnz: u32,
 ) {
     let tid = thread::index_1d();
-    let total = (batch as usize) * (rows as usize);
+    let rows_u = rows as usize;
+    let rows_q = rows_u / 4;
+    let total = (batch as usize) * rows_q;
     if tid.get() >= total {
         return;
     }
-    let bi = tid.get() / (rows as usize);
-    let ri = tid.get() % (rows as usize);
+    let bi = tid.get() / rows_q;
+    let ri_q = tid.get() % rows_q;
+    let ri_base = ri_q * 4;
 
-    // raw pointer 版 (inner loop の 2 bounds check / iter = 80 / thread を除去)。
-    // unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1` padding 含めて
-    // 確保)、weight.len() == cols * rows (FT 重み、arch 固定)。`if idx >= 0 && (idx as u32)
-    // < cols` のロジックチェックは値検査として保持。
+    // raw pointer 版。unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1`
+    // padding 含めて確保)、weight.len() == cols * rows (FT 重み、arch 固定、rows %
+    // 4 == 0)、`if idx >= 0 && (idx as u32) < cols` のロジックチェックは値検査として保持。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
-    let mut sum = 0.0_f32;
+    let mut s0: f32 = 0.0;
+    let mut s1: f32 = 0.0;
+    let mut s2: f32 = 0.0;
+    let mut s3: f32 = 0.0;
     let base = bi * (nnz as usize);
     let mut ni: u32 = 0;
     while ni < nnz {
         let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
-            sum += unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
+            let off = (idx as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() };
+            let w1 = unsafe { weight_ptr.add(off + 1).read() };
+            let w2 = unsafe { weight_ptr.add(off + 2).read() };
+            let w3 = unsafe { weight_ptr.add(off + 3).read() };
+            s0 += w0;
+            s1 += w1;
+            s2 += w2;
+            s3 += w3;
         }
         ni += 1;
     }
-    if let Some(o) = out.get_mut(tid) {
-        *o = sum;
+    let out_ptr = out.as_mut_ptr();
+    let out_base = bi * rows_u + ri_base;
+    unsafe {
+        out_ptr.add(out_base).write(s0);
+        out_ptr.add(out_base + 1).write(s1);
+        out_ptr.add(out_base + 2).write(s2);
+        out_ptr.add(out_base + 3).write(s3);
     }
 }
 
@@ -2732,7 +2758,28 @@ struct GpuTrainer {
 
     // loss + step
     loss_acc: DeviceBuffer<f64>,
+    /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
+    /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
+    loss_ring: AsyncLossRing,
+    /// L1f weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
+    /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
+    /// in-order に走る)。
+    cublas: CublasHandle,
     step_count: u64,
+}
+
+impl Drop for GpuTrainer {
+    fn drop(&mut self) {
+        // 残り queue 済 GPU 操作 (`loss_ring` の async D2H が `loss_acc` を read する等)
+        // を全て完了させてから field の Drop に進む。さもなければ struct field 宣言順
+        // (`loss_acc` → `loss_ring`) で `loss_acc` の device memory が先に `cuMemFree`
+        // され、`AsyncLossRing` 側の in-flight D2H が解放済 device メモリを read する
+        // race になる。本 sync で stream 上の全 op が完了するので、後続の per-field
+        // cleanup は全部 safe (cublas / loss_acc / loss_ring / ws の全 DeviceBuffer)。
+        // 失敗は無視 (Drop 中の error 報告は実用上困難、stream 破棄で driver が
+        // tracking を解除する debug-build 動作と等価)。
+        let _ = self.stream.synchronize();
+    }
 }
 
 /// `GpuTrainer::step_impl` の forward / backward で使う中間 activation と
@@ -3077,6 +3124,284 @@ fn copy_host_to_device_async_f32(
     Ok(())
 }
 
+// ===========================================================================
+// cuBLAS FFI — `dense_mm_bwd_weight_tiled` (L1f weight bwd) を `cublasSgemm_v2`
+// に置換。CUDA Toolkit 12.x の dynamic link で取得 (`build.rs` で
+// `cargo:rustc-link-lib=dylib=cublas`)。
+// ===========================================================================
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct cublasContext {
+    _opaque: [u8; 0],
+}
+#[allow(non_camel_case_types)]
+type cublasHandle_t = *mut cublasContext;
+#[allow(non_camel_case_types)]
+type cublasStatus_t = std::os::raw::c_int;
+#[allow(non_camel_case_types)]
+type cublasOperation_t = std::os::raw::c_int;
+
+const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
+const CUBLAS_OP_N: cublasOperation_t = 0;
+const CUBLAS_OP_T: cublasOperation_t = 1;
+
+#[link(name = "cublas", kind = "dylib")]
+unsafe extern "C" {
+    fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
+    fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
+    fn cublasSetStream_v2(
+        handle: cublasHandle_t,
+        stream_id: cuda_core::sys::CUstream,
+    ) -> cublasStatus_t;
+    fn cublasSgemm_v2(
+        handle: cublasHandle_t,
+        transa: cublasOperation_t,
+        transb: cublasOperation_t,
+        m: std::os::raw::c_int,
+        n: std::os::raw::c_int,
+        k: std::os::raw::c_int,
+        alpha: *const f32,
+        a: *const f32,
+        lda: std::os::raw::c_int,
+        b: *const f32,
+        ldb: std::os::raw::c_int,
+        beta: *const f32,
+        c: *mut f32,
+        ldc: std::os::raw::c_int,
+    ) -> cublasStatus_t;
+}
+
+/// RAII wrapper for `cublasHandle_t`。Create 失敗 / Set stream 失敗 / Destroy 失敗を
+/// `Result` で返す。CUDA stream に bind して以後の Sgemm を同 stream で in-order 実行。
+struct CublasHandle {
+    handle: cublasHandle_t,
+}
+
+// SAFETY: `cublasHandle_t` は CUDA driver が tracking する opaque handle。cuBLAS API は
+// driver thread safety guarantees に従い handle を別 thread から呼び出してよい
+// (`cublasSetStream_v2` が thread-affinity を切り替えるとき内部 lock を取る)。
+unsafe impl Send for CublasHandle {}
+
+impl CublasHandle {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut handle: cublasHandle_t = std::ptr::null_mut();
+        // SAFETY: cublasCreate_v2 は &mut handle に新規 handle を書き、CUBLAS_STATUS_SUCCESS
+        // 以外を返したら handle は invalid (read 禁止)。失敗時は早期 return。
+        let status = unsafe { cublasCreate_v2(&mut handle as *mut _) };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasCreate_v2 failed: status={status}").into());
+        }
+        // SAFETY: handle is valid (above), stream.cu_stream() returns the wrapped CUstream。
+        let status =
+            unsafe { cublasSetStream_v2(handle, stream.cu_stream() as cuda_core::sys::CUstream) };
+        if status != CUBLAS_STATUS_SUCCESS {
+            // SAFETY: handle is valid (cleanup before erroring).
+            unsafe {
+                cublasDestroy_v2(handle);
+            }
+            return Err(format!("cublasSetStream_v2 failed: status={status}").into());
+        }
+        Ok(Self { handle })
+    }
+
+    /// row-major C[M, N] = X^T @ Y、X[K, M] row-major、Y[K, N] row-major (X^T Y の reduce
+    /// 軸は K)。col-major cuBLAS で計算するため転置 trick を使う:
+    /// cublas は C_cm[N, M] = Y_cm[N, K] @ (X_cm[M, K])^T を計算、行列要素は同 memory。
+    /// 詳細は call 元コメント参照。`alpha=1`, `beta=0` (overwrite)。
+    ///
+    /// SAFETY: 全 device pointer は cudaMalloc 由来 + 各 buffer 長 == 仕様分、stream は
+    /// `cublasSetStream_v2` で bind 済の同一 stream を再利用。caller が形状不変条件
+    /// (X.len() >= k*m、Y.len() >= k*n、C.len() >= m*n) を保証。
+    unsafe fn sgemm_xt_y_rowmajor(
+        &self,
+        m: i32,
+        n: i32,
+        k: i32,
+        x_ptr: *const f32, // row-major [k, m]
+        y_ptr: *const f32, // row-major [k, n]
+        c_ptr: *mut f32,   // row-major [m, n]
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // col-major cuBLAS で row-major C_rm = X_rm^T @ Y_rm を出すには:
+        //   cublas C_cm[N, M] = Y_cm[N, K] @ (X_cm[M, K])^T と計算 (Y は trans=N、X は trans=T)
+        //   Y_cm[n, k] = Y_rm[k, n] (同 memory)、X_cm[m, k] = X_rm[k, m] (同 memory)。
+        //   結果 C_cm[n, m] = sum_k Y_rm[k, n] * X_rm[k, m] = C_rm[m, n] (同 memory)。
+        // 引数: A=Y, B=X, transA=N, transB=T, m=N, n=M, k=K, lda=N, ldb=M, ldc=N。
+        let status = unsafe {
+            cublasSgemm_v2(
+                self.handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_T,
+                n, // m for cublas = n (out_dim)
+                m, // n for cublas = m (in_dim)
+                k,
+                &alpha,
+                y_ptr,
+                n,
+                x_ptr,
+                m,
+                &beta,
+                c_ptr,
+                n,
+            )
+        };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasSgemm_v2 failed: status={status}").into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CublasHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: handle is valid (created in new()).
+            unsafe {
+                cublasDestroy_v2(self.handle);
+            }
+        }
+    }
+}
+
+/// `step()` 末尾の `loss_acc.to_host_vec` (内部で `stream.synchronize`) を排除し
+/// host が次 batch の launch を即発行できるようにする ring。
+///
+/// 2-slot ring + 1-step lag: step N で device の `loss_acc` を pinned cell[N%2] に
+/// async D2H + event record。返り値は step N-1 の loss (event[(N-1)%2] sync 後に
+/// pinned cell[(N-1)%2] を読む)。最初の 1 step は前 step が無いので 0.0 を返す。
+///
+/// pinned host (`cuMemHostAlloc`) なので driver は staging copy 無しで直接 DMA、
+/// 8 byte D2H + event record は host work と完全並行。
+///
+/// 末尾 step の loss は [`AsyncLossRing::flush_pending_loss`] で drain する。
+/// [`crate::TrainerBackend::flush_pending_loss`] 経由で本 ring の `flush_pending_loss`
+/// が superbatch 末で 1 回呼ばれ、未報告分が `sb_loss` に加算される。これにより
+/// pipeline 化しても per-sb loss 集計は正確 (`sum(L_0..L_{N-1})`、warmup placeholder
+/// 0 は sum に影響なし)。
+struct AsyncLossRing {
+    pinned: [*mut f64; 2],
+    events: [CudaEvent; 2],
+    step: usize,
+    primed: bool,
+}
+
+// SAFETY: `pinned` は `cuMemHostAlloc` で確保した page-locked memory、CUDA driver の
+// 内部 tracking 経由でアクセスされる。pointer 自体は host メモリで `Send` 安全。
+unsafe impl Send for AsyncLossRing {}
+
+impl AsyncLossRing {
+    fn new(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut pinned = [std::ptr::null_mut::<f64>(); 2];
+        for slot in pinned.iter_mut() {
+            let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: cuMemHostAlloc は page-locked host memory を 8 byte 確保、
+            // failure 時は CUresult != SUCCESS を返す (.result()? で check)。
+            unsafe {
+                cuda_core::sys::cuMemHostAlloc(
+                    &mut p as *mut _,
+                    std::mem::size_of::<f64>(),
+                    cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
+                )
+                .result()?;
+                // 初期値 0 (warmup で読まれないが defensive)
+                std::ptr::write(p as *mut f64, 0.0);
+            }
+            *slot = p as *mut f64;
+        }
+        let events = [ctx.new_event(None)?, ctx.new_event(None)?];
+        Ok(Self {
+            pinned,
+            events,
+            step: 0,
+            primed: false,
+        })
+    }
+
+    /// `loss_acc` (device 1-cell f64) を async D2H で pinned[cur] へ copy、event 記録。
+    /// 前 step (= step - 1) の event を sync して pinned[prev] を読み返り値とする。
+    /// 最初の呼出 (warmup) は 0.0 を返す。
+    fn read_and_queue_next(
+        &mut self,
+        stream: &CudaStream,
+        loss_acc: &DeviceBuffer<f64>,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let cur = self.step % 2;
+        // SAFETY: pinned[cur] is page-locked host memory (cuMemHostAlloc 8 bytes),
+        // loss_acc has len == 1 (= 8 bytes), stream 上 in-order なので async D2H は
+        // 直前の memset/atomic 完了後に実行される。
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                self.pinned[cur],
+                loss_acc.cu_deviceptr(),
+                std::mem::size_of::<f64>(),
+                stream.cu_stream(),
+            )?;
+        }
+        self.events[cur].record(stream)?;
+
+        let returned = if self.primed {
+            let prev = (self.step + 1) % 2; // = (step - 1) % 2
+            self.events[prev].synchronize()?;
+            // SAFETY: event sync 完了 = D2H 完了、pinned[prev] に書き込まれた f64 を読む。
+            unsafe { *self.pinned[prev] }
+        } else {
+            self.primed = true;
+            0.0
+        };
+
+        self.step += 1;
+        Ok(returned)
+    }
+
+    /// pipeline 末尾の drain: 最後に queue した step (= step - 1) の event を sync
+    /// して pinned[(step - 1) % 2] の loss を返す。未呼出 (warmup 直後など primed
+    /// = false) なら 0.0 を返す。
+    ///
+    /// `primed` を `false` に戻し `step` も 0 にリセットする。これにより次回 call
+    /// は warmup として 0.0 を返し、その次の call から再び lag-1 の正常 pipeline が
+    /// 始まる。caller (sb 末尾の trainer) は本 fn の返り値を sb_loss に加算する。
+    fn flush_pending_loss(&mut self) -> Result<f64, Box<dyn std::error::Error>> {
+        let returned = if self.primed {
+            let last = (self.step + 1) % 2;
+            self.events[last].synchronize()?;
+            // SAFETY: event sync 完了 = D2H 完了、pinned[last] に書き込まれた f64 を読む。
+            unsafe { *self.pinned[last] }
+        } else {
+            0.0
+        };
+        // 次回 sb は warmup から再開する (step も reset することで step % 2 計算が
+        // 一貫し、pinned/event 再利用に矛盾無し)。
+        self.primed = false;
+        self.step = 0;
+        Ok(returned)
+    }
+}
+
+impl Drop for AsyncLossRing {
+    fn drop(&mut self) {
+        // pinned cell を free する前に未完了の async D2H を待つ。さもなければ in-flight な
+        // memcpy_dtoh_async が解放後 host memory に書き戻して UB になる。primed = false の
+        // 場合は record されていない event なので skip。失敗は無視 (Drop 中の error 報告は
+        // 実用上困難、driver が in-flight copy を tracking する debug-build 動作と等価)。
+        if self.primed {
+            for event in self.events.iter() {
+                let _ = event.synchronize();
+            }
+        }
+        for slot in self.pinned.iter() {
+            if !slot.is_null() {
+                // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放する。
+                // 上の event sync で in-flight D2H が完了済。
+                unsafe {
+                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                }
+            }
+        }
+    }
+}
+
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
@@ -3174,6 +3499,8 @@ impl GpuTrainer {
             ws: GpuWorkspace::new(&stream, batch_size.max(1))?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            loss_ring: AsyncLossRing::new(ctx)?,
+            cublas: CublasHandle::new(&stream)?,
             step_count: 0,
         })
     }
@@ -3754,11 +4081,14 @@ impl GpuTrainer {
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
+        // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * FT_OUT / 4。
+        // FT_OUT = 1536 (4 の倍数) を arch 固定で保証。
+        debug_assert!(FT_OUT.is_multiple_of(4));
         cuda_launch! {
             kernel: sparse_ft_forward,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 4),
             args: [
                 slice(self.ft_w),
                 slice(self.ws.stm_idx_dev),
@@ -3770,7 +4100,7 @@ impl GpuTrainer {
             kernel: sparse_ft_forward,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 4),
             args: [
                 slice(self.ft_w),
                 slice(self.ws.nstm_idx_dev),
@@ -4288,26 +4618,26 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
-        // L1f weight backward は in_dim=FT_OUT(1536), out_dim=L1_OUT(16), batch=multiple of 16
-        // を満たすので shared-mem tiled 版 (~30x 少ない unique memory traffic) を使う。
-        // block=256, grid=FT_OUT/16=96.
-        debug_assert!(FT_OUT.is_multiple_of(16) && L1_OUT == 16);
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_tiled,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((FT_OUT / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.combined),
-                slice(self.ws.dl1_total),
-                slice_mut(self.l1f_w_grad),
-                b_u32, FT_OUT as u32, L1_OUT as u32
-            ]
-        }?;
+        // L1f weight backward: row-major `grad_w[FT_OUT, L1_OUT] = combined^T @ dl1_total`。
+        // combined[batch, FT_OUT] row-major、dl1_total[batch, L1_OUT] row-major、reduce 軸は
+        // batch = 65536。M = 16 と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
+        // split-K + tensor pipeline 最適化が効きやすい。
+        //
+        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc 由来、長さは arch 上
+        // invariant (`combined.len() == b*FT_OUT`、`dl1_total.len() == b*L1_OUT`、
+        // `l1f_w_grad.len() == FT_OUT*L1_OUT`)、`self.cublas` は `self.stream` に bind 済で
+        // 同 stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、結果は後続 kernel
+        // が観測する)。
+        unsafe {
+            self.cublas.sgemm_xt_y_rowmajor(
+                FT_OUT as i32, // m = in_dim
+                L1_OUT as i32, // n = out_dim
+                b_u32 as i32,  // k = batch
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.ws.dl1_total.cu_deviceptr() as *const f32,
+                self.l1f_w_grad.cu_deviceptr() as *mut f32,
+            )?;
+        }
         // L1f bias backward: shared-mem reduce で global atomic を 1M → ~16K に削減。
         const _: () = assert!(L1_OUT == 16);
         cuda_launch! {
@@ -4666,13 +4996,13 @@ impl GpuTrainer {
         }
         prof_tick!("optimizer");
 
-        // Read loss (`loss_acc` は 1-cell f64 buffer)。`to_host_vec` 内部で `stream.synchronize`
-        // するため、別途 `self.stream.synchronize()?` は不要 (2 重 sync を削減)。
-        let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
-        loss_vec
-            .first()
-            .copied()
-            .ok_or_else(|| -> Box<dyn std::error::Error> { "loss_acc buffer is empty".into() })
+        // `loss_acc` の host への取り出しを `AsyncLossRing` 経由で async 化。
+        // pinned host cell に `memcpy_dtoh_async` + event record、前 step の event を
+        // sync して 1 step lag で loss を返す (step 0 は warmup として 0.0、sb 末で
+        // [`TrainerBackend::flush_pending_loss`] が最終 step 分を drain する)。host は
+        // 次 batch の launch 発行で `stream.synchronize` 相当の block 待ちが消える。
+        self.loss_ring
+            .read_and_queue_next(&self.stream, &self.loss_acc)
     }
 }
 
@@ -4694,6 +5024,14 @@ impl TrainerBackend for GpuTrainer {
         let data = BatchData::from_batch_ref(batch, bucket_idx);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
+    }
+
+    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+        self.loss_ring.flush_pending_loss().map_err(|e| {
+            std::io::Error::other(format!(
+                "GpuTrainer::loss_ring.flush_pending_loss failed: {e}"
+            ))
+        })
     }
 
     fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
