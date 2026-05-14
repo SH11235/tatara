@@ -82,6 +82,7 @@ use clap::Parser;
 #[allow(unused_imports)]
 use cuda_core::IntoResult as _;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
+use cuda_device::memory::ld_global_v4_f32;
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
@@ -419,15 +420,15 @@ pub fn sparse_ft_forward(
     while ni < nnz {
         let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
+            // unsafe 妥当性: `off = idx * 1536 + ri_q * 4` は 4 倍数なので 16-byte
+            // 境界、weight 先頭は `cuMemAlloc` (256-byte align) で 16-byte aligned。
+            // 16 連続 byte の f32 は in-bounds (caller が rows == 1536、idx < cols を保証)。
             let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() };
-            let w1 = unsafe { weight_ptr.add(off + 1).read() };
-            let w2 = unsafe { weight_ptr.add(off + 2).read() };
-            let w3 = unsafe { weight_ptr.add(off + 3).read() };
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
+            let w = unsafe { ld_global_v4_f32(weight_ptr.add(off)) };
+            s0 += w[0];
+            s1 += w[1];
+            s2 += w[2];
+            s3 += w[3];
         }
         ni += 1;
     }
