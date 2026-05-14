@@ -2765,6 +2765,10 @@ struct GpuTrainer {
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
     cublas: CublasHandle,
+    /// `Batch` の per-step pageable `Vec` から pinned host scratch に host-to-host copy して
+    /// async H2D を pinned source から発行する。pageable + driver-internal staging 経由より
+    /// CPU 時間 + PCIe DMA throughput が安定する。
+    h2d_pinned: H2DPinnedScratch,
     step_count: u64,
 }
 
@@ -3055,61 +3059,6 @@ fn memset_zero<T>(
     Ok(())
 }
 
-/// pre-allocated device buffer に host slice を async memcpy。`DeviceBuffer::from_host`
-/// の毎-step cudaMalloc/Free を排除するため。Caller は `buf` と `src` の長さが一致
-/// (バッチ毎 fixed shape) を保証。
-fn copy_host_to_device_async_i32(
-    stream: &CudaStream,
-    buf: &DeviceBuffer<i32>,
-    src: &[i32],
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert!(
-        src.len() <= buf.len(),
-        "src.len()={} exceeds buf.len()={}",
-        src.len(),
-        buf.len()
-    );
-    let bytes = std::mem::size_of_val(src);
-    if bytes == 0 {
-        return Ok(());
-    }
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
-    Ok(())
-}
-
-fn copy_host_to_device_async_f32(
-    stream: &CudaStream,
-    buf: &DeviceBuffer<f32>,
-    src: &[f32],
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert!(
-        src.len() <= buf.len(),
-        "src.len()={} exceeds buf.len()={}",
-        src.len(),
-        buf.len()
-    );
-    let bytes = std::mem::size_of_val(src);
-    if bytes == 0 {
-        return Ok(());
-    }
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
-    Ok(())
-}
-
 // ===========================================================================
 // cuBLAS FFI — `dense_mm_bwd_weight_tiled` (L1f weight bwd) を `cublasSgemm_v2`
 // に置換。CUDA Toolkit 12.x の dynamic link で取得 (`build.rs` で
@@ -3246,6 +3195,143 @@ impl Drop for CublasHandle {
             }
         }
     }
+}
+
+// ===========================================================================
+// Pinned host buffers — `Batch.{stm_indices, nstm_indices, bucket_idx, score, wdl}`
+// は pageable `Vec` で driver-internal staging copy が dataloader thread に乗る。
+// 固定 capacity の pinned staging buffer を持って `step()` 内で host-to-host memcpy
+// → async H2D を pinned source から発行する。
+// ===========================================================================
+
+/// 固定長 pinned host scratch (`cuMemHostAlloc`)。型は generic でなく型別 (i32 / f32)
+/// に派生 alias を作る方が読みやすいので本 struct は generic ではなく usize byte 長を保持。
+struct PinnedHostBytes {
+    ptr: *mut std::os::raw::c_void,
+    bytes: usize,
+}
+
+unsafe impl Send for PinnedHostBytes {}
+
+impl PinnedHostBytes {
+    fn new(bytes: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        if bytes == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                bytes,
+            });
+        }
+        let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+        // SAFETY: cuMemHostAlloc は page-locked host memory を bytes 確保、CUDA driver の
+        // 内部 tracking 経由でアクセスされる。失敗時は CUresult != SUCCESS で書き戻し無し。
+        unsafe {
+            cuda_core::sys::cuMemHostAlloc(
+                &mut p as *mut _,
+                bytes,
+                cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+            .result()?;
+        }
+        Ok(Self { ptr: p, bytes })
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for PinnedHostBytes {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放。
+            unsafe {
+                cuda_core::sys::cuMemFreeHost(self.ptr);
+            }
+        }
+    }
+}
+
+/// `Batch.{stm_indices, nstm_indices, bucket_idx, score, wdl}` の H2D を pinned source
+/// から発行するための staging buffer 5 個。capacity は `GpuTrainer::new` で
+/// `batch_size * MAX_ACTIVE` (idx) / `batch_size` (scalar) で確保。step() で
+/// `Batch` slice を `std::ptr::copy_nonoverlapping` で pinned に転写 → async H2D。
+struct H2DPinnedScratch {
+    stm_idx: PinnedHostBytes,    // batch_size * MAX_ACTIVE * 4 bytes
+    nstm_idx: PinnedHostBytes,   // batch_size * MAX_ACTIVE * 4 bytes
+    bucket_idx: PinnedHostBytes, // batch_size * 4 bytes
+    score: PinnedHostBytes,      // batch_size * 4 bytes
+    wdl: PinnedHostBytes,        // batch_size * 4 bytes
+}
+
+impl H2DPinnedScratch {
+    fn new(batch_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let idx_bytes = batch_size * MAX_ACTIVE * std::mem::size_of::<i32>();
+        let scalar_bytes_i32 = batch_size * std::mem::size_of::<i32>();
+        let scalar_bytes_f32 = batch_size * std::mem::size_of::<f32>();
+        Ok(Self {
+            stm_idx: PinnedHostBytes::new(idx_bytes)?,
+            nstm_idx: PinnedHostBytes::new(idx_bytes)?,
+            bucket_idx: PinnedHostBytes::new(scalar_bytes_i32)?,
+            score: PinnedHostBytes::new(scalar_bytes_f32)?,
+            wdl: PinnedHostBytes::new(scalar_bytes_f32)?,
+        })
+    }
+}
+
+/// Batch の slice を pinned scratch に host-to-host memcpy したのち pinned source から
+/// device buffer へ async memcpy。caller が `pinned.capacity_bytes() >= src bytes` を
+/// 保証する (`H2DPinnedScratch::new` 時に `batch_size` 容量で確保、step() の `b` は
+/// `batch_size` を超えない)。
+fn copy_via_pinned_i32(
+    stream: &CudaStream,
+    pinned: &PinnedHostBytes,
+    dst: &DeviceBuffer<i32>,
+    src: &[i32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::mem::size_of_val(src);
+    if bytes == 0 {
+        return Ok(());
+    }
+    assert!(bytes <= pinned.capacity_bytes());
+    assert!(src.len() <= dst.len());
+    // SAFETY: src.len() * 4 = bytes ≤ pinned.bytes、両 pointer は非 overlap (異なる alloc)、
+    // pinned は page-locked なので host memcpy は通常通り、async H2D は pinned source から
+    // 直接 DMA。
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, pinned.ptr as *mut u8, bytes);
+        cuda_core::memory::memcpy_htod_async(
+            dst.cu_deviceptr(),
+            pinned.ptr as *const i32,
+            bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_via_pinned_f32(
+    stream: &CudaStream,
+    pinned: &PinnedHostBytes,
+    dst: &DeviceBuffer<f32>,
+    src: &[f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::mem::size_of_val(src);
+    if bytes == 0 {
+        return Ok(());
+    }
+    assert!(bytes <= pinned.capacity_bytes());
+    assert!(src.len() <= dst.len());
+    // SAFETY: 同上 (i32 版と同じ理屈、要素 type のみ違う)。
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, pinned.ptr as *mut u8, bytes);
+        cuda_core::memory::memcpy_htod_async(
+            dst.cu_deviceptr(),
+            pinned.ptr as *const f32,
+            bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
 }
 
 /// `step()` 末尾の `loss_acc.to_host_vec` (内部で `stream.synchronize`) を排除し
@@ -3458,6 +3544,7 @@ impl GpuTrainer {
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
             cublas: CublasHandle::new(&stream)?,
+            h2d_pinned: H2DPinnedScratch::new(batch_size.max(1))?,
             step_count: 0,
         })
     }
@@ -4021,14 +4108,42 @@ impl GpuTrainer {
             };
         }
 
-        // 入力 buffer を host → device (workspace pre-allocated buffer に in-place memcpy)。
-        // 元の `DeviceBuffer::from_host` は毎 step cudaMalloc + cudaMemcpyAsync + drop (cudaFree) で
-        // ~0.5-1 ms 浪費。pre-allocated に変えて malloc/free を削減。
-        copy_host_to_device_async_i32(&self.stream, &self.ws.stm_idx_dev, batch.stm_indices)?;
-        copy_host_to_device_async_i32(&self.stream, &self.ws.nstm_idx_dev, batch.nstm_indices)?;
-        copy_host_to_device_async_i32(&self.stream, &self.ws.bucket_idx_dev, batch.bucket_idx)?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, batch.score)?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, batch.wdl)?;
+        // 入力 buffer を host → device。Batch の pageable `Vec` を一旦 pinned scratch に
+        // host-to-host copy し、pinned source から async H2D を発行する。pageable async
+        // memcpy では driver が内部 pinned pool に staging copy するため CPU 時間 +
+        // dataloader thread の上に乗ってきていた、pinned 化で staging を排除する。
+        // 元の `DeviceBuffer::from_host` は毎 step cudaMalloc + cudaMemcpyAsync + drop で
+        // ~0.5-1 ms 浪費していたが、pre-allocated に変えて malloc/free を削減済。
+        copy_via_pinned_i32(
+            &self.stream,
+            &self.h2d_pinned.stm_idx,
+            &self.ws.stm_idx_dev,
+            batch.stm_indices,
+        )?;
+        copy_via_pinned_i32(
+            &self.stream,
+            &self.h2d_pinned.nstm_idx,
+            &self.ws.nstm_idx_dev,
+            batch.nstm_indices,
+        )?;
+        copy_via_pinned_i32(
+            &self.stream,
+            &self.h2d_pinned.bucket_idx,
+            &self.ws.bucket_idx_dev,
+            batch.bucket_idx,
+        )?;
+        copy_via_pinned_f32(
+            &self.stream,
+            &self.h2d_pinned.score,
+            &self.ws.score_dev,
+            batch.score,
+        )?;
+        copy_via_pinned_f32(
+            &self.stream,
+            &self.h2d_pinned.wdl,
+            &self.ws.wdl_dev,
+            batch.wdl,
+        )?;
         // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
         // loss_acc reset (accumulate semantics、再 alloc せず memset)
