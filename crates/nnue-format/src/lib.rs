@@ -1,6 +1,7 @@
 //! `nnue-format` crate — NNUE binary serialization (header + weights)。
 //!
-//! rshogi 互換 NNUE binary を扱う **GPU 非依存・pure CPU library**。trainer
+//! 量子化 NNUE binary (bullet-shogi v102 形式 + HalfKA_hm+PSQT 形式) の
+//! (de)serialize を担う **GPU 非依存・pure CPU library**。trainer
 //! (`bins/nnue_train`) が weight を量子化して書き出す際に呼ぶ。
 //!
 //! ## 提供 module

@@ -135,13 +135,16 @@ for f in docs/*.md README.md; do
 done
 ```
 
-特に **CLAUDE.md L88-89 が禁じる「dated 検証ブロック」の親戚** が reference
-doc に混入していないか focal にする:
+特に **CLAUDE.md の「ドキュメント規約」/「dated 検証ブロック禁止」項が
+指す内容の親戚** が reference doc に混入していないか focal にする:
 
 - 試行 → revert した経緯 ("X を試したが noise 内"、"NO-GO になった候補")
 - local 計測 delta ("+0.74% 改善"、"step 全体の 0.16%")
 - 着手前提メモ ("unblock には ~4-6h refactor が必要")
 - 個別 dataset / experiment 固有値 ("1143 files × 5 epoch"、"~616 GB")
+- 断定的な経験則 ("最終 epoch で良い"、"e1 で十分") — author の経験は事実
+  ではなく、出典がなければ書かない。「データ依存 / 試行錯誤」と書いて選択を
+  読者に委ねる
 
 これらの正しい置き場:
 

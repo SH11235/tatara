@@ -5173,7 +5173,7 @@ struct Cli {
     /// recipe 既定値 600)。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 600.0)]
     wrm_nnue2score: f32,
-    // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---
+    // --- 以下は v102 recipe との CLI 互換のために受けるが、現状未配線 ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
     optimizer: String,
@@ -5489,13 +5489,14 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 2: all weights finite ✓");
 
         // save random-init as quantised.bin for verify-nnue check
-        let out_path = "/tmp/our_quantised_randinit.bin";
+        let out_path = std::env::temp_dir().join("our_quantised_randinit.bin");
+        let out_path_str = out_path.display();
         let saved_weights = trainer.to_v102_weights()?;
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
-        let out_size = std::fs::metadata(out_path)?.len();
-        println!("[smoke] wrote {out_path}: {out_size} bytes");
+        let out_size = std::fs::metadata(&out_path)?.len();
+        println!("[smoke] wrote {out_path_str}: {out_size} bytes");
     }
 
     println!("[smoke] PASSED — GpuTrainer skeleton OK (v102 arch full path)");

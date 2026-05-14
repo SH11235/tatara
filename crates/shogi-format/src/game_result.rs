@@ -1,7 +1,5 @@
-//! 対局結果。
-//!
-//! discriminant は PackedSfenValue で使われる従来表現と互換
-//! (Loss=0, Draw=1, Win=2)。
+//! 対局結果。discriminant は `PackedSfenValue` の game_result encoding と
+//! 一致 (Loss=0, Draw=1, Win=2)。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
