@@ -2768,6 +2768,20 @@ struct GpuTrainer {
     step_count: u64,
 }
 
+impl Drop for GpuTrainer {
+    fn drop(&mut self) {
+        // 残り queue 済 GPU 操作 (`loss_ring` の async D2H が `loss_acc` を read する等)
+        // を全て完了させてから field の Drop に進む。さもなければ struct field 宣言順
+        // (`loss_acc` → `loss_ring`) で `loss_acc` の device memory が先に `cuMemFree`
+        // され、`AsyncLossRing` 側の in-flight D2H が解放済 device メモリを read する
+        // race になる。本 sync で stream 上の全 op が完了するので、後続の per-field
+        // cleanup は全部 safe (cublas / loss_acc / loss_ring / ws の全 DeviceBuffer)。
+        // 失敗は無視 (Drop 中の error 報告は実用上困難、stream 破棄で driver が
+        // tracking を解除する debug-build 動作と等価)。
+        let _ = self.stream.synchronize();
+    }
+}
+
 /// `GpuTrainer::step_impl` の forward / backward で使う中間 activation と
 /// activation-gradient buffer を **1 step ごとに再 alloc せず永続化** するための
 /// workspace。
