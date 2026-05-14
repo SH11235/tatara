@@ -156,6 +156,20 @@ pub trait TrainerBackend {
         loss: LossKind,
     ) -> io::Result<f64>;
 
+    /// backend が前 step の loss を pipeline 経由で遅延報告する場合 (例えば pinned
+    /// host ring を使った async loss readback) に、内部に滞留している未報告分の
+    /// `Σ err²` を drain して返す。default 実装は `0.0` を返す (同期 readback 実装
+    /// 向け)。
+    ///
+    /// caller (本 crate の [`run`]) は **superbatch 末尾** で呼び出すこと。背景:
+    /// async pipeline では `train_step` の N 番目の呼出が `step N-1` の loss を
+    /// 返し、最後の batch (`step N_per_sb - 1`) の loss は呼出されないまま残る。
+    /// `flush_pending_loss` を sb 末で 1 回呼んでこの残量を sb_loss に加算することで、
+    /// 1 sb の loss 集計が正確になる。
+    fn flush_pending_loss(&mut self) -> io::Result<f64> {
+        Ok(0.0)
+    }
+
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
     fn save_checkpoint(&mut self, path: &Path) -> io::Result<()>;
@@ -313,6 +327,14 @@ where
         (cfg.batches_per_superbatch as u64).saturating_mul(cfg.batch_size as u64);
     let run_start = Instant::now();
 
+    // backend の async H2D で `train_step` が返って直ぐ `loader.recycle` すると、
+    // queue 済 H2D copy のソース (`batch.stm_indices` 等の pageable `Vec`) を worker
+    // thread が reset / 再充填してしまう。これを防ぐため **1 step 遅延 recycle**:
+    // 直前 batch を `prev_pending` に保持し、次 `train_step` が queue 済 H2D を消化
+    // した時点で recycle する (次 step の event sync が直前 batch の full pipeline
+    // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
+    let mut prev_pending: Option<(Batch, Vec<i32>)> = None;
+
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
@@ -330,10 +352,20 @@ where
             let n_pos = batch.n_positions;
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
-            loader.recycle((batch, buckets));
+            // 直前 batch を recycle: その H2D は今 `train_step` 呼出内の event sync で
+            // 完了済 (lag-1 pipeline)。very first batch は prev_pending=None で no-op。
+            if let Some(prev) = prev_pending.take() {
+                loader.recycle(prev);
+            }
+            prev_pending = Some((batch, buckets));
             sb_loss += loss;
             sb_positions += n_pos as u64;
         }
+        // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
+        // 等) の場合、sb 内最後 batch の loss が未報告のまま残る。`flush_pending_loss`
+        // で drain して sb_loss に加算することで、1 sb の loss 集計が正確になる
+        // (同期 readback の default 実装は `0.0` を返すので no-op)。
+        sb_loss += backend.flush_pending_loss()?;
 
         let sb_secs = sb_start.elapsed().as_secs_f64().max(1e-9);
         let mean_loss = if sb_positions == 0 {
@@ -377,6 +409,12 @@ where
                 prune_old_raw_checkpoints(&cfg.output_dir, &cfg.net_id, keep);
             }
         }
+    }
+
+    // 最後に残った batch を recycle: 直前 sb 末の `flush_pending_loss` 内 event sync で
+    // 当該 batch の H2D は完了済、loader に返しても安全。
+    if let Some(prev) = prev_pending.take() {
+        loader.recycle(prev);
     }
 
     println!(
