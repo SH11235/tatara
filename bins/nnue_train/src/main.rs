@@ -3720,6 +3720,19 @@ impl GpuTrainer {
         if b == 0 {
             return Ok(0.0);
         }
+        // defense-in-depth: tiled kernels (grid=b/16) は b % 16 == 0 を要求する。
+        // CLI で `--batch-size` を 16 倍数に reject 済 (`run_training`)、`BucketedPrefetchedLoader`
+        // も `n_positions == batch_size` を保証する (`dataloader.rs:572`) ため通常到達しない。
+        // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
+        // 明示的な runtime check を入れる (PR #98 Codex review P2)。
+        if !b.is_multiple_of(16) {
+            return Err(format!(
+                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
+                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
+                b
+            )
+            .into());
+        }
         let b_u32 = b as u32;
 
         // 中間 activation workspace を batch `b` 以上に拡張 (grow-only、Issue #78)。
@@ -4894,6 +4907,19 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
         return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
+    }
+    // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` / `dense_mm_fwd_tiled_l1f`
+    // / `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
+    // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
+    // position の forward / backward が 走らず loss / gradient が corrupt する。`debug_assert!`
+    // は release で消えるので CLI で early reject する (Codex PR #98 review P2 finding)。
+    if !cli.batch_size.is_multiple_of(16) {
+        return Err(format!(
+            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
+             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
+            cli.batch_size
+        )
+        .into());
     }
     // loss kernel の選択: --win-rate-model → loss_wrm (bullet v102)、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
