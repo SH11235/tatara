@@ -8,11 +8,10 @@
 //!
 //! - **kernels** (forward / grad / adam_step / eval) は本 file の inline `#[kernel]`。
 //!   cuda-oxide rustc-codegen-cuda backend が bin entry 経由で到達可能な
-//!   `#[kernel]` のみ NVPTX IR 化するため、main.rs に置く必要がある (Stage 1-5
-//!   で確立)
+//!   `#[kernel]` のみ NVPTX IR 化するため、main.rs に置く必要がある
 //! - **GpuTrainer** は本 file。device buffer (weights / m / v / grad / loss_acc /
-//!   hist + scratch) を所有し、`step` / `eval_forward` で 1 batch 分の
-//!   forward → grad/eval → (training なら) adam_step を launch する
+//!   hist + scratch) を所有し、`step` で 1 batch 分の forward → grad → adam_step
+//!   を launch する
 //! - **host helper** (Batch builder / PSV reader / progress.bin I/O / CLI) は
 //!   GPU 非依存なので `lib.rs` の `host` module に置く。CI runner では本 crate
 //!   が `--exclude` されるため build されないが、host helper は `cargo test
@@ -547,7 +546,7 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// - `loss_acc`: `DeviceBuffer<f64>` (size = 1)
 /// - `hist`: `DeviceBuffer<u64>` (size = 8)
 ///
-/// 入力 (indices / targets / per_pos_norm / preds) は `step` / `eval_forward` 内で
+/// 入力 (indices / targets / per_pos_norm / preds) は `step` 内で
 /// `DeviceBuffer::from_host` / `zeroed` する。bullet-shogi 上流のような scratch
 /// reuse は cuda-oxide の `DeviceBuffer<T>::from_host` が新規 allocation のみ
 /// 提供するため一旦見送り、Stage 1-10 (#14) の perf 計測時に
@@ -707,57 +706,6 @@ impl GpuTrainer {
                 bc1,
                 bc2,
                 n_w_u32
-            ]
-        }?;
-
-        self.stream.synchronize()?;
-        Ok(())
-    }
-
-    /// 評価 path: forward → eval kernel (loss + histogram のみ、weight 不変)。
-    #[allow(dead_code)]
-    fn eval_forward(&mut self, batch: &Batch) -> Result<(), Box<dyn std::error::Error>> {
-        let n_pos = batch.n_positions;
-        if n_pos == 0 {
-            return Ok(());
-        }
-
-        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
-        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
-        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
-
-        let n_pos_u32 = n_pos as u32;
-        let max_inds_u32 = MAX_INDS_PER_POS as u32;
-        let cfg_pos = LaunchConfig {
-            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
-            block_dim: (BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        cuda_launch! {
-            kernel: forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(indices_dev),
-                slice(self.weights),
-                slice_mut(preds_dev),
-                n_pos_u32,
-                max_inds_u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: eval,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(preds_dev),
-                slice(targets_dev),
-                slice(self.loss_acc),
-                slice(self.hist),
-                n_pos_u32
             ]
         }?;
 

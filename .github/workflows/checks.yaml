@@ -44,27 +44,15 @@ jobs:
         if: steps.ws.outputs.empty == 'false'
         run: cargo fmt --all -- --check
 
-      # GPU 依存 crate (gpu-runtime / progress-kpabs-train) と experiments/001 は
-      # CUDA toolkit + LLVM 21+ + cuda-oxide が必要で GitHub-hosted runner では
-      # build できない。self-hosted runner の別 workflow で検証する想定で本
-      # workflow からは exclude する。
-      #
-      # Stage 1-5 (#9) で `exp-001-cuda-oxide-kpabs` も `cuda-host` を直接 dep
-      # に取った (`#[kernel]` macro 展開で `cuda_host::CudaKernel` を要求)
-      # ため、transitive で cuda-bindings の build script が `cuda.h` を要求して
-      # GitHub runner では build fail する。Stage 1-11 (#15) で同パターンを
-      # `bins/progress_kpabs_train` (= `progress-kpabs-train`) に昇格、本 workflow
-      # からも exclude する (gpu-kernels は CPU のみで CI に通る)。
-      # Stage 2-0 (#36) で `experiments/002-fused-kernels` (= `exp-002-fused-kernels`)
-      # を Stage 2 fused kernel suite の受け皿として追加、同じ理由で exclude する。
-      # Stage 3-0 (#56) で `bins/nnue_train` (= `nnue-trainer`、bin name は
-      # `nnue-train`) を追加、`cuda-host` 直接 dep のため同様に exclude する
-      # (`crates/nnue-format` / `crates/nnue-train` は CPU-only で CI に通る)。
-      # 新しい GPU 依存 crate を追加するときも同様に --exclude リストを更新すること。
+      # `cuda-host` を直接 / 推移的に dep する crate は CUDA toolkit + LLVM 21+ +
+      # cuda-oxide が必要で、GitHub-hosted runner では build できないため exclude する
+      # (build.rs が `cuda.h` を要求して fail する)。self-hosted runner の別 workflow
+      # で full check する想定。新規に GPU 依存 crate を追加する際は --exclude リストを
+      # 更新すること。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train --exclude nnue-trainer
+        run: cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer

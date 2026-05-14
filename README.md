@@ -17,9 +17,9 @@ NNUE 学習プロジェクト。GPU カーネルを Rust で書き、host から
 
 | Stage | スコープ |
 |---|---|
-| 1 | `experiments/001-cuda-oxide-kpabs/` で KP-abs progress trainer (4 kernel) を cuda-oxide 化 |
-| 2 | `crates/gpu-kernels/{pointwise,sparse}/` に hand-fused kernel 整備 |
-| 3 | `crates/nnue-train/` で HalfKA_hm 1536-16-32 training pipeline |
+| 1 | `bins/progress_kpabs_train/` で KP-abs progress trainer (4 kernel) を cuda-oxide 化 |
+| 2 | `crates/gpu-kernels/{pointwise,sparse}/` に hand-fused kernel reference (CPU) を整備 (GPU 側 `#[kernel]` は bin 側 inline) |
+| 3 | `crates/nnue-train/` + `bins/nnue_train/` で HalfKA_hm 1536-16-32 training pipeline |
 | 4 | research playground (PSQT, Threat, 新アーキテクチャ) |
 
 詳細は [docs/00-overview.md](docs/00-overview.md) と

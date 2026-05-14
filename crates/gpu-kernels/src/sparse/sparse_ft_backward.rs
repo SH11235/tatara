@@ -1,11 +1,10 @@
 //! Sparse feature transform backward kernel (HalfKA_hm 用、atomic scatter) の
 //! reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn sparse_ft_backward`) は **`experiments/002-fused-kernels/
-//! src/main.rs` に inline 定義** されている (Stage 1-5 で確立した「`#[kernel]`
-//! は bin entry に inline」制約)。本 module の `sparse_ft_backward_cpu` は GPU と
-//! 同じロジックを host で素直に書き写したもので、Stage 2-7 (#43) GPU↔CPU 数値
-//! 同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn sparse_ft_backward` は bin entry (`bins/nnue_train/src/main.rs`)
+//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
+//! 制約)。本 module の `sparse_ft_backward_cpu` は GPU と同じロジックを host で
+//! 書き写したもので、GPU↔CPU 数値同等性テストの reference 用。
 //!
 //! ## アルゴリズム (bullet 上流 `linear/sparse.rs::SparseMatmulBwd::evaluate` に等価)
 //!

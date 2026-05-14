@@ -9,18 +9,18 @@ path / 進捗** を一覧する。各 kernel issue (Stage 2-1〜2-7) で landed 
 
 | Pattern | Op 数 | 用途 | 上流 (bullet) | reference CPU 配置 | GPU `#[kernel]` 配置 | Issue / PR | Status |
 |---|---|---|---|---|---|---|---|
-| `fused_screlu_grad` | 2-3 | activation gradient (forward 経路と組合せ) | `crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU` | `pointwise/screlu_grad.rs` | `experiments/002-fused-kernels/src/main.rs::screlu_grad` | #37 (PR #46) | ✅ 実装済み |
-| `fused_loss_wdl` | 3-5 | sigmoid + WDL blend + scale | `crates/bullet_lib/src/value/loader.rs` (data-layer blend) + `dfo::Sigmoid` | `pointwise/loss_wdl.rs` | `experiments/002-fused-kernels/src/main.rs::loss_wdl` | #38 (PR #47) | ✅ 実装済み |
-| `fused_adamw_step` | 5 | AdamW (decay + clip 込み) | `crates/trainer/src/optimiser/adam.rs::AdamWParams` | `pointwise/adamw_step.rs` | `experiments/002-fused-kernels/src/main.rs::adamw_step` | #39 (PR #48) | ✅ 実装済み |
-| `fused_radam_step` | 5+host | RAdam (AdamW + bias correction + denom switch) | `crates/trainer/src/optimiser/radam.rs::RAdamParams` | `pointwise/radam_step.rs` | `experiments/002-fused-kernels/src/main.rs::radam_step` | #40 (PR #49) | ✅ 実装済み |
-| `fused_ranger_step` | RAdam + lookahead | Ranger (RAdam + slow params lerp、k-step periodic) | `crates/trainer/src/optimiser/ranger.rs` | `pointwise/ranger_step.rs` | `experiments/002-fused-kernels/src/main.rs::ranger_lookahead_lerp` (+ Stage 2-4 `radam_step` 再利用) | #41 (PR #50) | ✅ 実装済み |
+| `fused_screlu_grad` | 2-3 | activation gradient (forward 経路と組合せ) | `crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU` | `pointwise/screlu_grad.rs` | `bins/nnue_train/src/main.rs::screlu_grad` | #37 (PR #46) | ✅ 実装済み |
+| `fused_loss_wdl` | 3-5 | sigmoid + WDL blend + scale | `crates/bullet_lib/src/value/loader.rs` (data-layer blend) + `dfo::Sigmoid` | `pointwise/loss_wdl.rs` | `bins/nnue_train/src/main.rs::loss_wdl` | #38 (PR #47) | ✅ 実装済み |
+| `fused_adamw_step` | 5 | AdamW (decay + clip 込み) | `crates/trainer/src/optimiser/adam.rs::AdamWParams` | `pointwise/adamw_step.rs` | `bins/nnue_train/src/main.rs::adamw_step` | #39 (PR #48) | ✅ 実装済み |
+| `fused_radam_step` | 5+host | RAdam (AdamW + bias correction + denom switch) | `crates/trainer/src/optimiser/radam.rs::RAdamParams` | `pointwise/radam_step.rs` | `bins/nnue_train/src/main.rs::radam_step` | #40 (PR #49) | ✅ 実装済み |
+| `fused_ranger_step` | RAdam + lookahead | Ranger (RAdam + slow params lerp、k-step periodic) | `crates/trainer/src/optimiser/ranger.rs` | `pointwise/ranger_step.rs` | `bins/nnue_train/src/main.rs::ranger_lookahead_lerp` (+ Stage 2-4 `radam_step` 再利用) | #41 (PR #50) | ✅ 実装済み |
 
 ## Sparse FT kernels (`crates/gpu-kernels/src/sparse/`)
 
 | Pattern | Op 数 | 用途 | 上流 (bullet) | reference CPU 配置 | GPU `#[kernel]` 配置 | Issue / PR | Status |
 |---|---|---|---|---|---|---|---|
-| `sparse_ft_forward` | matmul | HalfKA_hm sparse feature transform forward | `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmul` | `sparse/sparse_ft_forward.rs` | `experiments/002-fused-kernels/src/main.rs::sparse_ft_forward` | #42 (PR #51) | ✅ 実装済み |
-| `sparse_ft_backward` | atomic scatter | 同 backward | `linear/sparse.rs::SparseMatmulBwd(Multi)` | `sparse/sparse_ft_backward.rs` | `experiments/002-fused-kernels/src/main.rs::sparse_ft_backward` | #43 (PR #52) | ✅ 実装済み |
+| `sparse_ft_forward` | matmul | HalfKA_hm sparse feature transform forward | `crates/compiler/src/tensor/operation/linear/sparse.rs::SparseMatmul` | `sparse/sparse_ft_forward.rs` | `bins/nnue_train/src/main.rs::sparse_ft_forward` | #42 (PR #51) | ✅ 実装済み |
+| `sparse_ft_backward` | atomic scatter | 同 backward | `linear/sparse.rs::SparseMatmulBwd(Multi)` | `sparse/sparse_ft_backward.rs` | `bins/nnue_train/src/main.rs::sparse_ft_backward` | #43 (PR #52) | ✅ 実装済み |
 
 ## ベンチ (Stage 2-8 / #44)
 
@@ -50,13 +50,13 @@ integration の actual training throughput で判断する deferred 扱いに整
 
 ### 絶対 samples/sec ベンチ結果 (sm_75 ローカル、RTX 2070 SUPER)
 
-実行コマンド (詳細は `experiments/002-fused-kernels/src/main.rs::bench_tests`
+実行コマンド (詳細は `bins/nnue_train/src/main.rs::bench_tests`
 docstring 参照):
 
 ```bash
-cd experiments/002-fused-kernels
+cd bins/nnue_train
 CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build
-cargo test -p exp-002-fused-kernels --bin exp-002-fused-kernels --release \
+cargo test -p nnue-trainer --bin nnue-trainer --release \
     -- bench_tests --test-threads=1 --nocapture
 ```
 
@@ -102,7 +102,7 @@ Stage 2-8 wrap-up 時点 (PR #N、本 PR):
 
 | 完了条件 | Status | 根拠 |
 |---|---|---|
-| 7 kernel が build-time PTX 化される | ✅ 達成 | Stage 2-1〜2-7 (#46-#52) で 7 kernel が `experiments/002-fused-kernels/src/main.rs` に inline 配置済、`exp_002_fused_kernels.ll` に 7 関数体 (`@screlu_grad / @loss_wdl / @adamw_step / @radam_step / @ranger_lookahead_lerp / @sparse_ft_forward / @sparse_ft_backward`) inline 確認 |
+| 7 kernel が build-time PTX 化される | ✅ 達成 | Stage 2-1〜2-7 (#46-#52) で 7 kernel が `bins/nnue_train/src/main.rs` に inline 配置済、`exp_002_fused_kernels.ll` に 7 関数体 (`@screlu_grad / @loss_wdl / @adamw_step / @radam_step / @ranger_lookahead_lerp / @sparse_ft_forward / @sparse_ft_backward`) inline 確認 |
 | benchmark で bullet runtime-fused 比 ≥ 90% | ⏳ deferred (#54) | sm_86 (sh11235 RTX 3080 Ti) GPU 占有解放後に手動計測。本 PR では sm_75 absolute samples/sec を baseline として記録、bullet 比は #54 で後追い |
 | Stage 3 (nnue-train) から呼び出せる API 形 | ✅ 部分達成 | reference CPU は `crates/gpu-kernels/{pointwise,sparse}/` に `pub fn` で公開、Stage 3 `bins/nnue_train` は cuda-oxide constraint により本 experiments crate の `#[kernel]` を直接 import せず **同 algorithm spec + reference CPU を参照して bins/nnue_train/main.rs に inline 配置する pattern** (Stage 1-5 の `bins/progress_kpabs_train` と同型)。Stage 3 着手時に host launch wrapper を `gpu-runtime` crate に昇格させる loader refactor (本 catalog の 運用方針 セクション 別 issue 参照) と合わせて完成 |
 

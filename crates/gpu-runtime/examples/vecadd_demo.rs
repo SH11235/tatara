@@ -7,13 +7,10 @@
 //! - kernel symbol resolve (`CudaModule::load_function("vecadd")`)
 //! - `DeviceBuffer` host↔device round-trip
 //!
-//! 完全な kernel launch は本 demo に含めない。技術的には
-//! `cuda_core::launch_kernel_on_stream` (unsafe) で raw に C void* 配列を
-//! 組み立てれば本 PR でも実現できるが、その手書き marshaling は
-//! `#[kernel]` 定義 + `cuda_launch!` macro が experiments/001-cuda-oxide-kpabs
-//! (Issue #8) で入れば不要 (throwaway boilerplate) になるので意図的に
-//! 入れない。本 demo は gpu-runtime crate の re-exports と `Result`/`Error`
-//! 型が実機でつながることを示すための smoke 限定。
+//! 完全な kernel launch は本 demo に含めない。`#[kernel]` 定義 + `cuda_launch!`
+//! macro を使う前提で、raw な `cuda_core::launch_kernel_on_stream` 経由の手書き
+//! marshaling は意図的に避ける。本 demo は gpu-runtime crate の re-exports と
+//! `Result` / `Error` 型が実機でつながることを示すための smoke 限定。
 //!
 //! ## 実行前提
 //!
