@@ -569,11 +569,17 @@ pub fn gather_and_sum_per_feature_overwrite(
     let off_start = offsets[feature] as usize;
     let off_end = offsets[feature + 1] as usize;
 
+    // raw pointer 版 (PTX で `setp.ge.u64; @%p bra` の bounds check 3 箇所を除去)。
+    // unsafe 妥当性: caller (`step_impl`) が `feature_positions.len() == batch * MAX_ACTIVE` を保証、
+    // `feat_offsets[feature]..feat_offsets[feature+1]` は phase B が正しく構築。
+    // grad_out / grad_w の範囲は arch (FT_IN × FT_OUT) で固定、launch config 上 ri < ft_out_u。
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
     let mut sum = 0.0_f32;
     let mut i = off_start;
     while i < off_end {
-        let bi = positions[i] as usize;
-        sum += grad_out[bi * ft_out_u + ri];
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
         i += 1;
     }
 
@@ -609,11 +615,14 @@ pub fn gather_and_sum_per_feature_add(
     let off_start = offsets[feature] as usize;
     let off_end = offsets[feature + 1] as usize;
 
+    // raw pointer 版 (overwrite と同じ理由、bounds check 3 箇所除去)。
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
     let mut sum = 0.0_f32;
     let mut i = off_start;
     while i < off_end {
-        let bi = positions[i] as usize;
-        sum += grad_out[bi * ft_out_u + ri];
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
         i += 1;
     }
 
