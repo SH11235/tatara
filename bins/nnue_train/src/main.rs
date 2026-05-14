@@ -4036,7 +4036,12 @@ impl GpuTrainer {
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
-        memset_zero(&self.stream, &self.ft_w_grad)?;
+        // ft_w_grad の memset_zero は `gather_and_sum_per_feature_overwrite` (phase D
+        // iter 0、stm) が全 (feature, ri) cell を sum (off_start==off_end の時も sum=0)
+        // で書き切る (main.rs:585-591 / 599) ため、ここでの 450MB reset は redundant。
+        // 2026-05-14 計測: pos/s 影響は ±0% (sm_86, 5 sb × 200 batches × bs=65536 で
+        // 670K → 671K)。perf 改善目的ではなく "毎 step 450MB の no-op を排除する論理
+        // 整理" として残す。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
