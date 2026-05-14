@@ -1,8 +1,7 @@
 # Performance ガイド
 
 `nnue-train` の throughput (pos/s) 期待値、GPU 機種別目安、`NNUE_TRAIN_STEP_PROFILE`
-での自己診断手順。本リポジトリ独自の最適化 (PR #98 + #103) を適用した状態が
-前提。
+での自己診断手順。
 
 ## 計測手順 (基準)
 
@@ -25,7 +24,7 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
 
 | GPU | sm | DRAM BW | 期待 pos/s | 400 sb ETA | 出典 |
 |---|---|---:|---:|---:|---|
-| RTX 3080 Ti | 86 | 912 GB/s | **~811K** | ~55 h | 本リポジトリ実測 (PR #103 適用後) |
+| RTX 3080 Ti | 86 | 912 GB/s | **~811K** | ~55 h | 本リポジトリ実測 |
 | RTX 4090 | 89 | 1008 GB/s | ~1.0-1.1M (推定) | ~40 h | DRAM BW 比 1.10× + clock 比、未実測 |
 | A100 40GB | 80 | 1555 GB/s | ~1.3M (推定) | ~32 h | DRAM 比だが int8 倍精度等は無関係、未実測 |
 | H100 SXM | 90 | 3 TB/s | ~2M? (推定) | ~20 h? | Hopper TC 未活用なので DRAM 律速ライン、未実測 |
@@ -37,10 +36,8 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
 
 bullet-shogi (上流、CUDA C++ 実装) と本リポジトリの違い:
 
-- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536、PR #103 適用後):
-  **811K pos/s**
-- bullet-shogi v102 同条件 (`/home/.../bullet-shogi/checkpoints/v102/train.log` の
-  `pos/sec` 19600 entry の avg): **691K pos/s**
+- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536): **~811K pos/s**
+- bullet-shogi v102 同条件 (CUDA C++ + NVRTC runtime fusion): **~691K pos/s**
 - 本リポジトリは bullet 比 **+17%** (sparse FT 系の bounds check 除去 + cuBLAS
   L1f bwd 化 + async loss readback の累積)
 
@@ -68,13 +65,13 @@ batch 1 以降の steady-state を見る。
 | phase | 時間 (ms) | 内容 |
 |---|---:|---|
 | `h2d+reset` | ~3.0 | 入力 5 buffer の H2D + loss_acc / grad reset |
-| `fwd_ft` (×2 perspectives) | ~22.7 | `sparse_ft_forward` (PR #103 で 26.5 → 22.7 ms、+4.4%) |
+| `fwd_ft` (×2 perspectives) | ~22.7 | `sparse_ft_forward` (HalfKA_hm sparse → 1536-dim per perspective、4-row threading) |
 | `fwd_ftpost` | ~1.5 | `ft_post_perspective_fwd` (bias add + CReLU + pairwise + scale) |
 | `fwd_L1` | ~7.5 | `dense_mm_fwd_bucket_tiled_l1` |
 | `fwd_L1f` | ~1.9 | `dense_mm_fwd_tiled_l1f` |
 | `fwd_L1tail` + `fwd_L2` + `forward` | ~0.5 | L3 + loss kernel |
 | `bwd_L3` + `bwd_L2` + `bwd_L1eff` | ~1.5 | |
-| `bwd_L1f` | **~4.3** | `cublasSgemm_v2` (PR #103 で 8.6 → 4.3 ms、+4.6%) |
+| `bwd_L1f` | **~4.3** | `cublasSgemm_v2` (l1f weight grad) |
 | `bwd_L1_inB` | ~4.4 | `dense_mm_bwd_input_tiled` |
 | `bwd_L1_wB` | ~3.1 | `dense_mm_bwd_weight_bucket_tiled_l1` |
 | `bwd_L1` | ~1.5 | L1 grad その他 |
@@ -87,7 +84,7 @@ batch 1 以降の steady-state を見る。
 
 ### 想定外の遅さを見つけたら
 
-1. **`fwd_ft` が 30 ms 以上**: `sparse_ft_forward` が PR #103 の 4-row threading
+1. **`fwd_ft` が 30 ms 以上**: `sparse_ft_forward` の 4-row threading
    になっていない可能性。`bins/nnue_train/nnue_train.ptx` を `awk '/.entry
    sparse_ft_forward\(/,/^}/'` で見て inner loop に `ld.b32 ... +0/+4/+8/+12` の
    4 連続 load が出ているか確認。
@@ -105,22 +102,21 @@ batch 1 以降の steady-state を見る。
    GPU other load 競合の可能性。`nvidia-smi` で GPU 使用率と温度確認、別
    process が GPU を占有していないか調べる。
 
-## NO-GO になった最適化候補 (再着手しない判断材料)
+## 現状未採用の最適化 (前提条件メモ)
 
-PR #103 で試行 + revert した候補。再着手するときの前提条件を [Issue #99](https://github.com/SH11235/rshogi-nnue/issues/99)
-末尾の判定表に記載:
+以下の最適化は計測上の改善余地が小さい / 構造改修コストが大きいため現状未採用。
+着手前提を残す:
 
-- **Pinned H2D wrapper**: c2 (async loss readback) 適用後 host CPU は GPU と
-  well overlap、+0.74% (noise 内)
-- **bias_grad shared-mem 化 (L2/L3)**: 独立 prof_tick 計測で bias_grad 合計
-  0.13 ms / step (step 全体 83 ms の 0.16%)、改善余地不足
+- **Pinned H2D wrapper**: host CPU は async loss readback の後 GPU と well
+  overlap しており、追加で pinned 化しても measurement noise 内 (+1% 未満)。
+- **bias_grad shared-mem 化 (L2/L3)**: 独立 `prof_tick` 計測で bias_grad 合計が
+  step 全体 (~83 ms) の 0.2% 未満、改善余地不足。
 - **CUDA Graph capture**: `ctx.default_stream()` (NULL CUstream) は
-  `cuStreamBeginCapture_v2` が拒否、unblock には GpuTrainer の stream 全面切替 +
-  AsyncLossRing 縮退 + cuBLAS capture compat 検証 + scalar arg 対応 (~4-6h
-  refactor) が必要
+  `cuStreamBeginCapture_v2` が拒否する。unblock には stream 全面切替 +
+  AsyncLossRing 縮退 + cuBLAS capture 互換性検証 + scalar arg 対応の
+  refactor が必要。
 
 ## 関連
 
 - [docs/training-quickstart.md](training-quickstart.md) — 学習を回す手順
 - [docs/setup.md](setup.md) — toolchain + CUDA toolkit root 解決
-- [Issue #99](https://github.com/SH11235/rshogi-nnue/issues/99) — perf 候補の判定表 + 次セッション申し送り

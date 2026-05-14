@@ -56,11 +56,11 @@ target/release/nnue-train \
 | `--keep-checkpoints 4` | raw `.ckpt` (~1.8GB/個) を直近 4 個だけ残す。量子化 `.bin` (~116MB) は常に全保持 |
 | `--threads 16` | dataloader prefetch worker 数。各 worker が PSV decode + sparse 抽出 + bucket 計算を 1 回で済ませて先読み |
 
-ETA (RTX 3080 Ti、本リポジトリの最適化 PR #103 適用後、811K pos/s 実測):
+ETA (RTX 3080 Ti、~811K pos/s 実測):
 
 - 1 sb = 6104 batches × 65536 positions = 400M positions ≈ 8 分
 - 400 sb full run ≈ **52-55 時間** (=~2.5 日)
-- bullet-shogi (691K pos/s avg) 比 **+17%** で同じ recipe を回せる
+- bullet-shogi (~691K pos/s) 比 **+17%** で同じ recipe を回せる
 
 GPU 機種別期待値の見積もりは [docs/performance.md](performance.md) を参照。
 
