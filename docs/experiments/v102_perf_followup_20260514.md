@@ -146,9 +146,88 @@ feature 構造では性能改善せず、別アプローチが必要:
 これら全て要 0.5–1 日の試作 + 計測 cycle で、確実な勝ち筋なし。実 work では本
 領域は cuda-oxide の register allocator の癖を確認しないと方針が立たない。
 
+## 仮説検証 (PTX + ptxas + variant 計測) — 2026-05-14 追補
+
+phase D v2 の negative 結果に対する 4 仮説 (spill / occupancy / early-exit / bounds
+check) を、再投入 + PTX 検査 + variant kernel で個別検証した。
+
+### H1 (register spill) — **REFUTED**
+
+PTX inspection (`grep ".local"`, `ptxas -v`):
+- v2 PTX: `.reg .pred %p<5>; .reg .b32 %r<15>; .reg .b64 %rd<25>` (h4 with raw-ptr)
+- ptxas: `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads` で OLD/v2 共
+- 6 個の f32 accumulator (acc0..acc5) は全 register 内に配置、local memory への spill 一切なし
+
+### H2 (occupancy/warp scheduling) — **REFUTED**
+
+ptxas -v + sm_86 capacity:
+| | regs/thread | block_dim | max blocks/SM | active warps/SM |
+|---|---:|---:|---:|---:|
+| OLD overwrite/add | 20 | 128 | 12 (cap by 1536 threads/SM) | 12×4 = **48** |
+| v2 (h4 with raw-ptr) overwrite/add | 40 | 256 | 6 (cap by 1536 threads/SM) | 6×8 = **48** |
+
+両者 sm_86 の最大 active warps/SM = 48 で full occupancy。occupancy 単独で説明不能。
+
+### H3 (empty-feature 早期 skip 消失) — **論理矛盾で testable でない**
+
+v2 overwrite は memset_zero 除去 (P6, f66acdb) 前提で empty feature でも 1536 cell に
+0 を書き切る必要があり、早期 skip と相容れない。v2 add は元から早期 skip 有。
+
+### H4 (bounds check 累積) — **CONFIRMED (-3.8 ms / -10%)**
+
+v2 を **`grad_out[bi * 1536 + tid + K*256]` の bounds-checked indexing から
+`grad_out_ptr.add(...).read()` の raw pointer read へ置換** して再計測:
+- v2 (bounds-checked): phD_stm 19.46 + phD_nstm 19.74 = **39.20 ms**
+- v2 (h4, raw-ptr):    phD_stm 17.7  + phD_nstm 17.8  = **35.4 ms** (-3.8 ms)
+
+PTX で `setp.ge.u64; @%p bra` (loop 内 6 連続) が消失、loop body が `ld.b32 + add.rn.f32`
+× 6 + ループ制御だけになることを確認。
+
+### v2 vs OLD の残り 6.3 ms 差の原因 (ncu 無しでは厳密確認不可)
+
+v2 (h4, 35.4 ms) と OLD (29.14 ms) の差は memory pipeline 由来と推測:
+- v2: 1 iter で **8 warps × 6 cache lines = 48 cache line read 同時要求**、6 KB 即時
+  fetch
+- OLD: 1 iter で **4 warps × 1 cache line = 4 cache line read**、512 byte fetch
+- 同 SM の queue depth / L2 bandwidth に対する instantaneous demand が v2 で大きい
+
+### **真の win: OLD 構造 + raw-ptr 化 → bullet 超え達成 (b8d2abf)**
+
+最大の発見は **既存 OLD kernel にも同じ bounds check が 3 箇所/iter ある** こと。OLD
+の構造 (12 blocks × 4 warps × 1 cache line/iter) を維持して bounds check のみ raw-ptr
+化したところ:
+
+| 計測 | sb1 | sb2 | sb3 | sb4 | sb5 | 平均 | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline (f2e3d34) | 667,194 | 676,530 | 671,547 | 667,636 | 666,562 | **669,894** | — |
+| OLD+rawptr (run 2) | 704,148 | 715,510 | 713,748 | 712,986 | 712,359 | **711,750** | **+6.1%** |
+| bullet-shogi v102 avg | — | — | — | — | — | **691,267** | rshogi 103% |
+
+phase D 時間: phD_stm 14.58 → 11.36, phD_nstm 14.56 → 10.81、合計 29.14 → **22.20 ms**
+(-6.94 ms = -24%)。step 全体への寄与: 6 ms × ~1000 steps/sb × 5 sb / 5 sb = +6.1% pos/s。
+
+loss 軌跡完全一致 (sb5 差 = 4e-5、f32 atomic 順序差以内)。
+
+ptxas reg 使用量: overwrite 20 → 26、add 20 → 28 (raw_ptr 値の register 保持分)。
+occupancy 不変 (max threads/SM = 1536 で cap)。
+
+### 教訓
+
+1. **review の "高 ROI 候補" は仮説止まりで、実測なしには結論できない** — phase D の
+   v2 試作は H1-H2 で説明可能と踏んだが、PTX 検査で両仮説とも REFUTED となり、H4
+   の bounds check のみ寄与と判明。
+2. **既存 kernel に同じ bounds check 問題が潜んでいる** — v2 のために導入した raw-ptr
+   化を OLD に逆適用したのが当セッション最大の win。コードベースに分散している同
+   パターンを系統的に raw-ptr 化すれば追加 win が期待できる (要 unsafe 妥当性監査)。
+3. **PTX + ptxas -v は cuda-oxide の挙動を観測する最短経路** — ncu 不可の WSL2 / 制限
+   環境でも、PTX inspection だけで spill / 占有 register / bounds check の有無を確認
+   できる。今後の最適化サイクルに組み込む価値あり。
+
 ## commit hash anchor
 
-- `f2e3d34` — EPIC #75 v102 perf 292K → 665K
+- `f2e3d34` — EPIC #75 v102 perf 292K → 665K (perf sprint baseline)
 - `f66acdb` — P6: ft_w_grad redundant memset 削除 (perf neutral)
 - `0972c9b` — measurement log doc (本ファイル) 追加
-- `0a071b1` — phase D に phD_stm / phD_nstm prof_tick 独立計測追加
+- `0a071b1` — phase D に phD_stm / phD_nstm 独立 prof_tick 追加
+- `b31dce8` — phase D v2 試作の negative 結果記録 (revert 済)
+- **`b8d2abf`** — **phase D gather kernel の bounds check を raw-ptr 化 (+6.1% pos/s, bullet 超え)**
