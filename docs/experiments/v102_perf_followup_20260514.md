@@ -110,7 +110,45 @@ phase breakdown (`f2e3d34` profile-on、batch=65536):
 3. **micro-optimization のレビューは実測なしには空振りしやすい**: P1/P5 のような 1
    kernel level の予測は ±数 ms で実測してみないと正味判断できない。
 
+## phase D v2 試作 (1 block per feature) — **失敗、revert**
+
+`phD_stm 14.58 ms + phD_nstm 14.56 ms = 29.14 ms` を target に、新版 `_v2` kernel を
+試作:
+- 構造: grid=(FT_IN, 1, 1)=73K blocks (旧版 880K の 12× 削減) × block_dim=256
+- 各 thread が register accumulator 6 個 (acc0..acc5) を持ち、bi loop 内で grad_out
+  の 1 row を 8 warps × 6 sweeps で sequential 読み (coalesced)
+- 単一 block per feature により nstm の atomic add を non-atomic RMW に置換
+- 期待効果 5–10 ms 削減
+
+**実測 (v2 適用、未 commit、1 sb × 3 batches × bs=65536)**:
+- phD_stm: **19.463 ms** (旧版 14.58 ms → +33%)
+- phD_nstm: **19.736 ms** (旧版 14.56 ms → +36%)
+- phase D 合計 **39.20 ms / step** (旧版 29.14 ms より +10.06 ms 悪化)
+- 1 sb の pos/s 比較: 252,864 vs 旧版 269,036 (-6%)、loss 0.161902 は一致 (correctness OK)
+
+**敗因仮説**:
+1. 6 register accumulator が cuda-oxide で local memory spill されている可能性
+   (確認には PTX 検査 + ncu のレジスタ使用量計測が必要)
+2. 1 block per feature への集約で per-block 内 work が増え、warp scheduler が他 block
+   の latency を隠せる余地が減った
+3. 旧版の `if sum != 0.0_f32` 早期 skip が消え、empty feature でも 1536 cell の 0
+   書き込みを実施
+4. 6 sweep × 14 bi = 84 indirect array access per thread の bounds check 累積コスト
+
+**判断**: revert (v2 kernel 削除、host launch も旧版に戻し)。phase D は 1 block per
+feature 構造では性能改善せず、別アプローチが必要:
+- compact appearing-features list を構築して空 block を完全排除
+  (要 stream compaction、device→host n_appearing 取得 or 最大 grid + early-exit)
+- shared mem reduction (multi-warp cooperation per row)
+- グリッド構造はそのままで grad_out の access pattern を transpose
+  (例: bi-major 内側、feature-major 外側)
+
+これら全て要 0.5–1 日の試作 + 計測 cycle で、確実な勝ち筋なし。実 work では本
+領域は cuda-oxide の register allocator の癖を確認しないと方針が立たない。
+
 ## commit hash anchor
 
 - `f2e3d34` — EPIC #75 v102 perf 292K → 665K
 - `f66acdb` — P6: ft_w_grad redundant memset 削除 (perf neutral)
+- `0972c9b` — measurement log doc (本ファイル) 追加
+- `0a071b1` — phase D に phD_stm / phD_nstm prof_tick 独立計測追加
