@@ -80,8 +80,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 #[allow(unused_imports)]
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
@@ -140,7 +140,7 @@ pub fn loss_wdl(
     out: &[f32],
     score: &[f32],
     wdl: &[f32],
-    per_pos_norm: &[f32],
+    per_pos_norm: f32, // scalar (= 1/n_pos)。元 `&[f32]` の broadcast を kernel arg 化
     mut dl_dout: DisjointSlice<f32>,
     loss_acc: &[f64],
     lambda: f32,
@@ -155,7 +155,7 @@ pub fn loss_wdl(
     let ys = 1.0_f32 / (1.0_f32 + (-(score[i.get()] * scale)).exp());
     let y = lambda * wdl[i.get()] + (1.0_f32 - lambda) * ys;
     let err = p - y;
-    let norm = per_pos_norm[i.get()];
+    let norm = per_pos_norm;
 
     if let Some(g) = dl_dout.get_mut(i) {
         *g = 2.0_f32 * err * p * (1.0_f32 - p) * scale * norm;
@@ -201,7 +201,7 @@ pub fn loss_wrm(
     out: &[f32],
     score: &[f32],
     wdl: &[f32],
-    per_pos_norm: &[f32],
+    per_pos_norm: f32, // scalar
     mut dl_dout: DisjointSlice<f32>,
     loss_acc: &[f64],
     lambda: f32,
@@ -227,7 +227,7 @@ pub fn loss_wrm(
     let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
     let err = qf - target;
-    let norm = per_pos_norm[i.get()];
+    let norm = per_pos_norm;
 
     if let Some(g) = dl_dout.get_mut(i) {
         *g = err * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm)) * norm;
@@ -394,18 +394,249 @@ pub fn sparse_ft_forward(
     let bi = tid.get() / (rows as usize);
     let ri = tid.get() % (rows as usize);
 
+    // raw pointer 版 (inner loop の 2 bounds check / iter = 80 / thread を除去)。
+    // unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1` padding 含めて
+    // 確保)、weight.len() == cols * rows (FT 重み、arch 固定)。`if idx >= 0 && (idx as u32)
+    // < cols` のロジックチェックは値検査として保持。
+    let indices_ptr = indices.as_ptr();
+    let weight_ptr = weight.as_ptr();
     let mut sum = 0.0_f32;
     let base = bi * (nnz as usize);
     let mut ni: u32 = 0;
     while ni < nnz {
-        let idx = indices[base + (ni as usize)];
+        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
-            sum += weight[(idx as usize) * (rows as usize) + ri];
+            sum += unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
         }
         ni += 1;
     }
     if let Some(o) = out.get_mut(tid) {
         *o = sum;
+    }
+}
+
+/// Phase 1 of inverse-index sparse_ft_backward: per-feature 出現回数を histogram。
+/// `counts[f]` に (b, slot) で `indices[b*nnz+slot] == f` の数を atomic accumulate。
+/// host が呼出前に `counts` を 0 reset。
+#[kernel]
+pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u32, cols: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (nnz as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let idx = indices[tid.get()];
+    if idx >= 0 && (idx as u32) < cols {
+        let cell = unsafe { &*(counts.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
+        cell.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Phase 2 of inverse-index: exclusive prefix sum over `counts[0..n]` → `offsets[0..=n]`。
+/// 73K elements、1 block × 1024 threads で **並列** Hillis-Steele scan:
+/// 1. 各 thread が n/1024 個の chunk を直列和算 → shared PARTIALS[tid] (per-thread total)
+/// 2. block 内で PARTIALS の exclusive scan (sync_threads × log2(1024) = 10 round)
+/// 3. 各 thread が chunk_offset を起点に再走査して `offsets[j]` を書き出す
+/// 4. tid=1023 が `offsets[n]` (= total) を書く
+///
+/// host: block_dim=(1024, 1, 1), grid_dim=(1, 1, 1)、shared_mem_bytes=0 (static)。
+#[kernel]
+pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
+    static mut PARTIALS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let n_u = n as usize;
+
+    let chunk = (n_u + block_dim_u - 1) / block_dim_u;
+    let start = tid * chunk;
+    let end_candidate = start + chunk;
+    let end = if end_candidate < n_u {
+        end_candidate
+    } else {
+        n_u
+    };
+
+    // Phase 1: per-thread sum
+    let mut local_sum: u32 = 0;
+    let mut i = start;
+    while i < end {
+        local_sum += counts[i];
+        i += 1;
+    }
+    unsafe {
+        PARTIALS[tid] = local_sum;
+    }
+    thread::sync_threads();
+
+    // Phase 2: Hillis-Steele inclusive scan
+    let mut offset_step: usize = 1;
+    while offset_step < block_dim_u {
+        let val: u32 = if tid >= offset_step {
+            unsafe { PARTIALS[tid - offset_step] }
+        } else {
+            0
+        };
+        thread::sync_threads();
+        unsafe {
+            PARTIALS[tid] += val;
+        }
+        thread::sync_threads();
+        offset_step <<= 1;
+    }
+
+    // PARTIALS[tid] is now INCLUSIVE scan. exclusive offset of own chunk:
+    let chunk_offset: u32 = if tid == 0 {
+        0
+    } else {
+        unsafe { PARTIALS[tid - 1] }
+    };
+    thread::sync_threads();
+
+    // Phase 3: per-thread output exclusive scan of chunk
+    let out_ptr = offsets.as_ptr() as *mut u32;
+    let mut acc = chunk_offset;
+    let mut j = start;
+    while j < end {
+        unsafe {
+            out_ptr.add(j).write(acc);
+        }
+        acc += counts[j];
+        j += 1;
+    }
+
+    // 最終 thread (= 担当 chunk が n-1 を含む thread) が offsets[n] = total を書く。
+    // 簡素化: tid=block_dim-1 が常に最後の chunk を持つ (chunk size ceil で配分なので)。
+    if tid == block_dim_u - 1 {
+        unsafe {
+            out_ptr.add(n_u).write(acc);
+        }
+    }
+}
+
+/// Phase 3 of inverse-index: 各 (b, slot) を inverse 順 (feature 別) に配置。
+/// `write_counters[f]` を atomic increment、`positions[offsets[f] + write_counters[f]] = bi`。
+/// host が呼出前に `write_counters` を 0 reset。
+#[kernel]
+pub fn scatter_positions(
+    indices: &[i32],
+    offsets: &[u32],
+    write_counters: &[u32],
+    positions: &[u32],
+    batch: u32,
+    nnz: u32,
+    cols: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (nnz as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = (tid.get() / (nnz as usize)) as u32;
+    let idx = indices[tid.get()];
+    if idx >= 0 && (idx as u32) < cols {
+        let cell =
+            unsafe { &*(write_counters.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
+        let pos = cell.fetch_add(1, AtomicOrdering::Relaxed);
+        let abs_pos = offsets[idx as usize] + pos;
+        unsafe {
+            let p = positions.as_ptr().add(abs_pos as usize) as *mut u32;
+            p.write(bi);
+        }
+    }
+}
+
+/// Phase 4 of inverse-index: 各 feature について grad_out の対応 row を sum し、
+/// `grad_w[feature][ri]` に書き出し (overwrite 版)。
+///
+/// block 構成: blockIdx_x = feature_id (`cols`)、blockIdx_y = ri tile (`ft_out / blockDim`)。
+/// block_dim threads (各 1 ri cell、cell 境界は block 内で disjoint なため atomic 不要)。
+/// 呼出 host は呼出前に grad_w を 0 reset (`memset_zero`)、書かなかった cell は 0 のまま。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn gather_and_sum_per_feature_overwrite(
+    grad_out: &[f32],
+    positions: &[u32],
+    offsets: &[u32],
+    grad_w: &[f32],
+    n_features: u32,
+    ft_out: u32,
+) {
+    let feature = thread::blockIdx_x() as usize;
+    let ri_block = thread::blockIdx_y() as usize;
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let ri = ri_block * block_dim + tid_local;
+    let ft_out_u = ft_out as usize;
+    if ri >= ft_out_u || feature >= (n_features as usize) {
+        return;
+    }
+
+    let off_start = offsets[feature] as usize;
+    let off_end = offsets[feature + 1] as usize;
+
+    // raw pointer 版 (PTX で `setp.ge.u64; @%p bra` の bounds check 3 箇所を除去)。
+    // unsafe 妥当性: caller (`step_impl`) が `feature_positions.len() == batch * MAX_ACTIVE` を保証、
+    // `feat_offsets[feature]..feat_offsets[feature+1]` は phase B が正しく構築。
+    // grad_out / grad_w の範囲は arch (FT_IN × FT_OUT) で固定、launch config 上 ri < ft_out_u。
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
+    let mut sum = 0.0_f32;
+    let mut i = off_start;
+    while i < off_end {
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
+        i += 1;
+    }
+
+    // 範囲外 (n_f=0、つまり off_start == off_end) でも sum=0 を書く: stm/nstm 共通の host が
+    // 呼出前 0-reset を委ねる代わりに本 kernel が常に書き切るほうが simpler。
+    let out_ptr = grad_w.as_ptr() as *mut f32;
+    unsafe {
+        out_ptr.add(feature * ft_out_u + ri).write(sum);
+    }
+}
+
+/// Phase 4 (add 版): nstm 第 2 回呼び出し用。stm の overwrite 結果に atomic 加算。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn gather_and_sum_per_feature_add(
+    grad_out: &[f32],
+    positions: &[u32],
+    offsets: &[u32],
+    grad_w: &[f32],
+    n_features: u32,
+    ft_out: u32,
+) {
+    let feature = thread::blockIdx_x() as usize;
+    let ri_block = thread::blockIdx_y() as usize;
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let ri = ri_block * block_dim + tid_local;
+    let ft_out_u = ft_out as usize;
+    if ri >= ft_out_u || feature >= (n_features as usize) {
+        return;
+    }
+
+    let off_start = offsets[feature] as usize;
+    let off_end = offsets[feature + 1] as usize;
+
+    // raw pointer 版 (overwrite と同じ理由、bounds check 3 箇所除去)。
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
+    let mut sum = 0.0_f32;
+    let mut i = off_start;
+    while i < off_end {
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
+        i += 1;
+    }
+
+    // atomicAdd で stm の結果に加算。
+    if sum != 0.0_f32 {
+        let cell =
+            unsafe { &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32) };
+        cell.fetch_add(sum, AtomicOrdering::Relaxed);
     }
 }
 
@@ -448,6 +679,60 @@ pub fn sparse_ft_backward(
                     as *const DeviceAtomicF32)
             };
             cell.fetch_add(g, AtomicOrdering::Relaxed);
+        }
+        ni += 1;
+    }
+}
+
+/// Fused stm+nstm sparse_ft_backward。2 回呼び出しを 1 kernel に統合し、kernel launch
+/// オーバーヘッドと per-thread setup を削減 (`bi` / `ri` / 計算は thread 共有)。
+/// per-thread の atomic add ops 数は変わらない (38 stm + 38 nstm = 76)。
+/// host が呼出前に `grad_weight` を 0 で初期化。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn sparse_ft_backward_dual(
+    grad_out_stm: &[f32],
+    grad_out_nstm: &[f32],
+    indices_stm: &[i32],
+    indices_nstm: &[i32],
+    grad_weight: &[f32],
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    nnz: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (rows as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (rows as usize);
+    let ri = tid.get() % (rows as usize);
+    let rows_u = rows as usize;
+    let nnz_u = nnz as usize;
+    let cols_u = cols as usize;
+
+    let g_stm = grad_out_stm[tid.get()];
+    let g_nstm = grad_out_nstm[tid.get()];
+    let base = bi * nnz_u;
+
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx_s = indices_stm[base + (ni as usize)];
+        if idx_s >= 0 && (idx_s as usize) < cols_u {
+            let cell = unsafe {
+                &*(grad_weight.as_ptr().add((idx_s as usize) * rows_u + ri)
+                    as *const DeviceAtomicF32)
+            };
+            cell.fetch_add(g_stm, AtomicOrdering::Relaxed);
+        }
+        let idx_n = indices_nstm[base + (ni as usize)];
+        if idx_n >= 0 && (idx_n as usize) < cols_u {
+            let cell = unsafe {
+                &*(grad_weight.as_ptr().add((idx_n as usize) * rows_u + ri)
+                    as *const DeviceAtomicF32)
+            };
+            cell.fetch_add(g_nstm, AtomicOrdering::Relaxed);
         }
         ni += 1;
     }
@@ -708,6 +993,91 @@ pub fn dense_mm_bwd_input(
     }
 }
 
+/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 fixed shape
+/// (`in_dim=1536`, `out_dim=16`)、`batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。
+///
+/// 元 `dense_mm_bwd_input` は w[ii][o] (out-major) read で warp 内 ii=0..31 が stride 16 = 64B
+/// = 32 cache lines load → uncoalesced。本 kernel は W_TILE / DY_TILE を shared に load
+/// (coalesced)、各 thread が 1 (bi, ii) cell を 16 FMA で完成。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input_tiled(
+    dy: &[f32],
+    w: &[f32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_IN × 16
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_B × 16
+
+    let tid_local = thread::threadIdx_x() as usize;
+    // 1D grid: block_idx encodes (b_block, ii_block). 全 cell の 1D 順序を保持し
+    // `dx.get_mut(thread::index_1d())` で disjoint write を成立させる。
+    // grid_dim = (in_dim/16) * (batch/16)、block index = b_block * (in_dim/16) + ii_block。
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let blocks_per_b_row = in_dim_u >> 4; // in_dim / 16
+    let block_lin = thread::blockIdx_x() as usize;
+    let block_b = block_lin / blocks_per_b_row;
+    let block_ii = block_lin % blocks_per_b_row;
+    let tid_b = tid_local >> 4;
+    let tid_i = tid_local & 15;
+    let b_start = block_b << 4;
+    let ii_start = block_ii << 4;
+    let global_bi = b_start + tid_b;
+    let global_ii = ii_start + tid_i;
+
+    let bi_ok = global_bi < batch_u;
+    let ii_ok = global_ii < in_dim_u;
+
+    // W_TILE [TILE_IN × out_dim=16]: 256 cells.
+    // Cell layout: W_TILE[ii_local * 16 + o] = w[(ii_start + ii_local) * out_dim + o]
+    // Map tid_local → (ii_local = tid/16, o = tid%16). For warp tid 0..31: ii_local in {0,1},
+    // o in 0..15 → 16-thread sub-group reads 16 consecutive o (= 1 cache line). Coalesced ✓
+    unsafe {
+        let ii_local_load = tid_b;
+        let o_load = tid_i;
+        let ii_global_load = ii_start + ii_local_load;
+        W_TILE[tid_local] = if ii_global_load < in_dim_u && o_load < out_dim_u {
+            w[ii_global_load * out_dim_u + o_load]
+        } else {
+            0.0_f32
+        };
+        // DY_TILE [TILE_B × 16] = 256 cells.
+        // Cell DY_TILE[b_local * 16 + o] = dy[(b_start + b_local) * out_dim + o]
+        // Map tid_local → (b_local = tid/16, o = tid%16). Coalesced.
+        let b_local_load = tid_b;
+        let bb_global_load = b_start + b_local_load;
+        DY_TILE[tid_local] = if bb_global_load < batch_u && o_load < out_dim_u {
+            dy[bb_global_load * out_dim_u + o_load]
+        } else {
+            0.0_f32
+        };
+    }
+    thread::sync_threads();
+
+    if bi_ok && ii_ok {
+        let mut acc = 0.0_f32;
+        let mut o: usize = 0;
+        while o < 16 {
+            unsafe {
+                acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
+            }
+            o += 1;
+        }
+        // 2D tile grid → cell index は (b_block, ii_block) と (tid_b, tid_i) から合成。
+        // thread::index_1d() (block_lin * 256 + tid_local) と cell_idx は order が異なるため
+        // raw pointer 経由で write (各 thread は disjoint cell を担当、host が grid_dim 整合)。
+        let cell_idx = global_bi * in_dim_u + global_ii;
+        unsafe {
+            *dx.as_mut_ptr().add(cell_idx) = acc;
+        }
+    }
+}
+
 /// Regular dense matrix multiply backward (wrt weight)。`dw[i][o] = sum_b x[b][i] * dy[b][o]`。
 /// 1 thread = 1 (in_index, out_index) weight cell、batch loop 内で sum、atomics 不要 (overwrite)。
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +1106,341 @@ pub fn dense_mm_bwd_weight(
     }
     if let Some(g) = grad_w.get_mut(tid) {
         *g = sum;
+    }
+}
+
+/// Tiled shared-memory variant of [`dense_mm_bwd_weight`]. L1f 用 (`in_dim=1536`,
+/// `out_dim=16`, `batch=65536`) を想定した固定タイル形状 (TILE_K=16, TILE_IN=16,
+/// TILE_OUT=16, block=256 threads)。`in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0`
+/// が host 契約。非該当形状では結果未定義 (host 側で sizes チェックの上で本 kernel を選ぶ)。
+///
+/// 1 block = 1 (TILE_IN × TILE_OUT) W tile。block 内 256 threads が batch を TILE_K=16
+/// chunk で cooperatively load し、shared memory 上で TILE_K 回 FMA。current "1 thread =
+/// 1 cell、scan batch" 比 ~33x 少ない unique memory read (x 16x redundant → 1x、dy 1536x → 1x)。
+///
+/// SAFETY: `static mut TILE` への access は block-local barrier (`sync_threads`) で
+/// race を防ぐ。各 thread の write index は disjoint なので per-thread access は安全。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_tiled(
+    x: &[f32],
+    dy: &[f32],
+    mut grad_w: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    // 256 element tiles → 1 KB / tile (= within 100 KB sm_86 shared mem budget)。
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_K × TILE_IN
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_K × TILE_OUT
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let tid_i = tid_local >> 4; // tid / 16
+    let tid_o = tid_local & 15; // tid % 16
+    let global_ii = block_x * 16 + tid_i;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let in_ok = global_ii < in_dim_u;
+    let out_ok = global_oi < out_dim_u;
+
+    let mut acc: f32 = 0.0_f32;
+    let n_k_tiles = batch_u >> 4; // batch / 16
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let b_start = k_tile << 4;
+        // Cooperative load: 256 threads × 1 cell each.
+        // X_TILE[k * TILE_IN + ii] = x[(b_start + k) * in_dim + (block_x * TILE_IN + ii)]
+        //  Warp threads (tid 0..31) → k = tid/16 ∈ {0,1}, ii = tid%16 ∈ 0..15.
+        //  Within k segment (tid 0..15 or 16..31), 16 consecutive ii → coalesced read of x row.
+        unsafe {
+            let bb = b_start + tid_i;
+            let global_ii_load = (block_x << 4) | tid_o;
+            // Use tid_i as k (0..15) and tid_o as ii within tile (0..15) for X load.
+            let mapped = (tid_i << 4) | tid_o; // = tid_local
+            if bb < batch_u && global_ii_load < in_dim_u {
+                X_TILE[mapped] = x[bb * in_dim_u + global_ii_load];
+            } else {
+                X_TILE[mapped] = 0.0_f32;
+            }
+            // DY_TILE[k * TILE_OUT + oi] = dy[(b_start + k) * out_dim + oi]
+            // Use tid_i as k and tid_o as oi.
+            if bb < batch_u && tid_o < out_dim_u {
+                DY_TILE[mapped] = dy[bb * out_dim_u + tid_o];
+            } else {
+                DY_TILE[mapped] = 0.0_f32;
+            }
+        }
+        thread::sync_threads();
+
+        // Compute: each thread computes 1 (global_ii, global_oi) cell using 16 K iterations.
+        if in_ok && out_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if in_ok && out_ok {
+        // cell_idx == thread::index_1d() since tid_i = tid/16, tid_o = tid%16 and
+        // global cell_idx = global_ii * out_dim + global_oi
+        //                 = (block_x * 16 + tid_i) * 16 + tid_o
+        //                 = block_x * 256 + tid_local = thread::index_1d().get()
+        let global_tid = thread::index_1d();
+        if let Some(g) = grad_w.get_mut(global_tid) {
+            *g = acc;
+        }
+    }
+}
+
+/// Tiled per-bucket weight backward (L1 / fixed shape: `in_dim=1536`, `out_dim=16`,
+/// `num_buckets=9`, `batch % 16 == 0`)。
+///
+/// 元の `dense_mm_bwd_weight_bucket` (1 thread = 1 (buc, oi, ii) cell、scan batch、
+/// bucket filter を inner loop で 9 倍冗長に評価) を「block per W tile (16x16)、
+/// 1 thread = 9 bucket × 1 cell の register accumulator、batch scan 1 回」に書き換え。
+/// 副作用: `dy_tile`、`x_tile`、`buc_tile` を shared mem に coalesced load し、batch を
+/// TILE_K=16 chunk で消化。bucket 分岐は uniform (同 k 内で warp 全 thread が同 buc) なので
+/// divergence なし。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l1(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let block_split = thread::blockIdx_y() as usize;
+    let num_splits = thread::gridDim_y() as usize;
+    let tid_i = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let global_ii = (block_x << 4) | tid_i;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let num_buc_u = num_buckets as usize;
+    let in_ok = global_ii < in_dim_u;
+    let out_ok = global_oi < out_dim_u;
+
+    // split-K: 各 block が batch slice を担当。num_splits=1 で従来形 (全 batch スキャン)。
+    let positions_per_split = (batch_u + num_splits - 1) / num_splits;
+    let split_b_start = block_split * positions_per_split;
+    if split_b_start >= batch_u {
+        return;
+    }
+    let split_b_end_candidate = split_b_start + positions_per_split;
+    let split_b_end = if split_b_end_candidate < batch_u {
+        split_b_end_candidate
+    } else {
+        batch_u
+    };
+    // TILE_K=16 単位で並ぶよう、batch slice は 16 の倍数を host が保証 (`debug_assert` 済)。
+    // 端数 split は最後の block が短くなる (b_end が batch_u に丸まる)。
+
+    // 9 個の bucket accumulator (fixed expansion で register に置く)。
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let n_k_tiles = (split_b_end - split_b_start) >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let b_start = split_b_start + (k_tile << 4);
+        unsafe {
+            let bb = b_start + tid_i;
+            let global_ii_load = (block_x << 4) | tid_o;
+            let mapped = (tid_i << 4) | tid_o;
+            X_TILE[mapped] = if bb < batch_u && global_ii_load < in_dim_u {
+                x[bb * in_dim_u + global_ii_load]
+            } else {
+                0.0_f32
+            };
+            DY_TILE[mapped] = if bb < batch_u && tid_o < out_dim_u {
+                dy[bb * out_dim_u + tid_o]
+            } else {
+                0.0_f32
+            };
+            // BUC_TILE: 16 個 (= TILE_K)。先頭 16 thread (tid_local < 16) が load 担当。
+            if tid_local < 16 {
+                let bb2 = b_start + tid_local;
+                BUC_TILE[tid_local] = if bb2 < batch_u {
+                    bucket_idx[bb2]
+                } else {
+                    -1_i32
+                };
+            }
+        }
+        thread::sync_threads();
+
+        if in_ok && out_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    let buc = BUC_TILE[k];
+                    let mul = X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
+                    // num_buckets=9 を想定。負値・>=9 は無視 (silent skip、元 kernel と同じ)。
+                    if buc == 0 {
+                        a0 += mul;
+                    } else if buc == 1 {
+                        a1 += mul;
+                    } else if buc == 2 {
+                        a2 += mul;
+                    } else if buc == 3 {
+                        a3 += mul;
+                    } else if buc == 4 {
+                        a4 += mul;
+                    } else if buc == 5 {
+                        a5 += mul;
+                    } else if buc == 6 {
+                        a6 += mul;
+                    } else if buc == 7 {
+                        a7 += mul;
+                    } else if buc == 8 {
+                        a8 += mul;
+                    }
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    // Write: grad_w[buc * out_dim * in_dim + global_ii * out_dim + global_oi] かと思いきや、
+    // 元 kernel の layout は `grad_w[buc][o][i]` row-major、つまり buc * out_dim * in_dim +
+    // out_idx * in_dim + in_idx (out-major そして in-major) で、`tid_in_block` 全 thread が
+    // bucket buc に対して書く 1 cell の index = buc * (out_dim * in_dim) + oi * in_dim + ii。
+    if in_ok && out_ok {
+        let per_bucket = out_dim_u * in_dim_u;
+        let cell_in_bucket = global_oi * in_dim_u + global_ii;
+        // split-K では num_splits >= 1 block が同 cell に partial sum を寄せるため atomicAdd。
+        // num_splits=1 でも 1 回の atomicAdd になるだけで結果は同じ (grad_w は host が memset 0)。
+        let raw = grad_w.as_ptr();
+        if num_buc_u >= 1 {
+            unsafe {
+                let c = &*(raw.add(cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a0, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 2 {
+            unsafe {
+                let c = &*(raw.add(per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a1, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 3 {
+            unsafe {
+                let c = &*(raw.add(2 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a2, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 4 {
+            unsafe {
+                let c = &*(raw.add(3 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a3, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 5 {
+            unsafe {
+                let c = &*(raw.add(4 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a4, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 6 {
+            unsafe {
+                let c = &*(raw.add(5 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a5, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 7 {
+            unsafe {
+                let c = &*(raw.add(6 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a6, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 8 {
+            unsafe {
+                let c = &*(raw.add(7 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a7, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 9 {
+            unsafe {
+                let c = &*(raw.add(8 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a8, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Bias gradient (block-level shared-mem reduction) — L1f 用 (`out_dim=16`)。
+///
+/// 元 `bias_grad` は 1M threads × 1 atomic → 16 cells で contention 大。本 kernel は
+/// 各 block (256 threads) が shared-mem 16-cell accumulator に集約 → 1 block × 16 atomic
+/// add で global に flush。global atomic 数 = blocks × 16 (= ~64K) で contention 大幅減。
+#[kernel]
+pub fn bias_grad_shared_l1f(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+    use core::ptr::addr_of_mut;
+    static mut PARTIAL: SharedArray<f32, 16> = SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_idx = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let total = batch_u * out_dim_u;
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+
+    // 初期化: 先頭 out_dim threads が PARTIAL を 0 reset。
+    if tid < out_dim_u {
+        unsafe {
+            partial_ptr.add(tid).write(0.0_f32);
+        }
+    }
+    thread::sync_threads();
+
+    // accumulate: 各 thread = 1 (b, oi) cell の dy 値を shared atomic add (16 cells に contention)。
+    let global_idx = block_idx * block_dim_u + tid;
+    if global_idx < total {
+        let oi = global_idx % out_dim_u;
+        let dyv = dy[global_idx];
+        let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+    }
+    thread::sync_threads();
+
+    // flush: 先頭 out_dim threads が PARTIAL → grad_bias に atomic add。
+    if tid < out_dim_u {
+        let p = unsafe { partial_ptr.add(tid).read() };
+        let cell = unsafe { &*(grad_bias.as_ptr().add(tid) as *const DeviceAtomicF32) };
+        cell.fetch_add(p, AtomicOrdering::Relaxed);
     }
 }
 
@@ -803,6 +1508,210 @@ pub fn dense_mm_fwd_bucket(
     }
     if let Some(o) = y.get_mut(tid) {
         *o = sum;
+    }
+}
+
+/// Tiled non-bucket forward dense matmul (L1f 用 fixed shape: `in_dim=1536`, `out_dim=16`)。
+/// 元 `dense_mm_fwd` は coalesced だが 1 thread = 1 (b, oi) で per-thread 1536 K iter で
+/// 並列度限界。本 kernel は block tile (TILE_B=16 × TILE_OUT=16 = 256 cells)、K=16 chunk
+/// で shared-mem cooperative load → 256 cells / block で並列度 4K blocks × 256 threads。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_tiled_l1f(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    let bias_init = if bi_ok && oi_ok {
+        bias[global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        // X_TILE [TILE_B × TILE_K]: x[(b_start+tid_b)*in_dim + (k_start+tid_o)]
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+            // W_TILE [TILE_OUT × TILE_K]: w[(k_start+k_local) * out_dim + tid_o_load]
+            // w layout: in-major × out-major (`w[ii * out_dim + oi]`)、coalesced for `tid_o` varies.
+            // Map tid_local → (k_local = tid/16, o_load = tid%16)
+            let k_local = tid_b; // tid_local / 16
+            let o_load = tid_o; // tid_local & 15
+            let kk2 = k_start + k_local;
+            W_TILE[tid_local] = if kk2 < in_dim_u && o_load < out_dim_u {
+                w[kk2 * out_dim_u + o_load]
+            } else {
+                0.0_f32
+            };
+        }
+        thread::sync_threads();
+
+        if bi_ok && oi_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(k << 4) | tid_o];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok && oi_ok {
+        if let Some(o) = y.get_mut(thread::index_1d()) {
+            *o = acc;
+        }
+    }
+}
+
+/// Tiled per-bucket forward dense matmul (L1 用 fixed shape: `in_dim=1536`, `out_dim=16`,
+/// `num_buckets=9`)。
+///
+/// 元 `dense_mm_fwd_bucket` は `w[buc][oi][ii]` layout のため、warp 内 16-thread sub-group が
+/// oi 軸を varying させると stride=in_dim=1536 で uncoalesced。本 kernel は 1 block = 1 batch
+/// tile (TILE_B=16) × 全 oi (= TILE_OUT=16)、K (= in_dim) を TILE_K=16 chunk で消化し、shared
+/// memory 上で `w_tile [NUM_BUCKETS × TILE_OUT × TILE_K]` を per-K-tile load (coalesced)。各
+/// thread は自分の bucket の W 行を shared から読んで accumulate。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_bucket_tiled_l1(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 × 16
+    static mut W_TILE: SharedArray<f32, 2304> = SharedArray::UNINIT; // 9 × 16 × 16
+    static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4; // tid / 16
+    let tid_o = tid_local & 15; // tid % 16
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let num_buc_u = num_buckets as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    // BUC_TILE load (1 回だけ、K loop の前)。
+    unsafe {
+        if tid_local < 16 {
+            let bb = b_start + tid_local;
+            BUC_TILE[tid_local] = if bb < batch_u { bucket_idx[bb] } else { -1_i32 };
+        }
+    }
+    thread::sync_threads();
+
+    // bucket 別 bias を初期値に。
+    let my_buc = unsafe { BUC_TILE[tid_b] };
+    let bias_init = if bi_ok && oi_ok && my_buc >= 0 && (my_buc as u32) < num_buckets {
+        bias[(my_buc as usize) * out_dim_u + global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4; // in_dim / 16
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        // X_TILE [TILE_B × TILE_K]: 16x16 = 256 cells、tid → (tid_b, tid_o) → ((b_start+tid_b), (k_start+tid_o))
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+        }
+        // W_TILE [NUM_BUCKETS × TILE_OUT × TILE_K] = 2304 cells, 256 threads × 9 cells each
+        // Cell layout: cell_idx = buc * 256 + oi_local * 16 + k_local
+        // tid_local → (oi_local = tid/16, k_local = tid%16)
+        // Per-bucket: read w[buc * out_dim * in_dim + oi_local * in_dim + (k_start + k_local)]
+        unsafe {
+            let oi_local = tid_b; // = tid_local / 16
+            let k_local = tid_o; // = tid_local & 15
+            let kk = k_start + k_local;
+            let mut buc: usize = 0;
+            while buc < num_buc_u {
+                let val = if oi_local < out_dim_u && kk < in_dim_u {
+                    w[buc * out_dim_u * in_dim_u + oi_local * in_dim_u + kk]
+                } else {
+                    0.0_f32
+                };
+                W_TILE[(buc << 8) | (oi_local << 4) | k_local] = val;
+                buc += 1;
+            }
+        }
+        thread::sync_threads();
+
+        // Compute: each thread accumulates 1 cell (global_bi, global_oi) over TILE_K K iterations.
+        if bi_ok && oi_ok && my_buc >= 0 && (my_buc as u32) < num_buckets {
+            let buc_u = my_buc as usize;
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(buc_u << 8) | (tid_o << 4) | k];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok && oi_ok {
+        if my_buc < 0 || (my_buc as u32) >= num_buckets {
+            if let Some(o) = y.get_mut(thread::index_1d()) {
+                *o = 0.0_f32;
+            }
+        } else if let Some(o) = y.get_mut(thread::index_1d()) {
+            *o = acc;
+        }
     }
 }
 
@@ -895,6 +1804,295 @@ pub fn dense_mm_bwd_weight_bucket(
     }
     if let Some(g) = grad_w.get_mut(tid) {
         *g = sum;
+    }
+}
+
+/// L3 weight backward (specialized: `in_dim=32`, `out_dim=1`, `num_buckets=9`)。
+///
+/// 元 `dense_mm_bwd_weight_bucket` は 288 cells × scan 65536 = 288 threads と並列度極小、
+/// 9.2ms 占有。本 kernel は split-K + 9 bucket register accumulator で並列度を上げる:
+/// - block dim = 32 (1 thread = 1 ii cell)
+/// - grid = num_batch_splits (e.g., 64) → 64 blocks × 32 threads = 2048 threads ≈ 25 / SM (sm_86)
+/// - 各 thread が 9 bucket × 1 ii の partial sum を batch_slice 内で集計
+/// - 完了後、9 cell ぶん atomicAdd で global grad_w に flush
+///
+/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。in_dim==32, out_dim==1,
+/// num_buckets==9 を満たすこと。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l3(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_split = thread::blockIdx_x() as usize;
+    let num_splits = thread::gridDim_x() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let ii = tid_local;
+    if ii >= in_dim_u {
+        return;
+    }
+
+    // 各 block が均等な batch slice を担当 (端数は block 0 に寄せず ceil で配分し overflow check)。
+    // ceil(batch / num_splits)、cuda-oxide は usize の `min()` / `div_ceil` で drop_in_place を
+    // 出してしまうので素朴な式で書く。
+    let positions_per_block = (batch_u + num_splits - 1) / num_splits;
+    let b_start = block_split * positions_per_block;
+    if b_start >= batch_u {
+        return;
+    }
+    let b_end_candidate = b_start + positions_per_block;
+    let b_end = if b_end_candidate < batch_u {
+        b_end_candidate
+    } else {
+        batch_u
+    };
+
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let mut bb = b_start;
+    while bb < b_end {
+        let buc = bucket_idx[bb];
+        let xv = x[bb * in_dim_u + ii];
+        // out_dim=1 想定 (oi=0 のみ)。dy[bb][0] を読む。
+        let dyv = dy[bb * out_dim_u];
+        let mul = xv * dyv;
+        if buc == 0 {
+            a0 += mul;
+        } else if buc == 1 {
+            a1 += mul;
+        } else if buc == 2 {
+            a2 += mul;
+        } else if buc == 3 {
+            a3 += mul;
+        } else if buc == 4 {
+            a4 += mul;
+        } else if buc == 5 {
+            a5 += mul;
+        } else if buc == 6 {
+            a6 += mul;
+        } else if buc == 7 {
+            a7 += mul;
+        } else if buc == 8 {
+            a8 += mul;
+        }
+        bb += 1;
+    }
+
+    // 9 cell flush。layout は buc * (out_dim * in_dim) + oi * in_dim + ii、oi=0 なので buc * in_dim + ii。
+    let num_buc_u = num_buckets as usize;
+    let raw = grad_w.as_ptr();
+    if num_buc_u >= 1 {
+        unsafe {
+            let c = &*(raw.add(ii) as *const DeviceAtomicF32);
+            c.fetch_add(a0, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 2 {
+        unsafe {
+            let c = &*(raw.add(in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a1, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 3 {
+        unsafe {
+            let c = &*(raw.add(2 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a2, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 4 {
+        unsafe {
+            let c = &*(raw.add(3 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a3, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 5 {
+        unsafe {
+            let c = &*(raw.add(4 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a4, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 6 {
+        unsafe {
+            let c = &*(raw.add(5 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a5, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 7 {
+        unsafe {
+            let c = &*(raw.add(6 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a6, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 8 {
+        unsafe {
+            let c = &*(raw.add(7 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a7, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 9 {
+        unsafe {
+            let c = &*(raw.add(8 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a8, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// L2 weight backward (specialized: `in_dim=30`, `out_dim=32`, `num_buckets=9`)。
+///
+/// 元 `dense_mm_bwd_weight_bucket` は 8640 cells × scan batch、並列度 ~34 blocks で遅い。
+/// 本 kernel は split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket
+/// acc) で並列度を上げる。block_dim = 32 × 30 = 960 threads (sm_86 max 1024 以内)、
+/// block grid = num_batch_splits。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l2(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_split = thread::blockIdx_x() as usize;
+    let num_splits = thread::gridDim_x() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    // tid → (oi, ii): oi = tid / in_dim, ii = tid % in_dim (block_dim = out_dim * in_dim)
+    let oi = tid_local / in_dim_u;
+    let ii = tid_local % in_dim_u;
+    if oi >= out_dim_u {
+        return;
+    }
+
+    let positions_per_block = (batch_u + num_splits - 1) / num_splits;
+    let b_start = block_split * positions_per_block;
+    if b_start >= batch_u {
+        return;
+    }
+    let b_end_candidate = b_start + positions_per_block;
+    let b_end = if b_end_candidate < batch_u {
+        b_end_candidate
+    } else {
+        batch_u
+    };
+
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let mut bb = b_start;
+    while bb < b_end {
+        let buc = bucket_idx[bb];
+        let xv = x[bb * in_dim_u + ii];
+        let dyv = dy[bb * out_dim_u + oi];
+        let mul = xv * dyv;
+        if buc == 0 {
+            a0 += mul;
+        } else if buc == 1 {
+            a1 += mul;
+        } else if buc == 2 {
+            a2 += mul;
+        } else if buc == 3 {
+            a3 += mul;
+        } else if buc == 4 {
+            a4 += mul;
+        } else if buc == 5 {
+            a5 += mul;
+        } else if buc == 6 {
+            a6 += mul;
+        } else if buc == 7 {
+            a7 += mul;
+        } else if buc == 8 {
+            a8 += mul;
+        }
+        bb += 1;
+    }
+
+    // grad_w layout: buc * (out_dim * in_dim) + oi * in_dim + ii。
+    let per_bucket = out_dim_u * in_dim_u;
+    let cell_in_bucket = oi * in_dim_u + ii;
+    let num_buc_u = num_buckets as usize;
+    let raw = grad_w.as_ptr();
+    if num_buc_u >= 1 {
+        unsafe {
+            let c = &*(raw.add(cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a0, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 2 {
+        unsafe {
+            let c = &*(raw.add(per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a1, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 3 {
+        unsafe {
+            let c = &*(raw.add(2 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a2, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 4 {
+        unsafe {
+            let c = &*(raw.add(3 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a3, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 5 {
+        unsafe {
+            let c = &*(raw.add(4 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a4, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 6 {
+        unsafe {
+            let c = &*(raw.add(5 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a5, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 7 {
+        unsafe {
+            let c = &*(raw.add(6 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a6, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 8 {
+        unsafe {
+            let c = &*(raw.add(7 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a7, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 9 {
+        unsafe {
+            let c = &*(raw.add(8 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a8, AtomicOrdering::Relaxed);
+        }
     }
 }
 
@@ -1602,6 +2800,19 @@ struct GpuWorkspace {
     dcombined: DeviceBuffer<f32>,            // b × FT_OUT
     dft_stm_out: DeviceBuffer<f32>,          // b × FT_OUT
     dft_nstm_out: DeviceBuffer<f32>,         // b × FT_OUT
+
+    // -- inverse-index sparse_ft_backward scratch (FT_IN+1 / max 2.5M) --
+    feat_counts: DeviceBuffer<u32>, // FT_IN: per-feature histogram (atomic build)
+    feat_offsets: DeviceBuffer<u32>, // FT_IN + 1: exclusive prefix sum
+    feat_write_ctr: DeviceBuffer<u32>, // FT_IN: scatter atomic counter
+    feat_positions: DeviceBuffer<u32>, // up to batch * MAX_ACTIVE: sorted positions
+
+    // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
+    stm_idx_dev: DeviceBuffer<i32>,    // batch * MAX_ACTIVE
+    nstm_idx_dev: DeviceBuffer<i32>,   // batch * MAX_ACTIVE
+    bucket_idx_dev: DeviceBuffer<i32>, // batch
+    score_dev: DeviceBuffer<f32>,      // batch
+    wdl_dev: DeviceBuffer<f32>,        // batch
 }
 
 impl GpuWorkspace {
@@ -1642,6 +2853,15 @@ impl GpuWorkspace {
             dcombined: z(batch * FT_OUT)?,
             dft_stm_out: z(batch * FT_OUT)?,
             dft_nstm_out: z(batch * FT_OUT)?,
+            feat_counts: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
+            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, FT_IN + 1)?,
+            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
+            feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
+            score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
         })
     }
 
@@ -1661,20 +2881,48 @@ impl GpuWorkspace {
 }
 
 /// Smoke / Stage 3-8 trainer 用の 1 batch 入力データ。
+/// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
+/// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
 #[allow(dead_code)]
-struct BatchData {
+struct BatchData<'a> {
     n_pos: usize,
-    stm_indices: Vec<i32>, // (n_pos × MAX_ACTIVE)、-1 padding 可
-    nstm_indices: Vec<i32>,
-    bucket_idx: Vec<i32>,   // (n_pos)、progress8kpabs の 0-8
-    score: Vec<f32>,        // (n_pos)、target eval cp の元
-    wdl: Vec<f32>,          // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
-    per_pos_norm: Vec<f32>, // (n_pos)、bullet loss normalisation
+    stm_indices: &'a [i32], // (n_pos × MAX_ACTIVE)、-1 padding 可
+    nstm_indices: &'a [i32],
+    bucket_idx: &'a [i32], // (n_pos)、progress8kpabs の 0-8
+    score: &'a [f32],      // (n_pos)、target eval cp の元
+    wdl: &'a [f32],        // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    per_pos_norm: f32,     // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)
 }
 
-impl BatchData {
+/// `BatchData` を owned 形で組み立てるための一時 buffer (smoke / test 用)。本体 train_step
+/// path では `BatchData::from_batch_ref` を使う (slice 借用)。
+struct BatchDataOwned {
+    n_pos: usize,
+    stm_indices: Vec<i32>,
+    nstm_indices: Vec<i32>,
+    bucket_idx: Vec<i32>,
+    score: Vec<f32>,
+    wdl: Vec<f32>,
+}
+
+impl BatchDataOwned {
+    fn as_ref(&self) -> BatchData<'_> {
+        let n = self.n_pos;
+        BatchData {
+            n_pos: n,
+            stm_indices: &self.stm_indices,
+            nstm_indices: &self.nstm_indices,
+            bucket_idx: &self.bucket_idx,
+            score: &self.score,
+            wdl: &self.wdl,
+            per_pos_norm: if n == 0 { 0.0 } else { 1.0_f32 / n as f32 },
+        }
+    }
+}
+
+impl BatchData<'_> {
     /// 決定論的な smoke 用 dummy batch。bucket_idx=0、small random sparse indices。
-    fn smoke_dummy(n_pos: usize) -> Self {
+    fn smoke_dummy(n_pos: usize) -> BatchDataOwned {
         let mut stm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
         let mut nstm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
         // 各 position に MAX_ACTIVE 個 (実 HalfKA_hm の典型局面と同等) の deterministic indices
@@ -1695,32 +2943,19 @@ impl BatchData {
                 nstm_indices[b * MAX_ACTIVE + k] = idx2;
             }
         }
-        Self {
+        BatchDataOwned {
             n_pos,
             stm_indices,
             nstm_indices,
             bucket_idx: vec![0_i32; n_pos],
             score: vec![0.0_f32; n_pos],
             wdl: vec![0.5_f32; n_pos],
-            per_pos_norm: vec![1.0_f32; n_pos],
         }
     }
 
-    /// `nnue-train` dataloader の `Batch` + per-position bucket から `BatchData`
-    /// を作る (Stage 3-8 trainer integrate)。
-    ///
-    /// `Batch` は `batch_size * max_active` 容量を持つが有効件数は `n_positions`
-    /// なので、sparse index は先頭 `n_positions * MAX_ACTIVE` 要素だけ切り出す。
-    /// `Batch::max_active` は HalfKA_hm の `MAX_ACTIVE_FEATURES` (= `MAX_ACTIVE`
-    /// = 40) を前提とする。
-    ///
-    /// `per_pos_norm` は **`1.0 / n_pos`** にする: `loss_wdl` kernel は per-position
-    /// gradient に `per_pos_norm` を掛けて backward に流すため、これで weight
-    /// gradient が batch 平均になり (atomic accumulate 後)、learning rate が
-    /// batch size に依存しなくなる (bullet の `mean` reduction と同じ意味)。
-    /// 報告 loss は `loss_acc` (= `Σ err²`) を position 数で割って平均にする
-    /// (kernel 側は `loss_acc` を norm で割らずに raw `err²` を足す)。
-    fn from_batch(batch: &Batch, bucket_idx: &[i32]) -> Self {
+    /// `nnue-train` dataloader の `Batch` + per-position bucket から borrowed `BatchData`
+    /// を作る (Stage 3-8 trainer integrate、`.to_vec()` を排して 22 MB の CPU memcpy 削減)。
+    fn from_batch_ref<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
         let n_pos = batch.n_positions;
         assert_eq!(
             bucket_idx.len(),
@@ -1740,14 +2975,14 @@ impl BatchData {
         } else {
             1.0_f32 / n_pos as f32
         };
-        Self {
+        BatchData {
             n_pos,
-            stm_indices: batch.stm_indices[..span].to_vec(),
-            nstm_indices: batch.nstm_indices[..span].to_vec(),
-            bucket_idx: bucket_idx.to_vec(),
-            score: batch.score[..n_pos].to_vec(),
-            wdl: batch.wdl[..n_pos].to_vec(),
-            per_pos_norm: vec![norm; n_pos],
+            stm_indices: &batch.stm_indices[..span],
+            nstm_indices: &batch.nstm_indices[..span],
+            bucket_idx,
+            score: &batch.score[..n_pos],
+            wdl: &batch.wdl[..n_pos],
+            per_pos_norm: norm,
         }
     }
 }
@@ -1793,6 +3028,61 @@ fn memset_zero<T>(
         unsafe {
             cuda_core::memory::memset_d8_async(buf.cu_deviceptr(), 0, bytes, stream.cu_stream())?;
         }
+    }
+    Ok(())
+}
+
+/// pre-allocated device buffer に host slice を async memcpy。`DeviceBuffer::from_host`
+/// の毎-step cudaMalloc/Free を排除するため。Caller は `buf` と `src` の長さが一致
+/// (バッチ毎 fixed shape) を保証。
+fn copy_host_to_device_async_i32(
+    stream: &CudaStream,
+    buf: &DeviceBuffer<i32>,
+    src: &[i32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        src.len() <= buf.len(),
+        "src.len()={} exceeds buf.len()={}",
+        src.len(),
+        buf.len()
+    );
+    let bytes = std::mem::size_of_val(src);
+    if bytes == 0 {
+        return Ok(());
+    }
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            buf.cu_deviceptr(),
+            src.as_ptr(),
+            bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_host_to_device_async_f32(
+    stream: &CudaStream,
+    buf: &DeviceBuffer<f32>,
+    src: &[f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        src.len() <= buf.len(),
+        "src.len()={} exceeds buf.len()={}",
+        src.len(),
+        buf.len()
+    );
+    let bytes = std::mem::size_of_val(src);
+    if bytes == 0 {
+        return Ok(());
+    }
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            buf.cu_deviceptr(),
+            src.as_ptr(),
+            bytes,
+            stream.cu_stream(),
+        )?;
     }
     Ok(())
 }
@@ -2424,6 +3714,19 @@ impl GpuTrainer {
         if b == 0 {
             return Ok(0.0);
         }
+        // defense-in-depth: tiled kernels (grid=b/16) は b % 16 == 0 を要求する。
+        // CLI で `--batch-size` を 16 倍数に reject 済 (`run_training`)、`BucketedPrefetchedLoader`
+        // も `n_positions == batch_size` を保証する (`dataloader.rs:572`) ため通常到達しない。
+        // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
+        // 明示的な runtime check を入れる (PR #98 Codex review P2)。
+        if !b.is_multiple_of(16) {
+            return Err(format!(
+                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
+                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
+                b
+            )
+            .into());
+        }
         let b_u32 = b as u32;
 
         // 中間 activation workspace を batch `b` 以上に拡張 (grow-only、Issue #78)。
@@ -2445,13 +3748,15 @@ impl GpuTrainer {
             };
         }
 
-        // 入力 buffer を host → device
-        let stm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.stm_indices)?;
-        let nstm_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.nstm_indices)?;
-        let bucket_idx_dev = DeviceBuffer::from_host(&self.stream, &batch.bucket_idx)?;
-        let score_dev = DeviceBuffer::from_host(&self.stream, &batch.score)?;
-        let wdl_dev = DeviceBuffer::from_host(&self.stream, &batch.wdl)?;
-        let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
+        // 入力 buffer を host → device (workspace pre-allocated buffer に in-place memcpy)。
+        // 元の `DeviceBuffer::from_host` は毎 step cudaMalloc + cudaMemcpyAsync + drop (cudaFree) で
+        // ~0.5-1 ms 浪費。pre-allocated に変えて malloc/free を削減。
+        copy_host_to_device_async_i32(&self.stream, &self.ws.stm_idx_dev, batch.stm_indices)?;
+        copy_host_to_device_async_i32(&self.stream, &self.ws.nstm_idx_dev, batch.nstm_indices)?;
+        copy_host_to_device_async_i32(&self.stream, &self.ws.bucket_idx_dev, batch.bucket_idx)?;
+        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, batch.score)?;
+        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, batch.wdl)?;
+        // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
         // loss_acc reset (accumulate semantics、再 alloc せず memset、Issue #78)
         memset_zero(&self.stream, &self.loss_acc)?;
@@ -2467,7 +3772,7 @@ impl GpuTrainer {
             config: cfg_1d(b * FT_OUT),
             args: [
                 slice(self.ft_w),
-                slice(stm_idx_dev),
+                slice(self.ws.stm_idx_dev),
                 slice_mut(self.ws.ft_stm_out),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
             ]
@@ -2479,11 +3784,12 @@ impl GpuTrainer {
             config: cfg_1d(b * FT_OUT),
             args: [
                 slice(self.ft_w),
-                slice(nstm_idx_dev),
+                slice(self.ws.nstm_idx_dev),
                 slice_mut(self.ws.ft_nstm_out),
                 b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
             ]
         }?;
+        prof_tick!("fwd_ft");
 
         // -- Forward step 3: ft_post_perspective_fwd → combined (B × FT_OUT) --
         cuda_launch! {
@@ -2500,28 +3806,46 @@ impl GpuTrainer {
             ]
         }?;
 
+        prof_tick!("fwd_ftpost");
+
         // -- Forward step 4: dense_mm_fwd_bucket L1 → l1_bucket (B × L1_OUT) --
+        // tiled (block=256 × grid=batch/16=4096) で W shared-mem caching、uncoalesced 軸を解消。
+        debug_assert!(
+            FT_OUT.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
+        );
         cuda_launch! {
-            kernel: dense_mm_fwd_bucket,
+            kernel: dense_mm_fwd_bucket_tiled_l1,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT),
+            config: LaunchConfig {
+                grid_dim: ((b / 16) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.combined),
                 slice(self.l1_w),
                 slice(self.l1_b),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.l1_bucket),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
+        prof_tick!("fwd_L1");
+
         // -- Forward step 5: dense_mm_fwd L1f shared → l1f_out (B × L1_OUT) --
+        // tiled (block=256 × grid=batch/16=4096 blocks): per-thread K iter 削減 + shared W cache。
+        debug_assert!(b.is_multiple_of(16) && FT_OUT.is_multiple_of(16) && L1_OUT == 16);
         cuda_launch! {
-            kernel: dense_mm_fwd,
+            kernel: dense_mm_fwd_tiled_l1f,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT),
+            config: LaunchConfig {
+                grid_dim: ((b / 16) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.combined),
                 slice(self.l1f_w),
@@ -2530,6 +3854,8 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
+
+        prof_tick!("fwd_L1f");
 
         // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × L1_OUT) --
         cuda_launch! {
@@ -2610,6 +3936,8 @@ impl GpuTrainer {
             ]
         }?;
 
+        prof_tick!("fwd_L1tail");
+
         // -- Forward step 11: L2 per-bucket dense → l2_out (B × 32) --
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
@@ -2620,7 +3948,7 @@ impl GpuTrainer {
                 slice(self.ws.l2_input),
                 slice(self.l2_w),
                 slice(self.l2_b),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.l2_out),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
@@ -2639,6 +3967,8 @@ impl GpuTrainer {
             ]
         }?;
 
+        prof_tick!("fwd_L2");
+
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
@@ -2649,7 +3979,7 @@ impl GpuTrainer {
                 slice(self.ws.l2_acted),
                 slice(self.l3_w),
                 slice(self.l3_b),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.l3_out),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
@@ -2681,9 +4011,9 @@ impl GpuTrainer {
                     config: cfg_1d(b),
                     args: [
                         slice(self.ws.net_output),
-                        slice(score_dev),
-                        slice(wdl_dev),
-                        slice(norm_dev),
+                        slice(self.ws.score_dev),
+                        slice(self.ws.wdl_dev),
+                        batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda, scale, b_u32
@@ -2701,9 +4031,9 @@ impl GpuTrainer {
                     config: cfg_1d(b),
                     args: [
                         slice(self.ws.net_output),
-                        slice(score_dev),
-                        slice(wdl_dev),
-                        slice(norm_dev),
+                        slice(self.ws.score_dev),
+                        slice(self.ws.wdl_dev),
+                        batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda, nnue2score, in_scaling, b_u32
@@ -2729,7 +4059,12 @@ impl GpuTrainer {
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
-        memset_zero(&self.stream, &self.ft_w_grad)?;
+        // ft_w_grad の memset_zero は `gather_and_sum_per_feature_overwrite` (phase D
+        // iter 0、stm) が全 (feature, ri) cell を sum (off_start==off_end の時も sum=0)
+        // で書き切る (main.rs:585-591 / 599) ため、ここでの 450MB reset は redundant。
+        // 2026-05-14 計測: pos/s 影響は ±0% (sm_86, 5 sb × 200 batches × bs=65536 で
+        // 670K → 671K)。perf 改善目的ではなく "毎 step 450MB の no-op を排除する論理
+        // 整理" として残す。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
@@ -2740,6 +4075,7 @@ impl GpuTrainer {
         memset_zero(&self.stream, &self.l3_w_grad)?;
         memset_zero(&self.stream, &self.l3_b_grad)?;
         memset_zero(&self.stream, &self.ws.dl1_total)?;
+        prof_tick!("bwd_reset");
 
         // -- Backward 14 reverse: dy_net_output が dl3_out と dl1_skip 両方の grad --
         // (elementwise_add 逆: dl3_out = dy, dl1_skip = dy、両者同じ buffer を直接渡せばよい)
@@ -2753,22 +4089,30 @@ impl GpuTrainer {
             args: [
                 slice(self.ws.dy_net_output),
                 slice(self.l3_w),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dl2_acted),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
+        // L3 weight bwd: in_dim=L2_OUT=32, out_dim=1, num_buckets=9。
+        // 元 kernel は 288 cells × scan batch で並列度小。split-K + 9 bucket register
+        // accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`) に切替。
+        // num_splits=64 → 64 blocks × 32 threads = 2048 threads ≈ 26 / SM (sm_86)。
+        debug_assert!(L2_OUT == 32 && NUM_BUCKETS == 9);
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket,
+            kernel: dense_mm_bwd_weight_bucket_tiled_l3,
             stream: self.stream,
             module: self.module,
-            // L3: in_dim=L2_OUT, out_dim=1 → grid = num_buckets * out_dim(=1) * in_dim
-            config: cfg_1d(NUM_BUCKETS * L2_OUT),
+            config: LaunchConfig {
+                grid_dim: (64, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.l2_acted),
                 slice(self.ws.dy_net_output),
-                slice(bucket_idx_dev),
-                slice_mut(self.l3_w_grad),
+                slice(self.ws.bucket_idx_dev),
+                slice(self.l3_w_grad),
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2779,11 +4123,13 @@ impl GpuTrainer {
             config: cfg_1d(b),
             args: [
                 slice(self.ws.dy_net_output),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice(self.l3_b_grad),
                 b_u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
+
+        prof_tick!("bwd_L3");
 
         // -- Backward 12 reverse: crelu_grad on l2_out --
         cuda_launch! {
@@ -2808,22 +4154,28 @@ impl GpuTrainer {
             args: [
                 slice(self.ws.dl2_out),
                 slice(self.l2_w),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dl2_input),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
+        // L2 weight bwd: in_dim=L2_IN=30, out_dim=L2_OUT=32, num_buckets=9。
+        // split-K + 9 bucket register accumulator (block_dim = 32 × 30 = 960、grid = 64 splits)。
+        debug_assert!(L2_IN == 30 && L2_OUT == 32 && NUM_BUCKETS == 9);
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket,
+            kernel: dense_mm_bwd_weight_bucket_tiled_l2,
             stream: self.stream,
             module: self.module,
-            // L2: in_dim=L2_IN, out_dim=L2_OUT → grid = num_buckets * out_dim * in_dim
-            config: cfg_1d(NUM_BUCKETS * L2_OUT * L2_IN),
+            config: LaunchConfig {
+                grid_dim: (64, 1, 1),
+                block_dim: ((L2_OUT * L2_IN) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.l2_input),
                 slice(self.ws.dl2_out),
-                slice(bucket_idx_dev),
-                slice_mut(self.l2_w_grad),
+                slice(self.ws.bucket_idx_dev),
+                slice(self.l2_w_grad),
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
@@ -2834,11 +4186,13 @@ impl GpuTrainer {
             config: cfg_1d(b * L2_OUT),
             args: [
                 slice(self.ws.dl2_out),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice(self.l2_b_grad),
                 b_u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
+
+        prof_tick!("bwd_L2");
 
         // -- Backward 10 reverse: crelu_grad on l2_pre --
         cuda_launch! {
@@ -2925,12 +4279,21 @@ impl GpuTrainer {
         // (elementwise_add 逆: dl1_bucket = dl1_total, dl1f = dl1_total)
         // 直接 dl1_total を両 dense_mm_bwd に渡す
 
+        prof_tick!("bwd_L1eff");
+
         // -- Backward 5 reverse: L1f shared dense grad --
+        // L1f input bwd: in_dim=FT_OUT=1536, out_dim=L1_OUT=16, batch=multiple of 16
+        // → tiled (block=256 = 16 batch × 16 in_dim cells、grid=batch/16 × in_dim/16 = 4096*96).
+        debug_assert!(b.is_multiple_of(16) && FT_OUT.is_multiple_of(16) && L1_OUT == 16);
         cuda_launch! {
-            kernel: dense_mm_bwd_input,
+            kernel: dense_mm_bwd_input_tiled,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: LaunchConfig {
+                grid_dim: (((b / 16) * (FT_OUT / 16)) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.dl1_total),
                 slice(self.l1f_w),
@@ -2938,11 +4301,19 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
+        // L1f weight backward は in_dim=FT_OUT(1536), out_dim=L1_OUT(16), batch=multiple of 16
+        // を満たすので shared-mem tiled 版 (~30x 少ない unique memory traffic) を使う。
+        // block=256, grid=FT_OUT/16=96.
+        debug_assert!(FT_OUT.is_multiple_of(16) && L1_OUT == 16);
         cuda_launch! {
-            kernel: dense_mm_bwd_weight,
+            kernel: dense_mm_bwd_weight_tiled,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(FT_OUT * L1_OUT),
+            config: LaunchConfig {
+                grid_dim: ((FT_OUT / 16) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.combined),
                 slice(self.ws.dl1_total),
@@ -2950,8 +4321,10 @@ impl GpuTrainer {
                 b_u32, FT_OUT as u32, L1_OUT as u32
             ]
         }?;
+        // L1f bias backward: shared-mem reduce で global atomic を 1M → ~16K に削減。
+        debug_assert!(L1_OUT == 16);
         cuda_launch! {
-            kernel: bias_grad,
+            kernel: bias_grad_shared_l1f,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * L1_OUT),
@@ -2962,6 +4335,8 @@ impl GpuTrainer {
             ]
         }?;
 
+        prof_tick!("bwd_L1f");
+
         // -- Backward 4 reverse: L1 per-bucket dense grad --
         cuda_launch! {
             kernel: dense_mm_bwd_input_bucket,
@@ -2971,25 +4346,37 @@ impl GpuTrainer {
             args: [
                 slice(self.ws.dl1_total),
                 slice(self.l1_w),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dcombined_from_l1),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
+        prof_tick!("bwd_L1_inB");
+        // L1 weight backward: in_dim=FT_OUT=1536, out_dim=L1_OUT=16, num_buckets=9。
+        // tiled (block=256 threads × 9 bucket accumulator) で batch スキャンを 9 倍冗長から
+        // 1 回に。block grid = in_dim/16 = 96。`debug_assert` で形状不変条件をログ。
+        debug_assert!(
+            FT_OUT.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
+        );
+        // split-K dim を grid_y に追加。num_splits=8 → grid=(96, 8)=768 blocks ≈ 9.6/SM (sm_86)。
         cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket,
+            kernel: dense_mm_bwd_weight_bucket_tiled_l1,
             stream: self.stream,
             module: self.module,
-            // L1: in_dim=FT_OUT, out_dim=L1_OUT → grid = num_buckets * out_dim * in_dim
-            config: cfg_1d(NUM_BUCKETS * L1_OUT * FT_OUT),
+            config: LaunchConfig {
+                grid_dim: ((FT_OUT / 16) as u32, 8, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [
                 slice(self.ws.combined),
                 slice(self.ws.dl1_total),
-                slice(bucket_idx_dev),
-                slice_mut(self.l1_w_grad),
+                slice(self.ws.bucket_idx_dev),
+                slice(self.l1_w_grad),
                 b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
+        prof_tick!("bwd_L1_wB");
         cuda_launch! {
             kernel: bias_grad_bucket,
             stream: self.stream,
@@ -2997,7 +4384,7 @@ impl GpuTrainer {
             config: cfg_1d(b * L1_OUT),
             args: [
                 slice(self.ws.dl1_total),
-                slice(bucket_idx_dev),
+                slice(self.ws.bucket_idx_dev),
                 slice(self.l1_b_grad),
                 b_u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
@@ -3016,6 +4403,8 @@ impl GpuTrainer {
                 (b * FT_OUT) as u32
             ]
         }?;
+
+        prof_tick!("bwd_L1");
 
         // -- Backward 3 reverse: ft_post_perspective_grad × 2 (stm, nstm) --
         // stm: d_combined_offset = 0
@@ -3049,32 +4438,108 @@ impl GpuTrainer {
             ]
         }?;
 
-        // -- Backward 1+2 reverse: sparse_ft_backward × 2 (atomic accumulate ft_w_grad) --
-        cuda_launch! {
-            kernel: sparse_ft_backward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT),
-            args: [
-                slice(self.ws.dft_stm_out),
-                slice(stm_idx_dev),
-                slice(self.ft_w_grad),
-                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: sparse_ft_backward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT),
-            args: [
-                slice(self.ws.dft_nstm_out),
-                slice(nstm_idx_dev),
-                slice(self.ft_w_grad),
-                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
-            ]
-        }?;
-        prof_tick!("backward");
+        prof_tick!("bwd_ftpost");
+
+        // -- Backward 1+2 reverse: sparse_ft_backward × 2 を inverse-index pipeline で実装。
+        // 旧: 各 (b, ri) thread が 38 atomic add → atomic contention で memory bandwidth peak。
+        // 新: phase A (count) → B (prefix sum) → C (scatter) → D (per-feature gather+sum)。
+        // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
+        let total_pairs = (b * MAX_ACTIVE) as u32;
+        let mut iter_idx: u32 = 0;
+        for (gout, idx_dev) in [
+            (&self.ws.dft_stm_out, &self.ws.stm_idx_dev),
+            (&self.ws.dft_nstm_out, &self.ws.nstm_idx_dev),
+        ] {
+            // A: feat_counts ← 0
+            memset_zero(&self.stream, &self.ws.feat_counts)?;
+            memset_zero(&self.stream, &self.ws.feat_write_ctr)?;
+            prof_tick!("phA_reset");
+            // A: build_feature_counts
+            cuda_launch! {
+                kernel: build_feature_counts,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * MAX_ACTIVE),
+                args: [
+                    slice(idx_dev),
+                    slice(self.ws.feat_counts),
+                    b_u32, MAX_ACTIVE as u32, FT_IN as u32
+                ]
+            }?;
+            prof_tick!("phA_count");
+            // B: exclusive_prefix_sum_small (1 block × 1024 threads, FT_IN ≈ 73K)
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    FT_IN as u32
+                ]
+            }?;
+            prof_tick!("phB_psum");
+            // C: scatter_positions
+            cuda_launch! {
+                kernel: scatter_positions,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * MAX_ACTIVE),
+                args: [
+                    slice(idx_dev),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_write_ctr),
+                    slice(self.ws.feat_positions),
+                    b_u32, MAX_ACTIVE as u32, FT_IN as u32
+                ]
+            }?;
+            prof_tick!("phC_scat");
+            // D: gather_and_sum_per_feature。block grid = (FT_IN, FT_OUT/128), block_dim=128.
+            // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
+            // host は grad_w を memset_zero 済みだが、overwrite kernel は全 cell を書き切る。
+            let d_config = LaunchConfig {
+                grid_dim: (FT_IN as u32, (FT_OUT / 128) as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            if iter_idx == 0 {
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite,
+                    stream: self.stream, module: self.module,
+                    config: d_config,
+                    args: [
+                        slice(gout),
+                        slice(self.ws.feat_positions),
+                        slice(self.ws.feat_offsets),
+                        slice(self.ft_w_grad),
+                        FT_IN as u32, FT_OUT as u32
+                    ]
+                }?;
+                // P-obs: phD iter 0 (stm overwrite) を独立計測する。`prof_tick!` は
+                // stream.synchronize を打つので、これが無いと前 iter の compute が次
+                // tick (phA_reset iter 1) に流れ込んで観測上 phA_reset が肥大化する。
+                prof_tick!("phD_stm");
+            } else {
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_add,
+                    stream: self.stream, module: self.module,
+                    config: d_config,
+                    args: [
+                        slice(gout),
+                        slice(self.ws.feat_positions),
+                        slice(self.ws.feat_offsets),
+                        slice(self.ft_w_grad),
+                        FT_IN as u32, FT_OUT as u32
+                    ]
+                }?;
+                prof_tick!("phD_nstm");
+            }
+            iter_idx += 1;
+            let _ = total_pairs; // unused yet
+        }
+        prof_tick!("bwd_ftbwd");
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
         self.step_count += 1;
@@ -3213,11 +4678,8 @@ impl GpuTrainer {
         }
         prof_tick!("optimizer");
 
-        self.stream.synchronize()?;
-
-        // Read loss (`loss_acc` は 1-cell f64 buffer。空なら異常 → error にして無防備 index を避ける)。
-        // この後 step_impl が return すると per-step buffer が drop され、呼び出し元 `step` が
-        // teardown tick を打つ (`*prof_t0` は上の `prof_tick!("optimizer")` が最後に更新した値)。
+        // Read loss (`loss_acc` は 1-cell f64 buffer)。`to_host_vec` 内部で `stream.synchronize`
+        // するため、別途 `self.stream.synchronize()?` は不要 (2 重 sync を削減)。
         let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
         loss_vec
             .first()
@@ -3241,7 +4703,7 @@ impl TrainerBackend for GpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> std::io::Result<f64> {
-        let data = BatchData::from_batch(batch, bucket_idx);
+        let data = BatchData::from_batch_ref(batch, bucket_idx);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
     }
@@ -3440,6 +4902,19 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
         return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
     }
+    // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` / `dense_mm_fwd_tiled_l1f`
+    // / `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
+    // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
+    // position の forward / backward が 走らず loss / gradient が corrupt する。`debug_assert!`
+    // は release で消えるので CLI で early reject する (Codex PR #98 review P2 finding)。
+    if !cli.batch_size.is_multiple_of(16) {
+        return Err(format!(
+            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
+             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
+            cli.batch_size
+        )
+        .into());
+    }
     // loss kernel の選択: --win-rate-model → loss_wrm (bullet v102)、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
         if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
@@ -3633,7 +5108,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -3657,7 +5132,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
-        let loss_wrm = trainer.step(&batch, 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        let loss_wrm = trainer.step(&batch.as_ref(), 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -3668,7 +5143,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -3677,7 +5152,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 1: all weights finite ✓");
 
         // step 2: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
-        let loss_wrm = trainer.step(&batch, lr, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
+        let loss_wrm = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -4280,6 +5755,87 @@ mod gpu_cpu_equivalence_tests {
     }
 
     #[test]
+    fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (64, 96)] {
+            let out_dim = 16_usize;
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| (i as f32) * 0.013 - 0.4)
+                .collect();
+            let w: Vec<f32> = (0..in_dim * out_dim)
+                .map(|i| (i as f32) * 0.0017 + 0.03)
+                .collect();
+            let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+            dense_mm_bwd_input_cpu(&dy, &w, &mut dx_cpu, batch, in_dim, out_dim);
+
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+            let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+            let blocks = (batch / 16) * (in_dim / 16);
+            let config = LaunchConfig {
+                grid_dim: (blocks as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled, stream: stream, module: module,
+                config: config,
+                args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
+                       batch as u32, in_dim as u32, out_dim as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close(
+                &format!("dense_mm_bwd_input_tiled b={batch} in={in_dim}"),
+                &dx_dev.to_host_vec(&stream)?,
+                &dx_cpu,
+                TOL,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        // tiled kernel は in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0 を要求
+        let (_ctx, module, stream) = open_module()?;
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (64, 96)] {
+            let out_dim = 16_usize;
+            let x: Vec<f32> = (0..batch * in_dim)
+                .map(|i| (i as f32) * 0.0031 - 0.7)
+                .collect();
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| (i as f32) * 0.013 - 0.3)
+                .collect();
+            let mut dw_cpu = vec![0.0_f32; in_dim * out_dim];
+            dense_mm_bwd_weight_cpu(&x, &dy, &mut dw_cpu, batch, in_dim, out_dim);
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, in_dim * out_dim)?;
+            // launch with block size 256, grid = in_dim/16 blocks
+            let blocks = in_dim / 16;
+            let config = LaunchConfig {
+                grid_dim: (blocks as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_tiled, stream: stream, module: module, config: config,
+                args: [slice(x_dev), slice(dy_dev), slice_mut(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close(
+                &format!("dense_mm_bwd_weight_tiled b={batch} in={in_dim}"),
+                &dw_dev.to_host_vec(&stream)?,
+                &dw_cpu,
+                TOL,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let (_ctx, module, stream) = open_module()?;
         let batch = 5_usize;
@@ -4360,6 +5916,60 @@ mod gpu_cpu_equivalence_tests {
             &y_cpu,
             TOL,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets <= 9
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
+            let out_dim = 16_usize;
+            let nb = NUM_BUCKETS;
+            let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+            let w: Vec<f32> = (0..nb * out_dim * in_dim)
+                .map(|i| i as f32 * 0.0007 + 0.05)
+                .collect();
+            let bias: Vec<f32> = (0..nb * out_dim).map(|i| i as f32 * 0.02 - 1.0).collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut y_cpu = vec![0.0_f32; batch * out_dim];
+            dense_mm_fwd_bucket_cpu(
+                &x,
+                &w,
+                &bias,
+                &bucket_idx,
+                &mut y_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+            let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+            let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
+            let blocks = batch / 16;
+            let config = LaunchConfig {
+                grid_dim: (blocks as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket_tiled_l1, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev), slice_mut(y_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close(
+                &format!("dense_mm_fwd_bucket_tiled_l1 b={batch} in={in_dim}"),
+                &y_dev.to_host_vec(&stream)?,
+                &y_cpu,
+                TOL,
+            );
+        }
         Ok(())
     }
 
@@ -4449,6 +6059,161 @@ mod gpu_cpu_equivalence_tests {
             &dw_cpu,
             TOL,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        // tiled L2 (in_dim=30, out_dim=32, num_buckets=9)
+        let (_ctx, module, stream) = open_module()?;
+        for &batch in &[16_usize, 64, 256, 1024] {
+            let in_dim = 30_usize;
+            let out_dim = 32_usize;
+            let nb = NUM_BUCKETS;
+            let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.013 - 0.4)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
+            dense_mm_bwd_weight_bucket_cpu(
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+            let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+            let num_splits = 8_usize;
+            let config = LaunchConfig {
+                grid_dim: (num_splits as u32, 1, 1),
+                block_dim: (960, 1, 1), // 32 × 30
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l2, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("dense_mm_bwd_weight_bucket_tiled_l2 b={batch}"),
+                &dw_dev.to_host_vec(&stream)?,
+                &dw_cpu,
+                TOL,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        // tiled L3 (in_dim=32, out_dim=1, num_buckets=9)
+        let (_ctx, module, stream) = open_module()?;
+        for &batch in &[16_usize, 64, 256, 1024] {
+            let in_dim = 32_usize;
+            let out_dim = 1_usize;
+            let nb = NUM_BUCKETS;
+            let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.013 - 0.4)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
+            dense_mm_bwd_weight_bucket_cpu(
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+            let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+            let num_splits = 8_usize;
+            let config = LaunchConfig {
+                grid_dim: (num_splits as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l3, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("dense_mm_bwd_weight_bucket_tiled_l3 b={batch}"),
+                &dw_dev.to_host_vec(&stream)?,
+                &dw_cpu,
+                TOL,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets == 9 を要求
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (32, 96)] {
+            let out_dim = 16_usize;
+            let nb = NUM_BUCKETS;
+            let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.013 - 0.4)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
+            dense_mm_bwd_weight_bucket_cpu(
+                &x,
+                &dy,
+                &bucket_idx,
+                &mut dw_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+            let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+            let blocks = in_dim / 16;
+            let config = LaunchConfig {
+                grid_dim: (blocks as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l1, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close(
+                &format!("dense_mm_bwd_weight_bucket_tiled_l1 b={batch} in={in_dim}"),
+                &dw_dev.to_host_vec(&stream)?,
+                &dw_cpu,
+                TOL,
+            );
+        }
         Ok(())
     }
 
