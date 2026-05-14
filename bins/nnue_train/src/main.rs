@@ -4390,7 +4390,6 @@ impl GpuTrainer {
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
-        prof_tick!("bwd_L3w");
         cuda_launch! {
             kernel: bias_grad_bucket,
             stream: self.stream,
@@ -4404,7 +4403,7 @@ impl GpuTrainer {
             ]
         }?;
 
-        prof_tick!("bwd_L3bias");
+        prof_tick!("bwd_L3");
 
         // -- Backward 12 reverse: crelu_grad on l2_out --
         cuda_launch! {
@@ -4454,7 +4453,6 @@ impl GpuTrainer {
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
-        prof_tick!("bwd_L2w");
         cuda_launch! {
             kernel: bias_grad_bucket,
             stream: self.stream,
@@ -4468,7 +4466,7 @@ impl GpuTrainer {
             ]
         }?;
 
-        prof_tick!("bwd_L2bias");
+        prof_tick!("bwd_L2");
 
         // -- Backward 10 reverse: crelu_grad on l2_pre --
         cuda_launch! {
