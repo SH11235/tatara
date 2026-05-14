@@ -4982,11 +4982,11 @@ impl GpuTrainer {
         }
         prof_tick!("optimizer");
 
-        // Loss readback を async + 1-step lag 化。`AsyncLossRing` が pinned host cell へ
-        // memcpy_dtoh_async + event record を行い、前 step の event を sync して loss を
-        // 返す。step 0 は 0.0 (前 step 無し)。元の `to_host_vec` は内部で
-        // `stream.synchronize` を呼び host が次 batch の launch 発行まで block していた、
-        // この block を排除する。
+        // `loss_acc` の host への取り出しを `AsyncLossRing` 経由で async 化。
+        // pinned host cell に `memcpy_dtoh_async` + event record、前 step の event を
+        // sync して 1 step lag で loss を返す (step 0 は warmup として 0.0、sb 末で
+        // [`TrainerBackend::flush_pending_loss`] が最終 step 分を drain する)。host は
+        // 次 batch の launch 発行で `stream.synchronize` 相当の block 待ちが消える。
         self.loss_ring
             .read_and_queue_next(&self.stream, &self.loss_acc)
     }
