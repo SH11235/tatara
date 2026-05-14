@@ -835,7 +835,7 @@ fn train_one_epoch(
                 steps += 1;
                 batch.clear();
 
-                if args.log_interval_steps > 0 && steps % args.log_interval_steps == 0 {
+                if args.log_interval_steps > 0 && steps.is_multiple_of(args.log_interval_steps) {
                     let (loss_sum, _) = trainer.read_loss_hist()?;
                     let avg = if samples_total > 0 {
                         loss_sum / samples_total as f64
