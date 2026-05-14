@@ -696,17 +696,16 @@ mod tests {
     }
 
     #[test]
-    fn load_v102_100_reference_if_available() {
-        // `/tmp/v102_100_quantised.bin` (bullet で生成した参照 checkpoint) が
-        // 存在するときのみ load + sanity check を回すローカル動作確認。CI では
-        // ファイルが無いので skip。
-        let path = "/tmp/v102_100_quantised.bin";
-        if !std::path::Path::new(path).exists() {
-            eprintln!("skipping load_v102_100_reference (file not found at {path})");
+    fn load_external_reference_if_env_set() {
+        // 外部 reference checkpoint (bullet 生成等) を `RSHOGI_NNUE_V102_REF_BIN`
+        // で指定すると load + sanity check を走らせる任意の regression check。
+        // env var 未設定なら skip (CI 想定)。
+        let Ok(path) = std::env::var("RSHOGI_NNUE_V102_REF_BIN") else {
+            eprintln!("skipping load_external_reference (RSHOGI_NNUE_V102_REF_BIN not set)");
             return;
-        }
-        let mut file = std::fs::File::open(path).expect("open quantised.bin");
-        let weights = V102Weights::load_quantised(&mut file).expect("parse quantised.bin");
+        };
+        let mut file = std::fs::File::open(&path).expect("open reference bin");
+        let weights = V102Weights::load_quantised(&mut file).expect("parse reference bin");
 
         // Sanity: 各 weight buffer の長さが期待値
         assert_eq!(weights.ft_w.len(), FT_IN * FT_OUT);
@@ -726,13 +725,13 @@ mod tests {
         let max_l2 = weights.l2_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         let max_l3 = weights.l3_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         eprintln!(
-            "[v102-100 load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)",
+            "[v102 ref load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)",
             weights.ft_w.len()
         );
-        eprintln!("[v102-100 load] FT weight max abs: {max_ft:.6}");
-        eprintln!("[v102-100 load] L1 weight max abs: {max_l1:.6}");
-        eprintln!("[v102-100 load] L2 weight max abs: {max_l2:.6}");
-        eprintln!("[v102-100 load] L3 weight max abs: {max_l3:.6}");
+        eprintln!("[v102 ref load] FT weight max abs: {max_ft:.6}");
+        eprintln!("[v102 ref load] L1 weight max abs: {max_l1:.6}");
+        eprintln!("[v102 ref load] L2 weight max abs: {max_l2:.6}");
+        eprintln!("[v102 ref load] L3 weight max abs: {max_l3:.6}");
 
         // 量子化範囲チェック: i8 weight は |w| <= 127/QB ≈ 1.984
         assert!(max_ft <= 2.0, "FT max abs {max_ft} > 2.0");
@@ -752,24 +751,22 @@ mod tests {
     }
 
     #[test]
-    fn save_v102_100_resaved_if_available() {
-        // `/tmp/v102_100_quantised.bin` を load → save し直して、size diff と
-        // byte diff count を確認するローカル regression check (CI では skip)。
-        // 別途 `verify_nnue_accumulator` 等で同等性を手動確認する想定。
-        let in_path = "/tmp/v102_100_quantised.bin";
-        let out_path = "/tmp/v102_100_resaved.bin";
-        if !std::path::Path::new(in_path).exists() {
-            eprintln!("skipping save_v102_100_resaved (file not found at {in_path})");
+    fn resave_external_reference_if_env_set() {
+        // 外部 reference checkpoint (`RSHOGI_NNUE_V102_REF_BIN`) を load → save
+        // し直して size と byte 差を比較する regression check。env 未設定なら skip。
+        let Ok(in_path) = std::env::var("RSHOGI_NNUE_V102_REF_BIN") else {
+            eprintln!("skipping resave_external_reference (RSHOGI_NNUE_V102_REF_BIN not set)");
             return;
-        }
-        let mut reader = std::io::BufReader::new(std::fs::File::open(in_path).unwrap());
+        };
+        let out_path = std::env::temp_dir().join("v102_ref_resaved.bin");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
         let weights = V102Weights::load_quantised(&mut reader).unwrap();
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path).unwrap());
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
         weights.save_quantised(&mut writer).unwrap();
         drop(writer);
 
-        let in_size = std::fs::metadata(in_path).unwrap().len();
-        let out_size = std::fs::metadata(out_path).unwrap().len();
+        let in_size = std::fs::metadata(&in_path).unwrap().len();
+        let out_size = std::fs::metadata(&out_path).unwrap().len();
         let diff = (out_size as i64) - (in_size as i64);
         eprintln!("[resave] in_size={in_size}, out_size={out_size}, diff={diff}");
         // Byte size は完全一致を期待 (layout regression detect)。
@@ -779,8 +776,8 @@ mod tests {
 
         // 参照との byte 差は最大 100 bytes 程度を許容範囲とする (rounding boundary
         // の本数は実 weight 分布次第だが、典型的に 0-5 bytes、安全 margin で 100 まで OK)
-        let in_bytes = std::fs::read(in_path).unwrap();
-        let out_bytes = std::fs::read(out_path).unwrap();
+        let in_bytes = std::fs::read(&in_path).unwrap();
+        let out_bytes = std::fs::read(&out_path).unwrap();
         let byte_diff_count = in_bytes
             .iter()
             .zip(out_bytes.iter())

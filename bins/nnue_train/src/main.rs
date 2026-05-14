@@ -5418,23 +5418,23 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
     println!("[smoke] step 0: init weights all finite ✓");
 
-    // /tmp/v102_100_quantised.bin が利用可能なら、bullet v102-100 (sb=100 checkpoint) を
-    // 注入して **golden forward 経路** (forward + backward + save) を検証する。
-    // 不在時は random init smoke のみ。
-    let v102_path = "/tmp/v102_100_quantised.bin";
-    if std::path::Path::new(v102_path).exists() {
-        println!("[smoke] loading bullet v102-100 reference from {v102_path} ...");
-        let mut reader = std::io::BufReader::new(std::fs::File::open(v102_path)?);
+    // `RSHOGI_NNUE_V102_REF_BIN` で外部 reference checkpoint (例: bullet で
+    // 生成した v102 互換 quantised.bin) を指定すると、注入して **golden forward
+    // 経路** (forward + backward + save) を検証する。未設定なら random init smoke のみ。
+    let v102_ref = std::env::var("RSHOGI_NNUE_V102_REF_BIN").ok();
+    if let Some(ref_path) = v102_ref.as_deref().filter(|p| std::path::Path::new(p).exists()) {
+        println!("[smoke] loading v102 reference from {ref_path} ...");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
         let weights = V102Weights::load_quantised(&mut reader)?;
         trainer.load_v102_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
-        println!("[smoke] v102-100 weights injected, all finite ✓");
+        println!("[smoke] v102 reference weights injected, all finite ✓");
 
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
-        println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
+        println!("[smoke] step 1 (post-v102 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
         }
@@ -5442,17 +5442,15 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 1: all weights finite ✓");
 
         // save back as our quantised.bin
-        let out_path = "/tmp/our_quantised.bin";
-        println!("[smoke] saving trained weights to {out_path} ...");
+        let out_path = std::env::temp_dir().join("our_quantised.bin");
+        let out_path_str = out_path.display();
+        println!("[smoke] saving trained weights to {out_path_str} ...");
         let saved_weights = trainer.to_v102_weights()?;
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
-        let out_size = std::fs::metadata(out_path)?.len();
-        println!("[smoke] wrote {out_path}: {out_size} bytes");
-        println!(
-            "[smoke] verify with:\n  /home/sh11235/git-repos/rshogi-oss/target/release/verify_nnue_accumulator \\\n    --nnue-file {out_path} \\\n    --ls-progress-coeff /mnt/e/rshogi-nnue/data/progress/progress_hao_full_cuda.e1.bin \\\n    --moves 10"
-        );
+        let out_size = std::fs::metadata(&out_path)?.len();
+        println!("[smoke] wrote {out_path_str}: {out_size} bytes");
 
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
@@ -5465,7 +5463,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         trainer.assert_all_weights_finite()?;
         println!("[smoke] step 2: all weights finite ✓");
     } else {
-        println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
+        println!("[smoke] (RSHOGI_NNUE_V102_REF_BIN not set or path missing; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
@@ -5595,8 +5593,7 @@ mod raw_ckpt_format_tests {
 // 走らせる:
 //
 // ```bash
-// cd bins/nnue_train
-// CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build
+// cd bins/nnue_train && CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 // cd ../.. && cargo test -p nnue-trainer --release -- --test-threads=1
 // ```
 //
