@@ -79,12 +79,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+#[allow(unused_imports)]
+use cuda_core::IntoResult as _;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
-#[allow(unused_imports)]
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
 use nnue_format::V102Weights;
 use nnue_train::dataloader::Batch;
@@ -2757,6 +2758,9 @@ struct GpuTrainer {
 
     // loss + step
     loss_acc: DeviceBuffer<f64>,
+    /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
+    /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
+    loss_ring: AsyncLossRing,
     step_count: u64,
 }
 
@@ -3102,6 +3106,117 @@ fn copy_host_to_device_async_f32(
     Ok(())
 }
 
+/// `step()` 末尾の `loss_acc.to_host_vec` (内部で `stream.synchronize`) を排除し
+/// host が次 batch の launch を即発行できるようにする ring。
+///
+/// 2-slot ring + 1-step lag: step N で device の `loss_acc` を pinned cell[N%2] に
+/// async D2H + event record。返り値は step N-1 の loss (event[(N-1)%2] sync 後に
+/// pinned cell[(N-1)%2] を読む)。最初の 1 step は前 step が無いので 0.0 を返す。
+///
+/// pinned host (`cuMemHostAlloc`) なので driver は staging copy 無しで直接 DMA、
+/// 8 byte D2H + event record は host work と完全並行。
+struct AsyncLossRing {
+    pinned: [*mut f64; 2],
+    events: [CudaEvent; 2],
+    step: usize,
+    primed: bool,
+}
+
+// SAFETY: `pinned` は `cuMemHostAlloc` で確保した page-locked memory、CUDA driver の
+// 内部 tracking 経由でアクセスされる。pointer 自体は host メモリで `Send` 安全。
+unsafe impl Send for AsyncLossRing {}
+
+impl AsyncLossRing {
+    fn new(ctx: &std::sync::Arc<CudaContext>) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut pinned = [std::ptr::null_mut::<f64>(); 2];
+        for slot in pinned.iter_mut() {
+            let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+            // SAFETY: cuMemHostAlloc は page-locked host memory を 8 byte 確保、
+            // failure 時は CUresult != SUCCESS を返す (.result()? で check)。
+            unsafe {
+                cuda_core::sys::cuMemHostAlloc(
+                    &mut p as *mut _,
+                    std::mem::size_of::<f64>(),
+                    cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
+                )
+                .result()?;
+                // 初期値 0 (warmup で読まれないが defensive)
+                std::ptr::write(p as *mut f64, 0.0);
+            }
+            *slot = p as *mut f64;
+        }
+        let events = [ctx.new_event(None)?, ctx.new_event(None)?];
+        Ok(Self {
+            pinned,
+            events,
+            step: 0,
+            primed: false,
+        })
+    }
+
+    /// `loss_acc` (device 1-cell f64) を async D2H で pinned[cur] へ copy、event 記録。
+    /// 前 step (= step - 1) の event を sync して pinned[prev] を読み返り値とする。
+    /// 最初の呼出 (warmup) は 0.0 を返す。
+    fn read_and_queue_next(
+        &mut self,
+        stream: &CudaStream,
+        loss_acc: &DeviceBuffer<f64>,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let cur = self.step % 2;
+        // SAFETY: pinned[cur] is page-locked host memory (cuMemHostAlloc 8 bytes),
+        // loss_acc has len == 1 (= 8 bytes), stream 上 in-order なので async D2H は
+        // 直前の memset/atomic 完了後に実行される。
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                self.pinned[cur],
+                loss_acc.cu_deviceptr(),
+                std::mem::size_of::<f64>(),
+                stream.cu_stream(),
+            )?;
+        }
+        self.events[cur].record(stream)?;
+
+        let returned = if self.primed {
+            let prev = (self.step + 1) % 2; // = (step - 1) % 2
+            self.events[prev].synchronize()?;
+            // SAFETY: event sync 完了 = D2H 完了、pinned[prev] に書き込まれた f64 を読む。
+            unsafe { *self.pinned[prev] }
+        } else {
+            self.primed = true;
+            0.0
+        };
+
+        self.step += 1;
+        Ok(returned)
+    }
+
+    /// 終了処理: 最後の event を sync して pending な D2H が完了するのを待つ。
+    /// 学習終了時 (Drop でも実質同等だが、明示の方が分かりやすい) に呼ぶ。
+    #[allow(dead_code)]
+    fn drain(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.primed {
+            let last = (self.step + 1) % 2;
+            self.events[last].synchronize()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncLossRing {
+    fn drop(&mut self) {
+        for slot in self.pinned.iter() {
+            if !slot.is_null() {
+                // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放する。
+                // Drop 順は CudaEvent が ctx を保持しているため、ここで host メモリ free
+                // のみ。失敗時は無視 (Drop 中の error 報告は実用上困難)。
+                unsafe {
+                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                }
+            }
+        }
+    }
+}
+
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
@@ -3199,6 +3314,7 @@ impl GpuTrainer {
             ws: GpuWorkspace::new(&stream, batch_size.max(1))?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            loss_ring: AsyncLossRing::new(ctx)?,
             step_count: 0,
         })
     }
@@ -4694,13 +4810,13 @@ impl GpuTrainer {
         }
         prof_tick!("optimizer");
 
-        // Read loss (`loss_acc` は 1-cell f64 buffer)。`to_host_vec` 内部で `stream.synchronize`
-        // するため、別途 `self.stream.synchronize()?` は不要 (2 重 sync を削減)。
-        let loss_vec = self.loss_acc.to_host_vec(&self.stream)?;
-        loss_vec
-            .first()
-            .copied()
-            .ok_or_else(|| -> Box<dyn std::error::Error> { "loss_acc buffer is empty".into() })
+        // Loss readback を async + 1-step lag 化。`AsyncLossRing` が pinned host cell へ
+        // memcpy_dtoh_async + event record を行い、前 step の event を sync して loss を
+        // 返す。step 0 は 0.0 (前 step 無し)。元の `to_host_vec` は内部で
+        // `stream.synchronize` を呼び host が次 batch の launch 発行まで block していた、
+        // この block を排除する。
+        self.loss_ring
+            .read_and_queue_next(&self.stream, &self.loss_acc)
     }
 }
 
