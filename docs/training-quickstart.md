@@ -18,8 +18,8 @@ PSV / `.bin` / checkpoint の命名規約と配置は
 
 ## Step 1: progress.bin を生成 (まだ無い場合)
 
-`progress-kpabs-train` で先に進行度係数を学習する。100M 局面で 5 epoch、
-RTX 3080 Ti で ~1.5 時間。
+`progress-kpabs-train` で先に進行度係数を学習する。`--epochs` で総 epoch
+数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
 
 ```bash
 target/release/progress-kpabs-train \
@@ -28,9 +28,10 @@ target/release/progress-kpabs-train \
   --games-per-step 1024 --epochs 5
 ```
 
-epoch ごとに `<run-name>.e<N>.bin` が出るので、`nnue-train` に渡すのは最終
-epoch (例: `e5.bin`) で良い。中間 epoch (`e1.bin`) を渡せば学習進行度の
-感覚を弱くしただけの bucket になる (NNUE 学習の進行と独立)。
+`nnue-train` には任意の epoch checkpoint (`<run-name>.e<N>.bin`) を
+`--progress-coeff` で渡す。どの epoch を採用するかは試行錯誤になる
+(progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立な
+ため何 epoch 必要かはデータ依存)。
 
 ## Step 2: nnue-train で本体を学習 (400 sb full run)
 
