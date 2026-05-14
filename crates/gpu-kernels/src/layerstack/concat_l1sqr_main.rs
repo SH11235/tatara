@@ -3,7 +3,7 @@
 //! GPU 側 (`#[kernel] fn concat_l1sqr_main_fwd` / `_grad`) は `bins/nnue_train/
 //! src/main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。bullet 上流の
 //! `l1_sqr.concat(l1_main)` (`shogi_layerstack.rs:1434` 付近、`l2_input` を作る前段)
-//! に等価。v102 では `a_dim == b_dim == L1_EFFECTIVE (= 15)`、`out_dim = 30`。
+//! に等価。`a_dim == b_dim == L1_EFFECTIVE (= 15)`、`out_dim = 30`。
 //!
 //! ## アルゴリズム
 //!
@@ -49,7 +49,7 @@ pub fn concat_l1sqr_main_fwd_cpu(
 
 /// `concat(a, b)` gradient reference — `da = dout[..dim]`、`db = dout[dim..2*dim]`。
 ///
-/// **Precondition: `a_dim == b_dim == dim`** (v102 では両方 `L1_EFFECTIVE`)。
+/// **Precondition: `a_dim == b_dim == dim`** (両方 `L1_EFFECTIVE`)。
 /// `dout.len() == batch * 2 * dim`、`da.len() == db.len() == batch * dim` 前提。
 pub fn concat_l1sqr_main_grad_cpu(
     dout: &[f32],
@@ -102,7 +102,7 @@ mod tests {
     /// da == a 部分の grad, db == b 部分の grad (concat は線形なので grad は split)。
     #[test]
     fn round_trip_v102_shape() {
-        // v102: a_dim = b_dim = 15, batch = 3
+        // a_dim = b_dim = 15, batch = 3
         let batch = 3;
         let dim = 15;
         let a: Vec<f32> = (0..batch * dim).map(|i| i as f32).collect();

@@ -12,19 +12,11 @@ publish = false
 workspace = true
 
 [dependencies]
-# CPU-only training pipeline library。schedule (lr/wdl) / dataloader (PSV → sparse
-# batch) / optimizer (Ranger/RAdam host state) を提供する。GPU `#[kernel]` 定義
-# は `bins/nnue_train/src/main.rs` 側 (cuda-oxide bin-entry inline 制約)、本 crate
-# は kernel launch も持たず host 側ロジックのみに留める方針 (CI で test を通す
-# ため `gpu-runtime` 依存も入れない)。
-#
-# - `shogi-format` (Stage 3-5 #61): PSV reader / PackedSfenValue 参照
-# - `shogi-features` (Stage 3-5 #61): HalfKA_hm sparse 特徴抽出 (Stage 3-1 #57 で追加)
-# - `gpu-kernels` (Stage 3-6 #62): pointwise / sparse reference CPU を参照
-#   (optimizer step 等の host orchestration / numerical reference 用)
-#
-# scaffold 段階では使われていないが、後続 issue が順次 `use` するので依存は
-# 先行宣言する。追加 dep (`rand` 等) は実装時に必要が確認されてから足す。
+# CPU-only training pipeline (schedule / dataloader / optimizer host state)。
+# GPU `#[kernel]` 定義は cuda-oxide の bin-entry inline 制約で
+# `bins/nnue_train/src/main.rs` 側に置く必要があり、本 crate は kernel launch を
+#持たず host 側ロジックのみに留める (GPU 非依存の test を CI に通すため
+# `gpu-runtime` も非依存)。`gpu-kernels` は CPU reference 実装の流用のみ。
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }

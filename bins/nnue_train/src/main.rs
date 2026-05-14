@@ -1,10 +1,9 @@
 //! `bins/nnue_train` binary entry point — bullet-shogi v102 互換 NNUE trainer。
 //!
-//! Stage 3-7 (#63) で本 file は **v102 LayerStack arch** の `#[kernel]` 群 (27 個、
-//! うち Stage 3 #84 で `loss_wrm` 追加) と host loop driver (GpuTrainer) を統合する。
-//! Stage 3-8 (#65) で CLI + trainer
-//! integrate、Stage 3-9 (#64) で自己対局検証 (rshogi-oss engine 2 個) で完結する
-//! 予定。
+//! 本 file は **v102 LayerStack arch** の `#[kernel]` 群 (27 個) と host loop
+//! driver (`GpuTrainer`) を統合する。cuda-oxide の bin-entry reachability 制約に
+//! より全 kernel を本 file に inline する必要がある (別 crate に置くと
+//! `compile_ll_to_ptx_via_llc` の symbol resolution から外れる)。
 //!
 //! ## v102 アーキテクチャ (LayerStack 1536-16-32 + progress8kpabs 9 buckets)
 //!
@@ -25,7 +24,7 @@
 //!
 //! ## kernel 一覧 (27 個、bin entry reachability のため全て本 file に inline)
 //!
-//! ### STATED (Stage 2 #46-#52 で landed、本 bin に inline copy)
+//! ### 共通 / 損失 / optimizer
 //! 1. `screlu_grad` — v102 では未使用、compile-reach のため preserve
 //! 2. `loss_wdl` — sigmoid-MSE 損失 + dy_net_output 勾配 (`out ≈ cp` で収束)
 //! 3. `adamw_step` — v102 では未使用、preserve
@@ -34,7 +33,7 @@
 //! 6. `sparse_ft_forward` — L0 forward
 //! 7. `sparse_ft_backward` — L0 backward (atomic scatter)
 //!
-//! ### NEW (Stage 3-7 で v102 arch のため追加)
+//! ### v102 LayerStack 専用 kernel
 //! 8. `ft_post_perspective_fwd` (FUSED: bias+CReLU+pairwise+scale)
 //! 9. `ft_post_perspective_grad` (FUSED: 上記 gradient + ft_bias grad)
 //! 10. `dense_mm_fwd` — regular dense matmul + bias
@@ -55,12 +54,12 @@
 //! 25. `slice_extract_2d` — 2D row 範囲を切り出し (l1_main / l1_skip の slice_rows)
 //! 26. `slice_scatter_2d` — 2D row 範囲へ書き戻し (l1_main / l1_skip slice の backward)
 //!
-//! ### NEW (Stage 3 #84 で bullet v102 厳密再現のため追加)
+//! ### bullet v102 厳密再現用 loss
 //! 27. `loss_wrm` — bullet win-rate-model 損失 + dy_net_output 勾配 (`out ≈ cp / nnue2score`
 //!     で収束、`--win-rate-model` 指定時に `loss_wdl` の代わりに使う。CPU reference は
 //!     `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`)
 //!
-//! ## cuda-oxide 制限への対応 (Stage 1-5〜2-7 で確立)
+//! ## cuda-oxide 制限への対応
 //!
 //! - `f32::clamp` / `f32::max` / `f32::min` lowering 失敗 → `if-else` ladder で展開
 //! - `i32::clamp` も同様 (Debug::fmt panic 経路を含む)
@@ -82,23 +81,27 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
+#[allow(unused_imports)]
 use cuda_host::cuda_launch;
+#[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+#[allow(unused_imports)]
 use nnue_format::V102Weights;
 use nnue_train::dataloader::Batch;
+#[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
 use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 // ===========================================================================
-// STATED kernels — Stage 2 (PR #46-#52) で landed、本 bin に inline copy
+// 共通 / 損失 / optimizer kernel (inline copy)
 // ===========================================================================
 
-/// SCReLU activation gradient (fused) — Stage 2-1 (#37 / PR #46) に inline 配置。
+/// SCReLU activation gradient (fused)。
 ///
-/// 本 v102 path では **未使用** (CReLU + pairwise_mul を使うため)。compile-reach
-/// 用に preserve (cuda-oxide の bin-entry constraint、Stage 1-5 で確立)。
+/// v102 path では **未使用** (CReLU + pairwise_mul を使うため)。cuda-oxide の
+/// bin-entry constraint に従い compile-reach のため preserve。
 ///
 /// 1 thread = 1 element、atomics 不要、in-place output (`dl_dx`)。
 #[kernel]
@@ -126,7 +129,7 @@ pub fn screlu_grad(x: &[f32], dl_dy: &[f32], mut dl_dx: DisjointSlice<f32>, n: u
     }
 }
 
-/// Sigmoid + WDL blend + scale loss kernel — Stage 2-2 (#38 / PR #47) inline。
+/// Sigmoid + WDL blend + scale loss kernel。
 ///
 /// 1 thread = 1 position。`dl_dout` は 1 thread = 1 index で排他更新 (atomics 不要)、
 /// `loss_acc` は f64 単一 cell の Σ err^2 で `DeviceAtomicF64::fetch_add`。
@@ -157,12 +160,12 @@ pub fn loss_wdl(
         *g = 2.0_f32 * err * p * (1.0_f32 - p) * scale * norm;
     }
 
-    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (Stage 1-6 / Stage 2-2 と同型)。
+    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済。
     let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 }
 
-/// bullet win-rate-model (WRM) loss kernel — Stage 3 (#84) inline。
+/// bullet win-rate-model (WRM) loss kernel。
 ///
 /// bullet `examples/shogi_layerstack.rs:2177-2188` (`loss_fn_wrm`、`--win-rate-model`
 /// + `--wrm-in-scaling` 指定時に選ばれる loss closure) + `crates/bullet_lib/src/value/
@@ -234,9 +237,10 @@ pub fn loss_wrm(
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 }
 
-/// Fused AdamW optimizer step — Stage 2-3 (#39 / PR #48) inline。
+/// Fused AdamW optimizer step。
 ///
-/// 本 v102 path では **未使用** (Ranger 使用)。compile-reach 用に preserve。
+/// v102 path では **未使用** (Ranger 使用)。cuda-oxide の bin-entry constraint に従い
+/// compile-reach のため preserve。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::manual_clamp)]
 #[kernel]
@@ -284,7 +288,7 @@ pub fn adamw_step(
     }
 }
 
-/// Fused RAdam optimizer step — Stage 2-4 (#40 / PR #49) inline。
+/// Fused RAdam optimizer step。
 ///
 /// `step_size` / `denom` は host 側 (`gpu_kernels::pointwise::radam_step::
 /// radam_compute_step_size_denom`) で step 番号から事前計算した scalar を値渡し。
@@ -341,7 +345,7 @@ pub fn radam_step(
     }
 }
 
-/// Ranger Lookahead lerp — Stage 2-5 (#41 / PR #50) inline。
+/// Ranger Lookahead lerp。
 ///
 /// `weights[i] = alpha * weights[i] + (1 - alpha) * slow[i]`、`slow[i] = weights[i]`。
 /// `step % k == 0` のときのみ host から呼ばれる lerp 部分。
@@ -366,7 +370,7 @@ pub fn ranger_lookahead_lerp(
     }
 }
 
-/// Sparse feature transform forward (HalfKA_hm 用) — Stage 2-6 (#42 / PR #51) inline。
+/// Sparse feature transform forward (HalfKA_hm 用)。
 ///
 /// 1 thread = 1 (batch, row)、column-major weight (`weight[idx * rows + ri]`)、
 /// atomics 不要 (各 thread は別 output cell に書く)。`-1` padding と `idx >= cols`
@@ -636,7 +640,7 @@ pub fn gather_and_sum_per_feature_add(
     }
 }
 
-/// Sparse feature transform backward (atomic scatter) — Stage 2-7 (#43 / PR #52) inline。
+/// Sparse feature transform backward (atomic scatter)。
 ///
 /// 1 thread = 1 (batch, row)、column-major `grad_weight[idx * rows + ri]`、
 /// **accumulate semantics** (host が呼出前に `grad_weight` を 0 で初期化)。
@@ -735,17 +739,14 @@ pub fn sparse_ft_backward_dual(
 }
 
 // ===========================================================================
-// NEW kernels (Stage 3-7 で v102 arch のため追加)
+// v102 LayerStack 専用 kernel
 // ===========================================================================
 //
 // 設計方針:
 // - atomics は host が呼出前に gradient buffer を 0 初期化する accumulate semantics
-//   (Stage 1-6 grad / Stage 2-7 sparse_ft_backward と同 convention)
 // - DisjointSlice<f32> は 1 thread = 1 cell の排他書き込み、&[f32] + raw atomic は
 //   多 thread → 1 cell の atomic accumulate
 // - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
-// - 数値同等性テスト (GPU↔CPU reference) は Stage 3-7 skeleton 段階では skip
-//   (Stage 3-8 trainer integrate / Stage 3-9 自己対局検証で本物の loss curve 比較)
 
 /// Fused FT post-processing (forward) — bias add → CReLU → pairwise_mul → scale。
 ///
@@ -834,7 +835,7 @@ pub fn ft_post_perspective_fwd(
 ///
 /// **2 回呼ばれる** (stm と nstm 各 1 回)。`grad_bias` は両 call で **共有** (FT bias
 /// は stm/nstm 共有のため、gradient は両方の和)。host は `grad_bias` を 1 回 zero 初期化、
-/// 2 call で atomic accumulate される (Stage 2-7 sparse_ft_backward 同 convention)。
+/// 2 call で atomic accumulate される。
 ///
 /// **stream synchronization**: 本 kernel は default stream で 2 connected launch
 /// (stm 用 + nstm 用) として実行される。cuda-oxide の default stream は serialized
@@ -1760,12 +1761,12 @@ pub fn dense_mm_bwd_input_bucket(
 /// 1 thread = 1 (bucket, out_index, in_index) weight cell。batch を inner loop で回し、
 /// `bucket_idx[b]` が自分の bucket の position だけ accumulate する。non-bucket 版
 /// `dense_mm_bwd_weight` と同じ「1 cell = 1 thread + batch loop」形なので atomic scatter
-/// は不要 (旧実装は 1 thread = 1 (batch, out, in) で同 weight cell へ多 thread atomic add
-/// していた → bucket 偏りで contention 大、Stage 3-quality #77 で本形に変更)。
+/// は不要 (1 thread = 1 (batch, out, in) で同 weight cell へ多 thread atomic add する
+/// 素直な形は bucket 偏りで contention が大きいので採用しない)。
 /// Layout: `grad_w` row-major (num_buckets * out_dim × in_dim) — bucket-major、その中 out-major
 /// (= `dense_mm_fwd_bucket` の weight layout と一致、`tid == grad_w index`)。
 /// out-of-range bucket (`bucket_idx[b] < 0` 等) の position はどの bucket cell にも match
-/// しないので無視される (旧実装の silent skip と同じ)。
+/// しないので silent skip される。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket(
@@ -2330,16 +2331,19 @@ pub fn slice_scatter_2d(
 // Host driver helpers (kernel module loader / launch utilities)
 // ===========================================================================
 
+#[allow(dead_code)]
 const BLOCK_DIM: u32 = 256;
 
 /// 1 D launch の grid 数を計算 (= ceil(n / block)、n=0 は block=1 個 launch)。
+#[allow(dead_code)]
 fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
     let blocks = ((n as u32).max(1)).div_ceil(block);
     (blocks, 1, 1)
 }
 
 /// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
-/// CudaModule を load。fallback 順: `.ll` → `.cubin` → `.ptx`。
+/// CudaModule を load。fallback 順は `.ll` → `.cubin` → `.ptx`。
+#[allow(dead_code)]
 fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
@@ -2389,9 +2393,9 @@ fn load_kernel_module_with_fallback(
     Ok(module)
 }
 
-/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。`kernel_names` のみ
-/// public symbol として保持、それ以外は internalize する (opt の `--internalize`
-/// pass)。
+/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。`kernel_names` で全 27
+/// kernel を internalize する。
+#[allow(dead_code)]
 fn compile_ll_to_ptx_via_llc(
     ll_path: &std::path::PathBuf,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -2420,8 +2424,8 @@ fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // Stage 3-7 + #84 で 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
-    // internalize-public-api-list で残す (kernel-list hazard、Stage 2-2 で確立)。
+    // 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
+    // internalize-public-api-list に残す (1 個でも漏れると opt の globaldce で消える)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
                        adamw_step,radam_step,ranger_lookahead_lerp,\
                        ft_post_perspective_fwd,ft_post_perspective_grad,\
@@ -2481,7 +2485,7 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
         .map_err(|e| {
             format!(
                 "failed to spawn {bin}: {e}. \
-                 Stage 3-7 は llvm-link-21 / opt-21 / llc-21 を要求 \
+                 LLVM 21 系 (llvm-link-21 / opt-21 / llc-21) を要求 \
                  (libNVVM が opaque pointer IR を parse できないため)。\
                  LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で別 binary 指定可。"
             )
@@ -2492,7 +2496,7 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// `libdevice.10.bc` を CUDA Toolkit から探す (Stage 1-9 / Stage 2 と同探索順)。
+/// `libdevice.10.bc` を CUDA Toolkit から探す。
 fn find_libdevice_bc() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     if let Ok(p) = std::env::var("CUDA_OXIDE_LIBDEVICE") {
         let path = std::path::PathBuf::from(p);
@@ -2544,7 +2548,7 @@ const L2_OUT: usize = 32;
 const NUM_BUCKETS: usize = 9; // progress8kpabs
 
 // ===========================================================================
-// raw checkpoint format (Issue #88、`--resume` 用)
+// raw checkpoint format (`--resume` 用)
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -2553,7 +2557,7 @@ const NUM_BUCKETS: usize = 9; // progress8kpabs
 /// まとめた self-contained format (`RNGR` は optimizer state だけ、weight は持たない)。
 const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 
-/// raw checkpoint format version (本 PR は 1、後続変更で increment)。
+/// raw checkpoint format version。
 const RAW_CKPT_VERSION: u32 = 1;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
@@ -2624,8 +2628,7 @@ const FT_POST_SCALE: f32 = 127.0 / 128.0;
 const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
-// `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する
-// (Stage 3-quality #86: 旧 main.rs での const 二重定義を解消)。
+// `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する。
 const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
     nnue_train::optimizer::RangerParams::DEFAULT;
 const BETA1: f32 = RANGER_DEFAULTS.beta1;
@@ -2637,7 +2640,7 @@ const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
 const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
 const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 // v102 は weight-decay を 0.0 に override する (`RangerParams::DEFAULT.decay` = 0.01 は
-// bullet の汎用 default、本 trainer は recipe どおり 0.0 を使う、memory project_v102_recipe.md)。
+// bullet の汎用 default、v102 recipe は 0.0)。
 const DECAY: f32 = 0.0;
 
 // smoke 用 loss params (v102 doc: scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600)。
@@ -2656,10 +2659,9 @@ const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
-// Stage 3-7 段階では smoke 動作 (NaN check) のみ、Stage 3-8 trainer integrate で
-// `crates/nnue-train::trainer` loop と統合する。
 // ===========================================================================
 
+#[allow(dead_code)] // 一部 field は host state 直接更新時のみ使う
 struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -2724,8 +2726,8 @@ struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    // 中間 activation / activation-grad の永続 workspace (Issue #78、batch_size 固定前提
-    // で `new` 時に確保。`step_impl` が requires より大きい batch を渡したら拡張)。
+    // 中間 activation / activation-grad の永続 workspace (batch_size 固定前提で `new`
+    // 時に確保。`step_impl` が requires より大きい batch を渡したら拡張)。
     ws: GpuWorkspace,
 
     // loss + step
@@ -2735,7 +2737,7 @@ struct GpuTrainer {
 
 /// `GpuTrainer::step_impl` の forward / backward で使う中間 activation と
 /// activation-gradient buffer を **1 step ごとに再 alloc せず永続化** するための
-/// workspace (Issue #78)。
+/// workspace。
 ///
 /// 各 buffer は `len_batch` 個の position 分のサイズで確保され、`step_impl` が
 /// より大きな batch を渡してきたら [`GpuWorkspace::ensure_batch`] で grow-only に
@@ -2868,9 +2870,10 @@ impl GpuWorkspace {
     }
 }
 
-/// Smoke / Stage 3-8 trainer 用の 1 batch 入力データ。
+/// Smoke / trainer 用の 1 batch 入力データ。
 /// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
 /// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
+#[allow(dead_code)]
 struct BatchData<'a> {
     n_pos: usize,
     stm_indices: &'a [i32], // (n_pos × MAX_ACTIVE)、-1 padding 可
@@ -2890,14 +2893,6 @@ struct BatchDataOwned {
     bucket_idx: Vec<i32>,
     score: Vec<f32>,
     wdl: Vec<f32>,
-}
-
-/// 1 step 分のハイパーパラメータ。scheduler 経由で per-batch に変化する値を束ねる。
-#[derive(Clone, Copy)]
-struct StepHyperParams {
-    lr: f32,
-    wdl_lambda: f32,
-    loss: LossKind,
 }
 
 impl BatchDataOwned {
@@ -2949,7 +2944,7 @@ impl BatchData<'_> {
     }
 
     /// `nnue-train` dataloader の `Batch` + per-position bucket から borrowed `BatchData`
-    /// を作る (Stage 3-8 trainer integrate、`.to_vec()` を排して 22 MB の CPU memcpy 削減)。
+    /// を作る (`.to_vec()` を避けて 22 MB の CPU memcpy を削減)。
     fn from_batch_ref<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
         let n_pos = batch.n_positions;
         assert_eq!(
@@ -3008,8 +3003,8 @@ fn xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
 }
 
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
-/// 再 alloc を伴わず既存 buffer を in-place で reset するため (Issue #78、grad /
-/// `loss_acc` の毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
+/// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
+/// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
 fn memset_zero<T>(
     stream: &CudaStream,
     buf: &DeviceBuffer<T>,
@@ -3084,7 +3079,7 @@ fn copy_host_to_device_async_f32(
 
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
-    /// 中間 activation workspace (`batch_size` 分、Issue #78) を確保。
+    /// 中間 activation workspace (`batch_size` 分) を確保。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
@@ -3104,8 +3099,8 @@ impl GpuTrainer {
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
 
-        // Weight init: small random for non-degenerate forward (smoke 用、Stage 3-8 で
-        // proper init: ft は bullet `init_with_effective_input_size(32)`、l1 は Zeroed 等)
+        // Weight init: small random for non-degenerate forward (smoke 用、後段で
+        // proper init を適用: ft は bullet `init_with_effective_input_size(32)`、l1 は Zeroed 等)
         let init_scale = 0.01_f32;
         let ft_w_init = xorshift_init(0x100_u64, ft_w_n, init_scale);
         let l1_w_init = xorshift_init(0x101_u64, l1_w_n, init_scale);
@@ -3114,7 +3109,7 @@ impl GpuTrainer {
         let l3_w_init = xorshift_init(0x104_u64, l3_w_n, init_scale);
 
         // Ranger Lookahead の slow weight は **0 初期化** (bullet `RangerLookahead::new`
-        // = `vec![0.0; size]` と同じ、Issue #84/#L6)。初回 lerp (`step % k == 0`) で
+        // = `vec![0.0; size]` と同じ)。初回 lerp (`step % k == 0`) で
         // `weights = alpha*weights + (1-alpha)*0 = alpha*weights` になる挙動も bullet と一致。
         Ok(Self {
             stream: stream.clone(),
@@ -3174,7 +3169,7 @@ impl GpuTrainer {
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
-            // 中間 activation workspace (Issue #78、`batch_size` 分。最低 1 で確保して
+            // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は batch=4 等を渡す)。
             ws: GpuWorkspace::new(&stream, batch_size.max(1))?,
             // loss + step
@@ -3195,7 +3190,7 @@ impl GpuTrainer {
     ///   初回 lerp は `new_w = alpha*fast + (1-alpha)*w_loaded` で、fine-tuning は lr が小さく
     ///   `fast ≈ w_loaded` なので **0 ではなく読み込んだ重みの方へ寄せる** anchor になる
     ///   (true な bullet resume なら `slow.bin` を読むべきだが、量子化 NNUE には optimizer
-    ///   state が無いので next-best な default) — PR #92 review (Codex P2) 指摘)
+    ///   state が無いので next-best な default)
     /// - `grad`: 0
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
@@ -3218,7 +3213,7 @@ impl GpuTrainer {
         // Optimizer state reset:
         // - m, v: 0 (fresh start)
         // - slow: loaded weights と同値 (warm-start anchor: 初回 lookahead lerp が
-        //   0 でなく読み込んだ重みの方へ寄る。`slow = 0` だと alpha 倍に縮む — PR #92 review 指摘)
+        //   0 でなく読み込んだ重みの方へ寄る。`slow = 0` だと alpha 倍に縮む)
         // - grad: 0
         let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
@@ -3402,7 +3397,7 @@ impl GpuTrainer {
         ]
     }
 
-    /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す (Issue #88)。
+    /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_v102_weights` → `save_quantised`)
     /// は推論用 final artifact なので別途従来どおり保存される。本 method はそれとは別の
@@ -3449,7 +3444,7 @@ impl GpuTrainer {
 
         // write+flush 本体を closure に括り、`fs::rename` 前の error path で
         // 中途半端な `<path>.tmp` を best-effort で消す (device→host download / write /
-        // flush 失敗で残骸を残さない、Issue #88 review)。
+        // flush 失敗で残骸を残さないため)。
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let groups = self.raw_ckpt_groups();
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
@@ -3498,14 +3493,14 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// `--resume` で raw checkpoint を読み戻す (Issue #88)。返り値は checkpoint に
-    /// 記録された **完了 superbatch 番号** (caller は通常その +1 から resume する)。
+    /// raw checkpoint を読み戻す (`--resume` 用)。返り値は checkpoint に記録された
+    /// **完了 superbatch 番号** (caller は通常その +1 から resume する)。
     ///
     /// magic / version 不一致、group 数 / 各 group の len が v102 arch と不一致、または
     /// `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
-    /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針、
-    /// Codex convention #62)。読み込んだ raw f32 を host → device upload し、
-    /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
+    /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
+    /// 読み込んだ raw f32 を host → device upload し、`self.step_count` を復元する。
+    /// `grad` buffer は触らない (step ごとに memset される)。
     fn load_raw_checkpoint(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
 
@@ -3643,21 +3638,27 @@ impl GpuTrainer {
     /// プロファイル時の前後 sync と **teardown tick** だけを担う。`step_impl` が
     /// return すると per-step device buffer の `Drop` (= `cuMemFree`) がそこで走るので、
     /// 最後の `prof_tick!` を `step_impl` の **外** で打つことで free 時間も breakdown に
-    /// 含める。
+    /// 含める。中間 activation / grad buffer は `GpuTrainer` 上の workspace に永続化
+    /// しているので、`step_impl` で drop されるのは入力 H2D buffer (`stm_idx_dev` 等、
+    /// position 数に比例した小さい buffer) だけになり、teardown tick は ~0 に落ちる。
     fn step(
         &mut self,
         batch: &BatchData,
-        params: StepHyperParams,
+        lr: f32,
+        wdl_lambda: f32,
+        loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
         // `synchronize()` + 経過時間を stderr に出す (粗い h2d / forward / backward /
         // optimizer / teardown breakdown 用)。未設定なら追加の sync ゼロ。
+        // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
+        // 取れないため、この粗い event timing が代替手段。
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         if profile_step {
             self.stream.synchronize()?;
         }
         let mut prof_t0 = std::time::Instant::now();
-        let result = self.step_impl(batch, params, profile_step, &mut prof_t0)?;
+        let result = self.step_impl(batch, lr, wdl_lambda, loss, profile_step, &mut prof_t0)?;
         // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
         if profile_step {
             self.stream.synchronize()?;
@@ -3675,31 +3676,29 @@ impl GpuTrainer {
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
     /// 本 file の `#[kernel]` 群で再現。中間 activation は `GpuTrainer` 上の永続 workspace
-    /// (`self.ws.*`、Issue #78) を使い回す — forward の各 activation は読まれる前に kernel が
+    /// (`self.ws.*`) を使い回す — forward の各 activation は読まれる前に kernel が
     /// 全 cell を上書きするので memset 不要。Backward path (~16 step): forward 逆順、`*_grad`
     /// buffer は本 method 冒頭で `memset_async(0)` で reset してから kernel が書き込む
     /// (per-bucket weight grad `dense_mm_bwd_weight_bucket` は 1 cell = 1 thread の overwrite、
     /// FT / L1f / bias の grad は atomic accumulate なので reset 必須。`dl1_total` も
     /// `slice_scatter_2d` の host 契約を守るため reset)。`loss_acc` も同様に毎 step memset。
-    /// 入力 H2D buffer (`stm_idx_dev` 等) だけは per-step `DeviceBuffer::from_host` のまま
-    /// (永続化は Issue #81 / P5 の範囲)。Optimizer: 10 weight groups × `radam_step`
-    /// (+ 周期 `ranger_lookahead_lerp`)。
+    /// 入力 H2D buffer (`stm_idx_dev` 等) は workspace 上の pre-allocated buffer に
+    /// async memcpy する。Optimizer: 10 weight groups × `radam_step` (+ 周期
+    /// `ranger_lookahead_lerp`)。
     ///
     /// `profile_step` / `prof_t0` は呼び出し元 ([`GpuTrainer::step`]) が管理し、本 method
     /// 内の `prof_tick!` が各 phase 境界で `*prof_t0` を更新する (戻った後に呼び出し元が
     /// teardown tick で読む)。
+    #[allow(clippy::too_many_arguments)]
     fn step_impl(
         &mut self,
         batch: &BatchData,
-        params: StepHyperParams,
+        lr: f32,
+        wdl_lambda: f32,
+        loss: LossKind,
         profile_step: bool,
         prof_t0: &mut std::time::Instant,
     ) -> Result<f64, Box<dyn std::error::Error>> {
-        let StepHyperParams {
-            lr,
-            wdl_lambda,
-            loss,
-        } = params;
         let b = batch.n_pos;
         if b == 0 {
             return Ok(0.0);
@@ -3708,7 +3707,7 @@ impl GpuTrainer {
         // CLI で `--batch-size` を 16 倍数に reject 済 (`run_training`)、`BucketedPrefetchedLoader`
         // も `n_positions == batch_size` を保証する (`dataloader.rs:572`) ため通常到達しない。
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
-        // 明示的な runtime check を入れる (PR #98 Codex review P2)。
+        // 明示的な runtime check を入れる。
         if !b.is_multiple_of(16) {
             return Err(format!(
                 "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
@@ -3719,7 +3718,7 @@ impl GpuTrainer {
         }
         let b_u32 = b as u32;
 
-        // 中間 activation workspace を batch `b` 以上に拡張 (grow-only、Issue #78)。
+        // 中間 activation workspace を batch `b` 以上に拡張 (grow-only)。
         // batch_size 固定なら起動時の `GpuWorkspace::new` で足りているので no-op。
         self.ws.ensure_batch(&self.stream, b)?;
 
@@ -3748,12 +3747,12 @@ impl GpuTrainer {
         copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, batch.wdl)?;
         // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
-        // loss_acc reset (accumulate semantics、再 alloc せず memset、Issue #78)
+        // loss_acc reset (accumulate semantics、再 alloc せず memset)
         memset_zero(&self.stream, &self.loss_acc)?;
         prof_tick!("h2d+reset");
 
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
-        // 中間 activation は workspace (`self.ws.*`) を使い回す (Issue #78、再 alloc 無し)。
+        // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
         cuda_launch! {
             kernel: sparse_ft_forward,
@@ -4036,8 +4035,8 @@ impl GpuTrainer {
         // ===== BACKWARD =====
         // 全 *_grad buffer を 0 で reset (atomic accumulate semantic に従う kernel が
         // 多い、また overwrite kernel も in-place 安全のため統一)。再 alloc せず
-        // `memset_async(0)` で既存 buffer を reset (Issue #78、`ft_w_grad` だけで ~450MB
-        // の `cudaMalloc`/`cudaFree` を毎 step 走らせていたのを撤廃)。
+        // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
+        // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
         let ft_w_n = FT_IN * FT_OUT;
         let ft_b_n = FT_OUT;
@@ -4049,12 +4048,10 @@ impl GpuTrainer {
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
-        // ft_w_grad の memset_zero は `gather_and_sum_per_feature_overwrite` (phase D
-        // iter 0、stm) が全 (feature, ri) cell を sum (off_start==off_end の時も sum=0)
-        // で書き切る (main.rs:585-591 / 599) ため、ここでの 450MB reset は redundant。
-        // 2026-05-14 計測: pos/s 影響は ±0% (sm_86, 5 sb × 200 batches × bs=65536 で
-        // 670K → 671K)。perf 改善目的ではなく "毎 step 450MB の no-op を排除する論理
-        // 整理" として残す。
+        // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
+        // `gather_and_sum_per_feature_overwrite` が全 (feature, ri) cell を sum
+        // (off_start==off_end の時も sum=0) で書き切るため、ここで 450MB を reset
+        // するのは無意味 (毎 step の no-op を排除する論理整理)。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
@@ -4695,12 +4692,7 @@ impl TrainerBackend for GpuTrainer {
         loss: LossKind,
     ) -> std::io::Result<f64> {
         let data = BatchData::from_batch_ref(batch, bucket_idx);
-        let params = StepHyperParams {
-            lr,
-            wdl_lambda,
-            loss,
-        };
-        self.step(&data, params)
+        self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
     }
 
@@ -4733,14 +4725,13 @@ impl TrainerBackend for GpuTrainer {
 }
 
 // ===========================================================================
-// CLI (clap) — Stage 3-8 (#65)、bullet `examples/shogi_layerstack.rs` の引数群を
-// v102 recipe (memory project_v102_recipe.md) に合わせて受ける
+// CLI (clap) — bullet `examples/shogi_layerstack.rs` の引数群を v102 recipe に合わせて受ける
 // ===========================================================================
 
 /// bullet-shogi v102 互換 HalfKA_hm 1536-16-32 LayerStack NNUE trainer。
 ///
 /// `--data <PSV>` を指定すると training loop を回す。省略すると GPU smoke test
-/// (`GpuTrainer` の forward/backward path 確認、Stage 3-7 由来) を実行する。
+/// (`GpuTrainer` の forward/backward path 確認) を実行する。
 #[derive(Parser, Debug)]
 #[command(name = "nnue-train", about = "rshogi NNUE trainer (v102 LayerStack)")]
 struct Cli {
@@ -4757,7 +4748,7 @@ struct Cli {
     net_id: String,
 
     /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
-    /// v102 recipe は 400 (memory project_v102_recipe.md)。
+    /// v102 recipe は 400。
     #[arg(long, default_value_t = 10)]
     superbatches: usize,
 
@@ -4765,7 +4756,7 @@ struct Cli {
     #[arg(long, default_value_t = 6104)]
     batches_per_superbatch: usize,
 
-    /// 1 batch あたりの position 数。default 16384 は本リポ既定、v102 recipe は 65536。
+    /// 1 batch あたりの position 数。default 16384 は smoke 既定、v102 recipe は 65536。
     #[arg(long, default_value_t = 16384)]
     batch_size: usize,
 
@@ -4810,7 +4801,7 @@ struct Cli {
     init_from: Option<PathBuf>,
 
     /// raw checkpoint (`{net_id}-{sb}.ckpt`) から weight + Ranger optimizer state
-    /// (m/v/slow/step) を復元して学習を再開する (Issue #88、真の resume)。`--init-from`
+    /// (m/v/slow/step) を復元して学習を再開する (真の resume)。`--init-from`
     /// とは排他 (`--init-from` は weight のみ注入し optimizer を reset するため)。
     /// `--start-superbatch` 未指定なら checkpoint に記録された superbatch の +1 から再開。
     #[arg(long)]
@@ -4822,7 +4813,7 @@ struct Cli {
     #[arg(long)]
     start_superbatch: Option<usize>,
 
-    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (Issue #88、ディスク節約)。
+    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (ディスク節約)。
     /// 未指定なら全保持 (raw state は ~1.8GB/個 なので save-rate × superbatches が
     /// 大きい長期ランでは指定推奨; 例 save-rate 20 / 400sb = 20 個 ≈ 36GB)。量子化
     /// `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
@@ -4851,10 +4842,10 @@ struct Cli {
     /// weight decay (kernel は 0.0 固定、非 0 指定で warning)。
     #[arg(long, default_value_t = 0.0)]
     weight_decay: f32,
-    /// dataloader prefetch worker 数 (Issue #89)。各 worker が PSV パース +
-    /// HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算を `decode()` 1 回で済ませて
-    /// 先読み供給する。`1` で従来の決定論的逐次 read 相当、`>= 2` で並列パース
-    /// (1 epoch 内の position 順序は非決定的; training では問題ない)。
+    /// dataloader prefetch worker 数。各 worker が PSV パース + HalfKA_hm sparse 抽出 +
+    /// progress8kpabs bucket 計算を `decode()` 1 回で済ませて先読み供給する。`1` で
+    /// 決定論的逐次 read、`>= 2` で並列パース (1 epoch 内の position 順序は非決定的;
+    /// training では問題ない)。
     #[arg(long, default_value_t = 16)]
     threads: usize,
     /// bucket mode ("progress8kpabs" のみ実装)。
@@ -4902,7 +4893,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // / `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
     // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
     // position の forward / backward が 走らず loss / gradient が corrupt する。`debug_assert!`
-    // は release で消えるので CLI で early reject する (Codex PR #98 review P2 finding)。
+    // は release で消えるので CLI で early reject する。
     if !cli.batch_size.is_multiple_of(16) {
         return Err(format!(
             "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
@@ -4987,7 +4978,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
-    // workspace を batch_size 分で確保 (Issue #78、partial 末尾 batch は grow-only で対応)。
+    // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(&ctx, cli.batch_size)?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
@@ -5069,7 +5060,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
-    // workspace を smoke の固定 batch 分で確保 (Issue #78)。
+    // workspace を smoke の固定 batch 分で確保。
     let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
@@ -5104,14 +5095,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(
-            &batch.as_ref(),
-            StepHyperParams {
-                lr,
-                wdl_lambda: WDL_LAMBDA,
-                loss: SMOKE_LOSS_SIGMOID,
-            },
-        )?;
+        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -5132,17 +5116,10 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             "[smoke] verify with:\n  /home/sh11235/git-repos/rshogi-oss/target/release/verify_nnue_accumulator \\\n    --nnue-file {out_path} \\\n    --ls-progress-coeff /mnt/e/rshogi-nnue/data/progress/progress_hao_full_cuda.e1.bin \\\n    --moves 10"
         );
 
-        // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する (#84)。
+        // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
-        let loss_wrm = trainer.step(
-            &batch.as_ref(),
-            StepHyperParams {
-                lr: 1e-3_f32,
-                wdl_lambda: WDL_LAMBDA,
-                loss: SMOKE_LOSS_WRM,
-            },
-        )?;
+        let loss_wrm = trainer.step(&batch.as_ref(), 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -5153,14 +5130,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
-        let loss = trainer.step(
-            &batch.as_ref(),
-            StepHyperParams {
-                lr,
-                wdl_lambda: WDL_LAMBDA,
-                loss: SMOKE_LOSS_SIGMOID,
-            },
-        )?;
+        let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
@@ -5169,14 +5139,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 1: all weights finite ✓");
 
         // step 2: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
-        let loss_wrm = trainer.step(
-            &batch.as_ref(),
-            StepHyperParams {
-                lr,
-                wdl_lambda: WDL_LAMBDA,
-                loss: SMOKE_LOSS_WRM,
-            },
-        )?;
+        let loss_wrm = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
             return Err(format!("step 2 (wrm) loss = {loss_wrm} is not finite").into());
@@ -5194,7 +5157,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] wrote {out_path}: {out_size} bytes");
     }
 
-    println!("[smoke] PASSED — Stage 3-7 GpuTrainer skeleton OK (v102 arch full path)");
+    println!("[smoke] PASSED — GpuTrainer skeleton OK (v102 arch full path)");
     Ok(())
 }
 
@@ -5215,7 +5178,7 @@ fn main() -> std::process::ExitCode {
 }
 
 // ===========================================================================
-// raw checkpoint format helper tests (Issue #88、GPU 不要)
+// raw checkpoint format helper tests (GPU 不要)
 // ===========================================================================
 #[cfg(test)]
 mod raw_ckpt_format_tests {
@@ -5283,14 +5246,13 @@ mod raw_ckpt_format_tests {
 }
 
 // ===========================================================================
-// GPU ↔ CPU reference 数値同等性テスト。
+// GPU ↔ CPU reference 数値同等性テスト
 //
-// 本 module は **GPU 必須**。CI 非対応 (GitHub-hosted runner に CUDA 無し)、
-// ローカル GPU box でのみ走る想定。`#[cfg(test)]` を main.rs 内に直接置くことで
-// kernel symbol (上の `#[kernel]` 群) に path 解決できる (tests/*.rs では bin の
-// `#[kernel]` に届かないため)。`nnue-trainer` は workspace `--exclude` で CI から
-// 外しているので CI には影響しない (typecheck は通す:
-// `cargo test -p nnue-trainer --release --no-run`)。
+// 本 module は **GPU 必須**。`#[cfg(test)]` を main.rs 内に置くことで kernel
+// symbol (上の `#[kernel]` 群) に直接 path 解決できる (tests/*.rs では bin の
+// `#[kernel]` に届かない)。`nnue-trainer` は workspace `--exclude` で CI から
+// 外しているので CI には影響しないが、typecheck は通す必要あり
+// (`cargo test -p nnue-trainer --release --no-run`)。
 //
 // 走らせる:
 //
@@ -5303,7 +5265,7 @@ mod raw_ckpt_format_tests {
 // 各テストは小規模 batch (b = 3〜4) で GPU kernel を launch → download → 上の
 // `gpu_kernels::layerstack::*_cpu` reference と比較。`-1` padding (sparse index /
 // bucket_idx)、全 9 bucket、CReLU 境界値 (ちょうど 0.0 / 1.0 / 負)、NaN 伝搬を含む。
-// tolerance: forward / gradient 1e-5、整数/index 出力は完全一致 (Stage 1/2 基準)。
+// tolerance: forward / gradient 1e-5、整数/index 出力は完全一致。
 //
 // kernel ↔ CPU ref 対応表は `gpu_kernels::layerstack` の module doc 参照。
 #[cfg(test)]
@@ -5325,7 +5287,7 @@ mod gpu_cpu_equivalence_tests {
         slice2d::{slice_extract_2d_cpu, slice_scatter_2d_cpu},
     };
 
-    /// forward / gradient の f32 tolerance (Stage 1/2 標準の 1e-5)。
+    /// forward / gradient の f32 tolerance。
     const TOL: f32 = 1e-5;
 
     type CudaCtxModuleStream = (
@@ -5378,8 +5340,7 @@ mod gpu_cpu_equivalence_tests {
 
     /// `assert_close` の relative-tolerance 版。atomic reduce (`fetch_add`) で複数
     /// thread が 1 cell に加算する出力は加算順序が GPU と CPU で異なり、和の大きさに
-    /// 比例した f32 round-off drift が出る (Stage 2-2 で atomic loss を 1e-6→1e-5 に
-    /// 緩めたのと同根)。`|gpu - cpu| <= tol * (1 + |cpu|)` で判定する。
+    /// 比例した f32 round-off drift が出る。`|gpu - cpu| <= tol * (1 + |cpu|)` で判定する。
     fn assert_close_rel(label: &str, gpu: &[f32], cpu: &[f32], tol: f32) {
         assert_eq!(gpu.len(), cpu.len(), "{label}: len mismatch");
         for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {

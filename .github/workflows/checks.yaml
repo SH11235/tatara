@@ -26,10 +26,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # workspace.members が [] のときは `cargo --workspace` が
+      # workspace.members が空 (`[]`) のときは `cargo --workspace` が
       #   "manifest is virtual, and the workspace has no members"
-      # で fail するので、crate が追加されるまで fmt/clippy/test を skip する。
-      # Stage 1 で `crates/shogi-format` 等を追加した時点で本ガードは通過する。
+      # で fail するため、空 workspace では fmt/clippy/test を skip する。
       - name: detect empty workspace
         id: ws
         run: |
@@ -44,15 +43,16 @@ jobs:
         if: steps.ws.outputs.empty == 'false'
         run: cargo fmt --all -- --check
 
-      # `cuda-host` を直接 / 推移的に dep する crate は CUDA toolkit + LLVM 21+ +
-      # cuda-oxide が必要で、GitHub-hosted runner では build できないため exclude する
-      # (build.rs が `cuda.h` を要求して fail する)。self-hosted runner の別 workflow
-      # で full check する想定。新規に GPU 依存 crate を追加する際は --exclude リストを
-      # 更新すること。
+      # 以下の --exclude リストは GPU (CUDA toolkit + LLVM 21+ + cuda-oxide) を
+      # 必要とする crate 一式。`#[kernel]` macro 展開で `cuda_host::CudaKernel` が
+      # 要求され、transitive な cuda-bindings build script が `cuda.h` を必要と
+      # するため GitHub-hosted runner では build できない。新しい GPU 依存 crate
+      # を追加するときも --exclude を更新すること (CPU full check は
+      # `scripts/local-ci.sh` で別途回す)。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer
+        run: cargo test --workspace --exclude gpu-runtime --exclude exp-001-cuda-oxide-kpabs --exclude exp-002-fused-kernels --exclude progress-kpabs-train --exclude nnue-trainer

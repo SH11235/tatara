@@ -12,10 +12,5 @@ publish = false
 workspace = true
 
 [dependencies]
-# NNUE binary (header / halfka_psqt weight quantisation) の serialization 専用 crate。
-# Stage 3-2 (#58) で `header` module、Stage 3-3 (#59) で `halfka_psqt` module を
-# 追加する。CPU-only library、GPU 依存は持たない。
-#
-# `shogi-format` は bona_piece / FE_OLD_END 等の定数参照のため Stage 3-3 で必要に
-# なる想定だが、scaffold 段階では依存ゼロでも build 通る。実際の依存追加は
-# Stage 3-3 着手時に行う (YAGNI)。
+# NNUE 重みファイル (header / halfka_psqt / v102 layerstack) の (de)serialization
+# 専用 crate。CPU-only、GPU 依存なし。

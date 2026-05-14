@@ -1,21 +1,20 @@
-//! bins/progress_kpabs_train binary entry point。
+//! `progress-kpabs-train` binary entry point。
 //!
-//! Stage 1-9 (#13) で本 file は kernel 定義 (`#[kernel]`) と host loop driver を
-//! 統合する。host loop は PSV file 群 → batch → forward → grad → adam_step を
-//! 駆動し、最終 weight を YaneuraOu 互換 progress.bin に出力する。
+//! 本 file は kernel 定義 (`#[kernel]`) と host loop driver を統合する。host
+//! loop は PSV file 群 → batch → forward → grad → adam_step を駆動し、最終
+//! weight を YaneuraOu 互換 `progress.bin` に出力する。
 //!
 //! ## 設計
 //!
-//! - **kernels** (forward / grad / adam_step / eval) は本 file の inline `#[kernel]`。
-//!   cuda-oxide rustc-codegen-cuda backend が bin entry 経由で到達可能な
-//!   `#[kernel]` のみ NVPTX IR 化するため、main.rs に置く必要がある
+//! - **kernels** (forward / grad / adam_step / eval) は本 file の inline
+//!   `#[kernel]`。cuda-oxide の rustc-codegen-cuda backend は bin entry 経由で
+//!   到達可能な `#[kernel]` のみ NVPTX IR 化するため、main.rs に置く必要がある。
 //! - **GpuTrainer** は本 file。device buffer (weights / m / v / grad / loss_acc /
-//!   hist + scratch) を所有し、`step` で 1 batch 分の forward → grad → adam_step
-//!   を launch する
+//!   hist + scratch) を所有し、`step` / `eval_forward` で 1 batch 分の
+//!   forward → grad/eval → (training なら) adam_step を launch する。
 //! - **host helper** (Batch builder / PSV reader / progress.bin I/O / CLI) は
-//!   GPU 非依存なので `lib.rs` の `host` module に置く。CI runner では本 crate
-//!   が `--exclude` されるため build されないが、host helper は `cargo test
-//!   -p progress-kpabs-train` で単体テスト可能
+//!   GPU 非依存なので `lib.rs` の `host` module に置く。host helper は
+//!   `cargo test -p progress-kpabs-train` で GPU なしで単体テストできる。
 //!
 //! ## 使い方
 //!
@@ -61,19 +60,17 @@ use progress_kpabs_train::host::{
 };
 use shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
 
-/// Forward kernel (KP-abs sigmoid prediction per position).
+/// Forward kernel (KP-abs sigmoid prediction per position)。
 ///
-/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
-/// inline 定義しているのは、cuda-oxide の rustc-codegen-cuda backend が
-/// **bin entry から到達可能な kernel** を PTX 化する設計だから (lib.rs 内
-/// kernel は `cargo oxide build <crate>` では PTX に出ない、本リポでは
-/// 経験的に未生成を確認)。GPU launch path は Stage 1-9 (#13) で host loop
-/// を組むときに ここから呼び出す。
+/// `#[kernel]` を main.rs に inline 定義しているのは、cuda-oxide の
+/// rustc-codegen-cuda backend が **bin entry から到達可能な kernel** のみを
+/// PTX 化する設計のため (lib.rs 内 `#[kernel]` は `cargo oxide build` の出力
+/// に現れない)。host 側 `GpuTrainer` は同じ file 内の `cuda_launch!` macro
+/// 経由で呼び出す。
 ///
 /// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_forward`) との差分は
-/// reference CPU 実装 (`src/kernels/forward.rs::forward_cpu`、lib path で
-/// `gpu_kernels::progress::forward::forward_cpu`) の docstring
-/// および `ATTRIBUTION.md` の Stage 1-5 entry を参照。
+/// reference CPU 実装 (`gpu_kernels::progress::forward::forward_cpu`) の
+/// docstring および `ATTRIBUTION.md` を参照。
 #[kernel]
 pub fn forward(
     indices: &[i32],
@@ -101,17 +98,14 @@ pub fn forward(
     }
 }
 
-/// Backward kernel (loss accumulation + gradient scatter + prediction histogram).
+/// Backward kernel (loss accumulation + gradient scatter + prediction histogram)。
 ///
-/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
-/// inline 定義しているのは forward と同じ理由 (cuda-oxide backend は bin
-/// entry から到達可能な kernel しか PTX 化しない)。GPU launch path は
-/// Stage 1-9 (#13) で host loop を組むときに ここから呼び出す。
+/// `#[kernel]` を main.rs に inline 定義しているのは forward と同じ理由
+/// (cuda-oxide backend は bin entry から到達可能な kernel しか PTX 化しない)。
 ///
 /// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_grad_loss_hist`) との
-/// 差分は reference CPU 実装 (`src/kernels/grad.rs::grad_cpu`、lib path で
-/// `gpu_kernels::progress::grad::grad_cpu`) の docstring および
-/// `ATTRIBUTION.md` の Stage 1-6 entry を参照。
+/// 差分は reference CPU 実装 (`gpu_kernels::progress::grad::grad_cpu`) の
+/// docstring および `ATTRIBUTION.md` を参照。
 ///
 /// Atomics:
 /// - `grad[idx]` の f32 加算 → `DeviceAtomicF32::fetch_add` (`atomicrmw fadd`)
@@ -159,7 +153,7 @@ pub fn grad(
             // bounds 確認済の前提で kernel に渡る)。
             // alignment: `f32` の `align_of` (4) は `DeviceAtomicF32` と同一
             // (`#[repr(transparent)]` over `UnsafeCell<f32>`)。non-atomic 経路で
-            // 同じ memory に書き込む code path は本 kernel/host loop には存在しない。
+            // 同じ memory に書き込む code path は本 kernel / host loop には存在しない。
             let grad_atom =
                 unsafe { &*(grad.as_ptr().add(idx as usize) as *const DeviceAtomicF32) };
             grad_atom.fetch_add(gscale, AtomicOrdering::Relaxed);
@@ -174,7 +168,7 @@ pub fn grad(
     // i32::clamp は内部で assert!(min <= max) → Debug::fmt panic path を含み、
     // cuda-oxide backend (rustc-codegen-cuda) が現状 lowering 未対応のため
     // bullet 上流 C++ の `if (b<0) b=0; if (b>7) b=7;` を verbatim 移植する。
-    // ここだけ clippy::manual_clamp を allow。
+    // ここだけ `clippy::manual_clamp` を allow。
     #[allow(clippy::manual_clamp)]
     let b = {
         let mut b = (p * 8.0f32) as i32;
@@ -193,13 +187,13 @@ pub fn grad(
 
 /// Adam optimizer step kernel (1 thread = 1 weight)。
 ///
-/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
-/// inline 定義しているのは forward / grad と同じ理由。GPU launch path は
-/// Stage 1-9 (#13) で host loop を組むときに ここから呼び出す。
+/// `#[kernel]` を main.rs に inline 定義しているのは forward / grad と同じ
+/// 理由 (cuda-oxide backend は bin entry から到達可能な kernel しか PTX 化
+/// しない)。
 ///
 /// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_adam_step`) との差分は
-/// reference CPU 実装 (`src/kernels/adam_step.rs::adam_step_cpu`) の docstring
-/// および `ATTRIBUTION.md` の Stage 1-7 entry を参照。
+/// reference CPU 実装 (`gpu_kernels::progress::adam_step::adam_step_cpu`) の
+/// docstring および `ATTRIBUTION.md` を参照。
 ///
 /// 引数数 (11) は bullet 上流 `k_adam_step` と 1:1 対応のため
 /// `too_many_arguments` を allow する。
@@ -249,23 +243,22 @@ pub fn adam_step(
     }
 }
 
-/// Evaluation kernel (loss + histogram only)。validation/test 時に gradient
-/// 計算なしで loss と prediction 分布を取るために使う。Stage 1-6 grad の
-/// gradient scatter 部分を取り除いたサブセット。
+/// Evaluation kernel (loss + histogram only)。validation / test 時に gradient
+/// 計算なしで loss と prediction 分布を取るために使う (`grad` から gradient
+/// scatter 部分を取り除いたサブセット)。
 ///
-/// **本 binary は kernel を直接 launch しない**。`#[kernel]` を main.rs に
-/// inline 定義しているのは forward / grad / adam_step と同じ理由。GPU launch
-/// path は Stage 1-9 (#13) で host loop を組むときに ここから呼び出す。
+/// `#[kernel]` を main.rs に inline 定義しているのは forward / grad / adam_step
+/// と同じ理由。
 ///
 /// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_eval_loss_hist`) との
-/// 差分は reference CPU 実装 (`src/kernels/eval.rs::eval_cpu`) の docstring
-/// および `ATTRIBUTION.md` の Stage 1-8 entry を参照。
+/// 差分は reference CPU 実装 (`gpu_kernels::progress::eval::eval_cpu`) の
+/// docstring および `ATTRIBUTION.md` を参照。
 ///
 /// Atomics:
 /// - `loss_acc` (single f64 cell) → `DeviceAtomicF64::fetch_add` (`atomicrmw fadd double`)
 /// - `hist[bin]` (u64) → `DeviceAtomicU64::fetch_add` (`atomicrmw add i64`)
 ///
-/// ordering は `Relaxed` (Stage 1-6 grad と同様、collection 用途で順序保証不要)。
+/// ordering は `Relaxed` (collection 用途で順序保証不要)。
 #[kernel]
 pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_pos: u32) {
     let pos = thread::index_1d();
@@ -281,8 +274,9 @@ pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_po
     let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 
-    // i32::clamp は cuda-oxide が現状 lowering 未対応 (Stage 1-6 grad と同根、
-    // panic 経路の Debug::fmt を含むため)。bullet 上流の if-else を verbatim 移植。
+    // i32::clamp は cuda-oxide が現状 lowering 未対応 (`grad` kernel と同根の
+    // panic 経路 `Debug::fmt` を含むため)。bullet 上流の if-else を verbatim
+    // 移植。
     #[allow(clippy::manual_clamp)]
     let b = {
         let mut b = (p * 8.0f32) as i32;
@@ -322,10 +316,10 @@ const BLOCK_DIM: u32 = 256;
 ///
 /// ## .ll → .ptx の変換
 ///
-/// `cuda_host::ltoir::build_cubin_from_ll` (libNVVM 経由) は本リポの cuda-oxide
-/// が出力する opaque pointer 形式の NVVM IR を parse できない (実機エラー:
-/// `libnvvm error 9: parse expected type`、IR の `define void @grad(ptr ...)`
-/// 行で reject される)。代わりに **`llc-21`** で素直に NVPTX backend を回す。
+/// `cuda_host::ltoir::build_cubin_from_ll` (libNVVM 経由) は cuda-oxide が出力
+/// する opaque pointer 形式の NVVM IR を parse できない (libNVVM 内蔵 LLVM が
+/// 古く、`define void @grad(ptr ...)` 形式を `libnvvm error 9: parse expected
+/// type` で reject する)。代わりに **`llc-21`** で素直に NVPTX backend を回す。
 /// `__nv_sqrtf` 等 libdevice intrinsic は `.extern .func` 宣言として残るが、
 /// CUDA driver の JIT linker が module load 時に libdevice と link する。
 fn load_kernel_module_with_fallback(
@@ -400,13 +394,12 @@ fn load_kernel_module_with_fallback(
 ///
 /// 結果の `.ptx` は `.extern .func` 宣言を含まず、`ptxas` / driver JIT が完結する。
 ///
-/// **なぜ `cuda-host::build_cubin_from_ll` (libNVVM 経由) を使わないか**: 本リポの
-/// cuda-oxide rev `6de0509` が出力する NVVM IR は opaque pointer 形式 (`define
-/// void @grad(ptr ...)`) で、libNVVM は古い LLVM 版を内蔵していて opaque
-/// pointer を parse できず `nvvmCompileProgram error 9: parse expected type`
-/// で reject される (実機確認、`progress_kpabs_train.ll:11` 由来)。
+/// **なぜ `cuda-host::build_cubin_from_ll` (libNVVM 経由) を使わないか**:
+/// cuda-oxide が出力する NVVM IR は opaque pointer 形式 (`define void @grad(ptr
+/// ...)`) で、libNVVM は古い LLVM 版を内蔵していて opaque pointer を parse
+/// できず `nvvmCompileProgram error 9: parse expected type` で reject される。
 /// `llvm-link-21 + opt-21 + llc-21` の組合せは LLVM 21 series 以降の opaque
-/// pointer をネイティブ扱いするため成功する。
+/// pointer をネイティブに扱うため成功する。
 fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let stem = ll_path
         .file_stem()
@@ -433,8 +426,8 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // 本実験の kernel 名 (Stage 1-5..1-8)。`@<name>` として `.ll` 側に出ている
-    // ものをそのまま渡す。順番は問わない。
+    // 本 binary に inline 定義した kernel 名。`@<name>` として `.ll` 側に
+    // 出ているものをそのまま渡す。順番は問わない。
     let kernel_names = "grad,forward,adam_step,eval";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
@@ -490,7 +483,7 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
         .map_err(|e| {
             format!(
                 "failed to spawn {bin}: {e}. \
-                 Stage 1-9 は llvm-link-21 / opt-21 / llc-21 を要求します \
+                 本 binary は llvm-link-21 / opt-21 / llc-21 を要求します \
                  (libNVVM が opaque pointer IR を parse できないため)。\
                  LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で別 binary を指定可。"
             )
@@ -538,19 +531,19 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 /// GPU 上で 4 kernel を順次起動する trainer。bullet-shogi 上流の `GpuTrainer`
-/// 相当だが本リポでは cuda-oxide の `cuda_launch!` macro を使うため kernel
-/// シンボルを直接渡せる (NVRTC 経由ではない)。
+/// 相当だが、cuda-oxide の `cuda_launch!` macro を使うため kernel シンボルを
+/// 直接渡せる (NVRTC 経由ではない)。
 ///
 /// device buffer は内部所有:
-/// - `weights / m / v / grad`: `DeviceBuffer<f32>` (size = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS)
+/// - `weights / m / v / grad`: `DeviceBuffer<f32>` (size = `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`)
 /// - `loss_acc`: `DeviceBuffer<f64>` (size = 1)
 /// - `hist`: `DeviceBuffer<u64>` (size = 8)
 ///
-/// 入力 (indices / targets / per_pos_norm / preds) は `step` 内で
-/// `DeviceBuffer::from_host` / `zeroed` する。bullet-shogi 上流のような scratch
-/// reuse は cuda-oxide の `DeviceBuffer<T>::from_host` が新規 allocation のみ
-/// 提供するため一旦見送り、Stage 1-10 (#14) の perf 計測時に
-/// `Stream::memcpy_h2d` 直接呼び出しで再利用化する想定 (TODO)。
+/// 入力 (`indices` / `targets` / `per_pos_norm` / `preds`) は `step` /
+/// `eval_forward` 内で `DeviceBuffer::from_host` / `zeroed` する (scratch reuse
+/// は cuda-oxide の `DeviceBuffer<T>::from_host` が新規 allocation のみ提供
+/// するため未実装、`Stream::memcpy_h2d` を直接呼び出す形で将来再利用化する
+/// 想定の TODO)。
 struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -623,8 +616,8 @@ impl GpuTrainer {
             return Ok(());
         }
 
-        // 入力 buffer は per-step に新規 alloc。Stage 1-10 で perf 計測時に
-        // `Stream::memcpy_h2d` で再利用化する想定 (TODO)。
+        // 入力 buffer は per-step に新規 alloc。perf 計測時に `Stream::memcpy_h2d`
+        // を直接呼んで再利用化する想定 (TODO)。
         let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
         let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
         let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
@@ -706,6 +699,57 @@ impl GpuTrainer {
                 bc1,
                 bc2,
                 n_w_u32
+            ]
+        }?;
+
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// 評価 path: forward → eval kernel (loss + histogram のみ、weight 不変)。
+    #[allow(dead_code)]
+    fn eval_forward(&mut self, batch: &Batch) -> Result<(), Box<dyn std::error::Error>> {
+        let n_pos = batch.n_positions;
+        if n_pos == 0 {
+            return Ok(());
+        }
+
+        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
+        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
+        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
+
+        let n_pos_u32 = n_pos as u32;
+        let max_inds_u32 = MAX_INDS_PER_POS as u32;
+        let cfg_pos = LaunchConfig {
+            grid_dim: grid_dim_1d(n_pos, BLOCK_DIM),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        cuda_launch! {
+            kernel: forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(indices_dev),
+                slice(self.weights),
+                slice_mut(preds_dev),
+                n_pos_u32,
+                max_inds_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: eval,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_pos,
+            args: [
+                slice(preds_dev),
+                slice(targets_dev),
+                slice(self.loss_acc),
+                slice(self.hist),
+                n_pos_u32
             ]
         }?;
 
@@ -899,28 +943,25 @@ fn main() -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1-10: GPU ↔ CPU reference 数値同等性テスト + samples/sec ベンチ
+// GPU ↔ CPU reference 数値同等性テスト + samples/sec ベンチ
 // ---------------------------------------------------------------------------
 //
-// 本 module は **GPU 必須**。CI ではないローカル sm_75 box でのみ走る想定で、
-// `#[cfg(test)]` で main.rs 内に置くことで kernel symbol (forward / grad /
-// adam_step / eval) に直接 path 解決できる (lib.rs 経由では bin のみに
-// 存在する `#[kernel]` に届かないため、tests/*.rs では呼び出せない)。
+// 本 module は **GPU 必須**。`#[cfg(test)]` で main.rs 内に置くことで kernel
+// symbol (forward / grad / adam_step / eval) に直接 path 解決できる (lib.rs
+// 経由では bin のみに存在する `#[kernel]` に届かないため `tests/*.rs` からは
+// 呼び出せない)。
 //
 // 走らせる:
 //
 // ```bash
 // cd bins/progress_kpabs_train
-// CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build  # .ll 生成
+// CUDA_OXIDE_TARGET=sm_75 cargo-oxide build  # .ll 生成
 // cargo test -p progress-kpabs-train --bin progress-kpabs-train --release \
 //     -- --test-threads=1
 // ```
 //
 // `--test-threads=1` は CudaContext を複数 test 間で共有しないため (各 test が
 // 独自に context を作る前提)。`--release` 推奨だが debug build でも動く。
-//
-// CI からは `cargo clippy --workspace --exclude progress-kpabs-train ...` の
-// 通り本 crate ごと exclude されているので影響なし。
 #[cfg(test)]
 mod gpu_cpu_equivalence_tests {
     use super::*;
@@ -1236,9 +1277,9 @@ mod gpu_cpu_equivalence_tests {
 
     /// 最小ベンチ: sample.psv の先頭ゲームから 4 games × 8 pos = 32 pos の batch を
     /// 組み、warm-up 1 step + 計測 50 steps の `samples/sec` を `println!` で記録。
-    /// Stage 1-10 の手動検証用 baseline。`> 1.0` だけ assert する loose check で
-    /// 環境差を吸収。安定した PR-to-PR perf tracking には別 `--bench` workflow
-    /// (criterion 等) が必要 (Stage 2+ 想定)。
+    /// 手動検証用の baseline で、`> 1.0` だけ assert する loose check により環境差
+    /// を吸収する。安定した PR 間 perf tracking には criterion 等の別 bench workflow
+    /// が必要。
     #[test]
     fn samples_per_sec_baseline_on_sample_psv() -> Result<(), Box<dyn std::error::Error>> {
         let (ctx, _module, _stream) = open_module()?;
@@ -1275,11 +1316,11 @@ mod gpu_cpu_equivalence_tests {
         let total_samples = n_pos_per_step * n_steps;
         let samples_per_sec = total_samples as f64 / elapsed.as_secs_f64();
         println!(
-            "Stage 1-10 baseline: {} positions/batch × {} steps in {:.3?} → {:.0} samples/sec",
+            "samples_per_sec baseline: {} positions/batch × {} steps in {:.3?} → {:.0} samples/sec",
             n_pos_per_step, n_steps, elapsed, samples_per_sec
         );
-        // 環境依存なので閾値は緩く: 1 sample/sec 以上ならまず動いている (大体 sm_75
-        // の本 box では 4 games × 8 positions = 32 / step が ~1ms 以下の見込み)
+        // 環境依存なので閾値は緩く: 1 sample/sec 以上ならまず動いている (sm_75 級
+        // GPU では 4 games × 8 positions = 32 / step が ~1ms 以下の見込み)。
         assert!(
             samples_per_sec > 1.0,
             "samples/sec too low: {samples_per_sec}"

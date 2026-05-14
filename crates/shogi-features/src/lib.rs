@@ -2,14 +2,10 @@
 //!
 //! - `progress_kpabs`: KP-absolute 特徴 (`81 * FE_OLD_END` 次元) と
 //!   logistic regression による 0..=1 progress / 0..=7 bucket。
-//!   bullet-shogi (commit `f275eb9`) の
-//!   `crates/bullet_lib/src/game/outputs.rs::ShogiProgressKPAbs` から vendor。
 //! - `halfka_hm`: HalfKA_hm (Half-Mirror) 特徴 (`45 * 1629 = 73_305` 次元、
-//!   合法局面の active 数固定 40)、Stage 3 NNUE 1536-16-32 trainer の入力。
-//!   bullet-shogi (commit `f275eb9`) の
-//!   `crates/bullet_lib/src/game/inputs/shogi_halfka.rs::ShogiHalfKA_hm` から vendor。
+//!   合法局面の active 数固定 40)、NNUE 1536-16-32 trainer の入力。
 //!
-//! 詳細な取り込み元・差分は本リポの `ATTRIBUTION.md` を参照。
+//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 pub mod halfka_hm;
 pub mod progress_kpabs;

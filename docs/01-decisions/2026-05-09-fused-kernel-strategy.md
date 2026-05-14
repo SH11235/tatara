@@ -1,4 +1,4 @@
-# ADR-0004: runtime fusion を build-time hand-fused kernel で代替する
+# runtime fusion を build-time hand-fused kernel で代替する
 
 - **Status**: Accepted
 - **Date**: 2026-05-09
@@ -15,12 +15,12 @@ naive port (1 op = 1 kernel) なら memory bandwidth bound で
 
 ## Decision
 
-本リポは **shogi NNUE 専用**で architecture が固定なため、必要な fused kernel
-パターンは **3〜5 種類で打ち止め**になる。それらを cuda-oxide で
-**build-time に hand-code** すれば bullet runtime-fused 相当の memory traffic
-を達成できる。
+本リポジトリは shogi NNUE 専用で architecture が固定のため、必要な fused
+kernel パターンは 3〜5 種類で打ち止めできる。それらを cuda-oxide で
+build-time に hand-code すれば bullet runtime-fused 相当の memory traffic を
+達成できる。
 
-### Fused kernel カタログ (Stage 2 で整備)
+### Fused kernel カタログ
 
 | Pattern | Op 数 | 用途 |
 |---|---|---|
@@ -35,8 +35,9 @@ naive port (1 op = 1 kernel) なら memory bandwidth bound で
 ## Consequences
 
 - 性能ギャップ ~±0% を狙える。「runtime fusion 喪失で −20〜−40%」の懸念は
-  naive port 限定の話で、本リポでは設計でカバーする。
+  naive port 限定の話で、設計でカバーする。
 - 実装は `crates/gpu-kernels/pointwise/` 配下に Pattern 1 個 = 1 ファイルで配置
-- 各 fused kernel に benchmark を併設して bullet 版との速度比較を継続検証
-- 新しい optimizer や activation を試す時はパターンを追加する必要がある (固定コスト)
-- 詳細カタログは `docs/kernels/fused-pattern-catalog.md` (Stage 2 で作成) に記録
+- 各 fused kernel に CPU reference 実装と数値同等性テストを併設する
+- 新しい optimizer や activation を試すときはパターンを追加する必要がある
+  (固定コスト)
+- 詳細カタログは `docs/kernels/fused-pattern-catalog.md`

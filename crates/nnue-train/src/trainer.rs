@@ -1,12 +1,12 @@
 //! Training-loop driver — host-side superbatch loop for the v102 NNUE trainer。
 //!
-//! bullet-shogi `crates/bullet_lib/src/value.rs::ValueTrainerInner` 相当の loop
-//! を、GPU 非依存の trait (`TrainerBackend`) 越しに駆動する。`bins/nnue_train::
+//! GPU 非依存の trait ([`TrainerBackend`]) 越しに 1 batch 分の forward / backward
+//! / optimizer step を呼び出す superbatch loop を提供する。`bins/nnue_train::
 //! GpuTrainer` が `TrainerBackend` を impl し、本 module の [`run`] がそれを
-//! 呼ぶ (Stage 3-0 規約: `nnue-train` crate は `gpu-runtime` に依存せず、kernel
-//! launch は bin 側に置く、Stage 1-9 pattern)。
+//! 駆動する (`nnue-train` crate は `gpu-runtime` に依存せず、kernel launch は
+//! bin 側に置く設計)。
 //!
-//! ## ループ構造 (bullet `ValueTrainerInner::train_custom` の簡易版)
+//! ## ループ構造
 //!
 //! ```text
 //! for sb in start_superbatch..=end_superbatch:
@@ -19,42 +19,36 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb)  # raw f32 + Ranger state (resume 用、Issue #88)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb)  # raw f32 + Ranger state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
 //! `start_superbatch != 1` で呼ぶと resume になる: lr/wdl scheduler は superbatch
-//! index 駆動 (`StepLR` は `(sb-1)/step`) なので `start_superbatch` を渡せば lr が
-//! 自動で正しい値に戻る (weight + optimizer state の復元自体は backend 側、
-//! `bins/nnue_train --resume` が `GpuTrainer::load_raw_checkpoint` 経由で行う)。
+//! index 駆動 (`StepLR` は `(sb-1)/step` を使う) なので `start_superbatch` を
+//! 渡せば lr が自動で正しい値に戻る。weight + optimizer state の復元自体は
+//! backend 側で別途行う必要がある (`bins/nnue_train --resume` 経路)。
 //!
-//! per-position の output bucket は progress8kpabs (`ShogiProgressKPAbs::bucket`、
-//! YaneuraOu 互換 `progress.bin` の重み付き和 → sigmoid → `floor(p * 8)` を
-//! `0..=7` に clamp) で求める。bullet v102 の network は 9 bucket を持つが
-//! progress8kpabs は bucket 8 を使わない (bullet `ShogiLayerStackBucket9`
-//! と同じ「9bucket 互換、bucket8 未使用」挙動)。`progress.bin` 未指定時は
-//! 重みが全 0 で `p = sigmoid(0) = 0.5` → 全 position が bucket 4 になる。
+//! ## per-position output bucket
 //!
-//! ## bullet 上流からの差分
+//! progress8kpabs (`ShogiProgressKPAbs::bucket`、YaneuraOu 互換 `progress.bin` の
+//! 重み付き和 → sigmoid → `floor(p * 8)` を `0..=7` に clamp) で求める。
+//! v102 の network は 9 bucket を持つが progress8kpabs は bucket 8 を使わない
+//! (9bucket 互換 layout で bucket8 未使用)。`progress.bin` 未指定時は重みが
+//! 全 0 で `p = sigmoid(0) = 0.5` となり、全 position が bucket 4 に collapse する。
 //!
-//! - bullet `ValueTrainerInner` (`bullet_core::Trainer` + `DataLoader` trait +
-//!   `LoggingConfig` 等) は使わず、Stage 1 `bins/progress_kpabs_train::
-//!   train_one_epoch` 流儀の直書き loop に簡素化 (Stage 1-1 / 3-1 / 3-4 と同じ
-//!   bullet trait 削除ポリシー)。
-//! - PSV stream は [`crate::dataloader::BucketedPrefetchedLoader`] (Issue #89)
-//!   経由で読む: `--threads` 本の worker が PSV パース + HalfKA_hm sparse 抽出 +
-//!   progress8kpabs bucket 計算を `PackedSfenValue::decode()` 1 回で済ませて
-//!   `(Batch, per-position bucket)` を先読み供給する。EOF で同 file を開き直して
-//!   次 epoch とする / `--score-drop-abs` skip / 空 file の `MAX_BARREN_PASSES`
-//!   ガードは loader 内の `PsvEpochReader` が担う (旧 `EpochStream` を移設)。
-//!   bullet の `--epoch-file-shuffle` (epoch ごと file shuffle) は本 stage では
-//!   未実装 — CLI フラグは受けても no-op。**worker 数 ≥ 2 では 1 epoch 内の
-//!   position の順序が非決定的になる** (`BucketedPrefetchedLoader` doc 参照;
-//!   training では問題ない)。
-//! - bullet `--score-drop-abs` (`5c4871c`: `|score| >= t` の position の
-//!   per-position loss weight を 0 にする) は本実装では **batch に push しない
-//!   (skip)** で近似する。loss/gradient へ寄与しない点は同じだが、batch の
-//!   構成 (slot 割当・順序) は厳密一致しない。
+//! ## score-drop-abs の近似
+//!
+//! bullet `--score-drop-abs t` は本来「`|score| >= t` の position の per-position
+//! loss weight を 0 にする」semantics。本実装は **batch に push しない (skip)**
+//! で近似する。loss/gradient へ寄与しない点は同じだが、batch の構成 (slot
+//! 割当・順序) は厳密一致しない。
+//!
+//! ## 決定論性
+//!
+//! `cfg.threads >= 2` のとき [`BucketedPrefetchedLoader`] は 1 epoch 内の
+//! position 順序が非決定的になる (loader doc 参照)。lr / wdl は `batch_idx`
+//! 駆動で順序非依存なので training には影響しない。決定論的順序が必要なら
+//! `cfg.threads = 1` を指定する。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,26 +65,24 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 
 /// training step で使う loss の種別と固定パラメータ。
 ///
-/// バックエンド ([`TrainerBackend::train_step`]) はこの enum で分岐して対応する
-/// loss kernel (`bins/nnue_train` の `loss_wdl` / `loss_wrm`) を起動する。GPU には
-/// 触らない (CPU-only crate に置ける、Stage 3-0 規約)。
+/// backend ([`TrainerBackend::train_step`]) はこの enum で分岐して対応する
+/// loss kernel (`loss_wdl` / `loss_wrm`) を起動する。本 enum 自体は GPU には
+/// 触らず CPU-only crate に置ける。
 ///
-/// - [`LossKind::Sigmoid`] — 旧来の plain sigmoid-MSE (`p = sigmoid(out * scale)`,
+/// - [`LossKind::Sigmoid`] — plain sigmoid-MSE (`p = sigmoid(out * scale)`,
 ///   target = `lambda*wdl + (1-lambda)*sigmoid(score * scale)`)。net_output が
-///   cp 単位 (`out ≈ cp`) で収束する。`bins/nnue_train` の `loss_wdl` kernel に対応。
-/// - [`LossKind::Wrm`] — bullet win-rate-model loss (nodchip 流、v102 recipe
-///   `--win-rate-model --wrm-in-scaling 340 --wrm-nnue2score 600`)。prediction /
-///   target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score` (O(1)) で
-///   収束し、`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。
-///   `bins/nnue_train` の `loss_wrm` kernel に対応 (CPU reference は
-///   `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`)。target 側 in_scaling (380) と
-///   offset (270) は bullet ハードコード、prediction 側 in_scaling は `--wrm-in-scaling`。
+///   cp 単位 (`out ≈ cp`) で収束する。
+/// - [`LossKind::Wrm`] — bullet win-rate-model loss (nodchip 流の WRM)。prediction
+///   / target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score`
+///   (O(1)) で収束し、量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と scale が整合する。
+///   target 側 `in_scaling` (380) と offset (270) は bullet ハードコード値、
+///   prediction 側 `in_scaling` は `--wrm-in-scaling` 経由で本 enum field から渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
-    /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 は `1/290`)。
+    /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 recipe は `1/290`)。
     Sigmoid { scale: f32 },
-    /// bullet win-rate-model loss。`nnue2score = --wrm-nnue2score` (600)、
-    /// `in_scaling = --wrm-in-scaling` (340、prediction 側のみ)。
+    /// bullet win-rate-model loss。`nnue2score = --wrm-nnue2score` (recipe 値 600)、
+    /// `in_scaling = --wrm-in-scaling` (recipe 値 340、prediction 側のみ)。
     Wrm { nnue2score: f32, in_scaling: f32 },
 }
 
@@ -164,22 +156,22 @@ pub trait TrainerBackend {
         loss: LossKind,
     ) -> io::Result<f64>;
 
-    /// 現在の weight を量子化 NNUE binary として `path` に書き出す
-    /// (Stage 3-3 `nnue-format` の `save_quantised` 相当を backend 側で実行)。
+    /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
+    /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
     fn save_checkpoint(&mut self, path: &Path) -> io::Result<()>;
 
-    /// resume 用 **raw f32 checkpoint** を `path` に書き出す (Issue #88)。
+    /// resume 用 **raw f32 checkpoint** を `path` に書き出す。
     ///
-    /// 量子化 `.bin` ([`TrainerBackend::save_checkpoint`]) と違い、全 weight group の
-    /// raw f32 値に加えて optimizer state (Ranger の `m` / `v` / `slow`) と step counter、
-    /// および現在の `superbatch` 番号を保存する。これを `--resume` で読み戻すと
-    /// optimizer state ごと学習を再開できる (`--init-from` は weight だけ注入し
-    /// optimizer state を reset するため真の resume にはならない)。
+    /// 量子化 `.bin` ([`TrainerBackend::save_checkpoint`]) と違い、全 weight
+    /// group の raw f32 値に加えて optimizer state (Ranger の `m` / `v` / `slow`)
+    /// と step counter、および現在の `superbatch` 番号を保存する。これを
+    /// `--resume` で読み戻すと optimizer state ごと学習を再開できる
+    /// (`--init-from` の weight だけ注入する経路と違い、optimizer 状態も
+    /// 復元される真の resume)。
     ///
-    /// backend 側 (`bins/nnue_train::GpuTrainer`) は device → host download → file 書き出し
-    /// (`.tmp` へ書いてから `rename` で atomic に置換) を行う。`crates/nnue-train` は
-    /// GPU 非依存なので、本 trait は **path / superbatch 番号だけ** を受け取り device IO は
-    /// backend 任せ (Stage 3-0 規約)。
+    /// backend 側は device → host download → file 書き出し (`.tmp` へ書いてから
+    /// `rename` で atomic に置換) を行う。本 crate は GPU 非依存なので、本 trait
+    /// は **path / superbatch 番号だけ** を受け取り device I/O は backend 任せ。
     fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> io::Result<()>;
 }
 
@@ -189,9 +181,9 @@ pub trait TrainerBackend {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
-/// bullet `TrainingSchedule` + `examples/shogi_layerstack.rs` CLI 引数のうち
-/// v102 recipe (memory `project_v102_recipe.md`) の再現に必要な subset を持つ。
-/// learning rate / WDL schedule は別に `LrScheduler` / `WdlScheduler` を渡す。
+/// v102 recipe (bullet 互換 NNUE 1536-16-32 + 9-bucket LayerStack) の再現に
+/// 必要な subset。learning rate / WDL schedule は別に [`LrScheduler`] /
+/// [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
@@ -208,18 +200,18 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
     pub save_rate: usize,
-    /// `Some(n)` のとき、新しい raw checkpoint (`{net_id}-{sb}.ckpt`) を書いた後、
-    /// 直近 `n` 個より古い raw checkpoint を削除する (Issue #88、`--keep-checkpoints`)。
-    /// `None` は全 raw checkpoint を保持 (default; raw state は ~1.8GB/個 なので
-    /// save-rate × superbatches が大きい長期ランでは明示指定推奨)。量子化 `.bin`
+    /// `Some(n)` のとき、新しい raw checkpoint (`{net_id}-{sb}.ckpt`) を書いた
+    /// 後、直近 `n` 個より古い raw checkpoint を削除する (`--keep-checkpoints`)。
+    /// `None` は全 raw checkpoint を保持。raw state は ~1.8GB/個 なので
+    /// save-rate × superbatches が大きい長期ランでは明示指定推奨。量子化 `.bin`
     /// (~116MB) は本設定に関わらず常に全保持する (推論 artifact なので保守的に)。
     pub keep_raw_checkpoints: Option<usize>,
     /// どの loss kernel で学習するか (sigmoid-MSE / bullet WRM) + 固定パラメータ。
     pub loss: LossKind,
-    /// `Some(t)` のとき `|score| >= t` の position を skip する (bullet `--score-drop-abs`)。
+    /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
-    /// dataloader の prefetch worker 数 (`--threads`、Issue #89)。`0` は `1` 扱い。
-    /// `1` で従来の決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
+    /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
+    /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
     pub threads: usize,
 }
@@ -276,10 +268,10 @@ impl TrainingConfig {
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
 /// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
 ///
-/// PSV stream は [`BucketedPrefetchedLoader`] (Issue #89) で `cfg.threads` 本の
-/// worker から `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer
-/// 再利用される。worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる
-/// 点に注意 (training では問題ない)。
+/// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
+/// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
+/// worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる点に注意
+/// (training では問題ない)。
 pub fn run<B, L, W>(
     backend: &mut B,
     data_path: &Path,
@@ -371,13 +363,12 @@ where
             format_hms(eta_secs),
         );
 
-        // MSRV 1.85: `usize::is_multiple_of` は 1.87 stable なので使わない (memory 既知の罠)。
         if sb % cfg.save_rate == 0 || sb == cfg.end_superbatch {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path)?;
             println!("[train] checkpoint saved: {}", path.display());
 
-            // resume 用 raw checkpoint (Issue #88): weight raw f32 + Ranger state + step + sb。
+            // resume 用 raw checkpoint: weight raw f32 + Ranger state + step + sb。
             let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));
             backend.save_resume_checkpoint(&raw_path, sb)?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
@@ -397,12 +388,12 @@ where
 }
 
 /// `{net_id}-{sb}.ckpt` 形式の raw checkpoint のうち、superbatch 番号 (`sb`) の
-/// 大きい順に `keep` 個だけ残し、それより古いものを削除する (Issue #88、
-/// `--keep-checkpoints`)。量子化 `.bin` には触らない (推論 artifact なので全保持)。
+/// 大きい順に `keep` 個だけ残し、それより古いものを削除する
+/// (`--keep-checkpoints`)。量子化 `.bin` には触らない (推論 artifact なので全保持)。
 ///
 /// 削除失敗 (権限・他プロセス) は警告のみで `run` を止めない (training 続行優先)。
-/// `keep == 0` は呼ばれない想定 (`TrainingConfig::validate` で reject 済) だが、
-/// 万一渡されても全削除はしない (no-op で警告)。
+/// `keep == 0` は `TrainingConfig::validate` で reject 済の想定だが、万一渡されても
+/// 全削除はしない (no-op で警告)。
 fn prune_old_raw_checkpoints(output_dir: &Path, net_id: &str, keep: usize) {
     if keep == 0 {
         eprintln!(
@@ -542,7 +533,7 @@ mod tests {
             self.last_buckets = bucket_idx.to_vec();
             self.max_batch_positions = self.max_batch_positions.max(batch.n_positions);
             self.seen_lr.push(lr);
-            // 単調減少する dummy loss (issue の「loss 推移 monotonic decreasing 観察」相当)。
+            // 単調減少する dummy loss (loss 推移の monotonic decreasing assertion 用)。
             Ok(1.0 / self.steps as f64)
         }
 
@@ -646,7 +637,7 @@ mod tests {
 
     #[test]
     fn run_with_start_superbatch_offset_resumes_loop_and_lr_schedule() {
-        // Issue #88: `start_superbatch != 1` (resume) で回したとき:
+        // `start_superbatch != 1` (resume) で呼んだとき:
         //  - 正しい step 回数 (start..=end の superbatch 数 × batches/sb)
         //  - checkpoint / resume-checkpoint が start..=end の番号で命名される
         //  - lr schedule が offset を反映する (StepLR sb=3 = start * gamma^2)
@@ -709,7 +700,7 @@ mod tests {
 
     #[test]
     fn keep_raw_checkpoints_prunes_oldest() {
-        // Issue #88: `--keep-checkpoints N` 相当。end_superbatch=6, save_rate=1 で
+        // `--keep-checkpoints N` 相当。end_superbatch=6, save_rate=1 で
         // 6 個の .ckpt が書かれるが keep=2 なら直近 2 個 (sb 5, 6) だけ残る。
         // (MockBackend は実 file を書かないので、テスト用に空 file を実 dir に置いて
         //  prune ロジックを exercise する。)
@@ -767,7 +758,8 @@ mod tests {
 
     #[test]
     fn prune_raw_checkpoints_sorts_numerically_not_lexically() {
-        // Issue #88 regression: superbatch 番号は parse 済 `usize` で降順 sort される。
+        // superbatch 番号は parse 済 `usize` で降順 sort される (string sort
+        // への regression 検出)。
         // 9, 10, 11 を keep=2 で prune したとき、数値 sort なら最古の 9 が消え 10/11 が残る。
         // lexical (string) sort に regress すると "10" < "11" < "9" となり 11 を誤って消す。
         let dir = std::env::temp_dir().join(format!(

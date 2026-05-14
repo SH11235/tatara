@@ -3,7 +3,7 @@
 //! GPU 側 (`#[kernel] fn crelu_fwd` / `crelu_grad`) は `bins/nnue_train/src/
 //! main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。bullet 上流の
 //! `crelu()` (`crates/trainer/src/model/builder.rs` の activation) と等価で、
-//! v102 では FT post / l2_pre / l2_out の activation に使われる。
+//! FT post / l2_pre / l2_out の activation に使われる。
 //!
 //! ## アルゴリズム
 //!

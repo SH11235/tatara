@@ -1,16 +1,16 @@
 //! Fused RAdam optimizer step (AdamW + bias correction + denom switch) の
 //! reference CPU 実装。
 //!
-//! GPU 側 `#[kernel] fn radam_step` は bin entry (`bins/nnue_train/src/main.rs`)
-//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
-//! 制約)。本 module の `radam_step_cpu` + `radam_compute_step_size_denom` は GPU と
-//! 同じロジックを host で書き写したもので、GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn radam_step` は呼び出し元 bin entry に inline 定義する
+//! (cuda-oxide rustc-codegen-cuda backend の bin-entry 制約)。本 module は
+//! GPU↔CPU 数値同等性テストの reference 用。
 //!
-//! ## アルゴリズム (bullet 上流 `optimiser/radam.rs::RAdam::update` + `OP` に等価)
+//! ## アルゴリズム
 //!
-//! RAdam は **Rectified Adam**。Adam の bias correction を `beta2_t` 由来の
-//! variance 補正係数 `step_size` に統合し、学習初期 (small `step`) で variance が
-//! 不安定なときは `1 / sqrt(v)` の正規化を **off** にして m のみで更新する。
+//! RAdam (Rectified Adam, Liu et al. 2019)。Adam の bias correction を `beta2_t`
+//! 由来の variance 補正係数 `step_size` に統合し、学習初期 (small `step`) で
+//! variance が不安定なときは `1 / sqrt(v)` の正規化を **off** にして m のみで
+//! 更新する。
 //!
 //! ```text
 //! host pre-compute (per step、scalar):
@@ -39,52 +39,36 @@
 //!         val   /= sqrt(v[i]) + eps             # variance 補正 ON
 //!     weights[i] -= rate * val
 //!     weights[i] = clamp(weights[i], min_w, max_w)
-//!     grad[i]    = 0                             # 次 batch 用に reset (Stage 1 慣行)
+//!     grad[i]    = 0                             # 次 batch 用に reset
 //! ```
 //!
-//! - **bias correction を `step_size` に畳み込む**: Stage 2-3 `adamw_step` (bias
-//!   correction なし) との最大の差分。bullet 上流 RAdam は `step_size` の中で
-//!   `bc1 = 1 - beta1^t` の inverse + variance 補正係数 `sqrt((1-beta2_t)*...)`
-//!   を取り込み、kernel 側は `rate = lr * step_size` 1 個で受ける
+//! - **bias correction を `step_size` に畳み込む**: `adamw_step` (bias correction
+//!   なし) との最大の差分。`step_size` に `bc1 = 1 - beta1^t` の inverse +
+//!   variance 補正係数 `sqrt((1-beta2_t)*...)` を取り込み、kernel 側は
+//!   `rate = lr * step_size` 1 個で受ける
 //! - **denom switch**: 学習初期で variance が不安定なときは `denom = 0` で
 //!   `1/sqrt(v)` を **off**、十分に accumulate された後 (n_sma > threshold) は
 //!   `denom = 1` で通常 Adam-like update
-//! - **n_sma threshold**: bullet 上流 default `5.0`、本実装も同 default
+//! - **n_sma threshold**: 論文 default `5.0`
 //! - host pre-compute の `step_size`, `denom` は per-step scalar、kernel に値渡し
-//!   (Stage 2-3 同 convention、bullet 上流の 1-element device buffer は本リポでは
-//!   見送り。詳細は ATTRIBUTION.md Stage 2-4 entry)
-//!
-//! ## bullet 上流との対応 / divergence
-//!
-//! - bullet `optimiser/radam.rs::RAdam::update` は `adj_ptr`, `rate_ptr`,
-//!   `step_size_ptr`, `denom_ptr` を 1-element device buffer で渡す。本実装は
-//!   全て `f32` / `i32` 値渡し (Stage 2-3 `adamw_step` と同 convention)。
-//!   Stage 3 trainer integration で device-side scheduling が必要になったら
-//!   別 issue で device buffer 化
-//! - bullet `radamOp` は `int denom` を condition として `if (denom) val /= sqrt(v) + eps;`
-//!   を実行。本実装も同型 (`if denom != 0 { ... }`)。i32 を bool に cast せず
-//!   `!= 0` の比較で使う点は Rust の型安全性に揃えたが意味は同じ
-//! - bullet `OP` template は `OP / DECL` 文字列置換 (`adam.rs:64-78`) で `BETA1`
-//!   等を埋め込む。本実装は kernel 引数で受けるためテンプレート置換不要 (Stage 1
-//!   `progress::adam_step` と同型、cuda-oxide では runtime const folding)
+//!   (1-element device buffer は使わない設計)
 //!
 //! ## cuda-oxide 制限
 //!
-//! - GPU kernel 側は `f32::clamp` を使えない (Stage 1-7 確認済) → `if-else`
-//!   ladder で展開
+//! - GPU kernel 側は `f32::clamp` を使えないため `if-else` ladder で展開
 //! - `f32::sqrt` は `__nv_sqrtf` (libdevice) に lowering される
 //! - host pre-compute fn (`radam_compute_step_size_denom`) は host 実行で
-//!   `f32::powf`, `f32::sqrt` を自由に使える (kernel 内では使わない)
+//!   `f32::powf` / `f32::sqrt` を自由に使える (kernel 内では使わない)
 
 /// RAdam の host pre-compute: step number から `step_size` と `denom` を計算する。
 ///
-/// bullet 上流 `optimiser/radam.rs::RAdam::update` (`:198-218`) と数式同一。
+/// 数式は module doc のアルゴリズム節 (RAdam, Liu et al. 2019) と同一。
 ///
 /// 入力前提:
-/// - `step >= 1` (1-indexed、bullet 上流と同型。`step = 0` で `beta^0 = 1` となり
-///   `bc1 = 0`、`step_size = 1/0 = +inf` になるので呼び出し側で避ける)
+/// - `step >= 1` (1-indexed。`step = 0` で `beta^0 = 1` となり `bc1 = 0`、
+///   `step_size = 1/0 = +inf` になるので呼び出し側で避ける)
 /// - `0 < beta1 < 1`, `0 < beta2 < 1`
-/// - `n_sma_threshold > 0` (default `5.0`)
+/// - `n_sma_threshold > 0` (論文 default `5.0`)
 ///
 /// 戻り値: `(step_size, denom)` (denom は 0 or 1 の i32、kernel 引数として
 /// そのまま渡す前提)。
@@ -117,7 +101,7 @@ pub fn radam_compute_step_size_denom(
 /// In-place mutation:
 /// - `weights[i]`: weight decay → bias-corrected RAdam update → clamp の 3 段
 /// - `m[i]` / `v[i]`: Adam 1 次 / 2 次 moment running average
-/// - `grad[i]`: 0.0 にリセット (次 batch の accumulation 用、Stage 1 慣行)
+/// - `grad[i]`: 0.0 にリセット (次 batch の accumulation 用)
 ///
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == n`
@@ -126,8 +110,8 @@ pub fn radam_compute_step_size_denom(
 /// - `step_size > 0`, `denom ∈ {0, 1}` (host pre-compute による、
 ///   `radam_compute_step_size_denom` の戻り値をそのまま渡す前提)
 ///
-/// 引数数 (14) は bullet 上流 RAdam の host pre-compute 引数を畳み込んだ形。
-/// `clippy::too_many_arguments` を allow (Stage 1 / Stage 2-3 同 convention)。
+/// 引数 14 個は RAdam の host pre-compute 引数を畳み込んだ形。
+/// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn radam_step_cpu(
     weights: &mut [f32],
@@ -174,7 +158,7 @@ mod tests {
 
     /// `radam_compute_step_size_denom`: 学習初期 (step=1) で n_sma が threshold を
     /// 下回り `denom = 0` (`1/sqrt(v)` off)、`step_size = 1 / bc1` になる。
-    /// bullet 上流 (`optimiser/radam.rs:201-216`) の式から手計算で確認。
+    /// RAdam 式から手計算で確認。
     #[test]
     fn step_size_denom_step_1_disables_variance() {
         let (step_size, denom) = radam_compute_step_size_denom(1, 0.9_f32, 0.999_f32, 5.0_f32);
@@ -190,9 +174,9 @@ mod tests {
         );
     }
 
-    /// `radam_compute_step_size_denom`: 大きな step でも n_sma が threshold を
-    /// 超え `denom = 1`、`step_size` は `sqrt((1 - beta2_t) * p1*p2*p3) / bc1` の
-    /// 形になる。step=1000、bullet 上流式から手計算。
+    /// `radam_compute_step_size_denom`: 大きな step では n_sma が threshold を
+    /// 超え `denom = 1`、`step_size = sqrt((1 - beta2_t) * p1*p2*p3) / bc1` の
+    /// 形になる。step=1000 で手計算。
     #[test]
     fn step_size_denom_large_step_enables_variance() {
         let step = 1000_u64;
@@ -201,7 +185,7 @@ mod tests {
         let n_sma_threshold = 5.0_f32;
         let (step_size, denom) = radam_compute_step_size_denom(step, beta1, beta2, n_sma_threshold);
 
-        // 期待値を bullet 流の手計算で再現
+        // RAdam 式を独立に再計算
         let step_f = step as f32;
         let beta2_t = beta2.powf(step_f);
         let n_sma_max = 2.0_f32 / (1.0_f32 - beta2) - 1.0_f32;
@@ -292,7 +276,7 @@ mod tests {
             1,
         );
 
-        // 期待値を f32 で再計算 → f64 cast (Stage 1-10 pitfall 回避)
+        // 期待値を f32 で再計算 → f64 cast (f32 リテラル比較の pitfall 回避)
         let g = 0.1_f32;
         let lr = 0.1_f32;
         let step_size = 1.0_f32;
@@ -309,7 +293,7 @@ mod tests {
     }
 
     /// `decay = 0`、`g = 0`、clip 有効で **clip がかかるとき** weights は
-    /// `[min_w, max_w]` の範囲外に出ない (Stage 2-3 adamw_step と同型ガード)。
+    /// `[min_w, max_w]` の範囲外に出ない (`adamw_step` と同型ガード)。
     #[test]
     fn clamp_pulls_weights_into_range() {
         let mut weights = vec![100.0_f32, -100.0, 0.5];
@@ -337,7 +321,7 @@ mod tests {
 
     /// 5 step の RAdam を host orchestration で回し、`step_size` / `denom` を
     /// 1 step ずつ更新しながら weights が target = 0 に向かって monotonic に
-    /// 近づくことを確認 (簡易 convergence、Stage 2-3 adamw_step と同型)。
+    /// 近づくことを確認 (簡易 convergence、`adamw_step` と同型)。
     #[test]
     fn five_step_monotonic_descent_with_radam_schedule() {
         let mut weights = vec![1.0_f32];
@@ -372,8 +356,8 @@ mod tests {
         }
     }
 
-    /// NaN 入力 (grad = NaN) で weights が NaN に汚染される (Stage 2-3 adamw_step
-    /// と同型、optimizer は NaN を握り潰さず伝搬する)。
+    /// NaN 入力 (grad = NaN) で weights が NaN に汚染される (`adamw_step` と同型、
+    /// optimizer は NaN を握り潰さず伝搬する)。
     #[test]
     fn nan_grad_propagates_into_weights() {
         let mut weights = vec![0.5_f32];
@@ -403,8 +387,8 @@ mod tests {
     }
 
     /// `min_w == max_w` で weights が単一値に collapse する degenerate clip
-    /// (Stage 2-3 adamw_step と同型ガード、kernel 側 if-else ladder の境界
-    /// 扱いが CPU `f32::clamp` と一致するか)。
+    /// (`adamw_step` と同型ガード、kernel 側 if-else ladder の境界扱いが CPU
+    /// `f32::clamp` と一致するか)。
     #[test]
     fn collapsed_clip_range_pins_weights_to_single_value() {
         let mut weights = vec![100.0_f32, -100.0, 0.0, 0.5];

@@ -1,13 +1,12 @@
-//! Stage 1-9 host helper の単体テスト (GPU 非依存)。
+//! host helper の単体テスト (GPU 非依存)。
 //!
-//! GPU 実行は CI で動かない (CI excluded crate) ため、host loop の
-//! 純粋ロジック (Batch builder / PSV reader / GameIterator / progress.bin I/O)
-//! のみを検証する。
+//! host loop の純粋ロジック (Batch builder / PSV reader / GameIterator /
+//! progress.bin I/O) のみを検証する。
 //!
 //! ## 使う test fixture
 //!
 //! - `crates/shogi-format/tests/data/sample.psv` (100 records、bullet-shogi
-//!   smoke_progress 由来の先頭 4000 bytes、Stage 1-1 で vendor)
+//!   smoke_progress 由来の先頭 4000 bytes を vendor したもの)
 
 use std::path::PathBuf;
 

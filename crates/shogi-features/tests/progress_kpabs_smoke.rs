@@ -1,9 +1,8 @@
 //! ShogiProgressKPAbs の smoke test。
 //!
-//! shogi-format crate の `tests/data/sample.psv` (smoke_progress/smoke.bin の
-//! 先頭 100 records) を共有して、各 record で `for_each_active_index` /
-//! `collect_active_indices` / `progress` / `bucket` が
-//! 妥当な値を返すことを確認する。
+//! shogi-format crate の `tests/data/sample.psv` (100 records) を共有して、
+//! 各 record で `for_each_active_index` / `collect_active_indices` /
+//! `progress` / `bucket` が妥当な値を返すことを確認する。
 //!
 //! 重み (`progress.bin`) は意図的にロードしないため、
 //! `weights()` は zero 配列、`progress()` は常に `sigmoid(0) = 0.5`、

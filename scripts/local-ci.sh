@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# scripts/local-ci.sh
-# PR 作成 / push 前必須の local check (fmt / clippy / test、全 crate)。
-# `.github/workflows/checks.yaml` は GitHub-hosted runner に CUDA / LLVM が無いため
-# GPU 依存 crate (gpu-runtime / experiments / progress-kpabs-train / nnue-trainer) を
-# clippy / test の workspace から exclude するが、本機 (CUDA + LLVM 22 install 済)
-# では **exclude なし全 crate** をチェックする。
+# CUDA + LLVM が揃った開発機で workspace 全体 (GPU crate 含む) の fmt / clippy /
+# test を回すスクリプト。GitHub Actions 側 (`.github/workflows/checks.yaml`) は
+# GPU crate を exclude しているため、push 前にここで full check を回す必要がある。
 #
-# test は `--release` で実行する: nnue-trainer の GPU 数値同等性テスト
-# (`gpu_cpu_equivalence_tests`) は debug build の f32 fma off で tolerance を満たさず
-# fail するため (release は本番経路と同じ codegen)。warm cache で fmt / clippy / test
-# 計 ~20s。
+# test は `--release` で実行する: GPU 数値同等性テストが debug build の f32 fma
+# off で tolerance を満たさず fail するため (release は本番経路と同じ codegen)。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

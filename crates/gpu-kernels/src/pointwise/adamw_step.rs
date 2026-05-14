@@ -1,13 +1,12 @@
 //! Fused AdamW optimizer step (decay + clip 込み) の reference CPU 実装。
 //!
-//! GPU 側 `#[kernel] fn adamw_step` は bin entry (`bins/nnue_train/src/main.rs`)
-//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
-//! 制約)。本 module の `adamw_step_cpu` は GPU と同じ更新式を host で書き写した
-//! もので、GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn adamw_step` は呼び出し元 bin entry に inline 定義する
+//! (cuda-oxide rustc-codegen-cuda backend の bin-entry 制約)。本 module は
+//! GPU↔CPU 数値同等性テストの reference 用。
 //!
-//! ## アルゴリズム (bullet 上流 `optimiser/adam.rs::AdamWParams::build` に等価)
+//! ## アルゴリズム
 //!
-//! 1 thread = 1 weight、atomics 不要 (Stage 1 `progress::adam_step` と同型)。
+//! AdamW (Loshchilov & Hutter 2019) + clip。1 thread = 1 weight、atomics 不要。
 //!
 //! ```text
 //! per element i:
@@ -18,54 +17,41 @@
 //!     val        = m[i] / (sqrt(v[i]) + eps)
 //!     weights[i] -= lr * val
 //!     weights[i] = clamp(weights[i], min_w, max_w)
-//!     grad[i]    = 0                             # 次 batch 用に reset (Stage 1 慣行)
+//!     grad[i]    = 0                             # 次 batch 用に reset
 //! ```
 //!
-//! - **bias correction なし**: bullet 上流 AdamW (`adam.rs:34-50`) は意図的に
-//!   bias correction (`bc1 = 1 - beta1^t` 等) を含まず、`val = m / (sqrt(v) + eps)`
-//!   を直接使う。RAdam と分岐させる前の "AdamW base" 形 (Stage 2-4 で RAdam に
-//!   bias correction + denom switch を加える)。Stage 1 `progress::adam_step` は
-//!   bc1/bc2 を host pre-compute して渡す形 (元の bullet `KERNELS_SRC::k_adam_step`)
-//!   と異なる convention で、混同しないよう本 docstring で明示
-//! - **decay + clip**: AdamW の差分。`decay = 0.0` で plain Adam (bullet 上流式)、
-//!   `min_w = f32::MIN, max_w = f32::MAX` で clip 無効
-//! - **grad reset**: Stage 1 `progress::adam_step` 慣行を踏襲。bullet 上流は
-//!   `gradients` を `const float*` で受けて reset しないが、本リポは host loop が
-//!   次 batch の `atomicAdd` 累積に向けて kernel 内で reset する設計
-//!
-//! ## bullet 上流との対応 / divergence
-//!
-//! - bullet `KernelSrc` は `float4` vectorize path を持つ (`size % 4 == 0` なら
-//!   1 thread = 4 weights を unroll)。本 PR は **scalar 1 thread = 1 weight** で
-//!   素直に書く (Stage 1 慣行、`size` が 4 の倍数でないケースの分岐コストが
-//!   学習律速にはならない、Stage 2-8 で必要に応じ optimize 候補)
-//! - bullet `adj * grad` は host buffer 経由 (`adj_ptr` 1-element)。本実装は
-//!   `lr` を直接渡す (Stage 1 同型)。`adj` (gradient_factor) が必要になる時は
-//!   後で追加する想定
+//! - **bias correction なし**: 本 AdamW kernel は意図的に bias correction
+//!   (`bc1 = 1 - beta1^t` 等) を含まず `val = m / (sqrt(v) + eps)` を直接使う
+//!   (RAdam に bias correction + denom switch を加える前の "AdamW base" 形)。
+//!   `progress::adam_step` 側は bc1/bc2 を host pre-compute して渡す別 convention
+//!   なので混同しないよう注意
+//! - **decay + clip**: `decay = 0.0` で plain Adam、`min_w = f32::MIN`,
+//!   `max_w = f32::MAX` で clip 無効
+//! - **grad reset**: 次 batch の `atomicAdd` 累積に向けて kernel 内で reset する
+//!   設計 (bullet 上流とは異なる convention)
 //!
 //! ## cuda-oxide 制限
 //!
-//! - GPU kernel 側は `f32::clamp` / `min` / `max` を使えない (Stage 1-7 で確認、
-//!   `Symbol std__intrinsics__maximum_number_nsz_f32 not found`)。**`if-else`
-//!   ladder で展開** する (`x < min_w ? min_w : x > max_w ? max_w : x`)。
-//!   CPU reference は host 実行で `f32::clamp` を使用
-//! - `v.sqrt()` は cuda-oxide が `__nv_sqrtf` (libdevice) に lowering する。
-//!   Stage 1-7 で動作確認済
+//! - GPU kernel 側は `f32::clamp` / `min` / `max` を使えない (`Symbol
+//!   std__intrinsics__maximum_number_nsz_f32 not found`)。`if-else` ladder で
+//!   展開する (`x < min_w ? min_w : x > max_w ? max_w : x`)。CPU reference は
+//!   host 実行で `f32::clamp` をそのまま使う
+//! - `v.sqrt()` は cuda-oxide が `__nv_sqrtf` (libdevice) に lowering する
 
 /// Reference CPU 実装。
 ///
 /// In-place mutation:
 /// - `weights[i]`: weight decay → Adam update → clamp の 3 段
 /// - `m[i]` / `v[i]`: Adam 1 次 / 2 次 moment running average
-/// - `grad[i]`: 0.0 にリセット (次 batch の accumulation 用、Stage 1 同 convention)
+/// - `grad[i]`: 0.0 にリセット (次 batch の accumulation 用)
 ///
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == n`
 /// - `lr ≥ 0`, `decay ≥ 0`, `0 < beta1 < 1`, `0 < beta2 < 1`, `eps > 0`
 /// - `min_w ≤ max_w` (host 側不変条件、`f32::clamp` の panic 経路を避けるため)
 ///
-/// 引数数 (12) は bullet 上流 `adam.rs::OP` 引数 + AdamW 拡張のため
-/// `clippy::too_many_arguments` を allow (Stage 1 `progress::adam_step` と同方針)。
+/// 引数 12 個は AdamW + clip の全パラメータを露出するため。
+/// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn adamw_step_cpu(
     weights: &mut [f32],
@@ -100,10 +86,9 @@ pub fn adamw_step_cpu(
 mod tests {
     use super::*;
 
-    /// `decay = 0`、clip 無効 (`-INF, +INF`) で plain Adam (bullet 上流の
-    /// `KERNELS_SRC::k_adam_step` の bias-correction を取り除いた形) と一致する。
-    /// `g = 0` (gradient ゼロ) なら m / v / weights は 1 step で変化なし
-    /// (m_init = 0、v_init = 0、val = 0 / eps = 0)。
+    /// `decay = 0`、clip 無効 (`-INF, +INF`) で plain Adam (bias correction なし)
+    /// と一致する。`g = 0` (gradient ゼロ) なら m / v / weights は 1 step で
+    /// 変化なし (m_init = 0、v_init = 0、val = 0 / eps = 0)。
     #[test]
     fn zero_grad_zero_decay_yields_no_change() {
         let mut weights = vec![0.5_f32, -0.3, 1.0];
@@ -159,7 +144,7 @@ mod tests {
             1,
         );
 
-        // 期待値は f32 で再計算 → f64 cast (Stage 1-10 pitfall 回避)
+        // 期待値は f32 で再計算 → f64 cast (f32 リテラル比較の pitfall 回避)
         let g = 0.1_f32;
         let lr = 0.1_f32;
         let decay = 0.01_f32;
@@ -276,12 +261,12 @@ mod tests {
         assert!(weights[0] < 0.7, "after 5 steps, w={}", weights[0]);
     }
 
-    /// NaN 入力 (grad = NaN) で weights が NaN に汚染されることを確認 (loss_wdl
-    /// と同型で NaN を伝搬する。学習中の NaN 検出は loss/optimizer 経路で気付ける
-    /// 必要があり、SCReLU のような握り潰しは optimizer では行わない)。
+    /// NaN 入力 (grad = NaN) で weights が NaN に汚染されることを確認。
+    /// optimizer は SCReLU と違い NaN を握り潰さず伝搬する (学習中の NaN 検出は
+    /// loss / optimizer 経路で気付ける必要があるため)。
     /// `m = beta1 * 0 + (1-beta1) * NaN = NaN`、`v` も `* NaN^2` で NaN、
     /// `m / sqrt(v)` も NaN、`weights -= lr * NaN = NaN`、最後の `clamp` で
-    /// f32::clamp は NaN 入力を NaN のまま返す (IEEE 754 仕様 + Rust spec)。
+    /// `f32::clamp` は NaN 入力を NaN のまま返す (IEEE 754 + Rust spec)。
     #[test]
     fn nan_grad_propagates_into_weights() {
         let mut weights = vec![0.5_f32];
@@ -312,11 +297,10 @@ mod tests {
     }
 
     /// `min_w == max_w` で weights が単一値に collapse する degenerate clip。
-    /// host 側不変条件 (`min_w ≤ max_w`) 内で許される境界 (`<` ではなく `≤`)。
-    /// kernel の if-else ladder (`p < min_w ? min_w : p > max_w ? max_w : p`)
-    /// で `min_w == max_w` のとき `p > max_w` が true なら max_w、false なら p
-    /// (`p < min_w` も false の経路) になる挙動が CPU の `f32::clamp` と一致する
-    /// ことを確認。
+    /// host 側不変条件 (`min_w ≤ max_w`) で許される境界。kernel の if-else
+    /// ladder (`p < min_w ? min_w : p > max_w ? max_w : p`) で `min_w == max_w`
+    /// のとき `p > max_w` が true なら max_w、false なら p (`p < min_w` も false
+    /// の経路) になる挙動が CPU の `f32::clamp` と一致することを確認。
     #[test]
     fn collapsed_clip_range_pins_weights_to_single_value() {
         let mut weights = vec![100.0_f32, -100.0, 0.0, 0.5];

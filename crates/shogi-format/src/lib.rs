@@ -1,7 +1,7 @@
 //! 将棋 NNUE 用の基本型と PackedSfenValue デコーダ。
 //!
-//! bullet-shogi (commit `f275eb9`) の `crates/bullet_lib/src/shogi/` から
-//! vendor。取り込み元・差分は本リポジトリの `ATTRIBUTION.md` を参照。
+//! 型定義 / バイト並びの出典は bullet-shogi のオリジナル実装
+//! (`ATTRIBUTION.md` 参照)。
 
 pub mod bona_piece;
 pub mod game_result;

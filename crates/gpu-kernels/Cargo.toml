@@ -12,7 +12,6 @@ publish = false
 workspace = true
 
 [dependencies]
-# 現状 progress kernel suite (forward/grad/adam_step/eval) は scalar f32/f64/i32/u64
-# 配列のみ扱い、`PackedSfenValue` 等 shogi-format 型に直接は依存しない。
-# Stage 2 で feature 抽出系の kernel CPU reference を加える際に shogi-format /
-# shogi-features を引き込む想定 (現時点では dep ゼロで十分)。
+# GPU kernel 実装と CPU reference 実装を提供する crate。kernel は scalar
+# f32/f64/i32/u64 配列のみを扱い、上位の shogi-format / shogi-features 型には
+# 依存しない (kernel は型に対して polymorphic、orchestration 側で variant を選ぶ)。

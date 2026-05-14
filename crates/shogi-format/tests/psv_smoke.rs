@@ -1,9 +1,8 @@
 //! PSV reader smoke test。
 //!
-//! `tests/data/sample.psv` は bullet-shogi 由来の `smoke_progress/smoke.bin`
-//! (nodchip hao_depth9 の thread_index=000.bin に同じ) の **先頭 100 records**
-//! (40 byte × 100 = 4000 bytes) を切り出したもの。Issue #5 受け入れ条件
-//! 「PSV を 1 batch 読める smoke test」を満たす。
+//! `tests/data/sample.psv` は nodchip hao_depth9 の thread_index=000.bin の
+//! **先頭 100 records** (40 byte × 100 = 4000 bytes) を切り出した固定 fixture。
+//! 1 batch 分の PSV を read & decode できることを確認する。
 
 use shogi_format::{Color, GameResult, PackedSfenValue};
 use std::fs;
@@ -87,7 +86,7 @@ fn read_one_batch_of_psv_records() {
 
 #[test]
 fn game_result_enum_discriminants_match_bullet() {
-    // bullet-shogi 互換: Loss=0, Draw=1, Win=2
+    // 上流 (bullet-shogi) と同じ discriminant: Loss=0, Draw=1, Win=2。
     assert_eq!(GameResult::Loss as u8, 0);
     assert_eq!(GameResult::Draw as u8, 1);
     assert_eq!(GameResult::Win as u8, 2);

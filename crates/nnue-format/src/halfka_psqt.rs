@@ -1,20 +1,9 @@
-//! HalfKA_hm + PSQT NNUE binary の save_quantised / load。
+//! HalfKA_hm + PSQT NNUE binary の `save_quantised` / `load`。
 //!
-//! Stage 3 (EPIC #17) の NNUE binary format。`NnueHeader` (Stage 3-2) に続いて、
-//! FT (sparse `73_305 → 1536`) + L1 (出力直前 linear) + PSQT (feature ごとの cp)
-//! を量子化 (i8 / i16 / i32 LE) して書き出す。
-//!
-//! ## scope
-//!
-//! 本 PR は **Issue #59 body の minimum (FT + L1 + PSQT)** を実装する。NNUE
-//! 1536-16-32 の full architecture (FT + 3 linear stack [16, 32, 1] + PSQT) は
-//! Stage 3-7 (`bins/nnue_train` で kernel inline + GpuTrainer) / Stage 3-8
-//! (trainer integrate) で本 layout を拡張する想定:
-//!
-//! - **本 PR**: FT + L1 (出力直前 linear、`FT_OUT_DIM*2 → L1_OUT_DIM`) + PSQT
-//! - **Stage 3-7 拡張案**: L1 を hidden stack (例: `3072 → 16 → 32 → 1`) に
-//!   差し替え、本 module は `HalfKAPsqtNet` を `pub enum NnueLayout { Minimal,
-//!   LayerStack {...} }` に拡張する形を予定 (Stage 3-8 で実機検証時に確定)
+//! `NnueHeader` (22 bytes) に続いて、FT (sparse `73_305 → 1536`) + L1 (出力
+//! 直前 linear) + PSQT (feature ごとの cp) を量子化 (i8 / i16 / i32 LE) して
+//! 書き出す minimal layout。本 module は single-bucket PSQT を扱う最小形で、
+//! 9-bucket LayerStack 形式は `v102_layerstack` を参照。
 //!
 //! ## binary layout (header 22 bytes 後)
 //!
@@ -26,41 +15,17 @@
 //! | 4     | `l1_bias`     | `i32`    | `L1_OUT_DIM`                | 4 each   |
 //! | 5     | `psqt`        | `i32`    | `NUM_FEATURES` (single bucket) | 4 each |
 //!
-//! 量子化は header の `qa` / `qb` を multiplier として使う (bullet
-//! `shogi_layerstack.rs:1512-1570` 慣行):
+//! 量子化は header の `qa` / `qb` を multiplier として使う:
 //! - `ft_weights` / `ft_bias`: i16 量子化、multiplier = `qa`
 //! - `l1_weights`: i8 量子化、multiplier = `qb`
 //! - `l1_bias`: i32 量子化、multiplier = `qa * qb`
 //! - `psqt`: i32 量子化、multiplier = `qa * qb` (bullet LayerStack 互換)
 //!
-//! `qa` / `qb` の actual 値は Stage 3-3 では確定せず (Stage 3-2 と同流儀、本 PR は
-//! placeholder `qa = qb = 64` の既定値で round-trip を確認するに留める)、Stage 3-8
-//! trainer integration / Stage 3-9 自己対局検証で確定。
+//! ## 出典
 //!
-//! ## PSQT shape の本 PR スコープ (bullet LayerStack との差分)
-//!
-//! bullet 上流 `examples/shogi_layerstack.rs:1469-1577` の LayerStack arch では
-//! PSQT は **`output_buckets (9) × num_features`** の 2D weight + 9 個の bias を
-//! 持つ。本 PR は **scope minimum で single bucket (`psqt: Vec<f32>` 長さ
-//! `num_features`、bias なし)** に限定する。multi-bucket 化は Stage 3-7 / 3-8
-//! trainer integration で NNUE 1536-16-32 full arch (FT + 3 linear stack +
-//! bucketed PSQT) に拡張するときに `HalfKAPsqtNet` を enum 化して対応する想定。
-//! 本 PR で multiplier (`qa * qb`) は bullet と一致させたが、layout 自体は
-//! single bucket 限定なので Stage 3-9 検証で rshogi 側 loader 互換性を確認する
-//! 段階で再度 layout 拡張が必要になる可能性が高い。
-//!
-//! ## bullet 上流参照
-//!
-//! `crates/trainer/src/model/save.rs::QuantTarget::quantise` (commit `f275eb9`、
-//! `model/save.rs:167-211`) の i8/i16/i32 量子化ロジックを **本リポ独自の
-//! quantise/dequantise helper として移植**。bullet 上流の `SavedFormat` /
-//! `ModelWeights` trait 機構は本リポでは使わず、`HalfKAPsqtNet` struct + 各
-//! field に対する direct quantize で完結させる (Stage 1-1 / Stage 3-1 と同じ
-//! bullet trait 削除ポリシー)。
-//!
-//! `examples/shogi_layerstack.rs` の `compute_psqt_material_values` 等の
-//! HalfKA_hm 特化 PSQT 初期化は本 PR scope 外 (trainer 側 init で扱う、Stage
-//! 3-7 / 3-8 で組み込む想定)。
+//! i8/i16/i32 量子化ロジック (`QuantTarget`) は bullet-shogi
+//! `crates/trainer/src/model/save.rs::QuantTarget::quantise` を移植
+//! (詳細は `ATTRIBUTION.md`)。
 
 use std::io::{self, Read, Write};
 
@@ -69,25 +34,22 @@ use crate::header::NnueHeader;
 /// FT (sparse) の出力次元 (NNUE 1536-16-32 の FT 部分)。
 pub const FT_OUT_DIM: usize = 1536;
 
-/// L1 (出力直前 linear) の出力次元 (本 PR minimum: 1、Stage 3-7 で hidden stack
-/// に拡張する想定で公開 const として保持)。
+/// L1 (出力直前 linear) の出力次元 (single-bucket minimum: 1)。
 pub const L1_OUT_DIM: usize = 1;
 
 /// HalfKA_hm 入力次元 (`shogi_features::halfka_hm::HALFKA_HM_DIMENSIONS` と
-/// 同値、本 crate が `shogi-features` に depend したくないため独立に宣言)。
-/// Stage 3-1 (#57) と整合性確認は `nnue_format_const_matches_shogi_features` の
-/// 想定で別 crate (`nnue-train`) test に置く方針 (本 crate は CPU-only minimal
-/// dependency を維持)。
+/// 同値、本 crate を CPU-only minimal dependency に保つため独立に宣言)。
 pub const NUM_FEATURES: usize = 73_305;
 
 // =============================================================================
-// QuantTarget — bullet `model/save.rs::QuantTarget` を本リポに移植
+// QuantTarget
 // =============================================================================
 
 /// 量子化目標型 (i8/i16/i32 + multiplier)。
 ///
-/// bullet 上流 `crates/trainer/src/model/save.rs::QuantTarget` を移植。
 /// `quantise(round, &[f32])` で f32 → 量子化後の byte 列を返す。
+/// アルゴリズムは bullet-shogi `model/save.rs::QuantTarget` から移植
+/// (詳細は `ATTRIBUTION.md`)。
 #[derive(Clone, Copy, Debug)]
 pub enum QuantTarget {
     /// `i16` 量子化、multiplier は通常 `qa`。
@@ -101,8 +63,7 @@ pub enum QuantTarget {
 impl QuantTarget {
     /// `buf` を量子化して LE bytes として書き出す。`round` true なら nearest 丸め、
     /// false なら truncate。量子化結果が target 型範囲を超えた場合は
-    /// `InvalidData` を返す (bullet 上流と同型、`model/save.rs:178-181, 187-190,
-    /// 197-200`)。
+    /// `InvalidData` を返す (silent overflow 防止)。
     pub fn quantise(self, round: bool, buf: &[f32]) -> io::Result<Vec<u8>> {
         let mut out = Vec::with_capacity(buf.len() * self.elem_bytes());
 
@@ -207,7 +168,7 @@ fn round_or_trunc(x: f64, round: bool) -> f64 {
 // HalfKAPsqtNet — minimum scope (FT + L1 + PSQT)
 // =============================================================================
 
-/// HalfKA_hm + PSQT NNUE 構造体 (Issue #59 minimum scope)。
+/// HalfKA_hm + PSQT NNUE 構造体 (single-bucket minimum scope)。
 ///
 /// dimensional info は runtime field として `ft_out_dim` / `l1_out_dim` /
 /// `num_features` で保持し、Vec の長さがこれと整合することを `validate()` で
@@ -218,7 +179,7 @@ pub struct HalfKAPsqtNet {
     pub num_features: usize,
     /// FT 出力次元 (typical `FT_OUT_DIM = 1536`)。
     pub ft_out_dim: usize,
-    /// L1 出力次元 (typical `L1_OUT_DIM = 1`、Stage 3-7 で拡張時更新)。
+    /// L1 出力次元 (single-bucket minimum: `L1_OUT_DIM = 1`)。
     pub l1_out_dim: usize,
     /// FT weights、shape `[num_features, ft_out_dim]` を row-major で flatten。
     pub ft_weights: Vec<f32>,
@@ -301,9 +262,7 @@ impl HalfKAPsqtNet {
         w.write_all(&bytes)?;
         let bytes = QuantTarget::I32(qa_qb).quantise(round, &self.l1_bias)?;
         w.write_all(&bytes)?;
-        // PSQT multiplier は bullet `shogi_layerstack.rs:1555-1570` と同じく
-        // `qa * qb` を採用 (YaneuraOu 互換、Codex review #59 指摘で修正)。
-        // 旧実装は `qa` のみで bullet 不一致だった。
+        // PSQT multiplier は bullet LayerStack 互換の `qa * qb` (YaneuraOu 互換)。
         let bytes = QuantTarget::I32(qa_qb).quantise(round, &self.psqt)?;
         w.write_all(&bytes)?;
 
@@ -328,7 +287,7 @@ impl HalfKAPsqtNet {
         let ft_bias = read_dequant_block(r, ft_out_dim, QuantTarget::I16(qa))?;
         let l1_weights = read_dequant_block(r, ft_out_dim * 2 * l1_out_dim, QuantTarget::I8(qb))?;
         let l1_bias = read_dequant_block(r, l1_out_dim, QuantTarget::I32(qa_qb))?;
-        // PSQT multiplier `qa * qb` (save_quantised 側と対称、bullet 互換)。
+        // PSQT multiplier `qa * qb` (save_quantised 側と対称)。
         let psqt = read_dequant_block(r, num_features, QuantTarget::I32(qa_qb))?;
 
         Ok((

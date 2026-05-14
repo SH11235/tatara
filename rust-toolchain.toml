@@ -1,8 +1,6 @@
-# cuda-oxide commit 6de0509 (2026-05-08) の rust-toolchain.toml と一致。
-# Stage 0-1 (#19) で `cargo oxide doctor` 全項目 ✓ + components install を実機検証済み:
-#   - rustc 1.96.0-nightly (55e86c996 2026-04-02)
-#   - clippy / rust-analyzer / rust-src / rustc-dev 全て installed
-# upstream cuda-oxide が channel を上げたら本ファイルも追従する。
+# Channel は upstream cuda-oxide の rust-toolchain.toml に追従する
+# (cuda-oxide が ABI-unstable な rustc internal API を直接使うため、
+#  channel ずれは link-time fail を引き起こす)。
 [toolchain]
 channel = "nightly-2026-04-03"
 components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy"]

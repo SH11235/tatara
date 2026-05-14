@@ -1,29 +1,22 @@
 //! PSV file → HalfKA_hm sparse batch dataloader (+ prefetch wrapper)。
 //!
-//! Stage 3 (EPIC #17) trainer の data 供給路。`PackedSfenValue` を `ShogiHalfKA_hm`
-//! で sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` /
-//! `wdl` / `per_pos_norm`) にまとめる。Stage 3-8 trainer loop が GPU buffer
-//! 転送前に本 dataloader から `Batch` を pull する。
+//! trainer の data 供給路。`PackedSfenValue` を `ShogiHalfKA_hm` で sparse
+//! index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` / `wdl` /
+//! `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
+//! 本 dataloader から `Batch` を pull する。
 //!
-//! ## bullet 上流からの差分
+//! ## 設計のポイント
 //!
-//! - bullet `crates/bullet_lib/src/value/dataloader.rs` の `ValueDataLoader<I,
-//!   O, D, W>` (`bullet_compiler::TValue` / `OutputBuckets` / `LoadableDataType` /
-//!   `WdlScheduler` を depend する trait 機構) は本リポでは使わず、**Stage 1
-//!   `bins/progress_kpabs_train/src/host/batch.rs` 流儀の直接 struct
-//!   実装** に簡素化 (Stage 1-1 / 3-1 / 3-4 と同じ bullet trait 削除ポリシー)
-//! - bullet `value/loader.rs:301-315` で行う **data-layer WDL blend
-//!   pre-compute** (`blend * result + (1-blend) * sigmoid(rscale * score)`) は
-//!   本リポでは **行わない**: Stage 2-2 `fused_loss_wdl` kernel が GPU 側で
-//!   blend を fuse するため、本 dataloader は `score` (raw cp) と `wdl`
-//!   (game result {0, 0.5, 1}) を別 buffer に保持する
-//! - bullet の `map_features_split` (asymmetric STM/NSTM Option emit) は
-//!   ShogiHalfKA_hm では使用せず、`map_features` (symmetric (stm, nstm) emit) で
-//!   STM/NSTM 同時 fill。-1 padding は bullet と同様 (Stage 2-6 `sparse_ft_forward`
-//!   kernel の silent skip と整合)
-//! - bullet の multi-thread prefetch (`bullet_trainer::run::dataloader` 経由) は
-//!   本リポでは `std::thread::spawn` + `std::sync::mpsc::sync_channel` の minimal
-//!   wrapper として `PrefetchedLoader` を提供 (prefetch depth は呼び出し側指定)
+//! - **WDL blend は GPU 側 (`loss_wdl` / `loss_wrm` kernel) で fuse する**ため、
+//!   本 dataloader は `score` (raw cp) と `wdl` (game result `{0, 0.5, 1}`) を
+//!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
+//! - sparse index は最大 active 数 (`MAX_ACTIVE_FEATURES = 40`) で固定容量を
+//!   持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward` kernel は
+//!   `-1` を silent skip する規約
+//! - 並列 prefetch は `std::thread::spawn` + `std::sync::mpsc::sync_channel` の
+//!   minimal wrapper として [`PrefetchedLoader`] (single-thread worker) と
+//!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
+//!   同時計算) を提供する
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -36,22 +29,21 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_format::{PackedSfenValue, ShogiBoard};
 
 // =============================================================================
-// Batch 構造体 (Stage 2-2 fused_loss_wdl + Stage 2-6 sparse_ft_forward 入力に整合)
+// Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
 // =============================================================================
 
 /// 1 batch 分の HalfKA_hm sparse + score/wdl/norm。
 ///
 /// - `stm_indices` / `nstm_indices`: shape `[batch_size, max_active]` を flatten
 ///   (row-major、`bi * max_active + j` で参照)。`-1` padding で未使用 slot を
-///   埋める (Stage 2-6 `sparse_ft_forward` の silent-skip semantics と整合)
-/// - `score`: raw cp (PackedSfenValue::score の i16 を f32 cast)
-/// - `wdl`: game result を {0.0, 0.5, 1.0} に正規化 (`Loss=0 → 0.0`,
-///   `Draw=1 → 0.5`, `Win=2 → 1.0`)
-/// - `per_pos_norm`: batch averaging 用 weight (default 1.0、Stage 1
-///   progress では `1/n_games` の game-relative norm、本 PR では trainer 側で
-///   override 可能な値として保持)
-/// - `n_positions`: 実際に詰めた数 (< batch_size の場合、末尾は uninitialised
-///   ではなく zero/`-1` のまま、trainer 側で `n_positions` を見て効果範囲を制御)
+///   埋める (`sparse_ft_forward` kernel の silent-skip semantics と整合)
+/// - `score`: raw cp (`PackedSfenValue::score` の i16 を f32 cast)
+/// - `wdl`: game result を `{0.0, 0.5, 1.0}` に正規化 (Loss → 0.0, Draw → 0.5,
+///   Win → 1.0)
+/// - `per_pos_norm`: batch averaging 用 weight (default 1.0、trainer 側で
+///   override 可能)
+/// - `n_positions`: 実際に詰めた数 (`< batch_size` の場合、末尾は uninitialised
+///   ではなく `0` / `-1` で保持される)
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub batch_size: usize,
@@ -81,14 +73,9 @@ impl Batch {
     }
 
     /// 既存 `Batch` を再利用 (alloc 削減)。全 slot を `-1` / `0.0` / `1.0` に
-    /// reset する。`PsvFileLoader::fill_batch` と、Issue #89 の
-    /// [`BucketedPrefetchedLoader`] の ring-buffer 化 worker (消費済み `Batch` を
-    /// pool channel 経由で worker に返して `reset()` 再利用) の両方で使われる。
-    ///
-    /// 注: 旧 [`PrefetchedLoader`] (Stage 3-5) は send 時 move のため `reset()`
-    /// 再利用ができず毎 iteration `Batch::with_capacity` を新規 alloc していた。
-    /// trainer が実際に使うのは Issue #89 で導入した [`BucketedPrefetchedLoader`]
-    /// (ring-buffer return path 付き) の方。
+    /// reset する。`PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の
+    /// ring-buffer return path (消費済み `Batch` を pool channel 経由で worker に
+    /// 返して `reset()` で再利用) の両方で使われる。
     pub fn reset(&mut self) {
         for v in &mut self.stm_indices {
             *v = -1;
@@ -109,22 +96,22 @@ impl Batch {
     }
 
     /// 1 position を batch に追加。`true` を返したら成功、`false` は batch 満杯。
-    /// `ShogiHalfKA_hm::map_features` で sparse index を slot に fill (`-1` の
-    /// 残りは padding として保持)。
+    /// `ShogiHalfKA_hm::map_features` で sparse index を slot に fill (残りは
+    /// `-1` padding)。
     ///
     /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
     /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
-    /// 1 回だけにすること (Issue #89)。
+    /// 1 回だけ呼んで `ShogiBoard` を使い回すこと (decode-once 経路)。
     pub fn push(&mut self, pos: &PackedSfenValue) -> bool {
         self.push_decoded(&pos.decode())
     }
 
     /// [`Batch::push`] の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
-    /// dataloader の prefetch worker が 1 局面につき `PackedSfenValue::decode()`
-    /// を 1 回だけ呼び、その `ShogiBoard` を HalfKA_hm 特徴抽出 (本メソッド) と
+    /// prefetch worker が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ
+    /// 呼び、その `ShogiBoard` を HalfKA_hm 特徴抽出 (本メソッド) と
     /// progress8kpabs bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で
-    /// 使い回すための入口 (Issue #89: decode-once)。`push(&pos)` は
+    /// 使い回すための入口 (decode-once)。`push(&pos)` は
     /// `push_decoded(&pos.decode())` と等価。
     pub fn push_decoded(&mut self, board: &ShogiBoard) -> bool {
         if self.n_positions >= self.batch_size {
@@ -141,23 +128,17 @@ impl Batch {
                 self.nstm_indices[row_off + j] = nstm_idx as i32;
                 j += 1;
             }
-            // overflow は silent skip。bullet 上流は `assert!(j_stm <=
-            // max_active)` で panic するが、本リポは
-            // `MAX_ACTIVE_FEATURES = 40` (合法局面固定) + `-1` padding の
-            // defensive 設計で許容 (実 PSV では到達不能)。
+            // overflow は silent skip (`MAX_ACTIVE_FEATURES = 40` は合法局面の
+            // 駒総数で固定、実 PSV では到達不能だが defensive に許容)。
         });
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);
-        // bullet `loader::GameResult::{Loss=0, Draw=1, Win=2}` を {0.0, 0.5, 1.0}
-        // に正規化 (bullet `loader.rs:312` と同型)。
-        //
-        // `ShogiBoard::result` は **raw i8** (`{-1=Loss, 0=Draw, +1=Win}`、PSV
-        // wire 形式 = `PackedSfenValue::game_result()` と同じ値) なので、そのまま
-        // `/ 2.0` すると Draw=0 と Win=1 が誤って 0.0 と 0.5 に圧縮される (Codex
-        // review #61 で見つかった `as u8 / 2.0` 直訳の罠)。`PackedSfenValue::
-        // result()` (`GameResult` enum、Loss=0/Draw=1/Win=2) と同じ map を i8 から
-        // 直接行う: `>0 → 1.0`, `<0 → 0.0`, `==0 → 0.5`。
+        // `ShogiBoard::result` は raw i8 (`{-1=Loss, 0=Draw, +1=Win}`、PSV wire
+        // 形式 = `PackedSfenValue::game_result()` と同じ値)。これを WDL 軸の
+        // `{0.0, 0.5, 1.0}` (Loss / Draw / Win) に sign-aware に map する
+        // (`>0 → 1.0`, `<0 → 0.0`, `==0 → 0.5`)。`as u8 / 2.0` で直訳すると
+        // Win=1 が誤って 0.5 に潰れるので必ず本 match を使うこと。
         self.wdl[bi] = match board.result {
             r if r > 0 => 1.0,
             r if r < 0 => 0.0,
@@ -181,7 +162,7 @@ impl Batch {
 }
 
 // =============================================================================
-// PsvFileLoader (single-threaded、Stage 1 progress と同流儀)
+// PsvFileLoader (single-threaded、逐次読み)
 // =============================================================================
 
 /// PSV file (PackedSfenValue × N、各 40 bytes 固定) を 1 record ずつ stream 読み。
@@ -272,10 +253,9 @@ impl PsvFileLoader {
 /// `PsvFileLoader` を別 thread で先読み、main thread が `next_batch()` で
 /// 取得する形の wrapper。`prefetch_depth` で channel 容量を制御。
 ///
-/// 現状 background loop は毎 iteration `Batch::with_capacity` を新規 alloc する
-/// 設計 (channel 経由で send=move、original を `reset()` reuse できないため)。
-/// alloc が trainer ホットパスでボトルネックになった段階で `Clone` 経由 send /
-/// `Arc<Batch>` 化 / double-buffer 化等を Stage 3-7/3-8 で検討する。
+/// 本 loader は単一 worker + 毎 iteration `Batch::with_capacity` を新規 alloc
+/// する単純な実装。`Batch` を pool で回す ring-buffer / bucket 同時計算が
+/// 必要なら [`BucketedPrefetchedLoader`] を使うこと。
 pub struct PrefetchedLoader {
     rx: mpsc::Receiver<io::Result<Batch>>,
     _handle: thread::JoinHandle<()>,
@@ -297,11 +277,10 @@ impl PrefetchedLoader {
         let handle = thread::spawn(move || {
             let mut loader = loader;
             loop {
-                // 毎ループ新規 alloc: mpsc::sync_channel が所有権を main thread に
-                // 移すため、background 側で `Batch::reset()` 再利用は不可。
-                // `prefetch_depth + 1` 個の batch を pool 化して return channel
-                // で回す ring buffer 設計は Stage 3-7/3-8 trainer integration で
-                // 必要に応じて追加 (本 PR scope では single-batch alloc 都度)。
+                // 毎ループ新規 alloc: `mpsc::sync_channel` が所有権を main
+                // thread に移すため、background 側で `Batch::reset()` 再利用は
+                // 不可。ring-buffer return path を持つ実装は
+                // [`BucketedPrefetchedLoader`] を参照。
                 let mut batch = Batch::with_capacity(batch_size, max_active);
                 match loader.fill_batch(&mut batch) {
                     Ok(0) => break, // EOF
@@ -348,10 +327,10 @@ impl PrefetchedLoader {
 pub const MAX_BARREN_PASSES: u32 = 5;
 
 /// `PsvFileLoader` を逐次読み、EOF で同 file を開き直して次 epoch とする stream
-/// reader。bullet `--score-drop-abs` の近似 skip と空 file の無限ループ防止
-/// (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない** — decode-once
-/// (Issue #89) のため、bucket は呼び出し側 (prefetch worker) が `PackedSfenValue::
-/// decode()` した `ShogiBoard` から `ShogiProgressKPAbs::bucket_board` で求める。
+/// reader。`--score-drop-abs` の近似 skip (`|score| >= t` を捨てる) と空 file の
+/// 無限ループ防止 (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない**
+/// (decode-once 経路: bucket は呼び出し側 prefetch worker が `decode()` した
+/// `ShogiBoard` から `ShogiProgressKPAbs::bucket_board` で求める)。
 ///
 /// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
@@ -382,8 +361,8 @@ impl PsvEpochReader {
         loop {
             match self.loader.next_psv()? {
                 Some(psv) => {
-                    // bullet `--score-drop-abs` の近似 (詳細は module doc)。
-                    // i64 cast で i16::MIN の abs overflow を避ける。
+                    // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
+                    // i64 cast で `i16::MIN` の abs overflow を避ける。
                     if let Some(t) = self.score_drop_abs
                         && i64::from(psv.score()).abs() >= i64::from(t)
                     {
@@ -415,7 +394,7 @@ impl PsvEpochReader {
 }
 
 // =============================================================================
-// BucketedPrefetchedLoader — Issue #89: bucket-aware / 並列パース / decode-once /
+// BucketedPrefetchedLoader — bucket-aware / 並列パース / decode-once /
 //                            ring-buffer return path
 // =============================================================================
 
@@ -430,9 +409,9 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 type BatchSlot = (Batch, Vec<i32>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
-/// 「PSV パース + HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算」を `decode()`
-/// **1 回** で済ませて main thread に `(Batch, buckets)` を渡す prefetch loader
-/// (Issue #89)。
+/// 「PSV パース + HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算」を
+/// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
+/// prefetch loader。
 ///
 /// ## 設計
 ///
@@ -446,22 +425,23 @@ type BatchSlot = (Batch, Vec<i32>);
 ///   thread 間共有して問題ない。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
-///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker が
-///   再借用して `reset()` / `clear()` で reuse。毎 batch の `Vec` 新規 alloc
-///   (~21MB) は起きない (#81 / #89 が予告していた follow-up)。
+///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
+///   が再借用して `reset()` / `clear()` で reuse。毎 batch の `Vec` 新規 alloc
+///   (~21MB) は発生しない。
 /// - **epoch 意味論**: 共有 reader が EOF で file を開き直す (= 次 epoch)、
-///   `score-drop-abs` skip、`MAX_BARREN_PASSES` ガード ([`PsvEpochReader`]) は
-///   従来 (`trainer.rs::EpochStream`) と同じ。ただし **1 epoch 内の position の
-///   順序は worker 数 ≥ 2 では非決定的** (各 worker が batch_size 件ずつ排他的に
-///   読むため batch 境界の切れ目が変わる)。training では問題ない (bullet 自体
-///   shuffle する; 適用される lr/wdl は loop の batch_idx で決まりデータ内容に
-///   依らない) が、決定論的順序が要る場合は `num_workers = 1` を使うこと。
-/// - **error 伝搬**: worker が reader から `io::Error` (主に barren-exhaustion) を
-///   受けたら shared error slot に格納して exit。main の [`Self::next_batch`] は
-///   全 worker が exit して result channel が閉じたら error slot を見て伝搬する。
+///   `score-drop-abs` skip、`MAX_BARREN_PASSES` ガードは [`PsvEpochReader`] が
+///   担う。ただし **1 epoch 内の position の順序は worker 数 ≥ 2 では非決定的**
+///   (各 worker が `batch_size` 件ずつ排他的に読むため batch 境界の切れ目が
+///   変わる)。training では問題ない (適用される lr/wdl は loop の `batch_idx` で
+///   決まりデータ内容に依らない) が、決定論的順序が要る場合は
+///   `num_workers = 1` を使うこと。
+/// - **error 伝搬**: worker が reader から `io::Error` (主に barren-exhaustion)
+///   を受けたら shared error slot に格納して exit。main の
+///   [`Self::next_batch`] は全 worker が exit して result channel が閉じたら
+///   error slot を見て伝搬する。
 /// - **終了**: main が `BucketedPrefetchedLoader` を drop すると [`Drop`] impl が
 ///   まず result/pool 両 channel endpoint を落として全 worker を unblock させ、
-///   その後 worker thread を join する (close-then-join、detail は `Drop` の doc)。
+///   その後 worker thread を join する (close-then-join、詳細は `Drop` の doc)。
 pub struct BucketedPrefetchedLoader {
     /// 完成 batch (Batch + per-position bucket) を worker → main で渡す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
@@ -749,9 +729,9 @@ mod tests {
     #[test]
     fn fill_batch_wdl_covers_loss_and_win_with_correct_values() {
         // sample.psv は Loss=50 / Win=50 (Draw を含まない) という偏った fixture。
-        // raw `game_result()` 直訳 (旧バグ: Win → 0.5) を回帰検出するため、
-        // `wdl == 1.0` が少なくとも 1 件存在することを確認 (`pos.result()` 経由の
-        // 正しい正規化なら Win → 1.0)。
+        // raw `game_result()` を直訳して `as u8 / 2.0` する経路だと Win → 0.5 に
+        // 潰れるので、`wdl == 1.0` が少なくとも 1 件存在することを確認
+        // (sign-aware な i8 → `{0.0, 0.5, 1.0}` map 経路の回帰検出)。
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         let mut batch = Batch::with_capacity(100, MAX_ACTIVE_FEATURES);
         loader.fill_batch(&mut batch).unwrap();
@@ -773,8 +753,8 @@ mod tests {
     #[test]
     fn batch_push_maps_draw_result_to_wdl_half() {
         // sample.psv は Loss=50 / Win=50 で Draw 行を持たないため、`result == 0
-        // → wdl == 0.5` のマッピングが本来カバーされない (Codex #95 review)。
-        // 実 PSV record を 1 件読んで game_result バイト (offset 38) を 0 に
+        // → wdl == 0.5` のマッピングがそのままではカバーされない。実 PSV
+        // record を 1 件読んで game_result バイト (offset 38) を 0 に
         // パッチした「Draw 局面」で push_decoded が wdl == 0.5 を出すことを確認。
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         let mut psv = loader.next_psv().unwrap().expect("at least 1 record");
@@ -862,7 +842,7 @@ mod tests {
         assert_eq!(first.n_positions, 4);
     }
 
-    // --- BucketedPrefetchedLoader (Issue #89) ---
+    // --- BucketedPrefetchedLoader ---
 
     fn run_bucketed_smoke(num_workers: usize) {
         // sample.psv は 100 records (Loss=50 / Win=50、Draw なし)。

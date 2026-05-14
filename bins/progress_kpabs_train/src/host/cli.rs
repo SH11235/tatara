@@ -1,9 +1,8 @@
 //! CLI 引数定義。
 //!
 //! bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs::Args`) のサブセット
-//! を移植。Stage 1-9 では「1 epoch 完走できる」「progress.bin が出力される」が
-//! 受け入れ条件のため、prefetch / multi-thread / val split / checkpoint 等は
-//! 範囲外として削っている (Stage 1-10 / Stage 2 で必要に応じて追加)。
+//! を移植している。prefetch / multi-thread / val split / checkpoint 等は本
+//! binary のスコープ外で未実装。
 
 use std::path::PathBuf;
 
@@ -16,7 +15,7 @@ use clap::Parser;
 )]
 pub struct Args {
     /// 学習データの PSV ファイル (`.bin`)。複数渡すには `,` 区切り。
-    /// 引数省略時は `run_training` で error を返す (Stage 1-9 では必須)。
+    /// 引数省略時は `run_training` で error を返す (実質必須)。
     #[arg(long)]
     pub data: Option<String>,
 
@@ -36,7 +35,7 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub max_games: usize,
 
-    /// epoch 数。Stage 1-9 では 1 で 1 epoch 完走を確認する想定。
+    /// epoch 数。
     #[arg(long, default_value_t = 1)]
     pub epochs: usize,
 
