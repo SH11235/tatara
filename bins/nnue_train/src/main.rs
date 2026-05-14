@@ -372,9 +372,16 @@ pub fn ranger_lookahead_lerp(
 
 /// Sparse feature transform forward (HalfKA_hm 用)。
 ///
-/// 1 thread = 1 (batch, row)、column-major weight (`weight[idx * rows + ri]`)、
-/// atomics 不要 (各 thread は別 output cell に書く)。`-1` padding と `idx >= cols`
-/// の異常入力は silent skip。
+/// 1 thread = 4 連続 row (output cells)、column-major weight (`weight[idx * rows + ri]`)、
+/// atomics 不要 (各 thread は別 4 output cell に書く)。`-1` padding と `idx >= cols`
+/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する、grid は
+/// `cfg_1d(batch * rows / 4)`。
+///
+/// 4 scalar weight read + 4 scalar store 形 (cuda-oxide / llc-22 では align(16)
+/// struct でも LSV は v4 load へ集約できず、struct 経由は逆に local alloca + spill
+/// が出るため scalar 形に統一)。1-row-per-thread と比較した win 源泉:
+/// - 4× 少ない thread → 4× 少ない launch overhead + setp/iter amortization
+/// - per-warp の memory transaction は同じ (warp 32 × 4 = 128 row span)、coalesce 維持
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward(
@@ -387,31 +394,49 @@ pub fn sparse_ft_forward(
     nnz: u32,
 ) {
     let tid = thread::index_1d();
-    let total = (batch as usize) * (rows as usize);
+    let rows_u = rows as usize;
+    let rows_q = rows_u / 4;
+    let total = (batch as usize) * rows_q;
     if tid.get() >= total {
         return;
     }
-    let bi = tid.get() / (rows as usize);
-    let ri = tid.get() % (rows as usize);
+    let bi = tid.get() / rows_q;
+    let ri_q = tid.get() % rows_q;
+    let ri_base = ri_q * 4;
 
-    // raw pointer 版 (inner loop の 2 bounds check / iter = 80 / thread を除去)。
-    // unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1` padding 含めて
-    // 確保)、weight.len() == cols * rows (FT 重み、arch 固定)。`if idx >= 0 && (idx as u32)
-    // < cols` のロジックチェックは値検査として保持。
+    // raw pointer 版。unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1`
+    // padding 含めて確保)、weight.len() == cols * rows (FT 重み、arch 固定、rows %
+    // 4 == 0)、`if idx >= 0 && (idx as u32) < cols` のロジックチェックは値検査として保持。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
-    let mut sum = 0.0_f32;
+    let mut s0: f32 = 0.0;
+    let mut s1: f32 = 0.0;
+    let mut s2: f32 = 0.0;
+    let mut s3: f32 = 0.0;
     let base = bi * (nnz as usize);
     let mut ni: u32 = 0;
     while ni < nnz {
         let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
-            sum += unsafe { weight_ptr.add((idx as usize) * (rows as usize) + ri).read() };
+            let off = (idx as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() };
+            let w1 = unsafe { weight_ptr.add(off + 1).read() };
+            let w2 = unsafe { weight_ptr.add(off + 2).read() };
+            let w3 = unsafe { weight_ptr.add(off + 3).read() };
+            s0 += w0;
+            s1 += w1;
+            s2 += w2;
+            s3 += w3;
         }
         ni += 1;
     }
-    if let Some(o) = out.get_mut(tid) {
-        *o = sum;
+    let out_ptr = out.as_mut_ptr();
+    let out_base = bi * rows_u + ri_base;
+    unsafe {
+        out_ptr.add(out_base).write(s0);
+        out_ptr.add(out_base + 1).write(s1);
+        out_ptr.add(out_base + 2).write(s2);
+        out_ptr.add(out_base + 3).write(s3);
     }
 }
 
@@ -3754,11 +3779,14 @@ impl GpuTrainer {
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
+        // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * FT_OUT / 4。
+        // FT_OUT = 1536 (4 の倍数) を arch 固定で保証。
+        debug_assert!(FT_OUT.is_multiple_of(4));
         cuda_launch! {
             kernel: sparse_ft_forward,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 4),
             args: [
                 slice(self.ft_w),
                 slice(self.ws.stm_idx_dev),
@@ -3770,7 +3798,7 @@ impl GpuTrainer {
             kernel: sparse_ft_forward,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 4),
             args: [
                 slice(self.ft_w),
                 slice(self.ws.nstm_idx_dev),
