@@ -1,8 +1,7 @@
 //! NNUE binary header の (de)serialise。
 //!
-//! Stage 3 (EPIC #17) の output binary 先頭に置く固定長 metadata。Stage 3-3
-//! (`halfka_psqt save/load`) で weight 本体の前に書かれ、Stage 3-9 自己対局
-//! 検証で rshogi (将棋エンジン) 側 loader が読む。
+//! output binary 先頭に置く固定長 22 bytes metadata。`halfka_psqt` の
+//! save/load で weight 本体の前に書かれ、将棋エンジン側 loader が読む。
 //!
 //! ## binary layout (固定長 22 bytes、little-endian)
 //!
@@ -22,17 +21,7 @@
 //! - `net_id`: 空文字列
 //! - `fv_scale = 16` — YaneuraOu cp 単位への scale
 //! - `qa = 64`、`qb = 64` — input / output quantisation multiplier (典型値、
-//!   Stage 3-3 halfka_psqt save/load で actual quant value が確定したら
-//!   trainer 側で上書きする)
-//!
-//! ## bullet 上流参照
-//!
-//! bullet-shogi `crates/bullet_lib/src/value/save.rs::save_quantised`
-//! (commit `f275eb9`) は header 概念を `ModelWeights::write_to_byte_buffer`
-//! 内に分散させており、`NnueHeader` のような明示 struct は存在しない。本実装は
-//! rshogi 互換性のため **本リポ独自の minimal header** を確定する形 (将来 Stage 3-9
-//! で rshogi 側 loader と整合性検証の上で調整可能)。bullet 上流からは「header に
-//! `net_id` / `fv_scale` / `qa` / `qb` を置く方針」のみ参照、layout は新規。
+//!   actual quant value は trainer 側で上書きする)
 
 use std::io::{self, Read, Write};
 
@@ -47,10 +36,10 @@ pub const NET_ID_LEN: usize = 16;
 /// `fv_scale` 既定値 (YaneuraOu cp スケール、典型値)。
 pub const DEFAULT_FV_SCALE: i16 = 16;
 
-/// `qa` 既定値 (input 量子化、Stage 3-3 で確定したら trainer から上書き)。
+/// `qa` 既定値 (input 量子化、trainer 側で実値に上書き)。
 pub const DEFAULT_QA: i16 = 64;
 
-/// `qb` 既定値 (output 量子化、Stage 3-3 で確定したら trainer から上書き)。
+/// `qb` 既定値 (output 量子化、trainer 側で実値に上書き)。
 pub const DEFAULT_QB: i16 = 64;
 
 /// NNUE binary 先頭 22 bytes の固定長 header。
@@ -60,9 +49,9 @@ pub struct NnueHeader {
     pub net_id: String,
     /// YaneuraOu cp スケール (典型 16)。
     pub fv_scale: i16,
-    /// input quantisation multiplier (Stage 3-3 で actual 値に更新)。
+    /// input quantisation multiplier (trainer 側で実値に更新)。
     pub qa: i16,
-    /// output quantisation multiplier (Stage 3-3 で actual 値に更新)。
+    /// output quantisation multiplier (trainer 側で実値に更新)。
     pub qb: i16,
 }
 

@@ -1,8 +1,9 @@
 //! Fused Ranger optimizer (RAdam + Lookahead) の reference CPU 実装。
 //!
-//! Ranger は **RAdam + Lookahead** の 2 段構成。RAdam (Stage 2-4
-//! `radam_step`) で fast params (`weights`) を更新しつつ、`step % k == 0` の
-//! ときだけ Lookahead lerp で **slow params (`s`) との SMA** を取る:
+//! Ranger (Wright 2019、bullet `ranger.rs` と同等) は **RAdam + Lookahead** の
+//! 2 段構成。RAdam で fast params (`weights`) を更新しつつ、`step % k == 0` の
+//! ときだけ Lookahead lerp (Zhang et al. 2019) で **slow params (`s`) との SMA**
+//! を取る:
 //!
 //! ```text
 //! per RAdam step:
@@ -11,12 +12,11 @@
 //!     ranger_lookahead_lerp_cpu(weights, slow, alpha)
 //! ```
 //!
-//! GPU 側は **2 kernel** 構成: Stage 2-4 `radam_step` を毎 step 呼び、
-//! `step % k == 0` のときだけ新規 `#[kernel] fn ranger_lookahead_lerp` を
-//! 追加で呼ぶ host orchestration。kernel 自体は scalar 1 thread = 1 weight
-//! の単純 pointwise (atomics 不要)。
+//! GPU 側は **2 kernel** 構成: `radam_step` を毎 step 呼び、`step % k == 0` の
+//! ときだけ `#[kernel] fn ranger_lookahead_lerp` を追加で呼ぶ host orchestration。
+//! kernel 自体は scalar 1 thread = 1 weight の単純 pointwise (atomics 不要)。
 //!
-//! ## アルゴリズム (bullet 上流 `optimiser/ranger.rs::build_ranger_op` に等価)
+//! ## アルゴリズム
 //!
 //! ```text
 //! Lookahead lerp (per element i):
@@ -25,42 +25,30 @@
 //!     slow[i]    = new_w        # weights / slow が同期する
 //! ```
 //!
-//! - `alpha ∈ [0, 1]`: lookahead blend (bullet default 0.5)
-//! - `k`: lookahead step (bullet default 6)
-//! - `slow` の初期値は `0.0` (bullet 上流 `RangerLookahead::new` の `Buffer::
-//!   from_host(...&TValue::F32(vec![0.0; size]))`、`ranger.rs:75`)
-//! - lerp 後は **weights == slow** で完全同期、bullet 上流 `build_ranger_op`
-//!   (`ranger.rs:43-44`) の `pntwise.write(w, ..., new_w); pntwise.write(s, ..., new_w);`
-//!   と同型
+//! - `alpha ∈ [0, 1]`: lookahead blend (典型値 0.5)
+//! - `k`: lookahead step (典型値 6)
+//! - `slow` の初期値は `0.0`
+//! - lerp 後は **weights == slow** で完全同期
 //!
-//! ## bullet 上流との対応 / divergence
+//! ## 設計メモ
 //!
-//! - bullet `RangerLookahead::update` (`ranger.rs:82-100`) は `inner.update()`
-//!   (RAdam) を毎 step 呼び、`self.step.is_multiple_of(self.k)` のとき
-//!   lerp kernel を実行。本実装も同 orchestration を `ranger_step_cpu` で再現
-//! - bullet `Ranger` は `WrapOptimiser<RangerLookahead<G, RAdam<G>>, RangerParams>`
-//!   で `RangerParams` (lr / beta1 / beta2 / decay / clip / alpha / k) を分解して
-//!   inner RAdam params + lookahead params に変換 (`ranger.rs:179-194`)。本実装は
-//!   `ranger_step_cpu` のシグネチャに必要パラメータを並べる scalar 形式
-//! - **slow params の checkpoint**: bullet は `slow.bin` に書き出して resume
-//!   時に復元する (`ranger.rs:147-159`)。本実装はその orchestration までは
-//!   含まず Stage 3 trainer integration で扱う
+//! - **slow params の checkpoint**: bullet 上流は `slow.bin` に書き出して resume
+//!   時に復元する。本 reference は orchestration までは含まず、trainer 側で扱う
 //!
 //! ## cuda-oxide 制限
 //!
 //! - lerp kernel は `+` / `*` のみで `f32::clamp` も `sqrt` も使わないため
-//!   cuda-oxide 制限に当たらない (Stage 1-5 forward の `+ z` と同等の素直な
-//!   pointwise op)
+//!   cuda-oxide 制限に当たらない
 
 /// Lookahead lerp の reference CPU 実装。
 ///
 /// In-place mutation:
 /// - `weights[i] = alpha * weights[i] + (1 - alpha) * slow[i]`
-/// - `slow[i] = weights[i]` (= 上の new_w、bullet 上流と同型で同期)
+/// - `slow[i] = weights[i]` (= 上の new_w、両者を同期させる)
 ///
 /// 入力前提:
 /// - `weights.len() == slow.len() == n`
-/// - `alpha ∈ [0, 1]` (host 側不変条件、bullet default 0.5)
+/// - `alpha ∈ [0, 1]` (host 側不変条件、典型値 0.5)
 pub fn ranger_lookahead_lerp_cpu(weights: &mut [f32], slow: &mut [f32], alpha: f32, n: usize) {
     let one_minus_alpha = 1.0_f32 - alpha;
     for i in 0..n {
@@ -73,18 +61,16 @@ pub fn ranger_lookahead_lerp_cpu(weights: &mut [f32], slow: &mut [f32], alpha: f
 /// Ranger orchestration の reference CPU 実装 (1 step)。
 ///
 /// `step` 番目の RAdam update を実行し、`step % k == 0` (`k > 0` 前提) の
-/// ときだけ Lookahead lerp を続けて実行する。bullet `RangerLookahead::update`
-/// (`ranger.rs:82-100`) の host 側 orchestration を CPU で再現したもので、
-/// Stage 3 trainer の RangerScheduler が GPU 上で同 sequence を組むときの
-/// reference 動作。
+/// ときだけ Lookahead lerp を続けて実行する。trainer 側 RangerScheduler が
+/// GPU 上で同 sequence を組むときの reference 動作。
 ///
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == slow.len() == n`
 /// - `step >= 1` (1-indexed、`radam_compute_step_size_denom` が要求する制約)
 /// - `k >= 1` (lookahead step 間隔)
 ///
-/// 引数数 (16) は bullet 上流 RangerParams を CPU 側で展開した形。
-/// `clippy::too_many_arguments` を allow (Stage 1 / 2-3 / 2-4 と同 convention)。
+/// 引数 16 個は RangerParams を CPU 側で展開した形。
+/// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn ranger_step_cpu(
     weights: &mut [f32],
@@ -113,10 +99,10 @@ pub fn ranger_step_cpu(
         weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n,
     );
 
-    // `k != 0` ガードは bullet 上流 `is_multiple_of(0)` (step != 0 で false、
-    // step == 0 で true、panic しない) と数値同型に揃えるため + CPU で
-    // `step % 0` が panic するため両方の defensive。Stage 3 trainer は
-    // `RangerParams` で `k >= 1` が保証されるが本 fn 単体での堅牢性を確保。
+    // `k != 0` ガード: CPU の `step % 0` は panic、`u64::is_multiple_of(0)` は
+    // step==0 のとき true / それ以外 false で panic しない (両者の動作差を埋め、
+    // 呼び出し側の `RangerParams` が `k >= 1` を保証しない経路でも安全に no-op
+    // にする)。
     if k != 0 && step.is_multiple_of(k) {
         ranger_lookahead_lerp_cpu(weights, slow, alpha, n);
     }
@@ -152,7 +138,7 @@ mod tests {
         assert_eq!(slow, vec![10.0_f32, 20.0, 30.0]);
     }
 
-    /// alpha = 0.5 (bullet default) で lerp は **平均**。
+    /// alpha = 0.5 (典型値) で lerp は **平均**。
     /// new_w = 0.5 * w + 0.5 * s = (w + s) / 2
     /// w=2, s=4 → new_w = 3、weights/slow 両方 3 に。
     #[test]
@@ -164,9 +150,8 @@ mod tests {
         assert_eq!(slow, vec![3.0_f32, 0.0, 5.0]);
     }
 
-    /// lerp 後は weights == slow で同期 (bullet `pntwise.write(w/s, ..., new_w)`
-    /// と同型)。任意の `(weights, slow, alpha)` で post-condition `weights == slow`
-    /// が成り立つ性質テスト。
+    /// lerp 後は weights == slow で同期する性質テスト。任意の `(weights, slow,
+    /// alpha)` で post-condition `weights == slow` が成り立つ。
     #[test]
     fn lerp_synchronizes_weights_and_slow() {
         let mut weights = vec![0.5_f32, -1.5, 2.7, 100.0];
@@ -198,7 +183,7 @@ mod tests {
         let mut slow = vec![0.0_f32];
 
         // step=1 (k=2): RAdam のみ実行、lerp 走らない。weights は RAdam 後の値、
-        // slow は 0 のまま (bullet 上流の `RangerLookahead::new` 初期値踏襲)
+        // slow は 0 のまま (RangerLookahead 初期値 0.0 を踏襲)
         ranger_step_cpu(
             &mut weights,
             &mut m,
@@ -259,10 +244,9 @@ mod tests {
         );
     }
 
-    /// `k = 1` (lerp が毎 step 走る境界値、bullet default 6 と異なるが妥当な
-    /// 設定値): step % 1 == 0 が常に true なので毎 step lerp、slow が weights に
-    /// 毎 step 追従する。grad = 0 で RAdam が no-op になる構成にして、lerp の
-    /// 効果のみ観察。
+    /// `k = 1` (lerp が毎 step 走る境界値): step % 1 == 0 が常に true なので
+    /// 毎 step lerp、slow が weights に毎 step 追従する。grad = 0 で RAdam が
+    /// no-op になる構成にして、lerp の効果のみ観察。
     /// w=1.0、slow=0.5、alpha=0.5 → new_w = 0.5*1.0 + 0.5*0.5 = 0.75
     #[test]
     fn step_cpu_k_equals_one_lerps_every_step() {

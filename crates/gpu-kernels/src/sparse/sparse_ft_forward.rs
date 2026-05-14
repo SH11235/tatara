@@ -1,10 +1,10 @@
 //! Sparse feature transform forward kernel (HalfKA_hm 用) の reference CPU 実装。
 //!
-//! GPU 側 `#[kernel] fn sparse_ft_forward` は bin entry
-//! (`bins/nnue_train/src/main.rs`) に inline 定義されている (cuda-oxide
-//! rustc-codegen-cuda backend の bin-entry 制約)。本 module の
-//! `sparse_ft_forward_cpu` は GPU と同じロジックを host で素直に書き写したもので、
-//! GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 (`#[kernel] fn sparse_ft_forward`) は `bins/nnue_train/src/main.rs` に
+//! inline 定義されている (cuda-oxide rustc-codegen-cuda backend は bin entry
+//! 経由で到達可能な kernel しか PTX 化しないため)。本 module の
+//! `sparse_ft_forward_cpu` は GPU と同じロジックを host に書き写したもので、
+//! GPU↔CPU 数値同等性テストの reference に使う。
 //!
 //! ## アルゴリズム (bullet 上流 `linear/sparse.rs::SparseMatmul::evaluate` に等価)
 //!
@@ -31,24 +31,21 @@
 //! - `out` (size `batch * rows`): per position の FT output、row-major で
 //!   `out[bi * rows + ri]` 位置
 //!
-//! ## bullet 上流との対応 / divergence
+//! ## bullet 上流との差分
 //!
-//! - bullet `SparseMatmul::evaluate` (`linear/sparse.rs:61-91`) は `DValue` 経由
-//!   の generic な dtype を受けるが、本実装は `f32` 固定 (NNUE training の hot
-//!   path で f32 のみを扱う)
-//! - bullet は `nnz` ループを runtime fusion で吸収する。本実装は `nnz` を
-//!   build-time の引数として受けて kernel 内 `for ni in 0..nnz` を素直に展開
-//!   (memory bandwidth bound なので unroll の差は小さい想定)
-//! - **silent skip on `idx >= cols`**: bullet 上流も `if idx >= 0 && (idx as
-//!   usize) < cols` で defensive にチェックする (`linear/sparse.rs:82`)。本実装
-//!   も同型に揃える
+//! - bullet `SparseMatmul::evaluate` は `DValue` 経由の generic dtype を受けるが、
+//!   本実装は `f32` 固定 (NNUE training hot path で f32 のみ扱う)
+//! - bullet は `nnz` ループを runtime fusion で吸収するが、本実装は `nnz` を
+//!   build-time 引数として受けて `for ni in 0..nnz` を素直に展開する (memory
+//!   bandwidth bound なので unroll の差は小さい想定)
+//! - **silent skip on `idx >= cols`**: bullet 上流の `if idx >= 0 && (idx as
+//!   usize) < cols` defensive check と同型
 //!
 //! ## cuda-oxide 制限
 //!
-//! - GPU kernel 側は `+` / `*` のみ + indexing (i32 比較含む) で cuda-oxide 制限
-//!   に当たらない (Stage 1-5 forward と同等の単純 pointwise op)
-//! - i32 比較 `idx >= 0` / `idx as usize < cols` は cuda-oxide で問題なく
-//!   compile される (Stage 1-6 grad の `if b < 0` / `if b > 7` と同型)
+//! GPU kernel 側は `+` / `*` + indexing (i32 比較含む) のみで cuda-oxide 制限に
+//!当たらない。`idx >= 0` / `(idx as usize) < cols` の i32 比較も問題なく compile
+//! される。
 
 /// Reference CPU 実装。
 ///
@@ -60,7 +57,7 @@
 /// - `out.len() == batch * rows` (row-major、`out[batch * rows + row]`)
 ///
 /// 引数数 (7) は bullet 上流 evaluate の入出力 + sparse 形状を漏れなく渡すため
-/// `clippy::too_many_arguments` を allow (Stage 1 / Stage 2 と同 convention)。
+/// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_ft_forward_cpu(
     weight: &[f32],
@@ -89,9 +86,9 @@ pub fn sparse_ft_forward_cpu(
 mod tests {
     use super::*;
 
-    /// bullet 上流 (`linear/sparse.rs::tests::evaluate`、`:243-253`) と同じ
-    /// shape (batch=2, rows=2, cols=3, nnz=4) で完全一致。期待値 [2, 4, 10, 14]
-    /// は bullet の test と同じ。本テストが緑なら bullet 上流と同レイアウトで
+    /// bullet 上流 (`linear/sparse.rs::tests::evaluate`) と同じ shape
+    /// (batch=2, rows=2, cols=3, nnz=4) で完全一致。期待値 [2, 4, 10, 14] は
+    /// bullet の test と同じ。本テストが緑なら bullet 上流と同レイアウトで
     /// 動作することが保証される。
     #[test]
     fn matches_bullet_upstream_evaluate_test() {

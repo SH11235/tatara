@@ -1,32 +1,28 @@
-//! bullet win-rate-model (WRM) loss kernel の reference CPU 実装。
+//! Win-rate-model (WRM) loss kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn loss_wrm`) は **`bins/nnue_train/src/main.rs` に inline
-//! 定義** されている (Stage 1-5 で確立した「`#[kernel]` は bin entry に inline」
-//! 制約)。本 module の `loss_wrm_cpu` は GPU と同じロジックを host で素直に書き
-//! 写したもので、Issue #84 / #85 の GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn loss_wrm` は呼び出し元 bin entry に inline 定義する
+//! (cuda-oxide rustc-codegen-cuda backend の bin-entry 制約)。本 module は
+//! GPU↔CPU 数値同等性テストの reference 用。
 //!
-//! ## アルゴリズム (bullet `loss_fn_wrm` + loader WRM target)
+//! ## アルゴリズム
 //!
-//! bullet 上流の v102 recipe (`--win-rate-model --wrm-in-scaling 340
-//! --wrm-nnue2score 600`) は loss を nodchip 流 win-rate-model にする。
-//! `crates/bullet_lib/src/value/loader.rs:300-316` (data-layer の WRM target +
-//! WDL blend) と `examples/shogi_layerstack.rs:2177-2188` (`loss_fn_wrm`) を
-//! NNUE 専用に hand-fuse する。
+//! nodchip 流 win-rate-model loss (bullet `loss_fn_wrm` + loader WRM target に等価)。
+//! target / prediction 双方で `(score - 270)/in_scaling` の sigmoid 対称差を取る:
 //!
 //! ```text
 //! per position i:
-//!     # --- target (bullet loader): in_scaling=380 / offset=270 はハードコード ---
+//!     # --- target (in_scaling=380, offset=270 は固定) ---
 //!     pt   = (score[i]  - 270) / 380
 //!     pmt  = (-score[i] - 270) / 380
 //!     target_wrm = 0.5 * (1 + sigmoid(pt) - sigmoid(pmt))
 //!     target = lambda * wdl[i] + (1 - lambda) * target_wrm
-//!     # --- prediction (bullet loss): scorenet = out * nnue2score ---
+//!     # --- prediction (scorenet = out * nnue2score) ---
 //!     scorenet = out[i] * nnue2score
 //!     q   = sigmoid((scorenet  - 270) / in_scaling)
 //!     qm  = sigmoid((-scorenet - 270) / in_scaling)
 //!     qf  = 0.5 * (1 + q - qm)
 //!     err = qf - target
-//!     loss_acc += err^2                          # un-normalized sum (loss_wdl と同型)
+//!     loss_acc += err^2                          # un-normalized sum
 //!     # chain rule: dq/dout = q(1-q) * nnue2score/in_scaling,
 //!     #             dqm/dout = -qm(1-qm) * nnue2score/in_scaling
 //!     #             dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q) + qm(1-qm))
@@ -37,36 +33,37 @@
 //! ## `loss_wdl` (sigmoid-MSE) との違い / なぜ WRM が要るか
 //!
 //! [`super::loss_wdl::loss_wdl_cpu`] は `p = sigmoid(out * scale)` で net_output に
-//! `scale = 1/scale_param` を掛けるため、net_output が **cp 単位** (`out ≈ cp`) で
-//! 収束する。一方 bullet v102 は WRM loss で `scorenet = out * nnue2score` (= `out * 600`)
-//! を cp 単位とみなすため、net_output は **`out ≈ cp / nnue2score` (O(1))** で収束
-//! する。`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) は bullet の
-//! このスケール (`out ≈ cp/600`) を前提とするので、bullet 互換 net を学習するには
-//! `loss_wrm` を使う必要がある (`loss_wdl` で学習した net は byte レイアウトは互換だが
+//! `scale = 1/scale_param` を掛けるため net_output は **cp 単位** (`out ≈ cp`) で
+//! 収束する。一方 WRM loss は `scorenet = out * nnue2score` (= `out * 600`) を
+//! cp 単位とみなすため、net_output は **`out ≈ cp / nnue2score` (O(1))** で収束する。
+//! `crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) は bullet と同じ
+//! スケール (`out ≈ cp/600`) を前提とするので、bullet 互換 net を学習するには
+//! WRM loss が必須 (sigmoid-MSE で学習した net は byte レイアウトは互換だが
 //! 数値スケールが ~600× ずれて量子化後に破綻する)。
 //!
-//! ## bullet 上流との対応 / divergence
+//! ## 定数の出典
 //!
-//! - bullet は **data layer で target を pre-compute** する (`loader.rs:305-315`
-//!   `blend * result + (1 - blend) * score` で `score` 変数が WRM target になっている)。
-//!   本実装は kernel 内に WRM target + WDL blend を畳み込み、`score` (raw cp) と `wdl`
-//!   ({0, 0.5, 1}) を 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
-//! - target 側 in_scaling は bullet で **380 ハードコード** (`--wrm-in-scaling` ではない)、
-//!   prediction 側 in_scaling は `--wrm-in-scaling` (340) — この非対称も bullet どおり。
-//! - offset 270 は target / prediction 双方で bullet ハードコード (`loss_fn_wrm` の
-//!   `let offset = 270.0` と loader の `(score - 270.0)`)。
-//! - `lambda` (WDL blend) は v102 recipe では 0.0 (target = target_wrm のみ) だが、
-//!   bullet `WdlScheduler` 互換のため引数として残す (`lambda = 1.0` で純 WDL)。
+//! - target 側 `in_scaling = 380` は bullet ハードコード (CLI `--wrm-in-scaling` ではない)
+//! - prediction 側 in_scaling は CLI `--wrm-in-scaling` (推奨 340)、target と非対称な
+//!   のも bullet 仕様どおり
+//! - offset 270 は target / prediction 双方で bullet ハードコード
+//! - `lambda` (WDL blend) は典型的には 0.0 (target = target_wrm のみ) だが、
+//!   WdlScheduler 互換のため引数として残す (`lambda = 1.0` で純 WDL)
+//!
+//! ## 実装メモ
+//!
+//! bullet 上流は data layer で target を pre-compute するが、本実装は kernel 内に
+//! WRM target + WDL blend を畳み込み、`score` (raw cp) と `wdl` ({0, 0.5, 1}) を
+//! 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
 //!
 //! ## NaN / Inf 挙動
 //!
 //! - `out[i] = NaN` / `score[i] = NaN` → sigmoid 経由で NaN 伝搬 (`loss_wdl` と同じ、
-//!   学習中の NaN を loss 経路で気付ける)。
+//!   学習中の NaN を loss 経路で気付ける)
 //! - `|score|` が非常に大きい場合 (例: ±32000 の mate-stamp) `(score - 270)/380` が
 //!   ±84 程度になり sigmoid が 0/1 に飽和する。`exp(±84)` は f32 範囲内 (`exp(88.7) ≈
-//!   3.4e38`) なので overflow せず、target_wrm は 0 か 1 に張り付くだけで NaN にならない
-//!   (v102 は `--score-drop-abs 32000` でこれら極値を除外する想定だが、kernel 自体は
-//!   robust)。`q*(1-q)` も飽和時は 0 になり grad が消える。
+//!   3.4e38`) なので overflow せず、target_wrm は 0 か 1 に張り付くだけで NaN に
+//!   ならない。`q*(1-q)` も飽和時は 0 になり grad が消える
 
 /// Reference CPU 実装。
 ///
@@ -76,13 +73,13 @@
 ///
 /// 入力前提:
 /// - `out.len() == score.len() == wdl.len() == per_pos_norm.len() == dl_dout.len() == n`
-/// - `nnue2score > 0` / `in_scaling > 0` (bullet `--wrm-nnue2score` / `--wrm-in-scaling`
-///   は正値、host 側で保証)
+/// - `nnue2score > 0` / `in_scaling > 0` (CLI `--wrm-nnue2score` /
+///   `--wrm-in-scaling` は正値、host 側で保証)
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
-/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win、bullet 上流 `pos.result() as u8 / 2.0` 同型)
+/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
 ///
-/// 引数数 (10) は host invariant を漏れなく渡すため bullet 上流より多い。clippy
-/// `too_many_arguments` を allow する (Stage 1 grad / `loss_wdl_cpu` と同 convention)。
+/// 引数 10 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wrm_cpu(
     out: &[f32],
@@ -99,14 +96,14 @@ pub fn loss_wrm_cpu(
     const OFFSET: f32 = 270.0;
     const TARGET_IN_SCALING: f32 = 380.0;
     for i in 0..n {
-        // target (bullet loader WRM target)
+        // target: WRM applied to raw cp score (target-side in_scaling = 380 固定)
         let s = score[i];
         let pt = (s - OFFSET) / TARGET_IN_SCALING;
         let pmt = (-s - OFFSET) / TARGET_IN_SCALING;
         let target_wrm = 0.5_f32 * (1.0_f32 + sigmoid_f32(pt) - sigmoid_f32(pmt));
         let target = lambda * wdl[i] + (1.0_f32 - lambda) * target_wrm;
 
-        // prediction (bullet loss_fn_wrm: WRM applied to net output)
+        // prediction: WRM applied to net output (scorenet = out * nnue2score)
         let scorenet = out[i] * nnue2score;
         let q = sigmoid_f32((scorenet - OFFSET) / in_scaling);
         let qm = sigmoid_f32((-scorenet - OFFSET) / in_scaling);
@@ -187,9 +184,8 @@ mod tests {
         assert_eq!(loss_acc, 0.0);
     }
 
-    /// loss / grad が bullet `loss_fn_wrm` + loader WRM target の式と一致することを、
-    /// 同じ式を独立に書き直して照合する (期待値は f32 計算 → f64 cast、Stage 1-10 の
-    /// f32 リテラル比較 pitfall 回避)。
+    /// loss / grad が docstring の式と一致することを、同じ式を独立に書き直して
+    /// 照合する (期待値は f32 計算 → f64 cast、f32 リテラル比較の pitfall 回避)。
     #[test]
     fn matches_bullet_wrm_formula() {
         let out = vec![0.3_f32, -0.8, 2.5, -0.05];
@@ -215,7 +211,7 @@ mod tests {
             4,
         );
 
-        // bullet の式を独立に再計算 (loader.rs:308-315 + loss_fn_wrm)
+        // 式を独立に再計算 (WRM target + WRM prediction)
         let sig = |x: f32| 1.0_f32 / (1.0_f32 + (-x).exp());
         let mut exp_loss = 0.0_f64;
         for i in 0..4 {
@@ -304,7 +300,7 @@ mod tests {
         }
     }
 
-    /// `per_pos_norm` は grad にだけ乗り loss_acc には乗らない (`loss_wdl` と同 convention)。
+    /// `per_pos_norm` は grad にだけ乗り loss_acc には乗らない convention (`loss_wdl` と同型)。
     #[test]
     fn per_pos_norm_scales_grad_but_not_loss() {
         let out = vec![1.5_f32; 3];

@@ -1,12 +1,13 @@
 //! Evaluation (loss + histogram only) kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn eval`) は **`src/main.rs` に inline 定義** されている
-//! (Stage 1-5 で確立した backend 仕様)。本 module の `eval_cpu` は GPU と
-//! 同じロジックを host で素直に書き写したもの。
+//! GPU 側 (`#[kernel] fn eval`) は `src/main.rs` に inline 定義されている
+//! (cuda-oxide rustc-codegen-cuda backend は bin entry 経由でしか PTX 化しない
+//! ため)。本 module の `eval_cpu` は GPU と同じロジックを host に書き写した
+//! もの。
 //!
 //! ## アルゴリズム
 //!
-//! 1 thread = 1 position。Stage 1-6 の `grad` から **gradient scatter を除いた**
+//! 1 thread = 1 position。`grad` kernel から **gradient scatter を除いた**
 //! 評価専用 path。weight 更新には使わず、validation/test 時の loss と prediction
 //! 分布を取るために使う:
 //!
@@ -31,7 +32,7 @@
 //! なので、同一 `(preds, targets, n_pos)` に対する `loss_acc` / `hist` 結果は
 //! `grad` を **scatter 無効化 (`indices` 全 `-1` padding)** で呼んだ結果と
 //! 一致するはず。`tests/eval_smoke.rs::eval_output_matches_grad_loss_hist_subset`
-//! で確認している (host loop 統合は Stage 1-9 で別途扱う)。
+//! で確認している。
 
 /// Reference CPU 実装。
 ///

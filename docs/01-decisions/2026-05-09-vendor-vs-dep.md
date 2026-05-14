@@ -1,4 +1,4 @@
-# ADR-0002: 依存戦略 — vendor と git dependency の使い分け
+# 依存戦略 — vendor と git dependency の使い分け
 
 - **Status**: Accepted
 - **Date**: 2026-05-09

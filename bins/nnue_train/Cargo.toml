@@ -1,7 +1,6 @@
 [package]
-# bin の package 名は crate `nnue-train` と衝突するため `nnue-trainer` にする。
-# binary 実行名 (`[[bin]] name`) は `nnue-train` を維持 (Stage 1 の
-# `progress-kpabs-train` と同流儀、`cargo run --bin nnue-train ...` で動かす)。
+# package 名は library crate `nnue-train` と衝突するため `nnue-trainer` を使い、
+# 実行ファイル名は `[[bin]] name` で `nnue-train` に揃える。
 name = "nnue-trainer"
 version = "0.1.0"
 edition = { workspace = true }
@@ -20,8 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 # host 側ロジック (schedule / dataloader / optimizer / trainer loop) は
-# `nnue-train` crate に置く。`nnue-format` は save_quantised / load の
-# entry point として本 bin から呼ぶ (Stage 3-8 #65 で integrate)。
+# library crate `nnue-train` 側、本 bin は GPU `#[kernel]` 定義と
+# kernel launch、CLI、save_quantised 呼び出しだけを行う。
 nnue-train = { workspace = true }
 nnue-format = { workspace = true }
 shogi-format = { workspace = true }
@@ -30,9 +29,10 @@ gpu-kernels = { workspace = true }
 gpu-runtime = { workspace = true }
 clap = { workspace = true }
 
-# cuda-oxide deps: device 側 API (`#[kernel]` / DisjointSlice / atomics) と
-# host 側 launch (`cuda_launch!` macro)。Stage 1 / Stage 2 と同 rev (`6de0509`)。
-# `cuda-core` は `cuda_launch!` macro 展開で参照されるため explicit dep。
+# cuda-oxide device 側 API (`#[kernel]` / DisjointSlice / atomics) + host 側
+# launch (`cuda_launch!` macro)。`cuda-core` は `cuda_launch!` の展開で参照
+# されるため bin の direct dep として明示する必要がある。rev は workspace 全体で
+# 揃え、`rust-toolchain.toml` の channel とも整合させる。
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }

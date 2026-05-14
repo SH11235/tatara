@@ -1,7 +1,7 @@
 //! Elementwise add kernel の reference CPU 実装。
 //!
 //! GPU 側 (`#[kernel] fn elementwise_add`) は `bins/nnue_train/src/main.rs` に
-//! inline 定義 (cuda-oxide bin-entry 制約)。v102 では forward の `l1_total =
+//! inline 定義 (cuda-oxide bin-entry 制約)。forward の `l1_total =
 //! l1_bucket + l1f_out`、`net_output = l3_out + l1_skip` と、backward の
 //! gradient-combine (`dl1_main = dl1_main_from_concat + dl1_main_from_sqr`、
 //! `dcombined = dcombined_from_l1 + dcombined_from_l1f`) に使われる

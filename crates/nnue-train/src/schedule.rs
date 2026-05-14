@@ -1,25 +1,17 @@
 //! Learning rate / WDL lambda scheduling。
 //!
-//! bullet-shogi (commit `f275eb9`) の
-//! `crates/bullet_lib/src/trainer/schedule/{lr,wdl}.rs` から vendor。Stage 3-8
-//! trainer loop で `superbatch` / `batch` index ごとに `LrScheduler::lr` /
-//! `WdlScheduler::blend` を呼び、Stage 2 `adamw_step` / `radam_step` /
-//! `loss_wdl` kernel の `lr` / `lambda` 引数として渡す host-side state を提供。
+//! superbatch loop が `superbatch` / `batch` index ごとに `LrScheduler::lr` /
+//! `WdlScheduler::blend` を呼び、optimizer kernel (`adamw_step` / `radam_step`)
+//! と loss kernel (`loss_wdl` / `loss_wrm`) の `lr` / `lambda` 引数として渡す
+//! host-side state を提供する。
 //!
-//! ## bullet 上流からの差分
+//! 計算 path (lr / blend) は bullet-shogi (`crates/bullet_lib/src/trainer/
+//! schedule/{lr,wdl}.rs`、`ATTRIBUTION.md` 参照) から移植し byte 一致。本 crate
+//! では ANSI 色付き terminal 出力 (`colourful`) は持たず、`std::fmt::Display`
+//! で plain string を返す形に統一する (色付けが必要なら呼び出し側で行う)。
 //!
-//! - bullet trait `LrScheduler` / `WdlScheduler` の `colourful(&self) -> String`
-//!   method (ANSI 色付き terminal 出力、`bullet_trainer::run::logger::ansi` 依存)
-//!   は **削除**。本リポでは `std::fmt::Display` impl で plain (color なし)
-//!   string を返す形に統一 (Stage 1-1 / Stage 3-1 と同じ bullet 外部 dep 削除
-//!   ポリシー、CLI 側で必要なら色付け追加可能)
-//! - **`LrScheduler` trait に `'static` を新規追加**: bullet 上流 (`lr.rs:7`) は
-//!   `LrScheduler: Clone + Debug + Send + Sync` で `'static` を持たないが、
-//!   `WdlScheduler` (`wdl.rs:7`) は `+ 'static` を持つ。本 PR は両 trait を
-//!   揃えて `+ 'static` を要求 (Stage 3-8 trainer state で `Arc` 共有 / thread
-//!   spawn する想定、borrow を持つ scheduler は許さない設計)。WdlScheduler の
-//!   `'static` は上流から保持
-//! - 計算 path (lr 計算 / blend 計算) は bullet 上流と byte 一致
+//! 両 trait に `+ 'static` を要求する: trainer state を `Arc` 共有 / thread
+//! spawn する想定で、borrow を持つ scheduler は許さない設計。
 
 use std::f32::consts::PI;
 use std::fmt::{Debug, Display};
@@ -92,7 +84,7 @@ pub struct StepLR {
 
 impl LrScheduler for StepLR {
     fn lr(&self, _batch: usize, superbatch: usize) -> f32 {
-        // bullet 上流と同じく saturating_sub(1) を使い、superbatch = 0 でも安全。
+        // saturating_sub(1) で superbatch = 0 でも安全に 0 step 扱い。
         let steps = superbatch.saturating_sub(1) / self.step;
         self.start * self.gamma.powi(steps as i32)
     }
@@ -203,8 +195,8 @@ pub struct WarmupLR<LR: LrScheduler> {
 impl<LR: LrScheduler> LrScheduler for WarmupLR<LR> {
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         let base_lr = self.inner.lr(batch, superbatch);
-        // bullet 上流 `lr.rs:172-178` と同型: 学習開始時 (superbatch=1) の
-        // batch < warmup_batches でのみ warmup interp、それ以外は base_lr。
+        // 学習開始時 (superbatch=1) の batch < warmup_batches でのみ warmup
+        // interp (`base_lr / (warmup_batches - batch)`)、それ以外は base_lr。
         if superbatch == 1 && batch < self.warmup_batches {
             base_lr / (self.warmup_batches - batch) as f32
         } else {
@@ -257,7 +249,7 @@ impl<First: LrScheduler, Second: LrScheduler> Display for SequenceLR<First, Seco
 // =============================================================================
 
 /// WDL lambda scheduling。`superbatch` / `batch` / `max` から f32 lambda を返す。
-/// loss_wdl kernel の `lambda` 引数 ( Stage 2-2 `fused_loss_wdl`) として渡される。
+/// loss kernel (`loss_wdl` / `loss_wrm`) の `lambda` 引数として渡される。
 pub trait WdlScheduler: Clone + Debug + Display + Send + Sync + 'static {
     /// 現在の batch / superbatch (max = 総 superbatch 数) に対する WDL lambda。
     fn blend(&self, batch: usize, superbatch: usize, max: usize) -> f32;
@@ -290,8 +282,7 @@ pub struct LinearWDL {
 
 impl WdlScheduler for LinearWDL {
     fn blend(&self, _batch: usize, superbatch: usize, max: usize) -> f32 {
-        // bullet 上流 `wdl.rs:40-41` と同型: (max - 1) で正規化、max=1 のとき 0 除算
-        // 回避のため .max(1)。
+        // `(max - 1)` で正規化、`max == 1` のとき 0 除算回避のため `.max(1)`。
         let grad = (self.end - self.start) / (max - 1).max(1) as f32;
         self.start + grad * (superbatch - 1) as f32
     }
@@ -361,8 +352,8 @@ impl<First: WdlScheduler, Second: WdlScheduler> Display for SequenceWDL<First, S
     }
 }
 
-/// runtime selection 用 enum wrapper (bullet 上流 `WdlSchedulerEnum` 同型、CLI
-/// から `--wdl const 0.5` / `--wdl linear 0.0 0.5` 等で生成想定)。
+/// runtime selection 用 enum wrapper (CLI から `--wdl const 0.5` /
+/// `--wdl linear 0.0 0.5` 等で生成する想定)。
 #[derive(Clone, Debug)]
 pub enum WdlSchedulerEnum {
     Constant(ConstantWDL),
@@ -433,7 +424,7 @@ mod tests {
             gamma: 0.5,
             step: 3,
         };
-        // bullet 上流: saturating_sub(1) / step → superbatch=0..3 で steps=0、
+        // saturating_sub(1) / step → superbatch=0..3 で steps=0、
         // superbatch=4..6 で steps=1、superbatch=7..9 で steps=2。
         assert_eq!(lr.lr(0, 0), 1.0);
         assert_eq!(lr.lr(0, 3), 1.0);
@@ -456,7 +447,7 @@ mod tests {
 
     #[test]
     fn cosine_decay_lr_matches_bullet_midpoint() {
-        // bullet: lambda = 1 - 0.5 * (1 + cos(PI * progress))。
+        // 数式: lambda = 1 - 0.5 * (1 + cos(PI * progress))。
         // progress=0.5 で cos(PI/2)=0、lambda=0.5、midpoint で initial と final の中間。
         let lr = CosineDecayLR {
             initial_lr: 1.0,
@@ -492,7 +483,7 @@ mod tests {
             inner,
             warmup_batches: 4,
         };
-        // bullet 上流: superbatch=1 + batch<warmup_batches で base/(warmup-batch)。
+        // superbatch=1 + batch<warmup_batches で base/(warmup-batch)。
         // batch=0 → 1/4=0.25, batch=1 → 1/3, batch=2 → 0.5, batch=3 → 1.0, batch=4 → 1.0 (warmup 終了)
         assert!((warmup.lr(0, 1) - 0.25).abs() < EPS);
         assert!((warmup.lr(1, 1) - (1.0 / 3.0)).abs() < EPS);
@@ -541,7 +532,7 @@ mod tests {
 
     #[test]
     fn linear_wdl_handles_max_one_without_division_by_zero() {
-        // bullet 上流 `(max - 1).max(1)` で max=1 でも 0 除算を回避。
+        // `(max - 1).max(1)` で max=1 でも 0 除算を回避することの確認。
         let w = LinearWDL {
             start: 0.0,
             end: 1.0,
@@ -569,7 +560,7 @@ mod tests {
 
     #[test]
     fn sequence_wdl_propagates_normalised_max() {
-        // bullet 上流 `wdl.rs:84-93`: first は max=midpoint、second は max-midpoint。
+        // first scheduler は max=midpoint、second scheduler は max-midpoint で呼ぶ。
         let first = LinearWDL {
             start: 0.0,
             end: 1.0,

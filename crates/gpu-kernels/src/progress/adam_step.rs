@@ -1,8 +1,9 @@
 //! Adam optimizer step kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn adam_step`) は **`src/main.rs` に inline 定義** されている
-//! (Stage 1-5 で確立した backend 仕様)。本 module の `adam_step_cpu` は GPU と
-//! 同じ更新式を host で素直に書き写したもの。
+//! GPU 側 (`#[kernel] fn adam_step`) は `src/main.rs` に inline 定義されている
+//! (cuda-oxide rustc-codegen-cuda backend は bin entry 経由でしか PTX 化しない
+//! ため)。本 module の `adam_step_cpu` は GPU と同じ更新式を host に書き写した
+//! もの。
 //!
 //! ## アルゴリズム
 //!
@@ -26,11 +27,12 @@
 //!
 //! - C++ `extern "C" __global__ void k_adam_step(...)` → Rust `#[kernel] fn adam_step(...)`
 //! - C++ output `float* weights / m / v / grad` (in-place) → Rust `mut DisjointSlice<f32>` × 4。
-//!   1 thread = 1 index で aliasing なし、atomics 不要 (Stage 1-6 grad とは異なる)
+//!   1 thread = 1 index で aliasing なし、atomics 不要 (`grad` kernel の scatter
+//!   path とは異なる)
 //! - C++ `fmaxf(bc1, 1e-30f)` → 本 CPU reference では `bc1.max(1e-30f32)`、
 //!   GPU kernel 側は `f32::max` が cuda-oxide で lowering 失敗するため
 //!   `if bc1 > 1e-30 { bc1 } else { 1e-30 }` に展開している (詳細は
-//!   `ATTRIBUTION.md` Stage 1-7 entry および `src/main.rs::adam_step` の comment)
+//!   `ATTRIBUTION.md` および `src/main.rs::adam_step` の comment 参照)
 //! - C++ `sqrtf(v_hat)` → Rust `v_hat.sqrt()` (cuda-oxide が `__nv_sqrtf` に lowering)
 //! - C++ `int n` → Rust `u32` (符号要らない)
 //!

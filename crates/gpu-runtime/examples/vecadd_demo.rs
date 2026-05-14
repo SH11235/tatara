@@ -7,10 +7,8 @@
 //! - kernel symbol resolve (`CudaModule::load_function("vecadd")`)
 //! - `DeviceBuffer` host↔device round-trip
 //!
-//! 完全な kernel launch は本 demo に含めない。`#[kernel]` 定義 + `cuda_launch!`
-//! macro を使う前提で、raw な `cuda_core::launch_kernel_on_stream` 経由の手書き
-//! marshaling は意図的に避ける。本 demo は gpu-runtime crate の re-exports と
-//! `Result` / `Error` 型が実機でつながることを示すための smoke 限定。
+//! 完全な kernel launch は本 demo に含めない (`#[kernel]` 定義 +
+//! `cuda_launch!` macro を使う production 経路と直交する smoke check のため)。
 //!
 //! ## 実行前提
 //!
@@ -34,7 +32,7 @@
 //! cargo run -p gpu-runtime --example vecadd_demo
 //! ```
 //!
-//! 成功時 (本マシン RTX 2070 SUPER):
+//! 成功時 (RTX 2070 SUPER 実機):
 //! ```text
 //! gpu-runtime vecadd demo
 //!   PTX:    .../cuda-oxide/.../vecadd.ptx

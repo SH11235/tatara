@@ -1,16 +1,13 @@
 //! Sigmoid + WDL blend + scale loss kernel の reference CPU 実装。
 //!
-//! GPU 側 `#[kernel] fn loss_wdl` は bin entry (`bins/nnue_train/src/main.rs`)
-//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
-//! 制約)。本 module の `loss_wdl_cpu` は GPU と同じロジックを host で書き写した
-//! もので、GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn loss_wdl` は呼び出し元 bin entry に inline 定義する
+//! (cuda-oxide rustc-codegen-cuda backend の bin-entry 制約)。本 module は
+//! GPU↔CPU 数値同等性テストの reference 用。
 //!
 //! ## アルゴリズム
 //!
-//! NNUE training の `MSE-on-sigmoid + WDL blend` を 1 fused kernel にまとめる。
-//! bullet 上流 (`crates/bullet_lib/src/value/loader.rs::301-316` の data-layer
-//! WDL blend と `crates/compiler/src/tensor/operation/autograd/dfo.rs::Sigmoid`)
-//! の loss path を NNUE 専用に hand-fuse する。
+//! NNUE training の `MSE-on-sigmoid + WDL blend` を 1 fused kernel にまとめる
+//! (bullet 上流の data-layer WDL blend + `Sigmoid` loss path に等価):
 //!
 //! ```text
 //! per position i:
@@ -18,44 +15,35 @@
 //!     ys  = sigmoid(score[i] * scale)          # 教師 cp score を確率に
 //!     y   = lambda * wdl[i] + (1 - lambda) * ys     # WDL blend
 //!     err = p - y
-//!     loss_acc += err^2                        # un-normalized sum (Stage 1-6 grad と同型)
+//!     loss_acc += err^2                        # un-normalized sum
 //!     dl_dout[i] = 2 * err * p * (1 - p) * scale * per_pos_norm[i]
 //! ```
 //!
-//! - `out`, `score` は同じ cp scale を共有する前提 (`scale = 1/scale_param`、
-//!   bullet 上流 `loader.rs::310` の `sigmoid(rscale * score)` と同流)
-//! - `lambda = 1.0` で純 WDL ターゲット、`lambda = 0.0` で純 score sigmoid。
-//!   bullet 上流の WdlScheduler が batch / superbatch 単位で動的に決める想定
-//! - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss=0, draw=0.5, win=1)、bullet 上流
-//!   `loader.rs::312` の `result() as u8 / 2.0` と同型
-//! - `per_pos_norm[i]` は Stage 1 grad と同型 (`1 / (n_games * game_len)`)。
-//!   loss_acc 側には乗らず、grad だけに乗る (Stage 1-6 grad と同 convention)
+//! - `out`, `score` は同じ cp scale を共有する前提 (`scale = 1/scale_param`)
+//! - `lambda = 1.0` で純 WDL ターゲット、`lambda = 0.0` で純 score sigmoid
+//!   (WdlScheduler が batch / superbatch 単位で動的に決める想定)
+//! - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss=0, draw=0.5, win=1)
+//! - `per_pos_norm[i]` は `1 / (n_games * game_len)`、loss_acc 側には乗らず
+//!   grad だけに乗る convention
 //!
-//! ## bullet 上流との対応 / divergence
+//! ## 実装メモ
 //!
-//! - bullet は **data layer で blend を pre-compute** する (`loader.rs::315`
-//!   `blend * result + (1 - blend) * score` の式が実体)。kernel 側は
-//!   pre-blended target に対する `output.sigmoid().squared_error(target)` (`builder.rs::505`)
-//!   を runtime PointwiseIR で fuse するだけ
-//! - 本実装は **kernel 内に WDL blend を畳み込む** ことで data layer から
-//!   sigmoid(score) と blend を消す。`score` と `wdl` を 2 buffer で渡す
-//!   trade-off だが、batch 1 度しか転送しないため total memory traffic は
-//!   bullet と同等以下
+//! - bullet 上流は data layer で blend を pre-compute するが、本実装は kernel
+//!   内に WDL blend を畳み込んで `score` (raw cp) と `wdl` ({0, 0.5, 1}) を
+//!   2 buffer で渡す。batch 1 度しか転送しないため total memory traffic は
+//!   同等以下
 //! - chain rule で sigmoid(out * scale) の `out` 微分には `* scale` が乗る
-//!   (`d/du sigmoid(u) = p (1-p)`、`u = out * scale`)。bullet 上流で `out`
-//!   が既に scale 済の cp 単位を持っている場合 (`scale = 1.0` 相当) は本式の
-//!   `* scale` 項が消えるだけで一致する
+//!   (`d/du sigmoid(u) = p (1-p)`、`u = out * scale`)
 //!
 //! ## NaN / Inf 挙動
 //!
 //! - `out[i] = NaN` → `p = sigmoid(NaN) = NaN`、`err = NaN`、`loss = NaN`、
-//!   `dl_dout = NaN` (NaN を伝搬)。bullet 上流も sigmoid path で同等
-//! - `score[i] = NaN` (= 教師の異常値) も同様に NaN 伝搬
-//! - `wdl[i] ∈ {0, 0.5, 1}` の invariant が破れた場合 (例えば `wdl = 2.0`)
-//!   は target が `[0, 1]` を超え、err も範囲外になるが kernel 側で潰さない
-//!   (host invariant 違反の検出は loader 側で行う前提)
-//! - SCReLU (Stage 2-1) と異なり本 kernel は NaN を握り潰さず伝搬するため、
-//!   学習中の NaN は loss 経路で気付ける (これは upstream と一致)
+//!   `dl_dout = NaN` (NaN を伝搬)
+//! - `score[i] = NaN` も同様に NaN 伝搬
+//! - `wdl[i]` が `{0, 0.5, 1}` invariant を破った場合は target が `[0, 1]` を
+//!   超えるが kernel 側で潰さない (host invariant 違反の検出は loader 側で行う)
+//! - SCReLU と異なり本 kernel は NaN を握り潰さず伝搬するため、学習中の NaN は
+//!   loss 経路で気付ける
 
 /// Reference CPU 実装。
 ///
@@ -65,16 +53,14 @@
 ///
 /// 入力前提:
 /// - `out.len() == score.len() == wdl.len() == per_pos_norm.len() == dl_dout.len() == n`
-/// - `scale > 0`。負の scale は `p` の sigmoid を反転させ chain rule の `* scale`
-///   項で grad の符号も反転させてしまい、別 loss を計算することになる。NNUE の
-///   `1/scale_param` 用法 (`scale_param > 0`) では常に成立、host (loader) 側で
-///   保証する前提
+/// - `scale > 0`。負の scale は sigmoid を反転させ chain rule で grad の符号も
+///   反転するため別 loss になる (NNUE の `1/scale_param` 用法では常に正、host
+///   側で保証する前提)
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 score sigmoid)
-/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win、bullet 上流 `pos.result()
-///   as u8 / 2.0` と同型)
+/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
 ///
-/// 引数数 (9) は host invariant を漏れなく渡すため bullet 上流より多い。
-/// clippy `too_many_arguments` を allow する (Stage 1 grad と同 convention)。
+/// 引数 9 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wdl_cpu(
     out: &[f32],
@@ -112,10 +98,8 @@ mod tests {
     }
 
     /// `lambda = 0` で WDL 項が消えるとき、kernel は `sigmoid(out*scale)` と
-    /// `sigmoid(score*scale)` の MSE になり、bullet 上流の plain
-    /// `output.sigmoid().squared_error(sigmoid(score*scale))` と一致する。
-    /// 期待値は f32 計算 → f64 cast (Stage 1-10 で確立した f32 リテラル比較
-    /// pitfall 回避)。
+    /// `sigmoid(score*scale)` の MSE になることを確認。
+    /// 期待値は f32 計算 → f64 cast (f32 リテラル比較の pitfall 回避)。
     #[test]
     fn lambda_zero_is_pure_sigmoid_mse() {
         let out = vec![0.5_f32, -0.3, 1.0];
@@ -192,9 +176,9 @@ mod tests {
         assert_eq!(loss_acc, 0.0);
     }
 
-    /// `per_pos_norm` は **grad にだけ** 乗り、`loss_acc` には乗らないことを
-    /// ガード (Stage 1 grad と同 convention)。同入力 norm = 1.0 と norm = 0.5
-    /// で loss_acc が同じ、dl_dout が半分になることで検証。
+    /// `per_pos_norm` は **grad にだけ** 乗り、`loss_acc` には乗らない
+    /// convention をガード。同入力で norm = 1.0 と norm = 0.5 を比べ、
+    /// loss_acc が同じ・dl_dout が半分になることで検証。
     #[test]
     fn per_pos_norm_scales_grad_but_not_loss() {
         let out = vec![1.0_f32; 4];
@@ -293,8 +277,8 @@ mod tests {
         assert_eq!(loss_acc, 7.0);
     }
 
-    /// loss_acc は **既存値に加算**される (Stage 1 grad と同型、batch 跨ぎ
-    /// 累積を host 側で持つため)。先行値 1.0 + 新加算分の合計になることを確認。
+    /// loss_acc は **既存値に加算**される (batch 跨ぎ累積を host 側で持つ
+    /// convention)。先行値 1.0 + 新加算分の合計になることを確認。
     #[test]
     fn loss_acc_accumulates_into_existing_value() {
         let out = vec![1.0_f32];

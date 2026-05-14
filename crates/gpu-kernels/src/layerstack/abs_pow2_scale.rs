@@ -2,8 +2,8 @@
 //!
 //! GPU 側 (`#[kernel] fn abs_pow2_scale_fwd` / `_grad`) は `bins/nnue_train/src/
 //! main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。bullet 上流の
-//! `abs_pow(2.0)` (`crates/trainer/src/model/builder.rs`) × scale 乗算で、v102
-//! では `l1_sqr = l1_main^2 * (127/128)` (`shogi_layerstack.rs:2260` 付近) に使う。
+//! `abs_pow(2.0)` (`crates/trainer/src/model/builder.rs`) × scale 乗算で、
+//! `l1_sqr = l1_main^2 * (127/128)` (`shogi_layerstack.rs:2260` 付近) に使う。
 //!
 //! ## アルゴリズム
 //!
@@ -14,7 +14,7 @@
 //!
 //! - bullet `abs_pow(2.0)` は数学的に `|x|^2 = x^2` なので abs 演算は不要
 //!   (kernel も同じ判断で `x * x` を直書きしている)。
-//! - scale は v102 では `127.0/128.0` (= `L1_SQR_SCALE`)、qa=127 量子化由来。
+//! - scale は `127.0/128.0` (= `L1_SQR_SCALE`)、qa=127 量子化由来。
 //! - NaN は伝搬する (`NaN * NaN * scale = NaN`、`2 * NaN * ... = NaN`)。
 
 /// `abs_pow(2) * scale` forward reference — `y[i] = x[i] * x[i] * scale`。

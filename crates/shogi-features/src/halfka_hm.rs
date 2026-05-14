@@ -1,10 +1,7 @@
 //! HalfKA_hm (Half-Mirror) 特徴量。
 //!
-//! bullet-shogi (commit `f275eb9`) の
-//! `crates/bullet_lib/src/game/inputs/shogi_halfka.rs` から `ShogiHalfKA_hm`
-//! 部分のみを vendor。Stage 3 (EPIC #17) の NNUE 1536-16-32 trainer の入力
-//! 特徴量として使用する (`bins/nnue_train` の sparse_ft_forward / dataloader
-//! が呼ぶ)。
+//! NNUE 1536-16-32 trainer の入力特徴量で、PackedSfenValue から
+//! `(stm_idx, nstm_idx)` の sparse index ペア (1 局面あたり最大 40 個) を抽出する。
 //!
 //! ## 仕様
 //!
@@ -14,36 +11,14 @@
 //! - 最大 active 特徴数: 40 (盤上駒 + 手駒 = 合法局面の駒総数固定 40)
 //! - nnue-pytorch 互換 hash: `FEATURE_HASH_HM_V2 = 0x7f134cb8` (HalfKA_hm_v2)
 //!
-//! 仕様詳細は bullet 上流ファイル先頭の doc コメント参照。
-//!
-//! ## bullet 上流からの差分
-//!
-//! - bullet `impl SparseInputType for ShogiHalfKA_hm` を削除し、`num_inputs` /
-//!   `max_active` / `map_features` / `shorthand` / `description` を inherent
-//!   method として実装 (Stage 1-1 `PackedSfenValue` / Stage 1-2
-//!   `ShogiProgressKPAbs` と同流儀)。bullet trait `SparseInputType` の interface
-//!   を再現する必要は無い (Stage 3-5 dataloader は inherent method を直接呼ぶ)
-//! - bullet `ShogiBoard::from_packed_sfen(pos)` 呼び出しは本リポの
-//!   `PackedSfenValue::decode()` に統一 (Stage 1-2 `progress_kpabs.rs` と同 idiom)
-//! - `crate::shogi::*` import を `shogi_format::*` に書き換え
-//! - bullet 上流の Non-Mirror 版 (`ShogiHalfKA`、`PIECE_INPUTS_NONMIRROR` 等、
-//!   約 250 行) は本 Stage 3 で使用しないため scope creep 回避で **取り込まない**。
-//!   将来 NNUE Non-Mirror モデルが必要になった場合は別 issue で追加する
-//! - 本リポ命名規約に揃えた alias 定数 (`SHOGI_HALFKA_HM_NUM_FEATURES` /
-//!   `SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES`) を Issue #57 受け入れ条件に応じて追加。
-//!   bullet 上流命名 (`HALFKA_HM_DIMENSIONS` / `MAX_ACTIVE_FEATURES`) も互換のため
-//!   保持し、両方を公開する
-//! - 新規 API: `collect_active_indices(pos) -> Vec<(usize, usize)>`。bullet
-//!   `map_features` の callback を Vec 化したもの (Stage 1-2
-//!   `ShogiProgressKPAbs::collect_active_indices` 同型)。dataloader / smoke
-//!   test 用
+//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END};
 use shogi_format::types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
 // =============================================================================
-// 定数 (bullet 上流命名)
+// 定数
 // =============================================================================
 
 /// nnue-pytorch 互換の特徴量 hash 値 (HalfKA_hm_v2)。
@@ -61,14 +36,11 @@ pub const HALFKA_HM_DIMENSIONS: usize = NUM_KING_BUCKETS * PIECE_INPUTS;
 /// 最大 active 特徴数 (盤上駒 + 手駒 = 40、合法局面で固定)。
 pub const MAX_ACTIVE_FEATURES: usize = 40;
 
-// =============================================================================
-// 定数 (本リポ命名 alias、Issue #57 受け入れ条件)
-// =============================================================================
-
-/// HalfKA_hm の総入力次元 (`HALFKA_HM_DIMENSIONS` の本リポ命名 alias)。
+/// `HALFKA_HM_DIMENSIONS` の長い名前 alias (`shogi-features` lib top-level
+/// re-export 経由で参照する callsite 用)。
 pub const SHOGI_HALFKA_HM_NUM_FEATURES: usize = HALFKA_HM_DIMENSIONS;
 
-/// HalfKA_hm の最大 active 特徴数 (`MAX_ACTIVE_FEATURES` の本リポ命名 alias)。
+/// `MAX_ACTIVE_FEATURES` の長い名前 alias。
 pub const SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES: usize = MAX_ACTIVE_FEATURES;
 
 // =============================================================================
@@ -107,9 +79,8 @@ impl ShogiHalfKA_hm {
     ///
     /// dataloader が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ呼んで
     /// その `ShogiBoard` を HalfKA_hm 特徴抽出と progress8kpabs bucket 計算の
-    /// 両方で使い回せるようにするための入口 (Issue #89: decode-once)。`map_features`
-    /// と完全に同じインデックスを emit する (`map_features` は `pos.decode()` 経由で
-    /// 本メソッドを呼ぶのと等価)。
+    /// 両方で使い回すための入口 (`pos.decode()` を呼ぶ `map_features` と完全に
+    /// 同じインデックスを emit する)。
     pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, f: F) {
         map_halfka_features(board, f);
     }
@@ -136,7 +107,7 @@ impl ShogiHalfKA_hm {
 }
 
 // =============================================================================
-// HalfKA_hm 特徴量計算 (bullet 上流ロジック)
+// HalfKA_hm 特徴量計算
 // =============================================================================
 
 /// HalfKA_hm 特徴量インデックスを列挙。
@@ -336,7 +307,7 @@ pub(crate) fn halfka_index(kb: usize, packed_bp: usize) -> usize {
 }
 
 // =============================================================================
-// テスト (bullet 上流の ShogiHalfKA_hm tests を移植)
+// テスト
 // =============================================================================
 
 #[cfg(test)]
@@ -553,11 +524,9 @@ mod tests {
 
     #[test]
     fn test_map_features_board_matches_map_features_on_real_psv() {
-        // 実 PSV (`sample.psv` 100 records) を decode して、legacy delegating path
-        // (`ShogiHalfKA_hm::map_features(&psv)` = 内部で `psv.decode()` → board path)
-        // と board path (`map_features_board(&psv.decode())`) が **完全に同じ
-        // インデックス列** を emit することを確認 (Issue #89 decode-once helper の
-        // 不変条件 + legacy path の回帰検出)。
+        // legacy delegating path (`map_features(&psv)` = 内部で `psv.decode()` →
+        // board path) と board path (`map_features_board(&psv.decode())`) が
+        // 同じインデックス列を emit する不変条件を実 PSV で確認する。
         let records = sample_psv_records();
         let mut nonempty = 0usize;
         for (i, psv) in records.iter().enumerate() {

@@ -1,18 +1,12 @@
 //! KP-absolute progress feature。
 //!
-//! bullet-shogi (commit `f275eb9`) の
-//! `crates/bullet_lib/src/game/outputs.rs::ShogiProgressKPAbs` から vendor。
-//!
 //! 仕様:
 //! - 特徴次元: `81 * FE_OLD_END = 81 * 1548 = 125_388` (玉位置 × BonaPiece)
 //! - 学習形式: logistic regression (`p = sigmoid(Σ w_i * x_i)`)
 //! - bucket 割当: `min(7, floor(p * 8.0))` (8 bucket)
 //! - 重み読込: YaneuraOu 互換 `progress.bin` (f64 little-endian × 125_388 個)
 //!
-//! bullet 上流からの差分:
-//! - bullet `OutputBuckets` trait の `impl` を削除。`bucket()` を inherent
-//!   method として残し、bullet trait に依存しないようにする (本リポ
-//!   `ATTRIBUTION.md` の「取り込み済 file」セクション参照)。
+//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -39,9 +33,8 @@ static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGH
 pub struct ShogiProgressKPAbs;
 
 impl ShogiProgressKPAbs {
-    /// bucket 数。bullet 上流の `OutputBuckets::BUCKETS` 相当を inherent const
-    /// として持つ (型レベルで bucket 数を参照したい下流 crate の利便性のため、
-    /// 自由関数定数 `SHOGI_PROGRESS8_NUM_BUCKETS` と同一値)。
+    /// bucket 数 (型レベルで bucket 数を参照したい呼び出し側のための inherent
+    /// const、自由関数定数 `SHOGI_PROGRESS8_NUM_BUCKETS` と同一値)。
     pub const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
 
     fn weights() -> &'static [f32] {
@@ -62,9 +55,9 @@ impl ShogiProgressKPAbs {
     /// `for_each_active_index` の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
     /// dataloader が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ呼んで
-    /// その `ShogiBoard` を HalfKA_hm 特徴抽出と本 progress 計算の両方で使い回せる
-    /// ようにするための入口 (Issue #89: decode-once)。`for_each_active_index` は
-    /// `pos.decode()` 経由で本メソッドを呼ぶのと等価。
+    /// その `ShogiBoard` を HalfKA_hm 特徴抽出と本 progress 計算の両方で使い回す
+    /// ための入口 (`for_each_active_index` は `pos.decode()` 経由で本メソッドを
+    /// 呼ぶのと等価)。
     pub fn for_each_active_index_board(board: &ShogiBoard, mut f: impl FnMut(usize)) {
         if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
             return;
@@ -156,7 +149,7 @@ impl ShogiProgressKPAbs {
         self.progress_board(&pos.decode())
     }
 
-    /// `progress` の **decode 済み `ShogiBoard` を直接受ける** 版 (Issue #89)。
+    /// `progress` の **decode 済み `ShogiBoard` を直接受ける** 版。
     pub fn progress_board(&self, board: &ShogiBoard) -> f32 {
         let weights = Self::weights();
         let mut sum = 0.0f32;
@@ -167,14 +160,11 @@ impl ShogiProgressKPAbs {
     }
 
     /// 8 bucket 割当 (`0..=7`)。
-    ///
-    /// bullet-shogi 上流では `OutputBuckets::bucket` trait method 経由で呼ぶが、
-    /// 本リポでは bullet trait 依存を避けるため inherent method として提供する。
     pub fn bucket(&self, pos: &PackedSfenValue) -> u8 {
         self.bucket_board(&pos.decode())
     }
 
-    /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版 (Issue #89)。
+    /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版。
     /// `bucket(&pos)` は `bucket_board(&pos.decode())` と等価。
     pub fn bucket_board(&self, board: &ShogiBoard) -> u8 {
         let p = self.progress_board(board);
@@ -206,11 +196,9 @@ mod tests {
 
     #[test]
     fn board_path_matches_legacy_path_on_real_psv() {
-        // 実 PSV (`sample.psv` 100 records) を decode して、legacy delegating path
-        // (`for_each_active_index(&psv)` / `progress(&psv)` / `bucket(&psv)` は
-        // 内部で `psv.decode()` → board path) と board path
-        // (`*_board(&psv.decode())`) が完全に一致することを確認 (Issue #89
-        // decode-once helper の不変条件 + legacy path の回帰検出)。
+        // legacy delegating path (`for_each_active_index(&psv)` / `progress(&psv)` /
+        // `bucket(&psv)` は内部で `psv.decode()` → board path) と board path
+        // (`*_board(&psv.decode())`) が完全に一致する不変条件を実 PSV で確認する。
         //
         // NOTE: 重みは未ロード前提 (zero weights → progress = sigmoid(0) = 0.5、
         // bucket 4)。本 unit-test binary では `load_from_bin` を一切呼ばないので

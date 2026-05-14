@@ -1,14 +1,12 @@
-//! SCReLU activation gradient (fused) reference CPU 実装。
+//! SCReLU activation gradient (fused) の reference CPU 実装。
 //!
-//! GPU 側 `#[kernel] fn screlu_grad` は bin entry (`bins/nnue_train/src/main.rs`)
-//! に inline 定義されている (cuda-oxide rustc-codegen-cuda backend の bin-entry
-//! 制約)。本 module の `screlu_grad_cpu` は GPU と同じロジックを host で書き写した
-//! もので、GPU↔CPU 数値同等性テストの reference 用。
+//! GPU 側 `#[kernel] fn screlu_grad` は呼び出し元 bin entry に inline 定義する
+//! (cuda-oxide rustc-codegen-cuda backend の bin-entry 制約)。本 module は
+//! GPU↔CPU 数値同等性テストの reference 用。
 //!
 //! ## アルゴリズム
 //!
-//! bullet 上流 (`crates/compiler/src/tensor/operation/autograd/dfo.rs::SCReLU`)
-//! の forward / backward から fused gradient を導出する:
+//! SCReLU の forward / backward は次の通り (bullet 上流 `SCReLU` 同等):
 //!
 //! ```text
 //! SCReLU.forward(x)  = clamp(x, 0, 1)^2
@@ -16,8 +14,7 @@
 //!                    = 2 * a * (a > 0 && a < 1)        (a = clamp(x, 0, 1))
 //! ```
 //!
-//! 入力 `x` を直接受け取る fused 形式に hand-fuse すると 1 thread = 1 element
-//! で:
+//! 入力 `x` を直接受け取る fused 形式に書き直すと 1 thread = 1 element で:
 //!
 //! ```text
 //! a    = clamp(x, 0, 1)
@@ -25,35 +22,21 @@
 //! dL_dx = dL_dy * dydx
 //! ```
 //!
-//! 端点 `x = 0` (a = 0) と `x = 1` (a = 1) では SCReLU の forward が piecewise
-//! 連続な極小・極大に達するため derivative は 0 (劣微分 0)。bullet 上流の
-//! `IsPositive` も `> 0` (strict) なので一致する。
+//! 端点 `x = 0` (a = 0) と `x = 1` (a = 1) では derivative は 0 (劣微分 0)。
 //!
-//! ## bullet 上流との対応
+//! ## 入力 x を受け取る理由 (出力 y を受け取る形との対比)
 //!
-//! - bullet `SCReLU::backward(output: y)` は forward の output を入力に取る形
-//!   (recompute なし、PointwiseIR が forward と同 batch でつなぐ前提) だが、
-//!   本 fused kernel は **forward の input `x` を直接受け取る**形にしている:
-//!   - CPU memory 上には x がそのまま残っているので追加 traffic 不要
-//!   - `clamp(x, 0, 1)` の評価で a を再計算するコストは 1 op、`sqrt(y)`
-//!     を取る方が高くつく (intrinsics call)
-//!   - bullet 流 `2 * sqrt(y) * IsPositive(1 - sqrt(y))` (y = a^2) は内部で
-//!     `a^2` と `sqrt(a^2)` を経由するため interior 値で 2 回の中間丸めが
-//!     入る。x からの再評価は `clamp` 1 回で済み、interior の `2 * a` を
-//!     直接出すので中間丸め (`sqrt(a*a)` 経由) を避けられる
-//! - 結果は数値同値: bullet `2 * sqrt(y) * IsPositive(1 - sqrt(y))` と本
-//!   実装 `2 * a * (a > 0 && a < 1)` は数学的に同一。float round-off も
-//!   x-based のほうが小さい (`sqrt(a*a)` の中間丸めが無い)
+//! - 出力 y からの再構成 `2 * sqrt(y) * IsPositive(1 - sqrt(y))` (y = a^2) は
+//!   `sqrt(a*a)` の中間丸めが入る。x から `clamp` 1 回で再計算した方が float
+//!   round-off が小さく、`sqrt` intrinsic call も避けられる
+//! - 結果は数学的に同値 (`2 * a * (a > 0 && a < 1)`)
 //!
 //! ## cuda-oxide 制限
 //!
-//! - host CPU reference では `f32::clamp(0.0, 1.0)` と `if-else` を使い分けて
-//!   readable に書く (host 実行で `f32::clamp` は問題なく動く)
-//! - GPU `#[kernel]` 側は `f32::clamp` も内部で `f32::max` / `f32::min` を呼ぶ
-//!   ため lowering 失敗するリスクあり (Stage 1-7 で確認した `f32::max` lowering
-//!   未対応問題)。kernel 側は **`if-else` ladder で展開**する (`x < 0 ? 0 : x > 1
-//!   ? 1 : x`)
+//! - GPU `#[kernel]` 側は `f32::clamp` / `f32::max` / `f32::min` を lower でき
+//!   ないため `if-else` ladder で展開する (`x < 0 ? 0 : x > 1 ? 1 : x`)
 //! - `IsPositive` (a > 0 && a < 1) も bool → f32 cast を介さず `if-else` で書く
+//! - host CPU reference では `f32::clamp` を使う (host 実行では問題なく動く)
 
 /// Reference CPU 実装。
 ///
@@ -68,20 +51,16 @@
 /// dl_dx[i] = dl_dy[i] * dydx
 /// ```
 ///
-/// ## NaN / Inf 挙動 (bullet 上流との divergence)
+/// ## NaN / Inf 挙動
 ///
-/// - `x[i] = NaN`: `clamp(NaN, 0, 1)` の結果は `NaN`、続く `0 < a` / `a < 1`
-///   比較は IEEE 754 仕様で **両方 false に倒れる** ため `dydx = 0`、`dl_dx = 0`
+/// - `x[i] = NaN`: `clamp(NaN, 0, 1)` は `NaN`、続く `0 < a` / `a < 1` 比較は
+///   IEEE 754 で両方 false に倒れるため `dydx = 0`、`dl_dx = 0`
 ///   (ただし `dl_dy[i] = NaN` なら `0 * NaN = NaN` で伝搬)
 /// - `x[i] = +Inf`: clamp で `a = 1.0`、`a < 1` false → `dydx = 0`
 /// - `x[i] = -Inf`: clamp で `a = 0.0`、`0 < a` false → `dydx = 0`
 ///
-/// bullet 上流の `2 * sqrt(y) * IsPositive(1 - sqrt(y))` (y = a^2) は NaN
-/// 入力で `2 * sqrt(NaN) * 0 = NaN` を伝搬する点で本実装と **divergent**。
-/// 本実装は NaN を 0 grad に握り潰すが、学習中の NaN 検出は forward / loss 等の
-/// 上流 op で行う前提なので致命的ではない。NaN を渡された SCReLU.backward 自体は
-/// 病態 (forward が NaN を出している) で、grad の経路で気付くより forward
-/// 経路での guard が本筋。
+/// NaN を 0 grad に握り潰すため学習中の NaN 検出はできないが、SCReLU.backward に
+/// NaN が渡る時点で forward が病態なので forward / loss 経路で気付く前提。
 pub fn screlu_grad_cpu(x: &[f32], dl_dy: &[f32], dl_dx: &mut [f32], n: usize) {
     for i in 0..n {
         let a = x[i].clamp(0.0_f32, 1.0_f32);
@@ -99,8 +78,8 @@ mod tests {
     use super::*;
 
     /// 手計算可能な少数 element を入れて期待値と一致するか検証する。
-    /// 期待値は f32 で計算して f64 cast (Stage 1-10 で確立した f32 リテラル比較
-    /// pitfall: 例 `(0.7 - 1.0)^2 != 0.09` を回避)。
+    /// 期待値は f32 で計算して f64 cast (f32 リテラル比較の pitfall
+    /// 例 `(0.7 - 1.0)^2 != 0.09` を回避)。
     #[test]
     fn small_known_input_matches_hand_calculation() {
         // x:    [-0.5, 0.0, 0.3, 0.7, 1.0, 1.5]
@@ -127,9 +106,9 @@ mod tests {
         }
     }
 
-    /// 端点ちょうど (a = 0 or a = 1) では derivative 0 (`>` strict、bullet
-    /// `IsPositive` と同義)。これが破れると forward と backward の整合性が
-    /// 崩れる (PointwiseIR との数値ドリフト) のでガード。
+    /// 端点ちょうど (a = 0 or a = 1) では derivative 0 (strict `>`)。
+    /// これが破れると forward と backward の整合性が崩れる (clamp の境界で
+    /// 数値ドリフトする) のでガード。
     #[test]
     fn boundary_a_equals_zero_or_one_yields_zero_grad() {
         let x = vec![0.0_f32, 1.0_f32];
@@ -171,10 +150,10 @@ mod tests {
         assert!(dl_dx.is_empty());
     }
 
-    /// NaN / Inf 入力では `dl_dx = 0` になる (bullet 上流は NaN を伝搬するが、
-    /// 本実装は `clamp + (0 < a && a < 1)` の比較が NaN/Inf で false に倒れるため
-    /// 自然と 0 に落ちる。docstring の "NaN / Inf 挙動" セクション参照)。
-    /// 学習中の NaN 検出は上流 (forward / loss) で行う前提。
+    /// NaN / Inf 入力では `dl_dx = 0` になる (`clamp + (0 < a && a < 1)` の
+    /// 比較が NaN/Inf で false に倒れるため自然に 0 に落ちる、docstring の
+    /// "NaN / Inf 挙動" セクション参照)。学習中の NaN 検出は上流 (forward /
+    /// loss) で行う前提。
     #[test]
     fn nan_and_inf_inputs_yield_zero_grad() {
         let x = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];

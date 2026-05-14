@@ -1,10 +1,10 @@
 //! Forward pass の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn forward`) は **`src/main.rs` に inline 定義** されている
+//! GPU 側 (`#[kernel] fn forward`) は `src/main.rs` に inline 定義されている
 //! (cuda-oxide の rustc-codegen-cuda backend は bin entry 経由で到達可能な
-//! kernel しか PTX 化しないため)。本 module の `forward_cpu` は GPU と
-//! 同じロジックを host で素直に書き写したもので、Stage 1-9 (#13) で
-//! host loop が組まれたときの numerical equivalence test の reference 用。
+//! kernel しか PTX 化しないため)。本 module の `forward_cpu` は GPU と同じ
+//! ロジックを host に書き写したもので、host loop の numerical equivalence test
+//! の reference に使う。
 //!
 //! ## アルゴリズム
 //!

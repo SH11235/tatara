@@ -10,8 +10,10 @@ rust-version = { workspace = true }
 [lints]
 workspace = true
 
-# cuda-oxide commit 6de0509 (Stage 0-1 で動作確認済 rev) に pin して取り込む。
-# vendor せず git dep のみ (ADR-0003 の依存方針 / ATTRIBUTION.md の cuda-oxide 節参照)。
+# cuda-oxide は ABI が rustc internal に張り付いた alpha crate のため commit
+# pin で取り込む。`rust-toolchain.toml` の channel と必ず揃える
+# (channel ずれは link-time fail)。詳細な選定理由は
+# docs/01-decisions/2026-05-09-cuda-oxide-adoption.md。
 [dependencies]
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }

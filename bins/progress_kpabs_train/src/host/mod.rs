@@ -2,23 +2,23 @@
 //!
 //! GPU 非依存の純粋ロジックを集める:
 //!
-//! - [`batch`]: position 群 → flat indices / targets / per_pos_norm 構造体
+//! - [`batch`]: position 群 → flat `indices` / `targets` / `per_pos_norm` 構造体
 //! - [`games`]: PSV ファイルを順次読み出し、`game_ply` の減少で「ゲーム境界」
 //!   を切る iterator (bullet-shogi の `GameIterator` と同等)
 //! - [`progress_bin`]: YaneuraOu 互換の `progress.bin` (f64 LE × N_WEIGHTS)
 //!   を読み書き
 //! - [`cli`]: `clap` ベースの CLI 引数定義 (`--data` `--output` `--lr` 等)
 //!
-//! GPU 周り (`GpuTrainer`、4 kernel の launch、device buffer 管理) は
-//! kernels が `src/main.rs` の `#[kernel]` を直接参照する都合上 main.rs に
-//! 置く。本 module は GPU を持たない CI でも build / test できる。
+//! GPU 周り (`GpuTrainer`、4 kernel の launch、device buffer 管理) は kernels
+//! が `src/main.rs` の `#[kernel]` を直接参照する都合上 main.rs に置く。本
+//! module は GPU を持たない環境でも build / test できる。
 
 pub mod batch;
 pub mod cli;
 pub mod games;
 pub mod progress_bin;
 
-/// Adam の β1 (bullet-shogi 上流と同値、Stage 1-7 でテストしたデフォルト)。
+/// Adam の β1 (bullet-shogi 上流と同値のデフォルト)。
 pub const ADAM_BETA1: f32 = 0.9;
 /// Adam の β2。
 pub const ADAM_BETA2: f32 = 0.999;

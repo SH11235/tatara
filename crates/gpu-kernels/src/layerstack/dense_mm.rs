@@ -4,7 +4,7 @@
 //! GPU 側 (`#[kernel] fn dense_mm_fwd` / `dense_mm_bwd_input` / `dense_mm_bwd_weight`
 //! / `bias_grad`) は `bins/nnue_train/src/main.rs` に inline 定義 (cuda-oxide
 //! bin-entry 制約)。bullet 上流の `Affine` / dense `linear` (`crates/trainer/src/
-//! model/builder.rs`) に等価で、v102 では **shared factorized L1f** layer
+//! model/builder.rs`) に等価で、**shared factorized L1f** layer
 //! (`combined (B×1536) → l1f_out (B×16)`) の forward / backward に使われる
 //! (`shogi_layerstack.rs:2244` 付近の `l1f` Affine)。
 //!
