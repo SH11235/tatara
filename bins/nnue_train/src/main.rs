@@ -4873,6 +4873,7 @@ impl GpuTrainer {
                    slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, ft_w_n as u32]
         }?;
+        prof_tick!("opt_ft_w");
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
@@ -4880,6 +4881,7 @@ impl GpuTrainer {
                    slice_mut(self.ft_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, ft_b_n as u32]
         }?;
+        prof_tick!("opt_ft_b");
         // L1
         cuda_launch! {
             kernel: radam_step,
@@ -4888,6 +4890,7 @@ impl GpuTrainer {
                    slice_mut(self.l1_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1_w_n as u32]
         }?;
+        prof_tick!("opt_l1_w");
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
@@ -4895,6 +4898,7 @@ impl GpuTrainer {
                    slice_mut(self.l1_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1_b_n as u32]
         }?;
+        prof_tick!("opt_l1_b");
         // L1f
         cuda_launch! {
             kernel: radam_step,
@@ -4903,6 +4907,7 @@ impl GpuTrainer {
                    slice_mut(self.l1f_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1f_w_n as u32]
         }?;
+        prof_tick!("opt_l1f_w");
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
@@ -4910,6 +4915,7 @@ impl GpuTrainer {
                    slice_mut(self.l1f_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1f_b_n as u32]
         }?;
+        prof_tick!("opt_l1f_b");
         // L2
         cuda_launch! {
             kernel: radam_step,
@@ -4918,6 +4924,7 @@ impl GpuTrainer {
                    slice_mut(self.l2_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l2_w_n as u32]
         }?;
+        prof_tick!("opt_l2_w");
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
@@ -4925,6 +4932,7 @@ impl GpuTrainer {
                    slice_mut(self.l2_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l2_b_n as u32]
         }?;
+        prof_tick!("opt_l2_b");
         // L3
         cuda_launch! {
             kernel: radam_step,
@@ -4933,6 +4941,7 @@ impl GpuTrainer {
                    slice_mut(self.l3_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l3_w_n as u32]
         }?;
+        prof_tick!("opt_l3_w");
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
@@ -4940,6 +4949,7 @@ impl GpuTrainer {
                    slice_mut(self.l3_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l3_b_n as u32]
         }?;
+        prof_tick!("opt_l3_b");
 
         // Lookahead lerp every K steps
         if self.step_count.is_multiple_of(RANGER_K) {
