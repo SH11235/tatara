@@ -32,13 +32,3 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-
-# cuda-oxide local override: candidate α (Issue #104) needs the
-# `cuda_device::memory::ld_global_v4_f32` intrinsic which only exists in the
-# local cuda-oxide checkout (feature branch `feature/ld-global-v4-f32`).
-# Remove this patch block once the intrinsic lands upstream and `rev = "..."`
-# in member Cargo.toml is bumped to a commit that includes it.
-[patch."https://github.com/NVlabs/cuda-oxide.git"]
-cuda-core = { path = "/mnt/nvme1/development/cuda-oxide/crates/cuda-core" }
-cuda-device = { path = "/mnt/nvme1/development/cuda-oxide/crates/cuda-device" }
-cuda-host = { path = "/mnt/nvme1/development/cuda-oxide/crates/cuda-host" }

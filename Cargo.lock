@@ -174,6 +174,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 [[package]]
 name = "cuda-bindings"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "bindgen",
 ]
@@ -181,6 +182,7 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -189,6 +191,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "cuda-macros",
 ]
@@ -196,6 +199,7 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "cuda-core",
  "cuda-macros",
@@ -208,6 +212,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -291,6 +296,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "libloading",
  "thiserror",
@@ -356,6 +362,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 dependencies = [
  "libloading",
  "thiserror",
@@ -441,6 +448,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6de0509#6de050946cd1013335a33cf2c5144888a32efab3"
 
 [[package]]
 name = "rustc-hash"
