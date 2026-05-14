@@ -1,9 +1,12 @@
 //! PackedSfen / PackedSfenValue デコーダ
 //!
-//! YaneuraOu の教師データ形式を読み込むためのモジュール。
-//! PackedSfenValue (40バイト) から局面を復元し、特徴量計算に使用する。
+//! 40-byte 圧縮局面 + score / move / WDL の bullet-shogi 教師データ形式を
+//! 読み込むためのモジュール (`ATTRIBUTION.md` 参照)。PackedSfenValue
+//! (40 bytes) から局面を復元し、特徴量計算に使用する。
 //!
-//! YaneuraOu-latest 互換（駒箱対応）。
+//! Huffman 表 (`HUFFMAN_TABLE`) と「成りbit + 先後bit」の bit layout は本 doc
+//! 内 / 関数 doc に直接記述している。駒箱 (hand 駒種外の駒) のフラグ判定にも
+//! 対応 (`decode_hand_piece` 参照)。
 
 use super::types::{Color, Hand, Piece, PieceType, Square};
 
@@ -11,7 +14,7 @@ use super::types::{Color, Hand, Piece, PieceType, Square};
 // Huffman 符号テーブル
 // =============================================================================
 
-/// Huffman 符号テーブル（YaneuraOu sfen_packer.cpp 準拠）
+/// Huffman 符号テーブル (PackedSfen の駒種 encoding に対応)
 ///
 /// インデックス: 0=NO_PIECE, 1=PAWN, 2=LANCE, 3=KNIGHT, 4=SILVER, 5=BISHOP, 6=ROOK, 7=GOLD
 const HUFFMAN_TABLE: [(u32, u8); 8] = [
@@ -123,7 +126,7 @@ impl PackedSfen {
 // PackedSfenValue (40バイト)
 // =============================================================================
 
-/// YaneuraOu の教師データ形式 (40バイト)
+/// 教師データ 1 局面 (40 バイト固定、PackedSfen + score/move/ply/WDL)。
 ///
 /// これが `SparseInputType::RequiredDataType` として使用される。
 ///
@@ -366,8 +369,7 @@ fn huffman_index_to_piece_type(idx: usize) -> PieceType {
 
 /// 盤上の駒をデコード
 ///
-/// YaneuraOu sfen_packer.cpp の read_board_piece_from_stream() に準拠。
-/// 形式: Huffman符号 + 成りbit(金以外) + 先後bit
+/// 形式: Huffman 符号 + 成り bit (金以外) + 先後 bit。
 fn decode_board_piece(stream: &mut BitStream) -> Piece {
     // Huffman 符号をデコードして駒種を取得
     let mut code = 0u32;
@@ -415,11 +417,10 @@ fn decode_board_piece(stream: &mut BitStream) -> Piece {
 
 /// 手駒をデコード
 ///
-/// YaneuraOu sfen_packer.cpp の read_hand_piece_from_stream() に準拠。
-/// 形式: Huffman符号(bit0を除く) + 成りbit(金以外、駒箱判定用) + 先後bit
+/// 形式: Huffman 符号 (bit0 を省略) + 成り bit (金以外、駒箱判定用) + 先後 bit。
 ///
 /// 戻り値: (駒, 駒箱フラグ)
-/// - 駒箱フラグが true の場合、その駒は持ち駒ではなく駒箱の駒
+/// - 駒箱フラグが true の場合、その駒は持ち駒ではなく駒箱の駒。
 fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
     // 手駒の Huffman 符号は盤上より1ビット少ない（bit0 を省略）
     let mut code = 0u32;

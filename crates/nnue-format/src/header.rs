@@ -16,10 +16,10 @@
 //! 中の UTF-8 bytes が 15 を超える場合は `write_to` が `InvalidInput` を返す
 //! (silent truncate しない、weight 損失防止のため)。
 //!
-//! ## 既定値 (typical YaneuraOu / nnue-pytorch convention)
+//! ## 既定値
 //!
 //! - `net_id`: 空文字列
-//! - `fv_scale = 16` — YaneuraOu cp 単位への scale
+//! - `fv_scale = 16` — centipawn 単位への scale
 //! - `qa = 64`、`qb = 64` — input / output quantisation multiplier (典型値、
 //!   actual quant value は trainer 側で上書きする)
 
@@ -33,7 +33,7 @@ pub const HEADER_BYTES: usize = 22;
 /// 実 string は最大 `NET_ID_LEN - 1 = 15` bytes、末尾 `\0` 必須。
 pub const NET_ID_LEN: usize = 16;
 
-/// `fv_scale` 既定値 (YaneuraOu cp スケール、典型値)。
+/// `fv_scale` 既定値 (centipawn スケール、典型値)。
 pub const DEFAULT_FV_SCALE: i16 = 16;
 
 /// `qa` 既定値 (input 量子化、trainer 側で実値に上書き)。
@@ -47,7 +47,7 @@ pub const DEFAULT_QB: i16 = 64;
 pub struct NnueHeader {
     /// network identifier (最大 15 bytes UTF-8 + 末尾 `\0` の 16 bytes 領域に格納)。
     pub net_id: String,
-    /// YaneuraOu cp スケール (典型 16)。
+    /// centipawn スケール (典型 16)。
     pub fv_scale: i16,
     /// input quantisation multiplier (trainer 側で実値に更新)。
     pub qa: i16,
@@ -125,7 +125,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn default_values_match_yaneuraou_typical() {
+    fn default_values_are_typical_constants() {
         let h = NnueHeader::default();
         assert_eq!(h.net_id, "");
         assert_eq!(h.fv_scale, 16);

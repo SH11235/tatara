@@ -1,7 +1,7 @@
 //! PSV reader smoke test。
 //!
-//! `tests/data/sample.psv` は nodchip hao_depth9 の thread_index=000.bin の
-//! **先頭 100 records** (40 byte × 100 = 4000 bytes) を切り出した固定 fixture。
+//! `tests/data/sample.psv` は外部 PSV データ 1 file の先頭 100 records
+//! (40 byte × 100 = 4000 bytes) を切り出した固定 fixture。
 //! 1 batch 分の PSV を read & decode できることを確認する。
 
 use shogi_format::{Color, GameResult, PackedSfenValue};
@@ -51,11 +51,10 @@ fn read_one_batch_of_psv_records() {
         assert!(ply <= 1024, "record {i}: game_ply {ply} が想定上限を超えた");
 
         let score = psv.score();
-        // YaneuraOu の VALUE_MATE_IN_MAX_PLY = 32000 / VALUE_MATE は ±32600+ なので、
-        // mate score 込みの上限として ±32600 を採用 (現 sample は ±32000 内に収まる)。
+        // mate score 込みの実用上限として ±32600 を採用 (sample は ±32000 内に収まる)。
         assert!(
             (-32_600..=32_600).contains(&score),
-            "record {i}: score {score} が想定範囲外 (YaneuraOu mate 含む ±32600)"
+            "record {i}: score {score} が想定範囲外 (mate 含む ±32600)"
         );
 
         // raw game_result は i8 (-1..=+1)

@@ -5123,7 +5123,7 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     save_rate: usize,
 
-    /// progress8kpabs 係数ファイル (YaneuraOu 互換 `progress.bin`、f64 LE × 81*FE_OLD_END)。
+    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 81*FE_OLD_END)。
     /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
     #[arg(long)]
     progress_coeff: Option<PathBuf>,

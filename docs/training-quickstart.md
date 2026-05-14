@@ -8,8 +8,8 @@ toolchain と CUDA / LLVM の準備は [docs/setup.md](setup.md) を参照。
 
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
-| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す。bullet-shogi 互換 | 数百 GB |
-| progress 係数 | YaneuraOu 互換 `progress.bin` (f64 LE × 81 × FE_OLD_END、固定 1,003,104 bytes) | `--progress-coeff` で渡す。9 bucket 振り分けに使う | 1.0 MB |
+| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
+| progress 係数 | `progress.bin` (f64 LE × 81 × `FE_OLD_END` = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。9 bucket 振り分けに使う | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | ~116 MB |
 
 PSV / `.bin` / checkpoint の命名規約と配置は
@@ -94,7 +94,7 @@ target/release/nnue-train \
 
 | ファイル | 形式 | 用途 |
 |---|---|---|
-| `v102_main-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact**。YaneuraOu / bullet と同じ binary layout |
+| `v102_main-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact** (`v102_layerstack` format、`crates/nnue-format/src/v102_layerstack.rs` 参照) |
 | `v102_main-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
 `v102_main-400.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで

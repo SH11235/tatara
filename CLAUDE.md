@@ -66,8 +66,9 @@ off で tolerance を満たさず fail するが、release では本番経路と
 - 非自明な不変条件 (例:「caller が `n_pos * MAX_ACTIVE` を保証する」)
 - 言語仕様で表せない constraint の理由 (例:「cuda-oxide が `f32::clamp` を
   lower できないため if-else 展開」)
-- コードを読んでも分からない外部参照 (例:「YaneuraOu progress.bin 形式に追従」、
-  論文 / upstream ライブラリの algorithm 出典)
+- コードを読んでも分からない外部参照 (例: 「bullet `loss_fn_wrm` のロジックを
+  移植」、論文 / upstream ライブラリの algorithm 出典)。ただし「準拠」「互換」
+  といった検証なしの曖昧な claim は禁止 (情報量ゼロかつ嘘の温床)。
 
 ## ドキュメント規約
 

@@ -92,11 +92,11 @@ bullet-shogi 命名を踏襲:
 - `data/progress/progress_haoek_full_cuda.e1.bin` — 上記の epoch 1 checkpoint
 
 自前生成する progress.bin は `output/progress/` 配下に同じ命名規約で出す。
-サイズは YaneuraOu 互換の **1,003,104 bytes** で固定 (異なれば異常)。
+サイズは **1,003,104 bytes** で固定 (`f64 LE × 81 × FE_OLD_END`、異なれば異常)。
 
 ### .nnue
 
-NNUE 重み (YaneuraOu 互換 binary)。`output/nnue/<model_id>.nnue` (例:
+NNUE 重み binary。`output/nnue/<model_id>.nnue` (例:
 `v100_20260601_223344.nnue`)。
 
 ### Checkpoint

@@ -49,7 +49,7 @@ pub const SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES: usize = MAX_ACTIVE_FEATURES;
 
 /// ShogiHalfKA_hm 特徴量。
 ///
-/// YaneuraOu / nnue-pytorch 互換の HalfKA_hm 特徴量。
+/// King × Piece の half-mirror encoding (`HALFKA_HM_DIMENSIONS = 73_305`)。
 /// coalesce 済みモデル専用 (Factorization の重みは Base 側に畳み込み済み)。
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, Default)]

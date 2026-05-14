@@ -1,4 +1,4 @@
-//! `progress.bin` I/O (YaneuraOu 互換、f64 little-endian × N_WEIGHTS)。
+//! `progress.bin` I/O (f64 little-endian × N_WEIGHTS、`1_003_104` bytes 固定)。
 //!
 //! bullet-shogi 上流 (`write_progress_bin` / `read_progress_bin`) を移植。
 //! Rust kernel 側は重みを `f32` で持つが、`progress.bin` の wire format は
@@ -10,8 +10,8 @@ use std::path::Path;
 
 use shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
 
-/// `weights` (長さ `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`、f32) を YaneuraOu
-/// 互換 progress.bin (f64 LE × N) として書き出す。
+/// `weights` (長さ `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`、f32) を
+/// `progress.bin` (f64 LE × N) として書き出す。
 pub fn write_progress_bin(path: &Path, weights: &[f32]) -> io::Result<()> {
     if weights.len() != SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS {
         return Err(io::Error::new(

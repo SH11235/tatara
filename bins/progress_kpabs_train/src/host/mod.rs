@@ -5,8 +5,7 @@
 //! - [`batch`]: position 群 → flat `indices` / `targets` / `per_pos_norm` 構造体
 //! - [`games`]: PSV ファイルを順次読み出し、`game_ply` の減少で「ゲーム境界」
 //!   を切る iterator (bullet-shogi の `GameIterator` と同等)
-//! - [`progress_bin`]: YaneuraOu 互換の `progress.bin` (f64 LE × N_WEIGHTS)
-//!   を読み書き
+//! - [`progress_bin`]: `progress.bin` (f64 LE × N_WEIGHTS) を読み書き
 //! - [`cli`]: `clap` ベースの CLI 引数定義 (`--data` `--output` `--lr` 等)
 //!
 //! GPU 周り (`GpuTrainer`、4 kernel の launch、device buffer 管理) は kernels

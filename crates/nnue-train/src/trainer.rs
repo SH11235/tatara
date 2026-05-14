@@ -1,4 +1,4 @@
-//! Training-loop driver — host-side superbatch loop for the v102 NNUE trainer。
+//! Training-loop driver — host-side superbatch loop for the NNUE trainer。
 //!
 //! GPU 非依存の trait ([`TrainerBackend`]) 越しに 1 batch 分の forward / backward
 //! / optimizer step を呼び出す superbatch loop を提供する。`bins/nnue_train::
@@ -30,11 +30,8 @@
 //!
 //! ## per-position output bucket
 //!
-//! progress8kpabs (`ShogiProgressKPAbs::bucket`、YaneuraOu 互換 `progress.bin` の
-//! 重み付き和 → sigmoid → `floor(p * 8)` を `0..=7` に clamp) で求める。
-//! v102 の network は 9 bucket を持つが progress8kpabs は bucket 8 を使わない
-//! (9bucket 互換 layout で bucket8 未使用)。`progress.bin` 未指定時は重みが
-//! 全 0 で `p = sigmoid(0) = 0.5` となり、全 position が bucket 4 に collapse する。
+//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * 8)` を `0..=7` に
+//! clamp。`progress.bin` 未指定時は重み 0 で全局面が bucket 4 に collapse する。
 //!
 //! ## score-drop-abs の近似
 //!

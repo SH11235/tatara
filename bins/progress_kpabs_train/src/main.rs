@@ -2,7 +2,7 @@
 //!
 //! 本 file は kernel 定義 (`#[kernel]`) と host loop driver を統合する。host
 //! loop は PSV file 群 → batch → forward → grad → adam_step を駆動し、最終
-//! weight を YaneuraOu 互換 `progress.bin` に出力する。
+//! weight を `progress.bin` (f64 LE × N) に出力する。
 //!
 //! ## 設計
 //!

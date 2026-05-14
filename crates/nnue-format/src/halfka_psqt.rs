@@ -240,7 +240,7 @@ impl HalfKAPsqtNet {
     /// `NnueHeader` (22 bytes) + 量子化 weight を `w` に書き込む。
     ///
     /// 量子化 multiplier は `header.qa` / `header.qb` を使う。`round` true で
-    /// nearest 丸め (典型 YaneuraOu 慣行)。
+    /// nearest 丸め。
     pub fn save_quantised<W: Write>(
         &self,
         w: &mut W,
@@ -262,7 +262,6 @@ impl HalfKAPsqtNet {
         w.write_all(&bytes)?;
         let bytes = QuantTarget::I32(qa_qb).quantise(round, &self.l1_bias)?;
         w.write_all(&bytes)?;
-        // PSQT multiplier は bullet LayerStack 互換の `qa * qb` (YaneuraOu 互換)。
         let bytes = QuantTarget::I32(qa_qb).quantise(round, &self.psqt)?;
         w.write_all(&bytes)?;
 
