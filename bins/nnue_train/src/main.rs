@@ -4494,6 +4494,10 @@ impl GpuTrainer {
                         FT_IN as u32, FT_OUT as u32
                     ]
                 }?;
+                // P-obs: phD iter 0 (stm overwrite) を独立計測する。`prof_tick!` は
+                // stream.synchronize を打つので、これが無いと前 iter の compute が次
+                // tick (phA_reset iter 1) に流れ込んで観測上 phA_reset が肥大化する。
+                prof_tick!("phD_stm");
             } else {
                 cuda_launch! {
                     kernel: gather_and_sum_per_feature_add,
@@ -4507,11 +4511,11 @@ impl GpuTrainer {
                         FT_IN as u32, FT_OUT as u32
                     ]
                 }?;
+                prof_tick!("phD_nstm");
             }
             iter_idx += 1;
             let _ = total_pairs; // unused yet
         }
-        prof_tick!("bwd_ft_stm");
         prof_tick!("bwd_ftbwd");
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
