@@ -3177,6 +3177,7 @@ const CUBLAS_OP_T: cublasOperation_t = 1;
 //   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16 (bit mask)
 #[allow(non_camel_case_types)]
 type cublasMath_t = std::os::raw::c_uint;
+const CUBLAS_DEFAULT_MATH: cublasMath_t = 0;
 const CUBLAS_TF32_TENSOR_OP_MATH: cublasMath_t = 3;
 
 #[link(name = "cublas", kind = "dylib")]
@@ -3218,7 +3219,18 @@ struct CublasHandle {
 unsafe impl Send for CublasHandle {}
 
 impl CublasHandle {
-    fn new(stream: &CudaStream) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `enable_tf32 = true` で Ampere+ Tensor Core を TF32 mode で活用する
+    /// (`cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`)。Sgemm の FP32
+    /// input は内部で TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32
+    /// accum に lower され、~2-3x throughput と引き換えに仮数 ~3 桁の精度低下を
+    /// 受ける。`false` では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) を
+    /// 使う。
+    ///
+    /// 本 net の数値同等性は `enable_tf32 = true` のとき 5 sb × 200 batches 計測
+    /// で sb5 diff < 1e-4 tolerance、長期 (400 sb) retest 未。本 handle は fwd
+    /// (`sgemm_fwd_rowmajor`) / bwd (`sgemm_xt_y_rowmajor`) 双方で共有されるため
+    /// L1f forward と weight backward の両 Sgemm に同 mode が効く。
+    fn new(stream: &CudaStream, enable_tf32: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let mut handle: cublasHandle_t = std::ptr::null_mut();
         // SAFETY: cublasCreate_v2 は &mut handle に新規 handle を書き、CUBLAS_STATUS_SUCCESS
         // 以外を返したら handle は invalid (read 禁止)。失敗時は早期 return。
@@ -3236,28 +3248,20 @@ impl CublasHandle {
             }
             return Err(format!("cublasSetStream_v2 failed: status={status}").into());
         }
-        // Ampere+ TC を TF32 で活用するため math mode を切替。Sgemm の FP32 input は
-        // 内部で TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32 accum に
-        // lower される。precision 損失は ~10-bit mantissa (FP32 23-bit より粗)、
-        // bullet baseline との loss tolerance (sb5 < 1e-4) を超える場合は要 fallback。
-        //
-        // **副作用**: 本 handle は `bwd_L1f` の `sgemm_xt_y_rowmajor` でも共有される
-        // ため、L1f weight backward の Sgemm も TF32 TC で走る。bwd_L1f の数値
-        // 同等性は sb5 diff 4.9e-5 < 1e-4 tolerance を 5 sb × 200 batches 計測で
-        // 確認済 (`gpu_kernels::dense_mm::dense_mm_bwd_weight_tiled_cpu` reference
-        // との直接 retest は未実施、loss 軌跡のみで担保)。
-        //
-        // **未検証 scope**: 400 sb prod 学習 (本 net の通常 epoch 数) での tolerance
-        // retest は未実施。長期学習で sb5 diff > 1e-4 となる場合は handle を 2 個に
-        // 分け、bwd_L1f だけ `CUBLAS_DEFAULT_MATH` に戻す fallback path を用意する。
+        let mode = if enable_tf32 {
+            CUBLAS_TF32_TENSOR_OP_MATH
+        } else {
+            CUBLAS_DEFAULT_MATH
+        };
         // SAFETY: handle is valid.
-        let status = unsafe { cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH) };
+        let status = unsafe { cublasSetMathMode(handle, mode) };
         if status != CUBLAS_STATUS_SUCCESS {
             // SAFETY: handle is valid (cleanup before erroring).
             unsafe {
                 cublasDestroy_v2(handle);
             }
-            return Err(format!("cublasSetMathMode(TF32) failed: status={status}").into());
+            let label = if enable_tf32 { "TF32" } else { "FP32" };
+            return Err(format!("cublasSetMathMode({label}) failed: status={status}").into());
         }
         Ok(Self { handle })
     }
@@ -3517,9 +3521,13 @@ impl Drop for AsyncLossRing {
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
+    ///
+    /// `enable_tf32` は cuBLAS の `cublasSetMathMode` 引数を切替 ([`CublasHandle::new`])、
+    /// `true` で Ampere+ TC TF32 mode、`false` で純 FP32。default は CLI 側で OFF。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
+        enable_tf32: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -3612,7 +3620,7 @@ impl GpuTrainer {
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
-            cublas: CublasHandle::new(&stream)?,
+            cublas: CublasHandle::new(&stream, enable_tf32)?,
             step_count: 0,
         })
     }
@@ -5318,6 +5326,18 @@ struct Cli {
     /// (受けるが未使用) file shuffle seed。
     #[arg(long, default_value_t = 0)]
     file_shuffle_seed: u64,
+    /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
+    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
+    /// 入力 FP32 を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
+    /// (~2-3x throughput、仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false`
+    /// では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
+    ///
+    /// 切替の意義: TF32 は仮数 13 bit 切り捨てで本 net の `fwd_L1f` / `bwd_L1f`
+    /// Sgemm に影響、loss tolerance は 5 sb × 200 batches で sb5 diff < 1e-4
+    /// 確認済 (precision floor 相当)、長期 (400 sb) retest 未。本リポは品質
+    /// conservative default で OFF。
+    #[arg(long)]
+    tf32: bool,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -5438,7 +5458,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size)?;
+    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size, cli.tf32)?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
         println!(
@@ -5519,8 +5539,9 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
-    // workspace を smoke の固定 batch 分で確保。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH)?;
+    // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
+    // training は CLI の `--tf32` を pass する)。
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (FT_IN * FT_OUT
