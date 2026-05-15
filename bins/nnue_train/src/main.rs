@@ -2204,6 +2204,108 @@ pub fn dense_mm_bwd_input_bucket(
     }
 }
 
+/// Sorted layout 版 [`dense_mm_bwd_input_bucket`] の tiled rewrite。caller が batch を
+/// bucket で sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
+/// (`exclusive_scan_aligned` 経由) を保証する前提。`blockIdx_y` = batch tile (`padded_b / 16`
+/// 個)、`blockIdx_x` = in_tile (`in_dim / 16` 個)。block 内 16 row は同一 bucket
+/// (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
+/// `W_TILE [in_tile=16 × out=16]` / `DY_TILE [b=16 × out=16]` を shared-mem に協調 load。
+/// per-cell 16 FMA を shared-mem 上で実行し、global write は raw-ptr 経由で disjoint。
+/// 出力 `dx[b][i]` は sorted batch 順、caller が `inverse_permute_rows_f32` で original
+/// 順に scatter する。padding 行 (`bucket_idx = -1`) は `dx_sorted` に 0 を書き、inverse
+/// permute は `perm = -1` sentinel で skip するので original 配列は影響を受けない。
+///
+/// `in_dim % 16 == 0` / `out_dim == 16` / `num_buckets <= 9` / `padded_batch % 16 == 0`
+/// は caller 契約。`w` layout は `w[bucket][o][i]` row-major (in-minor)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input_bucket_tiled_sorted(
+    dy: &[f32],
+    w: &[f32],
+    bucket_idx: &[i32],
+    mut dx: DisjointSlice<f32>,
+    padded_batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let block_b = thread::blockIdx_y() as usize;
+    let tid_b = tid_local >> 4;
+    let tid_i = tid_local & 15;
+    let b_start = block_b << 4;
+    let ii_start = block_x << 4;
+    let global_bi = b_start + tid_b;
+    let global_ii = ii_start + tid_i;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let padded_b_u = padded_batch as usize;
+    let bi_ok = global_bi < padded_b_u;
+    let ii_ok = global_ii < in_dim_u;
+
+    let block_buc = if b_start < padded_b_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    // W load: thread (tid_b, tid_i) → `o_load = tid_b`, `i_local_load = tid_i`。warp 内
+    // 16 thread は同 `o_load` で `i_local_load` 0..15 (in-minor で 16 連続 cell coalesced)。
+    // store W_TILE[(i_local_load << 4) | o_load] = w[buc][o_load][ii_start+i_local_load]。
+    // compute 側は thread (tid_b, tid_i) が W_TILE[(tid_i << 4) | o] を o loop で読み、
+    // 値 = w[buc][o][ii_start+tid_i] = 自分の cell の column の W 行。
+    unsafe {
+        let o_load = tid_b;
+        let i_local_load = tid_i;
+        let ii_global_load = ii_start + i_local_load;
+        let w_val = if block_buc_ok && o_load < out_dim_u && ii_global_load < in_dim_u {
+            w[block_buc_u * out_dim_u * in_dim_u + o_load * in_dim_u + ii_global_load]
+        } else {
+            0.0_f32
+        };
+        W_TILE[(i_local_load << 4) | o_load] = w_val;
+    }
+    unsafe {
+        let b_local_load = tid_b;
+        let o_load = tid_i;
+        let bb_global_load = b_start + b_local_load;
+        DY_TILE[tid_local] = if bb_global_load < padded_b_u && o_load < out_dim_u {
+            dy[bb_global_load * out_dim_u + o_load]
+        } else {
+            0.0_f32
+        };
+    }
+    thread::sync_threads();
+
+    if bi_ok && ii_ok {
+        let cell_idx = global_bi * in_dim_u + global_ii;
+        if !block_buc_ok {
+            unsafe {
+                *dx.as_mut_ptr().add(cell_idx) = 0.0_f32;
+            }
+        } else {
+            let mut acc = 0.0_f32;
+            let mut o: usize = 0;
+            while o < 16 {
+                unsafe {
+                    acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
+                }
+                o += 1;
+            }
+            unsafe {
+                *dx.as_mut_ptr().add(cell_idx) = acc;
+            }
+        }
+    }
+}
+
 /// Per-bucket dense matmul backward (wrt weight)。
 /// `grad_w[bucket][o][i] = sum_{b: bucket_idx[b]==bucket} x[b][i] * dy[b][o]` (overwrite、atomics 不要)。
 ///
@@ -2976,6 +3078,7 @@ fn compile_ll_to_ptx_via_llc(
                        permute_rows_f32,inverse_permute_rows_f32,\
                        dense_mm_fwd_bucket_tiled_l1_sorted,\
                        dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
+                       dense_mm_bwd_input_bucket_tiled_sorted,\
                        bias_grad_bucket_shared_sorted";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
@@ -3376,6 +3479,7 @@ struct GpuWorkspace {
     combined_sorted: DeviceBuffer<f32>,   // batch × FT_OUT (combined を perm で gather)
     l1_bucket_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (sorted fwd_L1 出力)
     dl1_total_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (dl1_total を perm で gather)
+    dcombined_from_l1_sorted: DeviceBuffer<f32>, // batch × FT_OUT (sorted bwd_L1_inB 出力)
 }
 
 impl GpuWorkspace {
@@ -3433,6 +3537,7 @@ impl GpuWorkspace {
             combined_sorted: z(padded_sort_batch(batch) * FT_OUT)?,
             l1_bucket_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
             dl1_total_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
+            dcombined_from_l1_sorted: z(padded_sort_batch(batch) * FT_OUT)?,
         })
     }
 
@@ -5412,25 +5517,10 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1f");
 
-        // -- Backward 4 reverse: L1 per-bucket dense grad --
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT),
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1_w),
-                slice(self.ws.bucket_idx_dev),
-                slice_mut(self.ws.dcombined_from_l1),
-                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
-        prof_tick!("bwd_L1_inB");
-        // L1 weight backward (sorted layout): combined_sorted は fwd_L1 で構築済、dl1_total を
-        // 同 perm で gather → dl1_total_sorted。bucket_offsets_dev も fwd_L1 で構築済。各 block
-        // は uniform-by-construction で 1 bucket の slice のみ accumulate (9-way if-else /
-        // 9 register accumulator / 9 atomicAdd を 1 個ずつに集約)。
+        // -- Backward 4 reverse: L1 per-bucket dense grad (sorted layout) --
+        // dl1_total を bucket_perm_dev で gather → dl1_total_sorted (bwd_L1_inB / wB / bias
+        // で消費)。fwd_L1 で構築済の sort 出力 (bucket_perm_dev / bucket_idx_sorted_dev /
+        // bucket_offsets_dev) を再利用、追加 sort 不要。
         debug_assert!(
             FT_OUT.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
         );
@@ -5445,6 +5535,34 @@ impl GpuTrainer {
                 padded_b as u32, L1_OUT as u32
             ]
         }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted,
+            stream: self.stream, module: self.module,
+            config: LaunchConfig {
+                grid_dim: ((FT_OUT / 16) as u32, (padded_b / 16) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [
+                slice(self.ws.dl1_total_sorted),
+                slice(self.l1_w),
+                slice(self.ws.bucket_idx_sorted_dev),
+                slice_mut(self.ws.dcombined_from_l1_sorted),
+                padded_b as u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: inverse_permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * FT_OUT),
+            args: [
+                slice(self.ws.dcombined_from_l1_sorted),
+                slice(self.ws.bucket_perm_dev),
+                slice(self.ws.dcombined_from_l1),
+                padded_b as u32, FT_OUT as u32
+            ]
+        }?;
+        prof_tick!("bwd_L1_inB");
         // split-K dim を grid_y に追加。num_splits=8 × NUM_BUCKETS=9 × in_tiles=96 = 6912 blocks。
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted,
@@ -7226,6 +7344,103 @@ mod gpu_cpu_equivalence_tests {
             &dx_cpu,
             TOL,
         );
+        Ok(())
+    }
+
+    /// 16-aligned bucket sort + permute_rows (dl1) + sorted+tiled bwd_input + inverse
+    /// permute の合成 pipeline が `dense_mm_bwd_input_bucket_cpu` と reduction tolerance 内
+    /// で一致することを確認。per-row independent (16 o iter の和) で sort stability に依存
+    /// しないが、tile 内 FMA 順が baseline と異なるため fp32 associativity で bit-exact 不可、
+    /// `assert_close_rel` で判定する。
+    #[test]
+    fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
+            let out_dim = 16_usize;
+            let nb = NUM_BUCKETS;
+            let padded = padded_sort_batch(batch);
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.013 - 0.4)
+                .collect();
+            let w: Vec<f32> = (0..nb * out_dim * in_dim)
+                .map(|i| i as f32 * 0.0007 + 0.05)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+            dense_mm_bwd_input_bucket_cpu(
+                &dy,
+                &w,
+                &bucket_idx,
+                &mut dx_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+            let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+            let mut dx_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * in_dim)?;
+            let dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+
+            memset_minus_one_i32(&stream, &perm_dev)?;
+            memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }?;
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }?;
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev),
+                       slice_mut(dx_sorted_dev), padded as u32, in_dim as u32,
+                       out_dim as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: inverse_permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * in_dim),
+                args: [slice(dx_sorted_dev), slice(perm_dev), slice(dx_dev),
+                       padded as u32, in_dim as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("dense_mm_bwd_input_bucket_tiled_sorted b={batch} in={in_dim}"),
+                &dx_dev.to_host_vec(&stream)?,
+                &dx_cpu,
+                TOL,
+            );
+        }
         Ok(())
     }
 
