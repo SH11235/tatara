@@ -3234,13 +3234,14 @@ impl CublasHandle {
         // bullet baseline との loss tolerance (sb5 < 1e-4) を超える場合は要 fallback。
         //
         // **副作用**: 本 handle は `bwd_L1f` の `sgemm_xt_y_rowmajor` でも共有される
-        // ため、L1f weight backward の Sgemm も TF32 TC で走る (この commit 以前は
-        // FP32 で走っていた)。bwd_L1f の数値同等性は本変更で sb5 diff 4.9e-5 < 1e-4
-        // tolerance を満たすことを 5 sb × 200 batches で確認済 (`gpu_kernels::
-        // dense_mm::dense_mm_bwd_weight_tiled_cpu` reference との直接 retest は
-        // 未実施、loss 軌跡のみで担保)。長期学習 (400 sb) で tolerance を破る場合
-        // は handle を 2 個に分けて bwd_L1f だけ default math に戻す fallback path
-        // を用意する。
+        // ため、L1f weight backward の Sgemm も TF32 TC で走る。bwd_L1f の数値
+        // 同等性は sb5 diff 4.9e-5 < 1e-4 tolerance を 5 sb × 200 batches 計測で
+        // 確認済 (`gpu_kernels::dense_mm::dense_mm_bwd_weight_tiled_cpu` reference
+        // との直接 retest は未実施、loss 軌跡のみで担保)。
+        //
+        // **未検証 scope**: 400 sb prod 学習 (本 net の通常 epoch 数) での tolerance
+        // retest は未実施。長期学習で sb5 diff > 1e-4 となる場合は handle を 2 個に
+        // 分け、bwd_L1f だけ `CUBLAS_DEFAULT_MATH` に戻す fallback path を用意する。
         // SAFETY: handle is valid.
         let status = unsafe { cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH) };
         if status != CUBLAS_STATUS_SUCCESS {
