@@ -1010,6 +1010,91 @@ pub fn ft_post_perspective_grad(
     bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
 }
 
+/// Fused 版 [`ft_post_perspective_grad`]: `dy = dcombined_a[idx] + dcombined_b[idx]`
+/// を in-register sum で計算し、materialized な合算 buffer 経由を避ける。math は
+/// `ft_post_perspective_grad` と同等で、`dy` の読み出し元のみ単一 buffer → 2 source
+/// の elementwise sum に置換。
+///
+/// 1 step あたり stm / nstm の 2 launch のみで完結 (合算 buffer を介す場合の合算
+/// kernel + grad 2 launch = 3 launch / 384MB DRAM roundtrip と比較して 1 launch +
+/// ~768MB DRAM 削減)。
+///
+/// `d_combined_stride` は両 source の row-stride (= COMBINED_DIM = FT_OUT)、
+/// `d_combined_offset` は perspective 別 offset (stm: 0、nstm: ft_dim/2)、両 source
+/// は同 stride・同 layout を caller が保証 (両者とも `b × COMBINED_DIM` workspace)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fused(
+    d_combined_a: &[f32],
+    d_combined_b: &[f32],
+    ft_out: &[f32],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f32>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy_idx = bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx;
+    let dy = d_combined_a[dy_idx] + d_combined_b[dy_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(grad_a);
+        out_ptr.add(ft_base + half + pair_idx).write(grad_b);
+    }
+
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
 /// Regular dense matrix multiply forward + bias add。
 ///
 /// `y[b][o] = bias[o] + sum_i x[b][i] * w[i][o]`。Layout: `x` row-major (batch × in_dim)、
@@ -2978,7 +3063,8 @@ fn compile_ll_to_ptx_via_llc(
                        permute_rows_f32,inverse_permute_rows_f32,\
                        dense_mm_fwd_bucket_tiled_l1_sorted,\
                        dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
-                       bias_grad_bucket_shared_sorted";
+                       bias_grad_bucket_shared_sorted,\
+                       ft_post_perspective_grad_fused";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -3352,7 +3438,6 @@ struct GpuWorkspace {
     dl1_total: DeviceBuffer<f32>,            // b × L1_OUT (毎 step memset、slice_scatter 契約)
     dcombined_from_l1f: DeviceBuffer<f32>,   // b × FT_OUT
     dcombined_from_l1: DeviceBuffer<f32>,    // b × FT_OUT
-    dcombined: DeviceBuffer<f32>,            // b × FT_OUT
     dft_stm_out: DeviceBuffer<f32>,          // b × FT_OUT
     dft_nstm_out: DeviceBuffer<f32>,         // b × FT_OUT
 
@@ -3416,7 +3501,6 @@ impl GpuWorkspace {
             dl1_total: z(batch * L1_OUT)?,
             dcombined_from_l1f: z(batch * FT_OUT)?,
             dcombined_from_l1: z(batch * FT_OUT)?,
-            dcombined: z(batch * FT_OUT)?,
             dft_stm_out: z(batch * FT_OUT)?,
             dft_nstm_out: z(batch * FT_OUT)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
@@ -5498,31 +5582,20 @@ impl GpuTrainer {
             ]
         }?;
 
-        // -- Combine dcombined = dcombined_from_l1 + dcombined_from_l1f --
-        cuda_launch! {
-            kernel: elementwise_add,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT),
-            args: [
-                slice(self.ws.dcombined_from_l1),
-                slice(self.ws.dcombined_from_l1f),
-                slice_mut(self.ws.dcombined),
-                (b * FT_OUT) as u32
-            ]
-        }?;
-
         prof_tick!("bwd_L1");
 
-        // -- Backward 3 reverse: ft_post_perspective_grad × 2 (stm, nstm) --
+        // -- Backward 3 reverse: ft_post_perspective_grad fused × 2 (stm, nstm) --
+        // `dy = dcombined_from_l1 + dcombined_from_l1f` を fused kernel が in-register
+        // で計算、合算済 buffer の materialize と read-back の DRAM roundtrip を避ける。
         // stm: d_combined_offset = 0
         cuda_launch! {
-            kernel: ft_post_perspective_grad,
+            kernel: ft_post_perspective_grad_fused,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * FT_OUT / 2),
             args: [
-                slice(self.ws.dcombined),
+                slice(self.ws.dcombined_from_l1),
+                slice(self.ws.dcombined_from_l1f),
                 slice(self.ws.ft_stm_out),
                 slice(self.ft_b),
                 slice_mut(self.ws.dft_stm_out),
@@ -5532,12 +5605,13 @@ impl GpuTrainer {
         }?;
         // nstm: d_combined_offset = FT_OUT/2 = 768
         cuda_launch! {
-            kernel: ft_post_perspective_grad,
+            kernel: ft_post_perspective_grad_fused,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * FT_OUT / 2),
             args: [
-                slice(self.ws.dcombined),
+                slice(self.ws.dcombined_from_l1),
+                slice(self.ws.dcombined_from_l1f),
                 slice(self.ws.ft_nstm_out),
                 slice(self.ft_b),
                 slice_mut(self.ws.dft_nstm_out),
@@ -7776,6 +7850,106 @@ mod gpu_cpu_equivalence_tests {
         // 和の大きさに比例した f32 round-off drift (相対 1e-6 級) が出る。relative tol。
         assert_close_rel(
             "ft_grad grad_bias",
+            &grad_bias_dev.to_host_vec(&stream)?,
+            &grad_bias_cpu,
+            TOL,
+        );
+        Ok(())
+    }
+
+    /// `ft_post_perspective_grad_fused` (d_combined = a+b の融合) が CPU reference
+    /// (元 kernel と同じ math) と reduction tolerance 内一致することを確認。
+    /// fused 版は `d_combined_a[idx] + d_combined_b[idx]` を in-register sum、それ以降
+    /// は元 kernel と同じ。
+    #[test]
+    fn ft_post_perspective_grad_fused_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let half = ft_dim / 2;
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let scale = FT_POST_SCALE;
+        let d_a: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.2_f32 + 0.011_f32 * i as f32)
+            .collect();
+        let d_b: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -0.8_f32 + 0.007_f32 * i as f32)
+            .collect();
+        let stm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let nstm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.5_f32 + 3.0_f32 * ((i * 5) % 11) as f32 / 10.0)
+            .collect();
+
+        // CPU reference: a+b を summed buffer に組み立てて元 grad_cpu を回す。
+        let d_combined: Vec<f32> = d_a.iter().zip(d_b.iter()).map(|(&x, &y)| x + y).collect();
+        let mut grad_bias_cpu = vec![0.0_f32; ft_dim];
+        let mut dft_stm_cpu = vec![0.0_f32; batch * ft_dim];
+        let mut dft_nstm_cpu = vec![0.0_f32; batch * ft_dim];
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &stm_ft,
+            &bias,
+            &mut dft_stm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            0,
+            ft_dim,
+            scale,
+        );
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &nstm_ft,
+            &bias,
+            &mut dft_nstm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            half,
+            ft_dim,
+            scale,
+        );
+
+        let da_dev = DeviceBuffer::from_host(&stream, &d_a)?;
+        let db_dev = DeviceBuffer::from_host(&stream, &d_b)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let stm_ft_dev = DeviceBuffer::from_host(&stream, &stm_ft)?;
+        let nstm_ft_dev = DeviceBuffer::from_host(&stream, &nstm_ft)?;
+        let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
+        let mut dft_stm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
+        let mut dft_nstm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
+        }?;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
+        }?;
+        stream.synchronize()?;
+        // dft_*: 和の順序は CPU と同じ (per-thread, no reduction)、tolerance は relative。
+        assert_close_rel(
+            "ft_grad_fused dft_stm",
+            &dft_stm_dev.to_host_vec(&stream)?,
+            &dft_stm_cpu,
+            TOL,
+        );
+        assert_close_rel(
+            "ft_grad_fused dft_nstm",
+            &dft_nstm_dev.to_host_vec(&stream)?,
+            &dft_nstm_cpu,
+            TOL,
+        );
+        assert_close_rel(
+            "ft_grad_fused grad_bias",
             &grad_bias_dev.to_host_vec(&stream)?,
             &grad_bias_cpu,
             TOL,
