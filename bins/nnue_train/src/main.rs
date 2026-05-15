@@ -3282,7 +3282,10 @@ impl CublasHandle {
     /// - 全 device pointer は `cudaMalloc` 由来、長さは仕様分 (a.len() >= m*k、
     ///   b.len() >= k*n、c.len() >= m*n)。
     /// - stream は `cublasSetStream_v2` で bind 済の同一 stream を再利用。
-    /// - TF32 math mode は handle 作成時に default で設定済 ([`CublasHandle::new`])。
+    /// - math mode は handle 作成時の `enable_tf32` 引数で固定 ([`CublasHandle::new`]):
+    ///   `true` で `CUBLAS_TF32_TENSOR_OP_MATH` (Ampere+ TC 経由、仮数 10-bit)、
+    ///   `false` で `CUBLAS_DEFAULT_MATH` (純 FP32 path)。本関数は mode 非依存で
+    ///   呼び出し可能、numeric tolerance は CLI `--tf32` 指定有無で変動する。
     /// - `beta=0` overwrite なので `c_ptr` の事前内容は使われない (caller は
     ///   `c_ptr` への書き込みを同 stream 内 in-order で行うこと、別 stream からの
     ///   race 書き込みは未定義動作)。
