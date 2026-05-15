@@ -607,13 +607,38 @@ pub fn gather_and_sum_per_feature_overwrite(
     // grad_out / grad_w の範囲は arch (FT_IN × FT_OUT) で固定、launch config 上 ri < ft_out_u。
     let grad_out_ptr = grad_out.as_ptr();
     let positions_ptr = positions.as_ptr();
-    let mut sum = 0.0_f32;
+    // 4-way unroll: 1 thread あたり 4 outstanding load + 4 accumulator で fadd dep chain
+    // を分割。1-load-1-fadd 版は per-thread に in-flight load 1 個しかなく、warp scheduler は
+    // memory load 待ちの Long Scoreboard stall で大半 idle になる (occupancy は full でも eligible
+    // warps が極小)。f32 fadd の re-association で sum 値が bit-exact には変わるが、bullet 比較
+    // tolerance (sb5 < 1e-4) には収まる。
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
     let mut i = off_start;
+    let unroll_end = if off_end >= off_start + 3 {
+        off_end - 3
+    } else {
+        off_start
+    };
+    while i < unroll_end {
+        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() };
+        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() };
+        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() };
+        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() };
+        i += 4;
+    }
     while i < off_end {
         let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
+        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
         i += 1;
     }
+    let sum = (sum0 + sum1) + (sum2 + sum3);
 
     // 範囲外 (n_f=0、つまり off_start == off_end) でも sum=0 を書く: stm/nstm 共通の host が
     // 呼出前 0-reset を委ねる代わりに本 kernel が常に書き切るほうが simpler。
@@ -650,13 +675,34 @@ pub fn gather_and_sum_per_feature_add(
     // raw pointer 版 (overwrite と同じ理由、bounds check 3 箇所除去)。
     let grad_out_ptr = grad_out.as_ptr();
     let positions_ptr = positions.as_ptr();
-    let mut sum = 0.0_f32;
+    // 4-way unroll: overwrite kernel と同方針 (Long Scoreboard stall 分散)。
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
     let mut i = off_start;
+    let unroll_end = if off_end >= off_start + 3 {
+        off_end - 3
+    } else {
+        off_start
+    };
+    while i < unroll_end {
+        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() };
+        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() };
+        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() };
+        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() };
+        i += 4;
+    }
     while i < off_end {
         let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
+        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
         i += 1;
     }
+    let sum = (sum0 + sum1) + (sum2 + sum3);
 
     // atomicAdd で stm の結果に加算。
     if sum != 0.0_f32 {
