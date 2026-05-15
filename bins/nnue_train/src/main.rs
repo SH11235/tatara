@@ -5330,13 +5330,11 @@ struct Cli {
     /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
     /// 入力 FP32 を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
-    /// (~2-3x throughput、仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false`
-    /// では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
+    /// (仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false` では
+    /// `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
     ///
-    /// 切替の意義: TF32 は仮数 13 bit 切り捨てで本 net の `fwd_L1f` / `bwd_L1f`
-    /// Sgemm に影響、loss tolerance は 5 sb × 200 batches で sb5 diff < 1e-4
-    /// 確認済 (precision floor 相当)、長期 (400 sb) retest 未。本リポは品質
-    /// conservative default で OFF。
+    /// 仮数 13 bit 切り捨てで `fwd_L1f` / `bwd_L1f` Sgemm の数値に影響するため、
+    /// 品質 conservative に default OFF。
     #[arg(long)]
     tf32: bool,
 }
