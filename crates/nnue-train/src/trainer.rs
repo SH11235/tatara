@@ -47,7 +47,7 @@
 //! 駆動で順序非依存なので training には影響しない。決定論的順序が必要なら
 //! `cfg.threads = 1` を指定する。
 
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -333,6 +333,16 @@ where
     // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
     let mut prev_pending: Option<(Batch, Vec<i32>)> = None;
 
+    // sb 内 batch 進捗 print の頻度 (env var で可変、`0` で disable)。stderr が
+    // TTY なら `\r` で同 line を上書き、それ以外 (pipe / `tee` ファイル等) なら
+    // `\n` で改行して log file が pure text に保たれるようにする。
+    let progress_every = std::env::var("NNUE_TRAIN_BATCH_PROGRESS_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(128);
+    let stderr_is_tty = io::stderr().is_terminal();
+    let progress_terminator = if stderr_is_tty { '\r' } else { '\n' };
+
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
@@ -358,6 +368,37 @@ where
             prev_pending = Some((batch, buckets));
             sb_loss += loss;
             sb_positions += n_pos as u64;
+
+            // batch 進捗 print: `progress_every` batches ごとに sb 内 pos/s + % +
+            // batch count を stderr に出す。TTY なら `\r` で上書き、pipe なら `\n`
+            // で改行 (`tee` log が editor で binary 判定されないよう)。
+            if progress_every > 0
+                && (batch_idx + 1) % progress_every == 0
+                && batch_idx + 1 < cfg.batches_per_superbatch
+            {
+                let done = batch_idx + 1;
+                let pct = 100.0 * done as f64 / cfg.batches_per_superbatch as f64;
+                let pps = sb_positions as f64 / sb_start.elapsed().as_secs_f64().max(1e-9);
+                let mut stderr = io::stderr().lock();
+                let _ = write!(
+                    stderr,
+                    "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
+                    progress_terminator,
+                    sb,
+                    cfg.end_superbatch,
+                    pct,
+                    done,
+                    cfg.batches_per_superbatch,
+                    pps,
+                );
+                let _ = stderr.flush();
+            }
+        }
+        // TTY モードでは sb 内最後 batch 後に `\r` 上書きされた progress 行が残る
+        // ので、sb 完了 println の前に明示的な改行で line を terminate する
+        // (TTY モードでなくても sb 内 progress があった場合は最後の `\n` は付与済)。
+        if stderr_is_tty && progress_every > 0 && cfg.batches_per_superbatch >= progress_every {
+            eprintln!();
         }
         // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
         // 等) の場合、sb 内最後 batch の loss が未報告のまま残る。`flush_pending_loss`
