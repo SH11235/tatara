@@ -1541,11 +1541,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
     } else {
         padded_b_u
     };
-    let buc_size = if buc_end > buc_start {
-        buc_end - buc_start
-    } else {
-        0
-    };
+    let buc_size = buc_end.saturating_sub(buc_start);
     let n_total_tiles = buc_size >> 4;
 
     let tiles_per_split = n_total_tiles.div_ceil(num_splits);
@@ -2547,6 +2543,77 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
     }
 }
 
+/// Sorted layout 版 [`bias_grad_bucket`] (block-level shared-mem reduce)。caller が batch を
+/// bucket で sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
+/// (`exclusive_scan_aligned` 経由) を保証する前提。block は `padded_b * out_dim / 256` 個、
+/// 1 block = 256 cells = 16 sorted rows × 16 oi (out_dim=16 想定)。1 block の全 row は同一
+/// bucket (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
+/// PARTIAL[out_dim] shared-mem accumulator に集約 → 1 block × out_dim atomic add で
+/// `grad_bias[block_buc][:]` に flush。global atomic 数 = blocks × out_dim
+/// (~4106 × 16 = ~66K) で contention は元 kernel の ~1M → ~66K の 15× 減。
+///
+/// padding 行 / 範囲外 bucket (block_buc = -1) は skip (PARTIAL flush しない)、
+/// caller が `grad_bias` を 0 初期化済の前提 (accumulate semantics は元と同じ)。
+///
+/// 数値同等性: 加算順が sort 済 batch 順 + per-block reduce 順になるため fp32
+/// associativity で baseline と bit-exact ではないが、reduction tolerance 内で一致。
+/// `out_dim == 16` / `block_dim == 256` / `padded_batch % 16 == 0` / `num_buckets <= 9` は
+/// caller 契約。
+#[kernel]
+pub fn bias_grad_bucket_shared_sorted(
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_bias: &[f32],
+    padded_batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    use core::ptr::addr_of_mut;
+    static mut PARTIAL: SharedArray<f32, 16> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_idx = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let out_dim_u = out_dim as usize;
+    let padded_b_u = padded_batch as usize;
+
+    // 1 block = block_dim cells (= 16 sorted rows × out_dim oi)、b_start = block の先頭行。
+    let b_start = (block_idx * block_dim_u) / out_dim_u;
+    let block_buc = if b_start < padded_b_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+
+    if tid < out_dim_u {
+        unsafe {
+            partial_ptr.add(tid).write(0.0_f32);
+        }
+    }
+    thread::sync_threads();
+
+    let global_idx = block_idx * block_dim_u + tid;
+    let total = padded_b_u * out_dim_u;
+    if block_buc_ok && global_idx < total {
+        let oi = global_idx % out_dim_u;
+        let dyv = dy[global_idx];
+        let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+    }
+    thread::sync_threads();
+
+    if block_buc_ok && tid < out_dim_u {
+        let p = unsafe { partial_ptr.add(tid).read() };
+        let cell_idx = block_buc_u * out_dim_u + tid;
+        let cell = unsafe { &*(grad_bias.as_ptr().add(cell_idx) as *const DeviceAtomicF32) };
+        cell.fetch_add(p, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Per-bucket bias gradient (atomic accumulate)。
 /// `grad_bias[bucket][o] += sum_{b ∈ bucket} dy[b][o]`。1 thread = 1 (batch, out)、atomic。
 #[kernel]
@@ -2908,7 +2975,8 @@ fn compile_ll_to_ptx_via_llc(
                        count_buckets,exclusive_scan_aligned,scatter_bucket_perm,\
                        permute_rows_f32,inverse_permute_rows_f32,\
                        dense_mm_fwd_bucket_tiled_l1_sorted,\
-                       dense_mm_bwd_weight_bucket_tiled_l1_sorted";
+                       dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
+                       bias_grad_bucket_shared_sorted";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -5396,16 +5464,19 @@ impl GpuTrainer {
             ]
         }?;
         prof_tick!("bwd_L1_wB");
+        // L1 bias: sorted layout で per-block shared-mem reduce、global atomic 数を
+        // ~1M → ~66K に削減。dl1_total_sorted / bucket_idx_sorted_dev は同 step 内で
+        // 構築済 (fwd_L1 + bwd_L1_wB 前 permute)。
         cuda_launch! {
-            kernel: bias_grad_bucket,
+            kernel: bias_grad_bucket_shared_sorted,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT),
+            config: cfg_1d(padded_b * L1_OUT),
             args: [
-                slice(self.ws.dl1_total),
-                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.dl1_total_sorted),
+                slice(self.ws.bucket_idx_sorted_dev),
                 slice(self.l1_b_grad),
-                b_u32, L1_OUT as u32, NUM_BUCKETS as u32
+                padded_b as u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
@@ -7480,6 +7551,77 @@ mod gpu_cpu_equivalence_tests {
             &gb_cpu,
             TOL,
         );
+        Ok(())
+    }
+
+    /// 16-aligned bucket sort + permute_rows (dy) + sorted block-shared bias_grad が
+    /// `bias_grad_bucket_cpu` と reduction tolerance 内で一致することを確認。
+    /// per-block shared atomic + per-block global atomic で加算順 ≠ baseline、
+    /// `assert_close_rel` で判定。
+    #[test]
+    fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        for &batch in &[16_usize, 32, 48, 64] {
+            let out_dim = 16_usize;
+            let nb = NUM_BUCKETS;
+            let padded = padded_sort_batch(batch);
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.017 - 0.9)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut gb_cpu = vec![0.0_f32; nb * out_dim];
+            bias_grad_bucket_cpu(&dy, &bucket_idx, &mut gb_cpu, batch, out_dim, nb);
+
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+            let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+            let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim)?;
+
+            memset_minus_one_i32(&stream, &perm_dev)?;
+            memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }?;
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }?;
+            cuda_launch! {
+                kernel: bias_grad_bucket_shared_sorted, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_sorted_dev), slice(bidx_sorted_dev), slice(gb_dev),
+                       padded as u32, out_dim as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("bias_grad_bucket_shared_sorted b={batch}"),
+                &gb_dev.to_host_vec(&stream)?,
+                &gb_cpu,
+                TOL,
+            );
+        }
         Ok(())
     }
 
