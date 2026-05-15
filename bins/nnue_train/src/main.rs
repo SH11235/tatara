@@ -2614,6 +2614,88 @@ pub fn bias_grad_bucket_shared_sorted(
     }
 }
 
+/// Sorted layout 版 [`bias_grad_bucket`] (L3 用、`out_dim = 1`)。caller が batch を bucket
+/// で sort 済かつ `bucket_offsets` (aligned exclusive scan) を渡す前提。grid 構成:
+/// - `blockIdx_x` = bucket 内 split (`gridDim_x` 個)
+/// - `blockIdx_y` = bucket (`num_buckets` 個)
+///
+/// 各 block は固定 bucket / 固定 split slice を担当、256 thread で grid-stride sum →
+/// 1 atomic add per block で `grad_bias[block_buc][0]` に flush。global atomic 数は
+/// `gridDim_x × num_buckets` (=72) で baseline (~65K = batch × 1) より ~900× 削減。
+/// `out_dim == 1` / `num_buckets <= 9` / `bucket_offsets` 長 ≥ num_buckets+1 は caller 契約。
+#[kernel]
+pub fn bias_grad_bucket_shared_sorted_l3(
+    dy: &[f32],
+    bucket_offsets: &[u32],
+    grad_bias: &[f32],
+    padded_batch: u32,
+    num_buckets: u32,
+) {
+    use core::ptr::addr_of_mut;
+    static mut PARTIAL: SharedArray<f32, 1> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let split = thread::blockIdx_x() as usize;
+    let num_splits = thread::gridDim_x() as usize;
+    let block_buc = thread::blockIdx_y() as usize;
+    let num_buc_u = num_buckets as usize;
+    let padded_b_u = padded_batch as usize;
+
+    let buc_ok = block_buc < num_buc_u;
+    if !buc_ok {
+        return;
+    }
+
+    let buc_start = bucket_offsets[block_buc] as usize;
+    let buc_end_raw = bucket_offsets[block_buc + 1] as usize;
+    let buc_end = if buc_end_raw < padded_b_u {
+        buc_end_raw
+    } else {
+        padded_b_u
+    };
+    let buc_size = buc_end.saturating_sub(buc_start);
+
+    let rows_per_split = buc_size.div_ceil(num_splits);
+    let split_start = buc_start + split * rows_per_split;
+    let split_end_cand = split_start + rows_per_split;
+    let split_end = if split_end_cand < buc_end {
+        split_end_cand
+    } else {
+        buc_end
+    };
+
+    // per-thread grid-stride sum、shared 経由で block-level reduce、1 atomic global flush。
+    let mut acc = 0.0_f32;
+    if split_start < buc_end {
+        let mut idx = split_start + tid;
+        while idx < split_end {
+            acc += dy[idx];
+            idx += block_dim_u;
+        }
+    }
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+    if tid == 0 {
+        unsafe {
+            partial_ptr.write(0.0_f32);
+        }
+    }
+    thread::sync_threads();
+
+    if acc != 0.0_f32 {
+        let cell = unsafe { &*(partial_ptr as *const DeviceAtomicF32) };
+        cell.fetch_add(acc, AtomicOrdering::Relaxed);
+    }
+    thread::sync_threads();
+
+    if tid == 0 {
+        let p = unsafe { partial_ptr.read() };
+        let gcell = unsafe { &*(grad_bias.as_ptr().add(block_buc) as *const DeviceAtomicF32) };
+        gcell.fetch_add(p, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Per-bucket bias gradient (atomic accumulate)。
 /// `grad_bias[bucket][o] += sum_{b ∈ bucket} dy[b][o]`。1 thread = 1 (batch, out)、atomic。
 #[kernel]
@@ -2976,7 +3058,8 @@ fn compile_ll_to_ptx_via_llc(
                        permute_rows_f32,inverse_permute_rows_f32,\
                        dense_mm_fwd_bucket_tiled_l1_sorted,\
                        dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
-                       bias_grad_bucket_shared_sorted";
+                       bias_grad_bucket_shared_sorted,\
+                       bias_grad_bucket_shared_sorted_l3";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -3376,6 +3459,7 @@ struct GpuWorkspace {
     combined_sorted: DeviceBuffer<f32>,   // batch × FT_OUT (combined を perm で gather)
     l1_bucket_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (sorted fwd_L1 出力)
     dl1_total_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (dl1_total を perm で gather)
+    dy_net_output_sorted: DeviceBuffer<f32>, // batch × 1 (dy_net_output を perm で gather、L3 bias 用)
 }
 
 impl GpuWorkspace {
@@ -3433,6 +3517,7 @@ impl GpuWorkspace {
             combined_sorted: z(padded_sort_batch(batch) * FT_OUT)?,
             l1_bucket_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
             dl1_total_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
+            dy_net_output_sorted: z(padded_sort_batch(batch))?,
         })
     }
 
@@ -5191,16 +5276,34 @@ impl GpuTrainer {
                 b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
+        // L3 bias backward (sorted): dy_net_output を bucket_perm_dev で gather →
+        // dy_net_output_sorted、per-bucket grid + shared-mem reduce で global atomic を
+        // ~65K → 72 (gridDim_x=8 × NUM_BUCKETS=9) に削減。fwd_L1 で構築済の bucket_perm_dev /
+        // bucket_offsets_dev を再利用。
         cuda_launch! {
-            kernel: bias_grad_bucket,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b),
+            kernel: permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b),
             args: [
                 slice(self.ws.dy_net_output),
-                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_perm_dev),
+                slice_mut(self.ws.dy_net_output_sorted),
+                padded_b as u32, 1_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad_bucket_shared_sorted_l3,
+            stream: self.stream, module: self.module,
+            config: LaunchConfig {
+                grid_dim: (8, NUM_BUCKETS as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [
+                slice(self.ws.dy_net_output_sorted),
+                slice(self.ws.bucket_offsets_dev),
                 slice(self.l3_b_grad),
-                b_u32, 1_u32, NUM_BUCKETS as u32
+                padded_b as u32, NUM_BUCKETS as u32
             ]
         }?;
 
@@ -7617,6 +7720,81 @@ mod gpu_cpu_equivalence_tests {
             stream.synchronize()?;
             assert_close_rel(
                 &format!("bias_grad_bucket_shared_sorted b={batch}"),
+                &gb_dev.to_host_vec(&stream)?,
+                &gb_cpu,
+                TOL,
+            );
+        }
+        Ok(())
+    }
+
+    /// 16-aligned bucket sort + permute_rows (dy out_dim=1) + per-bucket shared-mem reduce
+    /// が `bias_grad_bucket_cpu` (out_dim=1) と reduction tolerance 内で一致することを確認。
+    /// grid (num_splits=8, num_buckets=9) で各 block が 1 bucket の slice を grid-stride
+    /// sum、shared 1-cell accumulator → 1 atomic flush。
+    #[test]
+    fn bias_grad_bucket_shared_sorted_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        for &batch in &[16_usize, 32, 48, 64] {
+            let out_dim = 1_usize;
+            let nb = NUM_BUCKETS;
+            let padded = padded_sort_batch(batch);
+            let dy: Vec<f32> = (0..batch * out_dim)
+                .map(|i| i as f32 * 0.017 - 0.9)
+                .collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+            let mut gb_cpu = vec![0.0_f32; nb * out_dim];
+            bias_grad_bucket_cpu(&dy, &bucket_idx, &mut gb_cpu, batch, out_dim, nb);
+
+            let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+            let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+            let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim)?;
+
+            memset_minus_one_i32(&stream, &perm_dev)?;
+            memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }?;
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }?;
+            cuda_launch! {
+                kernel: bias_grad_bucket_shared_sorted_l3, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: (8, nb as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(dy_sorted_dev), slice(offsets_dev), slice(gb_dev),
+                       padded as u32, nb as u32]
+            }?;
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("bias_grad_bucket_shared_sorted_l3 b={batch}"),
                 &gb_dev.to_host_vec(&stream)?,
                 &gb_cpu,
                 TOL,
