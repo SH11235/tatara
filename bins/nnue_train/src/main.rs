@@ -2281,6 +2281,22 @@ pub fn concat_l1sqr_main_grad(
     }
 }
 
+/// Broadcast bias add — `out[bi, ni] += bias[ni]` for all batch rows。
+/// cuBLAS Sgemm (matmul のみ、bias 無し) の後に呼ぶ post-pass。1 thread = 1
+/// (bi, ni) cell、bias は warp 内で同じ ni を共有するため L1 hit pattern が良好。
+#[kernel]
+pub fn bias_add_per_row(bias: &[f32], mut out: DisjointSlice<f32>, batch: u32, n: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (n as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let col = tid.get() % (n as usize);
+    if let Some(o) = out.get_mut(tid) {
+        *o += bias[col];
+    }
+}
+
 /// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
 /// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
 #[kernel]
@@ -2460,6 +2476,7 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_bwd_weight_bucket,bias_grad_bucket,\
                        crelu_fwd,crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
                        concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
+                       bias_add_per_row,\
                        slice_extract_2d,slice_scatter_2d";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
@@ -3146,6 +3163,14 @@ const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
 const CUBLAS_OP_N: cublasOperation_t = 0;
 const CUBLAS_OP_T: cublasOperation_t = 1;
 
+// cublasMath_t (subset). Ampere+ TC を TF32 で動かすには
+// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` 後の Sgemm が自動で
+// FP32 input → TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32 accum
+// に lower される。FP32 比 ~2x スループット、~10-bit mantissa の精度低下。
+#[allow(non_camel_case_types)]
+type cublasMath_t = std::os::raw::c_uint;
+const CUBLAS_TF32_TENSOR_OP_MATH: cublasMath_t = 1;
+
 #[link(name = "cublas", kind = "dylib")]
 unsafe extern "C" {
     fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
@@ -3154,6 +3179,7 @@ unsafe extern "C" {
         handle: cublasHandle_t,
         stream_id: cuda_core::sys::CUstream,
     ) -> cublasStatus_t;
+    fn cublasSetMathMode(handle: cublasHandle_t, mode: cublasMath_t) -> cublasStatus_t;
     fn cublasSgemm_v2(
         handle: cublasHandle_t,
         transa: cublasOperation_t,
@@ -3202,7 +3228,67 @@ impl CublasHandle {
             }
             return Err(format!("cublasSetStream_v2 failed: status={status}").into());
         }
+        // Ampere+ TC を TF32 で活用するため math mode を切替。Sgemm の FP32 input は
+        // 内部で TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32 accum に
+        // lower される。precision 損失は ~10-bit mantissa (FP32 23-bit より粗)、
+        // bullet baseline との loss tolerance (sb5 < 1e-4) を超える場合は要 fallback。
+        // SAFETY: handle is valid.
+        let status = unsafe { cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH) };
+        if status != CUBLAS_STATUS_SUCCESS {
+            // SAFETY: handle is valid (cleanup before erroring).
+            unsafe {
+                cublasDestroy_v2(handle);
+            }
+            return Err(format!("cublasSetMathMode(TF32) failed: status={status}").into());
+        }
         Ok(Self { handle })
+    }
+
+    /// row-major C[M, N] = A[M, K] @ B[K, N]、`alpha=1`, `beta=0` (overwrite)。
+    /// fwd_L1f 用: combined[B, FT_OUT] @ l1f_w[FT_OUT, L1_OUT] → l1f_out[B, L1_OUT]。
+    /// col-major cuBLAS で計算するため、`C_cm[N, M] = B_cm[N, K] @ A_cm[M, K]^?` の
+    /// 転置 trick を使う。row-major と col-major は同 memory 表現で、cublas 視点では
+    /// A_rm[m, k] = A_cm[k, m]、B_rm[k, n] = B_cm[n, k]。
+    ///   row-major C[m, n] = sum_k A[m, k] * B[k, n]
+    ///   = col-major C[n, m] = sum_k B[n, k] * A[k, m]^?
+    /// → cublas call: A=B_dev, B=A_dev, transA=N, transB=N, m=N, n=M, k=K, lda=N, ldb=K, ldc=N。
+    ///
+    /// SAFETY: 全 device pointer は cudaMalloc 由来、長さは仕様分 (a.len() >= m*k、
+    /// b.len() >= k*n、c.len() >= m*n)、stream は `cublasSetStream_v2` で bind 済の
+    /// 同一 stream を再利用、TF32 math mode は handle 作成時に設定済。
+    unsafe fn sgemm_fwd_rowmajor(
+        &self,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_ptr: *const f32, // row-major [m, k]
+        b_ptr: *const f32, // row-major [k, n]
+        c_ptr: *mut f32,   // row-major [m, n]
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let status = unsafe {
+            cublasSgemm_v2(
+                self.handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n, // cublas m = N (cols of C in col-major)
+                m, // cublas n = M (rows of C in col-major)
+                k,
+                &alpha,
+                b_ptr, // cublas A = B (row-major [k, n] = col-major [n, k])
+                n,
+                a_ptr, // cublas B = A (row-major [m, k] = col-major [k, m])
+                k,
+                &beta,
+                c_ptr,
+                n,
+            )
+        };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasSgemm_v2 (fwd) failed: status={status}").into());
+        }
+        Ok(())
     }
 
     /// row-major C[M, N] = X^T @ Y、X[K, M] row-major、Y[K, N] row-major (X^T Y の reduce
@@ -4153,24 +4239,33 @@ impl GpuTrainer {
 
         prof_tick!("fwd_L1");
 
-        // -- Forward step 5: dense_mm_fwd L1f shared → l1f_out (B × L1_OUT) --
-        // tiled (block=256 × grid=batch/16=4096 blocks): per-thread K iter 削減 + shared W cache。
-        debug_assert!(b.is_multiple_of(16) && FT_OUT.is_multiple_of(16) && L1_OUT == 16);
+        // -- Forward step 5: L1f shared dense → l1f_out (B × L1_OUT) --
+        // cuBLAS Sgemm (TF32 TC) で matmul、`bias_add_per_row` kernel で bias を別 pass。
+        // shape: combined[B, FT_OUT] @ l1f_w[FT_OUT, L1_OUT] → l1f_out[B, L1_OUT]。
+        //
+        // SAFETY: combined / l1f_w / l1f_out は cudaMalloc 由来、長さは arch 上 invariant
+        // (combined.len() == B*FT_OUT、l1f_w.len() == FT_OUT*L1_OUT、l1f_out.len() == B*L1_OUT)、
+        // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行 (先行 kernel
+        // 完了後に Sgemm が走り、結果は後続 bias_add_per_row が観測)。
+        unsafe {
+            self.cublas.sgemm_fwd_rowmajor(
+                b_u32 as i32,  // m = batch
+                L1_OUT as i32, // n = out_dim
+                FT_OUT as i32, // k = in_dim
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.l1f_w.cu_deviceptr() as *const f32,
+                self.ws.l1f_out.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
-            kernel: dense_mm_fwd_tiled_l1f,
+            kernel: bias_add_per_row,
             stream: self.stream,
             module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((b / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            config: cfg_1d(b * L1_OUT),
             args: [
-                slice(self.ws.combined),
-                slice(self.l1f_w),
                 slice(self.l1f_b),
                 slice_mut(self.ws.l1f_out),
-                b_u32, FT_OUT as u32, L1_OUT as u32
+                b_u32, L1_OUT as u32
             ]
         }?;
 
