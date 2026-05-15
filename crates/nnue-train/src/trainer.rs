@@ -340,8 +340,11 @@ where
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(128);
-    let stderr_is_tty = io::stderr().is_terminal();
-    let progress_terminator = if stderr_is_tty { '\r' } else { '\n' };
+    let progress_terminator = if io::stderr().is_terminal() {
+        '\r'
+    } else {
+        '\n'
+    };
 
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
@@ -399,12 +402,13 @@ where
                 }
             }
         }
-        // TTY モードでは sb 内最後の batch progress が `\r` で書かれた状態で残る
-        // ため、sb 完了 println の前に明示的な改行を入れて line を terminate
-        // する (pipe / redirect モードは既に `\n` で改行済なので不要)。実際に
-        // progress を出力した sb のみ改行する (`sb_printed_progress` フラグ)、
-        // 0 回しか印字されなかった場合は余分な空行を出さない。
-        if stderr_is_tty && sb_printed_progress {
+        // progress line は terminator を **prefix** に置く format で書いている
+        // ため、TTY (`\r` 上書き) でも pipe (`\n` 改行) でも最後の line は末尾
+        // 改行を持たない。sb 完了 println が直後に続くと同一 line に追記されて
+        // しまうので、progress を 1 回でも印字した sb は明示的に改行を入れて
+        // line を terminate する。`sb_printed_progress` で 0 回 sb の余分な
+        // 空行を抑制。
+        if sb_printed_progress {
             eprintln!();
         }
         // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
