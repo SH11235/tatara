@@ -3222,14 +3222,12 @@ impl CublasHandle {
     /// `enable_tf32 = true` で Ampere+ Tensor Core を TF32 mode で活用する
     /// (`cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`)。Sgemm の FP32
     /// input は内部で TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32
-    /// accum に lower され、~2-3x throughput と引き換えに仮数 ~3 桁の精度低下を
-    /// 受ける。`false` では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) を
-    /// 使う。
+    /// accum に lower され、throughput と引き換えに仮数 ~3 桁の精度低下を受ける。
+    /// `false` では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) を使う。
     ///
-    /// 本 net の数値同等性は `enable_tf32 = true` のとき 5 sb × 200 batches 計測
-    /// で sb5 diff < 1e-4 tolerance、長期 (400 sb) retest 未。本 handle は fwd
-    /// (`sgemm_fwd_rowmajor`) / bwd (`sgemm_xt_y_rowmajor`) 双方で共有されるため
-    /// L1f forward と weight backward の両 Sgemm に同 mode が効く。
+    /// 本 handle は fwd (`sgemm_fwd_rowmajor`) / bwd (`sgemm_xt_y_rowmajor`)
+    /// 双方で共有されるため、L1f forward と weight backward の両 Sgemm に同
+    /// mode が効く。
     fn new(stream: &CudaStream, enable_tf32: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let mut handle: cublasHandle_t = std::ptr::null_mut();
         // SAFETY: cublasCreate_v2 は &mut handle に新規 handle を書き、CUBLAS_STATUS_SUCCESS
