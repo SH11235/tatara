@@ -25,7 +25,7 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
 
 | GPU | sm | DRAM BW | 期待 pos/s | 400 sb ETA | 出典 |
 |---|---|---:|---:|---:|---|
-| RTX 3080 Ti | 86 | 912 GB/s | **~827K** | ~53 h | 本リポジトリ実測 (Issue #104 δ 適用後) |
+| RTX 3080 Ti | 86 | 912 GB/s | **~827K** | ~53 h | 本リポジトリ実測 (cuBLAS Sgemm + TF32 TC 適用後) |
 | RTX 4090 | 89 | 1008 GB/s | ~1.0-1.1M (推定) | ~40 h | DRAM BW 比 1.10× + clock 比、未実測 |
 | A100 40GB | 80 | 1555 GB/s | ~1.3M (推定) | ~32 h | DRAM 比だが int8 倍精度等は無関係、未実測 |
 | H100 SXM | 90 | 3 TB/s | ~2M? (推定) | ~20 h? | Hopper TC 未活用なので DRAM 律速ライン、未実測 |
