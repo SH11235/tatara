@@ -347,6 +347,7 @@ where
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
+        let mut sb_printed_progress = false;
 
         for batch_idx in 0..cfg.batches_per_superbatch {
             let lr = lr_scheduler.lr(batch_idx, sb);
@@ -392,12 +393,15 @@ where
                     pps,
                 );
                 let _ = stderr.flush();
+                sb_printed_progress = true;
             }
         }
-        // TTY モードでは sb 内最後 batch 後に `\r` 上書きされた progress 行が残る
-        // ので、sb 完了 println の前に明示的な改行で line を terminate する
-        // (TTY モードでなくても sb 内 progress があった場合は最後の `\n` は付与済)。
-        if stderr_is_tty && progress_every > 0 && cfg.batches_per_superbatch >= progress_every {
+        // TTY モードでは sb 内最後の batch progress が `\r` で書かれた状態で残る
+        // ため、sb 完了 println の前に明示的な改行を入れて line を terminate
+        // する (pipe / redirect モードは既に `\n` で改行済なので不要)。実際に
+        // progress を出力した sb のみ改行する (`sb_printed_progress` フラグ)、
+        // 0 回しか印字されなかった場合は余分な空行を出さない。
+        if stderr_is_tty && sb_printed_progress {
             eprintln!();
         }
         // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
