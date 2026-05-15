@@ -3169,11 +3169,14 @@ const CUBLAS_OP_T: cublasOperation_t = 1;
 // に lower される。FP32 比 ~2x スループット、~10-bit mantissa の精度低下。
 #[allow(non_camel_case_types)]
 type cublasMath_t = std::os::raw::c_uint;
-// cublasMath_t enum 値 (`/usr/local/cuda-*/include/cublas_api.h` 由来):
-//   CUBLAS_DEFAULT_MATH         = 0
-//   CUBLAS_TENSOR_OP_MATH       = 1  (deprecated, CUDA 11 で FP16 TC fallback)
-//   CUBLAS_PEDANTIC_MATH        = 2
-//   CUBLAS_TF32_TENSOR_OP_MATH  = 3  (Ampere+ TF32 TC、FP32 input → TF32 cast → TC mma → FP32 accum)
+// cublasMath_t enum (`/usr/local/cuda-*/include/cublas_api.h` の `cublasMath_t`
+// 全エントリ、CUDA 12.9 時点):
+//   CUBLAS_DEFAULT_MATH                              = 0
+//   CUBLAS_TENSOR_OP_MATH                            = 1  (deprecated alias、FP16 TC fallback)
+//   CUBLAS_PEDANTIC_MATH                             = 2
+//   CUBLAS_TF32_TENSOR_OP_MATH                       = 3  (Ampere+ TF32 TC、FP32 input → TF32 cast → TC mma → FP32 accum)
+//   CUBLAS_FP32_EMULATED_BF16X9_MATH                 = 4  (Hopper+ BF16x9 emulation)
+//   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16 (bit mask)
 const CUBLAS_TF32_TENSOR_OP_MATH: cublasMath_t = 3;
 
 #[link(name = "cublas", kind = "dylib")]
