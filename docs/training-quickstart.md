@@ -8,8 +8,8 @@ toolchain と CUDA / LLVM の準備は [docs/setup.md](setup.md) を参照。
 
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
-| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す。bullet-shogi 互換 | 数百 GB |
-| progress 係数 | YaneuraOu 互換 `progress.bin` (f64 LE × 81 × FE_OLD_END、固定 1,003,104 bytes) | `--progress-coeff` で渡す。9 bucket 振り分けに使う | 1.0 MB |
+| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
+| progress 係数 | `progress.bin` (f64 LE × 81 × `FE_OLD_END` = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。9 bucket 振り分けに使う | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | ~116 MB |
 
 PSV / `.bin` / checkpoint の命名規約と配置は
@@ -18,19 +18,20 @@ PSV / `.bin` / checkpoint の命名規約と配置は
 
 ## Step 1: progress.bin を生成 (まだ無い場合)
 
-`progress-kpabs-train` で先に進行度係数を学習する。100M 局面で 5 epoch、
-RTX 3080 Ti で ~1.5 時間。
+`progress-kpabs-train` で先に進行度係数を学習する。`--epochs` で総 epoch
+数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
 
 ```bash
 target/release/progress-kpabs-train \
-  --data /path/to/DLSuisho15b_aoba_deduped_shuffled.bin \
-  --output output/progress/progress_hao_full_cuda.bin \
+  --data <path/to/shuffled-psv.bin> \
+  --output output/progress/<run-name>.bin \
   --games-per-step 1024 --epochs 5
 ```
 
-epoch ごとに `progress_hao_full_cuda.e<N>.bin` が出るので、`nnue-train` に
-渡すのは最終 epoch (例: `e5.bin`) で良い。中間 epoch (`e1.bin`) を渡せば
-学習進行度の感覚を弱くしただけの bucket になる (NNUE 学習の進行と独立)。
+`nnue-train` には任意の epoch checkpoint (`<run-name>.e<N>.bin`) を
+`--progress-coeff` で渡す。どの epoch を採用するかは試行錯誤になる
+(progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立な
+ため何 epoch 必要かはデータ依存)。
 
 ## Step 2: nnue-train で本体を学習 (400 sb full run)
 
@@ -39,9 +40,9 @@ bullet-shogi v102 recipe (400 superbatches × 6104 batches × 65536 positions
 
 ```bash
 target/release/nnue-train \
-  --data /path/to/DLSuisho15b_aoba_deduped_shuffled.bin \
-  --progress-coeff output/progress/progress_hao_full_cuda.e5.bin \
-  --output checkpoints/v102_main --net-id v102_main \
+  --data <path/to/shuffled-psv.bin> \
+  --progress-coeff <path/to/progress.e5.bin> \
+  --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
   --save-rate 20 --keep-checkpoints 4 \
@@ -56,11 +57,11 @@ target/release/nnue-train \
 | `--keep-checkpoints 4` | raw `.ckpt` (~1.8GB/個) を直近 4 個だけ残す。量子化 `.bin` (~116MB) は常に全保持 |
 | `--threads 16` | dataloader prefetch worker 数。各 worker が PSV decode + sparse 抽出 + bucket 計算を 1 回で済ませて先読み |
 
-ETA (RTX 3080 Ti、本リポジトリの最適化 PR #103 適用後、811K pos/s 実測):
+ETA (RTX 3080 Ti、~811K pos/s 実測):
 
 - 1 sb = 6104 batches × 65536 positions = 400M positions ≈ 8 分
 - 400 sb full run ≈ **52-55 時間** (=~2.5 日)
-- bullet-shogi (691K pos/s avg) 比 **+17%** で同じ recipe を回せる
+- bullet-shogi (~691K pos/s) 比 **+17%** で同じ recipe を回せる
 
 GPU 機種別期待値の見積もりは [docs/performance.md](performance.md) を参照。
 
@@ -94,7 +95,7 @@ target/release/nnue-train \
 
 | ファイル | 形式 | 用途 |
 |---|---|---|
-| `v102_main-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact**。YaneuraOu / bullet と同じ binary layout |
+| `v102_main-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact** (`v102_layerstack` format、`crates/nnue-format/src/v102_layerstack.rs` 参照) |
 | `v102_main-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
 `v102_main-400.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで

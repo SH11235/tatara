@@ -194,8 +194,8 @@ fn progress_bin_roundtrip() {
 }
 
 #[test]
-fn progress_bin_size_matches_yaneuraou_format() {
-    // YaneuraOu 互換 progress.bin は f64 LE × N_WEIGHTS = 1,003,104 bytes
+fn progress_bin_size_is_exactly_1003104_bytes() {
+    // progress.bin: f64 LE × N_WEIGHTS = 1_003_104 bytes 固定。
     let dir = tempdir();
     let path = dir.join("progress.bin");
     let weights = vec![0.0_f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
@@ -203,10 +203,7 @@ fn progress_bin_size_matches_yaneuraou_format() {
     let size = std::fs::metadata(&path).expect("stat").len();
     let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS as u64 * std::mem::size_of::<f64>() as u64;
     assert_eq!(size, expected);
-    assert_eq!(
-        size, 1_003_104,
-        "1,003,104 bytes は YaneuraOu progress.bin 仕様"
-    );
+    assert_eq!(size, 1_003_104);
 }
 
 #[test]

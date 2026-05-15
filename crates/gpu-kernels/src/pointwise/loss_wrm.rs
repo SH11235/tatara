@@ -6,7 +6,7 @@
 //!
 //! ## アルゴリズム
 //!
-//! nodchip 流 win-rate-model loss (bullet `loss_fn_wrm` + loader WRM target に等価)。
+//! bullet `loss_fn_wrm` + loader WRM target を移植した win-rate-model loss。
 //! target / prediction 双方で `(score - 270)/in_scaling` の sigmoid 対称差を取る:
 //!
 //! ```text

@@ -1,4 +1,4 @@
-//! Training-loop driver — host-side superbatch loop for the v102 NNUE trainer。
+//! Training-loop driver — host-side superbatch loop for the NNUE trainer。
 //!
 //! GPU 非依存の trait ([`TrainerBackend`]) 越しに 1 batch 分の forward / backward
 //! / optimizer step を呼び出す superbatch loop を提供する。`bins/nnue_train::
@@ -30,11 +30,8 @@
 //!
 //! ## per-position output bucket
 //!
-//! progress8kpabs (`ShogiProgressKPAbs::bucket`、YaneuraOu 互換 `progress.bin` の
-//! 重み付き和 → sigmoid → `floor(p * 8)` を `0..=7` に clamp) で求める。
-//! v102 の network は 9 bucket を持つが progress8kpabs は bucket 8 を使わない
-//! (9bucket 互換 layout で bucket8 未使用)。`progress.bin` 未指定時は重みが
-//! 全 0 で `p = sigmoid(0) = 0.5` となり、全 position が bucket 4 に collapse する。
+//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * 8)` を `0..=7` に
+//! clamp。`progress.bin` 未指定時は重み 0 で全局面が bucket 4 に collapse する。
 //!
 //! ## score-drop-abs の近似
 //!
@@ -72,11 +69,12 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 /// - [`LossKind::Sigmoid`] — plain sigmoid-MSE (`p = sigmoid(out * scale)`,
 ///   target = `lambda*wdl + (1-lambda)*sigmoid(score * scale)`)。net_output が
 ///   cp 単位 (`out ≈ cp`) で収束する。
-/// - [`LossKind::Wrm`] — bullet win-rate-model loss (nodchip 流の WRM)。prediction
-///   / target 双方に WRM を適用するため net_output が `out ≈ cp / nnue2score`
-///   (O(1)) で収束し、量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と scale が整合する。
-///   target 側 `in_scaling` (380) と offset (270) は bullet ハードコード値、
-///   prediction 側 `in_scaling` は `--wrm-in-scaling` 経由で本 enum field から渡る。
+/// - [`LossKind::Wrm`] — bullet `loss_fn_wrm` を移植した win-rate-model loss。
+///   prediction / target 双方に WRM を適用するため net_output が
+///   `out ≈ cp / nnue2score` (O(1)) で収束し、量子化 (`QA=127 / QB=64 /
+///   FV_SCALE=28`) と scale が整合する。target 側 `in_scaling` (380) と
+///   offset (270) は bullet ハードコード値、prediction 側 `in_scaling` は
+///   `--wrm-in-scaling` 経由で本 enum field から渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
     /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 recipe は `1/290`)。

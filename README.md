@@ -65,7 +65,7 @@ GPU crate を exclude した CPU-only check のみ走らせる。
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
-- [v102 binary save format](docs/bullet_v102_save_format_report.md) — bullet
+- [v102 binary save format](docs/bullet_v102_save_format.md) — bullet
   v102 LayerStack `quantised.bin` の binary layout 仕様
 
 ## 用語 (glossary)
@@ -82,6 +82,7 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
+| **v102** | bullet-shogi の LayerStack 量子化 save format バージョン (HalfKA_hm 1536-16-32 + 9-bucket、PSQT / Threat / HandCount 無しの最小形)。本リポの `bins/nnue_train` が出力する `.bin` はこの format。詳細は [docs/bullet_v102_save_format.md](docs/bullet_v102_save_format.md) |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.md` のサポート GPU マトリクス参照 |
 | **SASS** | NVIDIA GPU の世代別実機機械語。PTX から CUDA driver JIT が生成する終端形式。本リポでは直接扱わない |
 | **sm_XX** | NVIDIA GPU の compute capability (例: sm_75 = Turing、sm_86 = Ampere RTX 30xx)。PTX 生成時の target アーキ指定 (`CUDA_OXIDE_TARGET=sm_86` 等) に使う |

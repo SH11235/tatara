@@ -173,11 +173,11 @@ pub fn loss_wdl(
 /// loader.rs:300-316` (data-layer の WRM target + WDL blend) を NNUE 専用に hand-fuse。
 /// CPU reference は `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`。
 ///
-/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、prediction /
-/// target 双方に nodchip 流 WRM を適用するため net_output は `out ≈ cp / nnue2score`
-/// (O(1)) で収束し、`crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`、
-/// bullet の `out ≈ cp/600` スケール前提) と整合する。bullet v102 を厳密再現するには
-/// この kernel を使う。
+/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、
+/// prediction / target 双方に WRM を適用するため net_output は
+/// `out ≈ cp / nnue2score` (O(1)) で収束し、`crates/nnue-format` の量子化
+/// (`QA=127 / QB=64 / FV_SCALE=28`、bullet の `out ≈ cp/600` スケール前提)
+/// と整合する。bullet v102 を厳密再現するにはこの kernel を使う。
 ///
 /// - target: `pt = (score - 270)/380`、`pmt = (-score - 270)/380`、`target_wrm =
 ///   0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、`target = lambda*wdl + (1-lambda)*target_wrm`。
@@ -1266,7 +1266,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
     let in_ok = global_ii < in_dim_u;
     let out_ok = global_oi < out_dim_u;
 
-    // split-K: 各 block が batch slice を担当。num_splits=1 で従来形 (全 batch スキャン)。
+    // split-K: 各 block が batch slice を担当。num_splits=1 で 1 block が全 batch を scan。
     let positions_per_split = batch_u.div_ceil(num_splits);
     let split_b_start = block_split * positions_per_split;
     if split_b_start >= batch_u {
@@ -3163,20 +3163,20 @@ const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
 const CUBLAS_OP_N: cublasOperation_t = 0;
 const CUBLAS_OP_T: cublasOperation_t = 1;
 
-// cublasMath_t (subset). Ampere+ TC を TF32 で動かすには
-// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` 後の Sgemm が自動で
-// FP32 input → TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32 accum
-// に lower される。FP32 比 ~2x スループット、~10-bit mantissa の精度低下。
-#[allow(non_camel_case_types)]
-type cublasMath_t = std::os::raw::c_uint;
-// cublasMath_t enum (`/usr/local/cuda-*/include/cublas_api.h` の `cublasMath_t`
-// 全エントリ、CUDA 12.9 時点):
+// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼ぶと、以後の
+// Sgemm は FP32 input → TF32 (8-bit exp + 10-bit mantissa) cast → TC mma →
+// FP32 accum に lower される (Ampere+)。FP32 比 ~2x スループット、~10-bit
+// mantissa の精度低下。
+//
+// `cublasMath_t` enum (`/usr/local/cuda-*/include/cublas_api.h`、CUDA 12.9 時点):
 //   CUBLAS_DEFAULT_MATH                              = 0
 //   CUBLAS_TENSOR_OP_MATH                            = 1  (deprecated alias、FP16 TC fallback)
 //   CUBLAS_PEDANTIC_MATH                             = 2
-//   CUBLAS_TF32_TENSOR_OP_MATH                       = 3  (Ampere+ TF32 TC、FP32 input → TF32 cast → TC mma → FP32 accum)
+//   CUBLAS_TF32_TENSOR_OP_MATH                       = 3
 //   CUBLAS_FP32_EMULATED_BF16X9_MATH                 = 4  (Hopper+ BF16x9 emulation)
 //   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16 (bit mask)
+#[allow(non_camel_case_types)]
+type cublasMath_t = std::os::raw::c_uint;
 const CUBLAS_TF32_TENSOR_OP_MATH: cublasMath_t = 3;
 
 #[link(name = "cublas", kind = "dylib")]
@@ -3839,7 +3839,7 @@ impl GpuTrainer {
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_v102_weights` → `save_quantised`)
-    /// は推論用 final artifact なので別途従来どおり保存される。本 method はそれとは別の
+    /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
     /// `*.ckpt` file に、全 10 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
@@ -5244,7 +5244,7 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     save_rate: usize,
 
-    /// progress8kpabs 係数ファイル (YaneuraOu 互換 `progress.bin`、f64 LE × 81*FE_OLD_END)。
+    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 81*FE_OLD_END)。
     /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
@@ -5279,22 +5279,22 @@ struct Cli {
     #[arg(long)]
     keep_checkpoints: Option<usize>,
 
-    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm` kernel
-    /// (prediction / target 双方に nodchip 流 WRM) を使い、未指定なら `loss_wdl`
-    /// (plain sigmoid-MSE + `--scale`)。net_output のスケールが `out ≈ cp/--wrm-nnue2score`
-    /// になり量子化 (`QA=127/QB=64/FV_SCALE=28`) と整合するので bullet v102 互換 net を
-    /// 学習するには必須。
+    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm`
+    /// kernel (prediction / target 双方に WRM を適用) を使い、未指定なら
+    /// `loss_wdl` (plain sigmoid-MSE + `--scale`)。net_output のスケールが
+    /// `out ≈ cp/--wrm-nnue2score` になり量子化 (`QA=127/QB=64/FV_SCALE=28`)
+    /// と整合するので bullet v102 互換 net を学習するには必須。
     #[arg(long)]
     win_rate_model: bool,
-    /// WRM prediction 側の in-scaling (nodchip default 340)。target 側は bullet ハードコード
-    /// の 380。`--win-rate-model` 指定時のみ使う。
+    /// WRM prediction 側の in-scaling (bullet recipe 既定値 340)。target 側は
+    /// bullet ハードコードの 380。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 340.0)]
     wrm_in_scaling: f32,
-    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、nodchip default 600)。
-    /// `--win-rate-model` 指定時のみ使う。
+    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、bullet
+    /// recipe 既定値 600)。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 600.0)]
     wrm_nnue2score: f32,
-    // --- 以下は v102 recipe との CLI 互換のために受けるが、本 stage では未配線 ---
+    // --- 以下は v102 recipe との CLI 互換のために受けるが、現状未配線 ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
     optimizer: String,
@@ -5539,23 +5539,26 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
     println!("[smoke] step 0: init weights all finite ✓");
 
-    // /tmp/v102_100_quantised.bin が利用可能なら、bullet v102-100 (sb=100 checkpoint) を
-    // 注入して **golden forward 経路** (forward + backward + save) を検証する。
-    // 不在時は random init smoke のみ。
-    let v102_path = "/tmp/v102_100_quantised.bin";
-    if std::path::Path::new(v102_path).exists() {
-        println!("[smoke] loading bullet v102-100 reference from {v102_path} ...");
-        let mut reader = std::io::BufReader::new(std::fs::File::open(v102_path)?);
+    // `RSHOGI_NNUE_V102_REF_BIN` で外部 reference checkpoint (例: bullet で
+    // 生成した v102 互換 quantised.bin) を指定すると、注入して **golden forward
+    // 経路** (forward + backward + save) を検証する。未設定なら random init smoke のみ。
+    let v102_ref = std::env::var("RSHOGI_NNUE_V102_REF_BIN").ok();
+    if let Some(ref_path) = v102_ref
+        .as_deref()
+        .filter(|p| std::path::Path::new(p).exists())
+    {
+        println!("[smoke] loading v102 reference from {ref_path} ...");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
         let weights = V102Weights::load_quantised(&mut reader)?;
         trainer.load_v102_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
-        println!("[smoke] v102-100 weights injected, all finite ✓");
+        println!("[smoke] v102 reference weights injected, all finite ✓");
 
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
-        println!("[smoke] step 1 (post-v102-100 init, sigmoid-MSE): loss = {loss:.6e}");
+        println!("[smoke] step 1 (post-v102 init, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
         }
@@ -5563,17 +5566,15 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 1: all weights finite ✓");
 
         // save back as our quantised.bin
-        let out_path = "/tmp/our_quantised.bin";
-        println!("[smoke] saving trained weights to {out_path} ...");
+        let out_path = std::env::temp_dir().join("our_quantised.bin");
+        let out_path_str = out_path.display();
+        println!("[smoke] saving trained weights to {out_path_str} ...");
         let saved_weights = trainer.to_v102_weights()?;
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
-        let out_size = std::fs::metadata(out_path)?.len();
-        println!("[smoke] wrote {out_path}: {out_size} bytes");
-        println!(
-            "[smoke] verify with:\n  /home/sh11235/git-repos/rshogi-oss/target/release/verify_nnue_accumulator \\\n    --nnue-file {out_path} \\\n    --ls-progress-coeff /mnt/e/rshogi-nnue/data/progress/progress_hao_full_cuda.e1.bin \\\n    --moves 10"
-        );
+        let out_size = std::fs::metadata(&out_path)?.len();
+        println!("[smoke] wrote {out_path_str}: {out_size} bytes");
 
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
@@ -5586,7 +5587,9 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         trainer.assert_all_weights_finite()?;
         println!("[smoke] step 2: all weights finite ✓");
     } else {
-        println!("[smoke] (no v102_100_quantised.bin available; running random-init smoke only)");
+        println!(
+            "[smoke] (RSHOGI_NNUE_V102_REF_BIN not set or path missing; running random-init smoke only)"
+        );
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
@@ -5607,13 +5610,14 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 2: all weights finite ✓");
 
         // save random-init as quantised.bin for verify-nnue check
-        let out_path = "/tmp/our_quantised_randinit.bin";
+        let out_path = std::env::temp_dir().join("our_quantised_randinit.bin");
+        let out_path_str = out_path.display();
         let saved_weights = trainer.to_v102_weights()?;
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
-        let out_size = std::fs::metadata(out_path)?.len();
-        println!("[smoke] wrote {out_path}: {out_size} bytes");
+        let out_size = std::fs::metadata(&out_path)?.len();
+        println!("[smoke] wrote {out_path_str}: {out_size} bytes");
     }
 
     println!("[smoke] PASSED — GpuTrainer skeleton OK (v102 arch full path)");
@@ -5716,8 +5720,7 @@ mod raw_ckpt_format_tests {
 // 走らせる:
 //
 // ```bash
-// cd bins/nnue_train
-// CUDA_OXIDE_TARGET=sm_75 /mnt/e/cuda-oxide-target/release/cargo-oxide build
+// cd bins/nnue_train && CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 // cd ../.. && cargo test -p nnue-trainer --release -- --test-threads=1
 // ```
 //

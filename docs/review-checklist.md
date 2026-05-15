@@ -120,6 +120,44 @@ for d in $(rg -oE '^[│├└\s─]+([a-z_-]+)/' README.md \
 done
 ```
 
+### 2.5 section purpose alignment
+
+各 doc は冒頭 1-3 行で宣言した目的 (例: `performance.md` = "throughput 期待値 +
+GPU 機種別目安 + `NNUE_TRAIN_STEP_PROFILE` 自己診断手順") に沿わない section
+が混入していないか、section 見出しを並べて目視判定する。
+
+```bash
+# 各 doc の宣言目的 (header) と section 見出しを並べる
+for f in docs/*.md README.md; do
+  echo "=== $f ==="
+  head -3 "$f" | tail -2     # 宣言目的
+  rg -n '^##? ' "$f"          # section 見出し列挙
+done
+```
+
+特に **CLAUDE.md の「ドキュメント規約」/「dated 検証ブロック禁止」項が
+指す内容の親戚** が reference doc に混入していないか focal にする:
+
+- 試行 → revert した経緯 ("X を試したが noise 内"、"NO-GO になった候補")
+- local 計測 delta ("+0.74% 改善"、"step 全体の 0.16%")
+- 着手前提メモ ("unblock には ~4-6h refactor が必要")
+- 個別 dataset / experiment 固有値 ("1143 files × 5 epoch"、"~616 GB")
+- 断定的な経験則 ("最終 epoch で良い"、"e1 で十分") — author の経験は事実
+  ではなく、出典がなければ書かない。「データ依存 / 試行錯誤」と書いて選択を
+  読者に委ねる
+
+これらの正しい置き場:
+
+| 内容種別 | 置き場 |
+|---|---|
+| 試行 → revert 経緯 | git log / revert commit message |
+| アーキ判断 (採用 / 不採用の理由) | ADR (`docs/decisions/`) |
+| dated 計測ログ | `docs/experiments/` (gitignored、commit 不可) |
+| 「現状こうなっている」事実 | reference doc 本体 |
+
+検出は **section 単位 / paragraph 単位の目視** が必要。grep だけでは取り
+切れない (語彙ではなく structural な mismatch のため)。
+
 ## 3. コード特有チェック
 
 ### 3.1 漠然とした上流参照

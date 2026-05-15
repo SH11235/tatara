@@ -1,33 +1,6 @@
-//! BonaPiece - 駒の種類と位置を一意に表現するインデックス
+//! BonaPiece — 駒の種類と位置を一意に表現するインデックス。
 //!
-//! YaneuraOu の NNUE 実装で用いられる BonaPiece に準拠した定義。
-//!
-//! ## YaneuraOu BonaPiece定義 (DISTINGUISH_GOLDS無効時)
-//!
-//! ### 手駒 (1〜89)
-//! - f_hand_pawn = 1, e_hand_pawn = 20 (各18枚分)
-//! - f_hand_lance = 39, e_hand_lance = 44 (各4枚分)
-//! - f_hand_knight = 49, e_hand_knight = 54 (各4枚分)
-//! - f_hand_silver = 59, e_hand_silver = 64 (各4枚分)
-//! - f_hand_gold = 69, e_hand_gold = 74 (各4枚分)
-//! - f_hand_bishop = 79, e_hand_bishop = 82 (各2枚分)
-//! - f_hand_rook = 85, e_hand_rook = 88 (各2枚分)
-//! - fe_hand_end = 90
-//!
-//! ### 盤上駒 (90〜1547)
-//! - f_pawn = 90, e_pawn = 171
-//! - f_lance = 252, e_lance = 333
-//! - f_knight = 414, e_knight = 495
-//! - f_silver = 576, e_silver = 657
-//! - f_gold = 738, e_gold = 819
-//! - f_bishop = 900, e_bishop = 981
-//! - f_horse = 1062, e_horse = 1143
-//! - f_rook = 1224, e_rook = 1305
-//! - f_dragon = 1386, e_dragon = 1467
-//! - fe_end = 1548
-//!
-//! ### 王 (1548〜1710)
-//! - f_king = 1548, e_king = 1629
+//! オフセット定義は本 file の `pub const F_*` / `E_*` (本 file の値が正)。
 
 use super::types::{Color, Piece, PieceType, Square};
 

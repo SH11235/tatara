@@ -4,7 +4,7 @@
 //! - 特徴次元: `81 * FE_OLD_END = 81 * 1548 = 125_388` (玉位置 × BonaPiece)
 //! - 学習形式: logistic regression (`p = sigmoid(Σ w_i * x_i)`)
 //! - bucket 割当: `min(7, floor(p * 8.0))` (8 bucket)
-//! - 重み読込: YaneuraOu 互換 `progress.bin` (f64 little-endian × 125_388 個)
+//! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
 //!
 //! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
@@ -113,7 +113,7 @@ impl ShogiProgressKPAbs {
         Self::for_each_active_index(pos, |idx| out.push(idx));
     }
 
-    /// YaneuraOu 互換 `progress.bin` (f64 LE × `NUM_WEIGHTS`) を読み込む。
+    /// `progress.bin` (f64 LE × `NUM_WEIGHTS`、`1_003_104` bytes 固定) を読み込む。
     ///
     /// プロセスでロード可能な KP-absolute モデルは 1 つだけ (二回目以降は Err)。
     pub fn load_from_bin(path: &Path) -> Result<Self, String> {

@@ -2,7 +2,7 @@
 //!
 //! 本 file は kernel 定義 (`#[kernel]`) と host loop driver を統合する。host
 //! loop は PSV file 群 → batch → forward → grad → adam_step を駆動し、最終
-//! weight を YaneuraOu 互換 `progress.bin` に出力する。
+//! weight を `progress.bin` (f64 LE × N) に出力する。
 //!
 //! ## 設計
 //!
@@ -27,16 +27,16 @@
 //!
 //! # 実データで:
 //! cargo run --release -p progress-kpabs-train -- \
-//!     --data /mnt/e/rshogi-nnue/data/some.bin \
+//!     --data <path/to/training.bin> \
 //!     --output progress.bin --epochs 1
 //! ```
 //!
-//! 事前に `cargo-oxide build` で kernel `.ll` を生成しておく必要がある:
+//! 事前に `cargo-oxide build` で kernel `.ll` を生成しておく必要がある
+//! (`cargo-oxide` の build 手順は `docs/setup.md` 参照):
 //!
 //! ```bash
 //! cd bins/progress_kpabs_train && \
-//! CUDA_OXIDE_TARGET=sm_75 \
-//!     /mnt/e/cuda-oxide-target/release/cargo-oxide build
+//!     CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 //! ```
 //!
 //! 出力先 (workspace root の `progress_kpabs_train.ll`) は `KernelLoader`

@@ -49,7 +49,7 @@ Producer order is `header`, `ft_hash`, FT biases LEB128, FT weights LEB128, opti
 | Bucket 8 | `S + 206656` | `25832` | same as bucket 0 | Same per-bucket layout. |
 | EOF | `S + 232488` | `0` | EOF | Loader probes for trailing data and errors if any non-EOF byte remains (`crates/rshogi-core/src/nnue/network_layer_stacks.rs:268-298`). |
 
-Total file size is `232745 + Cb + Cw` bytes. There is no final 64-byte `bullet` padding for this custom/YaneuraOu format: `save_quantised` skips padding when any `SavedFormat` is custom (`crates/bullet_lib/src/value/save.rs:90-105`).
+Total file size is `232745 + Cb + Cw` bytes. There is no final 64-byte `bullet` padding for this custom format: `save_quantised` skips padding when any `SavedFormat` is custom (`crates/bullet_lib/src/value/save.rs:90-105`).
 
 ## B. LEB128 encoding spec
 
