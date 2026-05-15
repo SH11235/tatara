@@ -410,12 +410,49 @@ pub fn sparse_ft_forward(
     // 4 == 0)、`if idx >= 0 && (idx as u32) < cols` のロジックチェックは値検査として保持。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
+    // 2-way NNZ unroll + per-(ri, lane) 計 8 accumulator (s0..s3 × {a, b})。同 ri 内で
+    // 偶 / 奇 iter を別レーンに振って fadd 依存を 2 chain に分割、per-thread MLP を
+    // ri 4-way × NNZ 2-way = 8 outstanding load chain にする。warp scheduler が
+    // memory load 待ちで idle になるのを緩和 (ri 4-way 単独では eligible warps 極小)。
+    // 末尾 nnz が奇数の場合は tail loop で a レーンに加算。
+    let mut s0a: f32 = 0.0;
+    let mut s1a: f32 = 0.0;
+    let mut s2a: f32 = 0.0;
+    let mut s3a: f32 = 0.0;
+    let mut s0b: f32 = 0.0;
+    let mut s1b: f32 = 0.0;
+    let mut s2b: f32 = 0.0;
+    let mut s3b: f32 = 0.0;
     let base = bi * (nnz as usize);
     let mut ni: u32 = 0;
+    let nnz_pair_end = nnz & !1_u32;
+    while ni < nnz_pair_end {
+        let idx_a = unsafe { indices_ptr.add(base + (ni as usize)).read() };
+        let idx_b = unsafe { indices_ptr.add(base + (ni as usize) + 1).read() };
+        if idx_a >= 0 && (idx_a as u32) < cols {
+            let off = (idx_a as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() };
+            let w1 = unsafe { weight_ptr.add(off + 1).read() };
+            let w2 = unsafe { weight_ptr.add(off + 2).read() };
+            let w3 = unsafe { weight_ptr.add(off + 3).read() };
+            s0a += w0;
+            s1a += w1;
+            s2a += w2;
+            s3a += w3;
+        }
+        if idx_b >= 0 && (idx_b as u32) < cols {
+            let off = (idx_b as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() };
+            let w1 = unsafe { weight_ptr.add(off + 1).read() };
+            let w2 = unsafe { weight_ptr.add(off + 2).read() };
+            let w3 = unsafe { weight_ptr.add(off + 3).read() };
+            s0b += w0;
+            s1b += w1;
+            s2b += w2;
+            s3b += w3;
+        }
+        ni += 2;
+    }
     while ni < nnz {
         let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
         if idx >= 0 && (idx as u32) < cols {
@@ -424,13 +461,17 @@ pub fn sparse_ft_forward(
             let w1 = unsafe { weight_ptr.add(off + 1).read() };
             let w2 = unsafe { weight_ptr.add(off + 2).read() };
             let w3 = unsafe { weight_ptr.add(off + 3).read() };
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
+            s0a += w0;
+            s1a += w1;
+            s2a += w2;
+            s3a += w3;
         }
         ni += 1;
     }
+    let s0 = s0a + s0b;
+    let s1 = s1a + s1b;
+    let s2 = s2a + s2b;
+    let s3 = s3a + s3b;
     let out_ptr = out.as_mut_ptr();
     let out_base = bi * rows_u + ri_base;
     unsafe {
