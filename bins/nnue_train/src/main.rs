@@ -935,12 +935,11 @@ pub fn ft_post_perspective_grad(
     d_combined_stride: u32, // = combined_dim = ft_dim
     scale: f32,
 ) {
-    // 1 thread = 1 (bi, pair_idx) → 2 出力 (ii=pair_idx と ii=pair_idx+half、共通 dy/xa/xb を共有)。
-    // caller の launch config は `cfg_1d(batch * ft_dim / 2)` (`ft_dim` は偶、arch 上 invariant)。
-    // 旧 1 thread = 1 ii 設計 (per-thread 5 load + 4 if-else + 2 if-else 出力) はペア相手と完全に
-    // 同じ load を独立に発行していた、ペア化で per-thread load を共有して thread 数を半減し
-    // memory load 待ちの Long Scoreboard stall を緩和。grad_ft_out / grad_bias の cell 数と
-    // atomic 回数は不変 (per-thread 出力倍 + thread 数半)。
+    // 1 thread = 1 (bi, pair_idx) → 2 出力 (ii=pair_idx と ii=pair_idx+half) を per-thread に
+    // 担当させて dy / xa / xb / bias を 1 回読みで共有する。caller の launch config は
+    // `cfg_1d(batch * ft_dim / 2)` で、`ft_dim` 偶数性 (= `2 * half`、arch 上 invariant) が前提。
+    // grad_ft_out の cell 数と grad_bias への atomic 回数は thread 数半減 + per-thread 出力倍で
+    // 不変。同一 (bi, ii) cell に書く thread は 1 つのみ (cross-thread disjoint)。
     let tid = thread::index_1d();
     let half = (ft_dim as usize) / 2;
     let total_pairs = (batch as usize) * half;
@@ -991,9 +990,11 @@ pub fn ft_post_perspective_grad(
     // 1 thread が 2 cell (ft_base + pair_idx) と (ft_base + half + pair_idx) を書く。
     // DisjointSlice の `get_mut(ThreadIndex)` は 1 thread = 1 cell 安全契約を要求するので、
     // 2 cell 書きは sparse_ft_forward と同じく raw pointer 経由。
-    // SAFETY: grad_ft_out.len() == batch * ft_dim、各 thread が pair_idx ∈ [0, half) で
-    // 排他的に (ft_base + pair_idx) と (ft_base + half + pair_idx) を書く (cross-thread disjoint)、
-    // tid 範囲チェック (`tid >= total_pairs`) で `ft_base + half + pair_idx < batch * ft_dim` を保証。
+    // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の偶数性で
+    // pair_idx ∈ [0, half) → ii ∈ {pair_idx, pair_idx + half} ⊂ [0, ft_dim) に限る。tid 範囲
+    // チェック (`tid >= total_pairs` で `bi < batch`) と合わせて `ft_base + half + pair_idx <
+    // batch * ft_dim` が成立。同一 (bi, ii) cell を書く thread は他に存在しない (pair_idx
+    // 単射、cross-thread disjoint)。
     let out_ptr = grad_ft_out.as_mut_ptr();
     unsafe {
         out_ptr.add(ft_base + pair_idx).write(grad_a);
