@@ -2546,19 +2546,21 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
 /// Sorted layout 版 [`bias_grad_bucket`] (block-level shared-mem reduce)。caller が batch を
 /// bucket で sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
 /// (`exclusive_scan_aligned` 経由) を保証する前提。block は `padded_b * out_dim / 256` 個、
-/// 1 block = 256 cells = 16 sorted rows × 16 oi (out_dim=16 想定)。1 block の全 row は同一
-/// bucket (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
+/// 1 block = 256 cells = `256 / out_dim` 行 × `out_dim` oi (L1 では 16×16、L2 では 8×32)。
+/// `256 / out_dim ≤ 16` ⇒ 16-aligned sort 配下で 1 block の全 row は同一 bucket
+/// (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
 /// PARTIAL[out_dim] shared-mem accumulator に集約 → 1 block × out_dim atomic add で
 /// `grad_bias[block_buc][:]` に flush。global atomic 数 = blocks × out_dim
-/// (~4106 × 16 = ~66K) で contention は元 kernel の ~1M → ~66K の 15× 減。
+/// (L1: ~4106 × 16 = ~66K、L2: ~8213 × 32 = ~263K) で contention 大幅減。
 ///
 /// padding 行 / 範囲外 bucket (block_buc = -1) は skip (PARTIAL flush しない)、
 /// caller が `grad_bias` を 0 初期化済の前提 (accumulate semantics は元と同じ)。
 ///
 /// 数値同等性: 加算順が sort 済 batch 順 + per-block reduce 順になるため fp32
 /// associativity で baseline と bit-exact ではないが、reduction tolerance 内で一致。
-/// `out_dim == 16` / `block_dim == 256` / `padded_batch % 16 == 0` / `num_buckets <= 9` は
-/// caller 契約。
+/// `out_dim` は 16 / 32 を想定 (L1 bias / L2 bias)、いずれも `block_dim / out_dim ≤ 16`
+/// なので 16-aligned sort 配下で 1 block の全 row は uniform-bucket。`block_dim == 256` /
+/// `padded_batch % 16 == 0` / `num_buckets <= 9` / `out_dim <= 32` は caller 契約。
 #[kernel]
 pub fn bias_grad_bucket_shared_sorted(
     dy: &[f32],
@@ -2569,7 +2571,7 @@ pub fn bias_grad_bucket_shared_sorted(
     num_buckets: u32,
 ) {
     use core::ptr::addr_of_mut;
-    static mut PARTIAL: SharedArray<f32, 16> = SharedArray::UNINIT;
+    static mut PARTIAL: SharedArray<f32, 32> = SharedArray::UNINIT;
 
     let tid = thread::threadIdx_x() as usize;
     let block_idx = thread::blockIdx_x() as usize;
@@ -3376,6 +3378,7 @@ struct GpuWorkspace {
     combined_sorted: DeviceBuffer<f32>,   // batch × FT_OUT (combined を perm で gather)
     l1_bucket_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (sorted fwd_L1 出力)
     dl1_total_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (dl1_total を perm で gather)
+    dl2_out_sorted: DeviceBuffer<f32>,    // batch × L2_OUT (dl2_out を perm で gather、L2 bias 用)
 }
 
 impl GpuWorkspace {
@@ -3433,6 +3436,7 @@ impl GpuWorkspace {
             combined_sorted: z(padded_sort_batch(batch) * FT_OUT)?,
             l1_bucket_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
             dl1_total_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
+            dl2_out_sorted: z(padded_sort_batch(batch) * L2_OUT)?,
         })
     }
 
@@ -5254,16 +5258,30 @@ impl GpuTrainer {
                 b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
+        // L2 bias backward (sorted): dl2_out を bucket_perm_dev で gather → dl2_out_sorted、
+        // per-block shared-mem reduce で global atomic 数を ~2M → ~131K (16× 削減)。
+        // out_dim=32、block(256) = 8 sorted 行 × 32 oi cell、16-aligned sort で uniform-
+        // bucket。fwd_L1 で構築済の bucket_perm_dev / bucket_idx_sorted_dev を再利用。
         cuda_launch! {
-            kernel: bias_grad_bucket,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            kernel: permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * L2_OUT),
             args: [
                 slice(self.ws.dl2_out),
-                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_perm_dev),
+                slice_mut(self.ws.dl2_out_sorted),
+                padded_b as u32, L2_OUT as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad_bucket_shared_sorted,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * L2_OUT),
+            args: [
+                slice(self.ws.dl2_out_sorted),
+                slice(self.ws.bucket_idx_sorted_dev),
                 slice(self.l2_b_grad),
-                b_u32, L2_OUT as u32, NUM_BUCKETS as u32
+                padded_b as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
@@ -7561,8 +7579,16 @@ mod gpu_cpu_equivalence_tests {
     #[test]
     fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let (_ctx, module, stream) = open_module()?;
-        for &batch in &[16_usize, 32, 48, 64] {
-            let out_dim = 16_usize;
+        for &(batch, out_dim) in &[
+            (16_usize, 16_usize), // L1 bias 形状
+            (32, 16),
+            (48, 16),
+            (64, 16),
+            (16, 32), // L2 bias 形状
+            (32, 32),
+            (48, 32),
+            (64, 32),
+        ] {
             let nb = NUM_BUCKETS;
             let padded = padded_sort_batch(batch);
             let dy: Vec<f32> = (0..batch * out_dim)
