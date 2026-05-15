@@ -67,13 +67,14 @@
 //! - atomic add パターン: `unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicX) }
 //!   .fetch_add(_, AtomicOrdering::Relaxed)`
 //!
-//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 27 個):
+//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 29 個):
 //! `sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,adamw_step,radam_step,
 //! ranger_lookahead_lerp,ft_post_perspective_fwd,ft_post_perspective_grad,dense_mm_fwd,
 //! dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,dense_mm_fwd_bucket,
 //! dense_mm_bwd_input_bucket,dense_mm_bwd_weight_bucket,bias_grad_bucket,crelu_fwd,
 //! crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,concat_l1sqr_main_fwd,
-//! concat_l1sqr_main_grad,elementwise_add,slice_extract_2d,slice_scatter_2d`
+//! concat_l1sqr_main_grad,elementwise_add,bias_add_per_row,bucket_select_l1_with_bias,
+//! slice_extract_2d,slice_scatter_2d`
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2343,6 +2344,50 @@ pub fn bias_add_per_row(bias: &[f32], mut out: DisjointSlice<f32>, batch: u32, n
     }
 }
 
+/// Per-row bucket select + bias add。
+///
+/// `cublasSgemmStridedBatched` で得た `l1_all[NUM_BUCKETS, B, L1_OUT]` (各 bucket k について
+/// `combined @ l1_w[k]` を計算した結果) のうち、`bucket_idx[b]` で示される bucket の row を
+/// `y[b]` に書き出し、bucket 別 bias `bias[bucket_idx[b]][:]` を加算する。
+///
+/// caller (host) が `l1_all`、`bucket_idx`、`bias` の長さを保証 (それぞれ
+/// `num_buckets * batch * out_dim`、`batch`、`num_buckets * out_dim`)。`bucket_idx[b]` が
+/// `0..num_buckets` 範囲外なら `y[b][o] = 0.0` (`dense_mm_fwd_bucket_tiled_l1` の 0 fill
+/// semantics と一致)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn bucket_select_l1_with_bias(
+    l1_all: &[f32],
+    bucket_idx: &[i32],
+    bias: &[f32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let b = tid.get() / out_dim_u;
+    let o = tid.get() % out_dim_u;
+    let buc = bucket_idx[b];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        if let Some(slot) = y.get_mut(tid) {
+            *slot = 0.0_f32;
+        }
+        return;
+    }
+    let buc_u = buc as usize;
+    let val = l1_all[(buc_u * batch_u + b) * out_dim_u + o] + bias[buc_u * out_dim_u + o];
+    if let Some(slot) = y.get_mut(tid) {
+        *slot = val;
+    }
+}
+
 /// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
 /// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
 #[kernel]
@@ -2512,7 +2557,7 @@ fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
+    // 全 29 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
     // internalize-public-api-list に残す (1 個でも漏れると opt の globaldce で消える)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
                        adamw_step,radam_step,ranger_lookahead_lerp,\
@@ -2522,7 +2567,7 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_bwd_weight_bucket,bias_grad_bucket,\
                        crelu_fwd,crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
                        concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
-                       bias_add_per_row,\
+                       bias_add_per_row,bucket_select_l1_with_bias,\
                        slice_extract_2d,slice_scatter_2d";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
@@ -2868,21 +2913,25 @@ struct GpuWorkspace {
     len_batch: usize,
 
     // -- forward activations --
-    ft_stm_out: DeviceBuffer<f32>,    // b × FT_OUT
-    ft_nstm_out: DeviceBuffer<f32>,   // b × FT_OUT
-    combined: DeviceBuffer<f32>,      // b × COMBINED_DIM
-    l1_bucket: DeviceBuffer<f32>,     // b × L1_OUT
-    l1f_out: DeviceBuffer<f32>,       // b × L1_OUT
-    l1_total: DeviceBuffer<f32>,      // b × L1_OUT
-    l1_main: DeviceBuffer<f32>,       // b × L1_EFFECTIVE
-    l1_skip: DeviceBuffer<f32>,       // b × L1_SKIP
-    l1_sqr: DeviceBuffer<f32>,        // b × L1_EFFECTIVE
-    l2_pre: DeviceBuffer<f32>,        // b × L2_IN
-    l2_input: DeviceBuffer<f32>,      // b × L2_IN
-    l2_out: DeviceBuffer<f32>,        // b × L2_OUT
-    l2_acted: DeviceBuffer<f32>,      // b × L2_OUT
-    l3_out: DeviceBuffer<f32>,        // b
-    net_output: DeviceBuffer<f32>,    // b
+    ft_stm_out: DeviceBuffer<f32>,  // b × FT_OUT
+    ft_nstm_out: DeviceBuffer<f32>, // b × FT_OUT
+    combined: DeviceBuffer<f32>,    // b × COMBINED_DIM
+    /// `cublasSgemmStridedBatched` の出力 `combined @ l1_w[k]` を全 bucket k 分連続配置
+    /// (NUM_BUCKETS × b × L1_OUT)。後続 `bucket_select_l1_with_bias` が `bucket_idx[b]` で
+    /// 該当 bucket の row を `l1_bucket` に詰める。
+    l1_bucket_all: DeviceBuffer<f32>, // NUM_BUCKETS × b × L1_OUT
+    l1_bucket: DeviceBuffer<f32>,   // b × L1_OUT
+    l1f_out: DeviceBuffer<f32>,     // b × L1_OUT
+    l1_total: DeviceBuffer<f32>,    // b × L1_OUT
+    l1_main: DeviceBuffer<f32>,     // b × L1_EFFECTIVE
+    l1_skip: DeviceBuffer<f32>,     // b × L1_SKIP
+    l1_sqr: DeviceBuffer<f32>,      // b × L1_EFFECTIVE
+    l2_pre: DeviceBuffer<f32>,      // b × L2_IN
+    l2_input: DeviceBuffer<f32>,    // b × L2_IN
+    l2_out: DeviceBuffer<f32>,      // b × L2_OUT
+    l2_acted: DeviceBuffer<f32>,    // b × L2_OUT
+    l3_out: DeviceBuffer<f32>,      // b
+    net_output: DeviceBuffer<f32>,  // b
     dy_net_output: DeviceBuffer<f32>, // b (loss kernel が書き込む dnet)
 
     // -- backward activation-grads --
@@ -2926,6 +2975,7 @@ impl GpuWorkspace {
             ft_stm_out: z(batch * FT_OUT)?,
             ft_nstm_out: z(batch * FT_OUT)?,
             combined: z(batch * COMBINED_DIM)?,
+            l1_bucket_all: z(NUM_BUCKETS * batch * L1_OUT)?,
             l1_bucket: z(batch * L1_OUT)?,
             l1f_out: z(batch * L1_OUT)?,
             l1_total: z(batch * L1_OUT)?,
@@ -3251,6 +3301,27 @@ unsafe extern "C" {
         c: *mut f32,
         ldc: std::os::raw::c_int,
     ) -> cublasStatus_t;
+    #[allow(clippy::too_many_arguments)]
+    fn cublasSgemmStridedBatched(
+        handle: cublasHandle_t,
+        transa: cublasOperation_t,
+        transb: cublasOperation_t,
+        m: std::os::raw::c_int,
+        n: std::os::raw::c_int,
+        k: std::os::raw::c_int,
+        alpha: *const f32,
+        a: *const f32,
+        lda: std::os::raw::c_int,
+        stride_a: std::os::raw::c_longlong,
+        b: *const f32,
+        ldb: std::os::raw::c_int,
+        stride_b: std::os::raw::c_longlong,
+        beta: *const f32,
+        c: *mut f32,
+        ldc: std::os::raw::c_int,
+        stride_c: std::os::raw::c_longlong,
+        batch_count: std::os::raw::c_int,
+    ) -> cublasStatus_t;
 }
 
 /// RAII wrapper for `cublasHandle_t`。Create 失敗 / Set stream 失敗 / Destroy 失敗を
@@ -3364,6 +3435,73 @@ impl CublasHandle {
         };
         if status != CUBLAS_STATUS_SUCCESS {
             return Err(format!("cublasSgemm_v2 (fwd) failed: status={status}").into());
+        }
+        Ok(())
+    }
+
+    /// row-major Y[M, N] = X[M, K] @ W^T、ただし W は row-major `[N, K]` (= 既存
+    /// `dense_mm_fwd_bucket_tiled_l1` の `l1_w[bucket][out][in]` 形)。N 個の独立 batch を
+    /// 1 call で発火 (per-batch W、shared X、per-batch Y)。
+    ///
+    /// 行列 layout:
+    /// - X row-major `[M, K]`
+    /// - W row-major `[N, K]` (= matmul 上の W^T、各行 n が input K 次元 weight)
+    /// - Y row-major `[M, N]`
+    ///
+    /// stride 引数 (elements 単位):
+    /// - `stride_x_rowmajor`: X の batch 間 offset、`M * K` で各 batch 別 X、`0` で全 batch 共有。
+    /// - `stride_w_rowmajor`: W の batch 間 offset、`N * K` で各 batch 別 W。
+    /// - `stride_y_rowmajor`: Y の batch 間 offset、`M * N` で各 batch 別 Y。
+    ///
+    /// col-major cuBLAS への変換: `Y_cm[N, M] = W_cm^T @ X_cm` を計算 (`Y_rm[m,n] =
+    /// sum_k W_rm[n,k] * X_rm[m,k] = (W_cm^T @ X_cm)[n,m]`)。cuBLAS args は A=W (lda=K,
+    /// trans=T)、B=X (ldb=K, trans=N)、C col-major (ldc=N)。
+    ///
+    /// SAFETY: 全 device pointer は cudaMalloc 由来、各 buffer 長は仕様分 +
+    /// `(batch_count - 1) * stride_*_rowmajor` 範囲を満たすこと。stream は `cublasSetStream_v2`
+    /// で bind 済 + math mode は handle 作成時 `enable_tf32` で固定。`beta=0` overwrite。
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sgemm_xwt_strided_batched_rowmajor(
+        &self,
+        m: i32,
+        n: i32,
+        k: i32,
+        x_ptr: *const f32,
+        w_ptr: *const f32,
+        y_ptr: *mut f32,
+        stride_x_rowmajor: i64, // 0 for shared X across batches
+        stride_w_rowmajor: i64,
+        stride_y_rowmajor: i64,
+        batch_count: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let status = unsafe {
+            cublasSgemmStridedBatched(
+                self.handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                n,
+                m,
+                k,
+                &alpha,
+                w_ptr,
+                k,
+                stride_w_rowmajor,
+                x_ptr,
+                k,
+                stride_x_rowmajor,
+                &beta,
+                y_ptr,
+                n,
+                stride_y_rowmajor,
+                batch_count,
+            )
+        };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(
+                format!("cublasSgemmStridedBatched (XWT fwd) failed: status={status}").into(),
+            );
         }
         Ok(())
     }
@@ -4294,27 +4432,53 @@ impl GpuTrainer {
 
         prof_tick!("fwd_ftpost");
 
-        // -- Forward step 4: dense_mm_fwd_bucket L1 → l1_bucket (B × L1_OUT) --
-        // tiled (block=256 × grid=batch/16=4096) で W shared-mem caching、uncoalesced 軸を解消。
-        debug_assert!(
-            FT_OUT.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
-        );
+        // -- Forward step 4: bucketed L1 fwd → l1_bucket (B × L1_OUT) --
+        // cuBLAS Sgemm strided-batched (TF32 TC) で 9 bucket 全ての combined @ l1_w[k] を
+        // l1_bucket_all (NUM_BUCKETS × B × L1_OUT) に書き出し → bucket_select_l1_with_bias で
+        // bucket_idx[b] が選んだ row + bias[bucket_idx[b]] を l1_bucket に詰める。
+        //
+        // 旧 `dense_mm_fwd_bucket_tiled_l1` (#[kernel]) は per-block で 9 bucket 分の W を共有
+        // memory に load する設計で、ncu で MIO Throttle 21.5 cyc dominant (= per-K-tile に W tile
+        // 2304 cells = 9 bucket 分書き込む shared-mem pipe 競合)。strided-batched Sgemm は 1 bucket
+        // 分の W を Tensor Core fragment に流して MIO 経路を回避、9 launch overhead は
+        // batched call で 1 launch に集約。
+        //
+        // 計算量は 9× だが TF32 TC (Ampere 30 TFLOPS) で skinny matmul (M=B, K=FT_OUT, N=L1_OUT=16)
+        // でも実効 ~5-10 TFLOPS、9 × 3.2 GFLOPS = 29 GFLOPS = ~3-6 ms 想定 (旧 7.4 ms)。
+        //
+        // SAFETY: combined / l1_w / l1_bucket_all は cudaMalloc 由来、長さは arch invariant
+        // (combined.len() == B*FT_OUT、l1_w.len() == NUM_BUCKETS*FT_OUT*L1_OUT、l1_bucket_all.len()
+        // == NUM_BUCKETS*B*L1_OUT)。`self.cublas` は `self.stream` に bind 済 in-order 実行。
+        const _: () = assert!(L1_OUT == 16 && NUM_BUCKETS == 9);
+        // l1_w[bucket][out][in] = row-major [N=L1_OUT, K=FT_OUT] (= matmul 上の W^T)、
+        // combined[b][in] = row-major [M=B, K=FT_OUT]、l1_bucket_all[bucket][b][out] =
+        // row-major [batch][M=B, N=L1_OUT]。`sgemm_xwt_strided_batched_rowmajor` は
+        // Y = X @ W^T を計算する形なので、stride も該当する N*K / M*N に揃える。
+        unsafe {
+            self.cublas.sgemm_xwt_strided_batched_rowmajor(
+                b_u32 as i32,  // m = batch
+                L1_OUT as i32, // n = out_dim
+                FT_OUT as i32, // k = in_dim
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.l1_w.cu_deviceptr() as *const f32,
+                self.ws.l1_bucket_all.cu_deviceptr() as *mut f32,
+                0_i64,                        // strideX = 0 (combined を全 bucket で共有)
+                (L1_OUT * FT_OUT) as i64,     // strideW = N * K = L1_OUT * FT_OUT
+                (b as i64) * (L1_OUT as i64), // strideY = M * N = B * L1_OUT
+                NUM_BUCKETS as i32,
+            )?;
+        }
         cuda_launch! {
-            kernel: dense_mm_fwd_bucket_tiled_l1,
+            kernel: bucket_select_l1_with_bias,
             stream: self.stream,
             module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((b / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            config: cfg_1d(b * L1_OUT),
             args: [
-                slice(self.ws.combined),
-                slice(self.l1_w),
-                slice(self.l1_b),
+                slice(self.ws.l1_bucket_all),
                 slice(self.ws.bucket_idx_dev),
+                slice(self.l1_b),
                 slice_mut(self.ws.l1_bucket),
-                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+                b_u32, L1_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
