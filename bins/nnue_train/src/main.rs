@@ -1799,6 +1799,252 @@ pub fn dense_mm_fwd_bucket_tiled_l1(
     }
 }
 
+/// Bucket histogram。`bucket_idx` の各 value (有効 range `[0, num_buckets)`) ごとに
+/// thread が atomic add する。範囲外 (-1, >= num_buckets) は最後 slot `num_buckets`
+/// に集約 (invalid bin、後段で値 0 を書き込ませる)。counts は `num_buckets + 1` 要素。
+#[kernel]
+pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets: u32) {
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let b = bucket_idx[tid.get()];
+    let bin = if b >= 0 && (b as u32) < num_buckets {
+        b as u32
+    } else {
+        num_buckets
+    };
+    unsafe {
+        let atom = &*(counts.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
+        atom.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// `counts[0..n]` の exclusive prefix sum を `offsets[0..n]` に書く。`align` (= 16) で
+/// 各 bucket の sorted layout 開始 offset を round up し、bucket 境界を block size
+/// (`TILE_B = 16`) に揃える。bucket 末端と次 bucket 開始の間は padding 行 (caller 側で
+/// invalid bucket marker `-1` で埋める) になり、kernel は uniform block 前提で走れる。
+/// n ≤ NUM_BUCKETS + 1 = 10 想定で 1 thread sequential。
+#[kernel]
+pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u32) {
+    if thread::index_1d().get() != 0 {
+        return;
+    }
+    let n_u = n as usize;
+    let mut acc: u32 = 0;
+    let mut i: usize = 0;
+    while i < n_u {
+        // acc を align 倍数に切り上げ (acc % align == 0 でなければ次の境界へ)
+        let rem = acc % align;
+        if rem != 0 {
+            acc += align - rem;
+        }
+        unsafe {
+            let dst = offsets.as_ptr().add(i) as *mut u32;
+            *dst = acc;
+        }
+        acc += counts[i];
+        i += 1;
+    }
+}
+
+/// stable counting sort の scatter phase。各 thread が bucket_idx[i] = b を読み、
+/// dst = offsets[b] + (b 内 in-order rank) に perm[dst] = i / sorted_bucket[dst] = b
+/// を書き込む。in-order rank は `write_ctr[b]` を atomic_inc して取る (atomic 順
+/// 依存で stable ではない、bit-exact が必要な kernel では bucket boundary 内
+/// associativity 注意)。
+#[kernel]
+pub fn scatter_bucket_perm(
+    bucket_idx: &[i32],
+    offsets: &[u32],
+    write_ctr: &[u32],
+    perm: &[i32],
+    sorted_bucket: &[i32],
+    batch: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let b = bucket_idx[tid.get()];
+    let bin = if b >= 0 && (b as u32) < num_buckets {
+        b as u32
+    } else {
+        num_buckets
+    };
+    let rank = unsafe {
+        let atom = &*(write_ctr.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
+        atom.fetch_add(1, AtomicOrdering::Relaxed)
+    };
+    let dst = (offsets[bin as usize] + rank) as usize;
+    unsafe {
+        let perm_dst = perm.as_ptr().add(dst) as *mut i32;
+        *perm_dst = tid.get() as i32;
+        let sb_dst = sorted_bucket.as_ptr().add(dst) as *mut i32;
+        *sb_dst = b;
+    }
+}
+
+/// Row-permute (gather): `out[i, :] = in[perm[i], :]`。1 thread = 1 (row, col) cell、
+/// 1D launch (`batch * dim`)。perm[i] が範囲外 (`< 0 || >= batch`) は host 契約違反。
+#[kernel]
+pub fn permute_rows_f32(
+    input: &[f32],
+    perm: &[i32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let row = tid.get() / (dim as usize);
+    let col = tid.get() % (dim as usize);
+    let src_row = perm[row];
+    let val = if src_row >= 0 && (src_row as u32) < batch {
+        input[(src_row as usize) * (dim as usize) + col]
+    } else {
+        0.0_f32
+    };
+    if let Some(o) = output.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// Row-inverse-permute (scatter): `out[perm[i], :] = in[i, :]`。perm は forward
+/// gather index で、bijection 前提 (counting sort 出力)。1 thread = 1 (row, col) cell、
+/// 各 thread の write は disjoint なので raw ptr write OK。
+#[kernel]
+pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], batch: u32, dim: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let row = tid.get() / (dim as usize);
+    let col = tid.get() % (dim as usize);
+    let dst_row = perm[row];
+    if dst_row < 0 || (dst_row as u32) >= batch {
+        return;
+    }
+    let dst_idx = (dst_row as usize) * (dim as usize) + col;
+    unsafe {
+        let dst = output.as_ptr().add(dst_idx) as *mut f32;
+        *dst = input[tid.get()];
+    }
+}
+
+/// Sorted layout 版 [`dense_mm_fwd_bucket_tiled_l1`]。caller が batch を bucket で
+/// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
+/// (`exclusive_scan_aligned` 経由) を保証する前提。block 内全 TILE_B = 16 row は同一 bucket
+/// (uniform-by-construction、boundary block は存在しない)、per-K-tile の W_TILE shared-mem
+/// は 1 bucket 分 (16 × 16 = 256 cell) のみ load する分岐なし実装。padding 行は
+/// `bucket_idx = -1` で kernel が y=0 を書き、後段の inverse permute が perm=-1 sentinel で
+/// skip して original 配列には戻らない。
+///
+/// 数値同等性: per-row independent (k=0..15 加算順保持) で baseline と bit-exact、
+/// sort stability 不要。`in_dim % 16 == 0` / `out_dim == 16` / `batch % 16 == 0` /
+/// `num_buckets <= 9` は caller 契約。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 1 × 16 × 16
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    // aligned sorted layout 前提で block は uniform-by-construction。b_start の bucket を
+    // 代表 = 全 row 共通 bucket。padding 行 / 終端 block は bucket = -1 で skip。
+    let block_buc = if b_start < batch_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    let bias_init = if bi_ok && oi_ok && block_buc_ok {
+        bias[block_buc_u * out_dim_u + global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+        }
+        unsafe {
+            let oi_local = tid_b;
+            let k_local = tid_o;
+            let kk = k_start + k_local;
+            let val = if block_buc_ok && oi_local < out_dim_u && kk < in_dim_u {
+                w[block_buc_u * out_dim_u * in_dim_u + oi_local * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+            W_TILE[(oi_local << 4) | k_local] = val;
+        }
+        thread::sync_threads();
+
+        if bi_ok && oi_ok && block_buc_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(tid_o << 4) | k];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok && oi_ok {
+        if !block_buc_ok {
+            if let Some(o) = y.get_mut(thread::index_1d()) {
+                *o = 0.0_f32;
+            }
+        } else if let Some(o) = y.get_mut(thread::index_1d()) {
+            *o = acc;
+        }
+    }
+}
+
 /// Per-bucket dense matmul backward (wrt input)。`dx[b][i] = sum_o dy[b][o] * w[bucket_idx[b]][o][i]`。
 /// 1 thread = 1 (batch, in_index)、atomics 不要。
 #[allow(clippy::too_many_arguments)]
@@ -2537,7 +2783,10 @@ fn compile_ll_to_ptx_via_llc(
                        crelu_fwd,crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
                        concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
                        bias_add_per_row,\
-                       slice_extract_2d,slice_scatter_2d";
+                       slice_extract_2d,slice_scatter_2d,\
+                       count_buckets,exclusive_scan_aligned,scatter_bucket_perm,\
+                       permute_rows_f32,inverse_permute_rows_f32,\
+                       dense_mm_fwd_bucket_tiled_l1_sorted";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -2927,6 +3176,15 @@ struct GpuWorkspace {
     bucket_idx_dev: DeviceBuffer<i32>, // batch
     score_dev: DeviceBuffer<f32>,      // batch
     wdl_dev: DeviceBuffer<f32>,        // batch
+
+    // -- bucket sort scratch (fwd_L1 用 sorted layout 切換) --
+    bucket_counts_dev: DeviceBuffer<u32>, // NUM_BUCKETS + 1 (histogram + invalid bin)
+    bucket_offsets_dev: DeviceBuffer<u32>, // NUM_BUCKETS + 1 (exclusive scan)
+    bucket_write_ctr_dev: DeviceBuffer<u32>, // NUM_BUCKETS + 1 (scatter ranking counter)
+    bucket_perm_dev: DeviceBuffer<i32>,   // batch (perm[i] = original row index)
+    bucket_idx_sorted_dev: DeviceBuffer<i32>, // batch (sorted bucket values)
+    combined_sorted: DeviceBuffer<f32>,   // batch × FT_OUT (combined を perm で gather)
+    l1_bucket_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (sorted fwd_L1 出力)
 }
 
 impl GpuWorkspace {
@@ -2976,6 +3234,13 @@ impl GpuWorkspace {
             bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            bucket_counts_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
+            bucket_offsets_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
+            bucket_write_ctr_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
+            bucket_perm_dev: DeviceBuffer::<i32>::zeroed(stream, padded_sort_batch(batch))?,
+            bucket_idx_sorted_dev: DeviceBuffer::<i32>::zeroed(stream, padded_sort_batch(batch))?,
+            combined_sorted: z(padded_sort_batch(batch) * FT_OUT)?,
+            l1_bucket_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
         })
     }
 
@@ -3144,6 +3409,35 @@ fn memset_zero<T>(
         }
     }
     Ok(())
+}
+
+/// `i32` buffer の全要素を `-1` (= 0xFFFFFFFF) に async fill。bucket sort padding 行
+/// の bucket marker / perm sentinel を invalid に初期化する用途。`memset_d8(0xFF)` は
+/// 二の補数で -1 を作るため i32 専用 (符号無し型に対しては UINT_MAX を意味する)。
+fn memset_minus_one_i32(
+    stream: &CudaStream,
+    buf: &DeviceBuffer<i32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = buf.num_bytes();
+    if bytes > 0 {
+        unsafe {
+            cuda_core::memory::memset_d8_async(
+                buf.cu_deviceptr(),
+                0xFF,
+                bytes,
+                stream.cu_stream(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// bucket sort 用の padded sorted layout 容量を計算する。各 bucket は次 16-row 境界に
+/// align するため最大 `(NUM_BUCKETS + 1) * 15` 行の padding を要する。安全側で
+/// `(NUM_BUCKETS + 1) * 16` を上乗せして 16 倍数に切り上げる。
+fn padded_sort_batch(batch: usize) -> usize {
+    let raw = batch + (NUM_BUCKETS + 1) * 16;
+    raw.div_ceil(16) * 16
 }
 
 /// pre-allocated device buffer に host slice を async memcpy。`DeviceBuffer::from_host`
@@ -4308,27 +4602,109 @@ impl GpuTrainer {
 
         prof_tick!("fwd_ftpost");
 
-        // -- Forward step 4: dense_mm_fwd_bucket L1 → l1_bucket (B × L1_OUT) --
-        // tiled (block=256 × grid=batch/16=4096) で W shared-mem caching、uncoalesced 軸を解消。
+        // Forward L1: bucket sort で row を bucket_idx 昇順に並べ替え、各 bucket の sorted
+        // 開始 offset を TILE_B=16 境界に align してから `dense_mm_fwd_bucket_tiled_l1_sorted`
+        // を 1-bucket-per-block で走らせる (per-K-tile の W_TILE shared-mem load は 1 bucket
+        // 分のみ)。inverse permute で `l1_bucket` を original order に戻して後続に渡す。
+        // 数値同等性: fwd_L1 は per-row independent (k=0..15 加算順保持) のため sort stability
+        // に依らず baseline と bit-exact。
         debug_assert!(
             FT_OUT.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
         );
+
+        // a) histogram + 16-aligned scan + scatter。aligned offset で各 bucket が 16-row
+        // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
+        // bucket=-1 で initialise (sorted kernel 側で skip)、perm も -1 sentinel (inverse
+        // permute が skip)。
+        let padded_b = padded_sort_batch(b);
+        memset_zero(&self.stream, &self.ws.bucket_counts_dev)?;
+        memset_zero(&self.stream, &self.ws.bucket_write_ctr_dev)?;
+        memset_minus_one_i32(&self.stream, &self.ws.bucket_perm_dev)?;
+        memset_minus_one_i32(&self.stream, &self.ws.bucket_idx_sorted_dev)?;
         cuda_launch! {
-            kernel: dense_mm_fwd_bucket_tiled_l1,
+            kernel: count_buckets,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_counts_dev),
+                b_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_scan_aligned,
+            stream: self.stream, module: self.module,
+            config: LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [
+                slice(self.ws.bucket_counts_dev),
+                slice(self.ws.bucket_offsets_dev),
+                (NUM_BUCKETS + 1) as u32,
+                16_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: scatter_bucket_perm,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(self.ws.bucket_idx_dev),
+                slice(self.ws.bucket_offsets_dev),
+                slice(self.ws.bucket_write_ctr_dev),
+                slice(self.ws.bucket_perm_dev),
+                slice(self.ws.bucket_idx_sorted_dev),
+                b_u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // b) combined を perm で gather → combined_sorted。padding 行 (perm=-1) は
+        // permute kernel が 0 fill (sorted kernel 側で bucket=-1 で skip するので値不問)。
+        cuda_launch! {
+            kernel: permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * FT_OUT),
+            args: [
+                slice(self.ws.combined),
+                slice(self.ws.bucket_perm_dev),
+                slice_mut(self.ws.combined_sorted),
+                padded_b as u32, FT_OUT as u32
+            ]
+        }?;
+
+        // c) sorted fwd_L1 → l1_bucket_sorted。padded_b/16 block、各 block uniform 保証。
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: ((b / 16) as u32, 1, 1),
+                grid_dim: ((padded_b / 16) as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
             args: [
-                slice(self.ws.combined),
+                slice(self.ws.combined_sorted),
                 slice(self.l1_w),
                 slice(self.l1_b),
-                slice(self.ws.bucket_idx_dev),
-                slice_mut(self.ws.l1_bucket),
-                b_u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+                slice(self.ws.bucket_idx_sorted_dev),
+                slice_mut(self.ws.l1_bucket_sorted),
+                padded_b as u32, FT_OUT as u32, L1_OUT as u32, NUM_BUCKETS as u32
+            ]
+        }?;
+
+        // d) l1_bucket_sorted を perm で inverse-scatter → l1_bucket (original order)。
+        // padding 行 (perm=-1) は inverse permute kernel が skip。
+        cuda_launch! {
+            kernel: inverse_permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * L1_OUT),
+            args: [
+                slice(self.ws.l1_bucket_sorted),
+                slice(self.ws.bucket_perm_dev),
+                slice(self.ws.l1_bucket),
+                padded_b as u32, L1_OUT as u32
             ]
         }?;
 
@@ -6496,6 +6872,107 @@ mod gpu_cpu_equivalence_tests {
                 &y_cpu,
                 TOL,
             );
+        }
+        Ok(())
+    }
+
+    /// 16-aligned bucket sort + sorted fwd_L1 + inverse permute の合成 pipeline が
+    /// `dense_mm_fwd_bucket_cpu` と bit-exact 一致することを確認。fwd_L1 は per-row
+    /// independent (k=0..15 加算順保持) のため sort stability に依らず tolerance=0 が成立。
+    #[test]
+    fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
+            let out_dim = 16_usize;
+            let nb = NUM_BUCKETS;
+            let padded = padded_sort_batch(batch);
+            let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+            let w: Vec<f32> = (0..nb * out_dim * in_dim)
+                .map(|i| i as f32 * 0.0007 + 0.05)
+                .collect();
+            let bias: Vec<f32> = (0..nb * out_dim).map(|i| i as f32 * 0.02 - 1.0).collect();
+            let bucket_idx = bucket_idx_with_padding(batch, nb);
+
+            let mut y_cpu = vec![0.0_f32; batch * out_dim];
+            dense_mm_fwd_bucket_cpu(
+                &x,
+                &w,
+                &bias,
+                &bucket_idx,
+                &mut y_cpu,
+                batch,
+                in_dim,
+                out_dim,
+                nb,
+            );
+
+            let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+            let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+            let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+            let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+            let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+            let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+            let mut x_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * in_dim)?;
+            let mut y_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+            let y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
+
+            memset_minus_one_i32(&stream, &perm_dev)?;
+            memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }?;
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * in_dim),
+                args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
+                       padded as u32, in_dim as u32]
+            }?;
+            let blocks = padded / 16;
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket_tiled_l1_sorted, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(bidx_sorted_dev),
+                       slice_mut(y_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }?;
+            cuda_launch! {
+                kernel: inverse_permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(y_sorted_dev), slice(perm_dev), slice(y_dev),
+                       padded as u32, out_dim as u32]
+            }?;
+            stream.synchronize()?;
+
+            let y_gpu = y_dev.to_host_vec(&stream)?;
+            for (i, (&g, &c)) in y_gpu.iter().zip(y_cpu.iter()).enumerate() {
+                if g != c {
+                    panic!(
+                        "bucket_sort_fwd_l1 b={batch} in={in_dim} idx={i}: gpu={g} cpu={c} delta={}",
+                        g - c
+                    );
+                }
+            }
         }
         Ok(())
     }
