@@ -381,7 +381,7 @@ where
                 let pct = 100.0 * done as f64 / cfg.batches_per_superbatch as f64;
                 let pps = sb_positions as f64 / sb_start.elapsed().as_secs_f64().max(1e-9);
                 let mut stderr = io::stderr().lock();
-                let _ = write!(
+                let written = write!(
                     stderr,
                     "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
                     progress_terminator,
@@ -391,9 +391,12 @@ where
                     done,
                     cfg.batches_per_superbatch,
                     pps,
-                );
-                let _ = stderr.flush();
-                sb_printed_progress = true;
+                )
+                .is_ok();
+                if written {
+                    let _ = stderr.flush();
+                    sb_printed_progress = true;
+                }
             }
         }
         // TTY モードでは sb 内最後の batch progress が `\r` で書かれた状態で残る
