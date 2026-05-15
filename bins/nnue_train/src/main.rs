@@ -610,8 +610,8 @@ pub fn gather_and_sum_per_feature_overwrite(
     // 4-way unroll: 1 thread あたり 4 outstanding load + 4 accumulator で fadd dep chain
     // を分割。1-load-1-fadd 版は per-thread に in-flight load 1 個しかなく、warp scheduler は
     // memory load 待ちの Long Scoreboard stall で大半 idle になる (occupancy は full でも eligible
-    // warps が極小)。f32 fadd の re-association で sum 値が bit-exact には変わるが、bullet 比較
-    // tolerance (sb5 < 1e-4) には収まる。
+    // warps が極小)。partial sum 加算順が変わるため f32 fadd 非結合則で sum bit-pattern は
+    // 同値ではなくなる (`gpu_cpu_equivalence_tests` の release tolerance 範囲)。
     let mut sum0 = 0.0_f32;
     let mut sum1 = 0.0_f32;
     let mut sum2 = 0.0_f32;
