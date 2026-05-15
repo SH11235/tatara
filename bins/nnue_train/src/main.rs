@@ -935,23 +935,22 @@ pub fn ft_post_perspective_grad(
     d_combined_stride: u32, // = combined_dim = ft_dim
     scale: f32,
 ) {
+    // 1 thread = 1 (bi, pair_idx) → 2 出力 (ii=pair_idx と ii=pair_idx+half、共通 dy/xa/xb を共有)。
+    // caller の launch config は `cfg_1d(batch * ft_dim / 2)` (`ft_dim` は偶、arch 上 invariant)。
+    // 旧 1 thread = 1 ii 設計 (per-thread 5 load + 4 if-else + 2 if-else 出力) はペア相手と完全に
+    // 同じ load を独立に発行していた、ペア化で per-thread load を共有して thread 数を半減し
+    // memory load 待ちの Long Scoreboard stall を緩和。grad_ft_out / grad_bias の cell 数と
+    // atomic 回数は不変 (per-thread 出力倍 + thread 数半)。
     let tid = thread::index_1d();
-    let total = (batch as usize) * (ft_dim as usize);
-    if tid.get() >= total {
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
         return;
     }
-    let bi = tid.get() / (ft_dim as usize);
-    let ii = tid.get() % (ft_dim as usize);
-    let half = (ft_dim as usize) / 2;
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
 
-    // どちらの side か (前半 first or 後半 second)、ペア相手は同 pair_idx の反対側
-    let (pair_idx, is_first) = if ii < half {
-        (ii, true)
-    } else {
-        (ii - half, false)
-    };
-
-    // d_combined の対応 output cell を読む
+    // d_combined の対応 output cell (pair_idx 共通)
     let dy =
         d_combined[bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx];
 
@@ -974,26 +973,40 @@ pub fn ft_post_perspective_grad(
         xb
     };
 
-    let (my_pre, partner_post) = if is_first { (xa, yb) } else { (xb, ya) };
-
-    // forward: out = ya * yb * scale → d(out)/d(my_post) = partner_post * scale
-    let grad_my_post = dy * partner_post * scale;
-    // CReLU grad: 1 if 0 < my_pre < 1 else 0
-    let grad_my_pre = if my_pre > 0.0_f32 && my_pre < 1.0_f32 {
-        grad_my_post
+    // First side (ii = pair_idx): my_pre = xa, partner_post = yb
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    // Second side (ii = pair_idx + half): my_pre = xb, partner_post = ya
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
     } else {
         0.0_f32
     };
 
-    // grad_ft_out[tid] = grad_my_pre (bias は加算なので grad 同値)
-    if let Some(out) = grad_ft_out.get_mut(tid) {
-        *out = grad_my_pre;
+    // 1 thread が 2 cell (ft_base + pair_idx) と (ft_base + half + pair_idx) を書く。
+    // DisjointSlice の `get_mut(ThreadIndex)` は 1 thread = 1 cell 安全契約を要求するので、
+    // 2 cell 書きは sparse_ft_forward と同じく raw pointer 経由。
+    // SAFETY: grad_ft_out.len() == batch * ft_dim、各 thread が pair_idx ∈ [0, half) で
+    // 排他的に (ft_base + pair_idx) と (ft_base + half + pair_idx) を書く (cross-thread disjoint)、
+    // tid 範囲チェック (`tid >= total_pairs`) で `ft_base + half + pair_idx < batch * ft_dim` を保証。
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(grad_a);
+        out_ptr.add(ft_base + half + pair_idx).write(grad_b);
     }
 
-    // grad_bias[ii] += grad_my_pre (atomic, 共有 bias)
-    // SAFETY: grad_bias.len() == ft_dim、ii < ft_dim。
-    let bias_cell = unsafe { &*(grad_bias.as_ptr().add(ii) as *const DeviceAtomicF32) };
-    bias_cell.fetch_add(grad_my_pre, AtomicOrdering::Relaxed);
+    // grad_bias[ii] += grad_my_pre (atomic, 共有 bias)。
+    // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
 }
 
 /// Regular dense matrix multiply forward + bias add。
@@ -4905,7 +4918,7 @@ impl GpuTrainer {
             kernel: ft_post_perspective_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 2),
             args: [
                 slice(self.ws.dcombined),
                 slice(self.ws.ft_stm_out),
@@ -4920,7 +4933,7 @@ impl GpuTrainer {
             kernel: ft_post_perspective_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * FT_OUT),
+            config: cfg_1d(b * FT_OUT / 2),
             args: [
                 slice(self.ws.dcombined),
                 slice(self.ws.ft_nstm_out),
@@ -6862,12 +6875,12 @@ mod gpu_cpu_equivalence_tests {
         let mut dft_stm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
         let mut dft_nstm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
         cuda_launch! {
-            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim),
+            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
             args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev), slice_mut(dft_stm_dev),
                    slice(grad_bias_dev), batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
         }?;
         cuda_launch! {
-            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim),
+            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
             args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev), slice_mut(dft_nstm_dev),
                    slice(grad_bias_dev), batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
         }?;
