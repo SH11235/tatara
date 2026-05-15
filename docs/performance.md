@@ -25,24 +25,24 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
 
 | GPU | sm | DRAM BW | 期待 pos/s | 400 sb ETA | 出典 |
 |---|---|---:|---:|---:|---|
-| RTX 3080 Ti | 86 | 912 GB/s | **~811K** | ~55 h | 本リポジトリ実測 (PR #103 適用後) |
+| RTX 3080 Ti | 86 | 912 GB/s | **~827K** | ~53 h | 本リポジトリ実測 (Issue #104 δ 適用後) |
 | RTX 4090 | 89 | 1008 GB/s | ~1.0-1.1M (推定) | ~40 h | DRAM BW 比 1.10× + clock 比、未実測 |
 | A100 40GB | 80 | 1555 GB/s | ~1.3M (推定) | ~32 h | DRAM 比だが int8 倍精度等は無関係、未実測 |
 | H100 SXM | 90 | 3 TB/s | ~2M? (推定) | ~20 h? | Hopper TC 未活用なので DRAM 律速ライン、未実測 |
 | RTX 2070 SUPER | 75 | 448 GB/s | 動く範囲で測定要 | — | `CUDA_OXIDE_TARGET=sm_75` 必須、cuBLAS は OK |
 
 > **注**: 上記推定は `fwd_ft` + `bwd_L1f` の memory bandwidth 律速モデル
-> (DRAM BW 比例) + L2 reuse / launch overhead からの外挿。tensor core 化や
-> FP16 / BF16 は本リポジトリ未実装、純 FP32 算 + cuBLAS Sgemm のみ。
+> (DRAM BW 比例) + L2 reuse / launch overhead からの外挿。Ampere+ では cuBLAS
+> Sgemm が TF32 TC (`cublasSetMathMode(CUBLAS_TF32_TENSOR_OP_MATH)`) で動く。
+> FP16 / BF16 cast 経路は本リポジトリ未実装、TF32 のみ。
 
 bullet-shogi (上流、CUDA C++ 実装) と本リポジトリの違い:
 
-- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536、PR #103 適用後):
-  **811K pos/s**
+- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536): **827K pos/s**
 - bullet-shogi v102 同条件 (`/home/.../bullet-shogi/checkpoints/v102/train.log` の
   `pos/sec` 19600 entry の avg): **691K pos/s**
-- 本リポジトリは bullet 比 **+17%** (sparse FT 系の bounds check 除去 + cuBLAS
-  L1f bwd 化 + async loss readback の累積)
+- 本リポジトリは bullet 比 **+20%** (sparse FT 系の bounds check 除去 + cuBLAS
+  L1f bwd 化 + async loss readback + fwd_L1f TF32 TC の累積)
 
 ## Step phase profile 診断
 
@@ -71,7 +71,7 @@ batch 1 以降の steady-state を見る。
 | `fwd_ft` (×2 perspectives) | ~22.7 | `sparse_ft_forward` (PR #103 で 26.5 → 22.7 ms、+4.4%) |
 | `fwd_ftpost` | ~1.5 | `ft_post_perspective_fwd` (bias add + CReLU + pairwise + scale) |
 | `fwd_L1` | ~7.5 | `dense_mm_fwd_bucket_tiled_l1` |
-| `fwd_L1f` | ~1.9 | `dense_mm_fwd_tiled_l1f` |
+| `fwd_L1f` | ~0.55 | `cublasSgemm_v2` (TF32 TC) + `bias_add_per_row` |
 | `fwd_L1tail` + `fwd_L2` + `forward` | ~0.5 | L3 + loss kernel |
 | `bwd_L3` + `bwd_L2` + `bwd_L1eff` | ~1.5 | |
 | `bwd_L1f` | **~4.3** | `cublasSgemm_v2` (PR #103 で 8.6 → 4.3 ms、+4.6%) |
@@ -83,7 +83,7 @@ batch 1 以降の steady-state を見る。
 | `phD_stm` | ~11.3 | `gather_and_sum_per_feature_overwrite` (stm 側) |
 | `phD_nstm` | ~10.7 | 同上 (nstm 側) |
 | `optimizer` | ~4.5 | `radam_step` × 10 + `ranger_lookahead_lerp` × 10 |
-| **合計 (profile-on)** | **~83 ms** | (profile-off の steady-state では ~81 ms ≒ 811K pos/s) |
+| **合計 (profile-on)** | **~81 ms** | (profile-off の steady-state では ~79 ms ≒ 827K pos/s) |
 
 ### 想定外の遅さを見つけたら
 
