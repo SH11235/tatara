@@ -3232,6 +3232,15 @@ impl CublasHandle {
         // 内部で TF32 (8-bit exp + 10-bit mantissa) cast → TC mma → FP32 accum に
         // lower される。precision 損失は ~10-bit mantissa (FP32 23-bit より粗)、
         // bullet baseline との loss tolerance (sb5 < 1e-4) を超える場合は要 fallback。
+        //
+        // **副作用**: 本 handle は `bwd_L1f` の `sgemm_xt_y_rowmajor` でも共有される
+        // ため、L1f weight backward の Sgemm も TF32 TC で走る (この commit 以前は
+        // FP32 で走っていた)。bwd_L1f の数値同等性は本変更で sb5 diff 4.9e-5 < 1e-4
+        // tolerance を満たすことを 5 sb × 200 batches で確認済 (`gpu_kernels::
+        // dense_mm::dense_mm_bwd_weight_tiled_cpu` reference との直接 retest は
+        // 未実施、loss 軌跡のみで担保)。長期学習 (400 sb) で tolerance を破る場合
+        // は handle を 2 個に分けて bwd_L1f だけ default math に戻す fallback path
+        // を用意する。
         // SAFETY: handle is valid.
         let status = unsafe { cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH) };
         if status != CUBLAS_STATUS_SUCCESS {
@@ -3246,16 +3255,24 @@ impl CublasHandle {
 
     /// row-major C[M, N] = A[M, K] @ B[K, N]、`alpha=1`, `beta=0` (overwrite)。
     /// fwd_L1f 用: combined[B, FT_OUT] @ l1f_w[FT_OUT, L1_OUT] → l1f_out[B, L1_OUT]。
-    /// col-major cuBLAS で計算するため、`C_cm[N, M] = B_cm[N, K] @ A_cm[M, K]^?` の
-    /// 転置 trick を使う。row-major と col-major は同 memory 表現で、cublas 視点では
-    /// A_rm[m, k] = A_cm[k, m]、B_rm[k, n] = B_cm[n, k]。
-    ///   row-major C[m, n] = sum_k A[m, k] * B[k, n]
-    ///   = col-major C[n, m] = sum_k B[n, k] * A[k, m]^?
-    /// → cublas call: A=B_dev, B=A_dev, transA=N, transB=N, m=N, n=M, k=K, lda=N, ldb=K, ldc=N。
     ///
-    /// SAFETY: 全 device pointer は cudaMalloc 由来、長さは仕様分 (a.len() >= m*k、
-    /// b.len() >= k*n、c.len() >= m*n)、stream は `cublasSetStream_v2` で bind 済の
-    /// 同一 stream を再利用、TF32 math mode は handle 作成時に設定済。
+    /// col-major cuBLAS で row-major matmul を計算する転置 trick: 同 memory 表現
+    /// を cublas は col-major と解釈するので、`A_rm[m, k]` は `A_cm[k, m]`、
+    /// `B_rm[k, n]` は `B_cm[n, k]`、`C_rm[m, n]` は `C_cm[n, m]` と等価。
+    ///   row-major C[m, n] = sum_k A[m, k] * B[k, n]
+    ///   = col-major C[n, m] = sum_k B_cm[n, k] * A_cm[k, m]
+    /// → cublas call: A_arg=B_dev, B_arg=A_dev, transA=N, transB=N, m=N, n=M, k=K,
+    ///   lda=N, ldb=K, ldc=N。両 trans=N の単純形なので bwd 用 `sgemm_xt_y_rowmajor`
+    ///   (X^T @ Y、transB=T) より素直。
+    ///
+    /// SAFETY:
+    /// - 全 device pointer は `cudaMalloc` 由来、長さは仕様分 (a.len() >= m*k、
+    ///   b.len() >= k*n、c.len() >= m*n)。
+    /// - stream は `cublasSetStream_v2` で bind 済の同一 stream を再利用。
+    /// - TF32 math mode は handle 作成時に default で設定済 ([`CublasHandle::new`])。
+    /// - `beta=0` overwrite なので `c_ptr` の事前内容は使われない (caller は
+    ///   `c_ptr` への書き込みを同 stream 内 in-order で行うこと、別 stream からの
+    ///   race 書き込みは未定義動作)。
     unsafe fn sgemm_fwd_rowmajor(
         &self,
         m: i32,
