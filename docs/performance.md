@@ -18,8 +18,12 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
   --save-rate 5 --threads 16 --bucket-mode progress8kpabs
 ```
 
-1 回 1m30s 程度、合計 3 分で 5 sb 分の `pos/s` ログが出る。本ページの pos/s
-値はすべてこの手順での計測。`DATA` / `PROG` は local 依存なので各自のパスに置く。
+1 回 1m30s 程度、合計 3 分で 5 sb 分の `pos/s` ログが出る。`DATA` / `PROG` は
+local 依存なので各自のパスに置く。
+
+本ページの **実測** pos/s はこの手順による。FP16 構成は同コマンドに `--ft-fp16`
+/ `--ft-fp16 --ft-fp16-out` を追加して計測する。GPU 機種別表で「(推定)」と付いた
+行は未実測の外挿値で、外挿根拠は同表「出典」欄に記す。
 
 ## GPU 機種別 throughput 目安
 
