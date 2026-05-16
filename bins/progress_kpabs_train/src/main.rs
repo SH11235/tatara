@@ -412,6 +412,14 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     let opt_bc = dir.join(format!("{stem}.opt.bc"));
     let ptx_path = dir.join(format!("{stem}.ptx"));
 
+    // `.ll`→`.ptx` の中間/出力ファイル (linked.bc / opt.bc / .ptx) は stem 固定
+    // パスのため、複数スレッドが同時に compile すると `llc` が書き込み途中の
+    // `.bc` を読んで crash する。`cargo test` は 1 binary のテストを同一プロセスの
+    // 複数スレッドで走らせるので、プロセス内 Mutex で直列化すれば足りる。最初の
+    // スレッドが compile し、後続は lock 取得後に下の mtime cache で skip する。
+    static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // cache: skip rebuild if .ptx is newer than .ll
     if let (Ok(ll_meta), Ok(ptx_meta)) = (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
         && let (Ok(ll_mtime), Ok(ptx_mtime)) = (ll_meta.modified(), ptx_meta.modified())
