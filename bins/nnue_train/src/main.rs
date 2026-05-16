@@ -1,9 +1,9 @@
 #![feature(f16)]
 //! `bins/nnue_train` binary entry point — bullet-shogi v102 互換 NNUE trainer。
 //!
-//! 本 file は **v102 LayerStack arch** の `#[kernel]` 群 (27 個) と host loop
-//! driver (`GpuTrainer`) を統合する。cuda-oxide の bin-entry reachability 制約に
-//! より全 kernel を本 file に inline する必要がある (別 crate に置くと
+//! 本 file は **v102 LayerStack arch** の `#[kernel]` 群と host loop driver
+//! (`GpuTrainer`) を統合する。cuda-oxide の bin-entry reachability 制約により
+//! 全 kernel を本 file に inline する必要がある (別 crate に置くと
 //! `compile_ll_to_ptx_via_llc` の symbol resolution から外れる)。
 //!
 //! ## v102 アーキテクチャ (LayerStack 1536-16-32 + progress8kpabs 9 buckets)
@@ -23,42 +23,12 @@
 //! - **L3 (per-bucket)**: weight (9×32) + bias (9) → select(bucket) → 1
 //! - **net_output**: l3_out + l1_skip → 1 scalar
 //!
-//! ## kernel 一覧 (27 個、bin entry reachability のため全て本 file に inline)
+//! ## kernel 一覧
 //!
-//! ### 共通 / 損失 / optimizer
-//! 1. `screlu_grad` — v102 では未使用、compile-reach のため preserve
-//! 2. `loss_wdl` — sigmoid-MSE 損失 + dy_net_output 勾配 (`out ≈ cp` で収束)
-//! 3. `adamw_step` — v102 では未使用、preserve
-//! 4. `radam_step` — Ranger 1/2 (RAdam step)
-//! 5. `ranger_lookahead_lerp` — Ranger 2/2 (Lookahead lerp)
-//! 6. `sparse_ft_forward` — L0 forward
-//! 7. `sparse_ft_backward` — L0 backward (atomic scatter)
-//!
-//! ### v102 LayerStack 専用 kernel
-//! 8. `ft_post_perspective_fwd` (FUSED: bias+CReLU+pairwise+scale)
-//! 9. `ft_post_perspective_grad` (FUSED: 上記 gradient + ft_bias grad)
-//! 10. `dense_mm_fwd` — regular dense matmul + bias
-//! 11. `dense_mm_bwd_input` — input grad
-//! 12. `dense_mm_bwd_weight` — weight grad (1 thread = 1 cell)
-//! 13. `bias_grad` — generic atomic accumulate
-//! 14. `dense_mm_fwd_bucket` — per-bucket dense matmul + bias + select
-//! 15. `dense_mm_bwd_input_bucket` — per-bucket input grad
-//! 16. `dense_mm_bwd_weight_bucket` — per-bucket weight grad (1 thread = 1 (bucket,o,i) cell + batch loop、atomic 不要)
-//! 17. `bias_grad_bucket` — per-bucket bias grad (atomic per (bucket, o))
-//! 18. `crelu_fwd` — clip 0-1
-//! 19. `crelu_grad` — 1 if 0<x<1 else 0
-//! 20. `abs_pow2_scale_fwd` — y = x*x*scale (abs_pow(2) は |x|^2 = x^2 なので abs 不要)
-//! 21. `abs_pow2_scale_grad` — dx = 2*x*scale*dy
-//! 22. `concat_l1sqr_main_fwd` — concat 15+15 → 30
-//! 23. `concat_l1sqr_main_grad` — split 30 → 15+15
-//! 24. `elementwise_add` — a+b → c (forward + grad-copy 両用)
-//! 25. `slice_extract_2d` — 2D row 範囲を切り出し (l1_main / l1_skip の slice_rows)
-//! 26. `slice_scatter_2d` — 2D row 範囲へ書き戻し (l1_main / l1_skip slice の backward)
-//!
-//! ### bullet v102 厳密再現用 loss
-//! 27. `loss_wrm` — bullet win-rate-model 損失 + dy_net_output 勾配 (`out ≈ cp / nnue2score`
-//!     で収束、`--win-rate-model` 指定時に `loss_wdl` の代わりに使う。CPU reference は
-//!     `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`)
+//! kernel の確定一覧は `compile_ll_to_ptx_via_llc` に渡す `kernel_names` 定数を
+//! single source of truth とする (build 時の internalize-public-api list、ここから
+//! 漏れた kernel は `opt` の globaldce で削除されるため常に最新)。各 kernel の役割は
+//! 定義箇所の doc コメントを参照。アーキ上の繋がりは上記 v102 アーキテクチャ節を見る。
 //!
 //! ## cuda-oxide 制限への対応
 //!
@@ -67,14 +37,6 @@
 //! - `f32::sqrt`, `f32::exp` は libdevice (`__nv_sqrtf`, `__nv_expf`) に lowering OK
 //! - atomic add パターン: `unsafe { &*(slice.as_ptr().add(idx) as *const DeviceAtomicX) }
 //!   .fetch_add(_, AtomicOrdering::Relaxed)`
-//!
-//! kernel_names list (`compile_ll_to_ptx_via_llc` に渡す、計 27 個):
-//! `sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,adamw_step,radam_step,
-//! ranger_lookahead_lerp,ft_post_perspective_fwd,ft_post_perspective_grad,dense_mm_fwd,
-//! dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,dense_mm_fwd_bucket,
-//! dense_mm_bwd_input_bucket,dense_mm_bwd_weight_bucket,bias_grad_bucket,crelu_fwd,
-//! crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,concat_l1sqr_main_fwd,
-//! concat_l1sqr_main_grad,elementwise_add,slice_extract_2d,slice_scatter_2d`
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
