@@ -443,13 +443,15 @@ pub fn sparse_ft_forward(
 }
 
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
-/// 変換してから累算する。累算と出力は `f32` のまま。
+/// 変換してから累算する。累算と出力 (`out`) は `f32` のまま。
 ///
 /// `sparse_ft_forward` は DRAM 帯域律速 (RTX 3080 Ti 実測で peak DRAM BW の ~90%)
 /// で、その traffic の大半は active feature 行の weight gather read。weight を半精度に
 /// すると read byte 数が半減し、L2 にも 2 倍の行が載るため DRAM 律速が緩む。
 /// caller は `weight` に `ft_w` の FP16 mirror を渡し、FP32 master とは別管理する
 /// (optimizer は FP32 master を更新し、mirror は毎 step 変換し直す)。
+///
+/// `out` も `f16` にする版は [`sparse_ft_forward_fp16_out`] (`--ft-fp16-out`)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward_fp16(
@@ -506,6 +508,72 @@ pub fn sparse_ft_forward_fp16(
         out_ptr.add(out_base + 1).write(s1);
         out_ptr.add(out_base + 2).write(s2);
         out_ptr.add(out_base + 3).write(s3);
+    }
+}
+
+/// [`sparse_ft_forward_fp16`] の出力も `f16` にした版 (`--ft-fp16-out`)。`weight` を
+/// `f16` で読み、累算は `f32`、累算結果を round-to-nearest で `f16` に変換して `out`
+/// へ書く。
+///
+/// `out` (`ft_*_out`、b × FT_OUT) を `f16` にすると書き出し DRAM traffic が半減し、
+/// 後続の [`ft_post_perspective_fwd_fp16`] / [`ft_post_perspective_grad_fused_fp16`]
+/// の read も半精度になる。`ft_*_out` は CReLU 前の FT accumulator で値域は ~O(1〜数十)、
+/// f16 の有限域に収まる (loss scaling 不要、underflow する dft とは異なる)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn sparse_ft_forward_fp16_out(
+    weight: &[f16],
+    indices: &[i32],
+    mut out: DisjointSlice<f16>,
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    nnz: u32,
+) {
+    let tid = thread::index_1d();
+    let rows_u = rows as usize;
+    let rows_q = rows_u / 4;
+    let total = (batch as usize) * rows_q;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / rows_q;
+    let ri_q = tid.get() % rows_q;
+    let ri_base = ri_q * 4;
+
+    // unsafe 妥当性は [`sparse_ft_forward_fp16`] と同一。`weight` / `out` とも `f16` で、
+    // 4 連続 row の read / write は 8 byte 境界に整列する (idx*rows は偶数、ri_base は
+    // 4 の倍数)。
+    let indices_ptr = indices.as_ptr();
+    let weight_ptr = weight.as_ptr();
+    let mut s0: f32 = 0.0;
+    let mut s1: f32 = 0.0;
+    let mut s2: f32 = 0.0;
+    let mut s3: f32 = 0.0;
+    let base = bi * (nnz as usize);
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
+        if idx >= 0 && (idx as u32) < cols {
+            let off = (idx as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
+            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
+            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
+            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
+            s0 += w0;
+            s1 += w1;
+            s2 += w2;
+            s3 += w3;
+        }
+        ni += 1;
+    }
+    let out_ptr = out.as_mut_ptr();
+    let out_base = bi * rows_u + ri_base;
+    unsafe {
+        out_ptr.add(out_base).write(s0 as f16);
+        out_ptr.add(out_base + 1).write(s1 as f16);
+        out_ptr.add(out_base + 2).write(s2 as f16);
+        out_ptr.add(out_base + 3).write(s3 as f16);
     }
 }
 
@@ -798,6 +866,145 @@ pub fn gather_and_sum_per_feature_add(
     }
 }
 
+/// [`gather_and_sum_per_feature_overwrite`] の FP16 入力版。`grad_out` (dft) を `f16`
+/// で読み、各値を `f32` に変換してから累算する。累算と `grad_w` への書き出しは `f32`。
+///
+/// `grad_out` は b × FT_OUT で、本 kernel は 1 feature の出現位置すべてに対して全 ri
+/// 行を gather-read するため step 中で最も read DRAM traffic が大きい。`ft_post_
+/// perspective_grad_fused_fp16` が dft を `f16` で書くようになったため、その read 側も
+/// 半精度化して帯域を半減させる。
+///
+/// `grad_out` は `ft_post_perspective_grad_fused_fp16` 側で loss scaling 済 (値が
+/// `dft_scale` 倍されている)。本 kernel は scale 済の値を累算し、`grad_w` へ書く直前に
+/// `dft_inv_scale` (= 1 / dft_scale) を掛けて元の scale に戻す。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn gather_and_sum_per_feature_overwrite_fp16(
+    grad_out: &[f16],
+    positions: &[u32],
+    offsets: &[u32],
+    grad_w: &[f32],
+    n_features: u32,
+    ft_out: u32,
+    dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
+) {
+    let feature = thread::blockIdx_x() as usize;
+    let ri_block = thread::blockIdx_y() as usize;
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let ri = ri_block * block_dim + tid_local;
+    let ft_out_u = ft_out as usize;
+    if ri >= ft_out_u || feature >= (n_features as usize) {
+        return;
+    }
+
+    let off_start = offsets[feature] as usize;
+    let off_end = offsets[feature + 1] as usize;
+
+    // unsafe 妥当性は [`gather_and_sum_per_feature_overwrite`] と同一。`grad_out` のみ
+    // 要素型が `f16`、read 時に `f32` へ変換する。
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
+    let mut i = off_start;
+    let unroll_end = if off_end >= off_start + 3 {
+        off_end - 3
+    } else {
+        off_start
+    };
+    while i < unroll_end {
+        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() } as f32;
+        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() } as f32;
+        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() } as f32;
+        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() } as f32;
+        i += 4;
+    }
+    while i < off_end {
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() } as f32;
+        i += 1;
+    }
+    let sum = (sum0 + sum1) + (sum2 + sum3);
+
+    let out_ptr = grad_w.as_ptr() as *mut f32;
+    unsafe {
+        out_ptr
+            .add(feature * ft_out_u + ri)
+            .write(sum * dft_inv_scale);
+    }
+}
+
+/// [`gather_and_sum_per_feature_add`] の FP16 入力版。`grad_out` (dft) を `f16` で読み、
+/// `dft_inv_scale` で loss scaling を打ち消す以外は `gather_and_sum_per_feature_add` と
+/// 同一 (nstm 第 2 回呼び出しで stm の overwrite 結果へ atomic 加算)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn gather_and_sum_per_feature_add_fp16(
+    grad_out: &[f16],
+    positions: &[u32],
+    offsets: &[u32],
+    grad_w: &[f32],
+    n_features: u32,
+    ft_out: u32,
+    dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
+) {
+    let feature = thread::blockIdx_x() as usize;
+    let ri_block = thread::blockIdx_y() as usize;
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let ri = ri_block * block_dim + tid_local;
+    let ft_out_u = ft_out as usize;
+    if ri >= ft_out_u || feature >= (n_features as usize) {
+        return;
+    }
+
+    let off_start = offsets[feature] as usize;
+    let off_end = offsets[feature + 1] as usize;
+
+    let grad_out_ptr = grad_out.as_ptr();
+    let positions_ptr = positions.as_ptr();
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
+    let mut i = off_start;
+    let unroll_end = if off_end >= off_start + 3 {
+        off_end - 3
+    } else {
+        off_start
+    };
+    while i < unroll_end {
+        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() } as f32;
+        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() } as f32;
+        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() } as f32;
+        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() } as f32;
+        i += 4;
+    }
+    while i < off_end {
+        let bi = unsafe { positions_ptr.add(i).read() } as usize;
+        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() } as f32;
+        i += 1;
+    }
+    let sum = (sum0 + sum1) + (sum2 + sum3);
+
+    if sum != 0.0_f32 {
+        let cell =
+            unsafe { &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32) };
+        cell.fetch_add(sum * dft_inv_scale, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Sparse feature transform backward (atomic scatter)。
 ///
 /// 1 thread = 1 (batch, row)、column-major `grad_weight[idx * rows + ri]`、
@@ -966,6 +1173,83 @@ pub fn ft_post_perspective_fwd(
         let pair_idx = ri - half;
         let xa = nstm_ft_out[ft_base + pair_idx] + bias[pair_idx];
         let xb = nstm_ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    };
+
+    if let Some(o) = combined.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// [`ft_post_perspective_fwd`] の FP16 入力版。`stm_ft_out` / `nstm_ft_out` を `f16`
+/// で読み、`f32` に変換してから bias add 以降を計算する。math と `combined` 出力は
+/// `f32` のまま (`combined` は後続 dense L1 path が `f32` で読む)。
+///
+/// `sparse_ft_forward_fp16` が `ft_*_out` を `f16` で書くようになったため、その read
+/// 側も半精度化して DRAM traffic を合わせる。`f16` → `f32` 変換は値域を保つ無損失
+/// 変換なので、`combined` は FP32 版と同じ値域・同じ丸めで計算される (入力 `ft_*_out`
+/// 自体が `sparse_ft_forward_fp16` 時点で既に半精度量子化されている点のみ FP32 path と
+/// 異なる)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_fwd_fp16(
+    stm_ft_out: &[f16],
+    nstm_ft_out: &[f16],
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_dim: u32, // = 1536 (per-perspective input dim)
+    scale: f32,  // = 127.0/128.0
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (ft_dim as usize);
+    let ri = tid.get() % (ft_dim as usize);
+    let half = (ft_dim as usize) / 2;
+
+    let ft_base = bi * (ft_dim as usize);
+    let val = if ri < half {
+        // stm side, pair_idx = ri in [0, half)
+        let xa = stm_ft_out[ft_base + ri] as f32 + bias[ri];
+        let xb = stm_ft_out[ft_base + half + ri] as f32 + bias[half + ri];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    } else {
+        // nstm side, pair_idx = ri - half in [0, half)
+        let pair_idx = ri - half;
+        let xa = nstm_ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+        let xb = nstm_ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
         let ya = if xa < 0.0_f32 {
             0.0_f32
         } else if xa > 1.0_f32 {
@@ -1174,6 +1458,104 @@ pub fn ft_post_perspective_grad_fused(
         out_ptr.add(ft_base + half + pair_idx).write(grad_b);
     }
 
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
+/// [`ft_post_perspective_grad_fused`] の FP16 版。forward activation `ft_out` を `f16`
+/// で読み、`grad_ft_out` (dft) を `f16` で書く。`d_combined_a` / `_b` と `bias` /
+/// `grad_bias` は `f32` のまま (それぞれ dense L1 backward 出力と共有 FT bias で、
+/// 半精度化はこの kernel の scope 外)。
+///
+/// math は `ft_post_perspective_grad_fused` と同等。`grad_bias` への atomic accumulate
+/// は `f32` の `grad_a` / `grad_b` をそのまま使い (FP32 path と同じ精度)、`grad_ft_out`
+/// へ書く分のみ round-to-nearest で `f16` に変換する。`grad_ft_out` を半精度にすると
+/// 後続の inverse-index gather (`gather_and_sum_per_feature_*_fp16`) の read DRAM
+/// traffic が半減する (dft は b × FT_OUT で step 中で最も read 量が多い buffer)。
+///
+/// **loss scaling**: dft の値は batch 正規化 (1/batch) のため ~1e-8 規模で、そのまま
+/// f16 化すると全要素が subnormal 下限 (2^-24 ≈ 6e-8) を下回って 0 に潰れる。これを
+/// 防ぐため `grad_ft_out` へ書く値だけ `dft_scale` (power-of-2) を掛けて f16 normal
+/// range に持ち上げる。gather 側 (`gather_and_sum_per_feature_*_fp16`) が逆数を掛けて
+/// 元の scale に戻す。`grad_bias` は scale しない (f32 のため不要)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fused_fp16(
+    d_combined_a: &[f32],
+    d_combined_b: &[f32],
+    ft_out: &[f16],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f16>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+    dft_scale: f32, // grad_ft_out (f16) loss scaling 係数 (power-of-2)
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy_idx = bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx;
+    let dy = d_combined_a[dy_idx] + d_combined_b[dy_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
+    // `ft_post_perspective_grad_fused` と同一 (SAFETY 不変条件はそのまま、要素型のみ f16)。
+    // dft_scale を掛けてから f16 化する (loss scaling、gather 側で逆数を掛けて戻す)。
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr
+            .add(ft_base + pair_idx)
+            .write((grad_a * dft_scale) as f16);
+        out_ptr
+            .add(ft_base + half + pair_idx)
+            .write((grad_b * dft_scale) as f16);
+    }
+
+    // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
     let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
     bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
     let bias_cell_b =
@@ -3151,7 +3533,10 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
                        bias_grad_bucket_shared_sorted,\
                        ft_post_perspective_grad_fused,\
-                       sparse_ft_forward_fp16,cast_f32_to_f16";
+                       sparse_ft_forward_fp16,sparse_ft_forward_fp16_out,cast_f32_to_f16,\
+                       ft_post_perspective_fwd_fp16,ft_post_perspective_grad_fused_fp16,\
+                       gather_and_sum_per_feature_overwrite_fp16,\
+                       gather_and_sum_per_feature_add_fp16";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -3344,6 +3729,17 @@ fn read_f32_vec_io<R: std::io::Read>(r: &mut R, n: usize, what: &str) -> std::io
 const FT_POST_SCALE: f32 = 127.0 / 128.0;
 const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
+/// `--ft-fp16-out` で dft (FT activation gradient) を `f16` 化するときの loss scaling 係数。
+///
+/// dft は batch 正規化 (1/batch) のため値が ~1e-8 規模で、無 scale だと全要素が f16
+/// subnormal 下限 (2^-24 ≈ 6e-8) を下回り 0 に潰れて勾配が消える。`f16` へ書く前に本値
+/// を掛けて normal range に持ち上げ、gather 側で逆数を掛けて戻す。power-of-2 なので
+/// scale 自体は無誤差 (f16 量子化のみが誤差源)。
+///
+/// 2^30: 観測 dft の最大 ~2e-8 に対し overflow 余裕 ~3000× (max·scale ≈ 20 ≪ 65504)、
+/// かつ ~5e-14 までの値を normal range に載せる。
+const FT_DFT_FP16_SCALE: f32 = (1_u32 << 30) as f32;
+
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
 // `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する。
 const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
@@ -3462,6 +3858,9 @@ struct GpuTrainer {
     /// true なら forward の `sparse_ft_forward` を FP16 weight 版に切替える
     /// (`--ft-fp16`)。false で従来の FP32 path と bit-identical。
     ft_fp16: bool,
+    /// true なら FT activation (`ft_*_out` forward 出力 / `dft_*_out` backward 勾配) も
+    /// FP16 で保持する (`--ft-fp16-out`)。`ft_fp16` が true のときのみ true になりうる。
+    ft_fp16_out: bool,
     step_count: u64,
 }
 
@@ -3534,6 +3933,14 @@ struct GpuWorkspace {
     dft_stm_out: DeviceBuffer<f32>,          // b × FT_OUT
     dft_nstm_out: DeviceBuffer<f32>,         // b × FT_OUT
 
+    // FT activation の FP16 版。`ft_fp16_out` (`--ft-fp16-out`) が true のときだけ
+    // b × FT_OUT で確保され、`ft_*_out` / `dft_*_out` (f32) の代わりに使われる
+    // (f32 版はそのとき placeholder size でしか確保しない)。false なら全て `None`。
+    ft_stm_out_h: Option<DeviceBuffer<f16>>,   // b × FT_OUT
+    ft_nstm_out_h: Option<DeviceBuffer<f16>>,  // b × FT_OUT
+    dft_stm_out_h: Option<DeviceBuffer<f16>>,  // b × FT_OUT
+    dft_nstm_out_h: Option<DeviceBuffer<f16>>, // b × FT_OUT
+
     // -- inverse-index sparse_ft_backward scratch (FT_IN+1 / max 2.5M) --
     feat_counts: DeviceBuffer<u32>, // FT_IN: per-feature histogram (atomic build)
     feat_offsets: DeviceBuffer<u32>, // FT_IN + 1: exclusive prefix sum
@@ -3561,14 +3968,37 @@ struct GpuWorkspace {
 
 impl GpuWorkspace {
     /// `batch` 個の position 分の全 buffer を確保する (`GpuTrainer::new` から呼ぶ)。
-    fn new(stream: &CudaStream, batch: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    ///
+    /// `ft_fp16_out` が true なら FT activation (`ft_*_out` / `dft_*_out`) を `f16` で
+    /// 持つ。その場合 f32 版は使われないので placeholder size (FT_OUT 要素 = 1 行) で
+    /// のみ確保し、`*_h` (f16) を b × FT_OUT で確保する。false なら f32 版を
+    /// b × FT_OUT、`*_h` は `None`。
+    fn new(
+        stream: &CudaStream,
+        batch: usize,
+        ft_fp16_out: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
         };
+        // FT activation の f32 buffer size。ft_fp16_out 時は f16 版を使うので f32 版は
+        // placeholder (FT_OUT 要素) のみ。
+        let ft_act_f32_n = if ft_fp16_out { FT_OUT } else { batch * FT_OUT };
+        let alloc_h = |on: bool| -> Result<Option<DeviceBuffer<f16>>, Box<dyn std::error::Error>> {
+            if on {
+                Ok(Some(DeviceBuffer::<f16>::zeroed(stream, batch * FT_OUT)?))
+            } else {
+                Ok(None)
+            }
+        };
         Ok(Self {
             len_batch: batch,
-            ft_stm_out: z(batch * FT_OUT)?,
-            ft_nstm_out: z(batch * FT_OUT)?,
+            ft_stm_out: z(ft_act_f32_n)?,
+            ft_nstm_out: z(ft_act_f32_n)?,
+            ft_stm_out_h: alloc_h(ft_fp16_out)?,
+            ft_nstm_out_h: alloc_h(ft_fp16_out)?,
+            dft_stm_out_h: alloc_h(ft_fp16_out)?,
+            dft_nstm_out_h: alloc_h(ft_fp16_out)?,
             combined: z(batch * COMBINED_DIM)?,
             l1_bucket: z(batch * L1_OUT)?,
             l1f_out: z(batch * L1_OUT)?,
@@ -3594,8 +4024,8 @@ impl GpuWorkspace {
             dl1_total: z(batch * L1_OUT)?,
             dcombined_from_l1f: z(batch * FT_OUT)?,
             dcombined_from_l1: z(batch * FT_OUT)?,
-            dft_stm_out: z(batch * FT_OUT)?,
-            dft_nstm_out: z(batch * FT_OUT)?,
+            dft_stm_out: z(ft_act_f32_n)?,
+            dft_nstm_out: z(ft_act_f32_n)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, FT_IN + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
@@ -3620,13 +4050,15 @@ impl GpuWorkspace {
     /// `batch` 以上の容量を保証する (grow-only)。現 `len_batch` が足りていれば no-op、
     /// 足りなければ全 buffer を `batch` 分で再 alloc して `len_batch` を更新する
     /// (典型的には batch_size 固定なので一度も走らないか、起動時の確保で十分)。
+    /// `ft_fp16_out` は `GpuWorkspace::new` と同じ意味 (FT activation を f16 で持つか)。
     fn ensure_batch(
         &mut self,
         stream: &CudaStream,
         batch: usize,
+        ft_fp16_out: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if batch > self.len_batch {
-            *self = Self::new(stream, batch)?;
+            *self = Self::new(stream, batch, ft_fp16_out)?;
         }
         Ok(())
     }
@@ -4255,11 +4687,14 @@ impl GpuTrainer {
     ///
     /// `ft_fp16` が true なら FP16 weight mirror (`ft_w_h`) を確保し、forward の
     /// `sparse_ft_forward` を FP16 版に切替える。false なら mirror は未確保で従来 path。
+    /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
+    /// caller が validation 済)。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         enable_tf32: bool,
         ft_fp16: bool,
+        ft_fp16_out: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -4353,12 +4788,14 @@ impl GpuTrainer {
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は batch=4 等を渡す)。
-            ws: GpuWorkspace::new(&stream, batch_size.max(1))?,
+            // FT activation の f16 buffer 確保は `ft_fp16_out` で決まる。
+            ws: GpuWorkspace::new(&stream, batch_size.max(1), ft_fp16_out)?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
+            ft_fp16_out,
             step_count: 0,
         })
     }
@@ -4905,7 +5342,7 @@ impl GpuTrainer {
 
         // 中間 activation workspace を batch `b` 以上に拡張 (grow-only)。
         // batch_size 固定なら起動時の `GpuWorkspace::new` で足りているので no-op。
-        self.ws.ensure_batch(&self.stream, b)?;
+        self.ws.ensure_batch(&self.stream, b, self.ft_fp16_out)?;
 
         macro_rules! prof_tick {
             ($label:expr) => {
@@ -4963,10 +5400,45 @@ impl GpuTrainer {
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
         // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * FT_OUT / 4。
         // FT_OUT = 1536 (4 の倍数) を arch 固定で保証。
-        // `ft_fp16` 時は FP16 weight 版 (`sparse_ft_forward_fp16`) に切替える: 累算は
-        // f32 で同形、weight read のみ半精度で DRAM 帯域が半減する。
+        // forward kernel は 3 通り:
+        //  - `ft_fp16_out`: `sparse_ft_forward_fp16_out` — f16 weight read + f16 出力
+        //    (`ft_*_out_h`)。書き出し DRAM 帯域も半減。
+        //  - `ft_fp16` のみ: `sparse_ft_forward_fp16` — f16 weight read + f32 出力。
+        //  - どちらも無し: `sparse_ft_forward` — FP32 path、bit-identical。
+        // いずれも累算は f32、1 thread = 4 row なので grid は b * FT_OUT / 4。
         debug_assert!(FT_OUT.is_multiple_of(4));
-        if self.ft_fp16 {
+        if self.ft_fp16_out {
+            let ft_w_h = self
+                .ft_w_h
+                .as_ref()
+                .expect("ft_w_h is Some when ft_fp16 is enabled");
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16_out,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.stm_idx_dev),
+                    slice_mut(self.ws.ft_stm_out_h.as_mut()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16_out,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.nstm_idx_dev),
+                    slice_mut(self.ws.ft_nstm_out_h.as_mut()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+        } else if self.ft_fp16 {
             let ft_w_h = self
                 .ft_w_h
                 .as_ref()
@@ -5024,19 +5496,39 @@ impl GpuTrainer {
         prof_tick!("fwd_ft");
 
         // -- Forward step 3: ft_post_perspective_fwd → combined (B × FT_OUT) --
-        cuda_launch! {
-            kernel: ft_post_perspective_fwd,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * COMBINED_DIM),
-            args: [
-                slice(self.ws.ft_stm_out),
-                slice(self.ws.ft_nstm_out),
-                slice(self.ft_b),
-                slice_mut(self.ws.combined),
-                b_u32, FT_OUT as u32, FT_POST_SCALE
-            ]
-        }?;
+        // `ft_fp16_out` 時は f16 入力版 (`ft_post_perspective_fwd_fp16`)。`combined` 出力は
+        // 両 path とも f32 (後続 dense L1 path が f32 で読む)。
+        if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: ft_post_perspective_fwd_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * COMBINED_DIM),
+                args: [
+                    slice(self.ws.ft_stm_out_h.as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ws.ft_nstm_out_h.as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.combined),
+                    b_u32, FT_OUT as u32, FT_POST_SCALE
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: ft_post_perspective_fwd,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * COMBINED_DIM),
+                args: [
+                    slice(self.ws.ft_stm_out),
+                    slice(self.ws.ft_nstm_out),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.combined),
+                    b_u32, FT_OUT as u32, FT_POST_SCALE
+                ]
+            }?;
+        }
 
         prof_tick!("fwd_ftpost");
 
@@ -5745,52 +6237,92 @@ impl GpuTrainer {
         // -- Backward 3 reverse: ft_post_perspective_grad fused × 2 (stm, nstm) --
         // `dy = dcombined_from_l1 + dcombined_from_l1f` を fused kernel が in-register
         // で計算、合算済 buffer の materialize と read-back の DRAM roundtrip を避ける。
-        // stm: d_combined_offset = 0
-        cuda_launch! {
-            kernel: ft_post_perspective_grad_fused,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT / 2),
-            args: [
-                slice(self.ws.dcombined_from_l1),
-                slice(self.ws.dcombined_from_l1f),
-                slice(self.ws.ft_stm_out),
-                slice(self.ft_b),
-                slice_mut(self.ws.dft_stm_out),
-                slice(self.ft_b_grad),
-                b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE
-            ]
-        }?;
-        // nstm: d_combined_offset = FT_OUT/2 = 768
-        cuda_launch! {
-            kernel: ft_post_perspective_grad_fused,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT / 2),
-            args: [
-                slice(self.ws.dcombined_from_l1),
-                slice(self.ws.dcombined_from_l1f),
-                slice(self.ws.ft_nstm_out),
-                slice(self.ft_b),
-                slice_mut(self.ws.dft_nstm_out),
-                slice(self.ft_b_grad),
-                b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE
-            ]
-        }?;
+        // `ft_fp16_out` 時は forward activation `ft_*_out` を f16 で読み、dft 出力も f16
+        // で書く版 (`ft_post_perspective_grad_fused_fp16`)。`d_combined_*` / `ft_b` /
+        // `ft_b_grad` は両 path とも f32。stm: d_combined_offset = 0、nstm: = FT_OUT/2。
+        if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1),
+                    slice(self.ws.dcombined_from_l1f),
+                    slice(self.ws.ft_stm_out_h.as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_stm_out_h.as_mut()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b_grad),
+                    b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE,
+                    FT_DFT_FP16_SCALE
+                ]
+            }?;
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1),
+                    slice(self.ws.dcombined_from_l1f),
+                    slice(self.ws.ft_nstm_out_h.as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_nstm_out_h.as_mut()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b_grad),
+                    b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE,
+                    FT_DFT_FP16_SCALE
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1),
+                    slice(self.ws.dcombined_from_l1f),
+                    slice(self.ws.ft_stm_out),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_stm_out),
+                    slice(self.ft_b_grad),
+                    b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE
+                ]
+            }?;
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1),
+                    slice(self.ws.dcombined_from_l1f),
+                    slice(self.ws.ft_nstm_out),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_nstm_out),
+                    slice(self.ft_b_grad),
+                    b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE
+                ]
+            }?;
+        }
 
         prof_tick!("bwd_ftpost");
 
         // -- Backward 1+2 reverse: sparse_ft_backward × 2 を inverse-index pipeline で実装。
-        // 旧: 各 (b, ri) thread が 38 atomic add → atomic contention で memory bandwidth peak。
-        // 新: phase A (count) → B (prefix sum) → C (scatter) → D (per-feature gather+sum)。
+        // 各 (b, ri) thread が直接 38 atomic add する素朴版は atomic contention で memory
+        // bandwidth が飽和するため、phase A (count) → B (prefix sum) → C (scatter) →
+        // D (per-feature gather+sum) の inverse-index 構成にして atomic を D だけに局所化する。
         // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
+        // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
+        // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
         let total_pairs = (b * MAX_ACTIVE) as u32;
-        for (iter_idx, (gout, idx_dev)) in [
-            (&self.ws.dft_stm_out, &self.ws.stm_idx_dev),
-            (&self.ws.dft_nstm_out, &self.ws.nstm_idx_dev),
-        ]
-        .into_iter()
-        .enumerate()
+        for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
+            .into_iter()
+            .enumerate()
         {
             // A: feat_counts ← 0
             memset_zero(&self.stream, &self.ws.feat_counts)?;
@@ -5846,36 +6378,70 @@ impl GpuTrainer {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
+            // iter 0 = stm (dft_stm_out / overwrite)、iter 1 = nstm (dft_nstm_out / add)。
+            // `ft_fp16_out` 時は dft が f16 なので f16 入力版の gather kernel を使う。
             if iter_idx == 0 {
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_overwrite,
-                    stream: self.stream, module: self.module,
-                    config: d_config,
-                    args: [
-                        slice(gout),
-                        slice(self.ws.feat_positions),
-                        slice(self.ws.feat_offsets),
-                        slice(self.ft_w_grad),
-                        FT_IN as u32, FT_OUT as u32
-                    ]
-                }?;
+                if self.ft_fp16_out {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_overwrite_fp16,
+                        stream: self.stream, module: self.module,
+                        config: d_config,
+                        args: [
+                            slice(self.ws.dft_stm_out_h.as_ref()
+                                .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            FT_IN as u32, FT_OUT as u32, 1.0_f32 / FT_DFT_FP16_SCALE
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_overwrite,
+                        stream: self.stream, module: self.module,
+                        config: d_config,
+                        args: [
+                            slice(self.ws.dft_stm_out),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            FT_IN as u32, FT_OUT as u32
+                        ]
+                    }?;
+                }
                 // P-obs: phD iter 0 (stm overwrite) を独立計測する。`prof_tick!` は
                 // stream.synchronize を打つので、これが無いと前 iter の compute が次
                 // tick (phA_reset iter 1) に流れ込んで観測上 phA_reset が肥大化する。
                 prof_tick!("phD_stm");
             } else {
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_add,
-                    stream: self.stream, module: self.module,
-                    config: d_config,
-                    args: [
-                        slice(gout),
-                        slice(self.ws.feat_positions),
-                        slice(self.ws.feat_offsets),
-                        slice(self.ft_w_grad),
-                        FT_IN as u32, FT_OUT as u32
-                    ]
-                }?;
+                if self.ft_fp16_out {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add_fp16,
+                        stream: self.stream, module: self.module,
+                        config: d_config,
+                        args: [
+                            slice(self.ws.dft_nstm_out_h.as_ref()
+                                .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            FT_IN as u32, FT_OUT as u32, 1.0_f32 / FT_DFT_FP16_SCALE
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add,
+                        stream: self.stream, module: self.module,
+                        config: d_config,
+                        args: [
+                            slice(self.ws.dft_nstm_out),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            FT_IN as u32, FT_OUT as u32
+                        ]
+                    }?;
+                }
                 prof_tick!("phD_nstm");
             }
             let _ = total_pairs; // unused yet
@@ -6241,6 +6807,21 @@ struct Cli {
     /// 収まるため mirror 変換が ±inf へ overflow しない。
     #[arg(long)]
     ft_fp16: bool,
+
+    /// FT activation (`ft_*_out` の forward 出力と `dft_*_out` の backward 勾配) も
+    /// FP16 で保持する。`--ft-fp16` を要求する (weight FP16 path の上に積む拡張)。
+    ///
+    /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
+    /// inverse-index gather (step 中で最も DRAM read が多い `phD`) の帯域が半減する。
+    /// dft は batch 正規化で ~1e-8 規模のため、FP16 化時は loss scaling
+    /// ([`FT_DFT_FP16_SCALE`]) で normal range に持ち上げてから格納する。
+    ///
+    /// weight FP16 (`--ft-fp16`) とは別 flag に分けてあり、SPRT で
+    /// FP32 → `--ft-fp16` → `--ft-fp16 --ft-fp16-out` の 2 段で棋力影響を切り分け
+    /// られる。量子化誤差で棋力が変動しうるため default OFF、本番品質は SPRT 確認まで
+    /// 保証しない。
+    #[arg(long)]
+    ft_fp16_out: bool,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -6260,6 +6841,14 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli.optimizer
         )
         .into());
+    }
+    // --ft-fp16-out は weight FP16 path の上に積む拡張なので --ft-fp16 を要求する。
+    if cli.ft_fp16_out && !cli.ft_fp16 {
+        return Err(
+            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
+                    path の拡張)"
+                .into(),
+        );
     }
     // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss params のみ見る)。
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
@@ -6361,7 +6950,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size, cli.tf32, cli.ft_fp16)?;
+    let mut trainer =
+        GpuTrainer::new(&ctx, cli.batch_size, cli.tf32, cli.ft_fp16, cli.ft_fp16_out)?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
         println!(
@@ -6444,7 +7034,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     println!("[smoke] CUDA context created, loading kernel module...");
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false)?;
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (FT_IN * FT_OUT
@@ -8119,6 +8709,187 @@ mod gpu_cpu_equivalence_tests {
         );
         assert_close_rel(
             "ft_grad_fused grad_bias",
+            &grad_bias_dev.to_host_vec(&stream)?,
+            &grad_bias_cpu,
+            TOL,
+        );
+        Ok(())
+    }
+
+    // -- ft_post FP16 版 (--ft-fp16-out で FT activation を半精度化する経路) -------
+    //
+    // f16 入力は事前に round-to-nearest 量子化し、CPU reference にも同じ f16→f32 値を
+    // 渡す。これで「kernel の f16 read / indexing が正しいか」を、量子化誤差と分離して
+    // 検証できる (f16→f32 拡張は無損失なので GPU と CPU の演算入力は bit 一致)。
+
+    /// `f32` 列を round-to-nearest で `f16` 量子化し、`(f16 列, f16→f32 に戻した列)` を返す。
+    fn quantize_f16(v: &[f32]) -> (Vec<f16>, Vec<f32>) {
+        let h: Vec<f16> = v.iter().map(|&x| x as f16).collect();
+        let back: Vec<f32> = h.iter().map(|&x| x as f32).collect();
+        (h, back)
+    }
+
+    #[test]
+    fn ft_post_perspective_fwd_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let stm: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let nstm: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.5_f32 + 3.0_f32 * ((i * 5) % 11) as f32 / 10.0)
+            .collect();
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let scale = FT_POST_SCALE;
+        let (stm_h, stm_q) = quantize_f16(&stm);
+        let (nstm_h, nstm_q) = quantize_f16(&nstm);
+
+        // CPU reference は GPU が読むのと同じ f16→f32 値で計算する。
+        let mut combined_cpu = vec![0.0_f32; batch * ft_dim];
+        ft_post_perspective_fwd_cpu(
+            &stm_q,
+            &nstm_q,
+            &bias,
+            &mut combined_cpu,
+            batch,
+            ft_dim,
+            scale,
+        );
+
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm_h)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_h)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let mut combined_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
+        cuda_launch! {
+            kernel: ft_post_perspective_fwd_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(stm_dev), slice(nstm_dev), slice(bias_dev), slice_mut(combined_dev),
+                   batch as u32, ft_dim as u32, scale]
+        }?;
+        stream.synchronize()?;
+        // 入力 f16 値・f32 演算とも GPU/CPU 一致のため tight tolerance。
+        assert_close(
+            "ft_post_perspective_fwd_fp16",
+            &combined_dev.to_host_vec(&stream)?,
+            &combined_cpu,
+            TOL,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ft_post_perspective_grad_fused_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let half = ft_dim / 2;
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let scale = FT_POST_SCALE;
+        let d_a: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.2_f32 + 0.011_f32 * i as f32)
+            .collect();
+        let d_b: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -0.8_f32 + 0.007_f32 * i as f32)
+            .collect();
+        let stm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let nstm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.5_f32 + 3.0_f32 * ((i * 5) % 11) as f32 / 10.0)
+            .collect();
+        let (stm_ft_h, stm_ft_q) = quantize_f16(&stm_ft);
+        let (nstm_ft_h, nstm_ft_q) = quantize_f16(&nstm_ft);
+
+        // CPU reference は f16→f32 に戻した ft_out で計算する。
+        let d_combined: Vec<f32> = d_a.iter().zip(d_b.iter()).map(|(&x, &y)| x + y).collect();
+        let mut grad_bias_cpu = vec![0.0_f32; ft_dim];
+        let mut dft_stm_cpu = vec![0.0_f32; batch * ft_dim];
+        let mut dft_nstm_cpu = vec![0.0_f32; batch * ft_dim];
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &stm_ft_q,
+            &bias,
+            &mut dft_stm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            0,
+            ft_dim,
+            scale,
+        );
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &nstm_ft_q,
+            &bias,
+            &mut dft_nstm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            half,
+            ft_dim,
+            scale,
+        );
+
+        let da_dev = DeviceBuffer::from_host(&stream, &d_a)?;
+        let db_dev = DeviceBuffer::from_host(&stream, &d_b)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let stm_ft_dev = DeviceBuffer::from_host(&stream, &stm_ft_h)?;
+        let nstm_ft_dev = DeviceBuffer::from_host(&stream, &nstm_ft_h)?;
+        let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
+        let mut dft_stm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+        let mut dft_nstm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+        // test 入力 dft は O(数十) なので、production の FT_DFT_FP16_SCALE (2^30) では
+        // overflow する。loss scaling round-trip を検証する目的の小さい power-of-2 を使う。
+        let dft_scale = 64.0_f32;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+        }?;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+        }?;
+        stream.synchronize()?;
+        // dft 出力は f16 かつ dft_scale 倍されているので、読み戻して逆数を掛ける。GPU と
+        // CPU は同じ f32 演算結果を持つが、GPU 側のみ最後に f16 量子化されるため、f16
+        // round-off (相対 ~5e-4) を許容する relative tolerance。
+        let inv = 1.0_f32 / dft_scale;
+        let dft_stm_gpu: Vec<f32> = dft_stm_dev
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|&x| x as f32 * inv)
+            .collect();
+        let dft_nstm_gpu: Vec<f32> = dft_nstm_dev
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|&x| x as f32 * inv)
+            .collect();
+        assert_close_rel(
+            "ft_grad_fused_fp16 dft_stm",
+            &dft_stm_gpu,
+            &dft_stm_cpu,
+            2e-3,
+        );
+        assert_close_rel(
+            "ft_grad_fused_fp16 dft_nstm",
+            &dft_nstm_gpu,
+            &dft_nstm_cpu,
+            2e-3,
+        );
+        // grad_bias は f32 accumulate (FP32 path と同じ)、atomic 順序由来の drift のみ。
+        assert_close_rel(
+            "ft_grad_fused_fp16 grad_bias",
             &grad_bias_dev.to_host_vec(&stream)?,
             &grad_bias_cpu,
             TOL,
