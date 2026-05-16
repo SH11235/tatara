@@ -54,6 +54,7 @@ use std::time::Instant;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{Batch, BucketedPrefetchedLoader};
+use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
 
 // =============================================================================
@@ -305,6 +306,9 @@ impl TrainingConfig {
 ///   重みは process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
 /// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
+/// - `experiment`: `Some` のとき、run 開始時・superbatch ごと・正常終了時に
+///   experiment.json を atomic に書き出す。書き込み失敗は warning のみで
+///   training は止めない。`None` なら構造化ログを残さない
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
@@ -317,6 +321,7 @@ pub fn run<B, L, W>(
     lr_scheduler: &L,
     wdl_scheduler: &W,
     cfg: &TrainingConfig,
+    mut experiment: Option<&mut ExperimentLogger>,
 ) -> io::Result<()>
 where
     B: TrainerBackend,
@@ -346,6 +351,12 @@ where
         cfg.score_drop_abs,
         cfg.threads.max(1),
     );
+
+    // experiment.json を run 開始時点 (`status: "running"`) で一度書く。以降は
+    // superbatch ごとに incremental に上書きする。
+    if let Some(log) = experiment.as_mut() {
+        write_experiment_log(log);
+    }
 
     let positions_per_sb =
         (cfg.batches_per_superbatch as u64).saturating_mul(cfg.batch_size as u64);
@@ -471,7 +482,8 @@ where
             format_hms(eta_secs),
         );
 
-        if sb % cfg.save_rate == 0 || sb == cfg.end_superbatch {
+        let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
+        if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path)?;
             println!("[train] checkpoint saved: {}", path.display());
@@ -484,6 +496,23 @@ where
             if let Some(keep) = cfg.keep_raw_checkpoints {
                 prune_old_raw_checkpoints(&cfg.output_dir, &cfg.net_id, keep);
             }
+        }
+
+        // superbatch の処理 (checkpoint 保存を含む) をすべて終えてから
+        // experiment.json を更新する。これで `checkpoints` に載せたファイル名は
+        // 書き込み時点で実在する。
+        if let Some(log) = experiment.as_mut() {
+            log.record_superbatch(
+                sb,
+                mean_loss,
+                sb_positions,
+                run_start.elapsed().as_secs_f64(),
+            );
+            if saved {
+                log.note_checkpoint(format!("{}-{}.bin", cfg.net_id, sb));
+                log.note_checkpoint(format!("{}-{}.ckpt", cfg.net_id, sb));
+            }
+            write_experiment_log(log);
         }
     }
 
@@ -498,7 +527,23 @@ where
         format_hms(run_start.elapsed().as_secs_f64()),
         cfg.end_superbatch + 1 - cfg.start_superbatch,
     );
+
+    if let Some(log) = experiment.as_mut() {
+        log.mark_finished(run_start.elapsed().as_secs_f64());
+        write_experiment_log(log);
+    }
     Ok(())
+}
+
+/// experiment.json を書き出し、失敗時は warning のみ出して training を止めない
+/// (構造化ログは補助情報であり、書き込み失敗で学習を落とさない)。
+fn write_experiment_log(log: &ExperimentLogger) {
+    if let Err(e) = log.write() {
+        eprintln!(
+            "[train] warning: failed to write experiment log {}: {e}",
+            log.path().display()
+        );
+    }
 }
 
 /// `{net_id}-{sb}.ckpt` 形式の raw checkpoint のうち、superbatch 番号 (`sb`) の
@@ -692,7 +737,16 @@ mod tests {
         };
         let mut backend = MockBackend::new();
 
-        run(&mut backend, &sample_psv_path(), &progress, &lr, &wdl, &cfg).expect("run ok");
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
 
         // 3 superbatch × 2 batch = 6 train_step。
         assert_eq!(backend.steps, 6);
@@ -770,7 +824,16 @@ mod tests {
             ..base_cfg()
         };
         let mut backend = MockBackend::new();
-        run(&mut backend, &sample_psv_path(), &progress, &lr, &wdl, &cfg).expect("run ok");
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
 
         // 3 superbatch (3,4,5) × 2 batch = 6 step。
         assert_eq!(backend.steps, 6);
@@ -810,6 +873,114 @@ mod tests {
             "sb5 lr = {} expected {expected_sb5}",
             backend.seen_lr[4]
         );
+    }
+
+    #[test]
+    fn run_writes_experiment_json() {
+        // `run` に ExperimentLogger を渡すと、run 完了時に status "completed" の
+        // experiment.json が書かれ、history が superbatch 数、checkpoints が
+        // 保存した .bin/.ckpt 名で埋まることを検証する。
+        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Params};
+
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-exp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let json_path = dir.join("experiments").join("exp-test.json");
+
+        let params = Params {
+            architecture: "v102-LayerStack-1536-16-32-9bucket".to_string(),
+            l0: 1536,
+            l1: 16,
+            l2: 32,
+            num_buckets: 9,
+            optimizer: "ranger".to_string(),
+            bucket_mode: "progress8kpabs".to_string(),
+            progress_coeff: None,
+            lr: 1.0e-3,
+            lr_gamma: 0.9,
+            lr_step: 1,
+            batch_size: 8,
+            batches_per_superbatch: 2,
+            superbatches: 3,
+            start_superbatch: 1,
+            wdl: 0.0,
+            scale: 290.0,
+            weight_decay: 0.0,
+            qa: 127,
+            qb: 64,
+            loss_kind: "sigmoid".to_string(),
+            wrm_in_scaling: None,
+            wrm_nnue2score: None,
+            wrm_target_offset: None,
+            wrm_target_scaling: None,
+            score_drop_abs: None,
+            init_from: None,
+            tf32: false,
+            ft_fp16: false,
+            ft_fp16_out: false,
+            fp16_opt_state: false,
+            threads: 1,
+        };
+        let data = DataInfo {
+            name: "sample.psv".to_string(),
+            positions: 1_000,
+            total_positions: 0,
+            dataset_passes: 0.0,
+        };
+        let doc = ExperimentDoc::new(
+            "exp-test".to_string(),
+            "exp".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train --data sample.psv".to_string(),
+            None,
+            params,
+            data,
+        );
+        let mut logger = ExperimentLogger::new(json_path.clone(), doc);
+
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = base_cfg(); // start 1, end 3, save_rate 2
+        let mut backend = MockBackend::new();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            Some(&mut logger),
+        )
+        .expect("run ok");
+
+        let raw = std::fs::read_to_string(&json_path).expect("experiment.json written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["status"], "completed");
+        // start 1 .. end 3 → history 3 点。
+        assert_eq!(v["history"].as_array().expect("history array").len(), 3);
+        // save_rate 2 → sb 2, sb 3 で checkpoint。各 .bin + .ckpt = 4 件。
+        assert_eq!(
+            v["checkpoints"]
+                .as_array()
+                .expect("checkpoints array")
+                .len(),
+            4
+        );
+        assert_eq!(v["results"]["interrupted"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -934,7 +1105,7 @@ mod tests {
         std::fs::write(&tmp, b"").expect("write empty psv");
 
         let mut backend = MockBackend::new();
-        let result = run(&mut backend, &tmp, &progress, &lr, &wdl, &cfg);
+        let result = run(&mut backend, &tmp, &progress, &lr, &wdl, &cfg, None);
         let _ = std::fs::remove_file(&tmp);
 
         let err = result.expect_err("empty data file should error, not hang");

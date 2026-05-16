@@ -52,6 +52,7 @@ use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, 
 #[allow(unused_imports)]
 use nnue_format::V102Weights;
 use nnue_train::dataloader::Batch;
+use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
@@ -7438,6 +7439,11 @@ struct Cli {
     #[arg(long, default_value = "rshogi")]
     net_id: String,
 
+    /// experiment.json の `name` (実験管理 UI での表示名)。未指定なら net_id、
+    /// `--resume` 時は `{net_id} (resume @sb{開始 superbatch})`。
+    #[arg(long)]
+    experiment_name: Option<String>,
+
     /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
     /// v102 recipe は 400。
     #[arg(long, default_value_t = 10)]
@@ -7830,15 +7836,173 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
     trainer.sync_ft_w_h_mirror()?;
 
-    nnue_train::trainer::run(
+    let mut experiment = build_experiment_logger(cli, start_superbatch, resumed_superbatch, data);
+    println!("[train] experiment log: {}", experiment.path().display());
+
+    let result = nnue_train::trainer::run(
         &mut trainer,
         data,
         &progress,
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,
-    )?;
+        Some(&mut experiment),
+    );
+    if result.is_err() {
+        // run が error 終了したことを experiment.json に残す (status は "running"
+        // のまま、results.interrupted を立てる)。`run` は正常終了時のみ
+        // status を "completed" にする。
+        experiment.mark_interrupted();
+        if let Err(e) = experiment.write() {
+            eprintln!(
+                "[train] warning: failed to write experiment log {}: {e}",
+                experiment.path().display()
+            );
+        }
+    }
+    result?;
     Ok(())
+}
+
+/// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
+const PSV_RECORD_BYTES: u64 = 40;
+
+/// v102 LayerStack network の architecture 記述子 (FT 1536 → L1 16 → L2 32、
+/// progress8kpabs 9 bucket)。experiment.json `params.architecture` に記録する。
+const V102_ARCHITECTURE: &str = "v102-LayerStack-1536-16-32-9bucket";
+
+/// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
+/// に使う。JSON は非有限値を表現できず、混入すると serialise が丸ごと失敗して
+/// 構造化ログが 1 件も書けなくなる。`--scale` は `--win-rate-model` 指定時、
+/// `--weight-decay` は常に、CLI 側で finite 検証を経ないため防御する。
+fn finite_or_zero(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
+/// `path` の basename を `String` で返す。file_name が取れなければ path 全体の
+/// 表示文字列で代替する。
+fn file_basename(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// rshogi-nnue の git revision を best-effort で取得する。git が見つからない、
+/// または git repository 外で実行された場合は `None`。working tree に未 commit
+/// の変更があれば `-dirty` を付ける。
+fn git_commit() -> Option<String> {
+    let rev = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !rev.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(rev.stdout).ok()?.trim().to_string();
+    if commit.is_empty() {
+        return None;
+    }
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok();
+    let is_dirty = dirty.is_some_and(|out| out.status.success() && !out.stdout.is_empty());
+    Some(if is_dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    })
+}
+
+/// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
+/// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
+fn build_experiment_logger(
+    cli: &Cli,
+    start_superbatch: usize,
+    resumed_superbatch: Option<usize>,
+    data: &Path,
+) -> ExperimentLogger {
+    let start_secs = nnue_train::experiment::now_epoch_secs();
+    let id = format!(
+        "{}-{}",
+        cli.net_id,
+        nnue_train::experiment::format_utc_compact(start_secs)
+    );
+    let name = cli.experiment_name.clone().unwrap_or_else(|| {
+        if cli.resume.is_some() {
+            format!("{} (resume @sb{start_superbatch})", cli.net_id)
+        } else {
+            cli.net_id.clone()
+        }
+    });
+
+    let lineage = cli.resume.as_ref().map(|ckpt| Lineage {
+        // raw checkpoint format は producer run id を持たないため、親 run の
+        // experiment.json `id` は解決できない。lineage は checkpoint 参照のみ。
+        parent_id: None,
+        resumed_from_checkpoint: file_basename(ckpt),
+        resumed_from_superbatch: resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
+    });
+
+    let is_wrm = cli.win_rate_model;
+    let params = Params {
+        architecture: V102_ARCHITECTURE.to_string(),
+        l0: FT_OUT,
+        l1: L1_OUT,
+        l2: L2_OUT,
+        num_buckets: NUM_BUCKETS,
+        optimizer: cli.optimizer.clone(),
+        bucket_mode: cli.bucket_mode.clone(),
+        progress_coeff: cli.progress_coeff.as_deref().map(file_basename),
+        lr: finite_or_zero(cli.lr),
+        lr_gamma: finite_or_zero(cli.lr_gamma),
+        lr_step: cli.lr_step.max(1),
+        batch_size: cli.batch_size,
+        batches_per_superbatch: cli.batches_per_superbatch,
+        superbatches: cli.superbatches,
+        start_superbatch,
+        wdl: finite_or_zero(cli.wdl),
+        scale: finite_or_zero(cli.scale),
+        weight_decay: finite_or_zero(cli.weight_decay),
+        qa: nnue_format::v102_layerstack::QA,
+        qb: nnue_format::v102_layerstack::QB,
+        loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
+        wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
+        wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
+        wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
+        wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
+        score_drop_abs: cli.score_drop_abs,
+        init_from: cli.init_from.as_deref().map(file_basename),
+        tf32: cli.tf32,
+        ft_fp16: cli.ft_fp16,
+        ft_fp16_out: cli.ft_fp16_out,
+        fp16_opt_state: cli.fp16_opt_state,
+        threads: cli.threads,
+    };
+
+    let dataset_positions = std::fs::metadata(data)
+        .map(|m| m.len() / PSV_RECORD_BYTES)
+        .unwrap_or(0);
+    let data_info = DataInfo {
+        name: file_basename(data),
+        positions: dataset_positions,
+        total_positions: 0,
+        dataset_passes: 0.0,
+    };
+
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let json_path = cli.output.join("experiments").join(format!("{id}.json"));
+    let doc = ExperimentDoc::new(
+        id,
+        name,
+        start_secs,
+        git_commit(),
+        command,
+        lineage,
+        params,
+        data_info,
+    );
+    ExperimentLogger::new(json_path, doc)
 }
 
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
