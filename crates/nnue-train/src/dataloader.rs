@@ -908,7 +908,7 @@ mod tests {
         // 閾値 1: |score| >= 1 を skip。score == 0 の局面しか残らない可能性が高く、
         // 100 records 内に 1 batch (=8) ぶん埋まらないと epoch wrap で barren になりうる
         // が、sample.psv に score==0 が 8 件以上ある保証はない → barren error を許容。
-        // ここでは「閾値 32000 (= v102 既定) では全件通る」ことだけ確認する。
+        // ここでは「閾値 32000 (= 既定の score-drop 閾値) では全件通る」ことだけ確認する。
         let mut ok_loader =
             BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, Some(32000), 2, progress)
                 .unwrap();

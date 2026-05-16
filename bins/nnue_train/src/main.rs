@@ -1,12 +1,12 @@
 #![feature(f16)]
-//! `bins/nnue_train` binary entry point — bullet-shogi v102 互換 NNUE trainer。
+//! `bins/nnue_train` binary entry point — LayerStack NNUE trainer。
 //!
-//! 本 file は **v102 LayerStack arch** の `#[kernel]` 群と host loop driver
+//! 本 file は **LayerStack arch** の `#[kernel]` 群と host loop driver
 //! (`GpuTrainer`) を統合する。cuda-oxide の bin-entry reachability 制約により
 //! 全 kernel を本 file に inline する必要がある (別 crate に置くと
 //! `compile_ll_to_ptx_via_llc` の symbol resolution から外れる)。
 //!
-//! ## v102 アーキテクチャ (LayerStack 1536-16-32 + progress8kpabs 9 buckets)
+//! ## LayerStack アーキテクチャ (1536-16-32 + progress8kpabs 9 buckets)
 //!
 //! bullet `examples/shogi_layerstack.rs:2206-2289` の reference 実装を Rust +
 //! cuda-oxide で再現。PSQT 無し、hand_count_dense 無し。
@@ -28,7 +28,7 @@
 //! kernel の確定一覧は `compile_ll_to_ptx_via_llc` に渡す `kernel_names` 定数を
 //! single source of truth とする (build 時の internalize-public-api list、ここから
 //! 漏れた kernel は `opt` の globaldce で削除されるため常に最新)。各 kernel の役割は
-//! 定義箇所の doc コメントを参照。アーキ上の繋がりは上記 v102 アーキテクチャ節を見る。
+//! 定義箇所の doc コメントを参照。アーキ上の繋がりは上記 LayerStack アーキテクチャ節を見る。
 //!
 //! ## cuda-oxide 制限への対応
 //!
@@ -50,7 +50,7 @@ use cuda_host::cuda_launch;
 #[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
-use nnue_format::V102Weights;
+use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::Batch;
 #[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
@@ -64,7 +64,7 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 /// SCReLU activation gradient (fused)。
 ///
-/// v102 path では **未使用** (CReLU + pairwise_mul を使うため)。cuda-oxide の
+/// LayerStack path では **未使用** (CReLU + pairwise_mul を使うため)。cuda-oxide の
 /// bin-entry constraint に従い compile-reach のため preserve。
 ///
 /// 1 thread = 1 element、atomics 不要、in-place output (`dl_dx`)。
@@ -204,7 +204,7 @@ pub fn loss_wrm(
 
 /// Fused AdamW optimizer step。
 ///
-/// v102 path では **未使用** (Ranger 使用)。cuda-oxide の bin-entry constraint に従い
+/// LayerStack path では **未使用** (Ranger 使用)。cuda-oxide の bin-entry constraint に従い
 /// compile-reach のため preserve。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::manual_clamp)]
@@ -1336,7 +1336,7 @@ pub fn sparse_ft_backward_dual(
 }
 
 // ===========================================================================
-// v102 LayerStack 専用 kernel
+// LayerStack 専用 kernel
 // ===========================================================================
 //
 // 設計方針:
@@ -3532,7 +3532,7 @@ pub fn concat_l1sqr_main_fwd(
 
 /// Concat l1_sqr + l1_main backward — `da[b] = dout[b][..a_dim]`, `db[b] = dout[b][a_dim..]`。
 ///
-/// **Precondition: `a_dim == b_dim`** (v102 では両方 `l1_effective` = 15)。tid は
+/// **Precondition: `a_dim == b_dim`** (LayerStack では両方 `l1_effective` = 15)。tid は
 /// `da[tid]` と `db[tid]` (両 slice の同 tid cell) に書き込む。
 /// 1 thread = 1 (batch, dim_index) cell。
 #[kernel]
@@ -3902,7 +3902,7 @@ fn find_libdevice_bc() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 }
 
 // ===========================================================================
-// v102 architecture constants (bullet `shogi_layerstack.rs:1831-1834, 2097-2101` 由来)
+// LayerStack architecture constants
 // ===========================================================================
 
 const FT_IN: usize = 73_305; // `HALFKA_HM_DIMENSIONS` (shogi-features::halfka_hm)
@@ -4047,8 +4047,8 @@ const MAX_W: f32 = RANGER_DEFAULTS.max_weight;
 const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
 const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
 const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
-// v102 は weight-decay を 0.0 に override する (`RangerParams::DEFAULT.decay` = 0.01 は
-// bullet の汎用 default、v102 recipe は 0.0)。
+// この trainer は weight-decay を 0.0 にする (`RangerParams::DEFAULT.decay` の
+// 既定 0.01 を override)。
 const DECAY: f32 = 0.0;
 
 // smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600 /
@@ -4132,7 +4132,7 @@ impl MomentBuf {
 }
 
 // ===========================================================================
-// GpuTrainer (v102 LayerStack 1536-16-32 + progress8kpabs 9 buckets)
+// GpuTrainer (LayerStack 1536-16-32 + progress8kpabs 9 buckets)
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
@@ -5430,7 +5430,7 @@ impl GpuTrainer {
         })
     }
 
-    /// `V102Weights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
+    /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
     ///
     /// Optimizer state reset:
     /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
@@ -5451,7 +5451,10 @@ impl GpuTrainer {
     /// を呼ぶ。bullet `radam_step.rs::radam_compute_step_size_denom` は step >= 1 で
     /// 安全動作 (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` に
     /// なる、本 helper も `step >= 1` 前提)。本実装は step=0 で呼ばないため OK。
-    fn load_v102_weights(&mut self, w: &V102Weights) -> Result<(), Box<dyn std::error::Error>> {
+    fn load_layerstack_weights(
+        &mut self,
+        w: &LayerStackWeights,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -5524,9 +5527,9 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// device buffer を host に download し `V102Weights` を返す (save_quantised 前)。
-    fn to_v102_weights(&self) -> Result<V102Weights, Box<dyn std::error::Error>> {
-        Ok(V102Weights {
+    /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
+    fn to_layerstack_weights(&self) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
+        Ok(LayerStackWeights {
             ft_w: self.ft_w.to_host_vec(&self.stream)?,
             ft_b: self.ft_b.to_host_vec(&self.stream)?,
             l1_w: self.l1_w.to_host_vec(&self.stream)?,
@@ -5646,7 +5649,7 @@ impl GpuTrainer {
 
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
-    /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_v102_weights` → `save_quantised`)
+    /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_layerstack_weights` → `save_quantised`)
     /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
     /// `*.ckpt` file に、全 10 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
@@ -5773,7 +5776,7 @@ impl GpuTrainer {
     /// raw checkpoint を読み戻す (`--resume` 用)。返り値は checkpoint に記録された
     /// **完了 superbatch 番号** (caller は通常その +1 から resume する)。
     ///
-    /// magic / version 不一致、group 数 / 各 group の len が v102 arch と不一致、または
+    /// magic / version 不一致、group 数 / 各 group の len が LayerStack arch と不一致、または
     /// `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
     /// 読み込んだ raw f32 を host → device upload し、`self.step_count` を復元する。
@@ -7388,8 +7391,8 @@ impl TrainerBackend for GpuTrainer {
     }
 
     fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
-        let weights = self.to_v102_weights().map_err(|e| {
-            std::io::Error::other(format!("GpuTrainer::to_v102_weights failed: {e}"))
+        let weights = self.to_layerstack_weights().map_err(|e| {
+            std::io::Error::other(format!("GpuTrainer::to_layerstack_weights failed: {e}"))
         })?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -7416,15 +7419,15 @@ impl TrainerBackend for GpuTrainer {
 }
 
 // ===========================================================================
-// CLI (clap) — bullet `examples/shogi_layerstack.rs` の引数群を v102 recipe に合わせて受ける
+// CLI (clap) — 引数群は bullet-shogi `examples/shogi_layerstack.rs` に対応
 // ===========================================================================
 
-/// bullet-shogi v102 互換 HalfKA_hm 1536-16-32 LayerStack NNUE trainer。
+/// HalfKA_hm 1536-16-32 LayerStack NNUE trainer。
 ///
 /// `--data <PSV>` を指定すると training loop を回す。省略すると GPU smoke test
 /// (`GpuTrainer` の forward/backward path 確認) を実行する。
 #[derive(Parser, Debug)]
-#[command(name = "nnue-train", about = "rshogi NNUE trainer (v102 LayerStack)")]
+#[command(name = "nnue-train", about = "rshogi NNUE trainer (LayerStack)")]
 struct Cli {
     /// 教師データ PSV ファイル (`PackedSfenValue` × N、各 40 bytes)。省略時は GPU smoke test。
     #[arg(long)]
@@ -7439,15 +7442,15 @@ struct Cli {
     net_id: String,
 
     /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
-    /// v102 recipe は 400。
+    /// 本番は 400 程度。
     #[arg(long, default_value_t = 10)]
     superbatches: usize,
 
-    /// 1 superbatch あたりの batch 数 (v102 recipe = 6104)。
+    /// 1 superbatch あたりの batch 数。
     #[arg(long, default_value_t = 6104)]
     batches_per_superbatch: usize,
 
-    /// 1 batch あたりの position 数。default 16384 は smoke 既定、v102 recipe は 65536。
+    /// 1 batch あたりの position 数。default 16384 は smoke 用、本番は 65536 程度。
     #[arg(long, default_value_t = 16384)]
     batch_size: usize,
 
@@ -7485,7 +7488,7 @@ struct Cli {
     #[arg(long)]
     score_drop_abs: Option<i32>,
 
-    /// 学習開始前に量子化 v102 NNUE binary から weight を注入する (pretrained start)。
+    /// 学習開始前に量子化 NNUE binary から weight を注入する (pretrained start)。
     /// optimizer state (Ranger m/v/slow/step) は **reset** される — 真の resume には
     /// `--resume` を使うこと (`--init-from` と `--resume` は排他)。
     #[arg(long)]
@@ -7534,7 +7537,7 @@ struct Cli {
     /// `--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 380.0)]
     wrm_target_scaling: f32,
-    // --- 以下は v102 recipe との CLI 互換のために受けるが、現状未配線 ---
+    // --- 以下は parse するだけで未配線 (bullet-shogi の同名引数を渡しても弾かないため) ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
     optimizer: String,
@@ -7574,7 +7577,7 @@ struct Cli {
     /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
     /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
     ///
-    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・v102
+    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・量子化
     /// checkpoint いずれの経路でも小さく、FP16 の有限域 (`|x| <= 65504`) に十分
     /// 収まるため mirror 変換が ±inf へ overflow しない。
     #[arg(long)]
@@ -7659,7 +7662,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    // loss kernel の選択: --win-rate-model → loss_wrm (bullet v102)、未指定 → loss_wdl。
+    // loss kernel の選択: --win-rate-model → loss_wrm、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
         if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
             return Err(format!(
@@ -7705,7 +7708,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     if cli.weight_decay != 0.0 {
         eprintln!(
-            "[train] warning: --weight-decay {} ignored; the Ranger kernel uses weight-decay 0.0 (v102)",
+            "[train] warning: --weight-decay {} ignored; the Ranger kernel uses weight-decay 0.0",
             cli.weight_decay
         );
     }
@@ -7750,7 +7753,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ctx = CudaContext::new(0)?;
-    println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
+    println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
@@ -7767,8 +7770,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = V102Weights::load_quantised(&mut reader)?;
-        trainer.load_v102_weights(&weights)?;
+        let weights = LayerStackWeights::load_quantised(&mut reader)?;
+        trainer.load_layerstack_weights(&weights)?;
         None
     } else if let Some(ckpt) = &cli.resume {
         let sb = trainer.load_raw_checkpoint(ckpt)?;
@@ -7865,26 +7868,26 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
     println!("[smoke] step 0: init weights all finite ✓");
 
-    // `RSHOGI_NNUE_V102_REF_BIN` で外部 reference checkpoint (例: bullet で
-    // 生成した v102 互換 quantised.bin) を指定すると、注入して **golden forward
-    // 経路** (forward + backward + save) を検証する。未設定なら random init smoke のみ。
-    let v102_ref = std::env::var("RSHOGI_NNUE_V102_REF_BIN").ok();
-    if let Some(ref_path) = v102_ref
+    // `RSHOGI_NNUE_LAYERSTACK_REF_BIN` に既存の量子化 checkpoint (`.bin`) path を
+    // 指定すると、その weight を注入して forward + backward + save を一通り走らせる。
+    // 未設定なら random-init での smoke のみ。
+    let layerstack_ref = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN").ok();
+    if let Some(ref_path) = layerstack_ref
         .as_deref()
         .filter(|p| std::path::Path::new(p).exists())
     {
-        println!("[smoke] loading v102 reference from {ref_path} ...");
+        println!("[smoke] loading reference checkpoint from {ref_path} ...");
         let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
-        let weights = V102Weights::load_quantised(&mut reader)?;
-        trainer.load_v102_weights(&weights)?;
+        let weights = LayerStackWeights::load_quantised(&mut reader)?;
+        trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
-        println!("[smoke] v102 reference weights injected, all finite ✓");
+        println!("[smoke] reference weights injected, all finite ✓");
 
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
-        println!("[smoke] step 1 (post-v102 init, sigmoid-MSE): loss = {loss:.6e}");
+        println!("[smoke] step 1 (post reference-inject, sigmoid-MSE): loss = {loss:.6e}");
         if !loss.is_finite() {
             return Err(format!("step 1 loss = {loss} is not finite").into());
         }
@@ -7895,7 +7898,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         let out_path = std::env::temp_dir().join("our_quantised.bin");
         let out_path_str = out_path.display();
         println!("[smoke] saving trained weights to {out_path_str} ...");
-        let saved_weights = trainer.to_v102_weights()?;
+        let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
@@ -7914,7 +7917,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] step 2: all weights finite ✓");
     } else {
         println!(
-            "[smoke] (RSHOGI_NNUE_V102_REF_BIN not set or path missing; running random-init smoke only)"
+            "[smoke] (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set or path missing; running random-init smoke only)"
         );
         let batch = BatchData::smoke_dummy(SMOKE_BATCH);
         let lr = 1e-3_f32;
@@ -7938,7 +7941,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         // save random-init as quantised.bin for verify-nnue check
         let out_path = std::env::temp_dir().join("our_quantised_randinit.bin");
         let out_path_str = out_path.display();
-        let saved_weights = trainer.to_v102_weights()?;
+        let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         saved_weights.save_quantised(&mut writer)?;
         drop(writer);
@@ -7946,7 +7949,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");
     }
 
-    println!("[smoke] PASSED — GpuTrainer skeleton OK (v102 arch full path)");
+    println!("[smoke] PASSED — GpuTrainer skeleton OK (LayerStack arch full path)");
     Ok(())
 }
 
@@ -8271,7 +8274,7 @@ mod gpu_cpu_equivalence_tests {
         Ok(())
     }
 
-    // -- slice_extract_2d / slice_scatter_2d (v102 l1_main / l1_skip shapes) -
+    // -- slice_extract_2d / slice_scatter_2d (LayerStack l1_main / l1_skip shapes) -
 
     #[test]
     fn slice_extract_2d_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -8369,7 +8372,7 @@ mod gpu_cpu_equivalence_tests {
         Ok(())
     }
 
-    // -- concat_l1sqr_main fwd / grad (v102 dim 15 + 15 → 30) ----------------
+    // -- concat_l1sqr_main fwd / grad (LayerStack dim 15 + 15 → 30) ----------------
 
     #[test]
     fn concat_l1sqr_main_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -8431,7 +8434,7 @@ mod gpu_cpu_equivalence_tests {
     }
 
     // -- dense_mm (regular) fwd / bwd_input / bwd_weight / bias_grad ---------
-    // v102 L1f shape: in_dim=FT_OUT(=1536) は重いので、ここは小さい shape で
+    // L1f 実 shape: in_dim=FT_OUT(=1536) は重いので、ここは小さい shape で
     // layout 規約 (in-major weight、row-major x/y) を確認 (実 shape は equivalence で
     // 担保不要、layout が一致すれば良い)。1 つは L1f 実 shape の縮小版も入れる。
 

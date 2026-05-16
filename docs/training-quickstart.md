@@ -35,7 +35,7 @@ target/release/progress-kpabs-train \
 
 ## Step 2: nnue-train で本体を学習 (400 sb full run)
 
-bullet-shogi v102 recipe (400 superbatches × 6104 batches × 65536 positions
+典型的な full run (400 superbatches × 6104 batches × 65536 positions
 = ~160 GB 相当の position 通過):
 
 ```bash
@@ -51,8 +51,8 @@ target/release/nnue-train \
 
 | option | 目的 |
 |---|---|
-| `--win-rate-model` | bullet WRM loss (`loss_wrm` kernel)。`net_output ≈ cp/600` で収束、量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合。**v102 互換 net を学習するなら必須**。未指定なら plain sigmoid-MSE。 |
-| `--score-drop-abs 32000` | `|score| >= 32000` の局面を loss から除外 (詰み近傍の極端な値を弾く、bullet 流) |
+| `--win-rate-model` | WRM (win-rate-model) loss (`loss_wrm` kernel)。`net_output ≈ cp/600` で収束、量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合。**量子化推論と整合する net を学習するなら必須**。未指定なら plain sigmoid-MSE。 |
+| `--score-drop-abs 32000` | `|score| >= 32000` の局面を loss から除外 (詰み近傍の極端な値を弾く) |
 | `--save-rate 20` | 20 sb ごとに `{net_id}-{sb}.bin` (量子化) + `{net_id}-{sb}.ckpt` (raw resume) を書き出す |
 | `--keep-checkpoints 4` | raw `.ckpt` (~1.8GB/個) を直近 4 個だけ残す。量子化 `.bin` (~116MB) は常に全保持 |
 | `--threads 16` | dataloader prefetch worker 数。各 worker が PSV decode + sparse 抽出 + bucket 計算を 1 回で済ませて先読み |
@@ -74,11 +74,11 @@ raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在
 ```bash
 target/release/nnue-train \
   --data ... --progress-coeff ... \
-  --output checkpoints/v102_main --net-id v102_main \
+  --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
   --save-rate 20 --threads 16 --bucket-mode progress8kpabs \
-  --resume checkpoints/v102_main/v102_main-180.ckpt
+  --resume checkpoints/<run-name>/<run-name>-180.ckpt
 ```
 
 `--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から
@@ -91,14 +91,14 @@ target/release/nnue-train \
 
 ## Step 4: 出力 artifact の見方
 
-学習後 `checkpoints/v102_main/` に出るもの:
+学習後 `checkpoints/<run-name>/` に出るもの:
 
 | ファイル | 形式 | 用途 |
 |---|---|---|
-| `v102_main-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact** (`v102_layerstack` format、`crates/nnue-format/src/v102_layerstack.rs` 参照) |
-| `v102_main-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
+| `<run-name>-<sb>.bin` | 量子化 NNUE binary | **推論側に投入する artifact** (LayerStack format、`crates/nnue-format/src/layerstack_weights.rs` 参照) |
+| `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
-`v102_main-400.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで
+`<run-name>-400.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで
 測定する。
 
 ## 動作確認 (smoke)
@@ -129,7 +129,7 @@ target/release/nnue-train --data <PSV> --progress-coeff <progress.bin> \
 | `libcublas.so` 系の link / load エラー | CUDA Toolkit が `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH` のいずれにも無い。`CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` で明示する (build.rs / runtime 両方が同じ chain で解決) |
 | `CUDA_ERROR_INVALID_PTX` (driver error 218) | sub-Ampere GPU (sm_75) で `CUDA_OXIDE_TARGET` 未設定。`CUDA_OXIDE_TARGET=sm_75` を export してから再ビルド + 実行 |
 | pos/s が極端に低い (< 500K on RTX 3080 Ti) | `--threads` を CPU コア数の半分程度に設定、dataloader が prefetch 不足になっていないか確認。`NNUE_TRAIN_STEP_PROFILE=1` で phase breakdown を見る ([docs/performance.md](performance.md)) |
-| `--batch-size % 16 != 0` で reject | tiled L1 kernel が `b % 16 == 0` を要求 (`debug_assert!` で fail)。16 の倍数を渡す (v102 recipe は 65536 で確実に充足) |
+| `--batch-size % 16 != 0` で reject | tiled L1 kernel が `b % 16 == 0` を要求 (`debug_assert!` で fail)。16 の倍数を渡す (65536 なら確実に充足) |
 
 ## 関連
 

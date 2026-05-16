@@ -12,5 +12,5 @@ publish = false
 workspace = true
 
 [dependencies]
-# NNUE 重みファイル (header / halfka_psqt / v102 layerstack) の (de)serialization
+# NNUE 重みファイル (header / halfka_psqt / layerstack) の (de)serialization
 # 専用 crate。CPU-only、GPU 依存なし。

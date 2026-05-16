@@ -65,6 +65,10 @@ off で tolerance を満たさず fail するが、release では本番経路と
   `// Step 1: llvm-link <ll> libdevice → linked.bc` 等は OK)
 - **Issue / PR 番号参照**: 「Issue #N の」「PR #N で」「#NN review で」
 - **Migration history**: 「ここから昇格」「以前は…にあった」「旧 path は」
+- **外部バージョンタグ / 個人実験ラベル**: upstream のリリースタグや local の
+  実験番号をファイル名・型名・モジュール名・関数名・環境変数・コメントに
+  使わない。アーキ / format は内容を表す名前で呼ぶ (例: `LayerStack`、
+  `HalfKA_hm`)。glossary 登録は識別子化を正当化しない
 
 これらの情報は git log / PR description / `docs/` 配下に置く。コード内に書いて
 よいのは:
@@ -100,6 +104,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
   reference doc に混ぜない (計測経緯は git log / PR description が担当)。
 - **略語は README の glossary 章で一回だけ定義**。コード内では glossary に登録
   済の略語を素のまま使ってよい。新規略語を増やしたら glossary も更新する。
+  ただし glossary 登録は「定義済か」を満たすだけで「名前として妥当か」は別問題。
+  外部バージョンタグ / 個人実験ラベルは glossary に登録しても識別子に使わない
+  (コードコメント規約を参照)。
 
 ## レビュー観点 checklist
 

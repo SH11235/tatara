@@ -15,7 +15,7 @@
 //! - `pointwise`: pointwise fused kernel suite の reference CPU 置き場
 //!   (SCReLU grad / WDL loss / WRM loss / AdamW / RAdam / Ranger)
 //! - `sparse`: sparse FT kernel suite (forward / backward) の reference CPU
-//! - `layerstack`: v102 LayerStack arch 用 ~19 kernel
+//! - `layerstack`: LayerStack arch 用 ~19 kernel
 //!   (`ft_post_perspective` / `dense_mm` (+ bucket) / `crelu` /
 //!   `abs_pow2_scale` / `concat_l1sqr_main` / `elementwise` / `slice2d`) の
 //!   reference CPU。`bins/nnue_train` の `gpu_cpu_equivalence_tests` が使う。

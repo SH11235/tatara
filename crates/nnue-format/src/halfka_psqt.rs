@@ -3,7 +3,7 @@
 //! `NnueHeader` (22 bytes) に続いて、FT (sparse `73_305 → 1536`) + L1 (出力
 //! 直前 linear) + PSQT (feature ごとの cp) を量子化 (i8 / i16 / i32 LE) して
 //! 書き出す minimal layout。本 module は single-bucket PSQT を扱う最小形で、
-//! 9-bucket LayerStack 形式は `v102_layerstack` を参照。
+//! 9-bucket LayerStack 形式は `layerstack_weights` を参照。
 //!
 //! ## binary layout (header 22 bytes 後)
 //!

@@ -1,4 +1,4 @@
-# bullet-shogi v102 LayerStack `quantised.bin` save format
+# LayerStack NNUE `quantised.bin` save format
 
 Target architecture:
 
@@ -14,6 +14,8 @@ All offsets below are zero-based byte offsets. Multi-byte scalar fields are litt
 - `S = 257 + Cb + Cw`: first byte of bucket 0 LayerStacks data.
 
 `Cb` and `Cw` are not derivable from dimensions alone because `encode_leb128_tensor_i16` encodes each quantized value with variable length (`examples/shogi_layerstack.rs:1012-1027`, `examples/shogi_layerstack.rs:1030-1042`). Therefore numeric offsets after the FT blocks are `UNKNOWN` without the actual tensor values.
+
+> **Source paths in this document.** `examples/shogi_layerstack.rs` and `crates/bullet_lib/` are writer-side paths in a separate repository (`bullet-shogi`); `crates/rshogi-*` are loader-side paths in the engine repository (`rshogi`). Neither resides in this repository — only `crates/nnue-format/` paths do. The cited line numbers reference those external repositories and may drift over time.
 
 ## A. File layout
 

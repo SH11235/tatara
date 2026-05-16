@@ -1,10 +1,9 @@
-//! bullet-shogi v102 互換 LayerStack NNUE binary の save / load。
+//! LayerStack NNUE quantised binary の save / load。
 //!
-//! `bins/nnue_train` が出力する binary 形式。bullet-shogi v102 と byte 互換に
-//! することで、rshogi-oss 等の推論エンジンが `EvalFile=` で直接読み込めるように
-//! 設計されている (出典・参照実装は `ATTRIBUTION.md`)。
+//! `bins/nnue_train` が出力する binary 形式。推論エンジン rshogi が `EvalFile=`
+//! で直接読み込める byte layout (量子化アルゴリズムの出典は `ATTRIBUTION.md`)。
 //!
-//! ## v102 architecture (PSQT 無し、Threat 無し、HandCountDense 無し)
+//! ## LayerStack architecture (PSQT 無し、Threat 無し、HandCountDense 無し)
 //!
 //! - L0 (FT): `73305 → 1536`、weight + bias 共有 stm/nstm
 //! - per-perspective post: bias add → CReLU → pairwise_mul (1536 → 768) → ×127/128
@@ -30,7 +29,7 @@
 //! - `l1_bias_merged[bucket][out] = l1_b[bucket][out] + l1f_b[out]` (bias broadcast)
 //! - `l1_weight_merged[bucket][out][in] = l1_w[bucket][out][in] + l1f_w[in][out]` (in/out 軸入替注意)
 //!
-//! rshogi-oss は `Factorizer` を含む arch を reject する (coalesced only を要求)
+//! 推論エンジン rshogi は `Factorizer` を含む arch を reject する (coalesced only を要求)
 //! ため、save 時に必ず merge する不変条件。
 //!
 //! ## 量子化 scale
@@ -61,7 +60,7 @@
 use std::io::{self, Read, Write};
 
 // =============================================================================
-// constants (v102 architecture)
+// constants (LayerStack architecture)
 // =============================================================================
 
 pub const NNUE_VERSION: u32 = 0x7AF32F20;
@@ -94,7 +93,7 @@ pub fn pad32(x: usize) -> usize {
 // =============================================================================
 
 /// 符号付き LEB128 で `val` を `out` に append。
-/// 推論エンジン側 (rshogi-oss `nnue/leb128.rs::read_signed_leb128`) で
+/// 推論エンジン rshogi 側 (`nnue/leb128.rs::read_signed_leb128`) で
 /// 逆方向 decode できる形式。
 pub fn encode_signed_leb128(val: i64, out: &mut Vec<u8>) {
     let mut value = val;
@@ -115,7 +114,7 @@ pub fn encode_signed_leb128(val: i64, out: &mut Vec<u8>) {
 }
 
 /// i16 tensor を LEB128 magic + size + 圧縮データ形式で `out` に書く。
-/// 推論エンジン側 (rshogi-oss `read_compressed_tensor_i16_all`) で読み戻せる。
+/// 推論エンジン rshogi 側 (`read_compressed_tensor_i16_all`) で読み戻せる。
 pub fn write_leb128_tensor_i16<W: Write>(out: &mut W, values: &[i16]) -> io::Result<()> {
     let mut compressed = Vec::with_capacity(values.len() * 2);
     for &v in values {
@@ -208,8 +207,8 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 // arch_str + hash
 // =============================================================================
 
-/// v102 arch description string を生成。PSQT 無し / Threat 無し /
-/// HandCountDense 無しの最小形 (bullet v102 由来、`ATTRIBUTION.md` 参照)。
+/// LayerStack arch description string を生成。PSQT 無し / Threat 無し /
+/// HandCountDense 無しの最小形 (`arch_str` 形式の出典は `ATTRIBUTION.md`)。
 ///
 /// 形式 (実際は改行無しの 1 行):
 ///
@@ -255,14 +254,10 @@ pub fn build_arch_str(
     )
 }
 
-/// nnue-pytorch 互換 fc hash 計算。
+/// fc hash の計算 (nnue-pytorch 系の hash アルゴリズム、出典は `ATTRIBUTION.md`)。
 ///
-/// **注**: bullet-shogi 由来の関数名 (`compute_layerstack_fc_hash(l1_out, l2_in,
-/// l2_out)`) は misleading で、第 1 引数は実際には `FT_OUT` (= 1536)。本実装は
-/// 引数名を `ft_out` に統一して命名を揃える。
-///
-/// 推論エンジン側 (rshogi-oss `network_layer_stacks.rs`) は本 hash を skip
-/// するが、bullet 出力との byte 完全互換のために computed value を使う。
+/// 推論エンジン rshogi は本 hash を skip する (`network_layer_stacks.rs`) が、
+/// format 仕様上の正しい値として computed value を書き出す。
 pub const fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32 {
     // InputSlice hash (FT output × 2 dual perspective を XOR)
     let mut prev_hash: u32 = 0xEC42E90D;
@@ -291,17 +286,17 @@ pub const fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32
 /// FT hash: `FEATURE_HASH_HM_V2 ^ (ft_out * 2)`。
 pub const FT_HASH: u32 = 0x7f134cb8 ^ (FT_OUT as u32 * 2);
 
-/// per-bucket fc_hash。v102 の (ft_out=1536, l2_in=30, l2_out=32) 固定値を
+/// per-bucket fc_hash。LayerStack の (ft_out=1536, l2_in=30, l2_out=32) 固定値を
 /// `compute_fc_hash` (const fn) で評価。
 pub const FC_HASH: u32 = compute_fc_hash(FT_OUT, L2_IN, L2_OUT);
 
 pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 
 // =============================================================================
-// V102Weights — トレーナー側 weight 表現 (f32、kernel と同 layout)
+// LayerStackWeights — トレーナー側 weight 表現 (f32、kernel と同 layout)
 // =============================================================================
 
-/// v102 LayerStack の全 weight (f32、host 側保持)。
+/// LayerStack の全 weight (f32、host 側保持)。
 ///
 /// Layout は本 crate trainer の kernel 内部 layout と一致:
 /// - `ft_w`: `(FT_IN, FT_OUT)` row-major、`ft_w[feat * FT_OUT + out]`
@@ -315,7 +310,7 @@ pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 /// - `l3_w`: `(NUM_BUCKETS, L2_OUT)` (out_dim=1 なので out 軸省略)
 /// - `l3_b`: `(NUM_BUCKETS)`
 #[derive(Debug, Clone)]
-pub struct V102Weights {
+pub struct LayerStackWeights {
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
@@ -328,7 +323,7 @@ pub struct V102Weights {
     pub l3_b: Vec<f32>,
 }
 
-impl V102Weights {
+impl LayerStackWeights {
     /// 全 buffer を 0 で初期化した新規 instance。
     pub fn zeroed() -> Self {
         Self {
@@ -345,8 +340,8 @@ impl V102Weights {
         }
     }
 
-    /// bullet v102 互換 quantised.bin を `writer` に書き出す。
-    /// 推論エンジン側 `NetworkLayerStacks::read` で parse できる byte layout。
+    /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
+    /// `NetworkLayerStacks::read` で parse できる byte layout。
     pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // ---- header ----
         writer.write_all(&NNUE_VERSION.to_le_bytes())?;
@@ -463,18 +458,19 @@ impl V102Weights {
         Ok(())
     }
 
-    /// bullet v102 quantised.bin を parse し `V102Weights` を返す。
+    /// LayerStack quantised.bin を parse し `LayerStackWeights` を返す。
     ///
     /// 注: save 時に per-bucket l1 と shared l1f は merge されて書き出されるため、
     /// load 時には分離不能。本実装は **l1_w に merged 値をそのまま入れ、l1f_w /
     /// l1f_b は 0 にする** 方針 (forward 計算は等価)。
     ///
     /// **継続学習時の注意**: forward は等価でも、l1f が「shared factorized 部」と
-    /// しての意味は失われる (全て l1_w に畳まれた状態)。bullet 流に per-bucket l1
-    /// と shared l1f を別々に学習し続ける場合と勾配の流れ方が変わるため、本 method
-    /// で得た `V102Weights` から continue-training すると bullet の v102 学習軌跡
-    /// とは厳密一致しない。「pretrained 注入 → 1 step → save が byte 互換か」を
-    /// 見る用途、あるいは l1f を再び factorize し直す前提なら問題ない。
+    /// しての意味は失われる (全て l1_w に畳まれた状態)。per-bucket l1 と shared
+    /// l1f を別々に学習し続ける場合と勾配の流れ方が変わるため、本 method で得た
+    /// `LayerStackWeights` から continue-training すると factorize を保ったまま
+    /// 学習した場合の軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save し、
+    /// 出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは l1f を
+    /// 再び factorize し直す前提なら問題ない。
     pub fn load_quantised<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut buf4 = [0u8; 4];
 
@@ -503,7 +499,7 @@ impl V102Weights {
         let mut arch_bytes = vec![0u8; arch_len];
         reader.read_exact(&mut arch_bytes)?;
         let arch_str = String::from_utf8_lossy(&arch_bytes);
-        // PSQT / Threat / HandCount を含む arch は本実装でサポートしない (v102 標準形のみ)
+        // PSQT / Threat / HandCount を含む arch は本実装でサポートしない (plain LayerStack のみ)
         if arch_str.contains("PSQT=")
             || arch_str.contains("Threat=")
             || arch_str.contains("HandCount")
@@ -676,11 +672,11 @@ mod tests {
     #[test]
     fn weights_zeroed_save_load_roundtrip() {
         // 0 weight で save → load → 同じ 0 weight が復元できる
-        let original = V102Weights::zeroed();
+        let original = LayerStackWeights::zeroed();
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
         let mut cursor = std::io::Cursor::new(&buf);
-        let loaded = V102Weights::load_quantised(&mut cursor).unwrap();
+        let loaded = LayerStackWeights::load_quantised(&mut cursor).unwrap();
 
         assert_eq!(loaded.ft_w.len(), original.ft_w.len());
         assert_eq!(loaded.ft_b.len(), original.ft_b.len());
@@ -697,15 +693,15 @@ mod tests {
 
     #[test]
     fn load_external_reference_if_env_set() {
-        // 外部 reference checkpoint (bullet 生成等) を `RSHOGI_NNUE_V102_REF_BIN`
+        // 外部 reference checkpoint (bullet 生成等) を `RSHOGI_NNUE_LAYERSTACK_REF_BIN`
         // で指定すると load + sanity check を走らせる任意の regression check。
         // env var 未設定なら skip (CI 想定)。
-        let Ok(path) = std::env::var("RSHOGI_NNUE_V102_REF_BIN") else {
-            eprintln!("skipping load_external_reference (RSHOGI_NNUE_V102_REF_BIN not set)");
+        let Ok(path) = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN") else {
+            eprintln!("skipping load_external_reference (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set)");
             return;
         };
         let mut file = std::fs::File::open(&path).expect("open reference bin");
-        let weights = V102Weights::load_quantised(&mut file).expect("parse reference bin");
+        let weights = LayerStackWeights::load_quantised(&mut file).expect("parse reference bin");
 
         // Sanity: 各 weight buffer の長さが期待値
         assert_eq!(weights.ft_w.len(), FT_IN * FT_OUT);
@@ -725,13 +721,13 @@ mod tests {
         let max_l2 = weights.l2_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         let max_l3 = weights.l3_w.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         eprintln!(
-            "[v102 ref load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)",
+            "[layerstack ref load] FT nonzero: {nz_ft}/{} ({pct_ft:.2}%)",
             weights.ft_w.len()
         );
-        eprintln!("[v102 ref load] FT weight max abs: {max_ft:.6}");
-        eprintln!("[v102 ref load] L1 weight max abs: {max_l1:.6}");
-        eprintln!("[v102 ref load] L2 weight max abs: {max_l2:.6}");
-        eprintln!("[v102 ref load] L3 weight max abs: {max_l3:.6}");
+        eprintln!("[layerstack ref load] FT weight max abs: {max_ft:.6}");
+        eprintln!("[layerstack ref load] L1 weight max abs: {max_l1:.6}");
+        eprintln!("[layerstack ref load] L2 weight max abs: {max_l2:.6}");
+        eprintln!("[layerstack ref load] L3 weight max abs: {max_l3:.6}");
 
         // 量子化範囲チェック: i8 weight は |w| <= 127/QB ≈ 1.984
         assert!(max_ft <= 2.0, "FT max abs {max_ft} > 2.0");
@@ -752,15 +748,17 @@ mod tests {
 
     #[test]
     fn resave_external_reference_if_env_set() {
-        // 外部 reference checkpoint (`RSHOGI_NNUE_V102_REF_BIN`) を load → save
+        // 外部 reference checkpoint (`RSHOGI_NNUE_LAYERSTACK_REF_BIN`) を load → save
         // し直して size と byte 差を比較する regression check。env 未設定なら skip。
-        let Ok(in_path) = std::env::var("RSHOGI_NNUE_V102_REF_BIN") else {
-            eprintln!("skipping resave_external_reference (RSHOGI_NNUE_V102_REF_BIN not set)");
+        let Ok(in_path) = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN") else {
+            eprintln!(
+                "skipping resave_external_reference (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set)"
+            );
             return;
         };
-        let out_path = std::env::temp_dir().join("v102_ref_resaved.bin");
+        let out_path = std::env::temp_dir().join("layerstack_ref_resaved.bin");
         let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
-        let weights = V102Weights::load_quantised(&mut reader).unwrap();
+        let weights = LayerStackWeights::load_quantised(&mut reader).unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
         weights.save_quantised(&mut writer).unwrap();
         drop(writer);
@@ -794,7 +792,7 @@ mod tests {
     fn fc_hash_matches_bullet_formula() {
         // FC_HASH const と compute_fc_hash 関数の結果が一致 (const 展開の sanity)。
         assert_eq!(FC_HASH, compute_fc_hash(FT_OUT, L2_IN, L2_OUT));
-        // v102 (ft_out=1536, l2_in=30, l2_out=32) で computed value が
+        // LayerStack (ft_out=1536, l2_in=30, l2_out=32) で computed value が
         // 0 (placeholder) でないことを確認。
         assert_ne!(FC_HASH, 0, "FC_HASH should be computed, not placeholder");
     }

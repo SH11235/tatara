@@ -1,6 +1,6 @@
-//! 2 つの v102 quantised NNUE checkpoint (`.bin`) を比較する診断ツール。
+//! 2 つの LayerStack quantised NNUE checkpoint (`.bin`) を比較する診断ツール。
 //!
-//! 両 file を [`V102Weights::load_quantised`] で読んで f32 に dequant し、tensor ごとに
+//! 両 file を [`LayerStackWeights::load_quantised`] で読んで f32 に dequant し、tensor ごとに
 //! 差分統計 — 非ゼロ差の要素割合 / max・mean 絶対差 / RMSE / 各 L2 ノルム / cosine
 //! 類似度 — を表で出力する。精度モード変更 (TF32・FP16 量子化など) が学習後の重みを
 //! どれだけ動かしたかを、対局を回さずに確認するのに使う。
@@ -15,13 +15,13 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 
-use nnue_format::V102Weights;
+use nnue_format::LayerStackWeights;
 
-/// `path` の v102 quantised checkpoint を読み込む。失敗時はどの file かを含むエラー。
-fn load(path: &str) -> Result<V102Weights, Box<dyn Error>> {
+/// `path` の LayerStack quantised checkpoint を読み込む。失敗時はどの file かを含むエラー。
+fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("open `{path}`: {e}"))?;
-    V102Weights::load_quantised(&mut BufReader::new(file))
-        .map_err(|e| format!("parse `{path}` as v102 quantised NNUE: {e}").into())
+    LayerStackWeights::load_quantised(&mut BufReader::new(file))
+        .map_err(|e| format!("parse `{path}` as LayerStack quantised NNUE: {e}").into())
 }
 
 /// tensor `a` / `b` の要素ごとの差分統計を 1 行で出力する。長さ不一致はエラー。
@@ -71,7 +71,7 @@ fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
     let rmse = (sum_sq_diff / n as f64).sqrt();
     let norm_a = sum_a_sq.sqrt();
     let norm_b = sum_b_sq.sqrt();
-    // 全ゼロ tensor (v102 では l1f_w / l1f_b は load 後 0) は cosine 未定義。
+    // 全ゼロ tensor (LayerStack では l1f_w / l1f_b は load 後 0) は cosine 未定義。
     // 両方ゼロなら一致とみなし 1.0、片方だけゼロなら 0.0 を出す。
     let cos_sim = if norm_a > 0.0 && norm_b > 0.0 {
         sum_ab / (norm_a * norm_b)
@@ -102,7 +102,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("a = {}", args[1]);
     println!("b = {}", args[2]);
     // 各行は自己記述的 (key=value)。tensor ごとに 1 行。
-    // v102 LayerStack の全 weight tensor。l1f_w / l1f_b は shared factorized 層で、
+    // LayerStack の全 weight tensor。l1f_w / l1f_b は shared factorized 層で、
     // load_quantised 後は 0 (l1_w 側に畳み込まれている)。
     print_stats("ft_w", &a.ft_w, &b.ft_w)?;
     print_stats("ft_b", &a.ft_b, &b.ft_b)?;

@@ -71,7 +71,7 @@ mod tests {
     /// forward step: l1_total (B×16) → l1_main (B×15) at offset 0,
     /// l1_skip (B×1) at offset 15。
     #[test]
-    fn extract_l1_main_and_skip_v102() {
+    fn extract_l1_main_and_skip_layerstack() {
         // batch=2, src_stride=16
         let src: Vec<f32> = (0..2 * 16).map(|i| i as f32).collect();
         let mut l1_main = vec![0.0_f32; 2 * 15];
@@ -88,7 +88,7 @@ mod tests {
     /// scatter round-trips with extract: scatter dl1_main at 0 + dl1_skip at 15
     /// then extract back equals the originals.
     #[test]
-    fn scatter_then_extract_round_trip_v102() {
+    fn scatter_then_extract_round_trip_layerstack() {
         let batch = 3;
         let dst_stride = 16;
         let dl1_main: Vec<f32> = (0..batch * 15).map(|i| i as f32 + 0.25).collect();

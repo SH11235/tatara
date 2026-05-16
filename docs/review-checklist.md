@@ -263,6 +263,23 @@ rg -oE '\`?(crates|bins|docs|scripts)/[a-zA-Z0-9_/-]+\.(rs|md|toml|sh|yaml)\`?' 
    done
 ```
 
+### 4.3 外部バージョンタグ・個人実験ラベルを識別子にしない
+
+upstream のリリースタグや local の実験番号は、由来を
+知らない OSS reader に意味が通らない。ファイル名・型名・モジュール名・
+関数名・環境変数に使わない。アーキ / format は内容を表す名前で呼ぶ
+(例: `LayerStack`、`HalfKA_hm`)。glossary 登録は「定義済か」を満たすだけで
+「名前として妥当か」を保証しない — 登録済でも外部タグの識別子化は NG。
+
+```bash
+rg -n --type rust --type-add 'cfg:*.{toml,yaml,yml,sh,md}' --type cfg \
+   -e '\bv[0-9]{2,}\b' -e '\bexp[0-9]+\b' \
+   -g '!target/**' -g '!.git/**'
+```
+
+ヒットしたら文脈確認。Cargo dependency の SemVer (`v1.2.3`) や外部 API の
+version field 参照は false positive。
+
 ## 5. レビューフロー
 
 1. `bash scripts/local-ci.sh` PASS を前提

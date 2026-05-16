@@ -4,7 +4,7 @@
 完結させる個人プロジェクト。GPU kernel は
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (NVIDIA Labs の Rust → PTX
 rustc backend) で build-time に PTX 化し、host から device まで C++ / CUDA C++
-を介さない。学習対象は HalfKA_hm 1536-16-32 (LayerStack + PSQT、v102 layout)。
+を介さない。学習対象は HalfKA_hm 1536-16-32 LayerStack NNUE (+ PSQT)。
 
 > **NVIDIA only** — cuda-oxide が PTX 生成専用なため ROCm / AMD は対象外。
 > AMD GPU で類似の NNUE 学習を行いたい場合は CUDA / HIP 両 backend を持つ
@@ -48,7 +48,7 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | `crates/gpu-runtime/` | host 側 CUDA wrapper (cuda-host の薄ラッパ) |
 | `crates/gpu-kernels/` | kernel 実装 (`pointwise/` / `sparse/` / `layerstack/` / `progress/`) と CPU reference + 数値同等性テスト |
 | `crates/nnue-train/` | CPU-only training pipeline (schedule / dataloader / optimizer host state / superbatch loop driver) |
-| `crates/nnue-format/` | NNUE 重みファイル binary IO (header / halfka_psqt / v102 layerstack) |
+| `crates/nnue-format/` | NNUE 重みファイル binary IO (header / halfka_psqt / layerstack) |
 | `bins/nnue_train/` | NNUE 本番 trainer (GPU `#[kernel]` 定義はここに inline) |
 | `bins/progress_kpabs_train/` | KP-abs progress trainer (eval 用) |
 | `docs/` | ADR / setup / data layout / kernel catalog |
@@ -67,8 +67,8 @@ GPU crate を exclude した CPU-only check のみ走らせる。
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
-- [v102 binary save format](docs/bullet_v102_save_format.md) — bullet
-  v102 LayerStack `quantised.bin` の binary layout 仕様
+- [LayerStack binary save format](docs/nnue-layerstack-format.md) —
+  LayerStack `quantised.bin` の binary layout 仕様
 
 ## 用語 (glossary)
 
@@ -85,13 +85,14 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
-| **v102** | bullet-shogi の LayerStack 量子化 save format バージョン (HalfKA_hm 1536-16-32 + 9-bucket、PSQT / Threat / HandCount 無しの最小形)。本リポの `bins/nnue_train` が出力する `.bin` はこの format。詳細は [docs/bullet_v102_save_format.md](docs/bullet_v102_save_format.md) |
+| **LayerStack** | 最終段を per-output-bucket の affine 層に分けた NNUE アーキ。本リポの学習対象は HalfKA_hm 1536-16-32 + 9-bucket LayerStack (PSQT / Threat / HandCount 無し)。`bins/nnue_train` が出力する量子化 `.bin` の binary layout は [docs/nnue-layerstack-format.md](docs/nnue-layerstack-format.md) |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.md` のサポート GPU マトリクス参照 |
 | **SASS** | NVIDIA GPU の世代別実機機械語。PTX から CUDA driver JIT が生成する終端形式。本リポでは直接扱わない |
 | **sm_XX** | NVIDIA GPU の compute capability (例: sm_75 = Turing、sm_86 = Ampere RTX 30xx)。PTX 生成時の target アーキ指定 (`CUDA_OXIDE_TARGET=sm_86` 等) に使う |
 
 ## 関連リポジトリ
 
+- [rshogi](https://github.com/SH11235/rshogi) — 本リポで学習した NNUE をロードして対局する将棋エンジン
 - [bullet](https://github.com/jw1912/bullet) — 上流 (NNUE training framework)
 - [bullet-shogi](https://github.com/SH11235/bullet-shogi) — bullet の将棋向け fork
 - [cuda-oxide](https://github.com/NVlabs/cuda-oxide) — Rust → PTX rustc backend

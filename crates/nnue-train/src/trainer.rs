@@ -75,7 +75,7 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 ///   から本 enum field 経由で渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
-    /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 recipe は `1/290`)。
+    /// plain sigmoid-MSE。`scale = 1.0 / --scale` (典型値 `1/290`)。
     Sigmoid { scale: f32 },
     /// win-rate-model loss。
     ///
@@ -219,8 +219,8 @@ pub trait TrainerBackend {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
-/// v102 recipe (bullet 互換 NNUE 1536-16-32 + 9-bucket LayerStack) の再現に
-/// 必要な subset。learning rate / WDL schedule は別に [`LrScheduler`] /
+/// NNUE 1536-16-32 + 9-bucket LayerStack の学習に必要な subset。
+/// learning rate / WDL schedule は別に [`LrScheduler`] /
 /// [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {

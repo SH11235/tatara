@@ -5,8 +5,8 @@
 
 ## 計測手順 (基準)
 
-`--threads 16` + bullet v102 互換 hyper-param で 5 sb × 200 batches × bs=65536
-を 2 回実行、sb 2-5 mean (sb 1 は cold cache outlier として除外) で評価する:
+`--threads 16` で 5 sb × 200 batches × bs=65536 を 2 回実行、sb 2-5 mean
+(sb 1 は cold cache outlier として除外) で評価する:
 
 ```bash
 DATA=/path/to/PSV
@@ -47,7 +47,7 @@ throughput」を参照。
 bullet-shogi (上流、CUDA C++ 実装) と本リポジトリの違い:
 
 - 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536、default 構成): **~949K pos/s**
-- bullet-shogi v102 同条件 (CUDA C++ + NVRTC runtime fusion): **~691K pos/s**
+- bullet-shogi 同条件 (CUDA C++ + NVRTC runtime fusion): **~691K pos/s**
 - 本リポジトリは bullet 比 **+37%** (sparse FT 系の bounds check 除去・sorted
   kernel 化・cuBLAS L1f bwd 化・async loss readback・入力 H2D overlap の累積)
 
@@ -152,7 +152,7 @@ read。weight を半精度にすると read byte 数が半減し、`fwd_ft` phas
 精度設計: optimizer は FP32 master `ft_w` を更新し、forward 用の FP16 mirror
 (`ft_w_h`) は optimizer が weight を更新するのと同時に書き直す (専用 cast kernel は
 持たず `ft_w` の再 read を避ける)。weight grad / optimizer state / checkpoint は
-FP32 のまま (checkpoint は通常の v102 量子化フォーマット)。
+FP32 のまま (checkpoint は通常の量子化フォーマット)。
 
 量子化誤差で棋力が変動しうるため既定 OFF。loss 軌跡は FP32 と差 ~1e-5 程度だが、
 本番品質は SPRT で確認するまで保証しない。動作確認や簡易・高速な学習に使う

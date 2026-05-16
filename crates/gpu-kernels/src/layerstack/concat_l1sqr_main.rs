@@ -101,7 +101,7 @@ mod tests {
     /// forward → grad の round-trip: dout が forward の output と同 layout なら
     /// da == a 部分の grad, db == b 部分の grad (concat は線形なので grad は split)。
     #[test]
-    fn round_trip_v102_shape() {
+    fn round_trip_layerstack_shape() {
         // a_dim = b_dim = 15, batch = 3
         let batch = 3;
         let dim = 15;
