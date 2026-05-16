@@ -968,6 +968,11 @@ pub fn gather_and_sum_per_feature_add_fp16(
     let off_start = offsets[feature] as usize;
     let off_end = offsets[feature + 1] as usize;
 
+    // unsafe 妥当性は [`gather_and_sum_per_feature_overwrite`] / その `_fp16` 版と同一:
+    // caller が `positions.len() == batch * MAX_ACTIVE` を保証、`off_start..off_end` は
+    // phase B が構築した有効範囲、`grad_out` (`f16`) / `grad_w` (`f32`) の範囲は arch
+    // (FT_IN × FT_OUT) 固定で launch config 上 `ri < ft_out_u`。`grad_out` のみ要素型が
+    // `f16` で read 時に `f32` へ変換し、`grad_w` への atomic add は元 kernel と同じ。
     let grad_out_ptr = grad_out.as_ptr();
     let positions_ptr = positions.as_ptr();
     let mut sum0 = 0.0_f32;
@@ -3736,8 +3741,9 @@ const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 /// を掛けて normal range に持ち上げ、gather 側で逆数を掛けて戻す。power-of-2 なので
 /// scale 自体は無誤差 (f16 量子化のみが誤差源)。
 ///
-/// 2^30: 観測 dft の最大 ~2e-8 に対し overflow 余裕 ~3000× (max·scale ≈ 20 ≪ 65504)、
-/// かつ ~5e-14 までの値を normal range に載せる。
+/// 2^30: dft の最大は学習初期 step (loss が最大 = 勾配が最大の局面) でも ~2e-8 で、
+/// `max·scale ≈ 20 ≪ 65504` と overflow 余裕 ~3000×。dft は学習が進むほど縮むので
+/// 初期 step が実質 worst case。かつ ~5e-14 までの値を normal range に載せる。
 const FT_DFT_FP16_SCALE: f32 = (1_u32 << 30) as f32;
 
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
@@ -4696,6 +4702,10 @@ impl GpuTrainer {
         ft_fp16: bool,
         ft_fp16_out: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
+        // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
+        // 前提にするため constructor でも明示する。
+        debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
