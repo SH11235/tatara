@@ -6236,9 +6236,9 @@ struct Cli {
     /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
     /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
     ///
-    /// FT weight は optimizer の MIN_W/MAX_W clamp で `|w| <= 1.98` に bound され、
-    /// FP16 の有限正規数域 (`|x| <= 65504`) に十分収まるため mirror 変換が ±inf へ
-    /// overflow しない。
+    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・v102
+    /// checkpoint いずれの経路でも小さく、FP16 の有限域 (`|x| <= 65504`) に十分
+    /// 収まるため mirror 変換が ±inf へ overflow しない。
     #[arg(long)]
     ft_fp16: bool,
 }
