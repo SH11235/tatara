@@ -527,6 +527,10 @@ pub fn radam_step_f16state_mirror(
         };
         *w_ref = p_clamped;
         *g_ref = 0.0_f32;
+        // SAFETY: `mirror` は `weights` / `m` / `v` / `grad` と同要素数 `n` (caller が
+        // `ft_w` の要素数 `ft_w_n` を渡す)。kernel 冒頭で `i < n` を確認済みなので
+        // `mirror.add(i)` は in-bounds。各 thread は自分の `i` のみ書くため thread 間で
+        // aliasing は無い。`mirror` は他 buffer と別 alloc (caller 保証)。
         let mirror_ptr = mirror.as_mut_ptr();
         unsafe {
             mirror_ptr.add(i.get()).write(p_clamped as f16);
