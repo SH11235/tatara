@@ -878,9 +878,7 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let data_paths = args.data_paths();
     if data_paths.is_empty() {
-        return Err(
-            "--data is required (comma-separated PSV files). 引数省略は scaffold 時のみ".into(),
-        );
+        return Err("--data is required (comma-separated PSV files)".into());
     }
     for p in &data_paths {
         if !p.exists() {

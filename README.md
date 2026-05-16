@@ -81,6 +81,7 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | **SCReLU** | Squared Clipped ReLU — NNUE で広く使われる activation |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
+| **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
 | **v102** | bullet-shogi の LayerStack 量子化 save format バージョン (HalfKA_hm 1536-16-32 + 9-bucket、PSQT / Threat / HandCount 無しの最小形)。本リポの `bins/nnue_train` が出力する `.bin` はこの format。詳細は [docs/bullet_v102_save_format.md](docs/bullet_v102_save_format.md) |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.md` のサポート GPU マトリクス参照 |
