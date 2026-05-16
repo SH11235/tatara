@@ -40,7 +40,7 @@ fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let mut max_abs_diff = 0.0_f32;
+    let mut max_abs_diff = 0.0_f64;
     let mut sum_abs_diff = 0.0_f64;
     let mut sum_sq_diff = 0.0_f64;
     let mut diff_count = 0_usize;
@@ -48,18 +48,23 @@ fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
     let mut sum_b_sq = 0.0_f64;
     let mut sum_ab = 0.0_f64;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        let d = x - y;
+        // 2 つの f32 を先に f64 化してから引く。f32 同士の減算は値が近いとき
+        // cancellation で有効桁を失う (このツールは似た checkpoint の微小差を測る
+        // 用途なので致命的)。f64(f32) は lossless、その差は厳密に表せる。
+        let xf = x as f64;
+        let yf = y as f64;
+        let d = xf - yf;
         let abs_d = d.abs();
         max_abs_diff = max_abs_diff.max(abs_d);
-        // 1e-9 は dequant 後 f32 の同値判定 epsilon (厳密一致なら 0)。
+        // 1e-9 は dequant 後の同値判定 epsilon (厳密一致なら d == 0)。
         if abs_d > 1e-9 {
             diff_count += 1;
         }
-        sum_abs_diff += abs_d as f64;
-        sum_sq_diff += (d as f64) * (d as f64);
-        sum_a_sq += (x as f64) * (x as f64);
-        sum_b_sq += (y as f64) * (y as f64);
-        sum_ab += (x as f64) * (y as f64);
+        sum_abs_diff += abs_d;
+        sum_sq_diff += d * d;
+        sum_a_sq += xf * xf;
+        sum_b_sq += yf * yf;
+        sum_ab += xf * yf;
     }
 
     let mean_abs_diff = sum_abs_diff / n as f64;
