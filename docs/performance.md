@@ -112,11 +112,13 @@ FP16 で読む高速モードになる。既定 OFF では FP32 path と bit-ide
 peak DRAM BW の ~90%) で、その traffic の大半は active feature 行の weight gather
 read。weight を半精度にすると read byte 数が半減し、`fwd_ft` phase が大きく縮む:
 
-| 指標 (RTX 3080 Ti, bs=65536) | `--ft-fp16` OFF | `--ft-fp16` ON |
+本ページ冒頭の計測手順 (RTX 3080 Ti, bs=65536) で OFF / ON を比較すると:
+
+| 指標 | `--ft-fp16` OFF | `--ft-fp16` ON |
 |---|---:|---:|
 | `fwd_ft` (profile-on) | ~22.0 ms | ~9.0 ms |
 | FP16 mirror への cast (`ft_cast`) | — | ~0.83 ms |
-| pos/s (5 sb × 200 batches, sb 2-5 mean) | ~922K | ~1.10M |
+| pos/s | ~922K | ~1.10M |
 
 精度設計: optimizer は FP32 master `ft_w` を更新し、forward 用の FP16 mirror
 (`ft_w_h`) は毎 step master から変換し直す。weight grad / optimizer state /

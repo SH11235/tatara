@@ -473,9 +473,9 @@ pub fn sparse_ft_forward_fp16(
     let ri_base = ri_q * 4;
 
     // raw pointer 版。unsafe 妥当性は [`sparse_ft_forward`] と同一 (indices.len() ==
-    // batch * nnz、weight.len() == cols * rows、rows % 4 == 0)。weight のみ要素型が
-    // `f16` で、4 連続 row の read は 8 byte 境界に整列する (idx*rows は偶数、
-    // ri_base は 4 の倍数)。
+    // batch * nnz、weight.len() == cols * rows、out.len() == batch * rows、
+    // rows % 4 == 0)。weight のみ要素型が `f16` で、4 連続 row の read は 8 byte
+    // 境界に整列する (idx*rows は偶数、ri_base は 4 の倍数)。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
     let mut s0: f32 = 0.0;
@@ -511,16 +511,17 @@ pub fn sparse_ft_forward_fp16(
 
 /// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。
 /// FP32 master weight (`ft_w`) から forward 用 FP16 mirror を毎 step 生成するのに使う。
-/// 1 thread = 1 要素、`dst` は thread ごとに disjoint な cell へ書く。
+/// 1 thread = 1 要素、`dst` は thread ごとに disjoint な cell へ書く
+/// ([`DisjointSlice`] で mutable な device 出力として受ける)。
 #[kernel]
-pub fn cast_f32_to_f16(src: &[f32], dst: &[f16], n: u32) {
+pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     let i = thread::index_1d();
     if i.get() >= n as usize {
         return;
     }
+    // caller が `src.len() == dst.len() == n` を保証 (`ft_w` と同要素数で確保)。
     let v = src[i.get()];
-    // dst.len() == n を caller が保証 (`ft_w` と同要素数で確保)。
-    let dst_ptr = dst.as_ptr() as *mut f16;
+    let dst_ptr = dst.as_mut_ptr();
     unsafe {
         dst_ptr.add(i.get()).write(v as f16);
     }
@@ -4938,9 +4939,9 @@ impl GpuTrainer {
         // FP16 mirror 更新 (`--ft-fp16` 時のみ): optimizer が更新する FP32 master
         // `ft_w` を毎 step `ft_w_h` (f16) へ変換し直す。forward はこの mirror を読む。
         if self.ft_fp16 {
-            let ft_w_h = self
+            let mut ft_w_h = self
                 .ft_w_h
-                .as_ref()
+                .as_mut()
                 .expect("ft_w_h is Some when ft_fp16 is enabled");
             let ft_w_n = FT_IN * FT_OUT;
             cuda_launch! {
@@ -4950,7 +4951,7 @@ impl GpuTrainer {
                 config: cfg_1d(ft_w_n),
                 args: [
                     slice(self.ft_w),
-                    slice(ft_w_h),
+                    slice_mut(ft_w_h),
                     ft_w_n as u32
                 ]
             }?;
@@ -6234,6 +6235,10 @@ struct Cli {
     /// では FP32 path と bit-identical。`true` で `sparse_ft_forward` の weight DRAM
     /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
     /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
+    ///
+    /// FT weight は optimizer の MIN_W/MAX_W clamp で `|w| <= 1.98` に bound され、
+    /// FP16 の有限正規数域 (`|x| <= 65504`) に十分収まるため mirror 変換が ±inf へ
+    /// overflow しない。
     #[arg(long)]
     ft_fp16: bool,
 }
