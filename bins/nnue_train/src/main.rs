@@ -1485,11 +1485,12 @@ pub fn ft_post_perspective_grad_fused(
 /// 後続の inverse-index gather (`gather_and_sum_per_feature_*_fp16`) の read DRAM
 /// traffic が半減する (dft は b × FT_OUT で step 中で最も read 量が多い buffer)。
 ///
-/// **loss scaling**: dft の値は batch 正規化 (1/batch) のため ~1e-8 規模で、そのまま
-/// f16 化すると全要素が subnormal 下限 (2^-24 ≈ 6e-8) を下回って 0 に潰れる。これを
-/// 防ぐため `grad_ft_out` へ書く値だけ `dft_scale` (power-of-2) を掛けて f16 normal
-/// range に持ち上げる。gather 側 (`gather_and_sum_per_feature_*_fp16`) が逆数を掛けて
-/// 元の scale に戻す。`grad_bias` は scale しない (f32 のため不要)。
+/// **loss scaling**: dft の値は batch 正規化 (loss が 1/batch) のため `1/batch` に比例し、
+/// そのまま f16 化すると全要素が subnormal 下限 (2^-24 ≈ 6e-8) を下回って 0 に潰れる。
+/// これを防ぐため `grad_ft_out` へ書く値だけ caller 計算の `dft_scale`
+/// ([`FT_DFT_FP16_BASE_SCALE`] × batch) を掛けて f16 normal range に持ち上げる。gather
+/// 側 (`gather_and_sum_per_feature_*_fp16`) が逆数を掛けて元の scale に戻す。`grad_bias`
+/// は scale しない (f32 のため不要)。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::manual_clamp)]
 #[kernel]
@@ -1505,7 +1506,7 @@ pub fn ft_post_perspective_grad_fused_fp16(
     d_combined_offset: u32,
     d_combined_stride: u32,
     scale: f32,
-    dft_scale: f32, // grad_ft_out (f16) loss scaling 係数 (power-of-2)
+    dft_scale: f32, // grad_ft_out (f16) loss scaling 係数 (= FT_DFT_FP16_BASE_SCALE × batch)
 ) {
     let tid = thread::index_1d();
     let half = (ft_dim as usize) / 2;
@@ -3738,18 +3739,24 @@ fn read_f32_vec_io<R: std::io::Read>(r: &mut R, n: usize, what: &str) -> std::io
 const FT_POST_SCALE: f32 = 127.0 / 128.0;
 const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
-/// `--ft-fp16-out` で dft (FT activation gradient) を `f16` 化するときの loss scaling 係数。
+/// `--ft-fp16-out` で dft (FT activation gradient) を `f16` 化するときの loss scaling
+/// 基準係数。実際に使う scale は **`FT_DFT_FP16_BASE_SCALE * batch`** (caller が batch を
+/// 掛ける)。
 ///
-/// dft は batch 正規化 (1/batch) のため値が ~1e-8 規模で、無 scale だと全要素が f16
-/// subnormal 下限 (2^-24 ≈ 6e-8) を下回り 0 に潰れて勾配が消える。`f16` へ書く前に本値
-/// を掛けて normal range に持ち上げ、gather 側で逆数を掛けて戻す。power-of-2 なので
-/// scale 自体は無誤差 (f16 量子化のみが誤差源)。
+/// dft は batch 正規化 (loss が `1/batch`) のため値が `1/batch` に比例し、無 scale だと
+/// 全要素が f16 subnormal 下限 (2^-24 ≈ 6e-8) を下回り 0 に潰れて勾配が消える。`f16` へ
+/// 書く前に scale を掛けて normal range に持ち上げ、gather 側で逆数を掛けて戻す。
 ///
-/// 2^30: dft (FP32 path) の絶対値最大を学習初期 step (loss が最大 = 勾配が最大の局面)
-/// で実測すると ~2e-8。`max·scale ≈ 20 ≪ 65504` で overflow 余裕 ~3000×。dft は学習が
-/// 進むほど縮むので初期 step の実測値が実質 worst case。かつ ~5e-14 までの小さい値を
-/// f16 normal range に載せる。
-const FT_DFT_FP16_SCALE: f32 = (1_u32 << 30) as f32;
+/// scale を `batch` 比例にするのは、dft ∝ `1/batch` なので `dft * (BASE * batch)` が
+/// batch に依らず一定 (`dft * batch` の不変量 × BASE) になり、どの `--batch-size` でも
+/// 同じ f16 域に載るため。固定 scale だと小 batch で dft が大きくなり f16 max (65504) を
+/// 超えて inf 化し `ft_w_grad` を破壊する。
+///
+/// 2^14: `dft * batch` の不変量を学習初期 step (loss = 勾配が最大の局面) で実測すると
+/// ~1.2e-3。`不変量 * BASE ≈ 19 ≪ 65504` で overflow 余裕 ~3000×、batch 非依存。dft は
+/// 学習が進むほど縮むので初期 step が実質 worst case。batch=65536 のとき実 scale は
+/// `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
+const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
 // `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する。
@@ -6249,6 +6256,12 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1");
 
+        // dft (FT activation gradient) FP16 化の loss scaling 係数。dft ∝ 1/batch なので
+        // batch 比例にして batch 非依存に f16 域へ載せる ([`FT_DFT_FP16_BASE_SCALE`])。
+        // grad kernel が `* dft_scale` で書き、gather kernel が `* dft_inv_scale` で戻す。
+        let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
+        let dft_inv_scale = 1.0_f32 / dft_scale;
+
         // -- Backward 3 reverse: ft_post_perspective_grad fused × 2 (stm, nstm) --
         // `dy = dcombined_from_l1 + dcombined_from_l1f` を fused kernel が in-register
         // で計算、合算済 buffer の materialize と read-back の DRAM roundtrip を避ける。
@@ -6271,7 +6284,7 @@ impl GpuTrainer {
                         .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")),
                     slice(self.ft_b_grad),
                     b_u32, FT_OUT as u32, 0_u32, COMBINED_DIM as u32, FT_POST_SCALE,
-                    FT_DFT_FP16_SCALE
+                    dft_scale
                 ]
             }?;
             cuda_launch! {
@@ -6289,7 +6302,7 @@ impl GpuTrainer {
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled")),
                     slice(self.ft_b_grad),
                     b_u32, FT_OUT as u32, (FT_OUT / 2) as u32, COMBINED_DIM as u32, FT_POST_SCALE,
-                    FT_DFT_FP16_SCALE
+                    dft_scale
                 ]
             }?;
         } else {
@@ -6407,7 +6420,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32, 1.0_f32 / FT_DFT_FP16_SCALE
+                            FT_IN as u32, FT_OUT as u32, dft_inv_scale
                         ]
                     }?;
                 } else {
@@ -6440,7 +6453,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32, 1.0_f32 / FT_DFT_FP16_SCALE
+                            FT_IN as u32, FT_OUT as u32, dft_inv_scale
                         ]
                     }?;
                 } else {
@@ -6828,8 +6841,8 @@ struct Cli {
     ///
     /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
     /// inverse-index gather (step 中で最も DRAM read が多い `phD`) の帯域が半減する。
-    /// dft は batch 正規化で ~1e-8 規模のため、FP16 化時は loss scaling
-    /// ([`FT_DFT_FP16_SCALE`]) で normal range に持ち上げてから格納する。
+    /// dft は batch 正規化で `1/batch` に比例する微小値のため、FP16 化時は loss scaling
+    /// ([`FT_DFT_FP16_BASE_SCALE`] × batch) で normal range に持ち上げてから格納する。
     ///
     /// weight FP16 (`--ft-fp16`) とは別 flag に分けてあり、SPRT で
     /// FP32 → `--ft-fp16` → `--ft-fp16 --ft-fp16-out` の 2 段で棋力影響を切り分け
@@ -8858,8 +8871,8 @@ mod gpu_cpu_equivalence_tests {
         let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
         let mut dft_stm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
         let mut dft_nstm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
-        // test 入力 dft は O(数十) なので、production の FT_DFT_FP16_SCALE (2^30) では
-        // overflow する。loss scaling round-trip を検証する目的の小さい power-of-2 を使う。
+        // test 入力 dft は O(数十) なので、production の dft_scale (FT_DFT_FP16_BASE_SCALE
+        // × batch) では overflow する。loss scaling round-trip 検証用の小さい値を使う。
         let dft_scale = 64.0_f32;
         cuda_launch! {
             kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
