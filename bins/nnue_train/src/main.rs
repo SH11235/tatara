@@ -129,26 +129,25 @@ pub fn loss_wdl(
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 }
 
-/// bullet win-rate-model (WRM) loss kernel。
+/// Win-rate-model (WRM) loss kernel。
 ///
-/// bullet `examples/shogi_layerstack.rs:2177-2188` (`loss_fn_wrm`、`--win-rate-model`
-/// + `--wrm-in-scaling` 指定時に選ばれる loss closure) + `crates/bullet_lib/src/value/
-/// loader.rs:300-316` (data-layer の WRM target + WDL blend) を NNUE 専用に hand-fuse。
-/// CPU reference は `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`。
+/// 教師 score (centipawn) と net 出力の双方を win-rate に変換し、その二乗誤差を loss と
+/// する。`loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、prediction
+/// / target 双方に WRM 変換を掛けるため net_output は `out ≈ cp / nnue2score` (O(1)) の
+/// スケールで収束し、`crates/nnue-format` の量子化フォーマット (`QA=127 / QB=64 /
+/// FV_SCALE=28`) が前提とする net 出力スケールと整合する。CPU reference は
+/// `gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu`。
 ///
-/// `loss_wdl` (`p = sigmoid(out * scale)` で `out ≈ cp` で収束) と違い、
-/// prediction / target 双方に WRM を適用するため net_output は
-/// `out ≈ cp / nnue2score` (O(1)) で収束し、`crates/nnue-format` の量子化
-/// (`QA=127 / QB=64 / FV_SCALE=28`、bullet の `out ≈ cp/600` スケール前提)
-/// と整合する。bullet v102 を厳密再現するにはこの kernel を使う。
-///
-/// - target: `pt = (score - 270)/380`、`pmt = (-score - 270)/380`、`target_wrm =
-///   0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、`target = lambda*wdl + (1-lambda)*target_wrm`。
-///   in_scaling=380 と offset=270 は bullet ハードコード (`--wrm-in-scaling` ではない)。
+/// - target: `pt = (score - target_offset)/target_scaling`、`pmt = (-score -
+///   target_offset)/target_scaling`、`target_wrm = 0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、
+///   `target = lambda*wdl + (1-lambda)*target_wrm`。`target_offset` / `target_scaling` は
+///   WRM target sigmoid の中心と入力スケールで、CLI `--wrm-target-offset` /
+///   `--wrm-target-scaling` から渡る (既定 270 / 380、score 分布に応じて再調整可)。
 /// - prediction: `scorenet = out * nnue2score`、`q = sigmoid((scorenet - 270)/in_scaling)`、
-///   `qm = sigmoid((-scorenet - 270)/in_scaling)`、`qf = 0.5*(1 + q - qm)`。`in_scaling`
-///   (= `--wrm-in-scaling` = 340) は **prediction 側のみ**、`nnue2score` (= `--wrm-nnue2score`
-///   = 600)。
+///   `qm = sigmoid((-scorenet - 270)/in_scaling)`、`qf = 0.5*(1 + q - qm)`。prediction 側の
+///   offset 270 はハードコード (CLI 非公開、可変なのは target 側のみ)。`in_scaling`
+///   (= `--wrm-in-scaling`、既定 340) は prediction 側のみ、`nnue2score`
+///   (= `--wrm-nnue2score`、既定 600)。
 /// - `err = qf - target`、`loss_acc += err^2` (norm 無し、caller が position 数で割る)。
 /// - chain rule: `dq/dout = q(1-q) * nnue2score/in_scaling`、`dqm/dout = -qm(1-qm) *
 ///   nnue2score/in_scaling`、`dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q) + qm(1-qm))`、
@@ -170,20 +169,22 @@ pub fn loss_wrm(
     lambda: f32,
     nnue2score: f32,
     in_scaling: f32,
+    target_offset: f32,
+    target_scaling: f32,
     n: u32,
 ) {
     let i = thread::index_1d();
     if i.get() >= n as usize {
         return;
     }
-    // --- target (bullet loader WRM target、in_scaling=380 / offset=270 はハードコード) ---
+    // --- target (WRM applied to teacher score、offset/scaling は caller 指定) ---
     let s = score[i.get()];
-    let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - 270.0_f32) / 380.0_f32)).exp());
-    let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - 270.0_f32) / 380.0_f32)).exp());
+    let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
+    let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
     let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
     let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
 
-    // --- prediction (bullet loss_fn_wrm: WRM applied to net output) ---
+    // --- prediction (WRM applied to net output) ---
     let scorenet = out[i.get()] * nnue2score;
     let q = 1.0_f32 / (1.0_f32 + (-((scorenet - 270.0_f32) / in_scaling)).exp());
     let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - 270.0_f32) / in_scaling)).exp());
@@ -3865,7 +3866,8 @@ const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 // bullet の汎用 default、v102 recipe は 0.0)。
 const DECAY: f32 = 0.0;
 
-// smoke 用 loss params (v102 doc: scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600)。
+// smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600 /
+// target offset 270 / target scaling 380)。
 // trainer 経路では CLI から `LossKind` を組み立てるのでここは smoke 専用。
 const WDL_LAMBDA: f32 = 0.0;
 /// smoke で使う固定 batch position 数 (`GpuTrainer::new` の workspace 初期 batch にも使う)。
@@ -3874,6 +3876,8 @@ const SMOKE_LOSS_SIGMOID: LossKind = LossKind::Sigmoid { scale: 1.0 / 290.0 };
 const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     nnue2score: 600.0,
     in_scaling: 340.0,
+    target_offset: 270.0,
+    target_scaling: 380.0,
 };
 
 // ===========================================================================
@@ -5682,7 +5686,7 @@ impl GpuTrainer {
     }
 
     /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
-    /// [`LossKind::Wrm`] なら `loss_wrm` (bullet win-rate-model、v102 厳密再現) を起動する。
+    /// [`LossKind::Wrm`] なら `loss_wrm` (win-rate-model loss) を起動する。
     ///
     /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
     /// 本 file の `#[kernel]` 群で再現。中間 activation は `GpuTrainer` 上の永続 workspace
@@ -6200,7 +6204,7 @@ impl GpuTrainer {
 
         // -- Forward step 15: loss kernel → dy_net_output + loss_acc --
         // `LossKind::Sigmoid` → `loss_wdl` (plain sigmoid-MSE)、`LossKind::Wrm` →
-        // `loss_wrm` (bullet win-rate-model、v102 厳密再現)。
+        // `loss_wrm` (win-rate-model loss)。
         match loss {
             LossKind::Sigmoid { scale } => {
                 cuda_launch! {
@@ -6222,6 +6226,8 @@ impl GpuTrainer {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                target_offset,
+                target_scaling,
             } => {
                 cuda_launch! {
                     kernel: loss_wrm,
@@ -6235,7 +6241,8 @@ impl GpuTrainer {
                         batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
-                        wdl_lambda, nnue2score, in_scaling, b_u32
+                        wdl_lambda, nnue2score, in_scaling,
+                        target_offset, target_scaling, b_u32
                     ]
                 }?;
             }
@@ -7122,7 +7129,7 @@ struct Cli {
     wdl: f32,
 
     /// sigmoid loss の score scale (`loss_scale = 1 / scale`)。`--win-rate-model` 指定時は
-    /// 使わない (WRM loss は in_scaling=380/340 を使う)。
+    /// 使わない (WRM loss は `--wrm-*` 系の scaling を使う)。
     #[arg(long, default_value_t = 290.0)]
     scale: f32,
 
@@ -7165,21 +7172,29 @@ struct Cli {
     #[arg(long)]
     keep_checkpoints: Option<usize>,
 
-    /// bullet win-rate-model loss を使う (v102 recipe)。指定時は `loss_wrm`
-    /// kernel (prediction / target 双方に WRM を適用) を使い、未指定なら
-    /// `loss_wdl` (plain sigmoid-MSE + `--scale`)。net_output のスケールが
-    /// `out ≈ cp/--wrm-nnue2score` になり量子化 (`QA=127/QB=64/FV_SCALE=28`)
-    /// と整合するので bullet v102 互換 net を学習するには必須。
+    /// win-rate-model loss を使う。指定時は `loss_wrm` kernel (prediction / target
+    /// 双方に WRM を適用) を使い、未指定なら `loss_wdl` (plain sigmoid-MSE + `--scale`)。
+    /// net_output のスケールが `out ≈ cp/--wrm-nnue2score` になり、量子化
+    /// (`QA=127/QB=64/FV_SCALE=28`) が前提とするスケールと整合する。
     #[arg(long)]
     win_rate_model: bool,
-    /// WRM prediction 側の in-scaling (bullet recipe 既定値 340)。target 側は
-    /// bullet ハードコードの 380。`--win-rate-model` 指定時のみ使う。
+    /// WRM prediction 側の in-scaling (既定 340)。target 側の scaling
+    /// (`--wrm-target-scaling`) とは独立。`--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 340.0)]
     wrm_in_scaling: f32,
-    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、bullet
-    /// recipe 既定値 600)。`--win-rate-model` 指定時のみ使う。
+    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、既定 600)。
+    /// `--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 600.0)]
     wrm_nnue2score: f32,
+    /// WRM target sigmoid の中心オフセット (`target` が 0.5 になる score、既定 270)。
+    /// `--win-rate-model` 指定時のみ使う。
+    #[arg(long, default_value_t = 270.0)]
+    wrm_target_offset: f32,
+    /// WRM target sigmoid の入力スケール (steepness の逆数、既定 380)。既定 270/380 は
+    /// chess の評価値分布向けの値なので、score 分布が異なれば再調整する。
+    /// `--win-rate-model` 指定時のみ使う。
+    #[arg(long, default_value_t = 380.0)]
+    wrm_target_scaling: f32,
     // --- 以下は v102 recipe との CLI 互換のために受けるが、現状未配線 ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
@@ -7307,9 +7322,25 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        if !cli.wrm_target_offset.is_finite() {
+            return Err(format!(
+                "--wrm-target-offset must be finite (got {})",
+                cli.wrm_target_offset
+            )
+            .into());
+        }
+        if !(cli.wrm_target_scaling.is_finite() && cli.wrm_target_scaling > 0.0) {
+            return Err(format!(
+                "--wrm-target-scaling must be finite and > 0 (got {})",
+                cli.wrm_target_scaling
+            )
+            .into());
+        }
         LossKind::Wrm {
             nnue2score: cli.wrm_nnue2score,
             in_scaling: cli.wrm_in_scaling,
+            target_offset: cli.wrm_target_offset,
+            target_scaling: cli.wrm_target_scaling,
         }
     } else {
         if !(cli.scale.is_finite() && cli.scale > 0.0) {

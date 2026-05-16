@@ -69,19 +69,27 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 /// - [`LossKind::Sigmoid`] — plain sigmoid-MSE (`p = sigmoid(out * scale)`,
 ///   target = `lambda*wdl + (1-lambda)*sigmoid(score * scale)`)。net_output が
 ///   cp 単位 (`out ≈ cp`) で収束する。
-/// - [`LossKind::Wrm`] — bullet `loss_fn_wrm` を移植した win-rate-model loss。
-///   prediction / target 双方に WRM を適用するため net_output が
-///   `out ≈ cp / nnue2score` (O(1)) で収束し、量子化 (`QA=127 / QB=64 /
-///   FV_SCALE=28`) と scale が整合する。target 側 `in_scaling` (380) と
-///   offset (270) は bullet ハードコード値、prediction 側 `in_scaling` は
-///   `--wrm-in-scaling` 経由で本 enum field から渡る。
+/// - [`LossKind::Wrm`] — win-rate-model loss。prediction / target 双方に WRM 変換を
+///   適用するため net_output が `out ≈ cp / nnue2score` (O(1)) で収束する。
+///   `nnue2score` / `in_scaling` / `target_offset` / `target_scaling` はいずれも CLI
+///   から本 enum field 経由で渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
     /// plain sigmoid-MSE。`scale = 1.0 / --scale` (v102 recipe は `1/290`)。
     Sigmoid { scale: f32 },
-    /// bullet win-rate-model loss。`nnue2score = --wrm-nnue2score` (recipe 値 600)、
-    /// `in_scaling = --wrm-in-scaling` (recipe 値 340、prediction 側のみ)。
-    Wrm { nnue2score: f32, in_scaling: f32 },
+    /// win-rate-model loss。
+    ///
+    /// - `nnue2score` = `--wrm-nnue2score` (既定 600)
+    /// - `in_scaling` = `--wrm-in-scaling` (既定 340、prediction 側のみ)
+    /// - `target_offset` = `--wrm-target-offset` (既定 270、WRM target sigmoid の中心)
+    /// - `target_scaling` = `--wrm-target-scaling` (既定 380、WRM target sigmoid の
+    ///   入力スケール)
+    Wrm {
+        nnue2score: f32,
+        in_scaling: f32,
+        target_offset: f32,
+        target_scaling: f32,
+    },
 }
 
 impl LossKind {
@@ -98,6 +106,8 @@ impl LossKind {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                target_offset,
+                target_scaling,
             } => {
                 if !nnue2score.is_finite() || nnue2score <= 0.0 {
                     return Err(io::Error::other(format!(
@@ -107,6 +117,16 @@ impl LossKind {
                 if !in_scaling.is_finite() || in_scaling <= 0.0 {
                     return Err(io::Error::other(format!(
                         "wrm in_scaling must be finite and > 0 (got {in_scaling})"
+                    )));
+                }
+                if !target_offset.is_finite() {
+                    return Err(io::Error::other(format!(
+                        "wrm target_offset must be finite (got {target_offset})"
+                    )));
+                }
+                if !target_scaling.is_finite() || target_scaling <= 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm target_scaling must be finite and > 0 (got {target_scaling})"
                     )));
                 }
             }
@@ -122,7 +142,13 @@ impl std::fmt::Display for LossKind {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
-            } => write!(f, "wrm(nnue2score={nnue2score}, in_scaling={in_scaling})"),
+                target_offset,
+                target_scaling,
+            } => write!(
+                f,
+                "wrm(nnue2score={nnue2score}, in_scaling={in_scaling}, \
+                 target_offset={target_offset}, target_scaling={target_scaling})"
+            ),
         }
     }
 }
@@ -218,7 +244,7 @@ pub struct TrainingConfig {
     /// save-rate × superbatches が大きい長期ランでは明示指定推奨。量子化 `.bin`
     /// (~116MB) は本設定に関わらず常に全保持する (推論 artifact なので保守的に)。
     pub keep_raw_checkpoints: Option<usize>,
-    /// どの loss kernel で学習するか (sigmoid-MSE / bullet WRM) + 固定パラメータ。
+    /// どの loss kernel で学習するか (sigmoid-MSE / WRM) + 固定パラメータ。
     pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
@@ -999,7 +1025,9 @@ mod tests {
             TrainingConfig {
                 loss: LossKind::Wrm {
                     nnue2score: 600.0,
-                    in_scaling: 340.0
+                    in_scaling: 340.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0
                 },
                 ..base_cfg()
             }
@@ -1010,7 +1038,9 @@ mod tests {
             TrainingConfig {
                 loss: LossKind::Wrm {
                     nnue2score: 0.0,
-                    in_scaling: 340.0
+                    in_scaling: 340.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0
                 },
                 ..base_cfg()
             }
@@ -1021,7 +1051,23 @@ mod tests {
             TrainingConfig {
                 loss: LossKind::Wrm {
                     nnue2score: 600.0,
-                    in_scaling: -1.0
+                    in_scaling: -1.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        // target_scaling <= 0 は WRM target sigmoid を壊すので reject。
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0,
+                    target_offset: 270.0,
+                    target_scaling: 0.0
                 },
                 ..base_cfg()
             }

@@ -6,14 +6,14 @@
 //!
 //! ## アルゴリズム
 //!
-//! bullet `loss_fn_wrm` + loader WRM target を移植した win-rate-model loss。
-//! target / prediction 双方で `(score - 270)/in_scaling` の sigmoid 対称差を取る:
+//! 教師 score と net 出力の双方を win-rate に変換し、その二乗誤差を loss とする。
+//! target / prediction 双方で sigmoid 対称差を取る:
 //!
 //! ```text
 //! per position i:
-//!     # --- target (in_scaling=380, offset=270 は固定) ---
-//!     pt   = (score[i]  - 270) / 380
-//!     pmt  = (-score[i] - 270) / 380
+//!     # --- target (offset/scaling は caller 指定、既定 270 / 380) ---
+//!     pt   = (score[i]  - target_offset) / target_scaling
+//!     pmt  = (-score[i] - target_offset) / target_scaling
 //!     target_wrm = 0.5 * (1 + sigmoid(pt) - sigmoid(pmt))
 //!     target = lambda * wdl[i] + (1 - lambda) * target_wrm
 //!     # --- prediction (scorenet = out * nnue2score) ---
@@ -36,34 +36,36 @@
 //! `scale = 1/scale_param` を掛けるため net_output は **cp 単位** (`out ≈ cp`) で
 //! 収束する。一方 WRM loss は `scorenet = out * nnue2score` (= `out * 600`) を
 //! cp 単位とみなすため、net_output は **`out ≈ cp / nnue2score` (O(1))** で収束する。
-//! `crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) は bullet と同じ
-//! スケール (`out ≈ cp/600`) を前提とするので、bullet 互換 net を学習するには
-//! WRM loss が必須 (sigmoid-MSE で学習した net は byte レイアウトは互換だが
+//! `crates/nnue-format` の量子化 (`QA=127 / QB=64 / FV_SCALE=28`) は `out ≈ cp/600`
+//! スケールを前提とするので、その量子化フォーマット向けの net を学習するには
+//! WRM loss を使う (sigmoid-MSE で学習した net は byte レイアウトは互換だが
 //! 数値スケールが ~600× ずれて量子化後に破綻する)。
 //!
-//! ## 定数の出典
+//! ## 定数
 //!
-//! - target 側 `in_scaling = 380` は bullet ハードコード (CLI `--wrm-in-scaling` ではない)
-//! - prediction 側 in_scaling は CLI `--wrm-in-scaling` (推奨 340)、target と非対称な
-//!   のも bullet 仕様どおり
-//! - offset 270 は target / prediction 双方で bullet ハードコード
+//! - target 側 `target_offset` / `target_scaling` は caller 指定 (CLI
+//!   `--wrm-target-offset` / `--wrm-target-scaling`、既定 270 / 380)。既定 270/380 は
+//!   chess の評価値分布向けの値で、score 分布が異なるドメインでは再調整する
+//! - prediction 側 offset 270 はハードコード (caller から可変なのは target 側のみ)
+//! - prediction 側 `in_scaling` は CLI `--wrm-in-scaling` (既定 340)、target 側と
+//!   独立に指定する
 //! - `lambda` (WDL blend) は典型的には 0.0 (target = target_wrm のみ) だが、
 //!   WdlScheduler 互換のため引数として残す (`lambda = 1.0` で純 WDL)
 //!
 //! ## 実装メモ
 //!
-//! bullet 上流は data layer で target を pre-compute するが、本実装は kernel 内に
-//! WRM target + WDL blend を畳み込み、`score` (raw cp) と `wdl` ({0, 0.5, 1}) を
-//! 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
+//! WRM target + WDL blend を kernel 内に畳み込み、`score` (raw cp) と `wdl`
+//! ({0, 0.5, 1}) を 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
 //!
 //! ## NaN / Inf 挙動
 //!
 //! - `out[i] = NaN` / `score[i] = NaN` → sigmoid 経由で NaN 伝搬 (`loss_wdl` と同じ、
 //!   学習中の NaN を loss 経路で気付ける)
-//! - `|score|` が非常に大きい場合 (例: ±32000 の mate-stamp) `(score - 270)/380` が
-//!   ±84 程度になり sigmoid が 0/1 に飽和する。`exp(±84)` は f32 範囲内 (`exp(88.7) ≈
-//!   3.4e38`) なので overflow せず、target_wrm は 0 か 1 に張り付くだけで NaN に
-//!   ならない。`q*(1-q)` も飽和時は 0 になり grad が消える
+//! - `|score|` が非常に大きい場合 (例: ±32000 の mate-stamp) `(score -
+//!   target_offset)/target_scaling` が既定 380 で ±84 程度になり sigmoid が 0/1 に
+//!   飽和する。`exp(±84)` は f32 範囲内 (`exp(88.7) ≈ 3.4e38`) なので overflow せず、
+//!   target_wrm は 0 か 1 に張り付くだけで NaN にならない。`q*(1-q)` も飽和時は 0 に
+//!   なり grad が消える
 
 /// Reference CPU 実装。
 ///
@@ -73,12 +75,13 @@
 ///
 /// 入力前提:
 /// - `out.len() == score.len() == wdl.len() == per_pos_norm.len() == dl_dout.len() == n`
-/// - `nnue2score > 0` / `in_scaling > 0` (CLI `--wrm-nnue2score` /
-///   `--wrm-in-scaling` は正値、host 側で保証)
+/// - `nnue2score > 0` / `in_scaling > 0` / `target_scaling > 0` (CLI
+///   `--wrm-nnue2score` / `--wrm-in-scaling` / `--wrm-target-scaling` は正値、
+///   host 側で保証)、`target_offset` は任意の有限値
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
 /// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
 ///
-/// 引数 10 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// 引数 12 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
 /// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wrm_cpu(
@@ -91,22 +94,25 @@ pub fn loss_wrm_cpu(
     lambda: f32,
     nnue2score: f32,
     in_scaling: f32,
+    target_offset: f32,
+    target_scaling: f32,
     n: usize,
 ) {
-    const OFFSET: f32 = 270.0;
-    const TARGET_IN_SCALING: f32 = 380.0;
+    // prediction 側 offset はハードコード。target 側 offset / scaling のみ caller 指定
+    // (`target_offset` / `target_scaling`)。
+    const PRED_OFFSET: f32 = 270.0;
     for i in 0..n {
-        // target: WRM applied to raw cp score (target-side in_scaling = 380 固定)
+        // target: WRM applied to raw cp score
         let s = score[i];
-        let pt = (s - OFFSET) / TARGET_IN_SCALING;
-        let pmt = (-s - OFFSET) / TARGET_IN_SCALING;
+        let pt = (s - target_offset) / target_scaling;
+        let pmt = (-s - target_offset) / target_scaling;
         let target_wrm = 0.5_f32 * (1.0_f32 + sigmoid_f32(pt) - sigmoid_f32(pmt));
         let target = lambda * wdl[i] + (1.0_f32 - lambda) * target_wrm;
 
         // prediction: WRM applied to net output (scorenet = out * nnue2score)
         let scorenet = out[i] * nnue2score;
-        let q = sigmoid_f32((scorenet - OFFSET) / in_scaling);
-        let qm = sigmoid_f32((-scorenet - OFFSET) / in_scaling);
+        let q = sigmoid_f32((scorenet - PRED_OFFSET) / in_scaling);
+        let qm = sigmoid_f32((-scorenet - PRED_OFFSET) / in_scaling);
         let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
         let err = qf - target;
@@ -151,6 +157,8 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
+            380.0,
             1,
         );
         assert_eq!(loss_acc, 0.0, "err must be exactly zero at score=out=0");
@@ -178,6 +186,8 @@ mod tests {
             1.0,
             600.0,
             340.0,
+            270.0,
+            380.0,
             1,
         );
         assert_eq!(dl_dout[0], 0.0_f32);
@@ -187,7 +197,7 @@ mod tests {
     /// loss / grad が docstring の式と一致することを、同じ式を独立に書き直して
     /// 照合する (期待値は f32 計算 → f64 cast、f32 リテラル比較の pitfall 回避)。
     #[test]
-    fn matches_bullet_wrm_formula() {
+    fn matches_wrm_formula() {
         let out = vec![0.3_f32, -0.8, 2.5, -0.05];
         let score = vec![150.0_f32, -1200.0, 30.0, 5000.0];
         let wdl = vec![1.0_f32, 0.0, 0.5, 1.0];
@@ -208,6 +218,8 @@ mod tests {
             lambda,
             nnue2score,
             in_scaling,
+            270.0,
+            380.0,
             4,
         );
 
@@ -262,6 +274,8 @@ mod tests {
                 lambda,
                 nnue2score,
                 in_scaling,
+                270.0,
+                380.0,
                 1,
             );
             acc
@@ -280,6 +294,8 @@ mod tests {
                 lambda,
                 nnue2score,
                 in_scaling,
+                270.0,
+                380.0,
                 1,
             );
             // 中心差分は f64 で評価して打ち切り誤差を抑える
@@ -319,6 +335,8 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
+            380.0,
             3,
         );
         let mut dl_b = vec![0.0_f32; 3];
@@ -333,6 +351,8 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
+            380.0,
             3,
         );
 
@@ -367,6 +387,8 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
+            380.0,
             2,
         );
         assert!(
@@ -377,5 +399,59 @@ mod tests {
             dl_dout.iter().all(|g| g.is_finite()),
             "grads must be finite: {dl_dout:?}"
         );
+    }
+
+    /// `target_offset` / `target_scaling` が target_wrm に実際に効くことを、既定値
+    /// (270 / 380) と非既定値 (200 / 500) で loss を計算して照合する。`out = 0` で
+    /// prediction qf = 0.5 固定なので、loss = `(0.5 - target)^2` が target_wrm の
+    /// 違いをそのまま反映する。期待 target は同じ式を独立に書き直して照合。
+    #[test]
+    fn custom_target_params_change_target_wrm() {
+        let out = vec![0.0_f32]; // qf = 0.5 固定 → loss は target のみに依存
+        let score = vec![600.0_f32]; // 非ゼロ score: target_wrm が offset/scaling に依存
+        let wdl = vec![0.5_f32];
+        let sig = |x: f32| 1.0_f32 / (1.0_f32 + (-x).exp());
+        let target_wrm = |off: f32, sc: f32| {
+            0.5_f32 * (1.0_f32 + sig((600.0 - off) / sc) - sig((-600.0 - off) / sc))
+        };
+
+        let run = |off: f32, sc: f32| -> f64 {
+            let mut dl = vec![0.0_f32];
+            let mut acc = 0.0_f64;
+            loss_wrm_cpu(
+                &out,
+                &score,
+                &wdl,
+                &[1.0_f32],
+                &mut dl,
+                &mut acc,
+                0.0,
+                600.0,
+                340.0,
+                off,
+                sc,
+                1,
+            );
+            acc
+        };
+
+        // 既定 270/380 と非既定 200/500 で target_wrm は異なる → loss も異なる。
+        let loss_default = run(270.0, 380.0);
+        let loss_custom = run(200.0, 500.0);
+        assert!(
+            (loss_default - loss_custom).abs() > 1e-6,
+            "target params must change the loss: default={loss_default} custom={loss_custom}"
+        );
+
+        // それぞれ独立式 `(0.5 - target_wrm)^2` と一致することを確認。
+        for (off, sc) in [(270.0_f32, 380.0_f32), (200.0, 500.0)] {
+            let err = 0.5_f32 - target_wrm(off, sc);
+            let expected = (err as f64) * (err as f64);
+            let got = run(off, sc);
+            assert!(
+                approx_eq_f64(got, expected, 1e-10),
+                "off={off} sc={sc}: got {got} expected {expected}"
+            );
+        }
     }
 }
