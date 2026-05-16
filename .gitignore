@@ -38,6 +38,9 @@
 # local 計測ログ / 仮説検証メモ (commit せず手元で保管)
 /docs/experiments/
 
+# bench-pos.sh の machine 依存設定 (テンプレート: scripts/bench-pos.env.example)
+/scripts/bench-pos.env
+
 # OS / editor
 .DS_Store
 .idea/

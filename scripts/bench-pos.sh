@@ -10,17 +10,36 @@
 # `nvidia-smi -lgc` によるロックを試みる (root 権限が要る、権限が無ければ警告
 # のみ出して続行)。
 #
+# 入力データ path (DATA / PROG) は machine 依存なのでリポジトリに焼き込まない。
+# 毎回固定したい環境では gitignore 済の local 設定ファイル scripts/bench-pos.env
+# を置く (テンプレート: scripts/bench-pos.env.example)。
+#   DATA … PSV データファイル
+#   PROG … progress 係数ファイル
+#
 # 使い方:
+#   cp scripts/bench-pos.env.example scripts/bench-pos.env  # 初回、自環境の path を書く
 #   scripts/bench-pos.sh                       # FP32 default、RUNS 回
 #   scripts/bench-pos.sh --ft-fp16             # FP16 FT weight モード
 #   scripts/bench-pos.sh --ft-fp16 --ft-fp16-out
 #   RUNS=5 scripts/bench-pos.sh                # run 回数を変える
 #   BENCH_LOCK_CLOCK=1 scripts/bench-pos.sh    # GPU clock 固定 (要 root)
 #
+# 設定ファイルを使わず 1 回だけ path を渡す場合は env var を前置きする:
+#   DATA=/path/to/PSV PROG=/path/to/progress.bin scripts/bench-pos.sh
+#
 # nnue-train への追加 CLI フラグはそのまま "$@" で渡す。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# machine 依存の設定 (DATA / PROG 等) を gitignore 済の local ファイルから読む。
+# BENCH_ENV_FILE で path 変更可。テンプレート scripts/bench-pos.env.example は
+# `:=` 形式なので、明示的に前置きした env var がファイルの値より優先される。
+bench_env_file="${BENCH_ENV_FILE:-scripts/bench-pos.env}"
+if [[ -f "$bench_env_file" ]]; then
+  # shellcheck source=/dev/null
+  source "$bench_env_file"
+fi
 
 : "${CUDA_OXIDE_TARGET:=sm_86}"
 : "${LLVM_LINK_BIN:=/usr/bin/llvm-link-22}"
@@ -28,8 +47,8 @@ cd "$(dirname "$0")/.."
 : "${LLC_BIN:=/usr/bin/llc-22}"
 export CUDA_OXIDE_TARGET LLVM_LINK_BIN OPT_BIN LLC_BIN
 
-: "${DATA:=/mnt/nvme1/development/bullet-shogi/data/DLSuisho15b_aoba_deduped_shuffled.bin}"
-: "${PROG:=/mnt/nvme1/development/bullet-shogi/data/progress/progress_hao_full_cuda.e1.bin}"
+: "${DATA:?PSV データファイルの path を env var で指定する (例: DATA=/path/to/PSV PROG=/path/to/progress.bin scripts/bench-pos.sh)}"
+: "${PROG:?progress 係数ファイルの path を env var で指定する (DATA と同じ要領)}"
 : "${RUNS:=2}"
 : "${SUPERBATCHES:=5}"
 : "${BATCHES:=200}"
