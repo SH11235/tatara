@@ -972,7 +972,11 @@ pub fn gather_and_sum_per_feature_add_fp16(
     // caller が `positions.len() == batch * MAX_ACTIVE` を保証、`off_start..off_end` は
     // phase B が構築した有効範囲、`grad_out` (`f16`) / `grad_w` (`f32`) の範囲は arch
     // (FT_IN × FT_OUT) 固定で launch config 上 `ri < ft_out_u`。`grad_out` のみ要素型が
-    // `f16` で read 時に `f32` へ変換し、`grad_w` への atomic add は元 kernel と同じ。
+    // `f16` で read 時に `f32` へ変換する。`grad_w` への書き込みは atomic add: 末尾の
+    // `&*(grad_w.as_ptr().add(..) as *const DeviceAtomicF32)` cast は、`DeviceAtomicF32`
+    // が `f32` (align 4) と同レイアウト (`#[repr(transparent)]` over `UnsafeCell<f32>`)
+    // で `grad_w` の backing allocation が要求 alignment を満たすため有効。同 cell へ
+    // non-atomic に書く path は本 kernel / host loop に無い。
     let grad_out_ptr = grad_out.as_ptr();
     let positions_ptr = positions.as_ptr();
     let mut sum0 = 0.0_f32;
@@ -3741,9 +3745,10 @@ const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 /// を掛けて normal range に持ち上げ、gather 側で逆数を掛けて戻す。power-of-2 なので
 /// scale 自体は無誤差 (f16 量子化のみが誤差源)。
 ///
-/// 2^30: dft の最大は学習初期 step (loss が最大 = 勾配が最大の局面) でも ~2e-8 で、
-/// `max·scale ≈ 20 ≪ 65504` と overflow 余裕 ~3000×。dft は学習が進むほど縮むので
-/// 初期 step が実質 worst case。かつ ~5e-14 までの値を normal range に載せる。
+/// 2^30: dft (FP32 path) の絶対値最大を学習初期 step (loss が最大 = 勾配が最大の局面)
+/// で実測すると ~2e-8。`max·scale ≈ 20 ≪ 65504` で overflow 余裕 ~3000×。dft は学習が
+/// 進むほど縮むので初期 step の実測値が実質 worst case。かつ ~5e-14 までの小さい値を
+/// f16 normal range に載せる。
 const FT_DFT_FP16_SCALE: f32 = (1_u32 << 30) as f32;
 
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
