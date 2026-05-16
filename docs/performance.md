@@ -18,13 +18,17 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
   --save-rate 5 --threads 16 --bucket-mode progress8kpabs
 ```
 
-1 回 1m30s 程度、合計 3 分で 5 sb 分の `pos/s` ログが出る。
+1 回 1m30s 程度、合計 3 分で 5 sb 分の `pos/s` ログが出る。本ページの pos/s
+値はすべてこの手順での計測。`DATA` / `PROG` は local 依存なので各自のパスに置く。
 
 ## GPU 機種別 throughput 目安
 
+下表は **default (FP32) 構成** の pos/s。FP16 opt-in モードは後述「構成別
+throughput」を参照。
+
 | GPU | sm | DRAM BW | 期待 pos/s | 400 sb ETA | 出典 |
 |---|---|---:|---:|---:|---|
-| RTX 3080 Ti | 86 | 912 GB/s | **~827K** | ~53 h | 本リポジトリ実測 |
+| RTX 3080 Ti | 86 | 912 GB/s | **~922K** | ~48 h | 本リポジトリ実測 |
 | RTX 4090 | 89 | 1008 GB/s | ~1.0-1.1M (推定) | ~40 h | DRAM BW 比 1.10× + clock 比、未実測 |
 | A100 40GB | 80 | 1555 GB/s | ~1.3M (推定) | ~32 h | DRAM 比だが int8 倍精度等は無関係、未実測 |
 | H100 SXM | 90 | 3 TB/s | ~2M? (推定) | ~20 h? | Hopper TC 未活用なので DRAM 律速ライン、未実測 |
@@ -33,14 +37,29 @@ target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
 > **注**: 上記推定は `fwd_ft` + `bwd_L1f` の memory bandwidth 律速モデル
 > (DRAM BW 比例) + L2 reuse / launch overhead からの外挿。Ampere+ では cuBLAS
 > Sgemm が TF32 TC (`cublasSetMathMode(CUBLAS_TF32_TENSOR_OP_MATH)`) で動く。
-> FP16 / BF16 cast 経路は本リポジトリ未実装、TF32 のみ。
+> cuBLAS GEMM 自体の FP16 / BF16 TC 経路は未実装で TF32 のみ (FT weight /
+> activation の FP16 化は `--ft-fp16` 系、後述)。
 
 bullet-shogi (上流、CUDA C++ 実装) と本リポジトリの違い:
 
-- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536): **~827K pos/s**
+- 本リポジトリ (RTX 3080 Ti、5 sb × 200 batches × bs=65536、default 構成): **~922K pos/s**
 - bullet-shogi v102 同条件 (CUDA C++ + NVRTC runtime fusion): **~691K pos/s**
-- 本リポジトリは bullet 比 **+20%** (sparse FT 系の bounds check 除去 + cuBLAS
-  L1f bwd 化 + async loss readback + fwd_L1f TF32 TC の累積)
+- 本リポジトリは bullet 比 **+33%** (sparse FT 系の bounds check 除去・sorted
+  kernel 化・cuBLAS L1f bwd 化・async loss readback の累積)
+
+## 構成別 throughput (RTX 3080 Ti)
+
+FP16 モードは opt-in。既定 OFF では FP32 path と bit-identical。計測条件は冒頭
+「計測手順 (基準)」と同じ:
+
+| 構成 | pos/s | bullet 比 | 内容 |
+|---|---:|---:|---|
+| default (FP32) | ~922K | +33% | bit-identical な既定経路 |
+| `--ft-fp16` | ~1.10M | +60% | FT weight を FP16 read |
+| `--ft-fp16 --ft-fp16-out` | ~1.33M | +92% | + FT activation を FP16 保持 |
+
+各モードの精度設計と phase 別内訳は下記「FP16 FT weight モード」「FP16 FT
+activation モード」節を参照。
 
 ## Step phase profile 診断
 
@@ -63,6 +82,10 @@ batch 1 以降の steady-state を見る。
 
 ### 本リポジトリの steady-state 内訳 (RTX 3080 Ti、bs=65536、profile-on)
 
+各 phase の ms は kernel 最適化で変動する代表値。phase 間の比率と「想定外の
+遅さ」判定の基準として使い、現行の総合 throughput は「構成別 throughput」節を
+見る。
+
 | phase | 時間 (ms) | 内容 |
 |---|---:|---|
 | `h2d+reset` | ~3.0 | 入力 5 buffer の H2D + loss_acc / grad reset |
@@ -81,7 +104,7 @@ batch 1 以降の steady-state を見る。
 | `phD_stm` | ~11.3 | `gather_and_sum_per_feature_overwrite` (stm 側) |
 | `phD_nstm` | ~10.7 | 同上 (nstm 側) |
 | `optimizer` | ~4.5 | `radam_step` × 10 + `ranger_lookahead_lerp` × 10 |
-| **合計 (profile-on)** | **~81 ms** | (profile-off の steady-state では ~79 ms ≒ 827K pos/s) |
+| **合計 (profile-on)** | **~81 ms** | profile-off の steady-state はこれより短い (profile 同期分の overhead を除く) |
 
 ### 想定外の遅さを見つけたら
 
@@ -114,7 +137,7 @@ read。weight を半精度にすると read byte 数が半減し、`fwd_ft` phas
 
 本ページ冒頭の計測手順 (RTX 3080 Ti, bs=65536) で OFF / ON を比較すると:
 
-| 指標 | `--ft-fp16` OFF | `--ft-fp16` ON |
+| 指標 (RTX 3080 Ti) | `--ft-fp16` OFF | `--ft-fp16` ON |
 |---|---:|---:|
 | `fwd_ft` (profile-on) | ~22.0 ms | ~9.0 ms |
 | FP16 mirror への cast (`ft_cast`) | — | ~0.83 ms |
@@ -136,9 +159,9 @@ forward 出力 `ft_*_out` と backward 勾配 `dft_*_out` (どちらも b × FT_
 
 効くのは backward の inverse-index gather (`phD`)。`dft_*_out` は 1 feature の出現
 位置すべてに対して全 row を gather-read するため step 中で最も DRAM read traffic が
-大きい phase で、半精度化で帯域がほぼ半減する:
+大きい phase で、半精度化で帯域がほぼ半減する。RTX 3080 Ti での profile-on 計測:
 
-| 指標 (profile-on) | `--ft-fp16` のみ | `--ft-fp16 --ft-fp16-out` |
+| 指標 (RTX 3080 Ti, profile-on) | `--ft-fp16` のみ | `--ft-fp16 --ft-fp16-out` |
 |---|---:|---:|
 | `fwd_ft` | ~8.9 ms | ~8.3 ms |
 | `fwd_ftpost` | ~1.5 ms | ~1.0 ms |
