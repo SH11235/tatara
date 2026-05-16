@@ -3583,8 +3583,9 @@ fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
     let libdevice = find_libdevice_bc()?;
 
-    // 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
-    // internalize-public-api-list に残す (1 個でも漏れると opt の globaldce で消える)。
+    // module が launch する全 kernel 名。`@<name>` として `.ll` に出ているものを
+    // 漏れなく internalize-public-api-list に残す (1 個でも漏れると opt の globaldce
+    // で消える)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
                        adamw_step,radam_step,radam_step_fp16_mirror,\
                        ranger_lookahead_lerp,ranger_lookahead_lerp_fp16_mirror,\
