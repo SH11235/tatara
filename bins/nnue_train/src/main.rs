@@ -3929,6 +3929,8 @@ struct GpuTrainer {
     /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
     /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
     loss_ring: AsyncLossRing,
+    /// step 先頭の入力 H2D を専用 copy stream で直前 step の compute と overlap させる ring。
+    input_ring: InputUploadRing,
     /// L1f weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
@@ -3944,15 +3946,15 @@ struct GpuTrainer {
 
 impl Drop for GpuTrainer {
     fn drop(&mut self) {
-        // 残り queue 済 GPU 操作 (`loss_ring` の async D2H が `loss_acc` を read する等)
-        // を全て完了させてから field の Drop に進む。さもなければ struct field 宣言順
-        // (`loss_acc` → `loss_ring`) で `loss_acc` の device memory が先に `cuMemFree`
-        // され、`AsyncLossRing` 側の in-flight D2H が解放済 device メモリを read する
-        // race になる。本 sync で stream 上の全 op が完了するので、後続の per-field
-        // cleanup は全部 safe (cublas / loss_acc / loss_ring / ws の全 DeviceBuffer)。
+        // 残り queue 済 GPU 操作 (`loss_ring` の async D2H が `loss_acc` を read する、
+        // `input_ring` の copy stream H2D が `ws` の input buffer を write する等) を
+        // 両 stream で完了させてから field の Drop に進む。さもなければ struct field
+        // 宣言順で device memory が先に `cuMemFree` され、in-flight な copy が解放済
+        // メモリに触れる race になる。両 sync 後は後続 per-field cleanup が全部 safe。
         // 失敗は無視 (Drop 中の error 報告は実用上困難、stream 破棄で driver が
         // tracking を解除する debug-build 動作と等価)。
         let _ = self.stream.synchronize();
+        let _ = self.input_ring.copy_stream.synchronize();
     }
 }
 
@@ -3960,11 +3962,12 @@ impl Drop for GpuTrainer {
 /// activation-gradient buffer を **1 step ごとに再 alloc せず永続化** するための
 /// workspace。
 ///
-/// 各 buffer は `len_batch` 個の position 分のサイズで確保され、`step_impl` が
-/// より大きな batch を渡してきたら [`GpuWorkspace::ensure_batch`] で grow-only に
-/// 再 alloc する (典型的には batch_size 固定 + 末尾の partial batch なので拡張は
-/// 起きないか 1 回のみ)。`len_batch == 0` は「まだ未確保」を表す番兵 (実際には
-/// `GpuTrainer::new` で `batch_size` 分を確保するので step 時には常に > 0)。
+/// 各 buffer は `len_batch` 個の position 分のサイズで `GpuTrainer::new` 時に一度だけ
+/// 確保する。固定 batch 前提で、`step_impl` は [`GpuWorkspace::check_batch_capacity`]
+/// で batch が `len_batch` に収まることを検証する (実 dataloader は `batch_size` 以下の
+/// batch しか出さない。step 中の再 alloc は in-flight な compute の device memory を
+/// 解放する race になるため行わない)。`len_batch == 0` は「まだ未確保」を表す番兵
+/// (実際には `GpuTrainer::new` で `batch_size` 分を確保するので step 時には常に > 0)。
 ///
 /// **メモリ覚書**: forward path は DAG で各 activation は読まれる前に kernel が
 /// 全 cell を上書きするため memset 不要。`ws_batch` が現 batch `b` より大きい場合の
@@ -4026,11 +4029,19 @@ struct GpuWorkspace {
     feat_positions: DeviceBuffer<u32>, // up to batch * MAX_ACTIVE: sorted positions
 
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
-    stm_idx_dev: DeviceBuffer<i32>,    // batch * MAX_ACTIVE
-    nstm_idx_dev: DeviceBuffer<i32>,   // batch * MAX_ACTIVE
-    bucket_idx_dev: DeviceBuffer<i32>, // batch
-    score_dev: DeviceBuffer<f32>,      // batch
-    wdl_dev: DeviceBuffer<f32>,        // batch
+    // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
+    // 毎 step `mem::swap` し、直前 step が読んでいない back 側へ次 step 入力を copy
+    // stream で先行 H2D する ([`InputUploadRing`])。
+    stm_idx_dev: DeviceBuffer<i32>,         // batch * MAX_ACTIVE
+    nstm_idx_dev: DeviceBuffer<i32>,        // batch * MAX_ACTIVE
+    bucket_idx_dev: DeviceBuffer<i32>,      // batch
+    score_dev: DeviceBuffer<f32>,           // batch
+    wdl_dev: DeviceBuffer<f32>,             // batch
+    stm_idx_dev_back: DeviceBuffer<i32>,    // batch * MAX_ACTIVE
+    nstm_idx_dev_back: DeviceBuffer<i32>,   // batch * MAX_ACTIVE
+    bucket_idx_dev_back: DeviceBuffer<i32>, // batch
+    score_dev_back: DeviceBuffer<f32>,      // batch
+    wdl_dev_back: DeviceBuffer<f32>,        // batch
 
     // -- bucket sort scratch (fwd_L1 用 sorted layout 切換) --
     bucket_counts_dev: DeviceBuffer<u32>, // NUM_BUCKETS + 1 (histogram + invalid bin)
@@ -4113,6 +4124,11 @@ impl GpuWorkspace {
             bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            bucket_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
+            score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             bucket_counts_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
             bucket_offsets_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
             bucket_write_ctr_dev: DeviceBuffer::<u32>::zeroed(stream, NUM_BUCKETS + 1)?,
@@ -4125,18 +4141,22 @@ impl GpuWorkspace {
         })
     }
 
-    /// `batch` 以上の容量を保証する (grow-only)。現 `len_batch` が足りていれば no-op、
-    /// 足りなければ全 buffer を `batch` 分で再 alloc して `len_batch` を更新する
-    /// (典型的には batch_size 固定なので一度も走らないか、起動時の確保で十分)。
-    /// `ft_fp16_out` は `GpuWorkspace::new` と同じ意味 (FT activation を f16 で持つか)。
-    fn ensure_batch(
-        &mut self,
-        stream: &CudaStream,
-        batch: usize,
-        ft_fp16_out: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    /// `GpuTrainer::new` で確保した `len_batch` 容量に `batch` が収まることを検証する。
+    /// 収まらなければ error を返す (caller が step を中断)。
+    ///
+    /// workspace は固定 batch 前提で `GpuTrainer::new` 時に一度だけ確保する。実 dataloader
+    /// は `batch_size` 以下の batch しか出さない (末尾の partial batch は小さい) ので
+    /// 通常この検証は通る。step 中は前 step の compute が in-flight でありうるため、
+    /// ここで buffer を再 alloc すると使用中の device memory を解放する race になる。
+    /// よって grow はせず、容量超過は error として扱う。
+    fn check_batch_capacity(&self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
         if batch > self.len_batch {
-            *self = Self::new(stream, batch, ft_fp16_out)?;
+            return Err(format!(
+                "batch {batch} exceeds workspace capacity {} (workspace は GpuTrainer::new で\
+                 一度だけ確保する。--batch-size を増やす場合は再起動が要る)",
+                self.len_batch
+            )
+            .into());
         }
         Ok(())
     }
@@ -4756,6 +4776,240 @@ impl Drop for AsyncLossRing {
     }
 }
 
+/// step 先頭の入力 H2D (`stm/nstm idx` + `bucket/score/wdl` の 5 buffer) を専用
+/// copy stream で発行し、直前 step の compute と overlap させる ring。
+///
+/// 入力は dataloader から pageable な `Vec` で来る。pageable のままだと
+/// `cuMemcpyHtoDAsync` は driver の同期 staging copy になり copy engine の DMA を
+/// 使えず、compute と並走しない。pinned host buffer を経由し compute stream とは
+/// 別の copy stream で発行することで、H2D は直前 step の compute と並走する。
+///
+/// 2-slot pinned ring: step N は `pinned[N%2]` を使う。`pinned[N%2]` を最後に読んだ
+/// H2D (= step N-2) の event を [`upload`](Self::upload) 冒頭で sync してから上書き
+/// するので、in-flight な H2D が読んでいる pinned を host が書き換える race は起きない。
+///
+/// device 側の double-buffer (直前 step が読む buffer と次 step を H2D する buffer の
+/// 物理分離) は caller (`step_impl`) が active / back buffer を `mem::swap` して担う。
+/// 本 ring は H2D 先として「現在 active な」device buffer を受け取り、H2D 完了 event を
+/// compute stream に待たせる。
+struct InputUploadRing {
+    copy_stream: std::sync::Arc<CudaStream>,
+    // pinned host staging。stm/nstm は `batch * MAX_ACTIVE`、bucket/score/wdl は `batch`。
+    pinned_stm: [*mut i32; 2],
+    pinned_nstm: [*mut i32; 2],
+    pinned_bucket: [*mut i32; 2],
+    pinned_score: [*mut f32; 2],
+    pinned_wdl: [*mut f32; 2],
+    /// 各 slot の H2D 完了 event (copy stream に record)。compute stream が forward 前に待つ。
+    h2d_done: [CudaEvent; 2],
+    /// 各 slot を使った step の compute 完了 event (compute stream に record、
+    /// [`mark_step_done`](Self::mark_step_done))。同じ物理 device buffer を次に使う
+    /// step (= 2 step 後) の H2D 前に copy stream が待ち、in-flight な compute が
+    /// 読んでいる buffer を H2D が上書きする race を防ぐ。
+    step_done: [CudaEvent; 2],
+    /// stm/nstm pinned の要素容量 (`batch * MAX_ACTIVE`)。
+    cap_idx: usize,
+    /// bucket/score/wdl pinned の要素容量 (`batch`)。
+    cap_scalar: usize,
+    step: usize,
+}
+
+// SAFETY: 非 `Send` な field は raw pointer `pinned_*` のみ。これは `cuMemHostAlloc` で
+// 確保した page-locked host memory への pointer で、`InputUploadRing` が単独 owner、
+// 全 access は `&mut self` method (`upload` / `mark_step_done`) 経由で直列化される。
+// raw pointer 経由の aliasing も内部からの concurrent access も無いので別 thread へ
+// 移しても安全 (`AsyncLossRing` と同じ理由)。
+unsafe impl Send for InputUploadRing {}
+
+impl InputUploadRing {
+    /// copy stream + 2-slot pinned buffer + event を確保する。`batch` は最大 position 数。
+    fn new(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let copy_stream = ctx.new_stream()?;
+        let cap_idx = batch.max(1) * MAX_ACTIVE;
+        let cap_scalar = batch.max(1);
+        Ok(Self {
+            copy_stream,
+            pinned_stm: alloc_pinned_host::<i32>(cap_idx)?,
+            pinned_nstm: alloc_pinned_host::<i32>(cap_idx)?,
+            pinned_bucket: alloc_pinned_host::<i32>(cap_scalar)?,
+            pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
+            pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
+            h2d_done: [ctx.new_event(None)?, ctx.new_event(None)?],
+            step_done: [ctx.new_event(None)?, ctx.new_event(None)?],
+            cap_idx,
+            cap_scalar,
+            step: 0,
+        })
+    }
+
+    /// `batch` の入力 5 slice を pinned 経由で `dev_*` (caller が swap で active 化した
+    /// device buffer) へ copy stream で async H2D し、`compute_stream` に H2D 完了を
+    /// 待たせる。
+    ///
+    /// caller (`step_impl`) は呼出前に active / back device buffer を `mem::swap` 済で、
+    /// `dev_*` は直前 step が読んでいない側の物理 buffer であること。これにより H2D は
+    /// 直前 step の compute と物理 buffer 競合なしに並走する。
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        &mut self,
+        compute_stream: &CudaStream,
+        dev_stm: &DeviceBuffer<i32>,
+        h_stm: &[i32],
+        dev_nstm: &DeviceBuffer<i32>,
+        h_nstm: &[i32],
+        dev_bucket: &DeviceBuffer<i32>,
+        h_bucket: &[i32],
+        dev_score: &DeviceBuffer<f32>,
+        h_score: &[f32],
+        dev_wdl: &DeviceBuffer<f32>,
+        h_wdl: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            h_stm.len() <= self.cap_idx && h_nstm.len() <= self.cap_idx,
+            "input batch ({} idx) exceeds pinned capacity {}",
+            h_stm.len().max(h_nstm.len()),
+            self.cap_idx
+        );
+        assert!(
+            h_bucket.len() <= self.cap_scalar
+                && h_score.len() <= self.cap_scalar
+                && h_wdl.len() <= self.cap_scalar,
+            "input batch (scalar) exceeds pinned capacity {}",
+            self.cap_scalar
+        );
+        let slot = self.step % 2;
+        if self.step >= 2 {
+            // この物理 device buffer を最後に使った step (= step-2) の compute 完了を
+            // copy stream に待たせてから H2D する。host は loss_ring 経由で複数 step
+            // 先行しうるため、待たないと step-2 の backward がまだ読んでいる input
+            // buffer を H2D が上書きする race になる。step 0/1 は当該 slot 未 record。
+            self.copy_stream.wait(&self.step_done[slot])?;
+            // 同 slot の pinned を最後に read した H2D (= step-2) の完了を host が待ち、
+            // in-flight な H2D の読み元 pinned を下の copy_nonoverlapping が壊さないよう
+            // にする。
+            self.h2d_done[slot].synchronize()?;
+        }
+        // host: Vec → pinned[slot]。
+        // SAFETY: pinned[slot] は cuMemHostAlloc で cap 要素確保した有効 host memory、
+        // 上の assert で `src.len() <= cap` を保証。src (Vec) / dst (pinned) は別領域。
+        // step >= 2 の slot は直上の h2d_done sync で前回 H2D 完了済 (in-flight でない)。
+        unsafe {
+            std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
+            std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(
+                h_bucket.as_ptr(),
+                self.pinned_bucket[slot],
+                h_bucket.len(),
+            );
+            std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
+            std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
+        }
+        // device: pinned[slot] → dev_* (copy stream で async H2D)。
+        // SAFETY: 各 pinned[slot] は直上の copy_nonoverlapping で先頭 `h_*.len()` 要素を
+        // 初期化済の page-locked host memory。`from_raw_parts` で同じ `h_*.len()` 長の
+        // slice 化して既存 H2D helper に渡す (helper が `src.len() <= dev.len()` を assert)。
+        let cs: &CudaStream = &self.copy_stream;
+        unsafe {
+            copy_host_to_device_async_i32(
+                cs,
+                dev_stm,
+                std::slice::from_raw_parts(self.pinned_stm[slot], h_stm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nstm,
+                std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_bucket,
+                std::slice::from_raw_parts(self.pinned_bucket[slot], h_bucket.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_score,
+                std::slice::from_raw_parts(self.pinned_score[slot], h_score.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_wdl,
+                std::slice::from_raw_parts(self.pinned_wdl[slot], h_wdl.len()),
+            )?;
+        }
+        self.h2d_done[slot].record(cs)?;
+        // compute stream は H2D 完了後に forward が input を読むよう待つ。
+        compute_stream.wait(&self.h2d_done[slot])?;
+        Ok(())
+    }
+
+    /// step の compute が input buffer を読み終えた (= step 全体が完了した) ことを
+    /// `compute_stream` 上の event に記録し、step counter を進める。`step_impl` 末尾で
+    /// 呼ぶ。同じ物理 device buffer を使う次 step ([`upload`](Self::upload) の step+2)
+    /// が H2D 前にこの event を待ち、buffer reuse race を防ぐ。
+    fn mark_step_done(
+        &mut self,
+        compute_stream: &CudaStream,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let slot = self.step % 2;
+        self.step_done[slot].record(compute_stream)?;
+        self.step += 1;
+        Ok(())
+    }
+}
+
+impl Drop for InputUploadRing {
+    fn drop(&mut self) {
+        // pinned を free する前に in-flight な H2D を完了させる。copy stream を sync
+        // すれば全 H2D が完了する。失敗は無視 (Drop 中の error 報告は実用上困難)。
+        let _ = self.copy_stream.synchronize();
+        for slot in self
+            .pinned_stm
+            .iter()
+            .chain(self.pinned_nstm.iter())
+            .chain(self.pinned_bucket.iter())
+        {
+            if !slot.is_null() {
+                // SAFETY: cuMemHostAlloc で確保した pointer を cuMemFreeHost で解放。
+                // 上の copy stream sync で in-flight H2D は完了済。
+                unsafe {
+                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                }
+            }
+        }
+        for slot in self.pinned_score.iter().chain(self.pinned_wdl.iter()) {
+            if !slot.is_null() {
+                // SAFETY: 同上。
+                unsafe {
+                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                }
+            }
+        }
+    }
+}
+
+/// `cuMemHostAlloc` で page-locked host memory を `n` 要素分 2 slot 確保する。
+fn alloc_pinned_host<T>(n: usize) -> Result<[*mut T; 2], Box<dyn std::error::Error>> {
+    let mut out = [std::ptr::null_mut::<T>(); 2];
+    for slot in out.iter_mut() {
+        let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
+        // SAFETY: cuMemHostAlloc は page-locked host memory を `n * size_of::<T>()` byte
+        // 確保、失敗時は CUresult != SUCCESS を返す (.result()? で check)。
+        unsafe {
+            cuda_core::sys::cuMemHostAlloc(
+                &mut p as *mut _,
+                n * std::mem::size_of::<T>(),
+                cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+            .result()?;
+        }
+        *slot = p as *mut T;
+    }
+    Ok(out)
+}
+
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
@@ -4875,6 +5129,7 @@ impl GpuTrainer {
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
+            input_ring: InputUploadRing::new(ctx, batch_size.max(1))?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
             ft_fp16_out,
@@ -5442,9 +5697,9 @@ impl GpuTrainer {
         }
         let b_u32 = b as u32;
 
-        // 中間 activation workspace を batch `b` 以上に拡張 (grow-only)。
-        // batch_size 固定なら起動時の `GpuWorkspace::new` で足りているので no-op。
-        self.ws.ensure_batch(&self.stream, b, self.ft_fp16_out)?;
+        // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
+        // 起動時の `GpuWorkspace::new` で確保済)。
+        self.ws.check_batch_capacity(b)?;
 
         macro_rules! prof_tick {
             ($label:expr) => {
@@ -5461,14 +5716,32 @@ impl GpuTrainer {
             };
         }
 
-        // 入力 buffer を host → device (workspace pre-allocated buffer に in-place memcpy)。
-        // 元の `DeviceBuffer::from_host` は毎 step cudaMalloc + cudaMemcpyAsync + drop (cudaFree) で
-        // ~0.5-1 ms 浪費。pre-allocated に変えて malloc/free を削減。
-        copy_host_to_device_async_i32(&self.stream, &self.ws.stm_idx_dev, batch.stm_indices)?;
-        copy_host_to_device_async_i32(&self.stream, &self.ws.nstm_idx_dev, batch.nstm_indices)?;
-        copy_host_to_device_async_i32(&self.stream, &self.ws.bucket_idx_dev, batch.bucket_idx)?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, batch.score)?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, batch.wdl)?;
+        // 入力 5 buffer を host → device。active / back buffer を `mem::swap` してから
+        // back 側 (= 直前 step が読んでいない物理 buffer) へ専用 copy stream で先行 H2D
+        // する。H2D は直前 step の compute と並走し、compute stream は H2D 完了 event を
+        // 待ってから forward に進む ([`InputUploadRing`])。pageable な dataloader `Vec`
+        // は ring 内の pinned host buffer 経由で copy engine の DMA に載る。
+        std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(
+            &mut self.ws.bucket_idx_dev,
+            &mut self.ws.bucket_idx_dev_back,
+        );
+        std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
+        std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
+        self.input_ring.upload(
+            &self.stream,
+            &self.ws.stm_idx_dev,
+            batch.stm_indices,
+            &self.ws.nstm_idx_dev,
+            batch.nstm_indices,
+            &self.ws.bucket_idx_dev,
+            batch.bucket_idx,
+            &self.ws.score_dev,
+            batch.score,
+            &self.ws.wdl_dev,
+            batch.wdl,
+        )?;
         // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
         // loss_acc reset (accumulate semantics、再 alloc せず memset)
@@ -6693,6 +6966,11 @@ impl GpuTrainer {
             }?;
         }
         prof_tick!("optimizer");
+
+        // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の
+        // event に記録する。同じ物理 input buffer を使う step+2 の H2D がこれを待ち、
+        // in-flight compute が読む buffer を H2D が上書きする race を防ぐ。
+        self.input_ring.mark_step_done(&self.stream)?;
 
         // `loss_acc` の host への取り出しを `AsyncLossRing` 経由で async 化。
         // pinned host cell に `memcpy_dtoh_async` + event record、前 step の event を
