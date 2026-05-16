@@ -10,11 +10,9 @@ rust-version = { workspace = true }
 [lints]
 workspace = true
 
-# cuda-oxide は ABI が rustc internal に張り付いた alpha crate のため commit
-# pin で取り込む。`rust-toolchain.toml` の channel と必ず揃える
-# (channel ずれは link-time fail)。詳細な選定理由は
-# docs/decisions/2026-05-09-cuda-oxide-adoption.md。
+# cuda-oxide host API。git rev pin と選定理由は root Cargo.toml の
+# [workspace.dependencies] に集約。
 [dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-core = { workspace = true }
+cuda-host = { workspace = true }
 thiserror = "2"

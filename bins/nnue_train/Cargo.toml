@@ -31,8 +31,8 @@ clap = { workspace = true }
 
 # cuda-oxide device 側 API (`#[kernel]` / DisjointSlice / atomics) + host 側
 # launch (`cuda_launch!` macro)。`cuda-core` は `cuda_launch!` の展開で参照
-# されるため bin の direct dep として明示する必要がある。rev は workspace 全体で
-# 揃え、`rust-toolchain.toml` の channel とも整合させる。
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+# されるため bin の direct dep として明示する必要がある。git rev pin は root
+# Cargo.toml の [workspace.dependencies] に集約。
+cuda-core = { workspace = true }
+cuda-device = { workspace = true }
+cuda-host = { workspace = true }

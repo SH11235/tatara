@@ -23,7 +23,8 @@ gpu-runtime = { workspace = true }
 clap = { workspace = true }
 
 # cuda-oxide deps: device 側 API (#[kernel] / DisjointSlice / atomics) と host 側
-# launch (cuda_launch! macro)。`cuda-core` は macro 展開で参照されるため explicit dep。
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+# launch (cuda_launch! macro)。`cuda-core` は macro 展開で参照されるため explicit
+# dep。git rev pin は root Cargo.toml の [workspace.dependencies] に集約。
+cuda-core = { workspace = true }
+cuda-device = { workspace = true }
+cuda-host = { workspace = true }

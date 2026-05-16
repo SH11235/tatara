@@ -14,6 +14,7 @@ rustc backend) で build-time に PTX 化し、host から device まで C++ / C
 
 ### 環境要件
 
+- **OS** — Linux 一級サポート、Windows は WSL2 経由、macOS は GPU ビルド非対応
 - **NVIDIA GPU** (Ampere 以降 / sm_80+ を公式サポート、Turing / sm_75 も
   `CUDA_OXIDE_TARGET=sm_75` 環境変数で単純な kernel は動作)
 - **CUDA Toolkit 12.x** (12.9 で動作確認)
@@ -22,8 +23,9 @@ rustc backend) で build-time に PTX 化し、host から device まで C++ / C
 - **Rust nightly** (`rust-toolchain.toml` で cuda-oxide upstream の channel
   に追従、rustc internal ABI に依存するため channel を勝手に変えない)
 
-詳細なインストール手順とサポート GPU マトリクスは
-[docs/setup.md](docs/setup.md) を参照。
+GPU kernel をビルドする `cargo-oxide` のセットアップは
+`bash scripts/setup-cuda-oxide.sh`。詳細なインストール手順・OS 別の案内・
+サポート GPU マトリクスは [docs/setup.md](docs/setup.md) を参照。
 
 ### Build & test
 
@@ -53,8 +55,8 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 
 ## ドキュメント
 
-- [Setup guide](docs/setup.md) — CUDA / LLVM / rustup のインストール、サポート
-  GPU マトリクス、CUDA toolkit root 解決
+- [Setup guide](docs/setup.md) — OS 別の案内、CUDA / LLVM / `cargo-oxide` の
+  セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.md) — PSV データ準備 + 主要
   CLI option + 400 sb full run + resume / checkpoint 運用
 - [Performance guide](docs/performance.md) — GPU 機種別 throughput 目安 +
