@@ -1,3 +1,4 @@
+#![feature(f16)]
 //! `bins/nnue_train` binary entry point — bullet-shogi v102 互換 NNUE trainer。
 //!
 //! 本 file は **v102 LayerStack arch** の `#[kernel]` 群 (27 個) と host loop
@@ -438,6 +439,90 @@ pub fn sparse_ft_forward(
         out_ptr.add(out_base + 1).write(s1);
         out_ptr.add(out_base + 2).write(s2);
         out_ptr.add(out_base + 3).write(s3);
+    }
+}
+
+/// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
+/// 変換してから累算する。累算と出力は `f32` のまま。
+///
+/// `sparse_ft_forward` は DRAM 帯域律速 (RTX 3080 Ti 実測で peak DRAM BW の ~90%)
+/// で、その traffic の大半は active feature 行の weight gather read。weight を半精度に
+/// すると read byte 数が半減し、L2 にも 2 倍の行が載るため DRAM 律速が緩む。
+/// caller は `weight` に `ft_w` の FP16 mirror を渡し、FP32 master とは別管理する
+/// (optimizer は FP32 master を更新し、mirror は毎 step 変換し直す)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn sparse_ft_forward_fp16(
+    weight: &[f16],
+    indices: &[i32],
+    mut out: DisjointSlice<f32>,
+    batch: u32,
+    rows: u32,
+    cols: u32,
+    nnz: u32,
+) {
+    let tid = thread::index_1d();
+    let rows_u = rows as usize;
+    let rows_q = rows_u / 4;
+    let total = (batch as usize) * rows_q;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / rows_q;
+    let ri_q = tid.get() % rows_q;
+    let ri_base = ri_q * 4;
+
+    // raw pointer 版。unsafe 妥当性は [`sparse_ft_forward`] と同一 (indices.len() ==
+    // batch * nnz、weight.len() == cols * rows、rows % 4 == 0)。weight のみ要素型が
+    // `f16` で、4 連続 row の read は 8 byte 境界に整列する (idx*rows は偶数、
+    // ri_base は 4 の倍数)。
+    let indices_ptr = indices.as_ptr();
+    let weight_ptr = weight.as_ptr();
+    let mut s0: f32 = 0.0;
+    let mut s1: f32 = 0.0;
+    let mut s2: f32 = 0.0;
+    let mut s3: f32 = 0.0;
+    let base = bi * (nnz as usize);
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
+        if idx >= 0 && (idx as u32) < cols {
+            let off = (idx as usize) * rows_u + ri_base;
+            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
+            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
+            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
+            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
+            s0 += w0;
+            s1 += w1;
+            s2 += w2;
+            s3 += w3;
+        }
+        ni += 1;
+    }
+    let out_ptr = out.as_mut_ptr();
+    let out_base = bi * rows_u + ri_base;
+    unsafe {
+        out_ptr.add(out_base).write(s0);
+        out_ptr.add(out_base + 1).write(s1);
+        out_ptr.add(out_base + 2).write(s2);
+        out_ptr.add(out_base + 3).write(s3);
+    }
+}
+
+/// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。
+/// FP32 master weight (`ft_w`) から forward 用 FP16 mirror を毎 step 生成するのに使う。
+/// 1 thread = 1 要素、`dst` は thread ごとに disjoint な cell へ書く。
+#[kernel]
+pub fn cast_f32_to_f16(src: &[f32], dst: &[f16], n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let v = src[i.get()];
+    // dst.len() == n を caller が保証 (`ft_w` と同要素数で確保)。
+    let dst_ptr = dst.as_ptr() as *mut f16;
+    unsafe {
+        dst_ptr.add(i.get()).write(v as f16);
     }
 }
 
@@ -3064,7 +3149,8 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_fwd_bucket_tiled_l1_sorted,\
                        dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
                        bias_grad_bucket_shared_sorted,\
-                       ft_post_perspective_grad_fused";
+                       ft_post_perspective_grad_fused,\
+                       sparse_ft_forward_fp16,cast_f32_to_f16";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -3302,6 +3388,9 @@ struct GpuTrainer {
     ft_w_v: DeviceBuffer<f32>,
     ft_w_slow: DeviceBuffer<f32>,
     ft_w_grad: DeviceBuffer<f32>,
+    /// `ft_w` の FP16 mirror。`ft_fp16` が true のときだけ確保され、毎 step `ft_w`
+    /// (FP32 master) から変換される。`sparse_ft_forward_fp16` の weight 入力。
+    ft_w_h: Option<DeviceBuffer<f16>>,
     ft_b: DeviceBuffer<f32>,
     ft_b_m: DeviceBuffer<f32>,
     ft_b_v: DeviceBuffer<f32>,
@@ -3369,6 +3458,9 @@ struct GpuTrainer {
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
     cublas: CublasHandle,
+    /// true なら forward の `sparse_ft_forward` を FP16 weight 版に切替える
+    /// (`--ft-fp16`)。false で従来の FP32 path と bit-identical。
+    ft_fp16: bool,
     step_count: u64,
 }
 
@@ -4159,10 +4251,14 @@ impl GpuTrainer {
     ///
     /// `enable_tf32` は cuBLAS の `cublasSetMathMode` 引数を切替 ([`CublasHandle::new`])、
     /// `true` で Ampere+ TC TF32 mode、`false` で純 FP32。default は CLI 側で OFF。
+    ///
+    /// `ft_fp16` が true なら FP16 weight mirror (`ft_w_h`) を確保し、forward の
+    /// `sparse_ft_forward` を FP16 版に切替える。false なら mirror は未確保で従来 path。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         enable_tf32: bool,
+        ft_fp16: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -4200,6 +4296,11 @@ impl GpuTrainer {
             ft_w_v: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_w_h: if ft_fp16 {
+                Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
+            } else {
+                None
+            },
             ft_b: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
@@ -4256,6 +4357,7 @@ impl GpuTrainer {
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
+            ft_fp16,
             step_count: 0,
         })
     }
@@ -4833,36 +4935,91 @@ impl GpuTrainer {
         memset_zero(&self.stream, &self.loss_acc)?;
         prof_tick!("h2d+reset");
 
+        // FP16 mirror 更新 (`--ft-fp16` 時のみ): optimizer が更新する FP32 master
+        // `ft_w` を毎 step `ft_w_h` (f16) へ変換し直す。forward はこの mirror を読む。
+        if self.ft_fp16 {
+            let ft_w_h = self
+                .ft_w_h
+                .as_ref()
+                .expect("ft_w_h is Some when ft_fp16 is enabled");
+            let ft_w_n = FT_IN * FT_OUT;
+            cuda_launch! {
+                kernel: cast_f32_to_f16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_w_n),
+                args: [
+                    slice(self.ft_w),
+                    slice(ft_w_h),
+                    ft_w_n as u32
+                ]
+            }?;
+            prof_tick!("ft_cast");
+        }
+
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
         // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * FT_OUT / 4。
         // FT_OUT = 1536 (4 の倍数) を arch 固定で保証。
+        // `ft_fp16` 時は FP16 weight 版 (`sparse_ft_forward_fp16`) に切替える: 累算は
+        // f32 で同形、weight read のみ半精度で DRAM 帯域が半減する。
         debug_assert!(FT_OUT.is_multiple_of(4));
-        cuda_launch! {
-            kernel: sparse_ft_forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT / 4),
-            args: [
-                slice(self.ft_w),
-                slice(self.ws.stm_idx_dev),
-                slice_mut(self.ws.ft_stm_out),
-                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: sparse_ft_forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * FT_OUT / 4),
-            args: [
-                slice(self.ft_w),
-                slice(self.ws.nstm_idx_dev),
-                slice_mut(self.ws.ft_nstm_out),
-                b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
-            ]
-        }?;
+        if self.ft_fp16 {
+            let ft_w_h = self
+                .ft_w_h
+                .as_ref()
+                .expect("ft_w_h is Some when ft_fp16 is enabled");
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.stm_idx_dev),
+                    slice_mut(self.ws.ft_stm_out),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.nstm_idx_dev),
+                    slice_mut(self.ws.ft_nstm_out),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: sparse_ft_forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(self.ft_w),
+                    slice(self.ws.stm_idx_dev),
+                    slice_mut(self.ws.ft_stm_out),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * FT_OUT / 4),
+                args: [
+                    slice(self.ft_w),
+                    slice(self.ws.nstm_idx_dev),
+                    slice_mut(self.ws.ft_nstm_out),
+                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                ]
+            }?;
+        }
         prof_tick!("fwd_ft");
 
         // -- Forward step 3: ft_post_perspective_fwd → combined (B × FT_OUT) --
@@ -6072,6 +6229,13 @@ struct Cli {
     /// 品質 conservative に default OFF。
     #[arg(long)]
     tf32: bool,
+
+    /// FT weight (`ft_w`) を FP16 mirror で forward する高速モード。default `false`
+    /// では FP32 path と bit-identical。`true` で `sparse_ft_forward` の weight DRAM
+    /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
+    /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
+    #[arg(long)]
+    ft_fp16: bool,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -6192,7 +6356,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size, cli.tf32)?;
+    let mut trainer = GpuTrainer::new(&ctx, cli.batch_size, cli.tf32, cli.ft_fp16)?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
         println!(
@@ -6275,7 +6439,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     println!("[smoke] CUDA context created, loading kernel module...");
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false)?;
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (FT_IN * FT_OUT

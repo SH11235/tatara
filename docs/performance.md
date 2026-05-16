@@ -103,6 +103,29 @@ batch 1 以降の steady-state を見る。
    GPU other load 競合の可能性。`nvidia-smi` で GPU 使用率と温度確認、別
    process が GPU を占有していないか調べる。
 
+## FP16 FT weight モード (`--ft-fp16`)
+
+`--ft-fp16` を付けると、forward の `sparse_ft_forward` が FT weight (`ft_w`) を
+FP16 で読む高速モードになる。既定 OFF では FP32 path と bit-identical。
+
+`sparse_ft_forward` は step 中で唯一 DRAM 帯域律速の kernel (RTX 3080 Ti 実測で
+peak DRAM BW の ~90%) で、その traffic の大半は active feature 行の weight gather
+read。weight を半精度にすると read byte 数が半減し、`fwd_ft` phase が大きく縮む:
+
+| 指標 (RTX 3080 Ti, bs=65536) | `--ft-fp16` OFF | `--ft-fp16` ON |
+|---|---:|---:|
+| `fwd_ft` (profile-on) | ~22.0 ms | ~9.0 ms |
+| FP16 mirror への cast (`ft_cast`) | — | ~0.83 ms |
+| pos/s (5 sb × 200 batches, sb 2-5 mean) | ~922K | ~1.10M |
+
+精度設計: optimizer は FP32 master `ft_w` を更新し、forward 用の FP16 mirror
+(`ft_w_h`) は毎 step master から変換し直す。weight grad / optimizer state /
+checkpoint は FP32 のまま (checkpoint は通常の v102 量子化フォーマット)。
+
+量子化誤差で棋力が変動しうるため既定 OFF。loss 軌跡は FP32 と差 ~1e-5 程度だが、
+本番品質は SPRT で確認するまで保証しない。動作確認や簡易・高速な学習に使う
+opt-in option。
+
 ## 関連
 
 - [docs/training-quickstart.md](training-quickstart.md) — 学習を回す手順
