@@ -148,9 +148,10 @@ rev=$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//
 cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" cargo-oxide
 ```
 
-`~/.cargo/bin` を PATH に通しておくこと。cuda-oxide の rev を bump したとき
-(library 側 `Cargo.toml` を更新したとき) は `cargo-oxide` も同 rev に入れ直す:
-`FORCE=1 bash scripts/setup-cuda-oxide.sh`。
+`~/.cargo/bin` を PATH に通しておくこと。スクリプトは毎回 pin rev で
+`cargo-oxide` を入れ直すので、cuda-oxide の rev を bump したとき (library 側
+`Cargo.toml` を更新したとき) も同じく `bash scripts/setup-cuda-oxide.sh` を
+再実行すればよい。
 
 ## Smoke test
 

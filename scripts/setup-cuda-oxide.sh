@@ -4,9 +4,9 @@
 #
 # GPU kernel は cuda-oxide の rustc codegen backend で PTX 化する。その backend
 # を駆動する cargo subcommand `cargo-oxide` は、本リポジトリの依存 (cuda-core 等)
-# とは別に利用者の環境へ 1 度 install する必要がある。cuda-oxide repo の手動
-# clone は不要で、upstream が公式サポートする `cargo install --git` を使う。rev
-# は Cargo.lock が固定している cuda-oxide の rev をそのまま使い、library 側と
+# とは別に利用者の環境へ install する必要がある。cuda-oxide repo の手動 clone は
+# 不要で、upstream が公式サポートする `cargo install --git` を使う。rev は
+# Cargo.lock が固定している cuda-oxide の rev をそのまま使い、library 側と
 # codegen backend 側を同一 rev に揃える (rev ずれは codegen backend の ABI 不一致
 # を招く)。
 #
@@ -14,9 +14,10 @@
 # 不足はチェックして報告するだけなので、導入手順は docs/setup.md を参照。
 #
 # 使い方:
-#   bash scripts/setup-cuda-oxide.sh          # 初回セットアップ + 環境チェック
-#   FORCE=1 bash scripts/setup-cuda-oxide.sh  # cargo-oxide を再 install
-#                                             # (cuda-oxide rev を bump した後)
+#   bash scripts/setup-cuda-oxide.sh   # cargo-oxide を pin rev で install + 環境診断
+#
+# cargo-oxide は毎回 pin rev で入れ直すため、cuda-oxide rev を bump した後も
+# 同じコマンドを再実行すればよい。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,6 +49,7 @@ check() {  # check <表示名> <コマンド> <不足時の一言>
 echo "host 前提のチェック:"
 check rustup rustup "rustup 経由で nightly + rust-src / rustc-dev component が要る"
 check cargo  cargo  "Rust toolchain が要る"
+check git    git    "cargo install --git が git を呼ぶ"
 # llc は llc-22 → llc-21 の順で cuda-oxide が探す。どれか 1 つあれば良い。
 if command -v llc-22 >/dev/null 2>&1 || command -v llc-21 >/dev/null 2>&1 \
    || command -v llc >/dev/null 2>&1; then
@@ -70,27 +72,29 @@ if [[ "$missing" -ne 0 ]]; then
   echo
 fi
 
-# cargo-oxide の install。既に PATH にあれば skip し、rev bump 時は FORCE=1 で
-# 再 install する。--force は install 分岐でのみ付け、未 install 時は無害。
+# cargo-oxide を pin rev で install する。既に別 rev が入っていると codegen
+# backend の ABI がずれるため、毎回 --force で pin rev に入れ直す (cargo-oxide
+# 本体は小さく rebuild は数秒)。skip 判定で別 rev を見逃さないための方針。
 cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-if command -v cargo-oxide >/dev/null 2>&1 && [[ "${FORCE:-0}" != "1" ]]; then
-  echo "cargo-oxide は install 済み: $(command -v cargo-oxide)"
-  echo "  cuda-oxide rev を変えた場合は FORCE=1 で再 install してください。"
-else
-  echo "cargo-oxide を install します: cargo install --git ... --rev $rev"
-  cargo install --git "$CUDA_OXIDE_GIT" --rev "$rev" cargo-oxide --force
-fi
+echo "cargo-oxide を install します: cargo install --git ... --rev $rev"
+cargo install --git "$CUDA_OXIDE_GIT" --rev "$rev" cargo-oxide --force
 echo
 
-if ! command -v cargo-oxide >/dev/null 2>&1; then
+# install 先 ($cargo_bin/cargo-oxide) が PATH 上で解決されるか確認する。
+oxide="$cargo_bin/cargo-oxide"
+oxide_on_path="$(command -v cargo-oxide || true)"
+if [[ -z "$oxide_on_path" ]]; then
   echo "WARN: cargo-oxide が PATH にありません。次を shell rc に追加してください:"
   echo "      export PATH=\"$cargo_bin:\$PATH\""
   echo
+elif [[ "$oxide_on_path" != "$oxide" ]]; then
+  echo "WARN: PATH 上の cargo-oxide ($oxide_on_path) が install 先 $oxide を"
+  echo "      shadow しています。pin rev を使うには $cargo_bin を PATH 前方に置いてください。"
+  echo
 fi
 
-# 環境診断。cargo-oxide は初回実行時に codegen backend を自動で取得・ビルドして
-# キャッシュするため、doctor の初回は時間がかかる。
-oxide="$(command -v cargo-oxide || echo "$cargo_bin/cargo-oxide")"
+# 環境診断。install したばかりの pin rev の cargo-oxide で実行する。初回は
+# codegen backend を自動で取得・ビルドしてキャッシュするため時間がかかる。
 if [[ -x "$oxide" ]]; then
   echo "cargo oxide doctor:"
   doctor_status=0
@@ -100,7 +104,7 @@ if [[ -x "$oxide" ]]; then
     echo "WARN: doctor が問題を報告しました (上記)。docs/setup.md で対処してください。"
   fi
 else
-  echo "WARN: cargo-oxide が見つからないため doctor を skip しました。"
+  echo "WARN: $oxide が見つからないため doctor を skip しました。"
 fi
 
 echo
