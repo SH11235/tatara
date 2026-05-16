@@ -319,7 +319,7 @@ const BLOCK_DIM: u32 = 256;
 /// `cuda_host::ltoir::build_cubin_from_ll` (libNVVM 経由) は cuda-oxide が出力
 /// する opaque pointer 形式の NVVM IR を parse できない (libNVVM 内蔵 LLVM が
 /// 古く、`define void @grad(ptr ...)` 形式を `libnvvm error 9: parse expected
-/// type` で reject する)。代わりに **`llc-21`** で素直に NVPTX backend を回す。
+/// type` で reject する)。代わりに **`llc`** で素直に NVPTX backend を回す。
 /// `__nv_sqrtf` 等 libdevice intrinsic は `.extern .func` 宣言として残るが、
 /// CUDA driver の JIT linker が module load 時に libdevice と link する。
 fn load_kernel_module_with_fallback(
@@ -381,15 +381,15 @@ fn load_kernel_module_with_fallback(
 ///
 /// パイプライン (NVCC の `compileToCubin` と同等):
 ///
-/// 1. **`llvm-link-21 <ll> libdevice.10.bc → linked.bc`** で `__nv_sqrtf` 等の
+/// 1. **`llvm-link <ll> libdevice.10.bc → linked.bc`** で `__nv_sqrtf` 等の
 ///    libdevice intrinsic を IR レベルで取り込み
-/// 2. **`opt-21 --passes='nvvm-reflect,internalize,globaldce'
+/// 2. **`opt --passes='nvvm-reflect,internalize,globaldce'
 ///    --internalize-public-api-list=<kernel symbols> linked.bc → opt.bc`** で:
 ///    - kernel 以外の libdevice 関数を `internal` にして dead-code-elim 対象化
 ///    - `__nvvm_reflect()` 呼び出しを 0/1 const に置換 (libdevice 内 `__CUDA_FTZ`
 ///      等の query を解決)
 ///    - `globaldce` で未参照の libdevice 関数を削除
-/// 3. **`llc-21 --mtriple=nvptx64-nvidia-cuda --mcpu=<arch> -O2 opt.bc → .ptx`**
+/// 3. **`llc --mtriple=nvptx64-nvidia-cuda --mcpu=<arch> -O2 opt.bc → .ptx`**
 ///    で NVPTX backend が PTX 生成
 ///
 /// 結果の `.ptx` は `.extern .func` 宣言を含まず、`ptxas` / driver JIT が完結する。
@@ -398,8 +398,8 @@ fn load_kernel_module_with_fallback(
 /// cuda-oxide が出力する NVVM IR は opaque pointer 形式 (`define void @grad(ptr
 /// ...)`) で、libNVVM は古い LLVM 版を内蔵していて opaque pointer を parse
 /// できず `nvvmCompileProgram error 9: parse expected type` で reject される。
-/// `llvm-link-21 + opt-21 + llc-21` の組合せは LLVM 21 series 以降の opaque
-/// pointer をネイティブに扱うため成功する。
+/// `llvm-link + opt + llc` (LLVM 21+) の組合せは opaque pointer をネイティブに
+/// 扱うため成功する。
 fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let stem = ll_path
         .file_stem()
@@ -429,9 +429,10 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     }
 
     let arch = std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_75".to_string());
-    let llvm_link = std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| "llvm-link-21".to_string());
-    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| "opt-21".to_string());
-    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
+    let llvm_link =
+        std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| discover_llvm_tool("llvm-link"));
+    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| discover_llvm_tool("opt"));
+    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| discover_llvm_tool("llc"));
     let libdevice = find_libdevice_bc()?;
 
     // 本 binary に inline 定義した kernel 名。`@<name>` として `.ll` 側に
@@ -483,6 +484,27 @@ fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::
     Ok(ptx_path)
 }
 
+/// `.ll`→`.ptx` 変換に使う LLVM tool 名を解決する。`<tool>-22` → `<tool>-21`
+/// → 無印 `<tool>` の順で `--version` が通る最初の名前を返す (cuda-oxide 本体の
+/// `llc-22 → llc-21` 探索順に揃える)。どれも無ければ `<tool>-21` を返し、spawn
+/// 失敗時に `run_or_err` が導入方法を案内する。`LLVM_LINK_BIN` / `OPT_BIN` /
+/// `LLC_BIN` env が設定されていればそちらが優先される。
+fn discover_llvm_tool(tool: &str) -> String {
+    for suffix in ["-22", "-21", ""] {
+        let name = format!("{tool}{suffix}");
+        let ok = std::process::Command::new(&name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return name;
+        }
+    }
+    format!("{tool}-21")
+}
+
 /// `Command::new` + `args` + `status` を 1 行にまとめる helper。
 fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new(bin)
@@ -491,9 +513,10 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
         .map_err(|e| {
             format!(
                 "failed to spawn {bin}: {e}. \
-                 本 binary は llvm-link-21 / opt-21 / llc-21 を要求します \
-                 (libNVVM が opaque pointer IR を parse できないため)。\
-                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で別 binary を指定可。"
+                 .ll→.ptx 変換は LLVM 21+ の llvm-link / opt / llc を使う \
+                 (libNVVM が opaque pointer IR を parse できないため llc 経路)。\
+                 -22 / -21 を自動探索するが、見つからなければ \
+                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で明示指定する。"
             )
         })?;
     if !status.success() {

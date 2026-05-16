@@ -26,7 +26,7 @@ CUDA_OXIDE_GIT="https://github.com/NVlabs/cuda-oxide.git"
 
 # pin している cuda-oxide rev を Cargo.lock から読む。rev の単一情報源は root
 # Cargo.toml の [workspace.dependencies] で、Cargo.lock はその解決結果。
-rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-fA-F]+' Cargo.lock | sed 's/.*rev=//' || true)"
+rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//' || true)"
 if [[ -z "$rev" ]]; then
   echo "ERROR: Cargo.lock から cuda-oxide の rev を取得できませんでした。" >&2
   echo "       リポジトリ root で、cuda-oxide を依存に持つ状態で実行してください。" >&2
