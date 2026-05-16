@@ -439,7 +439,7 @@ pub fn sparse_ft_forward_fp16(
     // raw pointer 版。unsafe 妥当性は [`sparse_ft_forward`] と同一 (indices.len() ==
     // batch * nnz、weight.len() == cols * rows、out.len() == batch * rows、
     // rows % 4 == 0)。weight のみ要素型が `f16` で、4 連続 row の read は 8 byte
-    // 境界に整列する (idx*rows は偶数、ri_base は 4 の倍数)。
+    // 境界に整列する (idx*rows は 4 の倍数 [rows = FT_OUT = 1536]、ri_base は 4 の倍数)。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
     let mut s0: f32 = 0.0;
@@ -504,8 +504,8 @@ pub fn sparse_ft_forward_fp16_out(
     let ri_base = ri_q * 4;
 
     // unsafe 妥当性は [`sparse_ft_forward_fp16`] と同一。`weight` / `out` とも `f16` で、
-    // 4 連続 row の read / write は 8 byte 境界に整列する (idx*rows は偶数、ri_base は
-    // 4 の倍数)。
+    // 4 連続 row の read / write は 8 byte 境界に整列する (idx*rows は 4 の倍数
+    // [rows = FT_OUT = 1536]、ri_base は 4 の倍数)。
     let indices_ptr = indices.as_ptr();
     let weight_ptr = weight.as_ptr();
     let mut s0: f32 = 0.0;
@@ -6804,7 +6804,7 @@ struct Cli {
     /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
     /// inverse-index gather (step 中で最も DRAM read が多い `phD`) の帯域が半減する。
     /// dft は batch 正規化で `1/batch` に比例する微小値のため、FP16 化時は loss scaling
-    /// ([`FT_DFT_FP16_BASE_SCALE`] × batch) で normal range に持ち上げてから格納する。
+    /// (batch に比例する係数) で normal range に持ち上げてから格納する。
     ///
     /// weight FP16 (`--ft-fp16`) とは別 flag に分けてあり、SPRT で
     /// FP32 → `--ft-fp16` → `--ft-fp16 --ft-fp16-out` の 2 段で棋力影響を切り分け
