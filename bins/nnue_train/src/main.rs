@@ -7549,13 +7549,13 @@ struct Cli {
     #[arg(long)]
     ft_fp16_out: bool,
 
-    /// FT weight (`ft_w`) の Ranger optimizer moment (1st/2nd: `m` / `v`) を FP16 で
-    /// 保持する高速モード。default `false` では FP32 path と bit-identical。
+    /// 特徴変換器 (FT) の optimizer state を FP16 で保持する高速モード。default
+    /// `false` では FP32 path と bit-identical。
     ///
-    /// `ft_w` は 112.6M 要素あり、その optimizer step は `m` / `v` の read+write が
-    /// DRAM 帯域律速。`m` / `v` を半精度化すると optimizer phase の DRAM traffic が
-    /// 減る。`m` / `v` は batch 正規化された勾配由来で値が極めて小さいため、固定の
-    /// power-of-2 scale を掛けて FP16 の normal range に載せてから格納する。
+    /// FT は本ネットで最も要素数の多い層で、その optimizer 更新は state の read/write
+    /// がメモリ帯域律速。state を半精度化すると optimizer step のメモリ転送量が減って
+    /// 学習スループットが上がる。state は値が極めて小さいため、固定係数を掛けて FP16
+    /// の有効域に載せてから格納する。
     ///
     /// `--ft-fp16` / `--ft-fp16-out` とは独立した flag。量子化誤差で棋力が変動し
     /// うるため default OFF、本番品質は SPRT で確認するまで保証しない (動作確認や
