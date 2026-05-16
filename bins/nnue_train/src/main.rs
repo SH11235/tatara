@@ -309,6 +309,71 @@ pub fn radam_step(
     }
 }
 
+/// `radam_step` の FP16 mirror 同時更新 variant (`--ft-fp16` の `ft_w` 専用)。
+///
+/// forward は `ft_w` の FP16 mirror (`ft_w_h`) を読む。mirror を別 `cast_f32_to_f16`
+/// kernel で毎 step 作り直すと `ft_w` を丸ごと再 read する DRAM traffic が要るが、
+/// optimizer が `ft_w` を更新するこの kernel なら FP32 master が既に register に
+/// 載っているので、確定後の値をその場で `mirror[i]` へ half 精度で書けば再 read
+/// 不要になる。`mirror` は `weights` と同要素数 (caller 保証)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn radam_step_fp16_mirror(
+    mut weights: DisjointSlice<f32>,
+    mut m: DisjointSlice<f32>,
+    mut v: DisjointSlice<f32>,
+    mut grad: DisjointSlice<f32>,
+    mut mirror: DisjointSlice<f16>,
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    min_w: f32,
+    max_w: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let g_opt = grad.get_mut(i);
+    let m_opt = m.get_mut(i);
+    let v_opt = v.get_mut(i);
+    let w_opt = weights.get_mut(i);
+    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
+        let g = *g_ref;
+        let rate = lr * step_size;
+        let mut p = *w_ref;
+        p *= 1.0_f32 - decay * rate;
+        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
+        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
+        *m_ref = mi;
+        *v_ref = vi;
+        let mut val = mi;
+        if denom != 0 {
+            val /= vi.sqrt() + eps;
+        }
+        p -= rate * val;
+        let p_clamped = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+        *w_ref = p_clamped;
+        *g_ref = 0.0_f32;
+        let mirror_ptr = mirror.as_mut_ptr();
+        unsafe {
+            mirror_ptr.add(i.get()).write(p_clamped as f16);
+        }
+    }
+}
+
 /// Ranger Lookahead lerp。
 ///
 /// `weights[i] = alpha * weights[i] + (1 - alpha) * slow[i]`、`slow[i] = weights[i]`。
@@ -331,6 +396,37 @@ pub fn ranger_lookahead_lerp(
         let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
         *w_ref = new_w;
         *s_ref = new_w;
+    }
+}
+
+/// `ranger_lookahead_lerp` の FP16 mirror 同時更新 variant (`--ft-fp16` の `ft_w` 専用)。
+///
+/// lerp step では `radam_step_fp16_mirror` の後に lerp が `ft_w` を再度書き換えるため、
+/// forward が読む `ft_w_h` を lerp 後の最終値で同期し直す。`mirror` は `weights` と
+/// 同要素数 (caller 保証)。
+#[kernel]
+pub fn ranger_lookahead_lerp_fp16_mirror(
+    mut weights: DisjointSlice<f32>,
+    mut slow: DisjointSlice<f32>,
+    mut mirror: DisjointSlice<f16>,
+    alpha: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let one_minus_alpha = 1.0_f32 - alpha;
+    let w_opt = weights.get_mut(i);
+    let s_opt = slow.get_mut(i);
+    if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
+        let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
+        *w_ref = new_w;
+        *s_ref = new_w;
+        let mirror_ptr = mirror.as_mut_ptr();
+        unsafe {
+            mirror_ptr.add(i.get()).write(new_w as f16);
+        }
     }
 }
 
@@ -3490,7 +3586,8 @@ fn compile_ll_to_ptx_via_llc(
     // 全 27 kernel 名。`@<name>` として `.ll` に出ているものを漏れなく
     // internalize-public-api-list に残す (1 個でも漏れると opt の globaldce で消える)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
-                       adamw_step,radam_step,ranger_lookahead_lerp,\
+                       adamw_step,radam_step,radam_step_fp16_mirror,\
+                       ranger_lookahead_lerp,ranger_lookahead_lerp_fp16_mirror,\
                        ft_post_perspective_fwd,ft_post_perspective_grad,\
                        dense_mm_fwd,dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,\
                        dense_mm_fwd_bucket,dense_mm_bwd_input_bucket,\
@@ -5237,6 +5334,26 @@ impl GpuTrainer {
         Ok(())
     }
 
+    /// `--ft-fp16` の FP16 weight mirror (`ft_w_h`) を現在の `ft_w` から再生成する。
+    ///
+    /// 学習中の mirror は optimizer (`radam_step_fp16_mirror` /
+    /// `ranger_lookahead_lerp_fp16_mirror`) が `ft_w` 更新と同時に書く。ただし学習
+    /// 開始時は optimizer 未実行で mirror が初期 0 のままなので、最初の forward の前に
+    /// 一度だけ明示同期する。`ft_fp16` 無効時 (`ft_w_h` が `None`) は no-op。
+    fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            let ft_w_n = FT_IN * FT_OUT;
+            cuda_launch! {
+                kernel: cast_f32_to_f16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_w_n),
+                args: [slice(self.ft_w), slice_mut(ft_w_h), ft_w_n as u32]
+            }?;
+        }
+        Ok(())
+    }
+
     /// 1 batch 分の forward → loss kernel → backward → Ranger step を実行。
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
     ///
@@ -5356,28 +5473,6 @@ impl GpuTrainer {
         // loss_acc reset (accumulate semantics、再 alloc せず memset)
         memset_zero(&self.stream, &self.loss_acc)?;
         prof_tick!("h2d+reset");
-
-        // FP16 mirror 更新 (`--ft-fp16` 時のみ): optimizer が更新する FP32 master
-        // `ft_w` を毎 step `ft_w_h` (f16) へ変換し直す。forward はこの mirror を読む。
-        if self.ft_fp16 {
-            let mut ft_w_h = self
-                .ft_w_h
-                .as_mut()
-                .expect("ft_w_h is Some when ft_fp16 is enabled");
-            let ft_w_n = FT_IN * FT_OUT;
-            cuda_launch! {
-                kernel: cast_f32_to_f16,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_w_n),
-                args: [
-                    slice(self.ft_w),
-                    slice_mut(ft_w_h),
-                    ft_w_n as u32
-                ]
-            }?;
-            prof_tick!("ft_cast");
-        }
 
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
@@ -6443,15 +6538,27 @@ impl GpuTrainer {
         let (step_size, denom) =
             radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
 
-        // 10 weight groups × radam_step
+        // 10 weight groups × radam_step。`--ft-fp16` 時、FT weight だけは FP16 mirror
+        // (`ft_w_h`) 同時更新 variant を使い、forward 用 mirror を別 cast kernel 無しで
+        // 同期する (master FP32 が既に register 上にあるので half 書き出しのみ追加)。
         // FT
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-            args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                   slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
-                   MIN_W, MAX_W, ft_w_n as u32]
-        }?;
+        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            cuda_launch! {
+                kernel: radam_step_fp16_mirror,
+                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                       DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n as u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: radam_step,
+                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                       slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                       MIN_W, MAX_W, ft_w_n as u32]
+            }?;
+        }
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
@@ -6520,13 +6627,24 @@ impl GpuTrainer {
                    MIN_W, MAX_W, l3_b_n as u32]
         }?;
 
-        // Lookahead lerp every K steps
+        // Lookahead lerp every K steps。lerp は radam の後に FT weight を再度書き換える
+        // ので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新 variant を使い、
+        // forward 用 `ft_w_h` を lerp 後の最終値で同期し直す。
         if self.step_count.is_multiple_of(RANGER_K) {
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n as u32]
-            }?;
+            if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp_fp16_mirror,
+                    stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), slice_mut(ft_w_h),
+                           RANGER_ALPHA, ft_w_n as u32]
+                }?;
+            } else {
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp,
+                    stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n as u32]
+                }?;
+            }
             cuda_launch! {
                 kernel: ranger_lookahead_lerp,
                 stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
@@ -7007,6 +7125,10 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         score_drop_abs: cli.score_drop_abs,
         threads: cli.threads,
     };
+
+    // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
+    // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
+    trainer.sync_ft_w_h_mirror()?;
 
     nnue_train::trainer::run(
         &mut trainer,
