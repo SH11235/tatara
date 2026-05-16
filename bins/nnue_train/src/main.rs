@@ -374,6 +374,166 @@ pub fn radam_step_fp16_mirror(
     }
 }
 
+/// `radam_step` の 1st/2nd moment (`m` / `v`) を `f16` で保持する variant
+/// (`--fp16-opt-state` の `ft_w` 専用)。
+///
+/// Ranger の `m` / `v` を半精度で持つと、112.6M 要素の `ft_w` optimizer step の
+/// `m` / `v` read+write DRAM traffic が半減する。`m` / `v` は batch 正規化された
+/// 勾配由来で値域が極めて小さく (`|m|` 中央値 ~1e-9、`v` 中央値 ~1e-15) `f16` の
+/// normal range (`>= 6.1e-5`) を大きく下回るため、格納時に `m_scale` / `v_scale`
+/// (power-of-2、scale 自体は無誤差) を掛けて normal range へ持ち上げ、読み出し時に
+/// 割り戻す。算術は全て `f32`。
+///
+/// scale 後でも `f16` 有限域 (`|x| <= 65504`) を超えうる外れ値は格納前に clamp する。
+/// clamp された moment はその要素を高分散扱いにするだけだが、未 clamp の `+inf` は
+/// 以降の step で `vi = beta2*inf + ... = inf` と伝播し、その weight を恒久的に
+/// 更新不能にするため必ず潰す。`vi >= 0` なので `v` は上側のみ clamp する。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn radam_step_f16state(
+    mut weights: DisjointSlice<f32>,
+    mut m: DisjointSlice<f16>,
+    mut v: DisjointSlice<f16>,
+    mut grad: DisjointSlice<f32>,
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    min_w: f32,
+    max_w: f32,
+    m_scale: f32,
+    v_scale: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let g_opt = grad.get_mut(i);
+    let m_opt = m.get_mut(i);
+    let v_opt = v.get_mut(i);
+    let w_opt = weights.get_mut(i);
+    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
+        let g = *g_ref;
+        let rate = lr * step_size;
+        let mut p = *w_ref;
+        p *= 1.0_f32 - decay * rate;
+        // f16 格納値を真値へ割り戻す (scale は power-of-2 なので除算は無誤差)。
+        let m_prev = (*m_ref as f32) / m_scale;
+        let v_prev = (*v_ref as f32) / v_scale;
+        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
+        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
+        // 格納: scale 後 f16 有限域に clamp してから半精度化。
+        let ms = mi * m_scale;
+        let ms_c = if ms > 65504.0_f32 {
+            65504.0_f32
+        } else if ms < -65504.0_f32 {
+            -65504.0_f32
+        } else {
+            ms
+        };
+        *m_ref = ms_c as f16;
+        let vs = vi * v_scale;
+        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
+        *v_ref = vs_c as f16;
+        // val は本 step の真値 mi / vi で計算する (f16 丸めは次 step の read で 1 回だけ入る)。
+        let mut val = mi;
+        if denom != 0 {
+            val /= vi.sqrt() + eps;
+        }
+        p -= rate * val;
+        let p_clamped = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+        *w_ref = p_clamped;
+        *g_ref = 0.0_f32;
+    }
+}
+
+/// [`radam_step_f16state`] に FP16 weight mirror 同時更新を足した variant
+/// (`--fp16-opt-state` かつ `--ft-fp16` 時の `ft_w` 専用)。`m` / `v` が `f16`、
+/// かつ forward 用 `ft_w` mirror (`mirror`) も更新する。mirror 同時更新の意図は
+/// [`radam_step_fp16_mirror`] と同一。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn radam_step_f16state_mirror(
+    mut weights: DisjointSlice<f32>,
+    mut m: DisjointSlice<f16>,
+    mut v: DisjointSlice<f16>,
+    mut grad: DisjointSlice<f32>,
+    mut mirror: DisjointSlice<f16>,
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    min_w: f32,
+    max_w: f32,
+    m_scale: f32,
+    v_scale: f32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let g_opt = grad.get_mut(i);
+    let m_opt = m.get_mut(i);
+    let v_opt = v.get_mut(i);
+    let w_opt = weights.get_mut(i);
+    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
+        let g = *g_ref;
+        let rate = lr * step_size;
+        let mut p = *w_ref;
+        p *= 1.0_f32 - decay * rate;
+        let m_prev = (*m_ref as f32) / m_scale;
+        let v_prev = (*v_ref as f32) / v_scale;
+        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
+        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
+        let ms = mi * m_scale;
+        let ms_c = if ms > 65504.0_f32 {
+            65504.0_f32
+        } else if ms < -65504.0_f32 {
+            -65504.0_f32
+        } else {
+            ms
+        };
+        *m_ref = ms_c as f16;
+        let vs = vi * v_scale;
+        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
+        *v_ref = vs_c as f16;
+        let mut val = mi;
+        if denom != 0 {
+            val /= vi.sqrt() + eps;
+        }
+        p -= rate * val;
+        let p_clamped = if p < min_w {
+            min_w
+        } else if p > max_w {
+            max_w
+        } else {
+            p
+        };
+        *w_ref = p_clamped;
+        *g_ref = 0.0_f32;
+        let mirror_ptr = mirror.as_mut_ptr();
+        unsafe {
+            mirror_ptr.add(i.get()).write(p_clamped as f16);
+        }
+    }
+}
+
 /// Ranger Lookahead lerp。
 ///
 /// `weights[i] = alpha * weights[i] + (1 - alpha) * slow[i]`、`slow[i] = weights[i]`。
@@ -3588,6 +3748,7 @@ fn compile_ll_to_ptx_via_llc(
     // で消える)。
     let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
                        adamw_step,radam_step,radam_step_fp16_mirror,\
+                       radam_step_f16state,radam_step_f16state_mirror,\
                        ranger_lookahead_lerp,ranger_lookahead_lerp_fp16_mirror,\
                        ft_post_perspective_fwd,ft_post_perspective_grad,\
                        dense_mm_fwd,dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,\
@@ -3818,6 +3979,26 @@ const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 /// `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
 const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
+/// `--fp16-opt-state` で `ft_w` の Ranger 1st moment (`m`) を `f16` 格納するときの
+/// scale。`m` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
+///
+/// `m` は batch 正規化された勾配の EMA で、実測 (1000 step 時点の `ft_w` checkpoint)
+/// で `|m|` は p5 ~3e-13・中央値 ~3e-9・最大 ~1e-5。無 scale だと大半が `f16` の
+/// subnormal 下限 (2^-24 ≈ 6e-8) 以下に潰れる。`2^28` を掛けると中央値が `f16` の
+/// normal range 内 (~0.8)、最大値も `1e-5 * 2^28 ≈ 2.7e3 ≪ 65504` で overflow せず
+/// (学習初期の勾配増大に ~24× の余裕)。scale は power-of-2 で scale 自体は無誤差。
+const FT_OPT_M_SCALE: f32 = (1_u32 << 28) as f32;
+
+/// `--fp16-opt-state` で `ft_w` の Ranger 2nd moment (`v`) を `f16` 格納するときの
+/// scale。`v` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
+///
+/// `v` は勾配二乗の EMA で `m` よりさらに小さく、実測で中央値 ~2e-15・最大 ~2e-9。
+/// `m` と別 scale なのは値域が約 `m^2` のオーダーで異なるため。`2^40` を掛けると
+/// 中央値が `f16` normal range 内、最大値も `2e-9 * 2^40 ≈ 2.2e3 ≪ 65504` で
+/// overflow せず (初期勾配増大に ~30× の余裕)。`v >= 0` なので格納時の clamp は
+/// 上側のみ。scale は power-of-2。
+const FT_OPT_V_SCALE: f32 = (1_u64 << 40) as f32;
+
 // Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
 // `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する。
 const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
@@ -3845,6 +4026,72 @@ const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     in_scaling: 340.0,
 };
 
+/// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
+/// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
+/// optimizer phase の DRAM traffic を占めるため `f16` 化の効果がある一方、他 9 group
+/// の moment は小さく `f16` 化の意味が無いので `f32` (`DeviceBuffer<f32>`) のまま。
+enum MomentBuf {
+    F32(DeviceBuffer<f32>),
+    F16(DeviceBuffer<f16>),
+}
+
+impl MomentBuf {
+    /// 要素数 `n` の 0 初期化 moment buffer。`fp16` で `f16` / `f32` を選ぶ。
+    fn zeroed(
+        stream: &CudaStream,
+        n: usize,
+        fp16: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if fp16 {
+            Ok(MomentBuf::F16(DeviceBuffer::<f16>::zeroed(stream, n)?))
+        } else {
+            Ok(MomentBuf::F32(DeviceBuffer::<f32>::zeroed(stream, n)?))
+        }
+    }
+
+    /// device → host download し **真値の `f32`** で返す (raw checkpoint 用)。`f16`
+    /// variant は格納値が `scale` 倍されているので割り戻す (`f32` variant は scale
+    /// 無関係でそのまま)。
+    fn to_host_f32(
+        &self,
+        stream: &CudaStream,
+        scale: f32,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        match self {
+            MomentBuf::F32(b) => Ok(b.to_host_vec(stream)?),
+            MomentBuf::F16(b) => {
+                let inv = 1.0_f32 / scale;
+                Ok(b.to_host_vec(stream)?
+                    .into_iter()
+                    .map(|x| (x as f32) * inv)
+                    .collect())
+            }
+        }
+    }
+
+    /// **真値の `f32`** slice から moment buffer を作る (raw checkpoint resume 用)。
+    /// `fp16` で variant を選ぶ。`f16` variant は `scale` を掛けてから半精度化し、
+    /// `f16` 有限域 (`|x| <= 65504`) を超える値は clamp する (`f32` で書かれた
+    /// checkpoint を `--fp16-opt-state` で resume したとき外れ値が `inf` 化して以降の
+    /// step を壊すのを防ぐ。[`radam_step_f16state`] の格納時 clamp と同方針)。
+    fn from_host_f32(
+        stream: &CudaStream,
+        data: &[f32],
+        fp16: bool,
+        scale: f32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if fp16 {
+            let h: Vec<f16> = data
+                .iter()
+                .map(|&x| (x * scale).clamp(-65504.0, 65504.0) as f16)
+                .collect();
+            Ok(MomentBuf::F16(DeviceBuffer::from_host(stream, &h)?))
+        } else {
+            Ok(MomentBuf::F32(DeviceBuffer::from_host(stream, data)?))
+        }
+    }
+}
+
 // ===========================================================================
 // GpuTrainer (v102 LayerStack 1536-16-32 + progress8kpabs 9 buckets)
 //
@@ -3859,8 +4106,9 @@ struct GpuTrainer {
 
     // FT (single, shared across perspectives)
     ft_w: DeviceBuffer<f32>,
-    ft_w_m: DeviceBuffer<f32>,
-    ft_w_v: DeviceBuffer<f32>,
+    /// Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    ft_w_m: MomentBuf,
+    ft_w_v: MomentBuf,
     ft_w_slow: DeviceBuffer<f32>,
     ft_w_grad: DeviceBuffer<f32>,
     /// `ft_w` の FP16 mirror。`ft_fp16` が true のときだけ確保され、毎 step `ft_w`
@@ -3941,6 +4189,10 @@ struct GpuTrainer {
     /// true なら FT activation (`ft_*_out` forward 出力 / `dft_*_out` backward 勾配) も
     /// FP16 で保持する (`--ft-fp16-out`)。`ft_fp16` が true のときのみ true になりうる。
     ft_fp16_out: bool,
+    /// true なら `ft_w` の Ranger moment (`m` / `v`) を `f16` で保持する
+    /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
+    /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
+    fp16_opt_state: bool,
     step_count: u64,
 }
 
@@ -5027,6 +5279,7 @@ impl GpuTrainer {
         enable_tf32: bool,
         ft_fp16: bool,
         ft_fp16_out: bool,
+        fp16_opt_state: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
         // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
@@ -5064,8 +5317,8 @@ impl GpuTrainer {
             module,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
-            ft_w_m: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
-            ft_w_v: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
             ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_h: if ft_fp16 {
@@ -5133,6 +5386,7 @@ impl GpuTrainer {
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
             ft_fp16_out,
+            fp16_opt_state,
             step_count: 0,
         })
     }
@@ -5187,8 +5441,8 @@ impl GpuTrainer {
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
-        self.ft_w_m = zeros_f32(ft_w_n)?;
-        self.ft_w_v = zeros_f32(ft_w_n)?;
+        self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
+        self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_w_grad = zeros_f32(ft_w_n)?;
         self.ft_b_m = zeros_f32(ft_b_n)?;
@@ -5247,10 +5501,14 @@ impl GpuTrainer {
         })
     }
 
-    /// 各 weight group の `(name, expected_len, &w, &m, &v, &slow)` を v102 固定順で返す
-    /// (raw checkpoint の save/load で iterate するための immutable view)。`grad` は
-    /// resume に不要なので含めない。順序 = ft_w, ft_b, l1_w, l1_b, l1f_w, l1f_b, l2_w,
-    /// l2_b, l3_w, l3_b ([`V102Weights`] と同順、raw checkpoint format の group 順)。
+    /// `ft_w` を **除く** 9 weight group の `(name, expected_len, &w, &m, &v, &slow)` を
+    /// 固定順で返す (raw checkpoint の save/load で iterate するための immutable view)。
+    /// `grad` は resume に不要なので含めない。順序 = ft_b, l1_w, l1_b, l1f_w, l1f_b,
+    /// l2_w, l2_b, l3_w, l3_b。
+    ///
+    /// `ft_w` は `m` / `v` が `--fp16-opt-state` で `f16` ([`MomentBuf`]) になり buffer
+    /// 型が他 group と揃わないため本配列から外し、checkpoint format 上 1 番目の group
+    /// として save/load 側で個別に処理する (format の group 順は ft_w が先頭で不変)。
     #[allow(clippy::type_complexity)]
     fn raw_ckpt_groups(
         &self,
@@ -5261,8 +5519,7 @@ impl GpuTrainer {
         &DeviceBuffer<f32>,
         &DeviceBuffer<f32>,
         &DeviceBuffer<f32>,
-    ); 10] {
-        let ft_w_n = FT_IN * FT_OUT;
+    ); 9] {
         let ft_b_n = FT_OUT;
         let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
         let l1_b_n = NUM_BUCKETS * L1_OUT;
@@ -5273,14 +5530,6 @@ impl GpuTrainer {
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
         [
-            (
-                "ft_w",
-                ft_w_n,
-                &self.ft_w,
-                &self.ft_w_m,
-                &self.ft_w_v,
-                &self.ft_w_slow,
-            ),
             (
                 "ft_b",
                 ft_b_n,
@@ -5411,7 +5660,37 @@ impl GpuTrainer {
             w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
             w.write_all(&(superbatch as u64).to_le_bytes())?;
             w.write_all(&self.step_count.to_le_bytes())?;
-            w.write_all(&(groups.len() as u64).to_le_bytes())?;
+            // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
+            w.write_all(&((groups.len() + 1) as u64).to_le_bytes())?;
+
+            // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
+            // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
+            // resume 時に当該 run の精度へ再 quantize される)。
+            let ft_w_n = FT_IN * FT_OUT;
+            {
+                let w_host = self.ft_w.to_host_vec(&self.stream)?;
+                let m_host = self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)?;
+                let v_host = self.ft_w_v.to_host_f32(&self.stream, FT_OPT_V_SCALE)?;
+                let slow_host = self.ft_w_slow.to_host_vec(&self.stream)?;
+                for (label, got) in [
+                    ("w", w_host.len()),
+                    ("m", m_host.len()),
+                    ("v", v_host.len()),
+                    ("slow", slow_host.len()),
+                ] {
+                    if got != ft_w_n {
+                        return Err(format!(
+                            "raw checkpoint: group ft_w {label} buffer len {got} != expected {ft_w_n}"
+                        )
+                        .into());
+                    }
+                }
+                w.write_all(&(ft_w_n as u64).to_le_bytes())?;
+                write_f32_slice(&mut w, &w_host)?;
+                write_f32_slice(&mut w, &m_host)?;
+                write_f32_slice(&mut w, &v_host)?;
+                write_f32_slice(&mut w, &slow_host)?;
+            }
 
             for (name, expected_len, w_buf, m_buf, v_buf, slow_buf) in groups {
                 // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。
@@ -5491,7 +5770,8 @@ impl GpuTrainer {
         read_exact_or_invalid(&mut r, &mut buf8, "num_groups")?;
         let num_groups_u64 = u64::from_le_bytes(buf8);
 
-        let expected_groups: [(&'static str, usize); 10] = {
+        // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
+        let expected_groups: [(&'static str, usize); 9] = {
             let g = self.raw_ckpt_groups();
             [
                 (g[0].0, g[0].1),
@@ -5503,21 +5783,23 @@ impl GpuTrainer {
                 (g[6].0, g[6].1),
                 (g[7].0, g[7].1),
                 (g[8].0, g[8].1),
-                (g[9].0, g[9].1),
             ]
         };
-        if num_groups_u64 != expected_groups.len() as u64 {
+        let total_groups = expected_groups.len() + 1;
+        if num_groups_u64 != total_groups as u64 {
             return Err(invalid_data(format!(
-                "raw checkpoint num_groups {num_groups_u64} != expected {}",
-                expected_groups.len()
+                "raw checkpoint num_groups {num_groups_u64} != expected {total_groups}"
             )));
         }
 
-        // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
-        // upload して途中 fail だと中途半端な state になるため)。
-        let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(10);
-        for (name, expected_len) in expected_groups {
-            read_exact_or_invalid(&mut r, &mut buf8, &format!("group {name} len"))?;
+        // 1 group 分 (len + w/m/v/slow の f32 × len) を読む helper。`expected_len` と
+        // file 記載 len の不一致 / overflow は `InvalidData` で reject。
+        let read_group = |r: &mut std::io::BufReader<std::fs::File>,
+                          name: &str,
+                          expected_len: usize|
+         -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
+            let mut buf8 = [0u8; 8];
+            read_exact_or_invalid(r, &mut buf8, &format!("group {name} len"))?;
             let len_u64 = u64::from_le_bytes(buf8);
             let len: usize = len_u64.try_into().map_err(|_| {
                 invalid_data(format!(
@@ -5526,18 +5808,37 @@ impl GpuTrainer {
             })?;
             if len != expected_len {
                 return Err(invalid_data(format!(
-                    "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} (v102 arch)"
+                    "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} \
+                     (network architecture mismatch)"
                 )));
             }
-            let w_host = read_f32_vec_io(&mut r, len, &format!("group {name} w"))?;
-            let m_host = read_f32_vec_io(&mut r, len, &format!("group {name} m"))?;
-            let v_host = read_f32_vec_io(&mut r, len, &format!("group {name} v"))?;
-            let slow_host = read_f32_vec_io(&mut r, len, &format!("group {name} slow"))?;
-            loaded.push((w_host, m_host, v_host, slow_host));
+            let w_host = read_f32_vec_io(r, len, &format!("group {name} w"))?;
+            let m_host = read_f32_vec_io(r, len, &format!("group {name} m"))?;
+            let v_host = read_f32_vec_io(r, len, &format!("group {name} v"))?;
+            let slow_host = read_f32_vec_io(r, len, &format!("group {name} slow"))?;
+            Ok((w_host, m_host, v_host, slow_host))
+        };
+
+        // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
+        // upload して途中 fail だと中途半端な state になるため)。group 0 は ft_w。
+        let ft_w_loaded = read_group(&mut r, "ft_w", FT_IN * FT_OUT)?;
+        let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
+        for (name, expected_len) in expected_groups {
+            loaded.push(read_group(&mut r, name, expected_len)?);
         }
         // EOF 確認 (trailing garbage は許容するが、足りないのは上で read_exact が弾く)。
 
-        // host → device upload。order は `raw_ckpt_groups` (= ft_w, ft_b, ..., l3_b)。
+        // host → device upload。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ
+        // 量子化して載せ直す (checkpoint は真値 f32、mode 非依存)。
+        let (ftw_w, ftw_m, ftw_v, ftw_slow) = &ft_w_loaded;
+        self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
+        self.ft_w_m =
+            MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
+        self.ft_w_v =
+            MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
+        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
+
+        // 残り 9 group (順序は `raw_ckpt_groups` = ft_b, l1_w, ..., l3_b)。
         macro_rules! up {
             ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                 let (w, m, v, s) = &loaded[$idx];
@@ -5547,16 +5848,15 @@ impl GpuTrainer {
                 self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
             }};
         }
-        up!(0, ft_w, ft_w_m, ft_w_v, ft_w_slow);
-        up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
-        up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
-        up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
-        up!(4, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
-        up!(5, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
-        up!(6, l2_w, l2_w_m, l2_w_v, l2_w_slow);
-        up!(7, l2_b, l2_b_m, l2_b_v, l2_b_slow);
-        up!(8, l3_w, l3_w_m, l3_w_v, l3_w_slow);
-        up!(9, l3_b, l3_b_m, l3_b_v, l3_b_slow);
+        up!(0, ft_b, ft_b_m, ft_b_v, ft_b_slow);
+        up!(1, l1_w, l1_w_m, l1_w_v, l1_w_slow);
+        up!(2, l1_b, l1_b_m, l1_b_v, l1_b_slow);
+        up!(3, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
+        up!(4, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
+        up!(5, l2_w, l2_w_m, l2_w_v, l2_w_slow);
+        up!(6, l2_b, l2_b_m, l2_b_v, l2_b_slow);
+        up!(7, l3_w, l3_w_m, l3_w_v, l3_w_slow);
+        up!(8, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = step_count;
         Ok(superbatch)
@@ -6812,26 +7112,61 @@ impl GpuTrainer {
         let (step_size, denom) =
             radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
 
-        // 10 weight groups × radam_step。`--ft-fp16` 時、FT weight だけは FP16 mirror
-        // (`ft_w_h`) 同時更新 variant を使い、forward 用 mirror を別 cast kernel 無しで
-        // 同期する (master FP32 が既に register 上にあるので half 書き出しのみ追加)。
+        // 10 weight groups × radam_step。FT weight (`ft_w`) の radam は 2 つの opt-in
+        // flag で 4 通りに分岐する:
+        //  - `--ft-fp16`: FP16 mirror (`ft_w_h`) 同時更新 variant を使い、forward 用
+        //    mirror を別 cast kernel 無しで同期する (master FP32 が既に register 上に
+        //    あるので half 書き出しのみ追加)。
+        //  - `--fp16-opt-state`: m / v を `f16` で読み書きする `*_f16state` variant
+        //    (DRAM traffic 半減、scale 付き格納)。
+        // 他 9 group は moment が小さく `f16` 化の意味が無いので常に `radam_step`。
         // FT
-        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-            cuda_launch! {
-                kernel: radam_step_fp16_mirror,
-                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                       DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n as u32]
-            }?;
-        } else {
-            cuda_launch! {
-                kernel: radam_step,
-                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                       slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
-                       MIN_W, MAX_W, ft_w_n as u32]
-            }?;
+        match (&mut self.ft_w_m, &mut self.ft_w_v) {
+            (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
+                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                    cuda_launch! {
+                        kernel: radam_step_f16state_mirror,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: radam_step_f16state,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), lr, step_size, denom,
+                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
+                    }?;
+                }
+            }
+            (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
+                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                    cuda_launch! {
+                        kernel: radam_step_fp16_mirror,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n as u32]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: radam_step,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2,
+                               EPS, MIN_W, MAX_W, ft_w_n as u32]
+                    }?;
+                }
+            }
+            // m / v は同じ flag で `MomentBuf::zeroed` され、load/init でも同期するので
+            // 精度が食い違うことはない。
+            _ => unreachable!("ft_w m and v moment buffers always share precision"),
         }
         cuda_launch! {
             kernel: radam_step,
@@ -7209,6 +7544,20 @@ struct Cli {
     /// 保証しない。
     #[arg(long)]
     ft_fp16_out: bool,
+
+    /// FT weight (`ft_w`) の Ranger optimizer moment (1st/2nd: `m` / `v`) を FP16 で
+    /// 保持する高速モード。default `false` では FP32 path と bit-identical。
+    ///
+    /// `ft_w` は 112.6M 要素あり、その optimizer step は `m` / `v` の read+write が
+    /// DRAM 帯域律速。`m` / `v` を半精度化すると optimizer phase の DRAM traffic が
+    /// 減る。`m` / `v` は batch 正規化された勾配由来で値が極めて小さいため、固定の
+    /// power-of-2 scale を掛けて FP16 の normal range に載せてから格納する。
+    ///
+    /// `--ft-fp16` / `--ft-fp16-out` とは独立した flag。量子化誤差で棋力が変動し
+    /// うるため default OFF、本番品質は SPRT で確認するまで保証しない (動作確認や
+    /// 簡易・高速な学習に使う opt-in option)。
+    #[arg(long)]
+    fp16_opt_state: bool,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -7337,8 +7686,14 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (v102 LayerStack)...");
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    let mut trainer =
-        GpuTrainer::new(&ctx, cli.batch_size, cli.tf32, cli.ft_fp16, cli.ft_fp16_out)?;
+    let mut trainer = GpuTrainer::new(
+        &ctx,
+        cli.batch_size,
+        cli.tf32,
+        cli.ft_fp16,
+        cli.ft_fp16_out,
+        cli.fp16_opt_state,
+    )?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
         println!(
@@ -7425,7 +7780,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     println!("[smoke] CUDA context created, loading kernel module...");
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false)?;
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false, false)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (FT_IN * FT_OUT
