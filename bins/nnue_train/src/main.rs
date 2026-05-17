@@ -7888,9 +7888,9 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
 const PSV_RECORD_BYTES: u64 = 40;
 
-/// v102 LayerStack network の architecture 記述子 (FT 1536 → L1 16 → L2 32、
+/// LayerStack network の architecture 記述子 (FT 1536 → L1 16 → L2 32、
 /// progress8kpabs 9 bucket)。experiment.json `params.architecture` に記録する。
-const V102_ARCHITECTURE: &str = "v102-LayerStack-1536-16-32-9bucket";
+const LAYERSTACK_ARCHITECTURE: &str = "LayerStack-1536-16-32-9bucket";
 
 /// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
 /// に使う。JSON は非有限値を表現できず、混入すると serialise が丸ごと失敗して
@@ -7971,7 +7971,7 @@ fn build_experiment_logger(
 
     let is_wrm = cli.win_rate_model;
     let params = Params {
-        architecture: V102_ARCHITECTURE.to_string(),
+        architecture: LAYERSTACK_ARCHITECTURE.to_string(),
         l0: FT_OUT,
         l1: L1_OUT,
         l2: L2_OUT,
@@ -7989,8 +7989,8 @@ fn build_experiment_logger(
         wdl: finite_or_zero(cli.wdl),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
-        qa: nnue_format::v102_layerstack::QA,
-        qb: nnue_format::v102_layerstack::QB,
+        qa: nnue_format::layerstack_weights::QA,
+        qb: nnue_format::layerstack_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
         wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
         wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),

@@ -28,7 +28,7 @@ use serde::Serialize;
 /// トレーナー) 自身の version は [`Generator::version`] が別に持つ。
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// v102 recipe の量子化 `fv_scale` (`nnue_format::v102_layerstack::FV_SCALE` と
+/// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
 /// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
 /// 依存しないため定数を持ち直す。
 const FV_SCALE: i32 = 28;
@@ -434,7 +434,7 @@ mod tests {
 
     fn sample_params() -> Params {
         Params {
-            architecture: "v102-LayerStack-1536-16-32-9bucket".to_string(),
+            architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             l0: 1536,
             l1: 16,
             l2: 32,
@@ -480,8 +480,8 @@ mod tests {
 
     fn sample_doc() -> ExperimentDoc {
         ExperimentDoc::new(
-            "v102-20260517t041530z".to_string(),
-            "v102".to_string(),
+            "rshogi-20260517t041530z".to_string(),
+            "rshogi".to_string(),
             1_747_000_000,
             Some("7beb263".to_string()),
             "nnue-train --data teacher.psv".to_string(),
@@ -556,11 +556,11 @@ mod tests {
     #[test]
     fn write_produces_valid_json_and_is_idempotent_path() {
         let dir = std::env::temp_dir().join(format!("nnue-exp-test-{}", std::process::id()));
-        let path = dir.join("experiments").join("v102-test.json");
+        let path = dir.join("experiments").join("rshogi-test.json");
         let mut logger = ExperimentLogger::new(path.clone(), sample_doc());
         logger.record_superbatch(1, 0.04, 1_000_000, 10.0);
-        logger.note_checkpoint("v102-20.bin");
-        logger.note_checkpoint("v102-20.ckpt");
+        logger.note_checkpoint("rshogi-20.bin");
+        logger.note_checkpoint("rshogi-20.ckpt");
         logger.mark_finished(12.0);
         logger.write().expect("write ok");
 
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(v["generator"]["name"], "rshogi-nnue");
         assert_eq!(v["params"]["lr"], 0.000875);
         assert_eq!(v["history"][0]["superbatch"], 1);
-        assert_eq!(v["checkpoints"][0], "v102-20.bin");
+        assert_eq!(v["checkpoints"][0], "rshogi-20.bin");
         assert_eq!(v["results"]["interrupted"], false);
         // 上書きでも有効な JSON のまま (incremental write を模す)。
         logger.write().expect("rewrite ok");

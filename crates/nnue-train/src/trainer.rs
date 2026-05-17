@@ -893,7 +893,7 @@ mod tests {
         let json_path = dir.join("experiments").join("exp-test.json");
 
         let params = Params {
-            architecture: "v102-LayerStack-1536-16-32-9bucket".to_string(),
+            architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             l0: 1536,
             l1: 16,
             l2: 32,
