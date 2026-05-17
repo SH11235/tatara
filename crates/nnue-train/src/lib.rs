@@ -24,8 +24,11 @@
 //! - `trainer`: superbatch training loop driver (`TrainerBackend` trait +
 //!   `TrainingConfig` + `run`)。1 batch 分の GPU step は `bins/nnue_train::
 //!   GpuTrainer` (= `TrainerBackend` impl) が担う
+//! - `experiment`: 学習 run ごとの構造化ログ (experiment.json) を組み立て
+//!   incremental に書き出す (`ExperimentLogger` / `ExperimentDoc`)
 
 pub mod dataloader;
+pub mod experiment;
 pub mod optimizer;
 pub mod schedule;
 pub mod trainer;
