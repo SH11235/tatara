@@ -1778,14 +1778,32 @@ pub fn ft_post_perspective_grad_fused_fp16(
     // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
     // `ft_post_perspective_grad_fused` と同一 (SAFETY 不変条件はそのまま、要素型のみ f16)。
     // dft_scale を掛けてから f16 化する (loss scaling、gather 側で逆数を掛けて戻す)。
+    //
+    // scale 後の値は f16 有限域 (`|x| <= 65504`) を超えうる — dft は学習が進むと縮む
+    // 想定だったが実際は成長し、勾配スパイクで天井を越えると `as f16` が `±inf` を生む。
+    // `±inf` は gather で `ft_w_grad` に伝播し optimizer 経由で weight を NaN 化させ学習を
+    // 永久発散させるため、格納前に clamp する。clamp が当たるのは天井を越えた稀な外れ値
+    // のみで、その要素の勾配が cap されるだけ (発散の代わりに有界な近似)。
+    let da = grad_a * dft_scale;
+    let da_c = if da > 65504.0_f32 {
+        65504.0_f32
+    } else if da < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        da
+    };
+    let db = grad_b * dft_scale;
+    let db_c = if db > 65504.0_f32 {
+        65504.0_f32
+    } else if db < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        db
+    };
     let out_ptr = grad_ft_out.as_mut_ptr();
     unsafe {
-        out_ptr
-            .add(ft_base + pair_idx)
-            .write((grad_a * dft_scale) as f16);
-        out_ptr
-            .add(ft_base + half + pair_idx)
-            .write((grad_b * dft_scale) as f16);
+        out_ptr.add(ft_base + pair_idx).write(da_c as f16);
+        out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
 
     // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
