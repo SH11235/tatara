@@ -7923,10 +7923,14 @@ fn build_experiment_logger(
     data: &Path,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
+    // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
+    // 秒に開始しても (sweep / retry script 等)、pid が異なるため experiment.json
+    // の書き込み先 path が衝突せず、incremental write の上書き喪失が起きない。
     let id = format!(
-        "{}-{}",
+        "{}-{}-{}",
         cli.net_id,
-        nnue_train::experiment::format_utc_compact(start_secs)
+        nnue_train::experiment::format_utc_compact(start_secs),
+        std::process::id()
     );
     let name = cli.experiment_name.clone().unwrap_or_else(|| {
         if cli.resume.is_some() {
