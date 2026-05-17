@@ -1779,11 +1779,11 @@ pub fn ft_post_perspective_grad_fused_fp16(
     // `ft_post_perspective_grad_fused` と同一 (SAFETY 不変条件はそのまま、要素型のみ f16)。
     // dft_scale を掛けてから f16 化する (loss scaling、gather 側で逆数を掛けて戻す)。
     //
-    // scale 後の値は f16 有限域 (`|x| <= 65504`) を超えうる — dft は学習が進むと縮む
-    // 想定だったが実際は成長し、勾配スパイクで天井を越えると `as f16` が `±inf` を生む。
-    // `±inf` は gather で `ft_w_grad` に伝播し optimizer 経由で weight を NaN 化させ学習を
-    // 永久発散させるため、格納前に clamp する。clamp が当たるのは天井を越えた稀な外れ値
-    // のみで、その要素の勾配が cap されるだけ (発散の代わりに有界な近似)。
+    // `grad * dft_scale` は f16 有限域 (`|x| <= 65504`) を超えうる。clamp せず `as f16`
+    // すると天井を越えた値が `±inf` になり、gather で `ft_w_grad` に伝播 → optimizer
+    // 経由で weight を NaN 化させ学習を発散させる。これを防ぐため格納前に clamp する。
+    // clamp が当たるのは天井を越えた稀な外れ値のみで、その要素の勾配が cap される
+    // (発散の代わりに有界な近似)。
     let da = grad_a * dft_scale;
     let da_c = if da > 65504.0_f32 {
         65504.0_f32
