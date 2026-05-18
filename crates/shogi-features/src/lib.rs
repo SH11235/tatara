@@ -13,7 +13,7 @@ pub mod feature_set;
 pub mod halfka_hm;
 pub mod progress_kpabs;
 
-pub use feature_set::{FeatureSet, FeatureSetSpec, KingEncoding, KingSquareMode};
+pub use feature_set::{FeatureSet, FeatureSetSpec};
 pub use halfka_hm::{
     FEATURE_HASH_HM_V2, HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, NUM_KING_BUCKETS, PIECE_INPUTS,
     SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, SHOGI_HALFKA_HM_NUM_FEATURES, ShogiHalfKA_hm,

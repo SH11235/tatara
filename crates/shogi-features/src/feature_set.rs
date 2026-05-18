@@ -3,17 +3,18 @@
 //! 入力 feature set を **独立 2 軸**でパラメタライズした 1 本の indexer で
 //! 全 feature set を扱う:
 //!
-//! - 軸 1 — 玉特徴エンコード ([`KingEncoding`]): 玉を特徴に含めない /
+//! - 軸 1 — 玉特徴エンコード (`KingEncoding`): 玉を特徴に含めない /
 //!   自玉・敵玉を別 plane に置く / 両玉を 1 plane へ畳む。
-//! - 軸 2 — 玉マス処理 ([`KingSquareMode`]): 玉マスを 81 bucket でそのまま使うか、
+//! - 軸 2 — 玉マス処理 (`KingSquareMode`): 玉マスを 81 bucket でそのまま使うか、
 //!   6-9 筋を 1-4 筋へ反転して 45 bucket にする (盤駒も筋ミラーする)。
 //!
 //! 2 軸は作用対象が異なる: 軸 2 はマス座標 (玉マス→bucket、盤駒マス→筋ミラー)、
 //! 軸 1 は玉 BonaPiece の plane base に作用する。両者は干渉しない。
 //!
-//! 公開するのは [`FeatureSet`] の 5 variant のみ。無効な軸の組み合わせは
-//! 公開 enum として表現できない。[`FeatureSetSpec`] が公開 enum と内部 2 軸・
-//! 次元・hash を結ぶ単一の真実源で、生成は [`FeatureSet::spec`] 経由のみ。
+//! 2 軸は crate 内部の表現で、公開するのは [`FeatureSet`] の 5 variant のみ。
+//! 無効な軸の組み合わせは公開 enum として表現できない。[`FeatureSetSpec`] が
+//! 公開 enum と内部 2 軸・次元・hash を結ぶ単一の真実源で、生成は
+//! [`FeatureSet::spec`] 経由のみ。
 //!
 //! BonaPiece layout / 玉バケット計算式の出典は bullet-shogi のオリジナル実装
 //! (`ShogiHalfKP` / `ShogiHalfKA` / `ShogiHalfKA_hm`、`ATTRIBUTION.md` 参照)。
@@ -26,9 +27,9 @@ use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 // 軸 1 / 軸 2
 // =============================================================================
 
-/// 軸 1 — 玉特徴のエンコード方式。
+/// 軸 1 — 玉特徴のエンコード方式 (crate 内部表現)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KingEncoding {
+pub(crate) enum KingEncoding {
     /// 玉を特徴に含めない (HalfKP)。玉位置は bucket index にのみ効く。
     NoKing,
     /// 自玉・敵玉が別々の piece plane を占有する (HalfKA)。
@@ -37,9 +38,9 @@ pub enum KingEncoding {
     MergedPlane,
 }
 
-/// 軸 2 — 玉マスから king bucket への写像方式。
+/// 軸 2 — 玉マスから king bucket への写像方式 (crate 内部表現)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KingSquareMode {
+pub(crate) enum KingSquareMode {
     /// 玉マス (視点変換後) をそのまま 81 bucket に使う。
     Direct,
     /// 6-9 筋を 1-4 筋へ筋反転して 45 bucket にする。玉が 6-9 筋のときは
@@ -61,11 +62,11 @@ pub enum FeatureSet {
     HalfKp,
     /// 両玉を別 plane・ミラー無し。
     HalfKaSplit,
-    /// 両玉を 1 plane へ畳む・ミラー無し。参照実装なし (本リポ新規定義)。
+    /// 両玉を 1 plane へ畳む・ミラー無し。
     HalfKaMerged,
-    /// 両玉を別 plane・半面ミラー。参照実装なし (本リポ新規定義)。
+    /// 両玉を別 plane・半面ミラー。
     HalfKaHmSplit,
-    /// 両玉を 1 plane へ畳む・半面ミラー。現 production の入力。
+    /// 両玉を 1 plane へ畳む・半面ミラー。
     HalfKaHmMerged,
 }
 
@@ -226,16 +227,6 @@ impl FeatureSetSpec {
     /// 公開 feature set。
     pub const fn feature_set(&self) -> FeatureSet {
         self.feature_set
-    }
-
-    /// 軸 1 — 玉特徴のエンコード方式。
-    pub const fn king_encoding(&self) -> KingEncoding {
-        self.king_encoding
-    }
-
-    /// 軸 2 — 玉マスから king bucket への写像方式。
-    pub const fn king_square_mode(&self) -> KingSquareMode {
-        self.king_square_mode
     }
 
     /// king bucket 数 (81 または 45)。
@@ -489,21 +480,28 @@ mod tests {
     }
 
     #[test]
-    fn feature_hashes_are_pairwise_distinct() {
-        let mut hashes: Vec<u32> = FeatureSet::ALL
-            .iter()
-            .map(|fs| fs.spec().feature_hash())
-            .collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        assert_eq!(hashes.len(), 5, "feature hash が衝突している");
-    }
+    fn feature_hashes_are_pinned_and_distinct() {
+        // 各 cell の feature hash を数値で固定する (取り違え / typo 検出)。
+        // halfkp / halfka-split / halfka-hm-merged は bullet-shogi の hash 値、
+        // halfka-merged / halfka-hm-split は canonical 名の FNV-1a 32bit hash。
+        let expected: [(FeatureSet, u32); 5] = [
+            (FeatureSet::HalfKp, 0x5D69_D5B8),
+            (FeatureSet::HalfKaSplit, 0x5F13_4CB8),
+            (FeatureSet::HalfKaMerged, 0xACD6_8C97),
+            (FeatureSet::HalfKaHmSplit, 0x2A46_AC09),
+            (FeatureSet::HalfKaHmMerged, 0x7F13_4CB8),
+        ];
+        let mut seen = Vec::new();
+        for (fs, hash) in expected {
+            assert_eq!(fs.spec().feature_hash(), hash, "{}", fs.canonical_name());
+            seen.push(hash);
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "feature hash が衝突している");
 
-    #[test]
-    fn fnv1a32_is_deterministic() {
-        // 参照実装なし 2 cell の hash 導出を pin する。
-        assert_eq!(fnv1a32("halfka-merged"), FEATURE_HASH_HALFKA_MERGED);
-        assert_eq!(fnv1a32("halfka-hm-split"), FEATURE_HASH_HALFKA_HM_SPLIT);
-        assert_ne!(fnv1a32("a"), fnv1a32("b"));
+        // FNV-1a が canonical 名から決定的に上記の値を導くことを確認する。
+        assert_eq!(fnv1a32("halfka-merged"), 0xACD6_8C97);
+        assert_eq!(fnv1a32("halfka-hm-split"), 0x2A46_AC09);
     }
 }

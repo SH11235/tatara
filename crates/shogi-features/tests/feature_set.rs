@@ -1,7 +1,7 @@
 //! `feature_set` の参照照合・第一原理検証・回帰テスト。
 //!
 //! - 参照実装あり 3 cell (`halfkp` / `halfka-split` / `halfka-hm-merged`):
-//!   bullet-shogi 実装を移植した oracle / 現 production `ShogiHalfKA_hm` と照合。
+//!   bullet-shogi 実装を移植した oracle / `ShogiHalfKA_hm` と照合。
 //! - 参照実装なし 2 cell (`halfka-merged` / `halfka-hm-split`): index 範囲・
 //!   injective・玉 plane 衝突・退化一致・perspective swap・mirror involution を
 //!   第一原理で検証する。
@@ -248,9 +248,9 @@ fn crosscheck_halfka_split_against_bullet_oracle() {
 }
 
 #[test]
-fn regression_halfka_hm_merged_is_bit_identical_to_production() {
-    // 回帰保証: halfka-hm-merged は現 production `ShogiHalfKA_hm` と emission 順序
-    // 含め bit-identical な index を返す。
+fn regression_halfka_hm_merged_is_bit_identical_to_shogi_halfka_hm() {
+    // 回帰保証: halfka-hm-merged は `ShogiHalfKA_hm` と emission 順序含め
+    // bit-identical な index を返す。
     let spec = FeatureSet::HalfKaHmMerged.spec();
     let mut nonempty = 0;
     for psv in sample_psv_records() {
@@ -276,10 +276,10 @@ fn golden_halfka_hm_merged_kings_only() {
     let board = build_board(Color::Black, Square::new(4, 8), Square::new(4, 0), &[]);
     let spec = FeatureSet::HalfKaHmMerged.spec();
     assert_eq!(collect(&spec, &board), vec![(73268, 73268), (73260, 73260)],);
-    // 同一局面で production 実装とも一致する。
-    let mut via_production = Vec::new();
-    ShogiHalfKA_hm.map_features_board(&board, |stm, nstm| via_production.push((stm, nstm)));
-    assert_eq!(via_production, vec![(73268, 73268), (73260, 73260)]);
+    // 同一局面で `ShogiHalfKA_hm` とも一致する。
+    let mut via_shogi_halfka_hm = Vec::new();
+    ShogiHalfKA_hm.map_features_board(&board, |stm, nstm| via_shogi_halfka_hm.push((stm, nstm)));
+    assert_eq!(via_shogi_halfka_hm, vec![(73268, 73268), (73260, 73260)]);
 }
 
 #[test]
@@ -290,6 +290,17 @@ fn golden_halfka_merged_kings_only() {
     let board = build_board(Color::Black, Square::new(0, 0), Square::new(8, 8), &[]);
     let spec = FeatureSet::HalfKaMerged.spec();
     assert_eq!(collect(&spec, &board), vec![(1548, 1548), (1628, 1628)]);
+}
+
+#[test]
+fn golden_halfka_hm_split_kings_only() {
+    // bk=7筋3段 / wk=3筋7段 / 先手番。両玉とも視点変換後 file=6 (>= 5) のため
+    // 筋ミラーが効き king bucket は 2*9+2 = 20。SplitPlane は敵玉を畳まない。
+    //   自玉 packed = 筋ミラー(F_KING+56) = 1568 → index = 20*1710 + 1568 = 35768
+    //   敵玉 packed = 筋ミラー(E_KING+24) = 1689 → index = 20*1710 + 1689 = 35889
+    let board = build_board(Color::Black, Square::new(6, 2), Square::new(2, 6), &[]);
+    let spec = FeatureSet::HalfKaHmSplit.spec();
+    assert_eq!(collect(&spec, &board), vec![(35768, 35768), (35889, 35889)]);
 }
 
 // =============================================================================
@@ -402,8 +413,8 @@ fn degenerate_halfka_merged_is_halfka_split_plus_fold() {
 
 #[test]
 fn degenerate_halfka_hm_split_is_halfka_hm_merged_minus_fold() {
-    // halfka-hm-split (参照実装なし) を halfka-hm-merged (production 照合済み) に
-    // 紐づける。hm-merged は hm-split に fold を加えた cell。
+    // halfka-hm-split (参照実装なし) を halfka-hm-merged (`ShogiHalfKA_hm` と
+    // 照合済み) に紐づける。hm-merged は hm-split に fold を加えた cell。
     assert_merged_is_split_plus_fold(FeatureSet::HalfKaHmSplit, FeatureSet::HalfKaHmMerged);
 }
 
