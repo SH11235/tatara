@@ -296,8 +296,10 @@ fn golden_halfka_merged_kings_only() {
 fn golden_halfka_hm_split_kings_only() {
     // bk=7筋3段 / wk=3筋7段 / 先手番。両玉とも視点変換後 file=6 (>= 5) のため
     // 筋ミラーが効き king bucket は 2*9+2 = 20。SplitPlane は敵玉を畳まない。
-    //   自玉 packed = 筋ミラー(F_KING+56) = 1568 → index = 20*1710 + 1568 = 35768
-    //   敵玉 packed = 筋ミラー(E_KING+24) = 1689 → index = 20*1710 + 1689 = 35889
+    //   自玉 BonaPiece = F_KING + 56 = 1604、筋ミラー後の packed = 1568
+    //     → index = 20*1710 + 1568 = 35768
+    //   敵玉 BonaPiece = E_KING + 24 = 1653、筋ミラー後の packed = 1689
+    //     → index = 20*1710 + 1689 = 35889
     let board = build_board(Color::Black, Square::new(6, 2), Square::new(2, 6), &[]);
     let spec = FeatureSet::HalfKaHmSplit.spec();
     assert_eq!(collect(&spec, &board), vec![(35768, 35768), (35889, 35889)]);
