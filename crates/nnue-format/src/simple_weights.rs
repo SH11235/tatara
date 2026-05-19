@@ -707,14 +707,45 @@ mod tests {
 
     #[test]
     fn save_rejects_mismatched_buffer_length() {
-        // weight buffer の長さが id 次元と不整合なら save が InvalidInput で弾く。
+        // weight buffer 長が id 次元と不整合なら save が InvalidInput で弾く。
         let id = test_id(SimpleActivation::CReLU);
-        let mut w = SimpleWeights::zeroed(id, 16);
-        w.l1_b.push(0.0);
-        let err = w
-            .save_quantised(&mut Vec::new())
-            .expect_err("mismatched buffer length must reject");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // 長すぎる buffer。
+        let mut too_long = SimpleWeights::zeroed(id, 16);
+        too_long.l1_b.push(0.0);
+        assert_eq!(
+            too_long
+                .save_quantised(&mut Vec::new())
+                .expect_err("too-long buffer must reject")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // 短すぎる buffer (検証が無ければ index panic / 末尾切り捨てになる経路)。
+        let mut too_short = SimpleWeights::zeroed(id, 16);
+        too_short.ft_w.pop();
+        assert_eq!(
+            too_short
+                .save_quantised(&mut Vec::new())
+                .expect_err("too-short buffer must reject")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_utf8_arch_str() {
+        // arch_str は version(4) + network_hash(4) + arch_len(4) の後ろから始まる。
+        // 先頭バイトを不正 UTF-8 (0xFF) に潰すと load が InvalidData で reject する。
+        let id = test_id(SimpleActivation::CReLU);
+        let mut buf = Vec::new();
+        SimpleWeights::zeroed(id, 16)
+            .save_quantised(&mut buf)
+            .unwrap();
+        buf[12] = 0xFF;
+        let err = SimpleWeights::load(&mut std::io::Cursor::new(&buf), id)
+            .expect_err("invalid UTF-8 arch_str must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
