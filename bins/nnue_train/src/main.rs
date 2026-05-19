@@ -41,7 +41,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 #[allow(unused_imports)]
 use cuda_core::IntoResult as _;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
@@ -49,6 +49,7 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use nnue_format::ArchKind;
 #[allow(unused_imports)]
 use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::Batch;
@@ -7663,149 +7664,206 @@ impl TrainerBackend for GpuTrainer {
 // CLI (clap) — 引数群は bullet-shogi `examples/shogi_layerstack.rs` に対応
 // ===========================================================================
 
-/// HalfKA_hm 1536-16-32 LayerStack NNUE trainer。
+/// rshogi NNUE trainer。
 ///
-/// `--data <PSV>` を指定すると training loop を回す。省略すると GPU smoke test
-/// (`GpuTrainer` の forward/backward path 確認) を実行する。
+/// 学習する NNUE アーキを `layerstack` / `simple` サブコマンドで選ぶ。共有引数は
+/// サブコマンドの前後どちらに置いてもよい global 引数。`--data <PSV>` を指定すると
+/// training loop を回し、省略すると GPU smoke test (forward/backward path 確認) を
+/// 実行する。
 #[derive(Parser, Debug)]
-#[command(name = "nnue-train", about = "rshogi NNUE trainer (LayerStack)")]
+#[command(name = "nnue-train", about = "rshogi NNUE trainer")]
 struct Cli {
     /// 教師データ PSV ファイル (`PackedSfenValue` × N、各 40 bytes)。省略時は GPU smoke test。
-    #[arg(long)]
+    #[arg(long, global = true)]
     data: Option<PathBuf>,
 
     /// checkpoint 出力先 directory (`{net_id}-{superbatch}.bin` を書き出す)。
-    #[arg(long, default_value = "checkpoints")]
+    #[arg(long, default_value = "checkpoints", global = true)]
     output: PathBuf,
 
     /// network id (checkpoint file 名に使う)。
-    #[arg(long, default_value = "rshogi")]
+    #[arg(long, default_value = "rshogi", global = true)]
     net_id: String,
 
     /// 入力 feature set。次のいずれか: halfkp, halfka-split, halfka-merged,
     /// halfka-hm-split, halfka-hm-merged。FT 入力次元と active feature 数を決める。
     /// 既定の halfka-hm-merged は king-symmetric merged HalfKA。
-    #[arg(long, default_value = "halfka-hm-merged")]
+    #[arg(long, default_value = "halfka-hm-merged", global = true)]
     feature_set: String,
 
     /// experiment.json の `name` (実験管理 UI での表示名)。未指定なら net_id、
     /// `--resume` 時は `{net_id} (resume @sb{開始 superbatch})`。
-    #[arg(long)]
+    #[arg(long, global = true)]
     experiment_name: Option<String>,
 
     /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
     /// 本番は 400 程度。
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, global = true)]
     superbatches: usize,
 
     /// 1 superbatch あたりの batch 数。
-    #[arg(long, default_value_t = 6104)]
+    #[arg(long, default_value_t = 6104, global = true)]
     batches_per_superbatch: usize,
 
     /// 1 batch あたりの position 数。default 16384 は smoke 用、本番は 65536 程度。
-    #[arg(long, default_value_t = 16384)]
+    #[arg(long, default_value_t = 16384, global = true)]
     batch_size: usize,
 
     /// 初期 learning rate。
-    #[arg(long, default_value_t = 8.75e-4)]
+    #[arg(long, default_value_t = 8.75e-4, global = true)]
     lr: f32,
 
     /// LR gamma (`lr_step` superbatch ごとに gamma 倍)。
-    #[arg(long, default_value_t = 0.995)]
+    #[arg(long, default_value_t = 0.995, global = true)]
     lr_gamma: f32,
 
     /// LR step (gamma 倍する superbatch 間隔)。
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, global = true)]
     lr_step: usize,
 
     /// WDL blend lambda (constant)。
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, global = true)]
     wdl: f32,
 
     /// sigmoid loss の score scale (`loss_scale = 1 / scale`)。`--win-rate-model` 指定時は
     /// 使わない (WRM loss は `--wrm-*` 系の scaling を使う)。
-    #[arg(long, default_value_t = 290.0)]
+    #[arg(long, default_value_t = 290.0, global = true)]
     scale: f32,
 
     /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, global = true)]
     save_rate: usize,
 
-    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 81*FE_OLD_END)。
-    /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
-    #[arg(long)]
-    progress_coeff: Option<PathBuf>,
-
     /// `|score| >= score_drop_abs` の position を loss から除外する (bullet `--score-drop-abs`)。
-    #[arg(long)]
+    #[arg(long, global = true)]
     score_drop_abs: Option<i32>,
 
     /// 学習開始前に量子化 NNUE binary から weight を注入する (pretrained start)。
     /// optimizer state (Ranger m/v/slow/step) は **reset** される — 真の resume には
     /// `--resume` を使うこと (`--init-from` と `--resume` は排他)。
-    #[arg(long)]
+    #[arg(long, global = true)]
     init_from: Option<PathBuf>,
 
     /// raw checkpoint (`{net_id}-{sb}.ckpt`) から weight + Ranger optimizer state
     /// (m/v/slow/step) を復元して学習を再開する (真の resume)。`--init-from`
     /// とは排他 (`--init-from` は weight のみ注入し optimizer を reset するため)。
     /// `--start-superbatch` 未指定なら checkpoint に記録された superbatch の +1 から再開。
-    #[arg(long)]
+    #[arg(long, global = true)]
     resume: Option<PathBuf>,
 
     /// 学習を開始する superbatch 番号 (1-indexed, inclusive)。未指定時:
     /// `--resume` あり → checkpoint の superbatch +1、なし → 1。`1 <= N <= --superbatches`
     /// の範囲外ならエラー (resume で過去 sb をやり直す目的で明示指定も可)。
-    #[arg(long)]
+    #[arg(long, global = true)]
     start_superbatch: Option<usize>,
 
     /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (ディスク節約)。
     /// 未指定なら全保持 (raw state は ~1.8GB/個 なので save-rate × superbatches が
     /// 大きい長期ランでは指定推奨; 例 save-rate 20 / 400sb = 20 個 ≈ 36GB)。量子化
     /// `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
-    #[arg(long)]
+    #[arg(long, global = true)]
     keep_checkpoints: Option<usize>,
 
     /// win-rate-model loss を使う。指定時は `loss_wrm` kernel (prediction / target
     /// 双方に WRM を適用) を使い、未指定なら `loss_wdl` (plain sigmoid-MSE + `--scale`)。
     /// net_output のスケールが `out ≈ cp/--wrm-nnue2score` になり、量子化
     /// (`QA=127/QB=64/FV_SCALE=28`) が前提とするスケールと整合する。
-    #[arg(long)]
+    #[arg(long, global = true)]
     win_rate_model: bool,
     /// WRM prediction 側の in-scaling (既定 340)。target 側の scaling
     /// (`--wrm-target-scaling`) とは独立。`--win-rate-model` 指定時のみ使う。
-    #[arg(long, default_value_t = 340.0)]
+    #[arg(long, default_value_t = 340.0, global = true)]
     wrm_in_scaling: f32,
     /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、既定 600)。
     /// `--win-rate-model` 指定時のみ使う。
-    #[arg(long, default_value_t = 600.0)]
+    #[arg(long, default_value_t = 600.0, global = true)]
     wrm_nnue2score: f32,
     /// WRM target sigmoid の中心オフセット (`target` が 0.5 になる score、既定 270)。
     /// `--win-rate-model` 指定時のみ使う。
-    #[arg(long, default_value_t = 270.0)]
+    #[arg(long, default_value_t = 270.0, global = true)]
     wrm_target_offset: f32,
     /// WRM target sigmoid の入力スケール (steepness の逆数、既定 380)。既定 270/380 は
     /// chess の評価値分布向けの値なので、score 分布が異なれば再調整する。
     /// `--win-rate-model` 指定時のみ使う。
-    #[arg(long, default_value_t = 380.0)]
+    #[arg(long, default_value_t = 380.0, global = true)]
     wrm_target_scaling: f32,
     /// optimizer 名 ("ranger" のみ実装)。
-    #[arg(long, default_value = "ranger")]
+    #[arg(long, default_value = "ranger", global = true)]
     optimizer: String,
     /// Ranger optimizer の weight decay 係数 (AdamW 風の decoupled weight decay)。
     /// 既定 0.0 で decay 無し。非 0 で全 weight group の weight を毎 step わずかに
     /// 0 方向へ減衰させる。
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, global = true)]
     weight_decay: f32,
     /// dataloader prefetch worker 数。各 worker が PSV パース + HalfKA_hm sparse 抽出 +
     /// progress8kpabs bucket 計算を `decode()` 1 回で済ませて先読み供給する。`1` で
     /// 決定論的逐次 read、`>= 2` で並列パース (1 epoch 内の position 順序は非決定的;
     /// training では問題ない)。
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, global = true)]
     threads: usize,
+
+    /// FT weight (`ft_w`) を FP16 mirror で forward する高速モード。default `false`
+    /// では FP32 path と bit-identical。`true` で `sparse_ft_forward` の weight DRAM
+    /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
+    /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
+    ///
+    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・量子化
+    /// checkpoint いずれの経路でも小さく、FP16 の有限域 (`|x| <= 65504`) に十分
+    /// 収まるため mirror 変換が ±inf へ overflow しない。
+    #[arg(long, global = true)]
+    ft_fp16: bool,
+
+    /// 特徴変換器 (FT) の optimizer state を FP16 で保持する高速モード。default
+    /// `false` では FP32 path と bit-identical。
+    ///
+    /// FT は本ネットで最も要素数の多い層で、その optimizer 更新は state の read/write
+    /// がメモリ帯域律速。state を半精度化すると optimizer step のメモリ転送量が減って
+    /// 学習スループットが上がる。state は値が極めて小さいため、固定係数を掛けて FP16
+    /// の有効域に載せてから格納する。
+    ///
+    /// `--ft-fp16` / `--ft-fp16-out` とは独立した flag。量子化誤差で棋力が変動し
+    /// うるため default OFF、本番品質は SPRT で確認するまで保証しない (動作確認や
+    /// 簡易・高速な学習に使う opt-in option)。
+    #[arg(long, global = true)]
+    fp16_opt_state: bool,
+
+    /// 学習する NNUE アーキを選ぶサブコマンド (`layerstack` / `simple`)。
+    #[command(subcommand)]
+    arch: ArchCommand,
+}
+
+/// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
+#[derive(Subcommand, Debug)]
+enum ArchCommand {
+    /// progress8kpabs 9-bucket LayerStack アーキ (HalfKA_hm 1536-16-32)。
+    #[command(name = "layerstack")]
+    LayerStack(LayerstackArgs),
+    /// bullet-shogi 由来の Simple 4 層アーキ。
+    Simple(SimpleArgs),
+}
+
+impl ArchCommand {
+    /// サブコマンドに対応する [`ArchKind`]。
+    fn kind(&self) -> ArchKind {
+        match self {
+            ArchCommand::LayerStack(_) => ArchKind::LayerStack,
+            ArchCommand::Simple(_) => ArchKind::Simple,
+        }
+    }
+}
+
+/// LayerStack アーキ固有の引数。
+#[derive(Args, Debug)]
+struct LayerstackArgs {
+    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 81*FE_OLD_END)。
+    /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
+    #[arg(long)]
+    progress_coeff: Option<PathBuf>,
+
     /// bucket mode ("progress8kpabs" のみ実装)。
     #[arg(long, default_value = "progress8kpabs")]
     bucket_mode: String,
+
     /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
     /// 入力 FP32 を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
@@ -7816,17 +7874,6 @@ struct Cli {
     /// 品質 conservative に default OFF。
     #[arg(long)]
     tf32: bool,
-
-    /// FT weight (`ft_w`) を FP16 mirror で forward する高速モード。default `false`
-    /// では FP32 path と bit-identical。`true` で `sparse_ft_forward` の weight DRAM
-    /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
-    /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
-    ///
-    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・量子化
-    /// checkpoint いずれの経路でも小さく、FP16 の有限域 (`|x| <= 65504`) に十分
-    /// 収まるため mirror 変換が ±inf へ overflow しない。
-    #[arg(long)]
-    ft_fp16: bool,
 
     /// FT activation (`ft_*_out` の forward 出力と `dft_*_out` の backward 勾配) も
     /// FP16 で保持する。`--ft-fp16` を要求する (weight FP16 path の上に積む拡張)。
@@ -7842,23 +7889,43 @@ struct Cli {
     /// 保証しない。
     #[arg(long)]
     ft_fp16_out: bool,
+}
 
-    /// 特徴変換器 (FT) の optimizer state を FP16 で保持する高速モード。default
-    /// `false` では FP32 path と bit-identical。
-    ///
-    /// FT は本ネットで最も要素数の多い層で、その optimizer 更新は state の read/write
-    /// がメモリ帯域律速。state を半精度化すると optimizer step のメモリ転送量が減って
-    /// 学習スループットが上がる。state は値が極めて小さいため、固定係数を掛けて FP16
-    /// の有効域に載せてから格納する。
-    ///
-    /// `--ft-fp16` / `--ft-fp16-out` とは独立した flag。量子化誤差で棋力が変動し
-    /// うるため default OFF、本番品質は SPRT で確認するまで保証しない (動作確認や
-    /// 簡易・高速な学習に使う opt-in option)。
+/// Simple 4 層アーキ固有の引数。Simple の host pipeline は未実装で、これらは
+/// CLI 定義 (`nnue-train simple --help`) としてのみ存在する — run_training /
+/// smoke_test は arch 種別を見て early reject する。
+#[derive(Args, Debug)]
+struct SimpleArgs {
+    /// 層次元 preset (`<l1>x2-<l2>-<l3>`)。l1 は accumulator (FT 出力) 次元、
+    /// l2 / l3 は隠れ層次元。`--l1` / `--l2` / `--l3` で個別に上書きできる。
+    #[arg(long, default_value = "256x2-32-32")]
+    arch: String,
+
+    /// accumulator (FT 出力) 次元。未指定なら `--arch` preset の値。
     #[arg(long)]
-    fp16_opt_state: bool,
+    l1: Option<usize>,
+
+    /// 隠れ層 1 の次元。未指定なら `--arch` preset の値。
+    #[arg(long)]
+    l2: Option<usize>,
+
+    /// 隠れ層 2 の次元。未指定なら `--arch` preset の値。
+    #[arg(long)]
+    l3: Option<usize>,
+
+    /// 活性化関数 ("crelu" または "screlu")。
+    #[arg(long, default_value = "crelu")]
+    activation: String,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // アーキ種別で host pipeline を分岐する。Simple アーキは host pipeline が
+    // 未実装なので early reject、LayerStack はそのまま固有引数を取り出す。
+    let layerstack = match &cli.arch {
+        ArchCommand::LayerStack(args) => args,
+        ArchCommand::Simple(_) => return Err(simple_arch_unimplemented()),
+    };
+
     let data = cli.data.as_ref().expect("run_training called with --data");
 
     // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
@@ -7879,10 +7946,10 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         .spec();
 
     // --- 未実装オプション値の reject ---
-    if cli.bucket_mode != "progress8kpabs" {
+    if layerstack.bucket_mode != "progress8kpabs" {
         return Err(format!(
             "--bucket-mode '{}' is not implemented (only 'progress8kpabs')",
-            cli.bucket_mode
+            layerstack.bucket_mode
         )
         .into());
     }
@@ -7894,7 +7961,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     // --ft-fp16-out は weight FP16 path の上に積む拡張なので --ft-fp16 を要求する。
-    if cli.ft_fp16_out && !cli.ft_fp16 {
+    if layerstack.ft_fp16_out && !cli.ft_fp16 {
         return Err(
             "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
                     path の拡張)"
@@ -7993,7 +8060,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cli.output)?;
 
     // progress8kpabs weights (process-global; 未指定なら zero → 全 bucket 4)
-    let progress = match &cli.progress_coeff {
+    let progress = match &layerstack.progress_coeff {
         Some(p) => {
             println!("[train] loading progress8kpabs coeff: {}", p.display());
             ShogiProgressKPAbs::load_from_bin(p).map_err(|e| -> Box<dyn std::error::Error> {
@@ -8014,9 +8081,9 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut trainer = GpuTrainer::new(
         &ctx,
         cli.batch_size,
-        cli.tf32,
+        layerstack.tf32,
         cli.ft_fp16,
-        cli.ft_fp16_out,
+        layerstack.ft_fp16_out,
         cli.fp16_opt_state,
         feature_set,
         cli.weight_decay,
@@ -8102,6 +8169,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut experiment = build_experiment_logger(
         cli,
+        layerstack,
         feature_set,
         start_superbatch,
         resumed_superbatch,
@@ -8189,6 +8257,7 @@ fn git_commit() -> Option<String> {
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 fn build_experiment_logger(
     cli: &Cli,
+    layerstack: &LayerstackArgs,
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
@@ -8232,8 +8301,8 @@ fn build_experiment_logger(
         l2: L2_OUT,
         num_buckets: NUM_BUCKETS,
         optimizer: cli.optimizer.clone(),
-        bucket_mode: cli.bucket_mode.clone(),
-        progress_coeff: cli.progress_coeff.as_deref().map(file_basename),
+        bucket_mode: layerstack.bucket_mode.clone(),
+        progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
@@ -8253,9 +8322,9 @@ fn build_experiment_logger(
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
-        tf32: cli.tf32,
+        tf32: layerstack.tf32,
         ft_fp16: cli.ft_fp16,
-        ft_fp16_out: cli.ft_fp16_out,
+        ft_fp16_out: layerstack.ft_fp16_out,
         fp16_opt_state: cli.fp16_opt_state,
         threads: cli.threads,
     };
@@ -8285,7 +8354,22 @@ fn build_experiment_logger(
     ExperimentLogger::new(json_path, doc)
 }
 
-fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+/// Simple アーキはまだ host training pipeline を持たないことを示すエラー。
+/// run_training / smoke_test の両 entrypoint がこのメッセージで reject する。
+fn simple_arch_unimplemented() -> Box<dyn std::error::Error> {
+    format!(
+        "the '{}' architecture is not implemented yet (use the '{}' subcommand)",
+        ArchKind::Simple.canonical_name(),
+        ArchKind::LayerStack.canonical_name()
+    )
+    .into()
+}
+
+fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::Error>> {
+    // Simple アーキは host pipeline が未実装なので smoke でも early reject する。
+    if arch_kind == ArchKind::Simple {
+        return Err(simple_arch_unimplemented());
+    }
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
     // smoke は production feature set (`halfka-hm-merged`) で動作確認する。
@@ -8410,7 +8494,7 @@ fn main() -> std::process::ExitCode {
     let result = if cli.data.is_some() {
         run_training(&cli)
     } else {
-        smoke_test()
+        smoke_test(cli.arch.kind())
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -8487,6 +8571,72 @@ mod raw_ckpt_format_tests {
         let io_err = e.downcast::<std::io::Error>().expect("is io::Error");
         assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
         assert!(io_err.to_string().contains("boom"));
+    }
+}
+
+// ===========================================================================
+// CLI 構成テスト (clap、GPU 不要)
+// ===========================================================================
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap derive の構成 (global 引数 + 必須サブコマンド) が破綻していないこと。
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn layerstack_subcommand_parses() {
+        let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
+        assert_eq!(cli.arch.kind(), ArchKind::LayerStack);
+    }
+
+    #[test]
+    fn simple_subcommand_parses() {
+        let cli = Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand");
+        assert_eq!(cli.arch.kind(), ArchKind::Simple);
+    }
+
+    #[test]
+    fn subcommand_is_required() {
+        // サブコマンド未指定はエラー (clap サブコマンド必須化により CLI 文字列互換は破壊)。
+        assert!(Cli::try_parse_from(["nnue-train"]).is_err());
+    }
+
+    #[test]
+    fn shared_args_are_global_around_subcommand() {
+        // 共有 (global) 引数は値付き / フラグ いずれもサブコマンドの後ろに置ける。
+        let cli = Cli::try_parse_from([
+            "nnue-train",
+            "layerstack",
+            "--ft-fp16",
+            "--data",
+            "x.psv",
+            "--batch-size",
+            "4096",
+        ])
+        .expect("global args after subcommand");
+        assert!(cli.ft_fp16);
+        assert_eq!(cli.data.as_deref(), Some(std::path::Path::new("x.psv")));
+        assert_eq!(cli.batch_size, 4096);
+    }
+
+    #[test]
+    fn layerstack_specific_arg_rejected_on_simple() {
+        // layerstack 固有引数 (--tf32) は simple サブコマンドでは未知でエラー。
+        assert!(Cli::try_parse_from(["nnue-train", "simple", "--tf32"]).is_err());
+    }
+
+    #[test]
+    fn layerstack_specific_arg_rejected_before_subcommand() {
+        // layerstack 固有引数 (--progress-coeff) は global ではないので、
+        // サブコマンドより前には置けずエラーになる。
+        assert!(
+            Cli::try_parse_from(["nnue-train", "--progress-coeff", "p.bin", "layerstack"]).is_err()
+        );
     }
 }
 

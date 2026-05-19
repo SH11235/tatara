@@ -11,11 +11,12 @@
 ```bash
 DATA=/path/to/PSV
 PROG=/path/to/progress.bin
-target/release/nnue-train --data "$DATA" --progress-coeff "$PROG" \
+target/release/nnue-train --data "$DATA" \
   --output /tmp/bench --net-id bench \
   --superbatches 5 --batches-per-superbatch 200 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 5 --threads 16 --bucket-mode progress8kpabs
+  --save-rate 5 --threads 16 \
+  layerstack --progress-coeff "$PROG" --bucket-mode progress8kpabs
 ```
 
 1 回 1m30s 程度、合計 3 分で 5 sb 分の `pos/s` ログが出る。`DATA` / `PROG` は
@@ -76,11 +77,12 @@ profile-on は 25-33% の overhead を伴うので throughput 計測時は外す
 
 ```bash
 NNUE_TRAIN_STEP_PROFILE=1 target/release/nnue-train \
-  --data "$DATA" --progress-coeff "$PROG" \
+  --data "$DATA" \
   --output /tmp/prof --net-id prof \
   --superbatches 1 --batches-per-superbatch 5 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 1 --threads 16 --bucket-mode progress8kpabs \
+  --save-rate 1 --threads 16 \
+  layerstack --progress-coeff "$PROG" --bucket-mode progress8kpabs \
   2>&1 | grep step-profile
 ```
 

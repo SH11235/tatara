@@ -16,7 +16,7 @@ PSV / `.bin` / checkpoint の命名規約と配置は
 [docs/data-layout.md](data-layout.md) を参照 (`data/` 配下に symlink を貼る
 運用を推奨)。
 
-## Step 1: progress.bin を生成 (まだ無い場合)
+## progress.bin を生成 (まだ無い場合)
 
 `progress-kpabs-train` で先に進行度係数を学習する。`--epochs` で総 epoch
 数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
@@ -33,7 +33,7 @@ target/release/progress-kpabs-train \
 (progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立な
 ため何 epoch 必要かはデータ依存)。
 
-## Step 2: nnue-train で本体を学習 (400 sb full run)
+## nnue-train で本体を学習 (400 sb full run)
 
 典型的な full run (400 superbatches × 6104 batches × 65536 positions
 = ~160 GB 相当の position 通過):
@@ -41,12 +41,12 @@ target/release/progress-kpabs-train \
 ```bash
 target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
-  --progress-coeff <path/to/progress.e5.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 20 --keep-checkpoints 4 \
-  --threads 16 --bucket-mode progress8kpabs
+  --save-rate 20 --keep-checkpoints 4 --threads 16 \
+  layerstack \
+  --progress-coeff <path/to/progress.e5.bin> --bucket-mode progress8kpabs
 ```
 
 | option | 目的 |
@@ -65,7 +65,7 @@ target/release/nnue-train \
 所要時間は GPU と構成 (FP16 モード有無) で変わる。RTX 3080 Ti での throughput・
 400 sb ETA・GPU 機種別と構成別の目安は [docs/performance.md](performance.md) を参照。
 
-## Step 3: 学習中断・再開
+## 学習中断・再開
 
 raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在
 の superbatch 番号** を全部保存する。電源断や GPU エラーで止まっても完全
@@ -73,12 +73,13 @@ raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在
 
 ```bash
 target/release/nnue-train \
-  --data ... --progress-coeff ... \
+  --data ... \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 20 --threads 16 --bucket-mode progress8kpabs \
-  --resume checkpoints/<run-name>/<run-name>-180.ckpt
+  --save-rate 20 --threads 16 \
+  --resume checkpoints/<run-name>/<run-name>-180.ckpt \
+  layerstack --progress-coeff ... --bucket-mode progress8kpabs
 ```
 
 `--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から
@@ -89,7 +90,7 @@ target/release/nnue-train \
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
 > (真の resume)。両者は排他指定。
 
-## Step 4: 出力 artifact の見方
+## 出力 artifact の見方
 
 学習後 `checkpoints/<run-name>/` に出るもの:
 
@@ -103,22 +104,24 @@ target/release/nnue-train \
 
 ## 動作確認 (smoke)
 
-データ準備前に GPU 経路だけ確認したい場合は `--data` を省略すると `GpuTrainer`
-の forward / backward path を 1 step だけ実行する smoke test が走る:
+データ準備前に GPU 経路だけ確認したい場合は、アーキ サブコマンドを付けて
+`--data` を省略すると `GpuTrainer` の forward / backward path を 1 step だけ
+実行する smoke test が走る:
 
 ```bash
-target/release/nnue-train
+target/release/nnue-train layerstack
 # → "[smoke] forward + backward OK" の趣旨のログが出れば GPU 経路は健全
 ```
 
 または小規模 run (1 sb × 3 batches) で全 pipeline を 5 秒程度で回す:
 
 ```bash
-target/release/nnue-train --data <PSV> --progress-coeff <progress.bin> \
+target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 1 --threads 4 --bucket-mode progress8kpabs
+  --save-rate 1 --threads 4 \
+  layerstack --progress-coeff <progress.bin> --bucket-mode progress8kpabs
 ```
 
 ## トラブルシューティング
