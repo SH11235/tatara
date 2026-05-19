@@ -276,8 +276,36 @@ impl SimpleWeights {
         }
     }
 
-    /// Simple quantised binary を `writer` に書き出す。
+    /// 各 weight buffer の要素数が `id` の層次元と整合するか検証する。
+    /// 不整合は `save_quantised` 内の index 計算が panic / 末尾切り捨てに
+    /// なるため、書き出し前に `InvalidInput` で弾く。
+    fn check_buffer_lengths(&self) -> io::Result<()> {
+        let id = &self.id;
+        let groups = [
+            ("ft_w", self.ft_w.len(), id.ft_in() * id.ft_out),
+            ("ft_b", self.ft_b.len(), id.ft_out),
+            ("l1_w", self.l1_w.len(), id.l1_out * 2 * id.ft_out),
+            ("l1_b", self.l1_b.len(), id.l1_out),
+            ("l2_w", self.l2_w.len(), id.l2_out * id.l1_out),
+            ("l2_b", self.l2_b.len(), id.l2_out),
+            ("l3_w", self.l3_w.len(), id.l2_out),
+            ("l3_b", self.l3_b.len(), 1),
+        ];
+        for (name, got, want) in groups {
+            if got != want {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("SimpleWeights.{name} has {got} elements, expected {want}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Simple quantised binary を `writer` に書き出す。weight buffer の長さが
+    /// `id` の層次元と不整合なら、書き出し前に `InvalidInput` で返す。
     pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.check_buffer_lengths()?;
         let id = &self.id;
 
         // ---- header ----
@@ -348,7 +376,8 @@ impl SimpleWeights {
         }
         let mut arch_bytes = vec![0u8; arch_len];
         reader.read_exact(&mut arch_bytes)?;
-        let arch_str = String::from_utf8_lossy(&arch_bytes);
+        let arch_str = String::from_utf8(arch_bytes)
+            .map_err(|e| invalid(format!("arch_str is not valid UTF-8: {e}")))?;
         // identity 部 (`,fv_scale=` の手前) を expected から組んだ値と照合する。
         let (file_identity, fv_scale_str) = arch_str
             .rsplit_once(",fv_scale=")
@@ -674,6 +703,18 @@ mod tests {
             .unwrap();
         buf.truncate(buf.len() / 2);
         assert!(SimpleWeights::load(&mut std::io::Cursor::new(&buf), id).is_err());
+    }
+
+    #[test]
+    fn save_rejects_mismatched_buffer_length() {
+        // weight buffer の長さが id 次元と不整合なら save が InvalidInput で弾く。
+        let id = test_id(SimpleActivation::CReLU);
+        let mut w = SimpleWeights::zeroed(id, 16);
+        w.l1_b.push(0.0);
+        let err = w
+            .save_quantised(&mut Vec::new())
+            .expect_err("mismatched buffer length must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
