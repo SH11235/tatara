@@ -554,8 +554,9 @@ where
         // held-out validation: superbatch 末に forward-only 検証を 1 回走らせる
         // (`--test-data` 指定時のみ)。training step と同じ loss kind と、当 superbatch
         // 代表の wdl_lambda (`wdl_now` = batch_idx 0 の blend、sb 末 report と同値) で
-        // 測り、test_loss を同 superbatch の training loss と比較可能にする。現行の
-        // `WdlScheduler` は superbatch 単位で blend する (batch 内一定)。
+        // 測り、test_loss を同 superbatch の training loss と比較可能にする。superbatch
+        // 内で wdl が変動する scheduler (`WarmupWDL` の warmup 区間など) では
+        // batch_idx 0 の値で代表させる近似になる (sb 末 report と同じ扱い)。
         let validation = match &heldout {
             Some(set) => {
                 let report = set.evaluate(backend, wdl_now, cfg.loss)?;
