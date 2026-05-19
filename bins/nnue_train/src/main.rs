@@ -5771,8 +5771,9 @@ impl GpuTrainer {
     /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
     /// crash しても `<path>` は前回の完全な checkpoint のまま)。
     ///
-    /// `run_id` はこの checkpoint を書き出す run の experiment.json `id`。空文字列なら
-    /// run id を持たない checkpoint になる (resume 時の `lineage.parent_id` は省略)。
+    /// `run_id` はこの checkpoint を書き出す run の experiment.json `id`。空文字列、
+    /// または `MAX_RUN_ID_BYTES` 超過 (warning を出して省略) のときは run id を持た
+    /// ない checkpoint になり、resume 時の `lineage.parent_id` は解決されない。
     fn save_raw_checkpoint(
         &self,
         path: &Path,
@@ -5781,13 +5782,20 @@ impl GpuTrainer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
-        if run_id.len() > MAX_RUN_ID_BYTES {
-            return Err(format!(
-                "raw checkpoint producer run id length {} exceeds {MAX_RUN_ID_BYTES}",
-                run_id.len()
-            )
-            .into());
-        }
+        // 過長な run id (`{net_id}-{時刻}-{pid}`、通常数十バイト) は lineage という
+        // メタデータのために学習を中断させる価値がない。上限超過時は埋め込みを
+        // 省略 (長さ 0) し、warning を出して checkpoint 保存は続行する。
+        let run_id = if run_id.len() > MAX_RUN_ID_BYTES {
+            eprintln!(
+                "[train] warning: producer run id ({} bytes) exceeds {MAX_RUN_ID_BYTES}; \
+                 omitting it from {} (resume lineage parent will be unresolved)",
+                run_id.len(),
+                path.display()
+            );
+            ""
+        } else {
+            run_id
+        };
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -5925,10 +5933,10 @@ impl GpuTrainer {
         let mut buf4 = [0u8; 4];
         read_exact_or_invalid(&mut r, &mut buf4, "version")?;
         let version = u32::from_le_bytes(buf4);
-        if version > RAW_CKPT_VERSION {
+        if version == 0 || version > RAW_CKPT_VERSION {
             return Err(invalid_data(format!(
-                "raw checkpoint version {version} is newer than this build supports \
-                 (max {RAW_CKPT_VERSION})"
+                "raw checkpoint version {version} is not supported \
+                 (this build reads 1..={RAW_CKPT_VERSION})"
             )));
         }
         let mut buf8 = [0u8; 8];
