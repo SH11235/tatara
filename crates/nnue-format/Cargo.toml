@@ -14,3 +14,6 @@ workspace = true
 [dependencies]
 # NNUE 重みファイル (header / halfka_psqt / layerstack) の (de)serialization
 # 専用 crate。CPU-only、GPU 依存なし。
+# artifact identity (arch 文字列 / hash) を feature set から導出するため
+# shogi-features (CPU-only) に依存する。
+shogi-features = { workspace = true }
