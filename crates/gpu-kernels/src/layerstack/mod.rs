@@ -41,11 +41,17 @@
 //!
 //! ## アーキテクチャ定数 (bullet 由来)
 //!
-//! - `FT_IN = 73305` (`HALFKA_HM_DIMENSIONS`)、`FT_OUT = 1536` (per-perspective)
+//! FT 入力次元 (`ft_in`) と 1 perspective あたりの active feature 数
+//! (`max_active`) は入力 feature set ごとに異なる runtime 値で、kernel は
+//! `cols` / `nnz` / `ft_dim` を launch 引数で受け取る (本 module に固定
+//! 定数として持たない)。以下の FT_OUT 以降の次元は LayerStack トポロジで
+//! 固定 (feature set と独立):
+//!
+//! - `FT_OUT = 1536` (per-perspective FT 出力次元)
 //! - `COMBINED_DIM = FT_OUT = 1536` (pairwise 1536→768 を 2 perspective concat)
 //! - `L1_OUT = 16`、`L1_EFFECTIVE = L1_OUT - 1 = 15`、`L1_SKIP = 1`
 //! - `L2_IN = L1_EFFECTIVE * 2 = 30` (l1_sqr.concat(l1_main))、`L2_OUT = 32`
-//! - `NUM_BUCKETS = 9` (progress8kpabs)、`MAX_ACTIVE = 40` (nnz)
+//! - `NUM_BUCKETS = 9` (progress8kpabs)
 //! - `FT_POST_SCALE = L1_SQR_SCALE = 127.0/128.0` (`qa = 127` 由来)
 
 pub mod abs_pow2_scale;
