@@ -176,14 +176,18 @@ forward 出力 `ft_*_out` と backward 勾配 `dft_*_out` (どちらも b × FT_
 | `phD_stm` + `phD_nstm` | ~19.6 ms | ~9.7 ms |
 | pos/s | ~1.15M | ~1.41M |
 
-loss scaling: `dft_*_out` は batch 正規化 (loss が 1/batch) で値が `1/batch` に比例し
-(`--batch-size 65536` で ~1e-8 規模)、無 scale で FP16 化すると全要素が subnormal 下限
-(2^-24 ≈ 6e-8) を下回り 0 に潰れて勾配が消える。FP16 へ書く直前に係数
-`2^14 × batch` を掛けて normal range に持ち上げ、inverse-index gather 側で逆数を掛けて
-元の scale に戻す。scale を batch 比例にするのは dft ∝ 1/batch を打ち消して
-`--batch-size` 非依存に f16 域へ載せるため (固定係数だと小 batch で f16 max 65504 を
-超えて inf 化する)。forward の `ft_*_out` は CReLU 前の FT accumulator で値域が
-~O(1〜数十) と広く、loss scaling 不要。
+loss scaling: `dft_*_out` は batch 正規化 (loss が 1/batch) で値が `1/batch` に比例し、
+学習初期は `--batch-size 65536` で ~1e-8 規模。無 scale で FP16 化すると全要素が
+subnormal 下限 (2^-24 ≈ 6e-8) を下回り 0 に潰れて勾配が消えるため、FP16 へ書く直前に
+係数 `2^14 × batch` を掛けて normal range に持ち上げ、inverse-index gather 側で逆数を
+掛けて元の scale に戻す。scale を batch 比例にするのは dft ∝ 1/batch を打ち消して
+`--batch-size` 非依存に f16 域へ載せるため。
+
+ただし dft は学習が進むと縮まず**成長**し、scale 後の値は学習中盤で f16 上限 (65504)
+に達しうる。`ft_post_perspective_grad_fused_fp16` は f16 書き込み前に `±65504` へ
+clamp してこの overflow (→ `±inf` → 学習発散) を防ぐ。clamp が頻発する場合は scale
+過大の兆候で、scale の再評価が要る。forward の `ft_*_out` は CReLU 前の FT accumulator
+で値域が ~O(1〜数十) と狭く、loss scaling 不要。
 
 `--ft-fp16` と別 flag に分けてあるのは、SPRT で FP32 → `--ft-fp16` →
 `--ft-fp16 --ft-fp16-out` の 2 段に分けて weight FP16 と activation FP16 の棋力影響を

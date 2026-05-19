@@ -4041,10 +4041,11 @@ const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 /// 同じ f16 域に載るため。固定 scale だと小 batch で dft が大きくなり f16 max (65504) を
 /// 超えて inf 化し `ft_w_grad` を破壊する。
 ///
-/// 2^14: `dft * batch` の不変量を学習初期 step (loss = 勾配が最大の局面) で実測すると
-/// ~1.2e-3。`不変量 * BASE ≈ 19 ≪ 65504` で overflow 余裕 ~3000×、batch 非依存。dft は
-/// 学習が進むほど縮むので初期 step が実質 worst case。batch=65536 のとき実 scale は
-/// `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
+/// 2^14: `dft * batch` の不変量は学習初期で ~1.2e-3、`× BASE ≈ 19` と f16 normal
+/// range に収まる。ただし dft は学習が進むと縮まず成長し、scale 後の値が学習中盤で
+/// f16 上限 (65504) に達しうるため、`ft_post_perspective_grad_fused_fp16` は f16
+/// 書き込み前に `±65504` へ clamp する (overflow → `±inf` → 学習発散を防ぐ)。
+/// batch=65536 のとき実 scale は `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
 const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
 /// `--fp16-opt-state` で `ft_w` の Ranger 1st moment (`m`) を `f16` 格納するときの
