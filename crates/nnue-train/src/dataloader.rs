@@ -1,18 +1,19 @@
-//! PSV file → HalfKA_hm sparse batch dataloader (+ prefetch wrapper)。
+//! PSV file → feature-set sparse batch dataloader (+ prefetch wrapper)。
 //!
-//! trainer の data 供給路。`PackedSfenValue` を `ShogiHalfKA_hm` で sparse
-//! index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` / `wdl` /
+//! trainer の data 供給路。`PackedSfenValue` を [`FeatureSetSpec`] の indexer で
+//! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` / `wdl` /
 //! `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
-//! 本 dataloader から `Batch` を pull する。
+//! 本 dataloader から `Batch` を pull する。どの feature set を使うかは生成時に
+//! 渡す `FeatureSetSpec` で決まる (runtime 選択)。
 //!
 //! ## 設計のポイント
 //!
 //! - **WDL blend は GPU 側 (`loss_wdl` / `loss_wrm` kernel) で fuse する**ため、
 //!   本 dataloader は `score` (raw cp) と `wdl` (game result `{0, 0.5, 1}`) を
 //!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
-//! - sparse index は最大 active 数 (`MAX_ACTIVE_FEATURES = 40`) で固定容量を
-//!   持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward` kernel は
-//!   `-1` を silent skip する規約
+//! - sparse index は feature set の最大 active 数 (`FeatureSetSpec::max_active`)
+//!   で固定容量を持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward`
+//!   kernel は `-1` を silent skip する規約
 //! - 並列 prefetch は `std::thread::spawn` + `std::sync::mpsc::sync_channel` の
 //!   minimal wrapper として [`PrefetchedLoader`] (single-thread worker) と
 //!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use shogi_features::halfka_hm::{MAX_ACTIVE_FEATURES, ShogiHalfKA_hm};
+use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_format::{PackedSfenValue, ShogiBoard};
 
@@ -32,7 +33,7 @@ use shogi_format::{PackedSfenValue, ShogiBoard};
 // Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
 // =============================================================================
 
-/// 1 batch 分の HalfKA_hm sparse + score/wdl/norm。
+/// 1 batch 分の feature-set sparse + score/wdl/norm。
 ///
 /// - `stm_indices` / `nstm_indices`: shape `[batch_size, max_active]` を flatten
 ///   (row-major、`bi * max_active + j` で参照)。`-1` padding で未使用 slot を
@@ -47,6 +48,10 @@ use shogi_format::{PackedSfenValue, ShogiBoard};
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub batch_size: usize,
+    /// この batch を埋めた feature set。`push_decoded` の特徴抽出と
+    /// `max_active` / `ft_in` の決定はすべてこの spec が単一の真実源。
+    pub feature_set: FeatureSetSpec,
+    /// `feature_set.max_active()` のキャッシュ (sparse index の row stride)。
     pub max_active: usize,
     pub stm_indices: Vec<i32>,
     pub nstm_indices: Vec<i32>,
@@ -57,11 +62,13 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// `batch_size` × `max_active` の sparse 容量を持つ空 `Batch` を確保。
-    /// 全 index は `-1` (padding)、score/wdl/norm は `0.0`。
-    pub fn with_capacity(batch_size: usize, max_active: usize) -> Self {
+    /// `batch_size` × `feature_set.max_active()` の sparse 容量を持つ空 `Batch`
+    /// を確保。全 index は `-1` (padding)、score/wdl/norm は `0.0`。
+    pub fn with_capacity(batch_size: usize, feature_set: FeatureSetSpec) -> Self {
+        let max_active = feature_set.max_active();
         Self {
             batch_size,
+            feature_set,
             max_active,
             stm_indices: vec![-1; batch_size * max_active],
             nstm_indices: vec![-1; batch_size * max_active],
@@ -96,7 +103,7 @@ impl Batch {
     }
 
     /// 1 position を batch に追加。`true` を返したら成功、`false` は batch 満杯。
-    /// `ShogiHalfKA_hm::map_features` で sparse index を slot に fill (残りは
+    /// `feature_set` の indexer で sparse index を slot に fill (残りは
     /// `-1` padding)。
     ///
     /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
@@ -109,10 +116,9 @@ impl Batch {
     /// [`Batch::push`] の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
     /// prefetch worker が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ
-    /// 呼び、その `ShogiBoard` を HalfKA_hm 特徴抽出 (本メソッド) と
-    /// progress8kpabs bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で
-    /// 使い回すための入口 (decode-once)。`push(&pos)` は
-    /// `push_decoded(&pos.decode())` と等価。
+    /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と progress8kpabs
+    /// bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で使い回すための
+    /// 入口 (decode-once)。`push(&pos)` は `push_decoded(&pos.decode())` と等価。
     pub fn push_decoded(&mut self, board: &ShogiBoard) -> bool {
         if self.n_positions >= self.batch_size {
             return false;
@@ -121,15 +127,18 @@ impl Batch {
         let bi = self.n_positions;
         let row_off = bi * self.max_active;
 
+        // spec は `Copy` なので local に取り出し、`self` の他フィールドを
+        // 借りる closure と借用が衝突しないようにする。
+        let spec = self.feature_set;
         let mut j = 0usize;
-        ShogiHalfKA_hm.map_features_board(board, |stm_idx, nstm_idx| {
+        spec.map_features_board(board, |stm_idx, nstm_idx| {
             if j < self.max_active {
                 self.stm_indices[row_off + j] = stm_idx as i32;
                 self.nstm_indices[row_off + j] = nstm_idx as i32;
                 j += 1;
             }
-            // overflow は silent skip (`MAX_ACTIVE_FEATURES = 40` は合法局面の
-            // 駒総数で固定、実 PSV では到達不能だが defensive に許容)。
+            // overflow は silent skip (`max_active` は合法局面の駒総数で固定、
+            // 実 PSV では到達不能だが defensive に許容)。
         });
 
         // score / wdl / norm
@@ -262,13 +271,13 @@ pub struct PrefetchedLoader {
 }
 
 impl PrefetchedLoader {
-    /// 指定 path から PSV を読み、`batch_size` × `max_active` の sparse batch
-    /// として生成。`prefetch_depth` は背景 thread が main thread を先読みする
-    /// 深さ (`sync_channel(prefetch_depth)` の bound)。
+    /// 指定 path から PSV を読み、`feature_set` の sparse batch として生成。
+    /// `prefetch_depth` は背景 thread が main thread を先読みする深さ
+    /// (`sync_channel(prefetch_depth)` の bound)。
     pub fn spawn<P: AsRef<Path>>(
         path: P,
         batch_size: usize,
-        max_active: usize,
+        feature_set: FeatureSetSpec,
         prefetch_depth: usize,
     ) -> io::Result<Self> {
         let loader = PsvFileLoader::new(path)?;
@@ -281,7 +290,7 @@ impl PrefetchedLoader {
                 // thread に移すため、background 側で `Batch::reset()` 再利用は
                 // 不可。ring-buffer return path を持つ実装は
                 // [`BucketedPrefetchedLoader`] を参照。
-                let mut batch = Batch::with_capacity(batch_size, max_active);
+                let mut batch = Batch::with_capacity(batch_size, feature_set);
                 match loader.fill_batch(&mut batch) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
@@ -409,20 +418,20 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 type BatchSlot = (Batch, Vec<i32>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
-/// 「PSV パース + HalfKA_hm sparse 抽出 + progress8kpabs bucket 計算」を
+/// 「PSV パース + feature sparse 抽出 + progress8kpabs bucket 計算」を
 /// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
 /// prefetch loader。
 ///
 /// ## 設計
 ///
 /// - **decode-once**: worker は `psv.decode()` した `ShogiBoard` を
-///   `Batch::push_decoded` (HalfKA_hm 特徴) と `ShogiProgressKPAbs::bucket_board`
+///   `Batch::push_decoded` (feature 抽出) と `ShogiProgressKPAbs::bucket_board`
 ///   (output bucket) の両方に渡す。`pos.decode()` は 1 局面 1 回。
 /// - **並列パース**: worker は短い critical section (共有 `Mutex<PsvEpochReader>`
 ///   を lock して `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は
-///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`ShogiHalfKA_hm` /
-///   `ShogiProgressKPAbs` は ZST + process-global `OnceLock` (read-only) なので
-///   thread 間共有して問題ない。
+///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`FeatureSetSpec` は
+///   `Copy` の値型、`ShogiProgressKPAbs` は ZST + process-global `OnceLock`
+///   (read-only) なので thread 間共有して問題ない。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
 ///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
@@ -461,13 +470,15 @@ impl BucketedPrefetchedLoader {
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
     /// `progress` は output bucket を計算する [`ShogiProgressKPAbs`] (ZST; 重みは
     /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
-    /// 未ロードなら全 bucket 4)。
+    /// 未ロードなら全 bucket 4)。`feature_set` は sparse index 化に使う feature
+    /// set spec で、全 worker が共有する (`Copy`、read-only)。
     pub fn spawn(
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
         num_workers: usize,
         progress: ShogiProgressKPAbs,
+        feature_set: FeatureSetSpec,
     ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         let num_workers = num_workers.max(1);
@@ -484,7 +495,7 @@ impl BucketedPrefetchedLoader {
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
-                Batch::with_capacity(batch_size, MAX_ACTIVE_FEATURES),
+                Batch::with_capacity(batch_size, feature_set),
                 Vec::with_capacity(batch_size),
             );
             pool_tx
@@ -541,7 +552,7 @@ impl BucketedPrefetchedLoader {
                         }
                     }
 
-                    // decode-once: ShogiBoard を HalfKA_hm 特徴 + progress bucket
+                    // decode-once: ShogiBoard を feature 抽出 + progress bucket
                     // の両方に使う。
                     for psv in &scratch {
                         let board = psv.decode();
@@ -643,8 +654,13 @@ impl Drop for BucketedPrefetchedLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shogi_features::halfka_hm::HALFKA_HM_DIMENSIONS;
+    use shogi_features::FeatureSet;
     use std::path::PathBuf;
+
+    /// テストで使う feature set spec (現 production の halfka-hm-merged)。
+    fn test_spec() -> FeatureSetSpec {
+        FeatureSet::HalfKaHmMerged.spec()
+    }
 
     /// shogi-format crate test fixture (100 records × 40 bytes = 4000 bytes)。
     fn sample_psv_path() -> PathBuf {
@@ -658,10 +674,11 @@ mod tests {
 
     #[test]
     fn batch_with_capacity_initializes_padding_and_defaults() {
-        let batch = Batch::with_capacity(4, 8);
+        let spec = test_spec();
+        let batch = Batch::with_capacity(4, spec);
         assert_eq!(batch.batch_size, 4);
-        assert_eq!(batch.max_active, 8);
-        assert_eq!(batch.stm_indices.len(), 32);
+        assert_eq!(batch.max_active, spec.max_active());
+        assert_eq!(batch.stm_indices.len(), 4 * spec.max_active());
         assert!(batch.stm_indices.iter().all(|&i| i == -1));
         assert!(batch.nstm_indices.iter().all(|&i| i == -1));
         assert!(batch.score.iter().all(|&s| s == 0.0));
@@ -692,19 +709,19 @@ mod tests {
     #[test]
     fn fill_batch_indices_within_halfka_dim_or_padding() {
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        let mut batch = Batch::with_capacity(8, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(8, test_spec());
         let n = loader.fill_batch(&mut batch).unwrap();
         assert_eq!(n, 8);
         assert_eq!(batch.n_positions, 8);
         for (i, &idx) in batch.stm_indices.iter().enumerate() {
             assert!(
-                idx == -1 || (0..HALFKA_HM_DIMENSIONS as i32).contains(&idx),
-                "stm_indices[{i}] = {idx} は -1 padding か [0, HALFKA_HM_DIMENSIONS) の範囲"
+                idx == -1 || (0..test_spec().ft_in() as i32).contains(&idx),
+                "stm_indices[{i}] = {idx} は -1 padding か [0, ft_in) の範囲"
             );
         }
         for (i, &idx) in batch.nstm_indices.iter().enumerate() {
             assert!(
-                idx == -1 || (0..HALFKA_HM_DIMENSIONS as i32).contains(&idx),
+                idx == -1 || (0..test_spec().ft_in() as i32).contains(&idx),
                 "nstm_indices[{i}] = {idx}"
             );
         }
@@ -716,7 +733,7 @@ mod tests {
     #[test]
     fn fill_batch_wdl_is_in_valid_range() {
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        let mut batch = Batch::with_capacity(4, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(4, test_spec());
         loader.fill_batch(&mut batch).unwrap();
         for (i, &w) in batch.wdl.iter().enumerate() {
             assert!(
@@ -733,7 +750,7 @@ mod tests {
         // 潰れるので、`wdl == 1.0` が少なくとも 1 件存在することを確認
         // (sign-aware な i8 → `{0.0, 0.5, 1.0}` map 経路の回帰検出)。
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        let mut batch = Batch::with_capacity(100, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(100, test_spec());
         loader.fill_batch(&mut batch).unwrap();
         let win_count = batch.wdl.iter().filter(|&&w| w == 1.0).count();
         let loss_count = batch.wdl.iter().filter(|&&w| w == 0.0).count();
@@ -761,18 +778,18 @@ mod tests {
         psv.as_bytes_mut()[38] = 0; // game_result = 0 (Draw)
         assert_eq!(psv.game_result(), 0);
 
-        let mut batch = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(1, test_spec());
         assert!(batch.push(&psv));
         assert_eq!(batch.wdl[0], 0.5, "Draw (result == 0) → wdl == 0.5");
 
         // Win / Loss も合わせて回帰確認 (同 record をパッチ)。
         psv.as_bytes_mut()[38] = 1i8 as u8;
-        let mut b_win = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        let mut b_win = Batch::with_capacity(1, test_spec());
         assert!(b_win.push(&psv));
         assert_eq!(b_win.wdl[0], 1.0, "Win (result > 0) → wdl == 1.0");
 
         psv.as_bytes_mut()[38] = (-1i8) as u8;
-        let mut b_loss = Batch::with_capacity(1, MAX_ACTIVE_FEATURES);
+        let mut b_loss = Batch::with_capacity(1, test_spec());
         assert!(b_loss.push(&psv));
         assert_eq!(b_loss.wdl[0], 0.0, "Loss (result < 0) → wdl == 0.0");
     }
@@ -780,13 +797,13 @@ mod tests {
     #[test]
     fn fill_batch_consumes_stream_partial_at_eof() {
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        let mut batch = Batch::with_capacity(150, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(150, test_spec());
         let n = loader.fill_batch(&mut batch).unwrap();
         // sample.psv の 100 records しかない → 100 で打ち切り。
         assert_eq!(n, 100);
         assert_eq!(batch.n_positions, 100);
         // 残り 150-100=50 slot は padding のまま (-1 / 0.0 / 1.0)。
-        for j in 100 * MAX_ACTIVE_FEATURES..150 * MAX_ACTIVE_FEATURES {
+        for j in 100 * test_spec().max_active()..150 * test_spec().max_active() {
             assert_eq!(batch.stm_indices[j], -1);
         }
         for j in 100..150 {
@@ -797,7 +814,7 @@ mod tests {
 
     #[test]
     fn batch_push_returns_false_when_full() {
-        let mut batch = Batch::with_capacity(2, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(2, test_spec());
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         let psv1 = loader.next_psv().unwrap().unwrap();
         let psv2 = loader.next_psv().unwrap().unwrap();
@@ -810,7 +827,7 @@ mod tests {
 
     #[test]
     fn batch_reset_zeros_state() {
-        let mut batch = Batch::with_capacity(4, MAX_ACTIVE_FEATURES);
+        let mut batch = Batch::with_capacity(4, test_spec());
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         loader.fill_batch(&mut batch).unwrap();
         assert_eq!(batch.n_positions, 4);
@@ -822,8 +839,7 @@ mod tests {
 
     #[test]
     fn prefetched_loader_streams_sample_psv() {
-        let mut loader =
-            PrefetchedLoader::spawn(sample_psv_path(), 8, MAX_ACTIVE_FEATURES, 2).unwrap();
+        let mut loader = PrefetchedLoader::spawn(sample_psv_path(), 8, test_spec(), 2).unwrap();
         let mut total = 0;
         while let Some(batch) = loader.next_batch().unwrap() {
             total += batch.n_positions;
@@ -836,8 +852,7 @@ mod tests {
     #[test]
     fn prefetched_loader_handles_small_prefetch_depth() {
         // prefetch_depth=0 は内部で .max(1) で 1 に正規化。
-        let mut loader =
-            PrefetchedLoader::spawn(sample_psv_path(), 4, MAX_ACTIVE_FEATURES, 0).unwrap();
+        let mut loader = PrefetchedLoader::spawn(sample_psv_path(), 4, test_spec(), 0).unwrap();
         let first = loader.next_batch().unwrap().expect("at least 1 batch");
         assert_eq!(first.n_positions, 4);
     }
@@ -847,9 +862,15 @@ mod tests {
     fn run_bucketed_smoke(num_workers: usize) {
         // sample.psv は 100 records (Loss=50 / Win=50、Draw なし)。
         let progress = ShogiProgressKPAbs; // zero weights → 全 bucket 4
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 16, None, num_workers, progress)
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &sample_psv_path(),
+            16,
+            None,
+            num_workers,
+            progress,
+            test_spec(),
+        )
+        .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
         // 回す。
         for _ in 0..30 {
@@ -868,9 +889,9 @@ mod tests {
             for &w in &batch.wdl[..16] {
                 assert!(w == 0.0 || w == 1.0, "wdl 値 = {w}");
             }
-            // sparse index は [0, HALFKA_HM_DIMENSIONS) か -1 padding。
-            for &idx in &batch.stm_indices[..16 * MAX_ACTIVE_FEATURES] {
-                assert!(idx == -1 || (0..HALFKA_HM_DIMENSIONS as i32).contains(&idx));
+            // sparse index は [0, ft_in) か -1 padding。
+            for &idx in &batch.stm_indices[..16 * test_spec().max_active()] {
+                assert!(idx == -1 || (0..test_spec().ft_in() as i32).contains(&idx));
             }
             let active = batch.stm_indices.iter().filter(|&&i| i >= 0).count();
             assert!(active > 0, "実局面なので active features > 0");
@@ -893,7 +914,8 @@ mod tests {
     fn bucketed_loader_zero_workers_normalizes_to_one() {
         let progress = ShogiProgressKPAbs;
         let mut loader =
-            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, None, 0, progress).unwrap();
+            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, None, 0, progress, test_spec())
+                .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
@@ -909,9 +931,15 @@ mod tests {
         // 100 records 内に 1 batch (=8) ぶん埋まらないと epoch wrap で barren になりうる
         // が、sample.psv に score==0 が 8 件以上ある保証はない → barren error を許容。
         // ここでは「閾値 32000 (= 既定の score-drop 閾値) では全件通る」ことだけ確認する。
-        let mut ok_loader =
-            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, Some(32000), 2, progress)
-                .unwrap();
+        let mut ok_loader = BucketedPrefetchedLoader::spawn(
+            &sample_psv_path(),
+            8,
+            Some(32000),
+            2,
+            progress,
+            test_spec(),
+        )
+        .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         drop(ok_loader);
@@ -920,8 +948,15 @@ mod tests {
         // なければ barren error。sample.psv の score 分布次第なので、error か成功か
         // どちらでもよい (hang しないことが要点)。ここでは「呼んで返ってくる」ことの
         // み確認 (panic / hang しない)。
-        let mut drop_loader =
-            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 100, Some(1), 1, progress).unwrap();
+        let mut drop_loader = BucketedPrefetchedLoader::spawn(
+            &sample_psv_path(),
+            100,
+            Some(1),
+            1,
+            progress,
+            test_spec(),
+        )
+        .unwrap();
         let _ = drop_loader.next_batch();
     }
 
@@ -933,7 +968,8 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
-        let mut loader = BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress).unwrap();
+        let mut loader =
+            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec()).unwrap();
         let err = loader
             .next_batch()
             .expect_err("empty file → barren error, not None and not hang");
