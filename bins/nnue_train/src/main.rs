@@ -3955,11 +3955,19 @@ const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `1`: no feature-set header; the weights are always `halfka-hm-merged`.
 /// - `2`: a self-describing feature-set header (canonical name + `ft_in` +
 ///   `ft_out` + `max_active`) follows the magic + version fields.
+/// - `3`: a producer run id (length-prefixed UTF-8 — the experiment.json `id`
+///   of the run that wrote the checkpoint) follows the feature-set header.
+///   `--resume` reads it to fill `lineage.parent_id`.
 ///
-/// `load_raw_checkpoint` accepts both: version 1 is interpreted as
-/// `halfka-hm-merged` for backward compatibility, version 2 is validated
-/// against the requested feature set, versions above 2 are rejected.
-const RAW_CKPT_VERSION: u32 = 2;
+/// `load_raw_checkpoint` accepts all three: version 1 is interpreted as
+/// `halfka-hm-merged` for backward compatibility, versions 2 and 3 are
+/// validated against the requested feature set, versions above 3 are rejected.
+/// The producer run id is absent (`None`) for versions 1 and 2.
+const RAW_CKPT_VERSION: u32 = 3;
+
+/// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
+/// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
+const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
 type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -5732,15 +5740,17 @@ impl GpuTrainer {
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
     ///
-    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`] = 2):
+    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`] = 3):
     /// ```text
     /// magic        b"RNRC"             (4 bytes)
-    /// version      u32 (2)             (4 bytes)
+    /// version      u32 (3)             (4 bytes)
     /// fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
     /// fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
     /// ft_in        u64                 (FT 入力次元、feature set 依存)
     /// ft_out       u64                 (FT 出力次元、= FT_OUT)
     /// max_active   u64                 (1 perspective あたり active feature 数)
+    /// run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
+    /// run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
     /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
     /// step_count   u64  (Ranger lookahead step counter)
     /// num_groups   u64  (= 10、固定だが将来検証用)
@@ -5753,18 +5763,31 @@ impl GpuTrainer {
     ///   slow[f32 × len]
     /// ```
     ///
-    /// version 1 file には feature set header (`fs_name`/`ft_in`/`ft_out`/`max_active`)
-    /// が無く、weights は常に `halfka-hm-merged` として解釈される。
+    /// version 1 file には feature set header も run id も無く、weights は常に
+    /// `halfka-hm-merged` として解釈される。version 2 file は feature set header を
+    /// 持つが run id は持たない。writer は常に最新 version を書く。
     ///
     /// device → host download (`DeviceBuffer::to_host_vec`) → `<path>.tmp` へ `BufWriter`
     /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
     /// crash しても `<path>` は前回の完全な checkpoint のまま)。
+    ///
+    /// `run_id` はこの checkpoint を書き出す run の experiment.json `id`。空文字列なら
+    /// run id を持たない checkpoint になる (resume 時の `lineage.parent_id` は省略)。
     fn save_raw_checkpoint(
         &self,
         path: &Path,
         superbatch: usize,
+        run_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
+
+        if run_id.len() > MAX_RUN_ID_BYTES {
+            return Err(format!(
+                "raw checkpoint producer run id length {} exceeds {MAX_RUN_ID_BYTES}",
+                run_id.len()
+            )
+            .into());
+        }
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -5794,6 +5817,11 @@ impl GpuTrainer {
             w.write_all(&(self.feature_set.ft_in() as u64).to_le_bytes())?;
             w.write_all(&(FT_OUT as u64).to_le_bytes())?;
             w.write_all(&(self.feature_set.max_active() as u64).to_le_bytes())?;
+            // producer run id: この checkpoint を書き出した run の experiment.json
+            // `id`。resume 時に `lineage.parent_id` の解決に使う (空文字列なら長さ 0)。
+            let run_id_bytes = run_id.as_bytes();
+            w.write_all(&(run_id_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(run_id_bytes)?;
             w.write_all(&(superbatch as u64).to_le_bytes())?;
             w.write_all(&self.step_count.to_le_bytes())?;
             // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
@@ -5867,19 +5895,24 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// raw checkpoint を読み戻す (`--resume` 用)。返り値は checkpoint に記録された
-    /// **完了 superbatch 番号** (caller は通常その +1 から resume する)。
+    /// raw checkpoint を読み戻す (`--resume` 用)。返り値は `(完了 superbatch 番号,
+    /// producer run id)` — superbatch は caller が通常その +1 から resume する。
+    /// producer run id は version 3+ の checkpoint なら `Some` (resume run の
+    /// `lineage.parent_id` に使う)、version 1/2 や run id 未記録なら `None`。
     ///
-    /// magic 不一致、`version > 2`、group 数 / 各 group の len が LayerStack arch と不一致、
+    /// magic 不一致、`version > 3`、group 数 / 各 group の len が LayerStack arch と不一致、
     /// または `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
     ///
     /// version 1 file は feature set header を持たず、weights を `halfka-hm-merged` と
-    /// みなす。version 2 file は header の feature set / `ft_in` / `max_active` を読み、
+    /// みなす。version 2/3 file は header の feature set / `ft_in` / `max_active` を読み、
     /// 現 trainer の `feature_set` と一致しなければ reject する (feature set を跨いだ
     /// resume は許可しない)。読み込んだ raw f32 を host → device upload し、
     /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
-    fn load_raw_checkpoint(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    fn load_raw_checkpoint(
+        &mut self,
+        path: &Path,
+    ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
 
         let mut magic = [0u8; 4];
@@ -5956,6 +5989,30 @@ impl GpuTrainer {
                  requested '{want_name}' (feature set を跨いだ resume は不可)"
             )));
         }
+
+        // version 3+ は feature set header の直後に producer run id を持つ。
+        // version 1/2 は持たず `None`。長さ 0 も `None` (run id 未記録)。
+        let producer_run_id: Option<String> = if version >= 3 {
+            read_exact_or_invalid(&mut r, &mut buf4, "producer run id length")?;
+            let run_id_len = u32::from_le_bytes(buf4) as usize;
+            if run_id_len > MAX_RUN_ID_BYTES {
+                return Err(invalid_data(format!(
+                    "raw checkpoint producer run id length {run_id_len} is implausible \
+                     (max {MAX_RUN_ID_BYTES})"
+                )));
+            }
+            if run_id_len == 0 {
+                None
+            } else {
+                let mut run_id_bytes = vec![0u8; run_id_len];
+                read_exact_or_invalid(&mut r, &mut run_id_bytes, "producer run id")?;
+                Some(String::from_utf8(run_id_bytes).map_err(|_| {
+                    invalid_data("raw checkpoint producer run id is not valid UTF-8".to_string())
+                })?)
+            }
+        } else {
+            None
+        };
 
         read_exact_or_invalid(&mut r, &mut buf8, "superbatch")?;
         let superbatch_u64 = u64::from_le_bytes(buf8);
@@ -6058,7 +6115,7 @@ impl GpuTrainer {
         up!(8, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = step_count;
-        Ok(superbatch)
+        Ok((superbatch, producer_run_id))
     }
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
@@ -7575,16 +7632,22 @@ impl TrainerBackend for GpuTrainer {
         Ok(())
     }
 
-    fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch).map_err(|e| {
-            // 既に io::Error なら kind を保つ、それ以外は other で包む。
-            match e.downcast::<std::io::Error>() {
-                Ok(io_err) => *io_err,
-                Err(other) => std::io::Error::other(format!(
-                    "GpuTrainer::save_raw_checkpoint failed: {other}"
-                )),
-            }
-        })
+    fn save_resume_checkpoint(
+        &mut self,
+        path: &Path,
+        superbatch: usize,
+        run_id: &str,
+    ) -> std::io::Result<()> {
+        self.save_raw_checkpoint(path, superbatch, run_id)
+            .map_err(|e| {
+                // 既に io::Error なら kind を保つ、それ以外は other で包む。
+                match e.downcast::<std::io::Error>() {
+                    Ok(io_err) => *io_err,
+                    Err(other) => std::io::Error::other(format!(
+                        "GpuTrainer::save_raw_checkpoint failed: {other}"
+                    )),
+                }
+            })
     }
 }
 
@@ -7950,27 +8013,35 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         feature_set,
         cli.weight_decay,
     )?;
-    // resume / init-from の処理 → resumed_superbatch を決める。
-    let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
-        println!(
-            "[train] injecting pretrained weights from {} (optimizer state reset)",
-            init.display()
-        );
-        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = LayerStackWeights::load_quantised(&mut reader, feature_set)?;
-        trainer.load_layerstack_weights(&weights)?;
-        None
-    } else if let Some(ckpt) = &cli.resume {
-        let sb = trainer.load_raw_checkpoint(ckpt)?;
-        println!(
-            "[train] resuming from {} at superbatch {}",
-            ckpt.display(),
-            sb + 1
-        );
-        Some(sb)
-    } else {
-        None
-    };
+    // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id を決める。
+    let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
+        if let Some(init) = &cli.init_from {
+            println!(
+                "[train] injecting pretrained weights from {} (optimizer state reset)",
+                init.display()
+            );
+            let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+            let weights = LayerStackWeights::load_quantised(&mut reader, feature_set)?;
+            trainer.load_layerstack_weights(&weights)?;
+            (None, None)
+        } else if let Some(ckpt) = &cli.resume {
+            let (sb, parent_id) = trainer.load_raw_checkpoint(ckpt)?;
+            println!(
+                "[train] resuming from {} at superbatch {}",
+                ckpt.display(),
+                sb + 1
+            );
+            if parent_id.is_none() {
+                println!(
+                    "[train] note: {} predates producer run id embedding; \
+                     experiment.json lineage.parent_id will be omitted",
+                    ckpt.display()
+                );
+            }
+            (Some(sb), parent_id)
+        } else {
+            (None, None)
+        };
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
     let start_superbatch = match cli.start_superbatch {
@@ -8021,8 +8092,14 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
     trainer.sync_ft_w_h_mirror()?;
 
-    let mut experiment =
-        build_experiment_logger(cli, feature_set, start_superbatch, resumed_superbatch, data);
+    let mut experiment = build_experiment_logger(
+        cli,
+        feature_set,
+        start_superbatch,
+        resumed_superbatch,
+        resume_parent_id,
+        data,
+    );
     println!("[train] experiment log: {}", experiment.path().display());
 
     let result = nnue_train::trainer::run(
@@ -8107,6 +8184,7 @@ fn build_experiment_logger(
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
+    resume_parent_id: Option<String>,
     data: &Path,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
@@ -8128,9 +8206,10 @@ fn build_experiment_logger(
     });
 
     let lineage = cli.resume.as_ref().map(|ckpt| Lineage {
-        // raw checkpoint format は producer run id を持たないため、親 run の
-        // experiment.json `id` は解決できない。lineage は checkpoint 参照のみ。
-        parent_id: None,
+        // resume 元 `*.ckpt` (format version 3+) に埋め込まれた親 run の
+        // experiment.json `id`。version 1/2 の `*.ckpt` には無く `None` になり、
+        // その resume run の lineage は checkpoint 参照のみになる。
+        parent_id: resume_parent_id.clone(),
         resumed_from_checkpoint: file_basename(ckpt),
         resumed_from_superbatch: resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
     });
@@ -8388,10 +8467,10 @@ mod raw_ckpt_format_tests {
 
     #[test]
     fn raw_ckpt_constants_are_stable() {
-        // magic は format identity。version は後方互換読み (version 1 file の受理) を
-        // 維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
+        // magic は format identity。version は後方互換読み (version 1/2 file の受理)
+        // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
         assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-        assert_eq!(RAW_CKPT_VERSION, 2);
+        assert_eq!(RAW_CKPT_VERSION, 3);
     }
 
     #[test]

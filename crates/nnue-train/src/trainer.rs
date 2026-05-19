@@ -19,7 +19,7 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb)  # raw f32 + Ranger state (resume 用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id)  # raw f32 + Ranger state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
@@ -210,9 +210,16 @@ pub trait TrainerBackend {
     /// 復元される真の resume)。
     ///
     /// backend 側は device → host download → file 書き出し (`.tmp` へ書いてから
-    /// `rename` で atomic に置換) を行う。本 crate は GPU 非依存なので、本 trait
-    /// は **path / superbatch 番号だけ** を受け取り device I/O は backend 任せ。
-    fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> io::Result<()>;
+    /// `rename` で atomic に置換) を行う。本 crate は GPU 非依存なので device I/O は
+    /// backend 任せ。`run_id` はこの checkpoint を書き出す学習 run の experiment.json
+    /// `id` で、`*.ckpt` に producer run id として埋め込まれ、resume 時に lineage の
+    /// 親参照になる (空文字列なら埋め込まない)。
+    fn save_resume_checkpoint(
+        &mut self,
+        path: &Path,
+        superbatch: usize,
+        run_id: &str,
+    ) -> io::Result<()>;
 }
 
 // =============================================================================
@@ -494,8 +501,14 @@ where
             println!("[train] checkpoint saved: {}", path.display());
 
             // resume 用 raw checkpoint: weight raw f32 + Ranger state + step + sb。
+            // 実験ログがあれば run id を渡し `*.ckpt` に埋め込む (resume 時に
+            // その run が lineage の親として参照される)。
             let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));
-            backend.save_resume_checkpoint(&raw_path, sb)?;
+            let run_id = experiment
+                .as_deref()
+                .map(ExperimentLogger::id)
+                .unwrap_or("");
+            backend.save_resume_checkpoint(&raw_path, sb, run_id)?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
 
             if let Some(keep) = cfg.keep_raw_checkpoints {
@@ -650,6 +663,8 @@ mod tests {
         saves: Vec<PathBuf>,
         /// raw resume checkpoint の保存呼び出し (path, superbatch)。
         resume_saves: Vec<(PathBuf, usize)>,
+        /// `save_resume_checkpoint` に渡された producer run id (呼び出し順)。
+        resume_run_ids: Vec<String>,
         last_buckets: Vec<i32>,
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
@@ -661,6 +676,7 @@ mod tests {
                 steps: 0,
                 saves: Vec::new(),
                 resume_saves: Vec::new(),
+                resume_run_ids: Vec::new(),
                 last_buckets: Vec::new(),
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
@@ -706,8 +722,14 @@ mod tests {
             Ok(())
         }
 
-        fn save_resume_checkpoint(&mut self, path: &Path, superbatch: usize) -> io::Result<()> {
+        fn save_resume_checkpoint(
+            &mut self,
+            path: &Path,
+            superbatch: usize,
+            run_id: &str,
+        ) -> io::Result<()> {
             self.resume_saves.push((path.to_path_buf(), superbatch));
+            self.resume_run_ids.push(run_id.to_string());
             Ok(())
         }
     }
@@ -987,6 +1009,9 @@ mod tests {
             4
         );
         assert_eq!(v["results"]["interrupted"], false);
+        // resume checkpoint には logger の run id が渡される (`*.ckpt` の producer
+        // run id 埋め込み経路)。sb 2 / sb 3 の 2 回とも実験ログの id と一致する。
+        assert_eq!(backend.resume_run_ids, vec!["exp-test", "exp-test"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
