@@ -3492,6 +3492,30 @@ pub fn crelu_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, n: u32) {
     }
 }
 
+/// SCReLU forward — `y[i] = clip(x[i], 0, 1)²`。1 thread = 1 element。
+///
+/// `screlu_grad` と対の forward。host から未 launch だが cuda-oxide の bin-entry
+/// constraint に従い `kernel_names` に残して compile-reach を確保する。
+#[kernel]
+pub fn screlu_fwd(x: &[f32], mut y: DisjointSlice<f32>, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    #[allow(clippy::manual_clamp)]
+    let a = if xi < 0.0_f32 {
+        0.0_f32
+    } else if xi > 1.0_f32 {
+        1.0_f32
+    } else {
+        xi
+    };
+    if let Some(out) = y.get_mut(i) {
+        *out = a * a;
+    }
+}
+
 /// abs_pow(2) * scale forward — `y[i] = x[i] * x[i] * scale`。
 /// bullet `abs_pow(2.0)` は `|x|^2 = x^2` なので abs 不要。1 thread = 1 element。
 #[kernel]
@@ -3789,7 +3813,7 @@ fn compile_ll_to_ptx_via_llc(
                        dense_mm_fwd,dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,\
                        dense_mm_fwd_bucket,dense_mm_bwd_input_bucket,\
                        dense_mm_bwd_weight_bucket,bias_grad_bucket,\
-                       crelu_fwd,crelu_grad,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
+                       crelu_fwd,crelu_grad,screlu_fwd,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
                        concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
                        bias_add_per_row,\
                        slice_extract_2d,slice_scatter_2d,\
@@ -8982,6 +9006,7 @@ mod gpu_cpu_equivalence_tests {
         ft_post_perspective::{ft_post_perspective_fwd_cpu, ft_post_perspective_grad_cpu},
         slice2d::{slice_extract_2d_cpu, slice_scatter_2d_cpu},
     };
+    use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
 
     /// forward / gradient の f32 tolerance。
     const TOL: f32 = 1e-5;
@@ -9096,6 +9121,29 @@ mod gpu_cpu_equivalence_tests {
         }?;
         stream.synchronize()?;
         assert_close("crelu_grad", &dx_dev.to_host_vec(&stream)?, &dx_cpu, 0.0);
+        Ok(())
+    }
+
+    // -- screlu -------------------------------------------------------------
+
+    #[test]
+    fn screlu_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        let (_ctx, module, stream) = open_module()?;
+        let n = 257_usize;
+        let mut x = deterministic_floats(n, 1.0);
+        x.push(f32::NAN); // NaN propagation: clip(NaN)² → NaN (if-else passes through)
+        let n = x.len();
+        let mut y_cpu = vec![0.0_f32; n];
+        screlu_fwd_cpu(&x, &mut y_cpu, n);
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+        cuda_launch! {
+            kernel: screlu_fwd, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice_mut(y_dev), n as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close("screlu_fwd", &y_dev.to_host_vec(&stream)?, &y_cpu, 0.0);
         Ok(())
     }
 

@@ -6,6 +6,7 @@
 //!
 //! ## 提供する module
 //!
+//! - `screlu_fwd` — SCReLU activation forward
 //! - `screlu_grad` — SCReLU activation gradient
 //! - `loss_wdl` — sigmoid + WDL blend + scale
 //! - `adamw_step` — AdamW with decay + clip
@@ -18,4 +19,5 @@ pub mod loss_wdl;
 pub mod loss_wrm;
 pub mod radam_step;
 pub mod ranger_step;
+pub mod screlu_fwd;
 pub mod screlu_grad;
