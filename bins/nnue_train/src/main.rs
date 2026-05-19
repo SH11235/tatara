@@ -8358,8 +8358,9 @@ fn build_experiment_logger(
 /// run_training / smoke_test の両 entrypoint がこのメッセージで reject する。
 fn simple_arch_unimplemented() -> Box<dyn std::error::Error> {
     format!(
-        "the '{}' architecture is not implemented yet",
-        ArchKind::Simple.canonical_name()
+        "the '{}' architecture is not implemented yet (use the '{}' subcommand)",
+        ArchKind::Simple.canonical_name(),
+        ArchKind::LayerStack.canonical_name()
     )
     .into()
 }
@@ -8607,17 +8608,35 @@ mod cli_tests {
 
     #[test]
     fn shared_args_are_global_around_subcommand() {
-        // 共有 (global) 引数はサブコマンドの後ろに置いても解釈される。
-        let cli = Cli::try_parse_from(["nnue-train", "layerstack", "--ft-fp16", "--data", "x.psv"])
-            .expect("global args after subcommand");
+        // 共有 (global) 引数は値付き / フラグ いずれもサブコマンドの後ろに置ける。
+        let cli = Cli::try_parse_from([
+            "nnue-train",
+            "layerstack",
+            "--ft-fp16",
+            "--data",
+            "x.psv",
+            "--batch-size",
+            "4096",
+        ])
+        .expect("global args after subcommand");
         assert!(cli.ft_fp16);
         assert_eq!(cli.data.as_deref(), Some(std::path::Path::new("x.psv")));
+        assert_eq!(cli.batch_size, 4096);
     }
 
     #[test]
     fn layerstack_specific_arg_rejected_on_simple() {
         // layerstack 固有引数 (--tf32) は simple サブコマンドでは未知でエラー。
         assert!(Cli::try_parse_from(["nnue-train", "simple", "--tf32"]).is_err());
+    }
+
+    #[test]
+    fn layerstack_specific_arg_rejected_before_subcommand() {
+        // layerstack 固有引数 (--progress-coeff) は global ではないので、
+        // サブコマンドより前には置けずエラーになる。
+        assert!(
+            Cli::try_parse_from(["nnue-train", "--progress-coeff", "p.bin", "layerstack"]).is_err()
+        );
     }
 }
 
