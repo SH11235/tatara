@@ -25,8 +25,6 @@
 //! 7. L2: bias `i32` × `l2_out`、weight `i8` × `l2_out * pad32(l1_out)`
 //! 8. L3: bias `i32` × 1、weight `i8` × `pad32(l2_out)`
 //!
-//! 推論エンジン互換 / bullet-shogi `.bin` との byte 互換は対象外。本 module の
-//! `save_quantised` / `load` が round-trip する self-consistent な format で、
 //! 量子化アルゴリズム (QA/QB scale、`pad32`、hash) の出典は `ATTRIBUTION.md`。
 //!
 //! ## 量子化 scale
