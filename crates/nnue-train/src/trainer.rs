@@ -552,8 +552,10 @@ where
         let wdl_now = wdl_scheduler.blend(0, sb, cfg.end_superbatch);
 
         // held-out validation: superbatch 末に forward-only 検証を 1 回走らせる
-        // (`--test-data` 指定時のみ)。同 superbatch の training step と同じ
-        // wdl_lambda / loss kind で測り、test_loss を training loss と比較可能にする。
+        // (`--test-data` 指定時のみ)。training step と同じ loss kind と、当 superbatch
+        // 代表の wdl_lambda (`wdl_now` = batch_idx 0 の blend、sb 末 report と同値) で
+        // 測り、test_loss を同 superbatch の training loss と比較可能にする。現行の
+        // `WdlScheduler` は superbatch 単位で blend する (batch 内一定)。
         let validation = match &heldout {
             Some(set) => {
                 let report = set.evaluate(backend, wdl_now, cfg.loss)?;
@@ -1032,24 +1034,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_writes_experiment_json() {
-        // `run` に ExperimentLogger を渡すと、run 完了時に status "completed" の
-        // experiment.json が書かれ、history が superbatch 数、checkpoints が
-        // 保存した .bin/.ckpt 名で埋まることを検証する。
-        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Params};
-
-        let dir = std::env::temp_dir().join(format!(
-            "nnue-train-exp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let json_path = dir.join("experiments").join("exp-test.json");
-
-        let params = Params {
+    /// experiment.json テスト用の最小 `Params` (sigmoid loss、held-out 既定 None)。
+    fn experiment_params() -> crate::experiment::Params {
+        crate::experiment::Params {
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
@@ -1086,7 +1073,27 @@ mod tests {
             ft_fp16_out: false,
             fp16_opt_state: false,
             threads: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn run_writes_experiment_json() {
+        // `run` に ExperimentLogger を渡すと、run 完了時に status "completed" の
+        // experiment.json が書かれ、history が superbatch 数、checkpoints が
+        // 保存した .bin/.ckpt 名で埋まることを検証する。
+        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger};
+
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-exp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let json_path = dir.join("experiments").join("exp-test.json");
+
+        let params = experiment_params();
         let data = DataInfo {
             name: "sample.psv".to_string(),
             positions: 1_000,
@@ -1178,6 +1185,80 @@ mod tests {
         assert_eq!(backend.validate_steps, 3);
         // training step (3 sb × 2 batch/sb) は held-out validation の有無に依らない。
         assert_eq!(backend.steps, 6);
+    }
+
+    #[test]
+    fn run_with_test_data_records_validation_in_experiment_json() {
+        // held-out validation の結果が run → record_superbatch → experiment.json
+        // の history / results まで配線されていることを検証する。
+        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger};
+
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-exp-val-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let json_path = dir.join("experiments").join("exp-val.json");
+        let doc = ExperimentDoc::new(
+            "exp-val".to_string(),
+            "exp".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train --data sample.psv --test-data sample.psv".to_string(),
+            None,
+            experiment_params(),
+            DataInfo {
+                name: "sample.psv".to_string(),
+                positions: 1_000,
+                total_positions: 0,
+                dataset_passes: 0.0,
+            },
+        );
+        let mut logger = ExperimentLogger::new(json_path.clone(), doc);
+
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            test_data: Some(sample_psv_path()),
+            test_positions: 8,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            Some(&mut logger),
+        )
+        .expect("run ok");
+
+        let raw = std::fs::read_to_string(&json_path).expect("experiment.json written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        // history の各 superbatch に test_loss / test_accuracy が載る。
+        let h0 = &v["history"][0];
+        assert!(
+            h0["test_loss"].is_number(),
+            "history[0].test_loss missing: {h0}"
+        );
+        assert!(
+            h0["test_accuracy"].is_number(),
+            "history[0].test_accuracy missing: {h0}"
+        );
+        // best_test_loss は results に集約される。
+        assert!(v["results"]["best_test_loss"].is_number());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

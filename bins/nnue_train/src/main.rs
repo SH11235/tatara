@@ -4766,10 +4766,6 @@ impl GpuWorkspace {
     }
 }
 
-/// Smoke / trainer 用の 1 batch 入力データ。
-/// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
-/// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
-#[allow(dead_code)]
 /// [`GpuTrainer::step_impl`] の出力。
 ///
 /// `loss` は batch 全体の二乗誤差和 (`Σ err²`、position 数で割る前)。`net_output`
@@ -4780,6 +4776,10 @@ struct StepOutput {
     net_output: Vec<f32>,
 }
 
+/// Smoke / trainer 用の 1 batch 入力データ。
+/// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
+/// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
+#[allow(dead_code)]
 struct BatchData<'a> {
     n_pos: usize,
     stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可

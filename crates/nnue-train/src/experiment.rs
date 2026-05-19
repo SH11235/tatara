@@ -10,7 +10,11 @@
 //! - `nnue-lab` ExperimentJsonV1 の互換 superset。必須フィールド (`id` / `name`
 //!   / `date` / `params.{lr,batch_size,superbatches}` / `history[]`) は常に
 //!   schema どおりの型で出力する。本リポ固有の値は `params` / `data` /
-//!   `results` (いずれも `nnue-lab` 側で passthrough) に置く。
+//!   `results` (いずれも `nnue-lab` 側で passthrough) に置く。例外は schema v2 の
+//!   held-out validation メトリクスで、`history[]` 要素 (passthrough 非対象) にも
+//!   `test_loss` / `test_accuracy` を足す。これは `nnue-lab` の history schema
+//!   拡張を要する coupled change で、未拡張の `nnue-lab` では両キーが取り込み時に
+//!   削除される (ADR `docs/decisions/2026-05-17-experiment-json.md` 参照)。
 //! - 1 run = 1 ファイル。crash 耐性は incremental write で得る:
 //!   superbatch ごとに temp file + rename で全体を atomic に書き直すため、
 //!   中断時も最後の書き込みが `status: "running"` の妥当な JSON として残る。
@@ -27,10 +31,11 @@ use serde::Serialize;
 /// `nnue-lab` ExperimentJsonV1 と整合する schema 契約 version。producer (本
 /// トレーナー) 自身の version は [`Generator::version`] が別に持つ。
 ///
-/// version 2 で held-out validation メトリクス (`HistoryEntry::test_loss` /
-/// `test_accuracy`、`Results::best_test_loss`、`Params::test_data` /
-/// `test_positions`) を追加した。いずれも optional フィールドで、`--test-data`
-/// 未指定の run では出力されない。
+/// version 2 は held-out validation メトリクスを optional フィールドとして含む:
+/// `HistoryEntry::test_loss` / `test_accuracy`、`Results::best_test_loss`
+/// (+ superbatch)、`Params::test_data` / `test_positions`。いずれも `--test-data`
+/// 未指定の run では出力されない。`history[]` 要素への追加分は `nnue-lab` 側の
+/// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
@@ -124,7 +129,8 @@ pub struct Params {
     /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_data: Option<String>,
-    /// held-out validation 1 回あたりの検証局面数 (`--test-positions`)。
+    /// held-out validation の検証局面数 (`--test-positions` の要求値)。実際の
+    /// 検証集合は `batch_size` 単位に切り上げた満タン batch 数になる。
     /// `--test-data` 指定時のみ `Some`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_positions: Option<usize>,

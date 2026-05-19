@@ -33,7 +33,6 @@ use crate::trainer::{LossKind, TrainerBackend};
 pub struct ValidationReport {
     /// held-out 全 position の平均 loss (`Σ err² / n_positions`)。training loss と
     /// 同じ式・同じ単位なので同 superbatch の training loss と直接比べられる。
-    /// 検証集合が空なら `NaN`。
     pub mean_loss: f64,
     /// sign-agreement accuracy (`[0, 1]`)。引き分けは分母から除外。分母が 0
     /// (全て引き分け) なら `NaN`。
@@ -150,11 +149,8 @@ impl HeldoutSet {
             n_correct += correct;
             n_counted += counted;
         }
-        let mean_loss = if self.n_positions == 0 {
-            f64::NAN
-        } else {
-            sum_sq_err / self.n_positions as f64
-        };
+        // `HeldoutSet::load` が空集合を error にするため `n_positions >= batch_size > 0`。
+        let mean_loss = sum_sq_err / self.n_positions as f64;
         let accuracy = if n_counted == 0 {
             f64::NAN
         } else {
@@ -171,11 +167,12 @@ impl HeldoutSet {
 
 /// model 出力の符号が実際の対局結果と一致した数を `(n_correct, n_counted)` で返す。
 ///
-/// - `net_output[i] > 0` を「先手番有利と予測」、`batch.wdl[i] > 0.5` を「実際に
-///   先手番が勝った」と解釈し、両者の bool が一致したら correct。
+/// `net_output` と `batch.wdl` はともに **手番側 (side-to-move) 視点**で揃っている
+/// (loss kernel が両者を blend する前提)。
+///
+/// - `net_output[i] > 0` を「手番側が有利と予測」、`batch.wdl[i] > 0.5` を「実際に
+///   手番側が勝った」と解釈し、両者の bool が一致したら correct。
 /// - 引き分け (`wdl == 0.5`) は符号が無いので分母 (`n_counted`) からも除外する。
-/// - `net_output` と `batch.wdl` はともに手番視点で揃っている (loss kernel が両者を
-///   blend する前提)。
 ///
 /// `net_output` は `batch` の position 順に並ぶ per-position scalar。長さが
 /// `batch.n_positions` 未満なら短い方までを見る (防御的)。
