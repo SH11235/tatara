@@ -1,0 +1,10 @@
+# 改行コードをリポジトリ全体で LF に固定する。
+#
+# 個々の開発者の `core.autocrlf` 設定に依らず、リポジトリ内・作業ツリーとも
+# LF に揃える。Windows 環境で `core.autocrlf=true` のとき出る
+# "LF will be replaced by CRLF" 警告と、改行コード差のみの差分ノイズを防ぐ。
+# bash script (`scripts/*.sh`) は LF でないと動かないため、その担保も兼ねる。
+* text=auto eol=lf
+
+# バイナリの test fixture は改行コード変換の対象外にする。
+*.psv binary
