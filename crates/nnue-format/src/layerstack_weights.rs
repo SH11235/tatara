@@ -5,7 +5,7 @@
 //!
 //! ## LayerStack architecture (PSQT 無し、Threat 無し、HandCountDense 無し)
 //!
-//! - L0 (FT): `73305 → 1536`、weight + bias 共有 stm/nstm
+//! - L0 (FT): `ft_in → 1536`、weight + bias 共有 stm/nstm (ft_in は feature set 依存)
 //! - per-perspective post: bias add → CReLU → pairwise_mul (1536 → 768) → ×127/128
 //! - combined = stm.concat(nstm) = 1536
 //! - L1 (per-bucket delta + shared l1f factorized): 9 × 16 + (1536, 16)
@@ -59,6 +59,8 @@
 
 use std::io::{self, Read, Write};
 
+use shogi_features::FeatureSetSpec;
+
 // =============================================================================
 // constants (LayerStack architecture)
 // =============================================================================
@@ -66,7 +68,8 @@ use std::io::{self, Read, Write};
 pub const NNUE_VERSION: u32 = 0x7AF32F20;
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
-pub const FT_IN: usize = 73_305; // HalfKA_hm dimensions
+// FT 入力次元は feature set ごとに異なる runtime 値。LayerStack 側の
+// アーキ次元 (FT_OUT 以降) は feature set と独立で固定。
 pub const FT_OUT: usize = 1536;
 pub const L1_OUT: usize = 16;
 pub const L1_EFFECTIVE: usize = L1_OUT - 1; // = 15
@@ -212,7 +215,7 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///
 /// 形式 (実際は改行無しの 1 行):
 ///
-/// `Features=HalfKA_hm(Friend)[<input_size>-><ft_out>x2],
+/// `Features=<feature_name>(Friend)[<input_size>-><ft_out>x2],
 ///  Network=AffineTransform[1<-<l2_out>](
 ///  ClippedReLU[<l2_out>](
 ///  AffineTransform[<l2_out>-<l2_in>](
@@ -222,7 +225,10 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///  fv_scale=<fv_scale>`
 ///
 /// (実際は 1 行連結、ここでは可読性のため改行)
+///
+/// `feature_name` は `FeatureSetSpec::arch_feature_name` (`HalfKA_hm` 等)。
 pub fn build_arch_str(
+    feature_name: &str,
     input_size: usize,
     ft_out: usize,
     l1_out: usize,
@@ -231,7 +237,7 @@ pub fn build_arch_str(
     fv_scale: i32,
 ) -> String {
     format!(
-        "Features=HalfKA_hm(Friend)[{}->{}x2],\
+        "Features={}(Friend)[{}->{}x2],\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -239,6 +245,7 @@ pub fn build_arch_str(
          AffineTransform[{}<-{}](\
          InputSlice[{}(0:{})]))))),\
          fv_scale={}",
+        feature_name,
         input_size,
         ft_out,
         l2_out,     // Output input
@@ -283,14 +290,20 @@ pub const fn compute_fc_hash(ft_out: usize, _l2_in: usize, l2_out: usize) -> u32
     prev_hash
 }
 
-/// FT hash: `FEATURE_HASH_HM_V2 ^ (ft_out * 2)`。
-pub const FT_HASH: u32 = 0x7f134cb8 ^ (FT_OUT as u32 * 2);
+/// FT hash: `feature_hash ^ (ft_out * 2)`。feature 定数 (feature set 由来) と
+/// FT_OUT の合成。`feature_hash` は `FeatureSetSpec::feature_hash`。
+pub fn ft_hash(feature_hash: u32) -> u32 {
+    feature_hash ^ (FT_OUT as u32 * 2)
+}
 
 /// per-bucket fc_hash。LayerStack の (ft_out=1536, l2_in=30, l2_out=32) 固定値を
-/// `compute_fc_hash` (const fn) で評価。
+/// `compute_fc_hash` (const fn) で評価。feature set と直交するので const のまま。
 pub const FC_HASH: u32 = compute_fc_hash(FT_OUT, L2_IN, L2_OUT);
 
-pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
+/// network hash: `FC_HASH ^ ft_hash(feature_hash)`。
+pub fn network_hash(feature_hash: u32) -> u32 {
+    FC_HASH ^ ft_hash(feature_hash)
+}
 
 // =============================================================================
 // LayerStackWeights — トレーナー側 weight 表現 (f32、kernel と同 layout)
@@ -298,8 +311,9 @@ pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 
 /// LayerStack の全 weight (f32、host 側保持)。
 ///
-/// Layout は本 crate trainer の kernel 内部 layout と一致:
-/// - `ft_w`: `(FT_IN, FT_OUT)` row-major、`ft_w[feat * FT_OUT + out]`
+/// Layout は本 crate trainer の kernel 内部 layout と一致 (`ft_in` =
+/// `feature_set.ft_in()`):
+/// - `ft_w`: `(ft_in, FT_OUT)` row-major、`ft_w[feat * FT_OUT + out]`
 /// - `ft_b`: `(FT_OUT)` (stm/nstm 共有)
 /// - `l1_w`: `(NUM_BUCKETS, L1_OUT, FT_OUT)` row-major、`l1_w[buc * L1_OUT * FT_OUT + out * FT_OUT + in]`
 /// - `l1_b`: `(NUM_BUCKETS, L1_OUT)` row-major
@@ -311,6 +325,9 @@ pub const NETWORK_HASH: u32 = FC_HASH ^ FT_HASH;
 /// - `l3_b`: `(NUM_BUCKETS)`
 #[derive(Debug, Clone)]
 pub struct LayerStackWeights {
+    /// この weight が属する feature set。FT 入力次元 (`ft_in`) と
+    /// artifact identity (arch 文字列 / hash) の単一の真実源。
+    pub feature_set: FeatureSetSpec,
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
@@ -324,10 +341,12 @@ pub struct LayerStackWeights {
 }
 
 impl LayerStackWeights {
-    /// 全 buffer を 0 で初期化した新規 instance。
-    pub fn zeroed() -> Self {
+    /// 全 buffer を 0 で初期化した新規 instance。FT 入力次元は
+    /// `feature_set.ft_in()` で決まる。
+    pub fn zeroed(feature_set: FeatureSetSpec) -> Self {
         Self {
-            ft_w: vec![0.0; FT_IN * FT_OUT],
+            feature_set,
+            ft_w: vec![0.0; feature_set.ft_in() * FT_OUT],
             ft_b: vec![0.0; FT_OUT],
             l1_w: vec![0.0; NUM_BUCKETS * L1_OUT * FT_OUT],
             l1_b: vec![0.0; NUM_BUCKETS * L1_OUT],
@@ -343,16 +362,25 @@ impl LayerStackWeights {
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
     /// `NetworkLayerStacks::read` で parse できる byte layout。
     pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // ---- header ----
+        // ---- header ---- (arch 文字列・hash は feature set から導出)
+        let feature_hash = self.feature_set.feature_hash();
         writer.write_all(&NNUE_VERSION.to_le_bytes())?;
-        writer.write_all(&NETWORK_HASH.to_le_bytes())?;
-        let arch_str = build_arch_str(FT_IN, FT_OUT, L1_OUT, L2_IN, L2_OUT, FV_SCALE);
+        writer.write_all(&network_hash(feature_hash).to_le_bytes())?;
+        let arch_str = build_arch_str(
+            self.feature_set.arch_feature_name(),
+            self.feature_set.ft_in(),
+            FT_OUT,
+            L1_OUT,
+            L2_IN,
+            L2_OUT,
+            FV_SCALE,
+        );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
         writer.write_all(arch_bytes)?;
 
         // ---- FT hash ----
-        writer.write_all(&FT_HASH.to_le_bytes())?;
+        writer.write_all(&ft_hash(feature_hash).to_le_bytes())?;
 
         // ---- FT biases LEB128 (i16, scale=QA) ----
         let qa_f = QA as f64;
@@ -368,7 +396,7 @@ impl LayerStackWeights {
         write_leb128_tensor_i16(writer, &ft_b_i16)?;
 
         // ---- FT weights LEB128 (i16, scale=QA) ----
-        // piece 部分 = ft_in * ft_out (threat 無し)。本 trainer の ft_w は (FT_IN, FT_OUT)
+        // piece 部分 = ft_in * ft_out (threat 無し)。本 trainer の ft_w は (ft_in, FT_OUT)
         // row-major (ft_w[feat * FT_OUT + out])、これは bullet 内部の column-major と
         // 等価の access pattern (転置不要)。そのまま i16 quantize して書く。
         let ft_w_i16: Vec<i16> = self
@@ -471,7 +499,12 @@ impl LayerStackWeights {
     /// 学習した場合の軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save し、
     /// 出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは l1f を
     /// 再び factorize し直す前提なら問題ない。
-    pub fn load_quantised<R: Read>(reader: &mut R) -> io::Result<Self> {
+    /// `expected` は要求 feature set。file の arch 文字列・hash がこれと
+    /// 一致しなければ `InvalidData` で reject する (reject policy)。legacy の
+    /// `.bin` (`halfka-hm-merged`) は arch 文字列・hash が `halfka-hm-merged`
+    /// spec から導出した値と一致するため、`expected = halfka-hm-merged` で
+    /// そのまま受理される (後方互換)。
+    pub fn load_quantised<R: Read>(reader: &mut R, expected: FeatureSetSpec) -> io::Result<Self> {
         let mut buf4 = [0u8; 4];
 
         // version
@@ -484,8 +517,20 @@ impl LayerStackWeights {
             ));
         }
 
-        // network_hash (skip)
+        // network_hash — 要求 feature set 由来の値と照合 (整合性チェック)。
         reader.read_exact(&mut buf4)?;
+        let file_network_hash = u32::from_le_bytes(buf4);
+        let expected_network_hash = network_hash(expected.feature_hash());
+        if file_network_hash != expected_network_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "network_hash mismatch: file {file_network_hash:#x}, \
+                     expected {expected_network_hash:#x} for feature set {}",
+                    expected.canonical_name()
+                ),
+            ));
+        }
 
         // arch_str
         reader.read_exact(&mut buf4)?;
@@ -509,17 +554,47 @@ impl LayerStackWeights {
                 format!("unsupported arch (only plain LayerStack supported): {arch_str}"),
             ));
         }
+        // feature set の構造化フィールド (feature 名 + ft_in) を arch 文字列の
+        // `Features=...` 前置部で直接照合する (reject policy の authority)。
+        let expected_features_prefix = format!(
+            "Features={}(Friend)[{}->{}x2]",
+            expected.arch_feature_name(),
+            expected.ft_in(),
+            FT_OUT,
+        );
+        if !arch_str.starts_with(&expected_features_prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "feature set mismatch: expected `{expected_features_prefix}` \
+                     (feature set {}), file arch_str = `{arch_str}`",
+                    expected.canonical_name()
+                ),
+            ));
+        }
 
-        // ft_hash (skip)
+        // ft_hash — 要求 feature set 由来の値と照合。
         reader.read_exact(&mut buf4)?;
+        let file_ft_hash = u32::from_le_bytes(buf4);
+        let expected_ft_hash = ft_hash(expected.feature_hash());
+        if file_ft_hash != expected_ft_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ft_hash mismatch: file {file_ft_hash:#x}, \
+                     expected {expected_ft_hash:#x} for feature set {}",
+                    expected.canonical_name()
+                ),
+            ));
+        }
 
         // FT biases (LEB128 i16, FT_OUT 個)
         let ft_b_i16 = read_leb128_tensor_i16(reader, Some(FT_OUT))?;
         let qa_f = QA as f32;
         let ft_b: Vec<f32> = ft_b_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
-        // FT weights (LEB128 i16, FT_IN * FT_OUT 個)
-        let ft_w_i16 = read_leb128_tensor_i16(reader, Some(FT_IN * FT_OUT))?;
+        // FT weights (LEB128 i16, ft_in * FT_OUT 個)
+        let ft_w_i16 = read_leb128_tensor_i16(reader, Some(expected.ft_in() * FT_OUT))?;
         let ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
         // LayerStacks (9 buckets × {fc_hash, L1, L2, L3})
@@ -596,6 +671,7 @@ impl LayerStackWeights {
         }
 
         Ok(Self {
+            feature_set: expected,
             ft_w,
             ft_b,
             l1_w,
@@ -627,6 +703,12 @@ fn clamp_i8(v: f64) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shogi_features::FeatureSet;
+
+    /// テストで使う feature set spec (現 production の halfka-hm-merged)。
+    fn test_spec() -> FeatureSetSpec {
+        FeatureSet::HalfKaHmMerged.spec()
+    }
 
     #[test]
     fn leb128_roundtrip_zero() {
@@ -672,11 +754,11 @@ mod tests {
     #[test]
     fn weights_zeroed_save_load_roundtrip() {
         // 0 weight で save → load → 同じ 0 weight が復元できる
-        let original = LayerStackWeights::zeroed();
+        let original = LayerStackWeights::zeroed(test_spec());
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
         let mut cursor = std::io::Cursor::new(&buf);
-        let loaded = LayerStackWeights::load_quantised(&mut cursor).unwrap();
+        let loaded = LayerStackWeights::load_quantised(&mut cursor, test_spec()).unwrap();
 
         assert_eq!(loaded.ft_w.len(), original.ft_w.len());
         assert_eq!(loaded.ft_b.len(), original.ft_b.len());
@@ -692,6 +774,26 @@ mod tests {
     }
 
     #[test]
+    fn load_validates_feature_set_and_rejects_mismatch() {
+        // halfka-split で save した .bin は halfka-split で load でき、
+        // 異なる feature set (halfka-hm-merged) を要求すると reject される。
+        let split = FeatureSet::HalfKaSplit.spec();
+        let merged = FeatureSet::HalfKaHmMerged.spec();
+        let mut buf = Vec::new();
+        LayerStackWeights::zeroed(split)
+            .save_quantised(&mut buf)
+            .unwrap();
+
+        let ok = LayerStackWeights::load_quantised(&mut std::io::Cursor::new(&buf), split);
+        assert!(ok.is_ok(), "同一 feature set なら load できる");
+        assert_eq!(ok.unwrap().ft_w.len(), split.ft_in() * FT_OUT);
+
+        let err = LayerStackWeights::load_quantised(&mut std::io::Cursor::new(&buf), merged)
+            .expect_err("feature set 不一致は reject される");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn load_external_reference_if_env_set() {
         // 外部 reference checkpoint (bullet 生成等) を `RSHOGI_NNUE_LAYERSTACK_REF_BIN`
         // で指定すると load + sanity check を走らせる任意の regression check。
@@ -701,10 +803,11 @@ mod tests {
             return;
         };
         let mut file = std::fs::File::open(&path).expect("open reference bin");
-        let weights = LayerStackWeights::load_quantised(&mut file).expect("parse reference bin");
+        let weights =
+            LayerStackWeights::load_quantised(&mut file, test_spec()).expect("parse reference bin");
 
         // Sanity: 各 weight buffer の長さが期待値
-        assert_eq!(weights.ft_w.len(), FT_IN * FT_OUT);
+        assert_eq!(weights.ft_w.len(), test_spec().ft_in() * FT_OUT);
         assert_eq!(weights.ft_b.len(), FT_OUT);
         assert_eq!(weights.l1_w.len(), NUM_BUCKETS * L1_OUT * FT_OUT);
         assert_eq!(weights.l1_b.len(), NUM_BUCKETS * L1_OUT);
@@ -758,7 +861,7 @@ mod tests {
         };
         let out_path = std::env::temp_dir().join("layerstack_ref_resaved.bin");
         let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
-        let weights = LayerStackWeights::load_quantised(&mut reader).unwrap();
+        let weights = LayerStackWeights::load_quantised(&mut reader, test_spec()).unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
         weights.save_quantised(&mut writer).unwrap();
         drop(writer);
@@ -799,7 +902,15 @@ mod tests {
 
     #[test]
     fn arch_str_format() {
-        let s = build_arch_str(FT_IN, FT_OUT, L1_OUT, L2_IN, L2_OUT, FV_SCALE);
+        let s = build_arch_str(
+            "HalfKA_hm",
+            test_spec().ft_in(),
+            FT_OUT,
+            L1_OUT,
+            L2_IN,
+            L2_OUT,
+            FV_SCALE,
+        );
         assert!(s.contains("HalfKA_hm"));
         assert!(s.contains("73305->1536x2"));
         assert!(s.contains("AffineTransform[1<-32]"));
