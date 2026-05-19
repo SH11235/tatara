@@ -156,6 +156,22 @@ impl std::fmt::Display for LossKind {
 }
 
 // =============================================================================
+// ValidationStepOutput — forward + loss のみの 1 batch 出力
+// =============================================================================
+
+/// [`TrainerBackend::validate_step`] の結果 — held-out 1 batch の forward + loss
+/// 出力。weight 更新は伴わない。
+#[derive(Debug, Clone)]
+pub struct ValidationStepOutput {
+    /// batch 全体の二乗誤差和 (`Σ err²`、position 数で割る前)。
+    /// [`TrainerBackend::train_step`] の戻り値と同じ単位。
+    pub sum_sq_err: f64,
+    /// position ごとの net 出力スカラ (`batch.n_positions` 個、batch の position
+    /// 順)。sign-agreement accuracy の計算に使う。
+    pub net_output: Vec<f32>,
+}
+
+// =============================================================================
 // TrainerBackend — 1 batch 分の forward → loss → backward → optimizer step
 // =============================================================================
 
@@ -195,6 +211,24 @@ pub trait TrainerBackend {
     fn flush_pending_loss(&mut self) -> io::Result<f64> {
         Ok(0.0)
     }
+
+    /// 1 batch 分の **forward + loss のみ** を実行する (backward / optimizer step
+    /// なし、weight は一切更新しない)。held-out validation 用。
+    ///
+    /// 引数は [`TrainerBackend::train_step`] と同じ意味 (ただし `lr` は不要)。
+    /// 戻り値は batch 全体の `Σ err²` と position ごとの net 出力スカラ。
+    /// caller ([`crate::validation::HeldoutSet::evaluate`]) が前者を position 数で
+    /// 割って平均 loss に、後者を sign-agreement accuracy にする。
+    ///
+    /// `wdl_lambda` / `loss` は同 superbatch の training step と同じ値を渡すこと
+    /// (test_loss を training loss と比較可能にするため)。
+    fn validate_step(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> io::Result<ValidationStepOutput>;
 
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
@@ -264,6 +298,12 @@ pub struct TrainingConfig {
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
     pub threads: usize,
+    /// `Some` のとき held-out validation 用 PSV file。各 superbatch 末に
+    /// forward-only 検証を走らせ test_loss / test_accuracy を report する。
+    pub test_data: Option<PathBuf>,
+    /// held-out validation 1 回あたりの検証局面数 (`batch_size` 単位に切り上げて
+    /// 満タン batch を作る)。`test_data` が `None` のときは無視される。
+    pub test_positions: usize,
 }
 
 impl TrainingConfig {
@@ -300,6 +340,11 @@ impl TrainingConfig {
             return Err(io::Error::other(format!(
                 "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
             )));
+        }
+        if self.test_data.is_some() && self.test_positions == 0 {
+            return Err(io::Error::other(
+                "test_positions must be >= 1 when test_data is set",
+            ));
         }
         Ok(())
     }
@@ -363,6 +408,30 @@ where
         cfg.score_drop_abs,
         cfg.threads.max(1),
     );
+
+    // held-out validation 集合を起動時に固定読み込みする (`--test-data` 指定時)。
+    // 毎 superbatch 末に同じ集合で test_loss / test_accuracy を測る。
+    let heldout = match &cfg.test_data {
+        Some(test_path) => {
+            let set = crate::validation::HeldoutSet::load(
+                test_path,
+                cfg.batch_size,
+                cfg.score_drop_abs,
+                cfg.test_positions,
+                progress,
+                cfg.feature_set,
+            )?;
+            println!(
+                "[train] held-out validation: data={} | {} batches x bs {} ({} positions)",
+                test_path.display(),
+                set.n_batches(),
+                cfg.batch_size,
+                set.n_positions(),
+            );
+            Some(set)
+        }
+        None => None,
+    };
 
     // experiment.json を run 開始時点 (`status: "running"`) で一度書く。以降は
     // superbatch ごとに incremental に上書きする。
@@ -482,8 +551,33 @@ where
         let lr_now = lr_scheduler.lr(0, sb);
         let wdl_now = wdl_scheduler.blend(0, sb, cfg.end_superbatch);
 
+        // held-out validation: superbatch 末に forward-only 検証を 1 回走らせる
+        // (`--test-data` 指定時のみ)。同 superbatch の training step と同じ
+        // wdl_lambda / loss kind で測り、test_loss を training loss と比較可能にする。
+        let validation = match &heldout {
+            Some(set) => {
+                let report = set.evaluate(backend, wdl_now, cfg.loss)?;
+                if !report.mean_loss.is_finite() {
+                    eprintln!(
+                        "[train] warning: superbatch {sb} held-out validation loss is \
+                         non-finite ({}) — possible divergence",
+                        report.mean_loss
+                    );
+                }
+                Some(report)
+            }
+            None => None,
+        };
+        let val_str = match &validation {
+            Some(r) => format!(
+                " | test_loss {:.6} | test_acc {:.4}",
+                r.mean_loss, r.accuracy
+            ),
+            None => String::new(),
+        };
+
         println!(
-            "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}",
+            "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}{}",
             sb,
             cfg.end_superbatch,
             mean_loss,
@@ -492,6 +586,7 @@ where
             wdl_now,
             sb_secs,
             format_hms(eta_secs),
+            val_str,
         );
 
         let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
@@ -525,6 +620,8 @@ where
                 mean_loss,
                 sb_positions,
                 run_start.elapsed().as_secs_f64(),
+                validation.map(|r| r.mean_loss),
+                validation.map(|r| r.accuracy),
             );
             if saved {
                 log.note_checkpoint(format!("{}-{}.bin", cfg.net_id, sb));
@@ -668,6 +765,8 @@ mod tests {
         last_buckets: Vec<i32>,
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
+        /// `validate_step` の呼び出し回数 (held-out validation の検証用)。
+        validate_steps: usize,
     }
 
     impl MockBackend {
@@ -680,6 +779,7 @@ mod tests {
                 last_buckets: Vec::new(),
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
+                validate_steps: 0,
             }
         }
     }
@@ -717,6 +817,33 @@ mod tests {
             Ok(1.0 / self.steps as f64)
         }
 
+        fn validate_step(
+            &mut self,
+            batch: &Batch,
+            bucket_idx: &[i32],
+            wdl_lambda: f32,
+            loss: LossKind,
+        ) -> io::Result<ValidationStepOutput> {
+            assert_eq!(
+                bucket_idx.len(),
+                batch.n_positions,
+                "one bucket per position"
+            );
+            assert!(wdl_lambda.is_finite());
+            assert!(
+                loss.validate().is_ok(),
+                "loss params should be valid: {loss}"
+            );
+            self.validate_steps += 1;
+            // deterministic dummy: net_output に各 position の score を流用する
+            // (sign-agreement 計算が回ることだけ確認できればよい)。
+            let net_output: Vec<f32> = batch.score[..batch.n_positions].to_vec();
+            Ok(ValidationStepOutput {
+                sum_sq_err: 0.25 * batch.n_positions as f64,
+                net_output,
+            })
+        }
+
         fn save_checkpoint(&mut self, path: &Path) -> io::Result<()> {
             self.saves.push(path.to_path_buf());
             Ok(())
@@ -748,6 +875,8 @@ mod tests {
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
             threads: 2,
+            test_data: None,
+            test_positions: 0,
         }
     }
 
@@ -950,6 +1079,8 @@ mod tests {
             wrm_target_scaling: None,
             score_drop_abs: None,
             init_from: None,
+            test_data: None,
+            test_positions: None,
             tf32: false,
             ft_fp16: false,
             ft_fp16_out: false,
@@ -1014,6 +1145,89 @@ mod tests {
         assert_eq!(backend.resume_run_ids, vec!["exp-test", "exp-test"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_with_test_data_runs_held_out_validation_each_superbatch() {
+        // `--test-data` 相当: cfg.test_data を渡すと各 superbatch 末に
+        // validate_step が呼ばれる。training step 数は影響を受けない。
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            test_data: Some(sample_psv_path()),
+            test_positions: 8, // batch_size 8 → 満タン検証 batch 1 個
+            ..base_cfg()       // start 1, end 3, batches/sb 2
+        };
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
+        // 3 superbatch、各 superbatch 末に検証 batch 1 個 = validate_step 3 回。
+        assert_eq!(backend.validate_steps, 3);
+        // training step (3 sb × 2 batch/sb) は held-out validation の有無に依らない。
+        assert_eq!(backend.steps, 6);
+    }
+
+    #[test]
+    fn run_without_test_data_skips_validation() {
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 1.0,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = base_cfg(); // test_data: None
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
+        assert_eq!(
+            backend.validate_steps, 0,
+            "--test-data 未指定なら held-out validation は走らない"
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_test_positions_zero_with_test_data() {
+        // test_data 指定時に test_positions=0 は reject (満タン batch を作れない)。
+        assert!(
+            TrainingConfig {
+                test_data: Some(sample_psv_path()),
+                test_positions: 0,
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                test_data: Some(sample_psv_path()),
+                test_positions: 8,
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
