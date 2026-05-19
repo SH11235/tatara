@@ -5516,6 +5516,16 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // optimizer companion buffer (`ft_w_m`/`v`/`grad`/`slow`) は trainer の
+        // feature set で確保済。weight の feature set が異なると `ft_w` だけ別長に
+        // なり optimizer step が out-of-bounds になるため、ここで弾く。
+        if w.feature_set != self.feature_set {
+            return Err(invalid_data(format!(
+                "weight feature set '{}' does not match trainer feature set '{}'",
+                w.feature_set.canonical_name(),
+                self.feature_set.canonical_name()
+            )));
+        }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -5892,6 +5902,13 @@ impl GpuTrainer {
         if version >= 2 {
             read_exact_or_invalid(&mut r, &mut buf4, "feature set name length")?;
             let fs_name_len = u32::from_le_bytes(buf4) as usize;
+            // canonical 名は最長でも 16 byte ("halfka-hm-merged")。破損 file の
+            // 巨大長で過大 alloc しないよう保守的に上限を設ける。
+            if fs_name_len > 256 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint feature set name length {fs_name_len} is implausible (max 256)"
+                )));
+            }
             let mut fs_name_bytes = vec![0u8; fs_name_len];
             read_exact_or_invalid(&mut r, &mut fs_name_bytes, "feature set name")?;
             let fs_name = String::from_utf8(fs_name_bytes).map_err(|_| {
@@ -7518,7 +7535,7 @@ impl TrainerBackend for GpuTrainer {
         // dataloader が出した batch の feature set が trainer 構築時に選んだ feature set
         // と一致することを確認する (buffer サイズ / kernel launch 次元が前者を前提に
         // 確保済のため、不一致は out-of-bounds になる)。
-        if batch.feature_set.canonical_name() != self.feature_set.canonical_name() {
+        if batch.feature_set != self.feature_set {
             return Err(std::io::Error::other(format!(
                 "batch feature set '{}' does not match trainer feature set '{}'",
                 batch.feature_set.canonical_name(),
