@@ -16,7 +16,7 @@ PSV / `.bin` / checkpoint の命名規約と配置は
 [docs/data-layout.md](data-layout.md) を参照 (`data/` 配下に symlink を貼る
 運用を推奨)。
 
-## Step 1: progress.bin を生成 (まだ無い場合)
+## progress.bin を生成 (まだ無い場合)
 
 `progress-kpabs-train` で先に進行度係数を学習する。`--epochs` で総 epoch
 数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
@@ -33,7 +33,7 @@ target/release/progress-kpabs-train \
 (progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立な
 ため何 epoch 必要かはデータ依存)。
 
-## Step 2: nnue-train で本体を学習 (400 sb full run)
+## nnue-train で本体を学習 (400 sb full run)
 
 典型的な full run (400 superbatches × 6104 batches × 65536 positions
 = ~160 GB 相当の position 通過):
@@ -65,7 +65,7 @@ target/release/nnue-train \
 所要時間は GPU と構成 (FP16 モード有無) で変わる。RTX 3080 Ti での throughput・
 400 sb ETA・GPU 機種別と構成別の目安は [docs/performance.md](performance.md) を参照。
 
-## Step 3: 学習中断・再開
+## 学習中断・再開
 
 raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在
 の superbatch 番号** を全部保存する。電源断や GPU エラーで止まっても完全
@@ -90,7 +90,7 @@ target/release/nnue-train \
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
 > (真の resume)。両者は排他指定。
 
-## Step 4: 出力 artifact の見方
+## 出力 artifact の見方
 
 学習後 `checkpoints/<run-name>/` に出るもの:
 
