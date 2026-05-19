@@ -51,6 +51,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{Batch, BucketedPrefetchedLoader};
@@ -227,6 +228,9 @@ pub trait TrainerBackend {
 pub struct TrainingConfig {
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
     pub net_id: String,
+    /// 入力 feature set spec。dataloader の sparse index 化に使う
+    /// (どの feature set で学習するかの単一の真実源)。
+    pub feature_set: FeatureSetSpec,
     /// checkpoint の出力先 directory (呼び出し側で作成しておくこと)。
     pub output_dir: PathBuf,
     /// 開始 superbatch (1-indexed, inclusive)。
@@ -336,6 +340,7 @@ where
         cfg.score_drop_abs,
         cfg.threads,
         *progress,
+        cfg.feature_set,
     )?;
 
     println!(
@@ -710,6 +715,7 @@ mod tests {
     fn base_cfg() -> TrainingConfig {
         TrainingConfig {
             net_id: "test".to_string(),
+            feature_set: shogi_features::FeatureSet::HalfKaHmMerged.spec(),
             output_dir: PathBuf::from("/tmp/nnue-train-trainer-test-unused"),
             start_superbatch: 1,
             end_superbatch: 3,
