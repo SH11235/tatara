@@ -7734,14 +7734,6 @@ struct Cli {
     /// bucket mode ("progress8kpabs" のみ実装)。
     #[arg(long, default_value = "progress8kpabs")]
     bucket_mode: String,
-    /// (受けるが未実装) epoch ごとに file shuffle する。本実装は逐次 read + EOF wrap
-    /// (worker 数 >= 2 では各 worker が排他的に chunk を読むため batch 境界は epoch ごと
-    /// 不変ではないが、明示的 file-level shuffle は別 issue)。
-    #[arg(long)]
-    epoch_file_shuffle: bool,
-    /// (受けるが未使用) file shuffle seed。
-    #[arg(long, default_value_t = 0)]
-    file_shuffle_seed: u64,
     /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
     /// 入力 FP32 を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
@@ -7814,7 +7806,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         })?
         .spec();
 
-    // --- 未実装フラグの validation / warning ---
+    // --- 未実装オプション値の reject ---
     if cli.bucket_mode != "progress8kpabs" {
         return Err(format!(
             "--bucket-mode '{}' is not implemented (only 'progress8kpabs')",
@@ -7911,13 +7903,6 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             scale: 1.0 / cli.scale,
         }
     };
-    if cli.epoch_file_shuffle {
-        eprintln!(
-            "[train] warning: --epoch-file-shuffle is not implemented; reading {} sequentially and wrapping at EOF (--file-shuffle-seed {} ignored). With --threads >= 2 each worker reads a disjoint chunk per batch, so batch boundaries are not identical across epochs, but no explicit file-level shuffle is performed.",
-            data.display(),
-            cli.file_shuffle_seed
-        );
-    }
     if cli.threads == 0 {
         return Err("--threads must be >= 1".into());
     }
