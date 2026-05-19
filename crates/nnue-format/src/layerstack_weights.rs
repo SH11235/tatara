@@ -227,6 +227,14 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 /// (実際は 1 行連結、ここでは可読性のため改行)
 ///
 /// `feature_name` は `FeatureSetSpec::arch_feature_name` (`HalfKA_hm` 等)。
+/// arch 文字列の `Features=...` トークンを生成する。
+///
+/// `load_quantised` の reject policy はこのトークンを構造化フィールドの権威として
+/// `starts_with` 照合するため、生成は本関数 1 箇所に集約する。
+pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> String {
+    format!("Features={feature_name}(Friend)[{input_size}->{ft_out}x2]")
+}
+
 pub fn build_arch_str(
     feature_name: &str,
     input_size: usize,
@@ -237,7 +245,7 @@ pub fn build_arch_str(
     fv_scale: i32,
 ) -> String {
     format!(
-        "Features={}(Friend)[{}->{}x2],\
+        "{},\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -245,9 +253,7 @@ pub fn build_arch_str(
          AffineTransform[{}<-{}](\
          InputSlice[{}(0:{})]))))),\
          fv_scale={}",
-        feature_name,
-        input_size,
-        ft_out,
+        features_token(feature_name, input_size, ft_out),
         l2_out,     // Output input
         l2_out,     // L2 output / L3 input
         l2_out,     // L2 output
@@ -556,12 +562,8 @@ impl LayerStackWeights {
         }
         // feature set の構造化フィールド (feature 名 + ft_in) を arch 文字列の
         // `Features=...` 前置部で直接照合する (reject policy の authority)。
-        let expected_features_prefix = format!(
-            "Features={}(Friend)[{}->{}x2]",
-            expected.arch_feature_name(),
-            expected.ft_in(),
-            FT_OUT,
-        );
+        let expected_features_prefix =
+            features_token(expected.arch_feature_name(), expected.ft_in(), FT_OUT);
         if !arch_str.starts_with(&expected_features_prefix) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
