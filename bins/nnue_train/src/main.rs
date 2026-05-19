@@ -3959,12 +3959,17 @@ const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `3`: a producer run id (length-prefixed UTF-8 — the experiment.json `id`
 ///   of the run that wrote the checkpoint) follows the feature-set header.
 ///   `--resume` reads it to fill `lineage.parent_id`.
+/// - `4`: an arch-kind name (length-prefixed UTF-8) and a topology header (a
+///   count-prefixed list of `u64` layer dimensions) follow the producer run
+///   id. They pin which architecture and layer shape the checkpoint belongs
+///   to, so a checkpoint written by one architecture cannot be resumed by
+///   another.
 ///
-/// `load_raw_checkpoint` accepts all three: version 1 is interpreted as
-/// `halfka-hm-merged` for backward compatibility, versions 2 and 3 are
-/// validated against the requested feature set, versions above 3 are rejected.
-/// The producer run id is absent (`None`) for versions 1 and 2.
-const RAW_CKPT_VERSION: u32 = 3;
+/// `load_raw_checkpoint` accepts versions 1..=4. Version 1 is interpreted as
+/// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
+/// interpreted as `layerstack`. Versions above 4 are rejected. The producer
+/// run id is absent (`None`) for versions 1 and 2.
+const RAW_CKPT_VERSION: u32 = 4;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -3972,6 +3977,255 @@ const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
 type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// LayerStack アーキの topology header (v4+): FT 出力次元・L1 出力次元・L2 出力次元・
+/// bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
+const LAYERSTACK_TOPOLOGY: [u64; 4] = [
+    FT_OUT as u64,
+    L1_OUT as u64,
+    L2_OUT as u64,
+    NUM_BUCKETS as u64,
+];
+
+/// raw checkpoint header の arch identity 部 (write / read 双方の引数)。feature
+/// set・arch 種別・FT 出力次元・topology 次元列をまとめて持つ。
+struct RawCkptArch<'a> {
+    /// 入力 feature set (canonical 名 / `ft_in` / `max_active` の源)。
+    feature_set: FeatureSetSpec,
+    /// network アーキ種別。
+    arch_kind: ArchKind,
+    /// FT 出力次元 (feature set header の `ft_out` 欄に書く値)。
+    ft_out: u64,
+    /// arch 固有の層次元列 (v4 topology header)。
+    topology: &'a [u64],
+}
+
+/// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
+#[derive(Debug)]
+struct RawCkptHeader {
+    /// この checkpoint が表す完了 superbatch 番号。
+    superbatch: usize,
+    /// Ranger lookahead step counter。
+    step_count: u64,
+    /// format 記載の weight group 数 (caller が arch 期待値と照合する)。
+    num_groups: u64,
+    /// producer run の experiment.json id (version 3+ かつ記録ありなら `Some`)。
+    producer_run_id: Option<String>,
+}
+
+/// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
+/// 常に最新 [`RAW_CKPT_VERSION`] で書き出す。
+fn write_raw_ckpt_header<W: Write>(
+    w: &mut W,
+    arch: &RawCkptArch,
+    run_id: &str,
+    superbatch: u64,
+    step_count: u64,
+    num_groups: u64,
+) -> std::io::Result<()> {
+    w.write_all(&RAW_CKPT_MAGIC)?;
+    w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
+    // feature set header (v2+): canonical 名 + 次元 3 値。
+    let fs_name = arch.feature_set.canonical_name();
+    w.write_all(&(fs_name.len() as u32).to_le_bytes())?;
+    w.write_all(fs_name.as_bytes())?;
+    w.write_all(&(arch.feature_set.ft_in() as u64).to_le_bytes())?;
+    w.write_all(&arch.ft_out.to_le_bytes())?;
+    w.write_all(&(arch.feature_set.max_active() as u64).to_le_bytes())?;
+    // producer run id (v3+)。
+    w.write_all(&(run_id.len() as u32).to_le_bytes())?;
+    w.write_all(run_id.as_bytes())?;
+    // arch_kind + topology header (v4+)。
+    let arch_name = arch.arch_kind.canonical_name();
+    w.write_all(&(arch_name.len() as u32).to_le_bytes())?;
+    w.write_all(arch_name.as_bytes())?;
+    w.write_all(&(arch.topology.len() as u64).to_le_bytes())?;
+    for &dim in arch.topology {
+        w.write_all(&dim.to_le_bytes())?;
+    }
+    w.write_all(&superbatch.to_le_bytes())?;
+    w.write_all(&step_count.to_le_bytes())?;
+    w.write_all(&num_groups.to_le_bytes())?;
+    Ok(())
+}
+
+/// raw checkpoint の header を読み、`expected` の arch identity と照合する。
+/// version 1..=4 を受理し、不一致 / 破損は `InvalidData` で reject する。
+///
+/// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
+/// arch_kind 名と topology 次元列を `expected` と照合する。
+fn read_raw_ckpt_header<R: std::io::Read>(
+    r: &mut R,
+    expected: &RawCkptArch,
+) -> Result<RawCkptHeader, Box<dyn std::error::Error>> {
+    let mut magic = [0u8; 4];
+    read_exact_or_invalid(r, &mut magic, "magic")?;
+    if magic != RAW_CKPT_MAGIC {
+        return Err(invalid_data(format!(
+            "raw checkpoint magic mismatch: got {magic:?}, want {RAW_CKPT_MAGIC:?}"
+        )));
+    }
+    let mut buf4 = [0u8; 4];
+    read_exact_or_invalid(r, &mut buf4, "version")?;
+    let version = u32::from_le_bytes(buf4);
+    if version == 0 || version > RAW_CKPT_VERSION {
+        return Err(invalid_data(format!(
+            "raw checkpoint version {version} is not supported \
+             (this build reads 1..={RAW_CKPT_VERSION})"
+        )));
+    }
+    let mut buf8 = [0u8; 8];
+    let want_name = expected.feature_set.canonical_name();
+
+    // feature set header は version 2+。version 1 は header 無しで halfka-hm-merged 固定。
+    if version >= 2 {
+        read_exact_or_invalid(r, &mut buf4, "feature set name length")?;
+        let fs_name_len = u32::from_le_bytes(buf4) as usize;
+        if fs_name_len > 256 {
+            return Err(invalid_data(format!(
+                "raw checkpoint feature set name length {fs_name_len} is implausible (max 256)"
+            )));
+        }
+        let mut fs_name_bytes = vec![0u8; fs_name_len];
+        read_exact_or_invalid(r, &mut fs_name_bytes, "feature set name")?;
+        let fs_name = String::from_utf8(fs_name_bytes).map_err(|_| {
+            invalid_data("raw checkpoint feature set name is not valid UTF-8".to_string())
+        })?;
+        read_exact_or_invalid(r, &mut buf8, "ft_in")?;
+        let ckpt_ft_in = u64::from_le_bytes(buf8);
+        read_exact_or_invalid(r, &mut buf8, "ft_out")?;
+        let ckpt_ft_out = u64::from_le_bytes(buf8);
+        read_exact_or_invalid(r, &mut buf8, "max_active")?;
+        let ckpt_max_active = u64::from_le_bytes(buf8);
+
+        let want = expected.feature_set;
+        if fs_name != want_name {
+            return Err(invalid_data(format!(
+                "raw checkpoint feature set mismatch: checkpoint is '{fs_name}', \
+                 requested '{want_name}' (feature set を跨いだ resume は不可)"
+            )));
+        }
+        if ckpt_ft_in != want.ft_in() as u64 {
+            return Err(invalid_data(format!(
+                "raw checkpoint ft_in mismatch: got {ckpt_ft_in}, want {}",
+                want.ft_in()
+            )));
+        }
+        if ckpt_ft_out != expected.ft_out {
+            return Err(invalid_data(format!(
+                "raw checkpoint ft_out mismatch: got {ckpt_ft_out}, want {}",
+                expected.ft_out
+            )));
+        }
+        if ckpt_max_active != want.max_active() as u64 {
+            return Err(invalid_data(format!(
+                "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
+                want.max_active()
+            )));
+        }
+    } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {
+        return Err(invalid_data(format!(
+            "raw checkpoint version 1 is always 'halfka-hm-merged', \
+             requested '{want_name}' (feature set を跨いだ resume は不可)"
+        )));
+    }
+
+    // producer run id は version 3+。長さ 0 も「未記録」扱いで `None`。
+    let producer_run_id: Option<String> = if version >= 3 {
+        read_exact_or_invalid(r, &mut buf4, "producer run id length")?;
+        let run_id_len = u32::from_le_bytes(buf4) as usize;
+        if run_id_len > MAX_RUN_ID_BYTES {
+            return Err(invalid_data(format!(
+                "raw checkpoint producer run id length {run_id_len} is implausible \
+                 (max {MAX_RUN_ID_BYTES})"
+            )));
+        }
+        if run_id_len == 0 {
+            None
+        } else {
+            let mut run_id_bytes = vec![0u8; run_id_len];
+            read_exact_or_invalid(r, &mut run_id_bytes, "producer run id")?;
+            Some(String::from_utf8(run_id_bytes).map_err(|_| {
+                invalid_data("raw checkpoint producer run id is not valid UTF-8".to_string())
+            })?)
+        }
+    } else {
+        None
+    };
+
+    // arch_kind + topology header は version 4+。version 1..=3 は arch-kind header
+    // を持たず、Simple アーキが存在しなかった時代の checkpoint なので暗黙に layerstack。
+    if version >= 4 {
+        read_exact_or_invalid(r, &mut buf4, "arch kind name length")?;
+        let arch_name_len = u32::from_le_bytes(buf4) as usize;
+        if arch_name_len > 256 {
+            return Err(invalid_data(format!(
+                "raw checkpoint arch kind name length {arch_name_len} is implausible (max 256)"
+            )));
+        }
+        let mut arch_name_bytes = vec![0u8; arch_name_len];
+        read_exact_or_invalid(r, &mut arch_name_bytes, "arch kind name")?;
+        let arch_name = String::from_utf8(arch_name_bytes).map_err(|_| {
+            invalid_data("raw checkpoint arch kind name is not valid UTF-8".to_string())
+        })?;
+        let ckpt_arch = ArchKind::from_canonical_name(&arch_name).ok_or_else(|| {
+            invalid_data(format!(
+                "raw checkpoint has unknown arch kind '{arch_name}'"
+            ))
+        })?;
+        if ckpt_arch != expected.arch_kind {
+            return Err(invalid_data(format!(
+                "raw checkpoint arch kind mismatch: checkpoint is '{}', requested '{}' \
+                 (アーキを跨いだ resume は不可)",
+                ckpt_arch.canonical_name(),
+                expected.arch_kind.canonical_name()
+            )));
+        }
+        read_exact_or_invalid(r, &mut buf8, "topology dim count")?;
+        let topo_count = u64::from_le_bytes(buf8);
+        if topo_count != expected.topology.len() as u64 {
+            return Err(invalid_data(format!(
+                "raw checkpoint topology dim count {topo_count} != expected {}",
+                expected.topology.len()
+            )));
+        }
+        for (i, &want_dim) in expected.topology.iter().enumerate() {
+            read_exact_or_invalid(r, &mut buf8, "topology dim")?;
+            let got = u64::from_le_bytes(buf8);
+            if got != want_dim {
+                return Err(invalid_data(format!(
+                    "raw checkpoint topology dim {i} mismatch: got {got}, want {want_dim} \
+                     (network architecture mismatch)"
+                )));
+            }
+        }
+    } else if expected.arch_kind != ArchKind::LayerStack {
+        return Err(invalid_data(format!(
+            "raw checkpoint version {version} predates the arch-kind header and is \
+             always 'layerstack', requested '{}' (アーキを跨いだ resume は不可)",
+            expected.arch_kind.canonical_name()
+        )));
+    }
+
+    read_exact_or_invalid(r, &mut buf8, "superbatch")?;
+    let superbatch_u64 = u64::from_le_bytes(buf8);
+    let superbatch: usize = superbatch_u64.try_into().map_err(|_| {
+        invalid_data(format!(
+            "raw checkpoint superbatch {superbatch_u64} exceeds usize::MAX"
+        ))
+    })?;
+    read_exact_or_invalid(r, &mut buf8, "step_count")?;
+    let step_count = u64::from_le_bytes(buf8);
+    read_exact_or_invalid(r, &mut buf8, "num_groups")?;
+    let num_groups = u64::from_le_bytes(buf8);
+
+    Ok(RawCkptHeader {
+        superbatch,
+        step_count,
+        num_groups,
+        producer_run_id,
+    })
+}
 
 /// `io::ErrorKind::InvalidData` の `Box<dyn Error>` を作る短縮 helper (raw checkpoint
 /// の magic/version/dim 検証で使う、`RangerHostState::load_from_reader` と同方針)。
@@ -5741,10 +5995,11 @@ impl GpuTrainer {
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
     ///
-    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`] = 3):
+    /// header の write / read は [`write_raw_ckpt_header`] / [`read_raw_ckpt_header`]
+    /// に切り出してある。layout (全 little-endian、現行 [`RAW_CKPT_VERSION`] = 4):
     /// ```text
     /// magic        b"RNRC"             (4 bytes)
-    /// version      u32 (3)             (4 bytes)
+    /// version      u32 (4)             (4 bytes)
     /// fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
     /// fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
     /// ft_in        u64                 (FT 入力次元、feature set 依存)
@@ -5752,6 +6007,10 @@ impl GpuTrainer {
     /// max_active   u64                 (1 perspective あたり active feature 数)
     /// run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
     /// run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
+    /// arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
+    /// arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、LayerStack は "layerstack")
+    /// topo_count   u64                 (topology 次元の個数)
+    /// topology     u64 [topo_count]     (層次元列、LayerStack は FT_OUT/L1_OUT/L2_OUT/NUM_BUCKETS)
     /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
     /// step_count   u64  (Ranger lookahead step counter)
     /// num_groups   u64  (= 10、固定だが将来検証用)
@@ -5764,9 +6023,9 @@ impl GpuTrainer {
     ///   slow[f32 × len]
     /// ```
     ///
-    /// version 1 file には feature set header も run id も無く、weights は常に
-    /// `halfka-hm-merged` として解釈される。version 2 file は feature set header を
-    /// 持つが run id は持たない。writer は常に最新 version を書く。
+    /// version 1 file には feature set header も run id も arch header も無く、weights
+    /// は常に `halfka-hm-merged` / `layerstack` として解釈される。version 2/3 file は
+    /// arch header を持たず `layerstack` 扱い。writer は常に最新 version を書く。
     ///
     /// device → host download (`DeviceBuffer::to_host_vec`) → `<path>.tmp` へ `BufWriter`
     /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
@@ -5815,26 +6074,21 @@ impl GpuTrainer {
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let groups = self.raw_ckpt_groups();
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
-            w.write_all(&RAW_CKPT_MAGIC)?;
-            w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
-            // self-describing feature set header: canonical 名 + 次元 3 値。resume 時に
-            // 要求された feature set との一致を検証するための単一情報源。
-            let fs_name = self.feature_set.canonical_name();
-            let fs_name_bytes = fs_name.as_bytes();
-            w.write_all(&(fs_name_bytes.len() as u32).to_le_bytes())?;
-            w.write_all(fs_name_bytes)?;
-            w.write_all(&(self.feature_set.ft_in() as u64).to_le_bytes())?;
-            w.write_all(&(FT_OUT as u64).to_le_bytes())?;
-            w.write_all(&(self.feature_set.max_active() as u64).to_le_bytes())?;
-            // producer run id: この checkpoint を書き出した run の experiment.json
-            // `id`。resume 時に `lineage.parent_id` の解決に使う (空文字列なら長さ 0)。
-            let run_id_bytes = run_id.as_bytes();
-            w.write_all(&(run_id_bytes.len() as u32).to_le_bytes())?;
-            w.write_all(run_id_bytes)?;
-            w.write_all(&(superbatch as u64).to_le_bytes())?;
-            w.write_all(&self.step_count.to_le_bytes())?;
-            // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
-            w.write_all(&((groups.len() + 1) as u64).to_le_bytes())?;
+            // header (magic 〜 num_groups)。format 上の group 数は ft_w (個別処理) +
+            // `raw_ckpt_groups` の 9 = 10。
+            write_raw_ckpt_header(
+                &mut w,
+                &RawCkptArch {
+                    feature_set: self.feature_set,
+                    arch_kind: ArchKind::LayerStack,
+                    ft_out: FT_OUT as u64,
+                    topology: &LAYERSTACK_TOPOLOGY,
+                },
+                run_id,
+                superbatch as u64,
+                self.step_count,
+                (groups.len() + 1) as u64,
+            )?;
 
             // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
             // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
@@ -5909,14 +6163,15 @@ impl GpuTrainer {
     /// producer run id は version 3+ の checkpoint なら `Some` (resume run の
     /// `lineage.parent_id` に使う)、version 1/2 や run id 未記録なら `None`。
     ///
-    /// magic 不一致、`version > 3`、group 数 / 各 group の len が LayerStack arch と不一致、
-    /// または `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
+    /// magic 不一致、`version > 4`、arch kind / topology が LayerStack と不一致、group 数
+    /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
+    /// (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
     ///
-    /// version 1 file は feature set header を持たず、weights を `halfka-hm-merged` と
-    /// みなす。version 2/3 file は header の feature set / `ft_in` / `max_active` を読み、
-    /// 現 trainer の `feature_set` と一致しなければ reject する (feature set を跨いだ
-    /// resume は許可しない)。読み込んだ raw f32 を host → device upload し、
+    /// header の解析 (feature set / arch kind / topology の照合) は
+    /// [`read_raw_ckpt_header`] が担当する。version 1 file は feature set header を
+    /// 持たず weights を `halfka-hm-merged` とみなす。version 1..=3 は arch header を
+    /// 持たず `layerstack` とみなす。読み込んだ raw f32 を host → device upload し、
     /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
     fn load_raw_checkpoint(
         &mut self,
@@ -5924,116 +6179,19 @@ impl GpuTrainer {
     ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
 
-        let mut magic = [0u8; 4];
-        read_exact_or_invalid(&mut r, &mut magic, "magic")?;
-        if magic != RAW_CKPT_MAGIC {
-            return Err(invalid_data(format!(
-                "raw checkpoint magic mismatch: got {magic:?}, want {RAW_CKPT_MAGIC:?}"
-            )));
-        }
-        let mut buf4 = [0u8; 4];
-        read_exact_or_invalid(&mut r, &mut buf4, "version")?;
-        let version = u32::from_le_bytes(buf4);
-        if version == 0 || version > RAW_CKPT_VERSION {
-            return Err(invalid_data(format!(
-                "raw checkpoint version {version} is not supported \
-                 (this build reads 1..={RAW_CKPT_VERSION})"
-            )));
-        }
-        let mut buf8 = [0u8; 8];
-
-        // version 2+ は magic+version の直後に feature set header を持つ。version 1 は
-        // header が無く weights は常に `halfka-hm-merged`。いずれの場合も最終的に
-        // 現 trainer の `feature_set` と一致しなければ reject する。
-        let want_name = self.feature_set.canonical_name();
-        if version >= 2 {
-            read_exact_or_invalid(&mut r, &mut buf4, "feature set name length")?;
-            let fs_name_len = u32::from_le_bytes(buf4) as usize;
-            // canonical 名は最長でも 16 byte ("halfka-hm-merged")。破損 file の
-            // 巨大長で過大 alloc しないよう保守的に上限を設ける。
-            if fs_name_len > 256 {
-                return Err(invalid_data(format!(
-                    "raw checkpoint feature set name length {fs_name_len} is implausible (max 256)"
-                )));
-            }
-            let mut fs_name_bytes = vec![0u8; fs_name_len];
-            read_exact_or_invalid(&mut r, &mut fs_name_bytes, "feature set name")?;
-            let fs_name = String::from_utf8(fs_name_bytes).map_err(|_| {
-                invalid_data("raw checkpoint feature set name is not valid UTF-8".to_string())
-            })?;
-            read_exact_or_invalid(&mut r, &mut buf8, "ft_in")?;
-            let ckpt_ft_in = u64::from_le_bytes(buf8);
-            read_exact_or_invalid(&mut r, &mut buf8, "ft_out")?;
-            let ckpt_ft_out = u64::from_le_bytes(buf8);
-            read_exact_or_invalid(&mut r, &mut buf8, "max_active")?;
-            let ckpt_max_active = u64::from_le_bytes(buf8);
-
-            let want = self.feature_set;
-            if fs_name != want_name {
-                return Err(invalid_data(format!(
-                    "raw checkpoint feature set mismatch: checkpoint is '{fs_name}', \
-                     requested '{want_name}' (feature set を跨いだ resume は不可)"
-                )));
-            }
-            if ckpt_ft_in != want.ft_in() as u64 {
-                return Err(invalid_data(format!(
-                    "raw checkpoint ft_in mismatch: got {ckpt_ft_in}, want {}",
-                    want.ft_in()
-                )));
-            }
-            if ckpt_ft_out != FT_OUT as u64 {
-                return Err(invalid_data(format!(
-                    "raw checkpoint ft_out mismatch: got {ckpt_ft_out}, want {FT_OUT}"
-                )));
-            }
-            if ckpt_max_active != want.max_active() as u64 {
-                return Err(invalid_data(format!(
-                    "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
-                    want.max_active()
-                )));
-            }
-        } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {
-            return Err(invalid_data(format!(
-                "raw checkpoint version 1 is always 'halfka-hm-merged', \
-                 requested '{want_name}' (feature set を跨いだ resume は不可)"
-            )));
-        }
-
-        // version 3+ は feature set header の直後に producer run id を持つ。
-        // version 1/2 は持たず `None`。長さ 0 も `None` (run id 未記録)。
-        let producer_run_id: Option<String> = if version >= 3 {
-            read_exact_or_invalid(&mut r, &mut buf4, "producer run id length")?;
-            let run_id_len = u32::from_le_bytes(buf4) as usize;
-            if run_id_len > MAX_RUN_ID_BYTES {
-                return Err(invalid_data(format!(
-                    "raw checkpoint producer run id length {run_id_len} is implausible \
-                     (max {MAX_RUN_ID_BYTES})"
-                )));
-            }
-            if run_id_len == 0 {
-                None
-            } else {
-                let mut run_id_bytes = vec![0u8; run_id_len];
-                read_exact_or_invalid(&mut r, &mut run_id_bytes, "producer run id")?;
-                Some(String::from_utf8(run_id_bytes).map_err(|_| {
-                    invalid_data("raw checkpoint producer run id is not valid UTF-8".to_string())
-                })?)
-            }
-        } else {
-            None
-        };
-
-        read_exact_or_invalid(&mut r, &mut buf8, "superbatch")?;
-        let superbatch_u64 = u64::from_le_bytes(buf8);
-        let superbatch: usize = superbatch_u64.try_into().map_err(|_| {
-            invalid_data(format!(
-                "raw checkpoint superbatch {superbatch_u64} exceeds usize::MAX"
-            ))
-        })?;
-        read_exact_or_invalid(&mut r, &mut buf8, "step_count")?;
-        let step_count = u64::from_le_bytes(buf8);
-        read_exact_or_invalid(&mut r, &mut buf8, "num_groups")?;
-        let num_groups_u64 = u64::from_le_bytes(buf8);
+        // header (magic 〜 num_groups) を読み、feature set / arch / topology を照合する。
+        let header = read_raw_ckpt_header(
+            &mut r,
+            &RawCkptArch {
+                feature_set: self.feature_set,
+                arch_kind: ArchKind::LayerStack,
+                ft_out: FT_OUT as u64,
+                topology: &LAYERSTACK_TOPOLOGY,
+            },
+        )?;
+        let superbatch = header.superbatch;
+        let step_count = header.step_count;
+        let producer_run_id = header.producer_run_id;
 
         // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
         let expected_groups: [(&'static str, usize); 9] = {
@@ -6051,9 +6209,10 @@ impl GpuTrainer {
             ]
         };
         let total_groups = expected_groups.len() + 1;
-        if num_groups_u64 != total_groups as u64 {
+        if header.num_groups != total_groups as u64 {
             return Err(invalid_data(format!(
-                "raw checkpoint num_groups {num_groups_u64} != expected {total_groups}"
+                "raw checkpoint num_groups {} != expected {total_groups}",
+                header.num_groups
             )));
         }
 
@@ -8559,10 +8718,10 @@ mod raw_ckpt_format_tests {
 
     #[test]
     fn raw_ckpt_constants_are_stable() {
-        // magic は format identity。version は後方互換読み (version 1/2 file の受理)
+        // magic は format identity。version は後方互換読み (version 1..=3 file の受理)
         // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
         assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-        assert_eq!(RAW_CKPT_VERSION, 3);
+        assert_eq!(RAW_CKPT_VERSION, 4);
     }
 
     #[test]
@@ -8571,6 +8730,149 @@ mod raw_ckpt_format_tests {
         let io_err = e.downcast::<std::io::Error>().expect("is io::Error");
         assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
         assert!(io_err.to_string().contains("boom"));
+    }
+
+    /// arch header を持たない legacy (version 1..=3) raw checkpoint header を組む。
+    fn legacy_raw_ckpt_header(
+        version: u32,
+        fs: shogi_features::FeatureSetSpec,
+        run_id: Option<&str>,
+        superbatch: u64,
+        step_count: u64,
+        num_groups: u64,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&RAW_CKPT_MAGIC);
+        b.extend_from_slice(&version.to_le_bytes());
+        if version >= 2 {
+            let name = fs.canonical_name();
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&(fs.ft_in() as u64).to_le_bytes());
+            b.extend_from_slice(&(FT_OUT as u64).to_le_bytes());
+            b.extend_from_slice(&(fs.max_active() as u64).to_le_bytes());
+        }
+        if version >= 3 {
+            let rid = run_id.unwrap_or("");
+            b.extend_from_slice(&(rid.len() as u32).to_le_bytes());
+            b.extend_from_slice(rid.as_bytes());
+        }
+        b.extend_from_slice(&superbatch.to_le_bytes());
+        b.extend_from_slice(&step_count.to_le_bytes());
+        b.extend_from_slice(&num_groups.to_le_bytes());
+        b
+    }
+
+    fn layerstack_arch() -> RawCkptArch<'static> {
+        RawCkptArch {
+            feature_set: FeatureSet::HalfKaHmMerged.spec(),
+            arch_kind: ArchKind::LayerStack,
+            ft_out: FT_OUT as u64,
+            topology: &LAYERSTACK_TOPOLOGY,
+        }
+    }
+
+    #[test]
+    fn raw_ckpt_header_v4_round_trips() {
+        let arch = layerstack_arch();
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &arch, "net-20260520-1234", 7, 99, 10).unwrap();
+        let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+        assert_eq!(h.superbatch, 7);
+        assert_eq!(h.step_count, 99);
+        assert_eq!(h.num_groups, 10);
+        assert_eq!(h.producer_run_id.as_deref(), Some("net-20260520-1234"));
+    }
+
+    #[test]
+    fn raw_ckpt_header_empty_run_id_round_trips_to_none() {
+        let arch = layerstack_arch();
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &arch, "", 1, 0, 10).unwrap();
+        let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+        assert_eq!(h.producer_run_id, None);
+    }
+
+    #[test]
+    fn raw_ckpt_header_reads_legacy_v1_v2_v3() {
+        let fs = FeatureSet::HalfKaHmMerged.spec();
+        let arch = layerstack_arch();
+        // v1: header 無し、halfka-hm-merged 固定、arch は暗黙 layerstack。
+        let v1 = legacy_raw_ckpt_header(1, fs, None, 3, 30, 10);
+        let h1 = read_raw_ckpt_header(&mut Cursor::new(&v1), &arch).unwrap();
+        assert_eq!((h1.superbatch, h1.step_count, h1.num_groups), (3, 30, 10));
+        assert_eq!(h1.producer_run_id, None);
+        // v2: feature set header あり、run id 無し。
+        let v2 = legacy_raw_ckpt_header(2, fs, None, 4, 40, 10);
+        let h2 = read_raw_ckpt_header(&mut Cursor::new(&v2), &arch).unwrap();
+        assert_eq!(h2.superbatch, 4);
+        assert_eq!(h2.producer_run_id, None);
+        // v3: producer run id あり。
+        let v3 = legacy_raw_ckpt_header(3, fs, Some("legacy-run"), 5, 50, 10);
+        let h3 = read_raw_ckpt_header(&mut Cursor::new(&v3), &arch).unwrap();
+        assert_eq!(h3.superbatch, 5);
+        assert_eq!(h3.producer_run_id.as_deref(), Some("legacy-run"));
+    }
+
+    #[test]
+    fn raw_ckpt_header_rejects_wrong_arch_kind() {
+        // fs header は一致するが arch_kind だけ異なる v4 header を read → reject。
+        let fs = FeatureSet::HalfKaHmMerged.spec();
+        let written = RawCkptArch {
+            feature_set: fs,
+            arch_kind: ArchKind::Simple,
+            ft_out: FT_OUT as u64,
+            topology: &LAYERSTACK_TOPOLOGY,
+        };
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &written, "", 1, 0, 10).unwrap();
+        let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch())
+            .expect_err("arch kind mismatch must reject");
+        assert!(err.to_string().contains("arch kind mismatch"));
+    }
+
+    #[test]
+    fn raw_ckpt_header_rejects_wrong_topology() {
+        let fs = FeatureSet::HalfKaHmMerged.spec();
+        let wrong_topo = [1u64, 2, 3, 4];
+        let written = RawCkptArch {
+            feature_set: fs,
+            arch_kind: ArchKind::LayerStack,
+            ft_out: FT_OUT as u64,
+            topology: &wrong_topo,
+        };
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &written, "", 1, 0, 10).unwrap();
+        let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch())
+            .expect_err("topology mismatch must reject");
+        assert!(err.to_string().contains("topology dim"));
+    }
+
+    #[test]
+    fn raw_ckpt_header_rejects_legacy_non_layerstack_request() {
+        // version 1..=3 は arch header を持たず暗黙 layerstack。Simple として読もう
+        // とすると reject される。
+        let fs = FeatureSet::HalfKaHmMerged.spec();
+        let v3 = legacy_raw_ckpt_header(3, fs, None, 1, 0, 8);
+        let simple_topo = [256u64, 32, 32];
+        let simple_arch = RawCkptArch {
+            feature_set: fs,
+            arch_kind: ArchKind::Simple,
+            ft_out: FT_OUT as u64,
+            topology: &simple_topo,
+        };
+        let err = read_raw_ckpt_header(&mut Cursor::new(&v3), &simple_arch)
+            .expect_err("legacy checkpoint cannot be read as a non-layerstack arch");
+        assert!(err.to_string().contains("predates the arch-kind header"));
+    }
+
+    #[test]
+    fn raw_ckpt_header_rejects_unsupported_version() {
+        let fs = FeatureSet::HalfKaHmMerged.spec();
+        let mut buf = legacy_raw_ckpt_header(3, fs, None, 1, 0, 10);
+        // magic (4 bytes) 直後の version u32 を範囲外の値に書き換える。
+        buf[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch()).is_err());
     }
 }
 
