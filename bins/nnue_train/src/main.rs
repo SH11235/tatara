@@ -58,6 +58,7 @@ use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
 use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::{FeatureSet, FeatureSetSpec};
 
 // ===========================================================================
 // 共通 / 損失 / optimizer kernel (inline copy)
@@ -980,9 +981,9 @@ pub fn gather_and_sum_per_feature_overwrite(
     let off_end = offsets[feature + 1] as usize;
 
     // raw pointer 版 (PTX で `setp.ge.u64; @%p bra` の bounds check 3 箇所を除去)。
-    // unsafe 妥当性: caller (`step_impl`) が `feature_positions.len() == batch * MAX_ACTIVE` を保証、
+    // unsafe 妥当性: caller (`step_impl`) が `feature_positions.len() == batch * max_active` を保証、
     // `feat_offsets[feature]..feat_offsets[feature+1]` は phase B が正しく構築。
-    // grad_out / grad_w の範囲は arch (FT_IN × FT_OUT) で固定、launch config 上 ri < ft_out_u。
+    // grad_out / grad_w の範囲は arch (ft_in × ft_out) で固定、launch config 上 ri < ft_out_u。
     let grad_out_ptr = grad_out.as_ptr();
     let positions_ptr = positions.as_ptr();
     // 4-way unroll: 1 thread あたり 4 outstanding load + 4 accumulator で fadd dep chain
@@ -1193,9 +1194,9 @@ pub fn gather_and_sum_per_feature_add_fp16(
     let off_end = offsets[feature + 1] as usize;
 
     // unsafe 妥当性は [`gather_and_sum_per_feature_overwrite`] / その `_fp16` 版と同一:
-    // caller が `positions.len() == batch * MAX_ACTIVE` を保証、`off_start..off_end` は
+    // caller が `positions.len() == batch * max_active` を保証、`off_start..off_end` は
     // phase B が構築した有効範囲、`grad_out` (`f16`) / `grad_w` (`f32`) の範囲は arch
-    // (FT_IN × FT_OUT) 固定で launch config 上 `ri < ft_out_u`。`grad_out` のみ要素型が
+    // (ft_in × ft_out) 固定で launch config 上 `ri < ft_out_u`。`grad_out` のみ要素型が
     // `f16` で read 時に `f32` へ変換する。`grad_w` への書き込みは atomic add: 末尾の
     // `&*(grad_w.as_ptr().add(..) as *const DeviceAtomicF32)` cast は、`DeviceAtomicF32`
     // が `f32` (align 4) と同レイアウト (`#[repr(transparent)]` over `UnsafeCell<f32>`)
@@ -3923,10 +3924,14 @@ fn find_libdevice_bc() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 // ===========================================================================
 // LayerStack architecture constants
 // ===========================================================================
+//
+// FT input dim (`ft_in`) and active-feature count (`max_active`) are NOT
+// constants: they depend on the input feature set chosen at startup (see
+// `FeatureSetSpec`). They are carried as runtime fields on `GpuWorkspace` /
+// `GpuTrainer`. The values below describe the LayerStack topology after the
+// FT layer and are feature-set independent.
 
-const FT_IN: usize = 73_305; // `HALFKA_HM_DIMENSIONS` (shogi-features::halfka_hm)
 const FT_OUT: usize = 1536; // per-perspective FT output dim
-const MAX_ACTIVE: usize = 40; // `MAX_ACTIVE_FEATURES` (nnz per perspective per position)
 const COMBINED_DIM: usize = FT_OUT; // pairwise (1536 → 768) × 2 perspectives concat = 1536
 const L1_OUT: usize = 16;
 const L1_EFFECTIVE: usize = L1_OUT - 1; // = 15 (skip 1 dim、bullet:1433)
@@ -3946,7 +3951,15 @@ const NUM_BUCKETS: usize = 9; // progress8kpabs
 const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 
 /// raw checkpoint format version。
-const RAW_CKPT_VERSION: u32 = 1;
+///
+/// - `1`: no feature-set header; the weights are always `halfka-hm-merged`.
+/// - `2`: a self-describing feature-set header (canonical name + `ft_in` +
+///   `ft_out` + `max_active`) follows the magic + version fields.
+///
+/// `load_raw_checkpoint` accepts both: version 1 is interpreted as
+/// `halfka-hm-merged` for backward compatibility, version 2 is validated
+/// against the requested feature set, versions above 2 are rejected.
+const RAW_CKPT_VERSION: u32 = 2;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
 type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -4251,6 +4264,10 @@ struct GpuTrainer {
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
+    /// 入力 feature set spec。FT 入力次元 (`ft_in`) / active feature 数
+    /// (`max_active`) / artifact identity の単一の真実源。起動時に
+    /// `--feature-set` から一度だけ決まり、以降不変。
+    feature_set: FeatureSetSpec,
     step_count: u64,
 }
 
@@ -4290,6 +4307,13 @@ impl Drop for GpuTrainer {
 struct GpuWorkspace {
     /// この workspace が確保している batch (= position) 数。0 = 未確保。
     len_batch: usize,
+
+    /// FT 入力次元 (feature set ごとに異なる)。inverse-index scratch
+    /// (`feat_*`) と FT forward/backward kernel の launch arg に使う。
+    ft_in: usize,
+    /// 1 perspective あたりの active feature 数 (feature set ごとに異なる)。
+    /// 入力 index buffer (`stm_idx_dev` 等) の容量と FT kernel の launch arg。
+    max_active: usize,
 
     // -- forward activations --
     ft_stm_out: DeviceBuffer<f32>,    // b × FT_OUT
@@ -4332,23 +4356,23 @@ struct GpuWorkspace {
     dft_stm_out_h: Option<DeviceBuffer<f16>>,  // b × FT_OUT
     dft_nstm_out_h: Option<DeviceBuffer<f16>>, // b × FT_OUT
 
-    // -- inverse-index sparse_ft_backward scratch (FT_IN+1 / max 2.5M) --
-    feat_counts: DeviceBuffer<u32>, // FT_IN: per-feature histogram (atomic build)
-    feat_offsets: DeviceBuffer<u32>, // FT_IN + 1: exclusive prefix sum
-    feat_write_ctr: DeviceBuffer<u32>, // FT_IN: scatter atomic counter
-    feat_positions: DeviceBuffer<u32>, // up to batch * MAX_ACTIVE: sorted positions
+    // -- inverse-index sparse_ft_backward scratch (sized by feature set) --
+    feat_counts: DeviceBuffer<u32>, // ft_in: per-feature histogram (atomic build)
+    feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum
+    feat_write_ctr: DeviceBuffer<u32>, // ft_in: scatter atomic counter
+    feat_positions: DeviceBuffer<u32>, // up to batch * max_active: sorted positions
 
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
     // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
     // 毎 step `mem::swap` し、直前 step が読んでいない back 側へ次 step 入力を copy
     // stream で先行 H2D する ([`InputUploadRing`])。
-    stm_idx_dev: DeviceBuffer<i32>,         // batch * MAX_ACTIVE
-    nstm_idx_dev: DeviceBuffer<i32>,        // batch * MAX_ACTIVE
+    stm_idx_dev: DeviceBuffer<i32>,         // batch * max_active
+    nstm_idx_dev: DeviceBuffer<i32>,        // batch * max_active
     bucket_idx_dev: DeviceBuffer<i32>,      // batch
     score_dev: DeviceBuffer<f32>,           // batch
     wdl_dev: DeviceBuffer<f32>,             // batch
-    stm_idx_dev_back: DeviceBuffer<i32>,    // batch * MAX_ACTIVE
-    nstm_idx_dev_back: DeviceBuffer<i32>,   // batch * MAX_ACTIVE
+    stm_idx_dev_back: DeviceBuffer<i32>,    // batch * max_active
+    nstm_idx_dev_back: DeviceBuffer<i32>,   // batch * max_active
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
     score_dev_back: DeviceBuffer<f32>,      // batch
     wdl_dev_back: DeviceBuffer<f32>,        // batch
@@ -4376,7 +4400,10 @@ impl GpuWorkspace {
         stream: &CudaStream,
         batch: usize,
         ft_fp16_out: bool,
+        feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let ft_in = feature_set.ft_in();
+        let max_active = feature_set.max_active();
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
         };
@@ -4392,6 +4419,8 @@ impl GpuWorkspace {
         };
         Ok(Self {
             len_batch: batch,
+            ft_in,
+            max_active,
             ft_stm_out: z(ft_act_f32_n)?,
             ft_nstm_out: z(ft_act_f32_n)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
@@ -4425,17 +4454,17 @@ impl GpuWorkspace {
             dcombined_from_l1: z(batch * FT_OUT)?,
             dft_stm_out: z(ft_act_f32_n)?,
             dft_nstm_out: z(ft_act_f32_n)?,
-            feat_counts: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
-            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, FT_IN + 1)?,
-            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, FT_IN)?,
-            feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * MAX_ACTIVE)?,
-            stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
-            nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
+            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
+            feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
+            stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
-            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
-            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * MAX_ACTIVE)?,
+            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             bucket_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
@@ -4478,7 +4507,7 @@ impl GpuWorkspace {
 #[allow(dead_code)]
 struct BatchData<'a> {
     n_pos: usize,
-    stm_indices: &'a [i32], // (n_pos × MAX_ACTIVE)、-1 padding 可
+    stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可
     nstm_indices: &'a [i32],
     bucket_idx: &'a [i32], // (n_pos)、progress8kpabs の 0-8
     score: &'a [f32],      // (n_pos)、target eval cp の元
@@ -4514,25 +4543,29 @@ impl BatchDataOwned {
 
 impl BatchData<'_> {
     /// 決定論的な smoke 用 dummy batch。bucket_idx=0、small random sparse indices。
-    fn smoke_dummy(n_pos: usize) -> BatchDataOwned {
-        let mut stm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
-        let mut nstm_indices = vec![-1_i32; n_pos * MAX_ACTIVE];
-        // 各 position に MAX_ACTIVE 個 (実 HalfKA_hm の典型局面と同等) の deterministic indices
-        // を入れる。range [0, FT_IN) で seed-based に分散。
+    /// `feature_set` で `max_active` (1 perspective あたり active feature 数) と
+    /// index の範囲 `[0, ft_in)` が決まる。
+    fn smoke_dummy(n_pos: usize, feature_set: FeatureSetSpec) -> BatchDataOwned {
+        let ft_in = feature_set.ft_in();
+        let max_active = feature_set.max_active();
+        let mut stm_indices = vec![-1_i32; n_pos * max_active];
+        let mut nstm_indices = vec![-1_i32; n_pos * max_active];
+        // 各 position に max_active 個の deterministic indices を入れる。
+        // range [0, ft_in) で seed-based に分散。
         let mut s: u64 = 0xdead_beef;
         for b in 0..n_pos {
-            for k in 0..MAX_ACTIVE {
+            for k in 0..max_active {
                 // xorshift
                 s ^= s << 13;
                 s ^= s >> 7;
                 s ^= s << 17;
-                let idx = (s as usize % FT_IN) as i32;
-                stm_indices[b * MAX_ACTIVE + k] = idx;
+                let idx = (s as usize % ft_in) as i32;
+                stm_indices[b * max_active + k] = idx;
                 s ^= s << 13;
                 s ^= s >> 7;
                 s ^= s << 17;
-                let idx2 = (s as usize % FT_IN) as i32;
-                nstm_indices[b * MAX_ACTIVE + k] = idx2;
+                let idx2 = (s as usize % ft_in) as i32;
+                nstm_indices[b * max_active + k] = idx2;
             }
         }
         BatchDataOwned {
@@ -4556,12 +4589,16 @@ impl BatchData<'_> {
             bucket_idx.len(),
             n_pos
         );
+        let max_active = batch.feature_set.max_active();
         assert_eq!(
-            batch.max_active, MAX_ACTIVE,
-            "Batch::max_active ({}) must equal MAX_ACTIVE ({})",
-            batch.max_active, MAX_ACTIVE
+            batch.max_active,
+            max_active,
+            "Batch::max_active ({}) must equal feature set '{}' max_active ({})",
+            batch.max_active,
+            batch.feature_set.canonical_name(),
+            max_active
         );
-        let span = n_pos * MAX_ACTIVE;
+        let span = n_pos * max_active;
         let norm = if n_pos == 0 {
             0.0
         } else {
@@ -5104,7 +5141,7 @@ impl Drop for AsyncLossRing {
 /// compute stream に待たせる。
 struct InputUploadRing {
     copy_stream: std::sync::Arc<CudaStream>,
-    // pinned host staging。stm/nstm は `batch * MAX_ACTIVE`、bucket/score/wdl は `batch`。
+    // pinned host staging。stm/nstm は `batch * max_active`、bucket/score/wdl は `batch`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
     pinned_bucket: [*mut i32; 2],
@@ -5117,7 +5154,7 @@ struct InputUploadRing {
     /// step (= 2 step 後) の H2D 前に copy stream が待ち、in-flight な compute が
     /// 読んでいる buffer を H2D が上書きする race を防ぐ。
     step_done: [CudaEvent; 2],
-    /// stm/nstm pinned の要素容量 (`batch * MAX_ACTIVE`)。
+    /// stm/nstm pinned の要素容量 (`batch * max_active`)。
     cap_idx: usize,
     /// bucket/score/wdl pinned の要素容量 (`batch`)。
     cap_scalar: usize,
@@ -5132,13 +5169,15 @@ struct InputUploadRing {
 unsafe impl Send for InputUploadRing {}
 
 impl InputUploadRing {
-    /// copy stream + 2-slot pinned buffer + event を確保する。`batch` は最大 position 数。
+    /// copy stream + 2-slot pinned buffer + event を確保する。`batch` は最大 position 数、
+    /// `max_active` は 1 perspective あたりの active feature 数 (feature set 依存)。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch: usize,
+        max_active: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let copy_stream = ctx.new_stream()?;
-        let cap_idx = batch.max(1) * MAX_ACTIVE;
+        let cap_idx = batch.max(1) * max_active;
         let cap_scalar = batch.max(1);
         Ok(Self {
             copy_stream,
@@ -5338,6 +5377,7 @@ impl GpuTrainer {
         ft_fp16: bool,
         ft_fp16_out: bool,
         fp16_opt_state: bool,
+        feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
         // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
@@ -5346,8 +5386,9 @@ impl GpuTrainer {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
-        // 各 weight group の element 数
-        let ft_w_n = FT_IN * FT_OUT;
+        // 各 weight group の element 数 (FT 入力次元は feature set 依存)
+        let ft_in = feature_set.ft_in();
+        let ft_w_n = ft_in * FT_OUT;
         let ft_b_n = FT_OUT;
         let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
         let l1_b_n = NUM_BUCKETS * L1_OUT;
@@ -5436,15 +5477,16 @@ impl GpuTrainer {
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は batch=4 等を渡す)。
             // FT activation の f16 buffer 確保は `ft_fp16_out` で決まる。
-            ws: GpuWorkspace::new(&stream, batch_size.max(1), ft_fp16_out)?,
+            ws: GpuWorkspace::new(&stream, batch_size.max(1), ft_fp16_out, feature_set)?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
-            input_ring: InputUploadRing::new(ctx, batch_size.max(1))?,
+            input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
             ft_fp16_out,
             fp16_opt_state,
+            feature_set,
             step_count: 0,
         })
     }
@@ -5474,6 +5516,16 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // optimizer companion buffer (`ft_w_m`/`v`/`grad`/`slow`) は trainer の
+        // feature set で確保済。weight の feature set が異なると `ft_w` だけ別長に
+        // なり optimizer step が out-of-bounds になるため、ここで弾く。
+        if w.feature_set != self.feature_set {
+            return Err(invalid_data(format!(
+                "weight feature set '{}' does not match trainer feature set '{}'",
+                w.feature_set.canonical_name(),
+                self.feature_set.canonical_name()
+            )));
+        }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -5492,7 +5544,7 @@ impl GpuTrainer {
         let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
         };
-        let ft_w_n = FT_IN * FT_OUT;
+        let ft_w_n = self.feature_set.ft_in() * FT_OUT;
         let ft_b_n = FT_OUT;
         let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
         let l1_b_n = NUM_BUCKETS * L1_OUT;
@@ -5549,6 +5601,7 @@ impl GpuTrainer {
     /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
     fn to_layerstack_weights(&self) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
         Ok(LayerStackWeights {
+            feature_set: self.feature_set,
             ft_w: self.ft_w.to_host_vec(&self.stream)?,
             ft_b: self.ft_b.to_host_vec(&self.stream)?,
             l1_w: self.l1_w.to_host_vec(&self.stream)?,
@@ -5674,13 +5727,18 @@ impl GpuTrainer {
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
     ///
-    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`]):
+    /// layout (全 little-endian、[`RAW_CKPT_MAGIC`] / [`RAW_CKPT_VERSION`] = 2):
     /// ```text
-    /// 0..4     magic   b"RNRC"
-    /// 4..8     version u32 (1)
-    /// 8..16    superbatch u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
-    /// 16..24   step_count u64  (Ranger lookahead step counter)
-    /// 24..32   num_groups u64  (= 10、固定だが将来検証用)
+    /// magic        b"RNRC"             (4 bytes)
+    /// version      u32 (2)             (4 bytes)
+    /// fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
+    /// fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
+    /// ft_in        u64                 (FT 入力次元、feature set 依存)
+    /// ft_out       u64                 (FT 出力次元、= FT_OUT)
+    /// max_active   u64                 (1 perspective あたり active feature 数)
+    /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
+    /// step_count   u64  (Ranger lookahead step counter)
+    /// num_groups   u64  (= 10、固定だが将来検証用)
     /// then for each of 10 groups (順序 = `raw_ckpt_groups()` = ft_w, ft_b, l1_w, l1_b,
     ///   l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b):
     ///   len u64
@@ -5689,6 +5747,9 @@ impl GpuTrainer {
     ///   v[f32 × len]
     ///   slow[f32 × len]
     /// ```
+    ///
+    /// version 1 file には feature set header (`fs_name`/`ft_in`/`ft_out`/`max_active`)
+    /// が無く、weights は常に `halfka-hm-merged` として解釈される。
     ///
     /// device → host download (`DeviceBuffer::to_host_vec`) → `<path>.tmp` へ `BufWriter`
     /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
@@ -5719,6 +5780,15 @@ impl GpuTrainer {
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
             w.write_all(&RAW_CKPT_MAGIC)?;
             w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
+            // self-describing feature set header: canonical 名 + 次元 3 値。resume 時に
+            // 要求された feature set との一致を検証するための単一情報源。
+            let fs_name = self.feature_set.canonical_name();
+            let fs_name_bytes = fs_name.as_bytes();
+            w.write_all(&(fs_name_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(fs_name_bytes)?;
+            w.write_all(&(self.feature_set.ft_in() as u64).to_le_bytes())?;
+            w.write_all(&(FT_OUT as u64).to_le_bytes())?;
+            w.write_all(&(self.feature_set.max_active() as u64).to_le_bytes())?;
             w.write_all(&(superbatch as u64).to_le_bytes())?;
             w.write_all(&self.step_count.to_le_bytes())?;
             // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
@@ -5727,7 +5797,7 @@ impl GpuTrainer {
             // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
             // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
             // resume 時に当該 run の精度へ再 quantize される)。
-            let ft_w_n = FT_IN * FT_OUT;
+            let ft_w_n = self.feature_set.ft_in() * FT_OUT;
             {
                 let w_host = self.ft_w.to_host_vec(&self.stream)?;
                 let m_host = self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)?;
@@ -5795,11 +5865,15 @@ impl GpuTrainer {
     /// raw checkpoint を読み戻す (`--resume` 用)。返り値は checkpoint に記録された
     /// **完了 superbatch 番号** (caller は通常その +1 から resume する)。
     ///
-    /// magic / version 不一致、group 数 / 各 group の len が LayerStack arch と不一致、または
-    /// `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
+    /// magic 不一致、`version > 2`、group 数 / 各 group の len が LayerStack arch と不一致、
+    /// または `u64 → usize` overflow (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
-    /// 読み込んだ raw f32 を host → device upload し、`self.step_count` を復元する。
-    /// `grad` buffer は触らない (step ごとに memset される)。
+    ///
+    /// version 1 file は feature set header を持たず、weights を `halfka-hm-merged` と
+    /// みなす。version 2 file は header の feature set / `ft_in` / `max_active` を読み、
+    /// 現 trainer の `feature_set` と一致しなければ reject する (feature set を跨いだ
+    /// resume は許可しない)。読み込んだ raw f32 を host → device upload し、
+    /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
     fn load_raw_checkpoint(&mut self, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
 
@@ -5813,12 +5887,71 @@ impl GpuTrainer {
         let mut buf4 = [0u8; 4];
         read_exact_or_invalid(&mut r, &mut buf4, "version")?;
         let version = u32::from_le_bytes(buf4);
-        if version != RAW_CKPT_VERSION {
+        if version > RAW_CKPT_VERSION {
             return Err(invalid_data(format!(
-                "raw checkpoint version mismatch: got {version}, want {RAW_CKPT_VERSION}"
+                "raw checkpoint version {version} is newer than this build supports \
+                 (max {RAW_CKPT_VERSION})"
             )));
         }
         let mut buf8 = [0u8; 8];
+
+        // version 2+ は magic+version の直後に feature set header を持つ。version 1 は
+        // header が無く weights は常に `halfka-hm-merged`。いずれの場合も最終的に
+        // 現 trainer の `feature_set` と一致しなければ reject する。
+        let want_name = self.feature_set.canonical_name();
+        if version >= 2 {
+            read_exact_or_invalid(&mut r, &mut buf4, "feature set name length")?;
+            let fs_name_len = u32::from_le_bytes(buf4) as usize;
+            // canonical 名は最長でも 16 byte ("halfka-hm-merged")。破損 file の
+            // 巨大長で過大 alloc しないよう保守的に上限を設ける。
+            if fs_name_len > 256 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint feature set name length {fs_name_len} is implausible (max 256)"
+                )));
+            }
+            let mut fs_name_bytes = vec![0u8; fs_name_len];
+            read_exact_or_invalid(&mut r, &mut fs_name_bytes, "feature set name")?;
+            let fs_name = String::from_utf8(fs_name_bytes).map_err(|_| {
+                invalid_data("raw checkpoint feature set name is not valid UTF-8".to_string())
+            })?;
+            read_exact_or_invalid(&mut r, &mut buf8, "ft_in")?;
+            let ckpt_ft_in = u64::from_le_bytes(buf8);
+            read_exact_or_invalid(&mut r, &mut buf8, "ft_out")?;
+            let ckpt_ft_out = u64::from_le_bytes(buf8);
+            read_exact_or_invalid(&mut r, &mut buf8, "max_active")?;
+            let ckpt_max_active = u64::from_le_bytes(buf8);
+
+            let want = self.feature_set;
+            if fs_name != want_name {
+                return Err(invalid_data(format!(
+                    "raw checkpoint feature set mismatch: checkpoint is '{fs_name}', \
+                     requested '{want_name}' (feature set を跨いだ resume は不可)"
+                )));
+            }
+            if ckpt_ft_in != want.ft_in() as u64 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint ft_in mismatch: got {ckpt_ft_in}, want {}",
+                    want.ft_in()
+                )));
+            }
+            if ckpt_ft_out != FT_OUT as u64 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint ft_out mismatch: got {ckpt_ft_out}, want {FT_OUT}"
+                )));
+            }
+            if ckpt_max_active != want.max_active() as u64 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
+                    want.max_active()
+                )));
+            }
+        } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {
+            return Err(invalid_data(format!(
+                "raw checkpoint version 1 is always 'halfka-hm-merged', \
+                 requested '{want_name}' (feature set を跨いだ resume は不可)"
+            )));
+        }
+
         read_exact_or_invalid(&mut r, &mut buf8, "superbatch")?;
         let superbatch_u64 = u64::from_le_bytes(buf8);
         let superbatch: usize = superbatch_u64.try_into().map_err(|_| {
@@ -5882,7 +6015,7 @@ impl GpuTrainer {
 
         // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
         // upload して途中 fail だと中途半端な state になるため)。group 0 は ft_w。
-        let ft_w_loaded = read_group(&mut r, "ft_w", FT_IN * FT_OUT)?;
+        let ft_w_loaded = read_group(&mut r, "ft_w", self.feature_set.ft_in() * FT_OUT)?;
         let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
         for (name, expected_len) in expected_groups {
             loaded.push(read_group(&mut r, name, expected_len)?);
@@ -5959,7 +6092,7 @@ impl GpuTrainer {
     /// 一度だけ明示同期する。`ft_fp16` 無効時 (`ft_w_h` が `None`) は no-op。
     fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-            let ft_w_n = FT_IN * FT_OUT;
+            let ft_w_n = self.feature_set.ft_in() * FT_OUT;
             cuda_launch! {
                 kernel: cast_f32_to_f16,
                 stream: self.stream,
@@ -6136,7 +6269,7 @@ impl GpuTrainer {
                     slice(self.ws.stm_idx_dev),
                     slice_mut(self.ws.ft_stm_out_h.as_mut()
                         .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
             cuda_launch! {
@@ -6149,7 +6282,7 @@ impl GpuTrainer {
                     slice(self.ws.nstm_idx_dev),
                     slice_mut(self.ws.ft_nstm_out_h.as_mut()
                         .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
         } else if self.ft_fp16 {
@@ -6166,7 +6299,7 @@ impl GpuTrainer {
                     slice(ft_w_h),
                     slice(self.ws.stm_idx_dev),
                     slice_mut(self.ws.ft_stm_out),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
             cuda_launch! {
@@ -6178,7 +6311,7 @@ impl GpuTrainer {
                     slice(ft_w_h),
                     slice(self.ws.nstm_idx_dev),
                     slice_mut(self.ws.ft_nstm_out),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
         } else {
@@ -6191,7 +6324,7 @@ impl GpuTrainer {
                     slice(self.ft_w),
                     slice(self.ws.stm_idx_dev),
                     slice_mut(self.ws.ft_stm_out),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
             cuda_launch! {
@@ -6203,7 +6336,7 @@ impl GpuTrainer {
                     slice(self.ft_w),
                     slice(self.ws.nstm_idx_dev),
                     slice_mut(self.ws.ft_nstm_out),
-                    b_u32, FT_OUT as u32, FT_IN as u32, MAX_ACTIVE as u32
+                    b_u32, FT_OUT as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                 ]
             }?;
         }
@@ -6581,7 +6714,7 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_w_n = FT_IN * FT_OUT;
+        let ft_w_n = self.feature_set.ft_in() * FT_OUT;
         let ft_b_n = FT_OUT;
         let l1_w_n = NUM_BUCKETS * L1_OUT * FT_OUT;
         let l1_b_n = NUM_BUCKETS * L1_OUT;
@@ -7042,7 +7175,10 @@ impl GpuTrainer {
         // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
         // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
         // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
-        let total_pairs = (b * MAX_ACTIVE) as u32;
+        // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
+        let ft_in = self.ws.ft_in;
+        let max_active = self.ws.max_active;
+        let total_pairs = (b * max_active) as u32;
         for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
             .into_iter()
             .enumerate()
@@ -7055,15 +7191,15 @@ impl GpuTrainer {
             cuda_launch! {
                 kernel: build_feature_counts,
                 stream: self.stream, module: self.module,
-                config: cfg_1d(b * MAX_ACTIVE),
+                config: cfg_1d(b * max_active),
                 args: [
                     slice(idx_dev),
                     slice(self.ws.feat_counts),
-                    b_u32, MAX_ACTIVE as u32, FT_IN as u32
+                    b_u32, max_active as u32, ft_in as u32
                 ]
             }?;
             prof_tick!("phA_count");
-            // B: exclusive_prefix_sum_small (1 block × 1024 threads, FT_IN ≈ 73K)
+            // B: exclusive_prefix_sum_small (1 block × 1024 threads, ft_in ≈ 73K)
             cuda_launch! {
                 kernel: exclusive_prefix_sum_small,
                 stream: self.stream, module: self.module,
@@ -7075,7 +7211,7 @@ impl GpuTrainer {
                 args: [
                     slice(self.ws.feat_counts),
                     slice(self.ws.feat_offsets),
-                    FT_IN as u32
+                    ft_in as u32
                 ]
             }?;
             prof_tick!("phB_psum");
@@ -7083,21 +7219,21 @@ impl GpuTrainer {
             cuda_launch! {
                 kernel: scatter_positions,
                 stream: self.stream, module: self.module,
-                config: cfg_1d(b * MAX_ACTIVE),
+                config: cfg_1d(b * max_active),
                 args: [
                     slice(idx_dev),
                     slice(self.ws.feat_offsets),
                     slice(self.ws.feat_write_ctr),
                     slice(self.ws.feat_positions),
-                    b_u32, MAX_ACTIVE as u32, FT_IN as u32
+                    b_u32, max_active as u32, ft_in as u32
                 ]
             }?;
             prof_tick!("phC_scat");
-            // D: gather_and_sum_per_feature。block grid = (FT_IN, FT_OUT/128), block_dim=128.
+            // D: gather_and_sum_per_feature。block grid = (ft_in, FT_OUT/128), block_dim=128.
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
             // host は grad_w を memset_zero 済みだが、overwrite kernel は全 cell を書き切る。
             let d_config = LaunchConfig {
-                grid_dim: (FT_IN as u32, (FT_OUT / 128) as u32, 1),
+                grid_dim: (ft_in as u32, (FT_OUT / 128) as u32, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -7115,7 +7251,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32, dft_inv_scale
+                            ft_in as u32, FT_OUT as u32, dft_inv_scale
                         ]
                     }?;
                 } else {
@@ -7128,7 +7264,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32
+                            ft_in as u32, FT_OUT as u32
                         ]
                     }?;
                 }
@@ -7148,7 +7284,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32, dft_inv_scale
+                            ft_in as u32, FT_OUT as u32, dft_inv_scale
                         ]
                     }?;
                 } else {
@@ -7161,7 +7297,7 @@ impl GpuTrainer {
                             slice(self.ws.feat_positions),
                             slice(self.ws.feat_offsets),
                             slice(self.ft_w_grad),
-                            FT_IN as u32, FT_OUT as u32
+                            ft_in as u32, FT_OUT as u32
                         ]
                     }?;
                 }
@@ -7396,6 +7532,16 @@ impl TrainerBackend for GpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> std::io::Result<f64> {
+        // dataloader が出した batch の feature set が trainer 構築時に選んだ feature set
+        // と一致することを確認する (buffer サイズ / kernel launch 次元が前者を前提に
+        // 確保済のため、不一致は out-of-bounds になる)。
+        if batch.feature_set != self.feature_set {
+            return Err(std::io::Error::other(format!(
+                "batch feature set '{}' does not match trainer feature set '{}'",
+                batch.feature_set.canonical_name(),
+                self.feature_set.canonical_name()
+            )));
+        }
         let data = BatchData::from_batch_ref(batch, bucket_idx);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
@@ -7459,6 +7605,12 @@ struct Cli {
     /// network id (checkpoint file 名に使う)。
     #[arg(long, default_value = "rshogi")]
     net_id: String,
+
+    /// 入力 feature set。次のいずれか: halfkp, halfka-split, halfka-merged,
+    /// halfka-hm-split, halfka-hm-merged。FT 入力次元と active feature 数を決める。
+    /// 既定の halfka-hm-merged は king-symmetric merged HalfKA。
+    #[arg(long, default_value = "halfka-hm-merged")]
+    feature_set: String,
 
     /// experiment.json の `name` (実験管理 UI での表示名)。未指定なら net_id、
     /// `--resume` 時は `{net_id} (resume @sb{開始 superbatch})`。
@@ -7640,6 +7792,23 @@ struct Cli {
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let data = cli.data.as_ref().expect("run_training called with --data");
 
+    // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
+    // dataloader / checkpoint identity が参照する単一の真実源)。
+    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            let names: Vec<&str> = FeatureSet::ALL
+                .iter()
+                .map(|fs| fs.canonical_name())
+                .collect();
+            format!(
+                "--feature-set '{}' is not a known feature set (expected one of: {})",
+                cli.feature_set,
+                names.join(", ")
+            )
+            .into()
+        })?
+        .spec();
+
     // --- 未実装フラグの validation / warning ---
     if cli.bucket_mode != "progress8kpabs" {
         return Err(format!(
@@ -7786,6 +7955,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.ft_fp16,
         cli.ft_fp16_out,
         cli.fp16_opt_state,
+        feature_set,
     )?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
@@ -7794,7 +7964,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = LayerStackWeights::load_quantised(&mut reader)?;
+        let weights = LayerStackWeights::load_quantised(&mut reader, feature_set)?;
         trainer.load_layerstack_weights(&weights)?;
         None
     } else if let Some(ckpt) = &cli.resume {
@@ -7841,6 +8011,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let wdl_scheduler = ConstantWDL { value: cli.wdl };
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
+        feature_set,
         output_dir: cli.output.clone(),
         start_superbatch,
         end_superbatch: cli.superbatches,
@@ -7857,7 +8028,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
     trainer.sync_ft_w_h_mirror()?;
 
-    let mut experiment = build_experiment_logger(cli, start_superbatch, resumed_superbatch, data);
+    let mut experiment =
+        build_experiment_logger(cli, feature_set, start_superbatch, resumed_superbatch, data);
     println!("[train] experiment log: {}", experiment.path().display());
 
     let result = nnue_train::trainer::run(
@@ -7939,6 +8111,7 @@ fn git_commit() -> Option<String> {
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 fn build_experiment_logger(
     cli: &Cli,
+    feature_set: FeatureSetSpec,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
     data: &Path,
@@ -7972,6 +8145,8 @@ fn build_experiment_logger(
     let is_wrm = cli.win_rate_model;
     let params = Params {
         architecture: LAYERSTACK_ARCHITECTURE.to_string(),
+        feature_set: feature_set.canonical_name().to_string(),
+        ft_in: feature_set.ft_in(),
         l0: FT_OUT,
         l1: L1_OUT,
         l2: L2_OUT,
@@ -8033,12 +8208,14 @@ fn build_experiment_logger(
 fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
+    // smoke は production feature set (`halfka-hm-merged`) で動作確認する。
+    let feature_set = FeatureSet::HalfKaHmMerged.spec();
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false, false)?;
+    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false, false, feature_set)?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
-        (FT_IN * FT_OUT
+        (feature_set.ft_in() * FT_OUT
             + FT_OUT
             + NUM_BUCKETS * L1_OUT * FT_OUT
             + NUM_BUCKETS * L1_OUT
@@ -8064,13 +8241,13 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     {
         println!("[smoke] loading reference checkpoint from {ref_path} ...");
         let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
-        let weights = LayerStackWeights::load_quantised(&mut reader)?;
+        let weights = LayerStackWeights::load_quantised(&mut reader, feature_set)?;
         trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
         println!("[smoke] reference weights injected, all finite ✓");
 
         // forward + step 1 batch (sigmoid-MSE、golden forward/backward/save 経路)
-        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (post reference-inject, sigmoid-MSE): loss = {loss:.6e}");
@@ -8093,7 +8270,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
         // 追加 step: WRM loss kernel (`loss_wrm`) を runtime でも exercise する。
         // 上で save 済なので weights が変わっても verify 対象 (`out_path`) には影響しない。
-        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
         let loss_wrm = trainer.step(&batch.as_ref(), 1e-3_f32, WDL_LAMBDA, SMOKE_LOSS_WRM)?;
         println!("[smoke] step 2 (win-rate-model): loss = {loss_wrm:.6e}");
         if !loss_wrm.is_finite() {
@@ -8105,7 +8282,7 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[smoke] (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set or path missing; running random-init smoke only)"
         );
-        let batch = BatchData::smoke_dummy(SMOKE_BATCH);
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
         let lr = 1e-3_f32;
         let loss = trainer.step(&batch.as_ref(), lr, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         println!("[smoke] step 1 (sigmoid-MSE): loss = {loss:.6e}");
@@ -8209,9 +8386,10 @@ mod raw_ckpt_format_tests {
 
     #[test]
     fn raw_ckpt_constants_are_stable() {
-        // format identity が変わると古い checkpoint を resume できなくなるので pin。
+        // magic は format identity。version は後方互換読み (version 1 file の受理) を
+        // 維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
         assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-        assert_eq!(RAW_CKPT_VERSION, 1);
+        assert_eq!(RAW_CKPT_VERSION, 2);
     }
 
     #[test]

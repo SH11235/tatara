@@ -16,11 +16,15 @@ use std::fs::File;
 use std::io::BufReader;
 
 use nnue_format::LayerStackWeights;
+use shogi_features::FeatureSet;
 
 /// `path` の LayerStack quantised checkpoint を読み込む。失敗時はどの file かを含むエラー。
+///
+/// 比較対象は production の `halfka-hm-merged` checkpoint を想定し、その spec で
+/// load する (loader は arch / hash がこの feature set と一致するか検証する)。
 fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("open `{path}`: {e}"))?;
-    LayerStackWeights::load_quantised(&mut BufReader::new(file))
+    LayerStackWeights::load_quantised(&mut BufReader::new(file), FeatureSet::HalfKaHmMerged.spec())
         .map_err(|e| format!("parse `{path}` as LayerStack quantised NNUE: {e}").into())
 }
 
