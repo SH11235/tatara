@@ -4079,9 +4079,6 @@ const MAX_W: f32 = RANGER_DEFAULTS.max_weight;
 const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
 const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
 const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
-// この trainer は weight-decay を 0.0 にする (`RangerParams::DEFAULT.decay` の
-// 既定 0.01 を override)。
-const DECAY: f32 = 0.0;
 
 // smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600 /
 // target offset 270 / target scaling 380)。
@@ -4268,6 +4265,10 @@ struct GpuTrainer {
     /// (`max_active`) / artifact identity の単一の真実源。起動時に
     /// `--feature-set` から一度だけ決まり、以降不変。
     feature_set: FeatureSetSpec,
+    /// Ranger optimizer の weight decay 係数。各 weight group の `radam_step`
+    /// に一律 `decay` 引数として渡す。`--weight-decay` から起動時に決まり、
+    /// 以降不変。既定 0.0 で decay 無し。
+    weight_decay: f32,
     step_count: u64,
 }
 
@@ -5370,6 +5371,7 @@ impl GpuTrainer {
     /// `sparse_ft_forward` を FP16 版に切替える。false なら mirror は未確保で従来 path。
     /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
     /// caller が validation 済)。
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
@@ -5378,6 +5380,7 @@ impl GpuTrainer {
         ft_fp16_out: bool,
         fp16_opt_state: bool,
         feature_set: FeatureSetSpec,
+        weight_decay: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
         // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
@@ -5487,6 +5490,7 @@ impl GpuTrainer {
             ft_fp16_out,
             fp16_opt_state,
             feature_set,
+            weight_decay,
             step_count: 0,
         })
     }
@@ -7330,7 +7334,7 @@ impl GpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                     }?;
                 } else {
@@ -7339,7 +7343,7 @@ impl GpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), lr, step_size, denom,
-                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                     }?;
                 }
@@ -7352,14 +7356,14 @@ impl GpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               DECAY, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n as u32]
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n as u32]
                     }?;
                 } else {
                     cuda_launch! {
                         kernel: radam_step,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2,
+                               slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2,
                                EPS, MIN_W, MAX_W, ft_w_n as u32]
                     }?;
                 }
@@ -7372,7 +7376,7 @@ impl GpuTrainer {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
             args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
-                   slice_mut(self.ft_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, ft_b_n as u32]
         }?;
         // L1
@@ -7380,14 +7384,14 @@ impl GpuTrainer {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1_w_n),
             args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
-                   slice_mut(self.l1_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1_w_n as u32]
         }?;
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
             args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
-                   slice_mut(self.l1_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1_b_n as u32]
         }?;
         // L1f
@@ -7395,14 +7399,14 @@ impl GpuTrainer {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1f_w_n),
             args: [slice_mut(self.l1f_w), slice_mut(self.l1f_w_m), slice_mut(self.l1f_w_v),
-                   slice_mut(self.l1f_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l1f_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1f_w_n as u32]
         }?;
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
             args: [slice_mut(self.l1f_b), slice_mut(self.l1f_b_m), slice_mut(self.l1f_b_v),
-                   slice_mut(self.l1f_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l1f_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l1f_b_n as u32]
         }?;
         // L2
@@ -7410,14 +7414,14 @@ impl GpuTrainer {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l2_w_n),
             args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
-                   slice_mut(self.l2_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l2_w_n as u32]
         }?;
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
             args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
-                   slice_mut(self.l2_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l2_b_n as u32]
         }?;
         // L3
@@ -7425,14 +7429,14 @@ impl GpuTrainer {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l3_w_n),
             args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
-                   slice_mut(self.l3_w_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l3_w_n as u32]
         }?;
         cuda_launch! {
             kernel: radam_step,
             stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
             args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
-                   slice_mut(self.l3_b_grad), lr, step_size, denom, DECAY, BETA1, BETA2, EPS,
+                   slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l3_b_n as u32]
         }?;
 
@@ -7713,11 +7717,12 @@ struct Cli {
     /// `--win-rate-model` 指定時のみ使う。
     #[arg(long, default_value_t = 380.0)]
     wrm_target_scaling: f32,
-    // --- 以下は parse するだけで未配線 (bullet-shogi の同名引数を渡しても弾かないため) ---
     /// optimizer 名 ("ranger" のみ実装)。
     #[arg(long, default_value = "ranger")]
     optimizer: String,
-    /// weight decay (kernel は 0.0 固定、非 0 指定で warning)。
+    /// Ranger optimizer の weight decay 係数 (AdamW 風の decoupled weight decay)。
+    /// 既定 0.0 で decay 無し。非 0 で全 weight group の weight を毎 step わずかに
+    /// 0 方向へ減衰させる。
     #[arg(long, default_value_t = 0.0)]
     weight_decay: f32,
     /// dataloader prefetch worker 数。各 worker が PSV パース + HalfKA_hm sparse 抽出 +
@@ -7842,6 +7847,13 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
         return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
     }
+    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
+        return Err(format!(
+            "--weight-decay must be finite and >= 0 (got {})",
+            cli.weight_decay
+        )
+        .into());
+    }
     // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` / `dense_mm_fwd_tiled_l1f`
     // / `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
     // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
@@ -7899,12 +7911,6 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             scale: 1.0 / cli.scale,
         }
     };
-    if cli.weight_decay != 0.0 {
-        eprintln!(
-            "[train] warning: --weight-decay {} ignored; the Ranger kernel uses weight-decay 0.0",
-            cli.weight_decay
-        );
-    }
     if cli.epoch_file_shuffle {
         eprintln!(
             "[train] warning: --epoch-file-shuffle is not implemented; reading {} sequentially and wrapping at EOF (--file-shuffle-seed {} ignored). With --threads >= 2 each worker reads a disjoint chunk per batch, so batch boundaries are not identical across epochs, but no explicit file-level shuffle is performed.",
@@ -7956,6 +7962,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli.ft_fp16_out,
         cli.fp16_opt_state,
         feature_set,
+        cli.weight_decay,
     )?;
     // resume / init-from の処理 → resumed_superbatch を決める。
     let resumed_superbatch: Option<usize> = if let Some(init) = &cli.init_from {
@@ -8066,8 +8073,8 @@ const LAYERSTACK_ARCHITECTURE: &str = "LayerStack-1536-16-32-9bucket";
 
 /// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
 /// に使う。JSON は非有限値を表現できず、混入すると serialise が丸ごと失敗して
-/// 構造化ログが 1 件も書けなくなる。`--scale` は `--win-rate-model` 指定時、
-/// `--weight-decay` は常に、CLI 側で finite 検証を経ないため防御する。
+/// 構造化ログが 1 件も書けなくなる。`--scale` は `--win-rate-model` 指定時に
+/// CLI 側の finite 検証を経ないため防御する。
 fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
@@ -8212,7 +8219,16 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let feature_set = FeatureSet::HalfKaHmMerged.spec();
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
-    let mut trainer = GpuTrainer::new(&ctx, SMOKE_BATCH, false, false, false, false, feature_set)?;
+    let mut trainer = GpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        false,
+        false,
+        false,
+        false,
+        feature_set,
+        0.0,
+    )?;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (feature_set.ft_in() * FT_OUT
