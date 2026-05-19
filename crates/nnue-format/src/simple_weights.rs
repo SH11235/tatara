@@ -166,7 +166,7 @@ fn arch_identity(id: &SimpleId) -> String {
          AffineTransform[{}<-{}](\
          {}[{}](\
          AffineTransformSparseInput[{}<-{}](\
-         InputSlice[{}(0:{})]))))))",
+         InputSlice[{}(0:{})])))))",
         id.feature_set.arch_feature_name(),
         ft_in,
         ft_out,
@@ -775,6 +775,18 @@ mod tests {
         assert!(s.contains("AffineTransformSparseInput[32<-512]"));
         assert!(s.contains("InputSlice[512(0:512)]"));
         assert!(s.ends_with(",fv_scale=27"));
+    }
+
+    #[test]
+    fn arch_str_parentheses_balanced() {
+        // nnue-pytorch 系の arch 文字列は層の入れ子を括弧で表すため、
+        // `(` と `)` の数が一致していなければ malformed。
+        for act in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+            let s = build_arch_str(&test_id(act), 16);
+            let opens = s.matches('(').count();
+            let closes = s.matches(')').count();
+            assert_eq!(opens, closes, "arch_str parentheses unbalanced: `{s}`");
+        }
     }
 
     #[test]
