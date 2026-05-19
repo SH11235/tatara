@@ -73,6 +73,11 @@ pub struct Lineage {
 #[derive(Debug, Clone, Serialize)]
 pub struct Params {
     pub architecture: String,
+    /// 入力 feature set の canonical 名 (`halfka-hm-merged` 等)。
+    pub feature_set: String,
+    /// 入力 feature 総次元 `ft_in` (feature set ごとに異なる)。
+    pub ft_in: usize,
+    /// FT 出力次元 (per-perspective)。入力次元ではない点に注意。
     pub l0: usize,
     pub l1: usize,
     pub l2: usize,
@@ -435,6 +440,8 @@ mod tests {
     fn sample_params() -> Params {
         Params {
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
+            feature_set: "halfka-hm-merged".to_string(),
+            ft_in: 73_305,
             l0: 1536,
             l1: 16,
             l2: 32,
