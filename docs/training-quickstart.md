@@ -41,12 +41,12 @@ target/release/progress-kpabs-train \
 ```bash
 target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
-  --progress-coeff <path/to/progress.e5.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 20 --keep-checkpoints 4 \
-  --threads 16 --bucket-mode progress8kpabs
+  --save-rate 20 --keep-checkpoints 4 --threads 16 \
+  layerstack \
+  --progress-coeff <path/to/progress.e5.bin> --bucket-mode progress8kpabs
 ```
 
 | option | 目的 |
@@ -73,12 +73,13 @@ raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在
 
 ```bash
 target/release/nnue-train \
-  --data ... --progress-coeff ... \
+  --data ... \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches 400 --batches-per-superbatch 6104 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 20 --threads 16 --bucket-mode progress8kpabs \
-  --resume checkpoints/<run-name>/<run-name>-180.ckpt
+  --save-rate 20 --threads 16 \
+  --resume checkpoints/<run-name>/<run-name>-180.ckpt \
+  layerstack --progress-coeff ... --bucket-mode progress8kpabs
 ```
 
 `--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から
@@ -103,22 +104,24 @@ target/release/nnue-train \
 
 ## 動作確認 (smoke)
 
-データ準備前に GPU 経路だけ確認したい場合は `--data` を省略すると `GpuTrainer`
-の forward / backward path を 1 step だけ実行する smoke test が走る:
+データ準備前に GPU 経路だけ確認したい場合は、アーキ サブコマンドを付けて
+`--data` を省略すると `GpuTrainer` の forward / backward path を 1 step だけ
+実行する smoke test が走る:
 
 ```bash
-target/release/nnue-train
+target/release/nnue-train layerstack
 # → "[smoke] forward + backward OK" の趣旨のログが出れば GPU 経路は健全
 ```
 
 または小規模 run (1 sb × 3 batches) で全 pipeline を 5 秒程度で回す:
 
 ```bash
-target/release/nnue-train --data <PSV> --progress-coeff <progress.bin> \
+target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 --batch-size 65536 \
   --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-  --save-rate 1 --threads 4 --bucket-mode progress8kpabs
+  --save-rate 1 --threads 4 \
+  layerstack --progress-coeff <progress.bin> --bucket-mode progress8kpabs
 ```
 
 ## トラブルシューティング

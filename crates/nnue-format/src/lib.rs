@@ -6,6 +6,7 @@
 //!
 //! ## 提供 module
 //!
+//! - `arch_kind`: NNUE network アーキテクチャの種別 (`ArchKind`)
 //! - `header`: NNUE binary の先頭 22 bytes 固定長 metadata
 //!   (`NnueHeader`: net_id / fv_scale / qa / qb) の (de)serialise
 //! - `halfka_psqt`: HalfKA_hm + PSQT NNUE binary (FT + L1 + PSQT) の
@@ -13,10 +14,12 @@
 //! - `layerstack_weights`: LayerStack quantised binary
 //!   (HalfKA_hm + 9-bucket LayerStack) の save / load
 
+pub mod arch_kind;
 pub mod halfka_psqt;
 pub mod header;
 pub mod layerstack_weights;
 
+pub use arch_kind::ArchKind;
 pub use halfka_psqt::{FT_OUT_DIM, HalfKAPsqtNet, L1_OUT_DIM, NUM_FEATURES, QuantTarget};
 pub use header::{DEFAULT_FV_SCALE, DEFAULT_QA, DEFAULT_QB, HEADER_BYTES, NET_ID_LEN, NnueHeader};
 pub use layerstack_weights::LayerStackWeights;

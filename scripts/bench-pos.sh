@@ -96,12 +96,14 @@ nvidia-smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader \
 run_means=()
 for ((r = 1; r <= RUNS; r++)); do
   log=$(mktemp)
-  "$BIN" --data "$DATA" --progress-coeff "$PROG" \
+  "$BIN" \
+    --data "$DATA" \
     --output /tmp/bench-pos --net-id bench-pos \
     --superbatches "$SUPERBATCHES" --batches-per-superbatch "$BATCHES" \
     --batch-size "$BATCH_SIZE" \
     --lr 8.75e-4 --win-rate-model --score-drop-abs 32000 \
-    --save-rate "$SUPERBATCHES" --threads 16 --bucket-mode progress8kpabs \
+    --save-rate "$SUPERBATCHES" --threads 16 \
+    layerstack --progress-coeff "$PROG" --bucket-mode progress8kpabs \
     "$@" >"$log" 2>&1 || { cat "$log" >&2; rm -f "$log"; exit 1; }
 
   # "[train] superbatch N/5 | loss .. | NNNNNN pos/s | .." 行から sb2 以降を集計。
