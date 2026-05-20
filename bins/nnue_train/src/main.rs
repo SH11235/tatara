@@ -8730,6 +8730,19 @@ struct Cli {
     #[arg(long, global = true)]
     fp16_opt_state: bool,
 
+    /// risky 速度 flag を 4 つまとめて opt-in する shortcut。`--ft-fp16` /
+    /// `--fp16-opt-state` / (subcommand 側) `--ft-fp16-out` / `--tf32` を一括 ON
+    /// 相当にする (個別 flag と OR 結合、両 subcommand 対応)。
+    ///
+    /// default OFF (全 flag OFF で純 FP32 path、bit-identical)。指定時の実効値は
+    /// 起動時 log に展開出力 (`[train] --all-optim → ft_fp16=true ft_fp16_out=true
+    /// fp16_opt_state=true tf32=true`) して experiment.json の reproducibility を
+    /// 保つ。量子化 / TF32 誤差で棋力が変動しうるため default OFF。
+    ///
+    /// fine-grained 制御 (一部だけ ON) は本 flag を使わず個別 4 flag を列挙する。
+    #[arg(long, global = true)]
+    all_optim: bool,
+
     /// 学習する NNUE アーキを選ぶサブコマンド (`layerstack` / `simple`)。
     #[command(subcommand)]
     arch: ArchCommand,
@@ -9002,14 +9015,26 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
+    // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
+    // 実効値は起動時 log に展開出力し reproducibility 確保。
+    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
+    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
+    let ft_fp16_out = layerstack.ft_fp16_out || cli.all_optim;
+    let tf32 = layerstack.tf32 || cli.all_optim;
+    if cli.all_optim {
+        println!(
+            "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
+             fp16_opt_state={fp16_opt_state} tf32={tf32}"
+        );
+    }
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
         cli.batch_size,
-        layerstack.tf32,
-        cli.ft_fp16,
-        layerstack.ft_fp16_out,
-        cli.fp16_opt_state,
+        tf32,
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
         feature_set,
         cli.weight_decay,
     )?;
@@ -9255,10 +9280,12 @@ fn build_experiment_logger(
         // (未指定 run の experiment.json では両フィールドとも省略)。
         test_data: cli.test_data.as_deref().map(file_basename),
         test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
-        tf32: layerstack.tf32,
-        ft_fp16: cli.ft_fp16,
-        ft_fp16_out: layerstack.ft_fp16_out,
-        fp16_opt_state: cli.fp16_opt_state,
+        // 実効値を記録 (`--all-optim` 経由で ON になった場合も true として残す、
+        // raw 個別 flag が false でも experiment.json から再現可能)。
+        tf32: layerstack.tf32 || cli.all_optim,
+        ft_fp16: cli.ft_fp16 || cli.all_optim,
+        ft_fp16_out: layerstack.ft_fp16_out || cli.all_optim,
+        fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
         threads: cli.threads,
     };
 
@@ -9301,6 +9328,10 @@ fn build_experiment_logger_simple(
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
     data: &Path,
+    ft_fp16: bool,
+    ft_fp16_out: bool,
+    fp16_opt_state: bool,
+    tf32: bool,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     let net_id_compact = format!(
@@ -9366,10 +9397,11 @@ fn build_experiment_logger_simple(
         init_from: cli.init_from.as_deref().map(file_basename),
         test_data: cli.test_data.as_deref().map(file_basename),
         test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
-        tf32: false,
-        ft_fp16: false,
-        ft_fp16_out: false,
-        fp16_opt_state: false,
+        // 実効値を記録 (`--all-optim` 展開込み、caller `run_simple_training` 経由)。
+        tf32,
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
         threads: cli.threads,
     };
 
@@ -9622,16 +9654,30 @@ fn run_simple_training(
     // 有限・正値を保証済。
     let fv_scale =
         ((id.activation.qa() * nnue_format::simple_weights::QB) as f32 / cli.scale).round() as i32;
+    // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
+    // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
+    // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
+    // 設定再現に使う)。
+    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
+    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
+    let ft_fp16_out = simple_args.ft_fp16_out || cli.all_optim;
+    let tf32 = simple_args.tf32 || cli.all_optim;
+    if cli.all_optim {
+        println!(
+            "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
+             fp16_opt_state={fp16_opt_state} tf32={tf32}"
+        );
+    }
     let mut trainer = SimpleGpuTrainer::new(
         &ctx,
         cli.batch_size,
         id,
         cli.weight_decay,
         fv_scale,
-        cli.ft_fp16,
-        simple_args.ft_fp16_out,
-        cli.fp16_opt_state,
-        simple_args.tf32,
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
     )?;
 
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
@@ -9710,6 +9756,10 @@ fn run_simple_training(
         resumed_superbatch,
         resume_parent_id,
         data,
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
@@ -12681,6 +12731,33 @@ mod cli_tests {
     fn simple_subcommand_parses() {
         let cli = Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand");
         assert_eq!(cli.arch.kind(), ArchKind::Simple);
+    }
+
+    #[test]
+    fn all_optim_meta_flag_parses_for_both_subcommands() {
+        // `--all-optim` は global、`simple` / `layerstack` どちらの subcommand でも accept。
+        // 個別 4 flag (`--ft-fp16` / `--fp16-opt-state` / `--ft-fp16-out` / `--tf32`) を
+        // 一括 ON にする shortcut (dispatch 経路で OR 結合)。
+        let cli_simple = Cli::try_parse_from(["nnue-train", "--all-optim", "simple"])
+            .expect("simple should accept --all-optim");
+        assert!(cli_simple.all_optim);
+        assert!(matches!(cli_simple.arch, ArchCommand::Simple(_)));
+
+        let cli_layerstack = Cli::try_parse_from(["nnue-train", "--all-optim", "layerstack"])
+            .expect("layerstack should accept --all-optim");
+        assert!(cli_layerstack.all_optim);
+        assert!(matches!(cli_layerstack.arch, ArchCommand::LayerStack(_)));
+
+        // global なので subcommand 後置も accept (clap の global=true 標準動作)。
+        // 両 subcommand 後置 case を確認 (`global = true` の対称性保証)。
+        let cli_postfix_simple = Cli::try_parse_from(["nnue-train", "simple", "--all-optim"])
+            .expect("--all-optim should be accepted after `simple` (global)");
+        assert!(cli_postfix_simple.all_optim);
+
+        let cli_postfix_layerstack =
+            Cli::try_parse_from(["nnue-train", "layerstack", "--all-optim"])
+                .expect("--all-optim should be accepted after `layerstack` (global)");
+        assert!(cli_postfix_layerstack.all_optim);
     }
 
     #[test]
