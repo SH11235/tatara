@@ -9836,6 +9836,10 @@ impl SimpleGpuTrainer {
 
     /// 1 batch の forward → backward → Ranger optimizer step を走らせ、loss kernel が
     /// 累積した Σerr² を返す。`bucket_idx` は受け取らない (Simple アーキは bucket 無し)。
+    ///
+    /// 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
+    /// `synchronize()` + 経過時間を stderr に出す (粗い forward / backward / optimizer /
+    /// loss_readback breakdown)。LayerStack `GpuTrainer::step` と同 env var を共有。
     fn step(
         &mut self,
         batch: &BatchData,
@@ -9849,11 +9853,59 @@ impl SimpleGpuTrainer {
         }
         self.ws.check_batch_capacity(b)?;
 
+        let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
+            self.stream.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        if let Some(ref mut t0) = prof_t0 {
+            self.stream.synchronize()?;
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[step-profile] {:<14} {:8.3} ms",
+                "forward",
+                now.duration_since(*t0).as_secs_f64() * 1000.0
+            );
+            *t0 = now;
+        }
+
         self.run_backward_kernels(b)?;
+        if let Some(ref mut t0) = prof_t0 {
+            self.stream.synchronize()?;
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[step-profile] {:<14} {:8.3} ms",
+                "backward",
+                now.duration_since(*t0).as_secs_f64() * 1000.0
+            );
+            *t0 = now;
+        }
+
         self.run_optimizer_step(lr)?;
+        if let Some(ref mut t0) = prof_t0 {
+            self.stream.synchronize()?;
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[step-profile] {:<14} {:8.3} ms",
+                "optimizer",
+                now.duration_since(*t0).as_secs_f64() * 1000.0
+            );
+            *t0 = now;
+        }
 
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        if let Some(ref t0) = prof_t0 {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[step-profile] {:<14} {:8.3} ms",
+                "loss_readback",
+                now.duration_since(*t0).as_secs_f64() * 1000.0
+            );
+        }
+
         Ok(loss_host[0])
     }
 
@@ -10165,19 +10217,35 @@ impl SimpleGpuTrainer {
             }?,
         }
 
-        // -- L2 dense (l1_acted → l2_pre) + 活性化 (l2_pre → l2_acted) --
+        // -- L2 dense (l1_acted → l2_pre) cuBLAS Sgemm + bias_add_per_row --
+        // shape: l1_acted[B, l1_out] @ l2_w[l1_out, l2_out] → l2_pre[B, l2_out]、
+        // 続けて bias を別 kernel で row-add する (Sgemm 自身は bias 非対応)。
+        // L1 fwd と同じ手で、`dense_mm_fwd` の thread 数が `B * out_dim` で
+        // SM 占有率が低いのを cuBLAS で塗り替える。
+        //
+        // SAFETY: l1_acted / l2_w / l2_pre は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (`l1_acted.len() >= b * l1_out` / `l2_pre.len() >= b * l2_out` は事前の
+        // `ws.check_batch_capacity(b)` で保証、weight `l2_w.len() == l1_out * l2_out`
+        // は固定 shape)、`self.cublas` は `self.stream` に bind 済の同一 stream を再利用。
+        // `alpha=1`, `beta=0` overwrite なので `l2_pre` の事前内容は使われない (後続の
+        // `bias_add_per_row` が書き戻し)。`cu_deviceptr() as *const/*mut f32` cast の
+        // 妥当性は L1 と同じ前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
+        unsafe {
+            self.cublas.sgemm_fwd_rowmajor(
+                b_u32 as i32,
+                l2_out_u32 as i32,
+                l1_out_u32 as i32,
+                self.ws.l1_acted.cu_deviceptr() as *const f32,
+                self.l2_w.cu_deviceptr() as *const f32,
+                self.ws.l2_pre.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
-            kernel: dense_mm_fwd,
+            kernel: bias_add_per_row,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * self.id.l2_out),
-            args: [
-                slice(self.ws.l1_acted),
-                slice(self.l2_w),
-                slice(self.l2_b),
-                slice_mut(self.ws.l2_pre),
-                b_u32, l1_out_u32, l2_out_u32
-            ]
+            args: [slice(self.l2_b), slice_mut(self.ws.l2_pre), b_u32, l2_out_u32]
         }?;
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
@@ -10194,19 +10262,31 @@ impl SimpleGpuTrainer {
             }?,
         }
 
-        // -- L3 dense (l2_acted → net_output)。out_dim = 1 (スカラ出力) --
+        // -- L3 dense (l2_acted → net_output)。out_dim = 1 (スカラ出力)、cuBLAS Sgemm + bias --
+        // shape: l2_acted[B, l2_out] @ l3_w[l2_out, 1] → net_output[B, 1]。cuBLAS は
+        // N=1 (= matrix-vector 相当) でも内部で適切な algorithm を選ぶ。
+        //
+        // SAFETY: l2_acted / l3_w / net_output は cudaMalloc 由来 + 長さは仕様分以上
+        // (`l2_acted.len() >= b * l2_out` / `net_output.len() >= b` は事前の
+        // `ws.check_batch_capacity(b)` で保証、weight `l3_w.len() == l2_out` は固定 shape)。
+        // `alpha=1`, `beta=0` overwrite なので `net_output` の事前内容は使われない (後続の
+        // `bias_add_per_row` が書き戻し)。残りの不変条件は L1 / L2 と同じ。
+        unsafe {
+            self.cublas.sgemm_fwd_rowmajor(
+                b_u32 as i32,
+                1_i32,
+                l2_out_u32 as i32,
+                self.ws.l2_acted.cu_deviceptr() as *const f32,
+                self.l3_w.cu_deviceptr() as *const f32,
+                self.ws.net_output.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
-            kernel: dense_mm_fwd,
+            kernel: bias_add_per_row,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b),
-            args: [
-                slice(self.ws.l2_acted),
-                slice(self.l3_w),
-                slice(self.l3_b),
-                slice_mut(self.ws.net_output),
-                b_u32, l2_out_u32, 1_u32
-            ]
+            args: [slice(self.l3_b), slice_mut(self.ws.net_output), b_u32, 1_u32]
         }?;
 
         // -- loss kernel (Σerr² を loss_acc に atomic accumulate)、`dy_net_output` に
@@ -10264,6 +10344,28 @@ impl SimpleGpuTrainer {
     /// 0 初期化する。dense weight (l1/l2/l3_w) は `dense_mm_bwd_weight` が overwrite
     /// 書きなので初期化不要。
     fn run_backward_kernels(&mut self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
+            self.stream.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let tick = |label: &str,
+                    stream: &CudaStream,
+                    t0: &mut Option<std::time::Instant>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(t) = t0 {
+                stream.synchronize()?;
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[step-profile]   {:<12} {:8.3} ms",
+                    label,
+                    now.duration_since(*t).as_secs_f64() * 1000.0
+                );
+                *t = now;
+            }
+            Ok(())
+        };
         let b_u32 = b as u32;
         let ft_out_u32 = self.id.ft_out as u32;
         let l1_in_u32 = (2 * self.id.ft_out) as u32;
@@ -10284,25 +10386,48 @@ impl SimpleGpuTrainer {
         memset_zero(&self.stream, &self.l1_b_grad)?;
         memset_zero(&self.stream, &self.l2_b_grad)?;
         memset_zero(&self.stream, &self.l3_b_grad)?;
+        tick("bwd_memset", &self.stream, &mut prof_t0)?;
 
         // ---- L3: dy_net_output (b × 1) -> dl2_acted (b × l2_out), l3_w_grad, l3_b_grad ----
-        cuda_launch! {
-            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
-            config: cfg_1d(b * self.id.l2_out),
-            args: [slice(self.ws.dy_net_output), slice(self.l3_w), slice_mut(self.ws.dl2_acted),
-                   b_u32, l2_out_u32, 1_u32]
-        }?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
-            config: cfg_1d(self.id.l2_out),
-            args: [slice(self.ws.l2_acted), slice(self.ws.dy_net_output), slice_mut(self.l3_w_grad),
-                   b_u32, l2_out_u32, 1_u32]
-        }?;
+        // bwd_input: dl2_acted[B, l2_out] = dy_net_output[B, 1] @ l3_w[l2_out, 1]^T
+        // bwd_weight: l3_w_grad[l2_out, 1] = l2_acted[B, l2_out]^T @ dy_net_output[B, 1]
+        // out_dim=1 で weight grad は thread = l2_out (= 数十) しか起動できない matmul
+        // shape のため、cuBLAS Sgemm に委譲して内部 Sgemv-相当 algorithm + B 軸並列で
+        // SM 占有率を稼ぐ (untiled kernel は in_dim*out_dim thread 駆動で 1 warp 規模)。
+        //
+        // SAFETY: 全 device pointer は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (`dy_net_output.len() >= b` / `dl2_acted.len() >= b*l2_out` / `l2_acted.len()
+        // >= b*l2_out` は `ws.check_batch_capacity(b)` で保証、weight grad `l3_w_grad.len()
+        // == l2_out` は固定 shape)、`self.cublas` は `self.stream` に bind 済。
+        // `alpha=1`, `beta=0` overwrite なので `dl2_acted` / `l3_w_grad` の事前内容は
+        // 使われない。cast 妥当性は L1/L2 と同じ前提 (256 byte aligned cuMemAlloc 由来、
+        // `self` 借用と同 lifetime)。
+        unsafe {
+            self.cublas.sgemm_x_yt_rowmajor(
+                b_u32 as i32,
+                l2_out_u32 as i32,
+                1_i32,
+                self.ws.dy_net_output.cu_deviceptr() as *const f32,
+                self.l3_w.cu_deviceptr() as *const f32,
+                self.ws.dl2_acted.cu_deviceptr() as *mut f32,
+            )?;
+        }
+        unsafe {
+            self.cublas.sgemm_xt_y_rowmajor(
+                l2_out_u32 as i32,
+                1_i32,
+                b_u32 as i32,
+                self.ws.l2_acted.cu_deviceptr() as *const f32,
+                self.ws.dy_net_output.cu_deviceptr() as *const f32,
+                self.l3_w_grad.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
             kernel: bias_grad, stream: self.stream, module: self.module,
             config: cfg_1d(b),
             args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
         }?;
+        tick("L3_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L2 activation grad: dl2_acted -> dl2_pre (kernel reads l2_pre) ----
         match self.id.activation {
@@ -10320,24 +10445,47 @@ impl SimpleGpuTrainer {
             }?,
         }
 
-        // ---- L2 dense backward: dl2_pre -> dl1_acted, l2_w_grad, l2_b_grad ----
-        cuda_launch! {
-            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
-            config: cfg_1d(b * self.id.l1_out),
-            args: [slice(self.ws.dl2_pre), slice(self.l2_w), slice_mut(self.ws.dl1_acted),
-                   b_u32, l1_out_u32, l2_out_u32]
-        }?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
-            config: cfg_1d(self.id.l1_out * self.id.l2_out),
-            args: [slice(self.ws.l1_acted), slice(self.ws.dl2_pre), slice_mut(self.l2_w_grad),
-                   b_u32, l1_out_u32, l2_out_u32]
-        }?;
+        // ---- L2 dense backward: dl2_pre -> dl1_acted (cuBLAS), l2_w_grad (cuBLAS),
+        //      l2_b_grad (kernel) ----
+        // bwd_input: dl1_acted[B, l1_out] = dl2_pre[B, l2_out] @ l2_w[l1_out, l2_out]^T
+        // bwd_weight: l2_w_grad[l1_out, l2_out] = l1_acted[B, l1_out]^T @ dl2_pre[B, l2_out]
+        // weight grad は thread = l1_out*l2_out 駆動で `B` を内側 loop に置く構造、
+        // 小 matmul shape (in_dim*out_dim が数百-千) で SM 占有率を稼げない。cuBLAS Sgemm
+        // は `B` を block 並列に展開できる algorithm を選ぶ。
+        //
+        // SAFETY: 全 device pointer は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (`dl2_pre.len() >= b*l2_out` / `dl1_acted.len() >= b*l1_out` / `l1_acted.len()
+        // >= b*l1_out` は `ws.check_batch_capacity(b)` で保証、weight grad `l2_w_grad.len()
+        // == l1_out*l2_out` は固定 shape)、`self.cublas` は `self.stream` に bind 済。
+        // `alpha=1`, `beta=0` overwrite なので `dl1_acted` / `l2_w_grad` の事前内容は
+        // 使われない。cast 妥当性は L1 と同じ前提 (256 byte aligned cuMemAlloc、`self`
+        // 借用と同 lifetime)。
+        unsafe {
+            self.cublas.sgemm_x_yt_rowmajor(
+                b_u32 as i32,
+                l1_out_u32 as i32,
+                l2_out_u32 as i32,
+                self.ws.dl2_pre.cu_deviceptr() as *const f32,
+                self.l2_w.cu_deviceptr() as *const f32,
+                self.ws.dl1_acted.cu_deviceptr() as *mut f32,
+            )?;
+        }
+        unsafe {
+            self.cublas.sgemm_xt_y_rowmajor(
+                l1_out_u32 as i32,
+                l2_out_u32 as i32,
+                b_u32 as i32,
+                self.ws.l1_acted.cu_deviceptr() as *const f32,
+                self.ws.dl2_pre.cu_deviceptr() as *const f32,
+                self.l2_w_grad.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
             kernel: bias_grad, stream: self.stream, module: self.module,
             config: cfg_1d(l2_n),
             args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
         }?;
+        tick("L2_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
         match self.id.activation {
@@ -10396,6 +10544,7 @@ impl SimpleGpuTrainer {
             config: cfg_1d(l1_n),
             args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
         }?;
+        tick("L1_dense", &self.stream, &mut prof_t0)?;
 
         // ---- Concat inverse: dcombined -> dft_stm_acted (offset 0) + dft_nstm_acted (offset ft_out) ----
         // slice_extract_2d args: (src, dst, batch, src_stride, src_offset, out_dim)。
@@ -10496,6 +10645,7 @@ impl SimpleGpuTrainer {
                 }
             }
         }
+        tick("bwd_ft_act", &self.stream, &mut prof_t0)?;
 
         // ---- FT bias grad + FT weight grad: stm/nstm の両 perspective が同じ ft_b / ft_w
         // を共有するため atomic accumulate (host が呼出前に 0 初期化)。
@@ -10562,6 +10712,7 @@ impl SimpleGpuTrainer {
                        b_u32, ft_out_u32, ft_in_u32, max_active_u32]
             }?;
         }
+        tick("bwd_ft_bw", &self.stream, &mut prof_t0)?;
 
         Ok(())
     }
