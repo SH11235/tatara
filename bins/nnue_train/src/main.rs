@@ -9918,6 +9918,28 @@ impl SimpleGpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
+            self.stream.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let tick = |label: &str,
+                    stream: &CudaStream,
+                    t0: &mut Option<std::time::Instant>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(t) = t0 {
+                stream.synchronize()?;
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[step-profile]   {:<12} {:8.3} ms",
+                    label,
+                    now.duration_since(*t).as_secs_f64() * 1000.0
+                );
+                *t = now;
+            }
+            Ok(())
+        };
         let b = batch.n_pos;
         let b_u32 = b as u32;
         let ft_out_u32 = self.id.ft_out as u32;
@@ -9943,6 +9965,7 @@ impl SimpleGpuTrainer {
 
         // -- loss_acc を 0 にリセット (再 alloc 無し) --
         memset_zero(&self.stream, &self.loss_acc)?;
+        tick("h2d_reset", &self.stream, &mut prof_t0)?;
 
         // -- sparse_ft_forward × 2 (stm, nstm)。1 thread = 4 row。
         // 3 path 分岐:
@@ -10044,6 +10067,7 @@ impl SimpleGpuTrainer {
                 ]
             }?;
         }
+        tick("fwd_ft", &self.stream, &mut prof_t0)?;
 
         // -- FT post = bias add + 活性化 + concat。
         // `ft_fp16_out` 時は `simple_bias_act_fwd_fp16_in_crelu` が bias 加算 + CReLU を
@@ -10172,6 +10196,7 @@ impl SimpleGpuTrainer {
                 b_u32, ft_out_u32, l1_in_u32, ft_out_u32
             ]
         }?;
+        tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
         // shape: combined[B, 2*ft_out] @ l1_w[2*ft_out, l1_out] → l1_pre[B, l1_out]、
@@ -10288,6 +10313,7 @@ impl SimpleGpuTrainer {
             config: cfg_1d(b),
             args: [slice(self.l3_b), slice_mut(self.ws.net_output), b_u32, 1_u32]
         }?;
+        tick("fwd_dense", &self.stream, &mut prof_t0)?;
 
         // -- loss kernel (Σerr² を loss_acc に atomic accumulate)、`dy_net_output` に
         // L3 出力への grad を書く。`wdl_lambda` で score/wdl ターゲットを blend する。
@@ -10336,6 +10362,7 @@ impl SimpleGpuTrainer {
                 }?;
             }
         }
+        tick("fwd_loss", &self.stream, &mut prof_t0)?;
         Ok(())
     }
 
