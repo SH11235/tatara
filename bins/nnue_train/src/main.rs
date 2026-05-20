@@ -8830,6 +8830,17 @@ struct SimpleArgs {
     /// 保証しない opt-in option。
     #[arg(long)]
     ft_fp16_out: bool,
+
+    /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
+    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、L1/L2/L3 dense
+    /// Sgemm の FP32 入力を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
+    /// (仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false` では
+    /// `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
+    ///
+    /// 仮数 13 bit 切り捨てで dense Sgemm の数値に影響するため、品質 conservative に
+    /// default OFF。LayerStack `--tf32` と同方針 (棋力 risk opt-in)。
+    #[arg(long)]
+    tf32: bool,
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -9620,6 +9631,7 @@ fn run_simple_training(
         cli.ft_fp16,
         simple_args.ft_fp16_out,
         cli.fp16_opt_state,
+        simple_args.tf32,
     )?;
 
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
@@ -9925,14 +9937,14 @@ impl SimpleGpuWorkspace {
 /// アーキの host driver。1 batch の forward → loss → backward → Ranger optimizer step
 /// を 8 weight group ({ft, l1, l2, l3} × {w, b}) について実行する。
 ///
-/// Simple は LayerStack と違い `MomentBuf` を使わず純 `DeviceBuffer<f32>` で
-/// optimizer state を持つ (`--fp16-opt-state` 非対応)。`--ft-fp16` /
-/// `--ft-fp16-out` / `--tf32` の risky 精度 flag も受理しない。
+/// `--ft-fp16` / `--ft-fp16-out` / `--fp16-opt-state` / `--tf32` の risky 精度系 flag は
+/// LayerStack と同形で opt-in (default OFF で FP32 bit-identical、ON で risky 最適化)。
 ///
-/// L1 dense (B × 2*ft_out × l1_out) は forward / bwd_input / bwd_weight 3 経路を
-/// cuBLAS Sgemm (CUBLAS_DEFAULT_MATH、TC 不使用の純 FP32) に乗せる。L2 / L3 は次元が
-/// 小さく untiled `dense_mm_*` で残す。FT は専用 `sparse_ft_*` kernel、活性化と loss
-/// は固有 kernel。
+/// L1 dense (B × 2*ft_out × l1_out) は forward / bwd_input / bwd_weight 3 経路を cuBLAS
+/// Sgemm に乗せる。default math mode は `CUBLAS_DEFAULT_MATH` (純 FP32、TC 不使用)、
+/// `--tf32` 指定で `CUBLAS_TF32_TENSOR_OP_MATH` (Ampere+ TC、仮数 10-bit 丸め)。L2 / L3
+/// は次元が小さく untiled `dense_mm_*` で残す。FT は専用 `sparse_ft_*` kernel、活性化と
+/// loss は固有 kernel。
 struct SimpleGpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -10066,6 +10078,7 @@ impl SimpleGpuTrainer {
         ft_fp16: bool,
         ft_fp16_out: bool,
         fp16_opt_state: bool,
+        tf32: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `--ft-fp16-out` は weight FP16 path の拡張なので `--ft-fp16` を含意する。CLI
         // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
@@ -10073,9 +10086,12 @@ impl SimpleGpuTrainer {
         debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
-        // CUBLAS_DEFAULT_MATH 固定 — TF32 を使うと L1 dense の精度が落ちて FP32 baseline
-        // と diverge する。Simple は default FP32 を厳密に保つ規約。
-        let cublas = CublasHandle::new(&stream, false)?;
+        // `tf32` (CLI の `--tf32`) で cuBLAS math mode 切替。default OFF は
+        // `CUBLAS_DEFAULT_MATH` (純 FP32 path、L1/L2/L3 dense Sgemm bit-identical)。
+        // `true` で `CUBLAS_TF32_TENSOR_OP_MATH` を有効化し Ampere+ TC を使う (Sgemm 高速化、
+        // 仮数 23-bit → 10-bit 丸めで数値挙動が変わる、棋力 risk opt-in)。LayerStack
+        // `--tf32` と同方針。
+        let cublas = CublasHandle::new(&stream, tf32)?;
 
         let ft_in = id.ft_in();
         let ft_out = id.ft_out;
@@ -12118,6 +12134,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
+        false,
     )?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
@@ -12157,6 +12174,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_screlu,
         smoke_weight_decay,
         smoke_fv_scale,
+        false,
         false,
         false,
         false,
@@ -12230,6 +12248,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
+        false,
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
     let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -12256,6 +12275,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id,
         smoke_weight_decay,
         smoke_fv_scale,
+        false,
         false,
         false,
         false,
@@ -12688,9 +12708,15 @@ mod cli_tests {
     }
 
     #[test]
-    fn layerstack_specific_arg_rejected_on_simple() {
-        // layerstack 固有引数 (--tf32) は simple サブコマンドでは未知でエラー。
-        assert!(Cli::try_parse_from(["nnue-train", "simple", "--tf32"]).is_err());
+    fn simple_accepts_tf32_flag() {
+        // `--tf32` は LayerStack / Simple 両 subcommand で受理される (両方 cuBLAS handle
+        // に同 flag を渡す opt-in)。default OFF / 渡せば ON で TF32 TC 有効化。
+        let cli = Cli::try_parse_from(["nnue-train", "simple", "--tf32"])
+            .expect("simple should accept --tf32");
+        match cli.arch {
+            ArchCommand::Simple(args) => assert!(args.tf32),
+            ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+        }
     }
 
     #[test]
