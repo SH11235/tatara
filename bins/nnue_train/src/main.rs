@@ -8919,9 +8919,10 @@ fn run_simple_training(
         )
         .into());
     }
-    if cli.ft_fp16 || cli.fp16_opt_state {
+    if cli.fp16_opt_state {
         return Err(
-            "--ft-fp16 / --fp16-opt-state are LayerStack-only (Simple is FP32 master only)".into(),
+            "--fp16-opt-state is LayerStack-only (Simple keeps optimizer state in FP32 master)"
+                .into(),
         );
     }
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
@@ -9044,7 +9045,14 @@ fn run_simple_training(
     // 有限・正値を保証済。
     let fv_scale =
         ((id.activation.qa() * nnue_format::simple_weights::QB) as f32 / cli.scale).round() as i32;
-    let mut trainer = SimpleGpuTrainer::new(&ctx, cli.batch_size, id, cli.weight_decay, fv_scale)?;
+    let mut trainer = SimpleGpuTrainer::new(
+        &ctx,
+        cli.batch_size,
+        id,
+        cli.weight_decay,
+        fv_scale,
+        cli.ft_fp16,
+    )?;
 
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
         if let Some(init) = &cli.init_from {
@@ -9067,6 +9075,11 @@ fn run_simple_training(
         } else {
             (None, None)
         };
+
+    // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
+    // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
+    // `--ft-fp16` 未指定なら no-op。
+    trainer.sync_ft_w_h_mirror()?;
 
     let start_superbatch = match cli.start_superbatch {
         Some(n) => n,
@@ -9299,6 +9312,15 @@ struct SimpleGpuTrainer {
     /// L1 dense (FP32) 用 cuBLAS handle (TF32 不使用、`CUBLAS_DEFAULT_MATH`)。
     /// stream に bind 済で同一 stream 内 in-order 実行。
     cublas: CublasHandle,
+    /// `--ft-fp16` opt-in flag。`true` の間 forward は `sparse_ft_forward_fp16`
+    /// (FP16 weight read) を使い、optimizer は `radam_step_fp16_mirror` /
+    /// `ranger_lookahead_lerp_fp16_mirror` で `ft_w` 更新と同時に `ft_w_h` を書く。
+    /// FP32 master `ft_w` / 量子化 checkpoint byte layout は不変。
+    ft_fp16: bool,
+    /// `ft_w` の FP16 mirror。`ft_fp16` が `true` のときだけ `Some`。`sparse_ft_forward_fp16`
+    /// の weight 入力で、`radam_step_fp16_mirror` が optimizer step ごとに同期する。
+    /// 学習開始時の初期同期は [`sync_ft_w_h_mirror`](Self::sync_ft_w_h_mirror) で。
+    ft_w_h: Option<DeviceBuffer<f16>>,
 
     // -- weight (FP32) --
     /// FT 重み (`ft_in × ft_out`、feature-major: `ft_w[feat*ft_out + out]`)。
@@ -9385,6 +9407,7 @@ impl SimpleGpuTrainer {
         id: SimpleId,
         weight_decay: f32,
         fv_scale: i32,
+        ft_fp16: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -9491,6 +9514,11 @@ impl SimpleGpuTrainer {
             l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            ft_w_h: if ft_fp16 {
+                Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
+            } else {
+                None
+            },
             stream,
             module,
             id,
@@ -9498,7 +9526,27 @@ impl SimpleGpuTrainer {
             weight_decay,
             fv_scale,
             cublas,
+            ft_fp16,
         })
+    }
+
+    /// 学習開始時の `ft_w_h` 初期同期。`ft_w_h` は `new` で zeroed 確保、optimizer
+    /// (`radam_step_fp16_mirror` / `ranger_lookahead_lerp_fp16_mirror`) が以後 step ごと
+    /// に維持するが、最初の forward の前に一度 `ft_w` (FP32 master) から cast しないと
+    /// mirror が全 0 で forward が trivial になる。`--init-from` / `--resume` で `ft_w`
+    /// を読み込んだ後にも呼ぶ。`ft_fp16` が無効 (`ft_w_h` が `None`) なら no-op。
+    fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            let ft_w_n = self.ws.ft_in * self.id.ft_out;
+            cuda_launch! {
+                kernel: cast_f32_to_f16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_w_n),
+                args: [slice(self.ft_w), slice_mut(ft_w_h), ft_w_n as u32]
+            }?;
+        }
+        Ok(())
     }
 
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
@@ -9600,31 +9648,65 @@ impl SimpleGpuTrainer {
         // -- loss_acc を 0 にリセット (再 alloc 無し) --
         memset_zero(&self.stream, &self.loss_acc)?;
 
-        // -- sparse_ft_forward × 2 (stm, nstm)。FP32 path、1 thread = 4 row --
-        cuda_launch! {
-            kernel: sparse_ft_forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * self.id.ft_out / 4),
-            args: [
-                slice(self.ft_w),
-                slice(self.ws.stm_idx_dev),
-                slice_mut(self.ws.ft_stm_out),
-                b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: sparse_ft_forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * self.id.ft_out / 4),
-            args: [
-                slice(self.ft_w),
-                slice(self.ws.nstm_idx_dev),
-                slice_mut(self.ws.ft_nstm_out),
-                b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-            ]
-        }?;
+        // -- sparse_ft_forward × 2 (stm, nstm)。1 thread = 4 row。
+        // `ft_fp16` 時は `ft_w_h` (FP16 mirror) を読む `sparse_ft_forward_fp16`、
+        // 既定では FP32 master `ft_w` を読む `sparse_ft_forward` を使う。出力 `ft_*_out`
+        // は両 path とも f32 (`--ft-fp16-out` は LayerStack のみで Simple は未実装)。
+        if self.ft_fp16 {
+            let ft_w_h = self
+                .ft_w_h
+                .as_ref()
+                .expect("ft_w_h is Some when ft_fp16 is enabled");
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.ft_out / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.stm_idx_dev),
+                    slice_mut(self.ws.ft_stm_out),
+                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.ft_out / 4),
+                args: [
+                    slice(ft_w_h),
+                    slice(self.ws.nstm_idx_dev),
+                    slice_mut(self.ws.ft_nstm_out),
+                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: sparse_ft_forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.ft_out / 4),
+                args: [
+                    slice(self.ft_w),
+                    slice(self.ws.stm_idx_dev),
+                    slice_mut(self.ws.ft_stm_out),
+                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.ft_out / 4),
+                args: [
+                    slice(self.ft_w),
+                    slice(self.ws.nstm_idx_dev),
+                    slice_mut(self.ws.ft_nstm_out),
+                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                ]
+            }?;
+        }
 
         // -- FT post = bias add + 活性化 + concat。LayerStack の
         // ft_post_perspective_fwd と違い pairwise / scale を含まないため、既存
@@ -10090,12 +10172,24 @@ impl SimpleGpuTrainer {
         let l3_w_n = l2_out as u32;
         let l3_b_n = 1_u32;
 
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
-            args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                   slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
-        }?;
+        // ft_w optimizer: `ft_fp16` 時は `radam_step_fp16_mirror` (FP32 master 更新 +
+        // `ft_w_h` への f16 cast を 1 kernel に融合) を使い、forward 用 mirror を同期する。
+        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            cuda_launch! {
+                kernel: radam_step_fp16_mirror, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_w_n as usize),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                       self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                       slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
+                       BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+            }?;
+        }
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
             args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
@@ -10140,11 +10234,22 @@ impl SimpleGpuTrainer {
         }?;
 
         if self.step_count.is_multiple_of(RANGER_K) {
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_w_n as usize),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n]
-            }?;
+            // ft_w lookahead lerp: lerp は radam の後に ft_w を再度書き換えるので、
+            // `ft_fp16` 時は mirror 同時更新版で `ft_w_h` を lerp 後の最終値に同期する。
+            if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp_fp16_mirror, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_w_n as usize),
+                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), slice_mut(ft_w_h),
+                           RANGER_ALPHA, ft_w_n]
+                }?;
+            } else {
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_w_n as usize),
+                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n]
+                }?;
+            }
             cuda_launch! {
                 kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
                 config: cfg_1d(ft_b_n as usize),
@@ -10745,8 +10850,14 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     };
     let smoke_fv_scale = 16_i32;
     let smoke_weight_decay = 1e-7_f32;
-    let mut trainer =
-        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
+    let mut trainer = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id,
+        smoke_weight_decay,
+        smoke_fv_scale,
+        false,
+    )?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
         + 2 * id.ft_out * id.l1_out
@@ -10785,6 +10896,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_screlu,
         smoke_weight_decay,
         smoke_fv_scale,
+        false,
     )?;
     let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
     println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
@@ -10846,8 +10958,14 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let mut trainer_q =
-        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
+    let mut trainer_q = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id,
+        smoke_weight_decay,
+        smoke_fv_scale,
+        false,
+    )?;
     trainer_q.load_simple_weights(&reloaded)?;
     let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
     println!(
@@ -10867,8 +10985,14 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     // raw checkpoint は f32 を bit-identical に保つので loss は完全一致するはず。
     let raw_path = std::env::temp_dir().join(format!("simple-smoke-{}.ckpt", std::process::id()));
     trainer.save_raw_checkpoint(&raw_path, 1, "smoke")?;
-    let mut trainer_r =
-        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
+    let mut trainer_r = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id,
+        smoke_weight_decay,
+        smoke_fv_scale,
+        false,
+    )?;
     let (sb, _producer) = trainer_r.load_raw_checkpoint(&raw_path)?;
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
