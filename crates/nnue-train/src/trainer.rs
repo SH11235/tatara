@@ -304,6 +304,13 @@ pub struct TrainingConfig {
     /// held-out validation 1 回あたりの検証局面数 (`batch_size` 単位に切り上げて
     /// 満タン batch を作る)。`test_data` が `None` のときは無視される。
     pub test_positions: usize,
+    /// dataloader worker で `ShogiProgressKPAbs::bucket_board` を計算して per-position
+    /// bucket を `Batch` と共に返すか。LayerStack (bucket-aware) は `true`、Simple
+    /// (bucket-less) は `false` で worker CPU 仕事を ~1 board 推論分削減できる。
+    /// `false` のとき backend に渡る `bucket_idx` は空 slice になるので backend は
+    /// 参照してはならない (Simple `TrainerBackend::train_step` は元から bucket_idx
+    /// を使わない契約)。
+    pub compute_bucket: bool,
 }
 
 impl TrainingConfig {
@@ -393,6 +400,7 @@ where
         cfg.threads,
         *progress,
         cfg.feature_set,
+        cfg.compute_bucket,
     )?;
 
     println!(
@@ -880,6 +888,7 @@ mod tests {
             threads: 2,
             test_data: None,
             test_positions: 0,
+            compute_bucket: true,
         }
     }
 

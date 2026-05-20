@@ -5309,12 +5309,16 @@ impl BatchData<'_> {
 
     /// `nnue-train` dataloader の `Batch` + per-position bucket から borrowed `BatchData`
     /// を作る (`.to_vec()` を避けて 22 MB の CPU memcpy を削減)。
+    ///
+    /// `bucket_idx` は `n_pos` 個 (bucket-aware backend / LayerStack) または **空 slice**
+    /// (bucket-less backend / Simple、`TrainingConfig::compute_bucket = false` で worker が
+    /// bucket 計算を skip した経路) のいずれかを受け取る。空の場合は backend が `bucket_idx`
+    /// を参照しない契約 (Simple `TrainerBackend::train_step` は元から bucket_idx を使わない)。
     fn from_batch_ref<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
         let n_pos = batch.n_positions;
-        assert_eq!(
-            bucket_idx.len(),
-            n_pos,
-            "bucket_idx len ({}) must equal batch.n_positions ({})",
+        assert!(
+            bucket_idx.is_empty() || bucket_idx.len() == n_pos,
+            "bucket_idx len ({}) must be 0 (bucket-less backend) or batch.n_positions ({})",
             bucket_idx.len(),
             n_pos
         );
@@ -9060,6 +9064,7 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
+        compute_bucket: true,
     };
 
     // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
@@ -9670,6 +9675,7 @@ fn run_simple_training(
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
+        compute_bucket: false,
     };
 
     let mut experiment = build_experiment_logger_simple(
