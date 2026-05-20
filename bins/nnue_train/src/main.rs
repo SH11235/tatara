@@ -5307,21 +5307,34 @@ impl BatchData<'_> {
         }
     }
 
-    /// `nnue-train` dataloader の `Batch` + per-position bucket から borrowed `BatchData`
-    /// を作る (`.to_vec()` を避けて 22 MB の CPU memcpy を削減)。
-    ///
-    /// `bucket_idx` は `n_pos` 個 (bucket-aware backend / LayerStack) または **空 slice**
-    /// (bucket-less backend / Simple、`TrainingConfig::compute_bucket = false` で worker が
-    /// bucket 計算を skip した経路) のいずれかを受け取る。空の場合は backend が `bucket_idx`
-    /// を参照しない契約 (Simple `TrainerBackend::train_step` は元から bucket_idx を使わない)。
+    /// bucket-aware backend (LayerStack) 用: `nnue-train` dataloader の `Batch` +
+    /// per-position bucket (= `n_pos` 個) から borrowed `BatchData` を作る (`.to_vec()` を
+    /// 避けて 22 MB の CPU memcpy を削減)。`bucket_idx.len() == n_pos` を厳密 assert する
+    /// ので、誤って空 slice を渡すと panic で検出される。
     fn from_batch_ref<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
         let n_pos = batch.n_positions;
-        assert!(
-            bucket_idx.is_empty() || bucket_idx.len() == n_pos,
-            "bucket_idx len ({}) must be 0 (bucket-less backend) or batch.n_positions ({})",
+        assert_eq!(
+            bucket_idx.len(),
+            n_pos,
+            "bucket_idx len ({}) must equal batch.n_positions ({})",
             bucket_idx.len(),
             n_pos
         );
+        Self::from_batch_inner(batch, bucket_idx)
+    }
+
+    /// bucket-less backend (Simple) 用: bucket_idx は空 slice。`TrainingConfig::compute_bucket
+    /// = false` で worker が bucket 計算を skip した経路で使う (`SimpleGpuTrainer::train_step`
+    /// は元から bucket_idx を参照しない契約のため空 slice で安全)。LayerStack 経路で誤って
+    /// 本 fn を呼ぶと bucket_idx 不在で backend kernel が読む先がなくなるが、それは
+    /// host driver の責任で本 fn 内は検査しない (LayerStack ↔ Simple の host driver は
+    /// 別 path で型混在しない)。
+    fn from_batch_ref_bucketless<'a>(batch: &'a Batch) -> BatchData<'a> {
+        Self::from_batch_inner(batch, &[])
+    }
+
+    fn from_batch_inner<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
+        let n_pos = batch.n_positions;
         let max_active = batch.feature_set.max_active();
         assert_eq!(
             batch.max_active,
@@ -12000,10 +12013,11 @@ impl TrainerBackend for SimpleGpuTrainer {
                 self.id.feature_set.canonical_name(),
             )));
         }
-        // Simple は bucket を持たないため `bucket_idx` を kernel に渡さないが、
-        // `BatchData::from_batch_ref` の length 検査を再利用するため field として
-        // 受け取る (実 kernel launch では参照しない)。
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        // Simple は bucket を持たないため `bucket_idx` を kernel に渡さない (caller の
+        // `TrainerBackend` 契約上は受け取るが、`from_batch_ref_bucketless` で空 slice 化
+        // して下流 backend が `bucket_idx` に触れない経路を強制する)。
+        let _ = bucket_idx;
+        let data = BatchData::from_batch_ref_bucketless(batch);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("SimpleGpuTrainer::step failed: {e}")))
     }
@@ -12022,7 +12036,8 @@ impl TrainerBackend for SimpleGpuTrainer {
                 self.id.feature_set.canonical_name(),
             )));
         }
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        let _ = bucket_idx;
+        let data = BatchData::from_batch_ref_bucketless(batch);
         let out = self.validate(&data, wdl_lambda, loss).map_err(|e| {
             std::io::Error::other(format!("SimpleGpuTrainer::validate failed: {e}"))
         })?;

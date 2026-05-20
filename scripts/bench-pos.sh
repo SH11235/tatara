@@ -86,7 +86,14 @@ if [[ ! -x "$BIN" ]]; then
   echo "error: $BIN が無い。先に 'cargo build -p nnue-trainer --release' を実行" >&2
   exit 1
 fi
-for f in "$DATA" "$PROG"; do
+# 入力ファイル存在確認: DATA は全 ARCH 共通、PROG は ARCH=layerstack 時のみ。
+# ARCH=simple では PROG 未設定でも error にならないよう ARCH ごとに分岐する
+# (set -u 下で `"$PROG"` の無条件展開を避けるためでもある)。
+input_files=("$DATA")
+if [[ "$ARCH" == "layerstack" ]]; then
+  input_files+=("$PROG")
+fi
+for f in "${input_files[@]}"; do
   if [[ ! -f "$f" ]]; then
     echo "error: 入力ファイルが無い: $f" >&2
     exit 1
