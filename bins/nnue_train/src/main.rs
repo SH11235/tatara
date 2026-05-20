@@ -9702,6 +9702,12 @@ struct SimpleGpuTrainer {
     ws: SimpleGpuWorkspace,
     /// loss kernel が atomic add する Σerr² (f64、1 要素)。
     loss_acc: DeviceBuffer<f64>,
+    /// `step()` 末の `loss_acc` 同期読みを 1-step lag な async D2H に置換する pinned
+    /// host ring。host が `stream.synchronize` 待ち無しで次 batch の launch を発行できる
+    /// ようになる。sb 末で [`TrainerBackend::flush_pending_loss`] が drain する
+    /// (default `0.0` を本 trainer は override する)。`forward` / `validate` の同期
+    /// read 経路は ring を介さず loss_acc を直接読む。
+    loss_ring: AsyncLossRing,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
     /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
@@ -9842,6 +9848,7 @@ impl SimpleGpuTrainer {
             l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            loss_ring: AsyncLossRing::new(ctx)?,
             ft_w_h: if ft_fp16 {
                 Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
             } else {
@@ -9982,7 +9989,14 @@ impl SimpleGpuTrainer {
             *t0 = now;
         }
 
-        let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        // `loss_acc` の host 読みを [`AsyncLossRing`] 経由で async + 1-step lag に
+        // する。pinned host cell に `memcpy_dtoh_async` + event record、前 step の
+        // event を sync して 1 step 遅れで loss を返す (step 0 は warmup として 0.0、
+        // sb 末で [`TrainerBackend::flush_pending_loss`] が最終 step 分を drain する)。
+        // host は次 batch の launch 発行で `stream.synchronize` 相当の block 待ちが消える。
+        let loss = self
+            .loss_ring
+            .read_and_queue_next(&self.stream, &self.loss_acc)?;
         if let Some(ref t0) = prof_t0 {
             let now = std::time::Instant::now();
             eprintln!(
@@ -9992,7 +10006,7 @@ impl SimpleGpuTrainer {
             );
         }
 
-        Ok(loss_host[0])
+        Ok(loss)
     }
 
     /// forward kernel 列のみを走らせる (loss は host 同期 read しない)。`forward` /
@@ -11669,6 +11683,14 @@ impl TrainerBackend for SimpleGpuTrainer {
         Ok(ValidationStepOutput {
             sum_sq_err: out.loss,
             net_output: out.net_output,
+        })
+    }
+
+    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+        self.loss_ring.flush_pending_loss().map_err(|e| {
+            std::io::Error::other(format!(
+                "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {e}"
+            ))
         })
     }
 
