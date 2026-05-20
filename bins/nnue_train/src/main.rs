@@ -9100,12 +9100,6 @@ fn run_simple_training(
         )
         .into());
     }
-    if cli.fp16_opt_state {
-        return Err(
-            "--fp16-opt-state is LayerStack-only (Simple keeps optimizer state in FP32 master)"
-                .into(),
-        );
-    }
     // `--ft-fp16-out` は FP16 weight mirror 経路の上に積む拡張で、`--ft-fp16` を要求する。
     if simple_args.ft_fp16_out && !cli.ft_fp16 {
         return Err(
@@ -9252,6 +9246,7 @@ fn run_simple_training(
         fv_scale,
         cli.ft_fp16,
         simple_args.ft_fp16_out,
+        cli.fp16_opt_state,
     )?;
 
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
@@ -9554,6 +9549,11 @@ struct SimpleGpuTrainer {
     /// CLI 検証段階で activation = CReLU を要求する。dft は loss scaling で f16 域に
     /// 持ち上げる ([`FT_DFT_FP16_BASE_SCALE`] × batch、±65504 clamp 付き)。
     ft_fp16_out: bool,
+    /// `--fp16-opt-state` opt-in flag。`true` の間 `ft_w_m` / `ft_w_v` を [`MomentBuf::F16`]
+    /// で確保し、optimizer step は [`radam_step_f16state`] / [`radam_step_f16state_mirror`]
+    /// で動かす。FT 以外の moment は変更なし。raw checkpoint format は不変 (真値 f32 で
+    /// 書き出し、resume 時に当該 run の精度へ再 quantize する)。
+    fp16_opt_state: bool,
 
     // -- weight (FP32) --
     /// FT 重み (`ft_in × ft_out`、feature-major: `ft_w[feat*ft_out + out]`)。
@@ -9586,8 +9586,10 @@ struct SimpleGpuTrainer {
     l3_b_grad: DeviceBuffer<f32>,
 
     // -- Ranger optimizer state (RAdam 1st/2nd moment + Lookahead slow weight、各 weight と同 shape) --
-    ft_w_m: DeviceBuffer<f32>,
-    ft_w_v: DeviceBuffer<f32>,
+    /// FT Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    /// 他 7 group の moment buffer は小さく `f16` 化の意味が無いので `f32` のまま。
+    ft_w_m: MomentBuf,
+    ft_w_v: MomentBuf,
     ft_w_slow: DeviceBuffer<f32>,
     ft_b_m: DeviceBuffer<f32>,
     ft_b_v: DeviceBuffer<f32>,
@@ -9634,6 +9636,7 @@ impl Drop for SimpleGpuTrainer {
 }
 
 impl SimpleGpuTrainer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
@@ -9642,6 +9645,7 @@ impl SimpleGpuTrainer {
         fv_scale: i32,
         ft_fp16: bool,
         ft_fp16_out: bool,
+        fp16_opt_state: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `--ft-fp16-out` は weight FP16 path の拡張なので `--ft-fp16` を含意する。CLI
         // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
@@ -9726,8 +9730,8 @@ impl SimpleGpuTrainer {
             l2_b_grad: z(l2_b_n)?,
             l3_w_grad: z(l3_w_n)?,
             l3_b_grad: z(l3_b_n)?,
-            ft_w_m: z(ft_w_n)?,
-            ft_w_v: z(ft_w_n)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
             ft_w_slow,
             ft_b_m: z(ft_b_n)?,
             ft_b_v: z(ft_b_n)?,
@@ -9766,6 +9770,7 @@ impl SimpleGpuTrainer {
             cublas,
             ft_fp16,
             ft_fp16_out,
+            fp16_opt_state,
         })
     }
 
@@ -10582,24 +10587,60 @@ impl SimpleGpuTrainer {
         let l3_w_n = l2_out as u32;
         let l3_b_n = 1_u32;
 
-        // ft_w optimizer: `ft_fp16` 時は `radam_step_fp16_mirror` (FP32 master 更新 +
-        // `ft_w_h` への f16 cast を 1 kernel に融合) を使い、forward 用 mirror を同期する。
-        if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-            cuda_launch! {
-                kernel: radam_step_fp16_mirror, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_w_n as usize),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                       self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
-            }?;
-        } else {
-            cuda_launch! {
-                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
-                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
-                       slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
-            }?;
+        // ft_w optimizer: 2 つの opt-in flag で 4 通りに分岐する (LayerStack と同じパターン)。
+        //  - `--ft-fp16`: FP16 mirror (`ft_w_h`) 同時更新版 (`*_mirror`) を使い、forward 用
+        //    mirror を別 cast kernel 無しで同期する。
+        //  - `--fp16-opt-state`: m / v を `f16` で読み書きする `*_f16state` 系を使う (DRAM
+        //    traffic 半減、`FT_OPT_M_SCALE` / `FT_OPT_V_SCALE` で scale 付き格納)。
+        // 他 7 group は moment が小さく `f16` 化の意味が無いので常に `radam_step`。
+        match (&mut self.ft_w_m, &mut self.ft_w_v) {
+            (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
+                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                    cuda_launch! {
+                        kernel: radam_step_f16state_mirror,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: radam_step_f16state,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), lr, step_size, denom,
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                    }?;
+                }
+            }
+            (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
+                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                    cuda_launch! {
+                        kernel: radam_step_fp16_mirror, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: radam_step, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                               slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
+                               BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+                    }?;
+                }
+            }
+            _ => unreachable!("ft_w m and v moment buffers always share precision"),
         }
+
+        // 残り 7 group (ft_b, l1_w/b, l2_w/b, l3_w/b) は moment buffer 縮小余地が無いので
+        // 常に FP32 master + `radam_step`。FT 以外の `f16` 化は本フラグの範囲外。
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
             args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
@@ -10821,9 +10862,12 @@ impl SimpleGpuTrainer {
         self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
 
         // m / v / grad を 0 リセット、step_count を 0 に戻す (Ranger を最初から)。
+        // ft_w の m / v は [`MomentBuf`] で `--fp16-opt-state` 精度を保つため `zeroed`
+        // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。
+        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
+        self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         for buf in [
-            &self.ft_w_m,
-            &self.ft_w_v,
             &self.ft_w_grad,
             &self.ft_b_m,
             &self.ft_b_v,
@@ -10898,9 +10942,12 @@ impl SimpleGpuTrainer {
             self.id.l1_out as u64,
             self.id.l2_out as u64,
         ];
+        let ft_w_n = self.id.ft_in() * self.id.ft_out;
 
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+            // header (magic 〜 num_groups)。format 上の group 数は ft_w (個別処理) +
+            // `raw_ckpt_groups` の 7 = 8 (Simple は 8 weight group)。
             write_raw_ckpt_header(
                 &mut w,
                 &RawCkptArch {
@@ -10912,8 +10959,38 @@ impl SimpleGpuTrainer {
                 run_id,
                 superbatch as u64,
                 self.step_count,
-                groups.len() as u64,
+                (groups.len() + 1) as u64,
             )?;
+
+            // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
+            // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
+            // resume 時に当該 run の精度へ再 quantize される)。LayerStack の同 file format
+            // 規約と同じ。
+            {
+                let w_host = self.ft_w.to_host_vec(&self.stream)?;
+                let m_host = self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)?;
+                let v_host = self.ft_w_v.to_host_f32(&self.stream, FT_OPT_V_SCALE)?;
+                let slow_host = self.ft_w_slow.to_host_vec(&self.stream)?;
+                for (label, got) in [
+                    ("w", w_host.len()),
+                    ("m", m_host.len()),
+                    ("v", v_host.len()),
+                    ("slow", slow_host.len()),
+                ] {
+                    if got != ft_w_n {
+                        return Err(format!(
+                            "raw checkpoint: group ft_w {label} buffer len {got} != expected {ft_w_n}"
+                        )
+                        .into());
+                    }
+                }
+                w.write_all(&(ft_w_n as u64).to_le_bytes())?;
+                write_f32_slice(&mut w, &w_host)?;
+                write_f32_slice(&mut w, &m_host)?;
+                write_f32_slice(&mut w, &v_host)?;
+                write_f32_slice(&mut w, &slow_host)?;
+            }
+
             for (name, expected_len, w_buf, m_buf, v_buf, slow_buf) in groups {
                 let w_host = w_buf.to_host_vec(&self.stream)?;
                 let m_host = m_buf.to_host_vec(&self.stream)?;
@@ -10979,7 +11056,8 @@ impl SimpleGpuTrainer {
             },
         )?;
 
-        let expected_groups: [(&'static str, usize); 8] = {
+        // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 7 = 8。
+        let expected_groups: [(&'static str, usize); 7] = {
             let g = self.raw_ckpt_groups();
             [
                 (g[0].0, g[0].1),
@@ -10989,14 +11067,13 @@ impl SimpleGpuTrainer {
                 (g[4].0, g[4].1),
                 (g[5].0, g[5].1),
                 (g[6].0, g[6].1),
-                (g[7].0, g[7].1),
             ]
         };
-        if header.num_groups != expected_groups.len() as u64 {
+        let total_groups = expected_groups.len() + 1;
+        if header.num_groups != total_groups as u64 {
             return Err(invalid_data(format!(
-                "raw checkpoint num_groups {} != expected {}",
-                header.num_groups,
-                expected_groups.len()
+                "raw checkpoint num_groups {} != expected {total_groups}",
+                header.num_groups
             )));
         }
 
@@ -11025,10 +11102,22 @@ impl SimpleGpuTrainer {
             Ok((w_host, m_host, v_host, slow_host))
         };
 
+        // group 0 は ft_w (個別処理、`m` / `v` は当該 run の精度へ再 quantize)。
+        let ft_w_loaded = read_group(&mut r, "ft_w", self.id.ft_in() * self.id.ft_out)?;
         let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
         for (name, expected_len) in expected_groups {
             loaded.push(read_group(&mut r, name, expected_len)?);
         }
+
+        // host → device upload。ft_w の m / v は `--fp16-opt-state` の現在精度へ
+        // 量子化して載せ直す (checkpoint は真値 f32、mode 非依存)。
+        let (ftw_w, ftw_m, ftw_v, ftw_slow) = &ft_w_loaded;
+        self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
+        self.ft_w_m =
+            MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
+        self.ft_w_v =
+            MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
+        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
 
         macro_rules! up {
             ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
@@ -11039,24 +11128,23 @@ impl SimpleGpuTrainer {
                 self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
             }};
         }
-        up!(0, ft_w, ft_w_m, ft_w_v, ft_w_slow);
-        up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
-        up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
-        up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
-        up!(4, l2_w, l2_w_m, l2_w_v, l2_w_slow);
-        up!(5, l2_b, l2_b_m, l2_b_v, l2_b_slow);
-        up!(6, l3_w, l3_w_m, l3_w_v, l3_w_slow);
-        up!(7, l3_b, l3_b_m, l3_b_v, l3_b_slow);
+        up!(0, ft_b, ft_b_m, ft_b_v, ft_b_slow);
+        up!(1, l1_w, l1_w_m, l1_w_v, l1_w_slow);
+        up!(2, l1_b, l1_b_m, l1_b_v, l1_b_slow);
+        up!(3, l2_w, l2_w_m, l2_w_v, l2_w_slow);
+        up!(4, l2_b, l2_b_m, l2_b_v, l2_b_slow);
+        up!(5, l3_w, l3_w_m, l3_w_v, l3_w_slow);
+        up!(6, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = header.step_count;
         Ok((header.superbatch, header.producer_run_id))
     }
 
-    /// `save_raw_checkpoint` / `load_raw_checkpoint` で iterate する 8 weight group の
-    /// `(name, len, w, m, v, slow)`。順序は file format の固定順 (load 側が同じ並びで
-    /// upload する)。
-    fn raw_ckpt_groups(&self) -> [SimpleRawCkptGroupEntry<'_>; 8] {
-        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+    /// `save_raw_checkpoint` / `load_raw_checkpoint` で iterate する 7 weight group の
+    /// `(name, len, w, m, v, slow)`。ft_w は `m` / `v` が [`MomentBuf`] (`f32`/`f16`) で
+    /// 型が異なるため本 array から除外し、save/load 側で個別処理する (format の group
+    /// 順は ft_w が先頭で不変)。
+    fn raw_ckpt_groups(&self) -> [SimpleRawCkptGroupEntry<'_>; 7] {
         let ft_b_n = self.id.ft_out;
         let l1_w_n = 2 * self.id.ft_out * self.id.l1_out;
         let l1_b_n = self.id.l1_out;
@@ -11065,14 +11153,6 @@ impl SimpleGpuTrainer {
         let l3_w_n = self.id.l2_out;
         let l3_b_n = 1;
         [
-            (
-                "ft_w",
-                ft_w_n,
-                &self.ft_w,
-                &self.ft_w_m,
-                &self.ft_w_v,
-                &self.ft_w_slow,
-            ),
             (
                 "ft_b",
                 ft_b_n,
@@ -11268,6 +11348,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_fv_scale,
         false,
         false,
+        false,
     )?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
@@ -11307,6 +11388,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_screlu,
         smoke_weight_decay,
         smoke_fv_scale,
+        false,
         false,
         false,
     )?;
@@ -11378,6 +11460,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_fv_scale,
         false,
         false,
+        false,
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
     let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -11404,6 +11487,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id,
         smoke_weight_decay,
         smoke_fv_scale,
+        false,
         false,
         false,
     )?;
