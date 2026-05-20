@@ -5736,9 +5736,10 @@ impl Drop for AsyncLossRing {
 struct InputUploadRing {
     copy_stream: std::sync::Arc<CudaStream>,
     // pinned host staging。stm/nstm は `batch * max_active`、bucket/score/wdl は `batch`。
+    // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
-    pinned_bucket: [*mut i32; 2],
+    pinned_bucket: Option<[*mut i32; 2]>,
     pinned_score: [*mut f32; 2],
     pinned_wdl: [*mut f32; 2],
     /// 各 slot の H2D 完了 event (copy stream に record)。compute stream が forward 前に待つ。
@@ -5763,21 +5764,46 @@ struct InputUploadRing {
 unsafe impl Send for InputUploadRing {}
 
 impl InputUploadRing {
-    /// copy stream + 2-slot pinned buffer + event を確保する。`batch` は最大 position 数、
-    /// `max_active` は 1 perspective あたりの active feature 数 (feature set 依存)。
+    /// LayerStack 用: copy stream + 2-slot pinned buffer + event を確保する (bucket あり)。
+    /// `batch` は最大 position 数、`max_active` は 1 perspective あたりの active feature 数
+    /// (feature set 依存)。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch: usize,
         max_active: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(ctx, batch, max_active, true)
+    }
+
+    /// Simple アーキ用: bucket buffer を確保しないバリアント。Simple は bucket-less 入力
+    /// で kernel への bucket dispatch も無いため、bucket H2D 経路自体を持たない。
+    fn new_simple(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch: usize,
+        max_active: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(ctx, batch, max_active, false)
+    }
+
+    fn new_inner(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch: usize,
+        max_active: usize,
+        has_bucket: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let copy_stream = ctx.new_stream()?;
         let cap_idx = batch.max(1) * max_active;
         let cap_scalar = batch.max(1);
+        let pinned_bucket = if has_bucket {
+            Some(alloc_pinned_host::<i32>(cap_scalar)?)
+        } else {
+            None
+        };
         Ok(Self {
             copy_stream,
             pinned_stm: alloc_pinned_host::<i32>(cap_idx)?,
             pinned_nstm: alloc_pinned_host::<i32>(cap_idx)?,
-            pinned_bucket: alloc_pinned_host::<i32>(cap_scalar)?,
+            pinned_bucket,
             pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
             pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
             h2d_done: [ctx.new_event(None)?, ctx.new_event(None)?],
@@ -5835,6 +5861,10 @@ impl InputUploadRing {
             // にする。
             self.h2d_done[slot].synchronize()?;
         }
+        let pinned_bucket = self
+            .pinned_bucket
+            .as_ref()
+            .expect("InputUploadRing::upload (LayerStack) requires bucket-enabled ring");
         // host: Vec → pinned[slot]。
         // SAFETY: pinned[slot] は cuMemHostAlloc で cap 要素確保した有効 host memory、
         // 上の assert で `src.len() <= cap` を保証。src (Vec) / dst (pinned) は別領域。
@@ -5842,11 +5872,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
-            std::ptr::copy_nonoverlapping(
-                h_bucket.as_ptr(),
-                self.pinned_bucket[slot],
-                h_bucket.len(),
-            );
+            std::ptr::copy_nonoverlapping(h_bucket.as_ptr(), pinned_bucket[slot], h_bucket.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
         }
@@ -5869,7 +5895,7 @@ impl InputUploadRing {
             copy_host_to_device_async_i32(
                 cs,
                 dev_bucket,
-                std::slice::from_raw_parts(self.pinned_bucket[slot], h_bucket.len()),
+                std::slice::from_raw_parts(pinned_bucket[slot], h_bucket.len()),
             )?;
             copy_host_to_device_async_f32(
                 cs,
@@ -5884,6 +5910,82 @@ impl InputUploadRing {
         }
         self.h2d_done[slot].record(cs)?;
         // compute stream は H2D 完了後に forward が input を読むよう待つ。
+        compute_stream.wait(&self.h2d_done[slot])?;
+        Ok(())
+    }
+
+    /// Simple アーキ用 upload: bucket buffer を持たない 4 buffer 版 (stm/nstm/score/wdl)。
+    /// 動作セマンティクスは [`upload`](Self::upload) と同じ — caller が active/back を
+    /// `mem::swap` 済の `dev_*` に対し pinned 経由 copy stream で先行 H2D し、compute
+    /// stream に H2D 完了を待たせる。
+    #[allow(clippy::too_many_arguments)]
+    fn upload_simple(
+        &mut self,
+        compute_stream: &CudaStream,
+        dev_stm: &DeviceBuffer<i32>,
+        h_stm: &[i32],
+        dev_nstm: &DeviceBuffer<i32>,
+        h_nstm: &[i32],
+        dev_score: &DeviceBuffer<f32>,
+        h_score: &[f32],
+        dev_wdl: &DeviceBuffer<f32>,
+        h_wdl: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            self.pinned_bucket.is_none(),
+            "InputUploadRing::upload_simple called on bucket-enabled ring (LayerStack); \
+             use InputUploadRing::new_simple to construct the ring"
+        );
+        assert!(
+            h_stm.len() <= self.cap_idx && h_nstm.len() <= self.cap_idx,
+            "input batch ({} idx) exceeds pinned capacity {}",
+            h_stm.len().max(h_nstm.len()),
+            self.cap_idx
+        );
+        assert!(
+            h_score.len() <= self.cap_scalar && h_wdl.len() <= self.cap_scalar,
+            "input batch (scalar) exceeds pinned capacity {}",
+            self.cap_scalar
+        );
+        let slot = self.step % 2;
+        if self.step >= 2 {
+            self.copy_stream.wait(&self.step_done[slot])?;
+            self.h2d_done[slot].synchronize()?;
+        }
+        // SAFETY: pinned[slot] は cap 要素確保済 host memory、上 assert で `src.len() <= cap` を
+        // 保証。step >= 2 の slot は h2d_done sync で前回 H2D 完了済。
+        unsafe {
+            std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
+            std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
+            std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
+        }
+        let cs: &CudaStream = &self.copy_stream;
+        // SAFETY: pinned[slot] は直上で先頭 `h_*.len()` 要素を初期化済、`from_raw_parts`
+        // で `src.len() <= dev.len()` を満たすよう slice 化 (helper が assert)。
+        unsafe {
+            copy_host_to_device_async_i32(
+                cs,
+                dev_stm,
+                std::slice::from_raw_parts(self.pinned_stm[slot], h_stm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nstm,
+                std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_score,
+                std::slice::from_raw_parts(self.pinned_score[slot], h_score.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_wdl,
+                std::slice::from_raw_parts(self.pinned_wdl[slot], h_wdl.len()),
+            )?;
+        }
+        self.h2d_done[slot].record(cs)?;
         compute_stream.wait(&self.h2d_done[slot])?;
         Ok(())
     }
@@ -5908,11 +6010,15 @@ impl Drop for InputUploadRing {
         // pinned を free する前に in-flight な H2D を完了させる。copy stream を sync
         // すれば全 H2D が完了する。失敗は無視 (Drop 中の error 報告は実用上困難)。
         let _ = self.copy_stream.synchronize();
+        let bucket_slots: &[*mut i32] = match self.pinned_bucket.as_ref() {
+            Some(slots) => slots.as_slice(),
+            None => &[],
+        };
         for slot in self
             .pinned_stm
             .iter()
             .chain(self.pinned_nstm.iter())
-            .chain(self.pinned_bucket.iter())
+            .chain(bucket_slots.iter())
         {
             if !slot.is_null() {
                 // SAFETY: cuMemHostAlloc で確保した pointer を cuMemFreeHost で解放。
@@ -9513,8 +9619,10 @@ struct SimpleGpuWorkspace {
     /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
     feat_positions: DeviceBuffer<u32>,
 
-    // -- 入力 buffer --
-    /// stm sparse index (`b × max_active`、無効 slot は -1)。
+    // -- 入力 buffer (active / back ペア。`InputUploadRing` の double-buffer 規約) --
+    /// stm sparse index (`b × max_active`、無効 slot は -1)。active 側 = 現 step が forward
+    /// で read する物理 buffer。`step` 冒頭で back と `mem::swap` してから ring が back
+    /// (旧 active = 直前 step が読んでいない側) に async H2D する。
     stm_idx_dev: DeviceBuffer<i32>,
     /// 同 nstm。
     nstm_idx_dev: DeviceBuffer<i32>,
@@ -9522,6 +9630,13 @@ struct SimpleGpuWorkspace {
     score_dev: DeviceBuffer<f32>,
     /// target wdl (`b`、0.0/0.5/1.0)。
     wdl_dev: DeviceBuffer<f32>,
+    /// 同上、back 側物理 buffer。次 step の H2D 先 (`step` 冒頭で `mem::swap` で active
+    /// へ昇格)。直前 step の compute が読んでいる active と物理分離されるため、H2D は
+    /// 直前 step の compute と並走しても buffer 競合が起きない。
+    stm_idx_dev_back: DeviceBuffer<i32>,
+    nstm_idx_dev_back: DeviceBuffer<i32>,
+    score_dev_back: DeviceBuffer<f32>,
+    wdl_dev_back: DeviceBuffer<f32>,
 }
 
 impl SimpleGpuWorkspace {
@@ -9582,6 +9697,10 @@ impl SimpleGpuWorkspace {
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
         })
     }
 
@@ -9708,6 +9827,12 @@ struct SimpleGpuTrainer {
     /// (default `0.0` を本 trainer は override する)。`forward` / `validate` の同期
     /// read 経路は ring を介さず loss_acc を直接読む。
     loss_ring: AsyncLossRing,
+    /// `step()` 先頭の入力 H2D (`stm/nstm idx` + `score/wdl` の 4 buffer、Simple は
+    /// bucket 無し) を専用 copy stream で直前 step の compute と overlap させる ring。
+    /// [`AsyncLossRing`] による host run-ahead と組合せて compute と H2D を同時実行する。
+    /// `forward` / `validate` の同期 read 経路は ring を介さず直接 H2D する (1-shot で
+    /// 後続 backward / optimizer が無いため overlap 余地が薄い)。
+    input_ring: InputUploadRing,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
     /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
@@ -9721,9 +9846,11 @@ struct SimpleGpuTrainer {
 
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
-        // device buffer 解放前に stream 上の in-flight 操作を排出する
-        // (GpuTrainer と同じ規約: field drop 順による race を回避)。
+        // device buffer 解放前に compute / copy 両 stream の in-flight 操作を排出する
+        // (GpuTrainer と同じ規約: field drop 順による race を回避)。`input_ring` の
+        // copy stream H2D が `ws` の入力 buffer を write 中の解放を防ぐため。
         let _ = self.stream.synchronize();
+        let _ = self.input_ring.copy_stream.synchronize();
     }
 }
 
@@ -9849,6 +9976,7 @@ impl SimpleGpuTrainer {
             ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
+            input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
             ft_w_h: if ft_fp16 {
                 Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
             } else {
@@ -9922,7 +10050,7 @@ impl SimpleGpuTrainer {
             return Ok(0.0);
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(loss_host[0])
     }
@@ -9953,7 +10081,29 @@ impl SimpleGpuTrainer {
             None
         };
 
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        // 入力 4 buffer の H2D を `InputUploadRing` 経由で発行する。active / back を
+        // `mem::swap` してから back (= 直前 step が読んでいない側の物理 buffer) へ専用
+        // copy stream で先行 H2D。pageable な `BatchData` slice は ring 内の pinned host
+        // を経由して copy engine の DMA に載り、compute stream は H2D 完了 event を
+        // 待ってから forward に進む ([`AsyncLossRing`] による host run-ahead と組合せて
+        // h2d_reset を直前 step の compute と並走させる)。
+        std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
+        std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
+        self.input_ring.upload_simple(
+            &self.stream,
+            &self.ws.stm_idx_dev,
+            &batch.stm_indices[..b * self.ws.max_active],
+            &self.ws.nstm_idx_dev,
+            &batch.nstm_indices[..b * self.ws.max_active],
+            &self.ws.score_dev,
+            &batch.score[..b],
+            &self.ws.wdl_dev,
+            &batch.wdl[..b],
+        )?;
+
+        self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
         if let Some(ref mut t0) = prof_t0 {
             self.stream.synchronize()?;
             let now = std::time::Instant::now();
@@ -9989,6 +10139,11 @@ impl SimpleGpuTrainer {
             *t0 = now;
         }
 
+        // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の
+        // event に記録する。同じ物理 input buffer を使う step+2 の H2D がこれを待ち、
+        // in-flight な compute が読む buffer を H2D が上書きする race を防ぐ。
+        self.input_ring.mark_step_done(&self.stream)?;
+
         // `loss_acc` の host 読みを [`AsyncLossRing`] 経由で async + 1-step lag に
         // する。pinned host cell に `memcpy_dtoh_async` + event record、前 step の
         // event を sync して 1 step 遅れで loss を返す (step 0 は warmup として 0.0、
@@ -10012,11 +10167,18 @@ impl SimpleGpuTrainer {
     /// forward kernel 列のみを走らせる (loss は host 同期 read しない)。`forward` /
     /// `step` 共通の前段で、終了時 `net_output` / `dy_net_output` / `loss_acc` が device
     /// 上に書かれている。caller が batch capacity を事前検査する責務。
+    ///
+    /// `inputs_uploaded_externally` が `true` のとき caller (= `step`) が直前に
+    /// [`InputUploadRing`] で `ws.{stm,nstm}_idx_dev` / `ws.{score,wdl}_dev` への H2D
+    /// を queue 済とみなし、本 method 内では H2D を発行しない (compute stream は ring
+    /// の `h2d_done` event 経由で H2D 完了を既に待つ)。`false` のとき (`forward` /
+    /// `validate` 経路) は同期 H2D を default stream 上で発行する。
     fn run_forward_kernels(
         &mut self,
         batch: &BatchData,
         wdl_lambda: f32,
         loss: LossKind,
+        inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
@@ -10050,18 +10212,23 @@ impl SimpleGpuTrainer {
         let ft_n_u32 = ft_n as u32;
 
         // -- H2D upload (default stream 上の async memcpy、launch 列に直列で並ぶ) --
-        copy_host_to_device_async_i32(
-            &self.stream,
-            &self.ws.stm_idx_dev,
-            &batch.stm_indices[..b * self.ws.max_active],
-        )?;
-        copy_host_to_device_async_i32(
-            &self.stream,
-            &self.ws.nstm_idx_dev,
-            &batch.nstm_indices[..b * self.ws.max_active],
-        )?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+        // ring 経路では caller (= `step`) が swap + `input_ring.upload_simple` で
+        // copy stream に H2D を発行済で、`compute_stream.wait(h2d_done)` で本 stream に
+        // 完了待ちが乗っているため、ここでの H2D は不要。
+        if !inputs_uploaded_externally {
+            copy_host_to_device_async_i32(
+                &self.stream,
+                &self.ws.stm_idx_dev,
+                &batch.stm_indices[..b * self.ws.max_active],
+            )?;
+            copy_host_to_device_async_i32(
+                &self.stream,
+                &self.ws.nstm_idx_dev,
+                &batch.nstm_indices[..b * self.ws.max_active],
+            )?;
+            copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
+            copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+        }
 
         // -- loss_acc を 0 にリセット (再 alloc 無し) --
         memset_zero(&self.stream, &self.loss_acc)?;
@@ -11628,7 +11795,7 @@ impl SimpleGpuTrainer {
             });
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let net_output = self.ws.net_output.to_host_vec(&self.stream)?[..b].to_vec();
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(StepOutput {
