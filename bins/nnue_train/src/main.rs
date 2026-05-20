@@ -5283,6 +5283,53 @@ impl CublasHandle {
         }
         Ok(())
     }
+
+    /// row-major C[M, N] = X @ Y^T、X[M, K] row-major、Y[N, K] row-major。bwd_input 用:
+    /// dx[B, in_dim] = dy[B, out_dim] @ w[in_dim, out_dim]^T、reduce 軸は out_dim。
+    /// col-major cuBLAS で計算する転置 trick:
+    ///   C_rm[m, n] = sum_k X_rm[m, k] * Y_rm[n, k]
+    ///   = C_cm[n, m] = sum_k Y_cm[k, n] * X_cm[k, m]   (X_rm[m, k] と X_cm[k, m] は同 memory)
+    ///   → cublas A=Y (transA=T、shape [k, n] → 効果 [n, k])、B=X (transB=N、shape [k, m])
+    ///     m_cublas=n、n_cublas=m、k_cublas=k、lda=k、ldb=k、ldc=n。
+    /// `alpha=1`, `beta=0` (overwrite)。
+    ///
+    /// SAFETY: 全 device pointer は cudaMalloc 由来 + 各 buffer 長 >= 仕様分、stream は
+    /// `cublasSetStream_v2` で bind 済の同一 stream を再利用。caller が形状不変条件
+    /// (X.len() >= m*k、Y.len() >= n*k、C.len() >= m*n) を保証。
+    unsafe fn sgemm_x_yt_rowmajor(
+        &self,
+        m: i32,
+        n: i32,
+        k: i32,
+        x_ptr: *const f32, // row-major [m, k]
+        y_ptr: *const f32, // row-major [n, k]
+        c_ptr: *mut f32,   // row-major [m, n]
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let status = unsafe {
+            cublasSgemm_v2(
+                self.handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                n,
+                m,
+                k,
+                &alpha,
+                y_ptr,
+                k,
+                x_ptr,
+                k,
+                &beta,
+                c_ptr,
+                n,
+            )
+        };
+        if status != CUBLAS_STATUS_SUCCESS {
+            return Err(format!("cublasSgemm_v2 (bwd_input) failed: status={status}").into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CublasHandle {
@@ -9240,11 +9287,18 @@ impl SimpleGpuWorkspace {
 ///
 /// Simple は LayerStack と違い `MomentBuf` を使わず純 `DeviceBuffer<f32>` で
 /// optimizer state を持つ (`--fp16-opt-state` 非対応)。`--ft-fp16` /
-/// `--ft-fp16-out` / `--tf32` / cuBLAS 経路も使わず、`untiled` `dense_mm_fwd/bwd` の
-/// 合成で完結する。
+/// `--ft-fp16-out` / `--tf32` の risky 精度 flag も受理しない。
+///
+/// L1 dense (B × 2*ft_out × l1_out) は forward / bwd_input / bwd_weight 3 経路を
+/// cuBLAS Sgemm (CUBLAS_DEFAULT_MATH、TC 不使用の純 FP32) に乗せる。L2 / L3 は次元が
+/// 小さく untiled `dense_mm_*` で残す。FT は専用 `sparse_ft_*` kernel、活性化と loss
+/// は固有 kernel。
 struct SimpleGpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
+    /// L1 dense (FP32) 用 cuBLAS handle (TF32 不使用、`CUBLAS_DEFAULT_MATH`)。
+    /// stream に bind 済で同一 stream 内 in-order 実行。
+    cublas: CublasHandle,
 
     // -- weight (FP32) --
     /// FT 重み (`ft_in × ft_out`、feature-major: `ft_w[feat*ft_out + out]`)。
@@ -9334,6 +9388,9 @@ impl SimpleGpuTrainer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
+        // CUBLAS_DEFAULT_MATH 固定 — TF32 を使うと L1 dense の精度が落ちて FP32 baseline
+        // と diverge する。Simple は default FP32 を厳密に保つ規約。
+        let cublas = CublasHandle::new(&stream, false)?;
 
         let ft_in = id.ft_in();
         let ft_out = id.ft_out;
@@ -9440,6 +9497,7 @@ impl SimpleGpuTrainer {
             step_count: 0,
             weight_decay,
             fv_scale,
+            cublas,
         })
     }
 
@@ -9657,19 +9715,34 @@ impl SimpleGpuTrainer {
             ]
         }?;
 
-        // -- L1 dense (combined → l1_pre) + 活性化 (l1_pre → l1_acted) --
+        // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
+        // shape: combined[B, 2*ft_out] @ l1_w[2*ft_out, l1_out] → l1_pre[B, l1_out]、
+        // 続けて bias を別 kernel で row-add する (Sgemm 自身は bias 非対応)。
+        //
+        // SAFETY: combined / l1_w / l1_pre は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (workspace 系の `combined.len() >= b * (2*ft_out)` / `l1_pre.len() >= b * l1_out`
+        // は事前の `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)
+        // * l1_out` は固定 shape)、`self.cublas` は `self.stream` に bind 済で同 stream 内
+        // in-order 実行 (先行 kernel 完了後に Sgemm が走り、後続 bias_add_per_row が観測)。
+        // `cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す device
+        // pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が
+        // unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
+        unsafe {
+            self.cublas.sgemm_fwd_rowmajor(
+                b_u32 as i32,
+                l1_out_u32 as i32,
+                l1_in_u32 as i32,
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.l1_w.cu_deviceptr() as *const f32,
+                self.ws.l1_pre.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
-            kernel: dense_mm_fwd,
+            kernel: bias_add_per_row,
             stream: self.stream,
             module: self.module,
             config: cfg_1d(b * self.id.l1_out),
-            args: [
-                slice(self.ws.combined),
-                slice(self.l1_w),
-                slice(self.l1_b),
-                slice_mut(self.ws.l1_pre),
-                b_u32, l1_in_u32, l1_out_u32
-            ]
+            args: [slice(self.l1_b), slice_mut(self.ws.l1_pre), b_u32, l1_out_u32]
         }?;
         let l1_n = b * self.id.l1_out;
         let l1_n_u32 = l1_n as u32;
@@ -9876,19 +9949,42 @@ impl SimpleGpuTrainer {
             }?,
         }
 
-        // ---- L1 dense backward: dl1_pre -> dcombined, l1_w_grad, l1_b_grad ----
-        cuda_launch! {
-            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
-            config: cfg_1d(b * 2 * self.id.ft_out),
-            args: [slice(self.ws.dl1_pre), slice(self.l1_w), slice_mut(self.ws.dcombined),
-                   b_u32, l1_in_u32, l1_out_u32]
-        }?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
-            config: cfg_1d(2 * self.id.ft_out * self.id.l1_out),
-            args: [slice(self.ws.combined), slice(self.ws.dl1_pre), slice_mut(self.l1_w_grad),
-                   b_u32, l1_in_u32, l1_out_u32]
-        }?;
+        // ---- L1 dense backward: dl1_pre -> dcombined (cuBLAS), l1_w_grad (cuBLAS), l1_b_grad (kernel) ----
+        // bwd_input: dcombined[B, 2*ft_out] = dl1_pre[B, l1_out] @ l1_w[2*ft_out, l1_out]^T
+        //   ( = dx[b][i] = sum_o dy[b][o] * w[i][o] )
+        // SAFETY: dl1_pre / l1_w / dcombined は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (workspace 系の `dl1_pre.len() >= b*l1_out` / `dcombined.len() >= b*(2*ft_out)`
+        // は `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)*l1_out`
+        // は固定 shape)、`self.cublas` は `self.stream` に bind 済。`cu_deviceptr() as
+        // *const/*mut f32` cast の妥当性: cuMemAlloc が返す device pointer は 256 byte
+        // aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が unsafe block を超えて
+        // 生存するので元 buffer も同 lifetime で valid。
+        unsafe {
+            self.cublas.sgemm_x_yt_rowmajor(
+                b_u32 as i32,
+                l1_in_u32 as i32,
+                l1_out_u32 as i32,
+                self.ws.dl1_pre.cu_deviceptr() as *const f32,
+                self.l1_w.cu_deviceptr() as *const f32,
+                self.ws.dcombined.cu_deviceptr() as *mut f32,
+            )?;
+        }
+        // bwd_weight: l1_w_grad[2*ft_out, l1_out] = combined[B, 2*ft_out]^T @ dl1_pre[B, l1_out]
+        // SAFETY: combined / dl1_pre / l1_w_grad は cudaMalloc 由来 + 長さは Sgemm 仕様分
+        // 以上 (workspace 系の `combined.len() >= b*(2*ft_out)` / `dl1_pre.len() >= b*
+        // l1_out` は `ws.check_batch_capacity(b)` で保証、weight grad `l1_w_grad.len() ==
+        // (2*ft_out)*l1_out` は固定 shape)、stream 共有 + cast 妥当性は bwd_input と同じ
+        // 前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
+        unsafe {
+            self.cublas.sgemm_xt_y_rowmajor(
+                l1_in_u32 as i32,
+                l1_out_u32 as i32,
+                b_u32 as i32,
+                self.ws.combined.cu_deviceptr() as *const f32,
+                self.ws.dl1_pre.cu_deviceptr() as *const f32,
+                self.l1_w_grad.cu_deviceptr() as *mut f32,
+            )?;
+        }
         cuda_launch! {
             kernel: bias_grad, stream: self.stream, module: self.module,
             config: cfg_1d(l1_n),
