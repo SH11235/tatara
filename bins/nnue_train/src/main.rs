@@ -3863,6 +3863,70 @@ pub fn simple_sparse_ft_backward_fp16(
     }
 }
 
+/// Simple FT bias grad の dual variant: stm / nstm 両 perspective の dft (post-activation
+/// gradient) を 1 launch で読み込み、`grad_bias[oi]` への atomic add を per-thread に 1 回
+/// にまとめる kernel。1 thread = 1 (batch, ft_oi) cell、stm + nstm のローカル和を作って
+/// から atomic add するため、ft_b_grad への atomic contention 数は B * ft_dim 回 (per-cell
+/// 単発の bias_grad を 2 perspective 別 launch で 2 回打つ場合の半分)。
+///
+/// atomic add の演算は可換・結合的で、launch 順を入れ替えても per-FP32 cell の最終値は
+/// 同等 (FP32 加算の非結合性で bit pattern は同一とは限らないが、CPU 参照との許容差
+/// 範囲には収まる)。`grad_bias` は呼出前に host が 0 にリセット済 (`ws.ft_b_grad`)。
+#[kernel]
+pub fn simple_bias_grad_dual(
+    dft_stm: &[f32],
+    dft_nstm: &[f32],
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let oi = tid.get() % (ft_dim as usize);
+    let stm_val = dft_stm[tid.get()];
+    let nstm_val = dft_nstm[tid.get()];
+    let sum = stm_val + nstm_val;
+    // SAFETY: `grad_bias.len() == ft_dim` を host が保証 (workspace の `ft_b_grad` は
+    // ft_dim で固定)、`oi < ft_dim` は `tid % ft_dim` で保証。`f32` (align 4) と
+    // `DeviceAtomicF32` (`#[repr(transparent)]` over UnsafeCell<f32>) は同 alignment。
+    // 本 kernel 起動中に `grad_bias` を non-atomic 経路で書く path は無く (forward は
+    // bias を READ のみ、本関数より先に走る同 step backward 段も `ft_b_grad` を書かない)、
+    // atomic add 同士の競合は GPU が serialize する。
+    let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
+    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+}
+
+/// Simple FT bias grad dual の FP16 入力版 (`--ft-fp16-out` 経路)。stm / nstm 両 dft
+/// (`f16`、loss scaling 済) を読み、`dft_inv_scale` で打ち消した値を per-thread に 1 atomic
+/// で `ft_b_grad[oi]` に accumulate。FP32 版と同じ atomic 半減効果がある。
+#[kernel]
+pub fn simple_bias_grad_dual_fp16(
+    dft_stm: &[f16],
+    dft_nstm: &[f16],
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    dft_inv_scale: f32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let oi = tid.get() % (ft_dim as usize);
+    let stm_val = dft_stm[tid.get()] as f32 * dft_inv_scale;
+    let nstm_val = dft_nstm[tid.get()] as f32 * dft_inv_scale;
+    let sum = stm_val + nstm_val;
+    // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件
+    // (grad_bias.len() == ft_dim、oi < ft_dim、`DeviceAtomicF32` alignment 共有、
+    // non-atomic 競合 path 無し、atomic add 同士のみ GPU serialize)。
+    let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
+    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+}
+
 // ===========================================================================
 // Host driver helpers (kernel module loader / launch utilities)
 // ===========================================================================
@@ -3998,7 +4062,8 @@ fn compile_ll_to_ptx_via_llc(
                        gather_and_sum_per_feature_add_fp16,\
                        simple_bias_act_fwd_fp16_in_crelu,\
                        simple_act_grad_to_fp16_crelu_with_scale,\
-                       simple_bias_grad_fp16,simple_sparse_ft_backward_fp16";
+                       simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
+                       simple_bias_grad_dual,simple_bias_grad_dual_fp16";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -10706,6 +10771,10 @@ impl SimpleGpuTrainer {
         } else {
             1.0_f32 // unused on FP32 path
         };
+        // FT bias grad は両 perspective が同じ `ft_b` を共有するので、per-cell に stm + nstm
+        // の ローカル和を作って atomic add 1 回で `ft_b_grad[oi]` に accumulate する
+        // (`simple_bias_grad_dual`)。atomic contention は B * ft_dim 回で、stm / nstm を別
+        // launch で 2 回 atomic 打つ構成より半減。
         if self.ft_fp16_out {
             let dft_stm_out_h = self
                 .ws
@@ -10718,25 +10787,25 @@ impl SimpleGpuTrainer {
                 .as_ref()
                 .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
             cuda_launch! {
-                kernel: simple_bias_grad_fp16, stream: self.stream, module: self.module,
+                kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
                 config: cfg_1d(ft_n),
-                args: [slice(dft_stm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale_fp16]
-            }?;
-            cuda_launch! {
-                kernel: simple_bias_grad_fp16, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(dft_nstm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale_fp16]
+                args: [
+                    slice(dft_stm_out_h),
+                    slice(dft_nstm_out_h),
+                    slice(self.ft_b_grad),
+                    b_u32, ft_out_u32, dft_inv_scale_fp16
+                ]
             }?;
         } else {
             cuda_launch! {
-                kernel: bias_grad, stream: self.stream, module: self.module,
+                kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
                 config: cfg_1d(ft_n),
-                args: [slice(self.ws.dft_stm_out), slice(self.ft_b_grad), b_u32, ft_out_u32]
-            }?;
-            cuda_launch! {
-                kernel: bias_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ws.dft_nstm_out), slice(self.ft_b_grad), b_u32, ft_out_u32]
+                args: [
+                    slice(self.ws.dft_stm_out),
+                    slice(self.ws.dft_nstm_out),
+                    slice(self.ft_b_grad),
+                    b_u32, ft_out_u32
+                ]
             }?;
         }
 
