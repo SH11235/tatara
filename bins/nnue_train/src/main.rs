@@ -9719,13 +9719,14 @@ impl SimpleGpuTrainer {
         // shape: combined[B, 2*ft_out] @ l1_w[2*ft_out, l1_out] → l1_pre[B, l1_out]、
         // 続けて bias を別 kernel で row-add する (Sgemm 自身は bias 非対応)。
         //
-        // SAFETY: combined / l1_w / l1_pre は cudaMalloc 由来 + 長さは arch 上 invariant
-        // (`combined.len() == b * (2*ft_out)`、`l1_w.len() == (2*ft_out) * l1_out`、
-        // `l1_pre.len() == b * l1_out`)、`self.cublas` は `self.stream` に bind 済で同
-        // stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、後続 bias_add_per_row
-        // が観測)。`cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す
-        // device pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の
-        // 借用が unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
+        // SAFETY: combined / l1_w / l1_pre は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (workspace 系の `combined.len() >= b * (2*ft_out)` / `l1_pre.len() >= b * l1_out`
+        // は事前の `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)
+        // * l1_out` は固定 shape)、`self.cublas` は `self.stream` に bind 済で同 stream 内
+        // in-order 実行 (先行 kernel 完了後に Sgemm が走り、後続 bias_add_per_row が観測)。
+        // `cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す device
+        // pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が
+        // unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
         unsafe {
             self.cublas.sgemm_fwd_rowmajor(
                 b_u32 as i32,
@@ -9951,12 +9952,13 @@ impl SimpleGpuTrainer {
         // ---- L1 dense backward: dl1_pre -> dcombined (cuBLAS), l1_w_grad (cuBLAS), l1_b_grad (kernel) ----
         // bwd_input: dcombined[B, 2*ft_out] = dl1_pre[B, l1_out] @ l1_w[2*ft_out, l1_out]^T
         //   ( = dx[b][i] = sum_o dy[b][o] * w[i][o] )
-        // SAFETY: dl1_pre / l1_w / dcombined は cudaMalloc 由来、長さは arch 上 invariant
-        // (`dl1_pre.len() == b*l1_out`、`l1_w.len() == (2*ft_out)*l1_out`、
-        // `dcombined.len() == b*(2*ft_out)`)、`self.cublas` は `self.stream` に bind 済。
-        // `cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す device
-        // pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が
-        // unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
+        // SAFETY: dl1_pre / l1_w / dcombined は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
+        // (workspace 系の `dl1_pre.len() >= b*l1_out` / `dcombined.len() >= b*(2*ft_out)`
+        // は `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)*l1_out`
+        // は固定 shape)、`self.cublas` は `self.stream` に bind 済。`cu_deviceptr() as
+        // *const/*mut f32` cast の妥当性: cuMemAlloc が返す device pointer は 256 byte
+        // aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が unsafe block を超えて
+        // 生存するので元 buffer も同 lifetime で valid。
         unsafe {
             self.cublas.sgemm_x_yt_rowmajor(
                 b_u32 as i32,
@@ -9968,10 +9970,11 @@ impl SimpleGpuTrainer {
             )?;
         }
         // bwd_weight: l1_w_grad[2*ft_out, l1_out] = combined[B, 2*ft_out]^T @ dl1_pre[B, l1_out]
-        // SAFETY: combined / dl1_pre / l1_w_grad は cudaMalloc 由来、長さは arch 上 invariant
-        // (`combined.len() == b*(2*ft_out)`、`dl1_pre.len() == b*l1_out`、
-        // `l1_w_grad.len() == (2*ft_out)*l1_out`)、stream 共有 + cast 妥当性は bwd_input
-        // と同じ前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
+        // SAFETY: combined / dl1_pre / l1_w_grad は cudaMalloc 由来 + 長さは Sgemm 仕様分
+        // 以上 (workspace 系の `combined.len() >= b*(2*ft_out)` / `dl1_pre.len() >= b*
+        // l1_out` は `ws.check_batch_capacity(b)` で保証、weight grad `l1_w_grad.len() ==
+        // (2*ft_out)*l1_out` は固定 shape)、stream 共有 + cast 妥当性は bwd_input と同じ
+        // 前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
         unsafe {
             self.cublas.sgemm_xt_y_rowmajor(
                 l1_in_u32 as i32,
