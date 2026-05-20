@@ -3927,6 +3927,98 @@ pub fn simple_bias_grad_dual_fp16(
     cell.fetch_add(sum, AtomicOrdering::Relaxed);
 }
 
+/// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +
+/// `slice_scatter_2d` を 1 kernel に融合。`ft_out` に bias を in-place 加算してから (bwd
+/// indicator のため post-bias 値を保持) CReLU 適用結果を直接 `combined` の per-perspective
+/// slice (`dst_offset = 0` for stm / `ft_out_dim` for nstm) に書く。中間 `ft_*_acted`
+/// buffer の DRAM write+read (b × ft_out × 4 byte × 2 traversal) と、`ft_*_out` の
+/// bias_add → crelu 間の DRAM read+write (b × ft_out × 4 byte × 2 traversal) を消す。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_ft_post_fused_crelu(
+    mut ft_out: DisjointSlice<f32>,
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_out_dim: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out_dim as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    // SAFETY: ft_out.len() == batch * ft_out_dim (caller workspace 規約)、tid.get() <
+    // total で bounds、各 (bi, oi) cell は単独 writer (atomics 不要、disjoint)。
+    let pre_val: f32 = unsafe {
+        let cell = ft_out.get_unchecked_mut(tid.get());
+        let v = *cell + bias[oi];
+        *cell = v;
+        v
+    };
+    #[allow(clippy::manual_clamp)]
+    let acted = if pre_val <= 0.0_f32 {
+        0.0_f32
+    } else if pre_val >= 1.0_f32 {
+        1.0_f32
+    } else {
+        pre_val
+    };
+    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
+    // SAFETY: combined.len() == batch * 2 * ft_out_dim、`dst_offset + oi < 2*ft_out_dim`
+    // (caller が 0 or ft_out_dim を渡す)、bi < batch、disjoint write per (bi, oi)。
+    unsafe {
+        *combined.get_unchecked_mut(combined_idx) = acted;
+    }
+}
+
+/// Simple fwd_ft_post の fused kernel (SCReLU 版): bias_add + SCReLU forward
+/// (`y = clip(x, 0, 1) ^ 2`) + slice_scatter を融合。引数 / DRAM saving は
+/// [`simple_ft_post_fused_crelu`] と同型。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_ft_post_fused_screlu(
+    mut ft_out: DisjointSlice<f32>,
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_out_dim: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out_dim as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    // SAFETY: 同 [`simple_ft_post_fused_crelu`]。
+    let pre_val: f32 = unsafe {
+        let cell = ft_out.get_unchecked_mut(tid.get());
+        let v = *cell + bias[oi];
+        *cell = v;
+        v
+    };
+    #[allow(clippy::manual_clamp)]
+    let a = if pre_val < 0.0_f32 {
+        0.0_f32
+    } else if pre_val > 1.0_f32 {
+        1.0_f32
+    } else {
+        pre_val
+    };
+    let acted = a * a;
+    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
+    // SAFETY: 同 [`simple_ft_post_fused_crelu`]。
+    unsafe {
+        *combined.get_unchecked_mut(combined_idx) = acted;
+    }
+}
+
 /// Simple bwd_ft_act の fused kernel (CReLU 版): `slice_extract_2d` で `dcombined`
 /// の per-perspective 半分を切り出して読み取り、`ft_pre_act` (pre-activation FT 出力)
 /// で CReLU 指示関数 `0 < x < 1` を作って `dft_out` に直接書く。元の
@@ -4152,7 +4244,8 @@ fn compile_ll_to_ptx_via_llc(
                        simple_act_grad_to_fp16_crelu_with_scale,\
                        simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
                        simple_bias_grad_dual,simple_bias_grad_dual_fp16,\
-                       simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused";
+                       simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused,\
+                       simple_ft_post_fused_crelu,simple_ft_post_fused_screlu";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -10298,7 +10391,6 @@ impl SimpleGpuTrainer {
         let l1_out_u32 = self.id.l1_out as u32;
         let l2_out_u32 = self.id.l2_out as u32;
         let ft_n = b * self.id.ft_out;
-        let ft_n_u32 = ft_n as u32;
 
         // -- H2D upload (default stream 上の async memcpy、launch 列に直列で並ぶ) --
         // ring 経路では caller (= `step`) が swap + `input_ring.upload_simple` で
@@ -10466,92 +10558,87 @@ impl SimpleGpuTrainer {
                 ]
             }?;
         } else {
-            cuda_launch! {
-                kernel: bias_add_per_row,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ft_b), slice_mut(self.ws.ft_stm_out), b_u32, ft_out_u32]
-            }?;
-            cuda_launch! {
-                kernel: bias_add_per_row,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ft_b), slice_mut(self.ws.ft_nstm_out), b_u32, ft_out_u32]
-            }?;
-
-            // 活性化: ft_*_out → ft_*_acted。`id.activation` で CReLU / SCReLU を分岐。
-            // 4 箇所 (FT stm/nstm post、L1 post、L2 post) で同じ分岐が出る — `cuda_launch!`
-            // が kernel 識別子をマクロ引数で取るため共通化が難しく、inline 展開する。
+            // DEFAULT (FP32) path: bias_add + activation + slice_scatter (per perspective × 2)
+            // を 1 kernel に融合。`ft_*_out` に bias を in-place 加算 (bwd indicator が読む)
+            // した後、活性化結果を直接 `combined` の per-perspective slice に書く。中間
+            // `ft_*_acted` buffer の DRAM write+read と、bias_add → 活性化 間の `ft_*_out`
+            // 再 read+write が消える (1 perspective につき ~536 MB DRAM、2 perspective で
+            // ~1.07 GB)。`ft_fp16_out` 経路は scale / clamp / f16 cast 含むため融合外。
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     cuda_launch! {
-                        kernel: crelu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_stm_out),
-                            slice_mut(self.ws.ft_stm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_stm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, 0_u32
                         ]
                     }?;
                     cuda_launch! {
-                        kernel: crelu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_nstm_out),
-                            slice_mut(self.ws.ft_nstm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, ft_out_u32
                         ]
                     }?;
                 }
                 SimpleActivation::SCReLU => {
                     cuda_launch! {
-                        kernel: screlu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_stm_out),
-                            slice_mut(self.ws.ft_stm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_stm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, 0_u32
                         ]
                     }?;
                     cuda_launch! {
-                        kernel: screlu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_nstm_out),
-                            slice_mut(self.ws.ft_nstm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, ft_out_u32
                         ]
                     }?;
                 }
             }
         }
 
-        // concat: stm → combined[.. ft_out], nstm → combined[ft_out .. 2*ft_out]。
-        // slice_scatter_2d(src, dst, batch, in_dim, dst_stride, dst_offset)。
-        cuda_launch! {
-            kernel: slice_scatter_2d,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(ft_n),
-            args: [
-                slice(self.ws.ft_stm_acted),
-                slice_mut(self.ws.combined),
-                b_u32, ft_out_u32, l1_in_u32, 0_u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: slice_scatter_2d,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(ft_n),
-            args: [
-                slice(self.ws.ft_nstm_acted),
-                slice_mut(self.ws.combined),
-                b_u32, ft_out_u32, l1_in_u32, ft_out_u32
-            ]
-        }?;
+        // `ft_fp16_out` 経路は融合 kernel が `ft_*_acted` までしか書かないため `combined`
+        // へ slice_scatter する。DEFAULT 経路は `simple_ft_post_fused_*` が `combined` を
+        // 直書きするためここを skip する。
+        if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: slice_scatter_2d,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_n),
+                args: [
+                    slice(self.ws.ft_stm_acted),
+                    slice_mut(self.ws.combined),
+                    b_u32, ft_out_u32, l1_in_u32, 0_u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: slice_scatter_2d,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_n),
+                args: [
+                    slice(self.ws.ft_nstm_acted),
+                    slice_mut(self.ws.combined),
+                    b_u32, ft_out_u32, l1_in_u32, ft_out_u32
+                ]
+            }?;
+        }
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
