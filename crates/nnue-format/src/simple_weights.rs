@@ -58,14 +58,16 @@ use shogi_features::FeatureSetSpec;
 
 /// Simple アーキ量子化 binary の format version magic。
 ///
-/// 値は rshogi 推論エンジン (`rshogi-core::nnue::constants`) の `NNUE_VERSION_HALFKA`
-/// (= `0x7AF32F20`) と **意図的に異なる値** を選んでいる: エンジンは HalfKP / HalfKA_hm
-/// の LayerStack-equivalent 量子化形式を受理するが、本 Simple format は別レイアウト
-/// (`pad32` パディング込み dense / nnue-pytorch 風 arch 文字列) で、同じ magic を使うと
-/// エンジンが Simple `.bin` を誤って LayerStack ローダーに流して silent corruption になる。
-/// HalfKP 用 magic (`0x7AF32F16`) とも衝突しない値域を選ぶ。
-/// 詳細は `docs/decisions/2026-05-20-simple-quantised-format-engine-consumer.md` を参照。
-pub const NNUE_VERSION: u32 = 0x7AF32F21;
+/// 値は YaneuraOu upstream `source/eval/nnue/nnue_common.h` の `kVersion`
+/// (= `0x7AF32F16`) と一致させる。YaneuraOu の versioning モデルでは version magic
+/// は形式世代スタンプであり、アーキの弁別子ではない (全 NNUE ファイルで単一値、
+/// アーキは file 内 `kHashValue = FeatureTransformer::GetHashValue() ^
+/// Network::GetHashValue()` で識別する)。本 format の `network_hash` は同 hash 機構の
+/// 移植で、bullet-shogi の bucket-less 出力
+/// (`examples/shogi_simple.rs --output-format standard`) も同 magic を使う。
+/// 詳細は `docs/decisions/2026-05-20-simple-quantised-format-engine-consumer.md`
+/// を参照。
+pub const NNUE_VERSION: u32 = 0x7AF32F16;
 
 /// dense 層 weight の量子化 multiplier。
 pub const QB: i32 = 64;
