@@ -3927,6 +3927,186 @@ pub fn simple_bias_grad_dual_fp16(
     cell.fetch_add(sum, AtomicOrdering::Relaxed);
 }
 
+/// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +
+/// `slice_scatter_2d` を 1 kernel に融合。`ft_out` に bias を in-place 加算してから (bwd
+/// indicator のため post-bias 値を保持) CReLU 適用結果を直接 `combined` の per-perspective
+/// slice (`dst_offset = 0` for stm / `ft_out_dim` for nstm) に書く。中間 `ft_*_acted`
+/// buffer の DRAM write+read (b × ft_out × 4 byte × 2 traversal) と、`ft_*_out` の
+/// bias_add → crelu 間の DRAM read+write (b × ft_out × 4 byte × 2 traversal) を消す。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_ft_post_fused_crelu(
+    mut ft_out: DisjointSlice<f32>,
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_out_dim: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out_dim as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    // SAFETY: ft_out.len() == batch * ft_out_dim (caller workspace 規約)、tid.get() <
+    // total で bounds、各 (bi, oi) cell は単独 writer (atomics 不要、disjoint)。
+    let pre_val: f32 = unsafe {
+        let cell = ft_out.get_unchecked_mut(tid.get());
+        let v = *cell + bias[oi];
+        *cell = v;
+        v
+    };
+    #[allow(clippy::manual_clamp)]
+    let acted = if pre_val <= 0.0_f32 {
+        0.0_f32
+    } else if pre_val >= 1.0_f32 {
+        1.0_f32
+    } else {
+        pre_val
+    };
+    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
+    // SAFETY: combined.len() == batch * 2 * ft_out_dim、`dst_offset + oi < 2*ft_out_dim`
+    // (caller が 0 or ft_out_dim を渡す)、bi < batch、disjoint write per (bi, oi)。
+    unsafe {
+        *combined.get_unchecked_mut(combined_idx) = acted;
+    }
+}
+
+/// Simple fwd_ft_post の fused kernel (SCReLU 版): bias_add + SCReLU forward
+/// (`y = clip(x, 0, 1) ^ 2`) + slice_scatter を融合。引数 / DRAM saving は
+/// [`simple_ft_post_fused_crelu`] と同型。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_ft_post_fused_screlu(
+    mut ft_out: DisjointSlice<f32>,
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_out_dim: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out_dim as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    // SAFETY: 同 [`simple_ft_post_fused_crelu`]。
+    let pre_val: f32 = unsafe {
+        let cell = ft_out.get_unchecked_mut(tid.get());
+        let v = *cell + bias[oi];
+        *cell = v;
+        v
+    };
+    #[allow(clippy::manual_clamp)]
+    let a = if pre_val < 0.0_f32 {
+        0.0_f32
+    } else if pre_val > 1.0_f32 {
+        1.0_f32
+    } else {
+        pre_val
+    };
+    let acted = a * a;
+    let combined_idx = bi * (2 * ft_out_u) + (dst_offset as usize) + oi;
+    // SAFETY: 同 [`simple_ft_post_fused_crelu`]。
+    unsafe {
+        *combined.get_unchecked_mut(combined_idx) = acted;
+    }
+}
+
+/// Simple bwd_ft_act の fused kernel (CReLU 版): `slice_extract_2d` で `dcombined`
+/// の per-perspective 半分を切り出して読み取り、`ft_pre_act` (pre-activation FT 出力)
+/// で CReLU 指示関数 `0 < x < 1` を作って `dft_out` に直接書く。元の
+/// `slice_extract_2d` → `crelu_grad` の 2 kernel + 中間 `dft_*_acted` buffer の
+/// DRAM round-trip (b × ft_out × 4 byte の write+read) を 1 kernel + write-only に縮める。
+///
+/// `src_offset` で stm (= 0) / nstm (= ft_out) を選択する。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_bwd_ft_act_crelu_fused(
+    dcombined: &[f32],
+    ft_pre_act: &[f32],
+    dft_out: &[f32],
+    batch: u32,
+    ft_out: u32,
+    src_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    let l1_in = 2 * ft_out_u;
+    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dft_acted = dcombined[dcomb_idx];
+    let xi = ft_pre_act[tid.get()];
+    let g = if xi > 0.0_f32 && xi < 1.0_f32 {
+        dft_acted
+    } else {
+        0.0_f32
+    };
+    // SAFETY: dft_out.len() == batch * ft_out (caller workspace 規約)、tid.get() < total
+    // で bounds、各 tid は disjoint (bi, oi) cell に単独 writer、atomics 不要。
+    unsafe {
+        let p = dft_out.as_ptr().add(tid.get()) as *mut f32;
+        p.write(g);
+    }
+}
+
+/// Simple bwd_ft_act の fused kernel (SCReLU 版): `slice_extract_2d` + SCReLU grad
+/// (`clip(x, 0, 1)` の derivative `2 * a` を `0 < a < 1` の indicator で gate) を融合。
+/// 引数 / DRAM saving は [`simple_bwd_ft_act_crelu_fused`] と同型。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_bwd_ft_act_screlu_fused(
+    dcombined: &[f32],
+    ft_pre_act: &[f32],
+    dft_out: &[f32],
+    batch: u32,
+    ft_out: u32,
+    src_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    let l1_in = 2 * ft_out_u;
+    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dft_acted = dcombined[dcomb_idx];
+    let xi = ft_pre_act[tid.get()];
+    #[allow(clippy::manual_clamp)]
+    let a = if xi < 0.0_f32 {
+        0.0_f32
+    } else if xi > 1.0_f32 {
+        1.0_f32
+    } else {
+        xi
+    };
+    let dydx = if a > 0.0_f32 && a < 1.0_f32 {
+        2.0_f32 * a
+    } else {
+        0.0_f32
+    };
+    let g = dft_acted * dydx;
+    // SAFETY: 同 [`simple_bwd_ft_act_crelu_fused`] と同一不変条件。
+    unsafe {
+        let p = dft_out.as_ptr().add(tid.get()) as *mut f32;
+        p.write(g);
+    }
+}
+
 // ===========================================================================
 // Host driver helpers (kernel module loader / launch utilities)
 // ===========================================================================
@@ -4063,7 +4243,9 @@ fn compile_ll_to_ptx_via_llc(
                        simple_bias_act_fwd_fp16_in_crelu,\
                        simple_act_grad_to_fp16_crelu_with_scale,\
                        simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
-                       simple_bias_grad_dual,simple_bias_grad_dual_fp16";
+                       simple_bias_grad_dual,simple_bias_grad_dual_fp16,\
+                       simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused,\
+                       simple_ft_post_fused_crelu,simple_ft_post_fused_screlu";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -5736,9 +5918,10 @@ impl Drop for AsyncLossRing {
 struct InputUploadRing {
     copy_stream: std::sync::Arc<CudaStream>,
     // pinned host staging。stm/nstm は `batch * max_active`、bucket/score/wdl は `batch`。
+    // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
-    pinned_bucket: [*mut i32; 2],
+    pinned_bucket: Option<[*mut i32; 2]>,
     pinned_score: [*mut f32; 2],
     pinned_wdl: [*mut f32; 2],
     /// 各 slot の H2D 完了 event (copy stream に record)。compute stream が forward 前に待つ。
@@ -5763,21 +5946,46 @@ struct InputUploadRing {
 unsafe impl Send for InputUploadRing {}
 
 impl InputUploadRing {
-    /// copy stream + 2-slot pinned buffer + event を確保する。`batch` は最大 position 数、
-    /// `max_active` は 1 perspective あたりの active feature 数 (feature set 依存)。
+    /// LayerStack 用: copy stream + 2-slot pinned buffer + event を確保する (bucket あり)。
+    /// `batch` は最大 position 数、`max_active` は 1 perspective あたりの active feature 数
+    /// (feature set 依存)。
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch: usize,
         max_active: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(ctx, batch, max_active, true)
+    }
+
+    /// Simple アーキ用: bucket buffer を確保しないバリアント。Simple は bucket-less 入力
+    /// で kernel への bucket dispatch も無いため、bucket H2D 経路自体を持たない。
+    fn new_simple(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch: usize,
+        max_active: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(ctx, batch, max_active, false)
+    }
+
+    fn new_inner(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch: usize,
+        max_active: usize,
+        has_bucket: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let copy_stream = ctx.new_stream()?;
         let cap_idx = batch.max(1) * max_active;
         let cap_scalar = batch.max(1);
+        let pinned_bucket = if has_bucket {
+            Some(alloc_pinned_host::<i32>(cap_scalar)?)
+        } else {
+            None
+        };
         Ok(Self {
             copy_stream,
             pinned_stm: alloc_pinned_host::<i32>(cap_idx)?,
             pinned_nstm: alloc_pinned_host::<i32>(cap_idx)?,
-            pinned_bucket: alloc_pinned_host::<i32>(cap_scalar)?,
+            pinned_bucket,
             pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
             pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
             h2d_done: [ctx.new_event(None)?, ctx.new_event(None)?],
@@ -5835,6 +6043,10 @@ impl InputUploadRing {
             // にする。
             self.h2d_done[slot].synchronize()?;
         }
+        let pinned_bucket = self
+            .pinned_bucket
+            .as_ref()
+            .expect("InputUploadRing::upload (LayerStack) requires bucket-enabled ring");
         // host: Vec → pinned[slot]。
         // SAFETY: pinned[slot] は cuMemHostAlloc で cap 要素確保した有効 host memory、
         // 上の assert で `src.len() <= cap` を保証。src (Vec) / dst (pinned) は別領域。
@@ -5842,11 +6054,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
-            std::ptr::copy_nonoverlapping(
-                h_bucket.as_ptr(),
-                self.pinned_bucket[slot],
-                h_bucket.len(),
-            );
+            std::ptr::copy_nonoverlapping(h_bucket.as_ptr(), pinned_bucket[slot], h_bucket.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
         }
@@ -5869,7 +6077,7 @@ impl InputUploadRing {
             copy_host_to_device_async_i32(
                 cs,
                 dev_bucket,
-                std::slice::from_raw_parts(self.pinned_bucket[slot], h_bucket.len()),
+                std::slice::from_raw_parts(pinned_bucket[slot], h_bucket.len()),
             )?;
             copy_host_to_device_async_f32(
                 cs,
@@ -5884,6 +6092,82 @@ impl InputUploadRing {
         }
         self.h2d_done[slot].record(cs)?;
         // compute stream は H2D 完了後に forward が input を読むよう待つ。
+        compute_stream.wait(&self.h2d_done[slot])?;
+        Ok(())
+    }
+
+    /// Simple アーキ用 upload: bucket buffer を持たない 4 buffer 版 (stm/nstm/score/wdl)。
+    /// 動作セマンティクスは [`upload`](Self::upload) と同じ — caller が active/back を
+    /// `mem::swap` 済の `dev_*` に対し pinned 経由 copy stream で先行 H2D し、compute
+    /// stream に H2D 完了を待たせる。
+    #[allow(clippy::too_many_arguments)]
+    fn upload_simple(
+        &mut self,
+        compute_stream: &CudaStream,
+        dev_stm: &DeviceBuffer<i32>,
+        h_stm: &[i32],
+        dev_nstm: &DeviceBuffer<i32>,
+        h_nstm: &[i32],
+        dev_score: &DeviceBuffer<f32>,
+        h_score: &[f32],
+        dev_wdl: &DeviceBuffer<f32>,
+        h_wdl: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            self.pinned_bucket.is_none(),
+            "InputUploadRing::upload_simple called on bucket-enabled ring (LayerStack); \
+             use InputUploadRing::new_simple to construct the ring"
+        );
+        assert!(
+            h_stm.len() <= self.cap_idx && h_nstm.len() <= self.cap_idx,
+            "input batch ({} idx) exceeds pinned capacity {}",
+            h_stm.len().max(h_nstm.len()),
+            self.cap_idx
+        );
+        assert!(
+            h_score.len() <= self.cap_scalar && h_wdl.len() <= self.cap_scalar,
+            "input batch (scalar) exceeds pinned capacity {}",
+            self.cap_scalar
+        );
+        let slot = self.step % 2;
+        if self.step >= 2 {
+            self.copy_stream.wait(&self.step_done[slot])?;
+            self.h2d_done[slot].synchronize()?;
+        }
+        // SAFETY: pinned[slot] は cap 要素確保済 host memory、上 assert で `src.len() <= cap` を
+        // 保証。step >= 2 の slot は h2d_done sync で前回 H2D 完了済。
+        unsafe {
+            std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
+            std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
+            std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
+        }
+        let cs: &CudaStream = &self.copy_stream;
+        // SAFETY: pinned[slot] は直上で先頭 `h_*.len()` 要素を初期化済、`from_raw_parts`
+        // で `src.len() <= dev.len()` を満たすよう slice 化 (helper が assert)。
+        unsafe {
+            copy_host_to_device_async_i32(
+                cs,
+                dev_stm,
+                std::slice::from_raw_parts(self.pinned_stm[slot], h_stm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nstm,
+                std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_score,
+                std::slice::from_raw_parts(self.pinned_score[slot], h_score.len()),
+            )?;
+            copy_host_to_device_async_f32(
+                cs,
+                dev_wdl,
+                std::slice::from_raw_parts(self.pinned_wdl[slot], h_wdl.len()),
+            )?;
+        }
+        self.h2d_done[slot].record(cs)?;
         compute_stream.wait(&self.h2d_done[slot])?;
         Ok(())
     }
@@ -5908,11 +6192,15 @@ impl Drop for InputUploadRing {
         // pinned を free する前に in-flight な H2D を完了させる。copy stream を sync
         // すれば全 H2D が完了する。失敗は無視 (Drop 中の error 報告は実用上困難)。
         let _ = self.copy_stream.synchronize();
+        let bucket_slots: &[*mut i32] = match self.pinned_bucket.as_ref() {
+            Some(slots) => slots.as_slice(),
+            None => &[],
+        };
         for slot in self
             .pinned_stm
             .iter()
             .chain(self.pinned_nstm.iter())
-            .chain(self.pinned_bucket.iter())
+            .chain(bucket_slots.iter())
         {
             if !slot.is_null() {
                 // SAFETY: cuMemHostAlloc で確保した pointer を cuMemFreeHost で解放。
@@ -9513,8 +9801,10 @@ struct SimpleGpuWorkspace {
     /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
     feat_positions: DeviceBuffer<u32>,
 
-    // -- 入力 buffer --
-    /// stm sparse index (`b × max_active`、無効 slot は -1)。
+    // -- 入力 buffer (active / back ペア。`InputUploadRing` の double-buffer 規約) --
+    /// stm sparse index (`b × max_active`、無効 slot は -1)。active 側 = 現 step が forward
+    /// で read する物理 buffer。`step` 冒頭で back と `mem::swap` してから ring が back
+    /// (旧 active = 直前 step が読んでいない側) に async H2D する。
     stm_idx_dev: DeviceBuffer<i32>,
     /// 同 nstm。
     nstm_idx_dev: DeviceBuffer<i32>,
@@ -9522,6 +9812,13 @@ struct SimpleGpuWorkspace {
     score_dev: DeviceBuffer<f32>,
     /// target wdl (`b`、0.0/0.5/1.0)。
     wdl_dev: DeviceBuffer<f32>,
+    /// 同上、back 側物理 buffer。次 step の H2D 先 (`step` 冒頭で `mem::swap` で active
+    /// へ昇格)。直前 step の compute が読んでいる active と物理分離されるため、H2D は
+    /// 直前 step の compute と並走しても buffer 競合が起きない。
+    stm_idx_dev_back: DeviceBuffer<i32>,
+    nstm_idx_dev_back: DeviceBuffer<i32>,
+    score_dev_back: DeviceBuffer<f32>,
+    wdl_dev_back: DeviceBuffer<f32>,
 }
 
 impl SimpleGpuWorkspace {
@@ -9582,6 +9879,10 @@ impl SimpleGpuWorkspace {
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
         })
     }
 
@@ -9702,6 +10003,18 @@ struct SimpleGpuTrainer {
     ws: SimpleGpuWorkspace,
     /// loss kernel が atomic add する Σerr² (f64、1 要素)。
     loss_acc: DeviceBuffer<f64>,
+    /// `step()` 末の `loss_acc` 同期読みを 1-step lag な async D2H に置換する pinned
+    /// host ring。host が `stream.synchronize` 待ち無しで次 batch の launch を発行できる
+    /// ようになる。sb 末で [`TrainerBackend::flush_pending_loss`] が drain する
+    /// (default `0.0` を本 trainer は override する)。`forward` / `validate` の同期
+    /// read 経路は ring を介さず loss_acc を直接読む。
+    loss_ring: AsyncLossRing,
+    /// `step()` 先頭の入力 H2D (`stm/nstm idx` + `score/wdl` の 4 buffer、Simple は
+    /// bucket 無し) を専用 copy stream で直前 step の compute と overlap させる ring。
+    /// [`AsyncLossRing`] による host run-ahead と組合せて compute と H2D を同時実行する。
+    /// `forward` / `validate` の同期 read 経路は ring を介さず直接 H2D する (1-shot で
+    /// 後続 backward / optimizer が無いため overlap 余地が薄い)。
+    input_ring: InputUploadRing,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
     /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
@@ -9715,9 +10028,11 @@ struct SimpleGpuTrainer {
 
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
-        // device buffer 解放前に stream 上の in-flight 操作を排出する
-        // (GpuTrainer と同じ規約: field drop 順による race を回避)。
+        // device buffer 解放前に compute / copy 両 stream の in-flight 操作を排出する
+        // (GpuTrainer と同じ規約: field drop 順による race を回避)。`input_ring` の
+        // copy stream H2D が `ws` の入力 buffer を write 中の解放を防ぐため。
         let _ = self.stream.synchronize();
+        let _ = self.input_ring.copy_stream.synchronize();
     }
 }
 
@@ -9842,6 +10157,8 @@ impl SimpleGpuTrainer {
             l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            loss_ring: AsyncLossRing::new(ctx)?,
+            input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
             ft_w_h: if ft_fp16 {
                 Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
             } else {
@@ -9915,7 +10232,7 @@ impl SimpleGpuTrainer {
             return Ok(0.0);
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(loss_host[0])
     }
@@ -9946,7 +10263,29 @@ impl SimpleGpuTrainer {
             None
         };
 
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        // 入力 4 buffer の H2D を `InputUploadRing` 経由で発行する。active / back を
+        // `mem::swap` してから back (= 直前 step が読んでいない側の物理 buffer) へ専用
+        // copy stream で先行 H2D。pageable な `BatchData` slice は ring 内の pinned host
+        // を経由して copy engine の DMA に載り、compute stream は H2D 完了 event を
+        // 待ってから forward に進む ([`AsyncLossRing`] による host run-ahead と組合せて
+        // h2d_reset を直前 step の compute と並走させる)。
+        std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
+        std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
+        self.input_ring.upload_simple(
+            &self.stream,
+            &self.ws.stm_idx_dev,
+            &batch.stm_indices[..b * self.ws.max_active],
+            &self.ws.nstm_idx_dev,
+            &batch.nstm_indices[..b * self.ws.max_active],
+            &self.ws.score_dev,
+            &batch.score[..b],
+            &self.ws.wdl_dev,
+            &batch.wdl[..b],
+        )?;
+
+        self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
         if let Some(ref mut t0) = prof_t0 {
             self.stream.synchronize()?;
             let now = std::time::Instant::now();
@@ -9982,7 +10321,19 @@ impl SimpleGpuTrainer {
             *t0 = now;
         }
 
-        let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の
+        // event に記録する。同じ物理 input buffer を使う step+2 の H2D がこれを待ち、
+        // in-flight な compute が読む buffer を H2D が上書きする race を防ぐ。
+        self.input_ring.mark_step_done(&self.stream)?;
+
+        // `loss_acc` の host 読みを [`AsyncLossRing`] 経由で async + 1-step lag に
+        // する。pinned host cell に `memcpy_dtoh_async` + event record、前 step の
+        // event を sync して 1 step 遅れで loss を返す (step 0 は warmup として 0.0、
+        // sb 末で [`TrainerBackend::flush_pending_loss`] が最終 step 分を drain する)。
+        // host は次 batch の launch 発行で `stream.synchronize` 相当の block 待ちが消える。
+        let loss = self
+            .loss_ring
+            .read_and_queue_next(&self.stream, &self.loss_acc)?;
         if let Some(ref t0) = prof_t0 {
             let now = std::time::Instant::now();
             eprintln!(
@@ -9992,17 +10343,24 @@ impl SimpleGpuTrainer {
             );
         }
 
-        Ok(loss_host[0])
+        Ok(loss)
     }
 
     /// forward kernel 列のみを走らせる (loss は host 同期 read しない)。`forward` /
     /// `step` 共通の前段で、終了時 `net_output` / `dy_net_output` / `loss_acc` が device
     /// 上に書かれている。caller が batch capacity を事前検査する責務。
+    ///
+    /// `inputs_uploaded_externally` が `true` のとき caller (= `step`) が直前に
+    /// [`InputUploadRing`] で `ws.{stm,nstm}_idx_dev` / `ws.{score,wdl}_dev` への H2D
+    /// を queue 済とみなし、本 method 内では H2D を発行しない (compute stream は ring
+    /// の `h2d_done` event 経由で H2D 完了を既に待つ)。`false` のとき (`forward` /
+    /// `validate` 経路) は同期 H2D を default stream 上で発行する。
     fn run_forward_kernels(
         &mut self,
         batch: &BatchData,
         wdl_lambda: f32,
         loss: LossKind,
+        inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
@@ -10033,21 +10391,25 @@ impl SimpleGpuTrainer {
         let l1_out_u32 = self.id.l1_out as u32;
         let l2_out_u32 = self.id.l2_out as u32;
         let ft_n = b * self.id.ft_out;
-        let ft_n_u32 = ft_n as u32;
 
         // -- H2D upload (default stream 上の async memcpy、launch 列に直列で並ぶ) --
-        copy_host_to_device_async_i32(
-            &self.stream,
-            &self.ws.stm_idx_dev,
-            &batch.stm_indices[..b * self.ws.max_active],
-        )?;
-        copy_host_to_device_async_i32(
-            &self.stream,
-            &self.ws.nstm_idx_dev,
-            &batch.nstm_indices[..b * self.ws.max_active],
-        )?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
-        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+        // ring 経路では caller (= `step`) が swap + `input_ring.upload_simple` で
+        // copy stream に H2D を発行済で、`compute_stream.wait(h2d_done)` で本 stream に
+        // 完了待ちが乗っているため、ここでの H2D は不要。
+        if !inputs_uploaded_externally {
+            copy_host_to_device_async_i32(
+                &self.stream,
+                &self.ws.stm_idx_dev,
+                &batch.stm_indices[..b * self.ws.max_active],
+            )?;
+            copy_host_to_device_async_i32(
+                &self.stream,
+                &self.ws.nstm_idx_dev,
+                &batch.nstm_indices[..b * self.ws.max_active],
+            )?;
+            copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
+            copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+        }
 
         // -- loss_acc を 0 にリセット (再 alloc 無し) --
         memset_zero(&self.stream, &self.loss_acc)?;
@@ -10196,92 +10558,87 @@ impl SimpleGpuTrainer {
                 ]
             }?;
         } else {
-            cuda_launch! {
-                kernel: bias_add_per_row,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ft_b), slice_mut(self.ws.ft_stm_out), b_u32, ft_out_u32]
-            }?;
-            cuda_launch! {
-                kernel: bias_add_per_row,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ft_b), slice_mut(self.ws.ft_nstm_out), b_u32, ft_out_u32]
-            }?;
-
-            // 活性化: ft_*_out → ft_*_acted。`id.activation` で CReLU / SCReLU を分岐。
-            // 4 箇所 (FT stm/nstm post、L1 post、L2 post) で同じ分岐が出る — `cuda_launch!`
-            // が kernel 識別子をマクロ引数で取るため共通化が難しく、inline 展開する。
+            // DEFAULT (FP32) path: bias_add + activation + slice_scatter (per perspective × 2)
+            // を 1 kernel に融合。`ft_*_out` に bias を in-place 加算 (bwd indicator が読む)
+            // した後、活性化結果を直接 `combined` の per-perspective slice に書く。中間
+            // `ft_*_acted` buffer の DRAM write+read と、bias_add → 活性化 間の `ft_*_out`
+            // 再 read+write が消える (1 perspective につき ~536 MB DRAM、2 perspective で
+            // ~1.07 GB)。`ft_fp16_out` 経路は scale / clamp / f16 cast 含むため融合外。
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     cuda_launch! {
-                        kernel: crelu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_stm_out),
-                            slice_mut(self.ws.ft_stm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_stm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, 0_u32
                         ]
                     }?;
                     cuda_launch! {
-                        kernel: crelu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_nstm_out),
-                            slice_mut(self.ws.ft_nstm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, ft_out_u32
                         ]
                     }?;
                 }
                 SimpleActivation::SCReLU => {
                     cuda_launch! {
-                        kernel: screlu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_stm_out),
-                            slice_mut(self.ws.ft_stm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_stm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, 0_u32
                         ]
                     }?;
                     cuda_launch! {
-                        kernel: screlu_fwd, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        kernel: simple_ft_post_fused_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
-                            slice(self.ws.ft_nstm_out),
-                            slice_mut(self.ws.ft_nstm_acted),
-                            ft_n_u32
+                            slice_mut(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, ft_out_u32
                         ]
                     }?;
                 }
             }
         }
 
-        // concat: stm → combined[.. ft_out], nstm → combined[ft_out .. 2*ft_out]。
-        // slice_scatter_2d(src, dst, batch, in_dim, dst_stride, dst_offset)。
-        cuda_launch! {
-            kernel: slice_scatter_2d,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(ft_n),
-            args: [
-                slice(self.ws.ft_stm_acted),
-                slice_mut(self.ws.combined),
-                b_u32, ft_out_u32, l1_in_u32, 0_u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: slice_scatter_2d,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(ft_n),
-            args: [
-                slice(self.ws.ft_nstm_acted),
-                slice_mut(self.ws.combined),
-                b_u32, ft_out_u32, l1_in_u32, ft_out_u32
-            ]
-        }?;
+        // `ft_fp16_out` 経路は融合 kernel が `ft_*_acted` までしか書かないため `combined`
+        // へ slice_scatter する。DEFAULT 経路は `simple_ft_post_fused_*` が `combined` を
+        // 直書きするためここを skip する。
+        if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: slice_scatter_2d,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_n),
+                args: [
+                    slice(self.ws.ft_stm_acted),
+                    slice_mut(self.ws.combined),
+                    b_u32, ft_out_u32, l1_in_u32, 0_u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: slice_scatter_2d,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(ft_n),
+                args: [
+                    slice(self.ws.ft_nstm_acted),
+                    slice_mut(self.ws.combined),
+                    b_u32, ft_out_u32, l1_in_u32, ft_out_u32
+                ]
+            }?;
+        }
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
@@ -10487,7 +10844,6 @@ impl SimpleGpuTrainer {
         let ft_in_u32 = self.ws.ft_in as u32;
         let max_active_u32 = self.ws.max_active as u32;
         let ft_n = b * self.id.ft_out;
-        let ft_n_u32 = ft_n as u32;
         let l1_n = b * self.id.l1_out;
         let l1_n_u32 = l1_n as u32;
         let l2_n = b * self.id.l2_out;
@@ -10660,28 +11016,26 @@ impl SimpleGpuTrainer {
         }?;
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
-        // ---- Concat inverse: dcombined -> dft_stm_acted (offset 0) + dft_nstm_acted (offset ft_out) ----
-        // slice_extract_2d args: (src, dst, batch, src_stride, src_offset, out_dim)。
-        cuda_launch! {
-            kernel: slice_extract_2d, stream: self.stream, module: self.module,
-            config: cfg_1d(ft_n),
-            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                   b_u32, l1_in_u32, 0_u32, ft_out_u32]
-        }?;
-        cuda_launch! {
-            kernel: slice_extract_2d, stream: self.stream, module: self.module,
-            config: cfg_1d(ft_n),
-            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                   b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-        }?;
-
-        // ---- FT activation grad × 2: dft_*_acted -> dft_*_out (kernel reads ft_*_out) ----
-        // `ft_fp16_out` 時は activation grad + loss scaling + ±65504 clamp + f16 cast を
-        // 1 launch に融合 (`simple_act_grad_to_fp16_crelu_with_scale`)。ft_*_out_h は f16 で
-        // pre-bias、bias を kernel 内で加算して post-bias x を復元してから CReLU 指示関数を
-        // 適用する。dft_scale は `FT_DFT_FP16_BASE_SCALE × batch` (batch 比例で normal range)。
-        // 既定 path は activation 種別で crelu_grad / screlu_grad に分岐。
+        // ---- Concat inverse + activation grad の融合 ----
+        // dcombined (b × 2*ft_out) の per-perspective 半分を `src_offset` で切り出して読み、
+        // pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
+        // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
+        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む
+        // ため `slice_extract_2d` + `simple_act_grad_to_fp16_crelu_with_scale` の 2 kernel に
+        // 留める (融合範囲外、scale や clamp の数値挙動を切替で揺らさないため)。
         if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_n),
+                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
+                       b_u32, l1_in_u32, 0_u32, ft_out_u32]
+            }?;
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_n),
+                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
+                       b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
+            }?;
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
             let ft_stm_out_h = self
                 .ws
@@ -10731,30 +11085,30 @@ impl SimpleGpuTrainer {
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     cuda_launch! {
-                        kernel: crelu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
-                               slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_crelu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
                     }?;
                     cuda_launch! {
-                        kernel: crelu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
-                               slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_crelu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
                     }?;
                 }
                 SimpleActivation::SCReLU => {
                     cuda_launch! {
-                        kernel: screlu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
-                               slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_screlu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
                     }?;
                     cuda_launch! {
-                        kernel: screlu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
-                               slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_screlu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
                     }?;
                 }
             }
@@ -11614,7 +11968,7 @@ impl SimpleGpuTrainer {
             });
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
         let net_output = self.ws.net_output.to_host_vec(&self.stream)?[..b].to_vec();
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(StepOutput {
@@ -11669,6 +12023,14 @@ impl TrainerBackend for SimpleGpuTrainer {
         Ok(ValidationStepOutput {
             sum_sq_err: out.loss,
             net_output: out.net_output,
+        })
+    }
+
+    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+        self.loss_ring.flush_pending_loss().map_err(|e| {
+            std::io::Error::other(format!(
+                "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {e}"
+            ))
         })
     }
 
