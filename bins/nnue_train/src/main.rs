@@ -3927,6 +3927,94 @@ pub fn simple_bias_grad_dual_fp16(
     cell.fetch_add(sum, AtomicOrdering::Relaxed);
 }
 
+/// Simple bwd_ft_act の fused kernel (CReLU 版): `slice_extract_2d` で `dcombined`
+/// の per-perspective 半分を切り出して読み取り、`ft_pre_act` (pre-activation FT 出力)
+/// で CReLU 指示関数 `0 < x < 1` を作って `dft_out` に直接書く。元の
+/// `slice_extract_2d` → `crelu_grad` の 2 kernel + 中間 `dft_*_acted` buffer の
+/// DRAM round-trip (b × ft_out × 4 byte の write+read) を 1 kernel + write-only に縮める。
+///
+/// `src_offset` で stm (= 0) / nstm (= ft_out) を選択する。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_bwd_ft_act_crelu_fused(
+    dcombined: &[f32],
+    ft_pre_act: &[f32],
+    dft_out: &[f32],
+    batch: u32,
+    ft_out: u32,
+    src_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    let l1_in = 2 * ft_out_u;
+    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dft_acted = dcombined[dcomb_idx];
+    let xi = ft_pre_act[tid.get()];
+    let g = if xi > 0.0_f32 && xi < 1.0_f32 {
+        dft_acted
+    } else {
+        0.0_f32
+    };
+    // SAFETY: dft_out.len() == batch * ft_out (caller workspace 規約)、tid.get() < total
+    // で bounds、各 tid は disjoint (bi, oi) cell に単独 writer、atomics 不要。
+    unsafe {
+        let p = dft_out.as_ptr().add(tid.get()) as *mut f32;
+        p.write(g);
+    }
+}
+
+/// Simple bwd_ft_act の fused kernel (SCReLU 版): `slice_extract_2d` + SCReLU grad
+/// (`clip(x, 0, 1)` の derivative `2 * a` を `0 < a < 1` の indicator で gate) を融合。
+/// 引数 / DRAM saving は [`simple_bwd_ft_act_crelu_fused`] と同型。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn simple_bwd_ft_act_screlu_fused(
+    dcombined: &[f32],
+    ft_pre_act: &[f32],
+    dft_out: &[f32],
+    batch: u32,
+    ft_out: u32,
+    src_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let ft_out_u = ft_out as usize;
+    let total = (batch as usize) * ft_out_u;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / ft_out_u;
+    let oi = tid.get() % ft_out_u;
+    let l1_in = 2 * ft_out_u;
+    let dcomb_idx = bi * l1_in + (src_offset as usize) + oi;
+    let dft_acted = dcombined[dcomb_idx];
+    let xi = ft_pre_act[tid.get()];
+    #[allow(clippy::manual_clamp)]
+    let a = if xi < 0.0_f32 {
+        0.0_f32
+    } else if xi > 1.0_f32 {
+        1.0_f32
+    } else {
+        xi
+    };
+    let dydx = if a > 0.0_f32 && a < 1.0_f32 {
+        2.0_f32 * a
+    } else {
+        0.0_f32
+    };
+    let g = dft_acted * dydx;
+    // SAFETY: 同 [`simple_bwd_ft_act_crelu_fused`] と同一不変条件。
+    unsafe {
+        let p = dft_out.as_ptr().add(tid.get()) as *mut f32;
+        p.write(g);
+    }
+}
+
 // ===========================================================================
 // Host driver helpers (kernel module loader / launch utilities)
 // ===========================================================================
@@ -4063,7 +4151,8 @@ fn compile_ll_to_ptx_via_llc(
                        simple_bias_act_fwd_fp16_in_crelu,\
                        simple_act_grad_to_fp16_crelu_with_scale,\
                        simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
-                       simple_bias_grad_dual,simple_bias_grad_dual_fp16";
+                       simple_bias_grad_dual,simple_bias_grad_dual_fp16,\
+                       simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused";
 
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
@@ -10668,7 +10757,6 @@ impl SimpleGpuTrainer {
         let ft_in_u32 = self.ws.ft_in as u32;
         let max_active_u32 = self.ws.max_active as u32;
         let ft_n = b * self.id.ft_out;
-        let ft_n_u32 = ft_n as u32;
         let l1_n = b * self.id.l1_out;
         let l1_n_u32 = l1_n as u32;
         let l2_n = b * self.id.l2_out;
@@ -10841,28 +10929,26 @@ impl SimpleGpuTrainer {
         }?;
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
-        // ---- Concat inverse: dcombined -> dft_stm_acted (offset 0) + dft_nstm_acted (offset ft_out) ----
-        // slice_extract_2d args: (src, dst, batch, src_stride, src_offset, out_dim)。
-        cuda_launch! {
-            kernel: slice_extract_2d, stream: self.stream, module: self.module,
-            config: cfg_1d(ft_n),
-            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                   b_u32, l1_in_u32, 0_u32, ft_out_u32]
-        }?;
-        cuda_launch! {
-            kernel: slice_extract_2d, stream: self.stream, module: self.module,
-            config: cfg_1d(ft_n),
-            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                   b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-        }?;
-
-        // ---- FT activation grad × 2: dft_*_acted -> dft_*_out (kernel reads ft_*_out) ----
-        // `ft_fp16_out` 時は activation grad + loss scaling + ±65504 clamp + f16 cast を
-        // 1 launch に融合 (`simple_act_grad_to_fp16_crelu_with_scale`)。ft_*_out_h は f16 で
-        // pre-bias、bias を kernel 内で加算して post-bias x を復元してから CReLU 指示関数を
-        // 適用する。dft_scale は `FT_DFT_FP16_BASE_SCALE × batch` (batch 比例で normal range)。
-        // 既定 path は activation 種別で crelu_grad / screlu_grad に分岐。
+        // ---- Concat inverse + activation grad の融合 ----
+        // dcombined (b × 2*ft_out) の per-perspective 半分を `src_offset` で切り出して読み、
+        // pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
+        // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
+        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む
+        // ため `slice_extract_2d` + `simple_act_grad_to_fp16_crelu_with_scale` の 2 kernel に
+        // 留める (融合範囲外、scale や clamp の数値挙動を切替で揺らさないため)。
         if self.ft_fp16_out {
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_n),
+                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
+                       b_u32, l1_in_u32, 0_u32, ft_out_u32]
+            }?;
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_n),
+                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
+                       b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
+            }?;
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
             let ft_stm_out_h = self
                 .ws
@@ -10912,30 +10998,30 @@ impl SimpleGpuTrainer {
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     cuda_launch! {
-                        kernel: crelu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
-                               slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_crelu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
                     }?;
                     cuda_launch! {
-                        kernel: crelu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
-                               slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_crelu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
                     }?;
                 }
                 SimpleActivation::SCReLU => {
                     cuda_launch! {
-                        kernel: screlu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
-                               slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_screlu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
                     }?;
                     cuda_launch! {
-                        kernel: screlu_grad, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
-                               slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                        kernel: simple_bwd_ft_act_screlu_fused,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
                     }?;
                 }
             }
