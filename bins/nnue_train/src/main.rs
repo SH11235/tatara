@@ -3992,6 +3992,8 @@ fn compile_ll_to_ptx_via_llc(
                        ft_post_perspective_grad_fused,\
                        sparse_ft_forward_fp16,sparse_ft_forward_fp16_out,cast_f32_to_f16,\
                        ft_post_perspective_fwd_fp16,ft_post_perspective_grad_fused_fp16,\
+                       build_feature_counts,exclusive_prefix_sum_small,scatter_positions,\
+                       gather_and_sum_per_feature_overwrite,gather_and_sum_per_feature_add,\
                        gather_and_sum_per_feature_overwrite_fp16,\
                        gather_and_sum_per_feature_add_fp16,\
                        simple_bias_act_fwd_fp16_in_crelu,\
@@ -9431,6 +9433,21 @@ struct SimpleGpuWorkspace {
     /// 同 nstm。
     dft_nstm_out_h: Option<DeviceBuffer<f16>>,
 
+    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` →
+    //    `exclusive_prefix_sum_small` → `scatter_positions` → `gather_and_sum_per_feature_*`
+    //    pipeline 用)。per-feature gather で `dft_*_out` の DRAM read を 1 perspective につき
+    //    各 (feature, ft_out) cell ちょうど 1 回に抑え、global atomic 数も `b * ft_out *
+    //    max_active` から `b * max_active` (histogram + scatter) まで圧縮する。サイズは
+    //    feature set ごとに固定 (`ft_in` / `max_active` で決まる)。
+    /// per-feature 出現回数 histogram (`ft_in`、`build_feature_counts` で atomic build)。
+    feat_counts: DeviceBuffer<u32>,
+    /// `feat_counts` の exclusive prefix sum (`ft_in + 1`、`exclusive_prefix_sum_small` で構築)。
+    feat_offsets: DeviceBuffer<u32>,
+    /// `scatter_positions` 中の per-feature 書き込み位置カウンタ (`ft_in`、atomic incremented)。
+    feat_write_ctr: DeviceBuffer<u32>,
+    /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
+    feat_positions: DeviceBuffer<u32>,
+
     // -- 入力 buffer --
     /// stm sparse index (`b × max_active`、無効 slot は -1)。
     stm_idx_dev: DeviceBuffer<i32>,
@@ -9492,6 +9509,10 @@ impl SimpleGpuWorkspace {
             ft_nstm_out_h: alloc_h(ft_fp16_out)?,
             dft_stm_out_h: alloc_h(ft_fp16_out)?,
             dft_nstm_out_h: alloc_h(ft_fp16_out)?,
+            feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
+            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
+            feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
@@ -10407,8 +10428,9 @@ impl SimpleGpuTrainer {
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
 
-        // bias_grad / sparse_ft_backward は atomic add で累積する。host で 0 初期化必須。
-        memset_zero(&self.stream, &self.ft_w_grad)?;
+        // bias_grad は atomic add で累積するため host で 0 初期化必須。`ft_w_grad` は
+        // 後段の `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
+        // iter 0 = stm) が全 `(feature, ri)` cell を書き切るため reset 不要。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
         memset_zero(&self.stream, &self.l2_b_grad)?;
@@ -10677,8 +10699,14 @@ impl SimpleGpuTrainer {
         // ---- FT bias grad + FT weight grad: stm/nstm の両 perspective が同じ ft_b / ft_w
         // を共有するため atomic accumulate (host が呼出前に 0 初期化)。
         // `ft_fp16_out` 時は f16 dft buffer を read、`dft_inv_scale` で loss scaling を打ち消す。
+        // FT bias grad は両 perspective が同じ ft_b を共有するため atomic accumulate。
+        // host が呼出前に `ft_b_grad` を 0 reset 済 (本関数冒頭の memset_zero ブロック)。
+        let dft_inv_scale_fp16 = if self.ft_fp16_out {
+            1.0_f32 / (FT_DFT_FP16_BASE_SCALE * (b as f32))
+        } else {
+            1.0_f32 // unused on FP32 path
+        };
         if self.ft_fp16_out {
-            let dft_inv_scale = 1.0_f32 / (FT_DFT_FP16_BASE_SCALE * (b as f32));
             let dft_stm_out_h = self
                 .ws
                 .dft_stm_out_h
@@ -10692,26 +10720,12 @@ impl SimpleGpuTrainer {
             cuda_launch! {
                 kernel: simple_bias_grad_fp16, stream: self.stream, module: self.module,
                 config: cfg_1d(ft_n),
-                args: [slice(dft_stm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale]
+                args: [slice(dft_stm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale_fp16]
             }?;
             cuda_launch! {
                 kernel: simple_bias_grad_fp16, stream: self.stream, module: self.module,
                 config: cfg_1d(ft_n),
-                args: [slice(dft_nstm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale]
-            }?;
-            cuda_launch! {
-                kernel: simple_sparse_ft_backward_fp16, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(dft_stm_out_h), slice(self.ws.stm_idx_dev),
-                       slice_mut(self.ft_w_grad),
-                       b_u32, ft_out_u32, ft_in_u32, max_active_u32, dft_inv_scale]
-            }?;
-            cuda_launch! {
-                kernel: simple_sparse_ft_backward_fp16, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(dft_nstm_out_h), slice(self.ws.nstm_idx_dev),
-                       slice_mut(self.ft_w_grad),
-                       b_u32, ft_out_u32, ft_in_u32, max_active_u32, dft_inv_scale]
+                args: [slice(dft_nstm_out_h), slice(self.ft_b_grad), b_u32, ft_out_u32, dft_inv_scale_fp16]
             }?;
         } else {
             cuda_launch! {
@@ -10724,20 +10738,145 @@ impl SimpleGpuTrainer {
                 config: cfg_1d(ft_n),
                 args: [slice(self.ws.dft_nstm_out), slice(self.ft_b_grad), b_u32, ft_out_u32]
             }?;
+        }
+
+        // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
+        // 各 perspective につき (A) `build_feature_counts` で histogram、(B)
+        // `exclusive_prefix_sum_small` で offset、(C) `scatter_positions` で sorted position 列を
+        // 構築し、(D) `gather_and_sum_per_feature_overwrite` (1 回目 = stm) /
+        // `gather_and_sum_per_feature_add` (2 回目 = nstm) が `(feature, ri)` cell ごとに
+        // sum を書く。FP16 path は同 pipeline で `_fp16` 変種に dft_inv_scale を渡す。
+        // stm の overwrite が `ft_w_grad` の全 `(feature, ri)` cell を unconditionally 書き切るため、
+        // 本関数冒頭の memset_zero 群に `ft_w_grad` は含めない (LayerStack の同 pipeline と同規約)。
+        let gather_config = LaunchConfig {
+            grid_dim: (ft_in_u32, self.id.ft_out.div_ceil(128) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
+            .into_iter()
+            .enumerate()
+        {
+            // A1: feat_counts / feat_write_ctr を 0 にリセット (atomic build / scatter の前提)。
+            memset_zero(&self.stream, &self.ws.feat_counts)?;
+            memset_zero(&self.stream, &self.ws.feat_write_ctr)?;
+            // A2: 各 (b, ni) sparse index について feat_counts[feature] を atomic increment。
             cuda_launch! {
-                kernel: sparse_ft_backward, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ws.dft_stm_out), slice(self.ws.stm_idx_dev),
-                       slice_mut(self.ft_w_grad),
-                       b_u32, ft_out_u32, ft_in_u32, max_active_u32]
+                kernel: build_feature_counts,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * self.ws.max_active),
+                args: [
+                    slice(idx_dev),
+                    slice(self.ws.feat_counts),
+                    b_u32, max_active_u32, ft_in_u32
+                ]
             }?;
+            // B: exclusive prefix sum (1 block × 1024 threads、`ft_in` ~73K-138K に対応)。
             cuda_launch! {
-                kernel: sparse_ft_backward, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ws.dft_nstm_out), slice(self.ws.nstm_idx_dev),
-                       slice_mut(self.ft_w_grad),
-                       b_u32, ft_out_u32, ft_in_u32, max_active_u32]
+                kernel: exclusive_prefix_sum_small,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    ft_in_u32
+                ]
             }?;
+            // C: 各 (b, ni) sparse index について feat_positions の per-feature slot に
+            // batch position `b` を書き込む (`feat_write_ctr[feature]++` で位置決定)。
+            cuda_launch! {
+                kernel: scatter_positions,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * self.ws.max_active),
+                args: [
+                    slice(idx_dev),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_write_ctr),
+                    slice(self.ws.feat_positions),
+                    b_u32, max_active_u32, ft_in_u32
+                ]
+            }?;
+            // D: 各 (feature, ri) cell について feat_positions[feat_offsets[f]..feat_offsets[f+1]]
+            // を順 read して accumulate。iter 0 = stm は overwrite (全 cell 書き切り)、iter 1 =
+            // nstm は atomic add で stm 結果に重ねる。FP16 path は `dft_inv_scale` で loss scaling
+            // を打ち消しながら read。
+            if self.ft_fp16_out {
+                let dft_stm_out_h = self
+                    .ws
+                    .dft_stm_out_h
+                    .as_ref()
+                    .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
+                let dft_nstm_out_h = self
+                    .ws
+                    .dft_nstm_out_h
+                    .as_ref()
+                    .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
+                let dft_h = if iter_idx == 0 {
+                    dft_stm_out_h
+                } else {
+                    dft_nstm_out_h
+                };
+                if iter_idx == 0 {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_overwrite_fp16,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft_h),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            ft_in_u32, ft_out_u32, dft_inv_scale_fp16
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add_fp16,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft_h),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            ft_in_u32, ft_out_u32, dft_inv_scale_fp16
+                        ]
+                    }?;
+                }
+            } else {
+                let dft = if iter_idx == 0 {
+                    &self.ws.dft_stm_out
+                } else {
+                    &self.ws.dft_nstm_out
+                };
+                if iter_idx == 0 {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_overwrite,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            ft_in_u32, ft_out_u32
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            ft_in_u32, ft_out_u32
+                        ]
+                    }?;
+                }
+            }
         }
         tick("bwd_ft_bw", &self.stream, &mut prof_t0)?;
 
