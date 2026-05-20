@@ -51,7 +51,7 @@ use cuda_host::cuda_launch;
 use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 #[allow(unused_imports)]
 use nnue_format::LayerStackWeights;
-use nnue_format::{ArchKind, SimpleActivation, SimpleId};
+use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::dataloader::Batch;
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[allow(unused_imports)]
@@ -4001,6 +4001,17 @@ const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
 type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// `SimpleGpuTrainer::raw_ckpt_groups` の 1 要素。weight name + element count + 各
+/// `(weight, m, v, slow)` device buffer の借用 tuple。
+type SimpleRawCkptGroupEntry<'a> = (
+    &'static str,
+    usize,
+    &'a DeviceBuffer<f32>,
+    &'a DeviceBuffer<f32>,
+    &'a DeviceBuffer<f32>,
+    &'a DeviceBuffer<f32>,
+);
 
 /// LayerStack アーキの topology header (v4+): FT 出力次元・L1 出力次元・L2 出力次元・
 /// bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
@@ -8222,11 +8233,11 @@ struct SimpleArgs {
 }
 
 fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // アーキ種別で host pipeline を分岐する。Simple アーキは host pipeline が
-    // 未実装なので early reject、LayerStack はそのまま固有引数を取り出す。
+    // アーキ種別で host pipeline を分岐する。Simple は別 driver
+    // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
         ArchCommand::LayerStack(args) => args,
-        ArchCommand::Simple(_) => return Err(simple_arch_unimplemented()),
+        ArchCommand::Simple(args) => return run_simple_training(cli, args),
     };
 
     let data = cli.data.as_ref().expect("run_training called with --data");
@@ -8604,9 +8615,10 @@ fn build_experiment_logger(
         l0: FT_OUT,
         l1: L1_OUT,
         l2: L2_OUT,
-        num_buckets: NUM_BUCKETS,
+        num_buckets: Some(NUM_BUCKETS),
         optimizer: cli.optimizer.clone(),
-        bucket_mode: layerstack.bucket_mode.clone(),
+        bucket_mode: Some(layerstack.bucket_mode.clone()),
+        activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
@@ -8663,15 +8675,423 @@ fn build_experiment_logger(
     ExperimentLogger::new(json_path, doc)
 }
 
-/// Simple アーキはまだ host training pipeline を持たないことを示すエラー。
-/// run_training / smoke_test の両 entrypoint がこのメッセージで reject する。
-fn simple_arch_unimplemented() -> Box<dyn std::error::Error> {
-    format!(
-        "the '{}' architecture is not implemented yet (use the '{}' subcommand)",
-        ArchKind::Simple.canonical_name(),
-        ArchKind::LayerStack.canonical_name()
-    )
-    .into()
+/// Simple アーキ用の experiment.json ロガーを CLI 設定から組み立てる。
+/// LayerStack 用 [`build_experiment_logger`] と並ぶ Simple 用 helper で、
+/// `Params` の bucket / progress / TF32 / FT-FP16 系フィールドは Simple では
+/// 概念が無い (`bucket_mode` / `num_buckets` / `progress_coeff` は `None`、
+/// `tf32` / `ft_fp16` / `ft_fp16_out` / `fp16_opt_state` は `false`)。
+/// 量子化 multiplier (`qa` / `qb`) は活性化と `simple_weights` の固定値から決める。
+#[allow(clippy::too_many_arguments)]
+fn build_experiment_logger_simple(
+    cli: &Cli,
+    id: SimpleId,
+    start_superbatch: usize,
+    resumed_superbatch: Option<usize>,
+    resume_parent_id: Option<String>,
+    data: &Path,
+) -> ExperimentLogger {
+    let start_secs = nnue_train::experiment::now_epoch_secs();
+    let net_id_compact = format!(
+        "{}-{}-{}",
+        cli.net_id,
+        nnue_train::experiment::format_utc_compact(start_secs),
+        std::process::id()
+    );
+    let name = cli.experiment_name.clone().unwrap_or_else(|| {
+        if cli.resume.is_some() {
+            format!("{} (resume @sb{start_superbatch})", cli.net_id)
+        } else {
+            cli.net_id.clone()
+        }
+    });
+
+    let lineage = cli.resume.as_ref().map(|ckpt| Lineage {
+        parent_id: resume_parent_id.clone(),
+        resumed_from_checkpoint: file_basename(ckpt),
+        resumed_from_superbatch: resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
+    });
+
+    let architecture = format!(
+        "simple-{}-{}x2-{}-{}-{}",
+        id.feature_set.canonical_name(),
+        id.ft_out,
+        id.l1_out,
+        id.l2_out,
+        id.activation.canonical_name(),
+    );
+
+    let is_wrm = cli.win_rate_model;
+    let params = Params {
+        architecture,
+        feature_set: id.feature_set.canonical_name().to_string(),
+        ft_in: id.ft_in(),
+        l0: id.ft_out,
+        l1: id.l1_out,
+        l2: id.l2_out,
+        num_buckets: None,
+        optimizer: cli.optimizer.clone(),
+        bucket_mode: None,
+        activation: Some(id.activation.canonical_name().to_string()),
+        progress_coeff: None,
+        lr: finite_or_zero(cli.lr),
+        lr_gamma: finite_or_zero(cli.lr_gamma),
+        lr_step: cli.lr_step.max(1),
+        batch_size: cli.batch_size,
+        batches_per_superbatch: cli.batches_per_superbatch,
+        superbatches: cli.superbatches,
+        start_superbatch,
+        wdl: finite_or_zero(cli.wdl),
+        scale: finite_or_zero(cli.scale),
+        weight_decay: finite_or_zero(cli.weight_decay),
+        qa: id.activation.qa(),
+        qb: nnue_format::simple_weights::QB,
+        loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
+        wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
+        wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
+        wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
+        wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
+        score_drop_abs: cli.score_drop_abs,
+        init_from: cli.init_from.as_deref().map(file_basename),
+        test_data: cli.test_data.as_deref().map(file_basename),
+        test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
+        tf32: false,
+        ft_fp16: false,
+        ft_fp16_out: false,
+        fp16_opt_state: false,
+        threads: cli.threads,
+    };
+
+    let dataset_positions = std::fs::metadata(data)
+        .map(|m| m.len() / PSV_RECORD_BYTES)
+        .unwrap_or(0);
+    let data_info = DataInfo {
+        name: file_basename(data),
+        positions: dataset_positions,
+        total_positions: 0,
+        dataset_passes: 0.0,
+    };
+
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let json_path = cli
+        .output
+        .join("experiments")
+        .join(format!("{net_id_compact}.json"));
+    let doc = ExperimentDoc::new(
+        net_id_compact,
+        name,
+        start_secs,
+        git_commit(),
+        command,
+        lineage,
+        params,
+        data_info,
+    );
+    ExperimentLogger::new(json_path, doc)
+}
+
+/// Simple アーキの層次元 preset 文字列 (`"<ft_out>x2-<l1_out>-<l2_out>"`) を
+/// `(ft_out, l1_out, l2_out)` にパースする。bullet-shogi 由来の表記。
+///
+/// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
+/// 形式不一致や非整数は `--arch` の不正値として `InvalidInput` で返す。
+fn parse_simple_preset(s: &str) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
+    let (head, tail) = s
+        .split_once('-')
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!(
+                "--arch '{s}' must look like '<ft_out>x2-<l1_out>-<l2_out>' (e.g. '256x2-32-32')"
+            )
+            .into()
+        })?;
+    let ft_out_str = head
+        .strip_suffix("x2")
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!("--arch '{s}': leading FT block must end with 'x2' (e.g. '256x2-32-32')").into()
+        })?;
+    let ft_out: usize = ft_out_str
+        .parse()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("--arch '{s}': '{ft_out_str}' is not a non-negative integer FT dimension")
+                .into()
+        })?;
+    let (l1_out_str, l2_out_str) =
+        tail.split_once('-')
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "--arch '{s}': trailing block must look like '<l1_out>-<l2_out>' (got '{tail}')"
+                )
+                .into()
+            })?;
+    let l1_out: usize = l1_out_str
+        .parse()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("--arch '{s}': '{l1_out_str}' is not a non-negative integer L1 dimension")
+                .into()
+        })?;
+    let l2_out: usize = l2_out_str
+        .parse()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("--arch '{s}': '{l2_out_str}' is not a non-negative integer L2 dimension")
+                .into()
+        })?;
+    Ok((ft_out, l1_out, l2_out))
+}
+
+/// Simple 4 層アーキの training driver。`run_training` から `ArchCommand::Simple`
+/// 分岐で呼ばれる。LayerStack 側 (`run_training` 本体) と並ぶ単独 entrypoint で、
+/// trainer 構築・init_from / resume・lr / wdl スケジューラ・superbatch loop は
+/// 同じ `nnue_train::trainer::run` driver を使う。
+fn run_simple_training(
+    cli: &Cli,
+    simple_args: &SimpleArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = cli
+        .data
+        .as_ref()
+        .expect("run_simple_training called with --data");
+
+    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            let names: Vec<&str> = FeatureSet::ALL
+                .iter()
+                .map(|fs| fs.canonical_name())
+                .collect();
+            format!(
+                "--feature-set '{}' is not a known feature set (expected one of: {})",
+                cli.feature_set,
+                names.join(", ")
+            )
+            .into()
+        })?
+        .spec();
+
+    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
+        return Err(format!(
+            "--optimizer '{}' is not implemented (only 'ranger')",
+            cli.optimizer
+        )
+        .into());
+    }
+    if cli.ft_fp16 || cli.fp16_opt_state {
+        return Err(
+            "--ft-fp16 / --fp16-opt-state are LayerStack-only (Simple is FP32 master only)".into(),
+        );
+    }
+    if !(cli.lr.is_finite() && cli.lr > 0.0) {
+        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
+    }
+    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
+        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
+    }
+    if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
+        return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
+    }
+    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
+        return Err(format!(
+            "--weight-decay must be finite and >= 0 (got {})",
+            cli.weight_decay
+        )
+        .into());
+    }
+    if !cli.batch_size.is_multiple_of(16) {
+        return Err(format!(
+            "--batch-size must be a multiple of 16 (got {})",
+            cli.batch_size
+        )
+        .into());
+    }
+    if cli.threads == 0 {
+        return Err("--threads must be >= 1".into());
+    }
+    if cli.init_from.is_some() && cli.resume.is_some() {
+        return Err("--init-from and --resume are mutually exclusive".into());
+    }
+    if cli.superbatches == 0 {
+        return Err("--superbatches must be >= 1".into());
+    }
+    if let Some(0) = cli.keep_checkpoints {
+        return Err(
+            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
+        );
+    }
+
+    // 層次元の決定: --arch preset + --l1 / --l2 / --l3 override。
+    let (preset_ft_out, preset_l1_out, preset_l2_out) = parse_simple_preset(&simple_args.arch)?;
+    let ft_out = simple_args.l1.unwrap_or(preset_ft_out);
+    let l1_out = simple_args.l2.unwrap_or(preset_l1_out);
+    let l2_out = simple_args.l3.unwrap_or(preset_l2_out);
+    let activation = SimpleActivation::from_canonical_name(&simple_args.activation).ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "--activation '{}' is not implemented (expected one of: crelu, screlu)",
+                simple_args.activation
+            )
+            .into()
+        },
+    )?;
+    let id = SimpleId {
+        feature_set,
+        activation,
+        ft_out,
+        l1_out,
+        l2_out,
+    };
+
+    // Simple は loss kind に関わらず `cli.scale` を量子化 `fv_scale` の算出で参照
+    // するため、WRM 経路でも finite / 正値を要求する (LayerStack は WRM 時に scale
+    // を参照しないので sigmoid 経路でのみ検証していた)。
+    if !(cli.scale.is_finite() && cli.scale > 0.0) {
+        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
+    }
+    let loss = if cli.win_rate_model {
+        if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
+            return Err(format!(
+                "--wrm-in-scaling must be finite and > 0 (got {})",
+                cli.wrm_in_scaling
+            )
+            .into());
+        }
+        if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
+            return Err(format!(
+                "--wrm-nnue2score must be finite and > 0 (got {})",
+                cli.wrm_nnue2score
+            )
+            .into());
+        }
+        if !cli.wrm_target_offset.is_finite() {
+            return Err(format!(
+                "--wrm-target-offset must be finite (got {})",
+                cli.wrm_target_offset
+            )
+            .into());
+        }
+        if !(cli.wrm_target_scaling.is_finite() && cli.wrm_target_scaling > 0.0) {
+            return Err(format!(
+                "--wrm-target-scaling must be finite and > 0 (got {})",
+                cli.wrm_target_scaling
+            )
+            .into());
+        }
+        LossKind::Wrm {
+            nnue2score: cli.wrm_nnue2score,
+            in_scaling: cli.wrm_in_scaling,
+            target_offset: cli.wrm_target_offset,
+            target_scaling: cli.wrm_target_scaling,
+        }
+    } else {
+        LossKind::Sigmoid {
+            scale: 1.0 / cli.scale,
+        }
+    };
+
+    std::fs::create_dir_all(&cli.output)?;
+
+    // Simple は bucket-aware progress を持たない: dataloader に渡す
+    // `ShogiProgressKPAbs` は zero-weight default (全 position が bucket 4)、
+    // TrainerBackend::train_step 内で bucket index は無視される。
+    let progress = ShogiProgressKPAbs;
+
+    let ctx = CudaContext::new(0)?;
+    println!("[train] CUDA context ready, building SimpleGpuTrainer...");
+    // 推論側 evaluation scale: round(QA * QB / 学習 scale)。`cli.scale` は前段で
+    // 有限・正値を保証済。
+    let fv_scale =
+        ((id.activation.qa() * nnue_format::simple_weights::QB) as f32 / cli.scale).round() as i32;
+    let mut trainer = SimpleGpuTrainer::new(&ctx, cli.batch_size, id, cli.weight_decay, fv_scale)?;
+
+    let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
+        if let Some(init) = &cli.init_from {
+            println!(
+                "[train] injecting pretrained weights from {} (optimizer state reset)",
+                init.display()
+            );
+            let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+            let weights = SimpleWeights::load(&mut reader, id)?;
+            trainer.load_simple_weights(&weights)?;
+            (None, None)
+        } else if let Some(ckpt) = &cli.resume {
+            let (sb, parent_id) = trainer.load_raw_checkpoint(ckpt)?;
+            println!(
+                "[train] resuming from {} at superbatch {}",
+                ckpt.display(),
+                sb + 1
+            );
+            (Some(sb), parent_id)
+        } else {
+            (None, None)
+        };
+
+    let start_superbatch = match cli.start_superbatch {
+        Some(n) => n,
+        None => match resumed_superbatch {
+            Some(sb) => sb + 1,
+            None => 1,
+        },
+    };
+    if start_superbatch == 0 {
+        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
+    }
+    if start_superbatch > cli.superbatches {
+        return Err(format!(
+            "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train)",
+            cli.superbatches
+        )
+        .into());
+    }
+
+    let lr_scheduler = StepLR {
+        start: cli.lr,
+        gamma: cli.lr_gamma,
+        step: cli.lr_step.max(1),
+    };
+    let wdl_scheduler = ConstantWDL { value: cli.wdl };
+    let cfg = TrainingConfig {
+        net_id: cli.net_id.clone(),
+        feature_set,
+        output_dir: cli.output.clone(),
+        start_superbatch,
+        end_superbatch: cli.superbatches,
+        batches_per_superbatch: cli.batches_per_superbatch,
+        batch_size: cli.batch_size,
+        save_rate: cli.save_rate,
+        keep_raw_checkpoints: cli.keep_checkpoints,
+        loss,
+        score_drop_abs: cli.score_drop_abs,
+        threads: cli.threads,
+        test_data: cli.test_data.clone(),
+        test_positions: cli.test_positions,
+    };
+
+    let mut experiment = build_experiment_logger_simple(
+        cli,
+        id,
+        start_superbatch,
+        resumed_superbatch,
+        resume_parent_id,
+        data,
+    );
+    println!("[train] experiment log: {}", experiment.path().display());
+
+    let result = nnue_train::trainer::run(
+        &mut trainer,
+        data,
+        &progress,
+        &lr_scheduler,
+        &wdl_scheduler,
+        &cfg,
+        Some(&mut experiment),
+    );
+    if result.is_err() {
+        experiment.mark_interrupted();
+        if let Err(e) = experiment.write() {
+            eprintln!(
+                "[train] warning: failed to write experiment log {}: {e}",
+                experiment.path().display()
+            );
+        }
+    }
+    result?;
+    Ok(())
 }
 
 // ===========================================================================
@@ -8718,8 +9138,29 @@ struct SimpleGpuWorkspace {
     l2_acted: DeviceBuffer<f32>,
     /// L3 dense 出力 = ネットワーク 1 次元出力 (`b`)。
     net_output: DeviceBuffer<f32>,
-    /// loss kernel が書く dnet (`b`)。forward 専用では使わないが kernel が出力先を要求する。
+    /// loss kernel が書く dnet (= dy/d net_output、`b`)。backward の起点。
     dy_net_output: DeviceBuffer<f32>,
+
+    // -- backward gradient buffer (forward と対称配置) --
+    /// L2 活性化後への grad (`b × l2_out`)、`dense_mm_bwd_input` で L3 から伝播。
+    dl2_acted: DeviceBuffer<f32>,
+    /// L2 dense 出力への grad (`b × l2_out`)、活性化逆伝播の出力。
+    dl2_pre: DeviceBuffer<f32>,
+    /// L1 活性化後への grad (`b × l1_out`)。
+    dl1_acted: DeviceBuffer<f32>,
+    /// L1 dense 出力への grad (`b × l1_out`)。
+    dl1_pre: DeviceBuffer<f32>,
+    /// concat 後 (`b × 2*ft_out`) への grad。L1 dense backward の入力 grad 先。
+    dcombined: DeviceBuffer<f32>,
+    /// stm 活性化後への grad (`b × ft_out`)、concat 逆 (`slice_extract_2d`) の出力。
+    dft_stm_acted: DeviceBuffer<f32>,
+    /// 同 nstm。
+    dft_nstm_acted: DeviceBuffer<f32>,
+    /// stm FT 出力 (= bias add 直後 / 活性化直前) への grad (`b × ft_out`)。
+    /// `sparse_ft_backward` の入力 grad + `ft_b` bias grad の reduce 対象。
+    dft_stm_out: DeviceBuffer<f32>,
+    /// 同 nstm。
+    dft_nstm_out: DeviceBuffer<f32>,
 
     // -- 入力 buffer --
     /// stm sparse index (`b × max_active`、無効 slot は -1)。
@@ -8761,6 +9202,15 @@ impl SimpleGpuWorkspace {
             l2_acted: z(batch * l2_out)?,
             net_output: z(batch)?,
             dy_net_output: z(batch)?,
+            dl2_acted: z(batch * l2_out)?,
+            dl2_pre: z(batch * l2_out)?,
+            dl1_acted: z(batch * l1_out)?,
+            dl1_pre: z(batch * l1_out)?,
+            dcombined: z(batch * 2 * ft_out)?,
+            dft_stm_acted: z(batch * ft_out)?,
+            dft_nstm_acted: z(batch * ft_out)?,
+            dft_stm_out: z(batch * ft_out)?,
+            dft_nstm_out: z(batch * ft_out)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
@@ -8784,13 +9234,19 @@ impl SimpleGpuWorkspace {
     }
 }
 
-/// Simple 4 層アーキ用 GPU トレーナ (forward 専用)。LayerStack 用 `GpuTrainer`
-/// と並ぶもう一方のアーキの host driver。
+/// Simple 4 層アーキ用 GPU トレーナ。LayerStack 用 `GpuTrainer` と並ぶもう一方の
+/// アーキの host driver。1 batch の forward → loss → backward → Ranger optimizer step
+/// を 8 weight group ({ft, l1, l2, l3} × {w, b}) について実行する。
+///
+/// Simple は LayerStack と違い `MomentBuf` を使わず純 `DeviceBuffer<f32>` で
+/// optimizer state を持つ (`--fp16-opt-state` 非対応)。`--ft-fp16` /
+/// `--ft-fp16-out` / `--tf32` / cuBLAS 経路も使わず、`untiled` `dense_mm_fwd/bwd` の
+/// 合成で完結する。
 struct SimpleGpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
 
-    // -- weight (FP32 のみ、forward 専用なので optimizer state 無し) --
+    // -- weight (FP32) --
     /// FT 重み (`ft_in × ft_out`、feature-major: `ft_w[feat*ft_out + out]`)。
     /// `sparse_ft_forward` の weight layout と一致する。
     ft_w: DeviceBuffer<f32>,
@@ -8810,11 +9266,54 @@ struct SimpleGpuTrainer {
     /// L3 dense bias (1 要素)。
     l3_b: DeviceBuffer<f32>,
 
+    // -- gradient buffer (各 weight と同 shape、f32) --
+    ft_w_grad: DeviceBuffer<f32>,
+    ft_b_grad: DeviceBuffer<f32>,
+    l1_w_grad: DeviceBuffer<f32>,
+    l1_b_grad: DeviceBuffer<f32>,
+    l2_w_grad: DeviceBuffer<f32>,
+    l2_b_grad: DeviceBuffer<f32>,
+    l3_w_grad: DeviceBuffer<f32>,
+    l3_b_grad: DeviceBuffer<f32>,
+
+    // -- Ranger optimizer state (RAdam 1st/2nd moment + Lookahead slow weight、各 weight と同 shape) --
+    ft_w_m: DeviceBuffer<f32>,
+    ft_w_v: DeviceBuffer<f32>,
+    ft_w_slow: DeviceBuffer<f32>,
+    ft_b_m: DeviceBuffer<f32>,
+    ft_b_v: DeviceBuffer<f32>,
+    ft_b_slow: DeviceBuffer<f32>,
+    l1_w_m: DeviceBuffer<f32>,
+    l1_w_v: DeviceBuffer<f32>,
+    l1_w_slow: DeviceBuffer<f32>,
+    l1_b_m: DeviceBuffer<f32>,
+    l1_b_v: DeviceBuffer<f32>,
+    l1_b_slow: DeviceBuffer<f32>,
+    l2_w_m: DeviceBuffer<f32>,
+    l2_w_v: DeviceBuffer<f32>,
+    l2_w_slow: DeviceBuffer<f32>,
+    l2_b_m: DeviceBuffer<f32>,
+    l2_b_v: DeviceBuffer<f32>,
+    l2_b_slow: DeviceBuffer<f32>,
+    l3_w_m: DeviceBuffer<f32>,
+    l3_w_v: DeviceBuffer<f32>,
+    l3_w_slow: DeviceBuffer<f32>,
+    l3_b_m: DeviceBuffer<f32>,
+    l3_b_v: DeviceBuffer<f32>,
+    l3_b_slow: DeviceBuffer<f32>,
+
     ws: SimpleGpuWorkspace,
     /// loss kernel が atomic add する Σerr² (f64、1 要素)。
     loss_acc: DeviceBuffer<f64>,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
+    /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
+    step_count: u64,
+    /// Ranger optimizer の weight decay 係数 (`radam_step` 引数)。
+    weight_decay: f32,
+    /// 推論時の評価値スケール (`round(QA * QB / 学習 scale)`)。量子化 checkpoint
+    /// 出力の arch 文字列に書く (`SimpleWeights::fv_scale`)。
+    fv_scale: i32,
 }
 
 impl Drop for SimpleGpuTrainer {
@@ -8830,6 +9329,8 @@ impl SimpleGpuTrainer {
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
+        weight_decay: f32,
+        fv_scale: i32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
@@ -8849,8 +9350,8 @@ impl SimpleGpuTrainer {
             .into());
         }
 
-        // smoke 用 small random init。group ごとに seed を変えて weight が同一値で
-        // 潰れないようにする (forward の合成 layer 構造を踏むため)。
+        // small random init。group ごとに seed を変えて weight が同一値で潰れない
+        // ようにする (forward の合成 layer 構造を踏むため)。
         let ft_w_h = xorshift_init(0x5071_e001, ft_in * ft_out, 0.01);
         let ft_b_h = xorshift_init(0x5071_e002, ft_out, 0.01);
         let l1_w_h = xorshift_init(0x5071_e003, 2 * ft_out * l1_out, 0.01);
@@ -8861,20 +9362,84 @@ impl SimpleGpuTrainer {
         let l3_b_h = xorshift_init(0x5071_e008, 1, 0.01);
 
         let batch = batch_size.max(1);
+        let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+            DeviceBuffer::<f32>::zeroed(&stream, n).map_err(Into::into)
+        };
+        let ft_w_n = ft_in * ft_out;
+        let ft_b_n = ft_out;
+        let l1_w_n = 2 * ft_out * l1_out;
+        let l1_b_n = l1_out;
+        let l2_w_n = l1_out * l2_out;
+        let l2_b_n = l2_out;
+        let l3_w_n = l2_out;
+        let l3_b_n = 1;
+        // Lookahead slow weight は学習開始時 weights と同値で初期化する (bullet
+        // `Ranger` の初期 `slow_param ← param` 規約)。
+        let ft_w = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_b = DeviceBuffer::from_host(&stream, &ft_b_h)?;
+        let l1_w = DeviceBuffer::from_host(&stream, &l1_w_h)?;
+        let l1_b = DeviceBuffer::from_host(&stream, &l1_b_h)?;
+        let l2_w = DeviceBuffer::from_host(&stream, &l2_w_h)?;
+        let l2_b = DeviceBuffer::from_host(&stream, &l2_b_h)?;
+        let l3_w = DeviceBuffer::from_host(&stream, &l3_w_h)?;
+        let l3_b = DeviceBuffer::from_host(&stream, &l3_b_h)?;
+        let ft_w_slow = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_b_slow = DeviceBuffer::from_host(&stream, &ft_b_h)?;
+        let l1_w_slow = DeviceBuffer::from_host(&stream, &l1_w_h)?;
+        let l1_b_slow = DeviceBuffer::from_host(&stream, &l1_b_h)?;
+        let l2_w_slow = DeviceBuffer::from_host(&stream, &l2_w_h)?;
+        let l2_b_slow = DeviceBuffer::from_host(&stream, &l2_b_h)?;
+        let l3_w_slow = DeviceBuffer::from_host(&stream, &l3_w_h)?;
+        let l3_b_slow = DeviceBuffer::from_host(&stream, &l3_b_h)?;
         Ok(Self {
-            ft_w: DeviceBuffer::from_host(&stream, &ft_w_h)?,
-            ft_b: DeviceBuffer::from_host(&stream, &ft_b_h)?,
-            l1_w: DeviceBuffer::from_host(&stream, &l1_w_h)?,
-            l1_b: DeviceBuffer::from_host(&stream, &l1_b_h)?,
-            l2_w: DeviceBuffer::from_host(&stream, &l2_w_h)?,
-            l2_b: DeviceBuffer::from_host(&stream, &l2_b_h)?,
-            l3_w: DeviceBuffer::from_host(&stream, &l3_w_h)?,
-            l3_b: DeviceBuffer::from_host(&stream, &l3_b_h)?,
+            ft_w,
+            ft_b,
+            l1_w,
+            l1_b,
+            l2_w,
+            l2_b,
+            l3_w,
+            l3_b,
+            ft_w_grad: z(ft_w_n)?,
+            ft_b_grad: z(ft_b_n)?,
+            l1_w_grad: z(l1_w_n)?,
+            l1_b_grad: z(l1_b_n)?,
+            l2_w_grad: z(l2_w_n)?,
+            l2_b_grad: z(l2_b_n)?,
+            l3_w_grad: z(l3_w_n)?,
+            l3_b_grad: z(l3_b_n)?,
+            ft_w_m: z(ft_w_n)?,
+            ft_w_v: z(ft_w_n)?,
+            ft_w_slow,
+            ft_b_m: z(ft_b_n)?,
+            ft_b_v: z(ft_b_n)?,
+            ft_b_slow,
+            l1_w_m: z(l1_w_n)?,
+            l1_w_v: z(l1_w_n)?,
+            l1_w_slow,
+            l1_b_m: z(l1_b_n)?,
+            l1_b_v: z(l1_b_n)?,
+            l1_b_slow,
+            l2_w_m: z(l2_w_n)?,
+            l2_w_v: z(l2_w_n)?,
+            l2_w_slow,
+            l2_b_m: z(l2_b_n)?,
+            l2_b_v: z(l2_b_n)?,
+            l2_b_slow,
+            l3_w_m: z(l3_w_n)?,
+            l3_w_v: z(l3_w_n)?,
+            l3_w_slow,
+            l3_b_m: z(l3_b_n)?,
+            l3_b_v: z(l3_b_n)?,
+            l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             stream,
             module,
             id,
+            step_count: 0,
+            weight_decay,
+            fv_scale,
         })
     }
 
@@ -8906,6 +9471,26 @@ impl SimpleGpuTrainer {
     fn forward(
         &mut self,
         batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if b == 0 {
+            return Ok(0.0);
+        }
+        self.ws.check_batch_capacity(b)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        Ok(loss_host[0])
+    }
+
+    /// 1 batch の forward → backward → Ranger optimizer step を走らせ、loss kernel が
+    /// 累積した Σerr² を返す。`bucket_idx` は受け取らない (Simple アーキは bucket 無し)。
+    fn step(
+        &mut self,
+        batch: &BatchData,
+        lr: f32,
+        wdl_lambda: f32,
         loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
@@ -8914,6 +9499,24 @@ impl SimpleGpuTrainer {
         }
         self.ws.check_batch_capacity(b)?;
 
+        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        self.run_backward_kernels(b)?;
+        self.run_optimizer_step(lr)?;
+
+        let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        Ok(loss_host[0])
+    }
+
+    /// forward kernel 列のみを走らせる (loss は host 同期 read しない)。`forward` /
+    /// `step` 共通の前段で、終了時 `net_output` / `dy_net_output` / `loss_acc` が device
+    /// 上に書かれている。caller が batch capacity を事前検査する責務。
+    fn run_forward_kernels(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
         let b_u32 = b as u32;
         let ft_out_u32 = self.id.ft_out as u32;
         let l1_in_u32 = (2 * self.id.ft_out) as u32; // L1 入力 = stm/nstm concat 後
@@ -9127,7 +9730,8 @@ impl SimpleGpuTrainer {
             ]
         }?;
 
-        // -- loss kernel (Σerr² を loss_acc に atomic accumulate)。dnet は破棄 --
+        // -- loss kernel (Σerr² を loss_acc に atomic accumulate)、`dy_net_output` に
+        // L3 出力への grad を書く。`wdl_lambda` で score/wdl ターゲットを blend する。
         match loss {
             LossKind::Sigmoid { scale } => {
                 cuda_launch! {
@@ -9142,7 +9746,7 @@ impl SimpleGpuTrainer {
                         batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
-                        0.0_f32, // wdl_lambda (smoke は WDL blend を使わない)
+                        wdl_lambda,
                         scale,
                         b_u32
                     ]
@@ -9166,23 +9770,873 @@ impl SimpleGpuTrainer {
                         batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
-                        0.0_f32,
+                        wdl_lambda,
                         nnue2score, in_scaling,
                         target_offset, target_scaling, b_u32
                     ]
                 }?;
             }
         }
+        Ok(())
+    }
 
-        // -- loss_acc を sync 読み出して返す --
+    /// `run_forward_kernels` の直後に呼び、`dy_net_output` を起点として 8 weight group
+    /// の gradient buffer を埋める。bias / FT weight は atomic accumulate のため host で
+    /// 0 初期化する。dense weight (l1/l2/l3_w) は `dense_mm_bwd_weight` が overwrite
+    /// 書きなので初期化不要。
+    fn run_backward_kernels(&mut self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let b_u32 = b as u32;
+        let ft_out_u32 = self.id.ft_out as u32;
+        let l1_in_u32 = (2 * self.id.ft_out) as u32;
+        let l1_out_u32 = self.id.l1_out as u32;
+        let l2_out_u32 = self.id.l2_out as u32;
+        let ft_in_u32 = self.ws.ft_in as u32;
+        let max_active_u32 = self.ws.max_active as u32;
+        let ft_n = b * self.id.ft_out;
+        let ft_n_u32 = ft_n as u32;
+        let l1_n = b * self.id.l1_out;
+        let l1_n_u32 = l1_n as u32;
+        let l2_n = b * self.id.l2_out;
+        let l2_n_u32 = l2_n as u32;
+
+        // bias_grad / sparse_ft_backward は atomic add で累積する。host で 0 初期化必須。
+        memset_zero(&self.stream, &self.ft_w_grad)?;
+        memset_zero(&self.stream, &self.ft_b_grad)?;
+        memset_zero(&self.stream, &self.l1_b_grad)?;
+        memset_zero(&self.stream, &self.l2_b_grad)?;
+        memset_zero(&self.stream, &self.l3_b_grad)?;
+
+        // ---- L3: dy_net_output (b × 1) -> dl2_acted (b × l2_out), l3_w_grad, l3_b_grad ----
+        cuda_launch! {
+            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
+            config: cfg_1d(b * self.id.l2_out),
+            args: [slice(self.ws.dy_net_output), slice(self.l3_w), slice_mut(self.ws.dl2_acted),
+                   b_u32, l2_out_u32, 1_u32]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
+            config: cfg_1d(self.id.l2_out),
+            args: [slice(self.ws.l2_acted), slice(self.ws.dy_net_output), slice_mut(self.l3_w_grad),
+                   b_u32, l2_out_u32, 1_u32]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad, stream: self.stream, module: self.module,
+            config: cfg_1d(b),
+            args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
+        }?;
+
+        // ---- L2 activation grad: dl2_acted -> dl2_pre (kernel reads l2_pre) ----
+        match self.id.activation {
+            SimpleActivation::CReLU => cuda_launch! {
+                kernel: crelu_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
+                       slice_mut(self.ws.dl2_pre), l2_n_u32]
+            }?,
+            SimpleActivation::SCReLU => cuda_launch! {
+                kernel: screlu_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
+                       slice_mut(self.ws.dl2_pre), l2_n_u32]
+            }?,
+        }
+
+        // ---- L2 dense backward: dl2_pre -> dl1_acted, l2_w_grad, l2_b_grad ----
+        cuda_launch! {
+            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
+            config: cfg_1d(b * self.id.l1_out),
+            args: [slice(self.ws.dl2_pre), slice(self.l2_w), slice_mut(self.ws.dl1_acted),
+                   b_u32, l1_out_u32, l2_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
+            config: cfg_1d(self.id.l1_out * self.id.l2_out),
+            args: [slice(self.ws.l1_acted), slice(self.ws.dl2_pre), slice_mut(self.l2_w_grad),
+                   b_u32, l1_out_u32, l2_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad, stream: self.stream, module: self.module,
+            config: cfg_1d(l2_n),
+            args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+        }?;
+
+        // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
+        match self.id.activation {
+            SimpleActivation::CReLU => cuda_launch! {
+                kernel: crelu_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
+                       slice_mut(self.ws.dl1_pre), l1_n_u32]
+            }?,
+            SimpleActivation::SCReLU => cuda_launch! {
+                kernel: screlu_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
+                       slice_mut(self.ws.dl1_pre), l1_n_u32]
+            }?,
+        }
+
+        // ---- L1 dense backward: dl1_pre -> dcombined, l1_w_grad, l1_b_grad ----
+        cuda_launch! {
+            kernel: dense_mm_bwd_input, stream: self.stream, module: self.module,
+            config: cfg_1d(b * 2 * self.id.ft_out),
+            args: [slice(self.ws.dl1_pre), slice(self.l1_w), slice_mut(self.ws.dcombined),
+                   b_u32, l1_in_u32, l1_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight, stream: self.stream, module: self.module,
+            config: cfg_1d(2 * self.id.ft_out * self.id.l1_out),
+            args: [slice(self.ws.combined), slice(self.ws.dl1_pre), slice_mut(self.l1_w_grad),
+                   b_u32, l1_in_u32, l1_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad, stream: self.stream, module: self.module,
+            config: cfg_1d(l1_n),
+            args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+        }?;
+
+        // ---- Concat inverse: dcombined -> dft_stm_acted (offset 0) + dft_nstm_acted (offset ft_out) ----
+        // slice_extract_2d args: (src, dst, batch, src_stride, src_offset, out_dim)。
+        cuda_launch! {
+            kernel: slice_extract_2d, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
+                   b_u32, l1_in_u32, 0_u32, ft_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: slice_extract_2d, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
+                   b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
+        }?;
+
+        // ---- FT activation grad × 2: dft_*_acted -> dft_*_out (kernel reads ft_*_out) ----
+        match self.id.activation {
+            SimpleActivation::CReLU => {
+                cuda_launch! {
+                    kernel: crelu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
+                           slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                }?;
+                cuda_launch! {
+                    kernel: crelu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
+                           slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                }?;
+            }
+            SimpleActivation::SCReLU => {
+                cuda_launch! {
+                    kernel: screlu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [slice(self.ws.ft_stm_out), slice(self.ws.dft_stm_acted),
+                           slice_mut(self.ws.dft_stm_out), ft_n_u32]
+                }?;
+                cuda_launch! {
+                    kernel: screlu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [slice(self.ws.ft_nstm_out), slice(self.ws.dft_nstm_acted),
+                           slice_mut(self.ws.dft_nstm_out), ft_n_u32]
+                }?;
+            }
+        }
+
+        // ---- FT bias grad: stm/nstm 両 perspective が同じ ft_b を共有 → 両者の grad を累積 ----
+        cuda_launch! {
+            kernel: bias_grad, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dft_stm_out), slice(self.ft_b_grad), b_u32, ft_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: bias_grad, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dft_nstm_out), slice(self.ft_b_grad), b_u32, ft_out_u32]
+        }?;
+
+        // ---- FT weight grad × 2 (sparse_ft_backward、atomic accumulate) ----
+        cuda_launch! {
+            kernel: sparse_ft_backward, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dft_stm_out), slice(self.ws.stm_idx_dev),
+                   slice_mut(self.ft_w_grad),
+                   b_u32, ft_out_u32, ft_in_u32, max_active_u32]
+        }?;
+        cuda_launch! {
+            kernel: sparse_ft_backward, stream: self.stream, module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ws.dft_nstm_out), slice(self.ws.nstm_idx_dev),
+                   slice_mut(self.ft_w_grad),
+                   b_u32, ft_out_u32, ft_in_u32, max_active_u32]
+        }?;
+
+        Ok(())
+    }
+
+    /// Ranger optimizer step (RAdam + Lookahead) を 8 weight group に走らせる。
+    /// `RANGER_K` の倍数 step では lookahead lerp を続けて走らせ slow weight と
+    /// master weight を補間する。`run_backward_kernels` の直後に呼ぶ。
+    fn run_optimizer_step(&mut self, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
+        self.step_count += 1;
+        let (step_size, denom) =
+            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+
+        let ft_in = self.ws.ft_in;
+        let ft_out = self.id.ft_out;
+        let l1_out = self.id.l1_out;
+        let l2_out = self.id.l2_out;
+        let ft_w_n = (ft_in * ft_out) as u32;
+        let ft_b_n = ft_out as u32;
+        let l1_w_n = (2 * ft_out * l1_out) as u32;
+        let l1_b_n = l1_out as u32;
+        let l2_w_n = (l1_out * l2_out) as u32;
+        let l2_b_n = l2_out as u32;
+        let l3_w_n = l2_out as u32;
+        let l3_b_n = 1_u32;
+
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+            args: [slice_mut(self.ft_w), slice_mut(self.ft_w_m), slice_mut(self.ft_w_v),
+                   slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
+            args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
+                   slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, ft_b_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
+            args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
+                   slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l1_w_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
+            args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
+                   slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l1_b_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
+            args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
+                   slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l2_w_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
+            args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
+                   slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l2_b_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
+            args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
+                   slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l3_w_n]
+        }?;
+        cuda_launch! {
+            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
+            args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
+                   slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay,
+                   BETA1, BETA2, EPS, MIN_W, MAX_W, l3_b_n]
+        }?;
+
+        if self.step_count.is_multiple_of(RANGER_K) {
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_w_n as usize),
+                args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(ft_b_n as usize),
+                args: [slice_mut(self.ft_b), slice_mut(self.ft_b_slow), RANGER_ALPHA, ft_b_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_w_n as usize),
+                args: [slice_mut(self.l1_w), slice_mut(self.l1_w_slow), RANGER_ALPHA, l1_w_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_b_n as usize),
+                args: [slice_mut(self.l1_b), slice_mut(self.l1_b_slow), RANGER_ALPHA, l1_b_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_w_n as usize),
+                args: [slice_mut(self.l2_w), slice_mut(self.l2_w_slow), RANGER_ALPHA, l2_w_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_b_n as usize),
+                args: [slice_mut(self.l2_b), slice_mut(self.l2_b_slow), RANGER_ALPHA, l2_b_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l3_w_n as usize),
+                args: [slice_mut(self.l3_w), slice_mut(self.l3_w_slow), RANGER_ALPHA, l3_w_n]
+            }?;
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                config: cfg_1d(l3_b_n as usize),
+                args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n]
+            }?;
+        }
+        Ok(())
+    }
+
+    /// 現在の device 上の f32 weight を `SimpleWeights` (host 側 f32 row-major) に
+    /// 書き出す。
+    ///
+    /// 重み layout の対応:
+    /// - `ft_w` / `ft_b` / `l3_w` / `l3_b` : device と `SimpleWeights` で同 layout (転置不要)。
+    /// - `l1_w` : device は `[in=2*ft_out, out=l1_out]` (`l1_w[in*l1_out + out]`、
+    ///   `dense_mm_fwd` の weight pattern)、`SimpleWeights` は `[out=l1_out, in=2*ft_out]` 行優先
+    ///   (`l1_w[out*(2*ft_out) + in]`、`save_quantised` の i8 量子化が前提とする out-major 並び)
+    ///   → host 側で in-major → out-major に転置する。
+    /// - `l2_w` : 同パターンの転置 (`[l1_out, l2_out]` → `[l2_out, l1_out]`)。
+    fn to_simple_weights(&self) -> Result<SimpleWeights, Box<dyn std::error::Error>> {
+        let id = self.id;
+        let ft_out = id.ft_out;
+        let l1_out = id.l1_out;
+        let l2_out = id.l2_out;
+        let l1_in = 2 * ft_out;
+
+        let ft_w = self.ft_w.to_host_vec(&self.stream)?;
+        let ft_b = self.ft_b.to_host_vec(&self.stream)?;
+        let l1_w_in_major = self.l1_w.to_host_vec(&self.stream)?;
+        let l1_b = self.l1_b.to_host_vec(&self.stream)?;
+        let l2_w_in_major = self.l2_w.to_host_vec(&self.stream)?;
+        let l2_b = self.l2_b.to_host_vec(&self.stream)?;
+        let l3_w = self.l3_w.to_host_vec(&self.stream)?;
+        let l3_b = self.l3_b.to_host_vec(&self.stream)?;
+
+        let mut l1_w = vec![0.0_f32; l1_out * l1_in];
+        for out in 0..l1_out {
+            for inp in 0..l1_in {
+                l1_w[out * l1_in + inp] = l1_w_in_major[inp * l1_out + out];
+            }
+        }
+        let mut l2_w = vec![0.0_f32; l2_out * l1_out];
+        for out in 0..l2_out {
+            for inp in 0..l1_out {
+                l2_w[out * l1_out + inp] = l2_w_in_major[inp * l2_out + out];
+            }
+        }
+
+        Ok(SimpleWeights {
+            id,
+            fv_scale: self.fv_scale,
+            ft_w,
+            ft_b,
+            l1_w,
+            l1_b,
+            l2_w,
+            l2_b,
+            l3_w,
+            l3_b,
+        })
+    }
+
+    /// `SimpleWeights` を device 上に upload して現在の重み・lookahead slow を置き換える。
+    /// `m` / `v` / `grad` は 0 リセット、`step_count` を 0 に戻す (Ranger を最初から
+    /// やり直すのと等価)。`load_simple_weights` 後の slow weight は upload した weight
+    /// と同値 (lookahead が `w == slow` 状態から始まる、`new` と同じ規約)。
+    ///
+    /// `w.id` が現トレーナの `id` と一致しなければ early reject する (異 topology /
+    /// feature set の weight は受け入れない)。`fv_scale` は受け入れた値で上書きする。
+    ///
+    /// device buffer の layout 変換は [`Self::to_simple_weights`] と逆向きで、L1/L2 weight
+    /// は host 側で out-major → in-major に転置してから upload する。
+    fn load_simple_weights(&mut self, w: &SimpleWeights) -> Result<(), Box<dyn std::error::Error>> {
+        if w.id != self.id {
+            return Err(format!(
+                "SimpleGpuTrainer::load_simple_weights: id mismatch \
+                 (trainer ft_in={}, ft_out={}, l1_out={}, l2_out={}, activation={}, \
+                 feature_set={}; weights ft_in={}, ft_out={}, l1_out={}, l2_out={}, \
+                 activation={}, feature_set={})",
+                self.id.ft_in(),
+                self.id.ft_out,
+                self.id.l1_out,
+                self.id.l2_out,
+                self.id.activation.canonical_name(),
+                self.id.feature_set.canonical_name(),
+                w.id.ft_in(),
+                w.id.ft_out,
+                w.id.l1_out,
+                w.id.l2_out,
+                w.id.activation.canonical_name(),
+                w.id.feature_set.canonical_name(),
+            )
+            .into());
+        }
+        let ft_out = self.id.ft_out;
+        let l1_out = self.id.l1_out;
+        let l2_out = self.id.l2_out;
+        let l1_in = 2 * ft_out;
+
+        let mut l1_w_in_major = vec![0.0_f32; l1_in * l1_out];
+        for out in 0..l1_out {
+            for inp in 0..l1_in {
+                l1_w_in_major[inp * l1_out + out] = w.l1_w[out * l1_in + inp];
+            }
+        }
+        let mut l2_w_in_major = vec![0.0_f32; l1_out * l2_out];
+        for out in 0..l2_out {
+            for inp in 0..l1_out {
+                l2_w_in_major[inp * l2_out + out] = w.l2_w[out * l1_out + inp];
+            }
+        }
+
+        // weight 本体 (master と slow の両方を同値で初期化)。
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        self.l1_w = DeviceBuffer::from_host(&self.stream, &l1_w_in_major)?;
+        self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &l1_w_in_major)?;
+        self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+        self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+        self.l2_w = DeviceBuffer::from_host(&self.stream, &l2_w_in_major)?;
+        self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &l2_w_in_major)?;
+        self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+        self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+        self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
+        self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
+        self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+        self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+
+        // m / v / grad を 0 リセット、step_count を 0 に戻す (Ranger を最初から)。
+        for buf in [
+            &self.ft_w_m,
+            &self.ft_w_v,
+            &self.ft_w_grad,
+            &self.ft_b_m,
+            &self.ft_b_v,
+            &self.ft_b_grad,
+            &self.l1_w_m,
+            &self.l1_w_v,
+            &self.l1_w_grad,
+            &self.l1_b_m,
+            &self.l1_b_v,
+            &self.l1_b_grad,
+            &self.l2_w_m,
+            &self.l2_w_v,
+            &self.l2_w_grad,
+            &self.l2_b_m,
+            &self.l2_b_v,
+            &self.l2_b_grad,
+            &self.l3_w_m,
+            &self.l3_w_v,
+            &self.l3_w_grad,
+            &self.l3_b_m,
+            &self.l3_b_v,
+            &self.l3_b_grad,
+        ] {
+            memset_zero(&self.stream, buf)?;
+        }
+        self.step_count = 0;
+        self.fv_scale = w.fv_scale;
+        Ok(())
+    }
+
+    /// resume 用 raw f32 checkpoint を `path` に atomic に書き出す (LayerStack の
+    /// [`GpuTrainer::save_raw_checkpoint`] と同 format / 同方針)。
+    ///
+    /// 8 weight group の順序: `ft_w, ft_b, l1_w, l1_b, l2_w, l2_b, l3_w, l3_b`。
+    /// 各 group は `len u64 + w[f32×len] + m[f32×len] + v[f32×len] + slow[f32×len]`。
+    /// L1/L2 weight は device-native `[in, out]` 並びそのまま書く (resume 互換性は
+    /// device 上の layout で完結する)。
+    fn save_raw_checkpoint(
+        &self,
+        path: &Path,
+        superbatch: usize,
+        run_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        let run_id = if run_id.len() > MAX_RUN_ID_BYTES {
+            eprintln!(
+                "[train] warning: producer run id ({} bytes) exceeds {MAX_RUN_ID_BYTES}; \
+                 omitting it from {} (resume lineage parent will be unresolved)",
+                run_id.len(),
+                path.display()
+            );
+            ""
+        } else {
+            run_id
+        };
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".tmp");
+            std::path::PathBuf::from(p)
+        };
+
+        let groups = self.raw_ckpt_groups();
+        let topology: [u64; 3] = [
+            self.id.ft_out as u64,
+            self.id.l1_out as u64,
+            self.id.l2_out as u64,
+        ];
+
+        let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+            write_raw_ckpt_header(
+                &mut w,
+                &RawCkptArch {
+                    feature_set: self.id.feature_set,
+                    arch_kind: ArchKind::Simple,
+                    ft_out: self.id.ft_out as u64,
+                    topology: &topology,
+                },
+                run_id,
+                superbatch as u64,
+                self.step_count,
+                groups.len() as u64,
+            )?;
+            for (name, expected_len, w_buf, m_buf, v_buf, slow_buf) in groups {
+                let w_host = w_buf.to_host_vec(&self.stream)?;
+                let m_host = m_buf.to_host_vec(&self.stream)?;
+                let v_host = v_buf.to_host_vec(&self.stream)?;
+                let slow_host = slow_buf.to_host_vec(&self.stream)?;
+                for (label, got) in [
+                    ("w", w_host.len()),
+                    ("m", m_host.len()),
+                    ("v", v_host.len()),
+                    ("slow", slow_host.len()),
+                ] {
+                    if got != expected_len {
+                        return Err(format!(
+                            "raw checkpoint: group {name} {label} buffer len {got} != expected {expected_len}"
+                        )
+                        .into());
+                    }
+                }
+                w.write_all(&(expected_len as u64).to_le_bytes())?;
+                write_f32_slice(&mut w, &w_host)?;
+                write_f32_slice(&mut w, &m_host)?;
+                write_f32_slice(&mut w, &v_host)?;
+                write_f32_slice(&mut w, &slow_host)?;
+            }
+            w.flush()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// `--resume` 用に raw f32 checkpoint を読み戻す。返り値は完了 `(superbatch,
+    /// producer run id)` で、caller は通常 `superbatch + 1` から resume する。
+    ///
+    /// header (`arch_kind=Simple`, `topology=[ft_out, l1_out, l2_out]`, feature set)
+    /// は [`read_raw_ckpt_header`] が照合する。8 group 各 `(w, m, v, slow)` を
+    /// device へ upload し直し、`step_count` を復元する。`grad` は触らない
+    /// (step ごとに memset される)。
+    fn load_raw_checkpoint(
+        &mut self,
+        path: &Path,
+    ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let topology: [u64; 3] = [
+            self.id.ft_out as u64,
+            self.id.l1_out as u64,
+            self.id.l2_out as u64,
+        ];
+        let header = read_raw_ckpt_header(
+            &mut r,
+            &RawCkptArch {
+                feature_set: self.id.feature_set,
+                arch_kind: ArchKind::Simple,
+                ft_out: self.id.ft_out as u64,
+                topology: &topology,
+            },
+        )?;
+
+        let expected_groups: [(&'static str, usize); 8] = {
+            let g = self.raw_ckpt_groups();
+            [
+                (g[0].0, g[0].1),
+                (g[1].0, g[1].1),
+                (g[2].0, g[2].1),
+                (g[3].0, g[3].1),
+                (g[4].0, g[4].1),
+                (g[5].0, g[5].1),
+                (g[6].0, g[6].1),
+                (g[7].0, g[7].1),
+            ]
+        };
+        if header.num_groups != expected_groups.len() as u64 {
+            return Err(invalid_data(format!(
+                "raw checkpoint num_groups {} != expected {}",
+                header.num_groups,
+                expected_groups.len()
+            )));
+        }
+
+        let read_group = |r: &mut std::io::BufReader<std::fs::File>,
+                          name: &str,
+                          expected_len: usize|
+         -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
+            let mut buf8 = [0u8; 8];
+            read_exact_or_invalid(r, &mut buf8, &format!("group {name} len"))?;
+            let len_u64 = u64::from_le_bytes(buf8);
+            let len: usize = len_u64.try_into().map_err(|_| {
+                invalid_data(format!(
+                    "raw checkpoint group {name} len {len_u64} exceeds usize::MAX"
+                ))
+            })?;
+            if len != expected_len {
+                return Err(invalid_data(format!(
+                    "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} \
+                     (network architecture mismatch)"
+                )));
+            }
+            let w_host = read_f32_vec_io(r, len, &format!("group {name} w"))?;
+            let m_host = read_f32_vec_io(r, len, &format!("group {name} m"))?;
+            let v_host = read_f32_vec_io(r, len, &format!("group {name} v"))?;
+            let slow_host = read_f32_vec_io(r, len, &format!("group {name} slow"))?;
+            Ok((w_host, m_host, v_host, slow_host))
+        };
+
+        let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
+        for (name, expected_len) in expected_groups {
+            loaded.push(read_group(&mut r, name, expected_len)?);
+        }
+
+        macro_rules! up {
+            ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
+                let (w, m, v, s) = &loaded[$idx];
+                self.$w = DeviceBuffer::from_host(&self.stream, w)?;
+                self.$m = DeviceBuffer::from_host(&self.stream, m)?;
+                self.$v = DeviceBuffer::from_host(&self.stream, v)?;
+                self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+            }};
+        }
+        up!(0, ft_w, ft_w_m, ft_w_v, ft_w_slow);
+        up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
+        up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
+        up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
+        up!(4, l2_w, l2_w_m, l2_w_v, l2_w_slow);
+        up!(5, l2_b, l2_b_m, l2_b_v, l2_b_slow);
+        up!(6, l3_w, l3_w_m, l3_w_v, l3_w_slow);
+        up!(7, l3_b, l3_b_m, l3_b_v, l3_b_slow);
+
+        self.step_count = header.step_count;
+        Ok((header.superbatch, header.producer_run_id))
+    }
+
+    /// `save_raw_checkpoint` / `load_raw_checkpoint` で iterate する 8 weight group の
+    /// `(name, len, w, m, v, slow)`。順序は file format の固定順 (load 側が同じ並びで
+    /// upload する)。
+    fn raw_ckpt_groups(&self) -> [SimpleRawCkptGroupEntry<'_>; 8] {
+        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        let ft_b_n = self.id.ft_out;
+        let l1_w_n = 2 * self.id.ft_out * self.id.l1_out;
+        let l1_b_n = self.id.l1_out;
+        let l2_w_n = self.id.l1_out * self.id.l2_out;
+        let l2_b_n = self.id.l2_out;
+        let l3_w_n = self.id.l2_out;
+        let l3_b_n = 1;
+        [
+            (
+                "ft_w",
+                ft_w_n,
+                &self.ft_w,
+                &self.ft_w_m,
+                &self.ft_w_v,
+                &self.ft_w_slow,
+            ),
+            (
+                "ft_b",
+                ft_b_n,
+                &self.ft_b,
+                &self.ft_b_m,
+                &self.ft_b_v,
+                &self.ft_b_slow,
+            ),
+            (
+                "l1_w",
+                l1_w_n,
+                &self.l1_w,
+                &self.l1_w_m,
+                &self.l1_w_v,
+                &self.l1_w_slow,
+            ),
+            (
+                "l1_b",
+                l1_b_n,
+                &self.l1_b,
+                &self.l1_b_m,
+                &self.l1_b_v,
+                &self.l1_b_slow,
+            ),
+            (
+                "l2_w",
+                l2_w_n,
+                &self.l2_w,
+                &self.l2_w_m,
+                &self.l2_w_v,
+                &self.l2_w_slow,
+            ),
+            (
+                "l2_b",
+                l2_b_n,
+                &self.l2_b,
+                &self.l2_b_m,
+                &self.l2_b_v,
+                &self.l2_b_slow,
+            ),
+            (
+                "l3_w",
+                l3_w_n,
+                &self.l3_w,
+                &self.l3_w_m,
+                &self.l3_w_v,
+                &self.l3_w_slow,
+            ),
+            (
+                "l3_b",
+                l3_b_n,
+                &self.l3_b,
+                &self.l3_b_m,
+                &self.l3_b_v,
+                &self.l3_b_slow,
+            ),
+        ]
+    }
+
+    /// held-out validation 用 forward-only。weight は更新せず、batch 全体の `Σerr²`
+    /// と position ごとの net 出力 (`b` 個) を返す。
+    fn validate(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if b == 0 {
+            return Ok(StepOutput {
+                loss: 0.0,
+                net_output: Vec::new(),
+            });
+        }
+        self.ws.check_batch_capacity(b)?;
+        self.run_forward_kernels(batch, wdl_lambda, loss)?;
+        let net_output = self.ws.net_output.to_host_vec(&self.stream)?[..b].to_vec();
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
-        Ok(loss_host[0])
+        Ok(StepOutput {
+            loss: loss_host[0],
+            net_output,
+        })
+    }
+}
+
+impl TrainerBackend for SimpleGpuTrainer {
+    fn train_step(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        lr: f32,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> std::io::Result<f64> {
+        if batch.feature_set != self.id.feature_set {
+            return Err(std::io::Error::other(format!(
+                "batch feature set '{}' does not match trainer feature set '{}'",
+                batch.feature_set.canonical_name(),
+                self.id.feature_set.canonical_name(),
+            )));
+        }
+        // Simple は bucket を持たないため `bucket_idx` を kernel に渡さないが、
+        // `BatchData::from_batch_ref` の length 検査を再利用するため field として
+        // 受け取る (実 kernel launch では参照しない)。
+        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        self.step(&data, lr, wdl_lambda, loss)
+            .map_err(|e| std::io::Error::other(format!("SimpleGpuTrainer::step failed: {e}")))
+    }
+
+    fn validate_step(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> std::io::Result<ValidationStepOutput> {
+        if batch.feature_set != self.id.feature_set {
+            return Err(std::io::Error::other(format!(
+                "batch feature set '{}' does not match trainer feature set '{}'",
+                batch.feature_set.canonical_name(),
+                self.id.feature_set.canonical_name(),
+            )));
+        }
+        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        let out = self.validate(&data, wdl_lambda, loss).map_err(|e| {
+            std::io::Error::other(format!("SimpleGpuTrainer::validate failed: {e}"))
+        })?;
+        Ok(ValidationStepOutput {
+            sum_sq_err: out.loss,
+            net_output: out.net_output,
+        })
+    }
+
+    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
+        let weights = self.to_simple_weights().map_err(|e| {
+            std::io::Error::other(format!("SimpleGpuTrainer::to_simple_weights failed: {e}"))
+        })?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+        weights.save_quantised(&mut writer)?;
+        use std::io::Write;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn save_resume_checkpoint(
+        &mut self,
+        path: &Path,
+        superbatch: usize,
+        run_id: &str,
+    ) -> std::io::Result<()> {
+        self.save_raw_checkpoint(path, superbatch, run_id)
+            .map_err(|e| match e.downcast::<std::io::Error>() {
+                Ok(io_err) => *io_err,
+                Err(other) => std::io::Error::other(format!(
+                    "SimpleGpuTrainer::save_raw_checkpoint failed: {other}"
+                )),
+            })
     }
 }
 
 /// Simple アーキ用 smoke test。preset `256x2-32-32` (HalfKaHmMerged + CReLU) で
-/// `SimpleGpuTrainer` を構築し、forward path が finite な loss を返すことを確認する。
-/// SCReLU 活性化と WRM loss kernel も exercise する。
+/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む:
+/// 1. forward sanity — CReLU + SCReLU 両活性化 + sigmoid / WRM 両 loss kernel を
+///    1 step ずつ launch して loss が finite であること。
+/// 2. step が gradient を正しく配線していることを 10 step の loss 推移で確認する
+///    (loss が初期値より下がる)。
+/// 3. `to_simple_weights` → `save_quantised` → `SimpleWeights::load` →
+///    `load_simple_weights` の量子化 round-trip 後の forward が finite に走る。
+/// 4. `save_raw_checkpoint` → 新 trainer での `load_raw_checkpoint` 後の forward が
+///    元と完全一致 (raw f32 round-trip の exact preservation)。
 fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke/simple] CUDA context created, loading kernel module...");
@@ -9193,7 +10647,10 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         l1_out: 32,
         l2_out: 32,
     };
-    let mut trainer = SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id)?;
+    let smoke_fv_scale = 16_i32;
+    let smoke_weight_decay = 1e-7_f32;
+    let mut trainer =
+        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
         + 2 * id.ft_out * id.l1_out
@@ -9213,40 +10670,130 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id.activation.canonical_name(),
     );
     trainer.assert_all_weights_finite()?;
-    println!("[smoke/simple] step 0: init weights all finite ✓");
 
     let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-    let loss = trainer.forward(&batch.as_ref(), SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] step 1 (sigmoid-MSE): loss = {loss:.6e}");
+    let loss = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] forward 1 (sigmoid-MSE, crelu): loss = {loss:.6e}");
     if !loss.is_finite() {
-        return Err(format!("step 1 loss = {loss} is not finite").into());
+        return Err(format!("forward 1 loss = {loss} is not finite").into());
     }
     trainer.assert_all_weights_finite()?;
-    println!("[smoke/simple] step 1: forward path OK ✓");
 
-    // SCReLU 活性化を持つ別 trainer で 1 step 走らせ、screlu_fwd kernel の launch
-    // path (4 箇所の活性化分岐の SCReLU 側) を exercise する。
     let id_screlu = SimpleId {
         activation: SimpleActivation::SCReLU,
         ..id
     };
-    let mut trainer_screlu = SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id_screlu)?;
-    let loss_screlu = trainer_screlu.forward(&batch.as_ref(), SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] step 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
+    let mut trainer_screlu = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id_screlu,
+        smoke_weight_decay,
+        smoke_fv_scale,
+    )?;
+    let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
     if !loss_screlu.is_finite() {
-        return Err(format!("step 2 loss = {loss_screlu} is not finite").into());
+        return Err(format!("forward 2 loss = {loss_screlu} is not finite").into());
     }
 
-    // WRM loss kernel も exercise する。
-    let loss_wrm_val = trainer.forward(&batch.as_ref(), SMOKE_LOSS_WRM)?;
-    println!("[smoke/simple] step 3 (win-rate-model): loss = {loss_wrm_val:.6e}");
+    let loss_wrm_val = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    println!("[smoke/simple] forward 3 (win-rate-model, crelu): loss = {loss_wrm_val:.6e}");
     if !loss_wrm_val.is_finite() {
-        return Err(format!("step 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+        return Err(format!("forward 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+    }
+    println!("[smoke/simple] forward sanity OK ✓");
+
+    // 10-step gradient direction check。`smoke_dummy` は score=0 / wdl=0.5 で
+    // sigmoid loss の最小点 (target=0.5、init weights が小さく net_output≈0、
+    // p≈0.5) に近すぎるため、score を非ゼロにして target を 0.5 から動かし
+    // 学習信号を作る。
+    let mut training_batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    for s in training_batch.score.iter_mut() {
+        *s = 200.0;
+    }
+    for w in training_batch.wdl.iter_mut() {
+        *w = 0.8;
+    }
+    let lr = 1e-1_f32;
+    let initial_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    for step_idx in 0..10 {
+        let step_loss = trainer.step(&training_batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+        if !step_loss.is_finite() {
+            return Err(format!("step {step_idx} loss = {step_loss} is not finite").into());
+        }
+    }
+    trainer.assert_all_weights_finite()?;
+    let final_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] 10-step training: loss {initial_loss:.6e} -> {final_loss:.6e}");
+    // NaN は `>=` でも `<` でも false になるので、`is_finite` で別途弾く。
+    if !final_loss.is_finite() || final_loss >= initial_loss {
+        return Err(format!(
+            "10-step training did not decrease loss: initial = {initial_loss}, final = {final_loss} \
+             (backward / optimizer wiring likely broken)"
+        )
+        .into());
+    }
+    println!("[smoke/simple] gradient direction OK ✓");
+
+    // 量子化 round-trip: `to_simple_weights` -> `save_quantised` -> `SimpleWeights::load`
+    // -> `load_simple_weights`。量子化丸めで weight 値は変わるため loss は厳密一致しない;
+    // ここでは round-trip が format 上完結し、再 upload した weight で forward が finite
+    // に走ることを確認する。bit-identical な round-trip は次段の raw checkpoint で確認する。
+    let weights = trainer.to_simple_weights()?;
+    let mut quantised_bytes = Vec::new();
+    weights.save_quantised(&mut quantised_bytes)?;
+    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&quantised_bytes), id)?;
+    if reloaded.fv_scale != smoke_fv_scale {
+        return Err(format!(
+            "SimpleWeights round-trip: fv_scale mismatch (got {}, want {smoke_fv_scale})",
+            reloaded.fv_scale
+        )
+        .into());
+    }
+    let mut trainer_q =
+        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
+    trainer_q.load_simple_weights(&reloaded)?;
+    let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!(
+        "[smoke/simple] quantised round-trip: trained loss {final_loss:.6e} \
+         -> reloaded loss {loss_q:.6e} ({} bytes)",
+        quantised_bytes.len()
+    );
+    if !loss_q.is_finite() {
+        return Err(format!(
+            "quantised round-trip forward loss = {loss_q} is not finite \
+             (to_simple_weights / load_simple_weights transpose direction or format mismatch)"
+        )
+        .into());
+    }
+
+    // raw f32 checkpoint round-trip: save -> 新 trainer で load -> 同 batch で forward。
+    // raw checkpoint は f32 を bit-identical に保つので loss は完全一致するはず。
+    let raw_path = std::env::temp_dir().join(format!("simple-smoke-{}.ckpt", std::process::id()));
+    trainer.save_raw_checkpoint(&raw_path, 1, "smoke")?;
+    let mut trainer_r =
+        SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, smoke_weight_decay, smoke_fv_scale)?;
+    let (sb, _producer) = trainer_r.load_raw_checkpoint(&raw_path)?;
+    if sb != 1 {
+        return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
+    }
+    let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let _ = std::fs::remove_file(&raw_path);
+    let loss_r_rel = ((loss_r - final_loss).abs() / final_loss.abs().max(1e-12)) as f32;
+    println!(
+        "[smoke/simple] raw checkpoint round-trip: loss {final_loss:.6e} -> {loss_r:.6e} \
+         (relative {loss_r_rel:.3e})"
+    );
+    if !loss_r.is_finite() || loss_r_rel > 1e-6 {
+        return Err(format!(
+            "raw round-trip loss mismatch: final = {final_loss}, reloaded = {loss_r} \
+             (raw f32 should be bit-identical; group ordering / topology / step_count likely broken)"
+        )
+        .into());
     }
 
     println!(
-        "[smoke/simple] PASSED — SimpleGpuTrainer forward path OK \
-         (CReLU + SCReLU activations, sigmoid + wrm loss)"
+        "[smoke/simple] PASSED — forward + gradient + quantised round-trip + raw round-trip OK"
     );
     Ok(())
 }

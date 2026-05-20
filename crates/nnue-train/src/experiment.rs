@@ -91,9 +91,17 @@ pub struct Params {
     pub l0: usize,
     pub l1: usize,
     pub l2: usize,
-    pub num_buckets: usize,
+    /// output bucket 数。bucket を持たないアーキ (Simple 等) では未指定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_buckets: Option<usize>,
     pub optimizer: String,
-    pub bucket_mode: String,
+    /// bucket mode の canonical 名 (`progress8kpabs` 等)。bucket 無しアーキでは未指定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket_mode: Option<String>,
+    /// per-perspective 活性化の canonical 名 (`crelu` / `screlu`)。LayerStack のように
+    /// 活性化を struct に持たないアーキでは未指定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
     /// progress 係数ファイルの basename。未指定なら省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_coeff: Option<String>,
@@ -502,9 +510,10 @@ mod tests {
             l0: 1536,
             l1: 16,
             l2: 32,
-            num_buckets: 9,
+            num_buckets: Some(9),
             optimizer: "ranger".to_string(),
-            bucket_mode: "progress8kpabs".to_string(),
+            bucket_mode: Some("progress8kpabs".to_string()),
+            activation: None,
             progress_coeff: Some("progress.bin".to_string()),
             lr: 8.75e-4,
             lr_gamma: 0.995,
