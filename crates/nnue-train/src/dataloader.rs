@@ -479,6 +479,7 @@ impl BucketedPrefetchedLoader {
         num_workers: usize,
         progress: ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
+        compute_bucket: bool,
     ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         let num_workers = num_workers.max(1);
@@ -552,16 +553,21 @@ impl BucketedPrefetchedLoader {
                         }
                     }
 
-                    // decode-once: ShogiBoard を feature 抽出 + progress bucket
-                    // の両方に使う。
+                    // decode-once: ShogiBoard を feature 抽出 + (compute_bucket=true
+                    // のとき) progress bucket の両方に使う。`compute_bucket=false`
+                    // (Simple アーキ) では `progress.bucket_board` の per-position 推論
+                    // (~30-40 KP-abs weight load + exp + clamp) を skip し worker CPU を
+                    // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
                     for psv in &scratch {
                         let board = psv.decode();
                         let pushed = batch.push_decoded(&board);
                         debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
-                        buckets.push(i32::from(progress.bucket_board(&board)));
+                        if compute_bucket {
+                            buckets.push(i32::from(progress.bucket_board(&board)));
+                        }
                     }
                     debug_assert_eq!(batch.n_positions, batch_size);
-                    debug_assert_eq!(buckets.len(), batch_size);
+                    debug_assert!(!compute_bucket || buckets.len() == batch_size);
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
                     if result_tx.send((batch, buckets)).is_err() {
@@ -869,6 +875,7 @@ mod tests {
             num_workers,
             progress,
             test_spec(),
+            true,
         )
         .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
@@ -913,9 +920,16 @@ mod tests {
     #[test]
     fn bucketed_loader_zero_workers_normalizes_to_one() {
         let progress = ShogiProgressKPAbs;
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&sample_psv_path(), 8, None, 0, progress, test_spec())
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &sample_psv_path(),
+            8,
+            None,
+            0,
+            progress,
+            test_spec(),
+            true,
+        )
+        .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
@@ -938,6 +952,7 @@ mod tests {
             2,
             progress,
             test_spec(),
+            true,
         )
         .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
@@ -955,6 +970,7 @@ mod tests {
             1,
             progress,
             test_spec(),
+            true,
         )
         .unwrap();
         let _ = drop_loader.next_batch();
@@ -969,7 +985,7 @@ mod tests {
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
         let mut loader =
-            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec()).unwrap();
+            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true).unwrap();
         let err = loader
             .next_batch()
             .expect_err("empty file → barren error, not None and not hang");
