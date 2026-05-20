@@ -9723,7 +9723,9 @@ impl SimpleGpuTrainer {
         // (`combined.len() == b * (2*ft_out)`、`l1_w.len() == (2*ft_out) * l1_out`、
         // `l1_pre.len() == b * l1_out`)、`self.cublas` は `self.stream` に bind 済で同
         // stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、後続 bias_add_per_row
-        // が観測)。
+        // が観測)。`cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す
+        // device pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の
+        // 借用が unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
         unsafe {
             self.cublas.sgemm_fwd_rowmajor(
                 b_u32 as i32,
@@ -9952,6 +9954,9 @@ impl SimpleGpuTrainer {
         // SAFETY: dl1_pre / l1_w / dcombined は cudaMalloc 由来、長さは arch 上 invariant
         // (`dl1_pre.len() == b*l1_out`、`l1_w.len() == (2*ft_out)*l1_out`、
         // `dcombined.len() == b*(2*ft_out)`)、`self.cublas` は `self.stream` に bind 済。
+        // `cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す device
+        // pointer は 256 byte aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が
+        // unsafe block を超えて生存するので元 buffer も同 lifetime で valid。
         unsafe {
             self.cublas.sgemm_x_yt_rowmajor(
                 b_u32 as i32,
@@ -9965,7 +9970,8 @@ impl SimpleGpuTrainer {
         // bwd_weight: l1_w_grad[2*ft_out, l1_out] = combined[B, 2*ft_out]^T @ dl1_pre[B, l1_out]
         // SAFETY: combined / dl1_pre / l1_w_grad は cudaMalloc 由来、長さは arch 上 invariant
         // (`combined.len() == b*(2*ft_out)`、`dl1_pre.len() == b*l1_out`、
-        // `l1_w_grad.len() == (2*ft_out)*l1_out`)、stream 共有は forward と同様。
+        // `l1_w_grad.len() == (2*ft_out)*l1_out`)、stream 共有 + cast 妥当性は bwd_input
+        // と同じ前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
         unsafe {
             self.cublas.sgemm_xt_y_rowmajor(
                 l1_in_u32 as i32,
