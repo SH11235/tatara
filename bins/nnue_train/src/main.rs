@@ -57,7 +57,7 @@ use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage,
 #[allow(unused_imports)]
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::schedule::{ConstantWDL, StepLR};
-use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig};
+use nnue_train::trainer::{LossKind, TrainerBackend, TrainingConfig, ValidationStepOutput};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
@@ -4790,6 +4790,16 @@ impl GpuWorkspace {
     }
 }
 
+/// [`GpuTrainer::step_impl`] の出力。
+///
+/// `loss` は batch 全体の二乗誤差和 (`Σ err²`、position 数で割る前)。`net_output`
+/// は held-out validation (`validate == true`) のときだけ position ごとの net
+/// 出力スカラ (`n_pos` 個) で埋まり、通常の training step では空。
+struct StepOutput {
+    loss: f64,
+    net_output: Vec<f32>,
+}
+
 /// Smoke / trainer 用の 1 batch 入力データ。
 /// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
 /// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
@@ -6385,7 +6395,15 @@ impl GpuTrainer {
             self.stream.synchronize()?;
         }
         let mut prof_t0 = std::time::Instant::now();
-        let result = self.step_impl(batch, lr, wdl_lambda, loss, profile_step, &mut prof_t0)?;
+        let result = self.step_impl(
+            batch,
+            lr,
+            wdl_lambda,
+            loss,
+            false,
+            profile_step,
+            &mut prof_t0,
+        )?;
         // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
         if profile_step {
             self.stream.synchronize()?;
@@ -6395,7 +6413,41 @@ impl GpuTrainer {
                 prof_t0.elapsed().as_secs_f64() * 1000.0
             );
         }
-        Ok(result)
+        Ok(result.loss)
+    }
+
+    /// held-out validation の 1 batch を実行する。[`GpuTrainer::step_impl`] を
+    /// `validate = true` で呼び、forward + loss kernel のみ走らせる (backward /
+    /// optimizer step は無く、weight も optimizer state も一切更新しない)。
+    ///
+    /// 戻り値 [`StepOutput`] は batch 全体の `Σ err²` (`loss`) と position ごとの
+    /// net 出力スカラ (`net_output`)。caller (`TrainerBackend::validate_step`) が
+    /// 前者から平均 loss、後者から sign-agreement accuracy を出す。
+    ///
+    /// 冒頭で `stream.synchronize` し直前の training step (optimizer まで) の完了を
+    /// 待ってから検証 forward を始める。検証は superbatch あたり 1 回・~1 batch 分
+    /// なので同期コストは無視できる。
+    fn validate(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        // 直前の training step の GPU work 完了を待つ。検証 forward の H2D / kernel が
+        // in-flight な training compute と input buffer を取り合わないことを保証する。
+        self.stream.synchronize()?;
+        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
+        let mut prof_t0 = std::time::Instant::now();
+        // lr は validate モードでは optimizer を呼ばないため未使用 (0.0 を渡す)。
+        self.step_impl(
+            batch,
+            0.0,
+            wdl_lambda,
+            loss,
+            true,
+            profile_step,
+            &mut prof_t0,
+        )
     }
 
     /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
@@ -6416,6 +6468,12 @@ impl GpuTrainer {
     /// `profile_step` / `prof_t0` は呼び出し元 ([`GpuTrainer::step`]) が管理し、本 method
     /// 内の `prof_tick!` が各 phase 境界で `*prof_t0` を更新する (戻った後に呼び出し元が
     /// teardown tick で読む)。
+    ///
+    /// `validate == true` のときは **forward + loss kernel のみ**を実行し、loss kernel
+    /// 直後に `loss_acc` と `net_output` を同期読み出しして early return する
+    /// (backward / optimizer step は走らず weight は不変、held-out validation 用)。
+    /// `validate == false` の通常 training path はこの分岐に入らないため、訓練の
+    /// 数値挙動は本フラグ追加前と完全に同一。
     #[allow(clippy::too_many_arguments)]
     fn step_impl(
         &mut self,
@@ -6423,12 +6481,16 @@ impl GpuTrainer {
         lr: f32,
         wdl_lambda: f32,
         loss: LossKind,
+        validate: bool,
         profile_step: bool,
         prof_t0: &mut std::time::Instant,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
-            return Ok(0.0);
+            return Ok(StepOutput {
+                loss: 0.0,
+                net_output: Vec::new(),
+            });
         }
         // defense-in-depth: tiled kernels (grid=b/16) は b % 16 == 0 を要求する。
         // CLI で `--batch-size` を 16 倍数に reject 済 (`run_training`)、`BucketedPrefetchedLoader`
@@ -6961,6 +7023,20 @@ impl GpuTrainer {
             }
         }
         prof_tick!("forward");
+
+        // held-out validation: backward / optimizer をスキップし、loss kernel が
+        // 書いた `loss_acc` (batch の Σ err²) と `net_output` (position ごとの net
+        // 出力) を同期読み出しして early return する。weight も optimizer state も
+        // 更新しない。`net_output` workspace は固定 batch 容量で確保されているため
+        // 有効 position 数 `b` で truncate する。`to_host_vec` は内部で
+        // `stream.synchronize` するので forward kernel 完了後の値が読める。
+        if validate {
+            let loss = self.loss_acc.to_host_vec(&self.stream)?[0];
+            let mut net_output = self.ws.net_output.to_host_vec(&self.stream)?;
+            net_output.truncate(b);
+            prof_tick!("validate_io");
+            return Ok(StepOutput { loss, net_output });
+        }
 
         // ===== BACKWARD =====
         // 全 *_grad buffer を 0 で reset (atomic accumulate semantic に従う kernel が
@@ -7766,8 +7842,13 @@ impl GpuTrainer {
         // sync して 1 step lag で loss を返す (step 0 は warmup として 0.0、sb 末で
         // [`TrainerBackend::flush_pending_loss`] が最終 step 分を drain する)。host は
         // 次 batch の launch 発行で `stream.synchronize` 相当の block 待ちが消える。
-        self.loss_ring
-            .read_and_queue_next(&self.stream, &self.loss_acc)
+        let loss = self
+            .loss_ring
+            .read_and_queue_next(&self.stream, &self.loss_acc)?;
+        Ok(StepOutput {
+            loss,
+            net_output: Vec::new(),
+        })
     }
 }
 
@@ -7799,6 +7880,32 @@ impl TrainerBackend for GpuTrainer {
         let data = BatchData::from_batch_ref(batch, bucket_idx);
         self.step(&data, lr, wdl_lambda, loss)
             .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
+    }
+
+    fn validate_step(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> std::io::Result<ValidationStepOutput> {
+        // train_step と同じく batch の feature set が trainer の feature set と
+        // 一致することを確認する (GPU buffer / kernel 次元の前提)。
+        if batch.feature_set != self.feature_set {
+            return Err(std::io::Error::other(format!(
+                "batch feature set '{}' does not match trainer feature set '{}'",
+                batch.feature_set.canonical_name(),
+                self.feature_set.canonical_name()
+            )));
+        }
+        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        let out = self
+            .validate(&data, wdl_lambda, loss)
+            .map_err(|e| std::io::Error::other(format!("GpuTrainer::validate failed: {e}")))?;
+        Ok(ValidationStepOutput {
+            sum_sq_err: out.loss,
+            net_output: out.net_output,
+        })
     }
 
     fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
@@ -7859,6 +7966,19 @@ struct Cli {
     /// 教師データ PSV ファイル (`PackedSfenValue` × N、各 40 bytes)。省略時は GPU smoke test。
     #[arg(long, global = true)]
     data: Option<PathBuf>,
+
+    /// held-out validation 用の PSV ファイル。学習 `--data` とは別の、勾配更新に
+    /// 一度も使わない局面を渡す。指定すると各 superbatch 末に forward-only 検証を
+    /// 走らせ、test_loss (held-out 平均 loss) と test_accuracy (出力符号と対局結果の
+    /// 一致率) を train ログと experiment.json に出す。発散・過学習の早期検出に使う。
+    #[arg(long, global = true)]
+    test_data: Option<PathBuf>,
+
+    /// held-out validation 1 回あたりの検証局面数。test PSV の先頭からこの数だけ
+    /// 取り、`--batch-size` 単位に切り上げて満タン batch を作る。`--test-data`
+    /// 指定時のみ使う。
+    #[arg(long, default_value_t = 10000, global = true)]
+    test_positions: usize,
 
     /// checkpoint 出力先 directory (`{net_id}-{superbatch}.bin` を書き出す)。
     #[arg(long, default_value = "checkpoints", global = true)]
@@ -8344,6 +8464,8 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         loss,
         score_drop_abs: cli.score_drop_abs,
         threads: cli.threads,
+        test_data: cli.test_data.clone(),
+        test_positions: cli.test_positions,
     };
 
     // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
@@ -8505,6 +8627,10 @@ fn build_experiment_logger(
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
+        // test_data / test_positions は `--test-data` 指定時のみ記録する
+        // (未指定 run の experiment.json では両フィールドとも省略)。
+        test_data: cli.test_data.as_deref().map(file_basename),
+        test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
         tf32: layerstack.tf32,
         ft_fp16: cli.ft_fp16,
         ft_fp16_out: layerstack.ft_fp16_out,

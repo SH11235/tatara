@@ -10,7 +10,11 @@
 //! - `nnue-lab` ExperimentJsonV1 の互換 superset。必須フィールド (`id` / `name`
 //!   / `date` / `params.{lr,batch_size,superbatches}` / `history[]`) は常に
 //!   schema どおりの型で出力する。本リポ固有の値は `params` / `data` /
-//!   `results` (いずれも `nnue-lab` 側で passthrough) に置く。
+//!   `results` (いずれも `nnue-lab` 側で passthrough) に置く。例外は schema v2 の
+//!   held-out validation メトリクスで、`history[]` 要素 (passthrough 非対象) にも
+//!   `test_loss` / `test_accuracy` を足す。これは `nnue-lab` の history schema
+//!   拡張を要する coupled change で、未拡張の `nnue-lab` では両キーが取り込み時に
+//!   削除される (ADR `docs/decisions/2026-05-17-experiment-json.md` 参照)。
 //! - 1 run = 1 ファイル。crash 耐性は incremental write で得る:
 //!   superbatch ごとに temp file + rename で全体を atomic に書き直すため、
 //!   中断時も最後の書き込みが `status: "running"` の妥当な JSON として残る。
@@ -26,7 +30,13 @@ use serde::Serialize;
 
 /// `nnue-lab` ExperimentJsonV1 と整合する schema 契約 version。producer (本
 /// トレーナー) 自身の version は [`Generator::version`] が別に持つ。
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// version 2 は held-out validation メトリクスを optional フィールドとして含む:
+/// `HistoryEntry::test_loss` / `test_accuracy`、`Results::best_test_loss`
+/// (+ superbatch)、`Params::test_data` / `test_positions`。いずれも `--test-data`
+/// 未指定の run では出力されない。`history[]` 要素への追加分は `nnue-lab` 側の
+/// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
 /// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
@@ -116,6 +126,14 @@ pub struct Params {
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
+    /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_data: Option<String>,
+    /// held-out validation の検証局面数 (`--test-positions` の要求値)。実際の
+    /// 検証集合は `batch_size` 単位に切り上げた満タン batch 数になる。
+    /// `--test-data` 指定時のみ `Some`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_positions: Option<usize>,
     pub tf32: bool,
     pub ft_fp16: bool,
     pub ft_fp16_out: bool,
@@ -147,17 +165,31 @@ pub struct Results {
     pub best_loss: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_loss_superbatch: Option<usize>,
+    /// 最小の held-out `test_loss` と、それを記録した superbatch。held-out
+    /// validation が一度も走らなかった (`--test-data` 未指定) 場合は省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_test_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_test_loss_superbatch: Option<usize>,
     /// run 全体の平均 throughput (consumed positions / wall time)。
     pub mean_pos_per_sec: u64,
     /// run が error で中断されたか (`mark_interrupted` 済か)。
     pub interrupted: bool,
 }
 
-/// superbatch 1 点分の loss。
+/// superbatch 1 点分の training loss と、有効時の held-out validation メトリクス。
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
     pub superbatch: usize,
     pub loss: f64,
+    /// held-out 検証データ上の平均 loss。`--test-data` 指定時のみ `Some`。
+    /// 非有限値 (発散) は JSON 数値に表せないため `None` として記録する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_loss: Option<f64>,
+    /// held-out 検証データ上の sign-agreement accuracy (`[0, 1]`、引き分け除外)。
+    /// `--test-data` 指定時のみ `Some`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_accuracy: Option<f64>,
 }
 
 /// experiment.json として serialise される本体。フィールドは `nnue-lab`
@@ -229,6 +261,8 @@ impl ExperimentDoc {
                 fv_scale: FV_SCALE,
                 best_loss: None,
                 best_loss_superbatch: None,
+                best_test_loss: None,
+                best_test_loss_superbatch: None,
                 mean_pos_per_sec: 0,
                 interrupted: false,
             },
@@ -272,16 +306,23 @@ impl ExperimentLogger {
     }
 
     /// 1 superbatch 完了を記録する。`history` に 1 点追加し、`results` 集約値
-    /// (`best_loss` / `mean_pos_per_sec` / `training_time_seconds`) と
-    /// `data.total_positions` / `data.dataset_passes` を更新する。
+    /// (`best_loss` / `best_test_loss` / `mean_pos_per_sec` /
+    /// `training_time_seconds`) と `data.total_positions` / `data.dataset_passes`
+    /// を更新する。
     ///
-    /// `elapsed_seconds` は run 開始からの経過秒 (wall time)。
+    /// `elapsed_seconds` は run 開始からの経過秒 (wall time)。`test_loss` /
+    /// `test_accuracy` は held-out validation を走らせた場合のメトリクス
+    /// (`--test-data` 未指定なら `None`)。非有限な `test_loss` / `test_accuracy`
+    /// は JSON 数値に表せないため `None` に落として記録する (発散シグナルは
+    /// 呼び出し側が別途警告する)。
     pub fn record_superbatch(
         &mut self,
         superbatch: usize,
         mean_loss: f64,
         sb_positions: u64,
         elapsed_seconds: f64,
+        test_loss: Option<f64>,
+        test_accuracy: Option<f64>,
     ) {
         self.positions_trained = self.positions_trained.saturating_add(sb_positions);
 
@@ -296,7 +337,16 @@ impl ExperimentLogger {
             );
             0.0
         };
-        self.doc.history.push(HistoryEntry { superbatch, loss });
+        // held-out メトリクスは非有限値を JSON に出せないため None に落とす
+        // (0.0 だと best_test_loss を誤って更新するので 0.0 化はしない)。
+        let test_loss = test_loss.filter(|v| v.is_finite());
+        let test_accuracy = test_accuracy.filter(|v| v.is_finite());
+        self.doc.history.push(HistoryEntry {
+            superbatch,
+            loss,
+            test_loss,
+            test_accuracy,
+        });
 
         if mean_loss.is_finite()
             && self
@@ -307,6 +357,13 @@ impl ExperimentLogger {
         {
             self.doc.results.best_loss = Some(mean_loss);
             self.doc.results.best_loss_superbatch = Some(superbatch);
+        }
+
+        if let Some(tl) = test_loss
+            && self.doc.results.best_test_loss.is_none_or(|best| tl < best)
+        {
+            self.doc.results.best_test_loss = Some(tl);
+            self.doc.results.best_test_loss_superbatch = Some(superbatch);
         }
 
         let elapsed = elapsed_seconds.max(0.0);
@@ -468,6 +525,8 @@ mod tests {
             wrm_target_scaling: Some(380.0),
             score_drop_abs: None,
             init_from: None,
+            test_data: None,
+            test_positions: None,
             tf32: false,
             ft_fp16: true,
             ft_fp16_out: true,
@@ -517,7 +576,7 @@ mod tests {
     fn new_doc_is_running_with_empty_history() {
         let doc = sample_doc();
         assert_eq!(doc.status, "running");
-        assert_eq!(doc.schema_version, 1);
+        assert_eq!(doc.schema_version, 2);
         assert!(doc.history.is_empty());
         // date は開始 epoch から ISO 8601 UTC で導出され、初期 last_updated_at と一致。
         assert_eq!(doc.date, format_utc_iso(1_747_000_000));
@@ -527,9 +586,9 @@ mod tests {
     #[test]
     fn record_superbatch_updates_history_and_aggregates() {
         let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
-        logger.record_superbatch(1, 0.04, 1_000_000, 10.0);
-        logger.record_superbatch(2, 0.03, 1_000_000, 20.0);
-        logger.record_superbatch(3, 0.035, 1_000_000, 30.0);
+        logger.record_superbatch(1, 0.04, 1_000_000, 10.0, None, None);
+        logger.record_superbatch(2, 0.03, 1_000_000, 20.0, None, None);
+        logger.record_superbatch(3, 0.035, 1_000_000, 30.0, None, None);
 
         assert_eq!(logger.doc.history.len(), 3);
         assert_eq!(logger.doc.results.best_loss, Some(0.03));
@@ -544,16 +603,43 @@ mod tests {
     #[test]
     fn non_finite_loss_is_recorded_as_zero() {
         let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
-        logger.record_superbatch(1, f64::NAN, 1_000, 1.0);
+        logger.record_superbatch(1, f64::NAN, 1_000, 1.0, None, None);
         assert_eq!(logger.doc.history[0].loss, 0.0);
         // best_loss は非有限 loss を採らない。
         assert_eq!(logger.doc.results.best_loss, None);
     }
 
     #[test]
+    fn record_superbatch_tracks_validation_metrics() {
+        let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
+        logger.record_superbatch(1, 0.04, 1_000, 1.0, Some(0.05), Some(0.81));
+        logger.record_superbatch(2, 0.03, 1_000, 2.0, Some(0.042), Some(0.84));
+        // 非有限な test_loss は None に落ち、history にも best_test_loss にも入らない。
+        logger.record_superbatch(3, 0.02, 1_000, 3.0, Some(f64::INFINITY), Some(0.9));
+
+        assert_eq!(logger.doc.history[0].test_loss, Some(0.05));
+        assert_eq!(logger.doc.history[0].test_accuracy, Some(0.81));
+        assert_eq!(logger.doc.history[2].test_loss, None);
+        // best_test_loss は最小の有限 test_loss (sb2) を採る。
+        assert_eq!(logger.doc.results.best_test_loss, Some(0.042));
+        assert_eq!(logger.doc.results.best_test_loss_superbatch, Some(2));
+    }
+
+    #[test]
+    fn validation_metrics_omitted_when_never_recorded() {
+        // `--test-data` 無し相当: test_loss / test_accuracy を渡さない run。
+        let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
+        logger.record_superbatch(1, 0.04, 1_000, 1.0, None, None);
+        let v = serde_json::to_value(&logger.doc).expect("serialise");
+        assert!(v["history"][0].get("test_loss").is_none());
+        assert!(v["history"][0].get("test_accuracy").is_none());
+        assert!(v["results"].get("best_test_loss").is_none());
+    }
+
+    #[test]
     fn mark_interrupted_keeps_running_status() {
         let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
-        logger.record_superbatch(1, 0.04, 1_000, 1.0);
+        logger.record_superbatch(1, 0.04, 1_000, 1.0, None, None);
         logger.mark_interrupted();
         // error 中断は status を "running" のまま、interrupted フラグで表す。
         assert_eq!(logger.doc.status, "running");
@@ -565,7 +651,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nnue-exp-test-{}", std::process::id()));
         let path = dir.join("experiments").join("rshogi-test.json");
         let mut logger = ExperimentLogger::new(path.clone(), sample_doc());
-        logger.record_superbatch(1, 0.04, 1_000_000, 10.0);
+        logger.record_superbatch(1, 0.04, 1_000_000, 10.0, Some(0.05), Some(0.8));
         logger.note_checkpoint("rshogi-20.bin");
         logger.note_checkpoint("rshogi-20.ckpt");
         logger.mark_finished(12.0);
@@ -573,8 +659,11 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("file exists");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["status"], "completed");
+        // held-out メトリクスを渡した superbatch は history に出る。
+        assert_eq!(v["history"][0]["test_loss"], 0.05);
+        assert_eq!(v["history"][0]["test_accuracy"], 0.8);
         assert_eq!(v["generator"]["name"], "rshogi-nnue");
         assert_eq!(v["params"]["lr"], 0.000875);
         assert_eq!(v["history"][0]["superbatch"], 1);
