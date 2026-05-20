@@ -49,9 +49,9 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_launch;
 #[allow(unused_imports)]
 use gpu_runtime::{CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
-use nnue_format::ArchKind;
 #[allow(unused_imports)]
 use nnue_format::LayerStackWeights;
+use nnue_format::{ArchKind, SimpleActivation, SimpleId};
 use nnue_train::dataloader::Batch;
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[allow(unused_imports)]
@@ -8674,10 +8674,587 @@ fn simple_arch_unimplemented() -> Box<dyn std::error::Error> {
     .into()
 }
 
+// ===========================================================================
+// SimpleGpuTrainer — bucket 無し 4 層 Simple アーキの GPU トレーナ
+// ===========================================================================
+//
+// LayerStack 用 `GpuTrainer` (本 file 上方) と並ぶ、もう一方のアーキの host driver。
+// `SimpleId` (feature set / 活性化 / ft_out / l1_out / l2_out) で形が決まる 8
+// weight 群 (FT/L1/L2/L3 各 w・b) を device buffer で保持し、`forward` で 1 batch
+// の FT → bias add → 活性化 → concat → L1/L2/L3 dense → loss を既存 kernel の
+// 合成として走らせる。
+//
+// 本段階は **forward + smoke 専用** で、backward / optimizer / checkpoint /
+// `TrainerBackend` 実装は持たない。weight は xorshift 初期化のみ。
+
+/// Simple アーキ専用の forward 用 workspace。中間 activation buffer (全 f32) と
+/// 入力 buffer (sparse idx + score/wdl) を固定 batch 容量で `new` 時に確保する。
+struct SimpleGpuWorkspace {
+    /// `new` 時の固定 batch 容量 (`forward` 実行時にこれ以下を要求)。
+    len_batch: usize,
+    /// FT 入力次元 (`id.feature_set.ft_in()`)、kernel launch 引数で使う。
+    ft_in: usize,
+    /// 1 perspective あたりの active feature 上限 (`id.feature_set.max_active()`)。
+    max_active: usize,
+
+    // -- forward 中間 activation (すべて f32) --
+    /// sparse_ft_forward の stm 出力 (`b × ft_out`)。bias add は in-place でここに書き戻す。
+    ft_stm_out: DeviceBuffer<f32>,
+    /// 同 nstm。
+    ft_nstm_out: DeviceBuffer<f32>,
+    /// stm bias add + 活性化後 (`b × ft_out`)、concat 元の tmp。
+    ft_stm_acted: DeviceBuffer<f32>,
+    /// 同 nstm。
+    ft_nstm_acted: DeviceBuffer<f32>,
+    /// concat(stm_acted, nstm_acted) = `b × (2*ft_out)`。L1 dense の入力。
+    combined: DeviceBuffer<f32>,
+    /// L1 dense 出力 (pre-activation、`b × l1_out`)。
+    l1_pre: DeviceBuffer<f32>,
+    /// L1 活性化後 (`b × l1_out`)、L2 dense の入力。
+    l1_acted: DeviceBuffer<f32>,
+    /// L2 dense 出力 (`b × l2_out`)。
+    l2_pre: DeviceBuffer<f32>,
+    /// L2 活性化後 (`b × l2_out`)、L3 dense の入力。
+    l2_acted: DeviceBuffer<f32>,
+    /// L3 dense 出力 = ネットワーク 1 次元出力 (`b`)。
+    net_output: DeviceBuffer<f32>,
+    /// loss kernel が書く dnet (`b`)。forward 専用では使わないが kernel が出力先を要求する。
+    dy_net_output: DeviceBuffer<f32>,
+
+    // -- 入力 buffer --
+    /// stm sparse index (`b × max_active`、無効 slot は -1)。
+    stm_idx_dev: DeviceBuffer<i32>,
+    /// 同 nstm。
+    nstm_idx_dev: DeviceBuffer<i32>,
+    /// target score (`b`、centipawn)。
+    score_dev: DeviceBuffer<f32>,
+    /// target wdl (`b`、0.0/0.5/1.0)。
+    wdl_dev: DeviceBuffer<f32>,
+}
+
+impl SimpleGpuWorkspace {
+    fn new(
+        stream: &CudaStream,
+        batch: usize,
+        id: SimpleId,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let ft_in = id.ft_in();
+        let max_active = id.feature_set.max_active();
+        let ft_out = id.ft_out;
+        let l1_out = id.l1_out;
+        let l2_out = id.l2_out;
+        let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+            DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
+        };
+        Ok(Self {
+            len_batch: batch,
+            ft_in,
+            max_active,
+            ft_stm_out: z(batch * ft_out)?,
+            ft_nstm_out: z(batch * ft_out)?,
+            ft_stm_acted: z(batch * ft_out)?,
+            ft_nstm_acted: z(batch * ft_out)?,
+            combined: z(batch * 2 * ft_out)?,
+            l1_pre: z(batch * l1_out)?,
+            l1_acted: z(batch * l1_out)?,
+            l2_pre: z(batch * l2_out)?,
+            l2_acted: z(batch * l2_out)?,
+            net_output: z(batch)?,
+            dy_net_output: z(batch)?,
+            stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+            wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
+        })
+    }
+
+    /// `new` 時の `len_batch` 容量に `batch` が収まることを検証する
+    /// (`GpuWorkspace::check_batch_capacity` と同じ規約: 固定 batch 前提で
+    /// 容量超過は error)。
+    fn check_batch_capacity(&self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if batch > self.len_batch {
+            return Err(format!(
+                "SimpleGpuTrainer: batch {batch} exceeds workspace capacity {} \
+                 (re-construct SimpleGpuTrainer with a larger batch_size)",
+                self.len_batch
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Simple 4 層アーキ用 GPU トレーナ (forward 専用)。LayerStack 用 `GpuTrainer`
+/// と並ぶもう一方のアーキの host driver。
+struct SimpleGpuTrainer {
+    stream: std::sync::Arc<CudaStream>,
+    module: std::sync::Arc<CudaModule>,
+
+    // -- weight (FP32 のみ、forward 専用なので optimizer state 無し) --
+    /// FT 重み (`ft_in × ft_out`、feature-major: `ft_w[feat*ft_out + out]`)。
+    /// `sparse_ft_forward` の weight layout と一致する。
+    ft_w: DeviceBuffer<f32>,
+    /// FT bias (`ft_out`、stm/nstm 共有)。
+    ft_b: DeviceBuffer<f32>,
+    /// L1 dense 重み (`(2*ft_out) × l1_out`、in-major: `l1_w[in*l1_out + out]`)。
+    /// `dense_mm_fwd` の weight layout (`w[k*out_dim+oi]`) と一致する。
+    l1_w: DeviceBuffer<f32>,
+    /// L1 dense bias (`l1_out`)。
+    l1_b: DeviceBuffer<f32>,
+    /// L2 dense 重み (`l1_out × l2_out`、in-major)。
+    l2_w: DeviceBuffer<f32>,
+    /// L2 dense bias (`l2_out`)。
+    l2_b: DeviceBuffer<f32>,
+    /// L3 dense 重み (`l2_out × 1`、in-major)。
+    l3_w: DeviceBuffer<f32>,
+    /// L3 dense bias (1 要素)。
+    l3_b: DeviceBuffer<f32>,
+
+    ws: SimpleGpuWorkspace,
+    /// loss kernel が atomic add する Σerr² (f64、1 要素)。
+    loss_acc: DeviceBuffer<f64>,
+    /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
+    id: SimpleId,
+}
+
+impl Drop for SimpleGpuTrainer {
+    fn drop(&mut self) {
+        // device buffer 解放前に stream 上の in-flight 操作を排出する
+        // (GpuTrainer と同じ規約: field drop 順による race を回避)。
+        let _ = self.stream.synchronize();
+    }
+}
+
+impl SimpleGpuTrainer {
+    fn new(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch_size: usize,
+        id: SimpleId,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = ctx.default_stream();
+        let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
+
+        let ft_in = id.ft_in();
+        let ft_out = id.ft_out;
+        let l1_out = id.l1_out;
+        let l2_out = id.l2_out;
+        // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
+        // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
+        // 4 の倍数でない値が来る可能性があるので early reject する。
+        if !ft_out.is_multiple_of(4) {
+            return Err(format!(
+                "SimpleGpuTrainer: ft_out {ft_out} must be a multiple of 4 \
+                 (sparse_ft_forward processes 4 rows per thread)"
+            )
+            .into());
+        }
+
+        // smoke 用 small random init。group ごとに seed を変えて weight が同一値で
+        // 潰れないようにする (forward の合成 layer 構造を踏むため)。
+        let ft_w_h = xorshift_init(0x5071_e001, ft_in * ft_out, 0.01);
+        let ft_b_h = xorshift_init(0x5071_e002, ft_out, 0.01);
+        let l1_w_h = xorshift_init(0x5071_e003, 2 * ft_out * l1_out, 0.01);
+        let l1_b_h = xorshift_init(0x5071_e004, l1_out, 0.01);
+        let l2_w_h = xorshift_init(0x5071_e005, l1_out * l2_out, 0.01);
+        let l2_b_h = xorshift_init(0x5071_e006, l2_out, 0.01);
+        let l3_w_h = xorshift_init(0x5071_e007, l2_out, 0.01);
+        let l3_b_h = xorshift_init(0x5071_e008, 1, 0.01);
+
+        let batch = batch_size.max(1);
+        Ok(Self {
+            ft_w: DeviceBuffer::from_host(&stream, &ft_w_h)?,
+            ft_b: DeviceBuffer::from_host(&stream, &ft_b_h)?,
+            l1_w: DeviceBuffer::from_host(&stream, &l1_w_h)?,
+            l1_b: DeviceBuffer::from_host(&stream, &l1_b_h)?,
+            l2_w: DeviceBuffer::from_host(&stream, &l2_w_h)?,
+            l2_b: DeviceBuffer::from_host(&stream, &l2_b_h)?,
+            l3_w: DeviceBuffer::from_host(&stream, &l3_w_h)?,
+            l3_b: DeviceBuffer::from_host(&stream, &l3_b_h)?,
+            ws: SimpleGpuWorkspace::new(&stream, batch, id)?,
+            loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            stream,
+            module,
+            id,
+        })
+    }
+
+    /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
+    fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let groups: [(&DeviceBuffer<f32>, &str); 8] = [
+            (&self.ft_w, "ft_w"),
+            (&self.ft_b, "ft_b"),
+            (&self.l1_w, "l1_w"),
+            (&self.l1_b, "l1_b"),
+            (&self.l2_w, "l2_w"),
+            (&self.l2_b, "l2_b"),
+            (&self.l3_w, "l3_w"),
+            (&self.l3_b, "l3_b"),
+        ];
+        for (buf, name) in groups {
+            let v = buf.to_host_vec(&self.stream)?;
+            for (i, &x) in v.iter().enumerate() {
+                if !x.is_finite() {
+                    return Err(format!("{name}[{i}] = {x} is not finite (NaN or Inf)").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 1 batch の forward を走らせ、loss kernel が累積した Σerr² を返す。
+    /// backward は走らせず、loss kernel が書く dnet (`dy_net_output`) は捨てる。
+    fn forward(
+        &mut self,
+        batch: &BatchData,
+        loss: LossKind,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if b == 0 {
+            return Ok(0.0);
+        }
+        self.ws.check_batch_capacity(b)?;
+
+        let b_u32 = b as u32;
+        let ft_out_u32 = self.id.ft_out as u32;
+        let l1_in_u32 = (2 * self.id.ft_out) as u32; // L1 入力 = stm/nstm concat 後
+        let l1_out_u32 = self.id.l1_out as u32;
+        let l2_out_u32 = self.id.l2_out as u32;
+        let ft_n = b * self.id.ft_out;
+        let ft_n_u32 = ft_n as u32;
+
+        // -- H2D upload (default stream 上の async memcpy、launch 列に直列で並ぶ) --
+        copy_host_to_device_async_i32(
+            &self.stream,
+            &self.ws.stm_idx_dev,
+            &batch.stm_indices[..b * self.ws.max_active],
+        )?;
+        copy_host_to_device_async_i32(
+            &self.stream,
+            &self.ws.nstm_idx_dev,
+            &batch.nstm_indices[..b * self.ws.max_active],
+        )?;
+        copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
+        copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
+
+        // -- loss_acc を 0 にリセット (再 alloc 無し) --
+        memset_zero(&self.stream, &self.loss_acc)?;
+
+        // -- sparse_ft_forward × 2 (stm, nstm)。FP32 path、1 thread = 4 row --
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * self.id.ft_out / 4),
+            args: [
+                slice(self.ft_w),
+                slice(self.ws.stm_idx_dev),
+                slice_mut(self.ws.ft_stm_out),
+                b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: sparse_ft_forward,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * self.id.ft_out / 4),
+            args: [
+                slice(self.ft_w),
+                slice(self.ws.nstm_idx_dev),
+                slice_mut(self.ws.ft_nstm_out),
+                b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+            ]
+        }?;
+
+        // -- FT post = bias add + 活性化 + concat。LayerStack の
+        // ft_post_perspective_fwd と違い pairwise / scale を含まないため、既存
+        // kernel 6 launch (bias_add ×2 + 活性化 ×2 + slice_scatter ×2) で合成する。
+        cuda_launch! {
+            kernel: bias_add_per_row,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ft_b), slice_mut(self.ws.ft_stm_out), b_u32, ft_out_u32]
+        }?;
+        cuda_launch! {
+            kernel: bias_add_per_row,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(ft_n),
+            args: [slice(self.ft_b), slice_mut(self.ws.ft_nstm_out), b_u32, ft_out_u32]
+        }?;
+
+        // 活性化: ft_*_out → ft_*_acted。`id.activation` で CReLU / SCReLU を分岐。
+        // 4 箇所 (FT stm/nstm post、L1 post、L2 post) で同じ分岐が出る — `cuda_launch!`
+        // が kernel 識別子をマクロ引数で取るため共通化が難しく、inline 展開する。
+        match self.id.activation {
+            SimpleActivation::CReLU => {
+                cuda_launch! {
+                    kernel: crelu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [
+                        slice(self.ws.ft_stm_out),
+                        slice_mut(self.ws.ft_stm_acted),
+                        ft_n_u32
+                    ]
+                }?;
+                cuda_launch! {
+                    kernel: crelu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [
+                        slice(self.ws.ft_nstm_out),
+                        slice_mut(self.ws.ft_nstm_acted),
+                        ft_n_u32
+                    ]
+                }?;
+            }
+            SimpleActivation::SCReLU => {
+                cuda_launch! {
+                    kernel: screlu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [
+                        slice(self.ws.ft_stm_out),
+                        slice_mut(self.ws.ft_stm_acted),
+                        ft_n_u32
+                    ]
+                }?;
+                cuda_launch! {
+                    kernel: screlu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_n),
+                    args: [
+                        slice(self.ws.ft_nstm_out),
+                        slice_mut(self.ws.ft_nstm_acted),
+                        ft_n_u32
+                    ]
+                }?;
+            }
+        }
+
+        // concat: stm → combined[.. ft_out], nstm → combined[ft_out .. 2*ft_out]。
+        // slice_scatter_2d(src, dst, batch, in_dim, dst_stride, dst_offset)。
+        cuda_launch! {
+            kernel: slice_scatter_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(ft_n),
+            args: [
+                slice(self.ws.ft_stm_acted),
+                slice_mut(self.ws.combined),
+                b_u32, ft_out_u32, l1_in_u32, 0_u32
+            ]
+        }?;
+        cuda_launch! {
+            kernel: slice_scatter_2d,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(ft_n),
+            args: [
+                slice(self.ws.ft_nstm_acted),
+                slice_mut(self.ws.combined),
+                b_u32, ft_out_u32, l1_in_u32, ft_out_u32
+            ]
+        }?;
+
+        // -- L1 dense (combined → l1_pre) + 活性化 (l1_pre → l1_acted) --
+        cuda_launch! {
+            kernel: dense_mm_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * self.id.l1_out),
+            args: [
+                slice(self.ws.combined),
+                slice(self.l1_w),
+                slice(self.l1_b),
+                slice_mut(self.ws.l1_pre),
+                b_u32, l1_in_u32, l1_out_u32
+            ]
+        }?;
+        let l1_n = b * self.id.l1_out;
+        let l1_n_u32 = l1_n as u32;
+        match self.id.activation {
+            SimpleActivation::CReLU => cuda_launch! {
+                kernel: crelu_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+            }?,
+            SimpleActivation::SCReLU => cuda_launch! {
+                kernel: screlu_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+            }?,
+        }
+
+        // -- L2 dense (l1_acted → l2_pre) + 活性化 (l2_pre → l2_acted) --
+        cuda_launch! {
+            kernel: dense_mm_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b * self.id.l2_out),
+            args: [
+                slice(self.ws.l1_acted),
+                slice(self.l2_w),
+                slice(self.l2_b),
+                slice_mut(self.ws.l2_pre),
+                b_u32, l1_out_u32, l2_out_u32
+            ]
+        }?;
+        let l2_n = b * self.id.l2_out;
+        let l2_n_u32 = l2_n as u32;
+        match self.id.activation {
+            SimpleActivation::CReLU => cuda_launch! {
+                kernel: crelu_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+            }?,
+            SimpleActivation::SCReLU => cuda_launch! {
+                kernel: screlu_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+            }?,
+        }
+
+        // -- L3 dense (l2_acted → net_output)。out_dim = 1 (スカラ出力) --
+        cuda_launch! {
+            kernel: dense_mm_fwd,
+            stream: self.stream,
+            module: self.module,
+            config: cfg_1d(b),
+            args: [
+                slice(self.ws.l2_acted),
+                slice(self.l3_w),
+                slice(self.l3_b),
+                slice_mut(self.ws.net_output),
+                b_u32, l2_out_u32, 1_u32
+            ]
+        }?;
+
+        // -- loss kernel (Σerr² を loss_acc に atomic accumulate)。dnet は破棄 --
+        match loss {
+            LossKind::Sigmoid { scale } => {
+                cuda_launch! {
+                    kernel: loss_wdl,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.net_output),
+                        slice(self.ws.score_dev),
+                        slice(self.ws.wdl_dev),
+                        batch.per_pos_norm,
+                        slice_mut(self.ws.dy_net_output),
+                        slice(self.loss_acc),
+                        0.0_f32, // wdl_lambda (smoke は WDL blend を使わない)
+                        scale,
+                        b_u32
+                    ]
+                }?;
+            }
+            LossKind::Wrm {
+                nnue2score,
+                in_scaling,
+                target_offset,
+                target_scaling,
+            } => {
+                cuda_launch! {
+                    kernel: loss_wrm,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.net_output),
+                        slice(self.ws.score_dev),
+                        slice(self.ws.wdl_dev),
+                        batch.per_pos_norm,
+                        slice_mut(self.ws.dy_net_output),
+                        slice(self.loss_acc),
+                        0.0_f32,
+                        nnue2score, in_scaling,
+                        target_offset, target_scaling, b_u32
+                    ]
+                }?;
+            }
+        }
+
+        // -- loss_acc を sync 読み出して返す --
+        let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
+        Ok(loss_host[0])
+    }
+}
+
+/// Simple アーキ用 smoke test。preset `256x2-32-32` (HalfKaHmMerged + CReLU) で
+/// `SimpleGpuTrainer` を構築し、forward path が finite な loss を返すことを確認する。
+/// SCReLU 活性化と WRM loss kernel も exercise する。
+fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    println!("[smoke/simple] CUDA context created, loading kernel module...");
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let mut trainer = SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id)?;
+    let params = id.ft_in() * id.ft_out
+        + id.ft_out
+        + 2 * id.ft_out * id.l1_out
+        + id.l1_out
+        + id.l1_out * id.l2_out
+        + id.l2_out
+        + id.l2_out
+        + 1;
+    println!(
+        "[smoke/simple] SimpleGpuTrainer ready: 8 weight groups, ~{:.1}M params total \
+         (ft_in={}, ft_out={}, l1_out={}, l2_out={}, activation={})",
+        params as f64 / 1.0e6,
+        id.ft_in(),
+        id.ft_out,
+        id.l1_out,
+        id.l2_out,
+        id.activation.canonical_name(),
+    );
+    trainer.assert_all_weights_finite()?;
+    println!("[smoke/simple] step 0: init weights all finite ✓");
+
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    let loss = trainer.forward(&batch.as_ref(), SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] step 1 (sigmoid-MSE): loss = {loss:.6e}");
+    if !loss.is_finite() {
+        return Err(format!("step 1 loss = {loss} is not finite").into());
+    }
+    trainer.assert_all_weights_finite()?;
+    println!("[smoke/simple] step 1: forward path OK ✓");
+
+    // SCReLU 活性化を持つ別 trainer で 1 step 走らせ、screlu_fwd kernel の launch
+    // path (4 箇所の活性化分岐の SCReLU 側) を exercise する。
+    let id_screlu = SimpleId {
+        activation: SimpleActivation::SCReLU,
+        ..id
+    };
+    let mut trainer_screlu = SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id_screlu)?;
+    let loss_screlu = trainer_screlu.forward(&batch.as_ref(), SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] step 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
+    if !loss_screlu.is_finite() {
+        return Err(format!("step 2 loss = {loss_screlu} is not finite").into());
+    }
+
+    // WRM loss kernel も exercise する。
+    let loss_wrm_val = trainer.forward(&batch.as_ref(), SMOKE_LOSS_WRM)?;
+    println!("[smoke/simple] step 3 (win-rate-model): loss = {loss_wrm_val:.6e}");
+    if !loss_wrm_val.is_finite() {
+        return Err(format!("step 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+    }
+
+    println!(
+        "[smoke/simple] PASSED — SimpleGpuTrainer forward path OK \
+         (CReLU + SCReLU activations, sigmoid + wrm loss)"
+    );
+    Ok(())
+}
+
 fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::Error>> {
-    // Simple アーキは host pipeline が未実装なので smoke でも early reject する。
+    // Simple アーキは別 host pipeline (SimpleGpuTrainer) を持つので smoke も別系統。
     if arch_kind == ArchKind::Simple {
-        return Err(simple_arch_unimplemented());
+        return simple_smoke_test();
     }
     let ctx = CudaContext::new(0)?;
     println!("[smoke] CUDA context created, loading kernel module...");
