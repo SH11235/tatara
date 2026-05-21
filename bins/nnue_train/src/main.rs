@@ -9835,10 +9835,10 @@ fn run_simple_training(
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
-    // 推論側 evaluation scale: round(QA * QB / 学習 scale)。`cli.scale` は前段で
-    // 有限・正値を保証済。
-    let fv_scale =
-        ((id.activation.qa() * nnue_format::simple_weights::QB) as f32 / cli.scale).round() as i32;
+    // 推論側 evaluation scale。FT 活性化出力は活性化に依らず 127-scale のため
+    // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
+    // は前段で有限・正値を保証済。
+    let fv_scale = nnue_format::simple_weights::simple_fv_scale(cli.scale);
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の

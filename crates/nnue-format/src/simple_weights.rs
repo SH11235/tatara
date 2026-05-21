@@ -75,6 +75,27 @@ pub const NNUE_VERSION: u32 = 0x7AF32F16;
 /// dense 層 weight の量子化 multiplier。
 pub const QB: i32 = 64;
 
+/// FT 活性化後 (= dense 層入力) の量子化スケール。
+///
+/// FT の活性化出力は活性化関数に依らず常に 127-scale (CReLU の出力、SCReLU の
+/// `x²>>9`、Pairwise の 2 CReLU 積 ×127/128 いずれも 127-scale)。
+/// `SimpleActivation::qa()` (SCReLU=255) は FT 重み量子化用であり、dense bias
+/// scale と fv_scale の算出にはこの定数を用いる。
+pub const FT_OUTPUT_QA: i32 = 127;
+
+/// 推論側 evaluation scale `fv_scale` を算出する。
+///
+/// `fv_scale = round(FT_OUTPUT_QA × QB / scale)`。量子化ネットワークの生出力を
+/// centipawn 相当へ換算する除数で、`.bin` ヘッダの arch 文字列 (`build_arch_str`)
+/// に書き込まれ推論エンジンが参照する。
+///
+/// FT 活性化出力は活性化関数に依らず 127-scale ([`FT_OUTPUT_QA`]) のため、
+/// fv_scale も活性化非依存。`scale` は学習 loss の sigmoid scale で、呼び出し側で
+/// 有限・正値を保証すること。
+pub fn simple_fv_scale(scale: f32) -> i32 {
+    ((FT_OUTPUT_QA * QB) as f32 / scale).round() as i32
+}
+
 /// pad to multiple of 32 (SIMD alignment)。
 #[inline]
 pub fn pad32(x: usize) -> usize {
@@ -298,7 +319,7 @@ pub fn network_hash(id: &SimpleId) -> u32 {
 pub struct SimpleWeights {
     /// この weight の構造化 identity。
     pub id: SimpleId,
-    /// 推論時の評価値スケール (`round(QA*QB / 学習 scale)`)。arch 文字列に記録する。
+    /// 推論時の評価値スケール ([`simple_fv_scale`] で算出)。arch 文字列に記録する。
     pub fv_scale: i32,
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,
@@ -379,7 +400,7 @@ impl SimpleWeights {
             .write_all(&compute_fc_hash(id.combined_dim(), id.l1_out, id.l2_out).to_le_bytes())?;
 
         // ---- dense layers (bias i32 scale 127*QB, weight i8 scale QB) ----
-        let bias_scale = (127 * QB) as f64;
+        let bias_scale = (FT_OUTPUT_QA * QB) as f64;
         let weight_scale = QB as f64;
         // L1: (l1_out, combined_dim)
         write_i32_bias(writer, &self.l1_b, bias_scale)?;
@@ -477,7 +498,7 @@ impl SimpleWeights {
         }
 
         // dense layers
-        let bias_scale = (127 * QB) as f32;
+        let bias_scale = (FT_OUTPUT_QA * QB) as f32;
         let weight_scale = QB as f32;
         let l1_b = read_i32_bias(reader, expected.l1_out, bias_scale)?;
         let l1_w = read_i8_weight(
@@ -630,6 +651,17 @@ mod tests {
     }
 
     #[test]
+    fn simple_fv_scale_uses_ft_output_qa() {
+        // fv_scale = round(FT_OUTPUT_QA(127) × QB(64) / scale)、活性化に非依存。
+        // scale=290 → round(8128/290) = round(28.03) = 28
+        assert_eq!(simple_fv_scale(290.0), 28);
+        // scale=600 → round(8128/600) = round(13.55) = 14
+        assert_eq!(simple_fv_scale(600.0), 14);
+        // 回帰防止: 旧実装は SCReLU で QA=255 を使い scale=290 で 56 になっていた。
+        assert_ne!(simple_fv_scale(290.0), 56);
+    }
+
+    #[test]
     fn pad32_correct() {
         assert_eq!(pad32(0), 0);
         assert_eq!(pad32(1), 32);
@@ -694,7 +726,7 @@ mod tests {
         let id = test_id(SimpleActivation::CReLU);
         let qa = id.activation.qa() as f32;
         let qb = QB as f32;
-        let bias = (127 * QB) as f32;
+        let bias = (FT_OUTPUT_QA * QB) as f32;
         let mut w = SimpleWeights::zeroed(id, 16);
         for (i, v) in w.ft_w.iter_mut().enumerate() {
             *v = ((i % 7) as i32 - 3) as f32 / qa;
