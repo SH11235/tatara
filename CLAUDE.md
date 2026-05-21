@@ -1,4 +1,4 @@
-# rshogi-nnue リポ運用規約 (Claude Code 向け)
+# tatara リポ運用規約 (Claude Code 向け)
 
 本ファイルは Claude Code セッションが本リポで作業するときに必ず従う運用規約。
 人間 collaborator も読む想定だが、現状 user は SH11235 単独。

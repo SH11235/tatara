@@ -1,6 +1,6 @@
 # 開発環境セットアップ
 
-rshogi-nnue は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
+tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
 に据えるため、host (LLVM 21+, できれば LLVM 22) と GPU (sm_80+ 公式) の両方を
 整える必要がある。Ampere (sm_86) を primary に、Turing (sm_75) も
 `CUDA_OXIDE_TARGET=sm_75` 環境変数で動作する (制約は「sub-Ampere GPU」節と

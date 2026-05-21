@@ -2,11 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-05-19
-- **設計レビュー**: SH11235/rshogi-nnue#152 (Codex / Claude 両者 APPROVE)
+- **設計レビュー**: SH11235/tatara#152 (Codex / Claude 両者 APPROVE)
 
 ## Context
 
-rshogi-nnue は NNUE 入力 feature set として HalfKA_hm (merged-king-plane,
+tatara は NNUE 入力 feature set として HalfKA_hm (merged-king-plane,
 73,305 次元) 1 種類を compile-time const で固定していた。総入力次元 `FT_IN` /
 最大 active 数 `MAX_ACTIVE` / feature hash が `shogi-features` /
 `nnue-format` / `gpu-kernels` / `bins/nnue_train` に分散定数として埋まっている。
