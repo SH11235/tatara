@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/SH11235/rshogi-nnue"
+repository = "https://github.com/SH11235/tatara"
 authors = ["SH11235"]
 rust-version = "1.96"
 

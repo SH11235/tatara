@@ -476,7 +476,7 @@ fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
 impl PackedSfenValue {
     /// 対局結果 (raw i8 game_result から GameResult enum へ)。
     ///
-    /// rshogi-nnue では bullet-shogi の `LoadableDataType::result` 相当を
+    /// tatara では bullet-shogi の `LoadableDataType::result` 相当を
     /// inherent method として提供する。bullet 側の trait は依存させない。
     pub fn result(&self) -> crate::GameResult {
         match self.game_result() {

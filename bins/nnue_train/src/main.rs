@@ -9390,7 +9390,7 @@ fn file_basename(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// rshogi-nnue の git revision を best-effort で取得する。git が見つからない、
+/// tatara の git revision を best-effort で取得する。git が見つからない、
 /// または git repository 外で実行された場合は `None`。working tree に未 commit
 /// の変更があれば `-dirty` を付ける。
 fn git_commit() -> Option<String> {

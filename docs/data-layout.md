@@ -1,11 +1,11 @@
 # データ配置規約
 
-rshogi-nnue が扱う PSV / progress.bin / .nnue / checkpoint / ログの配置・
+tatara が扱う PSV / progress.bin / .nnue / checkpoint / ログの配置・
 命名・bullet-shogi 互換性を定義する。
 
 ## 物理配置
 
-- リポルートはどこに置いてもよい (`~/git-repos/rshogi-nnue/` 等を推奨)。
+- リポルートはどこに置いてもよい (`~/git-repos/tatara/` 等を推奨)。
 - 学習データ (PSV、教師、shuffle 済 bin 等) は大容量 (合計数百 GB) のため、
   別ドライブを推奨。リポ内 `data/` から symlink を張ると扱いやすい。
 - 学習出力 (progress.bin / .nnue / checkpoint) とログも別ドライブ推奨。

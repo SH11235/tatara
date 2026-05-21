@@ -18,7 +18,7 @@
 # 入れないため)。
 !crates/shogi-format/tests/data/sample.psv
 
-# rshogi-nnue 自前の学習出力 — docs/data-layout.md
+# tatara 自前の学習出力 — docs/data-layout.md
 /output
 **/output
 /logs

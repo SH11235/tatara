@@ -222,7 +222,7 @@ fn tempdir() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("rshogi-nnue-stage1-9-{pid}-{nanos}"));
+    let dir = std::env::temp_dir().join(format!("tatara-host-smoke-{pid}-{nanos}"));
     std::fs::create_dir_all(&dir).expect("mkdir temp");
     dir
 }
