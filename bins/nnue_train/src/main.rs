@@ -10152,7 +10152,8 @@ impl SimpleGpuTrainer {
         let l2_out = id.l2_out;
         // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
         // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
-        // 4 の倍数でない値が来る可能性があるので early reject する。
+        // 4 の倍数でない値が来る可能性があるので early reject する。4 の倍数性は
+        // pairwise が必要とする偶数性 (`half = ft_out / 2`) も内包する。
         if !ft_out.is_multiple_of(4) {
             return Err(format!(
                 "SimpleGpuTrainer: ft_out {ft_out} must be a multiple of 4 \
@@ -10160,6 +10161,12 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
+        // pairwise の `half = ft_out / 2` 分割が割り切れることを明示確認する
+        // (上の 4 の倍数チェックで保証済の不変条件、将来 4→2 緩和時の保険)。
+        debug_assert!(
+            ft_out.is_multiple_of(2),
+            "pairwise requires even ft_out for the half-split"
+        );
 
         // small random init。group ごとに seed を変えて weight が同一値で潰れない
         // ようにする (forward の合成 layer 構造を踏むため)。
