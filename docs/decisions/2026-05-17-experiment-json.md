@@ -79,14 +79,14 @@ producer 自身の version は `generator.version` が別に持つ。
 ```jsonc
 {
   "schema_version": 2,                // 現行値 (held-out フィールドは下の ※11)
-  "generator": { "name": "rshogi-nnue", "version": "0.1.0" },  // ※1
+  "generator": { "name": "tatara", "version": "0.1.0" },  // ※1
 
   "id": "rshogi-20260517t041530z-48213", // net_id + UTC 開始時刻 + pid、run 一意 (※2)
   "name": "rshogi",                   // 既定 = net_id (resume run は別既定、※3)
   "date": "2026-05-17T04:15:30Z",     // run 開始時刻 (ISO 8601 UTC)
   "status": "completed",              // "running" | "completed" のみ (※4)
   "last_updated_at": "2026-05-17T05:10:02Z",
-  "commit": "7beb263",                // rshogi-nnue の revision (dirty 時は印付き)
+  "commit": "7beb263",                // tatara の revision (dirty 時は印付き)
   "command": "nnue-train --data ... --superbatches 400 ...",
 
   "lineage": {                        // ※5  --resume した run のみ
@@ -141,7 +141,7 @@ producer 自身の version は `generator.version` が別に持つ。
 }
 ```
 
-- **※1 `generator`**: producer (rshogi-nnue / bullet-shogi) の区別用。top-level
+- **※1 `generator`**: producer (tatara / bullet-shogi) の区別用。top-level
   なので未改修の `nnue-lab` では正規化時に削除される (reject はされない)。
 - **※2 `id`**: `{net_id}-{UTC開始時刻}-{process id}` で run を一意化する。
   秒精度 UTC 時刻に process id を足すことで、同一 net_id / output で複数

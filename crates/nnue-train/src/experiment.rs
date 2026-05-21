@@ -55,11 +55,11 @@ pub struct Generator {
 }
 
 impl Generator {
-    /// 本トレーナーを表す `Generator` (`name = "rshogi-nnue"`、version は crate
+    /// 本トレーナーを表す `Generator` (`name = "tatara"`、version は crate
     /// version)。
-    pub fn rshogi_nnue() -> Self {
+    pub fn tatara() -> Self {
         Self {
-            name: "rshogi-nnue".to_string(),
+            name: "tatara".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -214,7 +214,7 @@ pub struct ExperimentDoc {
     pub status: String,
     /// 直近の書き込み時刻 (ISO 8601 UTC)。
     pub last_updated_at: String,
-    /// rshogi-nnue の source revision。取得できなければ省略。
+    /// tatara の source revision。取得できなければ省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub command: String,
@@ -253,7 +253,7 @@ impl ExperimentDoc {
         let date = format_utc_iso(start_epoch_secs);
         Self {
             schema_version: SCHEMA_VERSION,
-            generator: Generator::rshogi_nnue(),
+            generator: Generator::tatara(),
             id,
             name,
             last_updated_at: date.clone(),
@@ -673,7 +673,7 @@ mod tests {
         // held-out メトリクスを渡した superbatch は history に出る。
         assert_eq!(v["history"][0]["test_loss"], 0.05);
         assert_eq!(v["history"][0]["test_accuracy"], 0.8);
-        assert_eq!(v["generator"]["name"], "rshogi-nnue");
+        assert_eq!(v["generator"]["name"], "tatara");
         assert_eq!(v["params"]["lr"], 0.000875);
         assert_eq!(v["history"][0]["superbatch"], 1);
         assert_eq!(v["checkpoints"][0], "rshogi-20.bin");
