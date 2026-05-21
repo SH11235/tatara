@@ -8942,6 +8942,19 @@ struct Cli {
     arch: ArchCommand,
 }
 
+/// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
+/// で検証する。`true` を返したら制約違反 = error (FT activation FP16 が ON だが
+/// FT weight FP16 が OFF)。
+///
+/// `--all-optim` は `--ft-fp16` / `--ft-fp16-out` の双方を ON 相当にするため、`--all-optim`
+/// が指定されていれば制約は常に満たされる (両 flag が実効 ON)。よって制約違反は
+/// 「`--ft-fp16-out` が raw 指定されていて、`--all-optim` も無く、`--ft-fp16` も raw 指定
+/// されていない」ときのみ。これにより `--all-optim --ft-fp16-out` (冗長指定) を
+/// false-positive reject しない。
+fn ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw: bool, ft_fp16_raw: bool, all_optim: bool) -> bool {
+    ft_fp16_out_raw && !all_optim && !ft_fp16_raw
+}
+
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 enum ArchCommand {
@@ -9094,7 +9107,10 @@ fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     // --ft-fp16-out は weight FP16 path の上に積む拡張なので --ft-fp16 を要求する。
-    if layerstack.ft_fp16_out && !cli.ft_fp16 {
+    // `--all-optim` は両 flag を含意するため実効値で判定する
+    // ([`ft_fp16_out_missing_ft_fp16`]、`--all-optim --ft-fp16-out` を false-positive
+    // reject しない)。
+    if ft_fp16_out_missing_ft_fp16(layerstack.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
         return Err(
             "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
                     path の拡張)"
@@ -9712,7 +9728,9 @@ fn run_simple_training(
         .into());
     }
     // `--ft-fp16-out` は FP16 weight mirror 経路の上に積む拡張で、`--ft-fp16` を要求する。
-    if simple_args.ft_fp16_out && !cli.ft_fp16 {
+    // `--all-optim` は両 flag を含意するため実効値で判定する ([`ft_fp16_out_missing_ft_fp16`]、
+    // `--all-optim --ft-fp16-out` の冗長指定を false-positive reject しない)。
+    if ft_fp16_out_missing_ft_fp16(simple_args.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
         return Err(
             "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
              path の拡張)"
@@ -13277,6 +13295,29 @@ mod cli_tests {
             Cli::try_parse_from(["nnue-train", "layerstack", "--all-optim"])
                 .expect("--all-optim should be accepted after `layerstack` (global)");
         assert!(cli_postfix_layerstack.all_optim);
+    }
+
+    #[test]
+    fn ft_fp16_out_requires_ft_fp16_uses_effective_values() {
+        // `--ft-fp16-out` が `--ft-fp16` を要求する制約は実効値 (`--all-optim` 含意込み)
+        // で判定する。`ft_fp16_out_missing_ft_fp16(ft_fp16_out, ft_fp16, all_optim)` が
+        // `true` を返すと制約違反 = error。
+        //
+        // arg 順: (ft_fp16_out_raw, ft_fp16_raw, all_optim)。
+
+        // --ft-fp16-out 単独 (--ft-fp16 / --all-optim なし) → 制約違反 (error)。
+        assert!(ft_fp16_out_missing_ft_fp16(true, false, false));
+        // --ft-fp16-out --ft-fp16 → OK。
+        assert!(!ft_fp16_out_missing_ft_fp16(true, true, false));
+        // --all-optim 単独 (raw flag は両方 false) → OK (--all-optim が両方含意)。
+        assert!(!ft_fp16_out_missing_ft_fp16(false, false, true));
+        // --all-optim --ft-fp16-out (冗長指定) → OK。all_optim=true なら ft_fp16 も実効
+        // ON のため制約は充足、helper は常に false を返す。
+        assert!(!ft_fp16_out_missing_ft_fp16(true, false, true));
+        // flag なし → OK (ft_fp16_out が OFF なら制約は無関係)。
+        assert!(!ft_fp16_out_missing_ft_fp16(false, false, false));
+        // --ft-fp16 単独 (ft_fp16_out OFF) → OK。
+        assert!(!ft_fp16_out_missing_ft_fp16(false, true, false));
     }
 
     #[test]
