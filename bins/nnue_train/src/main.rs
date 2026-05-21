@@ -9586,10 +9586,13 @@ fn run_simple_training(
     };
 
     // `--ft-fp16-out` 経路は現在 CReLU 限定 (SCReLU / Pairwise 用 FP16 fused kernel は
-    // 未提供)。必要になれば `simple_bias_act_fwd_fp16_in_screlu` 等を追加して許可する。
-    if simple_args.ft_fp16_out && activation != SimpleActivation::CReLU {
+    // 未提供)。`--all-optim` も `ft_fp16_out` を含意するため、raw flag ではなく実効値
+    // (`simple_args.ft_fp16_out || cli.all_optim`) で判定する。実効値で見ないと
+    // `--all-optim --activation screlu` が reject を素通りし、トレーナ forward が
+    // activation 非依存に CReLU kernel を launch して誤った活性化で学習してしまう。
+    if (simple_args.ft_fp16_out || cli.all_optim) && activation != SimpleActivation::CReLU {
         return Err(format!(
-            "--ft-fp16-out currently requires --activation crelu \
+            "--ft-fp16-out (--all-optim implies it) currently requires --activation crelu \
              (FP16 FT activation path is not implemented for '{}')",
             activation.canonical_name()
         )
