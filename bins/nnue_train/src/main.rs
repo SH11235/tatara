@@ -1817,6 +1817,115 @@ pub fn ft_post_perspective_grad_fused_fp16(
     bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
 }
 
+/// 非 fused FP16 版 [`ft_post_perspective_grad`]: forward activation `ft_out` を `f16`
+/// で読み、`grad_ft_out` (dft) を loss scaling 付き `f16` で書く。`d_combined` は
+/// 単一 source (`ft_post_perspective_grad` と同じく、`d_combined_offset` で perspective
+/// の半分を切り出す)。`d_combined` / `bias` / `grad_bias` は `f32` のまま。
+///
+/// math は [`ft_post_perspective_grad_fused_fp16`] と同等で、`dy` の読み出し元のみ
+/// 2 source の in-register sum → 単一 buffer read に置き換わる。`grad_ft_out` へ書く
+/// 値は `dft_scale` ([`FT_DFT_FP16_BASE_SCALE`] × batch) を掛けて f16 normal range に
+/// 持ち上げ ±65504 clamp してから cast し、後続 [`simple_sparse_ft_backward_fp16`] が
+/// `dft_inv_scale` で打ち消す。`grad_bias` への atomic accumulate は scale しない
+/// `f32` の `grad_a` / `grad_b` をそのまま使う (FP32 path と同じ精度)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fp16(
+    d_combined: &[f32],
+    ft_out: &[f16],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f16>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+    dft_scale: f32,
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy =
+        d_combined[bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
+    // `ft_post_perspective_grad_fused_fp16` と同一。dft_scale を掛けてから f16 域へ
+    // clamp する (天井超過を ±inf にすると gather 経由で weight を NaN 化させるため)。
+    let da = grad_a * dft_scale;
+    let da_c = if da > 65504.0_f32 {
+        65504.0_f32
+    } else if da < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        da
+    };
+    let db = grad_b * dft_scale;
+    let db_c = if db > 65504.0_f32 {
+        65504.0_f32
+    } else if db < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        db
+    };
+    // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の
+    // 偶数性で pair_idx ∈ [0, half) → {pair_idx, half + pair_idx} ⊂ [0, ft_dim)、tid 範囲
+    // チェックで bi < batch。同一 (bi, ii) cell を書く thread は他に無い (pair_idx 単射)。
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(da_c as f16);
+        out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
+    }
+
+    // grad_bias は f32 accumulate を維持 (scale 無しの grad_a / grad_b を atomic add)。
+    // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
+    // `f32` (align 4) と `DeviceAtomicF32` は同 layout、non-atomic 書き込み path は無し。
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
 /// Regular dense matrix multiply forward + bias add。
 ///
 /// `y[b][o] = bias[o] + sum_i x[b][i] * w[i][o]`。Layout: `x` row-major (batch × in_dim)、
@@ -3785,6 +3894,88 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
     }
 }
 
+/// Simple FP16 FT activation forward (SCReLU): f16 FT 出力 + f32 bias → f32 acted。
+///
+/// [`simple_bias_act_fwd_fp16_in_crelu`] の SCReLU 版。活性化のみ `clamp(x, 0, 1)²`
+/// に置き換わり、f16 read / bias 加算 / 出力 layout は同一。
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn simple_bias_act_fwd_fp16_in_screlu(
+    ft_out: &[f16],
+    bias: &[f32],
+    mut ft_acted: DisjointSlice<f32>,
+    batch: u32,
+    ft_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let ri = tid.get() % (ft_dim as usize);
+    let x = ft_out[tid.get()] as f32 + bias[ri];
+    let a = if x < 0.0_f32 {
+        0.0_f32
+    } else if x > 1.0_f32 {
+        1.0_f32
+    } else {
+        x
+    };
+    if let Some(o) = ft_acted.get_mut(tid) {
+        *o = a * a;
+    }
+}
+
+/// Simple FP16 FT activation backward (SCReLU) + loss scaling + ±65504 clamp + f16 cast。
+///
+/// [`simple_act_grad_to_fp16_crelu_with_scale`] の SCReLU 版。CReLU の指示関数
+/// (`0 < x < 1` で 1) の代わりに SCReLU の局所微分 `d/dx clamp(x,0,1)² = 2·clamp(x,0,1)`
+/// (`0 < clamp < 1` 範囲、外は 0) を掛ける。loss scaling / ±65504 clamp / f16 cast は同一。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn simple_act_grad_to_fp16_screlu_with_scale(
+    ft_out: &[f16],
+    bias: &[f32],
+    dft_acted: &[f32],
+    mut dft_out: DisjointSlice<f16>,
+    batch: u32,
+    ft_dim: u32,
+    dft_scale: f32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let ri = tid.get() % (ft_dim as usize);
+    let x = ft_out[tid.get()] as f32 + bias[ri];
+    let a = if x < 0.0_f32 {
+        0.0_f32
+    } else if x > 1.0_f32 {
+        1.0_f32
+    } else {
+        x
+    };
+    let dydx = if a > 0.0_f32 && a < 1.0_f32 {
+        2.0_f32 * a
+    } else {
+        0.0_f32
+    };
+    let g = dft_acted[tid.get()] * dydx;
+    let s = g * dft_scale;
+    let s_c = if s > 65504.0_f32 {
+        65504.0_f32
+    } else if s < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        s
+    };
+    if let Some(o) = dft_out.get_mut(tid) {
+        *o = s_c as f16;
+    }
+}
+
 /// Simple FP16 FT bias gradient: f16 dft + inv_scale → f32 grad_bias atomic add。
 ///
 /// `--ft-fp16-out` 経路。`dft_*_out_h` (f16、loss scaling 済) を read、`dft_inv_scale`
@@ -4236,12 +4427,15 @@ fn compile_ll_to_ptx_via_llc(
                        ft_post_perspective_grad_fused,\
                        sparse_ft_forward_fp16,sparse_ft_forward_fp16_out,cast_f32_to_f16,\
                        ft_post_perspective_fwd_fp16,ft_post_perspective_grad_fused_fp16,\
+                       ft_post_perspective_grad_fp16,\
                        build_feature_counts,exclusive_prefix_sum_small,scatter_positions,\
                        gather_and_sum_per_feature_overwrite,gather_and_sum_per_feature_add,\
                        gather_and_sum_per_feature_overwrite_fp16,\
                        gather_and_sum_per_feature_add_fp16,\
                        simple_bias_act_fwd_fp16_in_crelu,\
                        simple_act_grad_to_fp16_crelu_with_scale,\
+                       simple_bias_act_fwd_fp16_in_screlu,\
+                       simple_act_grad_to_fp16_screlu_with_scale,\
                        simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
                        simple_bias_grad_dual,simple_bias_grad_dual_fp16,\
                        simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused,\
@@ -8833,7 +9027,7 @@ struct SimpleArgs {
     activation: String,
 
     /// FT activation (`ft_*_out` の forward 出力と `dft_*_out` の backward 勾配) も
-    /// FP16 で保持する。global `--ft-fp16` を要求し、現状 `--activation crelu` 限定。
+    /// FP16 で保持する。global `--ft-fp16` を要求する (crelu / screlu / pairwise 対応)。
     ///
     /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
     /// `sparse_ft_backward` の read 帯域が半減する。dft は batch 正規化で `1/batch`
@@ -9585,20 +9779,6 @@ fn run_simple_training(
         l2_out,
     };
 
-    // `--ft-fp16-out` 経路は現在 CReLU 限定 (SCReLU / Pairwise 用 FP16 fused kernel は
-    // 未提供)。`--all-optim` も `ft_fp16_out` を含意するため、raw flag ではなく実効値
-    // (`simple_args.ft_fp16_out || cli.all_optim`) で判定する。実効値で見ないと
-    // `--all-optim --activation screlu` が reject を素通りし、トレーナ forward が
-    // activation 非依存に CReLU kernel を launch して誤った活性化で学習してしまう。
-    if (simple_args.ft_fp16_out || cli.all_optim) && activation != SimpleActivation::CReLU {
-        return Err(format!(
-            "--ft-fp16-out (--all-optim implies it) currently requires --activation crelu \
-             (FP16 FT activation path is not implemented for '{}')",
-            activation.canonical_name()
-        )
-        .into());
-    }
-
     // Simple は loss kind に関わらず `cli.scale` を量子化 `fv_scale` の算出で参照
     // するため、WRM 経路でも finite / 正値を要求する (LayerStack は WRM 時に scale
     // を参照しないので sigmoid 経路でのみ検証していた)。
@@ -10017,11 +10197,13 @@ struct SimpleGpuTrainer {
     /// 学習開始時の初期同期は [`sync_ft_w_h_mirror`](Self::sync_ft_w_h_mirror) で。
     ft_w_h: Option<DeviceBuffer<f16>>,
     /// `--ft-fp16-out` opt-in flag。`true` の間 forward は `sparse_ft_forward_fp16_out`
-    /// (FP16 weight + FP16 出力) と [`simple_bias_act_fwd_fp16_in_crelu`] を使い、
-    /// backward は [`simple_act_grad_to_fp16_crelu_with_scale`] / [`simple_bias_grad_fp16`]
-    /// / [`simple_sparse_ft_backward_fp16`] で dft も f16 で持つ。`ft_fp16` を要求し、
-    /// CLI 検証段階で activation = CReLU を要求する。dft は loss scaling で f16 域に
-    /// 持ち上げる ([`FT_DFT_FP16_BASE_SCALE`] × batch、±65504 clamp 付き)。
+    /// (FP16 weight + FP16 出力) で `ft_*_out` を f16 化し、FT post は活性化別の f16
+    /// 入力 kernel (CReLU/SCReLU は `simple_bias_act_fwd_fp16_in_*`、Pairwise は
+    /// `ft_post_perspective_fwd_fp16`) で combined を作る。backward も活性化別の f16
+    /// 勾配 kernel (`simple_act_grad_to_fp16_*_with_scale` / `ft_post_perspective_grad_fp16`)
+    /// で dft を f16 化し、`simple_bias_grad_fp16` / `simple_sparse_ft_backward_fp16` が
+    /// 読み戻す。`ft_fp16` を要求する (3 活性化すべて対応)。dft は loss scaling で
+    /// f16 域に持ち上げる ([`FT_DFT_FP16_BASE_SCALE`] × batch、±65504 clamp 付き)。
     ft_fp16_out: bool,
     /// `--fp16-opt-state` opt-in flag。`true` の間 `ft_w_m` / `ft_w_v` を [`MomentBuf::F16`]
     /// で確保し、optimizer step は [`radam_step_f16state`] / [`radam_step_f16state_mirror`]
@@ -10618,45 +10800,92 @@ impl SimpleGpuTrainer {
         tick("fwd_ft", &self.stream, &mut prof_t0)?;
 
         // -- FT post = bias add + 活性化 + concat。
-        // `ft_fp16_out` 時は `simple_bias_act_fwd_fp16_in_crelu` が bias 加算 + CReLU を
-        // 融合し、f16 `ft_*_out_h` → f32 `ft_*_acted` に書く (CLI 検証で SCReLU は reject)。
-        // 既定は LayerStack の ft_post_perspective_fwd と違い pairwise / scale を含まない
-        // ため既存 4 launch (bias_add ×2 + 活性化 ×2) で合成する。
+        // `ft_fp16_out` 時は f16 `ft_*_out_h` を読む活性化別 kernel で `combined` を作る。
+        // CReLU / SCReLU は f32 `ft_*_acted` を経由して `slice_scatter_2d` で concat、
+        // Pairwise は `ft_post_perspective_fwd_fp16` が両 perspective まとめて `combined`
+        // を直書きする (slice_scatter 不要)。既定 (FP32) 経路は bias_add + 活性化 +
+        // slice_scatter を融合した kernel 群で合成する。
         if self.ft_fp16_out {
-            let ft_stm_out_h = self
-                .ws
-                .ft_stm_out_h
-                .as_ref()
-                .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: simple_bias_act_fwd_fp16_in_crelu,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(ft_stm_out_h),
-                    slice(self.ft_b),
-                    slice_mut(self.ws.ft_stm_acted),
-                    b_u32, ft_out_u32
-                ]
-            }?;
-            let ft_nstm_out_h = self
-                .ws
-                .ft_nstm_out_h
-                .as_ref()
-                .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: simple_bias_act_fwd_fp16_in_crelu,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(ft_nstm_out_h),
-                    slice(self.ft_b),
-                    slice_mut(self.ws.ft_nstm_acted),
-                    b_u32, ft_out_u32
-                ]
-            }?;
+            match self.id.activation {
+                SimpleActivation::CReLU => {
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_bias_act_fwd_fp16_in_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_stm_out_h), slice(self.ft_b),
+                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                        ]
+                    }?;
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_bias_act_fwd_fp16_in_crelu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_nstm_out_h), slice(self.ft_b),
+                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                        ]
+                    }?;
+                }
+                SimpleActivation::SCReLU => {
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_bias_act_fwd_fp16_in_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_stm_out_h), slice(self.ft_b),
+                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                        ]
+                    }?;
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_bias_act_fwd_fp16_in_screlu,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_nstm_out_h), slice(self.ft_b),
+                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                        ]
+                    }?;
+                }
+                SimpleActivation::Pairwise => {
+                    // f16 入力版 pairwise FT post。`combined` (b × ft_out) を直書きするため
+                    // 後段の slice_scatter は不要 (FP32 pairwise path と同じ構造)。
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: ft_post_perspective_fwd_fp16,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_stm_out_h), slice(ft_nstm_out_h), slice(self.ft_b),
+                            slice_mut(self.ws.combined), b_u32, ft_out_u32, FT_POST_SCALE
+                        ]
+                    }?;
+                }
+            }
         } else {
             // DEFAULT (FP32) path: bias_add + activation + slice_scatter (per perspective × 2)
             // を 1 kernel に融合。`ft_*_out` に bias を in-place 加算 (bwd indicator が読む)
@@ -10730,10 +10959,11 @@ impl SimpleGpuTrainer {
             }
         }
 
-        // `ft_fp16_out` 経路は融合 kernel が `ft_*_acted` までしか書かないため `combined`
-        // へ slice_scatter する。DEFAULT 経路は `simple_ft_post_fused_*` が `combined` を
-        // 直書きするためここを skip する。
-        if self.ft_fp16_out {
+        // `ft_fp16_out` の CReLU / SCReLU 経路は活性化 kernel が `ft_*_acted` までしか
+        // 書かないため `combined` へ slice_scatter する。Pairwise + `ft_fp16_out` は
+        // `ft_post_perspective_fwd_fp16` が `combined` を直書き済なので skip。DEFAULT 経路は
+        // `simple_ft_post_fused_*` / `ft_post_perspective_fwd` が `combined` 直書きで同様に skip。
+        if self.ft_fp16_out && self.id.activation != SimpleActivation::Pairwise {
             cuda_launch! {
                 kernel: slice_scatter_2d,
                 stream: self.stream,
@@ -11141,67 +11371,160 @@ impl SimpleGpuTrainer {
         // dcombined (b × combined_dim) の per-perspective 半分を `src_offset` で切り出して
         // 読み、pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
         // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
-        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む
-        // ため `slice_extract_2d` + `simple_act_grad_to_fp16_crelu_with_scale` の 2 kernel に
-        // 留める (融合範囲外、scale や clamp の数値挙動を切替で揺らさないため)。
+        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む。
+        // CReLU / SCReLU は `slice_extract_2d` + `simple_act_grad_to_fp16_*_with_scale`、
+        // Pairwise は `ft_post_perspective_grad_fp16` (`dcombined` を直接 offset 読み)。
         if self.ft_fp16_out {
-            cuda_launch! {
-                kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                       b_u32, l1_in_u32, 0_u32, ft_out_u32]
-            }?;
-            cuda_launch! {
-                kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                       b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-            }?;
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
-            let ft_stm_out_h = self
-                .ws
-                .ft_stm_out_h
-                .as_ref()
-                .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
-            let mut dft_stm_out_h = self
-                .ws
-                .dft_stm_out_h
-                .as_mut()
-                .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: simple_act_grad_to_fp16_crelu_with_scale,
-                stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(ft_stm_out_h),
-                    slice(self.ft_b),
-                    slice(self.ws.dft_stm_acted),
-                    slice_mut(dft_stm_out_h),
-                    b_u32, ft_out_u32, dft_scale
-                ]
-            }?;
-            let ft_nstm_out_h = self
-                .ws
-                .ft_nstm_out_h
-                .as_ref()
-                .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-            let mut dft_nstm_out_h = self
-                .ws
-                .dft_nstm_out_h
-                .as_mut()
-                .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: simple_act_grad_to_fp16_crelu_with_scale,
-                stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(ft_nstm_out_h),
-                    slice(self.ft_b),
-                    slice(self.ws.dft_nstm_acted),
-                    slice_mut(dft_nstm_out_h),
-                    b_u32, ft_out_u32, dft_scale
-                ]
-            }?;
+            match self.id.activation {
+                SimpleActivation::CReLU => {
+                    cuda_launch! {
+                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
+                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
+                    }?;
+                    cuda_launch! {
+                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
+                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
+                    }?;
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_stm_out_h = self
+                        .ws
+                        .dft_stm_out_h
+                        .as_mut()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_act_grad_to_fp16_crelu_with_scale,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_stm_out_h), slice(self.ft_b),
+                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            b_u32, ft_out_u32, dft_scale
+                        ]
+                    }?;
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_nstm_out_h = self
+                        .ws
+                        .dft_nstm_out_h
+                        .as_mut()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_act_grad_to_fp16_crelu_with_scale,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_nstm_out_h), slice(self.ft_b),
+                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            b_u32, ft_out_u32, dft_scale
+                        ]
+                    }?;
+                }
+                SimpleActivation::SCReLU => {
+                    cuda_launch! {
+                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
+                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
+                    }?;
+                    cuda_launch! {
+                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
+                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
+                    }?;
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_stm_out_h = self
+                        .ws
+                        .dft_stm_out_h
+                        .as_mut()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_act_grad_to_fp16_screlu_with_scale,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_stm_out_h), slice(self.ft_b),
+                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            b_u32, ft_out_u32, dft_scale
+                        ]
+                    }?;
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_nstm_out_h = self
+                        .ws
+                        .dft_nstm_out_h
+                        .as_mut()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_act_grad_to_fp16_screlu_with_scale,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(ft_nstm_out_h), slice(self.ft_b),
+                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            b_u32, ft_out_u32, dft_scale
+                        ]
+                    }?;
+                }
+                SimpleActivation::Pairwise => {
+                    // f16 入力版 pairwise FT post backward。`ft_post_perspective_grad` の
+                    // f16 版で、bias 未加算の f16 `ft_*_out_h` を読み、loss scaling 済
+                    // f16 `dft_*_out_h` を書く。FP32 pairwise と同じく `dft_*_out` の
+                    // 書き込みと同 pass で `ft_b_grad` (f32) を accumulate するため、
+                    // 後段の `simple_bias_grad_dual_fp16` は Pairwise では呼ばない。
+                    let ft_stm_out_h = self
+                        .ws
+                        .ft_stm_out_h
+                        .as_ref()
+                        .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_stm_out_h = self
+                        .ws
+                        .dft_stm_out_h
+                        .as_mut()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fp16,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                        args: [slice(self.ws.dcombined), slice(ft_stm_out_h),
+                               slice(self.ft_b), slice_mut(dft_stm_out_h),
+                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               0_u32, l1_in_u32, FT_POST_SCALE, dft_scale]
+                    }?;
+                    let ft_nstm_out_h = self
+                        .ws
+                        .ft_nstm_out_h
+                        .as_ref()
+                        .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    let mut dft_nstm_out_h = self
+                        .ws
+                        .dft_nstm_out_h
+                        .as_mut()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fp16,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                        args: [slice(self.ws.dcombined), slice(ft_nstm_out_h),
+                               slice(self.ft_b), slice_mut(dft_nstm_out_h),
+                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE, dft_scale]
+                    }?;
+                }
+            }
         } else {
             match self.id.activation {
                 SimpleActivation::CReLU => {
@@ -11271,46 +11594,49 @@ impl SimpleGpuTrainer {
         } else {
             1.0_f32 // unused on FP32 path
         };
-        // FT bias grad は両 perspective が同じ `ft_b` を共有するので、per-cell に stm + nstm
-        // の ローカル和を作って atomic add 1 回で `ft_b_grad[oi]` に accumulate する
-        // (`simple_bias_grad_dual`)。atomic contention は B * ft_dim 回で、stm / nstm を別
-        // launch で 2 回 atomic 打つ構成より半減。
-        if self.ft_fp16_out {
-            let dft_stm_out_h = self
-                .ws
-                .dft_stm_out_h
-                .as_ref()
-                .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-            let dft_nstm_out_h = self
-                .ws
-                .dft_nstm_out_h
-                .as_ref()
-                .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(dft_stm_out_h),
-                    slice(dft_nstm_out_h),
-                    slice(self.ft_b_grad),
-                    b_u32, ft_out_u32, dft_inv_scale_fp16
-                ]
-            }?;
-        } else if self.id.activation == SimpleActivation::Pairwise {
-            // Pairwise は `ft_post_perspective_grad` が `dft_*_out` を書くのと同じ pass で
-            // 同値を `ft_b_grad` へ atomic accumulate 済 (FT bias grad = pre-activation
-            // 勾配 dft の batch 和)。`simple_bias_grad_dual` の別 launch は不要。
-        } else {
-            cuda_launch! {
-                kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(self.ws.dft_stm_out),
-                    slice(self.ws.dft_nstm_out),
-                    slice(self.ft_b_grad),
-                    b_u32, ft_out_u32
-                ]
-            }?;
+        // FT bias grad: CReLU / SCReLU は per-cell に stm + nstm のローカル和を作って
+        // atomic add 1 回で `ft_b_grad[oi]` に accumulate する (`simple_bias_grad_dual`、
+        // atomic contention は B * ft_dim 回で stm/nstm 別 launch の半分)。Pairwise は
+        // `ft_post_perspective_grad[_fp16]` が `dft_*_out` 書き込みと同 pass で同値を
+        // `ft_b_grad` へ accumulate 済 (FT bias grad = pre-activation 勾配 dft の batch 和)
+        // のため、別 launch しない。
+        match self.id.activation {
+            SimpleActivation::Pairwise => {}
+            SimpleActivation::CReLU | SimpleActivation::SCReLU => {
+                if self.ft_fp16_out {
+                    let dft_stm_out_h = self
+                        .ws
+                        .dft_stm_out_h
+                        .as_ref()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
+                    let dft_nstm_out_h = self
+                        .ws
+                        .dft_nstm_out_h
+                        .as_ref()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
+                    cuda_launch! {
+                        kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [
+                            slice(dft_stm_out_h),
+                            slice(dft_nstm_out_h),
+                            slice(self.ft_b_grad),
+                            b_u32, ft_out_u32, dft_inv_scale_fp16
+                        ]
+                    }?;
+                } else {
+                    cuda_launch! {
+                        kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_n),
+                        args: [
+                            slice(self.ws.dft_stm_out),
+                            slice(self.ws.dft_nstm_out),
+                            slice(self.ft_b_grad),
+                            b_u32, ft_out_u32
+                        ]
+                    }?;
+                }
+            }
         }
 
         // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
@@ -12487,6 +12813,60 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     println!("[smoke/simple] pairwise OK ✓");
+
+    // `--ft-fp16-out` 経路 (FT activation を FP16 で保持) を 3 活性化すべてで確認する。
+    // f16 FT-out kernel が活性化別に正しく分岐し、loss scaling 込みの backward が
+    // finite に走って loss を下げることを見る。`ft_fp16` を要求するので両 flag ON、
+    // `ft_w_h` mirror は `sync_ft_w_h_mirror` で初期同期する (`run_simple_training` と同じ)。
+    for act in [
+        SimpleActivation::CReLU,
+        SimpleActivation::SCReLU,
+        SimpleActivation::Pairwise,
+    ] {
+        let id_fp16 = SimpleId {
+            activation: act,
+            ..id
+        };
+        let mut trainer_fp16 = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id_fp16,
+            smoke_weight_decay,
+            smoke_fv_scale,
+            true,  // ft_fp16 (ft_fp16_out が要求する)
+            true,  // ft_fp16_out
+            false, // fp16_opt_state
+            false, // tf32
+        )?;
+        trainer_fp16.sync_ft_w_h_mirror()?;
+        let fwd = trainer_fp16.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+        if !fwd.is_finite() {
+            return Err(format!("--ft-fp16-out {act:?} forward loss = {fwd} is not finite").into());
+        }
+        let init = trainer_fp16.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+        for step_idx in 0..10 {
+            let l = trainer_fp16.step(&training_batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+            if !l.is_finite() {
+                return Err(format!(
+                    "--ft-fp16-out {act:?} step {step_idx} loss = {l} is not finite"
+                )
+                .into());
+            }
+        }
+        trainer_fp16.assert_all_weights_finite()?;
+        let fin = trainer_fp16.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+        println!(
+            "[smoke/simple] --ft-fp16-out {act:?}: forward {fwd:.6e}, 10-step {init:.6e} -> {fin:.6e}"
+        );
+        if !fin.is_finite() || fin >= init {
+            return Err(format!(
+                "--ft-fp16-out {act:?} 10-step training did not decrease loss: \
+                 initial = {init}, final = {fin} (FP16 FT activation wiring likely broken)"
+            )
+            .into());
+        }
+    }
+    println!("[smoke/simple] --ft-fp16-out (crelu/screlu/pairwise) OK ✓");
 
     println!(
         "[smoke/simple] PASSED — forward + gradient + quantised round-trip + raw round-trip OK"
@@ -14660,6 +15040,199 @@ mod gpu_cpu_equivalence_tests {
             &grad_bias_cpu,
             TOL,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ft_post_perspective_grad_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        // 非 fused FP16 版 (Simple pairwise + --ft-fp16-out 経路)。単一 d_combined を
+        // offset 読みする以外は fused FP16 版と同 math、CPU reference は FP32 ref。
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let half = ft_dim / 2;
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let scale = FT_POST_SCALE;
+        let d_combined: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -2.0_f32 + 0.013_f32 * i as f32)
+            .collect();
+        let stm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let nstm_ft: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.5_f32 + 3.0_f32 * ((i * 5) % 11) as f32 / 10.0)
+            .collect();
+        let (stm_ft_h, stm_ft_q) = quantize_f16(&stm_ft);
+        let (nstm_ft_h, nstm_ft_q) = quantize_f16(&nstm_ft);
+
+        let mut grad_bias_cpu = vec![0.0_f32; ft_dim];
+        let mut dft_stm_cpu = vec![0.0_f32; batch * ft_dim];
+        let mut dft_nstm_cpu = vec![0.0_f32; batch * ft_dim];
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &stm_ft_q,
+            &bias,
+            &mut dft_stm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            0,
+            ft_dim,
+            scale,
+        );
+        ft_post_perspective_grad_cpu(
+            &d_combined,
+            &nstm_ft_q,
+            &bias,
+            &mut dft_nstm_cpu,
+            &mut grad_bias_cpu,
+            batch,
+            ft_dim,
+            half,
+            ft_dim,
+            scale,
+        );
+
+        let dc_dev = DeviceBuffer::from_host(&stream, &d_combined)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let stm_ft_dev = DeviceBuffer::from_host(&stream, &stm_ft_h)?;
+        let nstm_ft_dev = DeviceBuffer::from_host(&stream, &nstm_ft_h)?;
+        let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
+        let mut dft_stm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+        let mut dft_nstm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+        // test 入力は O(数十) なので production の dft_scale は overflow する。小さい値。
+        let dft_scale = 64.0_f32;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+        }?;
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+        }?;
+        stream.synchronize()?;
+        let inv = 1.0_f32 / dft_scale;
+        let dft_stm_gpu: Vec<f32> = dft_stm_dev
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|&x| x as f32 * inv)
+            .collect();
+        let dft_nstm_gpu: Vec<f32> = dft_nstm_dev
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|&x| x as f32 * inv)
+            .collect();
+        assert_close_rel("ft_grad_fp16 dft_stm", &dft_stm_gpu, &dft_stm_cpu, 2e-3);
+        assert_close_rel("ft_grad_fp16 dft_nstm", &dft_nstm_gpu, &dft_nstm_cpu, 2e-3);
+        assert_close_rel(
+            "ft_grad_fp16 grad_bias",
+            &grad_bias_dev.to_host_vec(&stream)?,
+            &grad_bias_cpu,
+            TOL,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simple_bias_act_fwd_fp16_in_screlu_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        // SCReLU FP16 FT activation forward: f16 ft_out + f32 bias → SCReLU `clamp(x,0,1)²`。
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let ft_out: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let (ft_out_h, ft_out_q) = quantize_f16(&ft_out);
+
+        let mut acted_cpu = vec![0.0_f32; batch * ft_dim];
+        for bi in 0..batch {
+            for (ri, &bias_r) in bias.iter().enumerate() {
+                let x = ft_out_q[bi * ft_dim + ri] + bias_r;
+                let a = x.clamp(0.0, 1.0);
+                acted_cpu[bi * ft_dim + ri] = a * a;
+            }
+        }
+
+        let ft_out_dev = DeviceBuffer::from_host(&stream, &ft_out_h)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let mut acted_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
+        cuda_launch! {
+            kernel: simple_bias_act_fwd_fp16_in_screlu, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice_mut(acted_dev),
+                   batch as u32, ft_dim as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            "simple_bias_act_fwd_fp16_in_screlu",
+            &acted_dev.to_host_vec(&stream)?,
+            &acted_cpu,
+            TOL,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // SCReLU FP16 FT activation backward: SCReLU 局所微分 `2·clamp(x,0,1)` を
+        // `dft_acted` に掛け、loss scaling 倍 → f16。読み戻して逆数を掛け CPU と比較。
+        let (_ctx, module, stream) = open_module()?;
+        let batch = 3_usize;
+        let ft_dim = FT_OUT;
+        let ft_out: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+            .collect();
+        let bias: Vec<f32> = (0..ft_dim)
+            .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+            .collect();
+        let dft_acted: Vec<f32> = (0..batch * ft_dim)
+            .map(|i| -2.0_f32 + 0.013_f32 * i as f32)
+            .collect();
+        let (ft_out_h, ft_out_q) = quantize_f16(&ft_out);
+
+        let mut g_cpu = vec![0.0_f32; batch * ft_dim];
+        for bi in 0..batch {
+            for (ri, &bias_r) in bias.iter().enumerate() {
+                let idx = bi * ft_dim + ri;
+                let x = ft_out_q[idx] + bias_r;
+                let a = x.clamp(0.0, 1.0);
+                let dydx = if a > 0.0 && a < 1.0 { 2.0 * a } else { 0.0 };
+                g_cpu[idx] = dft_acted[idx] * dydx;
+            }
+        }
+
+        let ft_out_dev = DeviceBuffer::from_host(&stream, &ft_out_h)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let dft_acted_dev = DeviceBuffer::from_host(&stream, &dft_acted)?;
+        let mut dft_out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+        // test 入力 dft は O(数十) なので production の dft_scale は overflow する。小さい値。
+        let dft_scale = 64.0_f32;
+        cuda_launch! {
+            kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+                   slice_mut(dft_out_dev), batch as u32, ft_dim as u32, dft_scale]
+        }?;
+        stream.synchronize()?;
+        let inv = 1.0_f32 / dft_scale;
+        let g_gpu: Vec<f32> = dft_out_dev
+            .to_host_vec(&stream)?
+            .iter()
+            .map(|&x| x as f32 * inv)
+            .collect();
+        assert_close_rel("simple_act_grad_to_fp16_screlu", &g_gpu, &g_cpu, 2e-3);
         Ok(())
     }
 }
