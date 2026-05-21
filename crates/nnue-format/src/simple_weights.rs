@@ -9,9 +9,11 @@
 //!
 //! - FT: `ft_in → ft_out`、weight + bias 共有 stm/nstm (`ft_in` は feature set 依存、
 //!   `ft_out` は CLI 設定値)
-//! - per-perspective 活性化 (CReLU または SCReLU) → `concat(stm, nstm)` = `2*ft_out`
-//! - L1 dense: `2*ft_out → l1_out` + bias → 活性化
-//! - L2 dense: `l1_out → l2_out` + bias → 活性化
+//! - per-perspective FT post 活性化 → `concat(stm, nstm)` = `l1_in`。CReLU / SCReLU は
+//!   elementwise で `l1_in = 2*ft_out`、Pairwise は前半×後半の積で 1 perspective が
+//!   半減し `l1_in = ft_out`
+//! - L1 dense: `l1_in → l1_out` + bias → CReLU / SCReLU
+//! - L2 dense: `l1_out → l2_out` + bias → CReLU / SCReLU
 //! - L3 dense: `l2_out → 1` + bias → スカラ net_output
 //!
 //! ## file layout (top-level、little-endian)
@@ -21,7 +23,7 @@
 //! 3. FT biases: `i16` × `ft_out` (raw、scale = QA)
 //! 4. FT weights: `i16` × `ft_in * ft_out` (raw、scale = QA)
 //! 5. `fc_hash` (u32) — dense 層群の topology hash
-//! 6. L1: bias `i32` × `l1_out` (scale = `127*QB`)、weight `i8` × `l1_out * pad32(2*ft_out)` (scale = QB)
+//! 6. L1: bias `i32` × `l1_out` (scale = `127*QB`)、weight `i8` × `l1_out * pad32(l1_in)` (scale = QB)
 //! 7. L2: bias `i32` × `l2_out`、weight `i8` × `l2_out * pad32(l1_out)`
 //! 8. L3: bias `i32` × 1、weight `i8` × `pad32(l2_out)`
 //!
@@ -34,9 +36,10 @@
 //! | FT | QA (i16) | QA (i16) |
 //! | L1 / L2 / L3 | `127*QB` (i32) | QB (i8) |
 //!
-//! QA は活性化で決まる: CReLU → 127、SCReLU → 255。dense 層の入力は活性化後で
-//! 常に 127-scale (CReLU の出力、SCReLU の `x²>>9` いずれも 127-scale) のため、
-//! dense bias scale は活性化に依らず `127*QB`。
+//! QA は活性化で決まる: CReLU / Pairwise → 127、SCReLU → 255。dense 層の入力は
+//! 活性化後で常に 127-scale (CReLU の出力、SCReLU の `x²>>9`、Pairwise の 2 CReLU
+//! 積 `×127/128` いずれも 127-scale) のため、dense bias scale は活性化に依らず
+//! `127*QB`。
 //!
 //! ## pad32
 //!
@@ -82,14 +85,23 @@ pub fn pad32(x: usize) -> usize {
 // SimpleActivation
 // =============================================================================
 
-/// Simple アーキの per-perspective 活性化関数。FT 出力の量子化 multiplier QA と
-/// arch 文字列の活性化トークンを決める。
+/// Simple アーキの FT post 活性化関数。FT 出力の量子化 multiplier QA と arch 文字列の
+/// 活性化トークンを決める。
+///
+/// `CReLU` / `SCReLU` は FT 出力を elementwise に変換する (出力次元 = 入力次元)。
+/// `Pairwise` は前半 `[0, ft_out/2)` と後半 `[ft_out/2, ft_out)` の対応 index 同士の
+/// 積を取り **出力次元を半減** する (`combined_dim` が L1 入力次元として連動する)。
+/// L1 / L2 の dense 層出力は `Pairwise` でも CReLU で活性化する (pairwise 乗算は
+/// FT post 固有で、単一ベクトルの dense 出力には適用しない)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SimpleActivation {
     /// Clipped ReLU (`clamp(x, 0, 1)`)。
     CReLU,
     /// Squared Clipped ReLU (`clamp(x, 0, 1)²`)。
     SCReLU,
+    /// Pairwise Clipped ReLU: `clamp(a, 0, 1) * clamp(b, 0, 1) * (127/128)`、`a` は
+    /// 前半 index、`b` は対応する後半 index。FT 出力次元を半減する。
+    Pairwise,
 }
 
 impl SimpleActivation {
@@ -98,6 +110,7 @@ impl SimpleActivation {
         match self {
             SimpleActivation::CReLU => "crelu",
             SimpleActivation::SCReLU => "screlu",
+            SimpleActivation::Pairwise => "pairwise",
         }
     }
 
@@ -106,22 +119,36 @@ impl SimpleActivation {
         match name {
             "crelu" => Some(SimpleActivation::CReLU),
             "screlu" => Some(SimpleActivation::SCReLU),
+            "pairwise" => Some(SimpleActivation::Pairwise),
             _ => None,
         }
     }
 
-    /// FT 出力の量子化 multiplier QA。CReLU は 127、SCReLU は 255。
+    /// FT 出力の量子化 multiplier QA。CReLU / Pairwise は 127、SCReLU は 255。
+    ///
+    /// Pairwise は 2 つの CReLU 出力の積で、各因子が CReLU と同じ `[0, 1]` 値域・
+    /// 127-scale 量子化を持つため QA = 127。
     pub const fn qa(self) -> i32 {
         match self {
-            SimpleActivation::CReLU => 127,
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => 127,
             SimpleActivation::SCReLU => 255,
         }
     }
 
-    /// arch 文字列の活性化トークン (nnue-pytorch 系の層名)。
+    /// FT post の出力次元が入力 (1 perspective あたり `ft_out`) に対して何分の 1 か。
+    /// CReLU / SCReLU は 1、Pairwise は 2 (前半×後半の積で半減)。
+    pub const fn ft_output_divisor(self) -> usize {
+        match self {
+            SimpleActivation::CReLU | SimpleActivation::SCReLU => 1,
+            SimpleActivation::Pairwise => 2,
+        }
+    }
+
+    /// arch 文字列の dense 層 (L1 / L2) 活性化トークン (nnue-pytorch 系の層名)。
+    /// Pairwise の dense 層は CReLU で活性化するため `ClippedReLU`。
     const fn arch_token(self) -> &'static str {
         match self {
-            SimpleActivation::CReLU => "ClippedReLU",
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => "ClippedReLU",
             SimpleActivation::SCReLU => "SqrClippedReLU",
         }
     }
@@ -152,6 +179,13 @@ impl SimpleId {
     pub fn ft_in(&self) -> usize {
         self.feature_set.ft_in()
     }
+
+    /// L1 dense の入力次元 (= stm/nstm の FT post 出力を concat した次元)。
+    /// CReLU / SCReLU は `2 * ft_out`、Pairwise は pairwise 乗算で 1 perspective が
+    /// `ft_out / 2` に縮むため `ft_out`。
+    pub fn combined_dim(&self) -> usize {
+        2 * self.ft_out / self.activation.ft_output_divisor()
+    }
 }
 
 // =============================================================================
@@ -165,10 +199,18 @@ fn arch_identity(id: &SimpleId) -> String {
     let ft_out = id.ft_out;
     let l1_out = id.l1_out;
     let l2_out = id.l2_out;
-    let l1_input = ft_out * 2;
+    let l1_input = id.combined_dim();
     let act = id.activation.arch_token();
+    // FT ブロックは活性化で 2 形式に分かれる。CReLU / SCReLU は `[ft_in->ft_outx2]`、
+    // Pairwise は FT 出力を pairwise 乗算で半減するため `[ft_in->ft_out/2x2]-Pairwise`。
+    // 推論エンジンは FT ブロックの `/2` と `-Pairwise` suffix で pairwise を識別し、
+    // `->Nx2]` から FT 次元を読む。
+    let ft_block = match id.activation {
+        SimpleActivation::Pairwise => format!("[{ft_in}->{ft_out}/2x2]-Pairwise"),
+        SimpleActivation::CReLU | SimpleActivation::SCReLU => format!("[{ft_in}->{ft_out}x2]"),
+    };
     format!(
-        "Features={}(Friend)[{}->{}x2],\
+        "Features={}(Friend){},\
          Network=AffineTransform[1<-{}](\
          {}[{}](\
          AffineTransform[{}<-{}](\
@@ -176,8 +218,7 @@ fn arch_identity(id: &SimpleId) -> String {
          AffineTransformSparseInput[{}<-{}](\
          InputSlice[{}(0:{})])))))",
         id.feature_set.arch_feature_name(),
-        ft_in,
-        ft_out,
+        ft_block,
         l2_out,   // Output layer input
         act,      // L2 出力の活性化
         l2_out,   // L2 output features
@@ -186,7 +227,7 @@ fn arch_identity(id: &SimpleId) -> String {
         act,      // L1 出力の活性化
         l1_out,   // L1 output features
         l1_out,   // L2 input / L1 output
-        l1_input, // L1 input (dual perspective)
+        l1_input, // L1 input (FT post 出力の concat 次元)
         l1_input, // InputSlice size
         l1_input, // InputSlice range
     )
@@ -199,11 +240,12 @@ pub fn build_arch_str(id: &SimpleId, fv_scale: i32) -> String {
 }
 
 /// dense 層群の topology hash (nnue-pytorch 系、出典は `ATTRIBUTION.md`)。
-/// 層次元 (`ft_out` / `l1_out` / `l2_out`) のみに依存する。
-pub const fn compute_fc_hash(ft_out: usize, l1_out: usize, l2_out: usize) -> u32 {
-    // InputSlice hash (FT output × 2 dual perspective)。
+/// 層次元 (`l1_input` / `l1_out` / `l2_out`) のみに依存する。`l1_input` は L1 dense の
+/// 入力次元 (= FT post 出力の concat、`SimpleId::combined_dim`)。
+pub const fn compute_fc_hash(l1_input: usize, l1_out: usize, l2_out: usize) -> u32 {
+    // InputSlice hash (L1 dense input = FT post 出力の concat 次元)。
     let mut prev_hash: u32 = 0xEC42E90D;
-    prev_hash ^= (ft_out * 2) as u32;
+    prev_hash ^= l1_input as u32;
 
     // FC 層の出力次元列: L1=l1_out / L2=l2_out / 出力=1。L1/L2 は活性化付き。
     // const fn なので index ベースの `while` で回す。
@@ -232,7 +274,7 @@ pub fn ft_hash(feature_hash: u32, ft_out: usize) -> u32 {
 
 /// network hash: `compute_fc_hash ^ ft_hash`。
 pub fn network_hash(id: &SimpleId) -> u32 {
-    compute_fc_hash(id.ft_out, id.l1_out, id.l2_out)
+    compute_fc_hash(id.combined_dim(), id.l1_out, id.l2_out)
         ^ ft_hash(id.feature_set.feature_hash(), id.ft_out)
 }
 
@@ -242,10 +284,11 @@ pub fn network_hash(id: &SimpleId) -> u32 {
 
 /// Simple アーキの全 weight (f32、host 側保持)。
 ///
-/// Layout (`ft_in` = `id.ft_in()`、`ft_out` / `l1_out` / `l2_out` = `id` の値):
+/// Layout (`ft_in` = `id.ft_in()`、`ft_out` / `l1_out` / `l2_out` = `id` の値、
+/// `l1_in` = `id.combined_dim()` = CReLU/SCReLU は `2*ft_out`・Pairwise は `ft_out`):
 /// - `ft_w`: `(ft_in, ft_out)` row-major、`ft_w[feat * ft_out + out]`
 /// - `ft_b`: `(ft_out)` (stm/nstm 共有)
-/// - `l1_w`: `(l1_out, 2*ft_out)` row-major
+/// - `l1_w`: `(l1_out, l1_in)` row-major
 /// - `l1_b`: `(l1_out)`
 /// - `l2_w`: `(l2_out, l1_out)` row-major
 /// - `l2_b`: `(l2_out)`
@@ -275,7 +318,7 @@ impl SimpleWeights {
             fv_scale,
             ft_w: vec![0.0; id.ft_in() * id.ft_out],
             ft_b: vec![0.0; id.ft_out],
-            l1_w: vec![0.0; id.l1_out * 2 * id.ft_out],
+            l1_w: vec![0.0; id.l1_out * id.combined_dim()],
             l1_b: vec![0.0; id.l1_out],
             l2_w: vec![0.0; id.l2_out * id.l1_out],
             l2_b: vec![0.0; id.l2_out],
@@ -292,7 +335,7 @@ impl SimpleWeights {
         let groups = [
             ("ft_w", self.ft_w.len(), id.ft_in() * id.ft_out),
             ("ft_b", self.ft_b.len(), id.ft_out),
-            ("l1_w", self.l1_w.len(), id.l1_out * 2 * id.ft_out),
+            ("l1_w", self.l1_w.len(), id.l1_out * id.combined_dim()),
             ("l1_b", self.l1_b.len(), id.l1_out),
             ("l2_w", self.l2_w.len(), id.l2_out * id.l1_out),
             ("l2_b", self.l2_b.len(), id.l2_out),
@@ -332,14 +375,21 @@ impl SimpleWeights {
         write_i16_quantised(writer, &self.ft_w, qa)?;
 
         // ---- dense topology hash ----
-        writer.write_all(&compute_fc_hash(id.ft_out, id.l1_out, id.l2_out).to_le_bytes())?;
+        writer
+            .write_all(&compute_fc_hash(id.combined_dim(), id.l1_out, id.l2_out).to_le_bytes())?;
 
         // ---- dense layers (bias i32 scale 127*QB, weight i8 scale QB) ----
         let bias_scale = (127 * QB) as f64;
         let weight_scale = QB as f64;
-        // L1: (l1_out, 2*ft_out)
+        // L1: (l1_out, combined_dim)
         write_i32_bias(writer, &self.l1_b, bias_scale)?;
-        write_i8_weight(writer, &self.l1_w, id.l1_out, 2 * id.ft_out, weight_scale)?;
+        write_i8_weight(
+            writer,
+            &self.l1_w,
+            id.l1_out,
+            id.combined_dim(),
+            weight_scale,
+        )?;
         // L2: (l2_out, l1_out)
         write_i32_bias(writer, &self.l2_b, bias_scale)?;
         write_i8_weight(writer, &self.l2_w, id.l2_out, id.l1_out, weight_scale)?;
@@ -418,7 +468,8 @@ impl SimpleWeights {
         // dense topology hash
         reader.read_exact(&mut buf4)?;
         let file_fc_hash = u32::from_le_bytes(buf4);
-        let expected_fc_hash = compute_fc_hash(expected.ft_out, expected.l1_out, expected.l2_out);
+        let expected_fc_hash =
+            compute_fc_hash(expected.combined_dim(), expected.l1_out, expected.l2_out);
         if file_fc_hash != expected_fc_hash {
             return Err(invalid(format!(
                 "fc_hash mismatch: file {file_fc_hash:#x}, expected {expected_fc_hash:#x}"
@@ -429,7 +480,12 @@ impl SimpleWeights {
         let bias_scale = (127 * QB) as f32;
         let weight_scale = QB as f32;
         let l1_b = read_i32_bias(reader, expected.l1_out, bias_scale)?;
-        let l1_w = read_i8_weight(reader, expected.l1_out, 2 * expected.ft_out, weight_scale)?;
+        let l1_w = read_i8_weight(
+            reader,
+            expected.l1_out,
+            expected.combined_dim(),
+            weight_scale,
+        )?;
         let l2_b = read_i32_bias(reader, expected.l2_out, bias_scale)?;
         let l2_w = read_i8_weight(reader, expected.l2_out, expected.l1_out, weight_scale)?;
         let l3_b = read_i32_bias(reader, 1, bias_scale)?;
@@ -583,9 +639,16 @@ mod tests {
         assert_eq!(pad32(512), 512);
     }
 
+    /// 全 [`SimpleActivation`] variant (テストの網羅対象)。
+    const ALL_ACTIVATIONS: [SimpleActivation; 3] = [
+        SimpleActivation::CReLU,
+        SimpleActivation::SCReLU,
+        SimpleActivation::Pairwise,
+    ];
+
     #[test]
     fn activation_name_round_trips() {
-        for act in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+        for act in ALL_ACTIVATIONS {
             assert_eq!(
                 SimpleActivation::from_canonical_name(act.canonical_name()),
                 Some(act)
@@ -595,8 +658,16 @@ mod tests {
     }
 
     #[test]
+    fn combined_dim_halves_for_pairwise() {
+        // CReLU / SCReLU は L1 入力 = 2*ft_out、Pairwise は ft_out (pairwise 乗算で半減)。
+        assert_eq!(test_id(SimpleActivation::CReLU).combined_dim(), 512);
+        assert_eq!(test_id(SimpleActivation::SCReLU).combined_dim(), 512);
+        assert_eq!(test_id(SimpleActivation::Pairwise).combined_dim(), 256);
+    }
+
+    #[test]
     fn zeroed_save_load_round_trips() {
-        for act in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+        for act in ALL_ACTIVATIONS {
             let id = test_id(act);
             let original = SimpleWeights::zeroed(id, 13);
             let mut buf = Vec::new();
@@ -607,7 +678,7 @@ mod tests {
             assert_eq!(loaded.id, id);
             assert_eq!(loaded.fv_scale, 13);
             assert_eq!(loaded.ft_w.len(), id.ft_in() * id.ft_out);
-            assert_eq!(loaded.l1_w.len(), id.l1_out * 2 * id.ft_out);
+            assert_eq!(loaded.l1_w.len(), id.l1_out * id.combined_dim());
             assert_eq!(loaded.l2_w.len(), id.l2_out * id.l1_out);
             assert_eq!(loaded.l3_w.len(), id.l2_out);
             assert_eq!(loaded.l3_b.len(), 1);
@@ -758,20 +829,26 @@ mod tests {
 
     #[test]
     fn file_size_matches_layout() {
-        let id = test_id(SimpleActivation::CReLU);
-        let mut buf = Vec::new();
-        SimpleWeights::zeroed(id, 16)
-            .save_quantised(&mut buf)
-            .unwrap();
+        for act in ALL_ACTIVATIONS {
+            let id = test_id(act);
+            let mut buf = Vec::new();
+            SimpleWeights::zeroed(id, 16)
+                .save_quantised(&mut buf)
+                .unwrap();
 
-        let arch_len = build_arch_str(&id, 16).len();
-        let header = 4 + 4 + 4 + arch_len; // version + network_hash + arch_len + arch_str
-        let ft = 4 + (id.ft_out + id.ft_in() * id.ft_out) * 2; // ft_hash + i16 ft_b/ft_w
-        let fc_hash = 4;
-        let l1 = id.l1_out * 4 + id.l1_out * pad32(2 * id.ft_out);
-        let l2 = id.l2_out * 4 + id.l2_out * pad32(id.l1_out);
-        let l3 = 4 + pad32(id.l2_out);
-        assert_eq!(buf.len(), header + ft + fc_hash + l1 + l2 + l3);
+            let arch_len = build_arch_str(&id, 16).len();
+            let header = 4 + 4 + 4 + arch_len; // version + network_hash + arch_len + arch_str
+            let ft = 4 + (id.ft_out + id.ft_in() * id.ft_out) * 2; // ft_hash + i16 ft_b/ft_w
+            let fc_hash = 4;
+            let l1 = id.l1_out * 4 + id.l1_out * pad32(id.combined_dim());
+            let l2 = id.l2_out * 4 + id.l2_out * pad32(id.l1_out);
+            let l3 = 4 + pad32(id.l2_out);
+            assert_eq!(
+                buf.len(),
+                header + ft + fc_hash + l1 + l2 + l3,
+                "file size mismatch for {act:?}"
+            );
+        }
     }
 
     #[test]
@@ -786,10 +863,23 @@ mod tests {
     }
 
     #[test]
+    fn arch_str_pairwise_uses_halved_l1_input_and_suffix() {
+        // Pairwise は FT ブロックに `/2` と `-Pairwise` suffix を持ち、L1 入力次元
+        // (AffineTransformSparseInput / InputSlice) が ft_out (= 256) に半減する。
+        let id = test_id(SimpleActivation::Pairwise);
+        let s = build_arch_str(&id, 27);
+        assert!(s.contains("HalfKA_hm(Friend)[73305->256/2x2]-Pairwise"));
+        assert!(s.contains("ClippedReLU[32]"));
+        assert!(s.contains("AffineTransformSparseInput[32<-256]"));
+        assert!(s.contains("InputSlice[256(0:256)]"));
+        assert!(s.ends_with(",fv_scale=27"));
+    }
+
+    #[test]
     fn arch_str_parentheses_balanced() {
         // nnue-pytorch 系の arch 文字列は層の入れ子を括弧で表すため、
         // `(` と `)` の数が一致していなければ malformed。
-        for act in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+        for act in ALL_ACTIVATIONS {
             let s = build_arch_str(&test_id(act), 16);
             let opens = s.matches('(').count();
             let closes = s.matches(')').count();
@@ -799,7 +889,8 @@ mod tests {
 
     #[test]
     fn fc_hash_depends_only_on_dimensions() {
-        // topology hash は層次元のみに依存し、feature set / 活性化に依らない。
+        // topology hash は層次元 (l1_input / l1_out / l2_out) のみに依存し、
+        // feature set / 活性化に依らない。
         let a = compute_fc_hash(256, 32, 32);
         assert_eq!(a, compute_fc_hash(256, 32, 32));
         assert_ne!(a, compute_fc_hash(512, 32, 32));
