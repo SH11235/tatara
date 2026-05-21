@@ -8827,7 +8827,8 @@ struct SimpleArgs {
     #[arg(long)]
     l3: Option<usize>,
 
-    /// 活性化関数 ("crelu" または "screlu")。
+    /// FT post 活性化関数 ("crelu" / "screlu" / "pairwise")。"pairwise" は前半×後半の
+    /// 対応 index の積を取り L1 入力次元を半減する (L1 / L2 dense は CReLU 活性化)。
     #[arg(long, default_value = "crelu")]
     activation: String,
 
@@ -9570,7 +9571,7 @@ fn run_simple_training(
     let activation = SimpleActivation::from_canonical_name(&simple_args.activation).ok_or_else(
         || -> Box<dyn std::error::Error> {
             format!(
-                "--activation '{}' is not implemented (expected one of: crelu, screlu)",
+                "--activation '{}' is not implemented (expected one of: crelu, screlu, pairwise)",
                 simple_args.activation
             )
             .into()
@@ -9584,14 +9585,15 @@ fn run_simple_training(
         l2_out,
     };
 
-    // `--ft-fp16-out` 経路は現在 CReLU 限定 (SCReLU 用 fused kernel は未提供)。
-    // 必要になれば `simple_bias_act_fwd_fp16_in_screlu` 等を追加して許可する。
+    // `--ft-fp16-out` 経路は現在 CReLU 限定 (SCReLU / Pairwise 用 FP16 fused kernel は
+    // 未提供)。必要になれば `simple_bias_act_fwd_fp16_in_screlu` 等を追加して許可する。
     if simple_args.ft_fp16_out && activation != SimpleActivation::CReLU {
-        return Err(
-            "--ft-fp16-out currently requires --activation crelu (Simple SCReLU FP16 path \
-             is not implemented)"
-                .into(),
-        );
+        return Err(format!(
+            "--ft-fp16-out currently requires --activation crelu \
+             (FP16 FT activation path is not implemented for '{}')",
+            activation.canonical_name()
+        )
+        .into());
     }
 
     // Simple は loss kind に関わらず `cli.scale` を量子化 `fv_scale` の算出で参照
@@ -9817,7 +9819,8 @@ struct SimpleGpuWorkspace {
     ft_stm_acted: DeviceBuffer<f32>,
     /// 同 nstm。
     ft_nstm_acted: DeviceBuffer<f32>,
-    /// concat(stm_acted, nstm_acted) = `b × (2*ft_out)`。L1 dense の入力。
+    /// stm/nstm の FT post 出力を concat した L1 dense 入力 (`b × combined_dim`、
+    /// CReLU/SCReLU は `2*ft_out`・Pairwise は `ft_out`)。
     combined: DeviceBuffer<f32>,
     /// L1 dense 出力 (pre-activation、`b × l1_out`)。
     l1_pre: DeviceBuffer<f32>,
@@ -9841,7 +9844,7 @@ struct SimpleGpuWorkspace {
     dl1_acted: DeviceBuffer<f32>,
     /// L1 dense 出力への grad (`b × l1_out`)。
     dl1_pre: DeviceBuffer<f32>,
-    /// concat 後 (`b × 2*ft_out`) への grad。L1 dense backward の入力 grad 先。
+    /// concat 後 (`b × combined_dim`) への grad。L1 dense backward の入力 grad 先。
     dcombined: DeviceBuffer<f32>,
     /// stm 活性化後への grad (`b × ft_out`)、concat 逆 (`slice_extract_2d`) の出力。
     dft_stm_acted: DeviceBuffer<f32>,
@@ -9932,7 +9935,7 @@ impl SimpleGpuWorkspace {
             ft_nstm_out: z(batch * ft_out)?,
             ft_stm_acted: z(batch * ft_out)?,
             ft_nstm_acted: z(batch * ft_out)?,
-            combined: z(batch * 2 * ft_out)?,
+            combined: z(batch * id.combined_dim())?,
             l1_pre: z(batch * l1_out)?,
             l1_acted: z(batch * l1_out)?,
             l2_pre: z(batch * l2_out)?,
@@ -9943,7 +9946,7 @@ impl SimpleGpuWorkspace {
             dl2_pre: z(batch * l2_out)?,
             dl1_acted: z(batch * l1_out)?,
             dl1_pre: z(batch * l1_out)?,
-            dcombined: z(batch * 2 * ft_out)?,
+            dcombined: z(batch * id.combined_dim())?,
             dft_stm_acted: z(batch * ft_out)?,
             dft_nstm_acted: z(batch * ft_out)?,
             dft_stm_out: z(batch * ft_out)?,
@@ -9990,8 +9993,8 @@ impl SimpleGpuWorkspace {
 /// `--ft-fp16` / `--ft-fp16-out` / `--fp16-opt-state` / `--tf32` の risky 精度系 flag は
 /// LayerStack と同形で opt-in (default OFF で FP32 bit-identical、ON で risky 最適化)。
 ///
-/// L1 dense (B × 2*ft_out × l1_out) は forward / bwd_input / bwd_weight 3 経路を cuBLAS
-/// Sgemm に乗せる。default math mode は `CUBLAS_DEFAULT_MATH` (純 FP32、TC 不使用)、
+/// L1 dense (B × combined_dim × l1_out) は forward / bwd_input / bwd_weight 3 経路を
+/// cuBLAS Sgemm に乗せる。default math mode は `CUBLAS_DEFAULT_MATH` (純 FP32、TC 不使用)、
 /// `--tf32` 指定で `CUBLAS_TF32_TENSOR_OP_MATH` (Ampere+ TC、仮数 10-bit 丸め)。L2 / L3
 /// は次元が小さく untiled `dense_mm_*` で残す。FT は専用 `sparse_ft_*` kernel、活性化と
 /// loss は固有 kernel。
@@ -10029,7 +10032,7 @@ struct SimpleGpuTrainer {
     ft_w: DeviceBuffer<f32>,
     /// FT bias (`ft_out`、stm/nstm 共有)。
     ft_b: DeviceBuffer<f32>,
-    /// L1 dense 重み (`(2*ft_out) × l1_out`、in-major: `l1_w[in*l1_out + out]`)。
+    /// L1 dense 重み (`combined_dim × l1_out`、in-major: `l1_w[in*l1_out + out]`)。
     /// `dense_mm_fwd` の weight layout (`w[k*out_dim+oi]`) と一致する。
     l1_w: DeviceBuffer<f32>,
     /// L1 dense bias (`l1_out`)。
@@ -10149,7 +10152,8 @@ impl SimpleGpuTrainer {
         let l2_out = id.l2_out;
         // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
         // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
-        // 4 の倍数でない値が来る可能性があるので early reject する。
+        // 4 の倍数でない値が来る可能性があるので early reject する。4 の倍数性は
+        // pairwise が必要とする偶数性 (`half = ft_out / 2`) も内包する。
         if !ft_out.is_multiple_of(4) {
             return Err(format!(
                 "SimpleGpuTrainer: ft_out {ft_out} must be a multiple of 4 \
@@ -10157,12 +10161,18 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
+        // pairwise の `half = ft_out / 2` 分割が割り切れることを明示確認する
+        // (上の 4 の倍数チェックで保証済の不変条件、将来 4→2 緩和時の保険)。
+        debug_assert!(
+            ft_out.is_multiple_of(2),
+            "pairwise requires even ft_out for the half-split"
+        );
 
         // small random init。group ごとに seed を変えて weight が同一値で潰れない
         // ようにする (forward の合成 layer 構造を踏むため)。
         let ft_w_h = xorshift_init(0x5071_e001, ft_in * ft_out, 0.01);
         let ft_b_h = xorshift_init(0x5071_e002, ft_out, 0.01);
-        let l1_w_h = xorshift_init(0x5071_e003, 2 * ft_out * l1_out, 0.01);
+        let l1_w_h = xorshift_init(0x5071_e003, id.combined_dim() * l1_out, 0.01);
         let l1_b_h = xorshift_init(0x5071_e004, l1_out, 0.01);
         let l2_w_h = xorshift_init(0x5071_e005, l1_out * l2_out, 0.01);
         let l2_b_h = xorshift_init(0x5071_e006, l2_out, 0.01);
@@ -10175,7 +10185,7 @@ impl SimpleGpuTrainer {
         };
         let ft_w_n = ft_in * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = 2 * ft_out * l1_out;
+        let l1_w_n = id.combined_dim() * l1_out;
         let l1_b_n = l1_out;
         let l2_w_n = l1_out * l2_out;
         let l2_b_n = l2_out;
@@ -10472,7 +10482,9 @@ impl SimpleGpuTrainer {
         let b = batch.n_pos;
         let b_u32 = b as u32;
         let ft_out_u32 = self.id.ft_out as u32;
-        let l1_in_u32 = (2 * self.id.ft_out) as u32; // L1 入力 = stm/nstm concat 後
+        // L1 入力 = stm/nstm の FT post 出力 concat。CReLU/SCReLU は 2*ft_out、
+        // Pairwise は pairwise 乗算で半減し ft_out。
+        let l1_in_u32 = self.id.combined_dim() as u32;
         let l1_out_u32 = self.id.l1_out as u32;
         let l2_out_u32 = self.id.l2_out as u32;
         let ft_n = b * self.id.ft_out;
@@ -10694,6 +10706,24 @@ impl SimpleGpuTrainer {
                         ]
                     }?;
                 }
+                SimpleActivation::Pairwise => {
+                    // Pairwise FT post: bias add + CReLU + pairwise_mul を 1 kernel で
+                    // 両 perspective まとめて `combined` (b × ft_out) に直書きする
+                    // (`ft_post_perspective_fwd` は stm を前半 `[0, ft_out/2)`、nstm を
+                    // 後半 `[ft_out/2, ft_out)` に置く)。`ft_*_out` は bias 未加算のまま
+                    // 保持し、backward の `ft_post_perspective_grad` が bias を再加算する。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_fwd,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                        args: [
+                            slice(self.ws.ft_stm_out),
+                            slice(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice_mut(self.ws.combined),
+                            b_u32, ft_out_u32, FT_POST_SCALE
+                        ]
+                    }?;
+                }
             }
         }
 
@@ -10727,12 +10757,12 @@ impl SimpleGpuTrainer {
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --
-        // shape: combined[B, 2*ft_out] @ l1_w[2*ft_out, l1_out] → l1_pre[B, l1_out]、
-        // 続けて bias を別 kernel で row-add する (Sgemm 自身は bias 非対応)。
+        // shape: combined[B, l1_in] @ l1_w[l1_in, l1_out] → l1_pre[B, l1_out] (l1_in =
+        // combined_dim)、続けて bias を別 kernel で row-add する (Sgemm 自身は bias 非対応)。
         //
         // SAFETY: combined / l1_w / l1_pre は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
-        // (workspace 系の `combined.len() >= b * (2*ft_out)` / `l1_pre.len() >= b * l1_out`
-        // は事前の `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)
+        // (workspace 系の `combined.len() >= b * l1_in` / `l1_pre.len() >= b * l1_out`
+        // は事前の `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == l1_in
         // * l1_out` は固定 shape)、`self.cublas` は `self.stream` に bind 済で同 stream 内
         // in-order 実行 (先行 kernel 完了後に Sgemm が走り、後続 bias_add_per_row が観測)。
         // `cu_deviceptr() as *const/*mut f32` cast の妥当性: cuMemAlloc が返す device
@@ -10757,8 +10787,10 @@ impl SimpleGpuTrainer {
         }?;
         let l1_n = b * self.id.l1_out;
         let l1_n_u32 = l1_n as u32;
+        // L1 / L2 の dense 出力は単一ベクトルで pairwise 乗算が適用できないため、
+        // Pairwise でも CReLU で活性化する (pairwise 乗算は FT post 固有)。
         match self.id.activation {
-            SimpleActivation::CReLU => cuda_launch! {
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
                 kernel: crelu_fwd, stream: self.stream, module: self.module,
                 config: cfg_1d(l1_n),
                 args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
@@ -10803,7 +10835,7 @@ impl SimpleGpuTrainer {
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
         match self.id.activation {
-            SimpleActivation::CReLU => cuda_launch! {
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
                 kernel: crelu_fwd, stream: self.stream, module: self.module,
                 config: cfg_1d(l2_n),
                 args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
@@ -10923,7 +10955,7 @@ impl SimpleGpuTrainer {
         };
         let b_u32 = b as u32;
         let ft_out_u32 = self.id.ft_out as u32;
-        let l1_in_u32 = (2 * self.id.ft_out) as u32;
+        let l1_in_u32 = self.id.combined_dim() as u32;
         let l1_out_u32 = self.id.l1_out as u32;
         let l2_out_u32 = self.id.l2_out as u32;
         let ft_in_u32 = self.ws.ft_in as u32;
@@ -10985,8 +11017,9 @@ impl SimpleGpuTrainer {
         tick("L3_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L2 activation grad: dl2_acted -> dl2_pre (kernel reads l2_pre) ----
+        // L1 / L2 dense は Pairwise でも CReLU 活性化 (forward と対)。
         match self.id.activation {
-            SimpleActivation::CReLU => cuda_launch! {
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
                 kernel: crelu_grad, stream: self.stream, module: self.module,
                 config: cfg_1d(l2_n),
                 args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
@@ -11044,7 +11077,7 @@ impl SimpleGpuTrainer {
 
         // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
         match self.id.activation {
-            SimpleActivation::CReLU => cuda_launch! {
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
                 kernel: crelu_grad, stream: self.stream, module: self.module,
                 config: cfg_1d(l1_n),
                 args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
@@ -11059,11 +11092,11 @@ impl SimpleGpuTrainer {
         }
 
         // ---- L1 dense backward: dl1_pre -> dcombined (cuBLAS), l1_w_grad (cuBLAS), l1_b_grad (kernel) ----
-        // bwd_input: dcombined[B, 2*ft_out] = dl1_pre[B, l1_out] @ l1_w[2*ft_out, l1_out]^T
-        //   ( = dx[b][i] = sum_o dy[b][o] * w[i][o] )
+        // bwd_input: dcombined[B, l1_in] = dl1_pre[B, l1_out] @ l1_w[l1_in, l1_out]^T
+        //   ( = dx[b][i] = sum_o dy[b][o] * w[i][o]、l1_in = combined_dim )
         // SAFETY: dl1_pre / l1_w / dcombined は cudaMalloc 由来 + 長さは Sgemm 仕様分以上
-        // (workspace 系の `dl1_pre.len() >= b*l1_out` / `dcombined.len() >= b*(2*ft_out)`
-        // は `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == (2*ft_out)*l1_out`
+        // (workspace 系の `dl1_pre.len() >= b*l1_out` / `dcombined.len() >= b*l1_in`
+        // は `ws.check_batch_capacity(b)` で保証、weight `l1_w.len() == l1_in*l1_out`
         // は固定 shape)、`self.cublas` は `self.stream` に bind 済。`cu_deviceptr() as
         // *const/*mut f32` cast の妥当性: cuMemAlloc が返す device pointer は 256 byte
         // aligned (`f32` の 4 byte 要求を満たす)、`self` の借用が unsafe block を超えて
@@ -11078,11 +11111,11 @@ impl SimpleGpuTrainer {
                 self.ws.dcombined.cu_deviceptr() as *mut f32,
             )?;
         }
-        // bwd_weight: l1_w_grad[2*ft_out, l1_out] = combined[B, 2*ft_out]^T @ dl1_pre[B, l1_out]
+        // bwd_weight: l1_w_grad[l1_in, l1_out] = combined[B, l1_in]^T @ dl1_pre[B, l1_out]
         // SAFETY: combined / dl1_pre / l1_w_grad は cudaMalloc 由来 + 長さは Sgemm 仕様分
-        // 以上 (workspace 系の `combined.len() >= b*(2*ft_out)` / `dl1_pre.len() >= b*
+        // 以上 (workspace 系の `combined.len() >= b*l1_in` / `dl1_pre.len() >= b*
         // l1_out` は `ws.check_batch_capacity(b)` で保証、weight grad `l1_w_grad.len() ==
-        // (2*ft_out)*l1_out` は固定 shape)、stream 共有 + cast 妥当性は bwd_input と同じ
+        // l1_in*l1_out` は固定 shape)、stream 共有 + cast 妥当性は bwd_input と同じ
         // 前提 (256 byte aligned cuMemAlloc 由来、`self` 借用と同 lifetime)。
         unsafe {
             self.cublas.sgemm_xt_y_rowmajor(
@@ -11102,8 +11135,8 @@ impl SimpleGpuTrainer {
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
         // ---- Concat inverse + activation grad の融合 ----
-        // dcombined (b × 2*ft_out) の per-perspective 半分を `src_offset` で切り出して読み、
-        // pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
+        // dcombined (b × combined_dim) の per-perspective 半分を `src_offset` で切り出して
+        // 読み、pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
         // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
         // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む
         // ため `slice_extract_2d` + `simple_act_grad_to_fp16_crelu_with_scale` の 2 kernel に
@@ -11196,6 +11229,31 @@ impl SimpleGpuTrainer {
                                slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
                     }?;
                 }
+                SimpleActivation::Pairwise => {
+                    // Pairwise FT post backward: `ft_post_perspective_grad` を stm /
+                    // nstm 各 1 回 launch する。1 thread = 1 pair (= dft の 2 cell を
+                    // 書く)、`dcombined` の per-perspective 半分を `d_combined_offset`
+                    // で切り出し、bias 未加算の `ft_*_out` に bias を再加算して CReLU
+                    // 指示関数 + pairwise 乗算の勾配を作る。この kernel は `dft_*_out`
+                    // を書くと同時に `ft_b_grad` へ bias 勾配を atomic accumulate する
+                    // ため、後段の `simple_bias_grad_dual` は Pairwise では呼ばない。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                               slice(self.ft_b), slice_mut(self.ws.dft_stm_out),
+                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               0_u32, l1_in_u32, FT_POST_SCALE]
+                    }?;
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad,
+                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                               slice(self.ft_b), slice_mut(self.ws.dft_nstm_out),
+                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE]
+                    }?;
+                }
             }
         }
         tick("bwd_ft_act", &self.stream, &mut prof_t0)?;
@@ -11235,6 +11293,10 @@ impl SimpleGpuTrainer {
                     b_u32, ft_out_u32, dft_inv_scale_fp16
                 ]
             }?;
+        } else if self.id.activation == SimpleActivation::Pairwise {
+            // Pairwise は `ft_post_perspective_grad` が `dft_*_out` を書くのと同じ pass で
+            // 同値を `ft_b_grad` へ atomic accumulate 済 (FT bias grad = pre-activation
+            // 勾配 dft の batch 和)。`simple_bias_grad_dual` の別 launch は不要。
         } else {
             cuda_launch! {
                 kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
@@ -11405,7 +11467,7 @@ impl SimpleGpuTrainer {
         let l2_out = self.id.l2_out;
         let ft_w_n = (ft_in * ft_out) as u32;
         let ft_b_n = ft_out as u32;
-        let l1_w_n = (2 * ft_out * l1_out) as u32;
+        let l1_w_n = (self.id.combined_dim() * l1_out) as u32;
         let l1_b_n = l1_out as u32;
         let l2_w_n = (l1_out * l2_out) as u32;
         let l2_b_n = l2_out as u32;
@@ -11570,17 +11632,16 @@ impl SimpleGpuTrainer {
     ///
     /// 重み layout の対応:
     /// - `ft_w` / `ft_b` / `l3_w` / `l3_b` : device と `SimpleWeights` で同 layout (転置不要)。
-    /// - `l1_w` : device は `[in=2*ft_out, out=l1_out]` (`l1_w[in*l1_out + out]`、
-    ///   `dense_mm_fwd` の weight pattern)、`SimpleWeights` は `[out=l1_out, in=2*ft_out]` 行優先
-    ///   (`l1_w[out*(2*ft_out) + in]`、`save_quantised` の i8 量子化が前提とする out-major 並び)
-    ///   → host 側で in-major → out-major に転置する。
+    /// - `l1_w` : device は `[in=combined_dim, out=l1_out]` (`l1_w[in*l1_out + out]`、
+    ///   `dense_mm_fwd` の weight pattern)、`SimpleWeights` は `[out=l1_out, in=combined_dim]`
+    ///   行優先 (`l1_w[out*combined_dim + in]`、`save_quantised` の i8 量子化が前提とする
+    ///   out-major 並び) → host 側で in-major → out-major に転置する。
     /// - `l2_w` : 同パターンの転置 (`[l1_out, l2_out]` → `[l2_out, l1_out]`)。
     fn to_simple_weights(&self) -> Result<SimpleWeights, Box<dyn std::error::Error>> {
         let id = self.id;
-        let ft_out = id.ft_out;
         let l1_out = id.l1_out;
         let l2_out = id.l2_out;
-        let l1_in = 2 * ft_out;
+        let l1_in = id.combined_dim();
 
         let ft_w = self.ft_w.to_host_vec(&self.stream)?;
         let ft_b = self.ft_b.to_host_vec(&self.stream)?;
@@ -11650,10 +11711,9 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
-        let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
         let l2_out = self.id.l2_out;
-        let l1_in = 2 * ft_out;
+        let l1_in = self.id.combined_dim();
 
         let mut l1_w_in_major = vec![0.0_f32; l1_in * l1_out];
         for out in 0..l1_out {
@@ -11971,7 +12031,7 @@ impl SimpleGpuTrainer {
     /// 順は ft_w が先頭で不変)。
     fn raw_ckpt_groups(&self) -> [SimpleRawCkptGroupEntry<'_>; 7] {
         let ft_b_n = self.id.ft_out;
-        let l1_w_n = 2 * self.id.ft_out * self.id.l1_out;
+        let l1_w_n = self.id.combined_dim() * self.id.l1_out;
         let l1_b_n = self.id.l1_out;
         let l2_w_n = self.id.l1_out * self.id.l2_out;
         let l2_b_n = self.id.l2_out;
@@ -12188,7 +12248,7 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
-        + 2 * id.ft_out * id.l1_out
+        + id.combined_dim() * id.l1_out
         + id.l1_out
         + id.l1_out * id.l2_out
         + id.l2_out
@@ -12348,6 +12408,82 @@ fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+
+    // Pairwise 活性化: forward sanity + 10-step gradient + 量子化 round-trip。
+    // Pairwise は L1 入力次元が半減する (combined_dim = ft_out) ため、workspace buffer /
+    // cuBLAS Sgemm shape / l1_w layout / 量子化 format がその dim で一貫することを確認する。
+    let id_pairwise = SimpleId {
+        activation: SimpleActivation::Pairwise,
+        ..id
+    };
+    let mut trainer_pw = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id_pairwise,
+        smoke_weight_decay,
+        smoke_fv_scale,
+        false,
+        false,
+        false,
+        false,
+    )?;
+    let loss_pw = trainer_pw.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!("[smoke/simple] forward 4 (sigmoid-MSE, pairwise): loss = {loss_pw:.6e}");
+    if !loss_pw.is_finite() {
+        return Err(format!("forward 4 (pairwise) loss = {loss_pw} is not finite").into());
+    }
+    let pw_initial_loss = trainer_pw.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    for step_idx in 0..10 {
+        let step_loss = trainer_pw.step(&training_batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+        if !step_loss.is_finite() {
+            return Err(
+                format!("pairwise step {step_idx} loss = {step_loss} is not finite").into(),
+            );
+        }
+    }
+    trainer_pw.assert_all_weights_finite()?;
+    let pw_final_loss = trainer_pw.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!(
+        "[smoke/simple] pairwise 10-step training: loss {pw_initial_loss:.6e} -> {pw_final_loss:.6e}"
+    );
+    if !pw_final_loss.is_finite() || pw_final_loss >= pw_initial_loss {
+        return Err(format!(
+            "pairwise 10-step training did not decrease loss: initial = {pw_initial_loss}, \
+             final = {pw_final_loss} (pairwise backward / optimizer wiring likely broken)"
+        )
+        .into());
+    }
+
+    let pw_weights = trainer_pw.to_simple_weights()?;
+    let mut pw_quantised = Vec::new();
+    pw_weights.save_quantised(&mut pw_quantised)?;
+    let pw_reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&pw_quantised), id_pairwise)?;
+    let mut trainer_pw_q = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id_pairwise,
+        smoke_weight_decay,
+        smoke_fv_scale,
+        false,
+        false,
+        false,
+        false,
+    )?;
+    trainer_pw_q.load_simple_weights(&pw_reloaded)?;
+    let pw_loss_q = trainer_pw_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    println!(
+        "[smoke/simple] pairwise quantised round-trip: trained loss {pw_final_loss:.6e} \
+         -> reloaded loss {pw_loss_q:.6e} ({} bytes)",
+        pw_quantised.len()
+    );
+    if !pw_loss_q.is_finite() {
+        return Err(format!(
+            "pairwise quantised round-trip forward loss = {pw_loss_q} is not finite \
+             (combined_dim plumbing or l1_w transpose direction likely broken)"
+        )
+        .into());
+    }
+    println!("[smoke/simple] pairwise OK ✓");
 
     println!(
         "[smoke/simple] PASSED — forward + gradient + quantised round-trip + raw round-trip OK"
@@ -12803,6 +12939,25 @@ mod cli_tests {
         assert!(
             Cli::try_parse_from(["nnue-train", "--progress-coeff", "p.bin", "layerstack"]).is_err()
         );
+    }
+
+    #[test]
+    fn simple_activation_arg_parses_and_maps() {
+        // `--activation` は crelu / screlu / pairwise を受理し、それぞれ
+        // `SimpleActivation` variant へ写る (未知値は run_simple_training が reject)。
+        for (name, want) in [
+            ("crelu", SimpleActivation::CReLU),
+            ("screlu", SimpleActivation::SCReLU),
+            ("pairwise", SimpleActivation::Pairwise),
+        ] {
+            let cli = Cli::try_parse_from(["nnue-train", "simple", "--activation", name])
+                .expect("simple should accept --activation");
+            let act = match cli.arch {
+                ArchCommand::Simple(args) => args.activation,
+                ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+            };
+            assert_eq!(SimpleActivation::from_canonical_name(&act), Some(want));
+        }
     }
 }
 
