@@ -98,6 +98,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
   (`0NNN-`) は並行 PR で衝突するので使わない。slug は内容トピック。
 - **ADR は現アーキの WHY を残す**。執行済 workflow / 完了済ロードマップを ADR
   に残さない (古くなったら削除して良い、ADR は immutable とは限らない)。
+- **実験ログ doc は `docs/experiments/` に置く。同 directory は `.gitignore` 済み**
+  で git 管理外 (頻繁に更新する作業記録のため)。worktree / PR の対象外、checkout 内
+  で直接編集する。`docs/decisions/` (ADR) 等 tracked な doc は通常どおり PR。
 - **directory tree / 構成図は現状を反映**。「将来こうする」予定や削除済 directory
   を残さない。
 - **dated 検証ブロック禁止**: 「2026-05-11 に X 環境で確認」型の log は
