@@ -2,7 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-05-19
-- **設計レビュー**: SH11235/tatara#152 (Codex / Claude 両者 APPROVE)
+- **設計レビュー**: Codex / Claude 両者 APPROVE
 
 ## Context
 
