@@ -78,12 +78,10 @@ host-side wait (launch overhead) が支配的になり、training の実 batch s
 
 ## 新規 fused kernel を追加するとき
 
-fused kernel strategy ADR が想定する「新しい optimizer / activation を試す時
-はパターンを追加する必要がある」運用に従う。手順:
+fused kernel strategy ADR が想定する「新しい optimizer / activation を試す時はパターンを追加する必要がある」運用に従う。手順:
 
 1. 本 catalog にエントリを追加
 2. `crates/gpu-kernels/` 配下に reference CPU 実装 + 数値同等性テスト
-3. `bins/nnue_train/src/kernels/` (`common` / `layerstack` / `simple` から
-   適切な file) に `#[kernel]` device 実装を追加
+3. `bins/nnue_train/src/kernels/` (`common` / `layerstack` / `simple` から適切な file) に `#[kernel]` device 実装を追加
 4. trainer の host 側 (`crates/nnue-train/src/trainer.rs` の `LossKind` 等)
    に enum branch を追加して switch できるようにする
