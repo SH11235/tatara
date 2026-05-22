@@ -6,7 +6,7 @@
 # Claude Code runtime state (transient)
 .claude/scheduled_tasks.lock
 
-# 教師データ (大容量、E: 上の symlink 先) — docs/data-layout.md
+# 教師データ (大容量)
 /data
 **/*.bin
 **/*.psv
@@ -18,7 +18,7 @@
 # 入れないため)。
 !crates/shogi-format/tests/data/sample.psv
 
-# tatara 自前の学習出力 — docs/data-layout.md
+# tatara 自前の学習出力
 /output
 **/output
 /logs

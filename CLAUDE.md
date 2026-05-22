@@ -42,9 +42,6 @@ off で tolerance を満たさず fail するが、release では本番経路と
   に含める。throughput 値には必ず測定 GPU (例「RTX 3080 Ti」) と再現コマンドを
   併記する。再現コマンドの data / progress path は local 依存なので placeholder
   (`/path/to/PSV` 等) にし、実 path は書かない
-- throughput を変える perf PR は同 PR 内で `docs/performance.md` の構成別 / GPU
-  機種別 throughput 表も更新する。doc は現在値のみ持ち、計測履歴は commit message
-  に委ねる (doc と git log で二重管理しない単一情報源運用)
 - negative result も commit を残す (revert commit + Issue 追記の 2 操作)
 - main への直接 push 禁止、必ず PR 経由
 - PR merge は CI green 必須、`--squash --delete-branch` で main に merge

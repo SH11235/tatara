@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # nnue-train の throughput (pos/s) を再現性高く計測するスクリプト。
 #
-# docs/performance.md の基準計測 (5 sb x 200 batches x bs 65536、sb1 は cold
+# 基準計測 (5 sb x 200 batches x bs 65536、sb1 は cold
 # cache outlier として除外、sb2-5 mean で評価) を RUNS 回まわし、run 間の
 # mean / 標準偏差 / 変動係数 (CV%) を出す。小さな perf 改善 (~1-2%) を run 間
 # ばらつきと区別して判定するための infra。
