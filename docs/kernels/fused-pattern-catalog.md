@@ -3,8 +3,6 @@
 [fused kernel strategy ADR](../decisions/2026-05-09-fused-kernel-strategy.md)
 で「runtime fusion を build-time hand-fused kernel で代替する」と決めた fused
 kernel の **責務 / op 数 / 配置ファイル** を一覧する。
-upstream (bullet) のどの関数を hand-fuse したかは各 kernel のソースコメント
-を参照。
 
 ## Pointwise fused kernels
 
@@ -34,27 +32,12 @@ bin-crate reachability 制約により bin crate 内に置く)。
 
 各 kernel には CPU reference 実装と数値同等性テストが併設されており、
 `scripts/local-ci.sh` の release build test 経由で常時検証される。
-absolute throughput (M samples/sec) は単一 kernel の micro-bench より、
-学習 step 全体での throughput (`bins/nnue_train` の pos/s ログ) で測る方が
-現実的 (training context では memory bandwidth が真に律速)。
 
-参考値 (RTX 2070 SUPER / sm_75、n_elements=1024、kernel-only timing、50 step
-平均):
-
-| Pattern | per-step | absolute |
-|---|---|---|
-| `fused_screlu_grad`         | ~32 µs | 32.1 M elements/sec |
-| `fused_loss_wdl`            | ~34 µs | 29.9 M elements/sec |
-| `fused_adamw_step`          | ~30 µs | 34.3 M elements/sec |
-| `fused_radam_step`          | ~30 µs | 34.9 M elements/sec |
-| `fused_ranger_step` (lerp)  | ~30 µs | 34.6 M elements/sec |
-| `sparse_ft_forward`         | ~35 µs | 29.6 M elements/sec |
-| `sparse_ft_backward`        | ~32 µs | 31.7 M elements/sec |
-
-1024 element 程度では kernel 実行時間 (< 50 µs) より `cuStreamSynchronize` の
-host-side wait overhead が支配的になる (launch overhead dominant)。training
-の実 batch size (≥ 8K) では launch overhead が薄まり bandwidth-bound に寄る
-ため、上の数値は regression detection 用 baseline として位置付ける。
+absolute throughput は単一 kernel の micro-bench より、学習 step 全体での
+throughput (`bins/nnue_train` の pos/s ログ) で測る。単一 kernel を小さい
+element 数で micro-bench すると、kernel 実行時間より `cuStreamSynchronize` の
+host-side wait (launch overhead) が支配的になり、training の実 batch size
+(≥ 8K) で bandwidth-bound に寄る本番挙動を反映しないため。
 
 ## 新規 fused kernel を追加するとき
 
