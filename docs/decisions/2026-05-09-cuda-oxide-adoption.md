@@ -34,16 +34,9 @@ GPU kernel は **cuda-oxide で書く**。NVCC / NVRTC は使わない。
 - nightly Rust (`rust-toolchain.toml` に pin) が必要 — cuda-oxide の `nightly-2026-04-03` に整合
 - runtime fusion (bullet-gpu の PointwiseIR) は失われる → 代替策は `2026-05-09-fused-kernel-strategy.md`
 - **GPU 要件: cuda-oxide 公式は Ampere+ (sm_80+)**。Turing (sm_75) は
-  `CUDA_OXIDE_TARGET=sm_75` 環境変数で公式パスのまま動く:
-  - `--arch=sm_75` flag は cuda-oxide 内部の `select_target()` (auto-detect) に
-    override されてしまい、`Basic` フォールバックの `sm_80` が選ばれる。結果と
-    して PTX header は `.target sm_80` になり Turing で
-    `CUDA_ERROR_INVALID_PTX` (driver error 218)
-  - 一方 `CUDA_OXIDE_TARGET=sm_75` (env var) は cuda-oxide pipeline で
-    `select_target()` をバイパスして `llc -mcpu=sm_75` までそのまま流れる
-  - **適用範囲**: 単純な pointwise / sparse / matmul kernel は OK。LLVM IR に
-    sm_80+ 専用 op (`cp.async`, `wgmma`, `tcgen05`, `tma.*`, `cluster.*`) が
-    含まれていると `llc` か CUDA driver 段階で失敗するため、fused optimizer
-    step や Hopper 専用 ops を使う kernel は sm_80+ 実機が必要
+  `CUDA_OXIDE_TARGET=sm_75` 環境変数で公式パスのまま動くが、sm_80+ 専用 op
+  (`cp.async` / `wgmma` 等) を含む kernel は sm_80+ 実機が要る。env var が必要な
+  理由 (`select_target()` の auto-detect を bypass する) と適用範囲・確認手順は
+  `docs/setup.md` の「sub-Ampere GPU」節。
 - cuda-oxide が alpha 段階のため、新機能は最小スコープで切り出して検証してから
   本流に取り込む段階的アプローチを採る。

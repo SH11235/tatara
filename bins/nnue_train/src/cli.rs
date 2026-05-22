@@ -55,7 +55,7 @@ pub(crate) struct Cli {
     pub(crate) experiment_name: Option<String>,
 
     /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
-    /// 本番は 400 程度。
+    /// 本番はより大きい値にする。
     #[arg(long, default_value_t = 10, global = true)]
     pub(crate) superbatches: usize,
 
@@ -63,7 +63,8 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 6104, global = true)]
     pub(crate) batches_per_superbatch: usize,
 
-    /// 1 batch あたりの position 数。default 16384 は smoke 用、本番は 65536 程度。
+    /// 1 batch あたりの position 数。GPU throughput と学習特性の両方に効く。
+    /// default 16384 は smoke 用。
     #[arg(long, default_value_t = 16384, global = true)]
     pub(crate) batch_size: usize,
 
@@ -115,10 +116,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) start_superbatch: Option<usize>,
 
-    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (ディスク節約)。
-    /// 未指定なら全保持 (raw state は ~1.8GB/個 なので save-rate × superbatches が
-    /// 大きい長期ランでは指定推奨; 例 save-rate 20 / 400sb = 20 個 ≈ 36GB)。量子化
-    /// `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
+    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (ディスク節約)。未指定なら
+    /// 全保持。raw state は ~1.8GB/個 と大きく長期ランで嵩むため指定を推奨。
+    /// 量子化 `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
     #[arg(long, global = true)]
     pub(crate) keep_checkpoints: Option<usize>,
 

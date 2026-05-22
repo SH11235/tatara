@@ -156,7 +156,7 @@ bash scripts/setup-cuda-oxide.sh
 - host 前提 (rustup / cargo / llc / clang / nvcc) の有無をチェックして報告
   (システムパッケージの install はしない)
 - その rev で `cargo install --git ... cargo-oxide` を実行
-- `cargo oxide doctor` で環境を診断
+- `cargo-oxide doctor` で環境を診断
 
 スクリプトを使わず手動で入れる場合は、`Cargo.lock` の cuda-oxide rev に
 合わせる:
@@ -173,7 +173,7 @@ cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" --forc
 
 ## Smoke test
 
-`cargo oxide doctor` が全項目 ✓ なら host 側は OK。続いて実際の kernel を
+`cargo-oxide doctor` が全項目 ✓ なら host 側は OK。続いて実際の kernel を
 ビルドする。リポジトリ root から:
 
 ```bash

@@ -35,7 +35,7 @@ bullet-shogi 由来コード (PSV reader、ShogiBoard 等) と cuda-oxide では
 
 - 利点: 上流の改善を rev bump で取り込める、vendor 不可能 (build process 全体に乗っている)
 - 欠点: alpha 期は API 破壊が起こり得る → rev pin で局所化
-- `crates/rustc-codegen-cuda` は cuda-oxide の build process に乗る (cargo subcommand `cargo oxide` 経由)
+- `crates/rustc-codegen-cuda` は cuda-oxide の build process に乗る (cargo subcommand `cargo-oxide` 経由)
 
 ### Pliron (transitive)
 
