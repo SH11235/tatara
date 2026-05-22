@@ -3,7 +3,7 @@
 //! `bins/nnue_train` が出力する binary 形式。推論エンジン rshogi が `EvalFile=`
 //! で直接読み込める byte layout (量子化アルゴリズムの出典は `ATTRIBUTION.md`)。
 //!
-//! ## LayerStack architecture (PSQT 無し、Threat 無し、HandCountDense 無し)
+//! ## LayerStack architecture (Threat 無し、HandCountDense 無し)
 //!
 //! - L0 (FT): `ft_in → ft_out`、weight + bias 共有 stm/nstm (ft_in は feature set
 //!   依存、ft_out は `--ft-out`)
@@ -13,6 +13,9 @@
 //! - l1_total = L1.select(bucket) + L1f、main (l1_out - 1) + skip (1) に slice
 //! - L2 (per-bucket): 9 × l2_out with input l2_in = (l1_out - 1) * 2
 //! - L3 (per-bucket output): 9 × 1
+//! - PSQT shortcut (任意): `(ft_in, NUM_BUCKETS=9)` の per-feature × per-bucket スカラー。
+//!   forward は `net_output += 0.5 * (psqt[stm,bucket] - psqt[nstm,bucket])` で
+//!   dense path と並列に加算される (Stockfish SFNNv10 系)。
 //!
 //! ## file layout (top-level)
 //!
@@ -20,7 +23,10 @@
 //! 2. ft_hash (4 LE u32)
 //! 3. ft_biases LEB128 (magic `COMPRESSED_LEB128` + size + signed LEB128 i16 列)
 //! 4. ft_weights LEB128 (同上、piece 部分 = `halfka_dim * ft_out`、threat 無し)
-//! 5. layerstacks: 9 bucket × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
+//! 5. **PSQT block (arch_str に `PSQT=9,` がある場合のみ)**: bias i32 LE × NUM_BUCKETS,
+//!    weights i32 LE × halfka_dim × NUM_BUCKETS (feature-major、各 feat 内 bucket 連番)。
+//!    scale は `QA * QB = 8128` (bullet-shogi LayerStack 互換、bias は 0 固定)。
+//! 6. layerstacks: 9 bucket × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
 //!
 //! ## save 時の L1 / L1f coalesce
 //!
@@ -240,6 +246,7 @@ pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> S
     format!("Features={feature_name}(Friend)[{input_size}->{ft_out}x2]")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_arch_str(
     feature_name: &str,
     input_size: usize,
@@ -248,9 +255,14 @@ pub fn build_arch_str(
     l2_in: usize,
     l2_out: usize,
     fv_scale: i32,
+    psqt_buckets: Option<usize>,
 ) -> String {
+    let psqt_part = match psqt_buckets {
+        Some(n) => format!("PSQT={n},"),
+        None => String::new(),
+    };
     format!(
-        "{},\
+        "{},{}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -259,6 +271,7 @@ pub fn build_arch_str(
          InputSlice[{}(0:{})]))))),\
          fv_scale={}",
         features_token(feature_name, input_size, ft_out),
+        psqt_part,
         l2_out,     // Output input
         l2_out,     // L2 output / L3 input
         l2_out,     // L2 output
@@ -348,6 +361,11 @@ pub struct LayerStackWeights {
     pub l2_b: Vec<f32>,
     pub l3_w: Vec<f32>,
     pub l3_b: Vec<f32>,
+    /// PSQT shortcut weight (任意)、長さ `ft_in * NUM_BUCKETS`、layout
+    /// `psqt_w[feat * NUM_BUCKETS + bucket]` (feature-major、各 feat 内 bucket 連番)。
+    /// `Some` で save 時に PSQT block が出力され、arch 文字列に `PSQT=9,` token が
+    /// 入る。`None` (既定) は従来の PSQT 無し layout と bit-identical。
+    pub psqt_w: Option<Vec<f32>>,
 }
 
 impl LayerStackWeights {
@@ -374,7 +392,21 @@ impl LayerStackWeights {
             l2_b: vec![0.0; NUM_BUCKETS * l2_out],
             l3_w: vec![0.0; NUM_BUCKETS * l2_out],
             l3_b: vec![0.0; NUM_BUCKETS],
+            psqt_w: None,
         }
+    }
+
+    /// PSQT shortcut weight 領域を 0 で確保した版 (PSQT 有効時用)。
+    /// `psqt_w` は長さ `feature_set.ft_in() * NUM_BUCKETS` の `Some` で確保される。
+    pub fn zeroed_with_psqt(
+        feature_set: FeatureSetSpec,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+    ) -> Self {
+        let mut s = Self::zeroed(feature_set, ft_out, l1_out, l2_out);
+        s.psqt_w = Some(vec![0.0; feature_set.ft_in() * NUM_BUCKETS]);
+        s
     }
 
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
@@ -392,6 +424,11 @@ impl LayerStackWeights {
         let feature_hash = self.feature_set.feature_hash();
         writer.write_all(&NNUE_VERSION.to_le_bytes())?;
         writer.write_all(&network_hash(feature_hash, ft_out, l2_out).to_le_bytes())?;
+        let psqt_buckets = if self.psqt_w.is_some() {
+            Some(NUM_BUCKETS)
+        } else {
+            None
+        };
         let arch_str = build_arch_str(
             self.feature_set.arch_feature_name(),
             self.feature_set.ft_in(),
@@ -400,6 +437,7 @@ impl LayerStackWeights {
             l2_in,
             l2_out,
             FV_SCALE,
+            psqt_buckets,
         );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
@@ -435,6 +473,36 @@ impl LayerStackWeights {
             })
             .collect();
         write_leb128_tensor_i16(writer, &ft_w_i16)?;
+
+        // ---- PSQT block (arch_str に PSQT=9, が入っているときのみ) ----
+        // bias は常に 0 固定 (forward 対称差で friend/enemy が打ち消し、勾配も常に 0)
+        // を i32 LE で NUM_BUCKETS 個書く。weights は `ft_in * NUM_BUCKETS` を
+        // feature-major (`psqt_w[feat * NUM_BUCKETS + bucket]`) でそのまま i32 LE 列に
+        // 書き出す。scale は `QA * QB = 8128` で bullet-shogi LayerStack 互換。
+        if let Some(psqt) = self.psqt_w.as_ref() {
+            let ft_in = self.feature_set.ft_in();
+            let expected = ft_in * NUM_BUCKETS;
+            if psqt.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "psqt_w length {} != expected {} (= ft_in {} * NUM_BUCKETS {})",
+                        psqt.len(),
+                        expected,
+                        ft_in,
+                        NUM_BUCKETS,
+                    ),
+                ));
+            }
+            let psqt_scale = (QA * QB) as f64;
+            for _ in 0..NUM_BUCKETS {
+                writer.write_all(&0_i32.to_le_bytes())?;
+            }
+            for &w in psqt {
+                let val = (psqt_scale * w as f64).round() as i32;
+                writer.write_all(&val.to_le_bytes())?;
+            }
+        }
 
         // ---- LayerStacks (9 buckets × {fc_hash, L1, L2, L3}) ----
         let qb_f = QB as f64;
@@ -534,12 +602,30 @@ impl LayerStackWeights {
     /// (`halfka-hm-merged` / `ft_out = DEFAULT_FT_OUT` / `l1_out = DEFAULT_L1_OUT` /
     /// `l2_out = DEFAULT_L2_OUT`) は arch 文字列・hash・layout が同 spec から導出した
     /// 値と一致するため、その既定値でそのまま受理される (後方互換)。
+    /// PSQT shortcut 層を含む `.bin` を load する場合は [`Self::load_quantised_with_psqt`]
+    /// を使う。本 method は PSQT 無しを要求し、PSQT を含む `.bin` は `Unsupported`
+    /// で reject する。
     pub fn load_quantised<R: Read>(
         reader: &mut R,
         expected: FeatureSetSpec,
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+    ) -> io::Result<Self> {
+        Self::load_quantised_with_psqt(reader, expected, ft_out, l1_out, l2_out, false)
+    }
+
+    /// PSQT shortcut の有無を caller が指定する load。`with_psqt = true` で
+    /// arch_str に `PSQT=9,` を要求 + PSQT block を読む、`false` で PSQT 無しを要求。
+    /// 不一致 (要求 true で `.bin` 側無し / 要求 false で `.bin` 側有り) は `InvalidData`
+    /// で reject する。
+    pub fn load_quantised_with_psqt<R: Read>(
+        reader: &mut R,
+        expected: FeatureSetSpec,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        with_psqt: bool,
     ) -> io::Result<Self> {
         // L1 出力 (skip 1 dim を除く) を 2 乗 + 連結した L2 入力次元。
         let l2_in = (l1_out - 1) * 2;
@@ -582,14 +668,44 @@ impl LayerStackWeights {
         let mut arch_bytes = vec![0u8; arch_len];
         reader.read_exact(&mut arch_bytes)?;
         let arch_str = String::from_utf8_lossy(&arch_bytes);
-        // PSQT / Threat / HandCount を含む arch は本実装でサポートしない (plain LayerStack のみ)
-        if arch_str.contains("PSQT=")
-            || arch_str.contains("Threat=")
-            || arch_str.contains("HandCount")
-        {
+        // Threat / HandCount は未対応。PSQT は caller の要求 (`with_psqt`) と一致する
+        // か検証する (要求 true なら `PSQT={NUM_BUCKETS},` を要求、false なら PSQT
+        // 含む `.bin` を reject)。
+        if arch_str.contains("Threat=") || arch_str.contains("HandCount") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("unsupported arch (only plain LayerStack supported): {arch_str}"),
+                format!("unsupported arch (Threat / HandCount not implemented): {arch_str}"),
+            ));
+        }
+        let psqt_token = format!("PSQT={NUM_BUCKETS},");
+        let file_has_psqt = arch_str.contains(&psqt_token);
+        let file_has_any_psqt = arch_str.contains("PSQT=");
+        // 不一致 bucket count (PSQT=N for N != NUM_BUCKETS) は build に依らず未対応。
+        if file_has_any_psqt && !file_has_psqt {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "unsupported PSQT bucket count in arch_str: `{arch_str}` \
+                     (this build supports `{psqt_token}` only)"
+                ),
+            ));
+        }
+        if with_psqt && !file_has_psqt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PSQT requested but not present in arch_str: `{arch_str}` \
+                     (expected `{psqt_token}` token)"
+                ),
+            ));
+        }
+        if !with_psqt && file_has_psqt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PSQT not requested but `.bin` arch_str has PSQT: `{arch_str}` \
+                     (use load_quantised_with_psqt with with_psqt=true to load PSQT models)"
+                ),
             ));
         }
         // feature set の構造化フィールド (feature 名 + ft_in) を arch 文字列の
@@ -644,6 +760,49 @@ impl LayerStackWeights {
         // FT weights (LEB128 i16, ft_in * ft_out 個)
         let ft_w_i16 = read_leb128_tensor_i16(reader, Some(expected.ft_in() * ft_out))?;
         let ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
+
+        // PSQT block (with_psqt = true のときのみ): bias i32 × NUM_BUCKETS + weights
+        // i32 × (ft_in * NUM_BUCKETS) を feature-major row-major で読む。scale は
+        // `QA * QB = 8128` (save 側と対称)。
+        //
+        // PSQT bias は forward の対称差 (friend / enemy が同じ bias を打ち消す) と
+        // backward の構造的勾配ゼロにより常に 0 で training される。本 trainer / kernel
+        // は PSQT bias を内部状態として持たず、`.bin` 上も常に 0 を書く。**`.bin` 側に
+        // 非ゼロ bias が入っていた場合は silent drop せず error で reject する** —
+        // bullet-shogi v101 も psqtb を Zeroed init で固定しており現実には全て 0 だが、
+        // 別実装由来などで非ゼロ bias が混入した場合に inference round-trip が破綻する
+        // のを防ぐため。
+        let psqt_bias_scale = (QA * QB) as f32;
+        let psqt_weight_scale = psqt_bias_scale;
+        let psqt_w: Option<Vec<f32>> = if with_psqt {
+            for bucket in 0..NUM_BUCKETS {
+                let mut bbuf = [0u8; 4];
+                reader.read_exact(&mut bbuf)?;
+                let raw = i32::from_le_bytes(bbuf);
+                if raw != 0 {
+                    let dequant = raw as f32 / psqt_bias_scale;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "PSQT bias bucket {bucket} is non-zero (raw i32 {raw}, dequant {dequant}); \
+                             tatara LayerStack PSQT is structurally bias-free (symmetric-diff design) \
+                             and cannot represent non-zero PSQT bias"
+                        ),
+                    ));
+                }
+            }
+            let n = expected.ft_in() * NUM_BUCKETS;
+            let mut w = Vec::with_capacity(n);
+            let mut wbuf = [0u8; 4];
+            for _ in 0..n {
+                reader.read_exact(&mut wbuf)?;
+                let q = i32::from_le_bytes(wbuf);
+                w.push(q as f32 / psqt_weight_scale);
+            }
+            Some(w)
+        } else {
+            None
+        };
 
         // LayerStacks (9 buckets × {fc_hash, L1, L2, L3})
         let qb_f = QB as f32;
@@ -730,6 +889,7 @@ impl LayerStackWeights {
             l2_b,
             l3_w,
             l3_b,
+            psqt_w,
         })
     }
 }
@@ -1114,6 +1274,7 @@ mod tests {
             (DEFAULT_L1_OUT - 1) * 2,
             DEFAULT_L2_OUT,
             FV_SCALE,
+            None,
         );
         assert!(s.contains("HalfKA_hm"));
         assert!(s.contains("73305->1536x2"));
@@ -1126,5 +1287,262 @@ mod tests {
         assert!(s.contains("fv_scale=28"));
         assert!(!s.contains("PSQT="));
         assert!(!s.contains("Threat="));
+    }
+
+    #[test]
+    fn build_arch_str_with_psqt_inserts_token() {
+        // psqt_buckets = Some(9) で `PSQT=9,` token が Features と Network の間に入る。
+        let s = build_arch_str("HalfKA_hm", 73_305, 1536, 16, 30, 32, 28, Some(9));
+        assert!(s.contains("PSQT=9,"));
+        // 順序: Features=...,PSQT=9,Network=...
+        let psqt_pos = s.find("PSQT=9,").unwrap();
+        let net_pos = s.find("Network=").unwrap();
+        assert!(psqt_pos < net_pos);
+        // 既存 token は維持。
+        assert!(s.contains("Features=HalfKA_hm(Friend)[73305->1536x2]"));
+        assert!(s.contains("fv_scale=28"));
+    }
+
+    #[test]
+    fn psqt_zeroed_save_load_roundtrip() {
+        let original = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        assert_eq!(
+            original.psqt_w.as_ref().unwrap().len(),
+            test_spec().ft_in() * NUM_BUCKETS
+        );
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+        let loaded = LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .unwrap();
+        let psqt = loaded.psqt_w.as_ref().expect("psqt_w should be Some");
+        assert_eq!(psqt.len(), test_spec().ft_in() * NUM_BUCKETS);
+        assert!(psqt.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn psqt_nonzero_roundtrip_quantises_exactly() {
+        // 1/QA/QB の境界内なら量子化 lossless。`1.0 / 8128 ≈ 1.23e-4` を 5 セルに置く。
+        let mut net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let psqt = net.psqt_w.as_mut().unwrap();
+        let lsb = 1.0_f32 / (QA * QB) as f32;
+        psqt[0] = lsb;
+        psqt[NUM_BUCKETS - 1] = -lsb;
+        psqt[NUM_BUCKETS] = 2.0 * lsb;
+        psqt[100 * NUM_BUCKETS + 3] = -3.0 * lsb;
+        psqt[(test_spec().ft_in() - 1) * NUM_BUCKETS + 5] = 7.0 * lsb;
+
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+        let loaded = LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .unwrap();
+        let loaded_psqt = loaded.psqt_w.as_ref().unwrap();
+        for (i, (&orig, &got)) in net
+            .psqt_w
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(loaded_psqt.iter())
+            .enumerate()
+        {
+            assert_eq!(orig, got, "psqt index {i}");
+        }
+    }
+
+    #[test]
+    fn load_rejects_psqt_when_not_requested() {
+        // PSQT 含む .bin を with_psqt=false で読むと InvalidData で reject される。
+        let net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+        let err = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        )
+        .expect_err("PSQT 含む .bin を with_psqt=false で読むと reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_rejects_missing_psqt_when_requested() {
+        // PSQT 無し .bin を with_psqt=true で読むと InvalidData で reject される。
+        let net =
+            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+        let err = LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .expect_err("PSQT 無し .bin を with_psqt=true で読むと reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// PSQT bias block の offset を「全 file 末尾から layerstacks 9 bucket 分 +
+    /// PSQT weights 分」を差し引いて求める helper。LEB128 が可変長で前方からの計算は
+    /// 困難だが、末尾の構造は size 固定なので逆算で確定する。
+    fn psqt_bias_start(buf_len: usize, ft_in: usize) -> usize {
+        let l1_padded_in = pad32(DEFAULT_FT_OUT);
+        let l2_in = (DEFAULT_L1_OUT - 1) * 2;
+        let l2_padded_in = pad32(l2_in);
+        let l3_padded_in = pad32(DEFAULT_L2_OUT);
+        let layerstack_per_bucket = 4 // fc_hash
+            + DEFAULT_L1_OUT * 4 // L1 bias i32
+            + DEFAULT_L1_OUT * l1_padded_in // L1 weights i8
+            + DEFAULT_L2_OUT * 4 // L2 bias
+            + DEFAULT_L2_OUT * l2_padded_in
+            + 4 // L3 bias
+            + l3_padded_in;
+        let layerstacks_total = NUM_BUCKETS * layerstack_per_bucket;
+        let psqt_weights_bytes = ft_in * NUM_BUCKETS * 4;
+        let psqt_bias_bytes = NUM_BUCKETS * 4;
+        buf_len - layerstacks_total - psqt_weights_bytes - psqt_bias_bytes
+    }
+
+    #[test]
+    fn load_rejects_nonzero_psqt_bias() {
+        // PSQT は構造的に bias-free だが、外部由来 .bin で非ゼロ bias が混入した場合は
+        // silent drop せず InvalidData で reject する。bucket 3 を patch することで、
+        // bucket 0..=2 が zero-pass branch を通過したあとで bucket 3 で error 経路が
+        // 起動するパスを exercise する (zero-branch coverage)。
+        let net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+
+        // bucket 3 の bias cell (i32 LE) を非ゼロに書き換える。
+        // raw i32 = 16256 → dequant = 16256 / 8128 = 2.0 (整然と確認できる値)。
+        let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
+        const TARGET_BUCKET: usize = 3;
+        const NONZERO_RAW: i32 = 16_256; // = QA * QB * 2.0
+        let cell_off = bias_start + TARGET_BUCKET * 4;
+        buf[cell_off..cell_off + 4].copy_from_slice(&NONZERO_RAW.to_le_bytes());
+
+        let err = LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .expect_err("non-zero PSQT bias must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = format!("{err}");
+        // error メッセージのフィールドを 1 個ずつ assert (バグで一部が落ちる regression を捕捉)。
+        assert!(msg.contains("PSQT bias"), "missing 'PSQT bias' in {msg}");
+        assert!(msg.contains("non-zero"), "missing 'non-zero' in {msg}");
+        // bucket index は patch した値 (TARGET_BUCKET=3、最初の zero-pass を抜けた後)
+        // である必要がある。
+        assert!(
+            msg.contains(&format!("bucket {TARGET_BUCKET}")),
+            "expected bucket index {TARGET_BUCKET} in {msg}"
+        );
+        // raw i32 値 (16256) と dequant 値 (2) が両方含まれる。
+        assert!(
+            msg.contains(&format!("raw i32 {NONZERO_RAW}")),
+            "missing raw i32 value in {msg}"
+        );
+        assert!(msg.contains("dequant 2"), "missing dequant value in {msg}");
+    }
+
+    #[test]
+    fn load_accepts_all_zero_psqt_bias() {
+        // 全 NUM_BUCKETS bucket の bias が 0 の通常 case が load を pass する
+        // ことを明示的に確認する (zero-branch の正常 path coverage)。
+        // psqt_zeroed_save_load_roundtrip も同じ path を通るが、本 test は「bias 領域
+        // の全 9 cell が 0」という前提を破った版 (非ゼロ patch) と直接対比できる。
+        let net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+        // bias 領域 9 個の i32 LE が全て 0 であることを直接確認する (zero-branch を
+        // どの bucket でも通る前提の test)。
+        let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
+        for bucket in 0..NUM_BUCKETS {
+            let off = bias_start + bucket * 4;
+            let raw = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            assert_eq!(raw, 0, "expected 0 PSQT bias at bucket {bucket}, got {raw}");
+        }
+        // 全 0 bias で load が成功する。
+        LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .expect("all-zero PSQT bias must load successfully");
+    }
+
+    #[test]
+    fn psqt_save_file_size_grows_by_expected_bytes() {
+        // PSQT 有り .bin は PSQT 無し .bin より `(NUM_BUCKETS + ft_in * NUM_BUCKETS) * 4`
+        // bytes 大きい (bias + weights の i32 LE 列、scale 共通 qa*qb)。
+        let ft_in = test_spec().ft_in();
+        let without =
+            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let with = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf_w = Vec::new();
+        let mut buf_wo = Vec::new();
+        with.save_quantised(&mut buf_w).unwrap();
+        without.save_quantised(&mut buf_wo).unwrap();
+        let arch_token_len = "PSQT=9,".len();
+        let psqt_bytes = (NUM_BUCKETS + ft_in * NUM_BUCKETS) * 4;
+        assert_eq!(
+            buf_w.len() - buf_wo.len(),
+            arch_token_len + psqt_bytes,
+            "size diff = arch token ({arch_token_len}) + PSQT block ({psqt_bytes})"
+        );
     }
 }

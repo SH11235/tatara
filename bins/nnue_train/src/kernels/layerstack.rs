@@ -2507,3 +2507,128 @@ pub fn slice_scatter_2d(
         *dst.get_unchecked_mut(dst_idx) = val;
     }
 }
+
+// =============================================================================
+// PSQT shortcut (Stockfish SFNNv10 系の per-feature × per-bucket スカラー prior)
+// =============================================================================
+//
+// 形式:
+//   psqt_w shape   = (ft_in, NUM_BUCKETS) row-major (`psqt_w[feat * NB + bucket]`)
+//   forward 出力   = net_output[b] += 0.5 * (Σ_f∈stm_active psqt_w[f,bk]
+//                                            − Σ_f∈nstm_active psqt_w[f,bk])
+//   backward       = 各 (b, ni) で psqt_w_grad[stm_idx[b,ni], bk] += +0.5 * dnet[b]
+//                                  psqt_w_grad[nstm_idx[b,ni], bk] += −0.5 * dnet[b]
+//
+// bullet-shogi `shogi_layerstack.rs:2330-2355` の `(stm_psqt - nstm_psqt).select(bucket) * 0.5`
+// 経路と等価。PSQT bias は対称差で勾配 0 のため kernel は持たない (.bin 上は 0 固定で書く)。
+
+/// PSQT shortcut forward (in-place add to net_output)。
+///
+/// 1 thread = 1 position (batch index `b`)。`net_output` には事前に
+/// `l3_out + l1_skip` が書かれている前提で、PSQT delta を加算する (in-place)。
+/// 1 thread / 1 cell の排他更新なので atomic 不要。
+///
+/// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip (bias 0 と等価)。
+/// `idx >= 0 && (idx as u32) < ft_in` の通常の sparse FT 防御も同様。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn psqt_diff_sparse_fwd_inplace(
+    psqt_w: &[f32],
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    bucket_idx: &[i32],
+    mut net_output: DisjointSlice<f32>,
+    batch: u32,
+    nnz: u32,
+    num_buckets: u32,
+    ft_in: u32,
+) {
+    let b = thread::index_1d();
+    if b.get() >= batch as usize {
+        return;
+    }
+    let bucket = bucket_idx[b.get()];
+    if bucket < 0 || (bucket as u32) >= num_buckets {
+        return;
+    }
+    let bucket_u = bucket as usize;
+    let nb_u = num_buckets as usize;
+    let base = b.get() * (nnz as usize);
+    let mut sum_stm: f32 = 0.0;
+    let mut sum_nstm: f32 = 0.0;
+    let mut ni: u32 = 0;
+    while ni < nnz {
+        let idx_s = stm_indices[base + (ni as usize)];
+        if idx_s >= 0 && (idx_s as u32) < ft_in {
+            sum_stm += psqt_w[(idx_s as usize) * nb_u + bucket_u];
+        }
+        let idx_n = nstm_indices[base + (ni as usize)];
+        if idx_n >= 0 && (idx_n as u32) < ft_in {
+            sum_nstm += psqt_w[(idx_n as usize) * nb_u + bucket_u];
+        }
+        ni += 1;
+    }
+    let delta = 0.5_f32 * (sum_stm - sum_nstm);
+    if let Some(out) = net_output.get_mut(b) {
+        *out += delta;
+    }
+}
+
+/// PSQT shortcut backward (atomic scatter to psqt_w_grad)。
+///
+/// 1 thread = 1 (batch index, nnz position) pair。stm + nstm の両 sparse index を
+/// 同 thread で処理し、`psqt_w_grad[idx * num_buckets + bucket]` に
+/// `±0.5 * dnet[b]` を atomic-add する。**accumulate semantics** (host が呼出前に
+/// `psqt_w_grad` を 0 初期化する責務)。
+///
+/// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。NUM_BUCKETS=9 が
+/// 小さく contention は限定的 (batch=65536 / nnz=40 / stm+nstm 両 add で
+/// 5.2M atomic-add / 660K cells ≒ 平均 8 thread/cell)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn psqt_diff_sparse_bwd(
+    dnet: &[f32],
+    stm_indices: &[i32],
+    nstm_indices: &[i32],
+    bucket_idx: &[i32],
+    psqt_w_grad: &[f32],
+    batch: u32,
+    nnz: u32,
+    num_buckets: u32,
+    ft_in: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (nnz as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (nnz as usize);
+    let ni = tid.get() % (nnz as usize);
+    let bucket = bucket_idx[bi];
+    if bucket < 0 || (bucket as u32) >= num_buckets {
+        return;
+    }
+    let bucket_u = bucket as usize;
+    let nb_u = num_buckets as usize;
+    let half_g = 0.5_f32 * dnet[bi];
+    let idx_s = stm_indices[bi * (nnz as usize) + ni];
+    if idx_s >= 0 && (idx_s as u32) < ft_in {
+        // SAFETY: `psqt_w_grad.len() == ft_in * num_buckets` host invariant、
+        // `idx_s < ft_in` / `bucket_u < num_buckets` で範囲内。`f32` (align 4) と
+        // `DeviceAtomicF32` (`#[repr(transparent)]`) は同 alignment、非 atomic 経路で
+        // 同 memory に書く path は本 kernel + radam_step 以外無し。
+        let cell = unsafe {
+            &*(psqt_w_grad.as_ptr().add((idx_s as usize) * nb_u + bucket_u)
+                as *const DeviceAtomicF32)
+        };
+        cell.fetch_add(half_g, AtomicOrdering::Relaxed);
+    }
+    let idx_n = nstm_indices[bi * (nnz as usize) + ni];
+    if idx_n >= 0 && (idx_n as u32) < ft_in {
+        let cell = unsafe {
+            &*(psqt_w_grad.as_ptr().add((idx_n as usize) * nb_u + bucket_u)
+                as *const DeviceAtomicF32)
+        };
+        cell.fetch_add(-half_g, AtomicOrdering::Relaxed);
+    }
+}

@@ -360,6 +360,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         false,
         feature_set,
         0.0,
+        None,
     )?;
     // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。
     let l2_in = (DEFAULT_L1_OUT - L1_SKIP) * 2;

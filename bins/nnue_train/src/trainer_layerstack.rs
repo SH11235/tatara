@@ -88,6 +88,11 @@ pub(crate) struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
+    /// PSQT shortcut の weight + Ranger optimizer state。`--psqt` 有効時のみ `Some`、
+    /// 既定 `None` で従来 path と bit-identical (forward / backward / optimizer の
+    /// PSQT 関連 launch は全て skip される)。
+    psqt: Option<PsqtState>,
+
     // 中間 activation / activation-grad の永続 workspace (batch_size 固定前提で `new`
     // 時に確保。`step_impl` が requires より大きい batch を渡したら拡張)。
     ws: GpuWorkspace,
@@ -122,6 +127,35 @@ pub(crate) struct GpuTrainer {
     /// 以降不変。既定 0.0 で decay 無し。
     weight_decay: f32,
     step_count: u64,
+}
+
+/// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
+/// `Option<PsqtState>` で gated。`psqt_w` shape は `(ft_in, NUM_BUCKETS)` row-major
+/// (`psqt_w[feat * NUM_BUCKETS + bucket]`)、bullet-shogi LayerStack PSQT の
+/// column-major `[NUM_BUCKETS, ft_in]` と byte-equivalent。`m` / `v` は f32 固定
+/// (PSQT weight 自体が ft_in * 9 = ~660K f32 = 2.6MB と小さいため FP16 化の利得が
+/// 小さく、複雑さを避ける)。
+pub(crate) struct PsqtState {
+    pub(crate) w: DeviceBuffer<f32>,
+    pub(crate) w_m: DeviceBuffer<f32>,
+    pub(crate) w_v: DeviceBuffer<f32>,
+    pub(crate) w_slow: DeviceBuffer<f32>,
+    pub(crate) w_grad: DeviceBuffer<f32>,
+}
+
+impl PsqtState {
+    /// 与えた初期 weight (長さ `ft_in * NUM_BUCKETS`) で確保する。Ranger state は
+    /// `m`/`v` = 0、`slow` = 0 (bullet `RangerLookahead::new` と同じ)、`grad` = 0。
+    fn new(stream: &CudaStream, initial_w: &[f32]) -> Result<Self, Box<dyn std::error::Error>> {
+        let n = initial_w.len();
+        Ok(Self {
+            w: DeviceBuffer::from_host(stream, initial_w)?,
+            w_m: DeviceBuffer::<f32>::zeroed(stream, n)?,
+            w_v: DeviceBuffer::<f32>::zeroed(stream, n)?,
+            w_slow: DeviceBuffer::<f32>::zeroed(stream, n)?,
+            w_grad: DeviceBuffer::<f32>::zeroed(stream, n)?,
+        })
+    }
 }
 
 impl Drop for GpuTrainer {
@@ -423,6 +457,7 @@ impl GpuTrainer {
         fp16_opt_state: bool,
         feature_set: FeatureSetSpec,
         weight_decay: f32,
+        psqt_init: Option<&[f32]>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
         // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
@@ -456,6 +491,23 @@ impl GpuTrainer {
         let l1f_w_init = xorshift_init(0x102_u64, l1f_w_n, init_scale);
         let l2_w_init = xorshift_init(0x103_u64, l2_w_n, init_scale);
         let l3_w_init = xorshift_init(0x104_u64, l3_w_n, init_scale);
+
+        // PSQT shortcut の初期 weight (有効時のみ確保)。長さ `ft_in * NUM_BUCKETS` を
+        // caller が validation 済の前提 (CLI / `run_training` 側で構築)。
+        let psqt = match psqt_init {
+            Some(init) => {
+                let expected = ft_in * NUM_BUCKETS;
+                if init.len() != expected {
+                    return Err(format!(
+                        "psqt_init length {} != expected {expected} (= ft_in {ft_in} * NUM_BUCKETS {NUM_BUCKETS})",
+                        init.len()
+                    )
+                    .into());
+                }
+                Some(PsqtState::new(&stream, init)?)
+            }
+            None => None,
+        };
 
         // Ranger Lookahead の slow weight は **0 初期化** (bullet `RangerLookahead::new`
         // = `vec![0.0; size]` と同じ)。初回 lerp (`step % k == 0`) で
@@ -523,6 +575,7 @@ impl GpuTrainer {
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            psqt,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は小さい固定 batch を渡す)。
             // FT activation の f16 buffer 確保は `ft_fp16_out` で決まる。
@@ -656,6 +709,38 @@ impl GpuTrainer {
         self.l3_b_v = zeros_f32(l3_b_n)?;
         self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
         self.l3_b_grad = zeros_f32(l3_b_n)?;
+        // PSQT (任意): trainer 側で psqt が enabled なら weight 側も `Some` を要求。
+        // load 側で `Some` でも trainer が `None` の組合せ (誤って PSQT 無し trainer に
+        // PSQT 含む weights を入れる) も同じく reject する。
+        match (self.psqt.as_mut(), w.psqt_w.as_ref()) {
+            (Some(psqt), Some(w_psqt)) => {
+                let n = self.feature_set.ft_in() * NUM_BUCKETS;
+                if w_psqt.len() != n {
+                    return Err(invalid_data(format!(
+                        "weight psqt_w length {} != expected {n}",
+                        w_psqt.len()
+                    )));
+                }
+                psqt.w = DeviceBuffer::from_host(&self.stream, w_psqt)?;
+                psqt.w_m = zeros_f32(n)?;
+                psqt.w_v = zeros_f32(n)?;
+                psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
+                psqt.w_grad = zeros_f32(n)?;
+            }
+            (Some(_), None) => {
+                return Err(invalid_data(
+                    "trainer has PSQT enabled but weights have no psqt_w (use a PSQT-trained .bin)"
+                        .to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(invalid_data(
+                    "weights carry psqt_w but trainer has PSQT disabled (rerun with --psqt)"
+                        .to_string(),
+                ));
+            }
+            (None, None) => {}
+        }
         self.step_count = 0;
         Ok(())
     }
@@ -664,6 +749,10 @@ impl GpuTrainer {
     pub(crate) fn to_layerstack_weights(
         &self,
     ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
+        let psqt_w = match self.psqt.as_ref() {
+            Some(p) => Some(p.w.to_host_vec(&self.stream)?),
+            None => None,
+        };
         Ok(LayerStackWeights {
             feature_set: self.feature_set,
             ft_w: self.ft_w.to_host_vec(&self.stream)?,
@@ -676,6 +765,7 @@ impl GpuTrainer {
             l2_b: self.l2_b.to_host_vec(&self.stream)?,
             l3_w: self.l3_w.to_host_vec(&self.stream)?,
             l3_b: self.l3_b.to_host_vec(&self.stream)?,
+            psqt_w,
         })
     }
 
@@ -874,22 +964,28 @@ impl GpuTrainer {
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let groups = self.raw_ckpt_groups();
             let ft_out = self.ws.ft_out;
-            let topology = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
+            // PSQT 有り ckpt は `[..., NUM_BUCKETS, NUM_BUCKETS]` (5 dims) で PSQT 無し
+            // (4 dims) と弁別する。PSQT 無し ckpt を PSQT 有り設定で `--resume` すると
+            // `topo_count` 不一致で reject される (PSQT bootstrap path は `--init-from`)。
+            let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
+            let topo5 = layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out);
+            let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
-            // header (magic 〜 num_groups)。format 上の group 数は ft_w (個別処理) +
-            // `raw_ckpt_groups` の 9 = 10。
+            // format 上の group 数: ft_w (個別処理) + raw_ckpt_groups の 9 + PSQT 有効
+            // なら +1 = 10 or 11。
+            let total_groups = (groups.len() + 1 + usize::from(self.psqt.is_some())) as u64;
             write_raw_ckpt_header(
                 &mut w,
                 &RawCkptArch {
                     feature_set: self.feature_set,
                     arch_kind: ArchKind::LayerStack,
                     ft_out: ft_out as u64,
-                    topology: &topology,
+                    topology,
                 },
                 run_id,
                 superbatch as u64,
                 self.step_count,
-                (groups.len() + 1) as u64,
+                total_groups,
             )?;
 
             // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
@@ -946,6 +1042,33 @@ impl GpuTrainer {
                 write_f32_slice(&mut w, &v_host)?;
                 write_f32_slice(&mut w, &slow_host)?;
             }
+            // PSQT (任意): 最後の group として書く。format の group 順は
+            // ft_w → raw_ckpt_groups の 9 → (psqt_w)。
+            if let Some(psqt) = self.psqt.as_ref() {
+                let psqt_n = self.feature_set.ft_in() * NUM_BUCKETS;
+                let w_host = psqt.w.to_host_vec(&self.stream)?;
+                let m_host = psqt.w_m.to_host_vec(&self.stream)?;
+                let v_host = psqt.w_v.to_host_vec(&self.stream)?;
+                let slow_host = psqt.w_slow.to_host_vec(&self.stream)?;
+                for (label, got) in [
+                    ("w", w_host.len()),
+                    ("m", m_host.len()),
+                    ("v", v_host.len()),
+                    ("slow", slow_host.len()),
+                ] {
+                    if got != psqt_n {
+                        return Err(format!(
+                            "raw checkpoint: group psqt_w {label} buffer len {got} != expected {psqt_n}"
+                        )
+                        .into());
+                    }
+                }
+                w.write_all(&(psqt_n as u64).to_le_bytes())?;
+                write_f32_slice(&mut w, &w_host)?;
+                write_f32_slice(&mut w, &m_host)?;
+                write_f32_slice(&mut w, &v_host)?;
+                write_f32_slice(&mut w, &slow_host)?;
+            }
             w.flush()?;
             Ok(())
         };
@@ -981,7 +1104,9 @@ impl GpuTrainer {
     ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let ft_out = self.ws.ft_out;
-        let topology = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
+        let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
+        let topo5 = layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out);
+        let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
 
         // header (magic 〜 num_groups) を読み、feature set / arch / topology を照合する。
         let header = read_raw_ckpt_header(
@@ -990,7 +1115,7 @@ impl GpuTrainer {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
                 ft_out: ft_out as u64,
-                topology: &topology,
+                topology,
             },
         )?;
         let superbatch = header.superbatch;
@@ -1012,7 +1137,7 @@ impl GpuTrainer {
                 (g[8].0, g[8].1),
             ]
         };
-        let total_groups = expected_groups.len() + 1;
+        let total_groups = expected_groups.len() + 1 + usize::from(self.psqt.is_some());
         if header.num_groups != total_groups as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint num_groups {} != expected {total_groups}",
@@ -1086,6 +1211,16 @@ impl GpuTrainer {
         up!(7, l3_w, l3_w_m, l3_w_v, l3_w_slow);
         up!(8, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
+        // PSQT (任意): 最後の group として読む (save 側と対称)。
+        if let Some(psqt) = self.psqt.as_mut() {
+            let psqt_n = self.feature_set.ft_in() * NUM_BUCKETS;
+            let (w_host, m_host, v_host, slow_host) = read_group(&mut r, "psqt_w", psqt_n)?;
+            psqt.w = DeviceBuffer::from_host(&self.stream, &w_host)?;
+            psqt.w_m = DeviceBuffer::from_host(&self.stream, &m_host)?;
+            psqt.w_v = DeviceBuffer::from_host(&self.stream, &v_host)?;
+            psqt.w_slow = DeviceBuffer::from_host(&self.stream, &slow_host)?;
+        }
+
         self.step_count = step_count;
         Ok((superbatch, producer_run_id))
     }
@@ -1110,6 +1245,17 @@ impl GpuTrainer {
                 if !x.is_finite() {
                     return Err(format!(
                         "{name}[{i}] = {x} is not finite (NaN or Inf)、smoke fail"
+                    )
+                    .into());
+                }
+            }
+        }
+        if let Some(psqt) = self.psqt.as_ref() {
+            let v = psqt.w.to_host_vec(&self.stream)?;
+            for (i, &x) in v.iter().enumerate() {
+                if !x.is_finite() {
+                    return Err(format!(
+                        "psqt_w[{i}] = {x} is not finite (NaN or Inf)、smoke fail"
                     )
                     .into());
                 }
@@ -1761,6 +1907,25 @@ impl GpuTrainer {
             ]
         }?;
 
+        // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
+        // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
+        if let Some(psqt) = self.psqt.as_ref() {
+            cuda_launch! {
+                kernel: psqt_diff_sparse_fwd_inplace,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b),
+                args: [
+                    slice(psqt.w),
+                    slice(self.ws.stm_idx_dev),
+                    slice(self.ws.nstm_idx_dev),
+                    slice(self.ws.bucket_idx_dev),
+                    slice_mut(self.ws.net_output),
+                    b_u32, self.ws.max_active as u32, NUM_BUCKETS as u32, self.ws.ft_in as u32
+                ]
+            }?;
+        }
+
         // -- Forward step 15: loss kernel → dy_net_output + loss_acc --
         // `LossKind::Sigmoid` → `loss_wdl` (plain sigmoid-MSE)、`LossKind::Wrm` →
         // `loss_wrm` (win-rate-model loss)。
@@ -1852,7 +2017,35 @@ impl GpuTrainer {
         memset_zero(&self.stream, &self.l3_w_grad)?;
         memset_zero(&self.stream, &self.l3_b_grad)?;
         memset_zero(&self.stream, &self.ws.dl1_total)?;
+        if let Some(psqt) = self.psqt.as_ref() {
+            memset_zero(&self.stream, &psqt.w_grad)?;
+        }
         prof_tick!("bwd_reset");
+
+        // -- Backward 14.5 reverse (optional): PSQT shortcut --
+        // forward の `net_output += psqt_delta` は加算なので、`dpsqt_delta = dnet`。
+        // 1 thread = (b, ni) で psqt_w_grad に atomic add する (memset 済の前提)。
+        // 同 dnet を後続 bwd_L3 もそのまま読むので、本 kernel は dnet を destructive
+        // に変更しない (read-only access)。
+        if let Some(psqt) = self.psqt.as_ref() {
+            let max_active = self.ws.max_active;
+            let ft_in_u = self.ws.ft_in as u32;
+            cuda_launch! {
+                kernel: psqt_diff_sparse_bwd,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * max_active),
+                args: [
+                    slice(self.ws.dy_net_output),
+                    slice(self.ws.stm_idx_dev),
+                    slice(self.ws.nstm_idx_dev),
+                    slice(self.ws.bucket_idx_dev),
+                    slice(psqt.w_grad),
+                    b_u32, max_active as u32, NUM_BUCKETS as u32, ft_in_u
+                ]
+            }?;
+            prof_tick!("bwd_psqt");
+        }
 
         // -- Backward 14 reverse: dy_net_output が dl3_out と dl1_skip 両方の grad --
         // (elementwise_add 逆: dl3_out = dy, dl1_skip = dy、両者同じ buffer を直接渡せばよい)
@@ -2562,6 +2755,17 @@ impl GpuTrainer {
                    slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
                    MIN_W, MAX_W, l3_b_n as u32]
         }?;
+        // PSQT (任意): radam_step を psqt_w に適用。`m`/`v` は f32 固定 (FP16 mirror なし)。
+        if let Some(psqt) = self.psqt.as_mut() {
+            let psqt_n = self.feature_set.ft_in() * NUM_BUCKETS;
+            cuda_launch! {
+                kernel: radam_step,
+                stream: self.stream, module: self.module, config: cfg_1d(psqt_n),
+                args: [slice_mut(psqt.w), slice_mut(psqt.w_m), slice_mut(psqt.w_v),
+                       slice_mut(psqt.w_grad), lr, step_size, denom, self.weight_decay,
+                       BETA1, BETA2, EPS, MIN_W, MAX_W, psqt_n as u32]
+            }?;
+        }
 
         // Lookahead lerp every K steps。lerp は radam の後に FT weight を再度書き換える
         // ので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新 variant を使い、
@@ -2626,6 +2830,14 @@ impl GpuTrainer {
                 stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
                 args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n as u32]
             }?;
+            if let Some(psqt) = self.psqt.as_mut() {
+                let psqt_n = self.feature_set.ft_in() * NUM_BUCKETS;
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp,
+                    stream: self.stream, module: self.module, config: cfg_1d(psqt_n),
+                    args: [slice_mut(psqt.w), slice_mut(psqt.w_slow), RANGER_ALPHA, psqt_n as u32]
+                }?;
+            }
         }
         prof_tick!("optimizer");
 

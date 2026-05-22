@@ -54,14 +54,33 @@ pub(crate) type SimpleRawCkptGroupEntry<'a> = (
     &'a DeviceBuffer<f32>,
 );
 
-/// LayerStack アーキの topology header (v4+): FT 出力次元・L1 出力次元・L2 出力次元・
-/// bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。FT 出力次元は
-/// `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2` で可変、bucket 数は固定。
+/// LayerStack アーキの topology header (v4+、PSQT 無し): FT 出力次元・L1 出力次元・
+/// L2 出力次元・bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
+/// FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2` で可変、bucket
+/// 数は固定。
 pub(crate) const fn layerstack_topology(ft_out: usize, l1_out: usize, l2_out: usize) -> [u64; 4] {
     [
         ft_out as u64,
         l1_out as u64,
         l2_out as u64,
+        NUM_BUCKETS as u64,
+    ]
+}
+
+/// PSQT 有効時の LayerStack topology header: 末尾に PSQT bucket 数 (= `NUM_BUCKETS`)
+/// を追加し、PSQT 無し ckpt (`[..., NUM_BUCKETS]`, 4 dims) と PSQT 有り ckpt
+/// (`[..., NUM_BUCKETS, NUM_BUCKETS]`, 5 dims) を `topo_count` で弁別可能にする。
+/// `--resume` で PSQT 有無を跨ぐ load は dim 数不一致で reject される。
+pub(crate) const fn layerstack_topology_with_psqt(
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+) -> [u64; 5] {
+    [
+        ft_out as u64,
+        l1_out as u64,
+        l2_out as u64,
+        NUM_BUCKETS as u64,
         NUM_BUCKETS as u64,
     ]
 }

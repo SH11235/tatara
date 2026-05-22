@@ -12,6 +12,7 @@
 pub mod feature_set;
 pub mod halfka_hm;
 pub mod progress_kpabs;
+pub mod psqt_material;
 
 pub use feature_set::{FeatureSet, FeatureSetSpec};
 pub use halfka_hm::{
@@ -21,3 +22,4 @@ pub use halfka_hm::{
 pub use progress_kpabs::{
     SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, SHOGI_PROGRESS8_NUM_BUCKETS, ShogiProgressKPAbs,
 };
+pub use psqt_material::{material_cp, psqt_material_values};
