@@ -66,8 +66,7 @@ pub(crate) fn load_kernel_module_with_fallback(
     Ok(module)
 }
 
-/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成。`kernel_names` で全 27
-/// kernel を internalize する。
+/// `.ll` を libdevice と link → opt → llc で `.ptx` 生成する。
 #[allow(dead_code)]
 pub(crate) fn compile_ll_to_ptx_via_llc(
     ll_path: &std::path::PathBuf,
@@ -106,43 +105,6 @@ pub(crate) fn compile_ll_to_ptx_via_llc(
     let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| discover_llvm_tool("llc"));
     let libdevice = find_libdevice_bc()?;
 
-    // module が launch する全 kernel 名。`@<name>` として `.ll` に出ているものを
-    // 漏れなく internalize-public-api-list に残す (1 個でも漏れると opt の globaldce
-    // で消える)。
-    let kernel_names = "sparse_ft_forward,sparse_ft_backward,loss_wdl,loss_wrm,screlu_grad,\
-                       adamw_step,radam_step,radam_step_fp16_mirror,\
-                       radam_step_f16state,radam_step_f16state_mirror,\
-                       ranger_lookahead_lerp,ranger_lookahead_lerp_fp16_mirror,\
-                       ft_post_perspective_fwd,ft_post_perspective_grad,\
-                       dense_mm_fwd,dense_mm_bwd_input,dense_mm_bwd_weight,bias_grad,\
-                       dense_mm_fwd_bucket,dense_mm_bwd_input_bucket,\
-                       dense_mm_bwd_weight_bucket,bias_grad_bucket,\
-                       crelu_fwd,crelu_grad,screlu_fwd,abs_pow2_scale_fwd,abs_pow2_scale_grad,\
-                       concat_l1sqr_main_fwd,concat_l1sqr_main_grad,elementwise_add,\
-                       bias_add_per_row,\
-                       slice_extract_2d,slice_scatter_2d,\
-                       count_buckets,exclusive_scan_aligned,scatter_bucket_perm,\
-                       permute_rows_f32,inverse_permute_rows_f32,\
-                       dense_mm_fwd_bucket_tiled_l1_sorted,\
-                       dense_mm_bwd_weight_bucket_tiled_l1_sorted,\
-                       bias_grad_bucket_shared_sorted,\
-                       ft_post_perspective_grad_fused,\
-                       sparse_ft_forward_fp16,sparse_ft_forward_fp16_out,cast_f32_to_f16,\
-                       ft_post_perspective_fwd_fp16,ft_post_perspective_grad_fused_fp16,\
-                       ft_post_perspective_grad_fp16,\
-                       build_feature_counts,exclusive_prefix_sum_small,scatter_positions,\
-                       gather_and_sum_per_feature_overwrite,gather_and_sum_per_feature_add,\
-                       gather_and_sum_per_feature_overwrite_fp16,\
-                       gather_and_sum_per_feature_add_fp16,\
-                       simple_bias_act_fwd_fp16_in_crelu,\
-                       simple_act_grad_to_fp16_crelu_with_scale,\
-                       simple_bias_act_fwd_fp16_in_screlu,\
-                       simple_act_grad_to_fp16_screlu_with_scale,\
-                       simple_bias_grad_fp16,simple_sparse_ft_backward_fp16,\
-                       simple_bias_grad_dual,simple_bias_grad_dual_fp16,\
-                       simple_bwd_ft_act_crelu_fused,simple_bwd_ft_act_screlu_fused,\
-                       simple_ft_post_fused_crelu,simple_ft_post_fused_screlu";
-
     // Step 1: llvm-link <ll> libdevice → linked.bc
     run_or_err(
         &llvm_link,
@@ -155,12 +117,13 @@ pub(crate) fn compile_ll_to_ptx_via_llc(
     )?;
 
     // Step 2: opt --passes='nvvm-reflect,internalize,globaldce'
-    let api = format!("--internalize-public-api-list={kernel_names}");
+    // internalize + globaldce で未使用の libdevice 関数を除去する。`#[kernel]` は
+    // cuda-oxide が `.ll` の `@llvm.used` に列挙するため internalize されず、
+    // public-api-list を渡さなくても PTX entry として残る。
     run_or_err(
         &opt_bin,
         &[
             "--passes=nvvm-reflect,internalize,globaldce".as_ref(),
-            api.as_ref(),
             linked_bc.as_os_str(),
             "-o".as_ref(),
             opt_bc.as_os_str(),
