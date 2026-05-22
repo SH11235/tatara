@@ -488,7 +488,7 @@ impl GpuTrainer {
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
-            // `len_batch == 0` (未確保) を作らない — smoke は batch=4 等を渡す)。
+            // `len_batch == 0` (未確保) を作らない — smoke は小さい固定 batch を渡す)。
             // FT activation の f16 buffer 確保は `ft_fp16_out` で決まる。
             ws: GpuWorkspace::new(&stream, batch_size.max(1), ft_out, ft_fp16_out, feature_set)?,
             // loss + step
