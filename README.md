@@ -28,7 +28,7 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 
 | アーキ | サブコマンド | 構造 |
 |---|---|---|
-| **LayerStack** | `layerstack` | 局面の進行度で 9 bucket に分け、出力層を bucket ごとに専用化(Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
+| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(9 bucket、Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
 | **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <l1>x2-<l2>-<l3>` で指定(`l1` = FT 出力、`l2`/`l3` = 隠れ層、既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
 
 ### 入力 feature set
