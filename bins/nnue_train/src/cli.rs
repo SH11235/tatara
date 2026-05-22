@@ -243,8 +243,9 @@ impl ArchCommand {
 /// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
-    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 81*FE_OLD_END)。
-    /// 未指定なら全 position が bucket 4 (zero weights → `sigmoid(0) = 0.5`)。
+    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 125388 = 玉 81 マス
+    /// × KP-abs 駒入力 1548)。未指定なら全 position が bucket 4
+    /// (zero weights → `sigmoid(0) = 0.5`)。
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 

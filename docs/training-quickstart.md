@@ -16,7 +16,7 @@
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
 | 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
-| progress 係数 | `progress.bin` (f64 LE × 81 × `FE_OLD_END` = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。LayerStack の 9 bucket 振り分け用 (simple では不要) | 1.0 MB |
+| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。LayerStack の 9 bucket 振り分け用 (simple では不要) | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)

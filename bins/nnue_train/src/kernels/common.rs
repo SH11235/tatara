@@ -5,8 +5,8 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// SCReLU activation gradient (fused)。
 ///
-/// LayerStack path では **未使用** (CReLU + pairwise_mul を使うため)。cuda-oxide の
-/// bin-entry constraint に従い compile-reach のため preserve。
+/// Simple アーキの `--activation screlu` backward で使う。LayerStack path は
+/// CReLU + pairwise_mul を使うため未使用。
 ///
 /// 1 thread = 1 element、atomics 不要、in-place output (`dl_dx`)。
 #[kernel]
