@@ -61,8 +61,9 @@ learning game progress and assigning it to output buckets is based on
 > game at a time (detecting game boundaries by `game_ply`) and labels each
 > position with its relative position within that game. With a shuffled PSV the
 > game boundaries break, the labels become meaningless, and correct coefficients
-> cannot be learned. The `nnue-train` examples for the main training use a
-> shuffled PSV — the requirement is the opposite, so do not mix them up.
+> cannot be learned. As a general rule the main NNUE training (`nnue-train`)
+> benefits from a *shuffled* PSV; progress training is the opposite, so do not
+> reuse the same file for both.
 
 Specify the total number of epochs with `--epochs`. Each epoch writes a
 `<run-name>.e<N>.bin` checkpoint, and the final epoch is also written to the
@@ -91,6 +92,24 @@ gap is normal, and a clearly widening gap is what to watch for. Because the real
 goal is a good bucket split, which a plain MSE only approximates, prefer an
 epoch where `val_loss` levels off over chasing its exact minimum, and judge the
 final `progress.bin` by the strength of the LayerStack NNUE trained with it.
+
+### Checking the bucket distribution
+
+`progress-bucket-survey` reports how a `progress.bin` assigns positions to the
+progress buckets. A roughly even spread is healthy; if one bucket dominates, the
+LayerStack output buckets are trained on very uneven amounts of data.
+
+```bash
+cargo build --release -p progress-bucket-survey
+target/release/progress-bucket-survey \
+  --data <path/to/consecutive-psv.bin> \
+  --progress output/progress/<run-name>.e5.bin \
+  --samples 200000
+```
+
+It prints a per-bucket count and percentage plus the top bucket's share. Only
+one `progress.bin` can be loaded per run, so to compare epochs run it once per
+`<run-name>.e<N>.bin` and compare the outputs.
 
 ### Training
 

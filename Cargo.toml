@@ -9,6 +9,7 @@ members = [
     "crates/nnue-train",
     "bins/progress_kpabs_train",
     "bins/nnue_train",
+    "bins/progress_bucket_survey",
 ]
 
 [workspace.package]

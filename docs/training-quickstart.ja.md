@@ -52,8 +52,9 @@ target/release/nnue-train \
 > 進行度係数は「1 局の中で局面がどこまで進んだか」を学習するもので、
 > `progress-kpabs-train` はデータを 1 局単位で読み(`game_ply` で対局境界を検出)、
 > 各局面にその局内での相対位置をラベル付けする。シャッフル済み PSV だと対局境界が
-> 壊れてラベルが無意味になり、正しい係数が学習できない。本体学習の `nnue-train`
-> 例ではシャッフル済み PSV を使っており、要求が逆なので取り違えないこと。
+> 壊れてラベルが無意味になり、正しい係数が学習できない。一般に本体の NNUE 学習
+> (`nnue-train`) はシャッフル済み PSV が望ましいが、進行度学習は逆で、シャッフル
+> すると正しく学習できない。同じファイルを両方に使い回さないこと。
 
 `--epochs` で総 epoch 数を指定する。epoch ごとに `<run-name>.e<N>.bin` の
 checkpoint が出力され、最終 epoch は `--output` の path にも書き出される。
@@ -81,6 +82,24 @@ target/release/progress-kpabs-train \
 すぎないので、`val_loss` の厳密な最小値を追うより頭打ちになった epoch を選び、
 最終的な `progress.bin` の良し悪しはそれで学習した LayerStack NNUE の棋力で
 判断する。
+
+### bucket 分布の確認
+
+`progress-bucket-survey` は `progress.bin` が局面を進行度 bucket にどう割り当てる
+かを集計する。分布がおおむね均等なら健全で、特定の bucket に偏っていると
+LayerStack の出力 bucket ごとの学習データ量が大きく不均衡になる。
+
+```bash
+cargo build --release -p progress-bucket-survey
+target/release/progress-bucket-survey \
+  --data <path/to/consecutive-psv.bin> \
+  --progress output/progress/<run-name>.e5.bin \
+  --samples 200000
+```
+
+bucket ごとの件数・割合と top bucket の占有率を表示する。1 回の実行で読み込める
+`progress.bin` は 1 つなので、epoch を比較するときは `<run-name>.e<N>.bin` ごとに
+実行して出力を見比べる。
 
 ### 学習
 

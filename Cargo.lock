@@ -405,6 +405,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "progress-bucket-survey"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "shogi-features",
+ "shogi-format",
+]
+
+[[package]]
 name = "progress-kpabs-train"
 version = "0.1.0"
 dependencies = [
