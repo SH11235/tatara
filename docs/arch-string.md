@@ -77,7 +77,7 @@ Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Clipped
 | `ClippedReLU[32]` | 32 要素の clipped ReLU |
 | `AffineTransform[1<-32]` | 出力層、32 → 1 |
 
-LayerStack の arch string は nnue-pytorch canonical form の要約で、L1f skip 接続や
+LayerStack の arch string は dense 層チェーンの要約で、L1f skip 接続や
 pairwise・per-bucket 構造は文字列に現れない。LayerStack の完全なアーキ記述は
 `crates/nnue-format/src/layerstack_weights.rs` の module doc を参照。
 
@@ -134,4 +134,3 @@ Simple 固有の点:
   load reject 契約
 - `crates/nnue-format/src/simple_weights.rs` — Simple の `build_arch_str` と
   load reject 契約
-- [ATTRIBUTION.md](../ATTRIBUTION.md) — arch string 形式・量子化アルゴリズムの出典
