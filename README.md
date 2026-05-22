@@ -1,118 +1,131 @@
+**English** | [日本語](README.ja.md)
+
 # tatara
 
-**将棋 NNUE 評価関数を高速に学習する Rust 製トレーナー。**
+**A fast Rust trainer for shogi NNUE evaluation networks.**
 
-tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を GPU で
-学習するツール。host から device まで **Rust 一言語**で書かれ、GPU kernel は
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide)(NVIDIA Labs の Rust → PTX
-rustc backend)で build-time に PTX 化する — C / C++ / CUDA C++ を一切介さない。
+tatara trains shogi NNUE (Efficiently Updatable Neural Network) evaluation
+networks on the GPU. It is written in **Rust end to end**, from host to device:
+GPU kernels are compiled to PTX at build time by
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide) (NVIDIA Labs' Rust → PTX
+rustc backend) — no C / C++ / CUDA C++ anywhere in the pipeline.
 
-GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA C++ trainer
-[bullet-shogi](https://github.com/SH11235/bullet-shogi) を上回る throughput を
-出す。RTX 3080 Ti 実測(LayerStack)で、bit-identical な既定経路でも bullet-shogi
-比 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×**。
+Hand-fusing the GPU kernels makes it **very fast** — it out-throughputs its
+upstream CUDA C++ trainer
+[bullet-shogi](https://github.com/SH11235/bullet-shogi). Measured on an RTX 3080
+Ti (LayerStack), even the bit-identical default path is **+37%** over
+bullet-shogi, and stacking the opt-in FP16 modes reaches up to **~2.1×**.
 
-*tatara(踏鞴)は砂鉄から玉鋼を精錬する日本の伝統的なたたら炉 — 生のデータからnet を鍛え上げる。*
+*tatara (踏鞴) is the traditional Japanese furnace that smelts iron sand into
+tamahagane steel — forging a net out of raw data.*
 
-> **NVIDIA only** — cuda-oxide が PTX 生成専用なため ROCm / AMD は対象外。
-> AMD GPU で類似の NNUE 学習を行いたい場合は CUDA / HIP 両 backend を持つ
-> 上流の [bullet-shogi](https://github.com/SH11235/bullet-shogi) を参照。
+> **NVIDIA only** — because cuda-oxide only generates PTX, ROCm / AMD is out of
+> scope. To train comparable shogi NNUE nets on an AMD GPU, see the upstream
+> [bullet-shogi](https://github.com/SH11235/bullet-shogi), which has both CUDA
+> and HIP backends.
 
-## 学習できる NNUE
+## What you can train
 
-学習する NNUE は、ネットワーク構造を決める **アーキテクチャ**(サブコマンド)と、
-盤面をどう入力ベクトルに変換するかを決める **入力 feature set**(`--feature-set`)を
-独立に選ぶ。
+A trained NNUE is defined by two independent choices: the **architecture**
+(a subcommand), which fixes the network structure, and the **input feature set**
+(`--feature-set`), which fixes how a board position is turned into an input
+vector.
 
-### アーキテクチャ
+### Architecture
 
-| アーキ | サブコマンド | 構造 |
+| Architecture | Subcommand | Structure |
 |---|---|---|
-| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(9 bucket、Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
-| **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <l1>x2-<l2>-<l3>` で指定(`l1` = FT 出力、`l2`/`l3` = 隠れ層、既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
+| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (9 buckets; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → 16 → 32 |
+| **Simple** | `simple` | A plain NNUE with no bucket split (FT → 2 hidden layers → single output). Layer dimensions are set with `--arch <l1>x2-<l2>-<l3>` (`l1` = FT output, `l2`/`l3` = hidden layers; default `256x2-32-32`); activation crelu / screlu / pairwise |
 
-### 入力 feature set
+### Input feature set
 
-`--feature-set` で 5 種から選べる(既定 `halfka-hm-merged`)。玉をどう特徴に含めるかが違う:
+`--feature-set` selects one of five (default `halfka-hm-merged`). They differ in
+how the kings are included as features:
 
-| `--feature-set` | 玉の扱い |
+| `--feature-set` | King handling |
 |---|---|
-| `halfkp` | 玉自体は駒の特徴に含めない |
-| `halfka-split` | 玉も含める。自玉用と敵玉用の特徴枠を別々に持つ |
-| `halfka-merged` | 玉も含める。自玉と敵玉で特徴枠を 1 つに共有する |
-| `halfka-hm-split` | `halfka-split` に加え、玉が常に盤の片側へ来るよう左右反転し、玉マスを 81 → 45 に圧縮 |
-| `halfka-hm-merged`(既定) | `halfka-merged` + 同じ左右反転による玉マス圧縮 |
+| `halfkp` | Kings themselves are not included as piece features |
+| `halfka-split` | Kings are included; own-king and enemy-king features have separate slots |
+| `halfka-merged` | Kings are included; own-king and enemy-king features share one slot |
+| `halfka-hm-split` | `halfka-split` plus a left-right mirror so the king always sits on one side of the board, compressing king squares 81 → 45 |
+| `halfka-hm-merged` (default) | `halfka-merged` plus the same left-right mirror king-square compression |
 
-既定の `halfka-hm-merged` は、Stockfish の **HalfKAv2_hm**(玉マスの左右反転 +
-自玉・敵玉の特徴枠を 1 つに共有)と同じ設計を将棋に適用したもの。
+The default `halfka-hm-merged` applies to shogi the same design as Stockfish's
+**HalfKAv2_hm** (left-right king-square mirroring + own-king/enemy-king features
+sharing one slot).
 
-別バイナリ `progress-kpabs-train` は LayerStack の bucket 係数 `progress.bin` を
-生成する KP-abs progress trainer。進行度を学習して出力 bucket に割り当てる手法は
-[nodchip 氏の記事](https://nodchip.hatenablog.com/entry/2026/02/04/000000) の
-アイデアに基づく。
+A separate binary, `progress-kpabs-train`, is a KP-abs progress trainer that
+produces `progress.bin`, the bucket coefficients for LayerStack. The approach of
+learning game progress and assigning it to output buckets is based on an idea
+from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000).
 
-## セットアップ
+## Setup
 
-### 環境要件
+### Requirements
 
-- **OS** — Linux 一級サポート、Windows は WSL2 経由、macOS は GPU ビルド非対応
-- **NVIDIA GPU** (Ampere 以降 / sm_80+ を公式サポート、Turing / sm_75 も
-  `CUDA_OXIDE_TARGET=sm_75` 環境変数で単純な kernel は動作)
-- **CUDA Toolkit 12.x** (12.9 で動作確認)
-- **LLVM 21+** (`llc-21` が floor、`llc-22` が atomics syncscope の完全性に
-  必要なので推奨)
-- **Rust nightly** (`rust-toolchain.toml` で cuda-oxide upstream の channel
-  に追従、rustc internal ABI に依存するため channel を勝手に変えない)
+- **OS** — Linux is first-class; Windows is supported via WSL2; macOS cannot
+  build the GPU crates
+- **NVIDIA GPU** (Ampere and later / sm_80+ is officially supported; Turing /
+  sm_75 also runs simple kernels with the `CUDA_OXIDE_TARGET=sm_75` environment
+  variable)
+- **CUDA Toolkit 12.x** (verified with 12.9)
+- **LLVM 21+** (`llc-21` is the floor; `llc-22` is recommended because it is
+  needed for fully correct atomics syncscope)
+- **Rust nightly** (`rust-toolchain.toml` tracks the cuda-oxide upstream
+  channel; do not change the channel yourself, since it depends on the rustc
+  internal ABI)
 
-GPU kernel をビルドする `cargo-oxide` のセットアップは
-`bash scripts/setup-cuda-oxide.sh`。詳細なインストール手順・OS 別の案内・
-サポート GPU マトリクスは [docs/setup.md](docs/setup.md) を参照。
+To set up `cargo-oxide`, which builds the GPU kernels, run
+`bash scripts/setup-cuda-oxide.sh`. For detailed installation steps, per-OS
+guidance, and the supported-GPU matrix, see [docs/setup.md](docs/setup.md).
 
-### ビルドと学習
+### Build and train
 
-kernel のビルドと smoke test は [docs/setup.md](docs/setup.md)、学習の回し方は
-[docs/training-quickstart.md](docs/training-quickstart.md) を参照。
+For building the kernels and running the smoke test, see
+[docs/setup.md](docs/setup.md); for how to run training, see
+[docs/training-quickstart.md](docs/training-quickstart.md).
 
-## ドキュメント
+## Documentation
 
-- [Setup guide](docs/setup.md) — OS 別の案内、CUDA / LLVM / `cargo-oxide` の
-  セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
-- [Training quickstart](docs/training-quickstart.md) — アーキ別の学習例 + 主要
-  CLI option + resume / checkpoint 運用
-- [ADR (Architecture Decision Records)](docs/decisions/) — 設計判断とその
-  rationale
-- [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
-  が何を担うか
-- [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
-  記述文字列の組み立てと load 時照合
+- [Setup guide](docs/setup.md) — per-OS guidance, CUDA / LLVM / `cargo-oxide`
+  setup, supported-GPU matrix, CUDA toolkit root resolution
+- [Training quickstart](docs/training-quickstart.md) — per-architecture training
+  examples + key CLI options + resume / checkpoint workflow
+- [ADR (Architecture Decision Records)](docs/decisions/) — design decisions and
+  their rationale
+- [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — which kernel
+  does what
+- [Arch string](docs/arch-string.md) — how the architecture-description string
+  embedded in the quantised `.bin` header is assembled and checked at load time
 
-## 用語 (glossary)
+## Glossary
 
-| 略語 | 意味 |
+| Abbreviation | Meaning |
 |---|---|
-| **NNUE** | Efficiently Updatable Neural Network — 将棋 / チェスエンジンで使われる軽量評価関数 |
-| **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
-| **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
-| **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
-| **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
-| **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
+| **NNUE** | Efficiently Updatable Neural Network — a lightweight evaluation function used by shogi / chess engines |
+| **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
+| **PSV** | PackedSfenValue — a training-data format from bullet-shogi (one position + score + WDL) |
+| **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
+| **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
+| **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
-| **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
-| **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
-| **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
-| **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.md` のサポート GPU マトリクス参照 |
-| **SASS** | NVIDIA GPU の世代別実機機械語。PTX から CUDA driver JIT が生成する終端形式。本リポでは直接扱わない |
-| **sm_XX** | NVIDIA GPU の compute capability (例: sm_75 = Turing、sm_86 = Ampere RTX 30xx)。PTX 生成時の target アーキ指定 (`CUDA_OXIDE_TARGET=sm_86` 等) に使う |
+| **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
+| **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
+| **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |
+| **PTX** | Parallel Thread Execution — a virtual ISA for NVIDIA GPUs. CUDA C++ / Rust → PTX (`.ptx` text) → the CUDA driver's JIT compiles it to SASS (real machine code) for execution. It is portable across generations (PTX built for sm_80 runs forward-compatibly on sm_86/89/90). See the supported-GPU matrix in `docs/setup.md` |
+| **SASS** | Per-generation real machine code for NVIDIA GPUs. The terminal form the CUDA driver JIT produces from PTX. This repository does not handle it directly |
+| **sm_XX** | The compute capability of an NVIDIA GPU (e.g. sm_75 = Turing, sm_86 = Ampere RTX 30xx). Used to specify the target architecture when generating PTX (`CUDA_OXIDE_TARGET=sm_86`, etc.) |
 
-## 関連リポジトリ
+## Related repositories
 
-- [rshogi](https://github.com/SH11235/rshogi) — 本リポで学習した NNUE をロードして対局する将棋エンジン
-- [bullet](https://github.com/jw1912/bullet) — 上流 (NNUE training framework)
-- [bullet-shogi](https://github.com/SH11235/bullet-shogi) — bullet の将棋向け fork
-- [cuda-oxide](https://github.com/NVlabs/cuda-oxide) — Rust → PTX rustc backend
+- [rshogi](https://github.com/SH11235/rshogi) — the shogi engine that loads and plays with the NNUE trained here
+- [bullet](https://github.com/jw1912/bullet) — upstream (NNUE training framework)
+- [bullet-shogi](https://github.com/SH11235/bullet-shogi) — a shogi-oriented fork of bullet
+- [cuda-oxide](https://github.com/NVlabs/cuda-oxide) — the Rust → PTX rustc backend
 
 ## License
 
-MIT (see [LICENSE](LICENSE))。
-bullet-shogi / bullet / cuda-oxide からの取り込み範囲とライセンス互換性は
-[ATTRIBUTION.md](ATTRIBUTION.md) を参照。
+MIT (see [LICENSE](LICENSE)).
+For the scope of code taken from bullet-shogi / bullet / cuda-oxide and license
+compatibility, see [ATTRIBUTION.md](ATTRIBUTION.md).

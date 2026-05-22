@@ -9,196 +9,220 @@ use crate::arch::*;
 // CLI (clap) — 引数群は bullet-shogi `examples/shogi_layerstack.rs` に対応
 // ===========================================================================
 
-/// rshogi NNUE trainer。
+/// Shogi NNUE trainer.
 ///
-/// 学習する NNUE アーキを `layerstack` / `simple` サブコマンドで選ぶ。共有引数は
-/// サブコマンドの前後どちらに置いてもよい global 引数。`--data <PSV>` を指定すると
-/// training loop を回し、省略すると GPU smoke test (forward/backward path 確認) を
-/// 実行する。
+/// Pick the NNUE architecture to train with the `layerstack` / `simple`
+/// subcommands. Shared options are global arguments and may be placed before or
+/// after the subcommand. Passing `--data <PSV>` runs the training loop;
+/// omitting it runs a GPU smoke test that exercises the forward/backward path.
 #[derive(Parser, Debug)]
-#[command(name = "nnue-train", about = "rshogi NNUE trainer")]
+#[command(name = "nnue-train", about = "Shogi NNUE trainer")]
 pub(crate) struct Cli {
-    /// 教師データ PSV ファイル (`PackedSfenValue` × N、各 40 bytes)。省略時は GPU smoke test。
+    /// Training data PSV file (`PackedSfenValue` x N, 40 bytes each). When omitted, runs a GPU smoke test.
     #[arg(long, global = true)]
     pub(crate) data: Option<PathBuf>,
 
-    /// held-out validation 用の PSV ファイル。学習 `--data` とは別の、勾配更新に
-    /// 一度も使わない局面を渡す。指定すると各 superbatch 末に forward-only 検証を
-    /// 走らせ、test_loss (held-out 平均 loss) と test_accuracy (出力符号と対局結果の
-    /// 一致率) を train ログと experiment.json に出す。発散・過学習の早期検出に使う。
+    /// PSV file for held-out validation. Pass positions that are never used for
+    /// a gradient update, separate from the training `--data`. When set, a
+    /// forward-only validation pass runs at the end of each superbatch and
+    /// reports test_loss (mean held-out loss) and test_accuracy (agreement
+    /// between the output sign and the game result) in the training log and
+    /// experiment.json. Used for early detection of divergence and overfitting.
     #[arg(long, global = true)]
     pub(crate) test_data: Option<PathBuf>,
 
-    /// held-out validation 1 回あたりの検証局面数。test PSV の先頭からこの数だけ
-    /// 取り、`--batch-size` 単位に切り上げて満タン batch を作る。`--test-data`
-    /// 指定時のみ使う。
+    /// Number of positions per held-out validation pass. Takes this many
+    /// positions from the start of the test PSV and rounds up to a whole
+    /// `--batch-size` multiple to form full batches. Used only when
+    /// `--test-data` is set.
     #[arg(long, default_value_t = 10000, global = true)]
     pub(crate) test_positions: usize,
 
-    /// checkpoint 出力先 directory (`{net_id}-{superbatch}.bin` を書き出す)。
+    /// Output directory for checkpoints (writes `{net_id}-{superbatch}.bin`).
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
 
-    /// network id (checkpoint file 名に使う)。
+    /// Network id (used in checkpoint file names).
     #[arg(long, default_value = "rshogi", global = true)]
     pub(crate) net_id: String,
 
-    /// 入力 feature set。次のいずれか: halfkp, halfka-split, halfka-merged,
-    /// halfka-hm-split, halfka-hm-merged。FT 入力次元と active feature 数を決める。
-    /// 既定の halfka-hm-merged は king-symmetric merged HalfKA。
+    /// Input feature set. One of: halfkp, halfka-split, halfka-merged,
+    /// halfka-hm-split, halfka-hm-merged. Determines the FT input dimension and
+    /// the number of active features. The default halfka-hm-merged is
+    /// king-symmetric merged HalfKA.
     #[arg(long, default_value = "halfka-hm-merged", global = true)]
     pub(crate) feature_set: String,
 
-    /// experiment.json の `name` (実験管理 UI での表示名)。未指定なら net_id、
-    /// `--resume` 時は `{net_id} (resume @sb{開始 superbatch})`。
+    /// `name` field in experiment.json (display name in the experiment-tracking
+    /// UI). Defaults to net_id, or `{net_id} (resume @sb{start superbatch})`
+    /// when `--resume` is used.
     #[arg(long, global = true)]
     pub(crate) experiment_name: Option<String>,
 
-    /// 学習する superbatch 数 (1..=superbatches を回す)。default 10 は smoke 用、
-    /// 本番はより大きい値にする。
+    /// Number of superbatches to train (runs 1..=superbatches). The default of
+    /// 10 is for smoke testing; use a much larger value for real training.
     #[arg(long, default_value_t = 10, global = true)]
     pub(crate) superbatches: usize,
 
-    /// 1 superbatch あたりの batch 数。
+    /// Number of batches per superbatch.
     #[arg(long, default_value_t = 6104, global = true)]
     pub(crate) batches_per_superbatch: usize,
 
-    /// 1 batch あたりの position 数。GPU throughput と学習特性の両方に効く。
-    /// default 16384 は smoke 用。
+    /// Number of positions per batch. Affects both GPU throughput and training
+    /// dynamics. The default of 16384 is for smoke testing.
     #[arg(long, default_value_t = 16384, global = true)]
     pub(crate) batch_size: usize,
 
-    /// 初期 learning rate。
+    /// Initial learning rate.
     #[arg(long, default_value_t = 8.75e-4, global = true)]
     pub(crate) lr: f32,
 
-    /// LR gamma (`lr_step` superbatch ごとに gamma 倍)。
+    /// LR gamma (multiplies the LR by gamma every `lr_step` superbatches).
     #[arg(long, default_value_t = 0.995, global = true)]
     pub(crate) lr_gamma: f32,
 
-    /// LR step (gamma 倍する superbatch 間隔)。
+    /// LR step (superbatch interval at which the LR is multiplied by gamma).
     #[arg(long, default_value_t = 1, global = true)]
     pub(crate) lr_step: usize,
 
-    /// WDL blend lambda (constant)。
+    /// WDL blend lambda (constant).
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) wdl: f32,
 
-    /// sigmoid loss の score scale (`loss_scale = 1 / scale`)。`--win-rate-model` 指定時は
-    /// 使わない (WRM loss は `--wrm-*` 系の scaling を使う)。
+    /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). Not used
+    /// when `--win-rate-model` is set (WRM loss uses the `--wrm-*` scaling
+    /// instead).
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 
-    /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
+    /// Write a checkpoint every `save_rate` superbatches (and at the end).
     #[arg(long, default_value_t = 20, global = true)]
     pub(crate) save_rate: usize,
 
-    /// `|score| >= score_drop_abs` の position を loss から除外する (bullet `--score-drop-abs`)。
+    /// Exclude positions with `|score| >= score_drop_abs` from the loss (bullet `--score-drop-abs`).
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
 
-    /// 学習開始前に量子化 NNUE binary から weight を注入する (pretrained start)。
-    /// optimizer state (Ranger m/v/slow/step) は **reset** される — 真の resume には
-    /// `--resume` を使うこと (`--init-from` と `--resume` は排他)。
+    /// Inject weights from a quantised NNUE binary before training starts
+    /// (pretrained start). The optimizer state (Ranger m/v/slow/step) is
+    /// **reset** — use `--resume` for a true resume (`--init-from` and
+    /// `--resume` are mutually exclusive).
     #[arg(long, global = true)]
     pub(crate) init_from: Option<PathBuf>,
 
-    /// raw checkpoint (`{net_id}-{sb}.ckpt`) から weight + Ranger optimizer state
-    /// (m/v/slow/step) を復元して学習を再開する (真の resume)。`--init-from`
-    /// とは排他 (`--init-from` は weight のみ注入し optimizer を reset するため)。
-    /// `--start-superbatch` 未指定なら checkpoint に記録された superbatch の +1 から再開。
+    /// Resume training by restoring weights + Ranger optimizer state
+    /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
+    /// resume. Mutually exclusive with `--init-from` (which injects weights only
+    /// and resets the optimizer). When `--start-superbatch` is omitted, resumes
+    /// from the superbatch recorded in the checkpoint + 1.
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 
-    /// 学習を開始する superbatch 番号 (1-indexed, inclusive)。未指定時:
-    /// `--resume` あり → checkpoint の superbatch +1、なし → 1。`1 <= N <= --superbatches`
-    /// の範囲外ならエラー (resume で過去 sb をやり直す目的で明示指定も可)。
+    /// Superbatch number to start training from (1-indexed, inclusive). When
+    /// omitted: with `--resume`, the checkpoint's superbatch + 1; otherwise 1.
+    /// An error if outside `1 <= N <= --superbatches` (may be set explicitly to
+    /// redo past superbatches on resume).
     #[arg(long, global = true)]
     pub(crate) start_superbatch: Option<usize>,
 
-    /// raw checkpoint (`*.ckpt`) を直近 N 個だけ残す (ディスク節約)。未指定なら
-    /// 全保持。raw state は ~1.8GB/個 と大きく長期ランで嵩むため指定を推奨。
-    /// 量子化 `.bin` (~116MB) は本設定に関わらず常に全保持 (推論 artifact)。
+    /// Keep only the most recent N raw checkpoints (`*.ckpt`) to save disk
+    /// space. When omitted, all are kept. Raw state is large (~1.8GB each) and
+    /// piles up over long runs, so setting this is recommended. Quantised `.bin`
+    /// files (~116MB) are always kept regardless of this setting (inference
+    /// artifacts).
     #[arg(long, global = true)]
     pub(crate) keep_checkpoints: Option<usize>,
 
-    /// win-rate-model loss を使う。指定時は `loss_wrm` kernel (prediction / target
-    /// 双方に WRM を適用) を使い、未指定なら `loss_wdl` (plain sigmoid-MSE + `--scale`)。
-    /// net_output のスケールが `out ≈ cp/--wrm-nnue2score` になり、量子化
-    /// (`QA=127/QB=64/FV_SCALE=28`) が前提とするスケールと整合する。
+    /// Use the win-rate-model loss. When set, uses the `loss_wrm` kernel
+    /// (applies WRM to both prediction and target); otherwise uses `loss_wdl`
+    /// (plain sigmoid-MSE + `--scale`). The net_output scale becomes
+    /// `out ≈ cp / --wrm-nnue2score`, matching the scale that quantisation
+    /// (`QA=127/QB=64/FV_SCALE=28`) assumes.
     #[arg(long, global = true)]
     pub(crate) win_rate_model: bool,
-    /// WRM prediction 側の in-scaling (既定 340)。target 側の scaling
-    /// (`--wrm-target-scaling`) とは独立。`--win-rate-model` 指定時のみ使う。
+    /// In-scaling for the WRM prediction side (default 340). Independent of the
+    /// target-side scaling (`--wrm-target-scaling`). Used only when
+    /// `--win-rate-model` is set.
     #[arg(long, default_value_t = 340.0, global = true)]
     pub(crate) wrm_in_scaling: f32,
-    /// WRM の nnue2score (`scorenet = net_output * --wrm-nnue2score`、既定 600)。
-    /// `--win-rate-model` 指定時のみ使う。
+    /// WRM nnue2score (`scorenet = net_output * --wrm-nnue2score`, default 600).
+    /// Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 600.0, global = true)]
     pub(crate) wrm_nnue2score: f32,
-    /// WRM target sigmoid の中心オフセット (`target` が 0.5 になる score、既定 270)。
-    /// `--win-rate-model` 指定時のみ使う。
+    /// Center offset of the WRM target sigmoid (the score at which `target` is
+    /// 0.5, default 270). Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 270.0, global = true)]
     pub(crate) wrm_target_offset: f32,
-    /// WRM target sigmoid の入力スケール (steepness の逆数、既定 380)。既定 270/380 は
-    /// chess の評価値分布向けの値なので、score 分布が異なれば再調整する。
-    /// `--win-rate-model` 指定時のみ使う。
+    /// Input scale of the WRM target sigmoid (inverse of steepness, default
+    /// 380). The defaults 270/380 are tuned for the chess score distribution;
+    /// retune them if your score distribution differs. Used only when
+    /// `--win-rate-model` is set.
     #[arg(long, default_value_t = 380.0, global = true)]
     pub(crate) wrm_target_scaling: f32,
-    /// optimizer 名 ("ranger" のみ実装)。
+    /// Optimizer name (only "ranger" is implemented).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
-    /// Ranger optimizer の weight decay 係数 (AdamW 風の decoupled weight decay)。
-    /// 既定 0.0 で decay 無し。非 0 で全 weight group の weight を毎 step わずかに
-    /// 0 方向へ減衰させる。
+    /// Weight decay coefficient for the Ranger optimizer (AdamW-style decoupled
+    /// weight decay). The default 0.0 means no decay. A non-zero value slightly
+    /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) weight_decay: f32,
-    /// dataloader prefetch worker 数。各 worker が PSV パース + HalfKA_hm sparse 抽出 +
-    /// progress8kpabs bucket 計算を `decode()` 1 回で済ませて先読み供給する。`1` で
-    /// 決定論的逐次 read、`>= 2` で並列パース (1 epoch 内の position 順序は非決定的;
-    /// training では問題ない)。
+    /// Number of dataloader prefetch workers. Each worker does PSV parsing +
+    /// HalfKA_hm sparse extraction + progress8kpabs bucket computation in a
+    /// single `decode()` call and supplies positions ahead of time. `1` gives
+    /// deterministic sequential reads; `>= 2` parses in parallel (position order
+    /// within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
 
-    /// FT weight (`ft_w`) を FP16 mirror で forward する高速モード。default `false`
-    /// では FP32 path と bit-identical。`true` で `sparse_ft_forward` の weight DRAM
-    /// 帯域を半減する代わり、量子化誤差で棋力が変動しうる (簡易・高速学習向けの
-    /// opt-in option、本番品質には SPRT で確認するまで default OFF)。
+    /// Fast mode that runs the FT weight (`ft_w`) forward pass through an FP16
+    /// mirror. With the default `false`, it is bit-identical to the FP32 path.
+    /// `true` halves the weight DRAM bandwidth of `sparse_ft_forward`, but
+    /// quantisation error may shift playing strength (an opt-in option for
+    /// quick, fast training; default OFF until production quality is confirmed
+    /// by SPRT).
     ///
-    /// FT weight は初期化・optimizer の MIN_W/MAX_W clamp (`|w| <= 1.98`)・量子化
-    /// checkpoint いずれの経路でも小さく、FP16 の有限域 (`|x| <= 65504`) に十分
-    /// 収まるため mirror 変換が ±inf へ overflow しない。
+    /// FT weights are small on every path — initialization, the optimizer's
+    /// MIN_W/MAX_W clamp (`|w| <= 1.98`), and the quantised checkpoint — so they
+    /// fit comfortably within the FP16 finite range (`|x| <= 65504`) and the
+    /// mirror conversion does not overflow to ±inf.
     #[arg(long, global = true)]
     pub(crate) ft_fp16: bool,
 
-    /// 特徴変換器 (FT) の optimizer state を FP16 で保持する高速モード。default
-    /// `false` では FP32 path と bit-identical。
+    /// Fast mode that keeps the feature transformer (FT) optimizer state in
+    /// FP16. With the default `false`, it is bit-identical to the FP32 path.
     ///
-    /// FT は本ネットで最も要素数の多い層で、その optimizer 更新は state の read/write
-    /// がメモリ帯域律速。state を半精度化すると optimizer step のメモリ転送量が減って
-    /// 学習スループットが上がる。state は値が極めて小さいため、固定係数を掛けて FP16
-    /// の有効域に載せてから格納する。
+    /// The FT is the largest layer in this network, and its optimizer update is
+    /// memory-bandwidth bound on the state read/write. Halving the precision of
+    /// the state reduces the memory traffic of the optimizer step and raises
+    /// training throughput. The state values are extremely small, so they are
+    /// multiplied by a fixed factor to bring them into the FP16 usable range
+    /// before being stored.
     ///
-    /// `--ft-fp16` / `--ft-fp16-out` とは独立した flag。量子化誤差で棋力が変動し
-    /// うるため default OFF、本番品質は SPRT で確認するまで保証しない (動作確認や
-    /// 簡易・高速な学習に使う opt-in option)。
+    /// An independent flag from `--ft-fp16` / `--ft-fp16-out`. Quantisation
+    /// error may shift playing strength, so it is default OFF and production
+    /// quality is not guaranteed until confirmed by SPRT (an opt-in option for
+    /// sanity checks and quick, fast training).
     #[arg(long, global = true)]
     pub(crate) fp16_opt_state: bool,
 
-    /// risky 速度 flag を 4 つまとめて opt-in する shortcut。`--ft-fp16` /
-    /// `--fp16-opt-state` / (subcommand 側) `--ft-fp16-out` / `--tf32` を一括 ON
-    /// 相当にする (個別 flag と OR 結合、両 subcommand 対応)。
+    /// Shortcut to opt into all four risky speed flags at once. Effectively
+    /// turns on `--ft-fp16` / `--fp16-opt-state` / (on the subcommand)
+    /// `--ft-fp16-out` / `--tf32` together (OR-combined with the individual
+    /// flags; works with both subcommands).
     ///
-    /// default OFF (全 flag OFF で純 FP32 path、bit-identical)。指定時の実効値は
-    /// 起動時 log に展開出力 (`[train] --all-optim → ft_fp16=true ft_fp16_out=true
-    /// fp16_opt_state=true tf32=true`) して experiment.json の reproducibility を
-    /// 保つ。量子化 / TF32 誤差で棋力が変動しうるため default OFF。
+    /// Default OFF (all flags OFF gives a pure FP32, bit-identical path). When
+    /// set, the effective values are expanded in the startup log
+    /// (`[train] --all-optim → ft_fp16=true ft_fp16_out=true fp16_opt_state=true
+    /// tf32=true`) to keep experiment.json reproducible. Default OFF because
+    /// quantisation / TF32 error may shift playing strength.
     ///
-    /// fine-grained 制御 (一部だけ ON) は本 flag を使わず個別 4 flag を列挙する。
+    /// For fine-grained control (turning on only some), do not use this flag;
+    /// list the four individual flags instead.
     #[arg(long, global = true)]
     pub(crate) all_optim: bool,
 
-    /// 学習する NNUE アーキを選ぶサブコマンド (`layerstack` / `simple`)。
+    /// Subcommand selecting the NNUE architecture to train (`layerstack` / `simple`).
     #[command(subcommand)]
     pub(crate) arch: ArchCommand,
 }
@@ -223,11 +247,10 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress8kpabs 9-bucket LayerStack アーキ (FT → L1 → L2 32、FT 次元は --ft-out、
-    /// L1 次元は --l1)。
+    /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2 32; FT dimension set by --ft-out, L1 dimension by --l1).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
-    /// bullet-shogi 由来の Simple 4 層アーキ。
+    /// Simple 4-layer architecture, ported from bullet-shogi.
     Simple(SimpleArgs),
 }
 
@@ -244,51 +267,59 @@ impl ArchCommand {
 /// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
-    /// progress8kpabs 係数ファイル (`progress.bin`、f64 LE × 125388 = 玉 81 マス
-    /// × KP-abs 駒入力 1548)。未指定なら全 position が bucket 4
-    /// (zero weights → `sigmoid(0) = 0.5`)。
+    /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
+    /// king squares x 1548 KP-abs piece inputs). When omitted, every position
+    /// falls in bucket 4 (zero weights → `sigmoid(0) = 0.5`).
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// bucket mode ("progress8kpabs" のみ実装)。
+    /// Bucket mode (only "progress8kpabs" is implemented).
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
 
-    /// FT (feature transformer) の 1 perspective あたり出力次元。正の 128 の倍数を
-    /// 指定する。既定値では従来構成と bit-identical で、既存 checkpoint と resume
-    /// 互換を保つ。
+    /// Output dimension of the FT (feature transformer) per perspective. Must be
+    /// a positive multiple of 128. The default value keeps the network
+    /// bit-identical to the standard layout and resume-compatible with existing
+    /// checkpoints.
     #[arg(long, default_value_t = DEFAULT_FT_OUT)]
     pub(crate) ft_out: usize,
 
-    /// L1 (per-bucket dense) 層の出力次元。`>= 2` を指定する。既定値では従来構成と
-    /// bit-identical で既存 checkpoint と resume 互換を保ち、最速の専用 matmul kernel
-    /// が走る。既定外の値では汎用 matmul kernel に切り替わる (数値は等価、速度は落ちる)。
+    /// Output dimension of the L1 (per-bucket dense) layer. Specify `>= 2`. The
+    /// default value keeps the network bit-identical to the standard layout and
+    /// resume-compatible with existing checkpoints, and runs the fastest
+    /// dedicated matmul kernel. A non-default value switches to a generic matmul
+    /// kernel (numerically equivalent, but slower).
     #[arg(long, default_value_t = DEFAULT_L1_OUT)]
     pub(crate) l1: usize,
 
-    /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
-    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
-    /// 入力 FP32 を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
-    /// (仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false` では
-    /// `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
+    /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
+    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the
+    /// FP32 Sgemm inputs to 10-bit-mantissa TF32 and running TC mma → FP32
+    /// accumulate (~3 significant decimal digits of mantissa; exponent range
+    /// same as FP32). With the default `false`, it runs `CUBLAS_DEFAULT_MATH` (a
+    /// pure FP32 path, no Tensor Cores).
     ///
-    /// 仮数 13 bit 切り捨てで `fwd_L1f` / `bwd_L1f` Sgemm の数値に影響するため、
-    /// 品質 conservative に default OFF。
+    /// Dropping 13 mantissa bits affects the numerics of the `fwd_L1f` /
+    /// `bwd_L1f` Sgemm, so it is conservatively default OFF for quality.
     #[arg(long)]
     pub(crate) tf32: bool,
 
-    /// FT activation (`ft_*_out` の forward 出力と `dft_*_out` の backward 勾配) も
-    /// FP16 で保持する。`--ft-fp16` を要求する (weight FP16 path の上に積む拡張)。
+    /// Also keep the FT activation (the `ft_*_out` forward output and the
+    /// `dft_*_out` backward gradient) in FP16. Requires `--ft-fp16` (an
+    /// extension stacked on top of the weight FP16 path).
     ///
-    /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
-    /// inverse-index gather (step 中で最も DRAM read が多い `phD`) の帯域が半減する。
-    /// dft は batch 正規化で `1/batch` に比例する微小値のため、FP16 化時は loss scaling
-    /// (batch に比例する係数) で normal range に持ち上げてから格納する。
+    /// `ft_*_out` is the output of `sparse_ft_forward`; making it FP16 halves
+    /// the bandwidth of the subsequent read + inverse-index gather (`phD`, the
+    /// heaviest DRAM read in a step). dft is a tiny value proportional to
+    /// `1/batch` from batch normalization, so when made FP16 it is lifted into
+    /// the normal range by loss scaling (a factor proportional to batch) before
+    /// being stored.
     ///
-    /// weight FP16 (`--ft-fp16`) とは別 flag に分けてあり、SPRT で
-    /// FP32 → `--ft-fp16` → `--ft-fp16 --ft-fp16-out` の 2 段で棋力影響を切り分け
-    /// られる。量子化誤差で棋力が変動しうるため default OFF、本番品質は SPRT 確認まで
-    /// 保証しない。
+    /// Split into a separate flag from weight FP16 (`--ft-fp16`) so that SPRT
+    /// can isolate the strength impact in two steps:
+    /// FP32 → `--ft-fp16` → `--ft-fp16 --ft-fp16-out`. Quantisation error may
+    /// shift playing strength, so it is default OFF and production quality is
+    /// not guaranteed until confirmed by SPRT.
     #[arg(long)]
     pub(crate) ft_fp16_out: bool,
 }
@@ -296,49 +327,57 @@ pub(crate) struct LayerstackArgs {
 /// Simple 4 層アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct SimpleArgs {
-    /// 層次元 preset (`<l1>x2-<l2>-<l3>`)。l1 は accumulator (FT 出力) 次元、
-    /// l2 / l3 は隠れ層次元。`--l1` / `--l2` / `--l3` で個別に上書きできる。
+    /// Layer-dimension preset (`<l1>x2-<l2>-<l3>`). l1 is the accumulator (FT
+    /// output) dimension; l2 / l3 are the hidden-layer dimensions. Each can be
+    /// overridden individually with `--l1` / `--l2` / `--l3`.
     #[arg(long, default_value = "256x2-32-32")]
     pub(crate) arch: String,
 
-    /// accumulator (FT 出力) 次元。未指定なら `--arch` preset の値。
+    /// Accumulator (FT output) dimension. Defaults to the `--arch` preset value.
     #[arg(long)]
     pub(crate) l1: Option<usize>,
 
-    /// 隠れ層 1 の次元。未指定なら `--arch` preset の値。
+    /// Dimension of hidden layer 1. Defaults to the `--arch` preset value.
     #[arg(long)]
     pub(crate) l2: Option<usize>,
 
-    /// 隠れ層 2 の次元。未指定なら `--arch` preset の値。
+    /// Dimension of hidden layer 2. Defaults to the `--arch` preset value.
     #[arg(long)]
     pub(crate) l3: Option<usize>,
 
-    /// FT post 活性化関数 ("crelu" / "screlu" / "pairwise")。"pairwise" は前半×後半の
-    /// 対応 index の積を取り L1 入力次元を半減する (L1 / L2 dense は CReLU 活性化)。
+    /// FT post-activation function ("crelu" / "screlu" / "pairwise").
+    /// "pairwise" multiplies the corresponding indices of the first and second
+    /// halves, halving the L1 input dimension (the L1 / L2 dense layers use
+    /// CReLU activation).
     #[arg(long, default_value = "crelu")]
     pub(crate) activation: String,
 
-    /// FT activation (`ft_*_out` の forward 出力と `dft_*_out` の backward 勾配) も
-    /// FP16 で保持する。global `--ft-fp16` を要求する (crelu / screlu / pairwise 対応)。
+    /// Also keep the FT activation (the `ft_*_out` forward output and the
+    /// `dft_*_out` backward gradient) in FP16. Requires the global `--ft-fp16`
+    /// (supports crelu / screlu / pairwise).
     ///
-    /// `ft_*_out` は `sparse_ft_forward` の出力で、これを FP16 化すると後続 read +
-    /// `sparse_ft_backward` の read 帯域が半減する。dft は batch 正規化で `1/batch`
-    /// に比例する微小値のため、FP16 化時は loss scaling (batch 比例) で normal range
-    /// に持ち上げてから格納する。
+    /// `ft_*_out` is the output of `sparse_ft_forward`; making it FP16 halves
+    /// the bandwidth of the subsequent read + the `sparse_ft_backward` read. dft
+    /// is a tiny value proportional to `1/batch` from batch normalization, so
+    /// when made FP16 it is lifted into the normal range by loss scaling
+    /// (proportional to batch) before being stored.
     ///
-    /// 量子化誤差で棋力が変動しうるため default OFF、本番品質は SPRT で確認するまで
-    /// 保証しない opt-in option。
+    /// An opt-in option: quantisation error may shift playing strength, so it is
+    /// default OFF and production quality is not guaranteed until confirmed by
+    /// SPRT.
     #[arg(long)]
     pub(crate) ft_fp16_out: bool,
 
-    /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
-    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、L1/L2/L3 dense
-    /// Sgemm の FP32 入力を 10-bit mantissa の TF32 に丸めて TC mma → FP32 accum で走る
-    /// (仮数精度 ~3 桁、指数範囲は FP32 同等)。default `false` では
-    /// `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) で走る。
+    /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
+    /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the
+    /// FP32 inputs of the L1/L2/L3 dense Sgemm to 10-bit-mantissa TF32 and
+    /// running TC mma → FP32 accumulate (~3 significant decimal digits of
+    /// mantissa; exponent range same as FP32). With the default `false`, it runs
+    /// `CUBLAS_DEFAULT_MATH` (a pure FP32 path, no Tensor Cores).
     ///
-    /// 仮数 13 bit 切り捨てで dense Sgemm の数値に影響するため、品質 conservative に
-    /// default OFF。LayerStack `--tf32` と同方針 (棋力 risk opt-in)。
+    /// Dropping 13 mantissa bits affects the numerics of the dense Sgemm, so it
+    /// is conservatively default OFF for quality. Same policy as LayerStack
+    /// `--tf32` (an opt-in flag with a playing-strength risk).
     #[arg(long)]
     pub(crate) tf32: bool,
 }

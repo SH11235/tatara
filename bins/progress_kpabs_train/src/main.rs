@@ -353,7 +353,7 @@ fn load_kernel_module_with_fallback(
         .ok_or_else(|| -> Box<dyn std::error::Error> {
             format!(
                 "kernel artifact `{name}.{{cubin,ptx,ll}}` not found in {} or {}.\n\
-                 先に cargo-oxide build を実行してください:\n  \
+                 Run cargo-oxide build first:\n  \
                  cd {} && CUDA_OXIDE_TARGET=sm_75 cargo-oxide build",
                 manifest_dir.display(),
                 workspace_root.display(),
@@ -513,10 +513,10 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
         .map_err(|e| {
             format!(
                 "failed to spawn {bin}: {e}. \
-                 .ll→.ptx 変換は LLVM 21+ の llvm-link / opt / llc を使う \
-                 (libNVVM が opaque pointer IR を parse できないため llc 経路)。\
-                 -22 / -21 を自動探索するが、見つからなければ \
-                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で明示指定する。"
+                 .ll→.ptx conversion uses the LLVM 21+ llvm-link / opt / llc tools \
+                 (the llc path, because libNVVM cannot parse opaque-pointer IR). \
+                 The -22 / -21 binaries are auto-discovered; if none are found, \
+                 set them explicitly via the LLVM_LINK_BIN / OPT_BIN / LLC_BIN env vars."
             )
         })?;
     if !status.success() {
@@ -554,8 +554,8 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
     Err(format!(
-        "libdevice.10.bc not found. CUDA_OXIDE_LIBDEVICE か CUDA_HOME を設定するか、\
-         CUDA Toolkit を入れてください。Tried:\n  {}",
+        "libdevice.10.bc not found. Set CUDA_OXIDE_LIBDEVICE or CUDA_HOME, \
+         or install the CUDA Toolkit. Tried:\n  {}",
         tried.join("\n  ")
     )
     .into())

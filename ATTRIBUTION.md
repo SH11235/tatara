@@ -1,31 +1,33 @@
 # Attribution
 
-このリポジトリは以下のオープンソースプロジェクトから派生・参照しています。
-各プロジェクトの著作権表示とライセンスは原本に従い保持されます。
+This repository derives from and references the open-source projects below.
+Each project's copyright notices and license are retained as in the original.
 
 ## bullet-shogi / bullet (MIT)
 
-- bullet-shogi: <https://github.com/SH11235/bullet-shogi> (jw1912/bullet の将棋向け fork)
+- bullet-shogi: <https://github.com/SH11235/bullet-shogi> (a shogi-oriented fork of jw1912/bullet)
 - bullet (upstream): <https://github.com/jw1912/bullet>
 - License: MIT
 
-NNUE 学習器のアルゴリズムは bullet-shogi / bullet から移植しています。
+The NNUE trainer algorithm is ported from bullet-shogi / bullet.
 
 ## cuda-oxide (Apache-2.0)
 
 - Source: <https://github.com/NVlabs/cuda-oxide>
 - License: Apache-2.0
-- 取り込み方: `Cargo.toml` の git dep + commit rev pin (vendor せず)。GPU
-  kernel を build-time に PTX 化する rustc backend として `crates/gpu-runtime`
-  と GPU 依存 bin が `cuda-core` / `cuda-host` / `cuda-device` を参照します。
+- How it is used: a git dependency in `Cargo.toml` pinned to a commit rev (not
+  vendored). As the rustc backend that compiles GPU kernels to PTX at build
+  time, `crates/gpu-runtime` and the GPU-dependent binaries reference
+  `cuda-core` / `cuda-host` / `cuda-device`.
 
 ## Pliron (Apache-2.0)
 
 - Source: <https://github.com/vaivaswatha/pliron>
 - License: Apache-2.0
-- 取り込み方: cuda-oxide が依存する transitive crate。
+- How it is used: a transitive crate that cuda-oxide depends on.
 
-## ライセンス互換性
+## License compatibility
 
-本リポジトリ自体は MIT。MIT は Apache-2.0 由来コードを含むコンパイル
-バイナリ配布と互換です。ソース配布時は各依存の `LICENSE` を保持してください。
+This repository itself is MIT. MIT is compatible with distributing compiled
+binaries that include Apache-2.0-derived code. When distributing source, retain
+the `LICENSE` file of each dependency.

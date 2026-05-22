@@ -59,8 +59,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // reject しない)。
     if ft_fp16_out_missing_ft_fp16(layerstack.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
         return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
-                    path の拡張)"
+            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
+                    FP16 path)"
                 .into(),
         );
     }
@@ -711,8 +711,8 @@ pub(crate) fn run_simple_training(
     // `--all-optim --ft-fp16-out` の冗長指定を false-positive reject しない)。
     if ft_fp16_out_missing_ft_fp16(simple_args.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
         return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 は weight FP16 \
-             path の拡張)"
+            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
+             FP16 path)"
                 .into(),
         );
     }

@@ -181,7 +181,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         if fs_name != want_name {
             return Err(invalid_data(format!(
                 "raw checkpoint feature set mismatch: checkpoint is '{fs_name}', \
-                 requested '{want_name}' (feature set を跨いだ resume は不可)"
+                 requested '{want_name}' (cannot resume across feature sets)"
             )));
         }
         if ckpt_ft_in != want.ft_in() as u64 {
@@ -205,7 +205,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {
         return Err(invalid_data(format!(
             "raw checkpoint version 1 is always 'halfka-hm-merged', \
-             requested '{want_name}' (feature set を跨いだ resume は不可)"
+             requested '{want_name}' (cannot resume across feature sets)"
         )));
     }
 
@@ -255,7 +255,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         if ckpt_arch != expected.arch_kind {
             return Err(invalid_data(format!(
                 "raw checkpoint arch kind mismatch: checkpoint is '{}', requested '{}' \
-                 (アーキを跨いだ resume は不可)",
+                 (cannot resume across architectures)",
                 ckpt_arch.canonical_name(),
                 expected.arch_kind.canonical_name()
             )));
@@ -281,7 +281,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     } else if expected.arch_kind != ArchKind::LayerStack {
         return Err(invalid_data(format!(
             "raw checkpoint version {version} predates the arch-kind header and is \
-             always 'layerstack', requested '{}' (アーキを跨いだ resume は不可)",
+             always 'layerstack', requested '{}' (cannot resume across architectures)",
             expected.arch_kind.canonical_name()
         )));
     }

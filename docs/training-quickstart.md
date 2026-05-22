@@ -1,27 +1,33 @@
-# 学習 Quickstart
+**English** | [日本語](training-quickstart.ja.md)
 
-`nnue-train` で将棋 NNUE を 1 から学習するための最短手順。GPU は Ampere+
-(sm_80+) 公式、Turing は `CUDA_OXIDE_TARGET=sm_75`。toolchain と CUDA / LLVM の
-準備は [docs/setup.md](setup.md) を参照。
+# Training quickstart
 
-学習する NNUE はアーキテクチャ(`simple` / `layerstack`)と入力 feature set を
-選んで決める(選択肢は [README](../README.md) の「学習できる NNUE」を参照)。
-本ページは 2 つの構成を例に手順を示す:
+The shortest path to training a shogi NNUE from scratch with `nnue-train`. GPUs:
+Ampere+ (sm_80+) is official, Turing uses `CUDA_OXIDE_TARGET=sm_75`. For setting
+up the toolchain and CUDA / LLVM, see [docs/setup.md](setup.md).
 
-- **例 1: HalfKP NNUE**(`simple` アーキ)— 最小構成。bucket を使わず前準備が少ない
-- **例 2: LayerStack NNUE** — 局面進行度の 9 bucket を使う構成
+A trained NNUE is defined by choosing an architecture (`simple` / `layerstack`)
+and an input feature set (for the options, see "What you can train" in the
+[README](../README.md)). This page shows the steps using two configurations as
+examples:
 
-## 必要な入力
+- **Example 1: HalfKP NNUE** (`simple` architecture) — the minimal
+  configuration. No buckets, so little preparation
+- **Example 2: LayerStack NNUE** — a configuration that uses the 9 game-progress
+  buckets
 
-| ファイル | 形式 | 用途 | サイズ目安 |
+## Required inputs
+
+| File | Format | Purpose | Approx. size |
 |---|---|---|---:|
-| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
-| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。LayerStack の 9 bucket 振り分け用 (simple では不要) | 1.0 MB |
-| (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
+| Training data PSV | `PackedSfenValue` × N (fixed 40 bytes / position) | Passed via `--data` | Hundreds of GB |
+| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff`. For LayerStack's 9-bucket assignment (not needed for simple) | 1.0 MB |
+| (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
 
-## 例 1: HalfKP NNUE を学習 (simple アーキ)
+## Example 1: Training a HalfKP NNUE (simple architecture)
 
-`simple` アーキは bucket を持たないので `progress.bin` が要らない。最小構成:
+The `simple` architecture has no buckets, so it does not need `progress.bin`.
+The minimal configuration:
 
 ```bash
 target/release/nnue-train \
@@ -33,27 +39,33 @@ target/release/nnue-train \
   simple
 ```
 
-`simple` は既定で `--arch 256x2-32-32` / `--activation crelu`。`--superbatches`
-の決め方と、追加で指定できる option は下記「主な option」を参照。
+`simple` defaults to `--arch 256x2-32-32` / `--activation crelu`. For how to
+choose `--superbatches` and the additional options you can pass, see "Key
+options" below.
 
-## 例 2: LayerStack NNUE を学習
+## Example 2: Training a LayerStack NNUE
 
-`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数 `progress.bin` を用意する。
+The `layerstack` architecture uses the 9 game-progress buckets, so prepare the
+bucket coefficients `progress.bin` first.
 
-### progress.bin を生成
+### Generating progress.bin
 
-`progress-kpabs-train` で進行度係数を学習する。進行度を学習して出力 bucket に
-割り当てる発想は [nodchip 氏の記事](https://nodchip.hatenablog.com/entry/2026/02/04/000000) に基づく。
+Train the progress coefficients with `progress-kpabs-train`. The idea of
+learning game progress and assigning it to output buckets is based on
+[a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000).
 
-> **データはシャッフルしないこと。** `progress-kpabs-train` の `--data` には
-> **連続した対局**の PSV(局面が対局順に並び、対局が次々と続くもの)を渡す。
-> 進行度係数は「1 局の中で局面がどこまで進んだか」を学習するもので、
-> `progress-kpabs-train` はデータを 1 局単位で読み(`game_ply` で対局境界を検出)、
-> 各局面にその局内での相対位置をラベル付けする。シャッフル済み PSV だと対局境界が
-> 壊れてラベルが無意味になり、正しい係数が学習できない。本体学習の `nnue-train`
-> 例ではシャッフル済み PSV を使っており、要求が逆なので取り違えないこと。
+> **Do not shuffle the data.** Pass `progress-kpabs-train`'s `--data` a PSV of
+> **consecutive games** (positions in game order, with games following one
+> after another). The progress coefficients learn "how far a position has
+> advanced within a single game", and `progress-kpabs-train` reads the data one
+> game at a time (detecting game boundaries by `game_ply`) and labels each
+> position with its relative position within that game. With a shuffled PSV the
+> game boundaries break, the labels become meaningless, and correct coefficients
+> cannot be learned. The `nnue-train` examples for the main training use a
+> shuffled PSV — the requirement is the opposite, so do not mix them up.
 
-`--epochs` で総 epoch 数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
+Specify the total number of epochs with `--epochs`; a `<run-name>.e<N>.bin` is
+written per epoch.
 
 ```bash
 target/release/progress-kpabs-train \
@@ -62,11 +74,11 @@ target/release/progress-kpabs-train \
   --games-per-step 1024 --epochs 5
 ```
 
-どの epoch の出力 (`<run-name>.e<N>.bin`) を使うかは試行錯誤になる
-(progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立なため
-何 epoch 必要かはデータ依存)。
+Which epoch's output (`<run-name>.e<N>.bin`) to use takes some trial and error
+(progress.bin is a coefficient that decides bucket assignment and is independent
+of NNUE training convergence, so how many epochs you need is data-dependent).
 
-### 学習
+### Training
 
 ```bash
 target/release/nnue-train \
@@ -77,38 +89,45 @@ target/release/nnue-train \
   layerstack --progress-coeff <path/to/progress.bin>
 ```
 
-`layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
+`layerstack` defaults to `--feature-set halfka-hm-merged` / 9 buckets. The FT
+output dimension can be changed with `--ft-out` (a multiple of 128, default
+1536).
 
-## 主な option
+## Key options
 
-`nnue-train` の CLI 既定値は動作確認 (smoke) 向けに小さい。本番学習で主に
-変更するのは:
+`nnue-train`'s CLI defaults are small, for smoke testing. The ones you mainly
+change for real training are:
 
-| option | CLI 既定 | 説明 |
+| Option | CLI default | Description |
 |---|---:|---|
-| `--superbatches` | 10 | 学習する superbatch 数。既定 10 は smoke 用、本番はもっと大きくする (下記「学習量の目安」) |
-| `--batch-size` | 16384 | 勾配更新 1 回あたりの局面数。GPU throughput と学習特性 (勾配のばらつき・更新回数) の両方に効く学習ハイパーパラメータ |
-| `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.md) 参照) |
-| `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state、サイズが大きい) を直近 N 個に保つ。最初は小さめ (例 4)、学習が安定したら 20〜100 に増やしてよい。量子化 `.bin` は常に全保持 |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。量子化推論向けの net を学習するなら追加する (未指定なら plain sigmoid-MSE) |
-| `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
+| `--superbatches` | 10 | Number of superbatches to train. The default 10 is for smoke testing; use a much larger value for real training (see "How much to train" below) |
+| `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
+| `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
+| `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state, large in size). Start small (e.g. 4); once training is stable you can raise it to 20–100. Quantised `.bin` files are always kept |
+| `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE) |
+| `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20) /
-`--threads` (16) などは既定のままでよく、変えたいときだけ渡す。
+`--threads` (16) and the like can be left at their defaults; pass them only when
+you want to change them.
 
-**学習量の目安**: 1 superbatch = `batches-per-superbatch × batch-size` 局面。
-既定の `batch-size` では 1 superbatch ≈ 1 億局面で、これは上流のチェス向け NNUE
-トレーナー [nnue-pytorch](https://github.com/official-stockfish/nnue-pytorch) の
-1 epoch (既定 `--epoch-size` = 1 億局面) とほぼ同じ規模。nnue-pytorch の既定は
-800 epoch。`--superbatches` は教師データ量と過学習の兼ね合いを見て決める。
+**How much to train**: 1 superbatch = `batches-per-superbatch × batch-size`
+positions. With the default `batch-size`, 1 superbatch ≈ 100 million positions,
+roughly the same scale as one epoch of the upstream chess NNUE trainer
+[nnue-pytorch](https://github.com/official-stockfish/nnue-pytorch) (default
+`--epoch-size` = 100 million positions). nnue-pytorch's default is 800 epochs.
+Decide `--superbatches` by balancing the amount of training data against
+overfitting.
 
-所要時間は GPU と構成 (FP16 モード有無) で大きく変わる。
+The time it takes varies greatly with the GPU and the configuration (whether
+FP16 modes are on).
 
-## 学習中断・再開
+## Interrupting and resuming training
 
-raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在の
-superbatch 番号** を全部保存する。電源断や GPU エラーで止まっても完全に再開
-できる。学習時と同じ option + アーキ サブコマンドに `--resume` を足す:
+A raw `.ckpt` saves everything: **weights + Ranger optimizer state
+(m / v / slow / step) + the current superbatch number**. Even if it stops on a
+power loss or a GPU error, you can fully resume. Add `--resume` to the same
+options + architecture subcommand used for training:
 
 ```bash
 target/release/nnue-train \
@@ -119,38 +138,39 @@ target/release/nnue-train \
   simple
 ```
 
-`--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から再開、
-`--start-superbatch N` 明示で過去 sb をやり直すことも可。
+With `--resume` (and `--start-superbatch` omitted), it resumes from the
+checkpoint's sb + 1; specifying `--start-superbatch N` explicitly lets you redo
+past superbatches.
 
-> **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
-> weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
-> training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
-> (真の resume)。両者は排他指定。
+> **Difference between `--resume` and `--init-from`**: `--init-from` injects
+> only the weights from a quantised `.bin` and **resets** the optimizer state
+> (fine-tuning / continued training); `--resume` restores both weights and
+> optimizer from a raw `.ckpt` (a true resume). The two are mutually exclusive.
 
-## 出力 artifact の見方
+## Reading the output artifacts
 
-学習後 `checkpoints/<run-name>/` に出るもの:
+After training, what appears under `checkpoints/<run-name>/`:
 
-| ファイル | 形式 | 用途 |
+| File | Format | Purpose |
 |---|---|---|
-| `<run-name>-<sb>.bin` | 量子化 NNUE binary | **推論エンジンに投入する artifact** (binary layout は `crates/nnue-format` 参照) |
-| `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
+| `<run-name>-<sb>.bin` | quantised NNUE binary | **The artifact to feed to the inference engine** (for the binary layout, see `crates/nnue-format`) |
+| `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | For `--resume`; not used for inference (pruned by `--keep-checkpoints`) |
 
-`<run-name>-<最終 sb>.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで
-測定する。
+`<run-name>-<final sb>.bin` is the final net. Measure playing strength by
+integrating it into the shogi engine.
 
-## 動作確認 (smoke)
+## Smoke test
 
-データ準備前に GPU 経路だけ確認したい場合は、アーキ サブコマンドを付けて
-`--data` を省略すると `GpuTrainer` の forward / backward path を 1 step だけ
-実行する smoke test が走る:
+If you want to check just the GPU path before preparing data, add the
+architecture subcommand and omit `--data`: a smoke test runs that executes the
+`GpuTrainer` forward / backward path for a single step:
 
 ```bash
 target/release/nnue-train simple
-# → "[smoke] forward + backward OK" の趣旨のログが出れば GPU 経路は健全
+# → if a log to the effect of "[smoke] forward + backward OK" appears, the GPU path is healthy
 ```
 
-または小規模 run (1 sb × 3 batches) で全 pipeline を数秒で回す:
+Or run the whole pipeline in a few seconds with a small run (1 sb × 3 batches):
 
 ```bash
 target/release/nnue-train --data <PSV> \
@@ -160,16 +180,16 @@ target/release/nnue-train --data <PSV> \
   simple
 ```
 
-## トラブルシューティング
+## Troubleshooting
 
-| 症状 | 原因 / 対応 |
+| Symptom | Cause / fix |
 |---|---|
-| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | 初回ビルド時 `cd bins/nnue_train && cargo-oxide build` で `.ll` を生成する必要がある。詳細は [docs/setup.md](setup.md) |
-| `libcublas.so` 系の link / load エラー | CUDA Toolkit が `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH` のいずれにも無い。`CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` で明示する (build.rs / runtime 両方が同じ chain で解決) |
-| `CUDA_ERROR_INVALID_PTX` (driver error 218) | sub-Ampere GPU (sm_75) で `CUDA_OXIDE_TARGET` 未設定。`CUDA_OXIDE_TARGET=sm_75` を export してから再ビルド + 実行 |
-| pos/s が極端に低い (< 500K on RTX 3080 Ti) | `--threads` を CPU コア数の半分程度に設定、dataloader の prefetch が間に合っているか確認。`NNUE_TRAIN_STEP_PROFILE=1` で各 phase (h2d / fwd / bwd / optimizer) の所要 ms を stderr に出して内訳を確認できる |
-| `--batch-size % 16 != 0` で reject | tiled L1 kernel が `b % 16 == 0` を要求 (`debug_assert!` で fail)。16 の倍数を渡す (既定の 16384 は条件を満たす) |
+| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | On the first build you need to generate the `.ll` with `cd bins/nnue_train && cargo-oxide build`. For details, see [docs/setup.md](setup.md) |
+| `libcublas.so` link / load errors | The CUDA Toolkit is in none of `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH`. Specify it explicitly with `CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` (both build.rs and runtime resolve via the same chain) |
+| `CUDA_ERROR_INVALID_PTX` (driver error 218) | On a sub-Ampere GPU (sm_75) with `CUDA_OXIDE_TARGET` unset. Export `CUDA_OXIDE_TARGET=sm_75`, then rebuild and rerun |
+| pos/s extremely low (< 500K on an RTX 3080 Ti) | Set `--threads` to about half your CPU core count and check whether the dataloader's prefetch is keeping up. `NNUE_TRAIN_STEP_PROFILE=1` prints the ms spent in each phase (h2d / fwd / bwd / optimizer) to stderr so you can see the breakdown |
+| rejected with `--batch-size % 16 != 0` | The tiled L1 kernel requires `b % 16 == 0` (fails via `debug_assert!`). Pass a multiple of 16 (the default 16384 satisfies the condition) |
 
-## 関連
+## Related
 
-- [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) セットアップ
+- [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) setup

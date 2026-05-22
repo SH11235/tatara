@@ -365,8 +365,8 @@ impl GpuWorkspace {
     ) -> Result<(), Box<dyn std::error::Error>> {
         if batch > self.len_batch {
             return Err(format!(
-                "batch {batch} exceeds workspace capacity {} (workspace は GpuTrainer::new で\
-                 一度だけ確保する。--batch-size を増やす場合は再起動が要る)",
+                "batch {batch} exceeds workspace capacity {} (the workspace is allocated \
+                 once in GpuTrainer::new; increasing --batch-size requires a restart)",
                 self.len_batch
             )
             .into());

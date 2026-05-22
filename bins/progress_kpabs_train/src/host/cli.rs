@@ -14,54 +14,56 @@ use clap::Parser;
     about = "KP-absolute progress trainer (cuda-oxide port of bullet-shogi shogi_progress_kpabs_train_cuda)"
 )]
 pub struct Args {
-    /// 学習データの PSV ファイル (`.bin`)。複数渡すには `,` 区切り。
-    /// 引数省略時は `run_training` で error を返す (実質必須)。
+    /// Training data PSV file(s) (`.bin`). Separate multiple files with `,`.
+    /// When omitted, `run_training` returns an error (effectively required).
     #[arg(long)]
     pub data: Option<String>,
 
-    /// 学習結果の progress.bin 出力先。
+    /// Output path for the trained progress.bin.
     #[arg(long)]
     pub output: PathBuf,
 
-    /// 既存 progress.bin から weight を warm-start する。
+    /// Warm-start weights from an existing progress.bin.
     #[arg(long)]
     pub init_from: Option<PathBuf>,
 
-    /// 1 Adam step あたりの mini-batch サイズ (games 単位)。
+    /// Mini-batch size per Adam step (in games).
     #[arg(long, default_value_t = 1024)]
     pub games_per_step: usize,
 
-    /// 走査する game 数の上限 (0 = unlimited)。`--val-fraction` 有効時は訓練と
-    /// 検証を合算した game 数に対する上限 (両者は同じ走査列から分割するため)。
+    /// Upper limit on the number of games to scan (0 = unlimited). When
+    /// `--val-fraction` is enabled, this is the limit on the combined training +
+    /// validation game count (both are split from the same scanned sequence).
     #[arg(long, default_value_t = 0)]
     pub max_games: usize,
 
-    /// held-out 検証に回す game の割合 (0.0 = 無効、既定)。例: 0.05 で全 game の
-    /// 約 1/20 を検証専用にし、各 epoch 末に訓練に使わなかった game 上の loss
-    /// (val_loss) を出力する。game 単位で分割するため同一 game の局面が訓練と
-    /// 検証に混ざらない。固定間隔で抜き出すので、データが棋戦・時期で
-    /// グループ化されている場合は事前にシャッフルしておくこと。指定可能範囲は
-    /// 0.0..=0.5。
+    /// Fraction of games to set aside for held-out validation (0.0 = disabled,
+    /// the default). For example, 0.05 reserves about 1/20 of all games for
+    /// validation only and reports the loss on the games not used for training
+    /// (val_loss) at the end of each epoch. The split is per game, so positions
+    /// from the same game never mix between training and validation. Games are
+    /// picked at a fixed interval, so if your data is grouped by tournament or
+    /// time period, shuffle it beforehand. The valid range is 0.0..=0.5.
     #[arg(long, default_value_t = 0.0)]
     pub val_fraction: f32,
 
-    /// epoch 数。
+    /// Number of epochs.
     #[arg(long, default_value_t = 1)]
     pub epochs: usize,
 
-    /// 学習率 (lr_scale 適用前)。
+    /// Learning rate (before lr_scale is applied).
     #[arg(long, default_value_t = 1e-3)]
     pub lr: f32,
 
-    /// lr scaling: `none` で固定、`sqrt` で `lr *= sqrt(games_per_step)`。
+    /// LR scaling: `none` keeps it fixed, `sqrt` applies `lr *= sqrt(games_per_step)`.
     #[arg(long, default_value = "sqrt")]
     pub lr_scale: LrScaleMode,
 
-    /// step ごとの log 出力間隔。0 で sub-step log を suppress (epoch 末のみ)。
+    /// Step interval for log output. 0 suppresses sub-step logs (end of epoch only).
     #[arg(long, default_value_t = 100)]
     pub log_interval_steps: usize,
 
-    /// CUDA device ordinal。
+    /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     pub device: usize,
 }

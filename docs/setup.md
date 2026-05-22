@@ -1,227 +1,237 @@
-# 開発環境セットアップ
+**English** | [日本語](setup.ja.md)
 
-tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
-に据えるため、host (LLVM 21+, できれば LLVM 22) と GPU (sm_80+ 公式) の両方を
-整える必要がある。Ampere (sm_86) を primary に、Turing (sm_75) も
-`CUDA_OXIDE_TARGET=sm_75` 環境変数で動作する (制約は「sub-Ampere GPU」節と
-末尾の GPU マトリクス参照)。
+# Development environment setup
 
-## 対応 OS
+tatara is built around **cuda-oxide** (NVIDIA Labs' Rust → PTX rustc backend),
+so you need to set up both the host (LLVM 21+, ideally LLVM 22) and the GPU
+(sm_80+ officially supported). Ampere (sm_86) is the primary target; Turing
+(sm_75) also works via the `CUDA_OXIDE_TARGET=sm_75` environment variable (for
+the constraints, see the "sub-Ampere GPU" section and the GPU matrix at the
+end).
 
-| OS | 位置づけ | 手順 |
+## Supported OSes
+
+| OS | Status | Steps |
 |---|---|---|
-| Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | WSL2 (Ubuntu) 経由でサポート。native Windows は cuda-oxide が公式に非サポート (CPU-only crate のみ native でビルド可) | 先に「Windows (WSL2) の準備」、以降は Linux と共通 |
-| macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
+| Linux | First-class support (verified on Ubuntu 22.04 / 24.04) | Follow the steps in this file directly |
+| Windows | Supported via WSL2 (Ubuntu). Native Windows is officially unsupported by cuda-oxide (only CPU-only crates build natively) | Do "Preparing Windows (WSL2)" first, then follow the Linux steps |
+| macOS | GPU builds unsupported | Work on a remote Linux machine with an NVIDIA GPU (see below) |
 
-cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
-macOS は NVIDIA GPU を積めず CUDA Toolkit も提供されない (Apple Silicon /
-Intel Mac いずれも) ため、macOS 単体では GPU crate (`gpu-runtime` / `bins/*`)
-をビルドできない。macOS から開発する場合は NVIDIA GPU を持つリモート Linux
-マシン (社内サーバや GPU クラウドインスタンス) 上でビルド・学習し、手元の
-macOS は SSH / エディタとして使う。CPU-only crate (`shogi-format` /
-`shogi-features` / `nnue-format` 等) 単体の編集と `cargo test -p <crate>` は
-macOS でも可能だが、`cargo build` を workspace 全体に掛けると cuda-oxide 依存の
-ビルドで失敗する。
+cuda-oxide and this repo's GPU crates require an **NVIDIA GPU + the CUDA
+Toolkit**. macOS cannot host an NVIDIA GPU and the CUDA Toolkit is not available
+for it (neither Apple Silicon nor Intel Macs), so macOS alone cannot build the
+GPU crates (`gpu-runtime` / `bins/*`). To develop from macOS, build and train on
+a remote Linux machine with an NVIDIA GPU (an in-house server or a GPU cloud
+instance) and use your local macOS for SSH / editing. Editing a CPU-only crate
+(`shogi-format` / `shogi-features` / `nnue-format`, etc.) on its own and running
+`cargo test -p <crate>` works on macOS, but running `cargo build` across the
+whole workspace fails on the cuda-oxide-dependent build.
 
-## Windows (WSL2) の準備
+## Preparing Windows (WSL2)
 
-native Windows での cuda-oxide ビルドは **upstream が公式に非サポート**。
-cuda-oxide の installation ドキュメント (末尾「関連」のリンク) は "cuda-oxide
-currently targets Linux only. Windows is not supported." と明記する (2026-05
-時点、Windows 対応の issue / 作業も無い)。加えて cuda-oxide は rustc internal
-ABI に直結する experimental backend で、本リポの `build.rs` も CUDA toolkit
-root を Linux パス (`/usr/local/cuda` / `lib64/libcublas.so`) で解決する。
-したがって GPU crate (`gpu-runtime` / `bins/*`) は Windows では
-**WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
-WSL2 内では本ファイルの Linux 手順がそのまま通る (cuda-oxide が公式にテスト
-しているのも Ubuntu 24.04)。
+Building cuda-oxide on native Windows is **officially unsupported upstream**.
+The cuda-oxide installation documentation (linked under "Related" at the end)
+explicitly states "cuda-oxide currently targets Linux only. Windows is not
+supported." (as of 2026-05; there is no Windows-support issue or work either).
+On top of that, cuda-oxide is an experimental backend tied directly to the rustc
+internal ABI, and this repo's `build.rs` also resolves the CUDA toolkit root
+using Linux paths (`/usr/local/cuda` / `lib64/libcublas.so`). So for the GPU
+crates (`gpu-runtime` / `bins/*`) on Windows, use **WSL2 + Ubuntu**. NVIDIA GPUs
+are visible through CUDA from WSL2, so inside WSL2 the Linux steps in this file
+work as-is (cuda-oxide is also officially tested on Ubuntu 24.04).
 
-なお CPU-only crate (`shogi-format` / `shogi-features` / `gpu-kernels` /
-`nnue-format` / `nnue-train`) は native Windows (MSVC toolchain) でも
-`cargo test` がそのまま通る (2026-05 に Windows 11 + nightly-2026-04-03 で
-242 tests green を確認)。GitHub Actions の CPU check と同じ範囲を手元の
-Windows PowerShell で回せる:
+Note that the CPU-only crates (`shogi-format` / `shogi-features` /
+`gpu-kernels` / `nnue-format` / `nnue-train`) pass `cargo test` even on native
+Windows (the MSVC toolchain) (242 tests verified green on Windows 11 +
+nightly-2026-04-03 in 2026-05). You can run the same scope as the GitHub Actions
+CPU check from your local Windows PowerShell:
 
 ```powershell
 cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer
 ```
 
-1. **Windows ホストに NVIDIA GPU ドライバを入れる。** WSL2 の CUDA は Windows
-   側ドライバを使う仕組みで、WSL2 内に GPU ドライバを入れてはいけない。
-2. **WSL2 と Ubuntu を入れる。** PowerShell (管理者) で:
+1. **Install the NVIDIA GPU driver on the Windows host.** WSL2's CUDA uses the
+   Windows-side driver; do not install a GPU driver inside WSL2.
+2. **Install WSL2 and Ubuntu.** In PowerShell (as administrator):
 
    ```powershell
    wsl --install -d Ubuntu-24.04
    ```
 
-3. **WSL2 内で `nvidia-smi` が GPU を表示することを確認する。** 表示されない
-   場合は Windows 側ドライバと WSL カーネル (`wsl --update`) を最新にする。
-4. **WSL2 内に CUDA Toolkit を入れる。** WSL 用の toolkit パッケージを使い、
-   ドライバ (`cuda-drivers`) は入れない (ドライバは Windows 側)。NVIDIA の
-   "CUDA on WSL" 配布から `cuda-toolkit-12-x` のみを入れる。
-5. これ以降は本ファイルの「システム install」からの手順を WSL2 のシェルで
-   そのまま実行する。
+3. **Confirm `nvidia-smi` shows the GPU inside WSL2.** If it does not, update the
+   Windows-side driver and the WSL kernel (`wsl --update`) to the latest.
+4. **Install the CUDA Toolkit inside WSL2.** Use the WSL toolkit package and do
+   not install the driver (`cuda-drivers`) — the driver is on the Windows side.
+   From NVIDIA's "CUDA on WSL" distribution, install only `cuda-toolkit-12-x`.
+5. From here on, run the steps from "System install" in this file in the WSL2
+   shell as-is.
 
-WSL2 のディスク使用量には注意が要る (末尾「WSL2 ディスク注意」)。
+Watch out for WSL2 disk usage (see "WSL2 disk note" at the end).
 
-## システム要件
+## System requirements
 
-| 項目 | 要件 | 備考 |
+| Item | Requirement | Notes |
 |---|---|---|
-| OS | Linux / WSL2 (Windows) | 「対応 OS」参照 |
-| CUDA Toolkit | 12.x (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
-| LLVM | **21+ (floor)、22 推奨** | apt.llvm.org が jammy / noble の両方に LLVM 20/21/22 を提供。`llc-22` が PATH にあれば cuda-oxide が優先する |
-| Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
-| Rust | nightly-2026-04-03 (cuda-oxide pinned) | `rust-toolchain.toml` で固定 |
-| GPU | **公式: Ampere+ (sm_80+)**。Turing (sm_75) も `CUDA_OXIDE_TARGET=sm_75` で動作 | RTX 30/40/50, A100, H100, B200 等 |
+| OS | Linux / WSL2 (Windows) | See "Supported OSes" |
+| CUDA Toolkit | 12.x (verified with 12.9) | nvcc, libNVVM, nvJitLink, **libcublas** |
+| LLVM | **21+ (floor), 22 recommended** | apt.llvm.org provides LLVM 20/21/22 for both jammy / noble. If `llc-22` is on PATH, cuda-oxide prefers it |
+| Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | Needed by `cuda-bindings`' bindgen (even on LLVM 22, one of clang-21/22 is required) |
+| Rust | nightly-2026-04-03 (cuda-oxide pinned) | Pinned by `rust-toolchain.toml` |
+| GPU | **Official: Ampere+ (sm_80+)**. Turing (sm_75) also works with `CUDA_OXIDE_TARGET=sm_75` | RTX 30/40/50, A100, H100, B200, etc. |
 
-## CUDA toolkit root の解決
+## Resolving the CUDA toolkit root
 
-`bins/nnue_train` は **libcublas** に dynamic link する (L1f weight backward を
-`cublasSgemm_v2` で実行するため)。build.rs / runtime ともに以下の優先順で CUDA
-toolkit root を探す:
+`bins/nnue_train` dynamically links against **libcublas** (it runs the L1f
+weight backward with `cublasSgemm_v2`). Both build.rs and the runtime look for
+the CUDA toolkit root in the following order of precedence:
 
-1. `CUDA_TOOLKIT_PATH` env (build.rs 専用 legacy alias、最優先)
-2. `CUDA_HOME` env (build / runtime 共通)
-3. `CUDA_PATH` env (同上)
-4. デフォルト path: `/usr/local/cuda` → `/usr/local/cuda-13.2` → `/usr/local/cuda-12.9` → `/opt/cuda`
+1. `CUDA_TOOLKIT_PATH` env (a legacy alias used only by build.rs; highest priority)
+2. `CUDA_HOME` env (shared by build / runtime)
+3. `CUDA_PATH` env (same)
+4. Default paths: `/usr/local/cuda` → `/usr/local/cuda-13.2` → `/usr/local/cuda-12.9` → `/opt/cuda`
 
-`<root>/lib64/libcublas.so` が存在する最初の root を採用。標準パスに CUDA
-Toolkit が入っていれば追加設定不要。非標準パスに置いている場合:
+It uses the first root where `<root>/lib64/libcublas.so` exists. No extra
+configuration is needed if the CUDA Toolkit is installed in a standard path. If
+you keep it in a non-standard path:
 
 ```bash
-export CUDA_HOME=/path/to/cuda-12.9    # build.rs / runtime 両方が拾う
-# または build.rs だけ向ける場合
+export CUDA_HOME=/path/to/cuda-12.9    # picked up by both build.rs and runtime
+# or, to point only build.rs:
 export CUDA_TOOLKIT_PATH=/path/to/cuda-12.9
 ```
 
-build.rs は `libcublas.so` が見つからなければ `cargo:warning` を出して
-`/usr/local/cuda/lib64` を fallback で emit する (build 自体は失敗せず、最終的
-に ld が `-lcublas` を解決できなければそこで止まる)。
+If build.rs cannot find `libcublas.so`, it emits a `cargo:warning` and falls
+back to emitting `/usr/local/cuda/lib64` (the build itself does not fail; it
+stops only if ld ultimately cannot resolve `-lcublas`).
 
-> **LLVM 22 と atomics の syncscope**: cuda-oxide の `atomics` example README
-> は「Atomic operations require llc-22 or newer for correct syncscope」と記載。
-> LLVM 21 でも例題は完走するが、`memory_order` まわりの正確な PTX が必要な本番
-> kernel では `llc-22` への昇格が望ましい。cuda-oxide の `cargo-oxide build`
-> (Rust → `.ll`) は `llc-22` → `llc-21` の順で auto-discover する
-> (`CUDA_OXIDE_LLC=/path` で固定可)。bin 起動時の `.ll`→`.ptx` 変換は別経路で、
-> `LLC_BIN` 等の env を使う (「Smoke test」参照)。
+> **LLVM 22 and atomics syncscope**: cuda-oxide's `atomics` example README
+> states "Atomic operations require llc-22 or newer for correct syncscope".
+> The example completes on LLVM 21 too, but for production kernels that need
+> precise PTX around `memory_order`, upgrading to `llc-22` is preferable.
+> cuda-oxide's `cargo-oxide build` (Rust → `.ll`) auto-discovers in the order
+> `llc-22` → `llc-21` (can be pinned with `CUDA_OXIDE_LLC=/path`). The
+> `.ll`→`.ptx` conversion at binary startup is a separate path that uses env
+> vars such as `LLC_BIN` (see "Smoke test").
 
-## システム install
+## System install
 
-Linux / WSL2 共通。Ubuntu (apt) 前提:
+Common to Linux / WSL2. Assumes Ubuntu (apt):
 
 ```bash
-# 基本ツール
+# Basic tools
 sudo apt-get update
 sudo apt-get install -y wget gnupg lsb-release
 
-# LLVM 21 系一式 (apt.llvm.org)。LLVM 22 を入れるなら `21` を `22` に置換
+# The full LLVM 21 series (apt.llvm.org). To install LLVM 22, replace `21` with `22`
 wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
 chmod +x /tmp/llvm.sh
 sudo /tmp/llvm.sh 21
 sudo apt-get install -y clang-21 libclang-common-21-dev
 
-# clang を vanilla 名で参照可能に
+# Make clang reachable under its vanilla name
 sudo update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-21   100
 sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
 
-# 確認
+# Verify
 which llc-21 clang
 llc-21 --version | grep nvptx
 ```
 
-Rust は rustup を使う。`rust-toolchain.toml` が nightly を pin しているので、
-リポジトリ内で `cargo` を叩けば対応 toolchain (と `rust-src` / `rustc-dev`
-component) が自動で入る。
+For Rust, use rustup. `rust-toolchain.toml` pins a nightly, so running `cargo`
+inside the repository automatically installs the matching toolchain (and the
+`rust-src` / `rustc-dev` components).
 
-## cuda-oxide のセットアップ
+## Setting up cuda-oxide
 
-GPU kernel を PTX 化する cargo subcommand `cargo-oxide` を install する。
-cuda-oxide repo を手動で clone する必要はない — upstream が `cargo install --git`
-を公式サポートしており、`cargo-oxide` は初回実行時に codegen backend を自動で
-取得・ビルドしてキャッシュする。
+Install `cargo-oxide`, the cargo subcommand that compiles GPU kernels to PTX.
+You do not need to manually clone the cuda-oxide repo — upstream officially
+supports `cargo install --git`, and `cargo-oxide` automatically fetches, builds,
+and caches the codegen backend on first run.
 
-本リポジトリ用の wrapper スクリプトを使うのが簡単:
+The easiest way is to use this repository's wrapper script:
 
 ```bash
 bash scripts/setup-cuda-oxide.sh
 ```
 
-スクリプトは以下を行う:
+The script does the following:
 
-- `Cargo.lock` が pin している cuda-oxide の rev を読む (library 側と codegen
-  backend 側を同一 rev に揃えるため — rev ずれは backend ABI 不一致を招く)
-- host 前提 (rustup / cargo / llc / clang / nvcc) の有無をチェックして報告
-  (システムパッケージの install はしない)
-- その rev で `cargo install --git ... cargo-oxide` を実行
-- `cargo-oxide doctor` で環境を診断
+- Reads the cuda-oxide rev pinned by `Cargo.lock` (to keep the library side and
+  the codegen backend side on the same rev — a rev mismatch causes a backend ABI
+  mismatch)
+- Checks for the host prerequisites (rustup / cargo / llc / clang / nvcc) and
+  reports their presence (it does not install system packages)
+- Runs `cargo install --git ... cargo-oxide` at that rev
+- Diagnoses the environment with `cargo-oxide doctor`
 
-スクリプトを使わず手動で入れる場合は、`Cargo.lock` の cuda-oxide rev に
-合わせる:
+To install manually without the script, match the cuda-oxide rev in
+`Cargo.lock`:
 
 ```bash
 rev=$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//')
 cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" --force cargo-oxide
 ```
 
-`~/.cargo/bin` を PATH に通しておくこと。スクリプトは毎回 pin rev で
-`cargo-oxide` を入れ直すので、cuda-oxide の rev を bump したとき (library 側
-`Cargo.toml` を更新したとき) も同じく `bash scripts/setup-cuda-oxide.sh` を
-再実行すればよい。
+Make sure `~/.cargo/bin` is on your PATH. The script reinstalls `cargo-oxide` at
+the pinned rev every time, so when you bump the cuda-oxide rev (when you update
+the library-side `Cargo.toml`), just rerun `bash scripts/setup-cuda-oxide.sh` the
+same way.
 
 ## Smoke test
 
-`cargo-oxide doctor` が全項目 ✓ なら host 側は OK。続いて実際の kernel を
-ビルドする。リポジトリ root から:
+If `cargo-oxide doctor` shows ✓ for every item, the host side is OK. Next, build
+the actual kernels. From the repository root:
 
 ```bash
 bash scripts/build-kernels.sh
 ```
 
-これは GPU の世代を `nvidia-smi` で判定し、kernel を持つ全 bin
-(`nnue_train` / `progress_kpabs_train`) を `cargo-oxide build` でビルドする。
-Ampere+ は既定 (sm_80 PTX、前方互換)、Turing (sm_75) は `CUDA_OXIDE_TARGET` を
-自動設定するので、環境変数を手で打つ必要はない。
+This detects the GPU generation with `nvidia-smi` and builds every binary that
+has kernels (`nnue_train` / `progress_kpabs_train`) with `cargo-oxide build`.
+Ampere+ uses the default (sm_80 PTX, forward-compatible) and Turing (sm_75) has
+`CUDA_OXIDE_TARGET` set automatically, so you do not need to type the
+environment variable by hand.
 
-特定の bin だけビルドしたいときは手動でも可:
+To build only a specific binary, you can do it manually:
 
 ```bash
 cd bins/nnue_train
 cargo-oxide build
 ```
 
-Ampere 以降 (sm_80+) はこれで OK。**Turing (sm_75) のみ**
-`CUDA_OXIDE_TARGET=sm_75 cargo-oxide build` と前置する (下記「sub-Ampere GPU」)。
+For Ampere and later (sm_80+), this is all you need. **Only for Turing
+(sm_75)**, prefix it with `CUDA_OXIDE_TARGET=sm_75 cargo-oxide build` (see
+"sub-Ampere GPU" below).
 
-`cargo-oxide build` は `#[kernel]` を NVPTX IR (`.ll`) に compile する。bin は
-起動時にこの `.ll` を libdevice と link して `.ptx` 化し CudaModule を load
-する。`.ll`→`.ptx` には LLVM 21+ の `llvm-link` / `opt` / `llc` を使い、`-22`
-→ `-21` を自動探索する (`LLVM_LINK_BIN` / `OPT_BIN` / `LLC_BIN` env で固定可)。
-エラーなく学習が始まれば pipeline は通っている。
+`cargo-oxide build` compiles `#[kernel]` to NVPTX IR (`.ll`). At startup the
+binary links this `.ll` with libdevice to produce `.ptx` and loads a CudaModule.
+The `.ll`→`.ptx` step uses LLVM 21+ `llvm-link` / `opt` / `llc`, auto-searching
+`-22` → `-21` (can be pinned with the `LLVM_LINK_BIN` / `OPT_BIN` / `LLC_BIN`
+env vars). If training starts without errors, the pipeline is working.
 
 ## sub-Ampere GPU (sm_75 Turing)
 
-`cargo-oxide` 単独では auto-detect (`select_target()`) が kernel features から
-target を選び、Basic フォールバックでは `sm_80` を選ぶ。`--arch=sm_75` を渡しても
-auto-detect が override するため PTX header は `.target sm_80` のままになり、
-Turing GPU では `CUDA_ERROR_INVALID_PTX` (driver error 218) で load が失敗する。
+On its own, `cargo-oxide`'s auto-detect (`select_target()`) picks a target from
+the kernel features, and the Basic fallback picks `sm_80`. Even if you pass
+`--arch=sm_75`, auto-detect overrides it, so the PTX header stays
+`.target sm_80` and loading fails on a Turing GPU with `CUDA_ERROR_INVALID_PTX`
+(driver error 218).
 
-回避策は **`CUDA_OXIDE_TARGET=sm_75` 環境変数**。これは `select_target()` を
-バイパスする一級 override で、`llc -mcpu=sm_75` までそのまま流れる:
+The workaround is the **`CUDA_OXIDE_TARGET=sm_75` environment variable**. It is a
+first-class override that bypasses `select_target()` and flows all the way
+through to `llc -mcpu=sm_75`:
 
 ```bash
 cd bins/progress_kpabs_train
 CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 ```
 
-毎回打つのが面倒なら shell rc に export しておく。
+If typing it every time is tedious, export it in your shell rc.
 
-### sm_75 の限界
+### sm_75 limitations
 
-`CUDA_OXIDE_TARGET=sm_75` で動くのは LLVM IR に sm_80+ 専用 op が含まれない
-場合に限る:
+`CUDA_OXIDE_TARGET=sm_75` only works when the LLVM IR contains no sm_80+-only
+ops:
 
 - `cp.async` — asynchronous global → shared copy (sm_80+)
 - `wgmma` — warpgroup matrix-multiply-accumulate (sm_90+ Hopper)
@@ -229,69 +239,71 @@ CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 - `tma.*` — Tensor Memory Accelerator (sm_90+)
 - `cluster.*` — Thread Block Cluster (sm_90+)
 
-これらを含む IR を sm_75 PTX に compile すると `llc` か CUDA driver の JIT
-load 段階で失敗する。KP-abs progress 系の単純な kernel (forward / grad scatter
-/ adam_step / eval) は sm_75 の適用範囲内。fused optimizer step や async copy /
-Hopper 専用 ops を使う kernel は sm_80+ GPU が要る。
+Compiling IR that contains these to sm_75 PTX fails either at `llc` or at the
+CUDA driver's JIT load stage. The simple KP-abs progress kernels (forward / grad
+scatter / adam_step / eval) are within sm_75's scope. Kernels that use a fused
+optimizer step or async copy / Hopper-only ops require an sm_80+ GPU.
 
-`cargo-oxide build` が生成した `.ll` (build を実行した bin ディレクトリに出る)
-を grep して sm_80+ op の混入を確認できる:
+You can grep the `.ll` that `cargo-oxide build` produces (it appears in the
+binary's directory where you ran the build) to check for sm_80+ ops:
 
 ```bash
 grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
   bins/progress_kpabs_train/progress_kpabs_train.ll
-# (出力なし = OK)
+# (no output = OK)
 ```
 
-## 実行のみのユーザー (kernel を改変しない場合)
+## Run-only users (not modifying the kernels)
 
-bin は kernel module を `<name>.ll` → `<name>.cubin` → `<name>.ptx` の順で
-探し、`.ll` があれば libdevice と link して `.ptx` に変換、無ければ既製の
-`.cubin` / `.ptx` を直接 load する。探索先は bin の crate ディレクトリと
-workspace root の両方。
+A binary looks for the kernel module in the order `<name>.ll` → `<name>.cubin`
+→ `<name>.ptx`; if a `.ll` is present it links it with libdevice and converts it
+to `.ptx`, otherwise it loads a prebuilt `.cubin` / `.ptx` directly. It searches
+both the binary's crate directory and the workspace root.
 
-このため、対象 GPU 向けの `.ptx` をあらかじめ持っていれば、それを bin の
-crate ディレクトリか workspace root に置くだけで `cargo-oxide` も LLVM も
-無しで kernel を load できる。`.ptx` は CUDA driver が JIT で SASS 化するので、
-`sm_80` 向けに生成した `.ptx` は Ampere 以降 (sm_86/89/90/100…) で前方互換に
-動く (Turing sm_75 は別途 sm_75 向け `.ptx` が要る)。
+So if you already have a `.ptx` for your target GPU, you can load the kernels
+without `cargo-oxide` or LLVM just by placing it in the binary's crate directory
+or the workspace root. The CUDA driver JITs the `.ptx` into SASS, so a `.ptx`
+generated for `sm_80` runs forward-compatibly on Ampere and later
+(sm_86/89/90/100…) (Turing sm_75 needs a separate sm_75 `.ptx`).
 
-ただし `.ptx` は kernel ソースを変えると stale になり、`.gitignore` 済みで
-git には含めない。現状この repo は pre-built `.ptx` を配布していないため、
-kernel を改変しないユーザーも初回は `cargo-oxide build` が必要になる。
+That said, a `.ptx` goes stale when the kernel source changes, and it is
+`.gitignore`d so it is not in git. This repo does not currently distribute
+prebuilt `.ptx`, so even users who do not modify the kernels need
+`cargo-oxide build` on the first run.
 
-## サポート GPU マトリクス
+## Supported GPU matrix
 
-| 世代 | sm | 代表的な GPU | 標準ビルドで動作 | `CUDA_OXIDE_TARGET=sm_XX` |
+| Generation | sm | Representative GPUs | Works with a standard build | `CUDA_OXIDE_TARGET=sm_XX` |
 |---|---|---|---|---|
-| Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | 未検証 (LLVM IR 互換性も要確認) |
-| Volta | sm_70 | V100, Titan V | ✗ | 動く可能性 (未検証) |
-| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✗ | ✅ 確認済み |
+| Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | Untested (LLVM IR compatibility also unverified) |
+| Volta | sm_70 | V100, Titan V | ✗ | May work (untested) |
+| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✗ | ✅ Verified |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
-| Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ 確認済み (primary) | n/a |
+| Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ Verified (primary) | n/a |
 | Ada | sm_89 | RTX 40xx | ✅ | n/a |
 | Hopper | sm_90 | H100, H200 | ✅ | n/a |
 | Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ | n/a |
 
-cuda-oxide の rev は本リポジトリの `Cargo.toml` (`[workspace.dependencies]`) に
-pin し、`scripts/setup-cuda-oxide.sh` が `cargo-oxide` を同 rev に揃える。LLVM は
-21 (sm_75) と 22 (sm_86) のいずれでも動作する。
+The cuda-oxide rev is pinned in this repository's `Cargo.toml`
+(`[workspace.dependencies]`), and `scripts/setup-cuda-oxide.sh` keeps
+`cargo-oxide` on the same rev. LLVM works on either 21 (sm_75) or 22 (sm_86).
 
-## WSL2 ディスク注意
+## WSL2 disk note
 
-WSL2 環境では `/` (ext4) は **C: ドライブ上の sparse vhdx** が実体。`df -h /` の
-表示は仮想容量で、物理は `df -h /mnt/c` の Avail に縛られる。数百 GB 級の
-学習データ (PSV、checkpoint、ログ) と Rust の build artifact (`target/`) は
-C: 圧迫を避けるため別ドライブに置くことを推奨する:
+In a WSL2 environment, `/` (ext4) is actually backed by a **sparse vhdx on the
+C: drive**. `df -h /` shows the virtual capacity; the physical limit is bound by
+the Avail of `df -h /mnt/c`. To avoid filling up C:, it is recommended to keep
+the hundreds-of-GB training data (PSV, checkpoints, logs) and Rust build
+artifacts (`target/`) on a separate drive:
 
-- 学習データは別ドライブの作業ディレクトリに置き、リポ内の `data/` から
-  symlink を張る
-- `CARGO_TARGET_DIR` を別ドライブのパスに向ける
+- Keep the training data in a working directory on a separate drive and symlink
+  to it from `data/` inside the repo
+- Point `CARGO_TARGET_DIR` at a path on a separate drive
 
-## 関連
+## Related
 
 - [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
-  採用判断と Consequences
+  the adoption decision and its Consequences
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)
-- [cuda-oxide atomics example README (LLVM 22 syncscope の根拠)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)
+- [cuda-oxide atomics example README (the basis for LLVM 22 syncscope)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)
