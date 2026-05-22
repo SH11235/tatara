@@ -2582,8 +2582,8 @@ pub fn psqt_diff_sparse_fwd_inplace(
 /// `psqt_w_grad` を 0 初期化する責務)。
 ///
 /// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。NUM_BUCKETS=9 が
-/// 小さく contention は限定的 (batch=65536 / nnz=40 / 660K cells で平均 ~4
-/// thread / cell)。
+/// 小さく contention は限定的 (batch=65536 / nnz=40 / stm+nstm 両 add で
+/// 5.2M atomic-add / 660K cells ≒ 平均 8 thread/cell)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn psqt_diff_sparse_bwd(
