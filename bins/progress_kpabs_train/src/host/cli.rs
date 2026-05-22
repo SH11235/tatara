@@ -1,8 +1,8 @@
 //! CLI 引数定義。
 //!
 //! bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs::Args`) のサブセット
-//! を移植している。prefetch / multi-thread / val split / checkpoint 等は本
-//! binary のスコープ外で未実装。
+//! を移植している。prefetch / multi-thread / checkpoint 等は本 binary の
+//! スコープ外で未実装。
 
 use std::path::PathBuf;
 
@@ -34,6 +34,15 @@ pub struct Args {
     /// 学習対象 game 数の上限 (0 = unlimited)。
     #[arg(long, default_value_t = 0)]
     pub max_games: usize,
+
+    /// held-out 検証に回す game の割合 (0.0 = 無効、既定)。例: 0.05 で全 game の
+    /// 約 1/20 を検証専用にし、各 epoch 末に訓練に使わなかった game 上の loss
+    /// (val_loss) を出力する。game 単位で分割するため同一 game の局面が訓練と
+    /// 検証に混ざらない。固定間隔で抜き出すので、データが棋戦・時期で
+    /// グループ化されている場合は事前にシャッフルしておくこと。指定可能範囲は
+    /// 0.0..=0.5。
+    #[arg(long, default_value_t = 0.0)]
+    pub val_fraction: f32,
 
     /// epoch 数。
     #[arg(long, default_value_t = 1)]
@@ -82,5 +91,46 @@ impl Args {
                 .map(PathBuf::from)
                 .collect(),
         }
+    }
+
+    /// `--val-fraction` から検証 game の抽出 stride を導出する。stride `N` は
+    /// 「`N` game ごとに 1 個を検証へ回す」(= 全体の約 `1/N`)。`val_fraction`
+    /// が 0 以下なら検証無効で `None`。
+    ///
+    /// 前提: `val_fraction` は呼び出し前に `0.0..=0.5` へ検証済みであること。
+    /// この範囲では `1.0 / val_fraction >= 2.0` なので stride は必ず 2 以上に
+    /// なる (範囲外の入力は `run_training` が reject する)。
+    pub fn val_stride(&self) -> Option<u64> {
+        if self.val_fraction <= 0.0 {
+            None
+        } else {
+            Some((1.0 / self.val_fraction).round() as u64)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["progress-kpabs-train", "--output", "/tmp/progress-test.bin"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn val_fraction_defaults_to_disabled() {
+        assert_eq!(parse(&[]).val_fraction, 0.0);
+        assert_eq!(parse(&[]).val_stride(), None);
+    }
+
+    #[test]
+    fn val_stride_rounds_fraction_to_nearest_stride() {
+        assert_eq!(parse(&["--val-fraction", "0.05"]).val_stride(), Some(20));
+        assert_eq!(parse(&["--val-fraction", "0.1"]).val_stride(), Some(10));
+        assert_eq!(parse(&["--val-fraction", "0.25"]).val_stride(), Some(4));
+        assert_eq!(parse(&["--val-fraction", "0.5"]).val_stride(), Some(2));
     }
 }

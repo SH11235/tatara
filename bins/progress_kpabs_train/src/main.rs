@@ -25,10 +25,10 @@
 //!     --output /tmp/progress.bin \
 //!     --games-per-step 4 --max-games 8 --lr 1e-3
 //!
-//! # 実データで:
+//! # 実データで (--val-fraction で held-out 検証 loss も出力):
 //! cargo run --release -p progress-kpabs-train -- \
 //!     --data <path/to/training.bin> \
-//!     --output progress.bin --epochs 1
+//!     --output progress.bin --epochs 1 --val-fraction 0.05
 //! ```
 //!
 //! 事前に `cargo-oxide build` で kernel `.ll` を生成しておく必要がある
@@ -738,7 +738,6 @@ impl GpuTrainer {
     }
 
     /// 評価 path: forward → eval kernel (loss + histogram のみ、weight 不変)。
-    #[allow(dead_code)]
     fn eval_forward(&mut self, batch: &Batch) -> Result<(), Box<dyn std::error::Error>> {
         let n_pos = batch.n_positions;
         if n_pos == 0 {
@@ -814,27 +813,71 @@ struct EpochStats {
     bucket_hist: [u64; 8],
 }
 
-/// 1 file 内の game を順次読んで batch を組み、`step` を呼ぶ。
-fn train_one_epoch(
+/// データ走査 1 pass の役割。`Train` は訓練 game で `step` (forward → grad →
+/// adam_step、weight 更新あり)、`Validate` は検証 game で `eval_forward`
+/// (forward → eval kernel のみ、weight 不変) を回す。`Train` が保持する
+/// `f32` は実効学習率。
+#[derive(Clone, Copy)]
+enum PassMode {
+    Train(f32),
+    Validate,
+}
+
+/// `game_seq` 番目 (非空 game を出現順に 0-indexed 採番) の game を検証へ回す
+/// か判定する。`stride` が `None` (検証無効) なら常に `false`。stride `N` の
+/// とき `N` game ごとに 1 個 (`game_seq % N == 0`) を検証に割り当てる。
+fn is_val_game(game_seq: u64, stride: Option<u64>) -> bool {
+    match stride {
+        None => false,
+        Some(n) => game_seq.is_multiple_of(n),
+    }
+}
+
+/// 1 batch を `mode` に応じて実行する。`Train` は forward → grad → adam_step
+/// (weight 更新あり)、`Validate` は forward → eval kernel のみ。
+fn run_batch(
+    trainer: &mut GpuTrainer,
+    batch: &Batch,
+    mode: PassMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match mode {
+        PassMode::Train(lr) => trainer.step(batch, lr),
+        PassMode::Validate => trainer.eval_forward(batch),
+    }
+}
+
+/// data file 群を 1 回走査し、`mode` に応じて訓練 / 検証の片側を実行する。
+///
+/// `--val-fraction` 有効時は非空 game を出現順に 0-indexed で採番し
+/// (`game_seq`)、`is_val_game` で訓練用 / 検証用に振り分ける。`Train` pass は
+/// 検証 game を、`Validate` pass は訓練 game を skip する。両 pass は同じ
+/// `game_seq` 採番と同じ `max_games` 上限を使うので、同一 `args` で順に 2 回
+/// 呼べば排他かつ網羅的な game 分割になる。検証 loss は epoch 完了後の固定
+/// weight で測る必要があるため、呼び出し側は `Train` pass 完了後に
+/// `Validate` pass を回す。
+fn run_data_pass(
     trainer: &mut GpuTrainer,
     data_files: &[PathBuf],
     args: &Args,
-    lr: f32,
     epoch: usize,
+    mode: PassMode,
 ) -> Result<EpochStats, Box<dyn std::error::Error>> {
     trainer.zero_loss_hist()?;
 
     let max_games = if args.max_games > 0 {
-        Some(args.max_games)
+        Some(args.max_games as u64)
     } else {
         None
     };
+    let val_stride = args.val_stride();
+    let want_val = matches!(mode, PassMode::Validate);
 
     let mut batch = Batch::new();
     let mut scratch: Vec<usize> = Vec::with_capacity(96);
     let mut samples_total = 0_usize;
     let mut games_total = 0_usize;
     let mut steps = 0_usize;
+    let mut game_seq = 0_u64;
     let start = Instant::now();
 
     'outer: for path in data_files {
@@ -844,21 +887,33 @@ fn train_one_epoch(
             if game.is_empty() {
                 continue;
             }
+            // `max_games` は走査した非空 game 数 (訓練 + 検証 合算) の上限。
+            // 両 pass が同じ閾値を使うことで採番と分割が一致する。
             if let Some(limit) = max_games
-                && games_total + batch.n_games >= limit
+                && game_seq >= limit
             {
                 break 'outer;
+            }
+            let seq = game_seq;
+            game_seq += 1;
+            // この pass が担当しない側の game は採番だけ進めて skip する
+            // (pass 間で採番を一致させるため skip 側も game_seq を消費する)。
+            if is_val_game(seq, val_stride) != want_val {
+                continue;
             }
             batch.push_game(&game, &mut scratch);
             if batch.n_games >= args.games_per_step {
                 batch.finalize();
                 games_total += batch.n_games;
                 samples_total += batch.n_positions;
-                trainer.step(&batch, lr)?;
+                run_batch(trainer, &batch, mode)?;
                 steps += 1;
                 batch.clear();
 
-                if args.log_interval_steps > 0 && steps.is_multiple_of(args.log_interval_steps) {
+                if matches!(mode, PassMode::Train(_))
+                    && args.log_interval_steps > 0
+                    && steps.is_multiple_of(args.log_interval_steps)
+                {
                     let (loss_sum, _) = trainer.read_loss_hist()?;
                     let avg = if samples_total > 0 {
                         loss_sum / samples_total as f64
@@ -875,12 +930,12 @@ fn train_one_epoch(
             }
         }
     }
-    // 残り (n_games < games_per_step) も 1 step として処理。
+    // 残り (n_games < games_per_step) も 1 batch として処理。
     if batch.n_games > 0 {
         batch.finalize();
         games_total += batch.n_games;
         samples_total += batch.n_positions;
-        trainer.step(&batch, lr)?;
+        run_batch(trainer, &batch, mode)?;
         steps += 1;
     }
 
@@ -905,6 +960,15 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.games_per_step == 0 {
         return Err("--games-per-step must be >= 1".into());
+    }
+    // 0.0..=0.5 の外 (負値 / 0.5 超 / NaN / inf) は reject。NaN/inf は
+    // `RangeInclusive::contains` が false を返すのでこの 1 条件で弾ける。
+    if !(0.0..=0.5).contains(&args.val_fraction) {
+        return Err(format!(
+            "--val-fraction must be within 0.0..=0.5 (got {}); 0.0 disables held-out validation",
+            args.val_fraction
+        )
+        .into());
     }
 
     let data_paths = args.data_paths();
@@ -938,16 +1002,43 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let lr = args.effective_lr();
-    let mut last_stats: EpochStats = EpochStats::default();
+    let val_enabled = args.val_stride().is_some();
     for epoch in 1..=args.epochs {
-        let stats = train_one_epoch(&mut trainer, &data_paths, &args, lr, epoch)?;
+        let train = run_data_pass(&mut trainer, &data_paths, &args, epoch, PassMode::Train(lr))?;
+        if !val_enabled {
+            println!(
+                "EPOCH {} DONE: games={} samples={} steps={} mean_loss={:.6} hist={:?}",
+                epoch, train.games, train.samples, train.steps, train.mean_loss, train.bucket_hist
+            );
+            continue;
+        }
+        // 検証有効時、game_seq 0 は常に検証側へ回る (`is_val_game`: 0 は任意の
+        // stride の倍数)。走査した game 数が少なすぎて訓練側が空になると、未学習
+        // の weight を書き出してしまうので、その前に明示エラーにする。
+        if train.samples == 0 {
+            return Err("--val-fraction holdout left no training games; at least 2 \
+                 games are required (raise --max-games or use a larger dataset)"
+                .into());
+        }
+        // 検証 loss は epoch 完了後の固定 weight で測る必要があるため、訓練
+        // pass の後にデータをもう一度走査して検証 game だけ評価する。訓練側に
+        // game があれば game_seq 0 は検証側に入るので `val.samples > 0` も保証。
+        let val = run_data_pass(&mut trainer, &data_paths, &args, epoch, PassMode::Validate)?;
         println!(
-            "EPOCH {} DONE: games={} samples={} steps={} mean_loss={:.6} hist={:?}",
-            epoch, stats.games, stats.samples, stats.steps, stats.mean_loss, stats.bucket_hist
+            "EPOCH {} DONE: train_games={} val_games={} train_samples={} val_samples={} \
+             train_steps={} train_loss={:.6} val_loss={:.6} train_hist={:?} val_hist={:?}",
+            epoch,
+            train.games,
+            val.games,
+            train.samples,
+            val.samples,
+            train.steps,
+            train.mean_loss,
+            val.mean_loss,
+            train.bucket_hist,
+            val.bucket_hist,
         );
-        last_stats = stats;
     }
-    let _ = last_stats; // 後続で使う予定なら拡張、現状は EOI 用に保持
 
     let weights = trainer.read_weights()?;
     write_progress_bin(&args.output, &weights)?;
@@ -968,6 +1059,33 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// 訓練 / 検証 game の振り分けロジックの単体テスト (GPU 不要)。
+#[cfg(test)]
+mod driver_logic_tests {
+    use super::is_val_game;
+
+    #[test]
+    fn val_disabled_routes_every_game_to_train() {
+        for seq in 0..256 {
+            assert!(!is_val_game(seq, None), "seq {seq} must not be val");
+        }
+    }
+
+    #[test]
+    fn stride_routes_every_nth_game_to_val() {
+        let stride = Some(20);
+        assert!(is_val_game(0, stride));
+        assert!(is_val_game(20, stride));
+        assert!(is_val_game(40, stride));
+        assert!(!is_val_game(1, stride));
+        assert!(!is_val_game(19, stride));
+        assert!(!is_val_game(21, stride));
+        // 1000 game 中ちょうど 1/20 (= 50 個) が検証へ回る。
+        let val_count = (0..1000_u64).filter(|&s| is_val_game(s, stride)).count();
+        assert_eq!(val_count, 50);
     }
 }
 
