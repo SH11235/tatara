@@ -1005,20 +1005,25 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let val_enabled = args.val_stride().is_some();
     for epoch in 1..=args.epochs {
         let train = run_data_pass(&mut trainer, &data_paths, &args, epoch, PassMode::Train(lr))?;
+        // 訓練 position が 0 のまま進むと未学習の weight を progress.bin に書き
+        // 出してしまうので、その前に明示エラーにする。検証有効時は game_seq 0 が
+        // 必ず検証側へ回る (`is_val_game`: 0 は任意 stride の倍数) ため、走査
+        // game 数が少なすぎると訓練側だけが空になりうる。
+        if train.samples == 0 {
+            return Err(if val_enabled {
+                "--val-fraction holdout left no training games; at least 2 games \
+                 are required (raise --max-games or use a larger dataset)"
+            } else {
+                "no training positions: the data files contain no non-empty games"
+            }
+            .into());
+        }
         if !val_enabled {
             println!(
                 "EPOCH {} DONE: games={} samples={} steps={} mean_loss={:.6} hist={:?}",
                 epoch, train.games, train.samples, train.steps, train.mean_loss, train.bucket_hist
             );
             continue;
-        }
-        // 検証有効時、game_seq 0 は常に検証側へ回る (`is_val_game`: 0 は任意の
-        // stride の倍数)。走査した game 数が少なすぎて訓練側が空になると、未学習
-        // の weight を書き出してしまうので、その前に明示エラーにする。
-        if train.samples == 0 {
-            return Err("--val-fraction holdout left no training games; at least 2 \
-                 games are required (raise --max-games or use a larger dataset)"
-                .into());
         }
         // 検証 loss は epoch 完了後の固定 weight で測る必要があるため、訓練
         // pass の後にデータをもう一度走査して検証 game だけ評価する。訓練側に
