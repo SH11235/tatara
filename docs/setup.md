@@ -66,7 +66,6 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 5. From here on, run the steps from "System install" in this file in the WSL2
    shell as-is.
 
-Watch out for WSL2 disk usage (see "WSL2 disk note" at the end).
 
 ## System requirements
 
@@ -287,18 +286,6 @@ prebuilt `.ptx`, so even users who do not modify the kernels need
 The cuda-oxide rev is pinned in this repository's `Cargo.toml`
 (`[workspace.dependencies]`), and `scripts/setup-cuda-oxide.sh` keeps
 `cargo-oxide` on the same rev. LLVM works on either 21 (sm_75) or 22 (sm_86).
-
-## WSL2 disk note
-
-In a WSL2 environment, `/` (ext4) is actually backed by a **sparse vhdx on the
-C: drive**. `df -h /` shows the virtual capacity; the physical limit is bound by
-the Avail of `df -h /mnt/c`. To avoid filling up C:, it is recommended to keep
-the hundreds-of-GB training data (PSV, checkpoints, logs) and Rust build
-artifacts (`target/`) on a separate drive:
-
-- Keep the training data in a working directory on a separate drive and symlink
-  to it from `data/` inside the repo
-- Point `CARGO_TARGET_DIR` at a path on a separate drive
 
 ## Related
 
