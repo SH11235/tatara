@@ -42,7 +42,8 @@ target/release/nnue-train \
 
 ### progress.bin を生成
 
-`progress-kpabs-train` で進行度係数を学習する。
+`progress-kpabs-train` で進行度係数を学習する。進行度を学習して出力 bucket に
+割り当てる発想は [nodchip 氏の記事](https://nodchip.hatenablog.com/entry/2026/02/04/000000) に基づく。
 
 > **データはシャッフルしないこと。** `progress-kpabs-train` の `--data` には
 > **連続した対局**の PSV(局面が対局順に並び、対局が次々と続くもの)を渡す。

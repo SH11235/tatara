@@ -1,5 +1,7 @@
-//! LayerStack architecture (FT → L1 16 → L2 32 + progress8kpabs 9 buckets) で
-//! 使う kernel の reference CPU 実装。
+//! LayerStack architecture (FT → L1 16 → L2 32、出力 bucket topology 9-way) で
+//! 使う kernel の reference CPU 実装。bucket index は progress8kpabs が局面
+//! ごとに 0..=7 を算出する (9 枠中 index 8 は予約で割当対象外、`arch.rs` の
+//! `NUM_BUCKETS` 参照)。
 //!
 //! GPU 側 `#[kernel]` 定義は **`bins/nnue_train/src/kernels/` に配置**
 //! されている (cuda-oxide rustc-codegen-cuda backend は `#[kernel]` を bin

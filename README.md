@@ -47,7 +47,9 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 自玉・敵玉の特徴枠を 1 つに共有)と同じ設計を将棋に適用したもの。
 
 別バイナリ `progress-kpabs-train` は LayerStack の bucket 係数 `progress.bin` を
-生成する KP-abs progress trainer。
+生成する KP-abs progress trainer。進行度を学習して出力 bucket に割り当てる手法は
+[nodchip 氏の記事](https://nodchip.hatenablog.com/entry/2026/02/04/000000) の
+アイデアに基づく。
 
 ## セットアップ
 
