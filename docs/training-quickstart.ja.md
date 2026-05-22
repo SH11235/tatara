@@ -55,7 +55,8 @@ target/release/nnue-train \
 > 壊れてラベルが無意味になり、正しい係数が学習できない。本体学習の `nnue-train`
 > 例ではシャッフル済み PSV を使っており、要求が逆なので取り違えないこと。
 
-`--epochs` で総 epoch 数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
+`--epochs` で総 epoch 数を指定する。epoch ごとに `<run-name>.e<N>.bin` の
+checkpoint が出力され、最終 epoch は `--output` の path にも書き出される。
 
 ```bash
 target/release/progress-kpabs-train \
