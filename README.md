@@ -29,7 +29,7 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 | アーキ | サブコマンド | 構造 |
 |---|---|---|
 | **LayerStack** | `layerstack` | 局面の進行度で 9 bucket に分け、出力層を bucket ごとに専用化(Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
-| **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <ft>x2-<l1>-<l2>` で指定(既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
+| **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <l1>x2-<l2>-<l3>` で指定(`l1` = FT 出力、`l2`/`l3` = 隠れ層、既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
 
 ### 入力 feature set
 
@@ -47,7 +47,7 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 自玉・敵玉の特徴枠を 1 つに共有)と同じ設計を将棋に適用したもの。2 軸モデルの
 設計詳細は [ADR](docs/decisions/2026-05-19-nnue-feature-set-two-axis-model.md) を参照。
 
-別バイナリ `progress_kpabs_train` は LayerStack の bucket 係数 `progress.bin` を
+別バイナリ `progress-kpabs-train` は LayerStack の bucket 係数 `progress.bin` を
 生成する KP-abs progress trainer。
 
 ## セットアップ
@@ -82,8 +82,8 @@ kernel のビルドと smoke test は [docs/setup.md](docs/setup.md)、学習の
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
-- [LayerStack binary save format](docs/nnue-layerstack-format.md) —
-  LayerStack `quantised.bin` の binary layout 仕様
+- [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
+  記述文字列の組み立てと load 時照合
 
 ## 用語 (glossary)
 
