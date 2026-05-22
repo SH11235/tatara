@@ -1,8 +1,7 @@
 //! CLI 引数定義。
 //!
 //! bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs::Args`) のサブセット
-//! を移植している。prefetch / multi-thread / checkpoint 等は本 binary の
-//! スコープ外で未実装。
+//! を移植している。prefetch / multi-thread 等は本 binary のスコープ外で未実装。
 
 use std::path::PathBuf;
 
@@ -19,7 +18,8 @@ pub struct Args {
     #[arg(long)]
     pub data: Option<String>,
 
-    /// Output path for the trained progress.bin.
+    /// Output path for the final progress.bin. Each epoch additionally writes a
+    /// checkpoint alongside it as <stem>.e<N>.bin.
     #[arg(long)]
     pub output: PathBuf,
 

@@ -42,7 +42,7 @@
 //! 出力先 (workspace root の `progress_kpabs_train.ll`) は `KernelLoader`
 //! が自動で probe する (CARGO_MANIFEST_DIR と workspace root の両方)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -954,6 +954,19 @@ fn run_data_pass(
     })
 }
 
+/// `--output` の path から epoch `epoch` の checkpoint path を導く。拡張子の
+/// 手前に `.e{epoch}` を挿入する (`out/foo.bin` → `out/foo.e3.bin`、拡張子の
+/// 無い `out/foo` → `out/foo.e3`)。
+fn epoch_checkpoint_path(output: &Path, epoch: usize) -> PathBuf {
+    let mut name = output.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(".e{epoch}"));
+    if let Some(ext) = output.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    output.with_file_name(name)
+}
+
 fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.epochs == 0 {
         return Err("--epochs must be >= 1".into());
@@ -1018,31 +1031,38 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             .into());
         }
-        if !val_enabled {
+        if val_enabled {
+            // 検証 loss は epoch 完了後の固定 weight で測る必要があるため、訓練
+            // pass の後にデータをもう一度走査して検証 game だけ評価する。訓練側に
+            // game があれば game_seq 0 は検証側に入るので `val.samples > 0` も保証。
+            let val = run_data_pass(&mut trainer, &data_paths, &args, epoch, PassMode::Validate)?;
+            println!(
+                "EPOCH {} DONE: train_games={} val_games={} train_samples={} val_samples={} \
+                 train_steps={} train_loss={:.6} val_loss={:.6} train_hist={:?} val_hist={:?}",
+                epoch,
+                train.games,
+                val.games,
+                train.samples,
+                val.samples,
+                train.steps,
+                train.mean_loss,
+                val.mean_loss,
+                train.bucket_hist,
+                val.bucket_hist,
+            );
+        } else {
             println!(
                 "EPOCH {} DONE: games={} samples={} steps={} mean_loss={:.6} hist={:?}",
                 epoch, train.games, train.samples, train.steps, train.mean_loss, train.bucket_hist
             );
-            continue;
         }
-        // 検証 loss は epoch 完了後の固定 weight で測る必要があるため、訓練
-        // pass の後にデータをもう一度走査して検証 game だけ評価する。訓練側に
-        // game があれば game_seq 0 は検証側に入るので `val.samples > 0` も保証。
-        let val = run_data_pass(&mut trainer, &data_paths, &args, epoch, PassMode::Validate)?;
-        println!(
-            "EPOCH {} DONE: train_games={} val_games={} train_samples={} val_samples={} \
-             train_steps={} train_loss={:.6} val_loss={:.6} train_hist={:?} val_hist={:?}",
-            epoch,
-            train.games,
-            val.games,
-            train.samples,
-            val.samples,
-            train.steps,
-            train.mean_loss,
-            val.mean_loss,
-            train.bucket_hist,
-            val.bucket_hist,
-        );
+
+        // epoch ごとの checkpoint を書き出し、どの epoch を採用するか後から
+        // 選べるようにする。最終 epoch の重みはループ後に `--output` へも書く。
+        let epoch_weights = trainer.read_weights()?;
+        let checkpoint = epoch_checkpoint_path(&args.output, epoch);
+        write_progress_bin(&checkpoint, &epoch_weights)?;
+        println!("wrote epoch {epoch} checkpoint: {}", checkpoint.display());
     }
 
     let weights = trainer.read_weights()?;
@@ -1070,7 +1090,23 @@ fn main() -> ExitCode {
 /// 訓練 / 検証 game の振り分けロジックの単体テスト (GPU 不要)。
 #[cfg(test)]
 mod driver_logic_tests {
-    use super::is_val_game;
+    use super::{epoch_checkpoint_path, is_val_game};
+
+    #[test]
+    fn epoch_checkpoint_path_inserts_before_extension() {
+        assert_eq!(
+            epoch_checkpoint_path(std::path::Path::new("out/progress/foo.bin"), 3),
+            std::path::PathBuf::from("out/progress/foo.e3.bin")
+        );
+    }
+
+    #[test]
+    fn epoch_checkpoint_path_handles_missing_extension() {
+        assert_eq!(
+            epoch_checkpoint_path(std::path::Path::new("foo"), 1),
+            std::path::PathBuf::from("foo.e1")
+        );
+    }
 
     #[test]
     fn val_disabled_routes_every_game_to_train() {

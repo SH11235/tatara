@@ -64,8 +64,9 @@ learning game progress and assigning it to output buckets is based on
 > cannot be learned. The `nnue-train` examples for the main training use a
 > shuffled PSV — the requirement is the opposite, so do not mix them up.
 
-Specify the total number of epochs with `--epochs`; a `<run-name>.e<N>.bin` is
-written per epoch.
+Specify the total number of epochs with `--epochs`. Each epoch writes a
+`<run-name>.e<N>.bin` checkpoint, and the final epoch is also written to the
+`--output` path.
 
 ```bash
 target/release/progress-kpabs-train \
