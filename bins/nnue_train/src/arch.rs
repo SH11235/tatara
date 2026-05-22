@@ -84,8 +84,11 @@ pub(crate) const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 // target offset 270 / target scaling 380)。
 // trainer 経路では CLI から `LossKind` を組み立てるのでここは smoke 専用。
 pub(crate) const WDL_LAMBDA: f32 = 0.0;
-/// smoke で使う固定 batch position 数 (`GpuTrainer::new` の workspace 初期 batch にも使う)。
-pub(crate) const SMOKE_BATCH: usize = 4;
+/// smoke で使う固定 batch position 数 (`GpuTrainer::new` の workspace 初期 batch
+/// にも使う)。LayerStack の tiled dense matmul kernel は grid を `b / 16` で張るため
+/// `b % 16 == 0` を要求する (`GpuTrainer::step_impl` の runtime check)。smoke は
+/// `train_step` を介さず `step` を直叩きするので、ここで 16 の倍数にしておく。
+pub(crate) const SMOKE_BATCH: usize = 16;
 pub(crate) const SMOKE_LOSS_SIGMOID: LossKind = LossKind::Sigmoid { scale: 1.0 / 290.0 };
 pub(crate) const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     nnue2score: 600.0,
