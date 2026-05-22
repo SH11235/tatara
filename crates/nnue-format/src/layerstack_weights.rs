@@ -1414,38 +1414,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    #[test]
-    fn load_rejects_nonzero_psqt_bias() {
-        // PSQT は構造的に bias-free だが、外部由来 .bin で非ゼロ bias が混入した場合は
-        // silent drop せず InvalidData で reject する。
-        let net = LayerStackWeights::zeroed_with_psqt(
-            test_spec(),
-            DEFAULT_FT_OUT,
-            DEFAULT_L1_OUT,
-            DEFAULT_L2_OUT,
-        );
-        let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
-
-        // PSQT bias block は arch_str + ft_hash + LEB128 FT bias + LEB128 FT weights
-        // の直後。LEB128 は可変長で offset 探索が難しいため、本 test は backwards
-        // から探す: 最後の i32 group が bias の最後の cell の直前 (= weights 末尾)。
-        // 代わりに「bias の最初の bucket cell」を直接 patch するため、PSQT bias 開始
-        // offset を計算で求める。
-        //
-        // 簡単化のため、bias 領域に 0 が並ぶ固定パターンを探して最初の 0 i32 を非ゼロ
-        // に書き換える。PSQT bias 9 個は全て 0 で連続書きされ、その直前は LEB128
-        // (i16 0 = 1 byte の `0x00` で終わる) なので「`0x00, 0x00, 0x00, 0x00, 0x00,
-        // 0x00, 0x00, 0x00` の 8 byte (= 連続する 2 個の i32 zero) 」を末尾から後方
-        // 探索 + 後続にさらに 32 bytes (=8 個 + 1 zero pad) の zero が続く位置が
-        // PSQT bias 開始。確実性のため、psqt_w 開始 offset から逆算する:
-        //   weights len = ft_in * NUM_BUCKETS * 4 byte
-        //   bias  len = NUM_BUCKETS * 4 byte
-        //   layerstack 9 buckets が続く (size 固定で計算可能)
-        // 代わりに「load して再 save した dump とのバイナリ diff」では計算が複雑なので、
-        // 直接 byte 探索で:「全 file 末尾から layerstack 9 buckets 分の長さを差し引き
-        // (= 9 × (4 + l1_out*4 + l1_out*pad32(ft_out) + l2_out*4 + l2_out*pad32(l2_in)
-        //   + 4 + pad32(l2_out)))、その直前が PSQT bias 末尾 (4 byte) 」と計算する。
+    /// PSQT bias block の offset を「全 file 末尾から layerstacks 9 bucket 分 +
+    /// PSQT weights 分」を差し引いて求める helper。LEB128 が可変長で前方からの計算は
+    /// 困難だが、末尾の構造は size 固定なので逆算で確定する。
+    fn psqt_bias_start(buf_len: usize, ft_in: usize) -> usize {
         let l1_padded_in = pad32(DEFAULT_FT_OUT);
         let l2_in = (DEFAULT_L1_OUT - 1) * 2;
         let l2_padded_in = pad32(l2_in);
@@ -1458,12 +1430,33 @@ mod tests {
             + 4 // L3 bias
             + l3_padded_in;
         let layerstacks_total = NUM_BUCKETS * layerstack_per_bucket;
-        let psqt_weights_bytes = test_spec().ft_in() * NUM_BUCKETS * 4;
+        let psqt_weights_bytes = ft_in * NUM_BUCKETS * 4;
         let psqt_bias_bytes = NUM_BUCKETS * 4;
-        let psqt_bias_start = buf.len() - layerstacks_total - psqt_weights_bytes - psqt_bias_bytes;
-        // 最初の bucket の bias (i32 LE) を非ゼロに書き換える。
-        let nonzero: i32 = 42;
-        buf[psqt_bias_start..psqt_bias_start + 4].copy_from_slice(&nonzero.to_le_bytes());
+        buf_len - layerstacks_total - psqt_weights_bytes - psqt_bias_bytes
+    }
+
+    #[test]
+    fn load_rejects_nonzero_psqt_bias() {
+        // PSQT は構造的に bias-free だが、外部由来 .bin で非ゼロ bias が混入した場合は
+        // silent drop せず InvalidData で reject する。bucket 3 を patch することで、
+        // bucket 0..=2 が zero-pass branch を通過したあとで bucket 3 で error 経路が
+        // 起動するパスを exercise する (zero-branch coverage)。
+        let net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+
+        // bucket 3 の bias cell (i32 LE) を非ゼロに書き換える。
+        // raw i32 = 16256 → dequant = 16256 / 8128 = 2.0 (整然と確認できる値)。
+        let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
+        const TARGET_BUCKET: usize = 3;
+        const NONZERO_RAW: i32 = 16_256; // = QA * QB * 2.0
+        let cell_off = bias_start + TARGET_BUCKET * 4;
+        buf[cell_off..cell_off + 4].copy_from_slice(&NONZERO_RAW.to_le_bytes());
 
         let err = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
@@ -1476,8 +1469,55 @@ mod tests {
         .expect_err("non-zero PSQT bias must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let msg = format!("{err}");
-        assert!(msg.contains("PSQT bias"));
-        assert!(msg.contains("non-zero"));
+        // error メッセージのフィールドを 1 個ずつ assert (バグで一部が落ちる regression を捕捉)。
+        assert!(msg.contains("PSQT bias"), "missing 'PSQT bias' in {msg}");
+        assert!(msg.contains("non-zero"), "missing 'non-zero' in {msg}");
+        // bucket index は patch した値 (TARGET_BUCKET=3、最初の zero-pass を抜けた後)
+        // である必要がある。
+        assert!(
+            msg.contains(&format!("bucket {TARGET_BUCKET}")),
+            "expected bucket index {TARGET_BUCKET} in {msg}"
+        );
+        // raw i32 値 (16256) と dequant 値 (2) が両方含まれる。
+        assert!(
+            msg.contains(&format!("raw i32 {NONZERO_RAW}")),
+            "missing raw i32 value in {msg}"
+        );
+        assert!(msg.contains("dequant 2"), "missing dequant value in {msg}");
+    }
+
+    #[test]
+    fn load_accepts_all_zero_psqt_bias() {
+        // 全 NUM_BUCKETS bucket の bias が 0 の通常 case が load を pass する
+        // ことを明示的に確認する (zero-branch の正常 path coverage)。
+        // psqt_zeroed_save_load_roundtrip も同じ path を通るが、本 test は「bias 領域
+        // の全 9 cell が 0」という前提を破った版 (非ゼロ patch) と直接対比できる。
+        let net = LayerStackWeights::zeroed_with_psqt(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+        );
+        let mut buf = Vec::new();
+        net.save_quantised(&mut buf).unwrap();
+        // bias 領域 9 個の i32 LE が全て 0 であることを直接確認する (zero-branch を
+        // どの bucket でも通る前提の test)。
+        let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
+        for bucket in 0..NUM_BUCKETS {
+            let off = bias_start + bucket * 4;
+            let raw = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            assert_eq!(raw, 0, "expected 0 PSQT bias at bucket {bucket}, got {raw}");
+        }
+        // 全 0 bias で load が成功する。
+        LayerStackWeights::load_quantised_with_psqt(
+            &mut std::io::Cursor::new(&buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            true,
+        )
+        .expect("all-zero PSQT bias must load successfully");
     }
 
     #[test]
