@@ -1,0 +1,2467 @@
+//! LayerStack 専用 kernel。
+//!
+//! 設計方針:
+//! - atomics は host が呼出前に gradient buffer を 0 初期化する accumulate semantics
+//! - DisjointSlice<f32> は 1 thread = 1 cell の排他書き込み、&[f32] + raw atomic は
+//!   多 thread → 1 cell の atomic accumulate
+//! - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
+
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
+
+/// Fused FT post-processing (forward) — bias add → CReLU → pairwise_mul → scale。
+///
+/// bullet `shogi_layerstack.rs:2241-2243` の `l0.forward(stm/nstm).crelu().
+/// pairwise_mul() * (127.0/128.0)` + `stm.concat(nstm)` を 1 kernel に集約 (両
+/// perspective まとめて combined 出力)。
+///
+/// 設計: 1 thread = combined buffer の 1 cell。`combined` の前半 (`[0, ft_dim/2)`) が
+/// stm の pairwise_mul 出力、後半 (`[ft_dim/2, ft_dim)`) が nstm の pairwise_mul 出力。
+/// 各 thread は自分が担当する combined cell の (batch, ri) と (is_stm, pair_idx) を
+/// 判定して、対応する perspective ft_out を読みに行く。
+///
+/// `pairwise_mul` semantic (bullet `builder.rs:557-560`): `slice_rows(0, n/2) *
+/// slice_rows(n/2, n)`、つまり前半 `[0, half)` と後半 `[half, n)` の **対応 index
+/// 同士** の積 (隣接 pair でなく)。本 kernel も同じ。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_fwd(
+    stm_ft_out: &[f32],
+    nstm_ft_out: &[f32],
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_dim: u32, // per-perspective の FT 出力次元 (runtime、--ft-out)
+    scale: f32,  // = 127.0/128.0
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (ft_dim as usize);
+    let ri = tid.get() % (ft_dim as usize);
+    let half = (ft_dim as usize) / 2;
+
+    let ft_base = bi * (ft_dim as usize);
+    let val = if ri < half {
+        // stm side, pair_idx = ri in [0, half)
+        let xa = stm_ft_out[ft_base + ri] + bias[ri];
+        let xb = stm_ft_out[ft_base + half + ri] + bias[half + ri];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    } else {
+        // nstm side, pair_idx = ri - half in [0, half)
+        let pair_idx = ri - half;
+        let xa = nstm_ft_out[ft_base + pair_idx] + bias[pair_idx];
+        let xb = nstm_ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    };
+
+    if let Some(o) = combined.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// [`ft_post_perspective_fwd`] の FP16 入力版。`stm_ft_out` / `nstm_ft_out` を `f16`
+/// で読み、`f32` に変換してから bias add 以降を計算する。math と `combined` 出力は
+/// `f32` のまま (`combined` は後続 dense L1 path が `f32` で読む)。
+///
+/// `sparse_ft_forward_fp16` が `ft_*_out` を `f16` で書くようになったため、その read
+/// 側も半精度化して DRAM traffic を合わせる。`f16` → `f32` 変換は値域を保つ無損失
+/// 変換なので、`combined` は FP32 版と同じ値域・同じ丸めで計算される (入力 `ft_*_out`
+/// 自体が `sparse_ft_forward_fp16` 時点で既に半精度量子化されている点のみ FP32 path と
+/// 異なる)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_fwd_fp16(
+    stm_ft_out: &[f16],
+    nstm_ft_out: &[f16],
+    bias: &[f32],
+    mut combined: DisjointSlice<f32>,
+    batch: u32,
+    ft_dim: u32, // per-perspective の FT 出力次元 (runtime、--ft-out)
+    scale: f32,  // = 127.0/128.0
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (ft_dim as usize);
+    let ri = tid.get() % (ft_dim as usize);
+    let half = (ft_dim as usize) / 2;
+
+    let ft_base = bi * (ft_dim as usize);
+    let val = if ri < half {
+        // stm side, pair_idx = ri in [0, half)
+        let xa = stm_ft_out[ft_base + ri] as f32 + bias[ri];
+        let xb = stm_ft_out[ft_base + half + ri] as f32 + bias[half + ri];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    } else {
+        // nstm side, pair_idx = ri - half in [0, half)
+        let pair_idx = ri - half;
+        let xa = nstm_ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+        let xb = nstm_ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+        let ya = if xa < 0.0_f32 {
+            0.0_f32
+        } else if xa > 1.0_f32 {
+            1.0_f32
+        } else {
+            xa
+        };
+        let yb = if xb < 0.0_f32 {
+            0.0_f32
+        } else if xb > 1.0_f32 {
+            1.0_f32
+        } else {
+            xb
+        };
+        ya * yb * scale
+    };
+
+    if let Some(o) = combined.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// Fused FT post-processing (backward) — scale grad → pairwise_mul grad → CReLU grad
+/// → bias grad。`ft_post_perspective_fwd` の per-perspective gradient。
+///
+/// **2 回呼ばれる** (stm と nstm 各 1 回)。`grad_bias` は両 call で **共有** (FT bias
+/// は stm/nstm 共有のため、gradient は両方の和)。host は `grad_bias` を 1 回 zero 初期化、
+/// 2 call で atomic accumulate される。
+///
+/// **stream synchronization**: 本 kernel は default stream で 2 connected launch
+/// (stm 用 + nstm 用) として実行される。cuda-oxide の default stream は serialized
+/// 実行 (各 launch は前の launch 完了後に開始) のため、`grad_bias` への atomic
+/// accumulate は 2 call 間で race condition を起こさない。明示的な
+/// `cudaStreamSynchronize` は host loop 末尾の `self.stream.synchronize()` で 1 回のみ。
+///
+/// 1 thread = 1 (batch, ft_dim_index) cell of this perspective's `grad_ft_out`。
+/// tid in `[0, batch * ft_dim)`、tid IS the cell to write。
+///
+/// `d_combined_offset` で combined buffer 内の自 perspective の位置を指す
+/// (stm: 0, nstm: ft_dim/2)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad(
+    d_combined: &[f32],                  // (batch × combined_dim)
+    ft_out: &[f32],                      // perspective's sparse_ft_forward output (batch × ft_dim)
+    bias: &[f32],                        // shared FT bias (ft_dim)
+    mut grad_ft_out: DisjointSlice<f32>, // perspective's dft output (batch × ft_dim)
+    grad_bias: &[f32],                   // shared, atomic accumulate (ft_dim)
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32, // 0 (stm) or ft_dim/2 (nstm)
+    d_combined_stride: u32, // = combined_dim = ft_dim
+    scale: f32,
+) {
+    // 1 thread = 1 (bi, pair_idx) → 2 出力 (ii=pair_idx と ii=pair_idx+half) を per-thread に
+    // 担当させて dy / xa / xb / bias を 1 回読みで共有する。caller の launch config は
+    // `cfg_1d(batch * ft_dim / 2)` で、`ft_dim` 偶数性 (= `2 * half`、arch 上 invariant) が前提。
+    // grad_ft_out の cell 数と grad_bias への atomic 回数は thread 数半減 + per-thread 出力倍で
+    // 不変。同一 (bi, ii) cell に書く thread は 1 つのみ (cross-thread disjoint)。
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    // d_combined の対応 output cell (pair_idx 共通)
+    let dy =
+        d_combined[bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    // First side (ii = pair_idx): my_pre = xa, partner_post = yb
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    // Second side (ii = pair_idx + half): my_pre = xb, partner_post = ya
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    // 1 thread が 2 cell (ft_base + pair_idx) と (ft_base + half + pair_idx) を書く。
+    // DisjointSlice の `get_mut(ThreadIndex)` は 1 thread = 1 cell 安全契約を要求するので、
+    // 2 cell 書きは sparse_ft_forward と同じく raw pointer 経由。
+    // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の偶数性で
+    // pair_idx ∈ [0, half) → ii ∈ {pair_idx, pair_idx + half} ⊂ [0, ft_dim) に限る。tid 範囲
+    // チェック (`tid >= total_pairs` で `bi < batch`) と合わせて `ft_base + half + pair_idx <
+    // batch * ft_dim` が成立。同一 (bi, ii) cell を書く thread は他に存在しない (pair_idx
+    // 単射、cross-thread disjoint)。
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(grad_a);
+        out_ptr.add(ft_base + half + pair_idx).write(grad_b);
+    }
+
+    // grad_bias[ii] += grad_my_pre (atomic, 共有 bias)。
+    // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
+/// Fused 版 [`ft_post_perspective_grad`]: `dy = dcombined_a[idx] + dcombined_b[idx]`
+/// を in-register sum で計算し、materialized な合算 buffer 経由を避ける。math は
+/// `ft_post_perspective_grad` と同等で、`dy` の読み出し元のみ単一 buffer → 2 source
+/// の elementwise sum に置換。
+///
+/// 1 step あたり stm / nstm の 2 launch のみで完結 (合算 buffer を介す場合の合算
+/// kernel + grad 2 launch = 3 launch / 384MB DRAM roundtrip と比較して 1 launch +
+/// ~768MB DRAM 削減)。
+///
+/// `d_combined_stride` は両 source の row-stride (= FT 出力次元 ft_out)、
+/// `d_combined_offset` は perspective 別 offset (stm: 0、nstm: ft_dim/2)、両 source
+/// は同 stride・同 layout を caller が保証 (両者とも `b × ft_out` workspace)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fused(
+    d_combined_a: &[f32],
+    d_combined_b: &[f32],
+    ft_out: &[f32],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f32>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy_idx = bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx;
+    let dy = d_combined_a[dy_idx] + d_combined_b[dy_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(grad_a);
+        out_ptr.add(ft_base + half + pair_idx).write(grad_b);
+    }
+
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
+/// [`ft_post_perspective_grad_fused`] の FP16 版。forward activation `ft_out` を `f16`
+/// で読み、`grad_ft_out` (dft) を `f16` で書く。`d_combined_a` / `_b` と `bias` /
+/// `grad_bias` は `f32` のまま (それぞれ dense L1 backward 出力と共有 FT bias で、
+/// 半精度化はこの kernel の scope 外)。
+///
+/// math は `ft_post_perspective_grad_fused` と同等。`grad_bias` への atomic accumulate
+/// は `f32` の `grad_a` / `grad_b` をそのまま使い (FP32 path と同じ精度)、`grad_ft_out`
+/// へ書く分のみ round-to-nearest で `f16` に変換する。`grad_ft_out` を半精度にすると
+/// 後続の inverse-index gather (`gather_and_sum_per_feature_*_fp16`) の read DRAM
+/// traffic が半減する (dft は b × ft_out で step 中で最も read 量が多い buffer)。
+///
+/// **loss scaling**: dft の値は batch 正規化 (loss が 1/batch) のため `1/batch` に比例し、
+/// そのまま f16 化すると全要素が subnormal 下限 (2^-24 ≈ 6e-8) を下回って 0 に潰れる。
+/// これを防ぐため `grad_ft_out` へ書く値だけ caller 計算の `dft_scale`
+/// ([`FT_DFT_FP16_BASE_SCALE`] × batch) を掛けて f16 normal range に持ち上げる。gather
+/// 側 (`gather_and_sum_per_feature_*_fp16`) が逆数を掛けて元の scale に戻す。`grad_bias`
+/// は scale しない (f32 のため不要)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fused_fp16(
+    d_combined_a: &[f32],
+    d_combined_b: &[f32],
+    ft_out: &[f16],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f16>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+    dft_scale: f32, // grad_ft_out (f16) loss scaling 係数 (= FT_DFT_FP16_BASE_SCALE × batch)
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy_idx = bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx;
+    let dy = d_combined_a[dy_idx] + d_combined_b[dy_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
+    // `ft_post_perspective_grad_fused` と同一 (SAFETY 不変条件はそのまま、要素型のみ f16)。
+    // dft_scale を掛けてから f16 化する (loss scaling、gather 側で逆数を掛けて戻す)。
+    //
+    // `grad * dft_scale` は f16 有限域 (`|x| <= 65504`) を超えうる。clamp せず `as f16`
+    // すると天井を越えた値が `±inf` になり、gather で `ft_w_grad` に伝播 → optimizer
+    // 経由で weight を NaN 化させ学習を発散させる。これを防ぐため格納前に clamp する。
+    // clamp が当たるのは天井を越えた稀な外れ値のみで、その要素の勾配が cap される
+    // (発散の代わりに有界な近似)。
+    let da = grad_a * dft_scale;
+    let da_c = if da > 65504.0_f32 {
+        65504.0_f32
+    } else if da < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        da
+    };
+    let db = grad_b * dft_scale;
+    let db_c = if db > 65504.0_f32 {
+        65504.0_f32
+    } else if db < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        db
+    };
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(da_c as f16);
+        out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
+    }
+
+    // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
+/// 非 fused FP16 版 [`ft_post_perspective_grad`]: forward activation `ft_out` を `f16`
+/// で読み、`grad_ft_out` (dft) を loss scaling 付き `f16` で書く。`d_combined` は
+/// 単一 source (`ft_post_perspective_grad` と同じく、`d_combined_offset` で perspective
+/// の半分を切り出す)。`d_combined` / `bias` / `grad_bias` は `f32` のまま。
+///
+/// math は [`ft_post_perspective_grad_fused_fp16`] と同等で、`dy` の読み出し元のみ
+/// 2 source の in-register sum → 単一 buffer read に置き換わる。`grad_ft_out` へ書く
+/// 値は `dft_scale` ([`FT_DFT_FP16_BASE_SCALE`] × batch) を掛けて f16 normal range に
+/// 持ち上げ ±65504 clamp してから cast し、後続 [`simple_sparse_ft_backward_fp16`] が
+/// `dft_inv_scale` で打ち消す。`grad_bias` への atomic accumulate は scale しない
+/// `f32` の `grad_a` / `grad_b` をそのまま使う (FP32 path と同じ精度)。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn ft_post_perspective_grad_fp16(
+    d_combined: &[f32],
+    ft_out: &[f16],
+    bias: &[f32],
+    mut grad_ft_out: DisjointSlice<f16>,
+    grad_bias: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    d_combined_offset: u32,
+    d_combined_stride: u32,
+    scale: f32,
+    dft_scale: f32,
+) {
+    let tid = thread::index_1d();
+    let half = (ft_dim as usize) / 2;
+    let total_pairs = (batch as usize) * half;
+    if tid.get() >= total_pairs {
+        return;
+    }
+    let bi = tid.get() / half;
+    let pair_idx = tid.get() % half;
+
+    let dy =
+        d_combined[bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx];
+
+    let ft_base = bi * (ft_dim as usize);
+    let xa = ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+    let xb = ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+
+    let ya = if xa < 0.0_f32 {
+        0.0_f32
+    } else if xa > 1.0_f32 {
+        1.0_f32
+    } else {
+        xa
+    };
+    let yb = if xb < 0.0_f32 {
+        0.0_f32
+    } else if xb > 1.0_f32 {
+        1.0_f32
+    } else {
+        xb
+    };
+
+    let grad_a_post = dy * yb * scale;
+    let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+        grad_a_post
+    } else {
+        0.0_f32
+    };
+    let grad_b_post = dy * ya * scale;
+    let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+        grad_b_post
+    } else {
+        0.0_f32
+    };
+
+    // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
+    // `ft_post_perspective_grad_fused_fp16` と同一。dft_scale を掛けてから f16 域へ
+    // clamp する (天井超過を ±inf にすると gather 経由で weight を NaN 化させるため)。
+    let da = grad_a * dft_scale;
+    let da_c = if da > 65504.0_f32 {
+        65504.0_f32
+    } else if da < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        da
+    };
+    let db = grad_b * dft_scale;
+    let db_c = if db > 65504.0_f32 {
+        65504.0_f32
+    } else if db < -65504.0_f32 {
+        -65504.0_f32
+    } else {
+        db
+    };
+    // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の
+    // 偶数性で pair_idx ∈ [0, half) → {pair_idx, half + pair_idx} ⊂ [0, ft_dim)、tid 範囲
+    // チェックで bi < batch。同一 (bi, ii) cell を書く thread は他に無い (pair_idx 単射)。
+    let out_ptr = grad_ft_out.as_mut_ptr();
+    unsafe {
+        out_ptr.add(ft_base + pair_idx).write(da_c as f16);
+        out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
+    }
+
+    // grad_bias は f32 accumulate を維持 (scale 無しの grad_a / grad_b を atomic add)。
+    // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
+    // `f32` (align 4) と `DeviceAtomicF32` は同 layout、non-atomic 書き込み path は無し。
+    let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+    let bias_cell_b =
+        unsafe { &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32) };
+    bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+}
+
+/// Regular dense matrix multiply forward + bias add。
+///
+/// `y[b][o] = bias[o] + sum_i x[b][i] * w[i][o]`。Layout: `x` row-major (batch × in_dim)、
+/// `w` row-major (in_dim × out_dim)、`y` row-major (batch × out_dim)、`bias` (out_dim)。
+///
+/// 1 thread = 1 (batch, out_index) cell、atomics 不要。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let mut sum = bias[oi];
+    let mut k: u32 = 0;
+    while k < in_dim {
+        sum += x[bi * (in_dim as usize) + (k as usize)] * w[(k as usize) * (out_dim as usize) + oi];
+        k += 1;
+    }
+    if let Some(o) = y.get_mut(tid) {
+        *o = sum;
+    }
+}
+
+/// Regular dense matrix multiply backward (wrt input)。`dx[b][i] = sum_o dy[b][o] * w[i][o]`。
+/// 1 thread = 1 (batch, in_index) cell、atomics 不要。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input(
+    dy: &[f32],
+    w: &[f32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (in_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (in_dim as usize);
+    let ii = tid.get() % (in_dim as usize);
+    let mut sum = 0.0_f32;
+    let mut o: u32 = 0;
+    while o < out_dim {
+        sum +=
+            dy[bi * (out_dim as usize) + (o as usize)] * w[ii * (out_dim as usize) + (o as usize)];
+        o += 1;
+    }
+    if let Some(d) = dx.get_mut(tid) {
+        *d = sum;
+    }
+}
+
+/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 (`in_dim=ft_out`,
+/// `out_dim=16` 固定)、`batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。
+///
+/// 元 `dense_mm_bwd_input` は w[ii][o] (out-major) read で warp 内 ii=0..31 が stride 16 = 64B
+/// = 32 cache lines load → uncoalesced。本 kernel は W_TILE / DY_TILE を shared に load
+/// (coalesced)、各 thread が 1 (bi, ii) cell を 16 FMA で完成。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input_tiled(
+    dy: &[f32],
+    w: &[f32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_IN × 16
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_B × 16
+
+    let tid_local = thread::threadIdx_x() as usize;
+    // 1D grid: block_idx encodes (b_block, ii_block). 全 cell の 1D 順序を保持し
+    // `dx.get_mut(thread::index_1d())` で disjoint write を成立させる。
+    // grid_dim = (in_dim/16) * (batch/16)、block index = b_block * (in_dim/16) + ii_block。
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let blocks_per_b_row = in_dim_u >> 4; // in_dim / 16
+    let block_lin = thread::blockIdx_x() as usize;
+    let block_b = block_lin / blocks_per_b_row;
+    let block_ii = block_lin % blocks_per_b_row;
+    let tid_b = tid_local >> 4;
+    let tid_i = tid_local & 15;
+    let b_start = block_b << 4;
+    let ii_start = block_ii << 4;
+    let global_bi = b_start + tid_b;
+    let global_ii = ii_start + tid_i;
+
+    let bi_ok = global_bi < batch_u;
+    let ii_ok = global_ii < in_dim_u;
+
+    // W_TILE [TILE_IN × out_dim=16]: 256 cells.
+    // Cell layout: W_TILE[ii_local * 16 + o] = w[(ii_start + ii_local) * out_dim + o]
+    // Map tid_local → (ii_local = tid/16, o = tid%16). For warp tid 0..31: ii_local in {0,1},
+    // o in 0..15 → 16-thread sub-group reads 16 consecutive o (= 1 cache line). Coalesced ✓
+    unsafe {
+        let ii_local_load = tid_b;
+        let o_load = tid_i;
+        let ii_global_load = ii_start + ii_local_load;
+        W_TILE[tid_local] = if ii_global_load < in_dim_u && o_load < out_dim_u {
+            w[ii_global_load * out_dim_u + o_load]
+        } else {
+            0.0_f32
+        };
+        // DY_TILE [TILE_B × 16] = 256 cells.
+        // Cell DY_TILE[b_local * 16 + o] = dy[(b_start + b_local) * out_dim + o]
+        // Map tid_local → (b_local = tid/16, o = tid%16). Coalesced.
+        let b_local_load = tid_b;
+        let bb_global_load = b_start + b_local_load;
+        DY_TILE[tid_local] = if bb_global_load < batch_u && o_load < out_dim_u {
+            dy[bb_global_load * out_dim_u + o_load]
+        } else {
+            0.0_f32
+        };
+    }
+    thread::sync_threads();
+
+    if bi_ok && ii_ok {
+        let mut acc = 0.0_f32;
+        let mut o: usize = 0;
+        while o < 16 {
+            unsafe {
+                acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
+            }
+            o += 1;
+        }
+        // 2D tile grid → cell index は (b_block, ii_block) と (tid_b, tid_i) から合成。
+        // thread::index_1d() (block_lin * 256 + tid_local) と cell_idx は order が異なるため
+        // raw pointer 経由で write (各 thread は disjoint cell を担当、host が grid_dim 整合)。
+        let cell_idx = global_bi * in_dim_u + global_ii;
+        unsafe {
+            *dx.as_mut_ptr().add(cell_idx) = acc;
+        }
+    }
+}
+
+/// Regular dense matrix multiply backward (wrt weight)。`dw[i][o] = sum_b x[b][i] * dy[b][o]`。
+/// 1 thread = 1 (in_index, out_index) weight cell、batch loop 内で sum、atomics 不要 (overwrite)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight(
+    x: &[f32],
+    dy: &[f32],
+    mut grad_w: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (in_dim as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let ii = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let mut sum = 0.0_f32;
+    let mut b: u32 = 0;
+    while b < batch {
+        sum +=
+            x[(b as usize) * (in_dim as usize) + ii] * dy[(b as usize) * (out_dim as usize) + oi];
+        b += 1;
+    }
+    if let Some(g) = grad_w.get_mut(tid) {
+        *g = sum;
+    }
+}
+
+/// Tiled shared-memory variant of [`dense_mm_bwd_weight`]. L1f 用 (`in_dim=ft_out`,
+/// `out_dim=16` 固定) を想定した固定タイル形状 (TILE_K=16, TILE_IN=16,
+/// TILE_OUT=16, block=256 threads)。`in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0`
+/// が host 契約。非該当形状では結果未定義 (host 側で sizes チェックの上で本 kernel を選ぶ)。
+///
+/// 1 block = 1 (TILE_IN × TILE_OUT) W tile。block 内 256 threads が batch を TILE_K=16
+/// chunk で cooperatively load し、shared memory 上で TILE_K 回 FMA。current "1 thread =
+/// 1 cell、scan batch" 比 ~33x 少ない unique memory read (x 16x redundant → 1x、dy ft_out x → 1x)。
+///
+/// SAFETY: `static mut TILE` への access は block-local barrier (`sync_threads`) で
+/// race を防ぐ。各 thread の write index は disjoint なので per-thread access は安全。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_tiled(
+    x: &[f32],
+    dy: &[f32],
+    mut grad_w: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    // 256 element tiles → 1 KB / tile (= within 100 KB sm_86 shared mem budget)。
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_K × TILE_IN
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_K × TILE_OUT
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let tid_i = tid_local >> 4; // tid / 16
+    let tid_o = tid_local & 15; // tid % 16
+    let global_ii = block_x * 16 + tid_i;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let in_ok = global_ii < in_dim_u;
+    let out_ok = global_oi < out_dim_u;
+
+    let mut acc: f32 = 0.0_f32;
+    let n_k_tiles = batch_u >> 4; // batch / 16
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let b_start = k_tile << 4;
+        // Cooperative load: 256 threads × 1 cell each.
+        // X_TILE[k * TILE_IN + ii] = x[(b_start + k) * in_dim + (block_x * TILE_IN + ii)]
+        //  Warp threads (tid 0..31) → k = tid/16 ∈ {0,1}, ii = tid%16 ∈ 0..15.
+        //  Within k segment (tid 0..15 or 16..31), 16 consecutive ii → coalesced read of x row.
+        unsafe {
+            let bb = b_start + tid_i;
+            let global_ii_load = (block_x << 4) | tid_o;
+            // Use tid_i as k (0..15) and tid_o as ii within tile (0..15) for X load.
+            let mapped = (tid_i << 4) | tid_o; // = tid_local
+            if bb < batch_u && global_ii_load < in_dim_u {
+                X_TILE[mapped] = x[bb * in_dim_u + global_ii_load];
+            } else {
+                X_TILE[mapped] = 0.0_f32;
+            }
+            // DY_TILE[k * TILE_OUT + oi] = dy[(b_start + k) * out_dim + oi]
+            // Use tid_i as k and tid_o as oi.
+            if bb < batch_u && tid_o < out_dim_u {
+                DY_TILE[mapped] = dy[bb * out_dim_u + tid_o];
+            } else {
+                DY_TILE[mapped] = 0.0_f32;
+            }
+        }
+        thread::sync_threads();
+
+        // Compute: each thread computes 1 (global_ii, global_oi) cell using 16 K iterations.
+        if in_ok && out_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if in_ok && out_ok {
+        // cell_idx == thread::index_1d() since tid_i = tid/16, tid_o = tid%16 and
+        // global cell_idx = global_ii * out_dim + global_oi
+        //                 = (block_x * 16 + tid_i) * 16 + tid_o
+        //                 = block_x * 256 + tid_local = thread::index_1d().get()
+        let global_tid = thread::index_1d();
+        if let Some(g) = grad_w.get_mut(global_tid) {
+            *g = acc;
+        }
+    }
+}
+
+/// Tiled per-bucket weight backward (L1 用: `in_dim=ft_out`、`out_dim=16` /
+/// `num_buckets=9` は固定、`batch % 16 == 0`)。
+///
+/// 元の `dense_mm_bwd_weight_bucket` (1 thread = 1 (buc, oi, ii) cell、scan batch、
+/// bucket filter を inner loop で 9 倍冗長に評価) を「block per W tile (16x16)、
+/// 1 thread = 9 bucket × 1 cell の register accumulator、batch scan 1 回」に書き換え。
+/// 副作用: `dy_tile`、`x_tile`、`buc_tile` を shared mem に coalesced load し、batch を
+/// TILE_K=16 chunk で消化。bucket 分岐は uniform (同 k 内で warp 全 thread が同 buc) なので
+/// divergence なし。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l1(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let block_split = thread::blockIdx_y() as usize;
+    let num_splits = thread::gridDim_y() as usize;
+    let tid_i = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let global_ii = (block_x << 4) | tid_i;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let num_buc_u = num_buckets as usize;
+    let in_ok = global_ii < in_dim_u;
+    let out_ok = global_oi < out_dim_u;
+
+    // split-K: 各 block が batch slice を担当。num_splits=1 で 1 block が全 batch を scan。
+    let positions_per_split = batch_u.div_ceil(num_splits);
+    let split_b_start = block_split * positions_per_split;
+    if split_b_start >= batch_u {
+        return;
+    }
+    let split_b_end_candidate = split_b_start + positions_per_split;
+    let split_b_end = if split_b_end_candidate < batch_u {
+        split_b_end_candidate
+    } else {
+        batch_u
+    };
+    // TILE_K=16 単位で並ぶよう、batch slice は 16 の倍数を host が保証 (`debug_assert` 済)。
+    // 端数 split は最後の block が短くなる (b_end が batch_u に丸まる)。
+
+    // 9 個の bucket accumulator (fixed expansion で register に置く)。
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let n_k_tiles = (split_b_end - split_b_start) >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let b_start = split_b_start + (k_tile << 4);
+        unsafe {
+            let bb = b_start + tid_i;
+            let global_ii_load = (block_x << 4) | tid_o;
+            let mapped = (tid_i << 4) | tid_o;
+            X_TILE[mapped] = if bb < batch_u && global_ii_load < in_dim_u {
+                x[bb * in_dim_u + global_ii_load]
+            } else {
+                0.0_f32
+            };
+            DY_TILE[mapped] = if bb < batch_u && tid_o < out_dim_u {
+                dy[bb * out_dim_u + tid_o]
+            } else {
+                0.0_f32
+            };
+            // BUC_TILE: 16 個 (= TILE_K)。先頭 16 thread (tid_local < 16) が load 担当。
+            if tid_local < 16 {
+                let bb2 = b_start + tid_local;
+                BUC_TILE[tid_local] = if bb2 < batch_u {
+                    bucket_idx[bb2]
+                } else {
+                    -1_i32
+                };
+            }
+        }
+        thread::sync_threads();
+
+        if in_ok && out_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    let buc = BUC_TILE[k];
+                    let mul = X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
+                    // num_buckets=9 を想定。負値・>=9 は無視 (silent skip、元 kernel と同じ)。
+                    if buc == 0 {
+                        a0 += mul;
+                    } else if buc == 1 {
+                        a1 += mul;
+                    } else if buc == 2 {
+                        a2 += mul;
+                    } else if buc == 3 {
+                        a3 += mul;
+                    } else if buc == 4 {
+                        a4 += mul;
+                    } else if buc == 5 {
+                        a5 += mul;
+                    } else if buc == 6 {
+                        a6 += mul;
+                    } else if buc == 7 {
+                        a7 += mul;
+                    } else if buc == 8 {
+                        a8 += mul;
+                    }
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    // Write: grad_w[buc * out_dim * in_dim + global_ii * out_dim + global_oi] かと思いきや、
+    // 元 kernel の layout は `grad_w[buc][o][i]` row-major、つまり buc * out_dim * in_dim +
+    // out_idx * in_dim + in_idx (out-major そして in-major) で、`tid_in_block` 全 thread が
+    // bucket buc に対して書く 1 cell の index = buc * (out_dim * in_dim) + oi * in_dim + ii。
+    if in_ok && out_ok {
+        let per_bucket = out_dim_u * in_dim_u;
+        let cell_in_bucket = global_oi * in_dim_u + global_ii;
+        // split-K では num_splits >= 1 block が同 cell に partial sum を寄せるため atomicAdd。
+        // num_splits=1 でも 1 回の atomicAdd になるだけで結果は同じ (grad_w は host が memset 0)。
+        let raw = grad_w.as_ptr();
+        if num_buc_u >= 1 {
+            unsafe {
+                let c = &*(raw.add(cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a0, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 2 {
+            unsafe {
+                let c = &*(raw.add(per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a1, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 3 {
+            unsafe {
+                let c = &*(raw.add(2 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a2, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 4 {
+            unsafe {
+                let c = &*(raw.add(3 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a3, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 5 {
+            unsafe {
+                let c = &*(raw.add(4 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a4, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 6 {
+            unsafe {
+                let c = &*(raw.add(5 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a5, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 7 {
+            unsafe {
+                let c = &*(raw.add(6 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a6, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 8 {
+            unsafe {
+                let c = &*(raw.add(7 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a7, AtomicOrdering::Relaxed);
+            }
+        }
+        if num_buc_u >= 9 {
+            unsafe {
+                let c = &*(raw.add(8 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+                c.fetch_add(a8, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Sorted layout 版 [`dense_mm_bwd_weight_bucket_tiled_l1`]。caller が batch を bucket で
+/// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済を保証する
+/// (`exclusive_scan_aligned` 経由)。grid 構成:
+/// - `blockIdx_x` = in_tile (`in_dim / 16` 個)
+/// - `blockIdx_y` = bucket 内 split-K (`gridDim_y` 個の連続 TILE_K slice)
+/// - `blockIdx_z` = bucket (`num_buckets` 個)
+///
+/// 各 block は uniform-by-construction で 1 bucket の slice のみ accumulate。9-way if-else
+/// dispatch / 9 register accumulator / 9 atomic write はすべて 1 個ずつに集約され、
+/// 終端で `grad_w[block_buc][oi][ii]` に 1 atomicAdd。
+///
+/// padding 行 (perm=-1 由来で `permute_rows_f32` が 0 fill) は x,dy=0 で sum=0 contribution、
+/// bucket slice 末端の 16-alignment slack 行も同様に silent に 0 contribution。
+///
+/// 数値同等性: 加算順序が sort 済 batch 順 + split-K 集約順になるため fp32 associativity で
+/// baseline と bit-exact ではないが、reduction tolerance (相対誤差 < `TOL`) 内で一致。
+/// `in_dim % 16 == 0` / `out_dim == 16` / `num_buckets <= 9` / `padded_batch % 16 == 0` /
+/// `bucket_offsets` が aligned exclusive scan 出力 は caller 契約。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
+    x: &[f32],
+    dy: &[f32],
+    bucket_offsets: &[u32],
+    grad_w: &[f32],
+    padded_batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_x = thread::blockIdx_x() as usize;
+    let block_split = thread::blockIdx_y() as usize;
+    let num_splits = thread::gridDim_y() as usize;
+    let block_buc = thread::blockIdx_z() as usize;
+    let tid_i = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let global_ii = (block_x << 4) | tid_i;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let padded_b_u = padded_batch as usize;
+    let num_buc_u = num_buckets as usize;
+    let in_ok = global_ii < in_dim_u;
+    let out_ok = global_oi < out_dim_u;
+    let buc_ok = block_buc < num_buc_u;
+
+    let buc_start = bucket_offsets[block_buc] as usize;
+    let buc_end_raw = bucket_offsets[block_buc + 1] as usize;
+    let buc_end = if buc_end_raw < padded_b_u {
+        buc_end_raw
+    } else {
+        padded_b_u
+    };
+    let buc_size = buc_end.saturating_sub(buc_start);
+    let n_total_tiles = buc_size >> 4;
+
+    let tiles_per_split = n_total_tiles.div_ceil(num_splits);
+    let split_tile_start = block_split * tiles_per_split;
+    let split_tile_end_cand = split_tile_start + tiles_per_split;
+    let split_tile_end = if split_tile_end_cand < n_total_tiles {
+        split_tile_end_cand
+    } else {
+        n_total_tiles
+    };
+
+    let mut acc: f32 = 0.0_f32;
+    if buc_ok && split_tile_start < n_total_tiles {
+        let mut k_tile = split_tile_start;
+        while k_tile < split_tile_end {
+            let b_start = buc_start + (k_tile << 4);
+            unsafe {
+                let bb = b_start + tid_i;
+                let global_ii_load = (block_x << 4) | tid_o;
+                let mapped = (tid_i << 4) | tid_o;
+                X_TILE[mapped] = if bb < buc_end && global_ii_load < in_dim_u {
+                    x[bb * in_dim_u + global_ii_load]
+                } else {
+                    0.0_f32
+                };
+                DY_TILE[mapped] = if bb < buc_end && tid_o < out_dim_u {
+                    dy[bb * out_dim_u + tid_o]
+                } else {
+                    0.0_f32
+                };
+            }
+            thread::sync_threads();
+
+            if in_ok && out_ok {
+                let mut k: usize = 0;
+                while k < 16 {
+                    unsafe {
+                        acc += X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
+                    }
+                    k += 1;
+                }
+            }
+            thread::sync_threads();
+            k_tile += 1;
+        }
+    }
+
+    if buc_ok && in_ok && out_ok {
+        let per_bucket = out_dim_u * in_dim_u;
+        let cell_in_bucket = global_oi * in_dim_u + global_ii;
+        let raw = grad_w.as_ptr();
+        unsafe {
+            let c = &*(raw.add(block_buc * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(acc, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// Bias gradient (block-level shared-mem reduction) — L1f 用 (`out_dim=16`)。
+///
+/// 元 `bias_grad` は 1M threads × 1 atomic → 16 cells で contention 大。本 kernel は
+/// 各 block (256 threads) が shared-mem 16-cell accumulator に集約 → 1 block × 16 atomic
+/// add で global に flush。global atomic 数 = blocks × 16 (= ~64K) で contention 大幅減。
+#[kernel]
+pub fn bias_grad_shared_l1f(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+    use core::ptr::addr_of_mut;
+    static mut PARTIAL: SharedArray<f32, 16> = SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_idx = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let total = batch_u * out_dim_u;
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+
+    // 初期化: 先頭 out_dim threads が PARTIAL を 0 reset。
+    if tid < out_dim_u {
+        unsafe {
+            partial_ptr.add(tid).write(0.0_f32);
+        }
+    }
+    thread::sync_threads();
+
+    // accumulate: 各 thread = 1 (b, oi) cell の dy 値を shared atomic add (16 cells に contention)。
+    let global_idx = block_idx * block_dim_u + tid;
+    if global_idx < total {
+        let oi = global_idx % out_dim_u;
+        let dyv = dy[global_idx];
+        let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+    }
+    thread::sync_threads();
+
+    // flush: 先頭 out_dim threads が PARTIAL → grad_bias に atomic add。
+    if tid < out_dim_u {
+        let p = unsafe { partial_ptr.add(tid).read() };
+        let cell = unsafe { &*(grad_bias.as_ptr().add(tid) as *const DeviceAtomicF32) };
+        cell.fetch_add(p, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Bias gradient (generic) — `grad_bias[o] += sum_b dy[b][o]` (atomic accumulate)。
+///
+/// 1 thread = 1 (batch, out) cell、各 oi が batch 数の atomic 寄与を受ける。
+/// host が呼出前に `grad_bias` を 0 で初期化する責務 (accumulate semantics)。
+#[kernel]
+pub fn bias_grad(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let oi = tid.get() % (out_dim as usize);
+    let dyv = dy[tid.get()];
+    // SAFETY: grad_bias[oi] within bounds (oi < out_dim、host が grad_bias.len() = out_dim 確保)。
+    let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
+    cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+}
+
+/// Per-bucket dense matrix multiply forward + bias + select。
+///
+/// `y[b] (out_dim 次元) = bias[bucket_idx[b]] + sum_i x[b][i] * w[bucket_idx[b]][i]`。
+/// Layout: `w` row-major (num_buckets * out_dim × in_dim) — bucket-major、その中で
+/// out-major。`bias` (num_buckets * out_dim)、`y` (batch × out_dim)。
+///
+/// 1 thread = 1 (batch, out_index) cell、`bucket_idx[bi]` で per-position bucket 選択。
+/// out-of-range bucket は silent skip (y は 0 のままになる)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_bucket(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let buc = bucket_idx[bi];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        if let Some(o) = y.get_mut(tid) {
+            *o = 0.0_f32;
+        }
+        return;
+    }
+    let buc_u = buc as usize;
+    let w_row_base = buc_u * (out_dim as usize) * (in_dim as usize) + oi * (in_dim as usize);
+    let bias_idx = buc_u * (out_dim as usize) + oi;
+    let mut sum = bias[bias_idx];
+    let mut k: u32 = 0;
+    while k < in_dim {
+        sum += x[bi * (in_dim as usize) + (k as usize)] * w[w_row_base + (k as usize)];
+        k += 1;
+    }
+    if let Some(o) = y.get_mut(tid) {
+        *o = sum;
+    }
+}
+
+/// Tiled non-bucket forward dense matmul (L1f 用: `in_dim=ft_out`、`out_dim=16` 固定)。
+/// 元 `dense_mm_fwd` は coalesced だが 1 thread = 1 (b, oi) で per-thread ft_out K iter で
+/// 並列度限界。本 kernel は block tile (TILE_B=16 × TILE_OUT=16 = 256 cells)、K=16 chunk
+/// で shared-mem cooperative load → 256 cells / block で並列度 4K blocks × 256 threads。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_tiled_l1f(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    let bias_init = if bi_ok && oi_ok {
+        bias[global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        // X_TILE [TILE_B × TILE_K]: x[(b_start+tid_b)*in_dim + (k_start+tid_o)]
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+            // W_TILE [TILE_OUT × TILE_K]: w[(k_start+k_local) * out_dim + tid_o_load]
+            // w layout: in-major × out-major (`w[ii * out_dim + oi]`)、coalesced for `tid_o` varies.
+            // Map tid_local → (k_local = tid/16, o_load = tid%16)
+            let k_local = tid_b; // tid_local / 16
+            let o_load = tid_o; // tid_local & 15
+            let kk2 = k_start + k_local;
+            W_TILE[tid_local] = if kk2 < in_dim_u && o_load < out_dim_u {
+                w[kk2 * out_dim_u + o_load]
+            } else {
+                0.0_f32
+            };
+        }
+        thread::sync_threads();
+
+        if bi_ok && oi_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(k << 4) | tid_o];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok
+        && oi_ok
+        && let Some(o) = y.get_mut(thread::index_1d())
+    {
+        *o = acc;
+    }
+}
+
+/// Tiled per-bucket forward dense matmul (L1 用: `in_dim=ft_out`、`out_dim=16` /
+/// `num_buckets=9` は固定)。
+///
+/// 元 `dense_mm_fwd_bucket` は `w[buc][oi][ii]` layout のため、warp 内 16-thread sub-group が
+/// oi 軸を varying させると stride=in_dim=ft_out で uncoalesced。本 kernel は 1 block = 1 batch
+/// tile (TILE_B=16) × 全 oi (= TILE_OUT=16)、K (= in_dim) を TILE_K=16 chunk で消化し、shared
+/// memory 上で `w_tile [NUM_BUCKETS × TILE_OUT × TILE_K]` を per-K-tile load (coalesced)。各
+/// thread は自分の bucket の W 行を shared から読んで accumulate。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_bucket_tiled_l1(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 × 16
+    static mut W_TILE: SharedArray<f32, 2304> = SharedArray::UNINIT; // 9 × 16 × 16
+    static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4; // tid / 16
+    let tid_o = tid_local & 15; // tid % 16
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let num_buc_u = num_buckets as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    // BUC_TILE load (1 回だけ、K loop の前)。
+    unsafe {
+        if tid_local < 16 {
+            let bb = b_start + tid_local;
+            BUC_TILE[tid_local] = if bb < batch_u { bucket_idx[bb] } else { -1_i32 };
+        }
+    }
+    thread::sync_threads();
+
+    // bucket 別 bias を初期値に。
+    let my_buc = unsafe { BUC_TILE[tid_b] };
+    let bias_init = if bi_ok && oi_ok && my_buc >= 0 && (my_buc as u32) < num_buckets {
+        bias[(my_buc as usize) * out_dim_u + global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4; // in_dim / 16
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        // X_TILE [TILE_B × TILE_K]: 16x16 = 256 cells、tid → (tid_b, tid_o) → ((b_start+tid_b), (k_start+tid_o))
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+        }
+        // W_TILE [NUM_BUCKETS × TILE_OUT × TILE_K] = 2304 cells, 256 threads × 9 cells each
+        // Cell layout: cell_idx = buc * 256 + oi_local * 16 + k_local
+        // tid_local → (oi_local = tid/16, k_local = tid%16)
+        // Per-bucket: read w[buc * out_dim * in_dim + oi_local * in_dim + (k_start + k_local)]
+        unsafe {
+            let oi_local = tid_b; // = tid_local / 16
+            let k_local = tid_o; // = tid_local & 15
+            let kk = k_start + k_local;
+            let mut buc: usize = 0;
+            while buc < num_buc_u {
+                let val = if oi_local < out_dim_u && kk < in_dim_u {
+                    w[buc * out_dim_u * in_dim_u + oi_local * in_dim_u + kk]
+                } else {
+                    0.0_f32
+                };
+                W_TILE[(buc << 8) | (oi_local << 4) | k_local] = val;
+                buc += 1;
+            }
+        }
+        thread::sync_threads();
+
+        // Compute: each thread accumulates 1 cell (global_bi, global_oi) over TILE_K K iterations.
+        if bi_ok && oi_ok && my_buc >= 0 && (my_buc as u32) < num_buckets {
+            let buc_u = my_buc as usize;
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(buc_u << 8) | (tid_o << 4) | k];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok && oi_ok {
+        if my_buc < 0 || (my_buc as u32) >= num_buckets {
+            if let Some(o) = y.get_mut(thread::index_1d()) {
+                *o = 0.0_f32;
+            }
+        } else if let Some(o) = y.get_mut(thread::index_1d()) {
+            *o = acc;
+        }
+    }
+}
+
+/// Bucket histogram。`bucket_idx` の各 value (有効 range `[0, num_buckets)`) ごとに
+/// thread が atomic add する。範囲外 (-1, >= num_buckets) は最後 slot `num_buckets`
+/// に集約 (invalid bin、後段で値 0 を書き込ませる)。counts は `num_buckets + 1` 要素。
+#[kernel]
+pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets: u32) {
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let b = bucket_idx[tid.get()];
+    let bin = if b >= 0 && (b as u32) < num_buckets {
+        b as u32
+    } else {
+        num_buckets
+    };
+    unsafe {
+        let atom = &*(counts.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
+        atom.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// `counts[0..n]` の exclusive prefix sum を `offsets[0..n]` に書く。`align` (= 16) で
+/// 各 bucket の sorted layout 開始 offset を round up し、bucket 境界を block size
+/// (`TILE_B = 16`) に揃える。bucket 末端と次 bucket 開始の間は padding 行 (caller 側で
+/// invalid bucket marker `-1` で埋める) になり、kernel は uniform block 前提で走れる。
+/// n ≤ NUM_BUCKETS + 1 = 10 想定で 1 thread sequential。
+#[kernel]
+pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u32) {
+    if thread::index_1d().get() != 0 {
+        return;
+    }
+    let n_u = n as usize;
+    let mut acc: u32 = 0;
+    let mut i: usize = 0;
+    while i < n_u {
+        // acc を align 倍数に切り上げ (acc % align == 0 でなければ次の境界へ)
+        let rem = acc % align;
+        if rem != 0 {
+            acc += align - rem;
+        }
+        unsafe {
+            let dst = offsets.as_ptr().add(i) as *mut u32;
+            *dst = acc;
+        }
+        acc += counts[i];
+        i += 1;
+    }
+}
+
+/// stable counting sort の scatter phase。各 thread が bucket_idx[i] = b を読み、
+/// dst = offsets[b] + (b 内 in-order rank) に perm[dst] = i / sorted_bucket[dst] = b
+/// を書き込む。in-order rank は `write_ctr[b]` を atomic_inc して取る (atomic 順
+/// 依存で stable ではない、bit-exact が必要な kernel では bucket boundary 内
+/// associativity 注意)。
+#[kernel]
+pub fn scatter_bucket_perm(
+    bucket_idx: &[i32],
+    offsets: &[u32],
+    write_ctr: &[u32],
+    perm: &[i32],
+    sorted_bucket: &[i32],
+    batch: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let b = bucket_idx[tid.get()];
+    let bin = if b >= 0 && (b as u32) < num_buckets {
+        b as u32
+    } else {
+        num_buckets
+    };
+    let rank = unsafe {
+        let atom = &*(write_ctr.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
+        atom.fetch_add(1, AtomicOrdering::Relaxed)
+    };
+    let dst = (offsets[bin as usize] + rank) as usize;
+    unsafe {
+        let perm_dst = perm.as_ptr().add(dst) as *mut i32;
+        *perm_dst = tid.get() as i32;
+        let sb_dst = sorted_bucket.as_ptr().add(dst) as *mut i32;
+        *sb_dst = b;
+    }
+}
+
+/// Row-permute (gather): `out[i, :] = in[perm[i], :]`。1 thread = 1 (row, col) cell、
+/// 1D launch (`batch * dim`)。perm[i] が範囲外 (`< 0 || >= batch`) は host 契約違反。
+#[kernel]
+pub fn permute_rows_f32(
+    input: &[f32],
+    perm: &[i32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let row = tid.get() / (dim as usize);
+    let col = tid.get() % (dim as usize);
+    let src_row = perm[row];
+    let val = if src_row >= 0 && (src_row as u32) < batch {
+        input[(src_row as usize) * (dim as usize) + col]
+    } else {
+        0.0_f32
+    };
+    if let Some(o) = output.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// Row-inverse-permute (scatter): `out[perm[i], :] = in[i, :]`。perm は forward
+/// gather index で、bijection 前提 (counting sort 出力)。1 thread = 1 (row, col) cell、
+/// 各 thread の write は disjoint なので raw ptr write OK。
+#[kernel]
+pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], batch: u32, dim: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let row = tid.get() / (dim as usize);
+    let col = tid.get() % (dim as usize);
+    let dst_row = perm[row];
+    if dst_row < 0 || (dst_row as u32) >= batch {
+        return;
+    }
+    let dst_idx = (dst_row as usize) * (dim as usize) + col;
+    unsafe {
+        let dst = output.as_ptr().add(dst_idx) as *mut f32;
+        *dst = input[tid.get()];
+    }
+}
+
+/// Sorted layout 版 [`dense_mm_fwd_bucket_tiled_l1`]。caller が batch を bucket で
+/// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
+/// (`exclusive_scan_aligned` 経由) を保証する前提。block 内全 TILE_B = 16 row は同一 bucket
+/// (uniform-by-construction、boundary block は存在しない)、per-K-tile の W_TILE shared-mem
+/// は 1 bucket 分 (16 × 16 = 256 cell) のみ load する分岐なし実装。padding 行は
+/// `bucket_idx = -1` で kernel が y=0 を書き、後段の inverse permute が perm=-1 sentinel で
+/// skip して original 配列には戻らない。
+///
+/// 数値同等性: per-row independent (k=0..15 加算順保持) で baseline と bit-exact、
+/// sort stability 不要。`in_dim % 16 == 0` / `out_dim == 16` / `batch % 16 == 0` /
+/// `num_buckets <= 9` は caller 契約。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut y: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 1 × 16 × 16
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_x() as usize;
+    let tid_b = tid_local >> 4;
+    let tid_o = tid_local & 15;
+    let b_start = block_b << 4;
+    let global_bi = b_start + tid_b;
+    let global_oi = tid_o;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let bi_ok = global_bi < batch_u;
+    let oi_ok = global_oi < out_dim_u;
+
+    // aligned sorted layout 前提で block は uniform-by-construction。b_start の bucket を
+    // 代表 = 全 row 共通 bucket。padding 行 / 終端 block は bucket = -1 で skip。
+    let block_buc = if b_start < batch_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    let bias_init = if bi_ok && oi_ok && block_buc_ok {
+        bias[block_buc_u * out_dim_u + global_oi]
+    } else {
+        0.0_f32
+    };
+    let mut acc: f32 = bias_init;
+
+    let n_k_tiles = in_dim_u >> 4;
+    let mut k_tile: usize = 0;
+    while k_tile < n_k_tiles {
+        let k_start = k_tile << 4;
+        unsafe {
+            let bb = b_start + tid_b;
+            let kk = k_start + tid_o;
+            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
+                x[bb * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+        }
+        unsafe {
+            let oi_local = tid_b;
+            let k_local = tid_o;
+            let kk = k_start + k_local;
+            let val = if block_buc_ok && oi_local < out_dim_u && kk < in_dim_u {
+                w[block_buc_u * out_dim_u * in_dim_u + oi_local * in_dim_u + kk]
+            } else {
+                0.0_f32
+            };
+            W_TILE[(oi_local << 4) | k_local] = val;
+        }
+        thread::sync_threads();
+
+        if bi_ok && oi_ok && block_buc_ok {
+            let mut k: usize = 0;
+            while k < 16 {
+                unsafe {
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(tid_o << 4) | k];
+                }
+                k += 1;
+            }
+        }
+        thread::sync_threads();
+        k_tile += 1;
+    }
+
+    if bi_ok && oi_ok {
+        if !block_buc_ok {
+            if let Some(o) = y.get_mut(thread::index_1d()) {
+                *o = 0.0_f32;
+            }
+        } else if let Some(o) = y.get_mut(thread::index_1d()) {
+            *o = acc;
+        }
+    }
+}
+
+/// Per-bucket dense matmul backward (wrt input)。`dx[b][i] = sum_o dy[b][o] * w[bucket_idx[b]][o][i]`。
+/// 1 thread = 1 (batch, in_index)、atomics 不要。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input_bucket(
+    dy: &[f32],
+    w: &[f32],
+    bucket_idx: &[i32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (in_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (in_dim as usize);
+    let ii = tid.get() % (in_dim as usize);
+    let buc = bucket_idx[bi];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        if let Some(d) = dx.get_mut(tid) {
+            *d = 0.0_f32;
+        }
+        return;
+    }
+    let buc_u = buc as usize;
+    let mut sum = 0.0_f32;
+    let mut o: u32 = 0;
+    while o < out_dim {
+        let w_idx =
+            buc_u * (out_dim as usize) * (in_dim as usize) + (o as usize) * (in_dim as usize) + ii;
+        sum += dy[bi * (out_dim as usize) + (o as usize)] * w[w_idx];
+        o += 1;
+    }
+    if let Some(d) = dx.get_mut(tid) {
+        *d = sum;
+    }
+}
+
+/// Per-bucket dense matmul backward (wrt weight)。
+/// `grad_w[bucket][o][i] = sum_{b: bucket_idx[b]==bucket} x[b][i] * dy[b][o]` (overwrite、atomics 不要)。
+///
+/// 1 thread = 1 (bucket, out_index, in_index) weight cell。batch を inner loop で回し、
+/// `bucket_idx[b]` が自分の bucket の position だけ accumulate する。non-bucket 版
+/// `dense_mm_bwd_weight` と同じ「1 cell = 1 thread + batch loop」形なので atomic scatter
+/// は不要 (1 thread = 1 (batch, out, in) で同 weight cell へ多 thread atomic add する
+/// 素直な形は bucket 偏りで contention が大きいので採用しない)。
+/// Layout: `grad_w` row-major (num_buckets * out_dim × in_dim) — bucket-major、その中 out-major
+/// (= `dense_mm_fwd_bucket` の weight layout と一致、`tid == grad_w index`)。
+/// out-of-range bucket (`bucket_idx[b] < 0` 等) の position はどの bucket cell にも match
+/// しないので silent skip される。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    mut grad_w: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let per_bucket = (out_dim as usize) * (in_dim as usize);
+    let total = (num_buckets as usize) * per_bucket;
+    if tid.get() >= total {
+        return;
+    }
+    let buc_u = tid.get() / per_bucket;
+    let rem = tid.get() % per_bucket;
+    let oi = rem / (in_dim as usize);
+    let ii = rem % (in_dim as usize);
+    // num_buckets は小さい (= 9) ので buc_u as i32 は wrap しない。負の bucket_idx は match しない。
+    let target_buc = buc_u as i32;
+    let mut sum = 0.0_f32;
+    let mut b: u32 = 0;
+    while b < batch {
+        let bb = b as usize;
+        if bucket_idx[bb] == target_buc {
+            sum += x[bb * (in_dim as usize) + ii] * dy[bb * (out_dim as usize) + oi];
+        }
+        b += 1;
+    }
+    if let Some(g) = grad_w.get_mut(tid) {
+        *g = sum;
+    }
+}
+
+/// L3 weight backward (specialized: `in_dim=32`, `out_dim=1`, `num_buckets=9`)。
+///
+/// 元 `dense_mm_bwd_weight_bucket` は 288 cells × scan 65536 = 288 threads と並列度極小、
+/// 9.2ms 占有。本 kernel は split-K + 9 bucket register accumulator で並列度を上げる:
+/// - block dim = 32 (1 thread = 1 ii cell)
+/// - grid = num_batch_splits (e.g., 64) → 64 blocks × 32 threads = 2048 threads ≈ 25 / SM (sm_86)
+/// - 各 thread が 9 bucket × 1 ii の partial sum を batch_slice 内で集計
+/// - 完了後、9 cell ぶん atomicAdd で global grad_w に flush
+///
+/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。in_dim==32, out_dim==1,
+/// num_buckets==9 を満たすこと。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l3(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_split = thread::blockIdx_x() as usize;
+    let num_splits = thread::gridDim_x() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let ii = tid_local;
+    if ii >= in_dim_u {
+        return;
+    }
+
+    // 各 block が均等な batch slice を担当 (端数は block 0 に寄せず ceil で配分し overflow check)。
+    // ceil(batch / num_splits)、cuda-oxide は usize の `min()` / `div_ceil` で drop_in_place を
+    // 出してしまうので素朴な式で書く。
+    let positions_per_block = batch_u.div_ceil(num_splits);
+    let b_start = block_split * positions_per_block;
+    if b_start >= batch_u {
+        return;
+    }
+    let b_end_candidate = b_start + positions_per_block;
+    let b_end = if b_end_candidate < batch_u {
+        b_end_candidate
+    } else {
+        batch_u
+    };
+
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let mut bb = b_start;
+    while bb < b_end {
+        let buc = bucket_idx[bb];
+        let xv = x[bb * in_dim_u + ii];
+        // out_dim=1 想定 (oi=0 のみ)。dy[bb][0] を読む。
+        let dyv = dy[bb * out_dim_u];
+        let mul = xv * dyv;
+        if buc == 0 {
+            a0 += mul;
+        } else if buc == 1 {
+            a1 += mul;
+        } else if buc == 2 {
+            a2 += mul;
+        } else if buc == 3 {
+            a3 += mul;
+        } else if buc == 4 {
+            a4 += mul;
+        } else if buc == 5 {
+            a5 += mul;
+        } else if buc == 6 {
+            a6 += mul;
+        } else if buc == 7 {
+            a7 += mul;
+        } else if buc == 8 {
+            a8 += mul;
+        }
+        bb += 1;
+    }
+
+    // 9 cell flush。layout は buc * (out_dim * in_dim) + oi * in_dim + ii、oi=0 なので buc * in_dim + ii。
+    let num_buc_u = num_buckets as usize;
+    let raw = grad_w.as_ptr();
+    if num_buc_u >= 1 {
+        unsafe {
+            let c = &*(raw.add(ii) as *const DeviceAtomicF32);
+            c.fetch_add(a0, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 2 {
+        unsafe {
+            let c = &*(raw.add(in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a1, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 3 {
+        unsafe {
+            let c = &*(raw.add(2 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a2, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 4 {
+        unsafe {
+            let c = &*(raw.add(3 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a3, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 5 {
+        unsafe {
+            let c = &*(raw.add(4 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a4, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 6 {
+        unsafe {
+            let c = &*(raw.add(5 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a5, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 7 {
+        unsafe {
+            let c = &*(raw.add(6 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a6, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 8 {
+        unsafe {
+            let c = &*(raw.add(7 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a7, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 9 {
+        unsafe {
+            let c = &*(raw.add(8 * in_dim_u + ii) as *const DeviceAtomicF32);
+            c.fetch_add(a8, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// L2 weight backward (specialized: `in_dim=30`, `out_dim=32`, `num_buckets=9`)。
+///
+/// 元 `dense_mm_bwd_weight_bucket` は 8640 cells × scan batch、並列度 ~34 blocks で遅い。
+/// 本 kernel は split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket
+/// acc) で並列度を上げる。block_dim = 32 × 30 = 960 threads (sm_86 max 1024 以内)、
+/// block grid = num_batch_splits。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_tiled_l2(
+    x: &[f32],
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_w: &[f32],
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_split = thread::blockIdx_x() as usize;
+    let num_splits = thread::gridDim_x() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    // tid → (oi, ii): oi = tid / in_dim, ii = tid % in_dim (block_dim = out_dim * in_dim)
+    let oi = tid_local / in_dim_u;
+    let ii = tid_local % in_dim_u;
+    if oi >= out_dim_u {
+        return;
+    }
+
+    let positions_per_block = batch_u.div_ceil(num_splits);
+    let b_start = block_split * positions_per_block;
+    if b_start >= batch_u {
+        return;
+    }
+    let b_end_candidate = b_start + positions_per_block;
+    let b_end = if b_end_candidate < batch_u {
+        b_end_candidate
+    } else {
+        batch_u
+    };
+
+    let mut a0 = 0.0_f32;
+    let mut a1 = 0.0_f32;
+    let mut a2 = 0.0_f32;
+    let mut a3 = 0.0_f32;
+    let mut a4 = 0.0_f32;
+    let mut a5 = 0.0_f32;
+    let mut a6 = 0.0_f32;
+    let mut a7 = 0.0_f32;
+    let mut a8 = 0.0_f32;
+
+    let mut bb = b_start;
+    while bb < b_end {
+        let buc = bucket_idx[bb];
+        let xv = x[bb * in_dim_u + ii];
+        let dyv = dy[bb * out_dim_u + oi];
+        let mul = xv * dyv;
+        if buc == 0 {
+            a0 += mul;
+        } else if buc == 1 {
+            a1 += mul;
+        } else if buc == 2 {
+            a2 += mul;
+        } else if buc == 3 {
+            a3 += mul;
+        } else if buc == 4 {
+            a4 += mul;
+        } else if buc == 5 {
+            a5 += mul;
+        } else if buc == 6 {
+            a6 += mul;
+        } else if buc == 7 {
+            a7 += mul;
+        } else if buc == 8 {
+            a8 += mul;
+        }
+        bb += 1;
+    }
+
+    // grad_w layout: buc * (out_dim * in_dim) + oi * in_dim + ii。
+    let per_bucket = out_dim_u * in_dim_u;
+    let cell_in_bucket = oi * in_dim_u + ii;
+    let num_buc_u = num_buckets as usize;
+    let raw = grad_w.as_ptr();
+    if num_buc_u >= 1 {
+        unsafe {
+            let c = &*(raw.add(cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a0, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 2 {
+        unsafe {
+            let c = &*(raw.add(per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a1, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 3 {
+        unsafe {
+            let c = &*(raw.add(2 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a2, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 4 {
+        unsafe {
+            let c = &*(raw.add(3 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a3, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 5 {
+        unsafe {
+            let c = &*(raw.add(4 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a4, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 6 {
+        unsafe {
+            let c = &*(raw.add(5 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a5, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 7 {
+        unsafe {
+            let c = &*(raw.add(6 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a6, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 8 {
+        unsafe {
+            let c = &*(raw.add(7 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a7, AtomicOrdering::Relaxed);
+        }
+    }
+    if num_buc_u >= 9 {
+        unsafe {
+            let c = &*(raw.add(8 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
+            c.fetch_add(a8, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// Sorted layout 版 [`bias_grad_bucket`] (block-level shared-mem reduce)。caller が batch を
+/// bucket で sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
+/// (`exclusive_scan_aligned` 経由) を保証する前提。block は `padded_b * out_dim / 256` 個、
+/// 1 block = 256 cells = `256 / out_dim` 行 × `out_dim` oi (L1 では 16×16、L2 では 8×32)。
+/// `256 / out_dim ≤ 16` ⇒ 16-aligned sort 配下で 1 block の全 row は同一 bucket
+/// (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
+/// PARTIAL[out_dim] shared-mem accumulator に集約 → 1 block × out_dim atomic add で
+/// `grad_bias[block_buc][:]` に flush。global atomic 数 = blocks × out_dim
+/// (L1: ~4106 × 16 = ~66K、L2: ~8213 × 32 = ~263K) で contention 大幅減。
+///
+/// padding 行 / 範囲外 bucket (block_buc = -1) は skip (PARTIAL flush しない)、
+/// caller が `grad_bias` を 0 初期化済の前提 (accumulate semantics は元と同じ)。
+///
+/// 数値同等性: 加算順が sort 済 batch 順 + per-block reduce 順になるため fp32
+/// associativity で baseline と bit-exact ではないが、reduction tolerance 内で一致。
+/// `out_dim` は 16 / 32 を想定 (L1 bias / L2 bias)、いずれも `block_dim / out_dim ≤ 16`
+/// なので 16-aligned sort 配下で 1 block の全 row は uniform-bucket。`block_dim == 256` /
+/// `padded_batch % 16 == 0` / `num_buckets <= 9` / `out_dim <= 32` は caller 契約。
+#[kernel]
+pub fn bias_grad_bucket_shared_sorted(
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_bias: &[f32],
+    padded_batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    use core::ptr::addr_of_mut;
+    static mut PARTIAL: SharedArray<f32, 32> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_idx = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let out_dim_u = out_dim as usize;
+    let padded_b_u = padded_batch as usize;
+
+    // 1 block = block_dim cells (= 16 sorted rows × out_dim oi)、b_start = block の先頭行。
+    let b_start = (block_idx * block_dim_u) / out_dim_u;
+    let block_buc = if b_start < padded_b_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+
+    if tid < out_dim_u {
+        unsafe {
+            partial_ptr.add(tid).write(0.0_f32);
+        }
+    }
+    thread::sync_threads();
+
+    let global_idx = block_idx * block_dim_u + tid;
+    let total = padded_b_u * out_dim_u;
+    if block_buc_ok && global_idx < total {
+        let oi = global_idx % out_dim_u;
+        let dyv = dy[global_idx];
+        let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+    }
+    thread::sync_threads();
+
+    if block_buc_ok && tid < out_dim_u {
+        let p = unsafe { partial_ptr.add(tid).read() };
+        let cell_idx = block_buc_u * out_dim_u + tid;
+        let cell = unsafe { &*(grad_bias.as_ptr().add(cell_idx) as *const DeviceAtomicF32) };
+        cell.fetch_add(p, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Per-bucket bias gradient (atomic accumulate)。
+/// `grad_bias[bucket][o] += sum_{b ∈ bucket} dy[b][o]`。1 thread = 1 (batch, out)、atomic。
+#[kernel]
+pub fn bias_grad_bucket(
+    dy: &[f32],
+    bucket_idx: &[i32],
+    grad_bias: &[f32],
+    batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let buc = bucket_idx[bi];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        return;
+    }
+    let buc_u = buc as usize;
+    let dyv = dy[tid.get()];
+    let cell_idx = buc_u * (out_dim as usize) + oi;
+    // SAFETY: cell_idx < num_buckets * out_dim、host が grad_bias.len() = same 確保。
+    let cell = unsafe { &*(grad_bias.as_ptr().add(cell_idx) as *const DeviceAtomicF32) };
+    cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+}
+
+/// CReLU forward — `y[i] = clip(x[i], 0, 1)`。1 thread = 1 element。
+#[kernel]
+pub fn crelu_fwd(x: &[f32], mut y: DisjointSlice<f32>, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    #[allow(clippy::manual_clamp)]
+    let yi = if xi < 0.0_f32 {
+        0.0_f32
+    } else if xi > 1.0_f32 {
+        1.0_f32
+    } else {
+        xi
+    };
+    if let Some(out) = y.get_mut(i) {
+        *out = yi;
+    }
+}
+
+/// CReLU gradient — `dx[i] = dy[i] if 0 < x[i] < 1 else 0`。1 thread = 1 element。
+#[kernel]
+pub fn crelu_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    let g = if xi > 0.0_f32 && xi < 1.0_f32 {
+        dy[i.get()]
+    } else {
+        0.0_f32
+    };
+    if let Some(out) = dx.get_mut(i) {
+        *out = g;
+    }
+}
+
+/// SCReLU forward — `y[i] = clip(x[i], 0, 1)²`。1 thread = 1 element。
+///
+/// `screlu_grad` と対の forward。host から未 launch だが、`#[kernel]` 定義は
+/// cuda-oxide が kernel artifact (PTX) に出力するため定義のまま残す。
+#[kernel]
+pub fn screlu_fwd(x: &[f32], mut y: DisjointSlice<f32>, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    #[allow(clippy::manual_clamp)]
+    let a = if xi < 0.0_f32 {
+        0.0_f32
+    } else if xi > 1.0_f32 {
+        1.0_f32
+    } else {
+        xi
+    };
+    if let Some(out) = y.get_mut(i) {
+        *out = a * a;
+    }
+}
+
+/// abs_pow(2) * scale forward — `y[i] = x[i] * x[i] * scale`。
+/// bullet `abs_pow(2.0)` は `|x|^2 = x^2` なので abs 不要。1 thread = 1 element。
+#[kernel]
+pub fn abs_pow2_scale_fwd(x: &[f32], mut y: DisjointSlice<f32>, scale: f32, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    if let Some(out) = y.get_mut(i) {
+        *out = xi * xi * scale;
+    }
+}
+
+/// abs_pow(2) * scale gradient — `dx[i] = 2 * x[i] * scale * dy[i]`。
+#[kernel]
+pub fn abs_pow2_scale_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, scale: f32, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    let g = 2.0_f32 * xi * scale * dy[i.get()];
+    if let Some(out) = dx.get_mut(i) {
+        *out = g;
+    }
+}
+
+/// Concat l1_sqr + l1_main forward — `out[b][..a_dim] = a[b]`, `out[b][a_dim..a_dim+b_dim] = b[b]`。
+///
+/// 1 thread = 1 (batch, output_index) cell。`out_dim = a_dim + b_dim`。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn concat_l1sqr_main_fwd(
+    a: &[f32],
+    b: &[f32],
+    mut out: DisjointSlice<f32>,
+    batch: u32,
+    a_dim: u32,
+    b_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let out_dim = (a_dim as usize) + (b_dim as usize);
+    let total = (batch as usize) * out_dim;
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / out_dim;
+    let oi = tid.get() % out_dim;
+    let val = if oi < (a_dim as usize) {
+        a[bi * (a_dim as usize) + oi]
+    } else {
+        b[bi * (b_dim as usize) + (oi - (a_dim as usize))]
+    };
+    if let Some(o) = out.get_mut(tid) {
+        *o = val;
+    }
+}
+
+/// Concat l1_sqr + l1_main backward — `da[b] = dout[b][..a_dim]`, `db[b] = dout[b][a_dim..]`。
+///
+/// **Precondition: `a_dim == b_dim`** (LayerStack では両方 `l1_effective` = 15)。tid は
+/// `da[tid]` と `db[tid]` (両 slice の同 tid cell) に書き込む。
+/// 1 thread = 1 (batch, dim_index) cell。
+#[kernel]
+pub fn concat_l1sqr_main_grad(
+    dout: &[f32],
+    mut da: DisjointSlice<f32>,
+    mut db: DisjointSlice<f32>,
+    batch: u32,
+    dim: u32, // a_dim == b_dim assumed
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (dim as usize);
+    let ii = tid.get() % (dim as usize);
+    let out_dim = 2 * (dim as usize);
+
+    let da_val = dout[bi * out_dim + ii];
+    let db_val = dout[bi * out_dim + (dim as usize) + ii];
+
+    if let Some(o) = da.get_mut(tid) {
+        *o = da_val;
+    }
+    if let Some(o) = db.get_mut(tid) {
+        *o = db_val;
+    }
+}
+
+/// Broadcast bias add — `out[bi, ni] += bias[ni]` for all batch rows。
+/// cuBLAS Sgemm (matmul のみ、bias 無し) の後に呼ぶ post-pass。1 thread = 1
+/// (bi, ni) cell、bias は warp 内で同じ ni を共有するため L1 hit pattern が良好。
+#[kernel]
+pub fn bias_add_per_row(bias: &[f32], mut out: DisjointSlice<f32>, batch: u32, n: u32) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (n as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let col = tid.get() % (n as usize);
+    if let Some(o) = out.get_mut(tid) {
+        *o += bias[col];
+    }
+}
+
+/// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
+/// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
+#[kernel]
+pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    if let Some(out) = c.get_mut(i) {
+        *out = a[i.get()] + b[i.get()];
+    }
+}
+
+/// Extract a 2D slice — `dst[bi][oi] = src[bi*src_stride + src_offset + oi]`。
+/// 1 thread = 1 dst cell。l1_total (B×16) → l1_main (B×15) / l1_skip (B×1) 抽出に使用。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn slice_extract_2d(
+    src: &[f32],
+    mut dst: DisjointSlice<f32>,
+    batch: u32,
+    src_stride: u32,
+    src_offset: u32,
+    out_dim: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    if let Some(o) = dst.get_mut(tid) {
+        *o = src[bi * (src_stride as usize) + (src_offset as usize) + oi];
+    }
+}
+
+/// Scatter a 2D slice — `dst[bi*dst_stride + dst_offset + ii] = src[bi*in_dim + ii]`。
+/// 1 thread = 1 src cell、`get_unchecked_mut` で任意 dst index に書き込む (escape hatch)。
+/// host が dst を呼出前に 0 (or 適切値) で初期化する責務。
+///
+/// 用途: backward で dl1_main (B×15) + dl1_skip (B×1) を dl1_total (B×16) に書き戻す
+/// (2 回 call、`dst_offset` で位置切替)。
+///
+/// SAFETY: 各 thread が unique (bi, ii) → unique dst_idx に書き込み。複数 call で
+/// `dst_offset` を変えれば disjoint な dst 範囲を書く。`dst_idx < dst.len()` は host
+/// invariant (`dst.len() == batch * dst_stride`、`dst_offset + in_dim <= dst_stride`)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn slice_scatter_2d(
+    src: &[f32],
+    mut dst: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    dst_stride: u32,
+    dst_offset: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (in_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (in_dim as usize);
+    let ii = tid.get() % (in_dim as usize);
+    let val = src[tid.get()];
+    let dst_idx = bi * (dst_stride as usize) + (dst_offset as usize) + ii;
+    // SAFETY: see docstring above. Each thread writes to a unique dst_idx, and host ensures bounds.
+    unsafe {
+        *dst.get_unchecked_mut(dst_idx) = val;
+    }
+}
