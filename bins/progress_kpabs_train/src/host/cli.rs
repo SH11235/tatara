@@ -31,7 +31,8 @@ pub struct Args {
     #[arg(long, default_value_t = 1024)]
     pub games_per_step: usize,
 
-    /// 学習対象 game 数の上限 (0 = unlimited)。
+    /// 走査する game 数の上限 (0 = unlimited)。`--val-fraction` 有効時は訓練と
+    /// 検証を合算した game 数に対する上限 (両者は同じ走査列から分割するため)。
     #[arg(long, default_value_t = 0)]
     pub max_games: usize,
 
