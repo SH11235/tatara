@@ -73,6 +73,14 @@ target/release/progress-kpabs-train \
 対局順を保つ必要があるためシャッフルはしない)、各 epoch 末に held-out な
 `val_loss` を出力する。有効にすると epoch ごとにデータ走査が 1 回増える。
 
+`val_loss` は健全性チェックと epoch 選びの目安であって、品質の精密な指標では
+ない。進行度モデルは単純(特徴ごとの重みを総和して sigmoid に通すだけ)なので
+過学習しにくく、`train_loss` と `val_loss` の差は小さいのが正常で、明確に広がる
+差が注意すべきサイン。また真の目的は良い bucket 分割で、素の MSE はその近似に
+すぎないので、`val_loss` の厳密な最小値を追うより頭打ちになった epoch を選び、
+最終的な `progress.bin` の良し悪しはそれで学習した LayerStack NNUE の棋力で
+判断する。
+
 ### 学習
 
 ```bash

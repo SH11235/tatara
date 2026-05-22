@@ -83,6 +83,14 @@ holds out roughly that fraction of games — every Nth game in input order, sinc
 the data must stay in consecutive-game order — and reports a held-out `val_loss`
 at the end of each epoch. This adds one extra pass over the data per epoch.
 
+Treat `val_loss` as a sanity check and an epoch-selection hint, not a precise
+quality score. The progress model is simple — per-feature weights summed and
+passed through a sigmoid — so it overfits little: a small `train_loss`/`val_loss`
+gap is normal, and a clearly widening gap is what to watch for. Because the real
+goal is a good bucket split, which a plain MSE only approximates, prefer an
+epoch where `val_loss` levels off over chasing its exact minimum, and judge the
+final `progress.bin` by the strength of the LayerStack NNUE trained with it.
+
 ### Training
 
 ```bash
