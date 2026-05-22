@@ -173,6 +173,16 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    // L2 出力次元の上限 256 は bias backward kernel の shared-mem accumulator
+    // (PARTIAL) 固定容量。L2 / L3 kernel は出力次元を runtime 引数で受けるため
+    // `l2_out` は特定数の倍数でなくてよい。
+    if layerstack.l2 < 2 || layerstack.l2 > 256 {
+        return Err(format!(
+            "--l2 must be in [2, 256] (got {}); it is the L2 per-bucket dense output width",
+            layerstack.l2
+        )
+        .into());
+    }
 
     std::fs::create_dir_all(&cli.output)?;
 
@@ -212,6 +222,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         cli.batch_size,
         layerstack.ft_out,
         layerstack.l1,
+        layerstack.l2,
         tf32,
         ft_fp16,
         ft_fp16_out,
@@ -232,6 +243,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 feature_set,
                 layerstack.ft_out,
                 layerstack.l1,
+                layerstack.l2,
             )?;
             trainer.load_layerstack_weights(&weights)?;
             (None, None)
@@ -347,9 +359,9 @@ pub(crate) const PSV_RECORD_BYTES: u64 = 40;
 
 /// LayerStack network の architecture 記述子 (FT → L1 → L2、progress8kpabs 9 bucket)。
 /// experiment.json `params.architecture` に記録する。FT 出力次元は `--ft-out`、L1
-/// 出力次元は `--l1` で可変、L2 出力次元 / bucket 数は固定。
-pub(crate) fn layerstack_architecture(ft_out: usize, l1_out: usize) -> String {
-    format!("LayerStack-{ft_out}-{l1_out}-{L2_OUT}-{NUM_BUCKETS}bucket")
+/// 出力次元は `--l1`、L2 出力次元は `--l2` で可変、bucket 数は固定。
+pub(crate) fn layerstack_architecture(ft_out: usize, l1_out: usize, l2_out: usize) -> String {
+    format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{NUM_BUCKETS}bucket")
 }
 
 /// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
@@ -435,12 +447,12 @@ pub(crate) fn build_experiment_logger(
 
     let is_wrm = cli.win_rate_model;
     let params = Params {
-        architecture: layerstack_architecture(layerstack.ft_out, layerstack.l1),
+        architecture: layerstack_architecture(layerstack.ft_out, layerstack.l1, layerstack.l2),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
         l0: layerstack.ft_out,
         l1: layerstack.l1,
-        l2: L2_OUT,
+        l2: layerstack.l2,
         num_buckets: Some(NUM_BUCKETS),
         optimizer: cli.optimizer.clone(),
         bucket_mode: Some(layerstack.bucket_mode.clone()),

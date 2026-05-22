@@ -14,7 +14,7 @@ use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
 // ===========================================================================
-// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 32 + progress8kpabs 9 buckets)
+// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progress8kpabs 9 buckets)
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
@@ -175,6 +175,9 @@ pub(crate) struct GpuWorkspace {
     /// activation buffer の幅と L1 forward/backward kernel の launch arg。`l1_effective`
     /// / `l2_in` はここから導出する ([`GpuWorkspace::l1_effective`])。
     l1_out: usize,
+    /// L2 (per-bucket dense) 層の出力次元。`--l2` から起動時に決まる。L2 系
+    /// activation buffer の幅と L2 / L3 forward/backward kernel の launch arg。
+    l2_out: usize,
 
     // -- forward activations --
     ft_stm_out: DeviceBuffer<f32>,    // b × ft_out
@@ -188,15 +191,15 @@ pub(crate) struct GpuWorkspace {
     l1_sqr: DeviceBuffer<f32>,        // b × l1_effective
     l2_pre: DeviceBuffer<f32>,        // b × l2_in
     l2_input: DeviceBuffer<f32>,      // b × l2_in
-    l2_out: DeviceBuffer<f32>,        // b × L2_OUT
-    l2_acted: DeviceBuffer<f32>,      // b × L2_OUT
+    l2_dense_out: DeviceBuffer<f32>,  // b × l2_out (L2 dense matmul output, pre-CReLU)
+    l2_acted: DeviceBuffer<f32>,      // b × l2_out
     l3_out: DeviceBuffer<f32>,        // b
     net_output: DeviceBuffer<f32>,    // b
     dy_net_output: DeviceBuffer<f32>, // b (loss kernel が書き込む dnet)
 
     // -- backward activation-grads --
-    dl2_acted: DeviceBuffer<f32>,            // b × L2_OUT
-    dl2_out: DeviceBuffer<f32>,              // b × L2_OUT
+    dl2_acted: DeviceBuffer<f32>,            // b × l2_out
+    dl2_out: DeviceBuffer<f32>,              // b × l2_out
     dl2_input: DeviceBuffer<f32>,            // b × l2_in
     dl2_pre: DeviceBuffer<f32>,              // b × l2_in
     dl1_sqr: DeviceBuffer<f32>,              // b × l1_effective
@@ -247,23 +250,26 @@ pub(crate) struct GpuWorkspace {
     combined_sorted: DeviceBuffer<f32>,   // batch × ft_out (combined を perm で gather)
     l1_bucket_sorted: DeviceBuffer<f32>,  // batch × l1_out (sorted fwd_L1 出力)
     dl1_total_sorted: DeviceBuffer<f32>,  // batch × l1_out (dl1_total を perm で gather)
-    dl2_out_sorted: DeviceBuffer<f32>,    // batch × L2_OUT (dl2_out を perm で gather、L2 bias 用)
+    dl2_out_sorted: DeviceBuffer<f32>,    // batch × l2_out (dl2_out を perm で gather、L2 bias 用)
 }
 
 impl GpuWorkspace {
     /// `batch` 個の position 分の全 buffer を確保する (`GpuTrainer::new` から呼ぶ)。
     /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)、`l1_out` は L1
-    /// (per-bucket dense) 層の出力次元 (`--l1`)。
+    /// (per-bucket dense) 層の出力次元 (`--l1`)、`l2_out` は L2 (per-bucket dense)
+    /// 層の出力次元 (`--l2`)。
     ///
     /// `ft_fp16_out` が true なら FT activation (`ft_*_out` / `dft_*_out`) を `f16` で
     /// 持つ。その場合 f32 版は使われないので placeholder size (`ft_out` 要素 = 1 行) で
     /// のみ確保し、`*_h` (f16) を `batch * ft_out` で確保する。false なら f32 版を
     /// `batch * ft_out`、`*_h` は `None`。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         stream: &CudaStream,
         batch: usize,
         ft_out: usize,
         l1_out: usize,
+        l2_out: usize,
         ft_fp16_out: bool,
         feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -292,6 +298,7 @@ impl GpuWorkspace {
             max_active,
             ft_out,
             l1_out,
+            l2_out,
             ft_stm_out: z(ft_act_f32_n)?,
             ft_nstm_out: z(ft_act_f32_n)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
@@ -307,13 +314,13 @@ impl GpuWorkspace {
             l1_sqr: z(batch * l1_effective)?,
             l2_pre: z(batch * l2_in)?,
             l2_input: z(batch * l2_in)?,
-            l2_out: z(batch * L2_OUT)?,
-            l2_acted: z(batch * L2_OUT)?,
+            l2_dense_out: z(batch * l2_out)?,
+            l2_acted: z(batch * l2_out)?,
             l3_out: z(batch)?,
             net_output: z(batch)?,
             dy_net_output: z(batch)?,
-            dl2_acted: z(batch * L2_OUT)?,
-            dl2_out: z(batch * L2_OUT)?,
+            dl2_acted: z(batch * l2_out)?,
+            dl2_out: z(batch * l2_out)?,
             dl2_input: z(batch * l2_in)?,
             dl2_pre: z(batch * l2_in)?,
             dl1_sqr: z(batch * l1_effective)?,
@@ -347,7 +354,7 @@ impl GpuWorkspace {
             combined_sorted: z(padded_sort_batch(batch) * ft_out)?,
             l1_bucket_sorted: z(padded_sort_batch(batch) * l1_out)?,
             dl1_total_sorted: z(padded_sort_batch(batch) * l1_out)?,
-            dl2_out_sorted: z(padded_sort_batch(batch) * L2_OUT)?,
+            dl2_out_sorted: z(padded_sort_batch(batch) * l2_out)?,
         })
     }
 
@@ -400,14 +407,16 @@ impl GpuTrainer {
     /// caller が validation 済)。
     ///
     /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)、`l1_out` は L1
-    /// (per-bucket dense) 層の出力次元 (`--l1`)。両者が weight group の要素数と
-    /// activation workspace の幅を決める。
+    /// (per-bucket dense) 層の出力次元 (`--l1`)、`l2_out` は L2 (per-bucket dense)
+    /// 層の出力次元 (`--l2`)。これらが weight group の要素数と activation workspace
+    /// の幅を決める。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         ft_out: usize,
         l1_out: usize,
+        l2_out: usize,
         enable_tf32: bool,
         ft_fp16: bool,
         ft_fp16_out: bool,
@@ -423,7 +432,8 @@ impl GpuTrainer {
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
-        // `--ft-out`、L1 出力次元は `--l1` 依存。`l2_in` は `l1_out` から導出)。
+        // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2` 依存。`l2_in` は
+        // `l1_out` から導出)。
         let ft_in = feature_set.ft_in();
         let l1_effective = l1_out - L1_SKIP;
         let l2_in = l1_effective * 2;
@@ -433,9 +443,9 @@ impl GpuTrainer {
         let l1_b_n = NUM_BUCKETS * l1_out;
         let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
-        let l2_b_n = NUM_BUCKETS * L2_OUT;
-        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l2_w_n = NUM_BUCKETS * l2_out * l2_in;
+        let l2_b_n = NUM_BUCKETS * l2_out;
+        let l3_w_n = NUM_BUCKETS * l2_out;
         let l3_b_n = NUM_BUCKETS;
 
         // Weight init: small random for non-degenerate forward (smoke 用、後段で
@@ -521,6 +531,7 @@ impl GpuTrainer {
                 batch_size.max(1),
                 ft_out,
                 l1_out,
+                l2_out,
                 ft_fp16_out,
                 feature_set,
             )?,
@@ -593,6 +604,7 @@ impl GpuTrainer {
         };
         let ft_out = self.ws.ft_out;
         let l1_out = self.ws.l1_out;
+        let l2_out = self.ws.l2_out;
         let l2_in = self.ws.l2_in();
         let ft_w_n = self.feature_set.ft_in() * ft_out;
         let ft_b_n = ft_out;
@@ -600,9 +612,9 @@ impl GpuTrainer {
         let l1_b_n = NUM_BUCKETS * l1_out;
         let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
-        let l2_b_n = NUM_BUCKETS * L2_OUT;
-        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l2_w_n = NUM_BUCKETS * l2_out * l2_in;
+        let l2_b_n = NUM_BUCKETS * l2_out;
+        let l3_w_n = NUM_BUCKETS * l2_out;
         let l3_b_n = NUM_BUCKETS;
         self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
@@ -688,15 +700,16 @@ impl GpuTrainer {
     ); 9] {
         let ft_out = self.ws.ft_out;
         let l1_out = self.ws.l1_out;
+        let l2_out = self.ws.l2_out;
         let l2_in = self.ws.l2_in();
         let ft_b_n = ft_out;
         let l1_w_n = NUM_BUCKETS * l1_out * ft_out;
         let l1_b_n = NUM_BUCKETS * l1_out;
         let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
-        let l2_b_n = NUM_BUCKETS * L2_OUT;
-        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l2_w_n = NUM_BUCKETS * l2_out * l2_in;
+        let l2_b_n = NUM_BUCKETS * l2_out;
+        let l3_w_n = NUM_BUCKETS * l2_out;
         let l3_b_n = NUM_BUCKETS;
         [
             (
@@ -797,7 +810,7 @@ impl GpuTrainer {
     /// arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
     /// arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、LayerStack は "layerstack")
     /// topo_count   u64                 (topology 次元の個数)
-    /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/l1_out/L2_OUT/NUM_BUCKETS)
+    /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/l1_out/l2_out/NUM_BUCKETS)
     /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
     /// step_count   u64  (Ranger lookahead step counter)
     /// num_groups   u64  (= 10、固定だが将来検証用)
@@ -861,7 +874,7 @@ impl GpuTrainer {
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let groups = self.raw_ckpt_groups();
             let ft_out = self.ws.ft_out;
-            let topology = layerstack_topology(ft_out, self.ws.l1_out);
+            let topology = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
             // header (magic 〜 num_groups)。format 上の group 数は ft_w (個別処理) +
             // `raw_ckpt_groups` の 9 = 10。
@@ -968,7 +981,7 @@ impl GpuTrainer {
     ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let ft_out = self.ws.ft_out;
-        let topology = layerstack_topology(ft_out, self.ws.l1_out);
+        let topology = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out);
 
         // header (magic 〜 num_groups) を読み、feature set / arch / topology を照合する。
         let header = read_raw_ckpt_header(
@@ -1269,6 +1282,8 @@ impl GpuTrainer {
         let l1_out = self.ws.l1_out;
         let l1_effective = self.ws.l1_effective();
         let l2_in = self.ws.l2_in();
+        // L2 (per-bucket dense) 層の出力次元 (`--l2` 由来)。L2 / L3 kernel の launch arg。
+        let l2_out = self.ws.l2_out;
         // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
         // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
         // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
@@ -1685,32 +1700,32 @@ impl GpuTrainer {
 
         prof_tick!("fwd_L1tail");
 
-        // -- Forward step 11: L2 per-bucket dense → l2_out (B × 32) --
+        // -- Forward step 11: L2 per-bucket dense → l2_dense_out (B × l2_out) --
         cuda_launch! {
             kernel: dense_mm_fwd_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            config: cfg_1d(b * l2_out),
             args: [
                 slice(self.ws.l2_input),
                 slice(self.l2_w),
                 slice(self.l2_b),
                 slice(self.ws.bucket_idx_dev),
-                slice_mut(self.ws.l2_out),
-                b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                slice_mut(self.ws.l2_dense_out),
+                b_u32, l2_in as u32, l2_out as u32, NUM_BUCKETS as u32
             ]
         }?;
 
-        // -- Forward step 12: l2_acted = CReLU(l2_out) (B × 32) --
+        // -- Forward step 12: l2_acted = CReLU(l2_dense_out) (B × l2_out) --
         cuda_launch! {
             kernel: crelu_fwd,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            config: cfg_1d(b * l2_out),
             args: [
-                slice(self.ws.l2_out),
+                slice(self.ws.l2_dense_out),
                 slice_mut(self.ws.l2_acted),
-                (b * L2_OUT) as u32
+                (b * l2_out) as u32
             ]
         }?;
 
@@ -1728,7 +1743,7 @@ impl GpuTrainer {
                 slice(self.l3_b),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.l3_out),
-                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+                b_u32, l2_out as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
 
@@ -1819,9 +1834,9 @@ impl GpuTrainer {
         let l1_b_n = NUM_BUCKETS * l1_out;
         let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
-        let l2_b_n = NUM_BUCKETS * L2_OUT;
-        let l3_w_n = NUM_BUCKETS * L2_OUT;
+        let l2_w_n = NUM_BUCKETS * l2_out * l2_in;
+        let l2_b_n = NUM_BUCKETS * l2_out;
+        let l3_w_n = NUM_BUCKETS * l2_out;
         let l3_b_n = NUM_BUCKETS;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
         // `gather_and_sum_per_feature_overwrite` が全 (feature, ri) cell を sum
@@ -1847,27 +1862,30 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            config: cfg_1d(b * l2_out),
             args: [
                 slice(self.ws.dy_net_output),
                 slice(self.l3_w),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dl2_acted),
-                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+                b_u32, l2_out as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
-        // L3 weight bwd: in_dim=L2_OUT=32, out_dim=1, num_buckets=9。
-        // 元 kernel は 288 cells × scan batch で並列度小。split-K + 9 bucket register
-        // accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`) に切替。
-        // num_splits=64 → 64 blocks × 32 threads = 2048 threads ≈ 26 / SM (sm_86)。
-        const _: () = assert!(L2_OUT == 32 && NUM_BUCKETS == 9);
+        // L3 weight bwd: in_dim=l2_out, out_dim=1, num_buckets=9。
+        // 元 kernel は (out_dim*in_dim*num_buckets) cells × scan batch で並列度小。
+        // split-K + 9 bucket register accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`)
+        // に切替。1 thread = 1 in_dim cell なので block_dim は in_dim (= l2_out) と一致
+        // させる (kernel は `ii >= in_dim` を return するため block_dim < in_dim だと
+        // 末尾 cell が未計算になる)。num_splits=64 → 64 blocks × l2_out threads。
+        // `--l2 <= 256` を CLI が保証するので block_dim は 1024 上限を超えない。
+        const _: () = assert!(NUM_BUCKETS == 9);
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l3,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
                 grid_dim: (64, 1, 1),
-                block_dim: (32, 1, 1),
+                block_dim: (l2_out as u32, 1, 1),
                 shared_mem_bytes: 0,
             },
             args: [
@@ -1875,7 +1893,7 @@ impl GpuTrainer {
                 slice(self.ws.dy_net_output),
                 slice(self.ws.bucket_idx_dev),
                 slice(self.l3_w_grad),
-                b_u32, L2_OUT as u32, 1_u32, NUM_BUCKETS as u32
+                b_u32, l2_out as u32, 1_u32, NUM_BUCKETS as u32
             ]
         }?;
         cuda_launch! {
@@ -1893,17 +1911,17 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L3");
 
-        // -- Backward 12 reverse: crelu_grad on l2_out --
+        // -- Backward 12 reverse: crelu_grad on l2_dense_out --
         cuda_launch! {
             kernel: crelu_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_OUT),
+            config: cfg_1d(b * l2_out),
             args: [
-                slice(self.ws.l2_out),
+                slice(self.ws.l2_dense_out),
                 slice(self.ws.dl2_acted),
                 slice_mut(self.ws.dl2_out),
-                (b * L2_OUT) as u32
+                (b * l2_out) as u32
             ]
         }?;
 
@@ -1918,19 +1936,19 @@ impl GpuTrainer {
                 slice(self.l2_w),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dl2_input),
-                b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                b_u32, l2_in as u32, l2_out as u32, NUM_BUCKETS as u32
             ]
         }?;
         // L2 weight backward: split-K + 9 bucket register accumulator。weight cell 空間
-        // (per-bucket L2_OUT × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
-        // 256 固定で launch する (`block_dim = L2_OUT * l2_in` だと l2_in 次第で 1024 thread を
+        // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
+        // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
         // 超えるため)。
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l2,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: ((L2_OUT * l2_in).div_ceil(256) as u32, 64, 1),
+                grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 64, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -1939,7 +1957,7 @@ impl GpuTrainer {
                 slice(self.ws.dl2_out),
                 slice(self.ws.bucket_idx_dev),
                 slice(self.l2_w_grad),
-                b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                b_u32, l2_in as u32, l2_out as u32, NUM_BUCKETS as u32
             ]
         }?;
         // L2 bias backward (sorted): dl2_out を bucket_perm_dev で gather → dl2_out_sorted、
@@ -1948,12 +1966,12 @@ impl GpuTrainer {
         cuda_launch! {
             kernel: permute_rows_f32,
             stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * L2_OUT),
+            config: cfg_1d(padded_b * l2_out),
             args: [
                 slice(self.ws.dl2_out),
                 slice(self.ws.bucket_perm_dev),
                 slice_mut(self.ws.dl2_out_sorted),
-                padded_b as u32, L2_OUT as u32
+                padded_b as u32, l2_out as u32
             ]
         }?;
         cuda_launch! {
@@ -1969,7 +1987,7 @@ impl GpuTrainer {
                 slice(self.ws.dl2_out_sorted),
                 slice(self.ws.bucket_idx_sorted_dev),
                 slice(self.l2_b_grad),
-                padded_b as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                padded_b as u32, l2_out as u32, NUM_BUCKETS as u32
             ]
         }?;
 

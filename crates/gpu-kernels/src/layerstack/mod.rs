@@ -47,12 +47,12 @@
 //! (`max_active`) は入力 feature set ごとに異なる runtime 値で、kernel は
 //! `cols` / `nnz` / `ft_dim` を launch 引数で受け取る (本 module に固定
 //! 定数として持たない)。FT 出力次元 `ft_out` は `--ft-out`、L1 出力次元
-//! `l1_out` は `--l1` で選ぶ runtime 値 (既定 1536 / 16) で、kernel はこれらも
-//! launch 引数で受ける。以下は LayerStack トポロジで固定の定数 / 派生次元:
+//! `l1_out` は `--l1`、L2 出力次元 `l2_out` は `--l2` で選ぶ runtime 値
+//! (既定 1536 / 16 / 32) で、kernel はこれらも launch 引数で受ける。以下は
+//! LayerStack トポロジで固定の定数 / 派生次元:
 //!
 //! - `l1_skip = 1`、`l1_effective = l1_out - 1`、`l2_in = l1_effective * 2`
 //!   (l1_sqr.concat(l1_main)) — いずれも `l1_out` から導出する派生次元
-//! - `L2_OUT = 32`
 //! - `NUM_BUCKETS = 9` (progress8kpabs)
 //! - `FT_POST_SCALE = L1_SQR_SCALE = 127.0/128.0` (`qa = 127` 由来)
 

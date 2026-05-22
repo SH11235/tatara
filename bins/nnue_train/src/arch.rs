@@ -6,10 +6,10 @@ use nnue_train::trainer::LossKind;
 //
 // FT input dim (`ft_in`) and active-feature count (`max_active`) depend on the
 // input feature set chosen at startup (see `FeatureSetSpec`). The FT output dim
-// is chosen from `--ft-out` and the L1 output dim from `--l1`. Those runtime
-// dims, plus `ft_in` / `max_active`, are carried as fields on `GpuWorkspace`.
-// The constants below describe the part of the LayerStack topology that stays
-// fixed regardless of CLI options.
+// is chosen from `--ft-out`, the L1 output dim from `--l1`, and the L2 output
+// dim from `--l2`. Those runtime dims, plus `ft_in` / `max_active`, are carried
+// as fields on `GpuWorkspace`. The constants below are the defaults for the
+// configurable dims plus the part of the topology that is fixed (`NUM_BUCKETS`).
 
 /// Default FT output dim (per perspective), used when `--ft-out` is not given.
 /// `--ft-out` accepts any positive multiple of 128: `gather_and_sum_per_feature`
@@ -32,7 +32,13 @@ pub(crate) const DEFAULT_L1_OUT: usize = 16;
 /// is added straight onto the network output.
 pub(crate) const L1_SKIP: usize = 1;
 
-pub(crate) const L2_OUT: usize = 32;
+/// Default L2 output dim, used when `--l2` is not given.
+///
+/// The L2 per-bucket dense layer outputs `l2_out` values per position; they feed
+/// a CReLU activation and then the L3 output layer. `--l2` accepts any value in
+/// [2, 256]; the upper bound is the fixed shared-memory accumulator capacity of
+/// the per-bucket bias-gradient kernel.
+pub(crate) const DEFAULT_L2_OUT: usize = 32;
 // LayerStack 出力 bucket 数。progress8kpabs (`shogi-features`) が局面ごとに
 // 割り当てる bucket index は 0..=7 の 8 値で、index 8 の重み枠は確保するが
 // 学習では使わない (9 枠確保・1 枠予約は設計上の意図)。

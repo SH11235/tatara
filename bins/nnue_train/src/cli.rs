@@ -247,7 +247,7 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2 32; FT dimension set by --ft-out, L1 dimension by --l1).
+    /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// Simple 4-layer architecture, ported from bullet-shogi.
@@ -291,6 +291,15 @@ pub(crate) struct LayerstackArgs {
     /// processed in 16-wide tiles — so non-default widths are not penalized.
     #[arg(long, default_value_t = DEFAULT_L1_OUT)]
     pub(crate) l1: usize,
+
+    /// Output dimension of the L2 (per-bucket dense) layer. Specify a value in
+    /// [2, 256]; the upper bound is the fixed shared-memory accumulator capacity
+    /// of the per-bucket bias-gradient kernel. The default keeps the network
+    /// bit-identical to the standard layout and resume-compatible with existing
+    /// checkpoints. The L2 / L3 kernels take the output dimension as a runtime
+    /// argument, so non-default widths are not penalized.
+    #[arg(long, default_value_t = DEFAULT_L2_OUT)]
+    pub(crate) l2: usize,
 
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the

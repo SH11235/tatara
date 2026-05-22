@@ -353,6 +353,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         SMOKE_BATCH,
         DEFAULT_FT_OUT,
         DEFAULT_L1_OUT,
+        DEFAULT_L2_OUT,
         false,
         false,
         false,
@@ -370,9 +371,9 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
             + NUM_BUCKETS * DEFAULT_L1_OUT
             + DEFAULT_FT_OUT * DEFAULT_L1_OUT
             + DEFAULT_L1_OUT
-            + NUM_BUCKETS * L2_OUT * l2_in
-            + NUM_BUCKETS * L2_OUT
-            + NUM_BUCKETS * L2_OUT
+            + NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
+            + NUM_BUCKETS * DEFAULT_L2_OUT
+            + NUM_BUCKETS * DEFAULT_L2_OUT
             + NUM_BUCKETS) as f64
             / 1.0e6
     );
@@ -395,6 +396,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
             feature_set,
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
         )?;
         trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;

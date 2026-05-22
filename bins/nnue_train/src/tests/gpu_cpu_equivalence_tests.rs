@@ -984,11 +984,17 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
-    // L2 weight backward: out_dim = L2_OUT 固定、in_dim = l2_in (= 2*(l1_out-1)、--l1 依存)。
-    // l1_out ∈ {16, 24, 32, 8} に対応する l2_in {30, 46, 62, 14} を検証する。
+    // L2 weight backward: out_dim は L2 出力次元 (`--l2`、可変)、in_dim = l2_in
+    // (= 2*(l1_out-1)、`--l1` 依存)。既定 out_dim 32 と非既定 {16, 64, 256} を
+    // 各種 in_dim・非 16 倍数 out_dim と組み合わせて検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[(16_usize, 30_usize), (64, 46), (256, 62), (1024, 14)] {
-        let out_dim = 32_usize;
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 30_usize, 32_usize), // 既定形状
+        (64, 46, 16),
+        (256, 62, 64),
+        (1024, 14, 256),
+        (32, 96, 30), // 非 16 倍数の out_dim
+    ] {
         let nb = NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
@@ -1037,10 +1043,17 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
 
 #[test]
 fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
-    // tiled L3 (in_dim=32, out_dim=1, num_buckets=9)
+    // tiled L3 (out_dim=1, num_buckets=9; in_dim は L2 出力次元 l2_out、可変)。
+    // host は block_dim を in_dim に一致させる。既定 in_dim 32 と非既定
+    // {16, 64, 256}・非 16 倍数の 30 を検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &batch in &[16_usize, 64, 256, 1024] {
-        let in_dim = 32_usize;
+    for &(batch, in_dim) in &[
+        (16_usize, 32_usize), // 既定形状
+        (64, 16),
+        (256, 64),
+        (1024, 256),
+        (32, 30), // 非 16 倍数の in_dim
+    ] {
         let out_dim = 1_usize;
         let nb = NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
@@ -1065,9 +1078,10 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
         let num_splits = 8_usize;
+        // block_dim は in_dim (= L2 出力次元) に一致させる (kernel は 1 thread = 1 ii cell)。
         let config = LaunchConfig {
             grid_dim: (num_splits as u32, 1, 1),
-            block_dim: (32, 1, 1),
+            block_dim: (in_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         cuda_launch! {
@@ -1277,7 +1291,7 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    // out_dim は L1 bias (= l1_out、可変) と L2 bias (= L2_OUT = 32) の双方を網羅する。
+    // out_dim は L1 bias (= l1_out) と L2 bias (= l2_out) の双方を網羅する (ともに可変)。
     for &(batch, out_dim) in &[
         (16_usize, 16_usize), // L1 bias 既定形状
         (32, 16),

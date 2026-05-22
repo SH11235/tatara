@@ -112,10 +112,14 @@ raw checkpoint format v4 は arch-kind 名 + count-prefixed な `u64` topology h
 - `FT_OUT` 可変化は GPU kernel を改造しない。host の buffer 確保・kernel launch
   arg・checkpoint topology・experiment.json・architecture 文字列が runtime 値を
   参照する。
-- `L1_OUT` / `L2_OUT` の可変化は custom kernel (`dense_mm_*_bucket_tiled_l1` /
-  `_l2` / `_l3`、`bias_grad_bucket_shared_sorted` 等) の tile 一般化を要する別
-  作業として残る。それまで両次元は runtime field に載るが起動時 check で現行値に
-  固定される。
-- `NUM_BUCKETS` 可変化は scope 外。必要になれば register unroll の解消を含む
-  別 ADR で扱う。
+- `L1_OUT` 可変化は L1 系 custom kernel (`dense_mm_*_bucket_tiled_l1` /
+  `bias_grad_bucket_shared_sorted` 等) を out_dim 一般化して行った。tile 定数
+  (`TILE_OUT=16`) は compile-time のまま、出力次元を 16 幅 out-tile に分割し
+  grid 次元 / reduction loop に展開する。
+- `L2_OUT` 可変化は L2 / L3 系 kernel が元から out_dim を runtime 引数で受ける
+  ため host plumbing のみで足りた (L3 weight backward だけ host が block_dim を
+  `l2_out` に合わせる)。
+- 3 層次元 (`FT_OUT` / `L1_OUT` / `L2_OUT`) は `GpuWorkspace` の runtime field に
+  載り、`--ft-out` / `--l1` / `--l2` で可変。`NUM_BUCKETS` 可変化は scope 外で、
+  必要になれば register unroll の解消を含む別 ADR で扱う。
 - 既定構成での bit-identical と既存 checkpoint resume 互換は維持される。

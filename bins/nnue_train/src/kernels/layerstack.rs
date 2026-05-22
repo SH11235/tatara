@@ -1857,19 +1857,21 @@ pub fn dense_mm_bwd_weight_bucket(
     }
 }
 
-/// L3 weight backward (specialized: `in_dim=32`, `out_dim=1`, `num_buckets=9`)。
+/// L3 weight backward (specialized: `out_dim=1`, `num_buckets=9`; `in_dim` は L2 の
+/// 出力次元で runtime arg)。
 ///
 /// split-K + 9 bucket register accumulator で並列度を確保する:
-/// - block dim = 32 (1 thread = 1 ii cell)
-/// - grid = num_batch_splits (e.g., 64) → 64 blocks × 32 threads = 2048 threads ≈ 25 / SM (sm_86)
+/// - block dim = in_dim (1 thread = 1 ii cell)。`ii >= in_dim` の thread は return
+///   するため、caller は block_dim を in_dim に一致させる (小さいと末尾 cell が未計算)。
+/// - grid = num_batch_splits (e.g., 64)
 /// - 各 thread が 9 bucket × 1 ii の partial sum を batch_slice 内で集計
 /// - 完了後、9 cell ぶん atomicAdd で global grad_w に flush
 ///
-/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では 288 cells = 288 threads しか
-/// 使えず並列度が極小になるため、本 specialized kernel を使う。
+/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では (in_dim * num_buckets) cells
+/// 分の threads しか使えず並列度が極小になるため、本 specialized kernel を使う。
 ///
-/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。in_dim==32, out_dim==1,
-/// num_buckets==9 を満たすこと。
+/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。out_dim==1,
+/// num_buckets==9、block_dim==in_dim を満たすこと。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l3(
@@ -2006,7 +2008,8 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
     }
 }
 
-/// L2 weight backward (`out_dim = L2_OUT`、`in_dim = l2_in` は `--l1` 依存、`num_buckets <= 9`)。
+/// L2 weight backward (`out_dim` は L2 出力次元 `l2_out` (`--l2` 依存)、`in_dim = l2_in`
+/// は `--l1` 依存、`num_buckets <= 9`)。
 ///
 /// split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket acc)
 /// で並列度を確保する。weight cell 空間 (per-bucket `out_dim * in_dim`) を `blockIdx_x`、
@@ -2177,7 +2180,7 @@ pub fn bias_grad_bucket_shared_sorted(
     num_buckets: u32,
 ) {
     use core::ptr::addr_of_mut;
-    // out_dim (= l1_out / L2_OUT) は host が <= 256 を保証。先頭 out_dim cell のみ使う。
+    // out_dim (= l1_out / l2_out) は host が <= 256 を保証。先頭 out_dim cell のみ使う。
     static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
 
     let tid = thread::threadIdx_x() as usize;

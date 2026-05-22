@@ -21,9 +21,9 @@ use shogi_features::FeatureSet;
 /// `path` の LayerStack quantised checkpoint を読み込む。失敗時はどの file かを含むエラー。
 ///
 /// 比較対象は production の `halfka-hm-merged` checkpoint を既定 FT 出力次元
-/// (`DEFAULT_FT_OUT`) / 既定 L1 出力次元 (`DEFAULT_L1_OUT`) で想定し、その spec で
-/// load する (loader は arch / hash / layout がこの feature set と層次元に一致するか
-/// 検証する)。
+/// (`DEFAULT_FT_OUT`) / 既定 L1 出力次元 (`DEFAULT_L1_OUT`) / 既定 L2 出力次元
+/// (`DEFAULT_L2_OUT`) で想定し、その spec で load する (loader は arch / hash /
+/// layout がこの feature set と層次元に一致するか検証する)。
 fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("open `{path}`: {e}"))?;
     LayerStackWeights::load_quantised(
@@ -31,6 +31,7 @@ fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
         FeatureSet::HalfKaHmMerged.spec(),
         nnue_format::layerstack_weights::DEFAULT_FT_OUT,
         nnue_format::layerstack_weights::DEFAULT_L1_OUT,
+        nnue_format::layerstack_weights::DEFAULT_L2_OUT,
     )
     .map_err(|e| format!("parse `{path}` as LayerStack quantised NNUE: {e}").into())
 }
