@@ -1271,8 +1271,8 @@ impl GpuTrainer {
         let l2_in = self.ws.l2_in();
         // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
         // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
-        // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out == 16` の
-        // とき `n_out_tiles == 1` で、launch 形状は out-tile 軸が 1 に縮退し従来と一致する。
+        // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
+        // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
         let n_out_tiles = l1_out.div_ceil(16);
 
         // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
