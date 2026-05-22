@@ -138,8 +138,10 @@ target/release/nnue-train \
 | `<run-name>-<sb>.bin` | 量子化 NNUE binary | **推論エンジンに投入する artifact** (binary layout は `crates/nnue-format` 参照) |
 | `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
-`<run-name>-<最終 sb>.bin` が最終 net。棋力検証は将棋エンジン側に組み込んで
-測定する。
+`<run-name>-<最終 sb>.bin` が最終 net。これは [rshogi](https://github.com/SH11235/rshogi)
+エンジンでロードする — YaneuraOu など他の将棋エンジンでは読めない
+([学習した net の使い方](../README.ja.md#学習した-net-の使い方) 参照)。棋力検証は
+エンジンに組み込んで測定する。
 
 ## 動作確認 (smoke)
 
