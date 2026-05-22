@@ -98,8 +98,8 @@ fn legacy_raw_ckpt_header(
     b
 }
 
-/// 既定 FT 出力次元の LayerStack topology (test helper、`'static` 借用用)。
-const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(DEFAULT_FT_OUT);
+/// 既定 FT / L1 出力次元の LayerStack topology (test helper、`'static` 借用用)。
+const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(DEFAULT_FT_OUT, DEFAULT_L1_OUT);
 
 fn layerstack_arch() -> RawCkptArch<'static> {
     RawCkptArch {

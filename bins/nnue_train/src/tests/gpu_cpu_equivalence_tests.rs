@@ -44,6 +44,12 @@ use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
 /// forward / gradient の f32 tolerance。
 const TOL: f32 = 1e-5;
 
+// L1 系次元は `--l1` で runtime 可変だが、本 module の kernel は出力幅を runtime arg
+// で受けるため、ここでは既定次元 (`DEFAULT_L1_OUT`) に固定した test fixture を使う。
+const L1_OUT: usize = DEFAULT_L1_OUT;
+const L1_EFFECTIVE: usize = L1_OUT - L1_SKIP;
+const L2_IN: usize = L1_EFFECTIVE * 2;
+
 type CudaCtxModuleStream = (
     std::sync::Arc<CudaContext>,
     std::sync::Arc<CudaModule>,

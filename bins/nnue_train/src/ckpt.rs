@@ -56,11 +56,11 @@ pub(crate) type SimpleRawCkptGroupEntry<'a> = (
 
 /// LayerStack アーキの topology header (v4+): FT 出力次元・L1 出力次元・L2 出力次元・
 /// bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。FT 出力次元は
-/// `--ft-out` で可変、残り 3 つは固定。
-pub(crate) const fn layerstack_topology(ft_out: usize) -> [u64; 4] {
+/// `--ft-out`、L1 出力次元は `--l1` で可変、残り 2 つは固定。
+pub(crate) const fn layerstack_topology(ft_out: usize, l1_out: usize) -> [u64; 4] {
     [
         ft_out as u64,
-        L1_OUT as u64,
+        l1_out as u64,
         L2_OUT as u64,
         NUM_BUCKETS as u64,
     ]
