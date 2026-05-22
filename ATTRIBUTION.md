@@ -9,22 +9,7 @@
 - bullet (upstream): <https://github.com/jw1912/bullet>
 - License: MIT
 
-**派生範囲**: 以下のファイル群は bullet-shogi / bullet からの移植 (vendor) を含み、
-オリジナルのアルゴリズム選択 / 数式 / 定数の出典が bullet にあります。
-
-- `crates/shogi-format/` — PackedSfenValue (PSV) reader、ShogiBoard / Hand 型、
-  Stockfish 系の `bona_piece` 定数
-- `crates/shogi-features/` — HalfKA_hm 特徴抽出と progress8kpabs バケット定義
-- `crates/gpu-kernels/` — pointwise / sparse / layerstack カーネルの hand-fused
-  実装。`loss_wdl` / `loss_wrm` / `ranger_step` / `radam_step` / `adamw_step` /
-  `screlu_grad` / sparse FT forward/backward / dense_mm bucket variants 等の
-  数式と定数 (WRM `in_scaling=380`, offset `270` 等の bullet ハードコード値含む)
-- `crates/nnue-format/src/layerstack_weights.rs` — LayerStack 量子化 binary
-  format (`QA=127 / QB=64 / FV_SCALE=28`、`FC_HASH` の compute 規則)
-- `crates/nnue-train/src/trainer.rs` — superbatch training loop と
-  `--score-drop-abs` / WDL blend / Ranger lookahead の挙動
-
-具体的な対応関係 (どの kernel が bullet のどの関数を hand-fuse したか) は各source ファイルの module doc コメントに記載しています。
+NNUE 学習器のアルゴリズムは bullet-shogi / bullet から移植しています。
 
 ## cuda-oxide (Apache-2.0)
 
