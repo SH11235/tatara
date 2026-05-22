@@ -5,8 +5,8 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// SCReLU activation gradient (fused)。
 ///
-/// LayerStack path では **未使用** (CReLU + pairwise_mul を使うため)。cuda-oxide の
-/// bin-entry constraint に従い compile-reach のため preserve。
+/// Simple アーキの `--activation screlu` backward で使う。LayerStack path は
+/// CReLU + pairwise_mul を使うため未使用。
 ///
 /// 1 thread = 1 element、atomics 不要、in-place output (`dl_dx`)。
 #[kernel]
@@ -44,7 +44,7 @@ pub fn loss_wdl(
     out: &[f32],
     score: &[f32],
     wdl: &[f32],
-    per_pos_norm: f32, // scalar (= 1/n_pos)。元 `&[f32]` の broadcast を kernel arg 化
+    per_pos_norm: f32, // scalar (= 1/n_pos)
     mut dl_dout: DisjointSlice<f32>,
     loss_acc: &[f64],
     lambda: f32,
@@ -609,9 +609,9 @@ pub fn sparse_ft_forward(
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
 /// 変換してから累算する。累算と出力 (`out`) は `f32` のまま。
 ///
-/// `sparse_ft_forward` は DRAM 帯域律速 (RTX 3080 Ti 実測で peak DRAM BW の ~90%)
-/// で、その traffic の大半は active feature 行の weight gather read。weight を半精度に
-/// すると read byte 数が半減し、L2 にも 2 倍の行が載るため DRAM 律速が緩む。
+/// `sparse_ft_forward` は DRAM 帯域律速で、その traffic の大半は active feature 行の
+/// weight gather read。weight を半精度にすると read byte 数が半減し、L2 にも 2 倍の
+/// 行が載るため DRAM 律速が緩む。
 /// caller は `weight` に `ft_w` の FP16 mirror を渡し、FP32 master とは別管理する
 /// (optimizer は FP32 master を更新し、mirror は毎 step 変換し直す)。
 ///
@@ -1035,7 +1035,7 @@ pub fn gather_and_sum_per_feature_add(
 ///
 /// `grad_out` は b × ft_out で、本 kernel は 1 feature の出現位置すべてに対して全 ri
 /// 行を gather-read するため step 中で最も read DRAM traffic が大きい。`ft_post_
-/// perspective_grad_fused_fp16` が dft を `f16` で書くようになったため、その read 側も
+/// perspective_grad_fused_fp16` が dft を `f16` で書くのに合わせ、その read 側も
 /// 半精度化して帯域を半減させる。
 ///
 /// `grad_out` は `ft_post_perspective_grad_fused_fp16` 側で loss scaling 済 (値が

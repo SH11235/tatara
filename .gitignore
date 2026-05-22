@@ -6,7 +6,7 @@
 # Claude Code runtime state (transient)
 .claude/scheduled_tasks.lock
 
-# 教師データ (大容量、E: 上の symlink 先) — docs/data-layout.md
+# 教師データ (大容量)
 /data
 **/*.bin
 **/*.psv
@@ -18,7 +18,7 @@
 # 入れないため)。
 !crates/shogi-format/tests/data/sample.psv
 
-# tatara 自前の学習出力 — docs/data-layout.md
+# tatara 自前の学習出力
 /output
 **/output
 /logs
@@ -27,9 +27,9 @@
 **/checkpoints
 
 # cuda-oxide が生成する NVPTX IR / PTX / cubin (kernel module 単位で
-# workspace root or 各 crate 配下に出る、Stage 1+ で増える)。
-# Stage 1-9 で host loader が `.ll → .linked.bc → .opt.bc → .ptx` の
-# pipeline を回すため、中間 LLVM bitcode (.bc) も無視する。
+# workspace root or 各 crate 配下に出る)。host loader が
+# `.ll → .linked.bc → .opt.bc → .ptx` の pipeline を回すため、中間 LLVM
+# bitcode (.bc) も無視する。
 **/*.ll
 **/*.ptx
 **/*.cubin

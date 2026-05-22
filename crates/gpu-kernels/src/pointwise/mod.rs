@@ -1,8 +1,8 @@
 //! Pointwise fused kernel suite の reference CPU。
 //!
-//! 1 kernel = 1 file で配置する。GPU 側 `#[kernel]` の inline 定義は
-//! `bins/nnue_train/src/main.rs` 側にある (cuda-oxide rustc-codegen-cuda
-//! backend の bin-entry 制約)。
+//! 1 kernel = 1 file で配置する。GPU 側 `#[kernel]` の定義は
+//! `bins/nnue_train/src/kernels/` 側にある (cuda-oxide rustc-codegen-cuda
+//! backend の bin-crate 制約)。
 //!
 //! ## 提供する module
 //!

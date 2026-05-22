@@ -84,12 +84,11 @@ pub(crate) struct StepOutput {
 /// Smoke / trainer 用の 1 batch 入力データ。
 /// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
 /// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
-#[allow(dead_code)]
 pub(crate) struct BatchData<'a> {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可
     pub(crate) nstm_indices: &'a [i32],
-    pub(crate) bucket_idx: &'a [i32], // (n_pos)、progress8kpabs の 0-8
+    pub(crate) bucket_idx: &'a [i32], // (n_pos)、progress8kpabs の 0..=7
     pub(crate) score: &'a [f32],      // (n_pos)、target eval cp の元
     pub(crate) wdl: &'a [f32],        // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
     pub(crate) per_pos_norm: f32, // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)

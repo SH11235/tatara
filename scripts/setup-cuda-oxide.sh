@@ -96,7 +96,7 @@ fi
 # 環境診断。install したばかりの pin rev の cargo-oxide で実行する。初回は
 # codegen backend を自動で取得・ビルドしてキャッシュするため時間がかかる。
 if [[ -x "$oxide" ]]; then
-  echo "cargo oxide doctor:"
+  echo "cargo-oxide doctor:"
   doctor_status=0
   "$oxide" doctor || doctor_status=$?
   echo

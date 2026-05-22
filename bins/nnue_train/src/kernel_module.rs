@@ -4,11 +4,9 @@ use gpu_runtime::{CudaContext, CudaModule};
 // Host driver helpers (kernel module loader / launch utilities)
 // ===========================================================================
 
-#[allow(dead_code)]
 pub(crate) const BLOCK_DIM: u32 = 256;
 
 /// 1 D launch の grid 数を計算 (= ceil(n / block)、n=0 は block=1 個 launch)。
-#[allow(dead_code)]
 pub(crate) fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
     let blocks = ((n as u32).max(1)).div_ceil(block);
     (blocks, 1, 1)
@@ -16,7 +14,6 @@ pub(crate) fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
 
 /// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
 /// CudaModule を load。fallback 順は `.ll` → `.cubin` → `.ptx`。
-#[allow(dead_code)]
 pub(crate) fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
@@ -67,7 +64,6 @@ pub(crate) fn load_kernel_module_with_fallback(
 }
 
 /// `.ll` を libdevice と link → opt → llc で `.ptx` 生成する。
-#[allow(dead_code)]
 pub(crate) fn compile_ll_to_ptx_via_llc(
     ll_path: &std::path::PathBuf,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {

@@ -95,7 +95,7 @@ pub fn ft_post_perspective_fwd(
 /// で読み、`f32` に変換してから bias add 以降を計算する。math と `combined` 出力は
 /// `f32` のまま (`combined` は後続 dense L1 path が `f32` で読む)。
 ///
-/// `sparse_ft_forward_fp16` が `ft_*_out` を `f16` で書くようになったため、その read
+/// `sparse_ft_forward_fp16` が `ft_*_out` を `f16` で書くのに合わせ、その read
 /// 側も半精度化して DRAM traffic を合わせる。`f16` → `f32` 変換は値域を保つ無損失
 /// 変換なので、`combined` は FP32 版と同じ値域・同じ丸めで計算される (入力 `ft_*_out`
 /// 自体が `sparse_ft_forward_fp16` 時点で既に半精度量子化されている点のみ FP32 path と
@@ -656,9 +656,9 @@ pub fn dense_mm_bwd_input(
 /// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 (`in_dim=ft_out`,
 /// `out_dim=16` 固定)、`batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。
 ///
-/// 元 `dense_mm_bwd_input` は w[ii][o] (out-major) read で warp 内 ii=0..31 が stride 16 = 64B
-/// = 32 cache lines load → uncoalesced。本 kernel は W_TILE / DY_TILE を shared に load
-/// (coalesced)、各 thread が 1 (bi, ii) cell を 16 FMA で完成。
+/// 非 tiled の [`dense_mm_bwd_input`] は w[ii][o] (out-major) read で warp 内 ii=0..31 が
+/// stride 16 = 64B = 32 cache lines load の uncoalesced になる。本 kernel は W_TILE /
+/// DY_TILE を shared に coalesced load し、各 thread が 1 (bi, ii) cell を 16 FMA で完成。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_input_tiled(
@@ -775,8 +775,9 @@ pub fn dense_mm_bwd_weight(
 /// が host 契約。非該当形状では結果未定義 (host 側で sizes チェックの上で本 kernel を選ぶ)。
 ///
 /// 1 block = 1 (TILE_IN × TILE_OUT) W tile。block 内 256 threads が batch を TILE_K=16
-/// chunk で cooperatively load し、shared memory 上で TILE_K 回 FMA。current "1 thread =
-/// 1 cell、scan batch" 比 ~33x 少ない unique memory read (x 16x redundant → 1x、dy ft_out x → 1x)。
+/// chunk で cooperatively load し、shared memory 上で TILE_K 回 FMA。1 thread = 1 cell
+/// で batch を scan する [`dense_mm_bwd_weight`] 比で unique memory read が ~33x 少ない
+/// (x の 16x redundant read → 1x、dy も ft_out 回 → 1x)。
 ///
 /// SAFETY: `static mut TILE` への access は block-local barrier (`sync_threads`) で
 /// race を防ぐ。各 thread の write index は disjoint なので per-thread access は安全。
@@ -863,14 +864,13 @@ pub fn dense_mm_bwd_weight_tiled(
 }
 
 /// Tiled per-bucket weight backward (L1 用: `in_dim=ft_out`、`out_dim=16` /
-/// `num_buckets=9` は固定、`batch % 16 == 0`)。
+/// `num_buckets=9` は固定、`batch % 16 == 0`)。[`dense_mm_bwd_weight_bucket`] の
+/// tiled variant。
 ///
-/// 元の `dense_mm_bwd_weight_bucket` (1 thread = 1 (buc, oi, ii) cell、scan batch、
-/// bucket filter を inner loop で 9 倍冗長に評価) を「block per W tile (16x16)、
-/// 1 thread = 9 bucket × 1 cell の register accumulator、batch scan 1 回」に書き換え。
-/// 副作用: `dy_tile`、`x_tile`、`buc_tile` を shared mem に coalesced load し、batch を
-/// TILE_K=16 chunk で消化。bucket 分岐は uniform (同 k 内で warp 全 thread が同 buc) なので
-/// divergence なし。
+/// 1 block = 1 W tile (16×16)。1 thread が 9 bucket 分の register accumulator を持ち、
+/// `dy_tile` / `x_tile` / `buc_tile` を shared mem に coalesced load しながら batch を
+/// TILE_K=16 chunk で 1 回 scan する。bucket 分岐は uniform (同 k 内で warp 全 thread が
+/// 同 buc) なので divergence なし。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l1(
@@ -965,7 +965,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
                 unsafe {
                     let buc = BUC_TILE[k];
                     let mul = X_TILE[(k << 4) | tid_i] * DY_TILE[(k << 4) | tid_o];
-                    // num_buckets=9 を想定。負値・>=9 は無視 (silent skip、元 kernel と同じ)。
+                    // num_buckets=9 を想定。負値・>=9 は無視 (silent skip)。
                     if buc == 0 {
                         a0 += mul;
                     } else if buc == 1 {
@@ -993,10 +993,8 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
         k_tile += 1;
     }
 
-    // Write: grad_w[buc * out_dim * in_dim + global_ii * out_dim + global_oi] かと思いきや、
-    // 元 kernel の layout は `grad_w[buc][o][i]` row-major、つまり buc * out_dim * in_dim +
-    // out_idx * in_dim + in_idx (out-major そして in-major) で、`tid_in_block` 全 thread が
-    // bucket buc に対して書く 1 cell の index = buc * (out_dim * in_dim) + oi * in_dim + ii。
+    // grad_w layout は `grad_w[buc][o][i]` row-major (bucket-major、その中 out-major)、
+    // つまり cell index = buc * (out_dim * in_dim) + oi * in_dim + ii。
     if in_ok && out_ok {
         let per_bucket = out_dim_u * in_dim_u;
         let cell_in_bucket = global_oi * in_dim_u + global_ii;
@@ -1179,9 +1177,9 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
 
 /// Bias gradient (block-level shared-mem reduction) — L1f 用 (`out_dim=16`)。
 ///
-/// 元 `bias_grad` は 1M threads × 1 atomic → 16 cells で contention 大。本 kernel は
-/// 各 block (256 threads) が shared-mem 16-cell accumulator に集約 → 1 block × 16 atomic
-/// add で global に flush。global atomic 数 = blocks × 16 (= ~64K) で contention 大幅減。
+/// 各 block (256 threads) が shared-mem 16-cell accumulator に集約してから 1 block ×
+/// 16 atomic add で global に flush する。global atomic 数 = blocks × 16 (= ~64K)。
+/// 全 thread が直接 global の 16 cells へ atomic add する [`bias_grad`] の contention を避ける。
 #[kernel]
 pub fn bias_grad_shared_l1f(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
     use core::ptr::addr_of_mut;
@@ -1289,9 +1287,12 @@ pub fn dense_mm_fwd_bucket(
 }
 
 /// Tiled non-bucket forward dense matmul (L1f 用: `in_dim=ft_out`、`out_dim=16` 固定)。
-/// 元 `dense_mm_fwd` は coalesced だが 1 thread = 1 (b, oi) で per-thread ft_out K iter で
-/// 並列度限界。本 kernel は block tile (TILE_B=16 × TILE_OUT=16 = 256 cells)、K=16 chunk
-/// で shared-mem cooperative load → 256 cells / block で並列度 4K blocks × 256 threads。
+/// [`dense_mm_fwd`] の tiled variant。
+///
+/// block tile (TILE_B=16 × TILE_OUT=16 = 256 cells) を K=16 chunk の shared-mem
+/// cooperative load で計算する。1 thread = 1 (b, oi) の [`dense_mm_fwd`] は per-thread
+/// で ft_out 回の K iteration を回すため並列度が限られるが、本 kernel は 256 cells /
+/// block の tile 並列で 4K blocks × 256 threads まで広げる。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_fwd_tiled_l1f(
@@ -1375,13 +1376,14 @@ pub fn dense_mm_fwd_tiled_l1f(
 }
 
 /// Tiled per-bucket forward dense matmul (L1 用: `in_dim=ft_out`、`out_dim=16` /
-/// `num_buckets=9` は固定)。
+/// `num_buckets=9` は固定)。[`dense_mm_fwd_bucket`] の tiled variant。
 ///
-/// 元 `dense_mm_fwd_bucket` は `w[buc][oi][ii]` layout のため、warp 内 16-thread sub-group が
-/// oi 軸を varying させると stride=in_dim=ft_out で uncoalesced。本 kernel は 1 block = 1 batch
-/// tile (TILE_B=16) × 全 oi (= TILE_OUT=16)、K (= in_dim) を TILE_K=16 chunk で消化し、shared
-/// memory 上で `w_tile [NUM_BUCKETS × TILE_OUT × TILE_K]` を per-K-tile load (coalesced)。各
-/// thread は自分の bucket の W 行を shared から読んで accumulate。
+/// 1 block = 1 batch tile (TILE_B=16) × 全 oi (= TILE_OUT=16)、K (= in_dim) を
+/// TILE_K=16 chunk で消化し、shared memory 上に `w_tile [NUM_BUCKETS × TILE_OUT ×
+/// TILE_K]` を per-K-tile coalesced load する。各 thread は自分の bucket の W 行を
+/// shared から読んで accumulate。`w[buc][oi][ii]` を直接 read する
+/// [`dense_mm_fwd_bucket`] は oi 軸 varying で stride=ft_out の uncoalesced read に
+/// なるのを、shared への coalesced load で回避する。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_fwd_bucket_tiled_l1(
@@ -1833,12 +1835,14 @@ pub fn dense_mm_bwd_weight_bucket(
 
 /// L3 weight backward (specialized: `in_dim=32`, `out_dim=1`, `num_buckets=9`)。
 ///
-/// 元 `dense_mm_bwd_weight_bucket` は 288 cells × scan 65536 = 288 threads と並列度極小、
-/// 9.2ms 占有。本 kernel は split-K + 9 bucket register accumulator で並列度を上げる:
+/// split-K + 9 bucket register accumulator で並列度を確保する:
 /// - block dim = 32 (1 thread = 1 ii cell)
 /// - grid = num_batch_splits (e.g., 64) → 64 blocks × 32 threads = 2048 threads ≈ 25 / SM (sm_86)
 /// - 各 thread が 9 bucket × 1 ii の partial sum を batch_slice 内で集計
 /// - 完了後、9 cell ぶん atomicAdd で global grad_w に flush
+///
+/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では 288 cells = 288 threads しか
+/// 使えず並列度が極小になるため、本 specialized kernel を使う。
 ///
 /// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。in_dim==32, out_dim==1,
 /// num_buckets==9 を満たすこと。
@@ -1980,10 +1984,10 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
 
 /// L2 weight backward (specialized: `in_dim=30`, `out_dim=32`, `num_buckets=9`)。
 ///
-/// 元 `dense_mm_bwd_weight_bucket` は 8640 cells × scan batch、並列度 ~34 blocks で遅い。
-/// 本 kernel は split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket
-/// acc) で並列度を上げる。block_dim = 32 × 30 = 960 threads (sm_86 max 1024 以内)、
-/// block grid = num_batch_splits。
+/// split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket
+/// acc) で並列度を確保する。block_dim = 32 × 30 = 960 threads (sm_86 max 1024 以内)、
+/// block grid = num_batch_splits。汎用の [`dense_mm_bwd_weight_bucket`] は L2 形状では
+/// 8640 cells を ~34 blocks でしか並べられず遅いため、本 specialized kernel を使う。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l2(

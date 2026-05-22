@@ -122,9 +122,9 @@ done
 
 ### 2.5 section purpose alignment
 
-各 doc は冒頭 1-3 行で宣言した目的 (例: `performance.md` = "throughput 期待値 +
-GPU 機種別目安 + `NNUE_TRAIN_STEP_PROFILE` 自己診断手順") に沿わない section
-が混入していないか、section 見出しを並べて目視判定する。
+各 doc は冒頭 1-3 行で宣言した目的 (例: `training-quickstart.md` = "`nnue-train`
+で将棋 NNUE を学習する最短手順") に沿わない section が混入していないか、section
+見出しを並べて目視判定する。
 
 ```bash
 # 各 doc の宣言目的 (header) と section 見出しを並べる
@@ -157,21 +157,6 @@ done
 
 検出は **section 単位 / paragraph 単位の目視** が必要。grep だけでは取り
 切れない (語彙ではなく structural な mismatch のため)。
-
-### 2.6 performance.md の throughput 鮮度
-
-`docs/performance.md` の pos/s 値が最新の perf PR と乖離していないか、各値に
-測定 GPU と再現コマンドが伴っているか確認する。
-
-```bash
-rg -n 'pos/s|~[0-9.]+[KM]\b' docs/performance.md   # doc 側の throughput 値
-git log --oneline -20 | rg -i 'pos/s'              # 直近 perf PR の計測値
-```
-
-- 構成別 / GPU 機種別表の値が直近 perf PR の commit message 計測値と一致するか
-- 各 throughput に GPU 名 (RTX 3080 Ti 等) が併記されているか
-- 再現コマンド (「計測手順」節) があり、data / progress path が placeholder か
-  (local 実 path を書いていないか)
 
 ## 3. コード特有チェック
 

@@ -11,8 +11,6 @@
 - load 時に、要求するネットワーク spec から同じ手順で arch string を組み立て直し、
   ファイル内の文字列と照合する。不一致なら別物の weight を取り違えて読み込む前に
   reject する (`load` / `load_quantised` の reject 契約)。
-- 形式は nnue-pytorch / YaneuraOu 系の network description に倣う (出典は
-  [ATTRIBUTION.md](../ATTRIBUTION.md))。
 
 組み立ては `crates/nnue-format` の 2 箇所:
 
@@ -79,13 +77,13 @@ Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Clipped
 | `ClippedReLU[32]` | 32 要素の clipped ReLU |
 | `AffineTransform[1<-32]` | 出力層、32 → 1 |
 
-LayerStack の arch string は nnue-pytorch canonical form の要約で、L1f skip 接続や
+LayerStack の arch string は dense 層チェーンの要約で、L1f skip 接続や
 pairwise・per-bucket 構造は文字列に現れない。LayerStack の完全なアーキ記述は
 `crates/nnue-format/src/layerstack_weights.rs` の module doc を参照。
 
 ## Simple の例
 
-Simple は bucket 無しの 4 層 dense アーキで、層次元が文字列上の dense 層チェーンと
+Simple は bucket 無しの 4 層アーキ (FT + dense 3 層) で、層次元が文字列上の dense 層チェーンと
 そのまま対応する。`HalfKA_hm` feature set・FT 出力 256・隠れ層 32/32 の場合。
 
 活性化 `crelu` (`fv_scale=13`):
@@ -136,4 +134,3 @@ Simple 固有の点:
   load reject 契約
 - `crates/nnue-format/src/simple_weights.rs` — Simple の `build_arch_str` と
   load reject 契約
-- [ATTRIBUTION.md](../ATTRIBUTION.md) — arch string 形式・量子化アルゴリズムの出典

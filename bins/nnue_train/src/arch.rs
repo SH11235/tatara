@@ -21,7 +21,10 @@ pub(crate) const L1_EFFECTIVE: usize = L1_OUT - 1; // = 15 (skip 1 dim、bullet:
 pub(crate) const L1_SKIP: usize = L1_OUT - L1_EFFECTIVE; // = 1
 pub(crate) const L2_IN: usize = L1_EFFECTIVE * 2; // = 30 (l1_sqr.concat(l1_main))、bullet:1434
 pub(crate) const L2_OUT: usize = 32;
-pub(crate) const NUM_BUCKETS: usize = 9; // progress8kpabs
+// LayerStack 出力 bucket 数。progress8kpabs (`shogi-features`) が局面ごとに
+// 割り当てる bucket index は 0..=7 の 8 値で、index 8 の重み枠は確保するが
+// 学習では使わない (9 枠確保・1 枠予約は設計上の意図)。
+pub(crate) const NUM_BUCKETS: usize = 9;
 
 // scale 定数 (bullet shogi_layerstack.rs:2241, 2260)
 pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;

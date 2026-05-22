@@ -1,9 +1,11 @@
-//! LayerStack architecture (1536-16-32 + progress8kpabs 9 buckets) で使う
-//! kernel の reference CPU 実装。
+//! LayerStack architecture (FT → L1 16 → L2 32、出力 bucket topology 9-way) で
+//! 使う kernel の reference CPU 実装。bucket index は progress8kpabs が局面
+//! ごとに 0..=7 を算出する (9 枠中 index 8 は予約で割当対象外、`arch.rs` の
+//! `NUM_BUCKETS` 参照)。
 //!
-//! GPU 側 `#[kernel]` 定義は **`bins/nnue_train/src/main.rs` に inline 配置**
+//! GPU 側 `#[kernel]` 定義は **`bins/nnue_train/src/kernels/` に配置**
 //! されている (cuda-oxide rustc-codegen-cuda backend は `#[kernel]` を bin
-//! crate entry に置く必要がある)。本 module 群はその `#[kernel]` のロジックを
+//! crate 内に置く必要がある)。本 module 群はその `#[kernel]` のロジックを
 //! host で素直に書き写した `*_cpu` 関数で、`bins/nnue_train` の
 //! `#[cfg(test)] mod gpu_cpu_equivalence_tests` が GPU↔CPU 数値同等性
 //! テストの reference として使う。
@@ -44,11 +46,10 @@
 //! FT 入力次元 (`ft_in`) と 1 perspective あたりの active feature 数
 //! (`max_active`) は入力 feature set ごとに異なる runtime 値で、kernel は
 //! `cols` / `nnz` / `ft_dim` を launch 引数で受け取る (本 module に固定
-//! 定数として持たない)。以下の FT_OUT 以降の次元は LayerStack トポロジで
-//! 固定 (feature set と独立):
+//! 定数として持たない)。FT 出力次元 `ft_out` も `--ft-out` で選ぶ runtime 値
+//! (既定 1536)。以下の `L1_OUT` 以降の次元は LayerStack トポロジで固定
+//! (feature set・`--ft-out` と独立):
 //!
-//! - `FT_OUT = 1536` (per-perspective FT 出力次元)
-//! - `COMBINED_DIM = FT_OUT = 1536` (pairwise 1536→768 を 2 perspective concat)
 //! - `L1_OUT = 16`、`L1_EFFECTIVE = L1_OUT - 1 = 15`、`L1_SKIP = 1`
 //! - `L2_IN = L1_EFFECTIVE * 2 = 30` (l1_sqr.concat(l1_main))、`L2_OUT = 32`
 //! - `NUM_BUCKETS = 9` (progress8kpabs)
