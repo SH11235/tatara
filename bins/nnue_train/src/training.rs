@@ -216,6 +216,57 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
              fp16_opt_state={fp16_opt_state} tf32={tf32}"
         );
     }
+    // PSQT shortcut の初期 weight (`--psqt` 有効時のみ確保)。`zeroed` は全 0、`material`
+    // は piece centipawn / out_scaling で全 bucket 同値を書く (Stockfish prior、bullet v101)。
+    // out_scaling 規約: WRM 有効時は `wrm_nnue2score` (= net_output が logit(WRM(cp)) の
+    // domain、PSQT も同 scale で寄与する)、無効時は `scale` (= sigmoid 経路の cp → logit
+    // 変換係数)。
+    let psqt_init_vec: Option<Vec<f32>> = if layerstack.psqt {
+        let n = feature_set.ft_in() * NUM_BUCKETS;
+        let vec = match layerstack.psqt_init {
+            PsqtInit::Zeroed => vec![0.0_f32; n],
+            PsqtInit::Material => {
+                let out_scaling = if cli.win_rate_model {
+                    cli.wrm_nnue2score
+                } else {
+                    cli.scale
+                };
+                if !(out_scaling.is_finite() && out_scaling > 0.0) {
+                    return Err(format!(
+                        "--psqt-init material requires a positive out_scaling \
+                         (got {} from {})",
+                        out_scaling,
+                        if cli.win_rate_model {
+                            "--wrm-nnue2score"
+                        } else {
+                            "--scale"
+                        }
+                    )
+                    .into());
+                }
+                shogi_features::psqt_material_values(
+                    feature_set.ft_in(),
+                    feature_set.ft_in(),
+                    NUM_BUCKETS,
+                    out_scaling,
+                )
+            }
+        };
+        println!(
+            "[train] PSQT shortcut: enabled (init={:?}, out_scaling={})",
+            layerstack.psqt_init,
+            if cli.win_rate_model {
+                cli.wrm_nnue2score
+            } else {
+                cli.scale
+            }
+        );
+        Some(vec)
+    } else {
+        println!("[train] PSQT shortcut: disabled");
+        None
+    };
+
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
@@ -229,6 +280,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         fp16_opt_state,
         feature_set,
         cli.weight_decay,
+        psqt_init_vec.as_deref(),
     )?;
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id を決める。
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
@@ -238,12 +290,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 init.display()
             );
             let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-            let weights = LayerStackWeights::load_quantised(
+            let weights = LayerStackWeights::load_quantised_with_psqt(
                 &mut reader,
                 feature_set,
                 layerstack.ft_out,
                 layerstack.l1,
                 layerstack.l2,
+                layerstack.psqt,
             )?;
             trainer.load_layerstack_weights(&weights)?;
             (None, None)

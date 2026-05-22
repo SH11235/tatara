@@ -36,6 +36,8 @@
 //! | `elementwise_add`             | [`elementwise::elementwise_add_cpu`] |
 //! | `slice_extract_2d`            | [`slice2d::slice_extract_2d_cpu`] |
 //! | `slice_scatter_2d`            | [`slice2d::slice_scatter_2d_cpu`] |
+//! | `psqt_diff_sparse_fwd_inplace`| [`psqt::psqt_diff_sparse_fwd_inplace_cpu`] |
+//! | `psqt_diff_sparse_bwd`        | [`psqt::psqt_diff_sparse_bwd_cpu`] |
 //!
 //! その他の reference (`loss_wdl` / `loss_wrm` / `sparse_ft_forward` /
 //! `sparse_ft_backward` / `screlu_grad` / `radam_step` / `ranger_step` /
@@ -63,4 +65,5 @@ pub mod dense_mm;
 pub mod dense_mm_bucket;
 pub mod elementwise;
 pub mod ft_post_perspective;
+pub mod psqt;
 pub mod slice2d;

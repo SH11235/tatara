@@ -331,6 +331,48 @@ pub(crate) struct LayerstackArgs {
     /// not guaranteed until confirmed by SPRT.
     #[arg(long)]
     pub(crate) ft_fp16_out: bool,
+
+    /// Enable the PSQT (Piece-Square Table) shortcut layer.
+    ///
+    /// PSQT is a per-feature × per-bucket scalar prior layered in parallel with
+    /// the dense `FT -> L1 -> L2 -> L3` path: `net_output +=
+    /// 0.5 * (Σ stm_active psqt_w[f, bucket] - Σ nstm_active psqt_w[f, bucket])`.
+    /// Stockfish SFNNv10 style — the dense path then only has to learn
+    /// non-material structure on top of the material prior carried by PSQT.
+    ///
+    /// Default OFF for bit-identical compatibility with non-PSQT checkpoints.
+    /// When enabled the saved `.bin` carries an extra `PSQT=9,` token in the
+    /// arch string plus an i32 PSQT block (scale `QA * QB = 8128`) compatible
+    /// with the bullet-shogi LayerStack PSQT format.
+    #[arg(long)]
+    pub(crate) psqt: bool,
+
+    /// PSQT shortcut weight initialiser: `zeroed` (default) or `material`.
+    ///
+    /// - `zeroed`: every PSQT weight starts at 0; the dense path absorbs
+    ///   material information first and PSQT only picks up the residual
+    ///   correction. Bullet-shogi observed prolonged plateaus with this init.
+    /// - `material`: PSQT weights are pre-loaded with centipawn piece values
+    ///   divided by `--wrm-nnue2score` (or `--scale` when WRM is off) so the
+    ///   shortcut already encodes piece material from step 0. The dense path
+    ///   then specialises in non-material structure (positional/tactical
+    ///   patterns). This matches bullet-shogi v101 PSQT.
+    ///
+    /// Requires `--psqt`. Material init additionally requires the loss to know
+    /// the centipawn → logit scaling: either use `--win-rate-model` with
+    /// `--wrm-in-scaling` (and `--wrm-nnue2score`) set, or use the sigmoid path
+    /// where `--scale` provides the conversion factor.
+    #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
+    pub(crate) psqt_init: PsqtInit,
+}
+
+/// PSQT shortcut の初期化方式。bullet-shogi v101 と同じセマンティクス。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PsqtInit {
+    /// Start every PSQT weight at zero (PSQT is initially inert).
+    Zeroed,
+    /// Pre-load PSQT with centipawn piece values / out_scaling (Material prior).
+    Material,
 }
 
 /// Simple 4 層アーキ固有の引数。
