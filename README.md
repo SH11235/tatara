@@ -44,8 +44,7 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 | `halfka-hm-merged`(既定) | `halfka-merged` + 同じ左右反転による玉マス圧縮 |
 
 既定の `halfka-hm-merged` は、Stockfish の **HalfKAv2_hm**(玉マスの左右反転 +
-自玉・敵玉の特徴枠を 1 つに共有)と同じ設計を将棋に適用したもの。2 軸モデルの
-設計詳細は [ADR](docs/decisions/2026-05-19-nnue-feature-set-two-axis-model.md) を参照。
+自玉・敵玉の特徴枠を 1 つに共有)と同じ設計を将棋に適用したもの。
 
 別バイナリ `progress-kpabs-train` は LayerStack の bucket 係数 `progress.bin` を
 生成する KP-abs progress trainer。
