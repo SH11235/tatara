@@ -174,12 +174,26 @@ cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" --forc
 ## Smoke test
 
 `cargo oxide doctor` が全項目 ✓ なら host 側は OK。続いて実際の kernel を
-ビルドする:
+ビルドする。リポジトリ root から:
+
+```bash
+bash scripts/build-kernels.sh
+```
+
+これは GPU の世代を `nvidia-smi` で判定し、kernel を持つ全 bin
+(`nnue_train` / `progress_kpabs_train`) を `cargo-oxide build` でビルドする。
+Ampere+ は既定 (sm_80 PTX、前方互換)、Turing (sm_75) は `CUDA_OXIDE_TARGET` を
+自動設定するので、環境変数を手で打つ必要はない。
+
+特定の bin だけビルドしたいときは手動でも可:
 
 ```bash
 cd bins/nnue_train
-CUDA_OXIDE_TARGET=sm_86 cargo-oxide build   # sm_XX は GPU 世代に合わせる
+cargo-oxide build
 ```
+
+Ampere 以降 (sm_80+) はこれで OK。**Turing (sm_75) のみ**
+`CUDA_OXIDE_TARGET=sm_75 cargo-oxide build` と前置する (下記「sub-Ampere GPU」)。
 
 `cargo-oxide build` は `#[kernel]` を NVPTX IR (`.ll`) に compile する。bin は
 起動時にこの `.ll` を libdevice と link して `.ptx` 化し CudaModule を load

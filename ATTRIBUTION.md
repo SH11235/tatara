@@ -24,8 +24,7 @@
 - `crates/nnue-train/src/trainer.rs` — superbatch training loop と
   `--score-drop-abs` / WDL blend / Ranger lookahead の挙動
 
-具体的な対応関係 (どの kernel が bullet のどの関数を hand-fuse したか) は各
-source ファイルの module doc コメントに記載しています。
+具体的な対応関係 (どの kernel が bullet のどの関数を hand-fuse したか) は各source ファイルの module doc コメントに記載しています。
 
 ## cuda-oxide (Apache-2.0)
 

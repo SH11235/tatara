@@ -28,7 +28,7 @@ GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA 
 
 | アーキ | サブコマンド | 構造 |
 |---|---|---|
-| **LayerStack** | `layerstack` | 局面の進行度で 9 bucket に分け、出力層を bucket ごとに専用化(Stockfish の "LayerStacks" と同じ発想)。FT 1536 → 16 → 32 |
+| **LayerStack** | `layerstack` | 局面の進行度で 9 bucket に分け、出力層を bucket ごとに専用化(Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
 | **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <ft>x2-<l1>-<l2>` で指定(既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
 
 ### 入力 feature set
@@ -90,17 +90,15 @@ kernel のビルドと smoke test は [docs/setup.md](docs/setup.md)、学習の
 | 略語 | 意味 |
 |---|---|
 | **NNUE** | Efficiently Updatable Neural Network — 将棋 / チェスエンジンで使われる軽量評価関数 |
-| **HalfKA_hm** | Half-Mirror 版 HalfKA 特徴量 (キング × 駒位置で sparse encode) |
 | **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
 | **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
-| **SCReLU** | Squared Clipped ReLU — NNUE で広く使われる activation |
+| **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
-| **LayerStack** | 出力層を局面進行度の 9 bucket ごとに分けた NNUE アーキ。`bins/nnue_train` の `layerstack` サブコマンドが扱う。量子化 `.bin` の binary layout は [docs/nnue-layerstack-format.md](docs/nnue-layerstack-format.md) |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.md` のサポート GPU マトリクス参照 |
 | **SASS** | NVIDIA GPU の世代別実機機械語。PTX から CUDA driver JIT が生成する終端形式。本リポでは直接扱わない |
 | **sm_XX** | NVIDIA GPU の compute capability (例: sm_75 = Turing、sm_86 = Ampere RTX 30xx)。PTX 生成時の target アーキ指定 (`CUDA_OXIDE_TARGET=sm_86` 等) に使う |

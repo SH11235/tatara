@@ -38,17 +38,25 @@ target/release/nnue-train \
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数
-`progress.bin` を用意する。
+`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数 `progress.bin` を用意する。
 
 ### progress.bin を生成
 
-`progress-kpabs-train` で進行度係数を学習する。`--epochs` で総 epoch 数を
-指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
+`progress-kpabs-train` で進行度係数を学習する。
+
+> **データはシャッフルしないこと。** `progress-kpabs-train` の `--data` には
+> **連続した対局**の PSV(局面が対局順に並び、対局が次々と続くもの)を渡す。
+> 進行度係数は「1 局の中で局面がどこまで進んだか」を学習するもので、
+> `progress-kpabs-train` はデータを 1 局単位で読み(`game_ply` で対局境界を検出)、
+> 各局面にその局内での相対位置をラベル付けする。シャッフル済み PSV だと対局境界が
+> 壊れてラベルが無意味になり、正しい係数が学習できない。本体学習の `nnue-train`
+> 例ではシャッフル済み PSV を使っており、要求が逆なので取り違えないこと。
+
+`--epochs` で総 epoch 数を指定し、epoch ごとに `<run-name>.e<N>.bin` が出力される。
 
 ```bash
 target/release/progress-kpabs-train \
-  --data <path/to/shuffled-psv.bin> \
+  --data <path/to/consecutive-psv.bin> \
   --output output/progress/<run-name>.bin \
   --games-per-step 1024 --epochs 5
 ```
@@ -68,7 +76,7 @@ target/release/nnue-train \
   layerstack --progress-coeff <path/to/progress.bin>
 ```
 
-`layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。
+`layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
 
 ## 主な option
 
