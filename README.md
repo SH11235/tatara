@@ -19,8 +19,8 @@ Ti: for the LayerStack architecture, even the bit-identical default path is
 **+20%** on the bit-identical default and around **+55%** with the opt-in
 FP16/TF32 modes (`--all-optim`).
 
-*tatara (踏鞴) is the traditional Japanese furnace that smelts iron sand into
-tamahagane steel — forging a net out of raw data.*
+*tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
+material) into tamahagane steel — forging a net out of raw data.*
 
 > **NVIDIA only** — because cuda-oxide only generates PTX, ROCm / AMD is out of
 > scope. To train comparable shogi NNUE nets on an AMD GPU, see the upstream

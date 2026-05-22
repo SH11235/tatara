@@ -16,7 +16,7 @@ bullet-shogi 比 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×
 アーキ(HalfKP `512x2-8-64`)は既定経路で約 **+20%**、opt-in の FP16/TF32 モード
 (`--all-optim`)で約 **+55%**。
 
-*tatara(踏鞴)は砂鉄から玉鋼を精錬する日本の伝統的なたたら炉 — 生のデータからnet を鍛え上げる。*
+*tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 
 > **NVIDIA only** — cuda-oxide が PTX 生成専用なため ROCm / AMD は対象外。
 > AMD GPU で類似の NNUE 学習を行いたい場合は CUDA / HIP 両 backend を持つ
