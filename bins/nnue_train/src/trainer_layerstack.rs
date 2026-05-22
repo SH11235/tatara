@@ -20,7 +20,6 @@ use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
 // ===========================================================================
 
-#[allow(dead_code)] // 一部 field は host state 直接更新時のみ使う
 pub(crate) struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
