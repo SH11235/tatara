@@ -13,8 +13,11 @@ rustc backend) — no C / C++ / CUDA C++ anywhere in the pipeline.
 Hand-fusing the GPU kernels makes it **very fast** — it out-throughputs its
 upstream CUDA C++ trainer
 [bullet-shogi](https://github.com/SH11235/bullet-shogi). Measured on an RTX 3080
-Ti (LayerStack), even the bit-identical default path is **+37%** over
-bullet-shogi, and stacking the opt-in FP16 modes reaches up to **~2.1×**.
+Ti: for the LayerStack architecture, even the bit-identical default path is
+**+37%** over bullet-shogi, and stacking the opt-in FP16 modes reaches up to
+**~2.1×**. For the Simple architecture (HalfKP `512x2-8-64`), it is around
+**+20%** on the bit-identical default and around **+55%** with the opt-in
+FP16/TF32 modes (`--all-optim`).
 
 *tatara (踏鞴) is the traditional Japanese furnace that smelts iron sand into
 tamahagane steel — forging a net out of raw data.*
