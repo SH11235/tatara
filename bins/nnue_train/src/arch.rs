@@ -22,9 +22,9 @@ pub(crate) const DEFAULT_FT_OUT: usize = 1536;
 ///
 /// The L1 dense layer outputs `l1_out` values per position; one of them is the
 /// skip-connection dim ([`L1_SKIP`]) and the rest ([`GpuWorkspace::l1_effective`])
-/// feed the squared + concatenated L2 input. At `l1_out == DEFAULT_L1_OUT` the
-/// per-bucket sorted/tiled dense matmul kernels run (their thread geometry bakes
-/// in this width); any other `l1_out` runs the generic dense matmul kernels.
+/// feed the squared + concatenated L2 input. The per-bucket sorted/tiled dense
+/// matmul kernels split the output into 16-wide out-tiles, so every `l1_out` runs
+/// on the same tiled path — `DEFAULT_L1_OUT == 16` is simply one out-tile.
 pub(crate) const DEFAULT_L1_OUT: usize = 16;
 
 /// Skip-connection dim carved out of the L1 output: `l1_total` is sliced into

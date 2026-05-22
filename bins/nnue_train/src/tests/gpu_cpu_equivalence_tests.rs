@@ -525,8 +525,15 @@ fn dense_mm_bwd_weight_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (64, 96)] {
-        let out_dim = 16_usize;
+    // out_dim は kernel 内の 16 幅 out-tile loop で消化される reduction 軸。既定の 16 に
+    // 加え、16 の倍数 (32) と非倍数 (24 / 8 / 17) を検証して out-tile 化を網羅する。
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 16_usize, 16_usize),
+        (32, 64, 32),
+        (64, 96, 24),
+        (16, 32, 8),
+        (32, 48, 17),
+    ] {
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| (i as f32) * 0.013 - 0.4)
             .collect();
@@ -624,6 +631,44 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     stream.synchronize()?;
     // atomic fetch_add で reduce されるため relative tol (grad_bias と同様)。
     assert_close_rel("bias_grad", &gb_dev.to_host_vec(&stream)?, &gb_cpu, TOL);
+    Ok(())
+}
+
+/// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
+/// tolerance 内で一致することを確認。out_dim (= l1_out) を 16 / 16 倍数 / 非倍数 /
+/// 上限 256 で網羅する。
+#[test]
+fn bias_grad_shared_l1f_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &(batch, out_dim) in &[
+        (5_usize, 16_usize),
+        (37, 24),
+        (128, 32),
+        (64, 8),
+        (51, 17),
+        (40, 256),
+    ] {
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.07 - 1.2)
+            .collect();
+        let mut gb_cpu = vec![0.0_f32; out_dim];
+        bias_grad_cpu(&dy, &mut gb_cpu, batch, out_dim);
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim)?;
+        cuda_launch! {
+            kernel: bias_grad_shared_l1f, stream: stream, module: module,
+            config: cfg_1d(batch * out_dim),
+            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("bias_grad_shared_l1f b={batch} out={out_dim}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
     Ok(())
 }
 
@@ -747,8 +792,14 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
 #[test]
 fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
-        let out_dim = 16_usize;
+    // out_dim は 16 幅 out-tile (grid_y) で消化する。16 / 16 倍数 / 非倍数を網羅。
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 16_usize, 16_usize),
+        (32, 64, 32),
+        (48, 96, 24),
+        (64, 32, 8),
+        (32, 48, 17),
+    ] {
         let nb = NUM_BUCKETS;
         let padded = padded_sort_batch(batch);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
@@ -810,11 +861,11 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
                    padded as u32, in_dim as u32]
         }?;
-        let blocks = padded / 16;
+        let n_out_tiles = out_dim.div_ceil(16);
         cuda_launch! {
             kernel: dense_mm_fwd_bucket_tiled_l1_sorted, stream: stream, module: module,
             config: LaunchConfig {
-                grid_dim: (blocks as u32, 1, 1),
+                grid_dim: ((padded / 16) as u32, n_out_tiles as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -933,10 +984,10 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
-    // tiled L2 (in_dim=30, out_dim=32, num_buckets=9)
+    // L2 weight backward: out_dim = L2_OUT 固定、in_dim = l2_in (= 2*(l1_out-1)、--l1 依存)。
+    // l1_out ∈ {16, 24, 32, 8} に対応する l2_in {30, 46, 62, 14} を検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &batch in &[16_usize, 64, 256, 1024] {
-        let in_dim = 30_usize;
+    for &(batch, in_dim) in &[(16_usize, 30_usize), (64, 46), (256, 62), (1024, 14)] {
         let out_dim = 32_usize;
         let nb = NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
@@ -961,9 +1012,10 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
         let num_splits = 8_usize;
+        let cell_blocks = (out_dim * in_dim).div_ceil(256);
         let config = LaunchConfig {
-            grid_dim: (num_splits as u32, 1, 1),
-            block_dim: (960, 1, 1), // 32 × 30
+            grid_dim: (cell_blocks as u32, num_splits as u32, 1),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         cuda_launch! {
@@ -1093,8 +1145,14 @@ fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::
 #[test]
 fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
-        let out_dim = 16_usize;
+    // out_dim は 16 幅 out-tile を grid_x (in-tile と畳む) で消化する。16 / 倍数 / 非倍数を網羅。
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 16_usize, 16_usize),
+        (32, 64, 32),
+        (48, 96, 24),
+        (64, 32, 8),
+        (32, 48, 17),
+    ] {
         let nb = NUM_BUCKETS;
         let padded = padded_sort_batch(batch);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
@@ -1161,7 +1219,7 @@ fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Err
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted, stream: stream, module: module,
             config: LaunchConfig {
-                grid_dim: ((in_dim / 16) as u32, 8, nb as u32),
+                grid_dim: (((in_dim / 16) * out_dim.div_ceil(16)) as u32, 8, nb as u32),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -1219,15 +1277,16 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
+    // out_dim は L1 bias (= l1_out、可変) と L2 bias (= L2_OUT = 32) の双方を網羅する。
     for &(batch, out_dim) in &[
-        (16_usize, 16_usize), // L1 bias 形状
+        (16_usize, 16_usize), // L1 bias 既定形状
         (32, 16),
-        (48, 16),
         (64, 16),
         (16, 32), // L2 bias 形状
-        (32, 32),
         (48, 32),
-        (64, 32),
+        (32, 24), // 非 16 倍数の l1_out
+        (48, 8),  // l1_out < 16
+        (64, 64), // l1_out > 32
     ] {
         let nb = NUM_BUCKETS;
         let padded = padded_sort_batch(batch);
@@ -1276,7 +1335,11 @@ fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error
         }?;
         cuda_launch! {
             kernel: bias_grad_bucket_shared_sorted, stream: stream, module: module,
-            config: cfg_1d(padded * out_dim),
+            config: LaunchConfig {
+                grid_dim: ((padded / 16) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
             args: [slice(dy_sorted_dev), slice(bidx_sorted_dev), slice(gb_dev),
                    padded as u32, out_dim as u32, nb as u32]
         }?;

@@ -653,12 +653,14 @@ pub fn dense_mm_bwd_input(
     }
 }
 
-/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 (`in_dim=ft_out`,
-/// `out_dim=16` 固定)、`batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。
+/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 (`in_dim=ft_out`)、
+/// `batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。`out_dim` は reduction 軸で、
+/// 16 幅の out-tile に分割して loop で消化するため任意の値に対応する (`out_dim` が 16 の
+/// 倍数でなければ末尾 out-tile は 0 padding)。
 ///
 /// 非 tiled の [`dense_mm_bwd_input`] は w[ii][o] (out-major) read で warp 内 ii=0..31 が
-/// stride 16 = 64B = 32 cache lines load の uncoalesced になる。本 kernel は W_TILE /
-/// DY_TILE を shared に coalesced load し、各 thread が 1 (bi, ii) cell を 16 FMA で完成。
+/// stride out_dim の uncoalesced になる。本 kernel は W_TILE / DY_TILE を shared に
+/// coalesced load し、各 thread が 1 (bi, ii) cell を out-tile ごと 16 FMA で完成させる。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_input_tiled(
@@ -669,13 +671,13 @@ pub fn dense_mm_bwd_input_tiled(
     in_dim: u32,
     out_dim: u32,
 ) {
-    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_IN × 16
-    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_B × 16
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_IN × TILE_OUT (16×16)
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_B × TILE_OUT (16×16)
 
     let tid_local = thread::threadIdx_x() as usize;
-    // 1D grid: block_idx encodes (b_block, ii_block). 全 cell の 1D 順序を保持し
-    // `dx.get_mut(thread::index_1d())` で disjoint write を成立させる。
-    // grid_dim = (in_dim/16) * (batch/16)、block index = b_block * (in_dim/16) + ii_block。
+    // 1D grid: block_idx encodes (b_block, ii_block). out 軸は kernel 内 loop で消化
+    // するため grid には現れない。grid_dim = (batch/16) * (in_dim/16)、block index =
+    // b_block * (in_dim/16) + ii_block。
     let in_dim_u = in_dim as usize;
     let out_dim_u = out_dim as usize;
     let batch_u = batch as usize;
@@ -693,41 +695,47 @@ pub fn dense_mm_bwd_input_tiled(
     let bi_ok = global_bi < batch_u;
     let ii_ok = global_ii < in_dim_u;
 
-    // W_TILE [TILE_IN × out_dim=16]: 256 cells.
-    // Cell layout: W_TILE[ii_local * 16 + o] = w[(ii_start + ii_local) * out_dim + o]
-    // Map tid_local → (ii_local = tid/16, o = tid%16). For warp tid 0..31: ii_local in {0,1},
-    // o in 0..15 → 16-thread sub-group reads 16 consecutive o (= 1 cache line). Coalesced ✓
-    unsafe {
-        let ii_local_load = tid_b;
-        let o_load = tid_i;
-        let ii_global_load = ii_start + ii_local_load;
-        W_TILE[tid_local] = if ii_global_load < in_dim_u && o_load < out_dim_u {
-            w[ii_global_load * out_dim_u + o_load]
-        } else {
-            0.0_f32
-        };
-        // DY_TILE [TILE_B × 16] = 256 cells.
-        // Cell DY_TILE[b_local * 16 + o] = dy[(b_start + b_local) * out_dim + o]
-        // Map tid_local → (b_local = tid/16, o = tid%16). Coalesced.
-        let b_local_load = tid_b;
-        let bb_global_load = b_start + b_local_load;
-        DY_TILE[tid_local] = if bb_global_load < batch_u && o_load < out_dim_u {
-            dy[bb_global_load * out_dim_u + o_load]
-        } else {
-            0.0_f32
-        };
+    // dx[bi][ii] = sum_o dy[bi][o] * w[ii][o] は out 軸の reduction。out_dim を 16 幅の
+    // out-tile に分割し、各 out-tile の W_TILE / DY_TILE を shared に coalesced load して
+    // 単一 accumulator に加算する (accumulator は全 out-tile を貫いて 1 個)。
+    let n_out_tiles = (out_dim_u + 15) >> 4;
+    let mut acc = 0.0_f32;
+    let mut ot: usize = 0;
+    while ot < n_out_tiles {
+        let o_load = (ot << 4) + tid_i;
+        unsafe {
+            // W_TILE[ii_local * 16 + o] = w[(ii_start + ii_local) * out_dim + (ot*16 + o)]。
+            // tid 0..31 内で 16-thread sub-group が 16 連続 o を読む → coalesced。
+            let ii_global_load = ii_start + tid_b;
+            W_TILE[tid_local] = if ii_global_load < in_dim_u && o_load < out_dim_u {
+                w[ii_global_load * out_dim_u + o_load]
+            } else {
+                0.0_f32
+            };
+            // DY_TILE[b_local * 16 + o] = dy[(b_start + b_local) * out_dim + (ot*16 + o)]。
+            let bb_global_load = b_start + tid_b;
+            DY_TILE[tid_local] = if bb_global_load < batch_u && o_load < out_dim_u {
+                dy[bb_global_load * out_dim_u + o_load]
+            } else {
+                0.0_f32
+            };
+        }
+        thread::sync_threads();
+
+        if bi_ok && ii_ok {
+            let mut o: usize = 0;
+            while o < 16 {
+                unsafe {
+                    acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
+                }
+                o += 1;
+            }
+        }
+        thread::sync_threads();
+        ot += 1;
     }
-    thread::sync_threads();
 
     if bi_ok && ii_ok {
-        let mut acc = 0.0_f32;
-        let mut o: usize = 0;
-        while o < 16 {
-            unsafe {
-                acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
-            }
-            o += 1;
-        }
         // 2D tile grid → cell index は (b_block, ii_block) と (tid_b, tid_i) から合成。
         // thread::index_1d() (block_lin * 256 + tid_local) と cell_idx は order が異なるため
         // raw pointer 経由で write (各 thread は disjoint cell を担当、host が grid_dim 整合)。
@@ -1061,21 +1069,22 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
 /// Sorted layout 版 [`dense_mm_bwd_weight_bucket_tiled_l1`]。caller が batch を bucket で
 /// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済を保証する
 /// (`exclusive_scan_aligned` 経由)。grid 構成:
-/// - `blockIdx_x` = in_tile (`in_dim / 16` 個)
+/// - `blockIdx_x` = `out_tile * (in_dim/16) + in_tile` (out-tile と in-tile を畳んだ 1 軸、
+///   in_tile は `in_dim/16` 個、out_tile は `ceil(out_dim/16)` 個)
 /// - `blockIdx_y` = bucket 内 split-K (`gridDim_y` 個の連続 TILE_K slice)
 /// - `blockIdx_z` = bucket (`num_buckets` 個)
 ///
-/// 各 block は uniform-by-construction で 1 bucket の slice のみ accumulate。9-way if-else
-/// dispatch / 9 register accumulator / 9 atomic write はすべて 1 個ずつに集約され、
-/// 終端で `grad_w[block_buc][oi][ii]` に 1 atomicAdd。
+/// 各 block は uniform-by-construction で 1 bucket の slice のみ accumulate し、終端で
+/// `grad_w[block_buc][oi][ii]` に 1 atomicAdd。`out_dim` は `TILE_OUT = 16` 幅の out-tile に
+/// 分割、`out_dim` が 16 の倍数でないとき末尾 out-tile は `out_ok` guard で部分書き込み。
 ///
 /// padding 行 (perm=-1 由来で `permute_rows_f32` が 0 fill) は x,dy=0 で sum=0 contribution、
 /// bucket slice 末端の 16-alignment slack 行も同様に silent に 0 contribution。
 ///
 /// 数値同等性: 加算順序が sort 済 batch 順 + split-K 集約順になるため fp32 associativity で
 /// baseline と bit-exact ではないが、reduction tolerance (相対誤差 < `TOL`) 内で一致。
-/// `in_dim % 16 == 0` / `out_dim == 16` / `num_buckets <= 9` / `padded_batch % 16 == 0` /
-/// `bucket_offsets` が aligned exclusive scan 出力 は caller 契約。
+/// `in_dim % 16 == 0` / `num_buckets <= 9` / `padded_batch % 16 == 0` /
+/// `bucket_offsets` が aligned exclusive scan 出力 / `blockIdx_x` 範囲は caller 契約。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
@@ -1092,19 +1101,23 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
     static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 
     let tid_local = thread::threadIdx_x() as usize;
-    let block_x = thread::blockIdx_x() as usize;
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let padded_b_u = padded_batch as usize;
+    let num_buc_u = num_buckets as usize;
+    // blockIdx_x は (out_tile, in_tile) を畳んだ 1 軸。in_tile が下位。
+    let in_tiles = in_dim_u >> 4;
+    let block_x_raw = thread::blockIdx_x() as usize;
+    let block_x = block_x_raw % in_tiles;
+    let out_tile = block_x_raw / in_tiles;
     let block_split = thread::blockIdx_y() as usize;
     let num_splits = thread::gridDim_y() as usize;
     let block_buc = thread::blockIdx_z() as usize;
     let tid_i = tid_local >> 4;
     let tid_o = tid_local & 15;
     let global_ii = (block_x << 4) | tid_i;
-    let global_oi = tid_o;
+    let global_oi = (out_tile << 4) + tid_o;
 
-    let in_dim_u = in_dim as usize;
-    let out_dim_u = out_dim as usize;
-    let padded_b_u = padded_batch as usize;
-    let num_buc_u = num_buckets as usize;
     let in_ok = global_ii < in_dim_u;
     let out_ok = global_oi < out_dim_u;
     let buc_ok = block_buc < num_buc_u;
@@ -1136,14 +1149,15 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
             unsafe {
                 let bb = b_start + tid_i;
                 let global_ii_load = (block_x << 4) | tid_o;
+                let oi_load = (out_tile << 4) + tid_o;
                 let mapped = (tid_i << 4) | tid_o;
                 X_TILE[mapped] = if bb < buc_end && global_ii_load < in_dim_u {
                     x[bb * in_dim_u + global_ii_load]
                 } else {
                     0.0_f32
                 };
-                DY_TILE[mapped] = if bb < buc_end && tid_o < out_dim_u {
-                    dy[bb * out_dim_u + tid_o]
+                DY_TILE[mapped] = if bb < buc_end && oi_load < out_dim_u {
+                    dy[bb * out_dim_u + oi_load]
                 } else {
                     0.0_f32
                 };
@@ -1175,15 +1189,18 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
     }
 }
 
-/// Bias gradient (block-level shared-mem reduction) — L1f 用 (`out_dim=16`)。
+/// Bias gradient (block-level shared-mem reduction) — L1f 用。`out_dim` は `--l1` 依存で、
+/// host が `<= 256` を保証する (`PARTIAL` の固定容量)。
 ///
-/// 各 block (256 threads) が shared-mem 16-cell accumulator に集約してから 1 block ×
-/// 16 atomic add で global に flush する。global atomic 数 = blocks × 16 (= ~64K)。
-/// 全 thread が直接 global の 16 cells へ atomic add する [`bias_grad`] の contention を避ける。
+/// 各 block (256 threads) が shared-mem の out_dim-cell accumulator に集約してから
+/// 1 block × out_dim atomic add で global に flush する。全 thread が直接 global の
+/// out_dim cells へ atomic add する [`bias_grad`] の contention を避ける。
 #[kernel]
 pub fn bias_grad_shared_l1f(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
     use core::ptr::addr_of_mut;
-    static mut PARTIAL: SharedArray<f32, 16> = SharedArray::UNINIT;
+    // out_dim (= l1_out) は host が <= 256 を保証。PARTIAL は固定上限で確保し先頭
+    // out_dim cell のみ使う (1 KB、occupancy への影響は無視できる)。
+    static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x() as usize;
     let block_idx = thread::blockIdx_x() as usize;
     let block_dim_u = thread::blockDim_x() as usize;
@@ -1641,9 +1658,13 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
 /// `bucket_idx = -1` で kernel が y=0 を書き、後段の inverse permute が perm=-1 sentinel で
 /// skip して original 配列には戻らない。
 ///
+/// `out_dim` は `TILE_OUT = 16` 幅の out-tile に分割し、各 out-tile を `blockIdx_y` で
+/// 受ける (grid_dim_y = `ceil(out_dim / 16)`)。1 block = 1 (batch-tile, out-tile)。
+/// `out_dim` が 16 の倍数でないとき末尾 out-tile は `oi_ok` guard で部分書き込み。
+///
 /// 数値同等性: per-row independent (k=0..15 加算順保持) で baseline と bit-exact、
-/// sort stability 不要。`in_dim % 16 == 0` / `out_dim == 16` / `batch % 16 == 0` /
-/// `num_buckets <= 9` は caller 契約。
+/// sort stability 不要。`in_dim % 16 == 0` / `batch % 16 == 0` / `num_buckets <= 9` /
+/// `grid_dim_y == ceil(out_dim/16)` は caller 契約。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
@@ -1658,15 +1679,16 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
     num_buckets: u32,
 ) {
     static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
-    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 1 × 16 × 16
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 1 bucket × 16 oi × 16 k
 
     let tid_local = thread::threadIdx_x() as usize;
     let block_b = thread::blockIdx_x() as usize;
+    let out_tile = thread::blockIdx_y() as usize;
     let tid_b = tid_local >> 4;
     let tid_o = tid_local & 15;
     let b_start = block_b << 4;
     let global_bi = b_start + tid_b;
-    let global_oi = tid_o;
+    let global_oi = (out_tile << 4) + tid_o;
 
     let in_dim_u = in_dim as usize;
     let out_dim_u = out_dim as usize;
@@ -1708,8 +1730,9 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
             let oi_local = tid_b;
             let k_local = tid_o;
             let kk = k_start + k_local;
-            let val = if block_buc_ok && oi_local < out_dim_u && kk < in_dim_u {
-                w[block_buc_u * out_dim_u * in_dim_u + oi_local * in_dim_u + kk]
+            let oi_global = (out_tile << 4) + oi_local;
+            let val = if block_buc_ok && oi_global < out_dim_u && kk < in_dim_u {
+                w[block_buc_u * out_dim_u * in_dim_u + oi_global * in_dim_u + kk]
             } else {
                 0.0_f32
             };
@@ -1731,12 +1754,13 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
     }
 
     if bi_ok && oi_ok {
-        if !block_buc_ok {
-            if let Some(o) = y.get_mut(thread::index_1d()) {
-                *o = 0.0_f32;
-            }
-        } else if let Some(o) = y.get_mut(thread::index_1d()) {
-            *o = acc;
+        // out-tile を grid に展開したため cell index は thread::index_1d() と一致しない。
+        // 各 thread は disjoint な (global_bi, global_oi) cell を担当するので raw ptr write。
+        // SAFETY: global_bi < batch、global_oi < out_dim ⇒ cell_idx < y.len() (= batch*out_dim)。
+        let cell_idx = global_bi * out_dim_u + global_oi;
+        let val = if block_buc_ok { acc } else { 0.0_f32 };
+        unsafe {
+            *y.as_mut_ptr().add(cell_idx) = val;
         }
     }
 }
@@ -1982,12 +2006,13 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
     }
 }
 
-/// L2 weight backward (specialized: `in_dim=30`, `out_dim=32`, `num_buckets=9`)。
+/// L2 weight backward (`out_dim = L2_OUT`、`in_dim = l2_in` は `--l1` 依存、`num_buckets <= 9`)。
 ///
-/// split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket
-/// acc) で並列度を確保する。block_dim = 32 × 30 = 960 threads (sm_86 max 1024 以内)、
-/// block grid = num_batch_splits。汎用の [`dense_mm_bwd_weight_bucket`] は L2 形状では
-/// 8640 cells を ~34 blocks でしか並べられず遅いため、本 specialized kernel を使う。
+/// split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket acc)
+/// で並列度を確保する。weight cell 空間 (per-bucket `out_dim * in_dim`) を `blockIdx_x`、
+/// batch split-K を `blockIdx_y` に分け、`block_dim` は cell 数と独立な固定値で launch
+/// する (`block_dim = out_dim * in_dim` だと `l2_in` 次第で 1024 thread を超えるため)。
+/// 汎用の [`dense_mm_bwd_weight_bucket`] は batch を bucket ごとに再 scan する分遅い。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l2(
@@ -2001,17 +2026,22 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
     num_buckets: u32,
 ) {
     let tid_local = thread::threadIdx_x() as usize;
-    let block_split = thread::blockIdx_x() as usize;
-    let num_splits = thread::gridDim_x() as usize;
+    let block_cell = thread::blockIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let block_split = thread::blockIdx_y() as usize;
+    let num_splits = thread::gridDim_y() as usize;
     let in_dim_u = in_dim as usize;
     let out_dim_u = out_dim as usize;
     let batch_u = batch as usize;
-    // tid → (oi, ii): oi = tid / in_dim, ii = tid % in_dim (block_dim = out_dim * in_dim)
-    let oi = tid_local / in_dim_u;
-    let ii = tid_local % in_dim_u;
-    if oi >= out_dim_u {
+    // weight cell 空間 (per-bucket out_dim*in_dim) を blockIdx_x で分割し、1 thread =
+    // 1 (oi, ii) cell。範囲外 thread は早期 return。
+    let per_bucket = out_dim_u * in_dim_u;
+    let cell_in_bucket = block_cell * block_dim_u + tid_local;
+    if cell_in_bucket >= per_bucket {
         return;
     }
+    let oi = cell_in_bucket / in_dim_u;
+    let ii = cell_in_bucket % in_dim_u;
 
     let positions_per_block = batch_u.div_ceil(num_splits);
     let b_start = block_split * positions_per_block;
@@ -2063,9 +2093,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
         bb += 1;
     }
 
-    // grad_w layout: buc * (out_dim * in_dim) + oi * in_dim + ii。
-    let per_bucket = out_dim_u * in_dim_u;
-    let cell_in_bucket = oi * in_dim_u + ii;
+    // grad_w layout: buc * (out_dim * in_dim) + oi * in_dim + ii (= per_bucket + cell_in_bucket)。
     let num_buc_u = num_buckets as usize;
     let raw = grad_w.as_ptr();
     if num_buc_u >= 1 {
@@ -2126,22 +2154,19 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
 
 /// Sorted layout 版 [`bias_grad_bucket`] (block-level shared-mem reduce)。caller が batch を
 /// bucket で sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
-/// (`exclusive_scan_aligned` 経由) を保証する前提。block は `padded_b * out_dim / 256` 個、
-/// 1 block = 256 cells = `256 / out_dim` 行 × `out_dim` oi (L1 では 16×16、L2 では 8×32)。
-/// `256 / out_dim ≤ 16` ⇒ 16-aligned sort 配下で 1 block の全 row は同一 bucket
-/// (uniform-by-construction)、`bucket_idx_sorted[b_start]` で代表 bucket を取得し
-/// PARTIAL[out_dim] shared-mem accumulator に集約 → 1 block × out_dim atomic add で
-/// `grad_bias[block_buc][:]` に flush。global atomic 数 = blocks × out_dim
-/// (L1: ~4106 × 16 = ~66K、L2: ~8213 × 32 = ~263K) で contention 大幅減。
+/// (`exclusive_scan_aligned` 経由) を保証する前提。1 block = sorted batch の連続 16 行 ×
+/// `out_dim` oi。16-aligned sort 配下で 16 行は同一 bucket (uniform-by-construction)、
+/// `bucket_idx_sorted[b_start]` で代表 bucket を取得し PARTIAL[out_dim] shared-mem
+/// accumulator に集約 → 1 block × out_dim atomic add で `grad_bias[block_buc][:]` に flush。
+/// 全 thread が直接 global へ atomic add する [`bias_grad_bucket`] の contention を避ける。
 ///
 /// padding 行 / 範囲外 bucket (block_buc = -1) は skip (PARTIAL flush しない)、
 /// caller が `grad_bias` を 0 初期化済の前提 (accumulate semantics は元と同じ)。
 ///
 /// 数値同等性: 加算順が sort 済 batch 順 + per-block reduce 順になるため fp32
 /// associativity で baseline と bit-exact ではないが、reduction tolerance 内で一致。
-/// `out_dim` は 16 / 32 を想定 (L1 bias / L2 bias)、いずれも `block_dim / out_dim ≤ 16`
-/// なので 16-aligned sort 配下で 1 block の全 row は uniform-bucket。`block_dim == 256` /
-/// `padded_batch % 16 == 0` / `num_buckets <= 9` / `out_dim <= 32` は caller 契約。
+/// `block_dim == 256` / `padded_batch % 16 == 0` / `num_buckets <= 9` / `out_dim <= 256`
+/// (PARTIAL 固定容量) / `grid_dim_x == padded_batch / 16` は caller 契約。
 #[kernel]
 pub fn bias_grad_bucket_shared_sorted(
     dy: &[f32],
@@ -2152,7 +2177,8 @@ pub fn bias_grad_bucket_shared_sorted(
     num_buckets: u32,
 ) {
     use core::ptr::addr_of_mut;
-    static mut PARTIAL: SharedArray<f32, 32> = SharedArray::UNINIT;
+    // out_dim (= l1_out / L2_OUT) は host が <= 256 を保証。先頭 out_dim cell のみ使う。
+    static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
 
     let tid = thread::threadIdx_x() as usize;
     let block_idx = thread::blockIdx_x() as usize;
@@ -2160,8 +2186,8 @@ pub fn bias_grad_bucket_shared_sorted(
     let out_dim_u = out_dim as usize;
     let padded_b_u = padded_batch as usize;
 
-    // 1 block = block_dim cells (= 16 sorted rows × out_dim oi)、b_start = block の先頭行。
-    let b_start = (block_idx * block_dim_u) / out_dim_u;
+    // 1 block = sorted batch の連続 16 行。16-aligned sort なので 16 行は同一 bucket。
+    let b_start = block_idx << 4;
     let block_buc = if b_start < padded_b_u {
         bucket_idx[b_start]
     } else {
@@ -2179,13 +2205,22 @@ pub fn bias_grad_bucket_shared_sorted(
     }
     thread::sync_threads();
 
-    let global_idx = block_idx * block_dim_u + tid;
-    let total = padded_b_u * out_dim_u;
-    if block_buc_ok && global_idx < total {
-        let oi = global_idx % out_dim_u;
-        let dyv = dy[global_idx];
-        let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
-        cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+    // 16 行 × out_dim cell を block_dim stride で走査し、各 cell の dy を PARTIAL[oi] に
+    // shared atomic add する (block 内の contention は out_dim cell に限定)。
+    if block_buc_ok {
+        let n_cells = 16 * out_dim_u;
+        let mut c = tid;
+        while c < n_cells {
+            let row = c / out_dim_u;
+            let oi = c % out_dim_u;
+            let bb = b_start + row;
+            if bb < padded_b_u {
+                let dyv = dy[bb * out_dim_u + oi];
+                let cell = unsafe { &*(partial_ptr.add(oi) as *const DeviceAtomicF32) };
+                cell.fetch_add(dyv, AtomicOrdering::Relaxed);
+            }
+            c += block_dim_u;
+        }
     }
     thread::sync_threads();
 
