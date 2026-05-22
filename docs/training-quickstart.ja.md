@@ -68,6 +68,11 @@ target/release/progress-kpabs-train \
 (progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立なため
 何 epoch 必要かはデータ依存)。
 
+どの epoch を使うか決める助けに `--val-fraction <f>`(例 `0.05`)を渡せる。
+おおよそ指定割合の対局を入力順の N 局ごとに検証用へ取り分け(データは連続
+対局順を保つ必要があるためシャッフルはしない)、各 epoch 末に held-out な
+`val_loss` を出力する。有効にすると epoch ごとにデータ走査が 1 回増える。
+
 ### 学習
 
 ```bash

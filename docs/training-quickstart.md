@@ -78,6 +78,11 @@ Which epoch's output (`<run-name>.e<N>.bin`) to use takes some trial and error
 (progress.bin is a coefficient that decides bucket assignment and is independent
 of NNUE training convergence, so how many epochs you need is data-dependent).
 
+To help decide which epoch to use, add `--val-fraction <f>` (e.g. `0.05`): it
+holds out roughly that fraction of games — every Nth game in input order, since
+the data must stay in consecutive-game order — and reports a held-out `val_loss`
+at the end of each epoch. This adds one extra pass over the data per epoch.
+
 ### Training
 
 ```bash
