@@ -1,7 +1,4 @@
-# tatara リポ運用規約 (Claude Code 向け)
-
-本ファイルは Claude Code セッションが本リポで作業するときに必ず従う運用規約。
-人間 collaborator も読む想定だが、現状 user は SH11235 単独。
+# tatara リポ運用規約
 
 ## CI 規約 (PR push 前必須)
 
@@ -28,11 +25,10 @@ off で tolerance を満たさず fail するが、release では本番経路と
 ## rust-version (MSRV) 規約
 
 `Cargo.toml` の `workspace.package.rust-version` は **保守的に下げない**、現在の
-`rust-toolchain.toml` pin (nightly のメジャー version) と揃える。本リポは個人
-プロジェクトで外部 consumer ゼロ、crates.io 公開も無い。低い MSRV は clippy
-(`clippy::incompatible_msrv`) で `div_ceil` / `is_multiple_of` 等の便利 method
-利用を誤ってエラー扱いさせる害がある。toolchain を上げたら rust-version も
-同期更新する。
+`rust-toolchain.toml` pin (nightly のメジャー version) と揃える。低い MSRV は
+clippy (`clippy::incompatible_msrv`) で `div_ceil` / `is_multiple_of` 等の便利
+method 利用を誤ってエラー扱いさせる害がある。toolchain を上げたら rust-version
+も同期更新する。
 
 ## commit / PR 規約
 
