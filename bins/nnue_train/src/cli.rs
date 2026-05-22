@@ -284,11 +284,11 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_FT_OUT)]
     pub(crate) ft_out: usize,
 
-    /// Output dimension of the L1 (per-bucket dense) layer. Specify `>= 2`. The
-    /// default value keeps the network bit-identical to the standard layout and
-    /// resume-compatible with existing checkpoints, and runs the fastest
-    /// dedicated matmul kernel. A non-default value switches to a generic matmul
-    /// kernel (numerically equivalent, but slower).
+    /// Output dimension of the L1 (per-bucket dense) layer. Specify a value in
+    /// [2, 256]. The default keeps the network bit-identical to the standard
+    /// layout and resume-compatible with existing checkpoints. Every value runs
+    /// on the same per-bucket tiled matmul kernels — the output dimension is
+    /// processed in 16-wide tiles — so non-default widths are not penalized.
     #[arg(long, default_value_t = DEFAULT_L1_OUT)]
     pub(crate) l1: usize,
 

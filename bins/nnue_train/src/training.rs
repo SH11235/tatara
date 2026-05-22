@@ -162,12 +162,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
     // L1 出力次元は skip 1 dim を除いた残りが L2 入力になるので、`l1_effective >= 1`
-    // (= `l1_out >= 2`) を要求する。`l1_out == 16` で従来の専用 matmul kernel、それ以外で
-    // 汎用 matmul kernel が走る (どちらも任意の `l1_out >= 2` で正しい)。
-    if layerstack.l1 < 2 {
+    // (= `l1_out >= 2`) を要求する。上限 256 は bias backward kernel の shared-mem
+    // accumulator (PARTIAL) 固定容量。L1 系 tiled dense matmul kernel は出力次元を
+    // 16 幅の out-tile に分割して扱うため、`l1_out` は 16 の倍数でなくてよい。
+    if layerstack.l1 < 2 || layerstack.l1 > 256 {
         return Err(format!(
-            "--l1 must be >= 2 (got {}); the L1 output reserves 1 skip dim and the rest \
-             feeds L2",
+            "--l1 must be in [2, 256] (got {}); the L1 output reserves 1 skip dim and the \
+             rest feeds L2",
             layerstack.l1
         )
         .into());
