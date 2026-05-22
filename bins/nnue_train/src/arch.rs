@@ -6,9 +6,10 @@ use nnue_train::trainer::LossKind;
 //
 // FT input dim (`ft_in`) and active-feature count (`max_active`) depend on the
 // input feature set chosen at startup (see `FeatureSetSpec`). The FT output dim
-// is chosen at startup from `--ft-out` (default `DEFAULT_FT_OUT`). All three are
-// carried as runtime fields on `GpuWorkspace`. The constants below describe the
-// fixed part of the LayerStack topology after the FT layer.
+// is chosen from `--ft-out` and the L1 output dim from `--l1`. Those runtime
+// dims, plus `ft_in` / `max_active`, are carried as fields on `GpuWorkspace`.
+// The constants below describe the part of the LayerStack topology that stays
+// fixed regardless of CLI options.
 
 /// Default FT output dim (per perspective), used when `--ft-out` is not given.
 /// `--ft-out` accepts any positive multiple of 128: `gather_and_sum_per_feature`
@@ -16,10 +17,21 @@ use nnue_train::trainer::LossKind;
 /// the same width — pairwise halves each perspective, then the two perspectives
 /// are concatenated back to the FT output width.
 pub(crate) const DEFAULT_FT_OUT: usize = 1536;
-pub(crate) const L1_OUT: usize = 16;
-pub(crate) const L1_EFFECTIVE: usize = L1_OUT - 1; // = 15 (skip 1 dim、bullet:1433)
-pub(crate) const L1_SKIP: usize = L1_OUT - L1_EFFECTIVE; // = 1
-pub(crate) const L2_IN: usize = L1_EFFECTIVE * 2; // = 30 (l1_sqr.concat(l1_main))、bullet:1434
+
+/// Default L1 output dim, used when `--l1` is not given.
+///
+/// The L1 dense layer outputs `l1_out` values per position; one of them is the
+/// skip-connection dim ([`L1_SKIP`]) and the rest ([`GpuWorkspace::l1_effective`])
+/// feed the squared + concatenated L2 input. At `l1_out == DEFAULT_L1_OUT` the
+/// per-bucket sorted/tiled dense matmul kernels run (their thread geometry bakes
+/// in this width); any other `l1_out` runs the generic dense matmul kernels.
+pub(crate) const DEFAULT_L1_OUT: usize = 16;
+
+/// Skip-connection dim carved out of the L1 output: `l1_total` is sliced into
+/// `l1_effective = l1_out - L1_SKIP` main dims plus this single skip dim, which
+/// is added straight onto the network output.
+pub(crate) const L1_SKIP: usize = 1;
+
 pub(crate) const L2_OUT: usize = 32;
 // LayerStack 出力 bucket 数。progress8kpabs (`shogi-features`) が局面ごとに
 // 割り当てる bucket index は 0..=7 の 8 値で、index 8 の重み枠は確保するが

@@ -14,7 +14,7 @@ use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
 // ===========================================================================
-// GpuTrainer (LayerStack: FT ft_out → L1 16 → L2 32 + progress8kpabs 9 buckets)
+// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 32 + progress8kpabs 9 buckets)
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
@@ -171,19 +171,23 @@ pub(crate) struct GpuWorkspace {
     /// post-FT activation buffer の幅と FT forward/backward kernel の launch arg。
     /// post-FT の `combined` buffer もこの幅 (pairwise で半減後に 2 perspective 連結)。
     ft_out: usize,
+    /// L1 (per-bucket dense) 層の出力次元。`--l1` から起動時に決まる。L1 系
+    /// activation buffer の幅と L1 forward/backward kernel の launch arg。`l1_effective`
+    /// / `l2_in` はここから導出する ([`GpuWorkspace::l1_effective`])。
+    l1_out: usize,
 
     // -- forward activations --
     ft_stm_out: DeviceBuffer<f32>,    // b × ft_out
     ft_nstm_out: DeviceBuffer<f32>,   // b × ft_out
     combined: DeviceBuffer<f32>,      // b × ft_out (post-FT、pairwise 後 2 perspective 連結)
-    l1_bucket: DeviceBuffer<f32>,     // b × L1_OUT
-    l1f_out: DeviceBuffer<f32>,       // b × L1_OUT
-    l1_total: DeviceBuffer<f32>,      // b × L1_OUT
-    l1_main: DeviceBuffer<f32>,       // b × L1_EFFECTIVE
+    l1_bucket: DeviceBuffer<f32>,     // b × l1_out
+    l1f_out: DeviceBuffer<f32>,       // b × l1_out
+    l1_total: DeviceBuffer<f32>,      // b × l1_out
+    l1_main: DeviceBuffer<f32>,       // b × l1_effective
     l1_skip: DeviceBuffer<f32>,       // b × L1_SKIP
-    l1_sqr: DeviceBuffer<f32>,        // b × L1_EFFECTIVE
-    l2_pre: DeviceBuffer<f32>,        // b × L2_IN
-    l2_input: DeviceBuffer<f32>,      // b × L2_IN
+    l1_sqr: DeviceBuffer<f32>,        // b × l1_effective
+    l2_pre: DeviceBuffer<f32>,        // b × l2_in
+    l2_input: DeviceBuffer<f32>,      // b × l2_in
     l2_out: DeviceBuffer<f32>,        // b × L2_OUT
     l2_acted: DeviceBuffer<f32>,      // b × L2_OUT
     l3_out: DeviceBuffer<f32>,        // b
@@ -193,13 +197,13 @@ pub(crate) struct GpuWorkspace {
     // -- backward activation-grads --
     dl2_acted: DeviceBuffer<f32>,            // b × L2_OUT
     dl2_out: DeviceBuffer<f32>,              // b × L2_OUT
-    dl2_input: DeviceBuffer<f32>,            // b × L2_IN
-    dl2_pre: DeviceBuffer<f32>,              // b × L2_IN
-    dl1_sqr: DeviceBuffer<f32>,              // b × L1_EFFECTIVE
-    dl1_main_from_concat: DeviceBuffer<f32>, // b × L1_EFFECTIVE
-    dl1_main_from_sqr: DeviceBuffer<f32>,    // b × L1_EFFECTIVE
-    dl1_main: DeviceBuffer<f32>,             // b × L1_EFFECTIVE
-    dl1_total: DeviceBuffer<f32>,            // b × L1_OUT (毎 step memset、slice_scatter 契約)
+    dl2_input: DeviceBuffer<f32>,            // b × l2_in
+    dl2_pre: DeviceBuffer<f32>,              // b × l2_in
+    dl1_sqr: DeviceBuffer<f32>,              // b × l1_effective
+    dl1_main_from_concat: DeviceBuffer<f32>, // b × l1_effective
+    dl1_main_from_sqr: DeviceBuffer<f32>,    // b × l1_effective
+    dl1_main: DeviceBuffer<f32>,             // b × l1_effective
+    dl1_total: DeviceBuffer<f32>,            // b × l1_out (毎 step memset、slice_scatter 契約)
     dcombined_from_l1f: DeviceBuffer<f32>,   // b × ft_out
     dcombined_from_l1: DeviceBuffer<f32>,    // b × ft_out
     dft_stm_out: DeviceBuffer<f32>,          // b × ft_out
@@ -241,14 +245,15 @@ pub(crate) struct GpuWorkspace {
     bucket_perm_dev: DeviceBuffer<i32>,   // batch (perm[i] = original row index)
     bucket_idx_sorted_dev: DeviceBuffer<i32>, // batch (sorted bucket values)
     combined_sorted: DeviceBuffer<f32>,   // batch × ft_out (combined を perm で gather)
-    l1_bucket_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (sorted fwd_L1 出力)
-    dl1_total_sorted: DeviceBuffer<f32>,  // batch × L1_OUT (dl1_total を perm で gather)
+    l1_bucket_sorted: DeviceBuffer<f32>,  // batch × l1_out (sorted fwd_L1 出力)
+    dl1_total_sorted: DeviceBuffer<f32>,  // batch × l1_out (dl1_total を perm で gather)
     dl2_out_sorted: DeviceBuffer<f32>,    // batch × L2_OUT (dl2_out を perm で gather、L2 bias 用)
 }
 
 impl GpuWorkspace {
     /// `batch` 個の position 分の全 buffer を確保する (`GpuTrainer::new` から呼ぶ)。
-    /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)。
+    /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)、`l1_out` は L1
+    /// (per-bucket dense) 層の出力次元 (`--l1`)。
     ///
     /// `ft_fp16_out` が true なら FT activation (`ft_*_out` / `dft_*_out`) を `f16` で
     /// 持つ。その場合 f32 版は使われないので placeholder size (`ft_out` 要素 = 1 行) で
@@ -258,11 +263,16 @@ impl GpuWorkspace {
         stream: &CudaStream,
         batch: usize,
         ft_out: usize,
+        l1_out: usize,
         ft_fp16_out: bool,
         feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let ft_in = feature_set.ft_in();
         let max_active = feature_set.max_active();
+        // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
+        // L2 入力次元。どちらも `l1_out` から導出する (struct method と同式)。
+        let l1_effective = l1_out - L1_SKIP;
+        let l2_in = l1_effective * 2;
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
         };
@@ -281,6 +291,7 @@ impl GpuWorkspace {
             ft_in,
             max_active,
             ft_out,
+            l1_out,
             ft_stm_out: z(ft_act_f32_n)?,
             ft_nstm_out: z(ft_act_f32_n)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
@@ -288,14 +299,14 @@ impl GpuWorkspace {
             dft_stm_out_h: alloc_h(ft_fp16_out)?,
             dft_nstm_out_h: alloc_h(ft_fp16_out)?,
             combined: z(batch * ft_out)?,
-            l1_bucket: z(batch * L1_OUT)?,
-            l1f_out: z(batch * L1_OUT)?,
-            l1_total: z(batch * L1_OUT)?,
-            l1_main: z(batch * L1_EFFECTIVE)?,
+            l1_bucket: z(batch * l1_out)?,
+            l1f_out: z(batch * l1_out)?,
+            l1_total: z(batch * l1_out)?,
+            l1_main: z(batch * l1_effective)?,
             l1_skip: z(batch * L1_SKIP)?,
-            l1_sqr: z(batch * L1_EFFECTIVE)?,
-            l2_pre: z(batch * L2_IN)?,
-            l2_input: z(batch * L2_IN)?,
+            l1_sqr: z(batch * l1_effective)?,
+            l2_pre: z(batch * l2_in)?,
+            l2_input: z(batch * l2_in)?,
             l2_out: z(batch * L2_OUT)?,
             l2_acted: z(batch * L2_OUT)?,
             l3_out: z(batch)?,
@@ -303,13 +314,13 @@ impl GpuWorkspace {
             dy_net_output: z(batch)?,
             dl2_acted: z(batch * L2_OUT)?,
             dl2_out: z(batch * L2_OUT)?,
-            dl2_input: z(batch * L2_IN)?,
-            dl2_pre: z(batch * L2_IN)?,
-            dl1_sqr: z(batch * L1_EFFECTIVE)?,
-            dl1_main_from_concat: z(batch * L1_EFFECTIVE)?,
-            dl1_main_from_sqr: z(batch * L1_EFFECTIVE)?,
-            dl1_main: z(batch * L1_EFFECTIVE)?,
-            dl1_total: z(batch * L1_OUT)?,
+            dl2_input: z(batch * l2_in)?,
+            dl2_pre: z(batch * l2_in)?,
+            dl1_sqr: z(batch * l1_effective)?,
+            dl1_main_from_concat: z(batch * l1_effective)?,
+            dl1_main_from_sqr: z(batch * l1_effective)?,
+            dl1_main: z(batch * l1_effective)?,
+            dl1_total: z(batch * l1_out)?,
             dcombined_from_l1f: z(batch * ft_out)?,
             dcombined_from_l1: z(batch * ft_out)?,
             dft_stm_out: z(ft_act_f32_n)?,
@@ -334,8 +345,8 @@ impl GpuWorkspace {
             bucket_perm_dev: DeviceBuffer::<i32>::zeroed(stream, padded_sort_batch(batch))?,
             bucket_idx_sorted_dev: DeviceBuffer::<i32>::zeroed(stream, padded_sort_batch(batch))?,
             combined_sorted: z(padded_sort_batch(batch) * ft_out)?,
-            l1_bucket_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
-            dl1_total_sorted: z(padded_sort_batch(batch) * L1_OUT)?,
+            l1_bucket_sorted: z(padded_sort_batch(batch) * l1_out)?,
+            dl1_total_sorted: z(padded_sort_batch(batch) * l1_out)?,
             dl2_out_sorted: z(padded_sort_batch(batch) * L2_OUT)?,
         })
     }
@@ -362,6 +373,18 @@ impl GpuWorkspace {
         }
         Ok(())
     }
+
+    /// L1 出力のうち skip-connection ([`L1_SKIP`]) を除いた main 次元。`l1_total` は
+    /// `l1_main` (この幅) と `l1_skip` ([`L1_SKIP`] 幅) に slice される。
+    pub(crate) fn l1_effective(&self) -> usize {
+        self.l1_out - L1_SKIP
+    }
+
+    /// L2 dense 層の入力次元 = `l1_sqr` (`l1_effective` 幅) と `l1_main`
+    /// (`l1_effective` 幅) の連結。
+    pub(crate) fn l2_in(&self) -> usize {
+        self.l1_effective() * 2
+    }
 }
 
 impl GpuTrainer {
@@ -376,13 +399,15 @@ impl GpuTrainer {
     /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
     /// caller が validation 済)。
     ///
-    /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)。weight group の
-    /// 要素数と activation workspace の幅を決める。
+    /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)、`l1_out` は L1
+    /// (per-bucket dense) 層の出力次元 (`--l1`)。両者が weight group の要素数と
+    /// activation workspace の幅を決める。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         ft_out: usize,
+        l1_out: usize,
         enable_tf32: bool,
         ft_fp16: bool,
         ft_fp16_out: bool,
@@ -398,15 +423,17 @@ impl GpuTrainer {
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
-        // `--ft-out` 依存)
+        // `--ft-out`、L1 出力次元は `--l1` 依存。`l2_in` は `l1_out` から導出)。
         let ft_in = feature_set.ft_in();
+        let l1_effective = l1_out - L1_SKIP;
+        let l2_in = l1_effective * 2;
         let ft_w_n = ft_in * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = NUM_BUCKETS * L1_OUT * ft_out;
-        let l1_b_n = NUM_BUCKETS * L1_OUT;
-        let l1f_w_n = ft_out * L1_OUT;
-        let l1f_b_n = L1_OUT;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l1_w_n = NUM_BUCKETS * l1_out * ft_out;
+        let l1_b_n = NUM_BUCKETS * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
@@ -489,7 +516,14 @@ impl GpuTrainer {
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は小さい固定 batch を渡す)。
             // FT activation の f16 buffer 確保は `ft_fp16_out` で決まる。
-            ws: GpuWorkspace::new(&stream, batch_size.max(1), ft_out, ft_fp16_out, feature_set)?,
+            ws: GpuWorkspace::new(
+                &stream,
+                batch_size.max(1),
+                ft_out,
+                l1_out,
+                ft_fp16_out,
+                feature_set,
+            )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             loss_ring: AsyncLossRing::new(ctx)?,
@@ -558,13 +592,15 @@ impl GpuTrainer {
             DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
         };
         let ft_out = self.ws.ft_out;
+        let l1_out = self.ws.l1_out;
+        let l2_in = self.ws.l2_in();
         let ft_w_n = self.feature_set.ft_in() * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = NUM_BUCKETS * L1_OUT * ft_out;
-        let l1_b_n = NUM_BUCKETS * L1_OUT;
-        let l1f_w_n = ft_out * L1_OUT;
-        let l1f_b_n = L1_OUT;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l1_w_n = NUM_BUCKETS * l1_out * ft_out;
+        let l1_b_n = NUM_BUCKETS * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
@@ -651,12 +687,14 @@ impl GpuTrainer {
         &DeviceBuffer<f32>,
     ); 9] {
         let ft_out = self.ws.ft_out;
+        let l1_out = self.ws.l1_out;
+        let l2_in = self.ws.l2_in();
         let ft_b_n = ft_out;
-        let l1_w_n = NUM_BUCKETS * L1_OUT * ft_out;
-        let l1_b_n = NUM_BUCKETS * L1_OUT;
-        let l1f_w_n = ft_out * L1_OUT;
-        let l1f_b_n = L1_OUT;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l1_w_n = NUM_BUCKETS * l1_out * ft_out;
+        let l1_b_n = NUM_BUCKETS * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
@@ -759,7 +797,7 @@ impl GpuTrainer {
     /// arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
     /// arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、LayerStack は "layerstack")
     /// topo_count   u64                 (topology 次元の個数)
-    /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/L1_OUT/L2_OUT/NUM_BUCKETS)
+    /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/l1_out/L2_OUT/NUM_BUCKETS)
     /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
     /// step_count   u64  (Ranger lookahead step counter)
     /// num_groups   u64  (= 10、固定だが将来検証用)
@@ -823,7 +861,7 @@ impl GpuTrainer {
         let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
             let groups = self.raw_ckpt_groups();
             let ft_out = self.ws.ft_out;
-            let topology = layerstack_topology(ft_out);
+            let topology = layerstack_topology(ft_out, self.ws.l1_out);
             let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
             // header (magic 〜 num_groups)。format 上の group 数は ft_w (個別処理) +
             // `raw_ckpt_groups` の 9 = 10。
@@ -930,7 +968,7 @@ impl GpuTrainer {
     ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let ft_out = self.ws.ft_out;
-        let topology = layerstack_topology(ft_out);
+        let topology = layerstack_topology(ft_out, self.ws.l1_out);
 
         // header (magic 〜 num_groups) を読み、feature set / arch / topology を照合する。
         let header = read_raw_ckpt_header(
@@ -1227,6 +1265,16 @@ impl GpuTrainer {
         let b_u32 = b as u32;
         // FT 出力次元 (`--ft-out`)。post-FT buffer の幅と FT kernel の launch arg。
         let ft_out = self.ws.ft_out;
+        // L1 (per-bucket dense) 層の次元 (`--l1` 由来) と派生次元。
+        let l1_out = self.ws.l1_out;
+        let l1_effective = self.ws.l1_effective();
+        let l2_in = self.ws.l2_in();
+        // L1 の per-bucket sorted/tiled dense matmul kernel は thread geometry に出力
+        // 幅 16 を焼き込んでいる。`l1_out == 16` のときだけそれらの専用 path を使い、
+        // 既定外の `l1_out` は出力幅を runtime arg で受ける汎用 dense matmul kernel に
+        // dispatch する (数値は等価、専用 path より遅い)。`l1_out == 16` の launch は
+        // 本 flag 導入前と引数 (値 16)・kernel・grid 形状すべて同一で bit-identical。
+        let fast_l1 = l1_out == 16;
 
         // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
         // 起動時の `GpuWorkspace::new` で確保済)。
@@ -1416,126 +1464,145 @@ impl GpuTrainer {
 
         prof_tick!("fwd_ftpost");
 
-        // Forward L1: bucket sort で row を bucket_idx 昇順に並べ替え、各 bucket の sorted
-        // 開始 offset を TILE_B=16 境界に align してから `dense_mm_fwd_bucket_tiled_l1_sorted`
-        // を 1-bucket-per-block で走らせる (per-K-tile の W_TILE shared-mem load は 1 bucket
-        // 分のみ)。inverse permute で `l1_bucket` を original order に戻して後続に渡す。
-        // 数値同等性: fwd_L1 は per-row independent (k=0..15 加算順保持) のため sort stability
-        // に依らず baseline と bit-exact。
-        debug_assert!(
-            ft_out.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
-        );
-
-        // a) histogram + 16-aligned scan + scatter。aligned offset で各 bucket が 16-row
-        // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
-        // bucket=-1 で initialise (sorted kernel 側で skip)、perm も -1 sentinel (inverse
-        // permute が skip)。
+        // Forward L1 (per-bucket dense)。`fast_l1` (= `l1_out == 16`) のときは bucket sort
+        // で row を bucket_idx 昇順に並べ替え、各 bucket の sorted 開始 offset を TILE_B=16
+        // 境界に align してから `dense_mm_fwd_bucket_tiled_l1_sorted` を 1-bucket-per-block
+        // で走らせ (per-K-tile の W_TILE shared-mem load は 1 bucket 分のみ)、inverse permute
+        // で `l1_bucket` を original order に戻す。既定外の `l1_out` は出力幅を runtime arg
+        // で受ける汎用 `dense_mm_fwd_bucket` を直接使う (sort/tiled 不要)。
+        // 数値同等性: fwd_L1 は per-row independent (k 加算順保持) のため両 path とも
+        // baseline と bit-exact、sort stability に依らない。
         let padded_b = padded_sort_batch(b);
-        memset_zero(&self.stream, &self.ws.bucket_counts_dev)?;
-        memset_zero(&self.stream, &self.ws.bucket_write_ctr_dev)?;
-        memset_minus_one_i32(&self.stream, &self.ws.bucket_perm_dev)?;
-        memset_minus_one_i32(&self.stream, &self.ws.bucket_idx_sorted_dev)?;
-        cuda_launch! {
-            kernel: count_buckets,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(b),
-            args: [
-                slice(self.ws.bucket_idx_dev),
-                slice(self.ws.bucket_counts_dev),
-                b_u32, NUM_BUCKETS as u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: exclusive_scan_aligned,
-            stream: self.stream, module: self.module,
-            config: LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.bucket_counts_dev),
-                slice(self.ws.bucket_offsets_dev),
-                (NUM_BUCKETS + 1) as u32,
-                16_u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: scatter_bucket_perm,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(b),
-            args: [
-                slice(self.ws.bucket_idx_dev),
-                slice(self.ws.bucket_offsets_dev),
-                slice(self.ws.bucket_write_ctr_dev),
-                slice(self.ws.bucket_perm_dev),
-                slice(self.ws.bucket_idx_sorted_dev),
-                b_u32, NUM_BUCKETS as u32
-            ]
-        }?;
+        if fast_l1 {
+            debug_assert!(ft_out.is_multiple_of(16) && NUM_BUCKETS == 9 && b.is_multiple_of(16));
 
-        // b) combined を perm で gather → combined_sorted。padding 行 (perm=-1) は
-        // permute kernel が 0 fill (sorted kernel 側で bucket=-1 で skip するので値不問)。
-        cuda_launch! {
-            kernel: permute_rows_f32,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * ft_out),
-            args: [
-                slice(self.ws.combined),
-                slice(self.ws.bucket_perm_dev),
-                slice_mut(self.ws.combined_sorted),
-                padded_b as u32, ft_out as u32
-            ]
-        }?;
+            // a) histogram + 16-aligned scan + scatter。aligned offset で各 bucket が 16-row
+            // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
+            // bucket=-1 で initialise (sorted kernel 側で skip)、perm も -1 sentinel (inverse
+            // permute が skip)。
+            memset_zero(&self.stream, &self.ws.bucket_counts_dev)?;
+            memset_zero(&self.stream, &self.ws.bucket_write_ctr_dev)?;
+            memset_minus_one_i32(&self.stream, &self.ws.bucket_perm_dev)?;
+            memset_minus_one_i32(&self.stream, &self.ws.bucket_idx_sorted_dev)?;
+            cuda_launch! {
+                kernel: count_buckets,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b),
+                args: [
+                    slice(self.ws.bucket_idx_dev),
+                    slice(self.ws.bucket_counts_dev),
+                    b_u32, NUM_BUCKETS as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: exclusive_scan_aligned,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.bucket_counts_dev),
+                    slice(self.ws.bucket_offsets_dev),
+                    (NUM_BUCKETS + 1) as u32,
+                    16_u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: scatter_bucket_perm,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b),
+                args: [
+                    slice(self.ws.bucket_idx_dev),
+                    slice(self.ws.bucket_offsets_dev),
+                    slice(self.ws.bucket_write_ctr_dev),
+                    slice(self.ws.bucket_perm_dev),
+                    slice(self.ws.bucket_idx_sorted_dev),
+                    b_u32, NUM_BUCKETS as u32
+                ]
+            }?;
 
-        // c) sorted fwd_L1 → l1_bucket_sorted。padded_b/16 block、各 block uniform 保証。
-        cuda_launch! {
-            kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((padded_b / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.combined_sorted),
-                slice(self.l1_w),
-                slice(self.l1_b),
-                slice(self.ws.bucket_idx_sorted_dev),
-                slice_mut(self.ws.l1_bucket_sorted),
-                padded_b as u32, ft_out as u32, L1_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
+            // b) combined を perm で gather → combined_sorted。padding 行 (perm=-1) は
+            // permute kernel が 0 fill (sorted kernel 側で bucket=-1 で skip するので値不問)。
+            cuda_launch! {
+                kernel: permute_rows_f32,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * ft_out),
+                args: [
+                    slice(self.ws.combined),
+                    slice(self.ws.bucket_perm_dev),
+                    slice_mut(self.ws.combined_sorted),
+                    padded_b as u32, ft_out as u32
+                ]
+            }?;
 
-        // d) l1_bucket_sorted を perm で inverse-scatter → l1_bucket (original order)。
-        // padding 行 (perm=-1) は inverse permute kernel が skip。
-        cuda_launch! {
-            kernel: inverse_permute_rows_f32,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * L1_OUT),
-            args: [
-                slice(self.ws.l1_bucket_sorted),
-                slice(self.ws.bucket_perm_dev),
-                slice(self.ws.l1_bucket),
-                padded_b as u32, L1_OUT as u32
-            ]
-        }?;
+            // c) sorted fwd_L1 → l1_bucket_sorted。padded_b/16 block、各 block uniform 保証。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
+                stream: self.stream,
+                module: self.module,
+                config: LaunchConfig {
+                    grid_dim: ((padded_b / 16) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.combined_sorted),
+                    slice(self.l1_w),
+                    slice(self.l1_b),
+                    slice(self.ws.bucket_idx_sorted_dev),
+                    slice_mut(self.ws.l1_bucket_sorted),
+                    padded_b as u32, ft_out as u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+
+            // d) l1_bucket_sorted を perm で inverse-scatter → l1_bucket (original order)。
+            // padding 行 (perm=-1) は inverse permute kernel が skip。
+            cuda_launch! {
+                kernel: inverse_permute_rows_f32,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * l1_out),
+                args: [
+                    slice(self.ws.l1_bucket_sorted),
+                    slice(self.ws.bucket_perm_dev),
+                    slice(self.ws.l1_bucket),
+                    padded_b as u32, l1_out as u32
+                ]
+            }?;
+        } else {
+            // 汎用 per-bucket dense matmul: combined[B, ft_out] @ l1_w[buc] + l1_b[buc]
+            // → l1_bucket[B, l1_out]。range 外 bucket の行は 0。1 thread = 1 (b, oi) cell。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * l1_out),
+                args: [
+                    slice(self.ws.combined),
+                    slice(self.l1_w),
+                    slice(self.l1_b),
+                    slice(self.ws.bucket_idx_dev),
+                    slice_mut(self.ws.l1_bucket),
+                    b_u32, ft_out as u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        }
 
         prof_tick!("fwd_L1");
 
-        // -- Forward step 5: L1f shared dense → l1f_out (B × L1_OUT) --
+        // -- Forward step 5: L1f shared dense → l1f_out (B × l1_out) --
         // cuBLAS Sgemm (TF32 TC) で matmul、`bias_add_per_row` kernel で bias を別 pass。
-        // shape: combined[B, ft_out] @ l1f_w[ft_out, L1_OUT] → l1f_out[B, L1_OUT]。
+        // shape: combined[B, ft_out] @ l1f_w[ft_out, l1_out] → l1f_out[B, l1_out]。
         //
         // SAFETY: combined / l1f_w / l1f_out は cudaMalloc 由来、長さは arch 上 invariant
-        // (combined.len() == B*ft_out、l1f_w.len() == ft_out*L1_OUT、l1f_out.len() == B*L1_OUT)、
+        // (combined.len() == B*ft_out、l1f_w.len() == ft_out*l1_out、l1f_out.len() == B*l1_out)、
         // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行 (先行 kernel
         // 完了後に Sgemm が走り、結果は後続 bias_add_per_row が観測)。
         unsafe {
             self.cublas.sgemm_fwd_rowmajor(
                 b_u32 as i32,  // m = batch
-                L1_OUT as i32, // n = out_dim
+                l1_out as i32, // n = out_dim
                 ft_out as i32, // k = in_dim
                 self.ws.combined.cu_deviceptr() as *const f32,
                 self.l1f_w.cu_deviceptr() as *const f32,
@@ -1546,40 +1613,40 @@ impl GpuTrainer {
             kernel: bias_add_per_row,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT),
+            config: cfg_1d(b * l1_out),
             args: [
                 slice(self.l1f_b),
                 slice_mut(self.ws.l1f_out),
-                b_u32, L1_OUT as u32
+                b_u32, l1_out as u32
             ]
         }?;
 
         prof_tick!("fwd_L1f");
 
-        // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × L1_OUT) --
+        // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × l1_out) --
         cuda_launch! {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_OUT),
+            config: cfg_1d(b * l1_out),
             args: [
                 slice(self.ws.l1_bucket),
                 slice(self.ws.l1f_out),
                 slice_mut(self.ws.l1_total),
-                (b * L1_OUT) as u32
+                (b * l1_out) as u32
             ]
         }?;
 
-        // -- Forward step 7: slice l1_total → l1_main (B × 15) + l1_skip (B × 1) --
+        // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
         cuda_launch! {
             kernel: slice_extract_2d,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.l1_total),
                 slice_mut(self.ws.l1_main),
-                b_u32, L1_OUT as u32, 0_u32, L1_EFFECTIVE as u32
+                b_u32, l1_out as u32, 0_u32, l1_effective as u32
             ]
         }?;
         cuda_launch! {
@@ -1590,48 +1657,48 @@ impl GpuTrainer {
             args: [
                 slice(self.ws.l1_total),
                 slice_mut(self.ws.l1_skip),
-                b_u32, L1_OUT as u32, L1_EFFECTIVE as u32, L1_SKIP as u32
+                b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32
             ]
         }?;
 
-        // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × 15) --
+        // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × l1_effective) --
         cuda_launch! {
             kernel: abs_pow2_scale_fwd,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.l1_main),
                 slice_mut(self.ws.l1_sqr),
                 L1_SQR_SCALE,
-                (b * L1_EFFECTIVE) as u32
+                (b * l1_effective) as u32
             ]
         }?;
 
-        // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × 30) --
+        // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × l2_in) --
         cuda_launch! {
             kernel: concat_l1sqr_main_fwd,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_IN),
+            config: cfg_1d(b * l2_in),
             args: [
                 slice(self.ws.l1_sqr),
                 slice(self.ws.l1_main),
                 slice_mut(self.ws.l2_pre),
-                b_u32, L1_EFFECTIVE as u32, L1_EFFECTIVE as u32
+                b_u32, l1_effective as u32, l1_effective as u32
             ]
         }?;
 
-        // -- Forward step 10: l2_input = CReLU(l2_pre) (B × 30) --
+        // -- Forward step 10: l2_input = CReLU(l2_pre) (B × l2_in) --
         cuda_launch! {
             kernel: crelu_fwd,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_IN),
+            config: cfg_1d(b * l2_in),
             args: [
                 slice(self.ws.l2_pre),
                 slice_mut(self.ws.l2_input),
-                (b * L2_IN) as u32
+                (b * l2_in) as u32
             ]
         }?;
 
@@ -1649,7 +1716,7 @@ impl GpuTrainer {
                 slice(self.l2_b),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.l2_out),
-                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
 
@@ -1767,11 +1834,11 @@ impl GpuTrainer {
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
         let ft_w_n = self.feature_set.ft_in() * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = NUM_BUCKETS * L1_OUT * ft_out;
-        let l1_b_n = NUM_BUCKETS * L1_OUT;
-        let l1f_w_n = ft_out * L1_OUT;
-        let l1f_b_n = L1_OUT;
-        let l2_w_n = NUM_BUCKETS * L2_OUT * L2_IN;
+        let l1_w_n = NUM_BUCKETS * l1_out * ft_out;
+        let l1_b_n = NUM_BUCKETS * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = NUM_BUCKETS * L2_OUT * l2_in;
         let l2_b_n = NUM_BUCKETS * L2_OUT;
         let l3_w_n = NUM_BUCKETS * L2_OUT;
         let l3_b_n = NUM_BUCKETS;
@@ -1864,61 +1931,94 @@ impl GpuTrainer {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_IN),
+            config: cfg_1d(b * l2_in),
             args: [
                 slice(self.ws.dl2_out),
                 slice(self.l2_w),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dl2_input),
-                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
             ]
         }?;
-        // L2 weight bwd: in_dim=L2_IN=30, out_dim=L2_OUT=32, num_buckets=9。
-        // split-K + 9 bucket register accumulator (block_dim = 32 × 30 = 960、grid = 64 splits)。
-        const _: () = assert!(L2_IN == 30 && L2_OUT == 32 && NUM_BUCKETS == 9);
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l2,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: (64, 1, 1),
-                block_dim: ((L2_OUT * L2_IN) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.l2_input),
-                slice(self.ws.dl2_out),
-                slice(self.ws.bucket_idx_dev),
-                slice(self.l2_w_grad),
-                b_u32, L2_IN as u32, L2_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
-        // L2 bias backward (sorted): dl2_out を bucket_perm_dev で gather → dl2_out_sorted、
-        // per-block shared-mem reduce で global atomic 数を ~2M → ~131K (16× 削減)。
-        // out_dim=32、block(256) = 8 sorted 行 × 32 oi cell、16-aligned sort で uniform-
-        // bucket。fwd_L1 で構築済の bucket_perm_dev / bucket_idx_sorted_dev を再利用。
-        cuda_launch! {
-            kernel: permute_rows_f32,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * L2_OUT),
-            args: [
-                slice(self.ws.dl2_out),
-                slice(self.ws.bucket_perm_dev),
-                slice_mut(self.ws.dl2_out_sorted),
-                padded_b as u32, L2_OUT as u32
-            ]
-        }?;
-        cuda_launch! {
-            kernel: bias_grad_bucket_shared_sorted,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * L2_OUT),
-            args: [
-                slice(self.ws.dl2_out_sorted),
-                slice(self.ws.bucket_idx_sorted_dev),
-                slice(self.l2_b_grad),
-                padded_b as u32, L2_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
+        // L2 weight bwd。`fast_l1` (l1_out==16 ⇒ l2_in==30) のときは split-K + 9 bucket
+        // register accumulator の専用 kernel (block_dim = L2_OUT × l2_in = 960 ≤ 1024)。
+        // 既定外の l1_out では l2_in が変わり block_dim が 1024 を超えうるため、1 thread
+        // = 1 weight cell の汎用 `dense_mm_bwd_weight_bucket` (overwrite、grad_w は memset
+        // 済) に切り替える。
+        if fast_l1 {
+            debug_assert!(l2_in == 30 && L2_OUT == 32 && NUM_BUCKETS == 9);
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l2,
+                stream: self.stream,
+                module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (64, 1, 1),
+                    block_dim: ((L2_OUT * l2_in) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.l2_input),
+                    slice(self.ws.dl2_out),
+                    slice(self.ws.bucket_idx_dev),
+                    slice(self.l2_w_grad),
+                    b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(NUM_BUCKETS * L2_OUT * l2_in),
+                args: [
+                    slice(self.ws.l2_input),
+                    slice(self.ws.dl2_out),
+                    slice(self.ws.bucket_idx_dev),
+                    slice_mut(self.l2_w_grad),
+                    b_u32, l2_in as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        }
+        // L2 bias backward。`fast_l1` のときは dl2_out を bucket_perm_dev で gather →
+        // per-block shared-mem reduce で global atomic 数を削減する sorted path。既定外の
+        // l1_out では sort 機構を組まないため、1 thread = 1 (b, oi) cell の汎用
+        // `bias_grad_bucket` (atomic accumulate) に切り替える。
+        if fast_l1 {
+            cuda_launch! {
+                kernel: permute_rows_f32,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * L2_OUT),
+                args: [
+                    slice(self.ws.dl2_out),
+                    slice(self.ws.bucket_perm_dev),
+                    slice_mut(self.ws.dl2_out_sorted),
+                    padded_b as u32, L2_OUT as u32
+                ]
+            }?;
+            cuda_launch! {
+                kernel: bias_grad_bucket_shared_sorted,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * L2_OUT),
+                args: [
+                    slice(self.ws.dl2_out_sorted),
+                    slice(self.ws.bucket_idx_sorted_dev),
+                    slice(self.l2_b_grad),
+                    padded_b as u32, L2_OUT as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad_bucket,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * L2_OUT),
+                args: [
+                    slice(self.ws.dl2_out),
+                    slice(self.ws.bucket_idx_dev),
+                    slice(self.l2_b_grad),
+                    b_u32, L2_OUT as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        }
 
         prof_tick!("bwd_L2");
 
@@ -1927,26 +2027,26 @@ impl GpuTrainer {
             kernel: crelu_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L2_IN),
+            config: cfg_1d(b * l2_in),
             args: [
                 slice(self.ws.l2_pre),
                 slice(self.ws.dl2_input),
                 slice_mut(self.ws.dl2_pre),
-                (b * L2_IN) as u32
+                (b * l2_in) as u32
             ]
         }?;
 
-        // -- Backward 9 reverse: split dl2_pre → dl1_sqr (15) + dl1_main_from_concat (15) --
+        // -- Backward 9 reverse: split dl2_pre → dl1_sqr + dl1_main_from_concat (各 l1_effective) --
         cuda_launch! {
             kernel: concat_l1sqr_main_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.dl2_pre),
                 slice_mut(self.ws.dl1_sqr),
                 slice_mut(self.ws.dl1_main_from_concat),
-                b_u32, L1_EFFECTIVE as u32
+                b_u32, l1_effective as u32
             ]
         }?;
 
@@ -1955,13 +2055,13 @@ impl GpuTrainer {
             kernel: abs_pow2_scale_grad,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.l1_main),
                 slice(self.ws.dl1_sqr),
                 slice_mut(self.ws.dl1_main_from_sqr),
                 L1_SQR_SCALE,
-                (b * L1_EFFECTIVE) as u32
+                (b * l1_effective) as u32
             ]
         }?;
 
@@ -1970,25 +2070,26 @@ impl GpuTrainer {
             kernel: elementwise_add,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.dl1_main_from_concat),
                 slice(self.ws.dl1_main_from_sqr),
                 slice_mut(self.ws.dl1_main),
-                (b * L1_EFFECTIVE) as u32
+                (b * l1_effective) as u32
             ]
         }?;
 
-        // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) + dl1_skip=dy_net_output (offset 15) --
+        // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) +
+        //    dl1_skip = dy_net_output (offset l1_effective) --
         cuda_launch! {
             kernel: slice_scatter_2d,
             stream: self.stream,
             module: self.module,
-            config: cfg_1d(b * L1_EFFECTIVE),
+            config: cfg_1d(b * l1_effective),
             args: [
                 slice(self.ws.dl1_main),
                 slice_mut(self.ws.dl1_total),
-                b_u32, L1_EFFECTIVE as u32, L1_OUT as u32, 0_u32
+                b_u32, l1_effective as u32, l1_out as u32, 0_u32
             ]
         }?;
         cuda_launch! {
@@ -1999,7 +2100,7 @@ impl GpuTrainer {
             args: [
                 slice(self.ws.dy_net_output),
                 slice_mut(self.ws.dl1_total),
-                b_u32, L1_SKIP as u32, L1_OUT as u32, L1_EFFECTIVE as u32
+                b_u32, L1_SKIP as u32, l1_out as u32, l1_effective as u32
             ]
         }?;
 
@@ -2010,62 +2111,95 @@ impl GpuTrainer {
         prof_tick!("bwd_L1eff");
 
         // -- Backward 5 reverse: L1f shared dense grad --
-        // L1f input bwd: in_dim=ft_out, out_dim=L1_OUT=16, batch=multiple of 16
-        // → tiled (block=256 = 16 batch × 16 in_dim cells、grid=batch/16 × in_dim/16).
-        debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16) && L1_OUT == 16);
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_tiled,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1f_w),
-                slice_mut(self.ws.dcombined_from_l1f),
-                b_u32, ft_out as u32, L1_OUT as u32
-            ]
-        }?;
-        // L1f weight backward: row-major `grad_w[ft_out, L1_OUT] = combined^T @ dl1_total`。
-        // combined[batch, ft_out] row-major、dl1_total[batch, L1_OUT] row-major、reduce 軸は
-        // batch。M = L1_OUT と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
-        // split-K + tensor pipeline 最適化が効きやすい。
+        // L1f input bwd: in_dim=ft_out, out_dim=l1_out。`fast_l1` (l1_out==16) のときは
+        // 16×16 tile の専用 kernel (block=256 = 16 batch × 16 in_dim cell、grid=batch/16
+        // × in_dim/16)。既定外の l1_out は out_dim を runtime arg で受ける汎用
+        // `dense_mm_bwd_input` (1 thread = 1 (b, ii) cell) に切り替える。
+        if fast_l1 {
+            debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled,
+                stream: self.stream,
+                module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.l1f_w),
+                    slice_mut(self.ws.dcombined_from_l1f),
+                    b_u32, ft_out as u32, l1_out as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: dense_mm_bwd_input,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * ft_out),
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.l1f_w),
+                    slice_mut(self.ws.dcombined_from_l1f),
+                    b_u32, ft_out as u32, l1_out as u32
+                ]
+            }?;
+        }
+        // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
+        // combined[batch, ft_out] row-major、dl1_total[batch, l1_out] row-major、reduce 軸は
+        // batch。M = l1_out と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
+        // split-K + tensor pipeline 最適化が効きやすい (cuBLAS は任意の n を受けるので分岐不要)。
         //
         // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc 由来、長さは arch 上
-        // invariant (`combined.len() == b*ft_out`、`dl1_total.len() == b*L1_OUT`、
-        // `l1f_w_grad.len() == ft_out*L1_OUT`)、`self.cublas` は `self.stream` に bind 済で
+        // invariant (`combined.len() == b*ft_out`、`dl1_total.len() == b*l1_out`、
+        // `l1f_w_grad.len() == ft_out*l1_out`)、`self.cublas` は `self.stream` に bind 済で
         // 同 stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、結果は後続 kernel
         // が観測する)。
         unsafe {
             self.cublas.sgemm_xt_y_rowmajor(
                 ft_out as i32, // m = in_dim
-                L1_OUT as i32, // n = out_dim
+                l1_out as i32, // n = out_dim
                 b_u32 as i32,  // k = batch
                 self.ws.combined.cu_deviceptr() as *const f32,
                 self.ws.dl1_total.cu_deviceptr() as *const f32,
                 self.l1f_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        // L1f bias backward: shared-mem reduce で global atomic を 1M → ~16K に削減。
-        const _: () = assert!(L1_OUT == 16);
-        cuda_launch! {
-            kernel: bias_grad_shared_l1f,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * L1_OUT),
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1f_b_grad),
-                b_u32, L1_OUT as u32
-            ]
-        }?;
+        // L1f bias backward。`fast_l1` のときは out_dim=16 の shared-mem reduce で global
+        // atomic 数を削減する専用 kernel。既定外の l1_out は 1 thread = 1 (b, oi) cell の
+        // 汎用 `bias_grad` (atomic accumulate) に切り替える。
+        if fast_l1 {
+            cuda_launch! {
+                kernel: bias_grad_shared_l1f,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * l1_out),
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.l1f_b_grad),
+                    b_u32, l1_out as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * l1_out),
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.l1f_b_grad),
+                    b_u32, l1_out as u32
+                ]
+            }?;
+        }
 
         prof_tick!("bwd_L1f");
 
-        // -- Backward 4 reverse: L1 per-bucket dense grad --
+        // -- Backward 4 reverse: L1 per-bucket dense grad (input)。`dense_mm_bwd_input_bucket`
+        //    は out_dim を runtime arg で受ける汎用 kernel なので l1_out 不問で分岐不要。
         cuda_launch! {
             kernel: dense_mm_bwd_input_bucket,
             stream: self.stream,
@@ -2076,62 +2210,92 @@ impl GpuTrainer {
                 slice(self.l1_w),
                 slice(self.ws.bucket_idx_dev),
                 slice_mut(self.ws.dcombined_from_l1),
-                b_u32, ft_out as u32, L1_OUT as u32, NUM_BUCKETS as u32
+                b_u32, ft_out as u32, l1_out as u32, NUM_BUCKETS as u32
             ]
         }?;
         prof_tick!("bwd_L1_inB");
-        // L1 weight backward (sorted layout): combined_sorted は fwd_L1 で構築済、dl1_total を
-        // 同 perm で gather → dl1_total_sorted。bucket_offsets_dev も fwd_L1 で構築済。各 block
-        // は uniform-by-construction で 1 bucket の slice のみ accumulate (9-way if-else /
-        // 9 register accumulator / 9 atomicAdd を 1 個ずつに集約)。
-        debug_assert!(
-            ft_out.is_multiple_of(16) && L1_OUT == 16 && NUM_BUCKETS == 9 && b.is_multiple_of(16)
-        );
-        cuda_launch! {
-            kernel: permute_rows_f32,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * L1_OUT),
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.ws.bucket_perm_dev),
-                slice_mut(self.ws.dl1_total_sorted),
-                padded_b as u32, L1_OUT as u32
-            ]
-        }?;
-        // split-K dim を grid_y に追加。num_splits=8 × NUM_BUCKETS=9 × in_tiles=96 = 6912 blocks。
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((ft_out / 16) as u32, 8, NUM_BUCKETS as u32),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.combined_sorted),
-                slice(self.ws.dl1_total_sorted),
-                slice(self.ws.bucket_offsets_dev),
-                slice(self.l1_w_grad),
-                padded_b as u32, ft_out as u32, L1_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
+        // L1 weight backward。`fast_l1` のときは combined_sorted / dl1_total_sorted を
+        // sorted layout で渡し、各 block が uniform-by-construction で 1 bucket の slice
+        // のみ accumulate する split-K 専用 kernel (combined_sorted / bucket_offsets_dev は
+        // fwd_L1 で構築済)。既定外の l1_out は sort 機構を組まないため、1 thread = 1 weight
+        // cell の汎用 `dense_mm_bwd_weight_bucket` (overwrite、grad_w は memset 済) を使う。
+        if fast_l1 {
+            debug_assert!(ft_out.is_multiple_of(16) && NUM_BUCKETS == 9 && b.is_multiple_of(16));
+            cuda_launch! {
+                kernel: permute_rows_f32,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * l1_out),
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.ws.bucket_perm_dev),
+                    slice_mut(self.ws.dl1_total_sorted),
+                    padded_b as u32, l1_out as u32
+                ]
+            }?;
+            // split-K dim を grid_y に追加。num_splits=8 × NUM_BUCKETS=9 × in_tiles。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted,
+                stream: self.stream,
+                module: self.module,
+                config: LaunchConfig {
+                    grid_dim: ((ft_out / 16) as u32, 8, NUM_BUCKETS as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.combined_sorted),
+                    slice(self.ws.dl1_total_sorted),
+                    slice(self.ws.bucket_offsets_dev),
+                    slice(self.l1_w_grad),
+                    padded_b as u32, ft_out as u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(NUM_BUCKETS * l1_out * ft_out),
+                args: [
+                    slice(self.ws.combined),
+                    slice(self.ws.dl1_total),
+                    slice(self.ws.bucket_idx_dev),
+                    slice_mut(self.l1_w_grad),
+                    b_u32, ft_out as u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        }
         prof_tick!("bwd_L1_wB");
-        // L1 bias: sorted layout で per-block shared-mem reduce、global atomic 数を
-        // ~1M → ~66K に削減。dl1_total_sorted / bucket_idx_sorted_dev は同 step 内で
-        // 構築済 (fwd_L1 + bwd_L1_wB 前 permute)。
-        cuda_launch! {
-            kernel: bias_grad_bucket_shared_sorted,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(padded_b * L1_OUT),
-            args: [
-                slice(self.ws.dl1_total_sorted),
-                slice(self.ws.bucket_idx_sorted_dev),
-                slice(self.l1_b_grad),
-                padded_b as u32, L1_OUT as u32, NUM_BUCKETS as u32
-            ]
-        }?;
+        // L1 bias backward。`fast_l1` のときは sorted layout の per-block shared-mem reduce
+        // で global atomic 数を削減する専用 kernel。既定外の l1_out は 1 thread = 1 (b, oi)
+        // cell の汎用 `bias_grad_bucket` (atomic accumulate) を使う。
+        if fast_l1 {
+            cuda_launch! {
+                kernel: bias_grad_bucket_shared_sorted,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(padded_b * l1_out),
+                args: [
+                    slice(self.ws.dl1_total_sorted),
+                    slice(self.ws.bucket_idx_sorted_dev),
+                    slice(self.l1_b_grad),
+                    padded_b as u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad_bucket,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * l1_out),
+                args: [
+                    slice(self.ws.dl1_total),
+                    slice(self.ws.bucket_idx_dev),
+                    slice(self.l1_b_grad),
+                    b_u32, l1_out as u32, NUM_BUCKETS as u32
+                ]
+            }?;
+        }
 
         prof_tick!("bwd_L1");
 

@@ -352,6 +352,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         &ctx,
         SMOKE_BATCH,
         DEFAULT_FT_OUT,
+        DEFAULT_L1_OUT,
         false,
         false,
         false,
@@ -359,15 +360,17 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         feature_set,
         0.0,
     )?;
+    // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。
+    let l2_in = (DEFAULT_L1_OUT - L1_SKIP) * 2;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (feature_set.ft_in() * DEFAULT_FT_OUT
             + DEFAULT_FT_OUT
-            + NUM_BUCKETS * L1_OUT * DEFAULT_FT_OUT
-            + NUM_BUCKETS * L1_OUT
-            + DEFAULT_FT_OUT * L1_OUT
-            + L1_OUT
-            + NUM_BUCKETS * L2_OUT * L2_IN
+            + NUM_BUCKETS * DEFAULT_L1_OUT * DEFAULT_FT_OUT
+            + NUM_BUCKETS * DEFAULT_L1_OUT
+            + DEFAULT_FT_OUT * DEFAULT_L1_OUT
+            + DEFAULT_L1_OUT
+            + NUM_BUCKETS * L2_OUT * l2_in
             + NUM_BUCKETS * L2_OUT
             + NUM_BUCKETS * L2_OUT
             + NUM_BUCKETS) as f64
@@ -387,7 +390,12 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
     {
         println!("[smoke] loading reference checkpoint from {ref_path} ...");
         let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
-        let weights = LayerStackWeights::load_quantised(&mut reader, feature_set, DEFAULT_FT_OUT)?;
+        let weights = LayerStackWeights::load_quantised(
+            &mut reader,
+            feature_set,
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+        )?;
         trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;
         println!("[smoke] reference weights injected, all finite ✓");

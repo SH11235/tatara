@@ -223,7 +223,8 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress8kpabs 9-bucket LayerStack アーキ (FT → L1 16 → L2 32、FT 次元は --ft-out)。
+    /// progress8kpabs 9-bucket LayerStack アーキ (FT → L1 → L2 32、FT 次元は --ft-out、
+    /// L1 次元は --l1)。
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// bullet-shogi 由来の Simple 4 層アーキ。
@@ -258,6 +259,12 @@ pub(crate) struct LayerstackArgs {
     /// 互換を保つ。
     #[arg(long, default_value_t = DEFAULT_FT_OUT)]
     pub(crate) ft_out: usize,
+
+    /// L1 (per-bucket dense) 層の出力次元。`>= 2` を指定する。既定値では従来構成と
+    /// bit-identical で既存 checkpoint と resume 互換を保ち、最速の専用 matmul kernel
+    /// が走る。既定外の値では汎用 matmul kernel に切り替わる (数値は等価、速度は落ちる)。
+    #[arg(long, default_value_t = DEFAULT_L1_OUT)]
+    pub(crate) l1: usize,
 
     /// Ampere+ Tensor Core を TF32 mode で使う opt-in flag。`true` で cuBLAS の
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)` を呼び、Sgemm の
