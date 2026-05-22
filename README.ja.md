@@ -88,6 +88,14 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
   記述文字列の組み立てと load 時照合
 
+## 学習した net の使い方
+
+tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/rshogi)
+エンジンでロードする前提の format。YaneuraOu など他の将棋エンジンとは **互換性が
+ない** — `.bin` header と SCReLU / Pairwise 活性化は本プロジェクト固有で、
+version 駆動の評価関数ローダーは誤読する。学習済みの参考 net は
+[GitHub Releases](https://github.com/SH11235/tatara/releases) に添付している。
+
 ## 用語 (glossary)
 
 | 略語 | 意味 |

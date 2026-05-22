@@ -156,8 +156,11 @@ After training, what appears under `checkpoints/<run-name>/`:
 | `<run-name>-<sb>.bin` | quantised NNUE binary | **The artifact to feed to the inference engine** (for the binary layout, see `crates/nnue-format`) |
 | `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | For `--resume`; not used for inference (pruned by `--keep-checkpoints`) |
 
-`<run-name>-<final sb>.bin` is the final net. Measure playing strength by
-integrating it into the shogi engine.
+`<run-name>-<final sb>.bin` is the final net. It is loaded by the
+[rshogi](https://github.com/SH11235/rshogi) engine — not by other shogi engines
+such as YaneuraOu (see
+[Using the trained net](../README.md#using-the-trained-net)). Measure playing
+strength by integrating it into the engine.
 
 ## Smoke test
 

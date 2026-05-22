@@ -99,6 +99,15 @@ For building the kernels and running the smoke test, see
 - [Arch string](docs/arch-string.md) — how the architecture-description string
   embedded in the quantised `.bin` header is assembled and checked at load time
 
+## Using the trained net
+
+The quantised `.bin` that tatara produces is designed to be loaded by the
+[rshogi](https://github.com/SH11235/rshogi) engine. It is **not** compatible
+with other shogi engines such as YaneuraOu: the `.bin` header and the
+SCReLU / Pairwise activations are specific to this project, so a version-driven
+evaluation-file loader would misread them. Pre-trained reference nets are
+attached to the [GitHub Releases](https://github.com/SH11235/tatara/releases).
+
 ## Glossary
 
 | Abbreviation | Meaning |
