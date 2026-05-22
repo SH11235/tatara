@@ -408,11 +408,11 @@ pub fn simple_ft_post_fused_screlu(
     }
 }
 
-/// Simple bwd_ft_act の fused kernel (CReLU 版): `slice_extract_2d` で `dcombined`
-/// の per-perspective 半分を切り出して読み取り、`ft_pre_act` (pre-activation FT 出力)
-/// で CReLU 指示関数 `0 < x < 1` を作って `dft_out` に直接書く。元の
-/// `slice_extract_2d` → `crelu_grad` の 2 kernel + 中間 `dft_*_acted` buffer の
-/// DRAM round-trip (b × ft_out × 4 byte の write+read) を 1 kernel + write-only に縮める。
+/// Simple bwd_ft_act の fused kernel (CReLU 版): `slice_extract_2d` と `crelu_grad`
+/// を 1 kernel に融合。`dcombined` の per-perspective 半分を切り出して読み取り、
+/// `ft_pre_act` (pre-activation FT 出力) で CReLU 指示関数 `0 < x < 1` を作って
+/// `dft_out` に直接書く。非融合の 2 kernel が要する中間 `dft_*_acted` buffer の
+/// DRAM round-trip (b × ft_out × 4 byte の write+read) を省く。
 ///
 /// `src_offset` で stm (= 0) / nstm (= ft_out) を選択する。
 #[allow(clippy::too_many_arguments)]
