@@ -37,13 +37,13 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub max_games: usize,
 
-    /// Fraction of games to set aside for held-out validation (0.0 = disabled,
-    /// the default). For example, 0.05 reserves about 1/20 of all games for
-    /// validation only and reports the loss on the games not used for training
-    /// (val_loss) at the end of each epoch. The split is per game, so positions
-    /// from the same game never mix between training and validation. Games are
-    /// picked at a fixed interval, so if your data is grouped by tournament or
-    /// time period, shuffle it beforehand. The valid range is 0.0..=0.5.
+    /// Fraction of games to hold out for validation (0.0 = disabled, the
+    /// default; valid range 0.0..=0.5). For example, 0.05 reserves about 1/20
+    /// of the games for validation only and reports their loss (val_loss) at
+    /// the end of each epoch. The hold-out is per game — every Nth game in
+    /// input order — so positions from one game never mix between training and
+    /// validation. The input must stay in consecutive-game order; do not
+    /// shuffle it. Enabling this adds one extra pass over the data per epoch.
     #[arg(long, default_value_t = 0.0)]
     pub val_fraction: f32,
 
