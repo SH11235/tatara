@@ -35,7 +35,7 @@ target/release/nnue-train \
   --output checkpoints/<run-name> --net-id <run-name> \
   --feature-set halfkp \
   --superbatches <N> \
-  --keep-checkpoints 4 \
+  --threads <N> \
   simple
 ```
 
@@ -118,7 +118,7 @@ target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches <N> \
-  --keep-checkpoints 4 \
+  --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
 ```
 
@@ -136,13 +136,14 @@ change for real training are:
 | `--superbatches` | 10 | Number of superbatches to train. The default 10 is for smoke testing; use a much larger value for real training (see "How much to train" below) |
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
-| `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state, large in size). Start small (e.g. 4); once training is stable you can raise it to 20–100. Quantised `.bin` files are always kept |
+| `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~100 MB ≈ 2 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
 | `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE) |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
+| `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 
-`--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20) /
-`--threads` (16) and the like can be left at their defaults; pass them only when
-you want to change them.
+`--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
+and the like can be left at their defaults; pass them only when you want to
+change them.
 
 **How much to train**: 1 superbatch = `batches-per-superbatch × batch-size`
 positions. With the default `batch-size`, 1 superbatch ≈ 100 million positions,
