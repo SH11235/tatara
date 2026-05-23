@@ -355,23 +355,19 @@ impl ShogiBoard {
     /// (固定 stack 配列) に集め、`BOARD_PIECE_TYPES` の順 × `Color::Black/White`
     /// の順で各 bucket を ascending square で iterate する。各 bucket 内の square
     /// 順序は board.iter() の order (= ascending) と一致するため、`pieces(color, pt)`
-    /// を 26 通り loop で呼ぶ既存パターンと emit 順は同一 (sparse feature index 列が
-    /// byte-identical)。
-    ///
-    /// `ShogiBoard` 自体は `pub` で任意の配置を構成できるため、合法局面の物理
-    /// 上限 (同 `(piece_type, color)` で歩 9 枚 / と金 18 枚等) を超える bucket は
-    /// **超過分を silent skip** して安全側に倒す (`debug_assert!` で test では拾う)。
-    /// `decode()` から得た board は upstream PSV 由来で常に範囲内、無視は実害なし。
+    /// を 26 通り loop で呼ぶパターンと emit する index 列は byte-identical
+    /// (合法局面 / 駒種数を超えた breakage も含めて完全等価、後述)。
     #[inline]
     pub fn for_each_board_piece<F: FnMut(Piece, Square)>(&self, mut f: F) {
         // PieceType discriminant は `#[repr(u8)]` で 0..=14、Color は同 0..=1。
         // bucket index = (piece_type as usize) * 2 + (color as usize)。
-        // MAX_PER_PC は同 (piece_type, color) の合法局面上限の最大値: と金 (ProPawn)
-        // は二歩規制対象外なので片側 18 枚理論上可、他駒は最大 4 (Lance/Knight/
-        // Silver/Gold + Pro*) or 2 (Bishop/Rook + 馬/龍)。安全側に 18 で揃える。
+        // MAX_PER_PC は board のマス数 = 81 (片色 1 piece type で全マス占有という
+        // 物理上の絶対上限) に揃える: `ShogiBoard` は `pub` で任意配置を構成可、
+        // 合法局面の自然上限 (歩 9 / と金 18 / 他 ≤ 4 等) を越える ad-hoc 局面
+        // (破損 PSV や test fixture) でも emit を欠落させないため。stack ~2.5 KB。
         const PT_VARIANTS: usize = 15;
         const COLORS: usize = 2;
-        const MAX_PER_PC: usize = 18;
+        const MAX_PER_PC: usize = 81;
         const BUCKETS: usize = PT_VARIANTS * COLORS;
 
         let mut counts = [0u8; BUCKETS];
@@ -384,16 +380,11 @@ impl ShogiBoard {
             }
             let bucket = (p.piece_type as usize) * COLORS + (p.color as usize);
             let n = counts[bucket] as usize;
-            if n >= MAX_PER_PC {
-                // 合法局面では到達しない経路 (上記 doc 参照)。release で OOB
-                // write を避けるため silent skip、debug build では拾う。
-                debug_assert!(
-                    false,
-                    "for_each_board_piece: bucket ({:?}, {:?}) exceeded MAX_PER_PC={}",
-                    p.piece_type, p.color, MAX_PER_PC,
-                );
-                continue;
-            }
+            // MAX_PER_PC = 81 = board のマス数。`for (i, ..) in board.iter()` で
+            // 1 マス 1 push なので、bucket 当たり最大 81 (実際は 79: 玉 2 マスは
+            // 上で skip 済) を超えることは型レベルで起きない。defensive 配置
+            // (assert は安価 / static cap 等価)。
+            debug_assert!(n < MAX_PER_PC);
             squares[bucket * MAX_PER_PC + n] = Square(i as u8);
             counts[bucket] = (n + 1) as u8;
         }
@@ -790,9 +781,8 @@ mod tests {
     #[test]
     fn test_for_each_board_piece_propawn_above_nifu_limit() {
         // と金 (ProPawn) は二歩規制対象外で同一色片側 18 枚まで合法的に到達可能。
-        // 内部 bucket 上限 `MAX_PER_PC = 18` がこの最悪ケースを許容すること、
-        // 出力が `pieces(color, pt)` を 26 通り loop で呼ぶ reference と一致する
-        // ことを確認する。
+        // helper が同一 bucket に 18 個積む経路を踏み、emit 順は `pieces(color, pt)`
+        // を 26 通り loop で呼ぶ reference と一致することを確認する。
         let mut board = ShogiBoard {
             black_king_sq: Square::new(0, 8),
             white_king_sq: Square::new(8, 0),
