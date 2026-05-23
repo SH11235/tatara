@@ -790,8 +790,9 @@ mod tests {
     #[test]
     fn test_for_each_board_piece_propawn_above_nifu_limit() {
         // と金 (ProPawn) は二歩規制対象外で同一色片側 18 枚まで合法的に到達可能。
-        // 内部 bucket 上限 `MAX_PER_PC = 18` がこの最悪ケースを許容することを確認
-        // し、emit 順は旧 `pieces(color, pt)` loop と一致することも併せて検証。
+        // 内部 bucket 上限 `MAX_PER_PC = 18` がこの最悪ケースを許容すること、
+        // 出力が `pieces(color, pt)` を 26 通り loop で呼ぶ reference と一致する
+        // ことを確認する。
         let mut board = ShogiBoard {
             black_king_sq: Square::new(0, 8),
             white_king_sq: Square::new(8, 0),
