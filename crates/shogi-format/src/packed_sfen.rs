@@ -8,7 +8,7 @@
 //! 内 / 関数 doc に直接記述している。駒箱 (hand 駒種外の駒) のフラグ判定にも
 //! 対応 (`decode_hand_piece` 参照)。
 
-use super::types::{Color, Hand, Piece, PieceType, Square};
+use super::types::{BOARD_PIECE_TYPES, Color, Hand, Piece, PieceType, Square};
 
 // =============================================================================
 // Huffman 符号テーブル
@@ -347,6 +347,60 @@ impl ShogiBoard {
             .filter(move |(_, p)| p.color == color && p.piece_type == pt)
             .map(|(i, _)| Square(i as u8))
     }
+
+    /// 盤上の駒 (玉以外) を **1 回の board 走査** で `(piece_type, color, ascending
+    /// square)` 順に `f(piece, square)` へ供給する。
+    ///
+    /// 内部では board を 81 マス 1-pass で `(piece_type, color)` の bucket
+    /// (固定 stack 配列) に集め、`BOARD_PIECE_TYPES` の順 × `Color::Black/White`
+    /// の順で各 bucket を ascending square で iterate する。各 bucket 内の square
+    /// 順序は board.iter() の order (= ascending) と一致するため、`pieces(color, pt)`
+    /// を 26 通り loop で呼ぶパターンと emit する index 列は byte-identical
+    /// (合法局面 / 駒種数を超えた breakage も含めて完全等価、後述)。
+    #[inline]
+    pub fn for_each_board_piece<F: FnMut(Piece, Square)>(&self, mut f: F) {
+        // PieceType discriminant は `#[repr(u8)]` で 0..=14、Color は同 0..=1。
+        // bucket index = (piece_type as usize) * 2 + (color as usize)。
+        // MAX_PER_PC は board のマス数 = 81 (片色 1 piece type で全マス占有という
+        // 物理上の絶対上限) に揃える: `ShogiBoard` は `pub` で任意配置を構成可、
+        // 合法局面の自然上限 (歩 9 / と金 18 / 他 ≤ 4 等) を越える ad-hoc 局面
+        // (破損 PSV や test fixture) でも emit を欠落させないため。stack ~2.5 KB。
+        const PT_VARIANTS: usize = 15;
+        const COLORS: usize = 2;
+        const MAX_PER_PC: usize = 81;
+        const BUCKETS: usize = PT_VARIANTS * COLORS;
+
+        let mut counts = [0u8; BUCKETS];
+        let mut squares = [Square::NONE; BUCKETS * MAX_PER_PC];
+
+        for (i, &p) in self.board.iter().enumerate() {
+            // None / King は board feature の対象外。
+            if matches!(p.piece_type, PieceType::None | PieceType::King) {
+                continue;
+            }
+            let bucket = (p.piece_type as usize) * COLORS + (p.color as usize);
+            let n = counts[bucket] as usize;
+            // MAX_PER_PC = 81 = board のマス数。`for (i, ..) in board.iter()` で
+            // 1 マス 1 push なので bucket 当たり最大 81 (ad-hoc board で全マスを
+            // 同 piece で埋めた場合の上限)、超過は型レベルで起こらない defensive
+            // 配置。
+            debug_assert!(n < MAX_PER_PC);
+            squares[bucket * MAX_PER_PC + n] = Square(i as u8);
+            counts[bucket] = (n + 1) as u8;
+        }
+
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                let bucket = (pt as usize) * COLORS + (color as usize);
+                let n = counts[bucket] as usize;
+                let row_start = bucket * MAX_PER_PC;
+                let piece = Piece::new(color, pt);
+                for k in 0..n {
+                    f(piece, squares[row_start + k]);
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -678,6 +732,95 @@ mod tests {
         assert_eq!(piece.piece_type, PieceType::Rook);
         assert_eq!(piece.color, Color::Black);
         assert!(is_piecebox);
+    }
+
+    #[test]
+    fn test_for_each_board_piece_matches_pieces_loop() {
+        // for_each_board_piece は board を 1-pass で走査し
+        // `(piece_type, color, ascending square)` 順に供給する。本テストは
+        // 同じ順序を `pieces(color, pt)` の 26 通り loop で組み立てた reference と
+        // 完全一致 (順序込み) であることを確認する。
+        // 局面: 黒 9 歩 + 白 9 歩 + 黒銀 1 + 白龍 1 + 両玉 (King は emit 対象外)。
+        let mut board = ShogiBoard {
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+        for file in 0..9 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+        board.board[Square::new(0, 7).index()] = Piece::new(Color::Black, PieceType::Silver);
+        board.board[Square::new(8, 1).index()] = Piece::new(Color::White, PieceType::Dragon);
+
+        let mut via_loop: Vec<(Piece, Square)> = Vec::new();
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    via_loop.push((Piece::new(color, pt), sq));
+                }
+            }
+        }
+
+        let mut via_helper: Vec<(Piece, Square)> = Vec::new();
+        board.for_each_board_piece(|p, sq| via_helper.push((p, sq)));
+
+        assert_eq!(via_loop, via_helper);
+        // King は emit 対象外であることを確認。
+        assert!(
+            via_helper
+                .iter()
+                .all(|(p, _)| p.piece_type != PieceType::King)
+        );
+        // 玉以外の駒数は 9 + 9 + 1 + 1 = 20。
+        assert_eq!(via_helper.len(), 20);
+    }
+
+    #[test]
+    fn test_for_each_board_piece_propawn_above_nifu_limit() {
+        // と金 (ProPawn) は二歩規制対象外で同一色片側 18 枚まで合法的に到達可能。
+        // helper が同一 bucket に 18 個積む経路を踏み、emit 順は `pieces(color, pt)`
+        // を 26 通り loop で呼ぶ reference と一致することを確認する。
+        let mut board = ShogiBoard {
+            black_king_sq: Square::new(0, 8),
+            white_king_sq: Square::new(8, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+        // 9 筋 × 2 段 = 18 マスに黒 ProPawn を配置 (二歩規制は ProPawn には適用
+        // されないので合法局面として表現可)。
+        for file in 0..9 {
+            board.board[Square::new(file, 5).index()] =
+                Piece::new(Color::Black, PieceType::ProPawn);
+            board.board[Square::new(file, 6).index()] =
+                Piece::new(Color::Black, PieceType::ProPawn);
+        }
+
+        let mut via_loop: Vec<(Piece, Square)> = Vec::new();
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    via_loop.push((Piece::new(color, pt), sq));
+                }
+            }
+        }
+        let mut via_helper: Vec<(Piece, Square)> = Vec::new();
+        board.for_each_board_piece(|p, sq| via_helper.push((p, sq)));
+
+        assert_eq!(via_helper.len(), 18);
+        assert_eq!(via_loop, via_helper);
+    }
+
+    #[test]
+    fn test_for_each_board_piece_empty_board() {
+        // 全 None の board は何も emit しない。
+        let board = ShogiBoard::default();
+        let mut emitted = 0;
+        board.for_each_board_piece(|_, _| emitted += 1);
+        assert_eq!(emitted, 0);
     }
 
     #[test]

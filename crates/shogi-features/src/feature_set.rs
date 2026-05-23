@@ -20,7 +20,7 @@
 //! (`ShogiHalfKP` / `ShogiHalfKA` / `ShogiHalfKA_hm`、`ATTRIBUTION.md` 参照)。
 
 use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
-use shogi_format::types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square};
+use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
 // =============================================================================
@@ -305,17 +305,14 @@ impl FeatureSetSpec {
         let stm_ctx = self.perspective_ctx(stm_king, stm);
         let nstm_ctx = self.perspective_ctx(nstm_king, nstm);
 
-        // 盤上の駒 (玉以外。`BOARD_PIECE_TYPES` は玉を含まない)。
-        for &pt in &BOARD_PIECE_TYPES {
-            for color in [Color::Black, Color::White] {
-                for sq in board.pieces(color, pt) {
-                    let piece = Piece::new(color, pt);
-                    let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
-                    let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
-                    f(self.index(&stm_ctx, stm_bp), self.index(&nstm_ctx, nstm_bp));
-                }
-            }
-        }
+        // 盤上の駒 (玉以外)。`ShogiBoard::for_each_board_piece` が board を 1-pass
+        // で `(piece_type, color, ascending square)` 順に供給する (`pieces(color, pt)`
+        // を 26 通り loop で呼ぶパターンと emit 順は同一、helper doc 参照)。
+        board.for_each_board_piece(|piece, sq| {
+            let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+            let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+            f(self.index(&stm_ctx, stm_bp), self.index(&nstm_ctx, nstm_bp));
+        });
 
         // 両玉の特徴 (軸 1 が玉を特徴化するときのみ)。
         if self.emits_king_feature() {
