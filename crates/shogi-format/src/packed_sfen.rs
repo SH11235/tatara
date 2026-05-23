@@ -381,9 +381,9 @@ impl ShogiBoard {
             let bucket = (p.piece_type as usize) * COLORS + (p.color as usize);
             let n = counts[bucket] as usize;
             // MAX_PER_PC = 81 = board のマス数。`for (i, ..) in board.iter()` で
-            // 1 マス 1 push なので、bucket 当たり最大 81 (実際は 79: 玉 2 マスは
-            // 上で skip 済) を超えることは型レベルで起きない。defensive 配置
-            // (assert は安価 / static cap 等価)。
+            // 1 マス 1 push なので bucket 当たり最大 81 (ad-hoc board で全マスを
+            // 同 piece で埋めた場合の上限)、超過は型レベルで起こらない defensive
+            // 配置。
             debug_assert!(n < MAX_PER_PC);
             squares[bucket * MAX_PER_PC + n] = Square(i as u8);
             counts[bucket] = (n + 1) as u8;
