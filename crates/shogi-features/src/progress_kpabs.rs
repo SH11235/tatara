@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use shogi_format::bona_piece::FE_OLD_END;
-use shogi_format::types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES};
-use shogi_format::{BonaPiece, Color, PackedSfenValue, Piece, ShogiBoard};
+use shogi_format::types::HAND_PIECE_TYPES;
+use shogi_format::{BonaPiece, Color, PackedSfenValue, ShogiBoard};
 
 /// 8 bucket を採用 (progress を 0..=7 にマップ)。
 pub const SHOGI_PROGRESS8_NUM_BUCKETS: usize = 8;
@@ -66,23 +66,17 @@ impl ShogiProgressKPAbs {
         let sq_bk = board.black_king_sq.index();
         let sq_wk = board.white_king_sq.inverse().index();
 
-        for &pt in &BOARD_PIECE_TYPES {
-            for color in [Color::Black, Color::White] {
-                for sq in board.pieces(color, pt) {
-                    let piece = Piece::new(color, pt);
-
-                    let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
-                    if bp_b != BonaPiece::ZERO {
-                        f(sq_bk * FE_OLD_END + bp_b.value() as usize);
-                    }
-
-                    let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
-                    if bp_w != BonaPiece::ZERO {
-                        f(sq_wk * FE_OLD_END + bp_w.value() as usize);
-                    }
-                }
+        board.for_each_board_piece(|piece, sq| {
+            let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
+            if bp_b != BonaPiece::ZERO {
+                f(sq_bk * FE_OLD_END + bp_b.value() as usize);
             }
-        }
+
+            let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
+            if bp_w != BonaPiece::ZERO {
+                f(sq_wk * FE_OLD_END + bp_w.value() as usize);
+            }
+        });
 
         for owner in [Color::Black, Color::White] {
             let hand = if owner == Color::Black {
