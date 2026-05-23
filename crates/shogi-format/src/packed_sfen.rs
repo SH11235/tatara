@@ -7,6 +7,12 @@
 //! Huffman 表 (`HUFFMAN_TABLE`) と「成りbit + 先後bit」の bit layout は本 doc
 //! 内 / 関数 doc に直接記述している。駒箱 (hand 駒種外の駒) のフラグ判定にも
 //! 対応 (`decode_hand_piece` 参照)。
+//!
+//! 駒種 Huffman 復号は `HUFFMAN_BOARD_LUT` (盤上、64 entry) /
+//! `HUFFMAN_HAND_LUT` (手駒、32 entry) の `peek_bits` 1 回 → table 1 lookup で
+//! `(piece_idx, code_bits)` を取得する形に集約している。LUT は `HUFFMAN_TABLE`
+//! の prefix code から `const fn` で生成しており、テーブル本体 (LSB-first
+//! pattern + bit 長) を改変すれば LUT も自動で追随する。
 
 use super::types::{BOARD_PIECE_TYPES, Color, Hand, Piece, PieceType, Square};
 
@@ -28,14 +34,91 @@ const HUFFMAN_TABLE: [(u32, u8); 8] = [
     (0x0f, 5), // GOLD:     01111
 ];
 
-/// 駒種インデックス（Huffman テーブル用）
-const HUFFMAN_PAWN: usize = 1;
-const HUFFMAN_LANCE: usize = 2;
-const HUFFMAN_KNIGHT: usize = 3;
-const HUFFMAN_SILVER: usize = 4;
-const HUFFMAN_BISHOP: usize = 5;
-const HUFFMAN_ROOK: usize = 6;
-const HUFFMAN_GOLD: usize = 7;
+/// 駒種インデックス（Huffman テーブル用）。`HUFFMAN_TABLE` の row index と
+/// `HuffmanEntry::piece_idx` の両方で同じ値を使う。
+const HUFFMAN_NONE: u8 = 0;
+const HUFFMAN_PAWN: u8 = 1;
+const HUFFMAN_LANCE: u8 = 2;
+const HUFFMAN_KNIGHT: u8 = 3;
+const HUFFMAN_SILVER: u8 = 4;
+const HUFFMAN_BISHOP: u8 = 5;
+const HUFFMAN_ROOK: u8 = 6;
+const HUFFMAN_GOLD: u8 = 7;
+
+// =============================================================================
+// Fast-Huffman lookup table
+// =============================================================================
+
+/// 1 駒の Huffman 符号 1 entry。
+///
+/// `code_bits` は符号自体の bit 長 (`HUFFMAN_TABLE` の `len`)。
+/// 成り flag / 先後 flag bit はここには含まない (caller 側で別途読む)。
+#[derive(Clone, Copy)]
+struct HuffmanEntry {
+    piece_idx: u8,
+    code_bits: u8,
+}
+
+/// 盤上駒 LUT 引きで peek する bit 数 (= `HUFFMAN_TABLE` 中の最大 `len`)。
+const HUFFMAN_BOARD_PEEK_BITS: u8 = 6;
+/// 手駒 LUT 引きで peek する bit 数 (= board 最大 - 1、bit0 が省略されるため)。
+const HUFFMAN_HAND_PEEK_BITS: u8 = 5;
+
+/// `HUFFMAN_TABLE` の prefix code から `peek` 値 → entry の lookup table を
+/// 生成する。
+///
+/// `hand` が true のときは bullet-shogi の手駒 encoding (盤上符号から bit0 を
+/// 省略 = `pattern >> 1`、bit 長 -1) を使う。`hand=true` では NO_PIECE は
+/// 手駒符号化に出現しないので除外する。
+///
+/// LSB-first 解釈なので「peek 値の下位 `code_bits` bit が `pattern` に一致」
+/// する最初の entry を返す。`HUFFMAN_TABLE` は prefix code (どの符号も他の符号
+/// の prefix でない) なので一致は高々 1 通りに決まる。
+const fn build_huffman_lut<const N: usize>(hand: bool) -> [HuffmanEntry; N] {
+    let mut lut = [HuffmanEntry {
+        piece_idx: HUFFMAN_NONE,
+        code_bits: 0,
+    }; N];
+    let mut v: u32 = 0;
+    while (v as usize) < N {
+        let mut matched = false;
+        let mut i = 0;
+        while i < HUFFMAN_TABLE.len() {
+            if !(hand && i == 0) {
+                let (mut pattern, mut len) = HUFFMAN_TABLE[i];
+                if hand {
+                    pattern >>= 1;
+                    len -= 1;
+                }
+                let mask: u32 = if len >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << len) - 1
+                };
+                if (v & mask) == pattern {
+                    lut[v as usize] = HuffmanEntry {
+                        piece_idx: i as u8,
+                        code_bits: len,
+                    };
+                    matched = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        // `HUFFMAN_TABLE` の prefix code は board (peek 6 bit) / hand (peek 5 bit)
+        // 共に全 peek 値を網羅する設計 (各 v に一意に一致)。網羅性が崩れたら
+        // const-eval 中に落として LUT 生成段階で error にする。
+        if !matched {
+            panic!("HUFFMAN_TABLE prefix code does not cover all peek values");
+        }
+        v += 1;
+    }
+    lut
+}
+
+const HUFFMAN_BOARD_LUT: [HuffmanEntry; 1 << HUFFMAN_BOARD_PEEK_BITS] = build_huffman_lut(false);
+const HUFFMAN_HAND_LUT: [HuffmanEntry; 1 << HUFFMAN_HAND_PEEK_BITS] = build_huffman_lut(true);
 
 // =============================================================================
 // ビットストリーム
@@ -96,6 +179,37 @@ impl<'a> BitStream<'a> {
             }
         }
         result
+    }
+
+    /// カーソルを進めずに n bit を先読みする (LSB-first, n ≤ 25)。
+    ///
+    /// 4-byte unaligned load + shift / mask の 1 pass。バッファ末尾を越えた
+    /// 部分は 0 で埋め (decode loop 側が `cursor() < limit` で終端を制御する
+    /// ため、padding が PAWN code 0 と衝突しても OOB panic が起きない)。
+    /// `n > 25` のときは bit_cursor の byte 内 offset (最大 7) と合わせて 32 bit
+    /// を越えるので debug_assert で落とす。
+    #[inline]
+    pub fn peek_bits(&self, n: u8) -> u32 {
+        debug_assert!(n <= 25, "peek_bits supports up to 25 bits (32 - 7 = 25)");
+        let byte_pos = self.bit_cursor / 8;
+        let bit_off = (self.bit_cursor % 8) as u32;
+
+        let mut buf = [0u8; 4];
+        let copy_len = self.data.len().saturating_sub(byte_pos).min(buf.len());
+        buf[..copy_len].copy_from_slice(&self.data[byte_pos..byte_pos + copy_len]);
+        let word = u32::from_le_bytes(buf);
+
+        let mask: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+        (word >> bit_off) & mask
+    }
+
+    /// カーソルを n bit 進める。`peek_bits` で取り出した bit の消費に使う。
+    ///
+    /// `read_bit` と違い OOB clamp はしない (bit_cursor は bit_limit を越え得る)。
+    /// 越えた後の `read_bit` は false を返すので decode loop 側で問題ない。
+    #[inline]
+    pub fn advance(&mut self, n: usize) {
+        self.bit_cursor += n;
     }
 }
 
@@ -408,7 +522,7 @@ impl ShogiBoard {
 // =============================================================================
 
 /// Huffman 符号インデックスから PieceType に変換
-fn huffman_index_to_piece_type(idx: usize) -> PieceType {
+fn huffman_index_to_piece_type(idx: u8) -> PieceType {
     match idx {
         HUFFMAN_PAWN => PieceType::Pawn,
         HUFFMAN_LANCE => PieceType::Lance,
@@ -425,48 +539,31 @@ fn huffman_index_to_piece_type(idx: usize) -> PieceType {
 ///
 /// 形式: Huffman 符号 + 成り bit (金以外) + 先後 bit。
 fn decode_board_piece(stream: &mut BitStream) -> Piece {
-    // Huffman 符号をデコードして駒種を取得
-    let mut code = 0u32;
-    let mut bits = 0u8;
+    let entry = HUFFMAN_BOARD_LUT[stream.peek_bits(HUFFMAN_BOARD_PEEK_BITS) as usize];
+    stream.advance(entry.code_bits as usize);
 
-    loop {
-        code |= (stream.read_bit() as u32) << bits;
-        bits += 1;
-
-        // テーブルから一致するエントリを探す
-        for (idx, &(pattern, len)) in HUFFMAN_TABLE.iter().enumerate() {
-            if bits == len && code == pattern {
-                if idx == 0 {
-                    // NO_PIECE
-                    return Piece::NONE;
-                }
-
-                let base_pt = huffman_index_to_piece_type(idx);
-
-                // 成りフラグ（金以外）
-                let promoted = if idx != HUFFMAN_GOLD {
-                    stream.read_bit()
-                } else {
-                    false
-                };
-
-                // 先後フラグ
-                let color = if stream.read_bit() {
-                    Color::White
-                } else {
-                    Color::Black
-                };
-
-                let pt = if promoted { base_pt.promote() } else { base_pt };
-                return Piece::new(color, pt);
-            }
-        }
-
-        // 最大6ビット
-        if bits > 6 {
-            return Piece::NONE;
-        }
+    if entry.piece_idx == HUFFMAN_NONE {
+        return Piece::NONE;
     }
+
+    let base_pt = huffman_index_to_piece_type(entry.piece_idx);
+
+    // 成りフラグ（金以外）
+    let promoted = if entry.piece_idx != HUFFMAN_GOLD {
+        stream.read_bit()
+    } else {
+        false
+    };
+
+    // 先後フラグ
+    let color = if stream.read_bit() {
+        Color::White
+    } else {
+        Color::Black
+    };
+
+    let pt = if promoted { base_pt.promote() } else { base_pt };
+    Piece::new(color, pt)
 }
 
 /// 手駒をデコード
@@ -476,51 +573,26 @@ fn decode_board_piece(stream: &mut BitStream) -> Piece {
 /// 戻り値: (駒, 駒箱フラグ)
 /// - 駒箱フラグが true の場合、その駒は持ち駒ではなく駒箱の駒。
 fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
-    // 手駒の Huffman 符号は盤上より1ビット少ない（bit0 を省略）
-    let mut code = 0u32;
-    let mut bits = 0u8;
+    let entry = HUFFMAN_HAND_LUT[stream.peek_bits(HUFFMAN_HAND_PEEK_BITS) as usize];
+    stream.advance(entry.code_bits as usize);
 
-    loop {
-        code |= (stream.read_bit() as u32) << bits;
-        bits += 1;
+    let base_pt = huffman_index_to_piece_type(entry.piece_idx);
 
-        for (idx, &(pattern, len)) in HUFFMAN_TABLE.iter().enumerate() {
-            // 手駒: pattern >> 1, len - 1
-            if idx == 0 {
-                continue; // NO_PIECE は手駒にない
-            }
+    // 成りフラグ（金以外）。これが true なら駒箱の駒。
+    let is_piecebox = if entry.piece_idx != HUFFMAN_GOLD {
+        stream.read_bit()
+    } else {
+        false
+    };
 
-            let hand_pattern = pattern >> 1;
-            let hand_len = len - 1;
+    // 先後フラグ
+    let color = if stream.read_bit() {
+        Color::White
+    } else {
+        Color::Black
+    };
 
-            if bits == hand_len && code == hand_pattern {
-                let base_pt = huffman_index_to_piece_type(idx);
-
-                // 成りフラグ（金以外）
-                // これが true なら駒箱の駒
-                let is_piecebox = if idx != HUFFMAN_GOLD {
-                    stream.read_bit()
-                } else {
-                    false
-                };
-
-                // 先後フラグ
-                let color = if stream.read_bit() {
-                    Color::White
-                } else {
-                    Color::Black
-                };
-
-                let piece = Piece::new(color, base_pt);
-                return (piece, is_piecebox);
-            }
-        }
-
-        if bits > 5 {
-            // エラー: 不正な符号
-            return (Piece::NONE, false);
-        }
-    }
+    (Piece::new(color, base_pt), is_piecebox)
 }
 
 // =============================================================================
@@ -844,5 +916,236 @@ mod tests {
 
         // OOB アクセスしても panic しない
         assert!(!stream.read_bit());
+    }
+
+    // ---------------------------------------------------------------------
+    // Fast-Huffman LUT の parity tests
+    //
+    // `legacy_decode_*` は本ファイル変更前の 1-bit ループ + 線形 scan 実装の
+    // 写し (test 用 reference)。LUT 経由の `decode_*` と全 6-bit / 5-bit
+    // 入力 × promote × color の組合せで bit-identical であることを確認する。
+    // ---------------------------------------------------------------------
+
+    fn legacy_decode_board_piece(stream: &mut BitStream) -> Piece {
+        let mut code = 0u32;
+        let mut bits = 0u8;
+        loop {
+            code |= (stream.read_bit() as u32) << bits;
+            bits += 1;
+            for (idx, &(pattern, len)) in HUFFMAN_TABLE.iter().enumerate() {
+                if bits == len && code == pattern {
+                    if idx == 0 {
+                        return Piece::NONE;
+                    }
+                    let base_pt = huffman_index_to_piece_type(idx as u8);
+                    let promoted = if idx as u8 != HUFFMAN_GOLD {
+                        stream.read_bit()
+                    } else {
+                        false
+                    };
+                    let color = if stream.read_bit() {
+                        Color::White
+                    } else {
+                        Color::Black
+                    };
+                    let pt = if promoted { base_pt.promote() } else { base_pt };
+                    return Piece::new(color, pt);
+                }
+            }
+            if bits > 6 {
+                return Piece::NONE;
+            }
+        }
+    }
+
+    fn legacy_decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
+        let mut code = 0u32;
+        let mut bits = 0u8;
+        loop {
+            code |= (stream.read_bit() as u32) << bits;
+            bits += 1;
+            for (idx, &(pattern, len)) in HUFFMAN_TABLE.iter().enumerate() {
+                if idx == 0 {
+                    continue;
+                }
+                let hand_pattern = pattern >> 1;
+                let hand_len = len - 1;
+                if bits == hand_len && code == hand_pattern {
+                    let base_pt = huffman_index_to_piece_type(idx as u8);
+                    let is_piecebox = if idx as u8 != HUFFMAN_GOLD {
+                        stream.read_bit()
+                    } else {
+                        false
+                    };
+                    let color = if stream.read_bit() {
+                        Color::White
+                    } else {
+                        Color::Black
+                    };
+                    return (Piece::new(color, base_pt), is_piecebox);
+                }
+            }
+            if bits > 5 {
+                return (Piece::NONE, false);
+            }
+        }
+    }
+
+    /// 5 byte (40 bit) ある任意の入力で `decode_board_piece` の結果と消費 bit 数
+    /// が legacy 1-bit ループ実装と完全一致することを 6-bit peek + 2 flag bit の
+    /// 全 256 組合せで確認する。
+    #[test]
+    fn fast_huffman_board_matches_legacy_all_inputs() {
+        // 8 bit (= 6 peek + 2 flag) の全入力を 5 byte buffer の先頭に置き、
+        // 残り byte は 0 padding。
+        for v in 0u16..256 {
+            let bytes = [v as u8, 0u8, 0u8, 0u8, 0u8];
+
+            let mut s_legacy = BitStream::new(&bytes);
+            let p_legacy = legacy_decode_board_piece(&mut s_legacy);
+
+            let mut s_fast = BitStream::new(&bytes);
+            let p_fast = decode_board_piece(&mut s_fast);
+
+            assert_eq!(p_legacy, p_fast, "piece mismatch at v={v:08b}");
+            assert_eq!(
+                s_legacy.cursor(),
+                s_fast.cursor(),
+                "cursor mismatch at v={v:08b}: legacy={} fast={}",
+                s_legacy.cursor(),
+                s_fast.cursor(),
+            );
+        }
+    }
+
+    #[test]
+    fn fast_huffman_hand_matches_legacy_all_inputs() {
+        // 7 bit (= 5 peek + 2 flag) の全入力を 5 byte buffer 先頭に置く。
+        for v in 0u16..128 {
+            let bytes = [v as u8, 0u8, 0u8, 0u8, 0u8];
+
+            let mut s_legacy = BitStream::new(&bytes);
+            let (p_legacy, box_legacy) = legacy_decode_hand_piece(&mut s_legacy);
+
+            let mut s_fast = BitStream::new(&bytes);
+            let (p_fast, box_fast) = decode_hand_piece(&mut s_fast);
+
+            assert_eq!(p_legacy, p_fast, "piece mismatch at v={v:08b}");
+            assert_eq!(box_legacy, box_fast, "piecebox flag mismatch at v={v:08b}");
+            assert_eq!(
+                s_legacy.cursor(),
+                s_fast.cursor(),
+                "cursor mismatch at v={v:08b}"
+            );
+        }
+    }
+
+    /// `tests/data/sample.psv` (100 records) を新旧両方の経路で decode し、
+    /// `ShogiBoard` の盤面 / 持駒 / 手番 / 玉位置が record 毎 byte-identical
+    /// であることを確認する。`from_packed_sfen` の上層 (king pos 読み出し / loop
+    /// 終端 / `is_piecebox` の hand 振り分け) も含めた end-to-end parity test。
+    #[test]
+    fn fast_huffman_full_decode_matches_legacy_on_sample_psv() {
+        use std::path::PathBuf;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            // sample.psv が無い環境 (fixture を持っていない fork など) は skip。
+            // 既存 `psv_smoke` test で存在は検証されているのでここでは required にしない。
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+        for (i, psv) in records.iter().enumerate() {
+            let fast = ShogiBoard::from_packed_sfen(psv);
+            let slow = legacy_from_packed_sfen(psv);
+            assert_eq!(fast.board, slow.board, "record {i}: board mismatch");
+            // Hand に PartialEq が無いので公開フィールド counts で比較する。
+            assert_eq!(
+                fast.black_hand.counts, slow.black_hand.counts,
+                "record {i}: black_hand"
+            );
+            assert_eq!(
+                fast.white_hand.counts, slow.white_hand.counts,
+                "record {i}: white_hand"
+            );
+            assert_eq!(
+                fast.side_to_move, slow.side_to_move,
+                "record {i}: side_to_move"
+            );
+            assert_eq!(
+                fast.black_king_sq, slow.black_king_sq,
+                "record {i}: black_king_sq"
+            );
+            assert_eq!(
+                fast.white_king_sq, slow.white_king_sq,
+                "record {i}: white_king_sq"
+            );
+        }
+    }
+
+    fn legacy_from_packed_sfen(psv: &PackedSfenValue) -> ShogiBoard {
+        let mut board = ShogiBoard {
+            score: psv.score(),
+            result: psv.game_result(),
+            ply: psv.game_ply(),
+            ..Default::default()
+        };
+        let mut stream = BitStream::new(&psv.sfen().data);
+
+        board.side_to_move = if stream.read_bit() {
+            Color::White
+        } else {
+            Color::Black
+        };
+        let black_king_idx = stream.read_bits(7) as u8;
+        let white_king_idx = stream.read_bits(7) as u8;
+        board.black_king_sq = Square(black_king_idx);
+        board.white_king_sq = Square(white_king_idx);
+        if black_king_idx < 81 {
+            board.board[black_king_idx as usize] = Piece::new(Color::Black, PieceType::King);
+        }
+        if white_king_idx < 81 {
+            board.board[white_king_idx as usize] = Piece::new(Color::White, PieceType::King);
+        }
+        for sq_idx in 0..81u8 {
+            if sq_idx == black_king_idx || sq_idx == white_king_idx {
+                continue;
+            }
+            board.board[sq_idx as usize] = legacy_decode_board_piece(&mut stream);
+        }
+        while stream.cursor() < 256 {
+            let (piece, is_piecebox) = legacy_decode_hand_piece(&mut stream);
+            if is_piecebox {
+                continue;
+            }
+            let pt = piece.piece_type;
+            match piece.color {
+                Color::Black => board.black_hand.add(pt, 1),
+                Color::White => board.white_hand.add(pt, 1),
+            }
+        }
+        board
+    }
+
+    #[test]
+    fn peek_bits_zero_pads_past_end() {
+        // バッファ末尾を越えた peek_bits は 0 padding で返ることを確認。
+        // (decode loop が cursor 終端を制御する前提で OOB panic させない。)
+        let data = [0xFFu8, 0xFFu8];
+        let stream = BitStream::new(&data);
+        // cursor=0 で 16 bit 全部読めることを peek で確認 (mask 通すと 0xFFFF)。
+        assert_eq!(stream.peek_bits(16), 0xFFFF);
+
+        // バッファ越え位置で peek
+        let mut s2 = BitStream::new(&data);
+        s2.advance(16);
+        assert_eq!(s2.peek_bits(6), 0); // 全て 0 padding
+
+        let mut s3 = BitStream::new(&data);
+        s3.advance(15);
+        // cursor 15: data[1] の bit 7 (=1) + 5 bit padding (=0) → 0b000001
+        assert_eq!(s3.peek_bits(6), 0b000001);
     }
 }
