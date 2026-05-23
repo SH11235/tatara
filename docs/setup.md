@@ -32,8 +32,7 @@ whole workspace fails on the cuda-oxide-dependent build.
 Building cuda-oxide on native Windows is **officially unsupported upstream**.
 The cuda-oxide installation documentation (linked under "Related" at the end)
 explicitly states "cuda-oxide currently targets Linux only. Windows is not
-supported." (as of 2026-05; there is no Windows-support issue or work either).
-On top of that, cuda-oxide is an experimental backend tied directly to the rustc
+supported." On top of that, cuda-oxide is an experimental backend tied directly to the rustc
 internal ABI, and this repo's `build.rs` also resolves the CUDA toolkit root
 using Linux paths (`/usr/local/cuda` / `lib64/libcublas.so`). So for the GPU
 crates (`gpu-runtime` / `bins/*`) on Windows, use **WSL2 + Ubuntu**. NVIDIA GPUs
@@ -42,8 +41,7 @@ work as-is (cuda-oxide is also officially tested on Ubuntu 24.04).
 
 Note that the CPU-only crates (`shogi-format` / `shogi-features` /
 `gpu-kernels` / `nnue-format` / `nnue-train`) pass `cargo test` even on native
-Windows (the MSVC toolchain) (242 tests verified green on Windows 11 +
-nightly-2026-04-03 in 2026-05). You can run the same scope as the GitHub Actions
+Windows (the MSVC toolchain). You can run the same scope as the GitHub Actions
 CPU check from your local Windows PowerShell:
 
 ```powershell
@@ -136,9 +134,25 @@ which llc-21 clang
 llc-21 --version | grep nvptx
 ```
 
-For Rust, use rustup. `rust-toolchain.toml` pins a nightly, so running `cargo`
-inside the repository automatically installs the matching toolchain (and the
-`rust-src` / `rustc-dev` components).
+## Install Rust
+
+If `rustup` is not yet on the host, bootstrap it:
+
+```bash
+wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+. "$HOME/.cargo/env"   # adds ~/.cargo/bin to PATH for the current shell
+```
+
+`--default-toolchain none` defers picking a host-default; this repo's
+`rust-toolchain.toml` pins the nightly that cuda-oxide requires, so the first
+`cargo` invocation inside the repository auto-installs the matching toolchain
+together with the `rust-src` / `rustc-dev` / `clippy` / `rust-analyzer`
+components:
+
+```bash
+cd /path/to/tatara
+rustup show active-toolchain   # triggers the pinned-nightly install on first run
+```
 
 ## Setting up cuda-oxide
 
@@ -286,6 +300,31 @@ prebuilt `.ptx`, so even users who do not modify the kernels need
 The cuda-oxide rev is pinned in this repository's `Cargo.toml`
 (`[workspace.dependencies]`), and `scripts/setup-cuda-oxide.sh` keeps
 `cargo-oxide` on the same rev. LLVM works on either 21 (sm_75) or 22 (sm_86).
+
+## Troubleshooting
+
+### `cargo build` ICE: "Missing SyntaxContext NN for crate alloc/core/std"
+
+Symptom: `cargo build` panics inside `rustc` with `Missing SyntaxContext NN for
+crate "alloc"` (or `core` / `std`), the query stack ends in `type_of` /
+`associated_item` for a stdlib symbol such as `Vec::from_parts` or
+`RawVecInner::with_capacity_in`, and the same panic reproduces on basic
+dependencies like `libloading` or `clap_lex`. Root cause is a corrupted stdlib
+`.rlib` / `.rmeta` in the installed nightly toolchain — the `decode_syntax_context`
+hashmap inside the precompiled stdlib metadata is missing entries the rest of
+the metadata still points at. Reinstall the pinned nightly:
+
+```bash
+toolchain=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+rustup toolchain uninstall "$toolchain"
+rustup show active-toolchain   # reads rust-toolchain.toml and reinstalls the pinned nightly
+cargo clean
+cargo build
+```
+
+`rustup` is content-addressed per component, so the reinstall just refetches
+the broken `rust-std` / `rustc-dev` archives. There is no need to delete
+`~/.cargo/registry` or rebuild a custom toolchain.
 
 ## Related
 
