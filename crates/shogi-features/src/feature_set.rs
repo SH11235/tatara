@@ -122,7 +122,7 @@ impl FeatureSet {
                 piece_inputs: PIECE_INPUTS_SPLIT,
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_SPLIT,
-                arch_feature_name: "HalfKA",
+                arch_feature_name: "HalfKaSplit",
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
                 feature_set: self,
@@ -132,7 +132,7 @@ impl FeatureSet {
                 piece_inputs: PIECE_INPUTS_MERGED,
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_MERGED,
-                arch_feature_name: "HalfKA_merged",
+                arch_feature_name: "HalfKaMerged",
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
                 feature_set: self,
@@ -142,7 +142,7 @@ impl FeatureSet {
                 piece_inputs: PIECE_INPUTS_SPLIT,
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_HM_SPLIT,
-                arch_feature_name: "HalfKA_hm_split",
+                arch_feature_name: "HalfKaHmSplit",
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
                 feature_set: self,
@@ -152,7 +152,7 @@ impl FeatureSet {
                 piece_inputs: PIECE_INPUTS_MERGED,
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_HM_MERGED,
-                arch_feature_name: "HalfKA_hm",
+                arch_feature_name: "HalfKaHmMerged",
             },
         }
     }
@@ -503,5 +503,22 @@ mod tests {
         // FNV-1a が canonical 名から決定的に上記の値を導くことを確認する。
         assert_eq!(fnv1a32("halfka-merged"), 0xACD6_8C97);
         assert_eq!(fnv1a32("halfka-hm-split"), 0x2A46_AC09);
+    }
+
+    #[test]
+    fn arch_feature_name_uses_pascal_case() {
+        // arch_str に embed される keyword は PascalCase 表記で固定する。
+        // 推論側 (rshogi) parser は両綴りを受理するが、emit は新規 .bin に
+        // 単一の canonical 形を残す。
+        let expected = [
+            (FeatureSet::HalfKp, "HalfKP"),
+            (FeatureSet::HalfKaSplit, "HalfKaSplit"),
+            (FeatureSet::HalfKaMerged, "HalfKaMerged"),
+            (FeatureSet::HalfKaHmSplit, "HalfKaHmSplit"),
+            (FeatureSet::HalfKaHmMerged, "HalfKaHmMerged"),
+        ];
+        for (fs, name) in expected {
+            assert_eq!(fs.spec().arch_feature_name(), name, "{:?}", fs);
+        }
     }
 }

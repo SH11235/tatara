@@ -887,7 +887,7 @@ mod tests {
     fn arch_str_contains_structured_fields() {
         let id = test_id(SimpleActivation::SCReLU);
         let s = build_arch_str(&id, 27);
-        assert!(s.contains("HalfKA_hm(Friend)[73305->256x2]"));
+        assert!(s.contains("HalfKaHmMerged(Friend)[73305->256x2]"));
         assert!(s.contains("SqrClippedReLU[32]"));
         assert!(s.contains("AffineTransformSparseInput[32<-512]"));
         assert!(s.contains("InputSlice[512(0:512)]"));
@@ -900,7 +900,7 @@ mod tests {
         // (AffineTransformSparseInput / InputSlice) が ft_out (= 256) に半減する。
         let id = test_id(SimpleActivation::Pairwise);
         let s = build_arch_str(&id, 27);
-        assert!(s.contains("HalfKA_hm(Friend)[73305->256/2x2]-Pairwise"));
+        assert!(s.contains("HalfKaHmMerged(Friend)[73305->256/2x2]-Pairwise"));
         assert!(s.contains("ClippedReLU[32]"));
         assert!(s.contains("AffineTransformSparseInput[32<-256]"));
         assert!(s.contains("InputSlice[256(0:256)]"));

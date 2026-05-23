@@ -237,7 +237,7 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///
 /// (実際は 1 行連結、ここでは可読性のため改行)
 ///
-/// `feature_name` は `FeatureSetSpec::arch_feature_name` (`HalfKA_hm` 等)。
+/// `feature_name` は `FeatureSetSpec::arch_feature_name` (`HalfKaHmMerged` 等)。
 /// arch 文字列の `Features=...` トークンを生成する。
 ///
 /// `load_quantised` の reject policy はこのトークンを構造化フィールドの権威として
@@ -1267,7 +1267,7 @@ mod tests {
     #[test]
     fn arch_str_format() {
         let s = build_arch_str(
-            "HalfKA_hm",
+            "HalfKaHmMerged",
             test_spec().ft_in(),
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
@@ -1276,7 +1276,7 @@ mod tests {
             FV_SCALE,
             None,
         );
-        assert!(s.contains("HalfKA_hm"));
+        assert!(s.contains("HalfKaHmMerged"));
         assert!(s.contains("73305->1536x2"));
         assert!(s.contains("AffineTransform[1<-32]"));
         assert!(s.contains("ClippedReLU[32]"));
@@ -1292,14 +1292,14 @@ mod tests {
     #[test]
     fn build_arch_str_with_psqt_inserts_token() {
         // psqt_buckets = Some(9) で `PSQT=9,` token が Features と Network の間に入る。
-        let s = build_arch_str("HalfKA_hm", 73_305, 1536, 16, 30, 32, 28, Some(9));
+        let s = build_arch_str("HalfKaHmMerged", 73_305, 1536, 16, 30, 32, 28, Some(9));
         assert!(s.contains("PSQT=9,"));
         // 順序: Features=...,PSQT=9,Network=...
         let psqt_pos = s.find("PSQT=9,").unwrap();
         let net_pos = s.find("Network=").unwrap();
         assert!(psqt_pos < net_pos);
         // 既存 token は維持。
-        assert!(s.contains("Features=HalfKA_hm(Friend)[73305->1536x2]"));
+        assert!(s.contains("Features=HalfKaHmMerged(Friend)[73305->1536x2]"));
         assert!(s.contains("fv_scale=28"));
     }
 
