@@ -183,20 +183,26 @@ impl<'a> BitStream<'a> {
 
     /// カーソルを進めずに n bit を先読みする (LSB-first, n ≤ 25)。
     ///
-    /// 4-byte unaligned load + shift / mask の 1 pass。バッファ末尾を越えた
-    /// 部分は 0 で埋め (decode loop 側が `cursor() < limit` で終端を制御する
-    /// ため、padding が PAWN code 0 と衝突しても OOB panic が起きない)。
+    /// 4-byte unaligned load + shift / mask の 1 pass。`bit_cursor` が
+    /// `bit_limit` を越えていても panic しない: slice 起点を `data.len()` に
+    /// clamp してから copy するので `&data[i..i]` で i > len になる経路は無く、
+    /// 末尾を越えた byte は 0 で埋まる。decode loop 側で `cursor() < limit` の
+    /// 終端制御を前提にしているため、padding が PAWN code 0 と衝突しても挙動
+    /// 上の問題は無い (caller 側で続けて読まれない)。
     /// `n > 25` のときは bit_cursor の byte 内 offset (最大 7) と合わせて 32 bit
     /// を越えるので debug_assert で落とす。
     #[inline]
     pub fn peek_bits(&self, n: u8) -> u32 {
         debug_assert!(n <= 25, "peek_bits supports up to 25 bits (32 - 7 = 25)");
-        let byte_pos = self.bit_cursor / 8;
         let bit_off = (self.bit_cursor % 8) as u32;
+        // bit_cursor が bit_limit を越え (advance で進めた後等)、(bit_cursor / 8)
+        // が data.len() を越えても panic しないよう clamp する。clamp 後の
+        // [start..start+copy_len] は常に `data` の有効 sub-slice。
+        let start = (self.bit_cursor / 8).min(self.data.len());
 
         let mut buf = [0u8; 4];
-        let copy_len = self.data.len().saturating_sub(byte_pos).min(buf.len());
-        buf[..copy_len].copy_from_slice(&self.data[byte_pos..byte_pos + copy_len]);
+        let copy_len = (self.data.len() - start).min(buf.len());
+        buf[..copy_len].copy_from_slice(&self.data[start..start + copy_len]);
         let word = u32::from_le_bytes(buf);
 
         let mask: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
@@ -921,9 +927,11 @@ mod tests {
     // ---------------------------------------------------------------------
     // Fast-Huffman LUT の parity tests
     //
-    // `legacy_decode_*` は本ファイル変更前の 1-bit ループ + 線形 scan 実装の
-    // 写し (test 用 reference)。LUT 経由の `decode_*` と全 6-bit / 5-bit
-    // 入力 × promote × color の組合せで bit-identical であることを確認する。
+    // `legacy_decode_*` は HUFFMAN_TABLE を 1-bit ループ + 全 entry 線形 scan で
+    // 復号する素直な reference 実装 (LUT-free)。LUT 経由の `decode_*` と全
+    // 6-bit (board) / 5-bit (hand) peek × promote × color の組合せで
+    // bit-identical (decoded piece + 消費 cursor 一致) であることを exhaustive に
+    // 確認するための double-check 経路。
     // ---------------------------------------------------------------------
 
     fn legacy_decode_board_piece(stream: &mut BitStream) -> Piece {
@@ -1048,12 +1056,18 @@ mod tests {
     fn fast_huffman_full_decode_matches_legacy_on_sample_psv() {
         use std::path::PathBuf;
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample.psv");
-        let Ok(bytes) = std::fs::read(&path) else {
-            // sample.psv が無い環境 (fixture を持っていない fork など) は skip。
-            // 既存 `psv_smoke` test で存在は検証されているのでここでは required にしない。
-            return;
-        };
+        // fixture が消えた状態で silent pass にすると parity claim が崩れるので
+        // hard fail させる (`tests/data/sample.psv` は repo 同梱、`psv_smoke` も
+        // 同じ file を required に扱う)。
+        let bytes =
+            std::fs::read(&path).expect("crates/shogi-format/tests/data/sample.psv が読めない");
         assert_eq!(bytes.len() % 40, 0);
+        // SAFETY:
+        // - `PackedSfenValue` は `#[repr(C)]` / size=40 / align=1 で `[u8; 40]` 単体の
+        //   POD (`size_of` test で検証済)、任意のバイト列が valid 表現。
+        // - `bytes` は `Vec<u8>` の所有データで align=1、`bytes.len() % 40 == 0` を
+        //   直前で確認済なので末端 partial record は無い。
+        // - 返す slice の lifetime は外側 `bytes` の lifetime 内に閉じる。
         let records: &[PackedSfenValue] = unsafe {
             std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
         };
@@ -1138,7 +1152,7 @@ mod tests {
         // cursor=0 で 16 bit 全部読めることを peek で確認 (mask 通すと 0xFFFF)。
         assert_eq!(stream.peek_bits(16), 0xFFFF);
 
-        // バッファ越え位置で peek
+        // バッファ末尾ちょうど (cursor=16, byte_pos == data.len()) で peek
         let mut s2 = BitStream::new(&data);
         s2.advance(16);
         assert_eq!(s2.peek_bits(6), 0); // 全て 0 padding
@@ -1147,5 +1161,13 @@ mod tests {
         s3.advance(15);
         // cursor 15: data[1] の bit 7 (=1) + 5 bit padding (=0) → 0b000001
         assert_eq!(s3.peek_bits(6), 0b000001);
+
+        // bit_cursor が bit_limit を大きく越えた (advance 連発の後 etc.、
+        // byte_pos > data.len()) ケースでも slice 起点 clamp により panic
+        // しないことを確認。
+        let mut s4 = BitStream::new(&data);
+        s4.advance(64); // bit_cursor=64 → byte_pos=8、data.len()=2
+        assert_eq!(s4.peek_bits(6), 0);
+        assert_eq!(s4.peek_bits(25), 0);
     }
 }
