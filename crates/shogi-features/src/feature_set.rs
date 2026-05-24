@@ -355,20 +355,16 @@ impl FeatureSetSpec {
         out
     }
 
-    /// active 特徴 index を `stm_out` / `nstm_out` slice に直接書込み、書込んだ
-    /// 件数を返す (closure 経由の [`map_features_board`] と byte-identical な
-    /// 出力を SIMD-friendly な形で得るための entry point)。`nnue-train` 側の
-    /// `Batch::push_decoded` がこの method を呼んで sparse 配列に詰める。
+    /// active 特徴 index を `stm_out` / `nstm_out` に直接書込んで件数を返す。
+    /// closure 経由 [`map_features_board`] と byte-identical な出力を SIMD store
+    /// と直接 fit する形で取り出す。
     ///
-    /// 玉位置が無効な局面 (片玉 / 詰将棋データ) は何も書込まず 0 を返す。
-    /// 出力 slice 長が `max_active` 未満の場合は超過分を silent skip する
-    /// (caller の defensive 動作に合わせる)。
+    /// 玉位置が無効な局面 (片玉 / 詰将棋) は 0 を返して何も書込まない。出力
+    /// slice 長 `max_active` 越えの分は silent skip する。
     ///
-    /// 内部 dispatch:
-    /// - HalfKaHmMerged の board phase は [`crate::simd`] (起動時 1 回 detect
-    ///   した scalar / AVX-2 / AVX-512 のいずれか) を経由
-    /// - その他 feature set および king / hand phase は closure-base path で
-    ///   1 経路 scalar
+    /// HalfKaHmMerged の board phase は [`crate::simd`] (runtime detect で
+    /// scalar / AVX-2 / AVX-512 のいずれか)、それ以外 / king / hand phase は
+    /// scalar。
     ///
     /// [`map_features_board`]: Self::map_features_board
     pub fn extract_active_features(
@@ -392,11 +388,10 @@ impl FeatureSetSpec {
         let cap = stm_out.len();
         let mut count = 0usize;
 
-        // ---- board phase ----
+        // board phase
         if crate::simd::spec_is_halfka_hm_merged(self) {
-            // SIMD path 用の (pt, color, sq) を i32 配列に積む。max board piece は
-            // 81 マス上限 (異常局面でも `for_each_board_piece` は 81 を越えない)
-            // なので 96 (16 lane 倍数) を確保する。
+            // (pt, color, sq) を i32 stack 配列に積む。`for_each_board_piece` は
+            // 81 マス上限、AVX-512 lane (16) 倍数で 96 確保。
             const STACK_BUF: usize = 96;
             let mut pt_buf = [0i32; STACK_BUF];
             let mut color_buf = [0i32; STACK_BUF];
@@ -411,8 +406,6 @@ impl FeatureSetSpec {
                 }
             });
 
-            // SIMD path に渡せる count を `cap - count` で頭打ちにする。実 PSV
-            // では駒数 40 で `max_active = 40` なので発火しないが defensive。
             let writable = n_pieces.min(cap.saturating_sub(count));
             if writable > 0 {
                 let stm_pers = crate::simd::PerspectiveOffset {
@@ -440,8 +433,7 @@ impl FeatureSetSpec {
                 count += writable;
             }
         } else {
-            // generic scalar path: 既存 `map_features_board` と同じ formula を
-            // closure で踏む (HalfKaHmMerged 以外は SIMD 化対象外)。
+            // HalfKaHmMerged 以外は SIMD 化対象外、closure で 1 駒ずつ計算。
             board.for_each_board_piece(|piece, sq| {
                 if count >= cap {
                     return;
@@ -454,7 +446,7 @@ impl FeatureSetSpec {
             });
         }
 
-        // ---- king phase ----
+        // king phase
         if self.emits_king_feature() {
             if count < cap {
                 let stm_friend = king_bonapiece(stm_king, stm, true);
@@ -472,7 +464,7 @@ impl FeatureSetSpec {
             }
         }
 
-        // ---- hand phase ----
+        // hand phase
         for owner in [Color::Black, Color::White] {
             for &pt in &HAND_PIECE_TYPES {
                 let n_hand = board.hand(owner).count(pt);
@@ -654,10 +646,9 @@ mod tests {
 
     #[test]
     fn extract_active_features_matches_map_features_board() {
-        // 公開 5 feature set 全てで、direct-write API (`extract_active_features`
-        // — HalfKaHmMerged は SIMD dispatch、それ以外 scalar fallback) が
-        // closure API (`map_features_board`) と byte-identical な sparse index
-        // 列を emit することを sample.psv 100 records で確認する。
+        // 公開 5 feature set × sample.psv 100 records で
+        // `extract_active_features` と `map_features_board` の sparse index 列が
+        // byte-identical であることを確認する。
         use std::path::PathBuf;
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");

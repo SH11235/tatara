@@ -1,15 +1,10 @@
-//! `map_features_board` の board phase 向け runtime SIMD dispatch。
+//! HalfKaHmMerged board phase の runtime SIMD dispatch。
 //!
-//! HalfKaHmMerged feature set の board piece 1 枚あたりの
-//! `(BonaPiece × 2 視点 → packed index × 2 視点)` 計算を SIMD lane に並べる
-//! ための path 群と、起動時 1 回判定の dispatch hook を置く。
+//! - `scalar`: lane-width 1 reference (常時 available、tail fallback も兼ねる)
+//! - `avx2`:   x86_64 + AVX-2 (8 lane × i32)
+//! - `avx512`: x86_64 + AVX-512F (16 lane × i32)
 //!
-//! - `scalar`: lane-width 1 の reference 実装、常時 available
-//! - `avx2`:   x86_64 + AVX-2 (8 lane × i32)、`#[target_feature]` 制御
-//! - `avx512`: x86_64 + AVX-512F (16 lane × i32)、`#[target_feature]` 制御
-//!
-//! dispatch は `BoardPhaseDispatch::detect()` 経由で起動時 1 回判定 → `OnceLock` に
-//! cache、以降は branch なしで関数 pointer 呼び出し。
+//! `BoardPhaseDispatch::detect()` で起動時 1 回判定し `OnceLock` に焼く。
 
 use crate::feature_set::FeatureSetSpec;
 use std::sync::OnceLock;
@@ -24,22 +19,20 @@ mod avx2;
 #[cfg(target_arch = "x86_64")]
 mod avx512;
 
-/// HalfKaHmMerged 専用 board phase の 1 視点コンテキスト (king bucket × piece
-/// inputs を事前計算した縦軸 offset、mirror 要否)。
+/// HalfKaHmMerged の 1 視点分 SIMD 入力 (king bucket offset を事前計算)。
 #[derive(Clone, Copy)]
 pub(crate) struct PerspectiveOffset {
-    /// `king_bucket * piece_inputs` (= 全 board piece の base offset)。
+    /// `king_bucket * piece_inputs`。
     pub kb_offset: i32,
-    /// 視点 sq → packed sq の file mirror 要否。
+    /// 盤駒 sq を file mirror する視点か。
     pub mirror: bool,
-    /// `1` if perspective == Color::Black else `0`、SIMD で sq 変換に使う。
+    /// `Color::Black` なら 1、`White` なら 0 (sq inverse の SIMD 分岐に使う)。
     pub black_persp: i32,
-    /// `0` if perspective == Color::Black else `1`、SIMD で is_friend 判定に使う。
+    /// `Color` を i32 に cast した値 (is_friend 判定に使う)。
     pub color_code: i32,
 }
 
-/// board phase SIMD path の入出力 (clippy::too_many_arguments を避ける
-/// 集約 struct、各 path は同じ shape を取る)。
+/// board phase SIMD path の入出力。各 path は同じ struct を受ける。
 pub(crate) struct BoardPhaseArgs<'a> {
     pub pt: &'a [i32],
     pub color: &'a [i32],
@@ -51,8 +44,7 @@ pub(crate) struct BoardPhaseArgs<'a> {
     pub nstm_out: &'a mut [i32],
 }
 
-/// 起動時に検出した SIMD dispatch tag。`BoardPhaseDispatch::detect()` で 1 回判定して
-/// `OnceLock` に焼く。AVX-512 → AVX-2 → Scalar の優先順。
+/// 起動時に検出した SIMD path tag。優先順は AVX-512 → AVX-2 → Scalar。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BoardPhaseDispatch {
     Scalar,
@@ -63,7 +55,6 @@ pub(crate) enum BoardPhaseDispatch {
 }
 
 impl BoardPhaseDispatch {
-    /// 起動時に CPU feature を 1 回検出して cache する。
     pub(crate) fn detect() -> BoardPhaseDispatch {
         static CACHED: OnceLock<BoardPhaseDispatch> = OnceLock::new();
         *CACHED.get_or_init(detect_uncached)
@@ -73,11 +64,6 @@ impl BoardPhaseDispatch {
 fn detect_uncached() -> BoardPhaseDispatch {
     #[cfg(target_arch = "x86_64")]
     {
-        // 本 path で使う intrinsic (`_mm512_loadu_si512` / `_mm512_set1_epi32` /
-        // `_mm512_cmpeq_epi32_mask` / `_mm512_mask_blend_epi32` /
-        // `_mm512_i32gather_epi32` / `_mm512_storeu_si512` 等) は全て AVX-512F
-        // のみで利用可能。DQ / BW / VL は本実装で要求しない (KNL 等 F-only host
-        // でも SIMD path に dispatch する)。
         if std::is_x86_feature_detected!("avx512f") {
             return BoardPhaseDispatch::Avx512;
         }
@@ -88,10 +74,7 @@ fn detect_uncached() -> BoardPhaseDispatch {
     BoardPhaseDispatch::Scalar
 }
 
-/// HalfKaHmMerged 専用 board phase を dispatch して output slice に直接書込む。
-///
-/// `BoardPhaseDispatch::detect()` で起動時に決定した path に dispatch、結果は scalar 経路と
-/// byte-identical (parity test 参照)。
+/// HalfKaHmMerged board phase を dispatch して output slice に直接書込む。
 #[inline]
 pub(crate) fn extract_halfka_hm_board_phase(mut args: BoardPhaseArgs<'_>) {
     debug_assert!(args.pt.len() >= args.n && args.color.len() >= args.n && args.sq.len() >= args.n);
@@ -100,26 +83,25 @@ pub(crate) fn extract_halfka_hm_board_phase(mut args: BoardPhaseArgs<'_>) {
         BoardPhaseDispatch::Scalar => scalar::extract_halfka_hm_board_phase(&mut args),
         #[cfg(target_arch = "x86_64")]
         BoardPhaseDispatch::Avx2 => {
-            // SAFETY: `BoardPhaseDispatch::detect()` が AVX-2 を確認済の path に来る。
+            // SAFETY: detect() が AVX-2 を確認済。
             unsafe { avx2::extract_halfka_hm_board_phase(&mut args) }
         }
         #[cfg(target_arch = "x86_64")]
         BoardPhaseDispatch::Avx512 => {
-            // SAFETY: `BoardPhaseDispatch::detect()` が AVX-512F を確認済の path に来る。
+            // SAFETY: detect() が AVX-512F を確認済。
             unsafe { avx512::extract_halfka_hm_board_phase(&mut args) }
         }
     }
 }
 
-/// HalfKaHmMerged feature set かを判定する小さな helper (dispatch hook が
-/// generic feature set には適用できないため)。
 pub(crate) fn spec_is_halfka_hm_merged(spec: &FeatureSetSpec) -> bool {
     use crate::FeatureSet;
     matches!(spec.feature_set(), FeatureSet::HalfKaHmMerged)
 }
 
-/// dispatch を強制的に scalar / AVX-2 / AVX-512 のいずれかで実行する test 用 hook
-/// (cache を介さず直接 path を呼ぶ)。release では使わない。
+/// test 用 forced-dispatch entry。runtime check 後にだけ unsafe で呼ぶ。
+/// runtime check に落ちた場合は silent skip (caller test が dispatch tag を
+/// 出力するので silent skip も視認可能)。
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -131,10 +113,9 @@ pub(crate) mod testing {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn extract_avx2(mut args: BoardPhaseArgs<'_>) {
         if !std::is_x86_feature_detected!("avx2") {
-            // AVX-2 が無いマシンでは test skip。
             return;
         }
-        // SAFETY: 直前の `is_x86_feature_detected!` で AVX-2 を確認している。
+        // SAFETY: 直前で AVX-2 を確認している。
         unsafe { avx2::extract_halfka_hm_board_phase(&mut args) }
     }
 
@@ -177,7 +158,6 @@ mod parity_tests {
         recs.to_vec()
     }
 
-    /// `board.for_each_board_piece` で得る (pt, color, sq) 3 array を構築する。
     fn collect_board_pieces(board: &ShogiBoard) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
         let mut pt = Vec::new();
         let mut color = Vec::new();
@@ -190,7 +170,6 @@ mod parity_tests {
         (pt, color, sq)
     }
 
-    /// HalfKaHmMerged の perspective 引数を 1 視点分組み立てる helper。
     fn build_perspective(
         spec: &FeatureSetSpec,
         king_sq: Square,
@@ -319,8 +298,7 @@ mod parity_tests {
         assert!(checked > 0, "sample.psv に valid record が無い");
     }
 
-    /// SIMD lane 境界 (8 / 16) の前後と tail-fallback path を網羅する size 群で
-    /// AVX-2 / AVX-512 / scalar 出力の byte-identical 性を確認する。
+    /// AVX-2 (8) / AVX-512 (16) の lane 境界前後 + tail fallback を網羅する n 群。
     #[test]
     fn board_phase_paths_match_at_lane_boundaries() {
         let spec = FeatureSet::HalfKaHmMerged.spec();
@@ -332,7 +310,6 @@ mod parity_tests {
         let (pt_all, color_all, sq_all) = collect_board_pieces(&board);
         assert!(pt_all.len() >= 16);
 
-        // lane width 8 (AVX-2) と 16 (AVX-512) の境界前後を網羅する n 群。
         for &n in &[0usize, 1, 7, 8, 9, 15, 16, 17, pt_all.len()] {
             if n > pt_all.len() {
                 continue;
@@ -352,12 +329,9 @@ mod parity_tests {
         }
     }
 
-    /// 同一 PSV record に対して 4 経路
-    /// (`map_features_board` closure / scalar / AVX-2 / AVX-512) すべての
-    /// 出力が一致することを 1 つの test で網羅確認する (path 間の局所 parity と
-    /// 高位 API 等価性をまとめて 1 経路にチェックして transitive 担保の漏れを
-    /// 防ぐ)。SIMD path は runtime detect が false なら該当 path だけ skip し、
-    /// どの path を比較したかを stdout に書き出して silent skip を視認可能に。
+    /// 同一 PSV record で `map_features_board` closure + scalar + AVX-2 +
+    /// AVX-512 の 4 経路を一括比較する。runtime detect が false の SIMD path は
+    /// silent skip するが、最後に各 path の比較件数を stdout に出して visible に。
     #[test]
     fn closure_and_all_simd_paths_agree_on_sample_psv() {
         let spec = FeatureSet::HalfKaHmMerged.spec();
@@ -377,12 +351,8 @@ mod parity_tests {
             }
             let (pt, color, sq) = collect_board_pieces(&board);
 
-            // 1. closure 経路 — 公開 API `map_features_board` を直接呼ぶ。
-            //    `map_features_board` は board pieces (`for_each_board_piece`
-            //    順) → king features (`emits_king_feature` 時 2 個) → hand
-            //    pieces の順に emit するので、先頭 `pt.len()` 要素が board
-            //    phase。SIMD path は board phase のみを計算するのでここで
-            //    truncate して比較する。
+            // `map_features_board` は board → king → hand の順に emit するので
+            // 先頭 `pt.len()` 要素 (board phase) を切り出して SIMD と比較する。
             let mut via_closure = Vec::new();
             spec.map_features_board(&board, |stm_idx, nstm_idx| {
                 via_closure.push((stm_idx as i32, nstm_idx as i32));
@@ -400,7 +370,6 @@ mod parity_tests {
             );
             let closure_board: Vec<(i32, i32)> = via_closure[..pt.len()].to_vec();
 
-            // 2. forced SIMD path 群
             let stm_pers = build_perspective(&spec, stm_king, stm);
             let nstm_pers = build_perspective(&spec, nstm_king, nstm);
             let (scalar_out, avx2, avx512) =
@@ -448,14 +417,13 @@ mod parity_tests {
         );
     }
 
-    /// 起動時 detect が現在 host で「scalar 以外」を選ぶことを確認する
-    /// (本機 i9-10900X / Ryzen 5950X 等の AVX-2 以降前提)。x86_64 以外の host
-    /// では skip。
+    /// AVX-2 以降を持つ x86_64 で detect が scalar に落ちないこと。Sandy Bridge
+    /// 以前は AVX-2 無しで scalar に落ちるので skip。
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn dispatch_selects_simd_on_x86_64() {
         if !std::is_x86_feature_detected!("avx2") {
-            return; // 極端に古い x86_64 (Sandy Bridge 以前) は AVX-2 無く scalar fallback。
+            return;
         }
         let detected = BoardPhaseDispatch::detect();
         assert!(
@@ -465,8 +433,7 @@ mod parity_tests {
         );
     }
 
-    /// SIMD lane を埋め切る `for_each_board_piece` 出力を作るための full-board
-    /// fixture (両陣 9 歩 + 駒台駒)。
+    /// 16 lane を超える駒数を持つ full-board fixture (両陣 9 歩 + 4 駒)。
     fn make_full_board() -> ShogiBoard {
         let mut board = ShogiBoard {
             side_to_move: Color::Black,

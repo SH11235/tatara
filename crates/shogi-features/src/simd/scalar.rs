@@ -1,19 +1,9 @@
-//! scalar reference 実装。lane-width 1 で SIMD path と byte-identical な形に
-//! 書く (parity test の信頼性を上げるため、`map_features_board` の式と完全に
-//! 同じ算法を踏む)。
+//! lane-width 1 reference 実装。SIMD path の tail fallback も兼ねるので
+//! 算法は `avx2` / `avx512` と完全に一致させる。
 
 use super::{BoardPhaseArgs, MIRRORED_SQ, PIECE_BASE_FLAT};
 
-/// HalfKaHmMerged 専用 board phase の scalar 実装。
-///
-/// per-piece に次を計算して `(stm_out[i], nstm_out[i])` に書込む:
-/// 1. `sq_index_stm = if stm.black_persp == 1 { sq } else { 80 - sq }`
-/// 2. `is_friend_stm = (color == stm.color_code) ? 1 : 0` (=`!is_friend_nstm`)
-/// 3. `base_*    = PIECE_BASE_FLAT[pt * 2 + is_friend_*]` (gather)
-/// 4. `sq_packed_* = stm.mirror ? MIRRORED_SQ[sq_index_*] : sq_index_*`
-/// 5. `idx_* = stm.kb_offset + base_* + sq_packed_*`
-///
-/// `n` が `pt.len()` / output 長を超えないことは caller が保証する。
+/// HalfKaHmMerged board phase の scalar 実装。
 #[inline]
 pub(super) fn extract_halfka_hm_board_phase(args: &mut BoardPhaseArgs<'_>) {
     let stm = args.stm;

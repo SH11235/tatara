@@ -1,9 +1,5 @@
-//! AVX-512 (16 lane × i32) board phase 実装。
-//!
-//! 関数単位で `#[target_feature(enable = "avx512f")]` を付与、binary 全体は
-//! AVX-512 必須化しない。caller の `BoardPhaseDispatch::detect()` が runtime
-//! feature check 後にのみ呼ぶ。本 path で使う intrinsic はすべて AVX-512F のみ
-//! で利用可能 (DQ/BW/VL の要求は不要)。
+//! AVX-512 (16 lane × i32) board phase 実装。使用 intrinsic は全て AVX-512F の
+//! base set 内で済むので DQ / BW / VL は要求しない。tail は scalar fallback。
 
 #![cfg(target_arch = "x86_64")]
 
@@ -16,19 +12,15 @@ use core::arch::x86_64::{
 
 const LANES: usize = 16;
 
-/// HalfKaHmMerged 専用 board phase の AVX-512 実装。
-///
 /// # Safety
 /// caller は AVX-512F が available であることを保証する
-/// (`super::BoardPhaseDispatch::detect()` で確認済の dispatch 経由、または
-/// `super::testing::extract_avx512` の `is_x86_feature_detected!` 経由)。
-/// `args` の各 slice は `args.n` 以上の長さ。
+/// (`super::BoardPhaseDispatch::detect()` または `super::testing::extract_avx512`
+/// の `is_x86_feature_detected!` 経由)。`args` の各 slice は `args.n` 以上。
 #[inline]
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn extract_halfka_hm_board_phase(args: &mut BoardPhaseArgs<'_>) {
     let stm = args.stm;
     let nstm = args.nstm;
-    // SAFETY: target_feature gate AVX-512 + caller がランタイム確認済。
     unsafe {
         let v_80 = _mm512_set1_epi32(80);
         let v_one = _mm512_set1_epi32(1);
@@ -50,8 +42,8 @@ pub(super) unsafe fn extract_halfka_hm_board_phase(args: &mut BoardPhaseArgs<'_>
             };
             let v_sq_idx_nstm = _mm512_sub_epi32(v_80, v_sq_idx_stm);
 
-            // AVX-512 では cmpeq の結果は `__mmask16`。`mask_blend(0, 1)` で
-            // {0, 1} ベクトルに変換する (`is_friend_stm`)。
+            // AVX-512 の cmpeq は `__mmask16` を返すので `mask_blend(0, 1)` で
+            // 0/1 ベクトルに直す (`_mm256_and_si256(cmp, 1)` 相当)。
             let mask_stm = _mm512_cmpeq_epi32_mask(v_color, v_stm_color);
             let v_is_friend_stm = _mm512_mask_blend_epi32(mask_stm, v_zero, v_one);
             let v_is_friend_nstm = _mm512_sub_epi32(v_one, v_is_friend_stm);
