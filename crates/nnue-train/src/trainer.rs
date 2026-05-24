@@ -187,7 +187,8 @@ pub trait TrainerBackend {
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
     ///
     /// - `batch`: HalfKA_hm sparse + score/wdl/norm (`batch.n_positions` が有効件数)
-    /// - `bucket_idx`: `batch.n_positions` 個の output bucket index (`0..=8`)
+    /// - `bucket_idx`: `batch.n_positions` 個の output bucket index
+    ///   (`0..num_buckets-1`、N は LayerStack `--num-buckets` で決まる runtime 値)
     /// - `lr`: learning rate (`LrScheduler` 由来)
     /// - `wdl_lambda`: WDL blend lambda (`WdlScheduler` 由来、loss kernel の `lambda`)
     /// - `loss`: どの loss kernel を起動するか (sigmoid-MSE / WRM) + 固定パラメータ
@@ -264,9 +265,10 @@ pub trait TrainerBackend {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
-/// NNUE 1536-16-32 + 9-bucket LayerStack の学習に必要な subset。
-/// learning rate / WDL schedule は別に [`LrScheduler`] /
-/// [`WdlScheduler`] を渡す。
+/// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
+/// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 9、
+/// LayerStack `--num-buckets` 由来)。learning rate / WDL schedule は別に
+/// [`LrScheduler`] / [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
