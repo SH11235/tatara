@@ -1,10 +1,5 @@
 //! PSQT shortcut の Material 初期化値計算。
 //!
-//! HalfKA 特徴量 (`feat = king_bucket * PIECE_INPUTS + packed_bonapiece`) ごとに
-//! 駒の centipawn 価値を 1 個割り当て、PSQT shortcut 重みの初期値として書き出す
-//! ためのテーブル。bullet-shogi `examples/shogi_layerstack.rs` の `psqt_material`
-//! モジュール + `compute_psqt_material_values` を移植したもの (`ATTRIBUTION.md`)。
-//!
 //! ## 駒価値 (centipawn)
 //!
 //! - 歩 (Pawn) = 100、香 (Lance) = 300、桂 (Knight) = 320
@@ -12,27 +7,35 @@
 //! - 馬 (Horse) = 1020 (= 角 × 1.2)、龍 (Dragon) = 1200 (= 飛 × 1.2)
 //! - 玉 (King) = 0
 //!
-//! 成歩 / 成香 / 成桂 / 成銀は BonaPiece 上で Gold スロットに統合されるため Gold と
-//! 同じ価値を共有する。
+//! 成歩 / 成香 / 成桂 / 成銀は BonaPiece 上で Gold スロットに統合されるため Gold
+//! と同じ価値を共有する。
 //!
-//! ## 出力 layout
+//! ## piece input layout 別の対応
 //!
-//! [`psqt_material_values`] は長さ `NUM_BUCKETS * input_size` (column-major
-//! `[NUM_BUCKETS, input_size]` flatten) の `Vec<f32>` を返す。各 feature index
-//! `feat` について `out[feat * NUM_BUCKETS .. feat * NUM_BUCKETS + NUM_BUCKETS]`
-//! の全 bucket セルに同一の `material / out_scaling` を書き込む (Material prior は
-//! bucket に依らず一定)。
+//! 各 feature set の `piece_inputs` 長は `BonaPiece` の plane 構成で決まり、
+//! 手駒 + 盤上駒 (`0..FE_OLD_END = 1548`) は全 feature set 共通、玉 plane の
+//! 有無と plane 数だけが variant ごとに異なる:
+//!
+//! | feature set | piece_inputs | 玉 plane |
+//! |---|---:|:--|
+//! | `HalfKp` | 1548 | 無し |
+//! | `HalfKaSplit` / `HalfKaHmSplit` | 1710 | F_KING (81) + E_KING (81) |
+//! | `HalfKaMerged` / `HalfKaHmMerged` | 1629 | F_KING (81) のみ (敵玉は -81 で同 plane に畳む) |
+//!
+//! 玉 = 0 で全 variant 共通なので、玉 plane 領域は default `0.0` のまま残せば
+//! 良い。
 
 use shogi_format::bona_piece::{
     E_BISHOP, E_DRAGON, E_GOLD, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE,
     E_HAND_PAWN, E_HAND_ROOK, E_HAND_SILVER, E_HORSE, E_KNIGHT, E_LANCE, E_PAWN, E_ROOK, E_SILVER,
     F_BISHOP, F_DRAGON, F_GOLD, F_HAND_BISHOP, F_HAND_GOLD, F_HAND_KNIGHT, F_HAND_LANCE,
     F_HAND_PAWN, F_HAND_ROOK, F_HAND_SILVER, F_HORSE, F_KNIGHT, F_LANCE, F_PAWN, F_ROOK, F_SILVER,
+    FE_OLD_END,
 };
 
-use crate::halfka_hm::PIECE_INPUTS;
+use crate::feature_set::FeatureSetSpec;
 
-/// 駒の centipawn 価値定数 (bullet-shogi `psqt_material` モジュール由来)。
+/// 駒の centipawn 価値定数。
 pub mod material_cp {
     pub const PAWN: f32 = 100.0;
     pub const LANCE: f32 = 300.0;
@@ -47,19 +50,21 @@ pub mod material_cp {
     pub const DRAGON: f32 = ROOK * 1.2;
 }
 
-/// `packed_bonapiece` (0..PIECE_INPUTS) → 駒の Material 値 (符号付き centipawn) の
-/// lookup table を構築。`pack_bonapiece` 適用後の値を引数に取る (E_KING は F_KING 平面に
-/// 既に畳まれている前提)。
-///
-/// friend 駒 = `+material`、enemy 駒 = `-material`、玉および空きスロットは 0。
-fn build_packed_bp_material_table() -> [f32; PIECE_INPUTS] {
+/// `packed_bonapiece` (0..piece_inputs) → 駒 Material 値 (符号付き centipawn) の
+/// lookup table。手駒 + 盤上駒部分 (`0..FE_OLD_END`) は全 feature set 共通、
+/// 玉 plane (`FE_OLD_END..`) は玉 = 0 で default 0 のまま残す。
+fn build_packed_bp_material_table(piece_inputs: usize) -> Vec<f32> {
     use material_cp::*;
 
-    let mut table = [0.0_f32; PIECE_INPUTS];
+    assert!(
+        piece_inputs >= FE_OLD_END,
+        "piece_inputs ({piece_inputs}) must be >= FE_OLD_END ({FE_OLD_END})"
+    );
+    let mut table = vec![0.0f32; piece_inputs];
 
-    let fill = |table: &mut [f32], base: u16, count: u16, value: f32| {
+    let fill = |t: &mut [f32], base: u16, count: u16, value: f32| {
         for i in 0..count {
-            table[(base + i) as usize] = value;
+            t[(base + i) as usize] = value;
         }
     };
 
@@ -100,42 +105,40 @@ fn build_packed_bp_material_table() -> [f32; PIECE_INPUTS] {
     fill(&mut table, F_DRAGON, 81, DRAGON);
     fill(&mut table, E_DRAGON, 81, -DRAGON);
 
-    // 玉 (F_KING..F_KING+81) は 0 のまま (table 初期値)。
+    // 玉 plane (`FE_OLD_END..piece_inputs`) は玉 = 0 で default 0 のまま。
+    // HalfKp は piece_inputs = FE_OLD_END で玉 plane を持たない (no-op)。
+
     table
 }
 
-/// PSQT shortcut 重みの Material 初期値を計算する (HalfKA / HalfKA_hm 共通)。
+/// PSQT 重みの Material 初期値を `FeatureSetSpec` から計算する。
 ///
-/// 戻り値は column-major `[num_buckets, input_size]` flatten された
-/// `Vec<f32>` で `out[feat * num_buckets + bucket]` の order。`input_size` は通常
-/// `halfka_dim`、`input_size > halfka_dim` (Threat tail 等) のケースは tail を
-/// `0` で残す。Material prior は bucket に依らないため `num_buckets` 軸は同一値で埋める。
+/// 戻り値は長さ `num_buckets * spec.ft_in()` の row-major
+/// `out[feat * num_buckets + bucket]`。Material prior は bucket 軸に依らないので
+/// `num_buckets` 軸は同一値で埋める。
 ///
 /// # Panics
 /// - `out_scaling <= 0.0`
-/// - `input_size < halfka_dim`
-/// - `halfka_dim % PIECE_INPUTS != 0`
+/// - `num_buckets == 0`
+/// - `spec.piece_inputs() < FE_OLD_END` (公開 5 feature set はいずれも満たす)
 pub fn psqt_material_values(
-    halfka_dim: usize,
-    input_size: usize,
+    spec: &FeatureSetSpec,
     num_buckets: usize,
     out_scaling: f32,
 ) -> Vec<f32> {
     assert!(out_scaling > 0.0, "out_scaling must be positive");
-    assert!(input_size >= halfka_dim, "input_size must be >= halfka_dim");
-    assert_eq!(
-        halfka_dim % PIECE_INPUTS,
-        0,
-        "halfka_dim must be a multiple of PIECE_INPUTS ({PIECE_INPUTS})"
-    );
+    assert!(num_buckets > 0, "num_buckets must be positive");
 
-    let packed_material = build_packed_bp_material_table();
-    let num_king_buckets = halfka_dim / PIECE_INPUTS;
+    let piece_inputs = spec.piece_inputs();
+    let king_buckets = spec.king_buckets();
+    let input_size = spec.ft_in();
+
+    let packed_material = build_packed_bp_material_table(piece_inputs);
     let mut vals = vec![0.0_f32; num_buckets * input_size];
 
-    for kb in 0..num_king_buckets {
+    for kb in 0..king_buckets {
         for (bp, &material) in packed_material.iter().enumerate() {
-            let feat = kb * PIECE_INPUTS + bp;
+            let feat = kb * piece_inputs + bp;
             let value = material / out_scaling;
             let base = feat * num_buckets;
             for slot in vals.iter_mut().skip(base).take(num_buckets) {
@@ -150,12 +153,14 @@ pub fn psqt_material_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::halfka_hm::HALFKA_HM_DIMENSIONS;
+    use crate::FeatureSet;
+    use crate::halfka_hm::{HALFKA_HM_DIMENSIONS, PIECE_INPUTS};
+    use shogi_format::bona_piece::F_KING;
 
     const TEST_NUM_BUCKETS: usize = 9;
 
     #[test]
-    fn material_constants_match_bullet() {
+    fn material_constants_pinned() {
         use material_cp::*;
         assert_eq!(PAWN, 100.0);
         assert_eq!(LANCE, 300.0);
@@ -170,8 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn packed_table_friend_signs() {
-        let t = build_packed_bp_material_table();
+    fn packed_table_friend_signs_halfka_merged() {
+        let t = build_packed_bp_material_table(PIECE_INPUTS);
         // F_PAWN..+81 が +100、E_PAWN..+81 が -100。
         assert_eq!(t[F_PAWN as usize], 100.0);
         assert_eq!(t[(F_PAWN + 80) as usize], 100.0);
@@ -185,54 +190,89 @@ mod tests {
     }
 
     #[test]
-    fn packed_table_king_is_zero() {
-        let t = build_packed_bp_material_table();
-        // F_KING (1548) 以降の 81 マスは 0 (玉は寄与しない)。
-        // E_KING は pack 後 F_KING 平面に畳まれているので range として等価。
-        for (i, &v) in t.iter().enumerate().take(PIECE_INPUTS).skip(1548) {
-            assert_eq!(v, 0.0, "king/empty slot {i} must be 0");
+    fn packed_table_king_plane_is_zero() {
+        // HalfKaMerged 系 (piece_inputs = 1629) の F_KING plane は 0。
+        let t = build_packed_bp_material_table(PIECE_INPUTS);
+        for (i, &v) in t
+            .iter()
+            .enumerate()
+            .take(PIECE_INPUTS)
+            .skip(F_KING as usize)
+        {
+            assert_eq!(v, 0.0, "king slot {i} must be 0");
+        }
+        // HalfKaSplit 系 (piece_inputs = 1710) の E_KING plane も 0。
+        let t = build_packed_bp_material_table(1710);
+        for (i, &v) in t.iter().enumerate().take(1710).skip(F_KING as usize) {
+            assert_eq!(v, 0.0, "split king slot {i} must be 0");
         }
     }
 
     #[test]
-    fn psqt_material_values_shape() {
-        let v = psqt_material_values(
-            HALFKA_HM_DIMENSIONS,
-            HALFKA_HM_DIMENSIONS,
-            TEST_NUM_BUCKETS,
-            600.0,
-        );
-        assert_eq!(v.len(), TEST_NUM_BUCKETS * HALFKA_HM_DIMENSIONS);
+    fn packed_table_halfkp_no_king_plane() {
+        // HalfKp (piece_inputs = 1548 = FE_OLD_END) は玉 plane 無し。
+        let t = build_packed_bp_material_table(FE_OLD_END);
+        assert_eq!(t.len(), FE_OLD_END);
+        // 手駒 / 盤上駒部分は埋まる、末尾の F_PAWN..E_DRAGON が centipawn 値で
+        // 終端しているのを抽出 check。
+        assert_eq!(t[F_PAWN as usize], 100.0);
+        assert_eq!(t[(E_DRAGON + 80) as usize], -1200.0);
+        assert_eq!(t[E_DRAGON as usize + 80], -1200.0);
+        // 末尾の最後の slot (E_DRAGON + 80) が FE_OLD_END - 1 = 1547。
+        assert_eq!(E_DRAGON as usize + 80 + 1, FE_OLD_END);
     }
 
     #[test]
-    fn psqt_material_values_uniform_across_buckets() {
-        let v = psqt_material_values(
-            HALFKA_HM_DIMENSIONS,
-            HALFKA_HM_DIMENSIONS,
-            TEST_NUM_BUCKETS,
-            600.0,
-        );
-        // 任意 feat について 9 bucket 全部同じ値であることを確認 (Material prior は bucket
-        // 軸に依らないため)。
-        for feat in [0_usize, 100, 1000, 5000, HALFKA_HM_DIMENSIONS - 1] {
-            let base = feat * TEST_NUM_BUCKETS;
-            let v0 = v[base];
-            for b in 1..TEST_NUM_BUCKETS {
-                assert_eq!(v[base + b], v0, "feat {feat} bucket {b} mismatch");
+    fn psqt_material_values_shape_all_feature_sets() {
+        let scaling = 600.0;
+        for fs in FeatureSet::ALL {
+            let spec = fs.spec();
+            let vals = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+            assert_eq!(
+                vals.len(),
+                TEST_NUM_BUCKETS * spec.ft_in(),
+                "{}: vals length mismatch",
+                fs.canonical_name()
+            );
+            // 全要素 finite。
+            assert!(
+                vals.iter().all(|v| v.is_finite()),
+                "{}: non-finite found",
+                fs.canonical_name()
+            );
+        }
+    }
+
+    #[test]
+    fn psqt_material_values_uniform_across_buckets_all_feature_sets() {
+        let scaling = 600.0;
+        for fs in FeatureSet::ALL {
+            let spec = fs.spec();
+            let vals = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+            // 任意 feat について 9 bucket 全部同じ値 (Material prior は bucket 軸に
+            // 依らないため)。spec ごとに ft_in が違うので probe 位置も spec 内に
+            // 収まるよう min を取る。
+            let probes = [0usize, 100, 1000, 5000, spec.ft_in() - 1];
+            for &feat in &probes {
+                let base = feat * TEST_NUM_BUCKETS;
+                let v0 = vals[base];
+                for b in 1..TEST_NUM_BUCKETS {
+                    assert_eq!(
+                        vals[base + b],
+                        v0,
+                        "{} feat {feat} bucket {b} mismatch",
+                        fs.canonical_name()
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn psqt_material_values_specific_features() {
+    fn psqt_material_values_specific_features_halfka_hm_merged() {
         let scaling = 600.0;
-        let v = psqt_material_values(
-            HALFKA_HM_DIMENSIONS,
-            HALFKA_HM_DIMENSIONS,
-            TEST_NUM_BUCKETS,
-            scaling,
-        );
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let v = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
         // king_bucket=0, packed_bp=F_PAWN+0 (=90): friend Pawn = +100/600。
         let kb = 0;
         let feat_pawn = kb * PIECE_INPUTS + F_PAWN as usize;
@@ -245,20 +285,84 @@ mod tests {
         let feat_hp = 10 * PIECE_INPUTS + (F_HAND_PAWN + 5) as usize;
         assert_eq!(v[feat_hp * TEST_NUM_BUCKETS], 100.0 / scaling);
         // king_bucket=20, packed_bp=F_KING+0: 玉 = 0。
-        let feat_king = 20 * PIECE_INPUTS + 1548;
+        let feat_king = 20 * PIECE_INPUTS + F_KING as usize;
         assert_eq!(v[feat_king * TEST_NUM_BUCKETS], 0.0);
     }
 
+    /// HalfKaHmMerged の出力が v0.3.0 既存実装と byte-identical であることを
+    /// 同じ算法で再構築して確認 (regression test)。
     #[test]
-    fn psqt_material_values_tail_zero_when_input_larger() {
-        // input_size > halfka_dim のとき末尾の Threat tail 領域は 0 で残る。
-        let halfka = HALFKA_HM_DIMENSIONS;
-        let extra = 100;
-        let v = psqt_material_values(halfka, halfka + extra, TEST_NUM_BUCKETS, 600.0);
-        assert_eq!(v.len(), TEST_NUM_BUCKETS * (halfka + extra));
-        for feat in halfka..halfka + extra {
-            for b in 0..TEST_NUM_BUCKETS {
-                assert_eq!(v[feat * TEST_NUM_BUCKETS + b], 0.0);
+    fn psqt_material_values_halfka_hm_merged_bit_identical_with_v0_3_0() {
+        // v0.3.0 までの式: vals = num_buckets * HALFKA_HM_DIMENSIONS、kb in
+        // 0..(HALFKA_HM_DIMENSIONS / PIECE_INPUTS) の二重ループ、material は
+        // packed_table[bp] / out_scaling、bucket 全 cell 同値。
+        let scaling = 600.0;
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        assert_eq!(spec.ft_in(), HALFKA_HM_DIMENSIONS);
+        assert_eq!(spec.piece_inputs(), PIECE_INPUTS);
+
+        let new_vals = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+
+        // 別経路で同算法を踏み比較。
+        let packed = build_packed_bp_material_table(PIECE_INPUTS);
+        let mut ref_vals = vec![0.0_f32; TEST_NUM_BUCKETS * HALFKA_HM_DIMENSIONS];
+        let num_king_buckets = HALFKA_HM_DIMENSIONS / PIECE_INPUTS;
+        for kb in 0..num_king_buckets {
+            for (bp, &material) in packed.iter().enumerate() {
+                let feat = kb * PIECE_INPUTS + bp;
+                let value = material / scaling;
+                let base = feat * TEST_NUM_BUCKETS;
+                for slot in ref_vals.iter_mut().skip(base).take(TEST_NUM_BUCKETS) {
+                    *slot = value;
+                }
+            }
+        }
+        assert_eq!(new_vals, ref_vals);
+    }
+
+    #[test]
+    fn psqt_material_values_halfkp_pawn_and_dragon() {
+        // HalfKp (piece_inputs = 1548、玉 plane 無し) でも手駒・盤上駒 prior
+        // 初期化が正しく動くこと。
+        let scaling = 600.0;
+        let spec = FeatureSet::HalfKp.spec();
+        let v = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+        let pi = spec.piece_inputs();
+        assert_eq!(pi, FE_OLD_END);
+        // king_bucket=0 の F_PAWN: +100/600
+        let feat_pawn = F_PAWN as usize;
+        assert_eq!(v[feat_pawn * TEST_NUM_BUCKETS], 100.0 / scaling);
+        // king_bucket=40 の E_DRAGON: ≈ -2.0
+        let feat_e_dragon = 40 * pi + E_DRAGON as usize;
+        assert!((v[feat_e_dragon * TEST_NUM_BUCKETS] - (-2.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn psqt_material_values_split_king_planes_zero() {
+        // HalfKaSplit / HalfKaHmSplit (piece_inputs = 1710) の F_KING / E_KING
+        // plane が 0 のまま、手駒 / 盤上駒 prior は埋まること。
+        let scaling = 600.0;
+        for fs in [FeatureSet::HalfKaSplit, FeatureSet::HalfKaHmSplit] {
+            let spec = fs.spec();
+            let v = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+            let pi = spec.piece_inputs();
+            assert_eq!(pi, 1710);
+            // king_bucket=0 の F_PAWN: +100/600
+            assert_eq!(
+                v[F_PAWN as usize * TEST_NUM_BUCKETS],
+                100.0 / scaling,
+                "{}: F_PAWN init",
+                fs.canonical_name()
+            );
+            // 玉 plane (FE_OLD_END..pi = 1548..1710) は 0。
+            for feat_bp in FE_OLD_END..pi {
+                let v0 = v[feat_bp * TEST_NUM_BUCKETS];
+                assert_eq!(
+                    v0,
+                    0.0,
+                    "{}: king plane bp {feat_bp} must be 0",
+                    fs.canonical_name()
+                );
             }
         }
     }
@@ -266,22 +370,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "out_scaling must be positive")]
     fn psqt_material_rejects_nonpositive_scaling() {
-        let _ = psqt_material_values(
-            HALFKA_HM_DIMENSIONS,
-            HALFKA_HM_DIMENSIONS,
-            TEST_NUM_BUCKETS,
-            0.0,
-        );
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let _ = psqt_material_values(&spec, TEST_NUM_BUCKETS, 0.0);
     }
 
     #[test]
-    #[should_panic(expected = "input_size must be >= halfka_dim")]
-    fn psqt_material_rejects_smaller_input() {
-        let _ = psqt_material_values(
-            HALFKA_HM_DIMENSIONS,
-            HALFKA_HM_DIMENSIONS - 1,
-            TEST_NUM_BUCKETS,
-            600.0,
-        );
+    #[should_panic(expected = "num_buckets must be positive")]
+    fn psqt_material_rejects_zero_buckets() {
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let _ = psqt_material_values(&spec, 0, 600.0);
     }
 }

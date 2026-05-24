@@ -244,12 +244,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     )
                     .into());
                 }
-                shogi_features::psqt_material_values(
-                    feature_set.ft_in(),
-                    feature_set.ft_in(),
-                    NUM_BUCKETS,
-                    out_scaling,
-                )
+                shogi_features::psqt_material_values(&feature_set, NUM_BUCKETS, out_scaling)
             }
         };
         println!(
