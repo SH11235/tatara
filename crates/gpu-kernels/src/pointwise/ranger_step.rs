@@ -1,6 +1,6 @@
 //! Fused Ranger optimizer (RAdam + Lookahead) の reference CPU 実装。
 //!
-//! Ranger (Wright 2019、bullet `ranger.rs` と同等) は **RAdam + Lookahead** の
+//! Ranger (Wright 2019) は **RAdam + Lookahead** の
 //! 2 段構成。RAdam で fast params (`weights`) を更新しつつ、`step % k == 0` の
 //! ときだけ Lookahead lerp (Zhang et al. 2019) で **slow params (`s`) との SMA**
 //! を取る:
@@ -32,8 +32,8 @@
 //!
 //! ## 設計メモ
 //!
-//! - **slow params の checkpoint**: bullet 上流は `slow.bin` に書き出して resume
-//!   時に復元する。本 reference は orchestration までは含まず、trainer 側で扱う
+//! - **slow params の checkpoint**: 本 reference は orchestration までは含まず、
+//!   resume 時の `slow` 復元等は trainer 側で扱う
 //!
 //! ## cuda-oxide 制限
 //!

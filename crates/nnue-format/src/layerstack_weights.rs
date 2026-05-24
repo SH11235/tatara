@@ -1,7 +1,7 @@
 //! LayerStack NNUE quantised binary の save / load。
 //!
 //! `bins/nnue_train` が出力する binary 形式。推論エンジン rshogi が `EvalFile=`
-//! で直接読み込める byte layout (量子化アルゴリズムの出典は `ATTRIBUTION.md`)。
+//! で直接読み込める byte layout。
 //!
 //! ## LayerStack architecture (Threat 無し、HandCountDense 無し)
 //!
@@ -25,7 +25,7 @@
 //! 4. ft_weights LEB128 (同上、piece 部分 = `halfka_dim * ft_out`、threat 無し)
 //! 5. **PSQT block (arch_str に `PSQT=9,` がある場合のみ)**: bias i32 LE × NUM_BUCKETS,
 //!    weights i32 LE × halfka_dim × NUM_BUCKETS (feature-major、各 feat 内 bucket 連番)。
-//!    scale は `QA * QB = 8128` (bullet-shogi LayerStack 互換、bias は 0 固定)。
+//!    scale は `QA * QB = 8128` (bias は 0 固定)。
 //! 6. layerstacks: 9 bucket × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
 //!
 //! ## save 時の L1 / L1f coalesce
@@ -58,12 +58,12 @@
 //! pad32(30) = 32, pad32(32) = 32。
 //! padding byte は 0 で埋める。
 //!
-//! ## 重み layout の差分 (bullet 内部 vs file)
+//! ## 重み layout
 //!
-//! bullet 内部はすべて **column-major** (`w[in * rows + out]`)。file は **row-major**
-//! per bucket (`for out in 0..out_dim: for in in 0..padded_in: write byte`)。
-//! 本 crate のトレーナー側 weight は row-major (`l1_w[bucket * out_dim * in_dim
-//! + out_idx * in_dim + in_idx]`) なので、そのまま file row-major に書ける (転置不要)。
+//! file は **row-major** per bucket (`for out in 0..out_dim: for in in
+//! 0..padded_in: write byte`)。本 crate のトレーナー側 weight も row-major
+//! (`l1_w[bucket * out_dim * in_dim + out_idx * in_dim + in_idx]`) なので、
+//! そのまま file row-major に書ける (転置不要)。
 
 use std::io::{self, Read, Write};
 
@@ -222,7 +222,7 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 // =============================================================================
 
 /// LayerStack arch description string を生成。PSQT 無し / Threat 無し /
-/// HandCountDense 無しの最小形 (`arch_str` 形式の出典は `ATTRIBUTION.md`)。
+/// HandCountDense 無しの最小形。
 ///
 /// 形式 (実際は改行無しの 1 行):
 ///
@@ -285,7 +285,7 @@ pub fn build_arch_str(
     )
 }
 
-/// fc hash の計算 (nnue-pytorch 系の hash アルゴリズム、出典は `ATTRIBUTION.md`)。
+/// fc hash の計算 (nnue-pytorch 系の hash アルゴリズム)。
 ///
 /// 推論エンジン rshogi は本 hash を skip する (`network_layer_stacks.rs`) が、
 /// format 仕様上の正しい値として computed value を書き出す。hash は隠れ層の
@@ -461,8 +461,7 @@ impl LayerStackWeights {
 
         // ---- FT weights LEB128 (i16, scale=QA) ----
         // piece 部分 = ft_in * ft_out (threat 無し)。本 trainer の ft_w は (ft_in, ft_out)
-        // row-major (ft_w[feat * ft_out + out])、これは bullet 内部の column-major と
-        // 等価の access pattern (転置不要)。そのまま i16 quantize して書く。
+        // row-major (ft_w[feat * ft_out + out]) で、そのまま i16 quantize して書く。
         let ft_w_i16: Vec<i16> = self
             .ft_w
             .iter()
@@ -478,7 +477,7 @@ impl LayerStackWeights {
         // bias は常に 0 固定 (forward 対称差で friend/enemy が打ち消し、勾配も常に 0)
         // を i32 LE で NUM_BUCKETS 個書く。weights は `ft_in * NUM_BUCKETS` を
         // feature-major (`psqt_w[feat * NUM_BUCKETS + bucket]`) でそのまま i32 LE 列に
-        // 書き出す。scale は `QA * QB = 8128` で bullet-shogi LayerStack 互換。
+        // 書き出す。scale は `QA * QB = 8128`。
         if let Some(psqt) = self.psqt_w.as_ref() {
             let ft_in = self.feature_set.ft_in();
             let expected = ft_in * NUM_BUCKETS;
@@ -769,7 +768,6 @@ impl LayerStackWeights {
         // backward の構造的勾配ゼロにより常に 0 で training される。本 trainer / kernel
         // は PSQT bias を内部状態として持たず、`.bin` 上も常に 0 を書く。**`.bin` 側に
         // 非ゼロ bias が入っていた場合は silent drop せず error で reject する** —
-        // bullet-shogi v101 も psqtb を Zeroed init で固定しており現実には全て 0 だが、
         // 別実装由来などで非ゼロ bias が混入した場合に inference round-trip が破綻する
         // のを防ぐため。
         let psqt_bias_scale = (QA * QB) as f32;
@@ -1130,7 +1128,7 @@ mod tests {
 
     #[test]
     fn load_external_reference_if_env_set() {
-        // 外部 reference checkpoint (bullet 生成等) を `RSHOGI_NNUE_LAYERSTACK_REF_BIN`
+        // 外部 reference checkpoint を `RSHOGI_NNUE_LAYERSTACK_REF_BIN`
         // で指定すると load + sanity check を走らせる任意の regression check。
         // env var 未設定なら skip (CI 想定)。
         let Ok(path) = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN") else {

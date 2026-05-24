@@ -1,6 +1,5 @@
 //! `progress.bin` I/O (f64 little-endian × N_WEIGHTS、`1_003_104` bytes 固定)。
 //!
-//! bullet-shogi 上流 (`write_progress_bin` / `read_progress_bin`) を移植。
 //! Rust kernel 側は重みを `f32` で持つが、`progress.bin` の wire format は
 //! `f64` LE であることに注意。書き込み時 f32→f64 cast、読み込み時 f64→f32 cast。
 

@@ -419,8 +419,8 @@ impl SimpleGpuTrainer {
         let l2_b_n = l2_out;
         let l3_w_n = l2_out;
         let l3_b_n = 1;
-        // Lookahead slow weight は学習開始時 weights と同値で初期化する (bullet
-        // `Ranger` の初期 `slow_param ← param` 規約)。
+        // Lookahead slow weight は学習開始時 weights と同値で初期化する
+        // (Ranger の初期 `slow_param ← param` 規約)。
         let ft_w = DeviceBuffer::from_host(&stream, &ft_w_h)?;
         let ft_b = DeviceBuffer::from_host(&stream, &ft_b_h)?;
         let l1_w = DeviceBuffer::from_host(&stream, &l1_w_h)?;

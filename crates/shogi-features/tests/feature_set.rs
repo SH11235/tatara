@@ -1,7 +1,7 @@
 //! `feature_set` の参照照合・第一原理検証・回帰テスト。
 //!
 //! - 参照実装あり 3 cell (`halfkp` / `halfka-split` / `halfka-hm-merged`):
-//!   bullet-shogi 実装を移植した oracle / `ShogiHalfKA_hm` と照合。
+//!   nnue-pytorch 系の index 式を移植した oracle / `ShogiHalfKA_hm` と照合。
 //! - 参照実装なし 2 cell (`halfka-merged` / `halfka-hm-split`): index 範囲・
 //!   injective・玉 plane 衝突・退化一致・perspective swap・mirror involution を
 //!   第一原理で検証する。
@@ -95,10 +95,10 @@ fn mirror_board(board: &ShogiBoard) -> ShogiBoard {
 }
 
 // =============================================================================
-// 参照 oracle (bullet-shogi 実装の index 式を移植)
+// 参照 oracle (nnue-pytorch 系の index 式を再構成)
 // =============================================================================
 
-/// bullet-shogi `shogi_halfkp.rs` の HalfKP index 式を移植した参照 oracle。
+/// HalfKP index 式の参照 oracle。
 /// 玉を特徴に含めず、`king_sq * 1548 + bonapiece`。
 fn oracle_halfkp(board: &ShogiBoard) -> Vec<(usize, usize)> {
     const FE_END: usize = 1548;
@@ -147,8 +147,8 @@ fn oracle_halfkp(board: &ShogiBoard) -> Vec<(usize, usize)> {
     out
 }
 
-/// bullet-shogi `shogi_halfka.rs` の `ShogiHalfKA` (Non-Mirror) index 式を
-/// 移植した参照 oracle。両玉を別 plane に置き `king_sq * 1710 + bonapiece`。
+/// `ShogiHalfKA` (Non-Mirror) index 式の参照 oracle。両玉を別 plane に置き
+/// `king_sq * 1710 + bonapiece`。
 fn oracle_halfka_split(board: &ShogiBoard) -> Vec<(usize, usize)> {
     const PI: usize = 1710;
     let mut out = Vec::new();
@@ -211,14 +211,14 @@ fn oracle_halfka_split(board: &ShogiBoard) -> Vec<(usize, usize)> {
 // =============================================================================
 
 #[test]
-fn crosscheck_halfkp_against_bullet_oracle() {
+fn crosscheck_halfkp_against_oracle() {
     let spec = FeatureSet::HalfKp.spec();
     let mut nonempty = 0;
     for psv in sample_psv_records() {
         let board = psv.decode();
         let got = collect(&spec, &board);
         let want = oracle_halfkp(&board);
-        assert_eq!(got, want, "halfkp が bullet-shogi HalfKP oracle と不一致");
+        assert_eq!(got, want, "halfkp が HalfKP oracle と不一致");
         nonempty += usize::from(!got.is_empty());
     }
     assert!(
@@ -228,17 +228,14 @@ fn crosscheck_halfkp_against_bullet_oracle() {
 }
 
 #[test]
-fn crosscheck_halfka_split_against_bullet_oracle() {
+fn crosscheck_halfka_split_against_oracle() {
     let spec = FeatureSet::HalfKaSplit.spec();
     let mut nonempty = 0;
     for psv in sample_psv_records() {
         let board = psv.decode();
         let got = collect(&spec, &board);
         let want = oracle_halfka_split(&board);
-        assert_eq!(
-            got, want,
-            "halfka-split が bullet-shogi HalfKA oracle と不一致"
-        );
+        assert_eq!(got, want, "halfka-split が HalfKA oracle と不一致");
         nonempty += usize::from(!got.is_empty());
     }
     assert!(
@@ -409,7 +406,7 @@ fn assert_merged_is_split_plus_fold(split_fs: FeatureSet, merged_fs: FeatureSet)
 
 #[test]
 fn degenerate_halfka_merged_is_halfka_split_plus_fold() {
-    // halfka-merged (参照実装なし) を halfka-split (bullet 照合済み) に紐づける。
+    // halfka-merged (参照実装なし) を halfka-split (oracle 照合済み) に紐づける。
     assert_merged_is_split_plus_fold(FeatureSet::HalfKaSplit, FeatureSet::HalfKaMerged);
 }
 

@@ -6,8 +6,6 @@
 //!   合法局面の active 数固定 40)、NNUE 1536-16-32 trainer の入力。
 //! - `progress_kpabs`: KP-absolute 特徴 (`81 * FE_OLD_END` 次元) と
 //!   logistic regression による 0..=1 progress / 0..=7 bucket。
-//!
-//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 pub mod feature_set;
 pub mod halfka_hm;

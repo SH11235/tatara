@@ -5,8 +5,6 @@
 //! - 学習形式: logistic regression (`p = sigmoid(Σ w_i * x_i)`)
 //! - bucket 割当: `min(7, floor(p * 8.0))` (8 bucket)
 //! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
-//!
-//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 use std::path::Path;
 use std::sync::OnceLock;

@@ -17,16 +17,9 @@
 //!
 //! `base = pos * max_inds`、padding 値 `-1` は skip。
 //!
-//! ## bullet 上流 (`KERNELS_SRC::k_forward`) との対応
+//! ## 実装メモ
 //!
-//! - C++ `extern "C" __global__ void k_forward(...)` → Rust `#[kernel] fn forward(...)`
-//! - C++ `const int*` / `const float*` → Rust `&[i32]` / `&[f32]`
-//! - C++ output `float* preds` → Rust `mut DisjointSlice<f32>`
-//! - C++ `int n_pos` / `int max_inds` → `u32` (符号要らないので素直に)
-//! - C++ `for (int j = 0; j < max_inds; ++j)` → Rust `while j < max_inds` (gemm 上流に倣う)
-//! - C++ `expf(-z)` → Rust `(-z).exp()` (cuda-oxide では libdevice 経由で `__nv_expf` に lowering)
-//!
-//! 計算ロジックは byte 単位で同一。
+//! - `(-z).exp()` は cuda-oxide が libdevice 経由で `__nv_expf` に lowering する。
 
 /// Reference CPU 実装。
 ///

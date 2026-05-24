@@ -9,10 +9,9 @@
 //!
 //! ## アルゴリズム
 //!
-//! bullet-shogi `examples/shogi_layerstack.rs:2330-2355` の dual-perspective psqt
-//! 経路の移植。layout は column-major `[NUM_BUCKETS, ft_in]` を row-major
-//! `psqt_w[feat * num_buckets + bucket]` で持つ (.bin save format と同じ
-//! feature-major order)。
+//! dual-perspective psqt の per-bucket スカラー prior。layout は row-major
+//! `psqt_w[feat * num_buckets + bucket]` (.bin save format と同じ feature-major
+//! order)。
 //!
 //! ```text
 //! forward (in-place add):

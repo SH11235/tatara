@@ -11,18 +11,17 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// Fused FT post-processing (forward) — bias add → CReLU → pairwise_mul → scale。
 ///
-/// bullet `shogi_layerstack.rs:2241-2243` の `l0.forward(stm/nstm).crelu().
-/// pairwise_mul() * (127.0/128.0)` + `stm.concat(nstm)` を 1 kernel に集約 (両
-/// perspective まとめて combined 出力)。
+/// `l0.forward(stm/nstm).crelu().pairwise_mul() * (127.0/128.0)` + `stm.concat(
+/// nstm)` を 1 kernel に集約 (両 perspective まとめて combined 出力)。
 ///
 /// 設計: 1 thread = combined buffer の 1 cell。`combined` の前半 (`[0, ft_dim/2)`) が
 /// stm の pairwise_mul 出力、後半 (`[ft_dim/2, ft_dim)`) が nstm の pairwise_mul 出力。
 /// 各 thread は自分が担当する combined cell の (batch, ri) と (is_stm, pair_idx) を
 /// 判定して、対応する perspective ft_out を読みに行く。
 ///
-/// `pairwise_mul` semantic (bullet `builder.rs:557-560`): `slice_rows(0, n/2) *
-/// slice_rows(n/2, n)`、つまり前半 `[0, half)` と後半 `[half, n)` の **対応 index
-/// 同士** の積 (隣接 pair でなく)。本 kernel も同じ。
+/// `pairwise_mul` semantic: `slice_rows(0, n/2) * slice_rows(n/2, n)`、つまり
+/// 前半 `[0, half)` と後半 `[half, n)` の **対応 index 同士** の積 (隣接 pair
+/// でなく)。
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::manual_clamp)]
 #[kernel]
@@ -2329,7 +2328,7 @@ pub fn screlu_fwd(x: &[f32], mut y: DisjointSlice<f32>, n: u32) {
 }
 
 /// abs_pow(2) * scale forward — `y[i] = x[i] * x[i] * scale`。
-/// bullet `abs_pow(2.0)` は `|x|^2 = x^2` なので abs 不要。1 thread = 1 element。
+/// `|x|^2 = x^2` なので abs は不要。1 thread = 1 element。
 #[kernel]
 pub fn abs_pow2_scale_fwd(x: &[f32], mut y: DisjointSlice<f32>, scale: f32, n: u32) {
     let i = thread::index_1d();
@@ -2519,8 +2518,7 @@ pub fn slice_scatter_2d(
 //   backward       = 各 (b, ni) で psqt_w_grad[stm_idx[b,ni], bk] += +0.5 * dnet[b]
 //                                  psqt_w_grad[nstm_idx[b,ni], bk] += −0.5 * dnet[b]
 //
-// bullet-shogi `shogi_layerstack.rs:2330-2355` の `(stm_psqt - nstm_psqt).select(bucket) * 0.5`
-// 経路と等価。PSQT bias は対称差で勾配 0 のため kernel は持たない (.bin 上は 0 固定で書く)。
+// PSQT bias は対称差で勾配 0 のため kernel は持たない (.bin 上は 0 固定で書く)。
 
 /// PSQT shortcut forward (in-place add to net_output)。
 ///

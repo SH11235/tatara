@@ -35,7 +35,7 @@
 //!
 //! ## score-drop-abs の近似
 //!
-//! bullet `--score-drop-abs t` は本来「`|score| >= t` の position の per-position
+//! `--score-drop-abs t` は本来「`|score| >= t` の position の per-position
 //! loss weight を 0 にする」semantics。本実装は **batch に push しない (skip)**
 //! で近似する。loss/gradient へ寄与しない点は同じだが、batch の構成 (slot
 //! 割当・順序) は厳密一致しない。

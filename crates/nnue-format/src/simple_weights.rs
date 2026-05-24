@@ -1,9 +1,8 @@
 //! Simple 4 層 NNUE quantised binary の save / load。
 //!
-//! `ArchKind::Simple` (bullet-shogi 由来の bucket 無し 4 層 dense アーキ) の
-//! 量子化 weight を 1 本の binary に (de)serialise する **GPU 非依存・pure CPU**
-//! module。LayerStack の [`crate::layerstack_weights`] と並ぶ、もう一方の
-//! アーキ用フォーマット。
+//! `ArchKind::Simple` (bucket 無し 4 層 dense アーキ) の量子化 weight を 1 本の
+//! binary に (de)serialise する **GPU 非依存・pure CPU** module。LayerStack の
+//! [`crate::layerstack_weights`] と並ぶ、もう一方のアーキ用フォーマット。
 //!
 //! ## Simple architecture (bucket 無し / PSQT 無し / skip 無し / L1f 無し)
 //!
@@ -26,8 +25,6 @@
 //! 6. L1: bias `i32` × `l1_out` (scale = `127*QB`)、weight `i8` × `l1_out * pad32(l1_in)` (scale = QB)
 //! 7. L2: bias `i32` × `l2_out`、weight `i8` × `l2_out * pad32(l1_out)`
 //! 8. L3: bias `i32` × 1、weight `i8` × `pad32(l2_out)`
-//!
-//! 量子化アルゴリズム (QA/QB scale、`pad32`、hash) の出典は `ATTRIBUTION.md`。
 //!
 //! ## 量子化 scale
 //!
@@ -66,10 +63,8 @@ use shogi_features::FeatureSetSpec;
 /// は形式世代スタンプであり、アーキの弁別子ではない (全 NNUE ファイルで単一値、
 /// アーキは file 内 `kHashValue = FeatureTransformer::GetHashValue() ^
 /// Network::GetHashValue()` で識別する)。本 format の `network_hash` は同 hash 機構の
-/// 移植で、bullet-shogi の bucket-less 出力
-/// (`examples/shogi_simple.rs --output-format standard`) も同 magic を使う。
-/// 詳細は `docs/decisions/2026-05-20-simple-quantised-format-engine-consumer.md`
-/// を参照。
+/// 移植。詳細は
+/// `docs/decisions/2026-05-20-simple-quantised-format-engine-consumer.md` を参照。
 pub const NNUE_VERSION: u32 = 0x7AF32F16;
 
 /// dense 層 weight の量子化 multiplier。
@@ -260,7 +255,7 @@ pub fn build_arch_str(id: &SimpleId, fv_scale: i32) -> String {
     format!("{},fv_scale={}", arch_identity(id), fv_scale)
 }
 
-/// dense 層群の topology hash (nnue-pytorch 系、出典は `ATTRIBUTION.md`)。
+/// dense 層群の topology hash (nnue-pytorch 系)。
 /// 層次元 (`l1_input` / `l1_out` / `l2_out`) のみに依存する。`l1_input` は L1 dense の
 /// 入力次元 (= FT post 出力の concat、`SimpleId::combined_dim`)。
 pub const fn compute_fc_hash(l1_input: usize, l1_out: usize, l2_out: usize) -> u32 {

@@ -5,8 +5,8 @@
 //!
 //! ## 使う test fixture
 //!
-//! - `crates/shogi-format/tests/data/sample.psv` (100 records、bullet-shogi
-//!   smoke_progress 由来の先頭 4000 bytes を vendor したもの)
+//! - `crates/shogi-format/tests/data/sample.psv` (100 records、PSV smoke 用に
+//!   vendor した先頭 4000 bytes)
 
 use std::path::PathBuf;
 
@@ -74,10 +74,10 @@ fn game_iterator_splits_by_ply_decrease() {
 
 #[test]
 fn game_iterator_splits_on_equal_ply_boundary() {
-    // bullet-shogi 上流は `cur_ply <= prev` を境界とするため、ply が等しい場合も
-    // 新ゲーム先頭になる (例: 1 局を 50 手目で打ち切って次局も 50 手目から始まる
-    // ような edge ケース)。本テストは sample.psv の先頭 1 record と重複した
-    // PSV を合成して、ply == prev の境界が正しく分割されることを確認する。
+    // `cur_ply <= prev` を境界とするため、ply が等しい場合も新ゲーム先頭に
+    // なる (例: 1 局を 50 手目で打ち切って次局も 50 手目から始まるような edge
+    // ケース)。本テストは sample.psv の先頭 1 record と重複した PSV を合成
+    // して、ply == prev の境界が正しく分割されることを確認する。
     let path = sample_psv_path();
     let mut cursor = PackCursor::open(&path).expect("open");
     let r0 = cursor.next_psv().expect("read").expect("Some");

@@ -7,9 +7,8 @@
 //!
 //! ## LayerStack アーキテクチャ (FT → L1 16 → L2 32 + progress8kpabs 9 buckets)
 //!
-//! bullet `examples/shogi_layerstack.rs:2206-2289` の reference 実装を Rust +
-//! cuda-oxide で再現。PSQT 無し、hand_count_dense 無し。FT 入力次元 `ft_in` は
-//! feature set 依存、FT 出力次元 `ft_out` は `--ft-out` 依存の runtime 値。
+//! PSQT 無し、hand_count_dense 無し。FT 入力次元 `ft_in` は feature set 依存、
+//! FT 出力次元 `ft_out` は `--ft-out` 依存の runtime 値。
 //!
 //! - **L0 (FT)**: sparse_ft_forward — weight (ft_in × ft_out), bias (ft_out, 共有)
 //! - **per-perspective post**: bias add → CReLU → pairwise_mul (ft_out→ft_out/2) → ×127/128

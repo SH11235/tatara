@@ -4,8 +4,7 @@
 //! inline 定義 (cuda-oxide bin-entry 制約)。forward の `l1_total =
 //! l1_bucket + l1f_out`、`net_output = l3_out + l1_skip` と、backward の
 //! gradient-combine (`dl1_main = dl1_main_from_concat + dl1_main_from_sqr`、
-//! `dcombined = dcombined_from_l1 + dcombined_from_l1f`) に使われる
-//! (bullet 上流では `+` operator overload に相当)。
+//! `dcombined = dcombined_from_l1 + dcombined_from_l1f`) に使われる。
 //!
 //! ## アルゴリズム
 //!

@@ -84,8 +84,8 @@ fn read_one_batch_of_psv_records() {
 }
 
 #[test]
-fn game_result_enum_discriminants_match_bullet() {
-    // 上流 (bullet-shogi) と同じ discriminant: Loss=0, Draw=1, Win=2。
+fn game_result_enum_discriminants_pinned() {
+    // PSV format の `result` field と一致する discriminant: Loss=0, Draw=1, Win=2。
     assert_eq!(GameResult::Loss as u8, 0);
     assert_eq!(GameResult::Draw as u8, 1);
     assert_eq!(GameResult::Win as u8, 2);

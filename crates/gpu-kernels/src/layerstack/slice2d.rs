@@ -2,10 +2,9 @@
 //!
 //! GPU 側 (`#[kernel] fn slice_extract_2d` / `slice_scatter_2d`) は
 //! `bins/nnue_train/src/main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。
-//! bullet 上流の `slice_rows(start, end)` (`crates/trainer/src/model/builder.rs`)
-//! に等価で、`l1_total (B×16)` から `l1_main (B×15)` (offset 0) と
-//! `l1_skip (B×1)` (offset 15) を切り出す forward と、その backward で
-//! `dl1_main` / `dl1_skip` を `dl1_total (B×16)` に書き戻すのに使う。
+//! `l1_total (B×16)` から `l1_main (B×15)` (offset 0) と `l1_skip (B×1)`
+//! (offset 15) を切り出す forward と、その backward で `dl1_main` /
+//! `dl1_skip` を `dl1_total (B×16)` に書き戻すのに使う。
 //!
 //! ## アルゴリズム
 //!

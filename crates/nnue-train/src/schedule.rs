@@ -5,10 +5,8 @@
 //! と loss kernel (`loss_wdl` / `loss_wrm`) の `lr` / `lambda` 引数として渡す
 //! host-side state を提供する。
 //!
-//! 計算 path (lr / blend) は bullet-shogi (`crates/bullet_lib/src/trainer/
-//! schedule/{lr,wdl}.rs`、`ATTRIBUTION.md` 参照) から移植し byte 一致。本 crate
-//! では ANSI 色付き terminal 出力 (`colourful`) は持たず、`std::fmt::Display`
-//! で plain string を返す形に統一する (色付けが必要なら呼び出し側で行う)。
+//! ANSI 色付き terminal 出力は持たず、`std::fmt::Display` で plain string を
+//! 返す形に統一する (色付けが必要なら呼び出し側で行う)。
 //!
 //! 両 trait に `+ 'static` を要求する: trainer state を `Arc` 共有 / thread
 //! spawn する想定で、borrow を持つ scheduler は許さない設計。
@@ -446,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_decay_lr_matches_bullet_midpoint() {
+    fn cosine_decay_lr_midpoint() {
         // 数式: lambda = 1 - 0.5 * (1 + cos(PI * progress))。
         // progress=0.5 で cos(PI/2)=0、lambda=0.5、midpoint で initial と final の中間。
         let lr = CosineDecayLR {

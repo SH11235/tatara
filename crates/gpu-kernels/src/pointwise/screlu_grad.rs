@@ -6,7 +6,7 @@
 //!
 //! ## アルゴリズム
 //!
-//! SCReLU の forward / backward は次の通り (bullet 上流 `SCReLU` 同等):
+//! SCReLU の forward / backward は次の通り:
 //!
 //! ```text
 //! SCReLU.forward(x)  = clamp(x, 0, 1)^2

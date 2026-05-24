@@ -6,7 +6,7 @@ use nnue_format::ArchKind;
 use crate::arch::*;
 
 // ===========================================================================
-// CLI (clap) — 引数群は bullet-shogi `examples/shogi_layerstack.rs` に対応
+// CLI (clap)
 // ===========================================================================
 
 /// Shogi NNUE trainer.
@@ -99,7 +99,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 20, global = true)]
     pub(crate) save_rate: usize,
 
-    /// Exclude positions with `|score| >= score_drop_abs` from the loss (bullet `--score-drop-abs`).
+    /// Exclude positions with `|score| >= score_drop_abs` from the loss.
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
 
@@ -250,7 +250,7 @@ pub(crate) enum ArchCommand {
     /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
-    /// Simple 4-layer architecture, ported from bullet-shogi.
+    /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
     Simple(SimpleArgs),
 }
 
@@ -342,8 +342,7 @@ pub(crate) struct LayerstackArgs {
     ///
     /// Default OFF for bit-identical compatibility with non-PSQT checkpoints.
     /// When enabled the saved `.bin` carries an extra `PSQT=9,` token in the
-    /// arch string plus an i32 PSQT block (scale `QA * QB = 8128`) compatible
-    /// with the bullet-shogi LayerStack PSQT format.
+    /// arch string plus an i32 PSQT block (scale `QA * QB = 8128`).
     #[arg(long)]
     pub(crate) psqt: bool,
 
@@ -351,12 +350,12 @@ pub(crate) struct LayerstackArgs {
     ///
     /// - `zeroed`: every PSQT weight starts at 0; the dense path absorbs
     ///   material information first and PSQT only picks up the residual
-    ///   correction. Bullet-shogi observed prolonged plateaus with this init.
+    ///   correction. Known to leave a long plateau early in training.
     /// - `material`: PSQT weights are pre-loaded with centipawn piece values
     ///   divided by `--wrm-nnue2score` (or `--scale` when WRM is off) so the
     ///   shortcut already encodes piece material from step 0. The dense path
     ///   then specialises in non-material structure (positional/tactical
-    ///   patterns). This matches bullet-shogi v101 PSQT.
+    ///   patterns).
     ///
     /// Requires `--psqt`. Material init additionally requires the loss to know
     /// the centipawn → logit scaling: either use `--win-rate-model` with
@@ -366,7 +365,7 @@ pub(crate) struct LayerstackArgs {
     pub(crate) psqt_init: PsqtInit,
 }
 
-/// PSQT shortcut の初期化方式。bullet-shogi v101 と同じセマンティクス。
+/// PSQT shortcut の初期化方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum PsqtInit {
     /// Start every PSQT weight at zero (PSQT is initially inert).

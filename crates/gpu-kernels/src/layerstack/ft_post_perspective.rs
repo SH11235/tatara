@@ -1,12 +1,10 @@
 //! Fused FT post-processing (forward / backward) kernel の reference CPU 実装。
 //!
 //! GPU 側 (`#[kernel] fn ft_post_perspective_fwd` / `_grad`) は `bins/nnue_train/
-//! src/main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。bullet 上流の
-//! `l0.forward(stm/nstm).crelu().pairwise_mul() * (127.0/128.0)` +
-//! `stm.concat(nstm)` (`shogi_layerstack.rs:2241-2243`) を 1 kernel に集約したもの。
-//! `pairwise_mul` semantic は bullet `crates/trainer/src/model/builder.rs:557-560`
-//! の `slice_rows(0, n/2) * slice_rows(n/2, n)` (前半と後半の **対応 index 同士** の
-//! 積、隣接 pair ではない)。
+//! src/main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。`l0.forward(stm/nstm)
+//! .crelu().pairwise_mul() * (127.0/128.0)` + `stm.concat(nstm)` を 1 kernel に
+//! 集約したもの。`pairwise_mul` の semantic は `slice_rows(0, n/2) * slice_rows(
+//! n/2, n)`、すなわち前半と後半の **対応 index 同士** の積 (隣接 pair ではない)。
 //!
 //! ## Layout 規約 (kernel と完全一致させる — テストの核心)
 //!
