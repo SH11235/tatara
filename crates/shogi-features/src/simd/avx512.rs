@@ -1,8 +1,9 @@
 //! AVX-512 (16 lane × i32) board phase 実装。
 //!
-//! 関数単位で `#[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]`
-//! を付与、binary 全体は AVX-512 必須化しない。caller の
-//! `BoardPhaseDispatch::detect()` が runtime feature check 後にのみ呼ぶ。
+//! 関数単位で `#[target_feature(enable = "avx512f")]` を付与、binary 全体は
+//! AVX-512 必須化しない。caller の `BoardPhaseDispatch::detect()` が runtime
+//! feature check 後にのみ呼ぶ。本 path で使う intrinsic はすべて AVX-512F のみ
+//! で利用可能 (DQ/BW/VL の要求は不要)。
 
 #![cfg(target_arch = "x86_64")]
 
@@ -18,11 +19,12 @@ const LANES: usize = 16;
 /// HalfKaHmMerged 専用 board phase の AVX-512 実装。
 ///
 /// # Safety
-/// caller は AVX-512F + DQ + BW + VL が available であることを保証する
-/// (`BoardPhase::detect()` で確認後にのみ呼ぶ)。`args` の各 slice は `args.n`
-/// 以上の長さ。
+/// caller は AVX-512F が available であることを保証する
+/// (`super::BoardPhaseDispatch::detect()` で確認済の dispatch 経由、または
+/// `super::testing::extract_avx512` の `is_x86_feature_detected!` 経由)。
+/// `args` の各 slice は `args.n` 以上の長さ。
 #[inline]
-#[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
+#[target_feature(enable = "avx512f")]
 pub(super) unsafe fn extract_halfka_hm_board_phase(args: &mut BoardPhaseArgs<'_>) {
     let stm = args.stm;
     let nstm = args.nstm;

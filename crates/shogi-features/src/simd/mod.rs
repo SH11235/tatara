@@ -6,9 +6,9 @@
 //!
 //! - `scalar`: lane-width 1 の reference 実装、常時 available
 //! - `avx2`:   x86_64 + AVX-2 (8 lane × i32)、`#[target_feature]` 制御
-//! - `avx512`: x86_64 + AVX-512F/DQ/BW/VL (16 lane × i32)、`#[target_feature]` 制御
+//! - `avx512`: x86_64 + AVX-512F (16 lane × i32)、`#[target_feature]` 制御
 //!
-//! dispatch は `BoardPhase::detect()` 経由で起動時 1 回判定 → `OnceLock` に
+//! dispatch は `BoardPhaseDispatch::detect()` 経由で起動時 1 回判定 → `OnceLock` に
 //! cache、以降は branch なしで関数 pointer 呼び出し。
 
 use crate::feature_set::FeatureSetSpec;
@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 
 mod scalar;
 mod tables;
+
+pub(crate) use tables::{MIRRORED_SQ, PIECE_BASE_FLAT};
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
@@ -49,7 +51,7 @@ pub(crate) struct BoardPhaseArgs<'a> {
     pub nstm_out: &'a mut [i32],
 }
 
-/// 起動時に検出した SIMD dispatch tag。`BoardPhase::detect()` で 1 回判定して
+/// 起動時に検出した SIMD dispatch tag。`BoardPhaseDispatch::detect()` で 1 回判定して
 /// `OnceLock` に焼く。AVX-512 → AVX-2 → Scalar の優先順。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BoardPhaseDispatch {
@@ -71,14 +73,12 @@ impl BoardPhaseDispatch {
 fn detect_uncached() -> BoardPhaseDispatch {
     #[cfg(target_arch = "x86_64")]
     {
-        // AVX-512 path は VL (256/128 bit AVX-512) と DQ / BW を併用 (mask 命令
-        // とバイト/ワード単位の compare に必要)。本リポ実装が前提とする命令の
-        // 最小組み合わせとして 4 サブセットを揃って要求する。
-        if std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512dq")
-            && std::is_x86_feature_detected!("avx512bw")
-            && std::is_x86_feature_detected!("avx512vl")
-        {
+        // 本 path で使う intrinsic (`_mm512_loadu_si512` / `_mm512_set1_epi32` /
+        // `_mm512_cmpeq_epi32_mask` / `_mm512_mask_blend_epi32` /
+        // `_mm512_i32gather_epi32` / `_mm512_storeu_si512` 等) は全て AVX-512F
+        // のみで利用可能。DQ / BW / VL は本実装で要求しない (KNL 等 F-only host
+        // でも SIMD path に dispatch する)。
+        if std::is_x86_feature_detected!("avx512f") {
             return BoardPhaseDispatch::Avx512;
         }
         if std::is_x86_feature_detected!("avx2") {
@@ -90,7 +90,7 @@ fn detect_uncached() -> BoardPhaseDispatch {
 
 /// HalfKaHmMerged 専用 board phase を dispatch して output slice に直接書込む。
 ///
-/// `BoardPhase::detect()` で起動時に決定した path に dispatch、結果は scalar 経路と
+/// `BoardPhaseDispatch::detect()` で起動時に決定した path に dispatch、結果は scalar 経路と
 /// byte-identical (parity test 参照)。
 #[inline]
 pub(crate) fn extract_halfka_hm_board_phase(mut args: BoardPhaseArgs<'_>) {
@@ -100,12 +100,12 @@ pub(crate) fn extract_halfka_hm_board_phase(mut args: BoardPhaseArgs<'_>) {
         BoardPhaseDispatch::Scalar => scalar::extract_halfka_hm_board_phase(&mut args),
         #[cfg(target_arch = "x86_64")]
         BoardPhaseDispatch::Avx2 => {
-            // SAFETY: `BoardPhase::detect()` が AVX-2 を確認済の path に来る。
+            // SAFETY: `BoardPhaseDispatch::detect()` が AVX-2 を確認済の path に来る。
             unsafe { avx2::extract_halfka_hm_board_phase(&mut args) }
         }
         #[cfg(target_arch = "x86_64")]
         BoardPhaseDispatch::Avx512 => {
-            // SAFETY: `BoardPhase::detect()` が AVX-512F/DQ/BW/VL を確認済の path に来る。
+            // SAFETY: `BoardPhaseDispatch::detect()` が AVX-512F を確認済の path に来る。
             unsafe { avx512::extract_halfka_hm_board_phase(&mut args) }
         }
     }
@@ -140,19 +140,13 @@ pub(crate) mod testing {
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn extract_avx512(mut args: BoardPhaseArgs<'_>) {
-        if !(std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512dq")
-            && std::is_x86_feature_detected!("avx512bw")
-            && std::is_x86_feature_detected!("avx512vl"))
-        {
+        if !std::is_x86_feature_detected!("avx512f") {
             return;
         }
-        // SAFETY: 直前で AVX-512F/DQ/BW/VL を確認している。
+        // SAFETY: 直前で AVX-512F を確認している。
         unsafe { avx512::extract_halfka_hm_board_phase(&mut args) }
     }
 }
-
-pub(crate) use tables::{MIRRORED_SQ, PIECE_BASE_FLAT};
 
 // =============================================================================
 // parity tests (scalar vs AVX-2 vs AVX-512)
@@ -261,11 +255,7 @@ mod parity_tests {
         };
         let avx512_out = {
             #[cfg(target_arch = "x86_64")]
-            if std::is_x86_feature_detected!("avx512f")
-                && std::is_x86_feature_detected!("avx512dq")
-                && std::is_x86_feature_detected!("avx512bw")
-                && std::is_x86_feature_detected!("avx512vl")
-            {
+            if std::is_x86_feature_detected!("avx512f") {
                 Some(run_path(
                     pt,
                     color,
@@ -360,6 +350,122 @@ mod parity_tests {
                 assert_eq!(scalar_out.1, avx512_out.1, "n={n}: nstm scalar vs AVX-512");
             }
         }
+    }
+
+    /// 同一 PSV record に対して 4 経路
+    /// (`map_features_board` closure / scalar / AVX-2 / AVX-512) すべての
+    /// 出力が一致することを 1 つの test で網羅確認する (path 間の局所 parity と
+    /// 高位 API 等価性をまとめて 1 経路にチェックして transitive 担保の漏れを
+    /// 防ぐ)。SIMD path は runtime detect が false なら該当 path だけ skip し、
+    /// どの path を比較したかを stdout に書き出して silent skip を視認可能に。
+    #[test]
+    fn closure_and_all_simd_paths_agree_on_sample_psv() {
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let records = sample_psv_records();
+        let mut compared_scalar = 0usize;
+        let mut compared_avx2 = 0usize;
+        let mut compared_avx512 = 0usize;
+        let mut closure_only = 0usize;
+        for (i, psv) in records.iter().enumerate() {
+            let board = psv.decode();
+            let stm = board.side_to_move;
+            let nstm = stm.opponent();
+            let stm_king = board.king_square(stm);
+            let nstm_king = board.king_square(nstm);
+            if !stm_king.is_valid() || !nstm_king.is_valid() {
+                continue;
+            }
+            let (pt, color, sq) = collect_board_pieces(&board);
+
+            // 1. closure 経路 (board phase だけを抜き出し、king / hand は除く)
+            let mut closure_board = Vec::new();
+            {
+                let stm_ctx = spec.perspective_ctx_for_test(stm_king, stm);
+                let nstm_ctx = spec.perspective_ctx_for_test(nstm_king, nstm);
+                let (stm_kb, stm_mirror) = stm_ctx;
+                let (nstm_kb, nstm_mirror) = nstm_ctx;
+                let pi = spec.piece_inputs();
+                use shogi_format::BonaPiece;
+                board.for_each_board_piece(|piece, s| {
+                    // map_features_board と同じ式を踏む (board piece の
+                    // `pack_bonapiece` は `folds_enemy_king` を trigger しない)。
+                    let stm_bp = BonaPiece::from_piece_square(piece, s, stm).value() as i32;
+                    let nstm_bp = BonaPiece::from_piece_square(piece, s, nstm).value() as i32;
+                    let stm_packed = pack_for_test(stm_bp, stm_mirror);
+                    let nstm_packed = pack_for_test(nstm_bp, nstm_mirror);
+                    let stm_idx = (stm_kb * pi) as i32 + stm_packed;
+                    let nstm_idx = (nstm_kb * pi) as i32 + nstm_packed;
+                    closure_board.push((stm_idx, nstm_idx));
+                });
+            }
+
+            if pt.is_empty() {
+                closure_only += 1;
+                continue;
+            }
+
+            // 2. forced SIMD path 群
+            let stm_pers = build_perspective(&spec, stm_king, stm);
+            let nstm_pers = build_perspective(&spec, nstm_king, nstm);
+            let (scalar_out, avx2, avx512) =
+                run_all_paths(&pt, &color, &sq, pt.len(), &stm_pers, &nstm_pers);
+
+            let scalar_pairs: Vec<(i32, i32)> = scalar_out
+                .0
+                .iter()
+                .zip(scalar_out.1.iter())
+                .map(|(&a, &b)| (a, b))
+                .collect();
+            assert_eq!(scalar_pairs, closure_board, "record {i}: scalar vs closure");
+            compared_scalar += 1;
+
+            if let Some(avx2_out) = avx2 {
+                let pairs: Vec<(i32, i32)> = avx2_out
+                    .0
+                    .iter()
+                    .zip(avx2_out.1.iter())
+                    .map(|(&a, &b)| (a, b))
+                    .collect();
+                assert_eq!(pairs, closure_board, "record {i}: AVX-2 vs closure");
+                compared_avx2 += 1;
+            }
+            if let Some(avx512_out) = avx512 {
+                let pairs: Vec<(i32, i32)> = avx512_out
+                    .0
+                    .iter()
+                    .zip(avx512_out.1.iter())
+                    .map(|(&a, &b)| (a, b))
+                    .collect();
+                assert_eq!(pairs, closure_board, "record {i}: AVX-512 vs closure");
+                compared_avx512 += 1;
+            }
+        }
+        // どの path が test で実際に比較されたか stdout に書き出して、
+        // (runtime feature 未対応で) silent skip された組合せが見えるようにする。
+        println!(
+            "closure_and_all_simd_paths_agree_on_sample_psv: scalar={compared_scalar} \
+             avx2={compared_avx2} avx512={compared_avx512} closure_only={closure_only}"
+        );
+        assert!(
+            compared_scalar > 0,
+            "scalar parity が 1 record も比較されなかった"
+        );
+    }
+
+    /// board piece 限定 `pack_bonapiece` (mirror のみ適用、enemy-king fold は
+    /// board piece では trigger しないので省略)。closure 比較 test 用 helper。
+    fn pack_for_test(bp: i32, mirror: bool) -> i32 {
+        use shogi_format::bona_piece::FE_HAND_END;
+        if !mirror || bp < FE_HAND_END as i32 {
+            return bp;
+        }
+        let rel = bp - FE_HAND_END as i32;
+        let piece_index = rel / 81;
+        let sq = rel % 81;
+        let file = sq / 9;
+        let rank = sq % 9;
+        let mirrored_sq = (8 - file) * 9 + rank;
+        FE_HAND_END as i32 + piece_index * 81 + mirrored_sq
     }
 
     /// 起動時 detect が現在 host で「scalar 以外」を選ぶことを確認する

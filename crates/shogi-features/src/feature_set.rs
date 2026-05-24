@@ -357,11 +357,12 @@ impl FeatureSetSpec {
 
     /// active 特徴 index を `stm_out` / `nstm_out` slice に直接書込み、書込んだ
     /// 件数を返す (closure 経由の [`map_features_board`] と byte-identical な
-    /// 出力を SIMD-friendly な形で得るための entry point)。
+    /// 出力を SIMD-friendly な形で得るための entry point)。`nnue-train` 側の
+    /// `Batch::push_decoded` がこの method を呼んで sparse 配列に詰める。
     ///
     /// 玉位置が無効な局面 (片玉 / 詰将棋データ) は何も書込まず 0 を返す。
     /// 出力 slice 長が `max_active` 未満の場合は超過分を silent skip する
-    /// ([`Batch::push_decoded`] の defensive 動作に合わせる)。
+    /// (caller の defensive 動作に合わせる)。
     ///
     /// 内部 dispatch:
     /// - HalfKaHmMerged の board phase は [`crate::simd`] (起動時 1 回 detect
@@ -370,7 +371,6 @@ impl FeatureSetSpec {
     ///   1 経路 scalar
     ///
     /// [`map_features_board`]: Self::map_features_board
-    /// [`Batch::push_decoded`]: ../../nnue_train/dataloader/struct.Batch.html#method.push_decoded
     pub fn extract_active_features(
         &self,
         board: &ShogiBoard,
@@ -654,10 +654,10 @@ mod tests {
 
     #[test]
     fn extract_active_features_matches_map_features_board() {
-        // 公開 5 feature set 全てで、新 API (`extract_active_features` —
-        // HalfKaHmMerged は SIMD dispatch、それ以外 scalar fallback) が
-        // 旧 closure API (`map_features_board`) と byte-identical な
-        // sparse index 列を emit することを sample.psv 100 records で確認する。
+        // 公開 5 feature set 全てで、direct-write API (`extract_active_features`
+        // — HalfKaHmMerged は SIMD dispatch、それ以外 scalar fallback) が
+        // closure API (`map_features_board`) と byte-identical な sparse index
+        // 列を emit することを sample.psv 100 records で確認する。
         use std::path::PathBuf;
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
@@ -703,8 +703,8 @@ mod tests {
     #[test]
     fn arch_feature_name_uses_pascal_case() {
         // arch_str に embed される keyword は PascalCase 表記で固定する。
-        // 推論側 (rshogi) parser は両綴りを受理するが、emit は新規 .bin に
-        // 単一の canonical 形を残す。
+        // 推論側 (rshogi) parser は両綴りを受理するが、emit 側は単一の
+        // canonical 形を残す。
         let expected = [
             (FeatureSet::HalfKp, "HalfKP"),
             (FeatureSet::HalfKaSplit, "HalfKaSplit"),

@@ -21,8 +21,10 @@ const LANES: usize = 8;
 /// HalfKaHmMerged 専用 board phase の AVX-2 実装。
 ///
 /// # Safety
-/// caller は AVX-2 が available であることを保証する (`BoardPhase::detect()`
-/// で確認後にのみ呼ぶ)。`args` の各 slice は `args.n` 以上の長さを持つこと。
+/// caller は AVX-2 が available であることを保証する
+/// (`super::BoardPhaseDispatch::detect()` で確認済の dispatch 経由、または
+/// `super::testing::extract_avx2` の `is_x86_feature_detected!` 経由)。
+/// `args` の各 slice は `args.n` 以上の長さを持つこと。
 #[inline]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn extract_halfka_hm_board_phase(args: &mut BoardPhaseArgs<'_>) {
