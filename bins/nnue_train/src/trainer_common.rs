@@ -3,7 +3,7 @@ use gpu_runtime::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, LaunchConfig
 use nnue_train::dataloader::Batch;
 use shogi_features::FeatureSetSpec;
 
-use crate::{arch::*, kernel_module::*};
+use crate::kernel_module::*;
 
 /// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
 /// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
@@ -279,10 +279,11 @@ pub(crate) fn memset_minus_one_i32(
 }
 
 /// bucket sort 用の padded sorted layout 容量を計算する。各 bucket は次 16-row 境界に
-/// align するため最大 `(NUM_BUCKETS + 1) * 15` 行の padding を要する。安全側で
-/// `(NUM_BUCKETS + 1) * 16` を上乗せして 16 倍数に切り上げる。
-pub(crate) fn padded_sort_batch(batch: usize) -> usize {
-    let raw = batch + (NUM_BUCKETS + 1) * 16;
+/// align するため最大 `(num_buckets + 1) * 15` 行の padding を要する。安全側で
+/// `(num_buckets + 1) * 16` を上乗せして 16 倍数に切り上げる。`+ 1` は invalid bin
+/// (bucket idx `< 0` / `>= num_buckets`) の slot 分。
+pub(crate) fn padded_sort_batch(batch: usize, num_buckets: usize) -> usize {
+    let raw = batch + (num_buckets + 1) * 16;
     raw.div_ceil(16) * 16
 }
 

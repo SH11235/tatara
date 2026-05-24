@@ -9,24 +9,26 @@
 //!   依存、ft_out は `--ft-out`)
 //! - per-perspective post: bias add → CReLU → pairwise_mul (ft_out → ft_out/2) → ×127/128
 //! - combined = stm.concat(nstm) = ft_out
-//! - L1 (per-bucket delta + shared l1f factorized): 9 × l1_out + (ft_out, l1_out)
+//! - L1 (per-bucket delta + shared l1f factorized): `num_buckets` × l1_out + (ft_out, l1_out)
 //! - l1_total = L1.select(bucket) + L1f、main (l1_out - 1) + skip (1) に slice
-//! - L2 (per-bucket): 9 × l2_out with input l2_in = (l1_out - 1) * 2
-//! - L3 (per-bucket output): 9 × 1
-//! - PSQT shortcut (任意): `(ft_in, NUM_BUCKETS=9)` の per-feature × per-bucket スカラー。
+//! - L2 (per-bucket): `num_buckets` × l2_out with input l2_in = (l1_out - 1) * 2
+//! - L3 (per-bucket output): `num_buckets` × 1
+//! - PSQT shortcut (任意): `(ft_in, num_buckets)` の per-feature × per-bucket スカラー。
 //!   forward は `net_output += 0.5 * (psqt[stm,bucket] - psqt[nstm,bucket])` で
 //!   dense path と並列に加算される (Stockfish SFNNv10 系)。
 //!
 //! ## file layout (top-level)
 //!
 //! 1. header: nnue_version (4 LE u32) + network_hash (4 LE u32) + arch_len (4 LE u32) + arch_str
-//! 2. ft_hash (4 LE u32)
-//! 3. ft_biases LEB128 (magic `COMPRESSED_LEB128` + size + signed LEB128 i16 列)
-//! 4. ft_weights LEB128 (同上、piece 部分 = `halfka_dim * ft_out`、threat 無し)
-//! 5. **PSQT block (arch_str に `PSQT=9,` がある場合のみ)**: bias i32 LE × NUM_BUCKETS,
-//!    weights i32 LE × halfka_dim × NUM_BUCKETS (feature-major、各 feat 内 bucket 連番)。
-//!    scale は `QA * QB = 8128` (bias は 0 固定)。
-//! 6. layerstacks: 9 bucket × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
+//! 2. **num_buckets (4 LE u32)** — current [`NNUE_VERSION`] のみ。bump 前の
+//!    [`LEGACY_NNUE_VERSION_BUCKETS9`] は本 field を持たず暗黙 `num_buckets = 9`
+//! 3. ft_hash (4 LE u32)
+//! 4. ft_biases LEB128 (magic `COMPRESSED_LEB128` + size + signed LEB128 i16 列)
+//! 5. ft_weights LEB128 (同上、piece 部分 = `halfka_dim * ft_out`、threat 無し)
+//! 6. **PSQT block (arch_str に `PSQT={num_buckets},` がある場合のみ)**: bias i32 LE
+//!    × num_buckets, weights i32 LE × halfka_dim × num_buckets (feature-major、各
+//!    feat 内 bucket 連番)。scale は `QA * QB = 8128` (bias は 0 固定)。
+//! 7. layerstacks: `num_buckets` × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
 //!
 //! ## save 時の L1 / L1f coalesce
 //!
@@ -73,11 +75,16 @@ use shogi_features::FeatureSetSpec;
 // constants (LayerStack architecture)
 // =============================================================================
 
-pub const NNUE_VERSION: u32 = 0x7AF32F20;
+/// 現行 `.bin` format version。`arch_str` の直後に `num_buckets: u32` を持つ
+/// self-describing layout。
+pub const NNUE_VERSION: u32 = 0x7AF32F21;
+/// `num_buckets` field が無かった旧 layout の version。load 時は暗黙
+/// `num_buckets = 9` として処理する (bump 前の配布 net 互換)。save には使わない。
+pub const LEGACY_NNUE_VERSION_BUCKETS9: u32 = 0x7AF32F20;
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
 // FT 入力次元は feature set ごと、FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、
-// L2 出力次元は `--l2` ごとに異なる runtime 値。bucket 数は固定。
+// L2 出力次元は `--l2`、bucket 数は `--num-buckets` ごとに異なる runtime 値。
 /// 既定 FT 出力次元 (1 perspective あたり)。`--ft-out` 未指定時の値。
 pub const DEFAULT_FT_OUT: usize = 1536;
 /// 既定 L1 出力次元。`--l1` 未指定時の値。L1 出力は skip 1 dim を除いた残り
@@ -86,7 +93,9 @@ pub const DEFAULT_L1_OUT: usize = 16;
 /// 既定 L2 出力次元。`--l2` 未指定時の値。L2 per-bucket dense 層の出力幅で、
 /// CReLU を経て L3 出力層の入力になる。
 pub const DEFAULT_L2_OUT: usize = 32;
-pub const NUM_BUCKETS: usize = 9;
+/// 既定 bucket 数。`--num-buckets` 未指定時、および legacy `.bin`
+/// ([`LEGACY_NNUE_VERSION_BUCKETS9`]) の暗黙 N。
+pub const DEFAULT_NUM_BUCKETS: usize = 9;
 
 pub const QA: i32 = 127;
 pub const QB: i32 = 64;
@@ -335,22 +344,26 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
 /// LayerStack の全 weight (f32、host 側保持)。
 ///
 /// Layout は本 crate trainer の kernel 内部 layout と一致 (`ft_in` =
-/// `feature_set.ft_in()`):
+/// `feature_set.ft_in()`、`num_buckets` は self field):
 /// - `ft_w`: `(ft_in, ft_out)` row-major、`ft_w[feat * ft_out + out]`
 /// - `ft_b`: `(ft_out)` (stm/nstm 共有)
-/// - `l1_w`: `(NUM_BUCKETS, l1_out, ft_out)` row-major、`l1_w[buc * l1_out * ft_out + out * ft_out + in]`
-/// - `l1_b`: `(NUM_BUCKETS, l1_out)` row-major
+/// - `l1_w`: `(num_buckets, l1_out, ft_out)` row-major、`l1_w[buc * l1_out * ft_out + out * ft_out + in]`
+/// - `l1_b`: `(num_buckets, l1_out)` row-major
 /// - `l1f_w`: `(ft_out, l1_out)` row-major、`l1f_w[in * l1_out + out]`
 /// - `l1f_b`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
-/// - `l2_w`: `(NUM_BUCKETS, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
-/// - `l2_b`: `(NUM_BUCKETS, l2_out)`
-/// - `l3_w`: `(NUM_BUCKETS, l2_out)` (out_dim=1 なので out 軸省略)
-/// - `l3_b`: `(NUM_BUCKETS)`
+/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
+/// - `l2_b`: `(num_buckets, l2_out)`
+/// - `l3_w`: `(num_buckets, l2_out)` (out_dim=1 なので out 軸省略)
+/// - `l3_b`: `(num_buckets)`
 #[derive(Debug, Clone)]
 pub struct LayerStackWeights {
     /// この weight が属する feature set。FT 入力次元 (`ft_in`) と
     /// artifact identity (arch 文字列 / hash) の単一の真実源。
     pub feature_set: FeatureSetSpec,
+    /// LayerStack output bucket count (`--num-buckets`)。per-bucket weight
+    /// buffer の bucket 軸長と、save / load 時の `.bin` `num_buckets` field を
+    /// 駆動する。
+    pub num_buckets: usize,
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
@@ -361,71 +374,79 @@ pub struct LayerStackWeights {
     pub l2_b: Vec<f32>,
     pub l3_w: Vec<f32>,
     pub l3_b: Vec<f32>,
-    /// PSQT shortcut weight (任意)、長さ `ft_in * NUM_BUCKETS`、layout
-    /// `psqt_w[feat * NUM_BUCKETS + bucket]` (feature-major、各 feat 内 bucket 連番)。
-    /// `Some` で save 時に PSQT block が出力され、arch 文字列に `PSQT=9,` token が
-    /// 入る。`None` (既定) は従来の PSQT 無し layout と bit-identical。
+    /// PSQT shortcut weight (任意)、長さ `ft_in * num_buckets`、layout
+    /// `psqt_w[feat * num_buckets + bucket]` (feature-major、各 feat 内 bucket 連番)。
+    /// `Some` で save 時に PSQT block が出力され、arch 文字列に `PSQT={num_buckets},`
+    /// token が入る。`None` (既定) は PSQT 無し layout。
     pub psqt_w: Option<Vec<f32>>,
 }
 
 impl LayerStackWeights {
     /// 全 buffer を 0 で初期化した新規 instance。FT 入力次元は
     /// `feature_set.ft_in()`、FT 出力次元は `ft_out` (`--ft-out`)、L1 出力次元は
-    /// `l1_out` (`--l1`)、L2 出力次元は `l2_out` (`--l2`) で決まる。L2 入力次元
-    /// `l2_in` は `l1_out` から導出する。
+    /// `l1_out` (`--l1`)、L2 出力次元は `l2_out` (`--l2`)、bucket 数は
+    /// `num_buckets` (`--num-buckets`) で決まる。L2 入力次元 `l2_in` は `l1_out`
+    /// から導出する。
     pub fn zeroed(
         feature_set: FeatureSetSpec,
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> Self {
+        assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let l2_in = (l1_out - 1) * 2;
         Self {
             feature_set,
+            num_buckets,
             ft_w: vec![0.0; feature_set.ft_in() * ft_out],
             ft_b: vec![0.0; ft_out],
-            l1_w: vec![0.0; NUM_BUCKETS * l1_out * ft_out],
-            l1_b: vec![0.0; NUM_BUCKETS * l1_out],
+            l1_w: vec![0.0; num_buckets * l1_out * ft_out],
+            l1_b: vec![0.0; num_buckets * l1_out],
             l1f_w: vec![0.0; ft_out * l1_out],
             l1f_b: vec![0.0; l1_out],
-            l2_w: vec![0.0; NUM_BUCKETS * l2_out * l2_in],
-            l2_b: vec![0.0; NUM_BUCKETS * l2_out],
-            l3_w: vec![0.0; NUM_BUCKETS * l2_out],
-            l3_b: vec![0.0; NUM_BUCKETS],
+            l2_w: vec![0.0; num_buckets * l2_out * l2_in],
+            l2_b: vec![0.0; num_buckets * l2_out],
+            l3_w: vec![0.0; num_buckets * l2_out],
+            l3_b: vec![0.0; num_buckets],
             psqt_w: None,
         }
     }
 
     /// PSQT shortcut weight 領域を 0 で確保した版 (PSQT 有効時用)。
-    /// `psqt_w` は長さ `feature_set.ft_in() * NUM_BUCKETS` の `Some` で確保される。
+    /// `psqt_w` は長さ `feature_set.ft_in() * num_buckets` の `Some` で確保される。
     pub fn zeroed_with_psqt(
         feature_set: FeatureSetSpec,
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> Self {
-        let mut s = Self::zeroed(feature_set, ft_out, l1_out, l2_out);
-        s.psqt_w = Some(vec![0.0; feature_set.ft_in() * NUM_BUCKETS]);
+        let mut s = Self::zeroed(feature_set, ft_out, l1_out, l2_out, num_buckets);
+        s.psqt_w = Some(vec![0.0; feature_set.ft_in() * num_buckets]);
         s
     }
 
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
-    /// `NetworkLayerStacks::read` で parse できる byte layout。
+    /// `NetworkLayerStacks::read` で parse できる byte layout (`num_buckets` を
+    /// header から読む対応が rshogi 側で要る)。
     pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // ---- header ---- (arch 文字列・hash は feature set + 層次元から導出)
         // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1f bias buffer の長さ
         // (どちらも 1 perspective / 1 dim あたり 1 要素)。L2 出力次元は L2 bias buffer の
-        // 長さを bucket 数で割った値 (`l2_b` は `(NUM_BUCKETS, l2_out)`)。L2 入力次元は
+        // 長さを bucket 数で割った値 (`l2_b` は `(num_buckets, l2_out)`)。L2 入力次元は
         // L1 出力から導出。
+        let num_buckets = self.num_buckets;
+        assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let ft_out = self.ft_b.len();
         let l1_out = self.l1f_b.len();
-        let l2_out = self.l2_b.len() / NUM_BUCKETS;
+        let l2_out = self.l2_b.len() / num_buckets;
         let l2_in = (l1_out - 1) * 2;
         let feature_hash = self.feature_set.feature_hash();
         writer.write_all(&NNUE_VERSION.to_le_bytes())?;
         writer.write_all(&network_hash(feature_hash, ft_out, l2_out).to_le_bytes())?;
         let psqt_buckets = if self.psqt_w.is_some() {
-            Some(NUM_BUCKETS)
+            Some(num_buckets)
         } else {
             None
         };
@@ -442,6 +463,9 @@ impl LayerStackWeights {
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
         writer.write_all(arch_bytes)?;
+
+        // ---- num_buckets (NNUE_VERSION bump 後の新 field) ----
+        writer.write_all(&(num_buckets as u32).to_le_bytes())?;
 
         // ---- FT hash ----
         writer.write_all(&ft_hash(feature_hash, ft_out).to_le_bytes())?;
@@ -473,28 +497,28 @@ impl LayerStackWeights {
             .collect();
         write_leb128_tensor_i16(writer, &ft_w_i16)?;
 
-        // ---- PSQT block (arch_str に PSQT=9, が入っているときのみ) ----
+        // ---- PSQT block (arch_str に PSQT={num_buckets}, が入っているときのみ) ----
         // bias は常に 0 固定 (forward 対称差で friend/enemy が打ち消し、勾配も常に 0)
-        // を i32 LE で NUM_BUCKETS 個書く。weights は `ft_in * NUM_BUCKETS` を
-        // feature-major (`psqt_w[feat * NUM_BUCKETS + bucket]`) でそのまま i32 LE 列に
+        // を i32 LE で num_buckets 個書く。weights は `ft_in * num_buckets` を
+        // feature-major (`psqt_w[feat * num_buckets + bucket]`) でそのまま i32 LE 列に
         // 書き出す。scale は `QA * QB = 8128`。
         if let Some(psqt) = self.psqt_w.as_ref() {
             let ft_in = self.feature_set.ft_in();
-            let expected = ft_in * NUM_BUCKETS;
+            let expected = ft_in * num_buckets;
             if psqt.len() != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "psqt_w length {} != expected {} (= ft_in {} * NUM_BUCKETS {})",
+                        "psqt_w length {} != expected {} (= ft_in {} * num_buckets {})",
                         psqt.len(),
                         expected,
                         ft_in,
-                        NUM_BUCKETS,
+                        num_buckets,
                     ),
                 ));
             }
             let psqt_scale = (QA * QB) as f64;
-            for _ in 0..NUM_BUCKETS {
+            for _ in 0..num_buckets {
                 writer.write_all(&0_i32.to_le_bytes())?;
             }
             for &w in psqt {
@@ -503,14 +527,14 @@ impl LayerStackWeights {
             }
         }
 
-        // ---- LayerStacks (9 buckets × {fc_hash, L1, L2, L3}) ----
+        // ---- LayerStacks (num_buckets × {fc_hash, L1, L2, L3}) ----
         let qb_f = QB as f64;
         let l1_bias_scale = (QA * QB) as f64; // = 8128
         let l2_bias_scale = 127.0 * qb_f; // = 8128 (QA == 127 前提)
         let l3_bias_scale = 127.0 * qb_f; // = 8128
 
         let fc_hash = compute_fc_hash(ft_out, l2_out);
-        for buc in 0..NUM_BUCKETS {
+        for buc in 0..num_buckets {
             // fc_hash per bucket
             writer.write_all(&fc_hash.to_le_bytes())?;
 
@@ -594,13 +618,15 @@ impl LayerStackWeights {
     /// 出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは l1f を
     /// 再び factorize し直す前提なら問題ない。
     /// `expected` は要求 feature set、`ft_out` は要求 FT 出力次元 (`--ft-out`)、
-    /// `l1_out` は要求 L1 出力次元 (`--l1`)、`l2_out` は要求 L2 出力次元 (`--l2`)。
-    /// file の arch 文字列・hash・各 layer の byte 数がこれらと一致しなければ
-    /// `InvalidData` で reject する (reject policy)。`l2_out` は `network_hash` に
-    /// 織り込まれるため、不一致は hash mismatch で弾かれる。legacy の `.bin`
-    /// (`halfka-hm-merged` / `ft_out = DEFAULT_FT_OUT` / `l1_out = DEFAULT_L1_OUT` /
-    /// `l2_out = DEFAULT_L2_OUT`) は arch 文字列・hash・layout が同 spec から導出した
-    /// 値と一致するため、その既定値でそのまま受理される (後方互換)。
+    /// `l1_out` は要求 L1 出力次元 (`--l1`)、`l2_out` は要求 L2 出力次元 (`--l2`)、
+    /// `num_buckets` は要求 bucket 数 (`--num-buckets`)。file の arch 文字列・hash・
+    /// `num_buckets` field・各 layer の byte 数がこれらと一致しなければ `InvalidData`
+    /// で reject する (reject policy)。`l2_out` は `network_hash` に織り込まれるため、
+    /// 不一致は hash mismatch で弾かれる。legacy `.bin`
+    /// ([`LEGACY_NNUE_VERSION_BUCKETS9`]) は `num_buckets` field を持たず暗黙
+    /// `num_buckets = 9` として扱われ、`num_buckets != 9` を要求した場合は
+    /// `InvalidData` で reject する (古い配布 net のままだと N != 9 に切り替えられない、
+    /// 想定挙動)。
     /// PSQT shortcut 層を含む `.bin` を load する場合は [`Self::load_quantised_with_psqt`]
     /// を使う。本 method は PSQT 無しを要求し、PSQT を含む `.bin` は `Unsupported`
     /// で reject する。
@@ -610,35 +636,43 @@ impl LayerStackWeights {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> io::Result<Self> {
-        Self::load_quantised_with_psqt(reader, expected, ft_out, l1_out, l2_out, false)
+        Self::load_quantised_with_psqt(reader, expected, ft_out, l1_out, l2_out, num_buckets, false)
     }
 
     /// PSQT shortcut の有無を caller が指定する load。`with_psqt = true` で
-    /// arch_str に `PSQT=9,` を要求 + PSQT block を読む、`false` で PSQT 無しを要求。
-    /// 不一致 (要求 true で `.bin` 側無し / 要求 false で `.bin` 側有り) は `InvalidData`
-    /// で reject する。
+    /// arch_str に `PSQT={num_buckets},` を要求 + PSQT block を読む、`false` で
+    /// PSQT 無しを要求。不一致 (要求 true で `.bin` 側無し / 要求 false で `.bin`
+    /// 側有り) は `InvalidData` で reject する。
     pub fn load_quantised_with_psqt<R: Read>(
         reader: &mut R,
         expected: FeatureSetSpec,
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
         with_psqt: bool,
     ) -> io::Result<Self> {
+        assert!(num_buckets >= 1, "num_buckets must be >= 1");
         // L1 出力 (skip 1 dim を除く) を 2 乗 + 連結した L2 入力次元。
         let l2_in = (l1_out - 1) * 2;
         let mut buf4 = [0u8; 4];
 
-        // version
+        // version (current NNUE_VERSION か legacy LEGACY_NNUE_VERSION_BUCKETS9 を受理、
+        // それ以外は reject。legacy は暗黙 num_buckets = 9 として処理する)。
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != NNUE_VERSION {
+        if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x})"),
+                format!(
+                    "unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x} or legacy \
+                     {LEGACY_NNUE_VERSION_BUCKETS9:#x})"
+                ),
             ));
         }
+        let file_is_legacy = version == LEGACY_NNUE_VERSION_BUCKETS9;
 
         // network_hash — 要求 feature set 由来の値と照合 (整合性チェック)。
         reader.read_exact(&mut buf4)?;
@@ -667,25 +701,54 @@ impl LayerStackWeights {
         let mut arch_bytes = vec![0u8; arch_len];
         reader.read_exact(&mut arch_bytes)?;
         let arch_str = String::from_utf8_lossy(&arch_bytes);
+
+        // num_buckets field (current NNUE_VERSION のみ。legacy は暗黙 9 として扱う)。
+        // legacy `.bin` を非 9 で load しようとした場合は明示 reject。
+        let file_num_buckets = if file_is_legacy {
+            if num_buckets != DEFAULT_NUM_BUCKETS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy NNUE version {LEGACY_NNUE_VERSION_BUCKETS9:#x} has implicit \
+                         num_buckets = {DEFAULT_NUM_BUCKETS}, but {num_buckets} was requested \
+                         (re-save the `.bin` with a current build to load it at non-default \
+                         bucket counts)"
+                    ),
+                ));
+            }
+            DEFAULT_NUM_BUCKETS
+        } else {
+            reader.read_exact(&mut buf4)?;
+            let v = u32::from_le_bytes(buf4) as usize;
+            if v != num_buckets {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("num_buckets mismatch: file {v}, expected {num_buckets}"),
+                ));
+            }
+            v
+        };
+
         // Threat / HandCount は未対応。PSQT は caller の要求 (`with_psqt`) と一致する
-        // か検証する (要求 true なら `PSQT={NUM_BUCKETS},` を要求、false なら PSQT
-        // 含む `.bin` を reject)。
+        // か検証する (要求 true なら `PSQT={file_num_buckets},` を要求、false なら
+        // PSQT 含む `.bin` を reject)。
         if arch_str.contains("Threat=") || arch_str.contains("HandCount") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("unsupported arch (Threat / HandCount not implemented): {arch_str}"),
             ));
         }
-        let psqt_token = format!("PSQT={NUM_BUCKETS},");
+        let psqt_token = format!("PSQT={file_num_buckets},");
         let file_has_psqt = arch_str.contains(&psqt_token);
         let file_has_any_psqt = arch_str.contains("PSQT=");
-        // 不一致 bucket count (PSQT=N for N != NUM_BUCKETS) は build に依らず未対応。
+        // bucket 数不一致 PSQT (`PSQT=N` で N != file の num_buckets) は構造的に壊れた
+        // file。num_buckets 検証で既に弾かれるはずだが defensive に reject する。
         if file_has_any_psqt && !file_has_psqt {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "unsupported PSQT bucket count in arch_str: `{arch_str}` \
-                     (this build supports `{psqt_token}` only)"
+                    "PSQT bucket count in arch_str does not match num_buckets={file_num_buckets}: \
+                     `{arch_str}`"
                 ),
             ));
         }
@@ -760,8 +823,8 @@ impl LayerStackWeights {
         let ft_w_i16 = read_leb128_tensor_i16(reader, Some(expected.ft_in() * ft_out))?;
         let ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
-        // PSQT block (with_psqt = true のときのみ): bias i32 × NUM_BUCKETS + weights
-        // i32 × (ft_in * NUM_BUCKETS) を feature-major row-major で読む。scale は
+        // PSQT block (with_psqt = true のときのみ): bias i32 × num_buckets + weights
+        // i32 × (ft_in * num_buckets) を feature-major row-major で読む。scale は
         // `QA * QB = 8128` (save 側と対称)。
         //
         // PSQT bias は forward の対称差 (friend / enemy が同じ bias を打ち消す) と
@@ -773,7 +836,7 @@ impl LayerStackWeights {
         let psqt_bias_scale = (QA * QB) as f32;
         let psqt_weight_scale = psqt_bias_scale;
         let psqt_w: Option<Vec<f32>> = if with_psqt {
-            for bucket in 0..NUM_BUCKETS {
+            for bucket in 0..num_buckets {
                 let mut bbuf = [0u8; 4];
                 reader.read_exact(&mut bbuf)?;
                 let raw = i32::from_le_bytes(bbuf);
@@ -789,7 +852,7 @@ impl LayerStackWeights {
                     ));
                 }
             }
-            let n = expected.ft_in() * NUM_BUCKETS;
+            let n = expected.ft_in() * num_buckets;
             let mut w = Vec::with_capacity(n);
             let mut wbuf = [0u8; 4];
             for _ in 0..n {
@@ -802,24 +865,24 @@ impl LayerStackWeights {
             None
         };
 
-        // LayerStacks (9 buckets × {fc_hash, L1, L2, L3})
+        // LayerStacks (num_buckets × {fc_hash, L1, L2, L3})
         let qb_f = QB as f32;
         let l1_bias_scale = (QA * QB) as f32;
         let l2_bias_scale = 127.0 * qb_f;
         let l3_bias_scale = 127.0 * qb_f;
 
-        let mut l1_w = vec![0.0_f32; NUM_BUCKETS * l1_out * ft_out];
-        let mut l1_b = vec![0.0_f32; NUM_BUCKETS * l1_out];
-        let mut l2_w = vec![0.0_f32; NUM_BUCKETS * l2_out * l2_in];
-        let mut l2_b = vec![0.0_f32; NUM_BUCKETS * l2_out];
-        let mut l3_w = vec![0.0_f32; NUM_BUCKETS * l2_out];
-        let mut l3_b = vec![0.0_f32; NUM_BUCKETS];
+        let mut l1_w = vec![0.0_f32; num_buckets * l1_out * ft_out];
+        let mut l1_b = vec![0.0_f32; num_buckets * l1_out];
+        let mut l2_w = vec![0.0_f32; num_buckets * l2_out * l2_in];
+        let mut l2_b = vec![0.0_f32; num_buckets * l2_out];
+        let mut l3_w = vec![0.0_f32; num_buckets * l2_out];
+        let mut l3_b = vec![0.0_f32; num_buckets];
 
         let l1_padded_in = pad32(ft_out);
         let l2_padded_in = pad32(l2_in);
         let l3_padded_in = pad32(l2_out);
 
-        for buc in 0..NUM_BUCKETS {
+        for buc in 0..num_buckets {
             // fc_hash (skip)
             reader.read_exact(&mut buf4)?;
 
@@ -877,6 +940,7 @@ impl LayerStackWeights {
 
         Ok(Self {
             feature_set: expected,
+            num_buckets,
             ft_w,
             ft_b,
             l1_w,
@@ -960,8 +1024,13 @@ mod tests {
     #[test]
     fn weights_zeroed_save_load_roundtrip() {
         // 0 weight で save → load → 同じ 0 weight が復元できる
-        let original =
-            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
         let mut cursor = std::io::Cursor::new(&buf);
@@ -971,6 +1040,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
 
@@ -992,8 +1062,13 @@ mod tests {
         // 既定外の FT 出力次元で zeroed → save → load しても layout が対称で、
         // buffer 長が ft_out に追従する。
         let ft_out = 256;
-        let original =
-            LayerStackWeights::zeroed(test_spec(), ft_out, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
         assert_eq!(original.ft_b.len(), ft_out);
         assert_eq!(original.ft_w.len(), test_spec().ft_in() * ft_out);
         let mut buf = Vec::new();
@@ -1004,11 +1079,15 @@ mod tests {
             ft_out,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
         assert_eq!(loaded.ft_b.len(), ft_out);
         assert_eq!(loaded.ft_w.len(), test_spec().ft_in() * ft_out);
-        assert_eq!(loaded.l1_w.len(), NUM_BUCKETS * DEFAULT_L1_OUT * ft_out);
+        assert_eq!(
+            loaded.l1_w.len(),
+            DEFAULT_NUM_BUCKETS * DEFAULT_L1_OUT * ft_out
+        );
         // 同じ .bin を別 ft_out で load すると arch / hash 不一致で reject される。
         let err = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
@@ -1016,6 +1095,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect_err("ft_out 不一致は reject される");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1027,11 +1107,22 @@ mod tests {
         // buffer 長が l1_out / l2_in に追従する。
         let l1_out = 24;
         let l2_in = (l1_out - 1) * 2;
-        let original =
-            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, l1_out, DEFAULT_L2_OUT);
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            l1_out,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
         assert_eq!(original.l1f_b.len(), l1_out);
-        assert_eq!(original.l1_w.len(), NUM_BUCKETS * l1_out * DEFAULT_FT_OUT);
-        assert_eq!(original.l2_w.len(), NUM_BUCKETS * DEFAULT_L2_OUT * l2_in);
+        assert_eq!(
+            original.l1_w.len(),
+            DEFAULT_NUM_BUCKETS * l1_out * DEFAULT_FT_OUT
+        );
+        assert_eq!(
+            original.l2_w.len(),
+            DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
+        );
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
         let loaded = LayerStackWeights::load_quantised(
@@ -1040,11 +1131,18 @@ mod tests {
             DEFAULT_FT_OUT,
             l1_out,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
-        assert_eq!(loaded.l1_b.len(), NUM_BUCKETS * l1_out);
-        assert_eq!(loaded.l1_w.len(), NUM_BUCKETS * l1_out * DEFAULT_FT_OUT);
-        assert_eq!(loaded.l2_w.len(), NUM_BUCKETS * DEFAULT_L2_OUT * l2_in);
+        assert_eq!(loaded.l1_b.len(), DEFAULT_NUM_BUCKETS * l1_out);
+        assert_eq!(
+            loaded.l1_w.len(),
+            DEFAULT_NUM_BUCKETS * l1_out * DEFAULT_FT_OUT
+        );
+        assert_eq!(
+            loaded.l2_w.len(),
+            DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
+        );
         // 同じ .bin を別 l1_out で load すると arch token 不一致で reject される。
         let err = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
@@ -1052,6 +1150,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect_err("l1_out 不一致は reject される");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1063,11 +1162,16 @@ mod tests {
         // buffer 長が l2_out に追従する。
         let l2_out = 64;
         let l2_in = (DEFAULT_L1_OUT - 1) * 2;
-        let original =
-            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, l2_out);
-        assert_eq!(original.l2_b.len(), NUM_BUCKETS * l2_out);
-        assert_eq!(original.l2_w.len(), NUM_BUCKETS * l2_out * l2_in);
-        assert_eq!(original.l3_w.len(), NUM_BUCKETS * l2_out);
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            l2_out,
+            DEFAULT_NUM_BUCKETS,
+        );
+        assert_eq!(original.l2_b.len(), DEFAULT_NUM_BUCKETS * l2_out);
+        assert_eq!(original.l2_w.len(), DEFAULT_NUM_BUCKETS * l2_out * l2_in);
+        assert_eq!(original.l3_w.len(), DEFAULT_NUM_BUCKETS * l2_out);
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
         let loaded = LayerStackWeights::load_quantised(
@@ -1076,11 +1180,12 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             l2_out,
+            DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
-        assert_eq!(loaded.l2_b.len(), NUM_BUCKETS * l2_out);
-        assert_eq!(loaded.l2_w.len(), NUM_BUCKETS * l2_out * l2_in);
-        assert_eq!(loaded.l3_w.len(), NUM_BUCKETS * l2_out);
+        assert_eq!(loaded.l2_b.len(), DEFAULT_NUM_BUCKETS * l2_out);
+        assert_eq!(loaded.l2_w.len(), DEFAULT_NUM_BUCKETS * l2_out * l2_in);
+        assert_eq!(loaded.l3_w.len(), DEFAULT_NUM_BUCKETS * l2_out);
         // 同じ .bin を別 l2_out で load すると network_hash 不一致で reject される
         // (l2_out は compute_fc_hash の隠れ層列に織り込まれている)。
         let err = LayerStackWeights::load_quantised(
@@ -1089,6 +1194,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect_err("l2_out 不一致は reject される");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1101,9 +1207,15 @@ mod tests {
         let split = FeatureSet::HalfKaSplit.spec();
         let merged = FeatureSet::HalfKaHmMerged.spec();
         let mut buf = Vec::new();
-        LayerStackWeights::zeroed(split, DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT)
-            .save_quantised(&mut buf)
-            .unwrap();
+        LayerStackWeights::zeroed(
+            split,
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .save_quantised(&mut buf)
+        .unwrap();
 
         let ok = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
@@ -1111,6 +1223,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         assert!(ok.is_ok(), "同一 feature set なら load できる");
         assert_eq!(ok.unwrap().ft_w.len(), split.ft_in() * DEFAULT_FT_OUT);
@@ -1121,6 +1234,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect_err("feature set 不一致は reject される");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1142,6 +1256,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect("parse reference bin");
 
@@ -1151,13 +1266,16 @@ mod tests {
         assert_eq!(weights.ft_b.len(), DEFAULT_FT_OUT);
         assert_eq!(
             weights.l1_w.len(),
-            NUM_BUCKETS * DEFAULT_L1_OUT * DEFAULT_FT_OUT
+            DEFAULT_NUM_BUCKETS * DEFAULT_L1_OUT * DEFAULT_FT_OUT
         );
-        assert_eq!(weights.l1_b.len(), NUM_BUCKETS * DEFAULT_L1_OUT);
-        assert_eq!(weights.l2_w.len(), NUM_BUCKETS * DEFAULT_L2_OUT * l2_in);
-        assert_eq!(weights.l2_b.len(), NUM_BUCKETS * DEFAULT_L2_OUT);
-        assert_eq!(weights.l3_w.len(), NUM_BUCKETS * DEFAULT_L2_OUT);
-        assert_eq!(weights.l3_b.len(), NUM_BUCKETS);
+        assert_eq!(weights.l1_b.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L1_OUT);
+        assert_eq!(
+            weights.l2_w.len(),
+            DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
+        );
+        assert_eq!(weights.l2_b.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT);
+        assert_eq!(weights.l3_w.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT);
+        assert_eq!(weights.l3_b.len(), DEFAULT_NUM_BUCKETS);
 
         // 非自明 weight (training 済みなので非 0 が多い)
         let nz_ft = weights.ft_w.iter().filter(|&&x| x != 0.0).count();
@@ -1210,6 +1328,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
@@ -1308,10 +1427,11 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         assert_eq!(
             original.psqt_w.as_ref().unwrap().len(),
-            test_spec().ft_in() * NUM_BUCKETS
+            test_spec().ft_in() * DEFAULT_NUM_BUCKETS
         );
 
         let mut buf = Vec::new();
@@ -1322,11 +1442,12 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
             true,
         )
         .unwrap();
         let psqt = loaded.psqt_w.as_ref().expect("psqt_w should be Some");
-        assert_eq!(psqt.len(), test_spec().ft_in() * NUM_BUCKETS);
+        assert_eq!(psqt.len(), test_spec().ft_in() * DEFAULT_NUM_BUCKETS);
         assert!(psqt.iter().all(|&x| x == 0.0));
     }
 
@@ -1338,14 +1459,15 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         let psqt = net.psqt_w.as_mut().unwrap();
         let lsb = 1.0_f32 / (QA * QB) as f32;
         psqt[0] = lsb;
-        psqt[NUM_BUCKETS - 1] = -lsb;
-        psqt[NUM_BUCKETS] = 2.0 * lsb;
-        psqt[100 * NUM_BUCKETS + 3] = -3.0 * lsb;
-        psqt[(test_spec().ft_in() - 1) * NUM_BUCKETS + 5] = 7.0 * lsb;
+        psqt[DEFAULT_NUM_BUCKETS - 1] = -lsb;
+        psqt[DEFAULT_NUM_BUCKETS] = 2.0 * lsb;
+        psqt[100 * DEFAULT_NUM_BUCKETS + 3] = -3.0 * lsb;
+        psqt[(test_spec().ft_in() - 1) * DEFAULT_NUM_BUCKETS + 5] = 7.0 * lsb;
 
         let mut buf = Vec::new();
         net.save_quantised(&mut buf).unwrap();
@@ -1355,6 +1477,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
             true,
         )
         .unwrap();
@@ -1379,6 +1502,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
         net.save_quantised(&mut buf).unwrap();
@@ -1388,6 +1512,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )
         .expect_err("PSQT 含む .bin を with_psqt=false で読むと reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1396,8 +1521,13 @@ mod tests {
     #[test]
     fn load_rejects_missing_psqt_when_requested() {
         // PSQT 無し .bin を with_psqt=true で読むと InvalidData で reject される。
-        let net =
-            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let net = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
         let mut buf = Vec::new();
         net.save_quantised(&mut buf).unwrap();
         let err = LayerStackWeights::load_quantised_with_psqt(
@@ -1406,6 +1536,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
             true,
         )
         .expect_err("PSQT 無し .bin を with_psqt=true で読むと reject");
@@ -1427,9 +1558,9 @@ mod tests {
             + DEFAULT_L2_OUT * l2_padded_in
             + 4 // L3 bias
             + l3_padded_in;
-        let layerstacks_total = NUM_BUCKETS * layerstack_per_bucket;
-        let psqt_weights_bytes = ft_in * NUM_BUCKETS * 4;
-        let psqt_bias_bytes = NUM_BUCKETS * 4;
+        let layerstacks_total = DEFAULT_NUM_BUCKETS * layerstack_per_bucket;
+        let psqt_weights_bytes = ft_in * DEFAULT_NUM_BUCKETS * 4;
+        let psqt_bias_bytes = DEFAULT_NUM_BUCKETS * 4;
         buf_len - layerstacks_total - psqt_weights_bytes - psqt_bias_bytes
     }
 
@@ -1444,6 +1575,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
         net.save_quantised(&mut buf).unwrap();
@@ -1462,6 +1594,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
             true,
         )
         .expect_err("non-zero PSQT bias must be rejected");
@@ -1486,7 +1619,7 @@ mod tests {
 
     #[test]
     fn load_accepts_all_zero_psqt_bias() {
-        // 全 NUM_BUCKETS bucket の bias が 0 の通常 case が load を pass する
+        // 全 DEFAULT_NUM_BUCKETS bucket の bias が 0 の通常 case が load を pass する
         // ことを明示的に確認する (zero-branch の正常 path coverage)。
         // psqt_zeroed_save_load_roundtrip も同じ path を通るが、本 test は「bias 領域
         // の全 9 cell が 0」という前提を破った版 (非ゼロ patch) と直接対比できる。
@@ -1495,13 +1628,14 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
         net.save_quantised(&mut buf).unwrap();
         // bias 領域 9 個の i32 LE が全て 0 であることを直接確認する (zero-branch を
         // どの bucket でも通る前提の test)。
         let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
-        for bucket in 0..NUM_BUCKETS {
+        for bucket in 0..DEFAULT_NUM_BUCKETS {
             let off = bias_start + bucket * 4;
             let raw = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
             assert_eq!(raw, 0, "expected 0 PSQT bias at bucket {bucket}, got {raw}");
@@ -1513,6 +1647,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
             true,
         )
         .expect("all-zero PSQT bias must load successfully");
@@ -1520,23 +1655,29 @@ mod tests {
 
     #[test]
     fn psqt_save_file_size_grows_by_expected_bytes() {
-        // PSQT 有り .bin は PSQT 無し .bin より `(NUM_BUCKETS + ft_in * NUM_BUCKETS) * 4`
+        // PSQT 有り .bin は PSQT 無し .bin より `(DEFAULT_NUM_BUCKETS + ft_in * DEFAULT_NUM_BUCKETS) * 4`
         // bytes 大きい (bias + weights の i32 LE 列、scale 共通 qa*qb)。
         let ft_in = test_spec().ft_in();
-        let without =
-            LayerStackWeights::zeroed(test_spec(), DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT);
+        let without = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
         let with = LayerStackWeights::zeroed_with_psqt(
             test_spec(),
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         );
         let mut buf_w = Vec::new();
         let mut buf_wo = Vec::new();
         with.save_quantised(&mut buf_w).unwrap();
         without.save_quantised(&mut buf_wo).unwrap();
         let arch_token_len = "PSQT=9,".len();
-        let psqt_bytes = (NUM_BUCKETS + ft_in * NUM_BUCKETS) * 4;
+        let psqt_bytes = (DEFAULT_NUM_BUCKETS + ft_in * DEFAULT_NUM_BUCKETS) * 4;
         assert_eq!(
             buf_w.len() - buf_wo.len(),
             arch_token_len + psqt_bytes,

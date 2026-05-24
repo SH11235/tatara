@@ -101,8 +101,9 @@ fn progress_and_bucket_with_zero_weights() {
             "record {i}: weights=0 で progress {p} が 0.5 から離れている"
         );
 
-        let b = kpabs.bucket(psv);
+        // zero weights → p = 0.5、`floor(0.5 * 9) = 4` を期待。
+        let b = kpabs.bucket(psv, 9);
         assert_eq!(b, 4, "record {i}: weights=0 で bucket={b} (期待: 4)");
-        assert!(b < 8, "bucket {b} が 0..=7 範囲外");
+        assert!(b < 9, "bucket {b} が 0..=8 範囲外");
     }
 }

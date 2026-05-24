@@ -692,7 +692,7 @@ fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let batch = 13_usize; // > 9 + 2 → all buckets + both out-of-range kinds
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = NUM_BUCKETS;
+    let nb = DEFAULT_NUM_BUCKETS;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let w: Vec<f32> = (0..nb * out_dim * in_dim)
         .map(|i| i as f32 * 0.0007 + 0.05)
@@ -738,7 +738,7 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
     // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets <= 9
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
         let out_dim = 16_usize;
-        let nb = NUM_BUCKETS;
+        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
             .map(|i| i as f32 * 0.0007 + 0.05)
@@ -800,8 +800,8 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         (64, 32, 8),
         (32, 48, 17),
     ] {
-        let nb = NUM_BUCKETS;
-        let padded = padded_sort_batch(batch);
+        let nb = DEFAULT_NUM_BUCKETS;
+        let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
             .map(|i| i as f32 * 0.0007 + 0.05)
@@ -899,7 +899,7 @@ fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Err
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = NUM_BUCKETS;
+    let nb = DEFAULT_NUM_BUCKETS;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
         .collect();
@@ -944,7 +944,7 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = NUM_BUCKETS;
+    let nb = DEFAULT_NUM_BUCKETS;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
@@ -995,7 +995,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
         (1024, 14, 256),
         (32, 96, 30), // 非 16 倍数の out_dim
     ] {
-        let nb = NUM_BUCKETS;
+        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1055,7 +1055,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         (32, 30), // 非 16 倍数の in_dim
     ] {
         let out_dim = 1_usize;
-        let nb = NUM_BUCKETS;
+        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1107,7 +1107,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::
     // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets == 9 を要求
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (32, 96)] {
         let out_dim = 16_usize;
-        let nb = NUM_BUCKETS;
+        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1167,8 +1167,8 @@ fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Err
         (64, 32, 8),
         (32, 48, 17),
     ] {
-        let nb = NUM_BUCKETS;
-        let padded = padded_sort_batch(batch);
+        let nb = DEFAULT_NUM_BUCKETS;
+        let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1256,7 +1256,7 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let batch = 13_usize;
     let out_dim = 32_usize;
-    let nb = NUM_BUCKETS;
+    let nb = DEFAULT_NUM_BUCKETS;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.017 - 0.9)
         .collect();
@@ -1302,8 +1302,8 @@ fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error
         (48, 8),  // l1_out < 16
         (64, 64), // l1_out > 32
     ] {
-        let nb = NUM_BUCKETS;
-        let padded = padded_sort_batch(batch);
+        let nb = DEFAULT_NUM_BUCKETS;
+        let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.017 - 0.9)
             .collect();
@@ -1971,5 +1971,195 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
         .map(|&x| x as f32 * inv)
         .collect();
     assert_close_rel("simple_act_grad_to_fp16_screlu", &g_gpu, &g_cpu, 2e-3);
+    Ok(())
+}
+
+// =============================================================================
+// `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS = 9) を GPU/CPU で
+// exercise する parametrised test。既存テストは既定 N=9 で動かしているが、
+// kernel は `num_buckets` を runtime 引数で受けるため N ≤ 9 で同じ correctness
+// 不変条件 (`bucket_idx >= num_buckets` を silent skip、CPU と bit-equal) が
+// 成立する。本セクションでは `N ∈ {2, 4, 8, 9}` の主要 N で fwd / bwd_input /
+// bwd_weight / bias_grad を回し、host plumbing 経由で kernel が runtime N を
+// 正しく受け取れていることを確認する。
+// =============================================================================
+
+/// `--num-buckets` で実験的に使う想定の N 値。
+const NUM_BUCKETS_PARAM_VALUES: [usize; 4] = [2, 4, 8, 9];
+
+#[test]
+fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 13_usize;
+    let in_dim = 30_usize;
+    let out_dim = 32_usize;
+    for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+        let w: Vec<f32> = (0..nb * out_dim * in_dim)
+            .map(|i| i as f32 * 0.0007 + 0.05)
+            .collect();
+        let bias: Vec<f32> = (0..nb * out_dim).map(|i| i as f32 * 0.02 - 1.0).collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let mut y_cpu = vec![0.0_f32; batch * out_dim];
+        dense_mm_fwd_bucket_cpu(
+            &x,
+            &w,
+            &bias,
+            &bucket_idx,
+            &mut y_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket, stream: stream, module: module,
+            config: cfg_1d(batch * out_dim),
+            args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev),
+                   slice_mut(y_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            &format!("dense_mm_fwd_bucket nb={nb}"),
+            &y_dev.to_host_vec(&stream)?,
+            &y_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dense_mm_bwd_input_bucket_matches_cpu_for_each_num_buckets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 13_usize;
+    let in_dim = 30_usize;
+    let out_dim = 32_usize;
+    for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.013 - 0.4)
+            .collect();
+        let w: Vec<f32> = (0..nb * out_dim * in_dim)
+            .map(|i| i as f32 * 0.0007 + 0.05)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+        dense_mm_bwd_input_bucket_cpu(
+            &dy,
+            &w,
+            &bucket_idx,
+            &mut dx_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
+            config: cfg_1d(batch * in_dim),
+            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            &format!("dense_mm_bwd_input_bucket nb={nb}"),
+            &dx_dev.to_host_vec(&stream)?,
+            &dx_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dense_mm_bwd_weight_bucket_matches_cpu_for_each_num_buckets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 13_usize;
+    let in_dim = 30_usize;
+    let out_dim = 32_usize;
+    for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.013 - 0.4)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
+        dense_mm_bwd_weight_bucket_cpu(
+            &x,
+            &dy,
+            &bucket_idx,
+            &mut dw_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket, stream: stream, module: module,
+            config: cfg_1d(nb * out_dim * in_dim),
+            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            &format!("dense_mm_bwd_weight_bucket nb={nb}"),
+            &dw_dev.to_host_vec(&stream)?,
+            &dw_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn bias_grad_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 13_usize;
+    let out_dim = 32_usize;
+    for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.017 - 0.9)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let mut gb_cpu = vec![0.0_f32; nb * out_dim];
+        bias_grad_bucket_cpu(&dy, &bucket_idx, &mut gb_cpu, batch, out_dim, nb);
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim)?;
+        cuda_launch! {
+            kernel: bias_grad_bucket, stream: stream, module: module,
+            config: cfg_1d(batch * out_dim),
+            args: [slice(dy_dev), slice(bidx_dev), slice(gb_dev),
+                   batch as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("bias_grad_bucket nb={nb}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
     Ok(())
 }

@@ -4,8 +4,6 @@ use gpu_runtime::DeviceBuffer;
 use nnue_format::ArchKind;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
-use crate::arch::*;
-
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 // ===========================================================================
@@ -56,32 +54,40 @@ pub(crate) type SimpleRawCkptGroupEntry<'a> = (
 
 /// LayerStack アーキの topology header (v4+、PSQT 無し): FT 出力次元・L1 出力次元・
 /// L2 出力次元・bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
-/// FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2` で可変、bucket
-/// 数は固定。
-pub(crate) const fn layerstack_topology(ft_out: usize, l1_out: usize, l2_out: usize) -> [u64; 4] {
+/// FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket
+/// 数は `--num-buckets` で可変 (resume 時に topology dim 列がそのまま照合され、
+/// 不一致は load 時に reject される)。
+pub(crate) const fn layerstack_topology(
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+) -> [u64; 4] {
     [
         ft_out as u64,
         l1_out as u64,
         l2_out as u64,
-        NUM_BUCKETS as u64,
+        num_buckets as u64,
     ]
 }
 
-/// PSQT 有効時の LayerStack topology header: 末尾に PSQT bucket 数 (= `NUM_BUCKETS`)
-/// を追加し、PSQT 無し ckpt (`[..., NUM_BUCKETS]`, 4 dims) と PSQT 有り ckpt
-/// (`[..., NUM_BUCKETS, NUM_BUCKETS]`, 5 dims) を `topo_count` で弁別可能にする。
-/// `--resume` で PSQT 有無を跨ぐ load は dim 数不一致で reject される。
+/// PSQT 有効時の LayerStack topology header: 末尾に PSQT bucket 数 (= `num_buckets`)
+/// を追加し、PSQT 無し ckpt (`[..., num_buckets]`, 4 dims) と PSQT 有り ckpt
+/// (`[..., num_buckets, num_buckets]`, 5 dims) を `topo_count` で弁別可能にする。
+/// `--resume` で PSQT 有無を跨ぐ load は dim 数不一致で reject される。PSQT bucket
+/// は LayerStack bucket と必ず一致するため同 `num_buckets` を 2 回書く。
 pub(crate) const fn layerstack_topology_with_psqt(
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    num_buckets: usize,
 ) -> [u64; 5] {
     [
         ft_out as u64,
         l1_out as u64,
         l2_out as u64,
-        NUM_BUCKETS as u64,
-        NUM_BUCKETS as u64,
+        num_buckets as u64,
+        num_buckets as u64,
     ]
 }
 

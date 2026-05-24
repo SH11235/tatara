@@ -466,6 +466,11 @@ impl BucketedPrefetchedLoader {
     /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
     /// 未ロードなら全 bucket 4)。`feature_set` は sparse index 化に使う feature
     /// set spec で、全 worker が共有する (`Copy`、read-only)。
+    /// `num_buckets` は worker が `progress.bucket_board(board, num_buckets)` を
+    /// 呼ぶときの bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
+    /// 計算自体が skip されるが、worker 側 assertion (`num_buckets >= 1`) は常に
+    /// 評価する。
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         path: &Path,
         batch_size: usize,
@@ -474,7 +479,12 @@ impl BucketedPrefetchedLoader {
         progress: ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
         compute_bucket: bool,
+        num_buckets: usize,
     ) -> io::Result<Self> {
+        assert!(
+            num_buckets >= 1,
+            "BucketedPrefetchedLoader requires num_buckets >= 1"
+        );
         assert!(batch_size >= 1, "batch_size must be >= 1");
         let num_workers = num_workers.max(1);
         let prefetch_depth = prefetch_depth_for(num_workers);
@@ -557,7 +567,7 @@ impl BucketedPrefetchedLoader {
                         let pushed = batch.push_decoded(&board);
                         debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
                         if compute_bucket {
-                            buckets.push(i32::from(progress.bucket_board(&board)));
+                            buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
                         }
                     }
                     debug_assert_eq!(batch.n_positions, batch_size);
@@ -870,6 +880,7 @@ mod tests {
             progress,
             test_spec(),
             true,
+            9,
         )
         .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
@@ -922,6 +933,7 @@ mod tests {
             progress,
             test_spec(),
             true,
+            9,
         )
         .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
@@ -947,6 +959,7 @@ mod tests {
             progress,
             test_spec(),
             true,
+            9,
         )
         .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
@@ -965,6 +978,7 @@ mod tests {
             progress,
             test_spec(),
             true,
+            9,
         )
         .unwrap();
         let _ = drop_loader.next_batch();
@@ -979,7 +993,8 @@ mod tests {
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
         let mut loader =
-            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true).unwrap();
+            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true, 9)
+                .unwrap();
         let err = loader
             .next_batch()
             .expect_err("empty file → barren error, not None and not hang");

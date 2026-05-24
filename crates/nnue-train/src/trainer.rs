@@ -311,6 +311,11 @@ pub struct TrainingConfig {
     /// 参照してはならない (Simple `TrainerBackend::train_step` は元から bucket_idx
     /// を使わない契約)。
     pub compute_bucket: bool,
+    /// LayerStack の output bucket 数 (`--num-buckets`)。dataloader worker が
+    /// `progress.bucket_board(board, num_buckets)` で `0..num_buckets-1` を emit
+    /// するために必要。`compute_bucket = false` の Simple 経路では bucket 計算
+    /// 自体が skip されるため値は参照されない (任意の `>= 1` で可)。
+    pub num_buckets: usize,
 }
 
 impl TrainingConfig {
@@ -401,6 +406,7 @@ where
         *progress,
         cfg.feature_set,
         cfg.compute_bucket,
+        cfg.num_buckets,
     )?;
 
     println!(
@@ -428,6 +434,7 @@ where
                 cfg.test_positions,
                 progress,
                 cfg.feature_set,
+                cfg.num_buckets,
             )?;
             println!(
                 "[train] held-out validation: data={} | {} batches x bs {} ({} positions)",
@@ -889,6 +896,7 @@ mod tests {
             test_data: None,
             test_positions: 0,
             compute_bucket: true,
+            num_buckets: 9,
         }
     }
 
