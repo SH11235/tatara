@@ -32,9 +32,8 @@
 //! - slow_params f32 LE × n_params
 //!
 //! buffer 順序 (momentum / velocity / slow_params) は device 側 `RangerHostState`
-//! の field 順と同一不変条件。bullet-shogi 由来の RAdam / Ranger 数式は
-//! `gpu_kernels::pointwise::{radam_step, ranger_lookahead_lerp}` に実装される
-//! (詳細は `ATTRIBUTION.md`)。
+//! の field 順と同一不変条件。RAdam / Ranger 数式は
+//! `gpu_kernels::pointwise::{radam_step, ranger_lookahead_lerp}` に実装される。
 
 use std::io::{self, Read, Write};
 
@@ -47,8 +46,8 @@ pub use gpu_kernels::pointwise::radam_step::radam_compute_step_size_denom;
 /// Ranger optimizer のハイパパラメータ。
 ///
 /// default (decay=0.01, beta1=0.99, beta2=0.999, min_weight=-1.98, max_weight=1.98,
-/// alpha=0.5, k=6) は bullet-shogi 由来 (詳細は `ATTRIBUTION.md`)。加えて
-/// `radam_step` kernel が要求する eps + n_sma_threshold を field 化している。
+/// alpha=0.5, k=6) は本 trainer の標準設定。`radam_step` kernel が要求する
+/// eps + n_sma_threshold を field 化している。
 #[derive(Clone, Copy, Debug)]
 pub struct RangerParams {
     /// weight decay 係数 (AdamW-style decoupled decay)。
@@ -362,9 +361,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn ranger_params_default_matches_bullet() {
+    fn ranger_params_default_values() {
         let p = RangerParams::default();
-        // bullet-shogi 由来の default: decay=0.01, beta1=0.99, beta2=0.999,
+        // 標準 default: decay=0.01, beta1=0.99, beta2=0.999,
         // min_weight=-1.98, max_weight=1.98, alpha=0.5, k=6,
         // eps=1e-8, n_sma_threshold=5.0。
         assert_eq!(p.decay, 0.01);

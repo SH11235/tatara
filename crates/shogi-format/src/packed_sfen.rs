@@ -1,8 +1,8 @@
 //! PackedSfen / PackedSfenValue デコーダ
 //!
-//! 40-byte 圧縮局面 + score / move / WDL の bullet-shogi 教師データ形式を
-//! 読み込むためのモジュール (`ATTRIBUTION.md` 参照)。PackedSfenValue
-//! (40 bytes) から局面を復元し、特徴量計算に使用する。
+//! 40-byte 圧縮局面 + score / move / WDL の教師データ形式を読み込むための
+//! モジュール。PackedSfenValue (40 bytes) から局面を復元し、特徴量計算に
+//! 使用する。
 //!
 //! Huffman 表 (`HUFFMAN_TABLE`) と「成りbit + 先後bit」の bit layout は本 doc
 //! 内 / 関数 doc に直接記述している。駒箱 (hand 駒種外の駒) のフラグ判定にも
@@ -67,9 +67,9 @@ const HUFFMAN_HAND_PEEK_BITS: u8 = 5;
 /// `HUFFMAN_TABLE` の prefix code から `peek` 値 → entry の lookup table を
 /// 生成する。
 ///
-/// `hand` が true のときは bullet-shogi の手駒 encoding (盤上符号から bit0 を
-/// 省略 = `pattern >> 1`、bit 長 -1) を使う。`hand=true` では NO_PIECE は
-/// 手駒符号化に出現しないので除外する。
+/// `hand` が true のときは手駒 encoding (盤上符号から bit0 を省略 =
+/// `pattern >> 1`、bit 長 -1) を使う。`hand=true` では NO_PIECE は手駒符号化に
+/// 出現しないので除外する。
 ///
 /// LSB-first 解釈なので「peek 値の下位 `code_bits` bit が `pattern` に一致」
 /// する最初の entry を返す。`HUFFMAN_TABLE` は prefix code (どの符号も他の符号
@@ -609,9 +609,6 @@ fn decode_hand_piece(stream: &mut BitStream) -> (Piece, bool) {
 
 impl PackedSfenValue {
     /// 対局結果 (raw i8 game_result から GameResult enum へ)。
-    ///
-    /// tatara では bullet-shogi の `LoadableDataType::result` 相当を
-    /// inherent method として提供する。bullet 側の trait は依存させない。
     pub fn result(&self) -> crate::GameResult {
         match self.game_result() {
             r if r > 0 => crate::GameResult::Win,

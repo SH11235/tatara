@@ -23,22 +23,16 @@
 //! `bc1`/`bc2` は host 側で step 番号 `t` から事前計算して渡す (`1 - beta^t`)。
 //! 1e-30 floor は学習初期 (small `t`) で `bc` が 0 に潰れるのを防ぐ。
 //!
-//! ## bullet 上流 (`KERNELS_SRC::k_adam_step`) との対応
+//! ## 実装メモ
 //!
-//! - C++ `extern "C" __global__ void k_adam_step(...)` → Rust `#[kernel] fn adam_step(...)`
-//! - C++ output `float* weights / m / v / grad` (in-place) → Rust `mut DisjointSlice<f32>` × 4。
-//!   1 thread = 1 index で aliasing なし、atomics 不要 (`grad` kernel の scatter
-//!   path とは異なる)
-//! - C++ `fmaxf(bc1, 1e-30f)` → 本 CPU reference では `bc1.max(1e-30f32)`、
-//!   GPU kernel 側は `f32::max` が cuda-oxide で lowering 失敗するため
-//!   `if bc1 > 1e-30 { bc1 } else { 1e-30 }` に展開している (詳細は
-//!   `ATTRIBUTION.md` および `src/main.rs::adam_step` の comment 参照)
-//! - C++ `sqrtf(v_hat)` → Rust `v_hat.sqrt()` (cuda-oxide が `__nv_sqrtf` に lowering)
-//! - C++ `int n` → Rust `u32` (符号要らない)
-//!
-//! 計算式は表面的差異 (Option-returning DisjointSlice / `len() < n` で silent skip)
-//! を除き同一。`weights.len() == m.len() == v.len() == grad.len() == n_weights`
-//! を host 側 invariant とすれば結果は同等。
+//! - 1 thread = 1 index で aliasing なし、atomics 不要 (`grad` kernel の scatter
+//!   path とは異なる)。
+//! - `bc.max(1e-30)` は本 CPU reference では `bc.max(1e-30f32)`。GPU kernel 側は
+//!   `f32::max` が cuda-oxide で lowering 失敗するため `if bc > 1e-30 { bc }
+//!   else { 1e-30 }` に展開している (`src/main.rs::adam_step` の comment 参照)。
+//! - `v_hat.sqrt()` は cuda-oxide が `__nv_sqrtf` (libdevice) に lowering する。
+//! - `weights.len() == m.len() == v.len() == grad.len() == n` を host 側
+//!   invariant として要求する。
 
 /// Reference CPU 実装。
 ///
@@ -50,8 +44,8 @@
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == n`
 ///
-/// 引数数 (10) は bullet 上流 `k_adam_step` と 1:1 対応のため
-/// clippy `too_many_arguments` を allow する。
+/// 引数数 (10) は kernel 側と 1:1 対応のため clippy `too_many_arguments` を
+/// allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn adam_step_cpu(
     weights: &mut [f32],

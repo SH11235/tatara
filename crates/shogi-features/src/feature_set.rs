@@ -15,9 +15,6 @@
 //! 無効な軸の組み合わせは公開 enum として表現できない。[`FeatureSetSpec`] が
 //! 公開 enum と内部 2 軸・次元・hash を結ぶ単一の真実源で、生成は
 //! [`FeatureSet::spec`] 経由のみ。
-//!
-//! BonaPiece layout / 玉バケット計算式の出典は bullet-shogi のオリジナル実装
-//! (`ShogiHalfKP` / `ShogiHalfKA` / `ShogiHalfKA_hm`、`ATTRIBUTION.md` 参照)。
 
 use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
 use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
@@ -174,12 +171,12 @@ const MAX_ACTIVE_NO_KING: usize = 38;
 /// 玉を含めるときの最大 active 特徴数 (合法局面の駒総数)。
 const MAX_ACTIVE_WITH_KING: usize = 40;
 
-// 参照実装あり 3 cell の feature hash は bullet-shogi の値 (nnue-pytorch 互換)。
-/// bullet-shogi `ShogiHalfKP::FEATURE_HASH`。
+// 参照実装あり 3 cell の feature hash は nnue-pytorch 系の固定値。
+/// halfkp の feature hash。
 const FEATURE_HASH_HALFKP: u32 = 0x5D69_D5B8;
-/// bullet-shogi `shogi_halfka::FEATURE_HASH_NONMIRROR`。
+/// halfka-split の feature hash。
 const FEATURE_HASH_HALFKA_SPLIT: u32 = 0x5F13_4CB8;
-/// bullet-shogi `shogi_halfka::FEATURE_HASH_HM_V2`。
+/// halfka-hm-merged の feature hash。
 const FEATURE_HASH_HALFKA_HM_MERGED: u32 = 0x7F13_4CB8;
 // 参照実装なし 2 cell は canonical 名の FNV-1a 32bit hash を feature 定数とする。
 // 外部エンジン互換は元々非対象なので reproducible で衝突しない値であれば良い。
@@ -621,7 +618,7 @@ mod tests {
     #[test]
     fn feature_hashes_are_pinned_and_distinct() {
         // 各 cell の feature hash を数値で固定する (取り違え / typo 検出)。
-        // halfkp / halfka-split / halfka-hm-merged は bullet-shogi の hash 値、
+        // halfkp / halfka-split / halfka-hm-merged は nnue-pytorch 系の固定値、
         // halfka-merged / halfka-hm-split は canonical 名の FNV-1a 32bit hash。
         let expected: [(FeatureSet, u32); 5] = [
             (FeatureSet::HalfKp, 0x5D69_D5B8),

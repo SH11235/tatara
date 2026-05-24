@@ -23,23 +23,11 @@
 //!
 //! `base = pos * max_inds`、padding 値 `-1` は skip。
 //!
-//! ## bullet 上流 (`KERNELS_SRC::k_grad_loss_hist`) との対応
+//! ## 実装メモ
 //!
-//! - C++ `extern "C" __global__ void k_grad_loss_hist(...)` → Rust `#[kernel] fn grad(...)`
-//! - C++ `const int*` / `const float*` / `double*` / `unsigned long long*` →
-//!   Rust `&[i32]` / `&[f32]` / `&[f64]` / `&[u64]`
-//! - C++ `atomicAdd(&grad[idx], gscale)` (f32) → Rust `DeviceAtomicF32::fetch_add(gscale, Relaxed)`
-//! - C++ `atomicAdd(loss_acc, err*err)` (f64) → Rust `DeviceAtomicF64::fetch_add(..., Relaxed)`
-//! - C++ `atomicAdd(&hist[b], 1ULL)` (u64) → Rust `DeviceAtomicU64::fetch_add(1, Relaxed)`
-//! - C++ `(int)(p * 8.0f)` の truncate-toward-zero → Rust `(p * 8.0f32) as i32`
-//!   (Rust は saturating cast だが clamp [0,7] が後段にあるため範囲内では同値)
-//! - C++ `for (int j = 0; j < max_inds; ++j)` → Rust `while j < max_inds` (forward と同じ)
-//!
-//! 上記の表面的差異 (atomic API、float→int の saturating cast、clamp 表現) を
-//! 除き計算ロジックは同一で、有限な finite 入力に対し同じ結果を返す。
-//! NaN / 非有限 `p` では Rust 側 `as i32` が i32 範囲に saturate するのに対し
-//! C++ 側 `(int)` は UB だが、後段の clamp [0,7] がいずれも 0 か 7 に丸めるため
-//! sigmoid 出力 (`forward` 側の値域 (0,1)) を流す production path では差は出ない。
+//! - `(p * 8.0f32) as i32` は Rust の saturating cast。NaN は 0 になる。後段の
+//!   clamp [0,7] が掛かるため、sigmoid 出力の値域 (0,1) であれば必ず 0..=7 に
+//!   収まる。
 //!
 //! ## 並列化と atomics
 //!
@@ -62,8 +50,8 @@
 /// - `indices` の非 padding 要素は `0..grad.len()` に収まる
 /// - `hist.len() == 8`
 ///
-/// 引数数 (9) は bullet 上流 `k_grad_loss_hist` と 1:1 対応するため
-/// clippy `too_many_arguments` を allow する。
+/// 引数数 (9) は kernel 側と 1:1 対応するため clippy `too_many_arguments` を
+/// allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn grad_cpu(
     indices: &[i32],

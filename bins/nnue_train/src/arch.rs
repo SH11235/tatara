@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 // 学習では使わない (9 枠確保・1 枠予約は設計上の意図)。
 pub(crate) const NUM_BUCKETS: usize = 9;
 
-// scale 定数 (bullet shogi_layerstack.rs:2241, 2260)
+// FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
 pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;
 pub(crate) const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
@@ -88,8 +88,8 @@ pub(crate) const FT_OPT_M_SCALE: f32 = (1_u32 << 28) as f32;
 /// 上側のみ。scale は power-of-2。
 pub(crate) const FT_OPT_V_SCALE: f32 = (1_u64 << 40) as f32;
 
-// Ranger optimizer params。bullet `RangerParams::default()` 由来の値は
-// `nnue_train::optimizer::RangerParams::DEFAULT` を single source of truth として参照する。
+// Ranger optimizer params。値は `nnue_train::optimizer::RangerParams::DEFAULT`
+// を single source of truth として参照する。
 pub(crate) const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
     nnue_train::optimizer::RangerParams::DEFAULT;
 pub(crate) const BETA1: f32 = RANGER_DEFAULTS.beta1;

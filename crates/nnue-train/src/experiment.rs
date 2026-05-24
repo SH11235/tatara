@@ -149,8 +149,8 @@ pub struct Params {
     pub threads: usize,
 }
 
-/// 教師データの情報。`positions` / `total_positions` の意味は `bullet-shogi` の
-/// experiment.json と揃える (producer 間で同じ意味になるよう)。
+/// 教師データの情報。`positions` はデータファイル中の局面数、
+/// `total_positions` は実際に学習に流す総局面数 (positions × pass)。
 #[derive(Debug, Clone, Serialize)]
 pub struct DataInfo {
     /// 教師データファイルの basename。

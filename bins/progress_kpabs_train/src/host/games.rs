@@ -1,15 +1,13 @@
 //! PSV reader & game splitter。
 //!
-//! bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs::PackCursor` /
-//! `GameIterator`) を移植。1 ファイル分の PSV record を順次読み、`game_ply`
-//! の減少をゲーム境界として `Vec<PackedSfenValue>` を返す iterator。
+//! 1 ファイル分の PSV record を順次読み、`game_ply` の減少をゲーム境界として
+//! `Vec<PackedSfenValue>` を返す iterator。
 //!
 //! ## ファイル形式
 //!
 //! `.bin` (PSV) は `PackedSfenValue` (40 bytes) の連続列。
 //! 1 ファイル = 複数ゲーム連結、ゲーム境界は明示マーカーなく `game_ply`
-//! が 1 → ... → max → 1 → ... と reset することで判定する (bullet 上流の
-//! 慣例)。
+//! が 1 → ... → max → 1 → ... と reset することで判定する。
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -77,9 +75,8 @@ impl PackCursor {
 ///
 /// `game_ply` が前 record より **小さいか等しい** (`cur_ply <= prev`) 時点で
 /// 「新しいゲームが始まった」と判定し、それまで積んだ records を 1 game として
-/// 返す。bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs:206`) が
-/// `<=` を採用しているのに合わせる (1 局を short-cut で同 ply 値に再開する
-/// edge ケースを正しく分離するため)。
+/// 返す。1 局を short-cut で同 ply 値に再開する edge ケースを正しく分離する
+/// ため `<` ではなく `<=` を採用する。
 pub struct GameIterator {
     cursor: PackCursor,
     /// 現在組み立て中のゲームの records。
@@ -108,9 +105,9 @@ impl GameIterator {
             match self.cursor.next_psv()? {
                 Some(psv) => {
                     let cur_ply = psv.game_ply();
-                    // bullet-shogi 上流の境界判定は `cur_ply <= prev` (= は前ゲーム末尾と
-                    // 同じ ply で新ゲームが始まる場合)。`<` だけだと等値境界が誤って
-                    // 前ゲームに merge されるため `<=` を踏襲する。
+                    // 境界判定は `cur_ply <= prev` (= は前ゲーム末尾と同じ ply で新
+                    // ゲームが始まる場合)。`<` だけだと等値境界が誤って前ゲームに
+                    // merge されるため `<=` を採用する。
                     if let Some(prev) = self.prev_ply
                         && cur_ply <= prev
                     {

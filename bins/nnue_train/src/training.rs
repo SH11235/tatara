@@ -217,7 +217,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
     // PSQT shortcut の初期 weight (`--psqt` 有効時のみ確保)。`zeroed` は全 0、`material`
-    // は piece centipawn / out_scaling で全 bucket 同値を書く (Stockfish prior、bullet v101)。
+    // は piece centipawn / out_scaling で全 bucket 同値を書く (Stockfish 系の prior)。
     // out_scaling 規約: WRM 有効時は `wrm_nnue2score` (= net_output が logit(WRM(cp)) の
     // domain、PSQT も同 scale で寄与する)、無効時は `scale` (= sigmoid 経路の cp → logit
     // 変換係数)。
@@ -683,7 +683,7 @@ pub(crate) fn build_experiment_logger_simple(
 }
 
 /// Simple アーキの層次元 preset 文字列 (`"<ft_out>x2-<l1_out>-<l2_out>"`) を
-/// `(ft_out, l1_out, l2_out)` にパースする。bullet-shogi 由来の表記。
+/// `(ft_out, l1_out, l2_out)` にパースする。
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
 /// 形式不一致や非整数は `--arch` の不正値として `InvalidInput` で返す。

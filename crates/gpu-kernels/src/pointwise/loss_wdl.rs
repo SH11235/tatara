@@ -6,8 +6,7 @@
 //!
 //! ## アルゴリズム
 //!
-//! NNUE training の `MSE-on-sigmoid + WDL blend` を 1 fused kernel にまとめる
-//! (bullet 上流の data-layer WDL blend + `Sigmoid` loss path に等価):
+//! NNUE training の `MSE-on-sigmoid + WDL blend` を 1 fused kernel にまとめる:
 //!
 //! ```text
 //! per position i:
@@ -28,10 +27,9 @@
 //!
 //! ## 実装メモ
 //!
-//! - bullet 上流は data layer で blend を pre-compute するが、本実装は kernel
-//!   内に WDL blend を畳み込んで `score` (raw cp) と `wdl` ({0, 0.5, 1}) を
-//!   2 buffer で渡す。batch 1 度しか転送しないため total memory traffic は
-//!   同等以下
+//! - WDL blend を kernel 内に畳み込み、`score` (raw cp) と `wdl` ({0, 0.5, 1})
+//!   を 2 buffer で渡す。batch 1 度しか転送しないため pre-compute する場合と
+//!   比較して total memory traffic は同等以下
 //! - chain rule で sigmoid(out * scale) の `out` 微分には `* scale` が乗る
 //!   (`d/du sigmoid(u) = p (1-p)`、`u = out * scale`)
 //!

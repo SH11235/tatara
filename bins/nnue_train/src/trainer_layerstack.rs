@@ -131,10 +131,9 @@ pub(crate) struct GpuTrainer {
 
 /// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
 /// `Option<PsqtState>` で gated。`psqt_w` shape は `(ft_in, NUM_BUCKETS)` row-major
-/// (`psqt_w[feat * NUM_BUCKETS + bucket]`)、bullet-shogi LayerStack PSQT の
-/// column-major `[NUM_BUCKETS, ft_in]` と byte-equivalent。`m` / `v` は f32 固定
-/// (PSQT weight 自体が ft_in * 9 = ~660K f32 = 2.6MB と小さいため FP16 化の利得が
-/// 小さく、複雑さを避ける)。
+/// (`psqt_w[feat * NUM_BUCKETS + bucket]`)。`m` / `v` は f32 固定 (PSQT weight 自体
+/// が ft_in * 9 = ~660K f32 = 2.6MB と小さいため FP16 化の利得が小さく、複雑さを
+/// 避ける)。
 pub(crate) struct PsqtState {
     pub(crate) w: DeviceBuffer<f32>,
     pub(crate) w_m: DeviceBuffer<f32>,
@@ -145,7 +144,7 @@ pub(crate) struct PsqtState {
 
 impl PsqtState {
     /// 与えた初期 weight (長さ `ft_in * NUM_BUCKETS`) で確保する。Ranger state は
-    /// `m`/`v` = 0、`slow` = 0 (bullet `RangerLookahead::new` と同じ)、`grad` = 0。
+    /// `m`/`v` = 0、`slow` = 0、`grad` = 0。
     fn new(stream: &CudaStream, initial_w: &[f32]) -> Result<Self, Box<dyn std::error::Error>> {
         let n = initial_w.len();
         Ok(Self {
@@ -484,7 +483,7 @@ impl GpuTrainer {
         let l3_b_n = NUM_BUCKETS;
 
         // Weight init: small random for non-degenerate forward (smoke 用、後段で
-        // proper init を適用: ft は bullet `init_with_effective_input_size(32)`、l1 は Zeroed 等)
+        // proper init を適用: ft は effective_input_size=32 の He init、l1 は Zeroed 等)
         let init_scale = 0.01_f32;
         let ft_w_init = xorshift_init(0x100_u64, ft_w_n, init_scale);
         let l1_w_init = xorshift_init(0x101_u64, l1_w_n, init_scale);
@@ -509,9 +508,8 @@ impl GpuTrainer {
             None => None,
         };
 
-        // Ranger Lookahead の slow weight は **0 初期化** (bullet `RangerLookahead::new`
-        // = `vec![0.0; size]` と同じ)。初回 lerp (`step % k == 0`) で
-        // `weights = alpha*weights + (1-alpha)*0 = alpha*weights` になる挙動も bullet と一致。
+        // Ranger Lookahead の slow weight は **0 初期化**。初回 lerp (`step % k == 0`)
+        // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         Ok(Self {
             stream: stream.clone(),
             module,
@@ -606,23 +604,22 @@ impl GpuTrainer {
     ///
     /// Optimizer state reset:
     /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
-    /// - `slow`: **loaded weights と同値** (warm-start anchor。`GpuTrainer::new` (from-scratch)
-    ///   は bullet `RangerLookahead::new` どおり `slow = 0` だが、`--init-from` は量子化済 NNUE
-    ///   の continue-training/fine-tuning であって bullet checkpoint resume (`slow.bin` 付き)
-    ///   ではない。`slow = 0` のままだと初回 lookahead lerp で `new_w = alpha*fast + (1-alpha)*0
-    ///   = alpha*fast` となり読み込んだ重みが全て ~alpha 倍に縮む。`slow = w_loaded` にすると
-    ///   初回 lerp は `new_w = alpha*fast + (1-alpha)*w_loaded` で、fine-tuning は lr が小さく
-    ///   `fast ≈ w_loaded` なので **0 ではなく読み込んだ重みの方へ寄せる** anchor になる
-    ///   (true な bullet resume なら `slow.bin` を読むべきだが、量子化 NNUE には optimizer
-    ///   state が無いので next-best な default)
+    /// - `slow`: **loaded weights と同値** (warm-start anchor。from-scratch path
+    ///   (`GpuTrainer::new`) は `slow = 0` だが、`--init-from` は量子化済 NNUE の
+    ///   continue-training/fine-tuning で optimizer state を持たない。`slow = 0`
+    ///   のままだと初回 lookahead lerp で `new_w = alpha*fast + (1-alpha)*0
+    ///   = alpha*fast` となり読み込んだ重みが全て ~alpha 倍に縮む。`slow = w_loaded`
+    ///   にすると初回 lerp は `new_w = alpha*fast + (1-alpha)*w_loaded` で、
+    ///   fine-tuning は lr が小さく `fast ≈ w_loaded` なので **0 ではなく
+    ///   読み込んだ重みの方へ寄せる** anchor になる)
     /// - `grad`: 0
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
     /// 注: `step_count = 0` 状態で `step()` を呼ぶと `self.step_count += 1` → 1 に
     /// なってから `radam_compute_step_size_denom(1, BETA1, BETA2, N_SMA_THRESHOLD)`
-    /// を呼ぶ。bullet `radam_step.rs::radam_compute_step_size_denom` は step >= 1 で
-    /// 安全動作 (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` に
-    /// なる、本 helper も `step >= 1` 前提)。本実装は step=0 で呼ばないため OK。
+    /// を呼ぶ。`radam_compute_step_size_denom` は step >= 1 で安全動作 (step=0 では
+    /// `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` になる)。本実装は
+    /// step=0 で呼ばないため OK。
     pub(crate) fn load_layerstack_weights(
         &mut self,
         w: &LayerStackWeights,
@@ -1369,8 +1366,8 @@ impl GpuTrainer {
     /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
     /// [`LossKind::Wrm`] なら `loss_wrm` (win-rate-model loss) を起動する。
     ///
-    /// Forward path (15 step): bullet `shogi_layerstack.rs:2241-2289` の reference 実装を
-    /// 本 file の `#[kernel]` 群で再現。中間 activation は `GpuTrainer` 上の永続 workspace
+    /// Forward path (15 step) は本 file の `#[kernel]` 群で実装する。中間
+    /// activation は `GpuTrainer` 上の永続 workspace
     /// (`self.ws.*`) を使い回す — forward の各 activation は読まれる前に kernel が
     /// 全 cell を上書きするので memset 不要。Backward path (~16 step): forward 逆順、`*_grad`
     /// buffer は本 method 冒頭で `memset_async(0)` で reset してから kernel が書き込む

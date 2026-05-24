@@ -12,8 +12,8 @@
 //! y[i] = a * a
 //! ```
 //!
-//! - clip 境界は `[0, 1]` (bullet 上流 `SCReLU` と一致)。`screlu_grad` が前提と
-//!   する `forward = clip(x, 0, 1)^2` と整合する。
+//! - clip 境界は `[0, 1]`。`screlu_grad` が前提とする `forward = clip(x, 0, 1)^2`
+//!   と整合する。
 //! - GPU `#[kernel]` 側は `f32::clamp` を lower できないため `if-else` ladder
 //!   (`x < 0 ? 0 : x > 1 ? 1 : x`) で clip を展開する。reference も同じ if-else で
 //!   書き、kernel と bit-完全一致させる (数値同等性テストの tolerance は 0)。

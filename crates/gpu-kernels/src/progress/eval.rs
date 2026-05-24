@@ -17,17 +17,6 @@
 //! hist[clamp(int(p*8), 0, 7)] += 1        (u64)
 //! ```
 //!
-//! ## bullet 上流 (`KERNELS_SRC::k_eval_loss_hist`) との対応
-//!
-//! - C++ `extern "C" __global__ void k_eval_loss_hist(...)` → Rust `#[kernel] fn eval(...)`
-//! - C++ `const float* preds / targets`, `double* loss_acc`, `unsigned long long* hist` →
-//!   Rust `&[f32]` / `&[f64]` / `&[u64]` (atomicAdd 経由でのみ書く前提)
-//! - C++ `atomicAdd(loss_acc, (double)err*(double)err)` → Rust
-//!   `DeviceAtomicF64::fetch_add(_, AtomicOrdering::Relaxed)`
-//! - C++ `atomicAdd(&hist[b], 1ULL)` → Rust `DeviceAtomicU64::fetch_add(1, Relaxed)`
-//! - C++ `(int)(p * 8.0f)` の truncate-toward-zero → Rust `(p * 8.0f32) as i32`
-//!   (Rust は saturating cast だが clamp [0,7] が後段にあるため範囲内では同値)
-//!
 //! `eval` は `grad` の真のサブセット (gradient scatter / per_pos_norm を除いた path)
 //! なので、同一 `(preds, targets, n_pos)` に対する `loss_acc` / `hist` 結果は
 //! `grad` を **scatter 無効化 (`indices` 全 `-1` padding)** で呼んだ結果と

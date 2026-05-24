@@ -10,8 +10,6 @@
 //! - 総入力次元: `45 * 1629 = 73_305`
 //! - 最大 active 特徴数: 40 (盤上駒 + 手駒 = 合法局面の駒総数固定 40)
 //! - nnue-pytorch 互換 hash: `FEATURE_HASH_HM_V2 = 0x7f134cb8` (HalfKA_hm_v2)
-//!
-//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END};
 use shogi_format::types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square};
@@ -323,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alias_constants_match_bullet() {
+    fn test_alias_constants_match_canonical() {
         assert_eq!(SHOGI_HALFKA_HM_NUM_FEATURES, HALFKA_HM_DIMENSIONS);
         assert_eq!(SHOGI_HALFKA_HM_NUM_FEATURES, 73_305);
         assert_eq!(SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, MAX_ACTIVE_FEATURES);

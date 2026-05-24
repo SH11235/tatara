@@ -6,7 +6,7 @@
 //! `sparse_ft_forward_cpu` は GPU と同じロジックを host に書き写したもので、
 //! GPU↔CPU 数値同等性テストの reference に使う。
 //!
-//! ## アルゴリズム (bullet 上流 `linear/sparse.rs::SparseMatmul::evaluate` に等価)
+//! ## アルゴリズム
 //!
 //! NNUE 入力層の sparse feature transform forward。`indices` は per-position の
 //! active feature index 配列 (`-1` を padding とする)、`weight` を column-major
@@ -22,24 +22,14 @@
 //!     out[bi * rows + ri] = sum
 //! ```
 //!
-//! - `weight` (size `rows * cols`): **column-major** (bullet 上流 `evaluate` の
-//!   `d.read(rows * idx + ri)` と同型)。column j の row i は
+//! - `weight` (size `rows * cols`): **column-major**。column j の row i は
 //!   `weight[j * rows + i]` 位置
 //! - `indices` (size `batch * nnz`): per position の active feature index、
-//!   `-1` は padding (skip)。`>= cols` の値も silent skip (bullet 上流の
-//!   defensive check と同型)
+//!   `-1` は padding (skip)。`>= cols` の値も defensive に silent skip
 //! - `out` (size `batch * rows`): per position の FT output、row-major で
 //!   `out[bi * rows + ri]` 位置
 //!
-//! ## bullet 上流との差分
-//!
-//! - bullet `SparseMatmul::evaluate` は `DValue` 経由の generic dtype を受けるが、
-//!   本実装は `f32` 固定 (NNUE training hot path で f32 のみ扱う)
-//! - bullet は `nnz` ループを runtime fusion で吸収するが、本実装は `nnz` を
-//!   build-time 引数として受けて `for ni in 0..nnz` を素直に展開する (memory
-//!   bandwidth bound なので unroll の差は小さい想定)
-//! - **silent skip on `idx >= cols`**: bullet 上流の `if idx >= 0 && (idx as
-//!   usize) < cols` defensive check と同型
+//! `f32` 固定 (NNUE training hot path で f32 のみ扱う)。
 //!
 //! ## cuda-oxide 制限
 //!
@@ -56,7 +46,7 @@
 /// - `indices.len() == batch * nnz` (`-1` padding 許容、`>= cols` も silent skip)
 /// - `out.len() == batch * rows` (row-major、`out[batch * rows + row]`)
 ///
-/// 引数数 (7) は bullet 上流 evaluate の入出力 + sparse 形状を漏れなく渡すため
+/// 引数数 (7) は入出力 + sparse 形状を漏れなく渡すため
 /// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_ft_forward_cpu(
@@ -86,12 +76,11 @@ pub fn sparse_ft_forward_cpu(
 mod tests {
     use super::*;
 
-    /// bullet 上流 (`linear/sparse.rs::tests::evaluate`) と同じ shape
-    /// (batch=2, rows=2, cols=3, nnz=4) で完全一致。期待値 [2, 4, 10, 14] は
-    /// bullet の test と同じ。本テストが緑なら bullet 上流と同レイアウトで
-    /// 動作することが保証される。
+    /// shape (batch=2, rows=2, cols=3, nnz=4) で期待値 [2, 4, 10, 14] を再現
+    /// する基準テスト (column-major weight + `-1` padding + duplicate idx の
+    /// 三点を 1 ケースで cover)。
     #[test]
-    fn matches_bullet_upstream_evaluate_test() {
+    fn matches_reference_evaluate_test() {
         let weights = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         // 2 batches × 4 nnz = 8 indices
         let indices = vec![0_i32, 1, -1, -1, 2, 2, 1, 0];
@@ -112,8 +101,7 @@ mod tests {
         assert_eq!(out, vec![0.0_f32, 0.0]);
     }
 
-    /// `idx >= cols` の異常入力 (bullet 上流 `evaluate` で `idx as usize < cols`
-    /// チェックされる経路) は silent skip。kernel が OOB read しないこと。
+    /// `idx >= cols` の異常入力は silent skip。kernel が OOB read しないこと。
     #[test]
     fn out_of_range_index_is_silently_skipped() {
         let weights = vec![1.0_f32, 2.0, 3.0, 4.0]; // rows=2, cols=2
@@ -126,8 +114,7 @@ mod tests {
     }
 
     /// 同 index の重複 (`indices = [0, 0, 1]`) は **重み合計** になる
-    /// (bullet 上流 `evaluate` の `for ni in 0..nnz` ループで重複 idx を別々に
-    /// 加算するのと同型)。
+    /// (`for ni in 0..nnz` ループで重複 idx を別々に加算する仕様)。
     #[test]
     fn duplicate_indices_are_summed() {
         let weights = vec![1.0_f32, 10.0, 2.0, 20.0]; // rows=2, cols=2

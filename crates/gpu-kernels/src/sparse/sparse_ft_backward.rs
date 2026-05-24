@@ -7,7 +7,7 @@
 //! `sparse_ft_backward_cpu` は GPU と同じロジックを host に書き写したもので、
 //! GPU↔CPU 数値同等性テストの reference に使う。
 //!
-//! ## アルゴリズム (bullet 上流 `linear/sparse.rs::SparseMatmulBwd::evaluate` に等価)
+//! ## アルゴリズム
 //!
 //! sparse forward の対 backward。column-major weight layout
 //! (`grad_weight[idx * rows + ri]`) は forward と同型。複数 (bi, ni) が同じ
@@ -26,20 +26,9 @@
 //! - **`grad_weight` の初期化**: 本 fn は **accumulate** semantics で既存値に
 //!   add する。host が呼び出し前に `device.memset(0)` (or `vec![0.0; ...]`) で
 //!   zero clear する責務
-//! - bullet 上流 `evaluate` は test 用に冒頭で `o.write(idx, zero)` を行うが、
-//!   本 fn は production kernel semantics (accumulate) に揃えるため zero clear を
-//!   含めない。test 側で初期化することで bullet 上流の expected 値を再現する
 //! - layout: column-major weight (forward と同 `weight[idx * rows + ri]`)
-//!
-//! ## bullet 上流との差分
-//!
-//! - bullet `evaluate_bwd` test (batch=2/rows=3/cols=3/nnz=4、
-//!   grad_out=[0,1,2,3,4,5]、indices=[0,1,-1,-1,2,2,1,0]、
-//!   expected=[3,5,7,3,5,7,6,8,10]) と同 fixture を CPU test で 1:1 再現
-//! - thread 配置: bullet 上流は PointwiseIR で per-row reduction、batch 軸別 unroll
-//!   想定。本実装は **flat 1D `tid = bi * rows + ri`** で batch 軸も込み (forward と
-//!   同型 idiom、atomic scatter で衝突を吸収)
-//! - `SparseMatmulBwdMulti` (複数 backward 集約) は対象外
+//! - thread 配置: **flat 1D `tid = bi * rows + ri`** で batch 軸も込み (forward
+//!   と同型 idiom、atomic scatter で衝突を吸収)
 //!
 //! ## cuda-oxide 制限
 //!
@@ -56,7 +45,7 @@
 /// - `indices.len() == batch * nnz` (`-1` padding 許容、`>= cols` も silent skip)
 /// - `grad_weight.len() == rows * cols` (column-major、`grad_weight[col * rows + row]`)
 ///
-/// 引数数 (7) は bullet 上流 evaluate と同型のため
+/// 引数数 (7) は入出力 + sparse 形状を漏れなく渡すため
 /// `clippy::too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn sparse_ft_backward_cpu(
@@ -85,12 +74,11 @@ pub fn sparse_ft_backward_cpu(
 mod tests {
     use super::*;
 
-    /// bullet 上流 (`linear/sparse.rs::tests::evaluate_bwd`) と同じ shape
-    /// (batch=2, rows=3, cols=3, nnz=4) で完全一致。期待値
-    /// [3,5,7,3,5,7,6,8,10] は bullet の test と同じ。本テストが緑なら bullet
-    /// 上流と同レイアウト + accumulate semantics で動作することが保証される。
+    /// shape (batch=2, rows=3, cols=3, nnz=4) で期待値 [3,5,7,3,5,7,6,8,10] を
+    /// 再現する基準テスト (column-major layout + `-1` padding + duplicate idx +
+    /// accumulate semantics を 1 ケースで cover)。
     #[test]
-    fn matches_bullet_upstream_evaluate_bwd_test() {
+    fn matches_reference_evaluate_bwd_test() {
         let grad_out = vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let indices = vec![0_i32, 1, -1, -1, 2, 2, 1, 0];
         let mut grad_weight = vec![0.0_f32; 9]; // rows * cols = 3*3
@@ -111,7 +99,7 @@ mod tests {
         assert_eq!(grad_weight, vec![0.0_f32; 6]);
     }
 
-    /// `idx >= cols` の異常入力は silent skip (bullet 上流と同型 defensive)。
+    /// `idx >= cols` の異常入力は silent skip (defensive)。
     #[test]
     fn out_of_range_index_is_silently_skipped() {
         let grad_out = vec![1.0_f32, 1.0]; // batch=1, rows=2
@@ -123,7 +111,7 @@ mod tests {
     }
 
     /// 同 index の重複 (`indices = [0, 0, 1]`) は **重み合計** に accumulate
-    /// (bullet 上流 `evaluate` と同型、kernel は atomic scatter で衝突を吸収)。
+    /// (kernel は atomic scatter で衝突を吸収)。
     #[test]
     fn duplicate_indices_are_summed() {
         let grad_out = vec![10.0_f32, 20.0]; // batch=1, rows=2

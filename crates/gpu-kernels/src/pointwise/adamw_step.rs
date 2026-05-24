@@ -28,7 +28,7 @@
 //! - **decay + clip**: `decay = 0.0` で plain Adam、`min_w = f32::MIN`,
 //!   `max_w = f32::MAX` で clip 無効
 //! - **grad reset**: 次 batch の `atomicAdd` 累積に向けて kernel 内で reset する
-//!   設計 (bullet 上流とは異なる convention)
+//!   設計
 //!
 //! ## cuda-oxide 制限
 //!

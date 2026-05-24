@@ -1,9 +1,8 @@
 //! CReLU (clipped ReLU) forward / gradient kernel の reference CPU 実装。
 //!
 //! GPU 側 (`#[kernel] fn crelu_fwd` / `crelu_grad`) は `bins/nnue_train/src/
-//! main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。bullet 上流の
-//! `crelu()` (`crates/trainer/src/model/builder.rs` の activation) と等価で、
-//! FT post / l2_pre / l2_out の activation に使われる。
+//! main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。FT post / l2_pre /
+//! l2_out の activation に使われる。
 //!
 //! ## アルゴリズム
 //!
@@ -12,8 +11,7 @@
 //! gradient: dx[i] = dy[i] if 0 < x[i] < 1 else 0
 //! ```
 //!
-//! - clamp 境界は `[0, 1]` (bullet の `CReLU` と一致、`abs_pow(2)` 前提の qa=127
-//!   量子化に合わせて 0..1 に丸める)。
+//! - clamp 境界は `[0, 1]` (`abs_pow(2)` 前提の qa=127 量子化に合わせる)。
 //! - gradient は **strict 不等号** (`x == 0` / `x == 1` ちょうどは grad 0)。
 //!   GPU kernel が `f32::clamp` lowering 失敗回避の if-else 展開で同じく strict に
 //!   書いているので、reference もそれに合わせる。

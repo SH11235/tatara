@@ -68,9 +68,8 @@ use shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
 /// に現れない)。host 側 `GpuTrainer` は同じ file 内の `cuda_launch!` macro
 /// 経由で呼び出す。
 ///
-/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_forward`) との差分は
-/// reference CPU 実装 (`gpu_kernels::progress::forward::forward_cpu`) の
-/// docstring および `ATTRIBUTION.md` を参照。
+/// アルゴリズム・I/O 規約は reference CPU 実装
+/// (`gpu_kernels::progress::forward::forward_cpu`) の docstring を参照。
 #[kernel]
 pub fn forward(
     indices: &[i32],
@@ -103,9 +102,8 @@ pub fn forward(
 /// `#[kernel]` を main.rs に inline 定義しているのは forward と同じ理由
 /// (cuda-oxide backend は bin entry から到達可能な kernel しか PTX 化しない)。
 ///
-/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_grad_loss_hist`) との
-/// 差分は reference CPU 実装 (`gpu_kernels::progress::grad::grad_cpu`) の
-/// docstring および `ATTRIBUTION.md` を参照。
+/// アルゴリズム・I/O 規約は reference CPU 実装
+/// (`gpu_kernels::progress::grad::grad_cpu`) の docstring を参照。
 ///
 /// Atomics:
 /// - `grad[idx]` の f32 加算 → `DeviceAtomicF32::fetch_add` (`atomicrmw fadd`)
@@ -113,10 +111,9 @@ pub fn forward(
 /// - `hist[bin]` の u64 加算 → `DeviceAtomicU64::fetch_add`
 ///
 /// ordering は全 `Relaxed`。loss/grad/hist は最終 reduce 結果のみ問題で、
-/// 順序保証は要らない (bullet 上流 C++ `atomicAdd` の暗黙 ordering と同等)。
+/// 順序保証は要らない。
 ///
-/// 引数数 (9) は bullet 上流 `k_grad_loss_hist` と 1:1 対応のため
-/// `too_many_arguments` を allow する。
+/// 引数数 (9) は kernel 引数と 1:1 対応のため `too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn grad(
@@ -166,8 +163,8 @@ pub fn grad(
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 
     // i32::clamp は内部で assert!(min <= max) → Debug::fmt panic path を含み、
-    // cuda-oxide backend (rustc-codegen-cuda) が現状 lowering 未対応のため
-    // bullet 上流 C++ の `if (b<0) b=0; if (b>7) b=7;` を verbatim 移植する。
+    // cuda-oxide backend (rustc-codegen-cuda) が現状 lowering 未対応のため、
+    // `if (b<0) b=0; if (b>7) b=7;` の if-else に展開する。
     // ここだけ `clippy::manual_clamp` を allow。
     #[allow(clippy::manual_clamp)]
     let b = {
@@ -191,12 +188,10 @@ pub fn grad(
 /// 理由 (cuda-oxide backend は bin entry から到達可能な kernel しか PTX 化
 /// しない)。
 ///
-/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_adam_step`) との差分は
-/// reference CPU 実装 (`gpu_kernels::progress::adam_step::adam_step_cpu`) の
-/// docstring および `ATTRIBUTION.md` を参照。
+/// アルゴリズム・I/O 規約は reference CPU 実装
+/// (`gpu_kernels::progress::adam_step::adam_step_cpu`) の docstring を参照。
 ///
-/// 引数数 (11) は bullet 上流 `k_adam_step` と 1:1 対応のため
-/// `too_many_arguments` を allow する。
+/// 引数数 (11) は kernel 引数と 1:1 対応のため `too_many_arguments` を allow する。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn adam_step(
@@ -231,8 +226,8 @@ pub fn adam_step(
         *m_ref = mi;
         *v_ref = vi;
         // f32::max は cuda-oxide が `std::intrinsics::maximum_number_nsz_f32` を解決できず
-        // ('Symbol ... not found') lowering 失敗するため、bullet 上流 C++ `fmaxf(bc, 1e-30f)`
-        // を if-else で verbatim 移植する。CPU reference (adam_step_cpu) は host 実行で
+        // ('Symbol ... not found') lowering 失敗するため、`fmaxf(bc, 1e-30f)` を
+        // if-else で展開する。CPU reference (adam_step_cpu) は host 実行で
         // f32::max を使用する。
         let bc1_safe = if bc1 > 1e-30f32 { bc1 } else { 1e-30f32 };
         let bc2_safe = if bc2 > 1e-30f32 { bc2 } else { 1e-30f32 };
@@ -250,9 +245,8 @@ pub fn adam_step(
 /// `#[kernel]` を main.rs に inline 定義しているのは forward / grad / adam_step
 /// と同じ理由。
 ///
-/// アルゴリズムと bullet-shogi 上流 (`KERNELS_SRC::k_eval_loss_hist`) との
-/// 差分は reference CPU 実装 (`gpu_kernels::progress::eval::eval_cpu`) の
-/// docstring および `ATTRIBUTION.md` を参照。
+/// アルゴリズム・I/O 規約は reference CPU 実装
+/// (`gpu_kernels::progress::eval::eval_cpu`) の docstring を参照。
 ///
 /// Atomics:
 /// - `loss_acc` (single f64 cell) → `DeviceAtomicF64::fetch_add` (`atomicrmw fadd double`)
@@ -275,8 +269,7 @@ pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_po
     loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
 
     // i32::clamp は cuda-oxide が現状 lowering 未対応 (`grad` kernel と同根の
-    // panic 経路 `Debug::fmt` を含むため)。bullet 上流の if-else を verbatim
-    // 移植。
+    // panic 経路 `Debug::fmt` を含むため)。if-else に展開する。
     #[allow(clippy::manual_clamp)]
     let b = {
         let mut b = (p * 8.0f32) as i32;
@@ -561,9 +554,8 @@ fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
     .into())
 }
 
-/// GPU 上で 4 kernel を順次起動する trainer。bullet-shogi 上流の `GpuTrainer`
-/// 相当だが、cuda-oxide の `cuda_launch!` macro を使うため kernel シンボルを
-/// 直接渡せる (NVRTC 経由ではない)。
+/// GPU 上で 4 kernel を順次起動する trainer。cuda-oxide の `cuda_launch!`
+/// macro を使うため kernel シンボルを直接渡せる (NVRTC 経由ではない)。
 ///
 /// device buffer は内部所有:
 /// - `weights / m / v / grad`: `DeviceBuffer<f32>` (size = `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`)

@@ -19,13 +19,7 @@
 //! - `ft_weights` / `ft_bias`: i16 量子化、multiplier = `qa`
 //! - `l1_weights`: i8 量子化、multiplier = `qb`
 //! - `l1_bias`: i32 量子化、multiplier = `qa * qb`
-//! - `psqt`: i32 量子化、multiplier = `qa * qb` (bullet LayerStack 互換)
-//!
-//! ## 出典
-//!
-//! i8/i16/i32 量子化ロジック (`QuantTarget`) は bullet-shogi
-//! `crates/trainer/src/model/save.rs::QuantTarget::quantise` を移植
-//! (詳細は `ATTRIBUTION.md`)。
+//! - `psqt`: i32 量子化、multiplier = `qa * qb`
 
 use std::io::{self, Read, Write};
 
@@ -48,8 +42,6 @@ pub const NUM_FEATURES: usize = 73_305;
 /// 量子化目標型 (i8/i16/i32 + multiplier)。
 ///
 /// `quantise(round, &[f32])` で f32 → 量子化後の byte 列を返す。
-/// アルゴリズムは bullet-shogi `model/save.rs::QuantTarget` から移植
-/// (詳細は `ATTRIBUTION.md`)。
 #[derive(Clone, Copy, Debug)]
 pub enum QuantTarget {
     /// `i16` 量子化、multiplier は通常 `qa`。

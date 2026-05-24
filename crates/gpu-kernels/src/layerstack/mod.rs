@@ -10,9 +10,6 @@
 //! `#[cfg(test)] mod gpu_cpu_equivalence_tests` が GPU↔CPU 数値同等性
 //! テストの reference として使う。
 //!
-//! bullet 上流の対応箇所 (`examples/shogi_layerstack.rs` /
-//! `crates/trainer/src/model/builder.rs`) は各 `*_cpu` の docstring に記載。
-//!
 //! ## kernel ↔ CPU reference 対応表
 //!
 //! | `#[kernel]` (bins/nnue_train) | CPU reference (本 crate) |
@@ -43,7 +40,7 @@
 //! `sparse_ft_backward` / `screlu_grad` / `radam_step` / `ranger_step` /
 //! `adamw_step`) は `pointwise/` / `sparse/` 配下にある。
 //!
-//! ## アーキテクチャ定数 (bullet 由来)
+//! ## アーキテクチャ定数
 //!
 //! FT 入力次元 (`ft_in`) と 1 perspective あたりの active feature 数
 //! (`max_active`) は入力 feature set ごとに異なる runtime 値で、kernel は

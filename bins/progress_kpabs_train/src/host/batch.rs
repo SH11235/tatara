@@ -1,6 +1,5 @@
 //! Batch builder for the KP-abs progress trainer。
 //!
-//! bullet-shogi 上流 (`shogi_progress_kpabs_train_cuda.rs::Batch`) を移植。
 //! 1 batch は K games (= `games_per_step`) 分の position をまとめて、kernel に
 //! 渡す flat 配列 (`indices`、`targets`、`per_pos_norm`) を構築する。
 //!

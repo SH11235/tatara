@@ -1,7 +1,4 @@
 //! 将棋 NNUE 用の基本型と PackedSfenValue デコーダ。
-//!
-//! 型定義 / バイト並びの出典は bullet-shogi のオリジナル実装
-//! (`ATTRIBUTION.md` 参照)。
 
 pub mod bona_piece;
 pub mod game_result;
