@@ -186,9 +186,11 @@ impl<'a> BitStream<'a> {
     /// 4-byte unaligned load + shift / mask の 1 pass。`bit_cursor` が
     /// `bit_limit` を越えていても panic しない: slice 起点を `data.len()` に
     /// clamp してから copy するので `&data[i..i]` で i > len になる経路は無く、
-    /// 末尾を越えた byte は 0 で埋まる。decode loop 側で `cursor() < limit` の
-    /// 終端制御を前提にしているため、padding が PAWN code 0 と衝突しても挙動
-    /// 上の問題は無い (caller 側で続けて読まれない)。
+    /// 末尾を越えた byte は 0 で埋まる。0 padding は board LUT では NO_PIECE、
+    /// hand LUT では PAWN code (盤上 PAWN の `01` から bit0 を省いた `0`) に
+    /// 該当するが、`from_packed_sfen` は board を 79 駒固定 / hand を
+    /// `cursor() < 256` で終端制御するため、末尾を越えた peek の戻り値が
+    /// 偶発的に新しい駒として消費されることは無い。
     /// `n > 25` のときは bit_cursor の byte 内 offset (最大 7) と合わせて 32 bit
     /// を越えるので debug_assert で落とす。
     #[inline]
