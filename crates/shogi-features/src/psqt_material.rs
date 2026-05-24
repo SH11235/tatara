@@ -154,7 +154,7 @@ pub fn psqt_material_values(
 mod tests {
     use super::*;
     use crate::FeatureSet;
-    use crate::halfka_hm::{HALFKA_HM_DIMENSIONS, PIECE_INPUTS};
+    use crate::halfka_hm::PIECE_INPUTS;
     use shogi_format::bona_piece::F_KING;
 
     const TEST_NUM_BUCKETS: usize = 9;
@@ -214,11 +214,10 @@ mod tests {
         let t = build_packed_bp_material_table(FE_OLD_END);
         assert_eq!(t.len(), FE_OLD_END);
         // 手駒 / 盤上駒部分は埋まる、末尾の F_PAWN..E_DRAGON が centipawn 値で
-        // 終端しているのを抽出 check。
+        // 終端しているのを抽出 check。末尾 slot (E_DRAGON + 80) が FE_OLD_END
+        // - 1 = 1547 になる。
         assert_eq!(t[F_PAWN as usize], 100.0);
         assert_eq!(t[(E_DRAGON + 80) as usize], -1200.0);
-        assert_eq!(t[E_DRAGON as usize + 80], -1200.0);
-        // 末尾の最後の slot (E_DRAGON + 80) が FE_OLD_END - 1 = 1547。
         assert_eq!(E_DRAGON as usize + 80 + 1, FE_OLD_END);
     }
 
@@ -289,35 +288,47 @@ mod tests {
         assert_eq!(v[feat_king * TEST_NUM_BUCKETS], 0.0);
     }
 
-    /// HalfKaHmMerged の出力が v0.3.0 既存実装と byte-identical であることを
-    /// 同じ算法で再構築して確認 (regression test)。
+    /// 全 5 feature set で代表 feature の prior が hardcoded な centipawn / scaling
+    /// と一致することを direct probe で確認する (helper 内のロジックが drift しても
+    /// hardcoded 値とは独立なので oracle として機能する)。
     #[test]
-    fn psqt_material_values_halfka_hm_merged_bit_identical_with_v0_3_0() {
-        // v0.3.0 までの式: vals = num_buckets * HALFKA_HM_DIMENSIONS、kb in
-        // 0..(HALFKA_HM_DIMENSIONS / PIECE_INPUTS) の二重ループ、material は
-        // packed_table[bp] / out_scaling、bucket 全 cell 同値。
-        let scaling = 600.0;
-        let spec = FeatureSet::HalfKaHmMerged.spec();
-        assert_eq!(spec.ft_in(), HALFKA_HM_DIMENSIONS);
-        assert_eq!(spec.piece_inputs(), PIECE_INPUTS);
+    fn psqt_material_values_hardcoded_probes_all_feature_sets() {
+        const SCALING: f32 = 600.0;
+        const PAWN_PRIOR: f32 = 100.0 / SCALING; // friend pawn = +100 / 600
+        const ROOK_PRIOR: f32 = 1000.0 / SCALING; // friend rook = +1000 / 600
+        const E_DRAGON_PRIOR: f32 = -1200.0 / SCALING; // enemy dragon = -1200 / 600
 
-        let new_vals = psqt_material_values(&spec, TEST_NUM_BUCKETS, scaling);
+        for fs in FeatureSet::ALL {
+            let spec = fs.spec();
+            let v = psqt_material_values(&spec, TEST_NUM_BUCKETS, SCALING);
+            let pi = spec.piece_inputs();
+            let nb = TEST_NUM_BUCKETS;
+            let name = fs.canonical_name();
 
-        // 別経路で同算法を踏み比較。
-        let packed = build_packed_bp_material_table(PIECE_INPUTS);
-        let mut ref_vals = vec![0.0_f32; TEST_NUM_BUCKETS * HALFKA_HM_DIMENSIONS];
-        let num_king_buckets = HALFKA_HM_DIMENSIONS / PIECE_INPUTS;
-        for kb in 0..num_king_buckets {
-            for (bp, &material) in packed.iter().enumerate() {
-                let feat = kb * PIECE_INPUTS + bp;
-                let value = material / scaling;
-                let base = feat * TEST_NUM_BUCKETS;
-                for slot in ref_vals.iter_mut().skip(base).take(TEST_NUM_BUCKETS) {
-                    *slot = value;
-                }
-            }
+            // king_bucket=0 の F_HAND_PAWN 1 枚目 (+100/600)
+            let feat = F_HAND_PAWN as usize;
+            assert_eq!(v[feat * nb], PAWN_PRIOR, "{name}: F_HAND_PAWN");
+
+            // king_bucket=0 の F_PAWN @ sq0 (+100/600)
+            let feat = F_PAWN as usize;
+            assert_eq!(v[feat * nb], PAWN_PRIOR, "{name}: F_PAWN");
+
+            // king_bucket=0 の F_HAND_ROOK 1 枚目 (+1000/600)
+            let feat = F_HAND_ROOK as usize;
+            assert_eq!(v[feat * nb], ROOK_PRIOR, "{name}: F_HAND_ROOK");
+
+            // king_bucket=0 の E_DRAGON @ sq80 (≈-2.0、float 丸めで 1e-5 内)
+            let feat = (E_DRAGON + 80) as usize;
+            assert!(
+                (v[feat * nb] - E_DRAGON_PRIOR).abs() < 1e-5,
+                "{name}: E_DRAGON@80"
+            );
+
+            // king_bucket=最後 (king_buckets - 1) の F_PAWN @ sq0 でも同じ prior
+            let kb = spec.king_buckets() - 1;
+            let feat = kb * pi + F_PAWN as usize;
+            assert_eq!(v[feat * nb], PAWN_PRIOR, "{name}: last_kb F_PAWN");
         }
-        assert_eq!(new_vals, ref_vals);
     }
 
     #[test]
