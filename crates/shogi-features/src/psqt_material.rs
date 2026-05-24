@@ -24,6 +24,8 @@
 //!
 //! 玉 = 0 で全 variant 共通なので、玉 plane 領域は default `0.0` のまま残せば
 //! 良い。
+//!
+//! 数式 / 定数の出典は bullet-shogi のオリジナル実装 (`ATTRIBUTION.md` 参照)。
 
 use shogi_format::bona_piece::{
     E_BISHOP, E_DRAGON, E_GOLD, E_HAND_BISHOP, E_HAND_GOLD, E_HAND_KNIGHT, E_HAND_LANCE,
