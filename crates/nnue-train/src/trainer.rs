@@ -30,8 +30,10 @@
 //!
 //! ## per-position output bucket
 //!
-//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * 8)` を `0..=7` に
-//! clamp。`progress.bin` 未指定時は重み 0 で全局面が bucket 4 に collapse する。
+//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * num_buckets)` を
+//! `0..num_buckets-1` に clamp する (LayerStack `--num-buckets` で N を選ぶ、
+//! [`TrainingConfig::num_buckets`])。`progress.bin` 未指定時は重み 0 で全局面
+//! が `floor(0.5 * N) = N/2` (N=8/9 ともに bucket 4) に collapse する。
 //!
 //! ## score-drop-abs の近似
 //!

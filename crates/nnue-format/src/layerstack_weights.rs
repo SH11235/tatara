@@ -1314,11 +1314,31 @@ mod tests {
     fn resave_external_reference_if_env_set() {
         // 外部 reference checkpoint (`RSHOGI_NNUE_LAYERSTACK_REF_BIN`) を load → save
         // し直して size と byte 差を比較する regression check。env 未設定なら skip。
+        //
+        // save 側は常に current `NNUE_VERSION` で書き出す (legacy 形式に書き戻す
+        // path は提供しない)。`LEGACY_NNUE_VERSION_BUCKETS9` の reference を load
+        // して save し直すと、current format で追加された `num_buckets: u32` field
+        // 4 bytes が増える (legacy → current への migration)。current format の
+        // reference なら同 version 同 size で round-trip する。
         let Ok(in_path) = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN") else {
             eprintln!(
                 "skipping resave_external_reference (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set)"
             );
             return;
+        };
+        // 入力 file の先頭 4 bytes (`NNUE_VERSION`) を読み、current / legacy の
+        // どちらの format かを判定する。期待 size diff は legacy → current なら +4
+        // (num_buckets: u32 が増える)、current → current なら 0。
+        let in_bytes = std::fs::read(&in_path).unwrap();
+        assert!(
+            in_bytes.len() >= 4,
+            "reference file too short to read version"
+        );
+        let in_version = u32::from_le_bytes(in_bytes[..4].try_into().unwrap());
+        let expected_size_diff = match in_version {
+            v if v == NNUE_VERSION => 0_i64,
+            v if v == LEGACY_NNUE_VERSION_BUCKETS9 => 4_i64,
+            v => panic!("unknown NNUE_VERSION in reference: {v:#x}"),
         };
         let out_path = std::env::temp_dir().join("layerstack_ref_resaved.bin");
         let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
@@ -1335,29 +1355,37 @@ mod tests {
         weights.save_quantised(&mut writer).unwrap();
         drop(writer);
 
-        let in_size = std::fs::metadata(&in_path).unwrap().len();
-        let out_size = std::fs::metadata(&out_path).unwrap().len();
-        let diff = (out_size as i64) - (in_size as i64);
-        eprintln!("[resave] in_size={in_size}, out_size={out_size}, diff={diff}");
-        // Byte size は完全一致を期待 (layout regression detect)。
-        // 値の byte 差は network_hash + 9 fc_hash + rounding boundary で最大 ~50 bytes、
-        // size diff は 0 のはず。layout に regression があれば size が大きく変わる。
-        assert_eq!(diff, 0, "size diff {diff} != 0 — layout regression?");
-
-        // 参照との byte 差は最大 100 bytes 程度を許容範囲とする (rounding boundary
-        // の本数は実 weight 分布次第だが、典型的に 0-5 bytes、安全 margin で 100 まで OK)
-        let in_bytes = std::fs::read(&in_path).unwrap();
-        let out_bytes = std::fs::read(&out_path).unwrap();
-        let byte_diff_count = in_bytes
-            .iter()
-            .zip(out_bytes.iter())
-            .filter(|(a, b)| a != b)
-            .count();
-        eprintln!("[resave] byte_diff_count={byte_diff_count}");
-        assert!(
-            byte_diff_count < 100,
-            "byte diff count {byte_diff_count} >= 100 — format regression suspected"
+        let in_size = in_bytes.len() as i64;
+        let out_size = std::fs::metadata(&out_path).unwrap().len() as i64;
+        let diff = out_size - in_size;
+        eprintln!(
+            "[resave] in_version={in_version:#x} in_size={in_size}, out_size={out_size}, \
+             diff={diff} (expected {expected_size_diff})"
         );
+        // Byte size は format version に対応した想定 diff (current → current は 0、
+        // legacy → current は +4) を期待 (layout regression detect)。
+        assert_eq!(
+            diff, expected_size_diff,
+            "size diff {diff} != expected {expected_size_diff} for in_version {in_version:#x} — \
+             layout regression?"
+        );
+
+        // 同 format round-trip (current → current) のみ byte-level 比較する。
+        // legacy → current の migration では header + 全 layerstack section の offset
+        // が 4 bytes ずれるため byte 単位比較は意味を持たない。
+        if in_version == NNUE_VERSION {
+            let out_bytes = std::fs::read(&out_path).unwrap();
+            let byte_diff_count = in_bytes
+                .iter()
+                .zip(out_bytes.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!("[resave] byte_diff_count={byte_diff_count}");
+            assert!(
+                byte_diff_count < 100,
+                "byte diff count {byte_diff_count} >= 100 — format regression suspected"
+            );
+        }
     }
 
     #[test]

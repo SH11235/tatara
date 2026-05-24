@@ -45,14 +45,14 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// given. progress-kpabs assigns each position to `floor(p * num_buckets)`,
 /// so the default 9 keeps the binning + weight-buffer shape identical to the
 /// historical layout and resume-compatible with existing checkpoints. The
-/// trainer accepts `[2, 9]`; values above 9 require the per-bucket weight
-/// backward kernels to be generalised (see Issue #237).
+/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
 /// Maximum supported bucket count without changing the per-bucket weight
 /// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
 /// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-/// skipped, larger N needs the kernel restructure tracked by Issue #237.
+/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
+/// restructure (register fan-out → `blockIdx.z` grid axis).
 pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
 
 // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。

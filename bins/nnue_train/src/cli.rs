@@ -247,7 +247,7 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
+    /// progress-kpabs N-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2; bucket count by --num-buckets).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
