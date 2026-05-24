@@ -127,19 +127,18 @@ impl Batch {
         let bi = self.n_positions;
         let row_off = bi * self.max_active;
 
-        // spec は `Copy` なので local に取り出し、`self` の他フィールドを
-        // 借りる closure と借用が衝突しないようにする。
+        // SIMD/scalar dispatch ありの直接書込み path。HalfKaHmMerged の board
+        // phase は `crate::simd` 経由で AVX-2/AVX-512/scalar のいずれかに、
+        // king / hand と他 feature set は scalar 一本に走る。出力は closure
+        // 経由 `map_features_board` と byte-identical (parity test 参照)。
         let spec = self.feature_set;
-        let mut j = 0usize;
-        spec.map_features_board(board, |stm_idx, nstm_idx| {
-            if j < self.max_active {
-                self.stm_indices[row_off + j] = stm_idx as i32;
-                self.nstm_indices[row_off + j] = nstm_idx as i32;
-                j += 1;
-            }
-            // overflow は silent skip (`max_active` は合法局面の駒総数で固定、
-            // 実 PSV では到達不能だが defensive に許容)。
-        });
+        let max_active = self.max_active;
+        let stm_slice = &mut self.stm_indices[row_off..row_off + max_active];
+        let nstm_slice = &mut self.nstm_indices[row_off..row_off + max_active];
+        let _ = spec.extract_active_features(board, stm_slice, nstm_slice);
+        // overflow は silent skip (`max_active` は合法局面の駒総数で固定、
+        // 実 PSV では到達不能だが defensive に許容)。`extract_active_features`
+        // が `cap` 越えを silent ignore する。
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);

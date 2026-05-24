@@ -355,6 +355,156 @@ impl FeatureSetSpec {
         out
     }
 
+    /// active 特徴 index を `stm_out` / `nstm_out` slice に直接書込み、書込んだ
+    /// 件数を返す (closure 経由の [`map_features_board`] と byte-identical な
+    /// 出力を SIMD-friendly な形で得るための entry point)。
+    ///
+    /// 玉位置が無効な局面 (片玉 / 詰将棋データ) は何も書込まず 0 を返す。
+    /// 出力 slice 長が `max_active` 未満の場合は超過分を silent skip する
+    /// ([`Batch::push_decoded`] の defensive 動作に合わせる)。
+    ///
+    /// 内部 dispatch:
+    /// - HalfKaHmMerged の board phase は [`crate::simd`] (起動時 1 回 detect
+    ///   した scalar / AVX-2 / AVX-512 のいずれか) を経由
+    /// - その他 feature set および king / hand phase は closure-base path で
+    ///   1 経路 scalar
+    ///
+    /// [`map_features_board`]: Self::map_features_board
+    /// [`Batch::push_decoded`]: ../../nnue_train/dataloader/struct.Batch.html#method.push_decoded
+    pub fn extract_active_features(
+        &self,
+        board: &ShogiBoard,
+        stm_out: &mut [i32],
+        nstm_out: &mut [i32],
+    ) -> usize {
+        debug_assert_eq!(stm_out.len(), nstm_out.len());
+
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
+        let stm_king = board.king_square(stm);
+        let nstm_king = board.king_square(nstm);
+        if !stm_king.is_valid() || !nstm_king.is_valid() {
+            return 0;
+        }
+
+        let stm_ctx = self.perspective_ctx(stm_king, stm);
+        let nstm_ctx = self.perspective_ctx(nstm_king, nstm);
+        let cap = stm_out.len();
+        let mut count = 0usize;
+
+        // ---- board phase ----
+        if crate::simd::spec_is_halfka_hm_merged(self) {
+            // SIMD path 用の (pt, color, sq) を i32 配列に積む。max board piece は
+            // 81 マス上限 (異常局面でも `for_each_board_piece` は 81 を越えない)
+            // なので 96 (16 lane 倍数) を確保する。
+            const STACK_BUF: usize = 96;
+            let mut pt_buf = [0i32; STACK_BUF];
+            let mut color_buf = [0i32; STACK_BUF];
+            let mut sq_buf = [0i32; STACK_BUF];
+            let mut n_pieces = 0usize;
+            board.for_each_board_piece(|piece, sq| {
+                if n_pieces < STACK_BUF {
+                    pt_buf[n_pieces] = piece.piece_type as i32;
+                    color_buf[n_pieces] = piece.color as i32;
+                    sq_buf[n_pieces] = sq.0 as i32;
+                    n_pieces += 1;
+                }
+            });
+
+            // SIMD path に渡せる count を `cap - count` で頭打ちにする。実 PSV
+            // では駒数 40 で `max_active = 40` なので発火しないが defensive。
+            let writable = n_pieces.min(cap.saturating_sub(count));
+            if writable > 0 {
+                let stm_pers = crate::simd::PerspectiveOffset {
+                    kb_offset: (stm_ctx.king_bucket * self.piece_inputs) as i32,
+                    mirror: stm_ctx.mirror_files,
+                    black_persp: if stm == Color::Black { 1 } else { 0 },
+                    color_code: stm as i32,
+                };
+                let nstm_pers = crate::simd::PerspectiveOffset {
+                    kb_offset: (nstm_ctx.king_bucket * self.piece_inputs) as i32,
+                    mirror: nstm_ctx.mirror_files,
+                    black_persp: if nstm == Color::Black { 1 } else { 0 },
+                    color_code: nstm as i32,
+                };
+                crate::simd::extract_halfka_hm_board_phase(crate::simd::BoardPhaseArgs {
+                    pt: &pt_buf,
+                    color: &color_buf,
+                    sq: &sq_buf,
+                    n: writable,
+                    stm: &stm_pers,
+                    nstm: &nstm_pers,
+                    stm_out: &mut stm_out[count..count + writable],
+                    nstm_out: &mut nstm_out[count..count + writable],
+                });
+                count += writable;
+            }
+        } else {
+            // generic scalar path: 既存 `map_features_board` と同じ formula を
+            // closure で踏む (HalfKaHmMerged 以外は SIMD 化対象外)。
+            board.for_each_board_piece(|piece, sq| {
+                if count >= cap {
+                    return;
+                }
+                let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+                let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+                stm_out[count] = self.index(&stm_ctx, stm_bp) as i32;
+                nstm_out[count] = self.index(&nstm_ctx, nstm_bp) as i32;
+                count += 1;
+            });
+        }
+
+        // ---- king phase ----
+        if self.emits_king_feature() {
+            if count < cap {
+                let stm_friend = king_bonapiece(stm_king, stm, true);
+                let nstm_friend = king_bonapiece(nstm_king, nstm, true);
+                stm_out[count] = self.index(&stm_ctx, stm_friend) as i32;
+                nstm_out[count] = self.index(&nstm_ctx, nstm_friend) as i32;
+                count += 1;
+            }
+            if count < cap {
+                let stm_enemy = king_bonapiece(nstm_king, stm, false);
+                let nstm_enemy = king_bonapiece(stm_king, nstm, false);
+                stm_out[count] = self.index(&stm_ctx, stm_enemy) as i32;
+                nstm_out[count] = self.index(&nstm_ctx, nstm_enemy) as i32;
+                count += 1;
+            }
+        }
+
+        // ---- hand phase ----
+        for owner in [Color::Black, Color::White] {
+            for &pt in &HAND_PIECE_TYPES {
+                let n_hand = board.hand(owner).count(pt);
+                for i in 1..=n_hand {
+                    if count >= cap {
+                        return count;
+                    }
+                    let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                    if stm_bp != BonaPiece::ZERO {
+                        let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                        stm_out[count] = self.index(&stm_ctx, stm_bp) as i32;
+                        nstm_out[count] = self.index(&nstm_ctx, nstm_bp) as i32;
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        count
+    }
+
+    /// `perspective_ctx` の crate 内 expose (parity test 用)。
+    #[cfg(test)]
+    pub(crate) fn perspective_ctx_for_test(
+        &self,
+        king_sq: Square,
+        perspective: Color,
+    ) -> (usize, bool) {
+        let ctx = self.perspective_ctx(king_sq, perspective);
+        (ctx.king_bucket, ctx.mirror_files)
+    }
+
     /// 1 視点分の king bucket / 筋ミラー要否を確定する。
     fn perspective_ctx(&self, king_sq: Square, perspective: Color) -> PerspectiveCtx {
         let king_idx = perspective_index(king_sq, perspective);
@@ -500,6 +650,54 @@ mod tests {
         // FNV-1a が canonical 名から決定的に上記の値を導くことを確認する。
         assert_eq!(fnv1a32("halfka-merged"), 0xACD6_8C97);
         assert_eq!(fnv1a32("halfka-hm-split"), 0x2A46_AC09);
+    }
+
+    #[test]
+    fn extract_active_features_matches_map_features_board() {
+        // 公開 5 feature set 全てで、新 API (`extract_active_features` —
+        // HalfKaHmMerged は SIMD dispatch、それ以外 scalar fallback) が
+        // 旧 closure API (`map_features_board`) と byte-identical な
+        // sparse index 列を emit することを sample.psv 100 records で確認する。
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            // fixture が無い CI 構成 (本リポでは同梱) は skip。
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (size_of test で 40 byte 確認済、align 1)、`bytes.len() % 40 == 0` を
+        // 直前で assert。`bytes` の所有 lifetime 内に閉じる slice。
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+
+        for fs in FeatureSet::ALL {
+            let spec = fs.spec();
+            for (i, psv) in records.iter().enumerate() {
+                let board = psv.decode();
+                // closure path
+                let mut via_closure = Vec::new();
+                spec.map_features_board(&board, |stm, nstm| {
+                    via_closure.push((stm as i32, nstm as i32));
+                });
+                // new direct-write path
+                let mut stm_buf = vec![0i32; spec.max_active()];
+                let mut nstm_buf = vec![0i32; spec.max_active()];
+                let n = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
+                let via_direct: Vec<(i32, i32)> =
+                    (0..n).map(|k| (stm_buf[k], nstm_buf[k])).collect();
+
+                assert_eq!(
+                    via_direct,
+                    via_closure,
+                    "{} record {}: extract_active_features と map_features_board が不一致",
+                    fs.canonical_name(),
+                    i
+                );
+            }
+        }
     }
 
     #[test]

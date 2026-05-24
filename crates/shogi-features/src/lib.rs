@@ -13,6 +13,7 @@ pub mod feature_set;
 pub mod halfka_hm;
 pub mod progress_kpabs;
 pub mod psqt_material;
+mod simd;
 
 pub use feature_set::{FeatureSet, FeatureSetSpec};
 pub use halfka_hm::{
