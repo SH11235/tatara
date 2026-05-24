@@ -377,32 +377,28 @@ mod parity_tests {
             }
             let (pt, color, sq) = collect_board_pieces(&board);
 
-            // 1. closure 経路 (board phase だけを抜き出し、king / hand は除く)
-            let mut closure_board = Vec::new();
-            {
-                let stm_ctx = spec.perspective_ctx_for_test(stm_king, stm);
-                let nstm_ctx = spec.perspective_ctx_for_test(nstm_king, nstm);
-                let (stm_kb, stm_mirror) = stm_ctx;
-                let (nstm_kb, nstm_mirror) = nstm_ctx;
-                let pi = spec.piece_inputs();
-                use shogi_format::BonaPiece;
-                board.for_each_board_piece(|piece, s| {
-                    // map_features_board と同じ式を踏む (board piece の
-                    // `pack_bonapiece` は `folds_enemy_king` を trigger しない)。
-                    let stm_bp = BonaPiece::from_piece_square(piece, s, stm).value() as i32;
-                    let nstm_bp = BonaPiece::from_piece_square(piece, s, nstm).value() as i32;
-                    let stm_packed = pack_for_test(stm_bp, stm_mirror);
-                    let nstm_packed = pack_for_test(nstm_bp, nstm_mirror);
-                    let stm_idx = (stm_kb * pi) as i32 + stm_packed;
-                    let nstm_idx = (nstm_kb * pi) as i32 + nstm_packed;
-                    closure_board.push((stm_idx, nstm_idx));
-                });
-            }
+            // 1. closure 経路 — 公開 API `map_features_board` を直接呼ぶ。
+            //    `map_features_board` は board pieces (`for_each_board_piece`
+            //    順) → king features (`emits_king_feature` 時 2 個) → hand
+            //    pieces の順に emit するので、先頭 `pt.len()` 要素が board
+            //    phase。SIMD path は board phase のみを計算するのでここで
+            //    truncate して比較する。
+            let mut via_closure = Vec::new();
+            spec.map_features_board(&board, |stm_idx, nstm_idx| {
+                via_closure.push((stm_idx as i32, nstm_idx as i32));
+            });
 
             if pt.is_empty() {
                 closure_only += 1;
                 continue;
             }
+            assert!(
+                via_closure.len() >= pt.len(),
+                "record {i}: closure emit が board piece 数を下回る ({} < {})",
+                via_closure.len(),
+                pt.len()
+            );
+            let closure_board: Vec<(i32, i32)> = via_closure[..pt.len()].to_vec();
 
             // 2. forced SIMD path 群
             let stm_pers = build_perspective(&spec, stm_king, stm);
@@ -450,22 +446,6 @@ mod parity_tests {
             compared_scalar > 0,
             "scalar parity が 1 record も比較されなかった"
         );
-    }
-
-    /// board piece 限定 `pack_bonapiece` (mirror のみ適用、enemy-king fold は
-    /// board piece では trigger しないので省略)。closure 比較 test 用 helper。
-    fn pack_for_test(bp: i32, mirror: bool) -> i32 {
-        use shogi_format::bona_piece::FE_HAND_END;
-        if !mirror || bp < FE_HAND_END as i32 {
-            return bp;
-        }
-        let rel = bp - FE_HAND_END as i32;
-        let piece_index = rel / 81;
-        let sq = rel % 81;
-        let file = sq / 9;
-        let rank = sq % 9;
-        let mirrored_sq = (8 - file) * 9 + rank;
-        FE_HAND_END as i32 + piece_index * 81 + mirrored_sq
     }
 
     /// 起動時 detect が現在 host で「scalar 以外」を選ぶことを確認する

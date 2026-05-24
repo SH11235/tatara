@@ -682,7 +682,7 @@ mod tests {
                 spec.map_features_board(&board, |stm, nstm| {
                     via_closure.push((stm as i32, nstm as i32));
                 });
-                // new direct-write path
+                // direct-write path
                 let mut stm_buf = vec![0i32; spec.max_active()];
                 let mut nstm_buf = vec![0i32; spec.max_active()];
                 let n = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
