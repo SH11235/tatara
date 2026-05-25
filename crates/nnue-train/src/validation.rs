@@ -57,7 +57,8 @@ pub struct HeldoutSet {
 }
 
 impl HeldoutSet {
-    /// test PSV file の **先頭から** 固定の検証集合を読み込む。
+    /// test PSV file の **先頭から** 固定の検証集合を読み込む
+    /// ([`HeldoutSet::load_from_range`] の `[0, file_size)` 特化)。
     ///
     /// `test_positions` を `batch_size` 単位に切り上げた数の満タン batch を作る。
     /// PSV を逐次読みし EOF で打ち切る (学習 loader のような epoch wrap はしない —
@@ -74,11 +75,43 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
+        let file_size = std::fs::metadata(path)?.len();
+        Self::load_from_range(
+            path,
+            0,
+            file_size,
+            batch_size,
+            score_drop_abs,
+            test_positions,
+            progress,
+            feature_set,
+            num_buckets,
+        )
+    }
+
+    /// test PSV file の `[start_offset, end_offset)` byte range から固定の検証
+    /// 集合を読み込む。training PSV の末尾 N 局面を holdout 専用に分離する
+    /// (`--test-tail-positions`) 経路で使う。挙動は [`HeldoutSet::load`] と同じく
+    /// EOF (= range 末尾) で打ち切り、wrap はしない。range 検証 (alignment /
+    /// `end <= file_size` / `start <= end`) は [`PsvFileLoader::new_range`] に
+    /// 委譲する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_from_range(
+        path: &Path,
+        start_offset: u64,
+        end_offset: u64,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        test_positions: usize,
+        progress: &ShogiProgressKPAbs,
+        feature_set: FeatureSetSpec,
+        num_buckets: usize,
+    ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let n_batches = test_positions.div_ceil(batch_size).max(1);
 
-        let mut loader = PsvFileLoader::new(path)?;
+        let mut loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         let mut batches: Vec<(Batch, Vec<i32>)> = Vec::with_capacity(n_batches);
         let mut cur = Batch::with_capacity(batch_size, feature_set);
         let mut cur_buckets: Vec<i32> = Vec::with_capacity(batch_size);
@@ -108,8 +141,8 @@ impl HeldoutSet {
 
         if batches.is_empty() {
             return Err(io::Error::other(format!(
-                "test data file {} has fewer than batch_size ({batch_size}) usable positions; \
-                 held-out validation needs at least one full batch",
+                "test data file {} range [{start_offset}, {end_offset}) has fewer than batch_size \
+                 ({batch_size}) usable positions; held-out validation needs at least one full batch",
                 path.display()
             )));
         }
@@ -280,6 +313,51 @@ mod tests {
         .expect("load held-out set");
         assert_eq!(set.n_batches(), 6);
         assert_eq!(set.n_positions(), 96);
+    }
+
+    #[test]
+    fn heldout_set_load_from_range_reads_tail_records() {
+        // sample.psv は 100 records。末尾 30 records (offset 2800..4000) を
+        // range 指定して読み、batch_size 16 で test_positions 30 → 切り上げ
+        // 2 batch (= 32 pos 要求) を試す。range には 30 records しか無いので
+        // EOF 打ち切りで満タン batch は 1 個 (16 pos)。
+        let progress = ShogiProgressKPAbs;
+        let set = HeldoutSet::load_from_range(
+            &sample_psv_path(),
+            2800,
+            4000,
+            16,
+            None,
+            30,
+            &progress,
+            test_spec(),
+            9,
+        )
+        .expect("load tail range");
+        assert_eq!(set.n_batches(), 1, "EOF で 2 batch 目は埋まらない");
+        assert_eq!(set.n_positions(), 16);
+    }
+
+    #[test]
+    fn heldout_set_load_from_range_errors_when_empty_range() {
+        // 空 range (start == end) は 1 件も埋められず error。
+        let progress = ShogiProgressKPAbs;
+        let err = HeldoutSet::load_from_range(
+            &sample_psv_path(),
+            4000,
+            4000,
+            16,
+            None,
+            16,
+            &progress,
+            test_spec(),
+            9,
+        )
+        .expect_err("empty range should error");
+        assert!(
+            err.to_string().contains("fewer than batch_size"),
+            "got: {err}"
+        );
     }
 
     #[test]

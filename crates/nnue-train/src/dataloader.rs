@@ -20,7 +20,7 @@
 //!   同時計算) を提供する
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -28,6 +28,11 @@ use std::thread;
 use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_format::{PackedSfenValue, ShogiBoard};
+
+/// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
+/// 40-byte struct). Used everywhere we compute byte offsets, validate range
+/// alignment, or convert between record counts and file sizes.
+pub const PSV_RECORD_BYTES: u64 = 40;
 
 // =============================================================================
 // Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
@@ -169,21 +174,73 @@ impl Batch {
 // =============================================================================
 
 /// PSV file (PackedSfenValue × N、各 40 bytes 固定) を 1 record ずつ stream 読み。
+///
+/// 読み出し範囲は file 全体 ([`PsvFileLoader::new`]) または
+/// `[start_offset, end_offset)` ([`PsvFileLoader::new_range`]) の byte range で
+/// 指定する。range の両端は [`PSV_RECORD_BYTES`] の倍数でなければならず、`end`
+/// が file size を超えても error。range 外まで読み進めず、`remaining_bytes`
+/// が 1 record 分に満たなくなった時点で EOF として `Ok(None)` を返す。
 pub struct PsvFileLoader {
     reader: BufReader<File>,
     eof: bool,
     path: PathBuf,
+    /// 残りどれだけ読めるか (byte)。range 末尾に達したら 1 record 分を切らず
+    /// EOF 扱いにするための gate。`new()` 経路では file_size と一致。
+    remaining_bytes: u64,
 }
 
 impl PsvFileLoader {
-    /// `path` の PSV file を open。
+    /// `path` の PSV file 全体を open。`new_range(path, 0, file_size)` と等価。
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path_buf = path.as_ref().to_path_buf();
-        let reader = BufReader::new(File::open(&path_buf)?);
+        let path_ref = path.as_ref();
+        let file = File::open(path_ref)?;
+        let file_size = file.metadata()?.len();
+        Self::open_range(path_ref, file, file_size, 0, file_size)
+    }
+
+    /// `path` の PSV file を `[start, end)` の byte range で open。range は
+    /// [`PSV_RECORD_BYTES`] の倍数でなければならず、`end > file_size` /
+    /// `start > end` も error。`start == end` (空 range) は許可し即 EOF。
+    pub fn new_range<P: AsRef<Path>>(path: P, start: u64, end: u64) -> io::Result<Self> {
+        let path_ref = path.as_ref();
+        let file = File::open(path_ref)?;
+        let file_size = file.metadata()?.len();
+        Self::open_range(path_ref, file, file_size, start, end)
+    }
+
+    fn open_range(
+        path: &Path,
+        mut file: File,
+        file_size: u64,
+        start: u64,
+        end: u64,
+    ) -> io::Result<Self> {
+        if start > end {
+            return Err(io::Error::other(format!(
+                "PsvFileLoader range start ({start}) > end ({end}) for {}",
+                path.display()
+            )));
+        }
+        if end > file_size {
+            return Err(io::Error::other(format!(
+                "PsvFileLoader range end ({end}) > file size ({file_size}) for {}",
+                path.display()
+            )));
+        }
+        if !start.is_multiple_of(PSV_RECORD_BYTES) || !end.is_multiple_of(PSV_RECORD_BYTES) {
+            return Err(io::Error::other(format!(
+                "PsvFileLoader range [{start}, {end}) is not aligned to PSV record size ({PSV_RECORD_BYTES} bytes) for {}",
+                path.display()
+            )));
+        }
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))?;
+        }
         Ok(Self {
-            reader,
+            reader: BufReader::new(file),
             eof: false,
-            path: path_buf,
+            path: path.to_path_buf(),
+            remaining_bytes: end - start,
         })
     }
 
@@ -193,18 +250,21 @@ impl PsvFileLoader {
     }
 
     /// 1 PSV record を読む。EOF なら `Ok(None)`、partial read は
-    /// `UnexpectedEof` で panic 相当の io::Error を返す。
+    /// `UnexpectedEof` で panic 相当の io::Error を返す。range 末尾
+    /// (`remaining_bytes < PSV_RECORD_BYTES`) も EOF 扱い (`Ok(None)`)。
     pub fn next_psv(&mut self) -> io::Result<Option<PackedSfenValue>> {
-        if self.eof {
+        if self.eof || self.remaining_bytes < PSV_RECORD_BYTES {
+            self.eof = true;
             return Ok(None);
         }
-        let mut buf = [0u8; 40];
+        let mut buf = [0u8; PSV_RECORD_BYTES as usize];
         match self.reader.read(&mut buf)? {
             0 => {
                 self.eof = true;
                 Ok(None)
             }
-            40 => {
+            n if n == PSV_RECORD_BYTES as usize => {
+                self.remaining_bytes -= PSV_RECORD_BYTES;
                 let mut psv = PackedSfenValue::default();
                 psv.as_bytes_mut().copy_from_slice(&buf);
                 Ok(Some(psv))
@@ -212,16 +272,17 @@ impl PsvFileLoader {
             n => {
                 // partial read — 残りを fill するまで blocking read。
                 let mut total = n;
-                while total < 40 {
+                while total < PSV_RECORD_BYTES as usize {
                     let got = self.reader.read(&mut buf[total..])?;
                     if got == 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!("partial PSV record: got {total} of 40 bytes"),
+                            format!("partial PSV record: got {total} of {PSV_RECORD_BYTES} bytes"),
                         ));
                     }
                     total += got;
                 }
+                self.remaining_bytes -= PSV_RECORD_BYTES;
                 let mut psv = PackedSfenValue::default();
                 psv.as_bytes_mut().copy_from_slice(&buf);
                 Ok(Some(psv))
@@ -339,6 +400,11 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 /// wrap するので「終わり」は無い)。
 struct PsvEpochReader {
     path: PathBuf,
+    /// 1 epoch の byte range `[start_offset, end_offset)`。wrap 時に
+    /// `PsvFileLoader::new_range(path, start, end)` で再 open する。`new()`
+    /// 経路では `(0, file_size)` で全体に等しい。
+    start_offset: u64,
+    end_offset: u64,
     loader: PsvFileLoader,
     score_drop_abs: Option<i32>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
@@ -348,10 +414,21 @@ struct PsvEpochReader {
 }
 
 impl PsvEpochReader {
-    fn new(path: &Path, score_drop_abs: Option<i32>) -> io::Result<Self> {
+    /// `path` を `[start_offset, end_offset)` 範囲で epoch wrap させる reader。
+    /// wrap 時の再 open も同 range で行う。`PsvFileLoader::new_range` 同様の
+    /// 範囲・alignment 検証はここでは行わず、`new_range` 内で検証する。
+    fn new_range(
+        path: &Path,
+        start_offset: u64,
+        end_offset: u64,
+        score_drop_abs: Option<i32>,
+    ) -> io::Result<Self> {
+        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         Ok(Self {
             path: path.to_path_buf(),
-            loader: PsvFileLoader::new(path)?,
+            start_offset,
+            end_offset,
+            loader,
             score_drop_abs,
             pushed_this_epoch: 0,
             barren_passes: 0,
@@ -379,9 +456,12 @@ impl PsvEpochReader {
                         self.barren_passes += 1;
                         if self.barren_passes >= MAX_BARREN_PASSES {
                             return Err(io::Error::other(format!(
-                                "data file {} yielded no usable positions over {} full passes \
-                                 (empty file, or all positions filtered out by score-drop-abs)",
+                                "data file {} range [{}, {}) yielded no usable positions over {} \
+                                 full passes (empty range, or all positions filtered out by \
+                                 score-drop-abs)",
                                 self.path.display(),
+                                self.start_offset,
+                                self.end_offset,
                                 self.barren_passes
                             )));
                         }
@@ -389,7 +469,8 @@ impl PsvEpochReader {
                         self.barren_passes = 0;
                     }
                     self.pushed_this_epoch = 0;
-                    self.loader = PsvFileLoader::new(&self.path)?;
+                    self.loader =
+                        PsvFileLoader::new_range(&self.path, self.start_offset, self.end_offset)?;
                 }
             }
         }
@@ -470,6 +551,12 @@ impl BucketedPrefetchedLoader {
     /// 呼ぶときの bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
     /// 計算自体が skip されるが、worker 側 assertion (`num_buckets >= 1`) は常に
     /// 評価する。
+    /// `train_end_offset` は training stream の上限 byte offset (`[0, train_end_offset)`
+    /// が training に使われる)。file 全体を使うときは file size をそのまま渡す。
+    /// 同 file 内に held-out tail を残す経路 (`--test-tail-positions`) で
+    /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
+    /// ようにするのが本パラメータの主用途。両端は [`PSV_RECORD_BYTES`] の倍数で
+    /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         path: &Path,
@@ -480,6 +567,7 @@ impl BucketedPrefetchedLoader {
         feature_set: FeatureSetSpec,
         compute_bucket: bool,
         num_buckets: usize,
+        train_end_offset: u64,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
@@ -493,7 +581,12 @@ impl BucketedPrefetchedLoader {
         // が最大 1、main が最大 1。
         let n_slots = prefetch_depth + num_workers + 1;
 
-        let reader = Arc::new(Mutex::new(PsvEpochReader::new(path, score_drop_abs)?));
+        let reader = Arc::new(Mutex::new(PsvEpochReader::new_range(
+            path,
+            0,
+            train_end_offset,
+            score_drop_abs,
+        )?));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
 
         let (result_tx, result_rx) = mpsc::sync_channel::<BatchSlot>(prefetch_depth);
@@ -717,6 +810,79 @@ mod tests {
     }
 
     #[test]
+    fn psv_file_loader_new_range_reads_only_specified_range() {
+        // sample.psv = 4000 bytes (100 records)。
+        // 範囲 [40, 80) は 1 record。
+        let mut one = PsvFileLoader::new_range(sample_psv_path(), 40, 80).unwrap();
+        assert!(one.next_psv().unwrap().is_some(), "1 record 読める");
+        assert!(one.next_psv().unwrap().is_none(), "次は range 末尾で None");
+
+        // 範囲 [0, 4000) は全 100 records。
+        let mut full = PsvFileLoader::new_range(sample_psv_path(), 0, 4000).unwrap();
+        let mut n = 0;
+        while full.next_psv().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 100);
+
+        // 範囲 [4000, 4000) は空 range、即 None。
+        let mut empty = PsvFileLoader::new_range(sample_psv_path(), 4000, 4000).unwrap();
+        assert!(empty.next_psv().unwrap().is_none());
+    }
+
+    #[test]
+    fn psv_file_loader_new_range_skips_records_before_start() {
+        // 末尾 30 records (offset 2800..4000) を取って、次に full range [0, 4000)
+        // で同じ末尾 30 records を取ったときと bit-equal になることを確認
+        // (Seek が record 境界に揃っている = 内容が一致する)。
+        let mut tail = PsvFileLoader::new_range(sample_psv_path(), 2800, 4000).unwrap();
+        let mut tail_records: Vec<PackedSfenValue> = Vec::new();
+        while let Some(psv) = tail.next_psv().unwrap() {
+            tail_records.push(psv);
+        }
+        assert_eq!(tail_records.len(), 30);
+
+        let mut full = PsvFileLoader::new(sample_psv_path()).unwrap();
+        let mut all_records: Vec<PackedSfenValue> = Vec::new();
+        while let Some(psv) = full.next_psv().unwrap() {
+            all_records.push(psv);
+        }
+        assert_eq!(all_records.len(), 100);
+        for i in 0..30 {
+            assert_eq!(
+                tail_records[i].as_bytes(),
+                all_records[70 + i].as_bytes(),
+                "tail[{i}] should equal full[{}]",
+                70 + i
+            );
+        }
+    }
+
+    #[test]
+    fn psv_file_loader_new_range_rejects_out_of_bounds_end() {
+        let err = PsvFileLoader::new_range(sample_psv_path(), 0, 4040)
+            .err()
+            .expect("end > file_size should error");
+        assert!(err.to_string().contains("> file size"), "got: {err}");
+    }
+
+    #[test]
+    fn psv_file_loader_new_range_rejects_misaligned() {
+        let err = PsvFileLoader::new_range(sample_psv_path(), 1, 80)
+            .err()
+            .expect("misaligned start should error");
+        assert!(err.to_string().contains("aligned"), "got: {err}");
+    }
+
+    #[test]
+    fn psv_file_loader_new_range_rejects_inverted() {
+        let err = PsvFileLoader::new_range(sample_psv_path(), 80, 40)
+            .err()
+            .expect("start > end should error");
+        assert!(err.to_string().contains("start"), "got: {err}");
+    }
+
+    #[test]
     fn fill_batch_indices_within_halfka_dim_or_padding() {
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
         let mut batch = Batch::with_capacity(8, test_spec());
@@ -869,11 +1035,19 @@ mod tests {
 
     // --- BucketedPrefetchedLoader ---
 
+    /// テスト fixture: file 全体を training に使う場合の `train_end_offset`
+    /// (= file size)。`std::fs::metadata` で取れる値そのもの。
+    fn full_range_end(path: &Path) -> u64 {
+        std::fs::metadata(path).expect("stat sample.psv").len()
+    }
+
     fn run_bucketed_smoke(num_workers: usize) {
         // sample.psv は 100 records (Loss=50 / Win=50、Draw なし)。
         let progress = ShogiProgressKPAbs; // zero weights → 全 bucket 4
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &sample_psv_path(),
+            &path,
             16,
             None,
             num_workers,
@@ -881,6 +1055,7 @@ mod tests {
             test_spec(),
             true,
             9,
+            end,
         )
         .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
@@ -925,17 +1100,11 @@ mod tests {
     #[test]
     fn bucketed_loader_zero_workers_normalizes_to_one() {
         let progress = ShogiProgressKPAbs;
-        let mut loader = BucketedPrefetchedLoader::spawn(
-            &sample_psv_path(),
-            8,
-            None,
-            0,
-            progress,
-            test_spec(),
-            true,
-            9,
-        )
-        .unwrap();
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
+        let mut loader =
+            BucketedPrefetchedLoader::spawn(&path, 8, None, 0, progress, test_spec(), true, 9, end)
+                .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
@@ -951,8 +1120,10 @@ mod tests {
         // 100 records 内に 1 batch (=8) ぶん埋まらないと epoch wrap で barren になりうる
         // が、sample.psv に score==0 が 8 件以上ある保証はない → barren error を許容。
         // ここでは「閾値 32000 (= 既定の score-drop 閾値) では全件通る」ことだけ確認する。
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
         let mut ok_loader = BucketedPrefetchedLoader::spawn(
-            &sample_psv_path(),
+            &path,
             8,
             Some(32000),
             2,
@@ -960,6 +1131,7 @@ mod tests {
             test_spec(),
             true,
             9,
+            end,
         )
         .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
@@ -971,7 +1143,7 @@ mod tests {
         // どちらでもよい (hang しないことが要点)。ここでは「呼んで返ってくる」ことの
         // み確認 (panic / hang しない)。
         let mut drop_loader = BucketedPrefetchedLoader::spawn(
-            &sample_psv_path(),
+            &path,
             100,
             Some(1),
             1,
@@ -979,9 +1151,54 @@ mod tests {
             test_spec(),
             true,
             9,
+            end,
         )
         .unwrap();
         let _ = drop_loader.next_batch();
+    }
+
+    #[test]
+    fn bucketed_loader_with_train_end_offset_caps_training_range() {
+        // file 全体 100 records のうち先頭 70 records (offset 2800) だけを
+        // training に使う。worker は epoch wrap で 70 records を周回しつづける
+        // ので、batch_size 8 で 30 batch (= 240 positions) 取っても barren に
+        // ならず満タン batch が返り続けることを確認する。
+        let progress = ShogiProgressKPAbs;
+        let path = sample_psv_path();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            2800,
+        )
+        .unwrap();
+        for _ in 0..30 {
+            let (batch, buckets) = loader
+                .next_batch()
+                .unwrap()
+                .expect("epoch wraps within capped range");
+            assert_eq!(batch.n_positions, 8);
+            assert_eq!(buckets.len(), 8);
+            loader.recycle((batch, buckets));
+        }
+    }
+
+    #[test]
+    fn psv_epoch_reader_new_range_wraps_within_range() {
+        // 末尾 30 records (offset 2800..4000) の範囲を epoch reader で読む。
+        // 100 record 分 next() しても barren error にならず (= range 内 wrap が
+        // 効いている)、各 record が必ず内容を返すことを確認する。
+        let mut reader = PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None).unwrap();
+        for i in 0..100 {
+            let _psv = reader
+                .next()
+                .unwrap_or_else(|e| panic!("wrap should keep returning records (i={i}): {e}"));
+        }
     }
 
     #[test]
@@ -993,7 +1210,7 @@ mod tests {
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
         let mut loader =
-            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true, 9)
+            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true, 9, 0)
                 .unwrap();
         let err = loader
             .next_batch()
