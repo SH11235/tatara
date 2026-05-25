@@ -51,6 +51,12 @@ struct Args {
     /// Also print a per-file histogram, not just the combined total.
     #[arg(long)]
     per_pack: bool,
+
+    /// Number of progress buckets to survey (LayerStack `--num-buckets`).
+    /// Must be in `[1, 9]`; defaults to 9 to match the LayerStack trainer
+    /// default. Position `p` maps to bucket `min(N-1, floor(p * N))`.
+    #[arg(long, default_value_t = 9)]
+    num_buckets: usize,
 }
 
 /// 1 PSV ファイルから最大 `max` 局面をサンプリングする。`offset` レコード目から
@@ -127,6 +133,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.stride == 0 {
         return Err("--stride must be >= 1".into());
     }
+    if !(1..=9).contains(&args.num_buckets) {
+        return Err(format!("--num-buckets must be in [1, 9] (got {})", args.num_buckets).into());
+    }
     let data_paths: Vec<PathBuf> = args
         .data
         .split(',')
@@ -142,7 +151,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // 持つため 1 プロセス 1 model (epoch 比較は本ツールを複数回実行する)。
     let kpabs = ShogiProgressKPAbs::load_from_bin(&args.progress)?;
 
-    let n_buckets = ShogiProgressKPAbs::BUCKETS;
+    let n_buckets = args.num_buckets;
     let mut total_hist = vec![0u64; n_buckets];
     let mut grand_total = 0usize;
     let mut remaining = args.samples;
@@ -157,7 +166,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let mut pack_hist = vec![0u64; n_buckets];
         for psv in &samples {
-            pack_hist[kpabs.bucket(psv) as usize] += 1;
+            pack_hist[kpabs.bucket(psv, n_buckets) as usize] += 1;
         }
         for (b, &count) in pack_hist.iter().enumerate() {
             total_hist[b] += count;
@@ -172,7 +181,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if grand_total == 0 {
         return Err("no positions read from --data files".into());
     }
-    print_hist("progress8kpabs bucket distribution (total)", &total_hist);
+    print_hist(
+        &format!("progress-kpabs bucket distribution (total, N={n_buckets})"),
+        &total_hist,
+    );
     Ok(())
 }
 

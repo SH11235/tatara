@@ -72,8 +72,10 @@ impl HeldoutSet {
         test_positions: usize,
         progress: &ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
+        num_buckets: usize,
     ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
+        assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let n_batches = test_positions.div_ceil(batch_size).max(1);
 
         let mut loader = PsvFileLoader::new(path)?;
@@ -95,7 +97,7 @@ impl HeldoutSet {
             let board = psv.decode();
             let pushed = cur.push_decoded(&board);
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
-            cur_buckets.push(i32::from(progress.bucket_board(&board)));
+            cur_buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
             if cur.n_positions == batch_size {
                 let full =
                     std::mem::replace(&mut cur, Batch::with_capacity(batch_size, feature_set));
@@ -255,7 +257,7 @@ mod tests {
         // sample.psv は 100 records。batch_size 16 / test_positions 40 →
         // 切り上げ 3 batch (48 pos) を要求するが、100 records あるので wrap せず 3 batch。
         let progress = ShogiProgressKPAbs;
-        let set = HeldoutSet::load(&sample_psv_path(), 16, None, 40, &progress, test_spec())
+        let set = HeldoutSet::load(&sample_psv_path(), 16, None, 40, &progress, test_spec(), 9)
             .expect("load held-out set");
         assert_eq!(set.n_batches(), 3);
         assert_eq!(set.n_positions(), 48);
@@ -273,6 +275,7 @@ mod tests {
             100_000,
             &progress,
             test_spec(),
+            9,
         )
         .expect("load held-out set");
         assert_eq!(set.n_batches(), 6);
@@ -283,8 +286,16 @@ mod tests {
     fn heldout_set_errors_when_file_too_small_for_one_batch() {
         // batch_size 200 > sample.psv 100 records → 満タン batch を 1 個も作れず error。
         let progress = ShogiProgressKPAbs;
-        let err = HeldoutSet::load(&sample_psv_path(), 200, None, 200, &progress, test_spec())
-            .expect_err("too-small test file should error");
+        let err = HeldoutSet::load(
+            &sample_psv_path(),
+            200,
+            None,
+            200,
+            &progress,
+            test_spec(),
+            9,
+        )
+        .expect_err("too-small test file should error");
         assert!(
             err.to_string().contains("fewer than batch_size"),
             "got: {err}"

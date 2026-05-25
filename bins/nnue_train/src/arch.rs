@@ -6,10 +6,11 @@ use nnue_train::trainer::LossKind;
 //
 // FT input dim (`ft_in`) and active-feature count (`max_active`) depend on the
 // input feature set chosen at startup (see `FeatureSetSpec`). The FT output dim
-// is chosen from `--ft-out`, the L1 output dim from `--l1`, and the L2 output
-// dim from `--l2`. Those runtime dims, plus `ft_in` / `max_active`, are carried
-// as fields on `GpuWorkspace`. The constants below are the defaults for the
-// configurable dims plus the part of the topology that is fixed (`NUM_BUCKETS`).
+// is chosen from `--ft-out`, the L1 output dim from `--l1`, the L2 output dim
+// from `--l2`, and the per-bucket dimension from `--num-buckets`. Those
+// runtime dims, plus `ft_in` / `max_active`, are carried as fields on
+// `GpuWorkspace`. The constants below are the defaults for the configurable
+// dims.
 
 /// Default FT output dim (per perspective), used when `--ft-out` is not given.
 /// `--ft-out` accepts any positive multiple of 128: `gather_and_sum_per_feature`
@@ -39,10 +40,20 @@ pub(crate) const L1_SKIP: usize = 1;
 /// [2, 256]; the upper bound is the fixed shared-memory accumulator capacity of
 /// the per-bucket bias-gradient kernel.
 pub(crate) const DEFAULT_L2_OUT: usize = 32;
-// LayerStack 出力 bucket 数。progress8kpabs (`shogi-features`) が局面ごとに
-// 割り当てる bucket index は 0..=7 の 8 値で、index 8 の重み枠は確保するが
-// 学習では使わない (9 枠確保・1 枠予約は設計上の意図)。
-pub(crate) const NUM_BUCKETS: usize = 9;
+
+/// Default LayerStack output bucket count, used when `--num-buckets` is not
+/// given. progress-kpabs assigns each position to `floor(p * num_buckets)`,
+/// so the default 9 keeps the binning + weight-buffer shape identical to the
+/// historical layout and resume-compatible with existing checkpoints. The
+/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
+pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
+
+/// Maximum supported bucket count without changing the per-bucket weight
+/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
+/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
+/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
+/// restructure (register fan-out → `blockIdx.z` grid axis).
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
 
 // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
 pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;

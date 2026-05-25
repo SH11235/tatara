@@ -30,8 +30,10 @@
 //!
 //! ## per-position output bucket
 //!
-//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * 8)` を `0..=7` に
-//! clamp。`progress.bin` 未指定時は重み 0 で全局面が bucket 4 に collapse する。
+//! `ShogiProgressKPAbs::bucket` が `floor(sigmoid(Σ w·x) * num_buckets)` を
+//! `0..num_buckets-1` に clamp する (LayerStack `--num-buckets` で N を選ぶ、
+//! [`TrainingConfig::num_buckets`])。`progress.bin` 未指定時は重み 0 で全局面
+//! が `floor(0.5 * N) = N/2` (N=8/9 ともに bucket 4) に collapse する。
 //!
 //! ## score-drop-abs の近似
 //!
@@ -185,7 +187,8 @@ pub trait TrainerBackend {
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
     ///
     /// - `batch`: HalfKA_hm sparse + score/wdl/norm (`batch.n_positions` が有効件数)
-    /// - `bucket_idx`: `batch.n_positions` 個の output bucket index (`0..=8`)
+    /// - `bucket_idx`: `batch.n_positions` 個の output bucket index
+    ///   (`0..num_buckets-1`、N は LayerStack `--num-buckets` で決まる runtime 値)
     /// - `lr`: learning rate (`LrScheduler` 由来)
     /// - `wdl_lambda`: WDL blend lambda (`WdlScheduler` 由来、loss kernel の `lambda`)
     /// - `loss`: どの loss kernel を起動するか (sigmoid-MSE / WRM) + 固定パラメータ
@@ -262,9 +265,10 @@ pub trait TrainerBackend {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
-/// NNUE 1536-16-32 + 9-bucket LayerStack の学習に必要な subset。
-/// learning rate / WDL schedule は別に [`LrScheduler`] /
-/// [`WdlScheduler`] を渡す。
+/// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
+/// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 9、
+/// LayerStack `--num-buckets` 由来)。learning rate / WDL schedule は別に
+/// [`LrScheduler`] / [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
@@ -311,6 +315,11 @@ pub struct TrainingConfig {
     /// 参照してはならない (Simple `TrainerBackend::train_step` は元から bucket_idx
     /// を使わない契約)。
     pub compute_bucket: bool,
+    /// LayerStack の output bucket 数 (`--num-buckets`)。dataloader worker が
+    /// `progress.bucket_board(board, num_buckets)` で `0..num_buckets-1` を emit
+    /// するために必要。`compute_bucket = false` の Simple 経路では bucket 計算
+    /// 自体が skip されるため値は参照されない (任意の `>= 1` で可)。
+    pub num_buckets: usize,
 }
 
 impl TrainingConfig {
@@ -351,6 +360,12 @@ impl TrainingConfig {
         if self.test_data.is_some() && self.test_positions == 0 {
             return Err(io::Error::other(
                 "test_positions must be >= 1 when test_data is set",
+            ));
+        }
+        if self.num_buckets == 0 {
+            return Err(io::Error::other(
+                "num_buckets must be >= 1 (`progress.bucket_board` requires at \
+                 least one bucket; LayerStack uses `--num-buckets` in [2, 9])",
             ));
         }
         Ok(())
@@ -401,6 +416,7 @@ where
         *progress,
         cfg.feature_set,
         cfg.compute_bucket,
+        cfg.num_buckets,
     )?;
 
     println!(
@@ -428,6 +444,7 @@ where
                 cfg.test_positions,
                 progress,
                 cfg.feature_set,
+                cfg.num_buckets,
             )?;
             println!(
                 "[train] held-out validation: data={} | {} batches x bs {} ({} positions)",
@@ -889,6 +906,7 @@ mod tests {
             test_data: None,
             test_positions: 0,
             compute_bucket: true,
+            num_buckets: 9,
         }
     }
 

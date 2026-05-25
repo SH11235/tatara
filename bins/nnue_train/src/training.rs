@@ -183,6 +183,18 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    // bucket 数の下限 2 は progress binning が意味を持つ最小値。上限 9 は L2 / L3
+    // per-bucket weight backward kernel の固定 9-register accumulator 容量
+    // (`MAX_SUPPORTED_NUM_BUCKETS`)。larger N would need the per-bucket weight
+    // backward kernels' register fan-out to be generalised.
+    if !(2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&layerstack.num_buckets) {
+        return Err(format!(
+            "--num-buckets must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}] (got {}); larger N \
+             requires the per-bucket weight backward kernels to be generalised",
+            layerstack.num_buckets
+        )
+        .into());
+    }
 
     std::fs::create_dir_all(&cli.output)?;
 
@@ -222,7 +234,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // domain、PSQT も同 scale で寄与する)、無効時は `scale` (= sigmoid 経路の cp → logit
     // 変換係数)。
     let psqt_init_vec: Option<Vec<f32>> = if layerstack.psqt {
-        let n = feature_set.ft_in() * NUM_BUCKETS;
+        let n = feature_set.ft_in() * layerstack.num_buckets;
         let vec = match layerstack.psqt_init {
             PsqtInit::Zeroed => vec![0.0_f32; n],
             PsqtInit::Material => {
@@ -244,7 +256,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     )
                     .into());
                 }
-                shogi_features::psqt_material_values(&feature_set, NUM_BUCKETS, out_scaling)
+                shogi_features::psqt_material_values(
+                    &feature_set,
+                    layerstack.num_buckets,
+                    out_scaling,
+                )
             }
         };
         println!(
@@ -269,6 +285,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.ft_out,
         layerstack.l1,
         layerstack.l2,
+        layerstack.num_buckets,
         tf32,
         ft_fp16,
         ft_fp16_out,
@@ -291,6 +308,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 layerstack.ft_out,
                 layerstack.l1,
                 layerstack.l2,
+                layerstack.num_buckets,
                 layerstack.psqt,
             )?;
             trainer.load_layerstack_weights(&weights)?;
@@ -360,6 +378,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
         compute_bucket: true,
+        num_buckets: layerstack.num_buckets,
     };
 
     // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
@@ -405,11 +424,16 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 /// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
 pub(crate) const PSV_RECORD_BYTES: u64 = 40;
 
-/// LayerStack network の architecture 記述子 (FT → L1 → L2、progress8kpabs 9 bucket)。
+/// LayerStack network の architecture 記述子 (FT → L1 → L2、progress N-bucket)。
 /// experiment.json `params.architecture` に記録する。FT 出力次元は `--ft-out`、L1
-/// 出力次元は `--l1`、L2 出力次元は `--l2` で可変、bucket 数は固定。
-pub(crate) fn layerstack_architecture(ft_out: usize, l1_out: usize, l2_out: usize) -> String {
-    format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{NUM_BUCKETS}bucket")
+/// 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は `--num-buckets` で可変。
+pub(crate) fn layerstack_architecture(
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+) -> String {
+    format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{num_buckets}bucket")
 }
 
 /// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
@@ -495,13 +519,18 @@ pub(crate) fn build_experiment_logger(
 
     let is_wrm = cli.win_rate_model;
     let params = Params {
-        architecture: layerstack_architecture(layerstack.ft_out, layerstack.l1, layerstack.l2),
+        architecture: layerstack_architecture(
+            layerstack.ft_out,
+            layerstack.l1,
+            layerstack.l2,
+            layerstack.num_buckets,
+        ),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
-        num_buckets: Some(NUM_BUCKETS),
+        num_buckets: Some(layerstack.num_buckets),
         optimizer: cli.optimizer.clone(),
         bucket_mode: Some(layerstack.bucket_mode.clone()),
         activation: None,
@@ -990,6 +1019,10 @@ pub(crate) fn run_simple_training(
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
         compute_bucket: false,
+        // Simple アーキは bucket-less で compute_bucket=false により bucket 計算
+        // 自体が skip される。値は dataloader の `num_buckets >= 1` assertion を
+        // 通すための placeholder。
+        num_buckets: 1,
     };
 
     let mut experiment = build_experiment_logger_simple(

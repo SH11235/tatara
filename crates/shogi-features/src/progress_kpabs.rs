@@ -3,7 +3,9 @@
 //! 仕様:
 //! - 特徴次元: `81 * FE_OLD_END = 81 * 1548 = 125_388` (玉位置 × BonaPiece)
 //! - 学習形式: logistic regression (`p = sigmoid(Σ w_i * x_i)`)
-//! - bucket 割当: `min(7, floor(p * 8.0))` (8 bucket)
+//! - bucket 割当: caller が指定した `num_buckets ∈ [1, u8::MAX as usize + 1]`
+//!   に対し `min(num_buckets - 1, floor(p * num_buckets))`。返り値が `u8` の
+//!   ため上限は 256 (`bucket = num_buckets - 1` が `u8::MAX` に収まる)
 //! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
 
 use std::path::Path;
@@ -13,9 +15,6 @@ use shogi_format::bona_piece::FE_OLD_END;
 use shogi_format::types::HAND_PIECE_TYPES;
 use shogi_format::{BonaPiece, Color, PackedSfenValue, ShogiBoard};
 
-/// 8 bucket を採用 (progress を 0..=7 にマップ)。
-pub const SHOGI_PROGRESS8_NUM_BUCKETS: usize = 8;
-
 /// KP-absolute 特徴の次元数: `81 * FE_OLD_END`。
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
@@ -23,18 +22,14 @@ static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 
-/// Progress-based 8 bucket assignment using KP-absolute features.
+/// Progress-based N-bucket assignment using KP-absolute features.
 ///
 /// 重みはプロセス全体で 1 つ (`OnceLock` で保持) のため、本 struct は `Copy`
-/// にできる。
+/// にできる。bucket 数 `N` は caller が指定する (LayerStack `--num-buckets` 等)。
 #[derive(Clone, Copy, Default)]
 pub struct ShogiProgressKPAbs;
 
 impl ShogiProgressKPAbs {
-    /// bucket 数 (型レベルで bucket 数を参照したい呼び出し側のための inherent
-    /// const、自由関数定数 `SHOGI_PROGRESS8_NUM_BUCKETS` と同一値)。
-    pub const BUCKETS: usize = SHOGI_PROGRESS8_NUM_BUCKETS;
-
     fn weights() -> &'static [f32] {
         SHOGI_PROGRESS_KP_ABS_WEIGHTS
             .get()
@@ -151,19 +146,36 @@ impl ShogiProgressKPAbs {
         p.clamp(0.0, 1.0)
     }
 
-    /// 8 bucket 割当 (`0..=7`)。
-    pub fn bucket(&self, pos: &PackedSfenValue) -> u8 {
-        self.bucket_board(&pos.decode())
+    /// N-bucket 割当 (`0..=num_buckets-1`)。`num_buckets ∈ [1, MAX_NUM_BUCKETS]`
+    /// を assert する (返り値が `u8` のため上限 256)。`num_buckets = 9` で
+    /// `floor(p * 9).clamp(0, 8)` を返し、index 8 まで emit する (LayerStack
+    /// 既定)。`num_buckets = N` での split 境界は `i / N` (`i = 0..N`) で等間隔。
+    pub fn bucket(&self, pos: &PackedSfenValue, num_buckets: usize) -> u8 {
+        self.bucket_board(&pos.decode(), num_buckets)
     }
 
     /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版。
-    /// `bucket(&pos)` は `bucket_board(&pos.decode())` と等価。
-    pub fn bucket_board(&self, board: &ShogiBoard) -> u8 {
+    /// `bucket(&pos, n)` は `bucket_board(&pos.decode(), n)` と等価。
+    pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+        assert!(
+            (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
+            "num_buckets must be in [1, {MAX_NUM_BUCKETS}] (got {num_buckets}); \
+             upper bound is `u8::MAX as usize + 1` so `bucket = num_buckets - 1` \
+             fits in u8"
+        );
         let p = self.progress_board(board);
-        let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        // num_buckets <= 256 を assert 済なので `as i32` キャストは無誤差、
+        // clamp の上下境界 (i32::MIN..i32::MAX 内) も安全に評価できる。
+        let n_i32 = num_buckets as i32;
+        let raw = (p * num_buckets as f32).floor() as i32;
+        raw.clamp(0, n_i32 - 1) as u8
     }
 }
+
+/// `ShogiProgressKPAbs::bucket{,_board}` が受け付ける `num_buckets` の上限。
+/// 返り値が `u8` のため `bucket = num_buckets - 1` が `u8::MAX = 255` に収まる
+/// 256 までを許容する (LayerStack 既定 9 を含む全 production 用途に十分な margin)。
+pub const MAX_NUM_BUCKETS: usize = u8::MAX as usize + 1;
 
 #[cfg(test)]
 mod tests {
@@ -224,13 +236,23 @@ mod tests {
                 "record {i}: progress の legacy/board path 不一致"
             );
             assert_eq!(
-                kpabs.bucket(psv),
-                kpabs.bucket_board(&board),
+                kpabs.bucket(psv, 9),
+                kpabs.bucket_board(&board, 9),
                 "record {i}: bucket の legacy/board path 不一致"
             );
-            // zero weights → progress 厳密に 0.5、bucket 4。
+            // zero weights → progress 厳密に 0.5。`floor(0.5 * N) = N/2` で
+            // N=8 / N=9 ともに 4。
             assert_eq!(kpabs.progress(psv), 0.5, "record {i}: zero-weight progress");
-            assert_eq!(kpabs.bucket(psv), 4, "record {i}: zero-weight bucket");
+            assert_eq!(
+                kpabs.bucket(psv, 9),
+                4,
+                "record {i}: zero-weight bucket N=9"
+            );
+            assert_eq!(
+                kpabs.bucket(psv, 8),
+                4,
+                "record {i}: zero-weight bucket N=8"
+            );
         }
         assert!(
             total_active > 0,
@@ -241,7 +263,7 @@ mod tests {
     #[test]
     fn bucket_board_matches_bucket_zero_weights() {
         // 最小局面 (両玉のみ) でも legacy/board path が一致し、zero-weight で
-        // progress = 0.5 / bucket = 4 になることを確認。
+        // progress = 0.5 / bucket = 4 (N=8 / N=9 共通) になることを確認。
         let mut board = ShogiBoard {
             side_to_move: Color::Black,
             ..Default::default()
@@ -250,6 +272,39 @@ mod tests {
         board.white_king_sq = shogi_format::types::Square::new(4, 0);
         let p = ShogiProgressKPAbs;
         assert_eq!(p.progress_board(&board), 0.5);
-        assert_eq!(p.bucket_board(&board), 4);
+        assert_eq!(p.bucket_board(&board, 9), 4);
+        assert_eq!(p.bucket_board(&board, 8), 4);
+    }
+
+    #[test]
+    fn bucket_board_ranges_for_varied_n() {
+        // zero weights → p = 0.5。N を 1..=9 まで振って `floor(p*N) = floor(0.5*N)`
+        // が返ることを確認 (N が偶数なら N/2、奇数なら (N-1)/2、N=1 は常に 0)。
+        let board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: shogi_format::types::Square::new(4, 8),
+            white_king_sq: shogi_format::types::Square::new(4, 0),
+            ..Default::default()
+        };
+        let p = ShogiProgressKPAbs;
+        for n in 1..=9 {
+            let want = ((0.5_f32 * n as f32).floor() as i32).clamp(0, n as i32 - 1) as u8;
+            let got = p.bucket_board(&board, n);
+            assert_eq!(got, want, "bucket_board mismatch for N={n}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "num_buckets must be in [1, 256]")]
+    fn bucket_board_rejects_too_large_num_buckets() {
+        // 上限 (MAX_NUM_BUCKETS = u8::MAX + 1 = 256) 超えは panic で reject される
+        // (`u8` 返り値で `bucket = num_buckets - 1` が表現可能な範囲のみ受け付ける)。
+        let board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: shogi_format::types::Square::new(4, 8),
+            white_king_sq: shogi_format::types::Square::new(4, 0),
+            ..Default::default()
+        };
+        let _ = ShogiProgressKPAbs.bucket_board(&board, MAX_NUM_BUCKETS + 1);
     }
 }

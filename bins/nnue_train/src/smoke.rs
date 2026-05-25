@@ -354,6 +354,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_FT_OUT,
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
+        DEFAULT_NUM_BUCKETS,
         false,
         false,
         false,
@@ -364,18 +365,19 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
     )?;
     // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。
     let l2_in = (DEFAULT_L1_OUT - L1_SKIP) * 2;
+    let n_buckets = DEFAULT_NUM_BUCKETS;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (feature_set.ft_in() * DEFAULT_FT_OUT
             + DEFAULT_FT_OUT
-            + NUM_BUCKETS * DEFAULT_L1_OUT * DEFAULT_FT_OUT
-            + NUM_BUCKETS * DEFAULT_L1_OUT
+            + n_buckets * DEFAULT_L1_OUT * DEFAULT_FT_OUT
+            + n_buckets * DEFAULT_L1_OUT
             + DEFAULT_FT_OUT * DEFAULT_L1_OUT
             + DEFAULT_L1_OUT
-            + NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
-            + NUM_BUCKETS * DEFAULT_L2_OUT
-            + NUM_BUCKETS * DEFAULT_L2_OUT
-            + NUM_BUCKETS) as f64
+            + n_buckets * DEFAULT_L2_OUT * l2_in
+            + n_buckets * DEFAULT_L2_OUT
+            + n_buckets * DEFAULT_L2_OUT
+            + n_buckets) as f64
             / 1.0e6
     );
 
@@ -398,6 +400,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
         )?;
         trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;

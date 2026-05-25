@@ -1,7 +1,7 @@
-//! LayerStack architecture (FT → L1 16 → L2 32、出力 bucket topology 9-way) で
-//! 使う kernel の reference CPU 実装。bucket index は progress8kpabs が局面
-//! ごとに 0..=7 を算出する (9 枠中 index 8 は予約で割当対象外、`arch.rs` の
-//! `NUM_BUCKETS` 参照)。
+//! LayerStack architecture (FT → L1 16 → L2 32、出力 bucket topology は
+//! `num_buckets` runtime 引数で決まる N-way) で使う kernel の reference CPU
+//! 実装。bucket index は caller 側の progress-kpabs が `floor(p * num_buckets)`
+//! を算出し、kernel は `bucket_idx < 0` / `>= num_buckets` を silent skip する。
 //!
 //! GPU 側 `#[kernel]` 定義は **`bins/nnue_train/src/kernels/` に配置**
 //! されている (cuda-oxide rustc-codegen-cuda backend は `#[kernel]` を bin
@@ -52,7 +52,8 @@
 //!
 //! - `l1_skip = 1`、`l1_effective = l1_out - 1`、`l2_in = l1_effective * 2`
 //!   (l1_sqr.concat(l1_main)) — いずれも `l1_out` から導出する派生次元
-//! - `NUM_BUCKETS = 9` (progress8kpabs)
+//! - `num_buckets` (`--num-buckets`、既定 9、上限 9 は per-bucket weight bwd
+//!   kernel の固定 9-register accumulator 由来)
 //! - `FT_POST_SCALE = L1_SQR_SCALE = 127.0/128.0` (`qa = 127` 由来)
 
 pub mod abs_pow2_scale;

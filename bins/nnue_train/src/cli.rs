@@ -247,7 +247,7 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress8kpabs 9-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
+    /// progress-kpabs N-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2; bucket count by --num-buckets).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
@@ -300,6 +300,20 @@ pub(crate) struct LayerstackArgs {
     /// argument, so non-default widths are not penalized.
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
+
+    /// LayerStack output bucket count. Each position is routed to bucket
+    /// `min(N-1, floor(p * N))` where `p` is the progress estimate. Specify a
+    /// value in `[2, 9]`; the upper bound is the fixed 9-register accumulator
+    /// in the per-bucket weight backward kernels. The default 9 keeps the
+    /// binning and weight-buffer shape identical to the standard layout and
+    /// resume-compatible with existing checkpoints. The historical 8-bucket
+    /// progress emission used `floor(p * 8)` on a 9-slot layout, leaving slot 8
+    /// unused; the unified design here means setting `--num-buckets 9` (the
+    /// default) actually emits index 8 — existing 9-bucket distributed nets
+    /// have an untrained slot 8 and may see a short-term eval shift on the
+    /// `p in [8/9, 1]` tail until continued training catches up.
+    #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
+    pub(crate) num_buckets: usize,
 
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the

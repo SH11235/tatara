@@ -2,11 +2,12 @@
 //!
 //! shogi-format crate の `tests/data/sample.psv` (100 records) を共有して、
 //! 各 record で `for_each_active_index` / `collect_active_indices` /
-//! `progress` / `bucket` が妥当な値を返すことを確認する。
+//! `progress` / `bucket(pos, num_buckets)` が妥当な値を返すことを確認する。
 //!
 //! 重み (`progress.bin`) は意図的にロードしないため、
 //! `weights()` は zero 配列、`progress()` は常に `sigmoid(0) = 0.5`、
-//! `bucket()` は `floor(0.5 * 8) = 4` になる。
+//! `bucket(pos, 9)` は `floor(0.5 * 9) = 4` になる (`num_buckets = 9` は
+//! LayerStack 既定)。
 
 use shogi_features::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 use shogi_format::PackedSfenValue;
@@ -77,7 +78,7 @@ fn collect_active_indices_matches_for_each() {
 fn progress_and_bucket_with_zero_weights() {
     // 重み未ロード時の global state 前提:
     //   weights = [0.0; N]  →  Σ w_i x_i = 0  →  sigmoid(0) = 0.5
-    //   bucket = floor(0.5 * 8.0) = 4
+    //   bucket(pos, 9) = floor(0.5 * 9) = 4
     //
     // CAVEAT: 本テストは `SHOGI_PROGRESS_KP_ABS_WEIGHTS` (OnceLock) が
     // この test binary プロセス内で **一度も .set() されていない** ことに
@@ -101,8 +102,9 @@ fn progress_and_bucket_with_zero_weights() {
             "record {i}: weights=0 で progress {p} が 0.5 から離れている"
         );
 
-        let b = kpabs.bucket(psv);
+        // zero weights → p = 0.5、`floor(0.5 * 9) = 4` を期待。
+        let b = kpabs.bucket(psv, 9);
         assert_eq!(b, 4, "record {i}: weights=0 で bucket={b} (期待: 4)");
-        assert!(b < 8, "bucket {b} が 0..=7 範囲外");
+        assert!(b < 9, "bucket {b} が 0..=8 範囲外");
     }
 }
