@@ -437,7 +437,20 @@ impl LayerStackWeights {
         // 長さを bucket 数で割った値 (`l2_b` は `(num_buckets, l2_out)`)。L2 入力次元は
         // L1 出力から導出。
         let num_buckets = self.num_buckets;
-        assert!(num_buckets >= 1, "num_buckets must be >= 1");
+        if num_buckets == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "num_buckets must be >= 1",
+            ));
+        }
+        // header の `num_buckets` field は u32。silent truncation を起こさず
+        // overflow 時に InvalidInput で reject する。
+        let num_buckets_u32 = u32::try_from(num_buckets).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("num_buckets {num_buckets} does not fit in u32 header field"),
+            )
+        })?;
         let ft_out = self.ft_b.len();
         let l1_out = self.l1f_b.len();
         let l2_out = self.l2_b.len() / num_buckets;
@@ -465,7 +478,7 @@ impl LayerStackWeights {
         writer.write_all(arch_bytes)?;
 
         // ---- num_buckets (NNUE_VERSION bump 後の新 field) ----
-        writer.write_all(&(num_buckets as u32).to_le_bytes())?;
+        writer.write_all(&num_buckets_u32.to_le_bytes())?;
 
         // ---- FT hash ----
         writer.write_all(&ft_hash(feature_hash, ft_out).to_le_bytes())?;
