@@ -555,7 +555,7 @@ impl BucketedPrefetchedLoader {
     /// が training に使われる)。file 全体を使うときは file size をそのまま渡す。
     /// 同 file 内に held-out tail を残す経路 (`--test-tail-positions`) で
     /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
-    /// ようにするのが本パラメータの主用途。両端は [`PSV_RECORD_BYTES`] の倍数で
+    /// ようにするのが主用途。`train_end_offset` は [`PSV_RECORD_BYTES`] の倍数で
     /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
