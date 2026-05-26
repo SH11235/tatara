@@ -135,13 +135,20 @@ pub struct Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
     /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
+    /// `--test-tail-positions` 経路では同 file (= training PSV) の末尾を holdout
+    /// にするためここではなく `test_tail_positions` 側に N が入る。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_data: Option<String>,
     /// held-out validation の検証局面数 (`--test-positions` の要求値)。実際の
     /// 検証集合は `batch_size` 単位に切り上げた満タン batch 数になる。
-    /// `--test-data` 指定時のみ `Some`。
+    /// `--test-data` または `--test-tail-positions` 指定時のみ `Some`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_positions: Option<usize>,
+    /// `--test-tail-positions` の値 (training PSV 末尾を holdout に分離する局面数)。
+    /// 同 file 内 holdout 経路でのみ `Some`、外部 file holdout (`--test-data`) と
+    /// holdout 無しでは省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_tail_positions: Option<u64>,
     pub tf32: bool,
     pub ft_fp16: bool,
     pub ft_fp16_out: bool,
@@ -149,13 +156,16 @@ pub struct Params {
     pub threads: usize,
 }
 
-/// 教師データの情報。`positions` はデータファイル中の局面数、
-/// `total_positions` は実際に学習に流す総局面数 (positions × pass)。
+/// 教師データの情報。`positions` は **training に使える局面数**
+/// (`--test-tail-positions N` 指定時は file 中の生 record 数から N を引いた値)。
+/// `total_positions` は実際に学習に流した総局面数 (training 範囲を pass 回数倍)。
 #[derive(Debug, Clone, Serialize)]
 pub struct DataInfo {
     /// 教師データファイルの basename。
     pub name: String,
-    /// データセットファイルの局面数。
+    /// 教師データのうち training に使える局面数。`--test-tail-positions N`
+    /// で末尾 N を holdout に切り出す場合、ここは raw 局面数 − N (= training
+    /// range の長さ)。`dataset_passes` の分母として使われる。
     pub positions: u64,
     /// 学習で消費した局面数 (superbatch ごとに加算)。
     pub total_positions: u64,
@@ -536,6 +546,7 @@ mod tests {
             init_from: None,
             test_data: None,
             test_positions: None,
+            test_tail_positions: None,
             tf32: false,
             ft_fp16: true,
             ft_fp16_out: true,

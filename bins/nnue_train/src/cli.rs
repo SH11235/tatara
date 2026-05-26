@@ -28,13 +28,24 @@ pub(crate) struct Cli {
     /// reports test_loss (mean held-out loss) and test_accuracy (agreement
     /// between the output sign and the game result) in the training log and
     /// experiment.json. Used for early detection of divergence and overfitting.
-    #[arg(long, global = true)]
+    /// Mutually exclusive with `--test-tail-positions`.
+    #[arg(long, global = true, conflicts_with = "test_tail_positions")]
     pub(crate) test_data: Option<PathBuf>,
 
+    /// Reserve the last N positions of `--data` as a same-file held-out
+    /// validation set: training reads positions in `[0, file_end - N * 40)`
+    /// and validation reads `[file_end - N * 40, file_end)`. Useful when the
+    /// training PSV is too large to split into separate files. Mutually
+    /// exclusive with `--test-data`. The first `--test-positions` of the
+    /// reserved tail are evaluated at the end of each superbatch.
+    #[arg(long, global = true, conflicts_with = "test_data")]
+    pub(crate) test_tail_positions: Option<u64>,
+
     /// Number of positions per held-out validation pass. Takes this many
-    /// positions from the start of the test PSV and rounds up to a whole
-    /// `--batch-size` multiple to form full batches. Used only when
-    /// `--test-data` is set.
+    /// positions from the start of the held-out source (either `--test-data`
+    /// or the tail reserved by `--test-tail-positions`) and rounds up to a
+    /// whole `--batch-size` multiple to form full batches. Used only when
+    /// one of those flags is set.
     #[arg(long, default_value_t = 10000, global = true)]
     pub(crate) test_positions: usize,
 

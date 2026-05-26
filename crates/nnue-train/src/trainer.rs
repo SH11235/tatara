@@ -56,7 +56,7 @@ use std::time::Instant;
 use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketedPrefetchedLoader};
+use crate::dataloader::{Batch, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
 use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
 
@@ -306,8 +306,15 @@ pub struct TrainingConfig {
     /// forward-only 検証を走らせ test_loss / test_accuracy を report する。
     pub test_data: Option<PathBuf>,
     /// held-out validation 1 回あたりの検証局面数 (`batch_size` 単位に切り上げて
-    /// 満タン batch を作る)。`test_data` が `None` のときは無視される。
+    /// 満タン batch を作る)。`test_data` / `test_tail_positions` がいずれも
+    /// `None` のときは無視される。
     pub test_positions: usize,
+    /// `Some(n)` のとき `data_path` 末尾 `n` 局面を training stream から除外し
+    /// held-out 専用に分離する (`--test-tail-positions`)。training は
+    /// `[0, file_size - n * PSV_RECORD_BYTES)`、validation は
+    /// `[file_size - n * PSV_RECORD_BYTES, file_size)` を読む。`test_data` と
+    /// 同時指定は `validate()` で error。
+    pub test_tail_positions: Option<u64>,
     /// dataloader worker で `ShogiProgressKPAbs::bucket_board` を計算して per-position
     /// bucket を `Batch` と共に返すか。LayerStack (bucket-aware) は `true`、Simple
     /// (bucket-less) は `false` で worker CPU 仕事を ~1 board 推論分削減できる。
@@ -362,6 +369,24 @@ impl TrainingConfig {
                 "test_positions must be >= 1 when test_data is set",
             ));
         }
+        if self.test_data.is_some() && self.test_tail_positions.is_some() {
+            return Err(io::Error::other(
+                "test_data and test_tail_positions are mutually exclusive \
+                 (pick one held-out source: external PSV file or training-data tail)",
+            ));
+        }
+        if let Some(n) = self.test_tail_positions {
+            if n == 0 {
+                return Err(io::Error::other(
+                    "test_tail_positions must be >= 1 when set",
+                ));
+            }
+            if self.test_positions == 0 {
+                return Err(io::Error::other(
+                    "test_positions must be >= 1 when test_tail_positions is set",
+                ));
+            }
+        }
         if self.num_buckets == 0 {
             return Err(io::Error::other(
                 "num_buckets must be >= 1 (`progress.bucket_board` requires at \
@@ -408,6 +433,39 @@ where
 {
     cfg.validate()?;
 
+    // data file の byte サイズを取って PSV alignment を確認。
+    // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
+    // 決まるため、tail 経路に入る前に確実に reject する。
+    let file_size = std::fs::metadata(data_path)?.len();
+    if !file_size.is_multiple_of(PSV_RECORD_BYTES) {
+        return Err(io::Error::other(format!(
+            "data file {} size {file_size} is not a multiple of PSV record size \
+             ({PSV_RECORD_BYTES} bytes); the file is corrupted or not a PackedSfenValue stream",
+            data_path.display(),
+        )));
+    }
+
+    let train_end_offset = match cfg.test_tail_positions {
+        Some(n) => {
+            let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
+                io::Error::other(format!(
+                    "test_tail_positions ({n}) * PSV record size ({PSV_RECORD_BYTES}) \
+                     overflows u64"
+                ))
+            })?;
+            if tail_bytes >= file_size {
+                return Err(io::Error::other(format!(
+                    "test_tail_positions ({n}) leaves no training records \
+                     (data file {} has {} records)",
+                    data_path.display(),
+                    file_size / PSV_RECORD_BYTES,
+                )));
+            }
+            file_size - tail_bytes
+        }
+        None => file_size,
+    };
+
     let mut loader = BucketedPrefetchedLoader::spawn(
         data_path,
         cfg.batch_size,
@@ -417,6 +475,7 @@ where
         cfg.feature_set,
         cfg.compute_bucket,
         cfg.num_buckets,
+        train_end_offset,
     )?;
 
     println!(
@@ -433,10 +492,12 @@ where
         cfg.threads.max(1),
     );
 
-    // held-out validation 集合を起動時に固定読み込みする (`--test-data` 指定時)。
-    // 毎 superbatch 末に同じ集合で test_loss / test_accuracy を測る。
-    let heldout = match &cfg.test_data {
-        Some(test_path) => {
+    // held-out validation 集合を起動時に固定読み込みする
+    // (`--test-data` または `--test-tail-positions` 指定時)。毎 superbatch 末に
+    // 同じ集合で test_loss / test_accuracy を測る。`validate()` で両者の同時
+    // 指定は reject 済みなので exhaustive な 4-arm match で意図を明示。
+    let heldout = match (&cfg.test_data, cfg.test_tail_positions) {
+        (Some(test_path), None) => {
             let set = crate::validation::HeldoutSet::load(
                 test_path,
                 cfg.batch_size,
@@ -447,7 +508,7 @@ where
                 cfg.num_buckets,
             )?;
             println!(
-                "[train] held-out validation: data={} | {} batches x bs {} ({} positions)",
+                "[train] held-out validation (external file): data={} | {} batches x bs {} ({} positions)",
                 test_path.display(),
                 set.n_batches(),
                 cfg.batch_size,
@@ -455,7 +516,32 @@ where
             );
             Some(set)
         }
-        None => None,
+        (None, Some(_)) => {
+            let set = crate::validation::HeldoutSet::load_from_range(
+                data_path,
+                train_end_offset,
+                file_size,
+                cfg.batch_size,
+                cfg.score_drop_abs,
+                cfg.test_positions,
+                progress,
+                cfg.feature_set,
+                cfg.num_buckets,
+            )?;
+            println!(
+                "[train] held-out validation (training tail): data={} | range [{}, {}) | \
+                 {} batches x bs {} ({} positions)",
+                data_path.display(),
+                train_end_offset,
+                file_size,
+                set.n_batches(),
+                cfg.batch_size,
+                set.n_positions(),
+            );
+            Some(set)
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("validate() rejects test_data + test_tail_positions"),
     };
 
     // experiment.json を run 開始時点 (`status: "running"`) で一度書く。以降は
@@ -905,6 +991,7 @@ mod tests {
             threads: 2,
             test_data: None,
             test_positions: 0,
+            test_tail_positions: None,
             compute_bucket: true,
             num_buckets: 9,
         }
@@ -1097,6 +1184,7 @@ mod tests {
             init_from: None,
             test_data: None,
             test_positions: None,
+            test_tail_positions: None,
             tf32: false,
             ft_fp16: false,
             ft_fp16_out: false,
@@ -1332,6 +1420,57 @@ mod tests {
         assert!(
             TrainingConfig {
                 test_data: Some(sample_psv_path()),
+                test_positions: 8,
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_test_data_and_tail_together() {
+        // 同時指定は held-out source 二重で意味不明 → error。
+        let err = TrainingConfig {
+            test_data: Some(sample_psv_path()),
+            test_positions: 8,
+            test_tail_positions: Some(16),
+            ..base_cfg()
+        }
+        .validate()
+        .expect_err("must reject simultaneous test_data + test_tail_positions");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_tail() {
+        let err = TrainingConfig {
+            test_tail_positions: Some(0),
+            test_positions: 8,
+            ..base_cfg()
+        }
+        .validate()
+        .expect_err("test_tail_positions == 0 should error");
+        assert!(err.to_string().contains(">= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_test_positions_with_tail() {
+        let err = TrainingConfig {
+            test_tail_positions: Some(8),
+            test_positions: 0,
+            ..base_cfg()
+        }
+        .validate()
+        .expect_err("test_positions must be >= 1 when tail is set");
+        assert!(err.to_string().contains("test_positions"), "got: {err}");
+    }
+
+    #[test]
+    fn config_validate_accepts_tail_with_positive_test_positions() {
+        assert!(
+            TrainingConfig {
+                test_tail_positions: Some(16),
                 test_positions: 8,
                 ..base_cfg()
             }

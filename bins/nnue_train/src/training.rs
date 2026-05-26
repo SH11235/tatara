@@ -377,6 +377,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
+        test_tail_positions: cli.test_tail_positions,
         compute_bucket: true,
         num_buckets: layerstack.num_buckets,
     };
@@ -422,7 +423,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
-pub(crate) const PSV_RECORD_BYTES: u64 = 40;
+/// crate 側 `nnue_train::dataloader::PSV_RECORD_BYTES` を re-export している。
+pub(crate) use nnue_train::dataloader::PSV_RECORD_BYTES;
 
 /// LayerStack network の architecture 記述子 (FT → L1 → L2、progress N-bucket)。
 /// experiment.json `params.architecture` に記録する。FT 出力次元は `--ft-out`、L1
@@ -554,10 +556,13 @@ pub(crate) fn build_experiment_logger(
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
-        // test_data / test_positions は `--test-data` 指定時のみ記録する
-        // (未指定 run の experiment.json では両フィールドとも省略)。
+        // test_data / test_positions / test_tail_positions は対応する CLI フラグ
+        // 指定時のみ Some を記録する (未指定 run の experiment.json では省略)。
+        // test_data と test_tail_positions は clap conflicts_with で同時指定不能。
         test_data: cli.test_data.as_deref().map(file_basename),
-        test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
+        test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
+            .then_some(cli.test_positions),
+        test_tail_positions: cli.test_tail_positions,
         // 実効値を記録 (`--all-optim` 経由で ON になった場合も true として残す、
         // raw 個別 flag が false でも experiment.json から再現可能)。
         tf32: layerstack.tf32 || cli.all_optim,
@@ -567,15 +572,7 @@ pub(crate) fn build_experiment_logger(
         threads: cli.threads,
     };
 
-    let dataset_positions = std::fs::metadata(data)
-        .map(|m| m.len() / PSV_RECORD_BYTES)
-        .unwrap_or(0);
-    let data_info = DataInfo {
-        name: file_basename(data),
-        positions: dataset_positions,
-        total_positions: 0,
-        dataset_passes: 0.0,
-    };
+    let data_info = build_data_info(cli, data);
 
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     let json_path = cli.output.join("experiments").join(format!("{id}.json"));
@@ -590,6 +587,28 @@ pub(crate) fn build_experiment_logger(
         data_info,
     );
     ExperimentLogger::new(json_path, doc)
+}
+
+/// `--data` の raw record 数から `--test-tail-positions` 分を差し引いて
+/// training-only な局面数を返す。両 builder (LayerStack / Simple) が同じ
+/// 算出ロジックを使うための単一エントリポイント。`data` の metadata 読み
+/// 出しに失敗したときは `0`、`--test-tail-positions` が raw 件数以上の場合は
+/// raw record 数をそのまま返す (`trainer::run` 側で `validate` 経由 reject
+/// される前提の defensive fallback)。
+pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
+    let total_records = std::fs::metadata(data)
+        .map(|m| m.len() / PSV_RECORD_BYTES)
+        .unwrap_or(0);
+    let train_records = match cli.test_tail_positions {
+        Some(n) if n < total_records => total_records - n,
+        _ => total_records,
+    };
+    DataInfo {
+        name: file_basename(data),
+        positions: train_records,
+        total_positions: 0,
+        dataset_passes: 0.0,
+    }
 }
 
 /// Simple アーキ用の experiment.json ロガーを CLI 設定から組み立てる。
@@ -674,7 +693,9 @@ pub(crate) fn build_experiment_logger_simple(
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
         test_data: cli.test_data.as_deref().map(file_basename),
-        test_positions: cli.test_data.as_ref().map(|_| cli.test_positions),
+        test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
+            .then_some(cli.test_positions),
+        test_tail_positions: cli.test_tail_positions,
         // 実効値を記録 (`--all-optim` 展開込み、caller `run_simple_training` 経由)。
         tf32,
         ft_fp16,
@@ -683,15 +704,7 @@ pub(crate) fn build_experiment_logger_simple(
         threads: cli.threads,
     };
 
-    let dataset_positions = std::fs::metadata(data)
-        .map(|m| m.len() / PSV_RECORD_BYTES)
-        .unwrap_or(0);
-    let data_info = DataInfo {
-        name: file_basename(data),
-        positions: dataset_positions,
-        total_positions: 0,
-        dataset_passes: 0.0,
-    };
+    let data_info = build_data_info(cli, data);
 
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     let json_path = cli
@@ -1018,6 +1031,7 @@ pub(crate) fn run_simple_training(
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
+        test_tail_positions: cli.test_tail_positions,
         compute_bucket: false,
         // Simple アーキは bucket-less で compute_bucket=false により bucket 計算
         // 自体が skip される。値は dataloader の `num_buckets >= 1` assertion を
