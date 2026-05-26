@@ -163,9 +163,10 @@ FP16 modes are on).
 
 To watch for overfitting and divergence (NaN) without waiting for SPRT
 self-play, add held-out validation: positions that are never used for a
-gradient update. Each superbatch ends with a forward-only pass over them and
-`test_loss` / `test_accuracy` are reported in the training log and
-`experiment.json`.
+gradient update. Each superbatch ends with a forward-only pass over them; the
+training log prints `test_loss` / `test_acc` (compact field name for
+console), and `experiment.json` records the same numbers as `test_loss` /
+`test_accuracy`.
 
 ### Three related flags
 
@@ -200,11 +201,13 @@ multiple).
 
 ### Example
 
+Reserve the last 1M positions as held-out, evaluate 10K of them each superbatch:
+
 ```bash
 target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
-  --test-tail-positions 1000000 \   # reserve last 1M positions as held-out
-  --test-positions 10000 \          # evaluate 10K of them each superbatch
+  --test-tail-positions 1000000 \
+  --test-positions 10000 \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches <N> --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
@@ -218,9 +221,10 @@ compared directly within a superbatch. A widening `test_loss − train_loss`
 gap signals overfitting; an early `test_loss` divergence often catches NaN
 issues before `train_loss` looks abnormal.
 
-`test_accuracy` is the sign-agreement between net output and the game result
-(draws excluded from the denominator). It is scale-invariant, so it can be
-compared across runs and configurations that have different loss scales.
+`test_acc` / `test_accuracy` is the sign-agreement between net output and the
+game result (draws excluded from the denominator). It is scale-invariant, so
+it can be compared across runs and configurations that have different loss
+scales.
 
 ## Interrupting and resuming training
 
