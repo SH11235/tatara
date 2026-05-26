@@ -234,11 +234,11 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gpu-kernels"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "gpu-runtime"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cuda-core",
  "cuda-host",
@@ -328,14 +328,14 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "nnue-format"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "shogi-features",
 ]
 
 [[package]]
 name = "nnue-train"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "gpu-kernels",
  "serde",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "nnue-trainer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "cuda-core",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "progress-bucket-survey"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "shogi-features",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "progress-kpabs-train"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "cuda-core",
@@ -527,14 +527,14 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shogi-features"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "shogi-format",
 ]
 
 [[package]]
 name = "shogi-format"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "strsim"
