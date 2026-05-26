@@ -128,6 +128,9 @@ target/release/nnue-train \
 | `--win-rate-model` | OFF | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。量子化推論向けの net を学習するなら追加する (未指定なら plain sigmoid-MSE) |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
+| `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
+| `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
+| `--num-buckets` (`layerstack`) | 9 | LayerStack の output bucket 数、`[2, 9]` の整数。各局面は `min(N-1, floor(progress * N))` で routing される。低い N は bucket 1 個あたりのサンプル数が増える代わりに局面別特殊化が緩む。既定 9 は既存配布 net と同じ binning |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。
@@ -139,6 +142,63 @@ target/release/nnue-train \
 800 epoch。`--superbatches` は教師データ量と過学習の兼ね合いを見て決める。
 
 所要時間は GPU と構成 (FP16 モード有無) で大きく変わる。
+
+## held-out validation
+
+過学習や数値発散 (NaN) を SPRT 自己対局を待たずに早期検知するには、held-out
+validation を有効化する。validation 用に「勾配更新に一切使わない局面」を別途
+保持し、毎 superbatch 末に forward-only パスで `test_loss` / `test_accuracy`
+を training log と `experiment.json` に記録する。
+
+### 関連する 3 つの flag
+
+| flag | 役割 | 種類 |
+|---|---|---|
+| `--test-tail-positions <N>` | held-out の **source**: `--data` の末尾 N 局面 | source A |
+| `--test-data <PATH>` | held-out の **source**: 別 PSV ファイル | source B |
+| `--test-positions <K>` | 選んだ source から毎 superbatch **評価する局面数** | evaluation size、両 source 共用 |
+
+`--test-tail-positions` と `--test-data` は held-out source の選択肢で、
+`clap conflicts_with` 双方向で排他 (どちらか 1 つ、または両方未指定 = held-out
+無効)。`--test-positions` は source 選択とは別軸のパラメータで、選ばれた
+source の先頭から K 局面 (満タン batch 切上げ) を毎 superbatch 末に評価する。
+
+### どちらの source を選ぶか
+
+- **`--test-tail-positions <N>` (推奨)**: `--data` 自身の末尾 N 局面を切り
+  分ける。training は `[0, file_end - N * 40)`、validation は
+  `[file_end - N * 40, file_end)` を読み、両者は byte range レベルで disjoint
+  なので contamination は構造的に発生しない。教師ファイル 1 本で training と
+  validation 両方をまかなえるので、別 file を用意して同期管理する手間が要らな
+  い。唯一のコストは training pool が N 局面減ること。教師全件 ≫ N の典型ケース
+  (例: 1e9 局面の教師に対し N = 1e6) では 0.1% 未満で実害なし
+- **`--test-data <path>`**: validation 専用の別 PSV ファイル。holdout 集合が
+  `--data` と独立して用意済 (異なる generator / 異なる時期の局面群) で、その
+  独立性を保ちたい積極的な理由があるときに使う。ergonomic 上の理由だけで `--data`
+  を 2 本に分割する利点は無い
+
+### 使用例
+
+```bash
+target/release/nnue-train \
+  --data <path/to/shuffled-psv.bin> \
+  --test-tail-positions 1000000 \   # 末尾 100 万局面を holdout に切り分け
+  --test-positions 10000 \          # うち先頭 1 万局面を毎 superbatch で評価
+  --output checkpoints/<run-name> --net-id <run-name> \
+  --superbatches <N> --threads <N> \
+  layerstack --progress-coeff <path/to/progress.bin>
+```
+
+### 指標の読み方
+
+`test_loss` は `train_loss` と同じ loss kernel (sigmoid-MSE または WRM) +
+同じ `--wdl` blend で計算するため、両者は単位・スケールが揃い同 superbatch 内
+で直接比較できる。`test_loss − train_loss` の差が広がっていけば過学習の兆候、
+`test_loss` が `train_loss` より早く異常値に飛ぶようなら NaN 発散の早期検知に
+なる。
+
+`test_accuracy` はモデル出力の符号と実対局結果の一致率 (引き分けは分母から除外)。
+scale 不変なので、loss スケールが異なる run / 設定の間でも直接比較できる。
 
 ## 学習中断・再開
 
