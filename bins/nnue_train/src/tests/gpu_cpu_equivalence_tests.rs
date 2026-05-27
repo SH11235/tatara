@@ -1727,6 +1727,8 @@ fn ft_post_perspective_grad_fused_fp16_matches_cpu() -> Result<(), Box<dyn std::
     let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
     let mut dft_stm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
     let mut dft_nstm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+    // FP16 clamp 計装の累積 counter (test では cap が当たらない小 dft_scale を使うので 0)。
+    let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     // test 入力 dft は O(数十) なので、production の dft_scale (FT_DFT_FP16_BASE_SCALE
     // × batch) では overflow する。loss scaling round-trip 検証用の小さい値を使う。
     let dft_scale = 64.0_f32;
@@ -1734,17 +1736,23 @@ fn ft_post_perspective_grad_fused_fp16_matches_cpu() -> Result<(), Box<dyn std::
         kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim / 2),
         args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
-               slice_mut(dft_stm_dev), slice(grad_bias_dev),
+               slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
     }?;
     cuda_launch! {
         kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim / 2),
         args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
-               slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+               slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
     }?;
     stream.synchronize()?;
+    // 小 dft_scale 経路では clamp は発火しない (`f16` 有限域 65504 を超えない)。
+    assert_eq!(
+        clamp_counter_dev.to_host_vec(&stream)?[0],
+        0,
+        "no clamp expected at small dft_scale"
+    );
     // dft 出力は f16 かつ dft_scale 倍されているので、読み戻して逆数を掛ける。GPU と
     // CPU は同じ f32 演算結果を持つが、GPU 側のみ最後に f16 量子化されるため、f16
     // round-off (相対 ~5e-4) を許容する relative tolerance。
@@ -1840,23 +1848,29 @@ fn ft_post_perspective_grad_fp16_matches_cpu() -> Result<(), Box<dyn std::error:
     let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
     let mut dft_stm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
     let mut dft_nstm_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+    let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     // test 入力は O(数十) なので production の dft_scale は overflow する。小さい値。
     let dft_scale = 64.0_f32;
     cuda_launch! {
         kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim / 2),
         args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev),
-               slice_mut(dft_stm_dev), slice(grad_bias_dev),
+               slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
     }?;
     cuda_launch! {
         kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim / 2),
         args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev),
-               slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+               slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
     }?;
     stream.synchronize()?;
+    assert_eq!(
+        clamp_counter_dev.to_host_vec(&stream)?[0],
+        0,
+        "no clamp expected at small dft_scale"
+    );
     let inv = 1.0_f32 / dft_scale;
     let dft_stm_gpu: Vec<f32> = dft_stm_dev
         .to_host_vec(&stream)?
@@ -1955,15 +1969,22 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let dft_acted_dev = DeviceBuffer::from_host(&stream, &dft_acted)?;
     let mut dft_out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+    let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     // test 入力 dft は O(数十) なので production の dft_scale は overflow する。小さい値。
     let dft_scale = 64.0_f32;
     cuda_launch! {
         kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
-               slice_mut(dft_out_dev), batch as u32, ft_dim as u32, dft_scale]
+               slice_mut(dft_out_dev), slice(clamp_counter_dev),
+               batch as u32, ft_dim as u32, dft_scale]
     }?;
     stream.synchronize()?;
+    assert_eq!(
+        clamp_counter_dev.to_host_vec(&stream)?[0],
+        0,
+        "no clamp expected at small dft_scale"
+    );
     let inv = 1.0_f32 / dft_scale;
     let g_gpu: Vec<f32> = dft_out_dev
         .to_host_vec(&stream)?
@@ -1971,6 +1992,65 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
         .map(|&x| x as f32 * inv)
         .collect();
     assert_close_rel("simple_act_grad_to_fp16_screlu", &g_gpu, &g_cpu, 2e-3);
+    Ok(())
+}
+
+#[test]
+fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Issue #160 monitor 計装: `dft_scale * grad` が `±65504` を超えた要素を
+    // device atomic counter で数える。host (`--monitor-fp16-clamps`) が sb 末で
+    // D2H read して `[fp16-clamp]` line を出す path の単体検証。
+    //
+    // 過大 `dft_scale` を渡し、grad の絶対値が非零 (`0 < x < 1` の cell) で必ず
+    // overflow するように入力を仕組む。期待 counter 値は host で再現できる。
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 2_usize;
+    let ft_dim = DEFAULT_FT_OUT;
+    // pre-activation を全 cell `0.5` にすると CReLU 指示関数 (`0 < x < 1`) が
+    // 全 cell で発火し、`g = dft_acted`、`dft_scale * dft_acted` の絶対値が
+    // overflow するように `dft_acted = 2.0`、`dft_scale = 1e6` を組合せる
+    // (`|2e6| >> 65504` で確実に clamp)。
+    let ft_out = vec![0.5_f32; batch * ft_dim];
+    let bias = vec![0.0_f32; ft_dim];
+    let dft_acted = vec![2.0_f32; batch * ft_dim];
+    let (ft_out_h, _) = quantize_f16(&ft_out);
+
+    let ft_out_dev = DeviceBuffer::from_host(&stream, &ft_out_h)?;
+    let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+    let dft_acted_dev = DeviceBuffer::from_host(&stream, &dft_acted)?;
+    let mut dft_out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+    let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
+    let dft_scale = 1.0e6_f32;
+    cuda_launch! {
+        kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
+        config: cfg_1d(batch * ft_dim),
+        args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               slice_mut(dft_out_dev), slice(clamp_counter_dev),
+               batch as u32, ft_dim as u32, dft_scale]
+    }?;
+    stream.synchronize()?;
+    let count = clamp_counter_dev.to_host_vec(&stream)?[0];
+    let expected = (batch * ft_dim) as u64;
+    assert_eq!(
+        count, expected,
+        "clamp counter should equal element count when all cells overflow"
+    );
+    // 2 回目 launch で counter は cumulative (= 2 × expected) になる (累積 counter)。
+    cuda_launch! {
+        kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
+        config: cfg_1d(batch * ft_dim),
+        args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               slice_mut(dft_out_dev), slice(clamp_counter_dev),
+               batch as u32, ft_dim as u32, dft_scale]
+    }?;
+    stream.synchronize()?;
+    let count2 = clamp_counter_dev.to_host_vec(&stream)?[0];
+    assert_eq!(
+        count2,
+        expected * 2,
+        "counter must be cumulative across launches"
+    );
     Ok(())
 }
 

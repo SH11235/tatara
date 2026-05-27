@@ -315,6 +315,14 @@ pub(crate) struct SimpleGpuTrainer {
     ws: SimpleGpuWorkspace,
     /// loss kernel が atomic add する Σerr² (f64、1 要素)。
     loss_acc: DeviceBuffer<f64>,
+    /// `--ft-fp16-out` 経路で `simple_act_grad_to_fp16_*_with_scale` が `dft_scale *
+    /// grad` を `±65504` に cap した要素数の cumulative atomic counter (len 1)。
+    /// `--monitor-fp16-clamps` 時に host が sb 末で D2H read、`[fp16-clamp]` line に
+    /// 出す。`--ft-fp16-out` 無しでは対象 kernel が launch されないので常に 0。
+    fp16_clamp_counter: DeviceBuffer<u64>,
+    /// `--ft-fp16-out` 経路で dft FP16 書き込みを行った要素数の host-side cumulative
+    /// counter。`[fp16-clamp]` ratio の分母。`--ft-fp16-out` 無しなら 0 のまま。
+    fp16_clamp_elems_written: u64,
     /// `step()` 末の `loss_acc` 同期読みを 1-step lag な async D2H に置換する pinned
     /// host ring。host が `stream.synchronize` 待ち無しで次 batch の launch を発行できる
     /// ようになる。sb 末で [`TrainerBackend::flush_pending_loss`] が drain する
@@ -480,6 +488,8 @@ impl SimpleGpuTrainer {
             l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
+            fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
             ft_w_h: if ft_fp16 {
@@ -1452,6 +1462,7 @@ impl SimpleGpuTrainer {
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
                             slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
                     }?;
@@ -1471,9 +1482,15 @@ impl SimpleGpuTrainer {
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
                             slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
                     }?;
+                    // stm + nstm の 2 launch × ft_n thread × 1 elem/thread = 2 * ft_n。
+                    // `ft_n = b * ft_out_u32` (= b * ft_dim) なので 2 * b * ft_dim 要素/step。
+                    self.fp16_clamp_elems_written = self
+                        .fp16_clamp_elems_written
+                        .saturating_add(2_u64 * ft_n as u64);
                 }
                 SimpleActivation::SCReLU => {
                     cuda_launch! {
@@ -1504,6 +1521,7 @@ impl SimpleGpuTrainer {
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
                             slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
                     }?;
@@ -1523,9 +1541,14 @@ impl SimpleGpuTrainer {
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
                             slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
                     }?;
+                    // see CReLU branch: stm+nstm 2 launch × ft_n elems = 2 * ft_n。
+                    self.fp16_clamp_elems_written = self
+                        .fp16_clamp_elems_written
+                        .saturating_add(2_u64 * ft_n as u64);
                 }
                 SimpleActivation::Pairwise => {
                     // f16 入力版 pairwise FT post backward。`ft_post_perspective_grad` の
@@ -1548,7 +1571,8 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
                         args: [slice(self.ws.dcombined), slice(ft_stm_out_h),
                                slice(self.ft_b), slice_mut(dft_stm_out_h),
-                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
+                               b_u32, ft_out_u32,
                                0_u32, l1_in_u32, FT_POST_SCALE, dft_scale]
                     }?;
                     let ft_nstm_out_h = self
@@ -1566,9 +1590,14 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
                         args: [slice(self.ws.dcombined), slice(ft_nstm_out_h),
                                slice(self.ft_b), slice_mut(dft_nstm_out_h),
-                               slice(self.ft_b_grad), b_u32, ft_out_u32,
+                               slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
+                               b_u32, ft_out_u32,
                                ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE, dft_scale]
                     }?;
+                    // Pairwise: stm+nstm 2 launch × (ft_n/2) thread × 2 elem/thread = 2 * ft_n。
+                    self.fp16_clamp_elems_written = self
+                        .fp16_clamp_elems_written
+                        .saturating_add(2_u64 * ft_n as u64);
                 }
             }
         } else {
@@ -2588,5 +2617,15 @@ impl TrainerBackend for SimpleGpuTrainer {
                     "SimpleGpuTrainer::save_raw_checkpoint failed: {other}"
                 )),
             })
+    }
+
+    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+        // `to_host_vec` 内部で `stream.synchronize` する。cumulative counter の sb 末
+        // 報告は同期 path で十分。
+        let host = self
+            .fp16_clamp_counter
+            .to_host_vec(&self.stream)
+            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
+        Ok((host[0], self.fp16_clamp_elems_written))
     }
 }

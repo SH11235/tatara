@@ -257,6 +257,21 @@ pub trait TrainerBackend {
         superbatch: usize,
         run_id: &str,
     ) -> io::Result<()>;
+
+    /// 累積 FP16 clamp event count + 累積処理要素数を device から読み出す。
+    ///
+    /// 戻り値 `(clamp_count, elems_processed)`:
+    /// - `clamp_count`: `--ft-fp16-out` 経路で `dft_scale * grad` を `±65504`
+    ///   (f16 有限域) に cap した要素数の合計 (累積)。
+    /// - `elems_processed`: 同 kernel が処理した FP16 書き込み要素数の合計
+    ///   (累積)。clamp ratio の分母。
+    ///
+    /// `--ft-fp16-out` 無し / clamp 計装を持たない backend では両方 `0`。caller
+    /// ([`run`]) は sb 末で読み、前回値との差分から sb 内 ratio を出して
+    /// `[fp16-clamp]` log line にする。
+    fn read_fp16_clamp_count(&mut self) -> io::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
 }
 
 // =============================================================================
@@ -327,6 +342,13 @@ pub struct TrainingConfig {
     /// するために必要。`compute_bucket = false` の Simple 経路では bucket 計算
     /// 自体が skip されるため値は参照されない (任意の `>= 1` で可)。
     pub num_buckets: usize,
+    /// `true` のとき各 superbatch 末で backend の累積 FP16 clamp event count を
+    /// 読んで `[fp16-clamp] sb=N total=X delta=Y elems=Z ratio=R` line を stderr に
+    /// 出す (`--monitor-fp16-clamps`)。Issue #160 の clamp 頻度監視。`false` は
+    /// no-op (D2H read も skip、kernel 側 atomic 計数は常時有効だが host 報告のみ
+    /// gate)。`--ft-fp16-out` 無しの run では FP16 clamp kernel 自体が launch
+    /// されないため total は常に 0。
+    pub monitor_fp16_clamps: bool,
 }
 
 impl TrainingConfig {
@@ -575,6 +597,11 @@ where
         '\n'
     };
 
+    // FP16 clamp monitor の前回 sb 末累積値 (delta 計算用)。`--monitor-fp16-clamps`
+    // 無しなら read 自体 skip するので未使用。
+    let mut prev_fp16_clamp_count: u64 = 0;
+    let mut prev_fp16_clamp_elems: u64 = 0;
+
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
@@ -702,6 +729,27 @@ where
             format_hms(eta_secs),
             val_str,
         );
+
+        if cfg.monitor_fp16_clamps {
+            // dft FP16 書き込みで `±65504` cap が当たった要素数 (累積) と処理要素数
+            // (累積) を device から読み、当 sb の delta + ratio を出す。`--ft-fp16-out`
+            // 無し / clamp 計装を持たない backend では `(0, 0)` で delta 0 / elems 0 /
+            // ratio 0 になる。
+            let (total_count, total_elems) = backend.read_fp16_clamp_count()?;
+            let delta_count = total_count.saturating_sub(prev_fp16_clamp_count);
+            let delta_elems = total_elems.saturating_sub(prev_fp16_clamp_elems);
+            prev_fp16_clamp_count = total_count;
+            prev_fp16_clamp_elems = total_elems;
+            let ratio = if delta_elems > 0 {
+                delta_count as f64 / delta_elems as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[fp16-clamp] sb={} total={} delta={} elems={} ratio={:.3e}",
+                sb, total_count, delta_count, delta_elems, ratio,
+            );
+        }
 
         let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
         if saved {
@@ -881,6 +929,14 @@ mod tests {
         seen_lr: Vec<f32>,
         /// `validate_step` の呼び出し回数 (held-out validation の検証用)。
         validate_steps: usize,
+        /// `read_fp16_clamp_count` の呼び出し回数。`--monitor-fp16-clamps` が
+        /// sb 末に呼んだ回数の検証用。
+        clamp_reads: usize,
+        /// `read_fp16_clamp_count` が返す `(count, elems)` の擬似累積。`train_step`
+        /// 1 回ごとに `(7, 100)` ずつ増やし、sb 末 delta が log line に反映される
+        /// ことを確認する。
+        clamp_count_sim: u64,
+        clamp_elems_sim: u64,
     }
 
     impl MockBackend {
@@ -894,6 +950,9 @@ mod tests {
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
                 validate_steps: 0,
+                clamp_reads: 0,
+                clamp_count_sim: 0,
+                clamp_elems_sim: 0,
             }
         }
     }
@@ -927,6 +986,8 @@ mod tests {
             self.last_buckets = bucket_idx.to_vec();
             self.max_batch_positions = self.max_batch_positions.max(batch.n_positions);
             self.seen_lr.push(lr);
+            self.clamp_count_sim += 7;
+            self.clamp_elems_sim += 100;
             // 単調減少する dummy loss (loss 推移の monotonic decreasing assertion 用)。
             Ok(1.0 / self.steps as f64)
         }
@@ -973,6 +1034,11 @@ mod tests {
             self.resume_run_ids.push(run_id.to_string());
             Ok(())
         }
+
+        fn read_fp16_clamp_count(&mut self) -> io::Result<(u64, u64)> {
+            self.clamp_reads += 1;
+            Ok((self.clamp_count_sim, self.clamp_elems_sim))
+        }
     }
 
     fn base_cfg() -> TrainingConfig {
@@ -994,6 +1060,7 @@ mod tests {
             test_tail_positions: None,
             compute_bucket: true,
             num_buckets: 9,
+            monitor_fp16_clamps: false,
         }
     }
 
@@ -1403,6 +1470,77 @@ mod tests {
             backend.validate_steps, 0,
             "--test-data 未指定なら held-out validation は走らない"
         );
+    }
+
+    #[test]
+    fn run_without_fp16_clamp_monitor_skips_clamp_read() {
+        // `--monitor-fp16-clamps` 未指定 (= base_cfg().monitor_fp16_clamps == false) なら
+        // backend の `read_fp16_clamp_count` を呼ばない (D2H copy / log line 共に skip)。
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 1.0,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = base_cfg(); // monitor_fp16_clamps: false
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
+        assert_eq!(
+            backend.clamp_reads, 0,
+            "monitor_fp16_clamps=false なら read_fp16_clamp_count は呼ばれない"
+        );
+    }
+
+    #[test]
+    fn run_with_fp16_clamp_monitor_reads_each_superbatch() {
+        // `--monitor-fp16-clamps` 指定で各 sb 末に backend の `read_fp16_clamp_count`
+        // を 1 回呼ぶ。base_cfg は start=1 / end=3 で 3 sb 走る。
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 1.0,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            monitor_fp16_clamps: true,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
+        let expected_sb_count = cfg.end_superbatch - cfg.start_superbatch + 1;
+        assert_eq!(
+            backend.clamp_reads, expected_sb_count,
+            "monitor_fp16_clamps=true なら sb 数だけ read される"
+        );
+        // 3 sb × 2 batches/sb × (7 clamps, 100 elems) per step = (42, 600)
+        let expected_count = 7 * backend.steps as u64;
+        let expected_elems = 100 * backend.steps as u64;
+        let (final_count, final_elems) = backend
+            .read_fp16_clamp_count()
+            .expect("read_fp16_clamp_count ok");
+        // backend.read を 1 回追加で呼んだので clamp_reads が +1 されている
+        assert!(final_count >= expected_count);
+        assert!(final_elems >= expected_elems);
     }
 
     #[test]

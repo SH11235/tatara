@@ -99,6 +99,17 @@ pub(crate) struct GpuTrainer {
 
     // loss + step
     loss_acc: DeviceBuffer<f64>,
+    /// `--ft-fp16-out` 経路で `ft_post_perspective_grad_fused_fp16` /
+    /// `ft_post_perspective_grad_fp16` が `dft_scale * grad` を `±65504` に cap した
+    /// 要素数の cumulative atomic counter (len 1)。`--monitor-fp16-clamps` 時に
+    /// host が sb 末で D2H read、`[fp16-clamp]` line に出す。
+    /// `--ft-fp16-out` 無しでは対象 kernel が launch されないので常に 0。
+    fp16_clamp_counter: DeviceBuffer<u64>,
+    /// `--ft-fp16-out` 経路で dft FP16 書き込みを行った要素数の host-side cumulative
+    /// counter。`[fp16-clamp]` ratio の分母。`fp16_clamp_counter` は dft write の
+    /// 1 element に対し 0 or 1 atomic add するので両者を割って clamp 比率 = (clamps /
+    /// elems) を出す。`--ft-fp16-out` 無しなら 0 のまま。
+    fp16_clamp_elems_written: u64,
     /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
     /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
     loss_ring: AsyncLossRing,
@@ -610,6 +621,8 @@ impl GpuTrainer {
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
+            fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
@@ -2469,6 +2482,7 @@ impl GpuTrainer {
                     slice_mut(self.ws.dft_stm_out_h.as_mut()
                         .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")),
                     slice(self.ft_b_grad),
+                    slice(self.fp16_clamp_counter),
                     b_u32, ft_out as u32, 0_u32, ft_out as u32, FT_POST_SCALE,
                     dft_scale
                 ]
@@ -2487,10 +2501,16 @@ impl GpuTrainer {
                     slice_mut(self.ws.dft_nstm_out_h.as_mut()
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled")),
                     slice(self.ft_b_grad),
+                    slice(self.fp16_clamp_counter),
                     b_u32, ft_out as u32, (ft_out / 2) as u32, ft_out as u32, FT_POST_SCALE,
                     dft_scale
                 ]
             }?;
+            // dft FP16 書き込みを行った要素数。stm + nstm の 2 launch × `b * ft_out / 2`
+            // thread × 2 element/thread (pair_a + pair_b) = `2 * b * ft_out` 要素/step。
+            self.fp16_clamp_elems_written = self
+                .fp16_clamp_elems_written
+                .saturating_add(2_u64 * b as u64 * ft_out as u64);
         } else {
             cuda_launch! {
                 kernel: ft_post_perspective_grad_fused,
@@ -2994,5 +3014,16 @@ impl TrainerBackend for GpuTrainer {
                     )),
                 }
             })
+    }
+
+    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+        // `to_host_vec` 内部で `stream.synchronize` する (`AsyncLossRing` と違って
+        // pinned host ring を介さない 1-shot D2H で十分、cumulative counter の sb 末
+        // 報告は同期 path で OK)。
+        let host = self
+            .fp16_clamp_counter
+            .to_host_vec(&self.stream)
+            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
+        Ok((host[0], self.fp16_clamp_elems_written))
     }
 }

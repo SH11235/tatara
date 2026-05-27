@@ -99,6 +99,21 @@ fn shared_args_are_global_around_subcommand() {
 }
 
 #[test]
+fn monitor_fp16_clamps_flag_defaults_off_and_parses_global() {
+    // default は false (新規 opt-in flag、`--ft-fp16-out` 経路の cap 監視 log を gate)。
+    let cli =
+        Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand should parse");
+    assert!(!cli.monitor_fp16_clamps);
+    // 指定すれば true、`global = true` なので subcommand 前後どちらでも accept。
+    let cli_pre = Cli::try_parse_from(["nnue-train", "--monitor-fp16-clamps", "simple"])
+        .expect("--monitor-fp16-clamps before subcommand");
+    assert!(cli_pre.monitor_fp16_clamps);
+    let cli_post = Cli::try_parse_from(["nnue-train", "layerstack", "--monitor-fp16-clamps"])
+        .expect("--monitor-fp16-clamps after subcommand");
+    assert!(cli_post.monitor_fp16_clamps);
+}
+
+#[test]
 fn simple_accepts_tf32_flag() {
     // `--tf32` は LayerStack / Simple 両 subcommand で受理される (両方 cuBLAS handle
     // に同 flag を渡す opt-in)。default OFF / 渡せば ON で TF32 TC 有効化。

@@ -233,6 +233,20 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) all_optim: bool,
 
+    /// Log the number of FP16 clamp events (`|x| > 65504` cap to `±65504`) in the
+    /// FT activation backward kernels (the `--ft-fp16-out` write path) at the end
+    /// of every superbatch. Used to gauge how often `dft_scale * grad` saturates
+    /// the FP16 finite range — a high rate suggests the loss scale should be
+    /// retuned, as systematic clamping caps gradient magnitudes and can shift
+    /// playing strength.
+    ///
+    /// The clamp counter is always active in the FP16 path; this flag only gates
+    /// the host-side D2H read and log line (`[fp16-clamp] sb=... clamps=...
+    /// delta=... elems=... ratio=...`). With `--ft-fp16-out` off, the counter
+    /// stays at zero because the clamp kernels are not launched.
+    #[arg(long, global = true)]
+    pub(crate) monitor_fp16_clamps: bool,
+
     /// Subcommand selecting the NNUE architecture to train (`layerstack` / `simple`).
     #[command(subcommand)]
     pub(crate) arch: ArchCommand,

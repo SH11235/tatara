@@ -380,6 +380,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         test_tail_positions: cli.test_tail_positions,
         compute_bucket: true,
         num_buckets: layerstack.num_buckets,
+        monitor_fp16_clamps: cli.monitor_fp16_clamps,
     };
 
     // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
@@ -1037,6 +1038,7 @@ pub(crate) fn run_simple_training(
         // 自体が skip される。値は dataloader の `num_buckets >= 1` assertion を
         // 通すための placeholder。
         num_buckets: 1,
+        monitor_fp16_clamps: cli.monitor_fp16_clamps,
     };
 
     let mut experiment = build_experiment_logger_simple(

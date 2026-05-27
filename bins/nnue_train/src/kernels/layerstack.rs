@@ -6,7 +6,7 @@
 //!   多 thread → 1 cell の atomic accumulate
 //! - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// Fused FT post-processing (forward) — bias add → CReLU → pairwise_mul → scale。
@@ -387,6 +387,7 @@ pub fn ft_post_perspective_grad_fused_fp16(
     bias: &[f32],
     mut grad_ft_out: DisjointSlice<f16>,
     grad_bias: &[f32],
+    clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
     ft_dim: u32,
     d_combined_offset: u32,
@@ -446,19 +447,25 @@ pub fn ft_post_perspective_grad_fused_fp16(
     // すると天井を越えた値が `±inf` になり、gather で `ft_w_grad` に伝播 → optimizer
     // 経由で weight を NaN 化させ学習を発散させる。これを防ぐため格納前に clamp する。
     // clamp が当たるのは天井を越えた稀な外れ値のみで、その要素の勾配が cap される
-    // (発散の代わりに有界な近似)。
+    // (発散の代わりに有界な近似)。`clamp_counter` は cap が当たった要素数の cumulative
+    // atomic counter で、host (`--monitor-fp16-clamps`) が sb 末に D2H read する。
     let da = grad_a * dft_scale;
+    let mut local_clamps: u64 = 0;
     let da_c = if da > 65504.0_f32 {
+        local_clamps += 1;
         65504.0_f32
     } else if da < -65504.0_f32 {
+        local_clamps += 1;
         -65504.0_f32
     } else {
         da
     };
     let db = grad_b * dft_scale;
     let db_c = if db > 65504.0_f32 {
+        local_clamps += 1;
         65504.0_f32
     } else if db < -65504.0_f32 {
+        local_clamps += 1;
         -65504.0_f32
     } else {
         db
@@ -467,6 +474,14 @@ pub fn ft_post_perspective_grad_fused_fp16(
     unsafe {
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
+    }
+    if local_clamps > 0 {
+        // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64` (align 8)
+        // と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。non-atomic 経路で同
+        // cell に書く path は本 kernel + Simple 4 kernel 以外無し (host は accumulate 後
+        // memset で reset を出さない、cumulative counter 設計)。
+        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
+        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }
 
     // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
@@ -497,6 +512,7 @@ pub fn ft_post_perspective_grad_fp16(
     bias: &[f32],
     mut grad_ft_out: DisjointSlice<f16>,
     grad_bias: &[f32],
+    clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
     ft_dim: u32,
     d_combined_offset: u32,
@@ -551,18 +567,24 @@ pub fn ft_post_perspective_grad_fp16(
     // grad_ft_out は f16。1 thread が 2 cell を書く構造・disjoint 性は
     // `ft_post_perspective_grad_fused_fp16` と同一。dft_scale を掛けてから f16 域へ
     // clamp する (天井超過を ±inf にすると gather 経由で weight を NaN 化させるため)。
+    // `clamp_counter` は cap が当たった要素数の cumulative atomic counter。
     let da = grad_a * dft_scale;
+    let mut local_clamps: u64 = 0;
     let da_c = if da > 65504.0_f32 {
+        local_clamps += 1;
         65504.0_f32
     } else if da < -65504.0_f32 {
+        local_clamps += 1;
         -65504.0_f32
     } else {
         da
     };
     let db = grad_b * dft_scale;
     let db_c = if db > 65504.0_f32 {
+        local_clamps += 1;
         65504.0_f32
     } else if db < -65504.0_f32 {
+        local_clamps += 1;
         -65504.0_f32
     } else {
         db
@@ -574,6 +596,11 @@ pub fn ft_post_perspective_grad_fp16(
     unsafe {
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
+    }
+    if local_clamps > 0 {
+        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
+        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
+        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }
 
     // grad_bias は f32 accumulate を維持 (scale 無しの grad_a / grad_b を atomic add)。
