@@ -1998,12 +1998,10 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
 #[test]
 fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Issue #160 monitor 計装: `dft_scale * grad` が `±65504` を超えた要素を
-    // device atomic counter で数える。host (`--monitor-fp16-clamps`) が sb 末で
-    // D2H read して `[fp16-clamp]` line を出す path の単体検証。
-    //
+    // FP16 clamp counter (`--ft-fp16-out` 経路の dft cap 監視) の単体検証。
     // 過大 `dft_scale` を渡し、grad の絶対値が非零 (`0 < x < 1` の cell) で必ず
-    // overflow するように入力を仕組む。期待 counter 値は host で再現できる。
+    // overflow するように入力を仕組み、device atomic counter が cap された要素数と
+    // 一致 + 2 回 launch で累積 (cumulative) することを確認する。
     let (_ctx, module, stream) = open_module()?;
     let batch = 2_usize;
     let ft_dim = DEFAULT_FT_OUT;

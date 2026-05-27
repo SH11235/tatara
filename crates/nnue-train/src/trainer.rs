@@ -344,10 +344,9 @@ pub struct TrainingConfig {
     pub num_buckets: usize,
     /// `true` のとき各 superbatch 末で backend の累積 FP16 clamp event count を
     /// 読んで `[fp16-clamp] sb=N total=X delta=Y elems=Z ratio=R` line を stderr に
-    /// 出す (`--monitor-fp16-clamps`)。Issue #160 の clamp 頻度監視。`false` は
-    /// no-op (D2H read も skip、kernel 側 atomic 計数は常時有効だが host 報告のみ
-    /// gate)。`--ft-fp16-out` 無しの run では FP16 clamp kernel 自体が launch
-    /// されないため total は常に 0。
+    /// 出す (`--monitor-fp16-clamps`)。`false` は no-op (D2H read も skip、kernel
+    /// 側 atomic 計数は常時有効だが host 報告のみ gate)。`--ft-fp16-out` 無しの
+    /// run では FP16 clamp kernel 自体が launch されないため total は常に 0。
     pub monitor_fp16_clamps: bool,
 }
 
@@ -1532,15 +1531,16 @@ mod tests {
             backend.clamp_reads, expected_sb_count,
             "monitor_fp16_clamps=true なら sb 数だけ read される"
         );
-        // 3 sb × 2 batches/sb × (7 clamps, 100 elems) per step = (42, 600)
+        // MockBackend は train_step ごとに (count, elems) を (+7, +100) ずつ
+        // 累積する。run 完了時 backend.steps = sb 数 × batches/sb で、最終 D2H
+        // read は正確に (7 * steps, 100 * steps) を返さなければならない。
         let expected_count = 7 * backend.steps as u64;
         let expected_elems = 100 * backend.steps as u64;
         let (final_count, final_elems) = backend
             .read_fp16_clamp_count()
             .expect("read_fp16_clamp_count ok");
-        // backend.read を 1 回追加で呼んだので clamp_reads が +1 されている
-        assert!(final_count >= expected_count);
-        assert!(final_elems >= expected_elems);
+        assert_eq!(final_count, expected_count);
+        assert_eq!(final_elems, expected_elems);
     }
 
     #[test]

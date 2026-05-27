@@ -476,10 +476,11 @@ pub fn ft_post_perspective_grad_fused_fp16(
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
     if local_clamps > 0 {
-        // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64` (align 8)
-        // と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。non-atomic 経路で同
-        // cell に書く path は本 kernel + Simple 4 kernel 以外無し (host は accumulate 後
-        // memset で reset を出さない、cumulative counter 設計)。
+        // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64`
+        // (align 8) と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。
+        // non-atomic 経路で同 cell に書く path は LayerStack 2 kernel (本 kernel と
+        // 非 fused 版) + Simple 2 kernel (CReLU / SCReLU) の計 4 launch site 以外
+        // 無く、cumulative counter なので host も memset reset を出さない。
         let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
         cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }

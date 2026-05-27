@@ -235,10 +235,10 @@ pub(crate) struct Cli {
 
     /// Log the number of FP16 clamp events (`|x| > 65504` cap to `±65504`) in the
     /// FT activation backward kernels (the `--ft-fp16-out` write path) at the end
-    /// of every superbatch. Used to gauge how often `dft_scale * grad` saturates
-    /// the FP16 finite range — a high rate suggests the loss scale should be
-    /// retuned, as systematic clamping caps gradient magnitudes and can shift
-    /// playing strength.
+    /// of every superbatch. Used to gauge how often the loss-scaled gradient
+    /// saturates the FP16 finite range — a high rate suggests the loss scale
+    /// should be retuned, as systematic clamping caps gradient magnitudes and
+    /// can shift playing strength.
     ///
     /// The clamp counter is always active in the FP16 path; this flag only gates
     /// the host-side D2H read and log line (`[fp16-clamp] sb=... clamps=...
