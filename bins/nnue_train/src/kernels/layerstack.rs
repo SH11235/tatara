@@ -478,9 +478,11 @@ pub fn ft_post_perspective_grad_fused_fp16(
     if local_clamps > 0 {
         // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64`
         // (align 8) と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。
-        // non-atomic 経路で同 cell に書く path は LayerStack 2 kernel (本 kernel と
-        // 非 fused 版) + Simple 2 kernel (CReLU / SCReLU) の計 4 launch site 以外
-        // 無く、cumulative counter なので host も memset reset を出さない。
+        // 同 cell を更新するのは本 kernel および同 file の `ft_post_perspective_
+        // grad_fp16`、`bins/nnue_train/src/kernels/simple.rs` の `simple_act_grad_
+        // to_fp16_{crelu,screlu}_with_scale` の計 4 kernel 関数で、いずれも
+        // `DeviceAtomicU64::fetch_add` 経由でのみ書く (non-atomic 経路無し)。
+        // cumulative counter なので host も memset reset を出さない。
         let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
         cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }
