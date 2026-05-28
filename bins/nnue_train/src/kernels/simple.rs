@@ -1,6 +1,6 @@
 //! Simple アーキ専用 kernel (`simple_*`)。
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, kernel, thread};
 
 /// Simple FP16 FT activation forward (CReLU): f16 FT 出力 + f32 bias → f32 acted。
@@ -63,6 +63,7 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
     bias: &[f32],
     dft_acted: &[f32],
     mut dft_out: DisjointSlice<f16>,
+    clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
     ft_dim: u32,
     dft_scale: f32,
@@ -80,15 +81,23 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
         0.0_f32
     };
     let s = g * dft_scale;
+    let mut local_clamps: u64 = 0;
     let s_c = if s > 65504.0_f32 {
+        local_clamps = 1;
         65504.0_f32
     } else if s < -65504.0_f32 {
+        local_clamps = 1;
         -65504.0_f32
     } else {
         s
     };
     if let Some(o) = dft_out.get_mut(tid) {
         *o = s_c as f16;
+    }
+    if local_clamps > 0 {
+        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
+        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
+        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }
 }
 
@@ -137,6 +146,7 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
     bias: &[f32],
     dft_acted: &[f32],
     mut dft_out: DisjointSlice<f16>,
+    clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
     ft_dim: u32,
     dft_scale: f32,
@@ -162,15 +172,23 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
     };
     let g = dft_acted[tid.get()] * dydx;
     let s = g * dft_scale;
+    let mut local_clamps: u64 = 0;
     let s_c = if s > 65504.0_f32 {
+        local_clamps = 1;
         65504.0_f32
     } else if s < -65504.0_f32 {
+        local_clamps = 1;
         -65504.0_f32
     } else {
         s
     };
     if let Some(o) = dft_out.get_mut(tid) {
         *o = s_c as f16;
+    }
+    if local_clamps > 0 {
+        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
+        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
+        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
     }
 }
 
