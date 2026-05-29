@@ -247,9 +247,77 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) monitor_fp16_clamps: bool,
 
+    /// Weight initialisation preset (applies to a fresh run; ignored when
+    /// `--init-from` / `--resume` loads weights).
+    ///
+    /// - `legacy`: every weight is uniform in `[-0.01, 0.01]`; biases are zero
+    ///   (Simple keeps biases uniform too). The historical default.
+    /// - `nnue-pytorch`: weights and biases are `uniform(-sqrt(1/fan_in),
+    ///   +sqrt(1/fan_in))`; bucketed layers copy bucket 0 to every bucket; the
+    ///   shared factorised layer (L1f) and the output bias are zero. Matches the
+    ///   nnue-pytorch HalfKA_hm initialisation, whose feature-transformer scale
+    ///   is far smaller than the legacy one.
+    #[arg(long, value_enum, default_value_t = InitPresetArg::Legacy, global = true)]
+    pub(crate) init_preset: InitPresetArg,
+
+    /// Base seed for the deterministic initialiser. Per weight group seeds are
+    /// derived from this so the same value reproduces the same initial weights.
+    /// Has no effect on `--init-preset legacy`, which keeps fixed historical
+    /// seeds for bit-identical reproduction of past runs.
+    #[arg(long, default_value_t = DEFAULT_INIT_SEED, global = true)]
+    pub(crate) init_seed: u64,
+
+    /// Override the feature-transformer (L0) weight initialiser on top of the
+    /// preset. Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
+    /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
+    /// `sqrt(gain / effective_or_fan_in)` (half-width for uniform, std for
+    /// normal). Examples: `uniform:fanin` (nnue-pytorch), `normal:fanin:2:32`
+    /// (`sqrt(2/32) = 0.25`), `uniform:abs:0.01` (legacy). Applies to the weight
+    /// only; the bias follows the preset.
+    #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
+    pub(crate) init_ft: Option<nnue_train::init::LayerInitOverride>,
+
+    /// Override the L1 weight initialiser. Same grammar as `--init-ft`.
+    #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
+    pub(crate) init_l1: Option<nnue_train::init::LayerInitOverride>,
+
+    /// Override the shared factorised L1f weight initialiser (layerstack only).
+    /// Same grammar as `--init-ft`.
+    #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
+    pub(crate) init_l1f: Option<nnue_train::init::LayerInitOverride>,
+
+    /// Override the L2 weight initialiser. Same grammar as `--init-ft`.
+    #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
+    pub(crate) init_l2: Option<nnue_train::init::LayerInitOverride>,
+
+    /// Override the L3 (output) weight initialiser. Same grammar as `--init-ft`.
+    #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
+    pub(crate) init_l3: Option<nnue_train::init::LayerInitOverride>,
+
     /// Subcommand selecting the NNUE architecture to train (`layerstack` / `simple`).
     #[command(subcommand)]
     pub(crate) arch: ArchCommand,
+}
+
+/// Default base seed for `--init-seed` (ASCII "nnue").
+pub(crate) const DEFAULT_INIT_SEED: u64 = 0x6E6E_7565;
+
+/// `--init-preset` の選択肢。lib 側 [`nnue_train::init::InitPreset`] への薄い対応。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum InitPresetArg {
+    #[default]
+    Legacy,
+    #[value(name = "nnue-pytorch")]
+    NnuePytorch,
+}
+
+impl InitPresetArg {
+    pub(crate) fn to_preset(self) -> nnue_train::init::InitPreset {
+        match self {
+            InitPresetArg::Legacy => nnue_train::init::InitPreset::Legacy,
+            InitPresetArg::NnuePytorch => nnue_train::init::InitPreset::NnuePytorch,
+        }
+    }
 }
 
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)

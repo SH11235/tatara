@@ -221,22 +221,6 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
     }
 }
 
-/// Deterministic xorshift init for weights (small random in `[-scale, scale]`)。
-pub(crate) fn xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
-    let mut s = seed.max(1);
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        // [0, 1) → [-1, 1) → × scale
-        let u = (s >> 11) as f32 / ((1u64 << 53) as f32);
-        let r = (u * 2.0 - 1.0) * scale;
-        v.push(r);
-    }
-    v
-}
-
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
 /// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
 /// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。

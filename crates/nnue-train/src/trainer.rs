@@ -1248,6 +1248,7 @@ mod tests {
             wrm_target_scaling: None,
             score_drop_abs: None,
             init_from: None,
+            init_preset: None,
             test_data: None,
             test_positions: None,
             test_tail_positions: None,

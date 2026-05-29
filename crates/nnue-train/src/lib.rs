@@ -28,9 +28,13 @@
 //!   (`HeldoutSet` + sign-agreement accuracy)
 //! - `experiment`: 学習 run ごとの構造化ログ (experiment.json) を組み立て
 //!   incremental に書き出す (`ExperimentLogger` / `ExperimentDoc`)
+//! - `init`: 重み初期化の汎用記述 (`Dist` / `Scale` / `LayerInit`) と決定論的
+//!   サンプラ (`sample`) + preset (`LayerStackInit` / `SimpleInit` の `legacy` /
+//!   `nnue_pytorch`)。bin 側 trainer 構築子が初期重みを生成するのに使う
 
 pub mod dataloader;
 pub mod experiment;
+pub mod init;
 pub mod optimizer;
 pub mod schedule;
 pub mod trainer;

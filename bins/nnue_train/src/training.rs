@@ -4,6 +4,7 @@ use gpu_runtime::CudaContext;
 use nnue_format::LayerStackWeights;
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
+use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
 use nnue_train::schedule::{ConstantWDL, StepLR};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
@@ -278,6 +279,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         None
     };
 
+    let init_spec = build_layerstack_init_spec(cli);
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
@@ -293,6 +295,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         feature_set,
         cli.weight_decay,
         psqt_init_vec.as_deref(),
+        &init_spec,
     )?;
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id を決める。
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
@@ -482,6 +485,85 @@ pub(crate) fn git_commit() -> Option<String> {
     })
 }
 
+/// 初期化方式を experiment.json 用に要約する。preset が legacy で override も無い
+/// 既定の run、および `--init-from` / `--resume` で重みが上書きされる run では
+/// `None` を返す (初期化選択が実 weight に効かないので記録しても reader を混乱
+/// させるだけ)。それ以外では preset 名・seed・override された層を記す。
+pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
+    if cli.init_from.is_some() || cli.resume.is_some() {
+        return None;
+    }
+    let overridden: Vec<&str> = [
+        ("ft", cli.init_ft.is_some()),
+        ("l1", cli.init_l1.is_some()),
+        ("l1f", cli.init_l1f.is_some()),
+        ("l2", cli.init_l2.is_some()),
+        ("l3", cli.init_l3.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    if cli.init_preset == InitPresetArg::Legacy && overridden.is_empty() {
+        return None;
+    }
+    let preset = match cli.init_preset {
+        InitPresetArg::Legacy => "legacy",
+        InitPresetArg::NnuePytorch => "nnue-pytorch",
+    };
+    if overridden.is_empty() {
+        Some(format!("{preset} (seed={})", cli.init_seed))
+    } else {
+        Some(format!(
+            "{preset} (seed={}, overrides: {})",
+            cli.init_seed,
+            overridden.join(",")
+        ))
+    }
+}
+
+/// LayerStack の weight 初期化 spec を CLI から組み立てる (preset + per-layer override)。
+pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
+    let mut spec = LayerStackInit::from_preset(cli.init_preset.to_preset(), cli.init_seed);
+    if let Some(ov) = cli.init_ft {
+        spec.apply_weight_override(WeightLayer::Ft, ov);
+    }
+    if let Some(ov) = cli.init_l1 {
+        spec.apply_weight_override(WeightLayer::L1, ov);
+    }
+    if let Some(ov) = cli.init_l1f {
+        spec.apply_weight_override(WeightLayer::L1f, ov);
+    }
+    if let Some(ov) = cli.init_l2 {
+        spec.apply_weight_override(WeightLayer::L2, ov);
+    }
+    if let Some(ov) = cli.init_l3 {
+        spec.apply_weight_override(WeightLayer::L3, ov);
+    }
+    spec
+}
+
+/// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1f` は L1f を持たない
+/// Simple では error。
+pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn std::error::Error>> {
+    let mut spec = SimpleInit::from_preset(cli.init_preset.to_preset(), cli.init_seed);
+    if let Some(ov) = cli.init_ft {
+        spec.apply_weight_override(WeightLayer::Ft, ov)?;
+    }
+    if let Some(ov) = cli.init_l1 {
+        spec.apply_weight_override(WeightLayer::L1, ov)?;
+    }
+    if let Some(ov) = cli.init_l1f {
+        spec.apply_weight_override(WeightLayer::L1f, ov)?;
+    }
+    if let Some(ov) = cli.init_l2 {
+        spec.apply_weight_override(WeightLayer::L2, ov)?;
+    }
+    if let Some(ov) = cli.init_l3 {
+        spec.apply_weight_override(WeightLayer::L3, ov)?;
+    }
+    Ok(spec)
+}
+
 /// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 pub(crate) fn build_experiment_logger(
@@ -557,6 +639,7 @@ pub(crate) fn build_experiment_logger(
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
+        init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
         // 指定時のみ Some を記録する (未指定 run の experiment.json では省略)。
         // test_data と test_tail_positions は clap conflicts_with で同時指定不能。
@@ -693,6 +776,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
+        init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
         test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
             .then_some(cli.test_positions),
@@ -927,6 +1011,10 @@ pub(crate) fn run_simple_training(
         }
     };
 
+    // `--init-l1f` は Simple では受け付けないため CUDA 初期化より前に解決して
+    // 早期 reject する (CUDA context 作成のコストを払わせない)。
+    let init_spec = build_simple_init_spec(cli)?;
+
     std::fs::create_dir_all(&cli.output)?;
 
     // Simple は bucket-aware progress を持たない: dataloader に渡す
@@ -964,6 +1052,7 @@ pub(crate) fn run_simple_training(
         ft_fp16_out,
         fp16_opt_state,
         tf32,
+        &init_spec,
     )?;
 
     let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
