@@ -625,9 +625,11 @@ pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::
         )
         .into());
     }
-    if !cli.loss_qp_asymmetry.is_finite() {
+    // qp_asymmetry は過大評価の追加ペナルティで >= 0。<= -1 では asym <= 0 となり当該
+    // 局面の loss が負・勾配が反転するため reject する。
+    if !(cli.loss_qp_asymmetry.is_finite() && cli.loss_qp_asymmetry >= 0.0) {
         return Err(format!(
-            "--loss-qp-asymmetry must be finite (got {})",
+            "--loss-qp-asymmetry must be finite and >= 0 (got {})",
             cli.loss_qp_asymmetry
         )
         .into());

@@ -183,9 +183,12 @@ impl LossKind {
                         "wrm pow_exp must be finite and >= 1 (got {pow_exp})"
                     )));
                 }
-                if !qp_asymmetry.is_finite() {
+                // qp_asymmetry は過大評価 (qf > target) の追加ペナルティで >= 0。負値は
+                // asym = 1 + qp_asymmetry を 1 未満にし、<= -1 では asym <= 0 で当該局面の
+                // loss が負・勾配符号が反転する (最適化が逆方向に進む) ため reject する。
+                if !qp_asymmetry.is_finite() || qp_asymmetry < 0.0 {
                     return Err(io::Error::other(format!(
-                        "wrm qp_asymmetry must be finite (got {qp_asymmetry})"
+                        "wrm qp_asymmetry must be finite and >= 0 (got {qp_asymmetry})"
                     )));
                 }
                 // weight boost は決着寄り局面の重みを増幅する用途で w1/w2 >= 0。w1 < 0
@@ -2068,9 +2071,13 @@ mod tests {
             .validate()
             .is_err()
         );
-        // weight boost の w1 / w2 < 0 は reject (w2<0 は weight base 0 で inf、w1<0 は
-        // de-emphasis で boost の意図に反する)。
-        for (w1, w2) in [(-1.0_f32, 0.5_f32), (0.0, -0.5)] {
+        // 拡張パラメータの負値は reject: qp_asymmetry<0 (asym<=0 で勾配反転)、weight
+        // boost の w1<0 (de-emphasis) / w2<0 (weight base 0 で inf)。
+        for (qp, w1, w2) in [
+            (-2.0_f32, 0.0_f32, 0.5_f32),
+            (0.0, -1.0, 0.5),
+            (0.0, 0.0, -0.5),
+        ] {
             assert!(
                 TrainingConfig {
                     loss: LossKind::Wrm {
@@ -2080,7 +2087,7 @@ mod tests {
                         target_offset: 270.0,
                         target_scaling: 380.0,
                         pow_exp: 2.0,
-                        qp_asymmetry: 0.0,
+                        qp_asymmetry: qp,
                         weight_boost_w1: w1,
                         weight_boost_w2: w2
                     },
@@ -2088,7 +2095,7 @@ mod tests {
                 }
                 .validate()
                 .is_err(),
-                "w1={w1} w2={w2} must be rejected"
+                "qp={qp} w1={w1} w2={w2} must be rejected"
             );
         }
         // score-drop-abs は >= 1。0 や負値は「全 position を drop」になるので reject。

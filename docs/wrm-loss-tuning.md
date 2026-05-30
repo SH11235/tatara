@@ -78,7 +78,7 @@ loss   = sum(loss_i) / sum(weight)                # normalized by the weight sum
 | Option | Default | Role |
 |---|---:|---|
 | `--loss-pow-exp` | 2.0 | Exponent of the error term `\|qf - target\|^pow_exp`. 2.0 is squared error; nnue-pytorch uses 2.5. Must be >= 1 |
-| `--loss-qp-asymmetry` | 0.0 | Extra penalty when the prediction exceeds the target (`qf > target`): that position's loss is multiplied by `1 + this`. 0 is symmetric |
+| `--loss-qp-asymmetry` | 0.0 | Extra penalty when the prediction exceeds the target (`qf > target`): that position's loss is multiplied by `1 + this`. 0 is symmetric. Must be >= 0 (a negative value would flip the sign of those positions' gradient) |
 | `--loss-weight-boost-w1` | 0.0 | Strength of the per-position weight boost. `0` gives uniform weight 1 (no boost); larger emphasizes decisive positions (`pf` near 0/1). Must be >= 0 |
 | `--loss-weight-boost-w2` | 0.5 | Exponent in the weight formula (curve shape). No effect when `w1` is 0. Must be >= 0 |
 

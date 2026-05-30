@@ -259,9 +259,10 @@ pub(crate) struct Cli {
     /// 2.0 keeps the loss kernel on its bit-identical squared-error path.
     #[arg(long, default_value_t = 2.0, global = true)]
     pub(crate) loss_pow_exp: f32,
-    /// Asymmetric penalty for overprediction (default 0.0, symmetric). When set,
-    /// positions where the prediction `qf` exceeds the target are weighted by
-    /// `1 + qp_asymmetry`. Used only when `--win-rate-model` is set.
+    /// Asymmetric penalty for overprediction (default 0.0 = symmetric; must be
+    /// non-negative). When set, positions where the prediction `qf` exceeds the
+    /// target are weighted by `1 + qp_asymmetry`. Used only when
+    /// `--win-rate-model` is set.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) loss_qp_asymmetry: f32,
     /// Weight-boost parameter w1 (default 0.0, must be >= 0). Per-position loss

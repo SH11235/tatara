@@ -70,7 +70,7 @@ loss   = sum(loss_i) / sum(weight)                # weight 和で正規化
 | flag | 既定 | 役割 |
 |---|---:|---|
 | `--loss-pow-exp` | 2.0 | 誤差項 `\|qf - target\|^pow_exp` の冪。2.0 で二乗誤差、nnue-pytorch は 2.5。1 以上 |
-| `--loss-qp-asymmetry` | 0.0 | prediction が target を超える (`qf > target`、過大評価) 局面の loss を `1 + この値` 倍する追加ペナルティ。0 で対称 |
+| `--loss-qp-asymmetry` | 0.0 | prediction が target を超える (`qf > target`、過大評価) 局面の loss を `1 + この値` 倍する追加ペナルティ。0 で対称。0 以上 (負値は当該局面の勾配符号を反転させる) |
 | `--loss-weight-boost-w1` | 0.0 | per-position 重み増幅の強さ。`0` で重み一律 1 (boost 無し)、大きいほど決着寄り (`pf` が 0/1 付近) を強調。0 以上 |
 | `--loss-weight-boost-w2` | 0.5 | 重み式の冪 (カーブ形状)。`w1` が 0 のとき無効。0 以上 |
 
