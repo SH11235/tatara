@@ -189,4 +189,4 @@ target/release/nnue-train --data <PSV> \
 - [Game-progress buckets: preparing `progress.bin`](progress-bin.md) — training and surveying the LayerStack bucket coefficients
 - [Held-out validation](held-out-validation.md) — `test_loss` / `test_acc` setup and how to read the metrics
 - [Training schedules](training-schedule.md) — learning-rate and WDL lambda scheduling
-- [Tuning the WRM loss](wrm-loss-tuning.md) — the WRM transform and its 5 tuning options
+- [Tuning the WRM loss](wrm-loss-tuning.md) — the WRM transform and its tuning options (win-rate transform + generalized loss form)
