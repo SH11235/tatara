@@ -131,7 +131,7 @@ pub struct Params {
     pub qb: i32,
     /// `"sigmoid"` または `"wrm"`。
     pub loss_kind: String,
-    /// WRM loss の 5 パラメータ。`loss_kind == "wrm"` のときのみ `Some`。
+    /// WRM loss の sigmoid パラメータ。`loss_kind == "wrm"` のときのみ `Some`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrm_in_scaling: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +142,17 @@ pub struct Params {
     pub wrm_target_offset: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrm_target_scaling: Option<f32>,
+    /// WRM loss の nnue-pytorch 一般化パラメータ (`--loss-pow-exp` /
+    /// `--loss-qp-asymmetry` / `--loss-weight-boost-w1` / `-w2`)。`loss_kind ==
+    /// "wrm"` のときのみ `Some`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrm_pow_exp: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrm_qp_asymmetry: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrm_weight_boost_w1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrm_weight_boost_w2: Option<f32>,
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
@@ -564,6 +575,10 @@ mod tests {
             wrm_nnue2score: Some(600.0),
             wrm_target_offset: Some(270.0),
             wrm_target_scaling: Some(380.0),
+            wrm_pow_exp: Some(2.0),
+            wrm_qp_asymmetry: Some(0.0),
+            wrm_weight_boost_w1: Some(0.0),
+            wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
             init_from: None,
             init_preset: None,
