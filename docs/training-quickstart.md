@@ -137,7 +137,7 @@ change for real training are:
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
 | `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~100 MB ≈ 2 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE) |
+| `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE). See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
@@ -300,3 +300,4 @@ target/release/nnue-train --data <PSV> \
 ## Related
 
 - [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) setup
+- [Tuning the WRM loss](wrm-loss-tuning.md) — the WRM transform and its 5 tuning options
