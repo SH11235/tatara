@@ -356,7 +356,7 @@ pub(crate) struct Cli {
 
     /// Override the feature-transformer (L0) weight initialiser. Applies to a
     /// fresh run; ignored when `--init-from` / `--resume` loads weights. The
-    /// default is `[-0.01, 0.01]` uniform with zero bias.
+    /// default weight init is `[-0.01, 0.01]` uniform.
     ///
     /// Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
     /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
