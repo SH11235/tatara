@@ -118,9 +118,11 @@ pub(crate) const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 //   - i16 FT weight/bias (scale QA、CReLU/Pairwise=127 · SCReLU=255): 飽和は
 //     ±32767/QA で ~±128〜258、i32 bias / PSQT (scale QA·QB): ±2^31/8128 ≈ ±264k
 //     と事実上 unbounded → clamp 無し (`W_CLAMP_NONE_*`)
-// kernel launch ごとに対象テンソルの値を渡す。設計根拠は
-// docs/decisions/2026-05-31-per-layer-weight-clamp.md。QB=64 は LayerStack と
-// Simple 両 format で共通 (`nnue_format::{layerstack_weights,simple_weights}`)。
+// L3 (output) weight も i8@QB 量子化 (他 dense weight と同じ) なので clamp は
+// ±127/QB で loss 非依存。nnue2score は出力 weight scale ではなく推論側 fv_scale
+// (`round(QA·QB/scale)`) に畳まれるため、出力 weight を loss 別に締める必要はない。
+// kernel launch ごとに対象テンソルの値を渡す。QB=64 は LayerStack と Simple 両
+// format で共通 (`nnue_format::{layerstack_weights,simple_weights}`)。
 
 /// i8 dense weight (L1 / L1f / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
 /// 据える L1 / L1f / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
