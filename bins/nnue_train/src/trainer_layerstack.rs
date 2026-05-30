@@ -522,10 +522,10 @@ impl GpuTrainer {
 
         // weight / bias の初期値を `init_spec` から生成する。fan_in は各層の入力次元
         // (FT=ft_in、L1/L1f=ft_out、L2=l2_in、L3=l2_out)、bias は対応 weight と同じ
-        // fan_in を使う (nnue-pytorch 互換: bias も `uniform(±sqrt(1/fan_in))`)。bucket
-        // 付き層 (l1/l2/l3) は bucket-major layout なので `bucketed` で渡し、
+        // fan_in を使う (`Scale::FanIn` の override 時に bias も同じ半値幅にするため)。
+        // bucket 付き層 (l1/l2/l3) は bucket-major layout なので `bucketed` で渡し、
         // `per_bucket_repeat` が立つと block_len = n/num_buckets 分を 1 回生成して
-        // num_buckets 回 tile する (bullet の `RepeatedUniform` 相当)。
+        // num_buckets 回 tile する。
         let ft_w_init = init::sample(WeightShape::flat(ft_w_n, ft_in), &init_spec.ft_w);
         let ft_b_init = init::sample(WeightShape::flat(ft_b_n, ft_in), &init_spec.ft_b);
         let l1_w_init = init::sample(

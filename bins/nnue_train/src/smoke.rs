@@ -38,7 +38,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
@@ -82,7 +82,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
     println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
@@ -154,7 +154,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
     let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -185,7 +185,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
     if sb != 1 {
@@ -223,7 +223,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     let loss_pw = trainer_pw.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
     println!("[smoke/simple] forward 4 (sigmoid-MSE, pairwise): loss = {loss_pw:.6e}");
@@ -266,7 +266,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         false,
         false,
         false,
-        &SimpleInit::legacy(),
+        &SimpleInit::default_uniform(),
     )?;
     trainer_pw_q.load_simple_weights(&pw_reloaded)?;
     let pw_loss_q = trainer_pw_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -307,7 +307,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             true,  // ft_fp16_out
             false, // fp16_opt_state
             false, // tf32
-            &SimpleInit::legacy(),
+            &SimpleInit::default_uniform(),
         )?;
         trainer_fp16.sync_ft_w_h_mirror()?;
         let fwd = trainer_fp16.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -370,7 +370,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         feature_set,
         0.0,
         None,
-        &LayerStackInit::legacy(),
+        &LayerStackInit::default_uniform(),
     )?;
     // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。
     let l2_in = (DEFAULT_L1_OUT - L1_SKIP) * 2;

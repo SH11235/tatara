@@ -3,14 +3,15 @@
 //! NNUE の学習結果は初期重みのスケールに敏感で、feature transformer の初期 std が
 //! 大きすぎると CReLU が飽和して学習初期の勾配が失われる。ここでは初期化方式を
 //! 「分布 (`Dist`) × 広がり (`Scale`) × bucket 複製 (`per_bucket_repeat`) × seed」
-//! の直交パラメータで表し、特定方式をハードコードせずに済むようにする。代表的な
-//! 方式は [`LayerStackInit`] / [`SimpleInit`] の preset (`legacy` / `nnue_pytorch`)
-//! として束ねる。
+//! の直交パラメータで表し、特定方式をハードコードせずに済むようにする。各アーキの
+//! 既定値は [`LayerStackInit::default_uniform`] / [`SimpleInit::default_uniform`] が
+//! 返し、`--init-{ft,l1,l1f,l2,l3}` SPEC override で層ごとに分布・広がりを差し替え
+//! られる。
 //!
 //! 値生成は xorshift ベースの決定論的 RNG で、同一 seed なら常に同一列を返す
 //! (smoke / 数値同等性テストの再現性を保つため)。`Dist::Uniform` + `Scale::Abs`
-//! は `legacy` preset と bit-identical な列を返すよう実装してあり、unit test
-//! (`uniform_abs_is_bit_identical_to_legacy_xorshift`) が保証する。
+//! は既定の `±0.01` 一様初期化と bit-identical な列を返すよう実装してあり、unit
+//! test (`uniform_abs_is_bit_identical_to_reference_xorshift`) が保証する。
 
 /// 重みをサンプリングする確率分布。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,7 +40,7 @@ pub struct LayerInit {
     pub dist: Dist,
     pub scale: Scale,
     /// `true` なら 1 bucket 分だけ生成して全 bucket に同値を複製する。bucket 付き
-    /// Linear を全 bucket 同一初期値で始める方式 (nnue-pytorch StackedLinear) を表す。
+    /// Linear を全 bucket 同一初期値で始める方式を表す。
     pub per_bucket_repeat: bool,
     pub seed: u64,
 }
@@ -105,8 +106,8 @@ impl WeightShape {
     }
 }
 
-/// xorshift64。`(s >> 11) / 2^53` で `[0, 1)` の一様乱数を作る。`legacy` preset
-/// が呼ぶ `Uniform` + `Abs(0.01)` 経路は本実装で bit-identical な列を生成する。
+/// xorshift64。`(s >> 11) / 2^53` で `[0, 1)` の一様乱数を作る。既定初期化が呼ぶ
+/// `Uniform` + `Abs(0.01)` 経路は本実装で bit-identical な列を生成する。
 struct XorShift {
     s: u64,
 }
@@ -207,21 +208,10 @@ pub fn sample(shape: WeightShape, init: &LayerInit) -> Vec<f32> {
     }
 }
 
-/// 名前付き初期化 preset。CLI の `--init-preset` に対応する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InitPreset {
-    /// 全 weight を `[-0.01, 0.01]` 一様、LayerStack の bias は 0 (Simple は bias も
-    /// 一様)。tatara のデフォルト初期化。
-    Legacy,
-    /// nnue-pytorch 互換: weight/bias とも `uniform(-sqrt(1/fan_in), +sqrt(1/fan_in))`、
-    /// bucket 付き層は bucket 0 を全 bucket に複製、共有因子層と出力 bias は 0。
-    NnuePytorch,
-}
-
-// preset ごとの seed。legacy preset は固定 seed を使い、`--init-seed` の影響を
-// 受けずに常に同じ列を再現する。
-const LEGACY_LS_SEEDS: [u64; 5] = [0x100, 0x101, 0x102, 0x103, 0x104];
-const LEGACY_SIMPLE_SEEDS: [u64; 8] = [
+// 既定初期化の group 別固定 seed。`--init-{ft,l1,...}` override を併用しても seed は
+// この固定値を保つので、同じ override 指定なら常に同じ初期重み列を再現する。
+const DEFAULT_LS_SEEDS: [u64; 5] = [0x100, 0x101, 0x102, 0x103, 0x104];
+const DEFAULT_SIMPLE_SEEDS: [u64; 8] = [
     0x5071_e001,
     0x5071_e002,
     0x5071_e003,
@@ -232,20 +222,7 @@ const LEGACY_SIMPLE_SEEDS: [u64; 8] = [
     0x5071_e008,
 ];
 
-// 非 legacy preset / override 用の group 別 salt。base seed と xor して group ごとに
-// 異なる列にする。
-const SALT_FT_W: u64 = 0x0001;
-const SALT_FT_B: u64 = 0x0002;
-const SALT_L1_W: u64 = 0x0011;
-const SALT_L1_B: u64 = 0x0012;
-const SALT_L1F_W: u64 = 0x0021;
-const SALT_L1F_B: u64 = 0x0022;
-const SALT_L2_W: u64 = 0x0031;
-const SALT_L2_B: u64 = 0x0032;
-const SALT_L3_W: u64 = 0x0041;
-const SALT_L3_B: u64 = 0x0042;
-
-const LEGACY_HALF_WIDTH: f32 = 0.01;
+const DEFAULT_HALF_WIDTH: f32 = 0.01;
 
 /// LayerStack (FT → L1(+L1f) → L2 → L3、bucket 付き) の全 weight group の初期化指定。
 #[derive(Debug, Clone, Copy)]
@@ -263,58 +240,24 @@ pub struct LayerStackInit {
 }
 
 impl LayerStackInit {
-    pub fn from_preset(preset: InitPreset, base_seed: u64) -> Self {
-        match preset {
-            InitPreset::Legacy => Self::legacy(),
-            InitPreset::NnuePytorch => Self::nnue_pytorch(base_seed),
-        }
-    }
-
-    /// legacy 初期化: weight は `[-0.01, 0.01]` 一様 (固定 seed)、bias は全て 0。
-    pub fn legacy() -> Self {
+    /// 既定初期化: weight は `[-0.01, 0.01]` 一様 (固定 seed)、bias は全て 0。
+    pub fn default_uniform() -> Self {
         Self {
-            ft_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_LS_SEEDS[0]),
+            ft_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[0]),
             ft_b: LayerInit::zeroed(),
-            l1_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_LS_SEEDS[1]),
+            l1_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[1]),
             l1_b: LayerInit::zeroed(),
-            l1f_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_LS_SEEDS[2]),
+            l1f_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[2]),
             l1f_b: LayerInit::zeroed(),
-            l2_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_LS_SEEDS[3]),
+            l2_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[3]),
             l2_b: LayerInit::zeroed(),
-            l3_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_LS_SEEDS[4]),
+            l3_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[4]),
             l3_b: LayerInit::zeroed(),
         }
     }
 
-    /// nnue-pytorch 互換: FT と bucket 付き Linear は `uniform(±sqrt(1/fan_in))`
-    /// (weight/bias 共通)、bucket 付き層は bucket 0 を複製、共有因子層 (L1f) は 0、
-    /// 出力 (L3) bias は 0。
-    pub fn nnue_pytorch(base: u64) -> Self {
-        let unif = |salt: u64, repeat: bool| LayerInit::uniform_fan_in(1.0, repeat, base ^ salt);
-        // zeroed group にも salt 由来 seed を持たせる: `--init-l1f` 等の CLI override
-        // が `dist` だけ差し替えたとき、seed が group ごとに異なる前提で決定論性を
-        // 保てるようにするため (Zeroed のままなら `sample` が seed を読まないので
-        // 無効化されている)。
-        let zero = |salt: u64| LayerInit {
-            seed: base ^ salt,
-            ..LayerInit::zeroed()
-        };
-        Self {
-            ft_w: unif(SALT_FT_W, false),
-            ft_b: unif(SALT_FT_B, false),
-            l1_w: unif(SALT_L1_W, true),
-            l1_b: unif(SALT_L1_B, true),
-            l1f_w: zero(SALT_L1F_W),
-            l1f_b: zero(SALT_L1F_B),
-            l2_w: unif(SALT_L2_W, true),
-            l2_b: unif(SALT_L2_B, true),
-            l3_w: unif(SALT_L3_W, true),
-            l3_b: zero(SALT_L3_B),
-        }
-    }
-
     /// CLI override (重み側のみ) を該当 group に適用する。`per_bucket_repeat` と
-    /// `seed` は preset 値を保ち、`dist` / `scale` だけ差し替える。
+    /// `seed` は既定値を保ち、`dist` / `scale` だけ差し替える。
     pub fn apply_weight_override(&mut self, layer: WeightLayer, ov: LayerInitOverride) {
         let target = match layer {
             WeightLayer::Ft => &mut self.ft_w,
@@ -341,43 +284,17 @@ pub struct SimpleInit {
 }
 
 impl SimpleInit {
-    pub fn from_preset(preset: InitPreset, base_seed: u64) -> Self {
-        match preset {
-            InitPreset::Legacy => Self::legacy(),
-            InitPreset::NnuePytorch => Self::nnue_pytorch(base_seed),
-        }
-    }
-
-    /// legacy 初期化: weight・bias とも `[-0.01, 0.01]` 一様 (固定 seed)。
-    pub fn legacy() -> Self {
+    /// 既定初期化: weight・bias とも `[-0.01, 0.01]` 一様 (固定 seed)。
+    pub fn default_uniform() -> Self {
         Self {
-            ft_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[0]),
-            ft_b: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[1]),
-            l1_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[2]),
-            l1_b: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[3]),
-            l2_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[4]),
-            l2_b: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[5]),
-            l3_w: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[6]),
-            l3_b: LayerInit::uniform_abs(LEGACY_HALF_WIDTH, LEGACY_SIMPLE_SEEDS[7]),
-        }
-    }
-
-    /// nnue-pytorch 互換: 全 Linear が `uniform(±sqrt(1/fan_in))` (weight/bias 共通)、
-    /// 出力 (L3) bias のみ 0。bucket / 共有因子層を持たない。
-    pub fn nnue_pytorch(base: u64) -> Self {
-        let unif = |salt: u64| LayerInit::uniform_fan_in(1.0, false, base ^ salt);
-        Self {
-            ft_w: unif(SALT_FT_W),
-            ft_b: unif(SALT_FT_B),
-            l1_w: unif(SALT_L1_W),
-            l1_b: unif(SALT_L1_B),
-            l2_w: unif(SALT_L2_W),
-            l2_b: unif(SALT_L2_B),
-            l3_w: unif(SALT_L3_W),
-            l3_b: LayerInit {
-                seed: base ^ SALT_L3_B,
-                ..LayerInit::zeroed()
-            },
+            ft_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[0]),
+            ft_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[1]),
+            l1_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[2]),
+            l1_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[3]),
+            l2_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[4]),
+            l2_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[5]),
+            l3_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[6]),
+            l3_b: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_SIMPLE_SEEDS[7]),
         }
     }
 
@@ -433,9 +350,8 @@ impl LayerInitOverride {
 /// - `uniform:fanin` / `uniform:fanin:<gain>` / `uniform:fanin:<gain>:<effective>`
 /// - `normal:` も同じ scale 部を取る
 ///
-/// 例: `uniform:fanin` (nnue-pytorch FT、半値幅 `sqrt(1/fan_in)`)、
-/// `normal:fanin:2:32` (He-normal 風 FT、`std=sqrt(2/32)=0.25`)、
-/// `uniform:abs:0.01` (legacy preset と等価)。
+/// 例: `uniform:fanin` (半値幅 `sqrt(1/fan_in)`)、`normal:fanin:2:32`
+/// (He-normal 風、`std=sqrt(2/32)=0.25`)、`uniform:abs:0.01` (既定初期化と等価)。
 pub fn parse_layer_init_spec(spec: &str) -> Result<LayerInitOverride, String> {
     let parts: Vec<&str> = spec.split(':').collect();
     let bad = |msg: &str| {
@@ -512,9 +428,9 @@ pub fn parse_layer_init_spec(spec: &str) -> Result<LayerInitOverride, String> {
 mod tests {
     use super::*;
 
-    /// `legacy` preset と bit-identity 比較するための xorshift 参照実装
+    /// 既定の `±0.01` 一様初期化と bit-identity 比較するための xorshift 参照実装
     /// (`Dist::Uniform` + `Scale::Abs` と同じ算式を直接書き下す)。
-    fn legacy_xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
+    fn reference_xorshift_init(seed: u64, n: usize, scale: f32) -> Vec<f32> {
         let mut s = seed.max(1);
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
@@ -528,19 +444,19 @@ mod tests {
     }
 
     #[test]
-    fn uniform_abs_is_bit_identical_to_legacy_xorshift() {
+    fn uniform_abs_is_bit_identical_to_reference_xorshift() {
         for &(seed, n) in &[(0x100_u64, 37), (0x5071_e003, 1024), (1, 9)] {
             let got = sample(
                 WeightShape::flat(n, 99),
                 &LayerInit::uniform_abs(0.01, seed),
             );
-            let want = legacy_xorshift_init(seed, n, 0.01);
+            let want = reference_xorshift_init(seed, n, 0.01);
             assert_eq!(got, want, "seed={seed:#x} n={n}");
         }
     }
 
     #[test]
-    fn nnue_pytorch_ft_uniform_half_width_matches_sqrt_inv_fan_in() {
+    fn fanin_uniform_half_width_matches_sqrt_inv_fan_in() {
         let fan_in = 73_305usize;
         let init = LayerInit::uniform_fan_in(1.0, false, 0xABCD);
         let v = sample(WeightShape::flat(200_000, fan_in), &init);
@@ -555,7 +471,7 @@ mod tests {
             min >= -bound && min < -bound * 0.98,
             "min={min} bound={bound}"
         );
-        // 一様分布の std は半値幅 / sqrt(3)。0.00213 付近 (blog の値) を許容誤差で確認。
+        // 一様分布の std は半値幅 / sqrt(3) (fan_in=73305 で 0.00213 付近) を許容誤差で確認。
         let var = v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / v.len() as f64;
         let std = var.sqrt();
         let expected_std = (bound as f64) / 3.0_f64.sqrt();
@@ -621,32 +537,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_preset_layerstack_biases_are_zeroed() {
-        let p = LayerStackInit::legacy();
+    fn default_uniform_layerstack_biases_are_zeroed() {
+        let p = LayerStackInit::default_uniform();
         assert_eq!(p.ft_b.dist, Dist::Zeroed);
         assert_eq!(p.l1_b.dist, Dist::Zeroed);
         assert_eq!(p.l3_b.dist, Dist::Zeroed);
         assert_eq!(p.ft_w.scale, Scale::Abs(0.01));
-    }
-
-    #[test]
-    fn nnue_pytorch_preset_zeroes_l1f_and_l3_bias() {
-        let p = LayerStackInit::nnue_pytorch(0x1);
-        assert_eq!(p.l1f_w.dist, Dist::Zeroed);
-        assert_eq!(p.l1f_b.dist, Dist::Zeroed);
-        assert_eq!(p.l3_b.dist, Dist::Zeroed);
-        assert!(p.l1_w.per_bucket_repeat);
-        assert!(p.l2_w.per_bucket_repeat);
-        assert!(p.l3_w.per_bucket_repeat);
-        assert!(!p.ft_w.per_bucket_repeat);
-        assert_eq!(p.ft_w.dist, Dist::Uniform);
-        assert_eq!(
-            p.ft_w.scale,
-            Scale::FanIn {
-                gain: 1.0,
-                effective: None
-            }
-        );
     }
 
     #[test]
