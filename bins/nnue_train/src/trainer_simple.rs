@@ -1930,7 +1930,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                     }?;
                 } else {
@@ -1939,7 +1939,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W,
+                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                     }?;
                 }
@@ -1952,7 +1952,7 @@ impl SimpleGpuTrainer {
                         config: cfg_1d(ft_w_n as usize),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                     }?;
                 } else {
                     cuda_launch! {
@@ -1960,7 +1960,7 @@ impl SimpleGpuTrainer {
                         config: cfg_1d(ft_w_n as usize),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
-                               BETA1, BETA2, EPS, MIN_W, MAX_W, ft_w_n]
+                               BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                     }?;
                 }
             }
@@ -1973,43 +1973,43 @@ impl SimpleGpuTrainer {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
             args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
                    slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, ft_b_n]
+                   BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
             args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
                    slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l1_w_n]
+                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
             args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
                    slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l1_b_n]
+                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
             args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
                    slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l2_w_n]
+                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
             args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
                    slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l2_b_n]
+                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
             args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
                    slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l3_w_n]
+                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
         }?;
         cuda_launch! {
             kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
             args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
                    slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, MIN_W, MAX_W, l3_b_n]
+                   BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
         }?;
 
         if self.step_count.is_multiple_of(RANGER_K) {

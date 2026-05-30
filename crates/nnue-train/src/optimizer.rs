@@ -45,9 +45,10 @@ pub use gpu_kernels::pointwise::radam_step::radam_compute_step_size_denom;
 
 /// Ranger optimizer のハイパパラメータ。
 ///
-/// default (decay=0.01, beta1=0.99, beta2=0.999, min_weight=-1.98, max_weight=1.98,
-/// alpha=0.5, k=6) は本 trainer の標準設定。`radam_step` kernel が要求する
-/// eps + n_sma_threshold を field 化している。
+/// default (decay=0.01, beta1=0.99, beta2=0.999, alpha=0.5, k=6) は本 trainer の
+/// 標準設定。`radam_step` kernel が要求する eps + n_sma_threshold を field 化して
+/// いる。weight clip 範囲は layer (テンソル) ごとに量子化定数から導出する別概念
+/// なので本 struct には持たせない (kernel launch 時に per-group で渡す)。
 #[derive(Clone, Copy, Debug)]
 pub struct RangerParams {
     /// weight decay 係数 (AdamW-style decoupled decay)。
@@ -58,10 +59,6 @@ pub struct RangerParams {
     pub beta2: f32,
     /// 数値安定化用 epsilon (`1/sqrt(v)+eps`)。
     pub eps: f32,
-    /// weight clip 下限。
-    pub min_weight: f32,
-    /// weight clip 上限。
-    pub max_weight: f32,
     /// Lookahead lerp 係数 (`weights = alpha * weights + (1-alpha) * slow`)。
     pub alpha: f32,
     /// Lookahead lerp 周期 (`step % k == 0` で lerp 起動)。
@@ -79,8 +76,6 @@ impl RangerParams {
         beta1: 0.99,
         beta2: 0.999,
         eps: 1e-8,
-        min_weight: -1.98,
-        max_weight: 1.98,
         alpha: 0.5,
         k: 6,
         n_sma_threshold: 5.0,
@@ -363,14 +358,12 @@ mod tests {
     #[test]
     fn ranger_params_default_values() {
         let p = RangerParams::default();
-        // 標準 default: decay=0.01, beta1=0.99, beta2=0.999,
-        // min_weight=-1.98, max_weight=1.98, alpha=0.5, k=6,
-        // eps=1e-8, n_sma_threshold=5.0。
+        // 標準 default: decay=0.01, beta1=0.99, beta2=0.999, alpha=0.5, k=6,
+        // eps=1e-8, n_sma_threshold=5.0。weight clip 範囲は per-layer で別途渡す
+        // ので本 struct には含まない。
         assert_eq!(p.decay, 0.01);
         assert_eq!(p.beta1, 0.99);
         assert_eq!(p.beta2, 0.999);
-        assert_eq!(p.min_weight, -1.98);
-        assert_eq!(p.max_weight, 1.98);
         assert_eq!(p.alpha, 0.5);
         assert_eq!(p.k, 6);
         assert_eq!(p.eps, 1e-8);

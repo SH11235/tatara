@@ -300,10 +300,11 @@ pub(crate) struct Cli {
     /// quick, fast training; default OFF until production quality is confirmed
     /// by SPRT).
     ///
-    /// FT weights are small on every path — initialization, the optimizer's
-    /// MIN_W/MAX_W clamp (`|w| <= 1.98`), and the quantised checkpoint — so they
-    /// fit comfortably within the FP16 finite range (`|x| <= 65504`) and the
-    /// mirror conversion does not overflow to ±inf.
+    /// FT weights stay small in practice — small-scale initialization plus
+    /// AdamW weight decay keep the master FP32 magnitude orders of magnitude
+    /// below the FP16 finite range (`|x| <= 65504`), so the mirror conversion is
+    /// not expected to overflow to ±inf under normal training. There is no hard
+    /// clamp on FT, so `--ft-fp16` remains an opt-in precision trade-off.
     #[arg(long, global = true)]
     pub(crate) ft_fp16: bool,
 

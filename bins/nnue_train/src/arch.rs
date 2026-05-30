@@ -106,11 +106,35 @@ pub(crate) const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
 pub(crate) const BETA1: f32 = RANGER_DEFAULTS.beta1;
 pub(crate) const BETA2: f32 = RANGER_DEFAULTS.beta2;
 pub(crate) const EPS: f32 = RANGER_DEFAULTS.eps;
-pub(crate) const MIN_W: f32 = RANGER_DEFAULTS.min_weight;
-pub(crate) const MAX_W: f32 = RANGER_DEFAULTS.max_weight;
 pub(crate) const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
 pub(crate) const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
 pub(crate) const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
+
+// Per-layer training-time weight clamp。clamp 範囲は対象テンソルの量子化 dtype で
+// 決まる:
+//   - i8 dense weight (scale QB): `round(w·QB)` を [-128, 127] に量子化するため
+//     正側端点 127 で飽和 → 対称 clamp ±i8::MAX/QB (`W_CLAMP_QUANT_*`)。負側は
+//     厳密には -128/QB まで取れるが、nnue 系では対称 clamp が慣例。
+//   - i16 FT weight/bias (scale QA、CReLU/Pairwise=127 · SCReLU=255): 飽和は
+//     ±32767/QA で ~±128〜258、i32 bias / PSQT (scale QA·QB): ±2^31/8128 ≈ ±264k
+//     と事実上 unbounded → clamp 無し (`W_CLAMP_NONE_*`)
+// kernel launch ごとに対象テンソルの値を渡す。設計根拠は
+// docs/decisions/2026-05-31-per-layer-weight-clamp.md。QB=64 は LayerStack と
+// Simple 両 format で共通 (`nnue_format::{layerstack_weights,simple_weights}`)。
+
+/// i8 dense weight (L1 / L1f / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
+/// 据える L1 / L1f / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
+/// `round(w·QB)` の正側端点 (127) に対応する。
+pub(crate) const W_CLAMP_QUANT_MIN: f32 =
+    -(i8::MAX as f32) / nnue_format::layerstack_weights::QB as f32;
+pub(crate) const W_CLAMP_QUANT_MAX: f32 =
+    i8::MAX as f32 / nnue_format::layerstack_weights::QB as f32;
+
+/// clamp 無しのテンソル (FT weight/bias、L3 bias、PSQT) に渡す sentinel。
+/// `radam_step` の clamp 分岐 `p < min` / `p > max` は有限 weight に対し常に false
+/// になり no-op (kernel signature を変えずに「clamp skip」を表現する)。
+pub(crate) const W_CLAMP_NONE_MIN: f32 = f32::MIN;
+pub(crate) const W_CLAMP_NONE_MAX: f32 = f32::MAX;
 
 // smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / in offset 270 /
 // nnue2score 600 / target offset 270 / target scaling 380)。
