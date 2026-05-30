@@ -316,6 +316,10 @@ pub(crate) struct SimpleGpuTrainer {
     ws: SimpleGpuWorkspace,
     /// loss kernel が atomic add する Σerr² (f64、1 要素)。
     loss_acc: DeviceBuffer<f64>,
+    /// extended WRM loss の per-position weight 和 Σw (f64、1 要素)。`wrm_weight_sum`
+    /// kernel が atomic add し、`loss_wrm` の extended 経路が `1/Σw` 正規化に読む。
+    /// 二乗誤差経路では未使用 (常に 0)。
+    weight_sum_acc: DeviceBuffer<f64>,
     /// `--ft-fp16-out` 経路で `simple_act_grad_to_fp16_*_with_scale` が `dft_scale *
     /// grad` を `±65504` に cap した要素数の cumulative atomic counter (len 1)。
     /// `--monitor-fp16-clamps` 時に host が sb 末で D2H read、`[fp16-clamp]` line に
@@ -492,6 +496,7 @@ impl SimpleGpuTrainer {
             l3_b_slow,
             ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            weight_sum_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
@@ -750,8 +755,9 @@ impl SimpleGpuTrainer {
             copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
         }
 
-        // -- loss_acc を 0 にリセット (再 alloc 無し) --
+        // -- loss_acc / weight_sum_acc を 0 にリセット (再 alloc 無し) --
         memset_zero(&self.stream, &self.loss_acc)?;
+        memset_zero(&self.stream, &self.weight_sum_acc)?;
         tick("h2d_reset", &self.stream, &mut prof_t0)?;
 
         // -- sparse_ft_forward × 2 (stm, nstm)。1 thread = 4 row。
@@ -1193,7 +1199,29 @@ impl SimpleGpuTrainer {
                 in_offset,
                 target_offset,
                 target_scaling,
+                pow_exp,
+                qp_asymmetry,
+                weight_boost_w1,
+                weight_boost_w2,
             } => {
+                // extended (nnue-pytorch 一般化) loss は Σw 正規化を要するので、先に
+                // wrm_weight_sum で Σw を確定させる。既定の拡張パラメータでは二乗誤差に
+                // 帰着し weight_sum を launch せず bit-identical 経路を通す。
+                let extended = loss.wrm_extended();
+                if extended {
+                    cuda_launch! {
+                        kernel: wrm_weight_sum,
+                        stream: self.stream,
+                        module: self.module,
+                        config: cfg_1d(b),
+                        args: [
+                            slice(self.ws.score_dev),
+                            slice(self.weight_sum_acc),
+                            weight_boost_w1, weight_boost_w2,
+                            target_offset, target_scaling, b_u32
+                        ]
+                    }?;
+                }
                 cuda_launch! {
                     kernel: loss_wrm,
                     stream: self.stream,
@@ -1208,7 +1236,11 @@ impl SimpleGpuTrainer {
                         slice(self.loss_acc),
                         wdl_lambda,
                         nnue2score, in_scaling, in_offset,
-                        target_offset, target_scaling, b_u32
+                        target_offset, target_scaling,
+                        pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
+                        slice(self.weight_sum_acc),
+                        if extended { 1_u32 } else { 0_u32 },
+                        b_u32
                     ]
                 }?;
             }

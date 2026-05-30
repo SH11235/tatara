@@ -173,4 +173,4 @@ target/release/nnue-train --data <PSV> \
 - [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) — LayerStack の bucket 係数の学習と確認
 - [held-out validation](held-out-validation.ja.md) — `test_loss` / `test_acc` の有効化と指標の読み方
 - [学習スケジュール](training-schedule.ja.md) — 学習率と WDL lambda のスケジューリング
-- [WRM loss のチューニング](wrm-loss-tuning.ja.md) — WRM の変換式と 5 つの調整引数
+- [WRM loss のチューニング](wrm-loss-tuning.ja.md) — WRM の変換式と調整引数 (勝率変換 + loss の一般化)

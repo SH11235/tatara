@@ -100,6 +100,10 @@ pub(crate) struct GpuTrainer {
 
     // loss + step
     loss_acc: DeviceBuffer<f64>,
+    /// extended WRM loss の per-position weight 和 Σw (f64、1 要素)。`wrm_weight_sum`
+    /// kernel が atomic add し、`loss_wrm` の extended 経路が `1/Σw` 正規化に読む。
+    /// 二乗誤差経路では未使用 (常に 0)。
+    weight_sum_acc: DeviceBuffer<f64>,
     /// `--ft-fp16-out` 経路で `ft_post_perspective_grad_fused_fp16` /
     /// `ft_post_perspective_grad_fp16` が `dft_scale * grad` を `±65504` に cap した
     /// 要素数の cumulative atomic counter (len 1)。`--monitor-fp16-clamps` 時に
@@ -646,6 +650,7 @@ impl GpuTrainer {
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
+            weight_sum_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
@@ -1555,8 +1560,9 @@ impl GpuTrainer {
         )?;
         // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
-        // loss_acc reset (accumulate semantics、再 alloc せず memset)
+        // loss_acc / weight_sum_acc reset (accumulate semantics、再 alloc せず memset)
         memset_zero(&self.stream, &self.loss_acc)?;
+        memset_zero(&self.stream, &self.weight_sum_acc)?;
         prof_tick!("h2d+reset");
 
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
@@ -2029,7 +2035,29 @@ impl GpuTrainer {
                 in_offset,
                 target_offset,
                 target_scaling,
+                pow_exp,
+                qp_asymmetry,
+                weight_boost_w1,
+                weight_boost_w2,
             } => {
+                // extended (nnue-pytorch 一般化) loss は Σw 正規化を要するので、先に
+                // wrm_weight_sum で Σw を確定させる。既定の拡張パラメータでは二乗誤差に
+                // 帰着し weight_sum を launch せず bit-identical 経路を通す。
+                let extended = loss.wrm_extended();
+                if extended {
+                    cuda_launch! {
+                        kernel: wrm_weight_sum,
+                        stream: self.stream,
+                        module: self.module,
+                        config: cfg_1d(b),
+                        args: [
+                            slice(self.ws.score_dev),
+                            slice(self.weight_sum_acc),
+                            weight_boost_w1, weight_boost_w2,
+                            target_offset, target_scaling, b_u32
+                        ]
+                    }?;
+                }
                 cuda_launch! {
                     kernel: loss_wrm,
                     stream: self.stream,
@@ -2043,7 +2071,11 @@ impl GpuTrainer {
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda, nnue2score, in_scaling, in_offset,
-                        target_offset, target_scaling, b_u32
+                        target_offset, target_scaling,
+                        pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
+                        slice(self.weight_sum_acc),
+                        if extended { 1_u32 } else { 0_u32 },
+                        b_u32
                     ]
                 }?;
             }

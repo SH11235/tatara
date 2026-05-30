@@ -128,4 +128,8 @@ pub(crate) const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     in_offset: 270.0,
     target_offset: 270.0,
     target_scaling: 380.0,
+    pow_exp: 2.0,
+    qp_asymmetry: 0.0,
+    weight_boost_w1: 0.0,
+    weight_boost_w2: 0.5,
 };

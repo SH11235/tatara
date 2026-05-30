@@ -39,6 +39,7 @@ use gpu_kernels::layerstack::{
     ft_post_perspective::{ft_post_perspective_fwd_cpu, ft_post_perspective_grad_cpu},
     slice2d::{slice_extract_2d_cpu, slice_scatter_2d_cpu},
 };
+use gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu;
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
 
 /// forward / gradient の f32 tolerance。
@@ -2239,5 +2240,161 @@ fn bias_grad_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std
             TOL,
         );
     }
+    Ok(())
+}
+
+// -- loss_wrm (win-rate-model loss) -------------------------------------
+
+/// WRM loss の固定パラメータ (`SMOKE_LOSS_WRM` と同じ sigmoid 定数)。
+const WRM_NNUE2SCORE: f32 = 600.0;
+const WRM_IN_SCALING: f32 = 340.0;
+const WRM_IN_OFFSET: f32 = 270.0;
+const WRM_TARGET_OFFSET: f32 = 270.0;
+const WRM_TARGET_SCALING: f32 = 380.0;
+
+/// `loss_wrm` の default 経路 (`extended=0`、二乗誤差) が CPU reference と一致する。
+#[test]
+fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let out = vec![0.3_f32, -0.8, 2.5, -0.05];
+    let score = vec![150.0_f32, -1200.0, 30.0, 5000.0];
+    let wdl = vec![1.0_f32, 0.0, 0.5, 1.0];
+    let b = out.len();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        2.0,
+        0.0,
+        0.0,
+        0.5,
+        false,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    // libdevice exp と std exp の差で grad は ~ulp レベルずれるため relative tolerance。
+    assert_close_rel(
+        "loss_wrm/default grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        1e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 1e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/default loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
+    Ok(())
+}
+
+/// `loss_wrm` の extended 経路 (`extended=1`、pow_exp / qp_asymmetry / weight boost +
+/// Σw 正規化) が CPU reference と一致する。`wrm_weight_sum` で Σw を先に reduce してから
+/// `loss_wrm` を launch する (host の trainer と同じ 2 段構成)。`f32::powf` の libdevice
+/// lowering もここで実機検証する。
+#[test]
+fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let out = vec![0.4_f32, -1.1, 0.05, 2.0, -0.3, 1.2];
+    let score = vec![300.0_f32, -700.0, 50.0, -2500.0, 1800.0, -40.0];
+    let wdl = vec![1.0_f32, 0.0, 0.5, 0.0, 1.0, 0.5];
+    let b = out.len();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+    let pow_exp = 2.5_f32;
+    let qp = 0.3_f32;
+    let w1 = 1.0_f32;
+    let w2 = 0.5_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        pow_exp,
+        qp,
+        w1,
+        w2,
+        true,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(score_dev), slice(sum_w_dev), w1, w2,
+            WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
+        ]
+    }?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    // exp / powf の libdevice 差が sigmoid → weight → Σw → 正規化と多段で乗るため
+    // relative tolerance を default 経路より少し緩める。
+    assert_close_rel(
+        "loss_wrm/extended grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        2e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 2e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/extended loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
     Ok(())
 }

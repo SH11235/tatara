@@ -89,13 +89,44 @@ pub enum LossKind {
     /// - `target_offset` = `--wrm-target-offset` (既定 270、WRM target sigmoid の中心)
     /// - `target_scaling` = `--wrm-target-scaling` (既定 380、WRM target sigmoid の
     ///   入力スケール)
+    ///
+    /// 以下は nnue-pytorch `calculate_sf_loss` の一般化 loss パラメータ。既定値
+    /// (`pow_exp=2 / qp_asymmetry=0 / weight_boost_w1=0`) では plain な二乗誤差に
+    /// 帰着し、loss kernel の bit-identical 経路を通る。
+    /// - `pow_exp` = `--loss-pow-exp` (既定 2.0、誤差の冪)
+    /// - `qp_asymmetry` = `--loss-qp-asymmetry` (既定 0.0、`qf > target` の過大評価
+    ///   ペナルティ係数)
+    /// - `weight_boost_w1` / `weight_boost_w2` = `--loss-weight-boost-w1` /
+    ///   `--loss-weight-boost-w2` (既定 0.0 / 0.5、決着寄り局面の loss 重み増幅。
+    ///   `w1=0` で weight≡1)
     Wrm {
         nnue2score: f32,
         in_scaling: f32,
         in_offset: f32,
         target_offset: f32,
         target_scaling: f32,
+        pow_exp: f32,
+        qp_asymmetry: f32,
+        weight_boost_w1: f32,
+        weight_boost_w2: f32,
     },
+}
+
+impl LossKind {
+    /// extended (nnue-pytorch 一般化) loss 経路が必要か。既定の拡張パラメータ
+    /// (`pow_exp=2 / qp_asymmetry=0 / weight_boost_w1=0`) では二乗誤差に帰着するため
+    /// `false` を返し、loss kernel は bit-identical な default 経路を通る。
+    pub fn wrm_extended(&self) -> bool {
+        match *self {
+            LossKind::Sigmoid { .. } => false,
+            LossKind::Wrm {
+                pow_exp,
+                qp_asymmetry,
+                weight_boost_w1,
+                ..
+            } => pow_exp != 2.0 || qp_asymmetry != 0.0 || weight_boost_w1 != 0.0,
+        }
+    }
 }
 
 impl LossKind {
@@ -115,6 +146,10 @@ impl LossKind {
                 in_offset,
                 target_offset,
                 target_scaling,
+                pow_exp,
+                qp_asymmetry,
+                weight_boost_w1,
+                weight_boost_w2,
             } => {
                 if !nnue2score.is_finite() || nnue2score <= 0.0 {
                     return Err(io::Error::other(format!(
@@ -141,6 +176,36 @@ impl LossKind {
                         "wrm target_scaling must be finite and > 0 (got {target_scaling})"
                     )));
                 }
+                // pow_exp は誤差 |err| の冪。grad は |err|^(pow_exp-1) を含むので
+                // pow_exp >= 1 でないと err→0 で発散する (既定 2.0)。
+                if !pow_exp.is_finite() || pow_exp < 1.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm pow_exp must be finite and >= 1 (got {pow_exp})"
+                    )));
+                }
+                // qp_asymmetry は過大評価 (qf > target) の追加ペナルティで >= 0。負値は
+                // asym = 1 + qp_asymmetry を 1 未満にし、<= -1 では asym <= 0 で当該局面の
+                // loss が負・勾配符号が反転する (最適化が逆方向に進む) ため reject する。
+                if !qp_asymmetry.is_finite() || qp_asymmetry < 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm qp_asymmetry must be finite and >= 0 (got {qp_asymmetry})"
+                    )));
+                }
+                // weight boost は決着寄り局面の重みを増幅する用途で w1/w2 >= 0。w1 < 0
+                // は重み < 1 の de-emphasis で boost の意図に反し、w2 < 0 は weight base
+                // が 0 (pf=0.5 や飽和) のとき `0^負 = inf` を生むため reject する。
+                // w1,w2 >= 0 なら weight >= 1、Σw >= n > 0 が保証され loss_wrm の 1/Σw が
+                // 安全になる。
+                if !weight_boost_w1.is_finite() || weight_boost_w1 < 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm weight_boost_w1 must be finite and >= 0 (got {weight_boost_w1})"
+                    )));
+                }
+                if !weight_boost_w2.is_finite() || weight_boost_w2 < 0.0 {
+                    return Err(io::Error::other(format!(
+                        "wrm weight_boost_w2 must be finite and >= 0 (got {weight_boost_w2})"
+                    )));
+                }
             }
         }
         Ok(())
@@ -157,11 +222,17 @@ impl std::fmt::Display for LossKind {
                 in_offset,
                 target_offset,
                 target_scaling,
+                pow_exp,
+                qp_asymmetry,
+                weight_boost_w1,
+                weight_boost_w2,
             } => write!(
                 f,
                 "wrm(nnue2score={nnue2score}, in_scaling={in_scaling}, \
                  in_offset={in_offset}, target_offset={target_offset}, \
-                 target_scaling={target_scaling})"
+                 target_scaling={target_scaling}, pow_exp={pow_exp}, \
+                 qp_asymmetry={qp_asymmetry}, weight_boost_w1={weight_boost_w1}, \
+                 weight_boost_w2={weight_boost_w2})"
             ),
         }
     }
@@ -1266,6 +1337,10 @@ mod tests {
             wrm_nnue2score: None,
             wrm_target_offset: None,
             wrm_target_scaling: None,
+            wrm_pow_exp: None,
+            wrm_qp_asymmetry: None,
+            wrm_weight_boost_w1: None,
+            wrm_weight_boost_w2: None,
             score_drop_abs: None,
             init_from: None,
             init_preset: None,
@@ -1854,7 +1929,11 @@ mod tests {
                     in_scaling: 340.0,
                     in_offset: 270.0,
                     target_offset: 270.0,
-                    target_scaling: 380.0
+                    target_scaling: 380.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
                 },
                 ..base_cfg()
             }
@@ -1868,7 +1947,11 @@ mod tests {
                     in_scaling: 340.0,
                     in_offset: 270.0,
                     target_offset: 270.0,
-                    target_scaling: 380.0
+                    target_scaling: 380.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
                 },
                 ..base_cfg()
             }
@@ -1882,7 +1965,11 @@ mod tests {
                     in_scaling: -1.0,
                     in_offset: 270.0,
                     target_offset: 270.0,
-                    target_scaling: 380.0
+                    target_scaling: 380.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
                 },
                 ..base_cfg()
             }
@@ -1897,7 +1984,11 @@ mod tests {
                     in_scaling: 340.0,
                     in_offset: 270.0,
                     target_offset: 270.0,
-                    target_scaling: 0.0
+                    target_scaling: 0.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
                 },
                 ..base_cfg()
             }
@@ -1912,13 +2003,101 @@ mod tests {
                     in_scaling: 340.0,
                     in_offset: f32::NAN,
                     target_offset: 270.0,
-                    target_scaling: 380.0
+                    target_scaling: 380.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
                 },
                 ..base_cfg()
             }
             .validate()
             .is_err()
         );
+        // 拡張パラメータ (pow_exp / qp_asymmetry / weight boost) を有効化した WRM は ok。
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0,
+                    in_offset: 270.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0,
+                    pow_exp: 2.5,
+                    qp_asymmetry: 0.3,
+                    weight_boost_w1: 1.0,
+                    weight_boost_w2: 0.5
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // pow_exp < 1 は grad が err→0 で発散するので reject。
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0,
+                    in_offset: 270.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0,
+                    pow_exp: 0.5,
+                    qp_asymmetry: 0.0,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        // 拡張パラメータの非有限値は reject。
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0,
+                    in_offset: 270.0,
+                    target_offset: 270.0,
+                    target_scaling: 380.0,
+                    pow_exp: 2.0,
+                    qp_asymmetry: f32::NAN,
+                    weight_boost_w1: 0.0,
+                    weight_boost_w2: 0.5
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        // 拡張パラメータの負値は reject: qp_asymmetry<0 (asym<=0 で勾配反転)、weight
+        // boost の w1<0 (de-emphasis) / w2<0 (weight base 0 で inf)。
+        for (qp, w1, w2) in [
+            (-2.0_f32, 0.0_f32, 0.5_f32),
+            (0.0, -1.0, 0.5),
+            (0.0, 0.0, -0.5),
+        ] {
+            assert!(
+                TrainingConfig {
+                    loss: LossKind::Wrm {
+                        nnue2score: 600.0,
+                        in_scaling: 340.0,
+                        in_offset: 270.0,
+                        target_offset: 270.0,
+                        target_scaling: 380.0,
+                        pow_exp: 2.0,
+                        qp_asymmetry: qp,
+                        weight_boost_w1: w1,
+                        weight_boost_w2: w2
+                    },
+                    ..base_cfg()
+                }
+                .validate()
+                .is_err(),
+                "qp={qp} w1={w1} w2={w2} must be rejected"
+            );
+        }
         // score-drop-abs は >= 1。0 や負値は「全 position を drop」になるので reject。
         assert!(
             TrainingConfig {

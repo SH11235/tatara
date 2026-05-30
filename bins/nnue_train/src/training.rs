@@ -95,46 +95,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     // loss kernel の選択: --win-rate-model → loss_wrm、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
-        if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
-            return Err(format!(
-                "--wrm-in-scaling must be finite and > 0 (got {})",
-                cli.wrm_in_scaling
-            )
-            .into());
-        }
-        if !cli.wrm_in_offset.is_finite() {
-            return Err(
-                format!("--wrm-in-offset must be finite (got {})", cli.wrm_in_offset).into(),
-            );
-        }
-        if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
-            return Err(format!(
-                "--wrm-nnue2score must be finite and > 0 (got {})",
-                cli.wrm_nnue2score
-            )
-            .into());
-        }
-        if !cli.wrm_target_offset.is_finite() {
-            return Err(format!(
-                "--wrm-target-offset must be finite (got {})",
-                cli.wrm_target_offset
-            )
-            .into());
-        }
-        if !(cli.wrm_target_scaling.is_finite() && cli.wrm_target_scaling > 0.0) {
-            return Err(format!(
-                "--wrm-target-scaling must be finite and > 0 (got {})",
-                cli.wrm_target_scaling
-            )
-            .into());
-        }
-        LossKind::Wrm {
-            nnue2score: cli.wrm_nnue2score,
-            in_scaling: cli.wrm_in_scaling,
-            in_offset: cli.wrm_in_offset,
-            target_offset: cli.wrm_target_offset,
-            target_scaling: cli.wrm_target_scaling,
-        }
+        build_wrm_loss(cli)?
     } else {
         if !(cli.scale.is_finite() && cli.scale > 0.0) {
             return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
@@ -621,6 +582,88 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
+/// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
+/// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
+/// layerstack / simple 両 entry で共有するこの helper で前段に行う。
+pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::Error>> {
+    if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
+        return Err(format!(
+            "--wrm-in-scaling must be finite and > 0 (got {})",
+            cli.wrm_in_scaling
+        )
+        .into());
+    }
+    if !cli.wrm_in_offset.is_finite() {
+        return Err(format!("--wrm-in-offset must be finite (got {})", cli.wrm_in_offset).into());
+    }
+    if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
+        return Err(format!(
+            "--wrm-nnue2score must be finite and > 0 (got {})",
+            cli.wrm_nnue2score
+        )
+        .into());
+    }
+    if !cli.wrm_target_offset.is_finite() {
+        return Err(format!(
+            "--wrm-target-offset must be finite (got {})",
+            cli.wrm_target_offset
+        )
+        .into());
+    }
+    if !(cli.wrm_target_scaling.is_finite() && cli.wrm_target_scaling > 0.0) {
+        return Err(format!(
+            "--wrm-target-scaling must be finite and > 0 (got {})",
+            cli.wrm_target_scaling
+        )
+        .into());
+    }
+    // pow_exp は誤差 |err| の冪。grad は |err|^(pow_exp-1) を含むので pow_exp >= 1 が要る。
+    if !(cli.loss_pow_exp.is_finite() && cli.loss_pow_exp >= 1.0) {
+        return Err(format!(
+            "--loss-pow-exp must be finite and >= 1 (got {})",
+            cli.loss_pow_exp
+        )
+        .into());
+    }
+    // qp_asymmetry は過大評価の追加ペナルティで >= 0。<= -1 では asym <= 0 となり当該
+    // 局面の loss が負・勾配が反転するため reject する。
+    if !(cli.loss_qp_asymmetry.is_finite() && cli.loss_qp_asymmetry >= 0.0) {
+        return Err(format!(
+            "--loss-qp-asymmetry must be finite and >= 0 (got {})",
+            cli.loss_qp_asymmetry
+        )
+        .into());
+    }
+    // weight boost は w1/w2 >= 0 (重み増幅用途)。w2 < 0 は weight base 0 で `0^負 = inf`
+    // を生み、w1 < 0 は de-emphasis で boost の意図に反する。w1,w2 >= 0 で weight >= 1、
+    // Σw >= n > 0 が保証される。
+    if !(cli.loss_weight_boost_w1.is_finite() && cli.loss_weight_boost_w1 >= 0.0) {
+        return Err(format!(
+            "--loss-weight-boost-w1 must be finite and >= 0 (got {})",
+            cli.loss_weight_boost_w1
+        )
+        .into());
+    }
+    if !(cli.loss_weight_boost_w2.is_finite() && cli.loss_weight_boost_w2 >= 0.0) {
+        return Err(format!(
+            "--loss-weight-boost-w2 must be finite and >= 0 (got {})",
+            cli.loss_weight_boost_w2
+        )
+        .into());
+    }
+    Ok(LossKind::Wrm {
+        nnue2score: cli.wrm_nnue2score,
+        in_scaling: cli.wrm_in_scaling,
+        in_offset: cli.wrm_in_offset,
+        target_offset: cli.wrm_target_offset,
+        target_scaling: cli.wrm_target_scaling,
+        pow_exp: cli.loss_pow_exp,
+        qp_asymmetry: cli.loss_qp_asymmetry,
+        weight_boost_w1: cli.loss_weight_boost_w1,
+        weight_boost_w2: cli.loss_weight_boost_w2,
+    })
+}
+
 /// CLI フラグから WDL lambda scheduler を構築する。`--start-wdl` と `--end-wdl`
 /// を両方指定すると `start → end` の線形 taper、いずれも未指定なら `--wdl` の
 /// 一定 lambda になる。片方だけの指定は error。`--wdl` と `--start-wdl` /
@@ -850,6 +893,10 @@ pub(crate) fn build_experiment_logger(
         wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
         wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
+        wrm_pow_exp: is_wrm.then(|| finite_or_zero(cli.loss_pow_exp)),
+        wrm_qp_asymmetry: is_wrm.then(|| finite_or_zero(cli.loss_qp_asymmetry)),
+        wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
+        wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
@@ -992,6 +1039,10 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
         wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
+        wrm_pow_exp: is_wrm.then(|| finite_or_zero(cli.loss_pow_exp)),
+        wrm_qp_asymmetry: is_wrm.then(|| finite_or_zero(cli.loss_qp_asymmetry)),
+        wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
+        wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
@@ -1187,46 +1238,7 @@ pub(crate) fn run_simple_training(
         return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
     }
     let loss = if cli.win_rate_model {
-        if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
-            return Err(format!(
-                "--wrm-in-scaling must be finite and > 0 (got {})",
-                cli.wrm_in_scaling
-            )
-            .into());
-        }
-        if !cli.wrm_in_offset.is_finite() {
-            return Err(
-                format!("--wrm-in-offset must be finite (got {})", cli.wrm_in_offset).into(),
-            );
-        }
-        if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
-            return Err(format!(
-                "--wrm-nnue2score must be finite and > 0 (got {})",
-                cli.wrm_nnue2score
-            )
-            .into());
-        }
-        if !cli.wrm_target_offset.is_finite() {
-            return Err(format!(
-                "--wrm-target-offset must be finite (got {})",
-                cli.wrm_target_offset
-            )
-            .into());
-        }
-        if !(cli.wrm_target_scaling.is_finite() && cli.wrm_target_scaling > 0.0) {
-            return Err(format!(
-                "--wrm-target-scaling must be finite and > 0 (got {})",
-                cli.wrm_target_scaling
-            )
-            .into());
-        }
-        LossKind::Wrm {
-            nnue2score: cli.wrm_nnue2score,
-            in_scaling: cli.wrm_in_scaling,
-            in_offset: cli.wrm_in_offset,
-            target_offset: cli.wrm_target_offset,
-            target_scaling: cli.wrm_target_scaling,
-        }
+        build_wrm_loss(cli)?
     } else {
         LossKind::Sigmoid {
             scale: 1.0 / cli.scale,

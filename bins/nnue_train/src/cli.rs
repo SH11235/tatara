@@ -253,6 +253,30 @@ pub(crate) struct Cli {
     /// `--win-rate-model` is set.
     #[arg(long, default_value_t = 380.0, global = true)]
     pub(crate) wrm_target_scaling: f32,
+    /// Exponent of the WRM error term `|qf - target|^pow_exp` (default 2.0, plain
+    /// squared error). nnue-pytorch uses 2.5. Must be >= 1 (the gradient contains
+    /// `|err|^(pow_exp-1)`). Used only when `--win-rate-model` is set; the default
+    /// 2.0 keeps the loss kernel on its bit-identical squared-error path.
+    #[arg(long, default_value_t = 2.0, global = true)]
+    pub(crate) loss_pow_exp: f32,
+    /// Asymmetric penalty for overprediction (default 0.0 = symmetric; must be
+    /// non-negative). When set, positions where the prediction `qf` exceeds the
+    /// target are weighted by `1 + qp_asymmetry`. Used only when
+    /// `--win-rate-model` is set.
+    #[arg(long, default_value_t = 0.0, global = true)]
+    pub(crate) loss_qp_asymmetry: f32,
+    /// Weight-boost parameter w1 (default 0.0, must be >= 0). Per-position loss
+    /// weight is `1 + (2^w1 - 1) * ((pf-0.5)^2 * pf*(1-pf))^w2`, amplifying
+    /// decisive positions; `w1 = 0` gives uniform weight 1 (no boost). The total
+    /// loss is then normalised by the sum of weights. Used only when
+    /// `--win-rate-model` is set.
+    #[arg(long, default_value_t = 0.0, global = true)]
+    pub(crate) loss_weight_boost_w1: f32,
+    /// Weight-boost parameter w2 (default 0.5, the exponent in the weight
+    /// formula, must be >= 0). Has no effect when `--loss-weight-boost-w1` is 0.
+    /// Used only when `--win-rate-model` is set.
+    #[arg(long, default_value_t = 0.5, global = true)]
+    pub(crate) loss_weight_boost_w2: f32,
     /// Optimizer name (only "ranger" is implemented).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
