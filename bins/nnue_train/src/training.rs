@@ -5,7 +5,7 @@ use nnue_format::LayerStackWeights;
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{StepLR, WdlSchedulerEnum};
+use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec};
@@ -363,11 +363,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
 
-    let lr_scheduler = StepLR {
-        start: cli.lr,
-        gamma: cli.lr_gamma,
-        step: cli.lr_step.max(1),
-    };
+    let lr_scheduler = build_lr_scheduler(cli)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
@@ -402,6 +398,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         resumed_superbatch,
         resume_parent_id,
         data,
+        lr_scheduler.to_string(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
@@ -444,6 +441,123 @@ pub(crate) fn layerstack_architecture(
     num_buckets: usize,
 ) -> String {
     format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{num_buckets}bucket")
+}
+
+/// `--lr-schedule` と関連 flag から runtime LR scheduler を構築する。`--lr` /
+/// `--lr-gamma` の finite/正値検証は caller 側で済ませている前提で、ここでは
+/// schedule 固有 flag (decay 終端 / one-cycle 係数 / warmup) を検証する。
+/// LayerStack / Simple 両 driver が同じ配線を共有するための単一エントリポイント。
+///
+/// linear/cosine/exponential の終端 (`--lr-final-superbatch` 未指定時) と one-cycle
+/// の total horizon は `--superbatches` から決まるため、resume で `--superbatches` を
+/// 変えると同じ superbatch でも返す lr が変わる (曲線が伸縮する)。step は horizon を
+/// 持たず `--superbatches` に依存しないので影響を受けない。
+pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+    use nnue_train::schedule::*;
+
+    let lr = cli.lr;
+    // linear / cosine / exponential の減衰終端 superbatch。未指定なら run 全体。
+    let final_superbatch = cli.lr_final_superbatch.unwrap_or(cli.superbatches);
+
+    let base = match cli.lr_schedule {
+        LrScheduleArg::Step => LrSchedulerEnum::Step(StepLR {
+            start: lr,
+            gamma: cli.lr_gamma,
+            step: cli.lr_step.max(1),
+        }),
+        LrScheduleArg::Constant => LrSchedulerEnum::Constant(ConstantLR { value: lr }),
+        LrScheduleArg::Drop => LrSchedulerEnum::Drop(DropLR {
+            start: lr,
+            gamma: cli.lr_gamma,
+            drop: cli.lr_step,
+        }),
+        LrScheduleArg::Linear => {
+            validate_decay(cli.lr_final, final_superbatch, false)?;
+            LrSchedulerEnum::LinearDecay(LinearDecayLR {
+                initial_lr: lr,
+                final_lr: cli.lr_final,
+                final_superbatch,
+            })
+        }
+        LrScheduleArg::Cosine => {
+            validate_decay(cli.lr_final, final_superbatch, false)?;
+            LrSchedulerEnum::CosineDecay(CosineDecayLR {
+                initial_lr: lr,
+                final_lr: cli.lr_final,
+                final_superbatch,
+            })
+        }
+        LrScheduleArg::Exponential => {
+            validate_decay(cli.lr_final, final_superbatch, true)?;
+            LrSchedulerEnum::ExponentialDecay(ExponentialDecayLR {
+                initial_lr: lr,
+                final_lr: cli.lr_final,
+                final_superbatch,
+            })
+        }
+        LrScheduleArg::OneCycle => {
+            if !cli.lr_warmup_pct.is_finite() || !(0.0..=1.0).contains(&cli.lr_warmup_pct) {
+                return Err(format!(
+                    "--lr-warmup-pct must be finite and in [0.0, 1.0] (got {})",
+                    cli.lr_warmup_pct
+                )
+                .into());
+            }
+            if !(cli.lr_div_factor.is_finite() && cli.lr_div_factor >= 1.0) {
+                return Err(format!(
+                    "--lr-div-factor must be finite and >= 1 (got {}); the initial LR is \
+                     --lr / --lr-div-factor and must not exceed the peak --lr",
+                    cli.lr_div_factor
+                )
+                .into());
+            }
+            if !(cli.lr_final_div_factor.is_finite() && cli.lr_final_div_factor > 0.0) {
+                return Err(format!(
+                    "--lr-final-div-factor must be finite and > 0 (got {})",
+                    cli.lr_final_div_factor
+                )
+                .into());
+            }
+            LrSchedulerEnum::OneCycle(OneCycleLR::new(
+                lr,
+                cli.lr_warmup_pct,
+                cli.lr_div_factor,
+                cli.lr_final_div_factor,
+                cli.superbatches.max(1),
+            ))
+        }
+    };
+
+    match cli.lr_warmup_steps {
+        Some(_) if matches!(cli.lr_schedule, LrScheduleArg::OneCycle) => Err(
+            "--lr-warmup-steps cannot be combined with --lr-schedule one-cycle \
+             (one-cycle carries its own warmup)"
+                .into(),
+        ),
+        Some(w) => Ok(base.with_warmup(w)),
+        None => Ok(base),
+    }
+}
+
+/// linear / cosine / exponential 減衰の終端パラメータを検証する。`require_positive`
+/// は exponential 用 (幾何補間 `(final/initial)^lambda` のため `final_lr > 0` を要求)。
+fn validate_decay(
+    final_lr: f32,
+    final_superbatch: usize,
+    require_positive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !final_lr.is_finite() || final_lr < 0.0 {
+        return Err(format!("--lr-final must be finite and >= 0 (got {final_lr})").into());
+    }
+    if require_positive && final_lr <= 0.0 {
+        return Err(
+            "--lr-schedule exponential requires --lr-final > 0 (geometric interpolation)".into(),
+        );
+    }
+    if final_superbatch == 0 {
+        return Err("--lr-final-superbatch must be >= 1".into());
+    }
+    Ok(())
 }
 
 /// 非有限な f32 (NaN / inf) を `0.0` に丸める。experiment.json の数値フィールド
@@ -606,6 +720,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 
 /// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
@@ -614,6 +729,7 @@ pub(crate) fn build_experiment_logger(
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
     data: &Path,
+    lr_schedule: String,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
@@ -663,6 +779,7 @@ pub(crate) fn build_experiment_logger(
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
+        lr_schedule,
         batch_size: cli.batch_size,
         batches_per_superbatch: cli.batches_per_superbatch,
         superbatches: cli.superbatches,
@@ -756,6 +873,7 @@ pub(crate) fn build_experiment_logger_simple(
     ft_fp16_out: bool,
     fp16_opt_state: bool,
     tf32: bool,
+    lr_schedule: String,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     let net_id_compact = format!(
@@ -803,6 +921,7 @@ pub(crate) fn build_experiment_logger_simple(
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
+        lr_schedule,
         batch_size: cli.batch_size,
         batches_per_superbatch: cli.batches_per_superbatch,
         superbatches: cli.superbatches,
@@ -1150,11 +1269,7 @@ pub(crate) fn run_simple_training(
         .into());
     }
 
-    let lr_scheduler = StepLR {
-        start: cli.lr,
-        gamma: cli.lr_gamma,
-        step: cli.lr_step.max(1),
-    };
+    let lr_scheduler = build_lr_scheduler(cli)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
@@ -1191,6 +1306,7 @@ pub(crate) fn run_simple_training(
         ft_fp16_out,
         fp16_opt_state,
         tf32,
+        lr_scheduler.to_string(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
