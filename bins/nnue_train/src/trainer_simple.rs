@@ -4,6 +4,7 @@ use cuda_host::cuda_launch;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::dataloader::Batch;
+use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
 
@@ -368,6 +369,7 @@ impl SimpleGpuTrainer {
         ft_fp16_out: bool,
         fp16_opt_state: bool,
         tf32: bool,
+        init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `--ft-fp16-out` は weight FP16 path の拡張なので `--ft-fp16` を含意する。CLI
         // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
@@ -404,16 +406,18 @@ impl SimpleGpuTrainer {
             "pairwise requires even ft_out for the half-split"
         );
 
-        // small random init。group ごとに seed を変えて weight が同一値で潰れない
-        // ようにする (forward の合成 layer 構造を踏むため)。
-        let ft_w_h = xorshift_init(0x5071_e001, ft_in * ft_out, 0.01);
-        let ft_b_h = xorshift_init(0x5071_e002, ft_out, 0.01);
-        let l1_w_h = xorshift_init(0x5071_e003, id.combined_dim() * l1_out, 0.01);
-        let l1_b_h = xorshift_init(0x5071_e004, l1_out, 0.01);
-        let l2_w_h = xorshift_init(0x5071_e005, l1_out * l2_out, 0.01);
-        let l2_b_h = xorshift_init(0x5071_e006, l2_out, 0.01);
-        let l3_w_h = xorshift_init(0x5071_e007, l2_out, 0.01);
-        let l3_b_h = xorshift_init(0x5071_e008, 1, 0.01);
+        // weight / bias の初期値を `init_spec` から生成する。Simple は bucket / 共有
+        // 因子層を持たないので全 group `flat`。fan_in は各層の入力次元 (FT=ft_in、
+        // L1=combined_dim()、L2=l1_out、L3=l2_out)、bias は対応 weight と同じ fan_in。
+        let ft_w_h = init::sample(WeightShape::flat(ft_in * ft_out, ft_in), &init_spec.ft_w);
+        let ft_b_h = init::sample(WeightShape::flat(ft_out, ft_in), &init_spec.ft_b);
+        let l1_in = id.combined_dim();
+        let l1_w_h = init::sample(WeightShape::flat(l1_in * l1_out, l1_in), &init_spec.l1_w);
+        let l1_b_h = init::sample(WeightShape::flat(l1_out, l1_in), &init_spec.l1_b);
+        let l2_w_h = init::sample(WeightShape::flat(l1_out * l2_out, l1_out), &init_spec.l2_w);
+        let l2_b_h = init::sample(WeightShape::flat(l2_out, l1_out), &init_spec.l2_b);
+        let l3_w_h = init::sample(WeightShape::flat(l2_out, l2_out), &init_spec.l3_w);
+        let l3_b_h = init::sample(WeightShape::flat(1, l2_out), &init_spec.l3_b);
 
         let batch = batch_size.max(1);
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {

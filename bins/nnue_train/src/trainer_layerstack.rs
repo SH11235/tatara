@@ -6,6 +6,7 @@ use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfi
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::Batch;
+use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
 use shogi_features::FeatureSetSpec;
@@ -485,6 +486,7 @@ impl GpuTrainer {
         feature_set: FeatureSetSpec,
         weight_decay: f32,
         psqt_init: Option<&[f32]>,
+        init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
@@ -514,14 +516,37 @@ impl GpuTrainer {
         let l3_w_n = num_buckets * l2_out;
         let l3_b_n = num_buckets;
 
-        // Weight init: small random for non-degenerate forward (smoke 用、後段で
-        // proper init を適用: ft は effective_input_size=32 の He init、l1 は Zeroed 等)
-        let init_scale = 0.01_f32;
-        let ft_w_init = xorshift_init(0x100_u64, ft_w_n, init_scale);
-        let l1_w_init = xorshift_init(0x101_u64, l1_w_n, init_scale);
-        let l1f_w_init = xorshift_init(0x102_u64, l1f_w_n, init_scale);
-        let l2_w_init = xorshift_init(0x103_u64, l2_w_n, init_scale);
-        let l3_w_init = xorshift_init(0x104_u64, l3_w_n, init_scale);
+        // weight / bias の初期値を `init_spec` から生成する。fan_in は各層の入力次元
+        // (FT=ft_in、L1/L1f=ft_out、L2=l2_in、L3=l2_out)、bias は対応 weight と同じ
+        // fan_in を使う (nnue-pytorch 互換: bias も `uniform(±sqrt(1/fan_in))`)。bucket
+        // 付き層 (l1/l2/l3) は bucket-major layout なので `bucketed` で渡し、
+        // `per_bucket_repeat` が立つと block_len = n/num_buckets 分を 1 回生成して
+        // num_buckets 回 tile する (bullet の `RepeatedUniform` 相当)。
+        let ft_w_init = init::sample(WeightShape::flat(ft_w_n, ft_in), &init_spec.ft_w);
+        let ft_b_init = init::sample(WeightShape::flat(ft_b_n, ft_in), &init_spec.ft_b);
+        let l1_w_init = init::sample(
+            WeightShape::bucketed(l1_w_n, num_buckets, ft_out),
+            &init_spec.l1_w,
+        );
+        let l1_b_init = init::sample(
+            WeightShape::bucketed(l1_b_n, num_buckets, ft_out),
+            &init_spec.l1_b,
+        );
+        let l1f_w_init = init::sample(WeightShape::flat(l1f_w_n, ft_out), &init_spec.l1f_w);
+        let l1f_b_init = init::sample(WeightShape::flat(l1f_b_n, ft_out), &init_spec.l1f_b);
+        let l2_w_init = init::sample(
+            WeightShape::bucketed(l2_w_n, num_buckets, l2_in),
+            &init_spec.l2_w,
+        );
+        let l2_b_init = init::sample(
+            WeightShape::bucketed(l2_b_n, num_buckets, l2_in),
+            &init_spec.l2_b,
+        );
+        let l3_w_init = init::sample(
+            WeightShape::bucketed(l3_w_n, num_buckets, l2_out),
+            &init_spec.l3_w,
+        );
+        let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l2_out), &init_spec.l3_b);
 
         // PSQT shortcut の初期 weight (有効時のみ確保)。長さ `ft_in * num_buckets` を
         // caller が validation 済の前提 (CLI / `run_training` 側で構築)。
@@ -556,7 +581,7 @@ impl GpuTrainer {
             } else {
                 None
             },
-            ft_b: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b: DeviceBuffer::from_host(&stream, &ft_b_init)?,
             ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
@@ -567,7 +592,7 @@ impl GpuTrainer {
             l1_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
             l1_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
             l1_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
-            l1_b: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b: DeviceBuffer::from_host(&stream, &l1_b_init)?,
             l1_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
             l1_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
             l1_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
@@ -578,7 +603,7 @@ impl GpuTrainer {
             l1f_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
             l1f_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
             l1f_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_b: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            l1f_b: DeviceBuffer::from_host(&stream, &l1f_b_init)?,
             l1f_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
             l1f_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
             l1f_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
@@ -589,7 +614,7 @@ impl GpuTrainer {
             l2_w_v: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
             l2_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
             l2_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
-            l2_b: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b: DeviceBuffer::from_host(&stream, &l2_b_init)?,
             l2_b_m: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
             l2_b_v: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
             l2_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
@@ -600,7 +625,7 @@ impl GpuTrainer {
             l3_w_v: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
             l3_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
             l3_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
-            l3_b: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b: DeviceBuffer::from_host(&stream, &l3_b_init)?,
             l3_b_m: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,

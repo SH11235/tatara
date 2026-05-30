@@ -134,6 +134,10 @@ pub struct Params {
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
+    /// 重み初期化方式の要約 (`--init-preset` + seed + override)。preset が legacy で
+    /// override も無い既定の run では省略する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_preset: Option<String>,
     /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
     /// `--test-tail-positions` 経路では同 file (= training PSV) の末尾を holdout
     /// にするためここではなく `test_tail_positions` 側に N が入る。
@@ -544,6 +548,7 @@ mod tests {
             wrm_target_scaling: Some(380.0),
             score_drop_abs: None,
             init_from: None,
+            init_preset: None,
             test_data: None,
             test_positions: None,
             test_tail_positions: None,
