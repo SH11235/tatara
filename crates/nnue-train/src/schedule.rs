@@ -183,6 +183,91 @@ impl Display for ExponentialDecayLR {
     }
 }
 
+/// 1cycle policy (Smith, "super-convergence")。学習全体 `total_superbatch` を
+/// warmup と anneal の 2 相に分け、`initial_lr` → `max_lr` → `final_lr` と山なりに
+/// 動かす。両相とも half-cosine 補間 (`superbatch <= warmup_superbatch` で
+/// `initial_lr` → `max_lr`、以降 `total_superbatch` までに `max_lr` → `final_lr`)。
+/// 補間の形は PyTorch `OneCycleLR` の `anneal_strategy='cos'` と同じだが、進捗は
+/// optimizer step ではなく **superbatch 単位**で測り、`progress = superbatch /
+/// 境界 superbatch` とする (同 module の [`LinearDecayLR`] / [`CosineDecayLR`] と
+/// 同じ刻み方で、`superbatch` は学習ループで 1..=total を渡す)。よって 1 番目の
+/// superbatch は `initial_lr` ちょうどではなく 1/`warmup_superbatch` だけ進んだ点に
+/// なる (warmup が十分長ければ無視できる)。
+///
+/// `LrScheduler::lr` は総 superbatch 数を受け取らないため、進捗の分母となる
+/// `warmup_superbatch` / `total_superbatch` を field に保持する。
+#[derive(Clone, Debug)]
+pub struct OneCycleLR {
+    pub initial_lr: f32,
+    pub max_lr: f32,
+    pub final_lr: f32,
+    pub warmup_superbatch: usize,
+    pub total_superbatch: usize,
+}
+
+impl OneCycleLR {
+    /// PyTorch `OneCycleLR` と同じ導出で構築する。`initial_lr = max_lr /
+    /// div_factor`、`final_lr = initial_lr / final_div_factor`、warmup 境界は
+    /// `round(warmup_pct * total_superbatch)`。
+    pub fn new(
+        max_lr: f32,
+        warmup_pct: f32,
+        div_factor: f32,
+        final_div_factor: f32,
+        total_superbatch: usize,
+    ) -> Self {
+        let initial_lr = max_lr / div_factor;
+        let final_lr = initial_lr / final_div_factor;
+        let warmup_superbatch = (warmup_pct * total_superbatch as f32)
+            .round()
+            .clamp(0.0, total_superbatch as f32) as usize;
+        Self {
+            initial_lr,
+            max_lr,
+            final_lr,
+            warmup_superbatch,
+            total_superbatch,
+        }
+    }
+}
+
+/// half-cosine 補間。`p = 0` で `start`、`p = 1` で `end` (両端で傾き 0)。
+fn cosine_interp(start: f32, end: f32, p: f32) -> f32 {
+    end + 0.5 * (start - end) * (1.0 + (PI * p).cos())
+}
+
+impl LrScheduler for OneCycleLR {
+    fn lr(&self, _batch: usize, superbatch: usize) -> f32 {
+        if superbatch <= self.warmup_superbatch {
+            // warmup: initial_lr → max_lr。warmup_superbatch=0 (warmup_pct=0)
+            // のときはこの枝に superbatch=0 のみ入りうるので denom を 1 で守る。
+            let denom = self.warmup_superbatch.max(1) as f32;
+            cosine_interp(self.initial_lr, self.max_lr, superbatch as f32 / denom)
+        } else if superbatch >= self.total_superbatch {
+            self.final_lr
+        } else {
+            // anneal: max_lr → final_lr。
+            let denom = (self.total_superbatch - self.warmup_superbatch).max(1) as f32;
+            let p = (superbatch - self.warmup_superbatch) as f32 / denom;
+            cosine_interp(self.max_lr, self.final_lr, p)
+        }
+    }
+}
+
+impl Display for OneCycleLR {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "one-cycle {} → max {} (warmup to superbatch {}) → cosine anneal to {} at superbatch {}",
+            self.initial_lr,
+            self.max_lr,
+            self.warmup_superbatch,
+            self.final_lr,
+            self.total_superbatch
+        )
+    }
+}
+
 /// `warmup_batches` 期間 (superbatch=1 内) で sub-scheduler の lr を warmup。
 #[derive(Clone, Debug)]
 pub struct WarmupLR<LR: LrScheduler> {
@@ -239,6 +324,61 @@ impl<First: LrScheduler, Second: LrScheduler> Display for SequenceLR<First, Seco
             "{}, then after {} superbatches, {}",
             self.first, self.first_scheduler_final_superbatch, self.second
         )
+    }
+}
+
+/// runtime selection 用 enum wrapper (CLI の `--lr-schedule` から生成する想定)。
+/// `Warmup` variant は任意の非 Warmup scheduler を [`WarmupLR`] で包む (`Box` で
+/// 再帰型のサイズを有限化する)。
+#[derive(Clone, Debug)]
+pub enum LrSchedulerEnum {
+    Constant(ConstantLR),
+    Step(StepLR),
+    Drop(DropLR),
+    LinearDecay(LinearDecayLR),
+    CosineDecay(CosineDecayLR),
+    ExponentialDecay(ExponentialDecayLR),
+    OneCycle(OneCycleLR),
+    Warmup(Box<WarmupLR<LrSchedulerEnum>>),
+}
+
+impl LrSchedulerEnum {
+    /// `self` を `warmup_batches` の [`WarmupLR`] で包む。
+    pub fn with_warmup(self, warmup_batches: usize) -> Self {
+        Self::Warmup(Box::new(WarmupLR {
+            inner: self,
+            warmup_batches,
+        }))
+    }
+}
+
+impl LrScheduler for LrSchedulerEnum {
+    fn lr(&self, batch: usize, superbatch: usize) -> f32 {
+        match self {
+            Self::Constant(s) => s.lr(batch, superbatch),
+            Self::Step(s) => s.lr(batch, superbatch),
+            Self::Drop(s) => s.lr(batch, superbatch),
+            Self::LinearDecay(s) => s.lr(batch, superbatch),
+            Self::CosineDecay(s) => s.lr(batch, superbatch),
+            Self::ExponentialDecay(s) => s.lr(batch, superbatch),
+            Self::OneCycle(s) => s.lr(batch, superbatch),
+            Self::Warmup(s) => s.lr(batch, superbatch),
+        }
+    }
+}
+
+impl Display for LrSchedulerEnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Constant(s) => Display::fmt(s, f),
+            Self::Step(s) => Display::fmt(s, f),
+            Self::Drop(s) => Display::fmt(s, f),
+            Self::LinearDecay(s) => Display::fmt(s, f),
+            Self::CosineDecay(s) => Display::fmt(s, f),
+            Self::ExponentialDecay(s) => Display::fmt(s, f),
+            Self::OneCycle(s) => Display::fmt(s, f),
+            Self::Warmup(s) => Display::fmt(s, f),
+        }
     }
 }
 
@@ -506,6 +646,59 @@ mod tests {
         assert_eq!(seq.lr(0, 5), 1.0);
         assert_eq!(seq.lr(0, 6), 2.0);
         assert_eq!(seq.lr(0, 100), 2.0);
+    }
+
+    #[test]
+    fn one_cycle_lr_warmup_then_anneal() {
+        // max_lr=1, div_factor=25 → initial=0.04、final_div_factor=100 →
+        // final=0.04/100=0.0004。warmup_pct=0.2、total=10 → warmup_superbatch=2。
+        let lr = OneCycleLR::new(1.0, 0.2, 25.0, 100.0, 10);
+        assert_eq!(lr.initial_lr, 0.04);
+        assert_eq!(lr.warmup_superbatch, 2);
+        assert!((lr.final_lr - 0.0004).abs() < EPS);
+
+        // superbatch=0: warmup p=0 → initial_lr。
+        assert!((lr.lr(0, 0) - 0.04).abs() < EPS);
+        // superbatch=2 (warmup 終端): p=1 → max_lr。
+        assert!((lr.lr(0, 2) - 1.0).abs() < EPS);
+        // warmup 中点 superbatch=1: p=0.5 → initial と max の中間。
+        let mid_warmup = 0.04 + 0.5 * (1.0 - 0.04);
+        assert!((lr.lr(0, 1) - mid_warmup).abs() < EPS);
+        // anneal 中点 superbatch=6: (6-2)/(10-2)=0.5 → max と final の中間。
+        let mid_anneal = 0.0004 + 0.5 * (1.0 - 0.0004);
+        assert!((lr.lr(0, 6) - mid_anneal).abs() < EPS);
+        // 終端以降は final_lr で saturate。
+        assert!((lr.lr(0, 10) - 0.0004).abs() < EPS);
+        assert!((lr.lr(0, 100) - 0.0004).abs() < EPS);
+    }
+
+    #[test]
+    fn one_cycle_lr_zero_warmup_pct_has_no_division_by_zero() {
+        // warmup_pct=0 → warmup_superbatch=0。superbatch=0 で denom.max(1) により
+        // 0 除算を回避し initial_lr を返す。
+        let lr = OneCycleLR::new(1.0, 0.0, 25.0, 100.0, 10);
+        assert_eq!(lr.warmup_superbatch, 0);
+        assert!(lr.lr(0, 0).is_finite());
+        // superbatch>=1 は anneal 相 (max_lr から下る)。
+        assert!(lr.lr(0, 1).is_finite());
+    }
+
+    #[test]
+    fn lr_scheduler_enum_dispatches_and_wraps_warmup() {
+        let step = LrSchedulerEnum::Step(StepLR {
+            start: 1.0,
+            gamma: 0.5,
+            step: 3,
+        });
+        // enum dispatch は内側 StepLR と一致。
+        assert!((step.lr(0, 4) - 0.5).abs() < EPS);
+
+        // with_warmup は superbatch=1 内の batch warmup を加える (WarmupLR と同形)。
+        let warmed = LrSchedulerEnum::Constant(ConstantLR { value: 1.0 }).with_warmup(4);
+        assert!((warmed.lr(0, 1) - 0.25).abs() < EPS);
+        assert!((warmed.lr(3, 1) - 1.0).abs() < EPS);
+        // superbatch != 1 では warmup inactive。
+        assert!((warmed.lr(0, 2) - 1.0).abs() < EPS);
     }
 
     #[test]

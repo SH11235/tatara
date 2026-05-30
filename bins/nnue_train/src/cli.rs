@@ -88,13 +88,71 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 8.75e-4, global = true)]
     pub(crate) lr: f32,
 
-    /// LR gamma (multiplies the LR by gamma every `lr_step` superbatches).
+    /// Learning-rate schedule shape. The schedule maps a superbatch index to a
+    /// learning rate; --lr is the starting (or, for one-cycle, the peak) rate.
+    ///
+    /// - step (default): multiply --lr by --lr-gamma every --lr-step
+    ///   superbatches. Bit-identical to the historical behaviour.
+    /// - constant: hold --lr for the whole run (--lr-gamma / --lr-step ignored).
+    /// - drop: hold --lr, then multiply by --lr-gamma once after --lr-step
+    ///   superbatches.
+    /// - linear / cosine / exponential: decay from --lr to --lr-final by
+    ///   --lr-final-superbatch (defaults to --superbatches), then hold
+    ///   --lr-final. exponential requires --lr-final > 0.
+    /// - one-cycle: warm up from --lr/--lr-div-factor to the peak --lr over the
+    ///   first --lr-warmup-pct of --superbatches, then cosine-anneal to
+    ///   --lr/--lr-div-factor/--lr-final-div-factor.
+    #[arg(long, value_enum, default_value_t = LrScheduleArg::Step, global = true)]
+    pub(crate) lr_schedule: LrScheduleArg,
+
+    /// LR gamma. For --lr-schedule step, multiplies the LR every --lr-step
+    /// superbatches; for drop, the one-shot multiplier applied after --lr-step
+    /// superbatches. Ignored by the other schedules.
     #[arg(long, default_value_t = 0.995, global = true)]
     pub(crate) lr_gamma: f32,
 
-    /// LR step (superbatch interval at which the LR is multiplied by gamma).
+    /// LR step. For --lr-schedule step, the superbatch interval at which the LR
+    /// is multiplied by --lr-gamma; for drop, the superbatch after which the LR
+    /// drops once. Ignored by the other schedules.
     #[arg(long, default_value_t = 1, global = true)]
     pub(crate) lr_step: usize,
+
+    /// Final learning rate for the linear / cosine / exponential decay
+    /// schedules. The LR decays from --lr to this value by
+    /// --lr-final-superbatch and then holds. exponential requires a value > 0
+    /// (it interpolates the LR geometrically). Ignored by the other schedules.
+    #[arg(long, default_value_t = 1e-5, global = true)]
+    pub(crate) lr_final: f32,
+
+    /// Superbatch by which the linear / cosine / exponential decay reaches
+    /// --lr-final. When omitted, defaults to --superbatches (decay spans the
+    /// whole run), so resuming with a different --superbatches rescales the
+    /// decay curve; pass it explicitly to pin the horizon. one-cycle likewise
+    /// uses --superbatches as its horizon. Ignored by the other schedules.
+    #[arg(long, global = true)]
+    pub(crate) lr_final_superbatch: Option<usize>,
+
+    /// Warm up the learning rate over the first N batches of the first
+    /// superbatch, ramping from a small fraction of the scheduled LR up to it,
+    /// on top of any --lr-schedule. Applies to every schedule except one-cycle
+    /// (which carries its own warmup). When omitted, no batch-level warmup.
+    #[arg(long, global = true)]
+    pub(crate) lr_warmup_steps: Option<usize>,
+
+    /// one-cycle only: fraction of --superbatches spent warming up from the
+    /// initial LR to the peak --lr before annealing. Must be in [0.0, 1.0].
+    #[arg(long, default_value_t = 0.2, global = true)]
+    pub(crate) lr_warmup_pct: f32,
+
+    /// one-cycle only: the initial LR is --lr divided by this factor (the peak
+    /// is --lr). Must be >= 1 so the initial LR does not exceed the peak.
+    #[arg(long, default_value_t = 25.0, global = true)]
+    pub(crate) lr_div_factor: f32,
+
+    /// one-cycle only: the final LR is the initial LR (--lr / --lr-div-factor)
+    /// divided by this factor. Must be > 0.
+    #[arg(long, default_value_t = 1e4, global = true)]
+    pub(crate) lr_final_div_factor: f32,
 
     /// WDL blend lambda (constant). Mutually exclusive with the linear-taper
     /// pair `--start-wdl` / `--end-wdl`.
@@ -319,6 +377,20 @@ pub(crate) struct Cli {
 
 /// Default base seed for `--init-seed` (ASCII "nnue").
 pub(crate) const DEFAULT_INIT_SEED: u64 = 0x6E6E_7565;
+
+/// `--lr-schedule` の選択肢。lib 側 schedule 型への runtime selection。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum LrScheduleArg {
+    #[default]
+    Step,
+    Constant,
+    Drop,
+    Linear,
+    Cosine,
+    Exponential,
+    #[value(name = "one-cycle")]
+    OneCycle,
+}
 
 /// `--init-preset` の選択肢。lib 側 [`nnue_train::init::InitPreset`] への薄い対応。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]

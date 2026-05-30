@@ -135,6 +135,170 @@ fn layerstack_specific_arg_rejected_before_subcommand() {
 }
 
 #[test]
+fn lr_schedule_defaults_to_step_bit_identical() {
+    use nnue_train::schedule::{LrScheduler, LrSchedulerEnum, StepLR};
+
+    // `--lr-schedule` 省略時は従来の StepLR と一致する (default step、bit-identical)。
+    let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack");
+    assert_eq!(cli.lr_schedule, LrScheduleArg::Step);
+    let sched = crate::training::build_lr_scheduler(&cli).expect("build step scheduler");
+    assert!(matches!(sched, LrSchedulerEnum::Step(_)));
+
+    let reference = StepLR {
+        start: cli.lr,
+        gamma: cli.lr_gamma,
+        step: cli.lr_step.max(1),
+    };
+    for (batch, sb) in [(0, 1), (0, 2), (3, 5), (0, 50)] {
+        assert_eq!(sched.lr(batch, sb), reference.lr(batch, sb));
+    }
+}
+
+#[test]
+fn lr_schedule_one_cycle_builds_and_records_warmup_boundary() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    // one-cycle は --superbatches を total として warmup 境界を解決する
+    // (warmup_pct 0.2 × 10 = 2)。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "one-cycle",
+        "--superbatches",
+        "10",
+        "--lr",
+        "1e-3",
+        "layerstack",
+    ])
+    .expect("one-cycle parse");
+    let sched = crate::training::build_lr_scheduler(&cli).expect("build one-cycle");
+    match sched {
+        LrSchedulerEnum::OneCycle(oc) => {
+            assert_eq!(oc.total_superbatch, 10);
+            assert_eq!(oc.warmup_superbatch, 2);
+            assert_eq!(oc.max_lr, 1e-3);
+        }
+        other => panic!("expected OneCycle, got {other}"),
+    }
+}
+
+#[test]
+fn lr_schedule_cosine_defaults_final_superbatch_to_superbatches() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    // --lr-final-superbatch 省略時は --superbatches に解決される。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "cosine",
+        "--superbatches",
+        "400",
+        "--lr-final",
+        "1e-6",
+        "layerstack",
+    ])
+    .expect("cosine parse");
+    match crate::training::build_lr_scheduler(&cli).expect("build cosine") {
+        LrSchedulerEnum::CosineDecay(c) => {
+            assert_eq!(c.final_superbatch, 400);
+            assert_eq!(c.final_lr, 1e-6);
+        }
+        other => panic!("expected CosineDecay, got {other}"),
+    }
+}
+
+#[test]
+fn lr_schedule_drop_and_linear_build_expected_variants() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    let drop = Cli::try_parse_from(["nnue-train", "--lr-schedule", "drop", "layerstack"])
+        .expect("drop parse");
+    assert!(matches!(
+        crate::training::build_lr_scheduler(&drop).expect("build drop"),
+        LrSchedulerEnum::Drop(_)
+    ));
+
+    let linear = Cli::try_parse_from(["nnue-train", "--lr-schedule", "linear", "layerstack"])
+        .expect("linear parse");
+    assert!(matches!(
+        crate::training::build_lr_scheduler(&linear).expect("build linear"),
+        LrSchedulerEnum::LinearDecay(_)
+    ));
+}
+
+#[test]
+fn lr_warmup_steps_wraps_in_warmup() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    let cli = Cli::try_parse_from(["nnue-train", "--lr-warmup-steps", "200", "layerstack"])
+        .expect("warmup-steps parse");
+    assert!(matches!(
+        crate::training::build_lr_scheduler(&cli).expect("build warmup"),
+        LrSchedulerEnum::Warmup(_)
+    ));
+}
+
+#[test]
+fn lr_warmup_steps_rejected_with_one_cycle() {
+    // one-cycle は自前の warmup を持つので --lr-warmup-steps との併用は reject。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "one-cycle",
+        "--lr-warmup-steps",
+        "200",
+        "layerstack",
+    ])
+    .expect("parse ok");
+    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+}
+
+#[test]
+fn lr_schedule_exponential_rejects_zero_final() {
+    // exponential は (final/initial)^lambda の幾何補間のため final > 0 を要求。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "exponential",
+        "--lr-final",
+        "0",
+        "layerstack",
+    ])
+    .expect("parse ok");
+    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+}
+
+#[test]
+fn lr_schedule_one_cycle_rejects_div_factor_below_one() {
+    // div_factor < 1 だと initial_lr = max_lr / div_factor が peak --lr を超え、
+    // warmup が下りになるので reject。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "one-cycle",
+        "--lr-div-factor",
+        "0.5",
+        "layerstack",
+    ])
+    .expect("parse ok");
+    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+}
+
+#[test]
+fn lr_schedule_one_cycle_rejects_out_of_range_warmup_pct() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "one-cycle",
+        "--lr-warmup-pct",
+        "1.5",
+        "layerstack",
+    ])
+    .expect("parse ok");
+    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+}
+
+#[test]
 fn simple_activation_arg_parses_and_maps() {
     // `--activation` は crelu / screlu / pairwise を受理し、それぞれ
     // `SimpleActivation` variant へ写る (未知値は run_simple_training が reject)。

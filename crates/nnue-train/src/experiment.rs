@@ -108,6 +108,10 @@ pub struct Params {
     pub lr: f32,
     pub lr_gamma: f32,
     pub lr_step: usize,
+    /// 実効 LR スケジュールの説明 (`--lr-schedule` 選択と解決済みパラメータ)。
+    /// `lr` / `lr_gamma` / `lr_step` は step スケジュール用の生 flag 値で、
+    /// 他スケジュールでは未使用なため、再現に必要な実効形をここに残す。
+    pub lr_schedule: String,
     pub batch_size: usize,
     pub batches_per_superbatch: usize,
     pub superbatches: usize,
@@ -542,6 +546,7 @@ mod tests {
             lr: 8.75e-4,
             lr_gamma: 0.995,
             lr_step: 1,
+            lr_schedule: "start 0.000875 gamma 0.995 drop every 1 superbatches".to_string(),
             batch_size: 65_536,
             batches_per_superbatch: 6_104,
             superbatches: 400,
