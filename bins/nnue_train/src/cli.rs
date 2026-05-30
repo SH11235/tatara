@@ -108,7 +108,7 @@ pub(crate) struct Cli {
     /// LR gamma. For --lr-schedule step, multiplies the LR every --lr-step
     /// superbatches; for drop, the one-shot multiplier applied after --lr-step
     /// superbatches. Ignored by the other schedules.
-    #[arg(long, default_value_t = 0.995, global = true)]
+    #[arg(long, default_value_t = 0.992, global = true)]
     pub(crate) lr_gamma: f32,
 
     /// LR step. For --lr-schedule step, the superbatch interval at which the LR
