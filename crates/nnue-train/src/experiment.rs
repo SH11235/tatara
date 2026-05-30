@@ -119,9 +119,11 @@ pub struct Params {
     pub qb: i32,
     /// `"sigmoid"` または `"wrm"`。
     pub loss_kind: String,
-    /// WRM loss の 4 パラメータ。`loss_kind == "wrm"` のときのみ `Some`。
+    /// WRM loss の 5 パラメータ。`loss_kind == "wrm"` のときのみ `Some`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrm_in_scaling: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrm_in_offset: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrm_nnue2score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +545,7 @@ mod tests {
             qb: 64,
             loss_kind: "wrm".to_string(),
             wrm_in_scaling: Some(340.0),
+            wrm_in_offset: Some(270.0),
             wrm_nnue2score: Some(600.0),
             wrm_target_offset: Some(270.0),
             wrm_target_scaling: Some(380.0),
@@ -708,6 +711,7 @@ mod tests {
         let mut params = sample_params();
         params.loss_kind = "sigmoid".to_string();
         params.wrm_in_scaling = None;
+        params.wrm_in_offset = None;
         params.wrm_nnue2score = None;
         params.wrm_target_offset = None;
         params.wrm_target_scaling = None;

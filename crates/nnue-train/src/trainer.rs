@@ -75,8 +75,8 @@ use crate::schedule::{LrScheduler, WdlScheduler};
 ///   cp 単位 (`out ≈ cp`) で収束する。
 /// - [`LossKind::Wrm`] — win-rate-model loss。prediction / target 双方に WRM 変換を
 ///   適用するため net_output が `out ≈ cp / nnue2score` (O(1)) で収束する。
-///   `nnue2score` / `in_scaling` / `target_offset` / `target_scaling` はいずれも CLI
-///   から本 enum field 経由で渡る。
+///   `nnue2score` / `in_scaling` / `in_offset` / `target_offset` / `target_scaling` は
+///   いずれも CLI から本 enum field 経由で渡る。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LossKind {
     /// plain sigmoid-MSE。`scale = 1.0 / --scale` (典型値 `1/290`)。
@@ -85,12 +85,14 @@ pub enum LossKind {
     ///
     /// - `nnue2score` = `--wrm-nnue2score` (既定 600)
     /// - `in_scaling` = `--wrm-in-scaling` (既定 340、prediction 側のみ)
+    /// - `in_offset` = `--wrm-in-offset` (既定 270、WRM prediction sigmoid の中心)
     /// - `target_offset` = `--wrm-target-offset` (既定 270、WRM target sigmoid の中心)
     /// - `target_scaling` = `--wrm-target-scaling` (既定 380、WRM target sigmoid の
     ///   入力スケール)
     Wrm {
         nnue2score: f32,
         in_scaling: f32,
+        in_offset: f32,
         target_offset: f32,
         target_scaling: f32,
     },
@@ -110,6 +112,7 @@ impl LossKind {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                in_offset,
                 target_offset,
                 target_scaling,
             } => {
@@ -121,6 +124,11 @@ impl LossKind {
                 if !in_scaling.is_finite() || in_scaling <= 0.0 {
                     return Err(io::Error::other(format!(
                         "wrm in_scaling must be finite and > 0 (got {in_scaling})"
+                    )));
+                }
+                if !in_offset.is_finite() {
+                    return Err(io::Error::other(format!(
+                        "wrm in_offset must be finite (got {in_offset})"
                     )));
                 }
                 if !target_offset.is_finite() {
@@ -146,12 +154,14 @@ impl std::fmt::Display for LossKind {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                in_offset,
                 target_offset,
                 target_scaling,
             } => write!(
                 f,
                 "wrm(nnue2score={nnue2score}, in_scaling={in_scaling}, \
-                 target_offset={target_offset}, target_scaling={target_scaling})"
+                 in_offset={in_offset}, target_offset={target_offset}, \
+                 target_scaling={target_scaling})"
             ),
         }
     }
@@ -1243,6 +1253,7 @@ mod tests {
             qb: 64,
             loss_kind: "sigmoid".to_string(),
             wrm_in_scaling: None,
+            wrm_in_offset: None,
             wrm_nnue2score: None,
             wrm_target_offset: None,
             wrm_target_scaling: None,
@@ -1832,6 +1843,7 @@ mod tests {
                 loss: LossKind::Wrm {
                     nnue2score: 600.0,
                     in_scaling: 340.0,
+                    in_offset: 270.0,
                     target_offset: 270.0,
                     target_scaling: 380.0
                 },
@@ -1845,6 +1857,7 @@ mod tests {
                 loss: LossKind::Wrm {
                     nnue2score: 0.0,
                     in_scaling: 340.0,
+                    in_offset: 270.0,
                     target_offset: 270.0,
                     target_scaling: 380.0
                 },
@@ -1858,6 +1871,7 @@ mod tests {
                 loss: LossKind::Wrm {
                     nnue2score: 600.0,
                     in_scaling: -1.0,
+                    in_offset: 270.0,
                     target_offset: 270.0,
                     target_scaling: 380.0
                 },
@@ -1872,8 +1886,24 @@ mod tests {
                 loss: LossKind::Wrm {
                     nnue2score: 600.0,
                     in_scaling: 340.0,
+                    in_offset: 270.0,
                     target_offset: 270.0,
                     target_scaling: 0.0
+                },
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        // in_offset は任意の有限値だが非有限値は reject (target_offset と同じ扱い)。
+        assert!(
+            TrainingConfig {
+                loss: LossKind::Wrm {
+                    nnue2score: 600.0,
+                    in_scaling: 340.0,
+                    in_offset: f32::NAN,
+                    target_offset: 270.0,
+                    target_scaling: 380.0
                 },
                 ..base_cfg()
             }

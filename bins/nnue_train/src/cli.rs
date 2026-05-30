@@ -156,6 +156,12 @@ pub(crate) struct Cli {
     /// `--win-rate-model` is set.
     #[arg(long, default_value_t = 340.0, global = true)]
     pub(crate) wrm_in_scaling: f32,
+    /// Center offset of the WRM prediction win-rate sigmoid, subtracted from the
+    /// scaled net score inside `sigmoid((net*nnue2score - offset)/in_scaling)`
+    /// (default 270). Independent of the target-side offset
+    /// (`--wrm-target-offset`). Used only when `--win-rate-model` is set.
+    #[arg(long, default_value_t = 270.0, global = true)]
+    pub(crate) wrm_in_offset: f32,
     /// WRM nnue2score (`scorenet = net_output * --wrm-nnue2score`, default 600).
     /// Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 600.0, global = true)]

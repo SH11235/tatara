@@ -84,10 +84,10 @@ pub fn loss_wdl(
 ///   `target = lambda*wdl + (1-lambda)*target_wrm`。`target_offset` / `target_scaling` は
 ///   WRM target sigmoid の中心と入力スケールで、CLI `--wrm-target-offset` /
 ///   `--wrm-target-scaling` から渡る (既定 270 / 380、score 分布に応じて再調整可)。
-/// - prediction: `scorenet = out * nnue2score`、`q = sigmoid((scorenet - 270)/in_scaling)`、
-///   `qm = sigmoid((-scorenet - 270)/in_scaling)`、`qf = 0.5*(1 + q - qm)`。prediction 側の
-///   offset 270 はハードコード (CLI 非公開、可変なのは target 側のみ)。`in_scaling`
-///   (= `--wrm-in-scaling`、既定 340) は prediction 側のみ、`nnue2score`
+/// - prediction: `scorenet = out * nnue2score`、`q = sigmoid((scorenet - in_offset)/in_scaling)`、
+///   `qm = sigmoid((-scorenet - in_offset)/in_scaling)`、`qf = 0.5*(1 + q - qm)`。
+///   `in_offset` (= `--wrm-in-offset`、既定 270、prediction sigmoid の中心) /
+///   `in_scaling` (= `--wrm-in-scaling`、既定 340) は prediction 側のみ、`nnue2score`
 ///   (= `--wrm-nnue2score`、既定 600)。
 /// - `err = qf - target`、`loss_acc += err^2` (norm 無し、caller が position 数で割る)。
 /// - chain rule: `dq/dout = q(1-q) * nnue2score/in_scaling`、`dqm/dout = -qm(1-qm) *
@@ -110,6 +110,7 @@ pub fn loss_wrm(
     lambda: f32,
     nnue2score: f32,
     in_scaling: f32,
+    in_offset: f32,
     target_offset: f32,
     target_scaling: f32,
     n: u32,
@@ -127,8 +128,8 @@ pub fn loss_wrm(
 
     // --- prediction (WRM applied to net output) ---
     let scorenet = out[i.get()] * nnue2score;
-    let q = 1.0_f32 / (1.0_f32 + (-((scorenet - 270.0_f32) / in_scaling)).exp());
-    let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - 270.0_f32) / in_scaling)).exp());
+    let q = 1.0_f32 / (1.0_f32 + (-((scorenet - in_offset) / in_scaling)).exp());
+    let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - in_offset) / in_scaling)).exp());
     let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
     let err = qf - target;

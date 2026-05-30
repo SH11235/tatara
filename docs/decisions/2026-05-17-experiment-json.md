@@ -109,7 +109,7 @@ producer 自身の version は `generator.version` が別に持つ。
 
     // 本リポ固有の knob (flat 配置、※6)
     "loss_kind": "wrm",
-    "wrm_in_scaling": 340.0, "wrm_nnue2score": 600.0,
+    "wrm_in_scaling": 340.0, "wrm_in_offset": 270.0, "wrm_nnue2score": 600.0,
     "wrm_target_offset": 270.0, "wrm_target_scaling": 380.0,   // ※7
     "score_drop_abs": null,
     "init_from": null,                      // --init-from の basename or null (※8)
@@ -166,8 +166,8 @@ producer 自身の version は `generator.version` が別に持つ。
   作業で頻出するため、差分表に出る flat 配置が有用。`params.rshogi` 等に
   ネストすると差分表から見えなくなる。
 - **※7 WRM パラメータ**: `loss_kind` が `"wrm"` のとき、loss を再現するには
-  `wrm_in_scaling` / `wrm_nnue2score` / `wrm_target_offset` /
-  `wrm_target_scaling` の 4 値が必要。4 値すべてを出力する。`loss_kind` が
+  `wrm_in_scaling` / `wrm_in_offset` / `wrm_nnue2score` / `wrm_target_offset` /
+  `wrm_target_scaling` の 5 値が必要。5 値すべてを出力する。`loss_kind` が
   `"sigmoid"` のときは `scale` が効き、WRM 系キーは無効。
 - **※8 `init_from`**: `--init-from` (weight のみ注入、optimizer reset) の
   入力ファイル basename。これは weight 初期化であって学習継続ではないため

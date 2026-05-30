@@ -2020,6 +2020,7 @@ impl GpuTrainer {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                in_offset,
                 target_offset,
                 target_scaling,
             } => {
@@ -2035,7 +2036,7 @@ impl GpuTrainer {
                         batch.per_pos_norm,
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
-                        wdl_lambda, nnue2score, in_scaling,
+                        wdl_lambda, nnue2score, in_scaling, in_offset,
                         target_offset, target_scaling, b_u32
                     ]
                 }?;

@@ -1190,6 +1190,7 @@ impl SimpleGpuTrainer {
             LossKind::Wrm {
                 nnue2score,
                 in_scaling,
+                in_offset,
                 target_offset,
                 target_scaling,
             } => {
@@ -1206,7 +1207,7 @@ impl SimpleGpuTrainer {
                         slice_mut(self.ws.dy_net_output),
                         slice(self.loss_acc),
                         wdl_lambda,
-                        nnue2score, in_scaling,
+                        nnue2score, in_scaling, in_offset,
                         target_offset, target_scaling, b_u32
                     ]
                 }?;

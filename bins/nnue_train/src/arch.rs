@@ -112,8 +112,8 @@ pub(crate) const RANGER_ALPHA: f32 = RANGER_DEFAULTS.alpha;
 pub(crate) const RANGER_K: u64 = RANGER_DEFAULTS.k as u64;
 pub(crate) const N_SMA_THRESHOLD: f32 = RANGER_DEFAULTS.n_sma_threshold;
 
-// smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / nnue2score 600 /
-// target offset 270 / target scaling 380)。
+// smoke 用 loss params (scale=290, wdl=0.0、wrm in_scaling 340 / in offset 270 /
+// nnue2score 600 / target offset 270 / target scaling 380)。
 // trainer 経路では CLI から `LossKind` を組み立てるのでここは smoke 専用。
 pub(crate) const WDL_LAMBDA: f32 = 0.0;
 /// smoke で使う固定 batch position 数 (`GpuTrainer::new` の workspace 初期 batch
@@ -125,6 +125,7 @@ pub(crate) const SMOKE_LOSS_SIGMOID: LossKind = LossKind::Sigmoid { scale: 1.0 /
 pub(crate) const SMOKE_LOSS_WRM: LossKind = LossKind::Wrm {
     nnue2score: 600.0,
     in_scaling: 340.0,
+    in_offset: 270.0,
     target_offset: 270.0,
     target_scaling: 380.0,
 };

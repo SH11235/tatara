@@ -18,8 +18,8 @@
 //!     target = lambda * wdl[i] + (1 - lambda) * target_wrm
 //!     # --- prediction (scorenet = out * nnue2score) ---
 //!     scorenet = out[i] * nnue2score
-//!     q   = sigmoid((scorenet  - 270) / in_scaling)
-//!     qm  = sigmoid((-scorenet - 270) / in_scaling)
+//!     q   = sigmoid((scorenet  - in_offset) / in_scaling)
+//!     qm  = sigmoid((-scorenet - in_offset) / in_scaling)
 //!     qf  = 0.5 * (1 + q - qm)
 //!     err = qf - target
 //!     loss_acc += err^2                          # un-normalized sum
@@ -46,8 +46,8 @@
 //! - target 側 `target_offset` / `target_scaling` は caller 指定 (CLI
 //!   `--wrm-target-offset` / `--wrm-target-scaling`、既定 270 / 380)。既定 270/380 は
 //!   chess の評価値分布向けの値で、score 分布が異なるドメインでは再調整する
-//! - prediction 側 offset 270 はハードコード (caller から可変なのは target 側のみ)
-//! - prediction 側 `in_scaling` は CLI `--wrm-in-scaling` (既定 340)、target 側と
+//! - prediction 側 `in_offset` / `in_scaling` は CLI `--wrm-in-offset` (既定 270、
+//!   prediction sigmoid の中心) / `--wrm-in-scaling` (既定 340)、いずれも target 側と
 //!   独立に指定する
 //! - `lambda` (WDL blend) は典型的には 0.0 (target = target_wrm のみ) だが、
 //!   WdlScheduler 互換のため引数として残す (`lambda = 1.0` で純 WDL)
@@ -77,11 +77,11 @@
 /// - `out.len() == score.len() == wdl.len() == per_pos_norm.len() == dl_dout.len() == n`
 /// - `nnue2score > 0` / `in_scaling > 0` / `target_scaling > 0` (CLI
 ///   `--wrm-nnue2score` / `--wrm-in-scaling` / `--wrm-target-scaling` は正値、
-///   host 側で保証)、`target_offset` は任意の有限値
+///   host 側で保証)、`in_offset` / `target_offset` は任意の有限値
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
 /// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
 ///
-/// 引数 12 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// 引数 13 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
 /// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wrm_cpu(
@@ -94,13 +94,11 @@ pub fn loss_wrm_cpu(
     lambda: f32,
     nnue2score: f32,
     in_scaling: f32,
+    in_offset: f32,
     target_offset: f32,
     target_scaling: f32,
     n: usize,
 ) {
-    // prediction 側 offset はハードコード。target 側 offset / scaling のみ caller 指定
-    // (`target_offset` / `target_scaling`)。
-    const PRED_OFFSET: f32 = 270.0;
     for i in 0..n {
         // target: WRM applied to raw cp score
         let s = score[i];
@@ -111,8 +109,8 @@ pub fn loss_wrm_cpu(
 
         // prediction: WRM applied to net output (scorenet = out * nnue2score)
         let scorenet = out[i] * nnue2score;
-        let q = sigmoid_f32((scorenet - PRED_OFFSET) / in_scaling);
-        let qm = sigmoid_f32((-scorenet - PRED_OFFSET) / in_scaling);
+        let q = sigmoid_f32((scorenet - in_offset) / in_scaling);
+        let qm = sigmoid_f32((-scorenet - in_offset) / in_scaling);
         let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
         let err = qf - target;
@@ -158,6 +156,7 @@ mod tests {
             600.0,
             340.0,
             270.0,
+            270.0,
             380.0,
             1,
         );
@@ -186,6 +185,7 @@ mod tests {
             1.0,
             600.0,
             340.0,
+            270.0,
             270.0,
             380.0,
             1,
@@ -218,6 +218,7 @@ mod tests {
             lambda,
             nnue2score,
             in_scaling,
+            270.0,
             270.0,
             380.0,
             4,
@@ -275,6 +276,7 @@ mod tests {
                 nnue2score,
                 in_scaling,
                 270.0,
+                270.0,
                 380.0,
                 1,
             );
@@ -294,6 +296,7 @@ mod tests {
                 lambda,
                 nnue2score,
                 in_scaling,
+                270.0,
                 270.0,
                 380.0,
                 1,
@@ -336,6 +339,7 @@ mod tests {
             600.0,
             340.0,
             270.0,
+            270.0,
             380.0,
             3,
         );
@@ -351,6 +355,7 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
             270.0,
             380.0,
             3,
@@ -387,6 +392,7 @@ mod tests {
             0.0,
             600.0,
             340.0,
+            270.0,
             270.0,
             380.0,
             2,
@@ -428,6 +434,7 @@ mod tests {
                 0.0,
                 600.0,
                 340.0,
+                270.0,
                 off,
                 sc,
                 1,
@@ -451,6 +458,66 @@ mod tests {
             assert!(
                 approx_eq_f64(got, expected, 1e-10),
                 "off={off} sc={sc}: got {got} expected {expected}"
+            );
+        }
+    }
+
+    /// `in_offset` が prediction qf に効くことを、既定値 (270) と非既定値 (200) で
+    /// loss を計算して照合する。`lambda = 1` で target を純 WDL (draw = 0.5) に固定し、
+    /// `scorenet != 0` (out = 1) にすると loss = `(qf - 0.5)^2` が in_offset の違いを
+    /// そのまま反映する。期待 qf は同じ式を独立に書き直して照合。
+    #[test]
+    fn custom_in_offset_changes_prediction() {
+        let out = vec![1.0_f32]; // scorenet = 600 != 0 → qf が in_offset に依存
+        let score = vec![0.0_f32];
+        let wdl = vec![0.5_f32]; // lambda = 1 で target = 0.5 固定
+        let nnue2score = 600.0_f32;
+        let in_scaling = 340.0_f32;
+        let sig = |x: f32| 1.0_f32 / (1.0_f32 + (-x).exp());
+        let qf = |off: f32| {
+            let scorenet = 1.0_f32 * nnue2score;
+            let q = sig((scorenet - off) / in_scaling);
+            let qm = sig((-scorenet - off) / in_scaling);
+            0.5_f32 * (1.0_f32 + q - qm)
+        };
+
+        let run = |off: f32| -> f64 {
+            let mut dl = vec![0.0_f32];
+            let mut acc = 0.0_f64;
+            loss_wrm_cpu(
+                &out,
+                &score,
+                &wdl,
+                &[1.0_f32],
+                &mut dl,
+                &mut acc,
+                1.0,
+                nnue2score,
+                in_scaling,
+                off,
+                270.0,
+                380.0,
+                1,
+            );
+            acc
+        };
+
+        // 既定 270 と非既定 200 で qf は異なる → loss も異なる。
+        let loss_default = run(270.0);
+        let loss_custom = run(200.0);
+        assert!(
+            (loss_default - loss_custom).abs() > 1e-6,
+            "in_offset must change the loss: default={loss_default} custom={loss_custom}"
+        );
+
+        // それぞれ独立式 `(qf - 0.5)^2` と一致することを確認。
+        for off in [270.0_f32, 200.0] {
+            let err = qf(off) - 0.5_f32;
+            let expected = (err as f64) * (err as f64);
+            let got = run(off);
+            assert!(
+                approx_eq_f64(got, expected, 1e-10),
+                "off={off}: got {got} expected {expected}"
             );
         }
     }

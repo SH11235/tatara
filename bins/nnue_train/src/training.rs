@@ -104,6 +104,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             )
             .into());
         }
+        if !cli.wrm_in_offset.is_finite() {
+            return Err(
+                format!("--wrm-in-offset must be finite (got {})", cli.wrm_in_offset).into(),
+            );
+        }
         if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
             return Err(format!(
                 "--wrm-nnue2score must be finite and > 0 (got {})",
@@ -128,6 +133,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         LossKind::Wrm {
             nnue2score: cli.wrm_nnue2score,
             in_scaling: cli.wrm_in_scaling,
+            in_offset: cli.wrm_in_offset,
             target_offset: cli.wrm_target_offset,
             target_scaling: cli.wrm_target_scaling,
         }
@@ -642,6 +648,7 @@ pub(crate) fn build_experiment_logger(
         qb: nnue_format::layerstack_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
         wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
+        wrm_in_offset: is_wrm.then(|| finite_or_zero(cli.wrm_in_offset)),
         wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
         wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
@@ -779,6 +786,7 @@ pub(crate) fn build_experiment_logger_simple(
         qb: nnue_format::simple_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
         wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
+        wrm_in_offset: is_wrm.then(|| finite_or_zero(cli.wrm_in_offset)),
         wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
         wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
         wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
@@ -986,6 +994,11 @@ pub(crate) fn run_simple_training(
             )
             .into());
         }
+        if !cli.wrm_in_offset.is_finite() {
+            return Err(
+                format!("--wrm-in-offset must be finite (got {})", cli.wrm_in_offset).into(),
+            );
+        }
         if !(cli.wrm_nnue2score.is_finite() && cli.wrm_nnue2score > 0.0) {
             return Err(format!(
                 "--wrm-nnue2score must be finite and > 0 (got {})",
@@ -1010,6 +1023,7 @@ pub(crate) fn run_simple_training(
         LossKind::Wrm {
             nnue2score: cli.wrm_nnue2score,
             in_scaling: cli.wrm_in_scaling,
+            in_offset: cli.wrm_in_offset,
             target_offset: cli.wrm_target_offset,
             target_scaling: cli.wrm_target_scaling,
         }
