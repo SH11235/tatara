@@ -68,7 +68,9 @@ over, so the taper collapses to `--start-wdl`.
 ## Where the value is recorded
 
 The effective schedule is written to the run's `experiment.json` under
-`params`: `wdl` for the constant case, and `start_wdl` / `end_wdl` for a linear
-taper (omitted when unused). `test_loss` is computed with the same `lambda` as
-`train_loss` at each superbatch, so the two stay on one scale (see "Reading the
-metrics" in the [quickstart](training-quickstart.md)).
+`params`. The `wdl` field is always present (the constant lambda); a linear
+taper additionally records `start_wdl` / `end_wdl` (omitted otherwise), and in
+that case the scheduler derives `lambda` from those endpoints and ignores
+`wdl`. `test_loss` is computed with the same `lambda` as `train_loss` at each
+superbatch, so the two stay on one scale (see "Reading the metrics" in the
+[quickstart](training-quickstart.md)).

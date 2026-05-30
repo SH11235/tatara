@@ -62,8 +62,10 @@ taper は `--start-wdl` に縮退する。
 
 ## 値の記録先
 
-実効スケジュールは run の `experiment.json` の `params` に記録される: 一定なら
-`wdl`、線形 taper なら `start_wdl` / `end_wdl`（未使用時は省略）。`test_loss` は
-各 superbatch で `train_loss` と同じ `lambda` で計算されるので、両者は同じ
-スケールに乗る（[quickstart](training-quickstart.ja.md) の「メトリクスの読み方」を
-参照）。
+実効スケジュールは run の `experiment.json` の `params` に記録される。`wdl`
+フィールドは常に存在し（一定 lambda の値）、線形 taper のときは追加で
+`start_wdl` / `end_wdl` が記録される（taper でないときは省略）。taper 時は
+scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` の値は
+使われない。`test_loss` は各 superbatch で `train_loss` と同じ `lambda` で
+計算されるので、両者は同じスケールに乗る（[quickstart](training-quickstart.ja.md)
+の「指標の読み方」を参照）。
