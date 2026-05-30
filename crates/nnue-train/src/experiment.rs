@@ -112,7 +112,15 @@ pub struct Params {
     pub batches_per_superbatch: usize,
     pub superbatches: usize,
     pub start_superbatch: usize,
+    /// constant WDL lambda。`--start-wdl` / `--end-wdl` による linear taper 時は
+    /// scheduler に使われず、taper の値は `start_wdl` / `end_wdl` 側に入る。
     pub wdl: f32,
+    /// linear WDL taper の始点 / 終点。`--start-wdl` / `--end-wdl` 指定時のみ
+    /// `Some` で、constant lambda (`--wdl`) の run では省略する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_wdl: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_wdl: Option<f32>,
     pub scale: f32,
     pub weight_decay: f32,
     pub qa: i32,
@@ -537,6 +545,8 @@ mod tests {
             superbatches: 400,
             start_superbatch: 1,
             wdl: 0.0,
+            start_wdl: None,
+            end_wdl: None,
             scale: 290.0,
             weight_decay: 0.0,
             qa: 127,
@@ -727,5 +737,29 @@ mod tests {
         assert!(v.get("lineage").is_none());
         assert!(v["params"].get("wrm_in_scaling").is_none());
         assert!(v["params"].get("progress_coeff").is_none());
+        // linear WDL taper を使わない run では start/end は省略 (constant lambda は `wdl`)。
+        assert!(v["params"].get("start_wdl").is_none());
+        assert!(v["params"].get("end_wdl").is_none());
+    }
+
+    #[test]
+    fn linear_wdl_taper_is_serialized() {
+        // linear taper run (`--start-wdl` / `--end-wdl`) は両 field を効値で記録する。
+        let mut params = sample_params();
+        params.start_wdl = Some(0.0);
+        params.end_wdl = Some(0.75);
+        let doc = ExperimentDoc::new(
+            "net-20260517t041530z".to_string(),
+            "net".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train".to_string(),
+            None,
+            params,
+            sample_data(),
+        );
+        let v = serde_json::to_value(&doc).expect("serialise");
+        assert_eq!(v["params"]["start_wdl"], 0.0);
+        assert_eq!(v["params"]["end_wdl"], 0.75);
     }
 }

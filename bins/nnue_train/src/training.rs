@@ -5,7 +5,7 @@ use nnue_format::LayerStackWeights;
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{ConstantWDL, StepLR};
+use nnue_train::schedule::{StepLR, WdlSchedulerEnum};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec};
@@ -66,14 +66,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
     // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss params のみ見る)。
+    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
         return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
     }
     if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
         return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
-        return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
     }
     if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
         return Err(format!(
@@ -364,7 +362,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         gamma: cli.lr_gamma,
         step: cli.lr_step.max(1),
     };
-    let wdl_scheduler = ConstantWDL { value: cli.wdl };
+    let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
         feature_set,
@@ -448,6 +446,34 @@ pub(crate) fn layerstack_architecture(
 /// CLI 側の finite 検証を経ないため防御する。
 pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
+}
+
+/// CLI フラグから WDL lambda scheduler を構築する。`--start-wdl` と `--end-wdl`
+/// を両方指定すると `start → end` の線形 taper、いずれも未指定なら `--wdl` の
+/// 一定 lambda になる。片方だけの指定は error。`--wdl` と `--start-wdl` /
+/// `--end-wdl` の同時指定は clap の `conflicts_with` で parse 時に reject される。
+/// すべての値が finite かつ `[0.0, 1.0]` であることを要求する (kernel に NaN /
+/// 範囲外を流さない)。
+pub(crate) fn build_wdl_scheduler(
+    cli: &Cli,
+) -> Result<WdlSchedulerEnum, Box<dyn std::error::Error>> {
+    fn check(name: &str, value: f32) -> Result<f32, Box<dyn std::error::Error>> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be finite and in [0.0, 1.0] (got {value})").into());
+        }
+        Ok(value)
+    }
+
+    match (cli.start_wdl, cli.end_wdl) {
+        (Some(start), Some(end)) => Ok(WdlSchedulerEnum::linear(
+            check("--start-wdl", start)?,
+            check("--end-wdl", end)?,
+        )),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("--start-wdl and --end-wdl must be set together for a linear WDL taper".into())
+        }
+        (None, None) => Ok(WdlSchedulerEnum::constant(check("--wdl", cli.wdl)?)),
+    }
 }
 
 /// `path` の basename を `String` で返す。file_name が取れなければ path 全体の
@@ -636,6 +662,8 @@ pub(crate) fn build_experiment_logger(
         superbatches: cli.superbatches,
         start_superbatch,
         wdl: finite_or_zero(cli.wdl),
+        start_wdl: cli.start_wdl.map(finite_or_zero),
+        end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         qa: nnue_format::layerstack_weights::QA,
@@ -773,6 +801,8 @@ pub(crate) fn build_experiment_logger_simple(
         superbatches: cli.superbatches,
         start_superbatch,
         wdl: finite_or_zero(cli.wdl),
+        start_wdl: cli.start_wdl.map(finite_or_zero),
+        end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         qa: id.activation.qa(),
@@ -912,14 +942,12 @@ pub(crate) fn run_simple_training(
                 .into(),
         );
     }
+    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
         return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
     }
     if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
         return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.wdl.is_finite() || !(0.0..=1.0).contains(&cli.wdl) {
-        return Err(format!("--wdl must be finite and in [0.0, 1.0] (got {})", cli.wdl).into());
     }
     if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
         return Err(format!(
@@ -1113,7 +1141,7 @@ pub(crate) fn run_simple_training(
         gamma: cli.lr_gamma,
         step: cli.lr_step.max(1),
     };
-    let wdl_scheduler = ConstantWDL { value: cli.wdl };
+    let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
         feature_set,

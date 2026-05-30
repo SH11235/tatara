@@ -152,3 +152,83 @@ fn simple_activation_arg_parses_and_maps() {
         assert_eq!(SimpleActivation::from_canonical_name(&act), Some(want));
     }
 }
+
+#[test]
+fn wdl_taper_flags_parse_global_and_conflict_with_wdl() {
+    use nnue_train::schedule::WdlSchedulerEnum;
+
+    use crate::training::build_wdl_scheduler;
+
+    // 未指定なら `--wdl` の constant lambda (default 0.0)。
+    let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("defaults parse");
+    assert!(cli.start_wdl.is_none() && cli.end_wdl.is_none());
+    match build_wdl_scheduler(&cli).expect("constant scheduler") {
+        WdlSchedulerEnum::Constant(c) => assert_eq!(c.value, 0.0),
+        WdlSchedulerEnum::Linear(_) => panic!("expected constant WDL"),
+    }
+
+    // 両指定で linear taper。`global = true` なので subcommand 後置でも accept。
+    // 端点 0.0 / 1.0 (`[0.0, 1.0]` の境界) はいずれも valid。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "simple",
+        "--start-wdl",
+        "1.0",
+        "--end-wdl",
+        "0.0",
+    ])
+    .expect("linear taper flags parse");
+    match build_wdl_scheduler(&cli).expect("linear scheduler") {
+        WdlSchedulerEnum::Linear(l) => {
+            assert_eq!(l.start, 1.0);
+            assert_eq!(l.end, 0.0);
+        }
+        WdlSchedulerEnum::Constant(_) => panic!("expected linear WDL"),
+    }
+
+    // `--wdl` と `--start-wdl` / `--end-wdl` の同時指定は parse 時に reject。
+    assert!(
+        Cli::try_parse_from(["nnue-train", "simple", "--wdl", "0.5", "--start-wdl", "0.0"])
+            .is_err()
+    );
+    assert!(
+        Cli::try_parse_from(["nnue-train", "simple", "--wdl", "0.5", "--end-wdl", "0.5"]).is_err()
+    );
+}
+
+#[test]
+fn build_wdl_scheduler_rejects_partial_and_out_of_range() {
+    use crate::training::build_wdl_scheduler;
+
+    // 片方だけの指定は error (両指定で linear、未指定で constant の二択)。
+    let only_start =
+        Cli::try_parse_from(["nnue-train", "simple", "--start-wdl", "0.0"]).expect("parses");
+    assert!(build_wdl_scheduler(&only_start).is_err());
+    let only_end =
+        Cli::try_parse_from(["nnue-train", "simple", "--end-wdl", "0.5"]).expect("parses");
+    assert!(build_wdl_scheduler(&only_end).is_err());
+
+    // 範囲外 (`[0.0, 1.0]` 外) は error。
+    let out_of_range = Cli::try_parse_from([
+        "nnue-train",
+        "simple",
+        "--start-wdl",
+        "0.0",
+        "--end-wdl",
+        "1.5",
+    ])
+    .expect("parses");
+    assert!(build_wdl_scheduler(&out_of_range).is_err());
+
+    // 非有限値 (NaN) も error (kernel に NaN lambda を流さない)。
+    let nan = Cli::try_parse_from([
+        "nnue-train",
+        "simple",
+        "--start-wdl",
+        "nan",
+        "--end-wdl",
+        "0.5",
+    ])
+    .expect("parses");
+    assert!(build_wdl_scheduler(&nan).is_err());
+}
