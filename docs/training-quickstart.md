@@ -46,70 +46,9 @@ options" below.
 ## Example 2: Training a LayerStack NNUE
 
 The `layerstack` architecture uses the 9 game-progress buckets, so prepare the
-bucket coefficients `progress.bin` first.
-
-### Generating progress.bin
-
-Train the progress coefficients with `progress-kpabs-train`. The idea of
-learning game progress and assigning it to output buckets is based on
-[a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000).
-
-> **Do not shuffle the data.** Pass `progress-kpabs-train`'s `--data` a PSV of
-> **consecutive games** (positions in game order, with games following one
-> after another). The progress coefficients learn "how far a position has
-> advanced within a single game", and `progress-kpabs-train` reads the data one
-> game at a time (detecting game boundaries by `game_ply`) and labels each
-> position with its relative position within that game. With a shuffled PSV the
-> game boundaries break, the labels become meaningless, and correct coefficients
-> cannot be learned. As a general rule the main NNUE training (`nnue-train`)
-> benefits from a *shuffled* PSV; progress training is the opposite, so do not
-> reuse the same file for both.
-
-Specify the total number of epochs with `--epochs`. Each epoch writes a
-`<run-name>.e<N>.bin` checkpoint, and the final epoch is also written to the
-`--output` path.
-
-```bash
-target/release/progress-kpabs-train \
-  --data <path/to/consecutive-psv.bin> \
-  --output output/progress/<run-name>.bin \
-  --games-per-step 1024 --epochs 5
-```
-
-Which epoch's output (`<run-name>.e<N>.bin`) to use takes some trial and error
-(progress.bin is a coefficient that decides bucket assignment and is independent
-of NNUE training convergence, so how many epochs you need is data-dependent).
-
-To help decide which epoch to use, add `--val-fraction <f>` (e.g. `0.05`): it
-holds out roughly that fraction of games — every Nth game in input order, since
-the data must stay in consecutive-game order — and reports a held-out `val_loss`
-at the end of each epoch. This adds one extra pass over the data per epoch.
-
-Treat `val_loss` as a sanity check and an epoch-selection hint, not a precise
-quality score. The progress model is simple — per-feature weights summed and
-passed through a sigmoid — so it overfits little: a small `train_loss`/`val_loss`
-gap is normal, and a clearly widening gap is what to watch for. Because the real
-goal is a good bucket split, which a plain MSE only approximates, prefer an
-epoch where `val_loss` levels off over chasing its exact minimum, and judge the
-final `progress.bin` by the strength of the LayerStack NNUE trained with it.
-
-### Checking the bucket distribution
-
-`progress-bucket-survey` reports how a `progress.bin` assigns positions to the
-progress buckets. A roughly even spread is healthy; if one bucket dominates, the
-LayerStack output buckets are trained on very uneven amounts of data.
-
-```bash
-cargo build --release -p progress-bucket-survey
-target/release/progress-bucket-survey \
-  --data <path/to/consecutive-psv.bin> \
-  --progress output/progress/<run-name>.e5.bin \
-  --samples 200000
-```
-
-It prints a per-bucket count and percentage plus the top bucket's share. Only
-one `progress.bin` can be loaded per run, so to compare epochs run it once per
-`<run-name>.e<N>.bin` and compare the outputs.
+bucket coefficients `progress.bin` first — train it with `progress-kpabs-train`
+and check the bucket split with `progress-bucket-survey`, as described in
+[Game-progress buckets: preparing `progress.bin`](progress-bin.md).
 
 ### Training
 
@@ -163,70 +102,10 @@ FP16 modes are on).
 
 To watch for overfitting and divergence (NaN) without waiting for SPRT
 self-play, add held-out validation: positions that are never used for a
-gradient update. Each superbatch ends with a forward-only pass over them; the
-training log prints `test_loss` / `test_acc` (compact field name for
-console), and `experiment.json` records the same numbers as `test_loss` /
-`test_accuracy`.
-
-### Three related flags
-
-| Flag | Role | Type |
-|---|---|---|
-| `--test-tail-positions <N>` | Held-out **source**: the last N positions of `--data` itself | source A |
-| `--test-data <PATH>` | Held-out **source**: a separate PSV file | source B |
-| `--test-positions <K>` | How many positions are **evaluated** per superbatch from the chosen source | evaluation size, shared |
-
-`--test-tail-positions` and `--test-data` are alternative held-out sources and
-are mutually exclusive — pick one (or neither, to disable held-out
-validation). `--test-positions` is a separate parameter that determines how
-many positions of that chosen source actually get scored every superbatch
-(drawn from the start of the source and rounded up to a whole `--batch-size`
-multiple).
-
-### Which source to pick
-
-- **`--test-tail-positions <N>` (recommended)**: reserve the last N positions
-  of `--data` itself. Training reads `[0, file_end - N * 40)` and validation
-  reads `[file_end - N * 40, file_end)`; the two ranges are disjoint by
-  construction so contamination cannot occur. One file does both jobs, which
-  removes the need to prepare a separate held-out PSV and to keep two files in
-  sync. The only cost is that training loses N positions from its pool — for
-  `N << total positions` (e.g. 1e6 reserved out of 1e9 trained) this is well
-  under 0.1% and not noticeable.
-- **`--test-data <path>`**: a separate PSV file used only for validation. Use
-  it when you have a held-out set that is meaningfully independent of `--data`
-  (different generator, different time period, etc.) and you want that
-  independence preserved. For ergonomic reasons alone there is no benefit to
-  splitting `--data` into two files.
-
-### Example
-
-Reserve the last 1M positions as held-out, evaluate 10K of them each superbatch:
-
-```bash
-target/release/nnue-train \
-  --data <path/to/shuffled-psv.bin> \
-  --test-tail-positions 1000000 \
-  --test-positions 10000 \
-  --output checkpoints/<run-name> --net-id <run-name> \
-  --superbatches <N> --threads <N> \
-  layerstack --progress-coeff <path/to/progress.bin>
-```
-
-### Reading the metrics
-
-`test_loss` uses the same loss kernel (sigmoid-MSE or WRM) and the same WDL
-lambda blend as `train_loss`, so the two are on the same scale and can be
-compared directly within a superbatch. For how to set that blend — a constant
-`--wdl` or a linear `--start-wdl` / `--end-wdl` taper — see
-[Training schedules](training-schedule.md). A widening `test_loss − train_loss`
-gap signals overfitting; an early `test_loss` divergence often catches NaN
-issues before `train_loss` looks abnormal.
-
-`test_acc` / `test_accuracy` is the sign-agreement between net output and the
-game result (draws excluded from the denominator). It is scale-invariant, so
-it can be compared across runs and configurations that have different loss
-scales.
+gradient update, scored each superbatch and reported as `test_loss` /
+`test_acc`. Enable it with `--test-tail-positions` (or `--test-data`) plus
+`--test-positions`; see [Held-out validation](held-out-validation.md) for the
+flags, how to pick the held-out source, and how to read the metrics.
 
 ## Interrupting and resuming training
 
@@ -307,4 +186,7 @@ target/release/nnue-train --data <PSV> \
 ## Related
 
 - [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) setup
+- [Game-progress buckets: preparing `progress.bin`](progress-bin.md) — training and surveying the LayerStack bucket coefficients
+- [Held-out validation](held-out-validation.md) — `test_loss` / `test_acc` setup and how to read the metrics
+- [Training schedules](training-schedule.md) — learning-rate and WDL lambda scheduling
 - [Tuning the WRM loss](wrm-loss-tuning.md) — the WRM transform and its 5 tuning options

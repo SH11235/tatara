@@ -115,4 +115,4 @@ constant lambda); a linear taper additionally records `start_wdl` / `end_wdl`
 (omitted otherwise), and in that case the scheduler derives `lambda` from those
 endpoints and ignores `wdl`. `test_loss` is computed with the same `lambda` as
 `train_loss` at each superbatch, so the two stay on one scale (see "Reading the
-metrics" in the [quickstart](training-quickstart.md)).
+metrics" in [Held-out validation](held-out-validation.md)).

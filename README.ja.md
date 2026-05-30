@@ -83,8 +83,12 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
   セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.ja.md) — アーキ別の学習例 + 主要
   CLI option + resume / checkpoint 運用
-- [Training schedules](docs/training-schedule.ja.md) — WDL lambda のスケジューリング
-  (一定 `--wdl` / 線形 `--start-wdl` / `--end-wdl` taper) の使い分け
+- [局面進行度 bucket: `progress.bin` の用意](docs/progress-bin.ja.md) — LayerStack
+  の bucket 係数の学習と bucket 分布の確認
+- [held-out validation](docs/held-out-validation.ja.md) — `test_loss` / `test_acc`
+  の有効化、held-out source の選び方、指標の読み方
+- [Training schedules](docs/training-schedule.ja.md) — 学習率 (`--lr-schedule`) と
+  WDL lambda (`--wdl` / `--start-wdl` / `--end-wdl`) のスケジューリング
 - [ADR (Architecture Decision Records)](docs/decisions/) — 設計判断とその
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel

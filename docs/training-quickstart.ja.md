@@ -40,66 +40,10 @@ target/release/nnue-train \
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数 `progress.bin` を用意する。
-
-### progress.bin を生成
-
-`progress-kpabs-train` で進行度係数を学習する。進行度を学習して出力 bucket に
-割り当てる発想は [nodchip 氏の記事](https://nodchip.hatenablog.com/entry/2026/02/04/000000) に基づく。
-
-> **データはシャッフルしないこと。** `progress-kpabs-train` の `--data` には
-> **連続した対局**の PSV(局面が対局順に並び、対局が次々と続くもの)を渡す。
-> 進行度係数は「1 局の中で局面がどこまで進んだか」を学習するもので、
-> `progress-kpabs-train` はデータを 1 局単位で読み(`game_ply` で対局境界を検出)、
-> 各局面にその局内での相対位置をラベル付けする。シャッフル済み PSV だと対局境界が
-> 壊れてラベルが無意味になり、正しい係数が学習できない。一般に本体の NNUE 学習
-> (`nnue-train`) はシャッフル済み PSV が望ましいが、進行度学習は逆で、シャッフル
-> すると正しく学習できない。同じファイルを両方に使い回さないこと。
-
-`--epochs` で総 epoch 数を指定する。epoch ごとに `<run-name>.e<N>.bin` の
-checkpoint が出力され、最終 epoch は `--output` の path にも書き出される。
-
-```bash
-target/release/progress-kpabs-train \
-  --data <path/to/consecutive-psv.bin> \
-  --output output/progress/<run-name>.bin \
-  --games-per-step 1024 --epochs 5
-```
-
-どの epoch の出力 (`<run-name>.e<N>.bin`) を使うかは試行錯誤になる
-(progress.bin は bucket 割当を決める係数で、NNUE 学習の収束とは独立なため
-何 epoch 必要かはデータ依存)。
-
-どの epoch を使うか決める助けに `--val-fraction <f>`(例 `0.05`)を渡せる。
-おおよそ指定割合の対局を入力順の N 局ごとに検証用へ取り分け(データは連続
-対局順を保つ必要があるためシャッフルはしない)、各 epoch 末に held-out な
-`val_loss` を出力する。有効にすると epoch ごとにデータ走査が 1 回増える。
-
-`val_loss` は健全性チェックと epoch 選びの目安であって、品質の精密な指標では
-ない。進行度モデルは単純(特徴ごとの重みを総和して sigmoid に通すだけ)なので
-過学習しにくく、`train_loss` と `val_loss` の差は小さいのが正常で、明確に広がる
-差が注意すべきサイン。また真の目的は良い bucket 分割で、素の MSE はその近似に
-すぎないので、`val_loss` の厳密な最小値を追うより頭打ちになった epoch を選び、
-最終的な `progress.bin` の良し悪しはそれで学習した LayerStack NNUE の棋力で
-判断する。
-
-### bucket 分布の確認
-
-`progress-bucket-survey` は `progress.bin` が局面を進行度 bucket にどう割り当てる
-かを集計する。分布がおおむね均等なら健全で、特定の bucket に偏っていると
-LayerStack の出力 bucket ごとの学習データ量が大きく不均衡になる。
-
-```bash
-cargo build --release -p progress-bucket-survey
-target/release/progress-bucket-survey \
-  --data <path/to/consecutive-psv.bin> \
-  --progress output/progress/<run-name>.e5.bin \
-  --samples 200000
-```
-
-bucket ごとの件数・割合と top bucket の占有率を表示する。1 回の実行で読み込める
-`progress.bin` は 1 つなので、epoch を比較するときは `<run-name>.e<N>.bin` ごとに
-実行して出力を見比べる。
+`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数
+`progress.bin` を用意する——`progress-kpabs-train` で学習し、`progress-bucket-survey`
+で bucket 分布を確認する。手順は
+[局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
 
 ### 学習
 
@@ -146,65 +90,10 @@ target/release/nnue-train \
 ## held-out validation
 
 過学習や数値発散 (NaN) を SPRT 自己対局を待たずに早期検知するには、held-out
-validation を有効化する。validation 用に「勾配更新に一切使わない局面」を別途
-保持し、毎 superbatch 末に forward-only パスで集計する。training log は
-`test_loss` / `test_acc` を出力 (console 向けの短い field 名)、`experiment.json`
-は同じ値を `test_loss` / `test_accuracy` として記録する。
-
-### 関連する 3 つの flag
-
-| flag | 役割 | 種類 |
-|---|---|---|
-| `--test-tail-positions <N>` | held-out の **source**: `--data` の末尾 N 局面 | source A |
-| `--test-data <PATH>` | held-out の **source**: 別 PSV ファイル | source B |
-| `--test-positions <K>` | 選んだ source から毎 superbatch **評価する局面数** | evaluation size、両 source 共用 |
-
-`--test-tail-positions` と `--test-data` は held-out source の選択肢で、
-`clap conflicts_with` 双方向で排他 (どちらか 1 つ、または両方未指定 = held-out
-無効)。`--test-positions` は source 選択とは別軸のパラメータで、選ばれた
-source の先頭から K 局面 (満タン batch 切上げ) を毎 superbatch 末に評価する。
-
-### どちらの source を選ぶか
-
-- **`--test-tail-positions <N>` (推奨)**: `--data` 自身の末尾 N 局面を切り
-  分ける。training は `[0, file_end - N * 40)`、validation は
-  `[file_end - N * 40, file_end)` を読み、両者は byte range レベルで disjoint
-  なので contamination は構造的に発生しない。教師ファイル 1 本で training と
-  validation 両方をまかなえるので、別 file を用意して同期管理する手間が要らな
-  い。唯一のコストは training pool が N 局面減ること。教師全件 ≫ N の典型ケース
-  (例: 1e9 局面の教師に対し N = 1e6) では 0.1% 未満で実害なし
-- **`--test-data <path>`**: validation 専用の別 PSV ファイル。holdout 集合が
-  `--data` と独立して用意済 (異なる generator / 異なる時期の局面群) で、その
-  独立性を保ちたい積極的な理由があるときに使う。ergonomic 上の理由だけで `--data`
-  を 2 本に分割する利点は無い
-
-### 使用例
-
-末尾 100 万局面を holdout に切り分け、うち先頭 1 万局面を毎 superbatch で評価:
-
-```bash
-target/release/nnue-train \
-  --data <path/to/shuffled-psv.bin> \
-  --test-tail-positions 1000000 \
-  --test-positions 10000 \
-  --output checkpoints/<run-name> --net-id <run-name> \
-  --superbatches <N> --threads <N> \
-  layerstack --progress-coeff <path/to/progress.bin>
-```
-
-### 指標の読み方
-
-`test_loss` は `train_loss` と同じ loss kernel (sigmoid-MSE または WRM) +
-同じ WDL lambda blend で計算するため、両者は単位・スケールが揃い同 superbatch 内
-で直接比較できる。この blend の設定方法（一定の `--wdl` か、線形の
-`--start-wdl` / `--end-wdl` taper か）は
-[学習スケジュール](training-schedule.ja.md) を参照。`test_loss − train_loss` の差が広がっていけば過学習の兆候、
-`test_loss` が `train_loss` より早く異常値に飛ぶようなら NaN 発散の早期検知に
-なる。
-
-`test_acc` / `test_accuracy` はモデル出力の符号と実対局結果の一致率 (引き分け
-は分母から除外)。scale 不変なので、loss スケールが異なる run / 設定の間でも直接
-比較できる。
+validation を有効化する。勾配更新に一切使わない局面を毎 superbatch 末に集計し、
+`test_loss` / `test_acc` として出力する。`--test-tail-positions`(または
+`--test-data`)+ `--test-positions` で有効化する。flag・held-out source の選び方・
+指標の読み方は [held-out validation](held-out-validation.ja.md) を参照。
 
 ## 学習中断・再開
 
@@ -281,4 +170,7 @@ target/release/nnue-train --data <PSV> \
 ## 関連
 
 - [docs/setup.ja.md](setup.ja.md) — toolchain (LLVM / CUDA / cuda-oxide) セットアップ
+- [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) — LayerStack の bucket 係数の学習と確認
+- [held-out validation](held-out-validation.ja.md) — `test_loss` / `test_acc` の有効化と指標の読み方
+- [学習スケジュール](training-schedule.ja.md) — 学習率と WDL lambda のスケジューリング
 - [WRM loss のチューニング](wrm-loss-tuning.ja.md) — WRM の変換式と 5 つの調整引数

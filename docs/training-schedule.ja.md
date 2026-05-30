@@ -107,5 +107,5 @@ taper は `--start-wdl` に縮退する。
 `start_wdl` / `end_wdl` が記録される（taper でないときは省略）。taper 時は
 scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` の値は
 使われない。`test_loss` は各 superbatch で `train_loss` と同じ `lambda` で
-計算されるので、両者は同じスケールに乗る（[quickstart](training-quickstart.ja.md)
+計算されるので、両者は同じスケールに乗る（[held-out validation](held-out-validation.ja.md)
 の「指標の読み方」を参照）。
