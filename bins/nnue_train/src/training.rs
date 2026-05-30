@@ -727,14 +727,10 @@ pub(crate) fn git_commit() -> Option<String> {
     })
 }
 
-/// 初期化方式を experiment.json 用に要約する。preset が legacy で override も無い
-/// 既定の run、および `--init-from` / `--resume` で重みが上書きされる run では
-/// `None` を返す (初期化選択が実 weight に効かないので記録しても reader を混乱
-/// させるだけ)。それ以外では preset 名・seed・override された層を記す。
-///
-/// `seed=` は `--init-seed` が実際に効く非 legacy preset でのみ記す。legacy preset は
-/// 全 group (override 層含む) が固定 seed を使い `--init-seed` を読まないため、seed を
-/// 出すと experiment.json から再現する reader を誤らせる。
+/// 初期化方式を experiment.json 用に要約する。override が無い既定の run、および
+/// `--init-from` / `--resume` で重みが上書きされる run では `None` を返す (初期化
+/// 選択が実 weight に効かないので記録しても reader を混乱させるだけ)。override が
+/// あれば差し替えた層名を記す。
 pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     if cli.init_from.is_some() || cli.resume.is_some() {
         return None;
@@ -749,31 +745,15 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))
     .collect();
-    if cli.init_preset == InitPresetArg::Legacy && overridden.is_empty() {
+    if overridden.is_empty() {
         return None;
     }
-    let preset = match cli.init_preset {
-        InitPresetArg::Legacy => "legacy",
-        InitPresetArg::NnuePytorch => "nnue-pytorch",
-    };
-    let mut fields: Vec<String> = Vec::new();
-    // legacy は固定 seed なので `--init-seed` の値は無意味。記録しない。
-    if cli.init_preset != InitPresetArg::Legacy {
-        fields.push(format!("seed={}", cli.init_seed));
-    }
-    if !overridden.is_empty() {
-        fields.push(format!("overrides: {}", overridden.join(",")));
-    }
-    if fields.is_empty() {
-        Some(preset.to_string())
-    } else {
-        Some(format!("{preset} ({})", fields.join(", ")))
-    }
+    Some(format!("overrides: {}", overridden.join(",")))
 }
 
-/// LayerStack の weight 初期化 spec を CLI から組み立てる (preset + per-layer override)。
+/// LayerStack の weight 初期化 spec を CLI から組み立てる (既定値 + per-layer override)。
 pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
-    let mut spec = LayerStackInit::from_preset(cli.init_preset.to_preset(), cli.init_seed);
+    let mut spec = LayerStackInit::default_uniform();
     if let Some(ov) = cli.init_ft {
         spec.apply_weight_override(WeightLayer::Ft, ov);
     }
@@ -795,7 +775,7 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
 /// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1f` は L1f を持たない
 /// Simple では error。
 pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn std::error::Error>> {
-    let mut spec = SimpleInit::from_preset(cli.init_preset.to_preset(), cli.init_seed);
+    let mut spec = SimpleInit::default_uniform();
     if let Some(ov) = cli.init_ft {
         spec.apply_weight_override(WeightLayer::Ft, ov)?;
     }
@@ -1414,50 +1394,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_default_run_logs_no_init_summary() {
+    fn default_run_logs_no_init_summary() {
         assert_eq!(init_summary_for_log(&parse(&[])), None);
     }
 
     #[test]
-    fn legacy_with_override_omits_seed() {
-        // legacy は固定 seed なので override 併用時も `--init-seed` は効かない。
-        // log に seed を出すと再現時に誤解を招くため省く。
-        let cli = parse(&["--init-seed", "777", "--init-ft", "uniform:fanin"]);
-        assert_eq!(
-            init_summary_for_log(&cli).as_deref(),
-            Some("legacy (overrides: ft)")
-        );
+    fn override_logs_overridden_layers() {
+        let cli = parse(&["--init-ft", "uniform:fanin"]);
+        assert_eq!(init_summary_for_log(&cli).as_deref(), Some("overrides: ft"));
     }
 
     #[test]
-    fn nnue_pytorch_logs_seed() {
-        let cli = parse(&["--init-preset", "nnue-pytorch", "--init-seed", "42"]);
+    fn multiple_overrides_are_listed() {
+        let cli = parse(&["--init-ft", "uniform:fanin", "--init-l2", "zero"]);
         assert_eq!(
             init_summary_for_log(&cli).as_deref(),
-            Some("nnue-pytorch (seed=42)")
-        );
-    }
-
-    #[test]
-    fn nnue_pytorch_with_override_logs_seed_and_overrides() {
-        let cli = parse(&[
-            "--init-preset",
-            "nnue-pytorch",
-            "--init-seed",
-            "42",
-            "--init-l2",
-            "zero",
-        ]);
-        assert_eq!(
-            init_summary_for_log(&cli).as_deref(),
-            Some("nnue-pytorch (seed=42, overrides: l2)")
+            Some("overrides: ft,l2")
         );
     }
 
     #[test]
     fn init_from_run_logs_no_summary() {
-        // `--init-from` は重みを上書きするので初期化選択は実 weight に効かない。
-        let cli = parse(&["--init-preset", "nnue-pytorch", "--init-from", "base.bin"]);
+        // `--init-from` は重みを上書きするので override 指定は実 weight に効かない。
+        let cli = parse(&["--init-ft", "uniform:fanin", "--init-from", "base.bin"]);
         assert_eq!(init_summary_for_log(&cli), None);
     }
 }

@@ -159,8 +159,9 @@ pub struct Params {
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
-    /// 重み初期化方式の要約 (`--init-preset` + seed + override)。preset が legacy で
-    /// override も無い既定の run では省略する。
+    /// 重み初期化の override 要約 (`--init-{ft,l1,l1f,l2,l3}` で差し替えた層名)。
+    /// override の無い既定の run では省略する。field 名は experiment.json schema
+    /// 互換のため従来どおり `init_preset`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_preset: Option<String>,
     /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
