@@ -248,6 +248,11 @@ With `--resume` (and `--start-superbatch` omitted), it resumes from the
 checkpoint's sb + 1; specifying `--start-superbatch N` explicitly lets you redo
 past superbatches.
 
+For LR schedules with a horizon, the checkpoint records the resolved horizon so
+the curve is reproduced on resume independently of `--superbatches`; see
+[Horizon and resuming](training-schedule.md#horizon-and-resuming) for the
+precedence rules.
+
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state
 > (fine-tuning / continued training); `--resume` restores both weights and

@@ -53,10 +53,10 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=3 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=4 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 4);
+    assert_eq!(RAW_CKPT_VERSION, 5);
 }
 
 #[test]
@@ -98,6 +98,36 @@ fn legacy_raw_ckpt_header(
     b
 }
 
+/// LR-horizon header を持たない version 4 の LayerStack raw checkpoint header を
+/// 組む (arch-kind + topology header あり、horizon なし)。
+fn v4_layerstack_header(superbatch: u64, step_count: u64, num_groups: u64) -> Vec<u8> {
+    let fs = FeatureSet::HalfKaHmMerged.spec();
+    let mut b = Vec::new();
+    b.extend_from_slice(&RAW_CKPT_MAGIC);
+    b.extend_from_slice(&4u32.to_le_bytes());
+    // feature set header (v2+)。
+    let name = fs.canonical_name();
+    b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b.extend_from_slice(&(fs.ft_in() as u64).to_le_bytes());
+    b.extend_from_slice(&(DEFAULT_FT_OUT as u64).to_le_bytes());
+    b.extend_from_slice(&(fs.max_active() as u64).to_le_bytes());
+    // producer run id (v3+、空)。
+    b.extend_from_slice(&0u32.to_le_bytes());
+    // arch-kind + topology header (v4+)。
+    let arch_name = ArchKind::LayerStack.canonical_name();
+    b.extend_from_slice(&(arch_name.len() as u32).to_le_bytes());
+    b.extend_from_slice(arch_name.as_bytes());
+    b.extend_from_slice(&(DEFAULT_LAYERSTACK_TOPOLOGY.len() as u64).to_le_bytes());
+    for &dim in &DEFAULT_LAYERSTACK_TOPOLOGY {
+        b.extend_from_slice(&dim.to_le_bytes());
+    }
+    b.extend_from_slice(&superbatch.to_le_bytes());
+    b.extend_from_slice(&step_count.to_le_bytes());
+    b.extend_from_slice(&num_groups.to_le_bytes());
+    b
+}
+
 /// 既定 FT / L1 / L2 出力次元 + 既定 bucket 数の LayerStack topology
 /// (test helper、`'static` 借用用)。
 const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(
@@ -117,22 +147,34 @@ fn layerstack_arch() -> RawCkptArch<'static> {
 }
 
 #[test]
-fn raw_ckpt_header_v4_round_trips() {
+fn raw_ckpt_header_v5_round_trips_with_lr_horizon() {
     let arch = layerstack_arch();
     let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &arch, "net-20260520-1234", 7, 99, 10).unwrap();
+    write_raw_ckpt_header(&mut buf, &arch, "net-20260520-1234", 7, 99, Some(123), 10).unwrap();
     let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!(h.superbatch, 7);
     assert_eq!(h.step_count, 99);
     assert_eq!(h.num_groups, 10);
     assert_eq!(h.producer_run_id.as_deref(), Some("net-20260520-1234"));
+    assert_eq!(h.lr_horizon, Some(123));
+}
+
+#[test]
+fn raw_ckpt_header_absent_lr_horizon_round_trips_to_none() {
+    // horizon を持たない schedule (step / constant / drop) は None で書かれ、
+    // read 側も None に戻る (sentinel 0)。
+    let arch = layerstack_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "", 1, 0, None, 10).unwrap();
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!(h.lr_horizon, None);
 }
 
 #[test]
 fn raw_ckpt_header_empty_run_id_round_trips_to_none() {
     let arch = layerstack_arch();
     let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &arch, "", 1, 0, 10).unwrap();
+    write_raw_ckpt_header(&mut buf, &arch, "", 1, 0, None, 10).unwrap();
     let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!(h.producer_run_id, None);
 }
@@ -156,6 +198,21 @@ fn raw_ckpt_header_reads_legacy_v1_v2_v3() {
     let h3 = read_raw_ckpt_header(&mut Cursor::new(&v3), &arch).unwrap();
     assert_eq!(h3.superbatch, 5);
     assert_eq!(h3.producer_run_id.as_deref(), Some("legacy-run"));
+    // v1..=3 は LR horizon header を持たないので None に解釈される (後方互換)。
+    assert_eq!(h1.lr_horizon, None);
+    assert_eq!(h2.lr_horizon, None);
+    assert_eq!(h3.lr_horizon, None);
+}
+
+#[test]
+fn raw_ckpt_header_v4_reads_lr_horizon_as_none() {
+    // version 4 は LR horizon header を持たない。read 側は schedule 情報無しと
+    // みなし None を返す (caller は CLI 値から再構築する、現行挙動を維持)。
+    let arch = layerstack_arch();
+    let v4 = v4_layerstack_header(6, 60, 10);
+    let h = read_raw_ckpt_header(&mut Cursor::new(&v4), &arch).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (6, 60, 10));
+    assert_eq!(h.lr_horizon, None);
 }
 
 #[test]
@@ -169,7 +226,7 @@ fn raw_ckpt_header_rejects_wrong_arch_kind() {
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     };
     let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &written, "", 1, 0, 10).unwrap();
+    write_raw_ckpt_header(&mut buf, &written, "", 1, 0, None, 10).unwrap();
     let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch())
         .expect_err("arch kind mismatch must reject");
     assert!(err.to_string().contains("arch kind mismatch"));
@@ -186,7 +243,7 @@ fn raw_ckpt_header_rejects_wrong_topology() {
         topology: &wrong_topo,
     };
     let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &written, "", 1, 0, 10).unwrap();
+    write_raw_ckpt_header(&mut buf, &written, "", 1, 0, None, 10).unwrap();
     let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch())
         .expect_err("topology mismatch must reject");
     assert!(err.to_string().contains("topology dim"));

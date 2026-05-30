@@ -301,43 +301,47 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         psqt_init_vec.as_deref(),
         &init_spec,
     )?;
-    // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id を決める。
-    let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
-        if let Some(init) = &cli.init_from {
+    // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
+    // 保存済 LR horizon を決める。
+    let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
+        Option<usize>,
+        Option<String>,
+        Option<usize>,
+    ) = if let Some(init) = &cli.init_from {
+        println!(
+            "[train] injecting pretrained weights from {} (optimizer state reset)",
+            init.display()
+        );
+        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+        let weights = LayerStackWeights::load_quantised_with_psqt(
+            &mut reader,
+            feature_set,
+            layerstack.ft_out,
+            layerstack.l1,
+            layerstack.l2,
+            layerstack.num_buckets,
+            layerstack.psqt,
+        )?;
+        trainer.load_layerstack_weights(&weights)?;
+        (None, None, None)
+    } else if let Some(ckpt) = &cli.resume {
+        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(ckpt)?;
+        println!(
+            "[train] resuming from {} at superbatch {}",
+            ckpt.display(),
+            sb + 1
+        );
+        if parent_id.is_none() {
             println!(
-                "[train] injecting pretrained weights from {} (optimizer state reset)",
-                init.display()
+                "[train] note: {} predates producer run id embedding; \
+                 experiment.json lineage.parent_id will be omitted",
+                ckpt.display()
             );
-            let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-            let weights = LayerStackWeights::load_quantised_with_psqt(
-                &mut reader,
-                feature_set,
-                layerstack.ft_out,
-                layerstack.l1,
-                layerstack.l2,
-                layerstack.num_buckets,
-                layerstack.psqt,
-            )?;
-            trainer.load_layerstack_weights(&weights)?;
-            (None, None)
-        } else if let Some(ckpt) = &cli.resume {
-            let (sb, parent_id) = trainer.load_raw_checkpoint(ckpt)?;
-            println!(
-                "[train] resuming from {} at superbatch {}",
-                ckpt.display(),
-                sb + 1
-            );
-            if parent_id.is_none() {
-                println!(
-                    "[train] note: {} predates producer run id embedding; \
-                     experiment.json lineage.parent_id will be omitted",
-                    ckpt.display()
-                );
-            }
-            (Some(sb), parent_id)
-        } else {
-            (None, None)
-        };
+        }
+        (Some(sb), parent_id, lr_horizon)
+    } else {
+        (None, None, None)
+    };
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
     let start_superbatch = match cli.start_superbatch {
@@ -363,7 +367,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
 
-    let lr_scheduler = build_lr_scheduler(cli)?;
+    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),
@@ -452,12 +456,23 @@ pub(crate) fn layerstack_architecture(
 /// の total horizon は `--superbatches` から決まるため、resume で `--superbatches` を
 /// 変えると同じ superbatch でも返す lr が変わる (曲線が伸縮する)。step は horizon を
 /// 持たず `--superbatches` に依存しないので影響を受けない。
-pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+///
+/// `resumed_horizon` は v5+ checkpoint から復元した保存済 horizon ([`crate::ckpt`])。
+/// 指定時は `--superbatches` 由来の default より優先され、curve が `--superbatches`
+/// から独立に再現される。優先順位は [`resolve_lr_horizon`] 参照。
+pub(crate) fn build_lr_scheduler(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
     use nnue_train::schedule::*;
 
     let lr = cli.lr;
-    // linear / cosine / exponential の減衰終端 superbatch。未指定なら run 全体。
-    let final_superbatch = cli.lr_final_superbatch.unwrap_or(cli.superbatches);
+    // linear / cosine / exponential の減衰終端 superbatch。優先順位は explicit
+    // --lr-final-superbatch > resume した保存 horizon > --superbatches。horizon を
+    // 使う schedule の arm 内でのみ解決する (horizon を持たない step / constant /
+    // drop で resume horizon の note を出さないため)。
+    let decay_horizon =
+        || resolve_lr_horizon(cli.lr_final_superbatch, resumed_horizon, cli.superbatches);
 
     let base = match cli.lr_schedule {
         LrScheduleArg::Step => LrSchedulerEnum::Step(StepLR {
@@ -472,6 +487,7 @@ pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn s
             drop: cli.lr_step,
         }),
         LrScheduleArg::Linear => {
+            let final_superbatch = decay_horizon();
             validate_decay(cli.lr_final, final_superbatch, false)?;
             LrSchedulerEnum::LinearDecay(LinearDecayLR {
                 initial_lr: lr,
@@ -480,6 +496,7 @@ pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn s
             })
         }
         LrScheduleArg::Cosine => {
+            let final_superbatch = decay_horizon();
             validate_decay(cli.lr_final, final_superbatch, false)?;
             LrSchedulerEnum::CosineDecay(CosineDecayLR {
                 initial_lr: lr,
@@ -488,6 +505,7 @@ pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn s
             })
         }
         LrScheduleArg::Exponential => {
+            let final_superbatch = decay_horizon();
             validate_decay(cli.lr_final, final_superbatch, true)?;
             LrSchedulerEnum::ExponentialDecay(ExponentialDecayLR {
                 initial_lr: lr,
@@ -518,12 +536,15 @@ pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn s
                 )
                 .into());
             }
+            // one-cycle は専用の horizon flag を持たないので、explicit 引数は常に
+            // None。resume した保存 horizon があればそれを、無ければ --superbatches。
+            let total = resolve_lr_horizon(None, resumed_horizon, cli.superbatches).max(1);
             LrSchedulerEnum::OneCycle(OneCycleLR::new(
                 lr,
                 cli.lr_warmup_pct,
                 cli.lr_div_factor,
                 cli.lr_final_div_factor,
-                cli.superbatches.max(1),
+                total,
             ))
         }
     };
@@ -536,6 +557,38 @@ pub(crate) fn build_lr_scheduler(cli: &Cli) -> Result<LrSchedulerEnum, Box<dyn s
         ),
         Some(w) => Ok(base.with_warmup(w)),
         None => Ok(base),
+    }
+}
+
+/// LR schedule の horizon (decay の `final_superbatch` / one-cycle の
+/// `total_superbatch`) を解決する。優先順位:
+///
+/// 1. `explicit` — resume か否かに関わらず明示された CLI horizon flag
+///    (decay の `--lr-final-superbatch`)。one-cycle は専用 flag が無いため常に `None`。
+/// 2. `resumed` — v5+ checkpoint から復元した保存済 horizon。curve を
+///    `--superbatches` から独立に再現させる。
+/// 3. `default` — `--superbatches` 由来の fallback (新規 run / 保存 horizon 無し)。
+///
+/// resume 時に保存 horizon が default を上書きする / 明示 flag が保存 horizon を
+/// 上書きする場合は operator 向けに 1 行 note を出す。
+fn resolve_lr_horizon(explicit: Option<usize>, resumed: Option<usize>, default: usize) -> usize {
+    match (explicit, resumed) {
+        (Some(e), Some(saved)) => {
+            println!(
+                "[train] note: explicit --lr-final-superbatch {e} overrides the resumed \
+                 checkpoint LR horizon {saved}"
+            );
+            e
+        }
+        (Some(e), None) => e,
+        (None, Some(saved)) => {
+            println!(
+                "[train] using saved LR horizon {saved} from checkpoint \
+                 (schedule curve stays independent of --superbatches)"
+            );
+            saved
+        }
+        (None, None) => default,
     }
 }
 
@@ -1224,27 +1277,30 @@ pub(crate) fn run_simple_training(
         &init_spec,
     )?;
 
-    let (resumed_superbatch, resume_parent_id): (Option<usize>, Option<String>) =
-        if let Some(init) = &cli.init_from {
-            println!(
-                "[train] injecting pretrained weights from {} (optimizer state reset)",
-                init.display()
-            );
-            let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-            let weights = SimpleWeights::load(&mut reader, id)?;
-            trainer.load_simple_weights(&weights)?;
-            (None, None)
-        } else if let Some(ckpt) = &cli.resume {
-            let (sb, parent_id) = trainer.load_raw_checkpoint(ckpt)?;
-            println!(
-                "[train] resuming from {} at superbatch {}",
-                ckpt.display(),
-                sb + 1
-            );
-            (Some(sb), parent_id)
-        } else {
-            (None, None)
-        };
+    let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
+        Option<usize>,
+        Option<String>,
+        Option<usize>,
+    ) = if let Some(init) = &cli.init_from {
+        println!(
+            "[train] injecting pretrained weights from {} (optimizer state reset)",
+            init.display()
+        );
+        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+        let weights = SimpleWeights::load(&mut reader, id)?;
+        trainer.load_simple_weights(&weights)?;
+        (None, None, None)
+    } else if let Some(ckpt) = &cli.resume {
+        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(ckpt)?;
+        println!(
+            "[train] resuming from {} at superbatch {}",
+            ckpt.display(),
+            sb + 1
+        );
+        (Some(sb), parent_id, lr_horizon)
+    } else {
+        (None, None, None)
+    };
 
     // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
     // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
@@ -1269,7 +1325,7 @@ pub(crate) fn run_simple_training(
         .into());
     }
 
-    let lr_scheduler = build_lr_scheduler(cli)?;
+    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         net_id: cli.net_id.clone(),

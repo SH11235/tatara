@@ -945,7 +945,7 @@ impl GpuTrainer {
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
     ///
     /// header の write / read は [`write_raw_ckpt_header`] / [`read_raw_ckpt_header`]
-    /// に切り出してある。layout (全 little-endian、現行 [`RAW_CKPT_VERSION`] = 4):
+    /// に切り出してある。layout (全 little-endian、現行 [`RAW_CKPT_VERSION`] = 5):
     /// ```text
     /// magic        b"RNRC"             (4 bytes)
     /// version      u32 (4)             (4 bytes)
@@ -962,6 +962,7 @@ impl GpuTrainer {
     /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/l1_out/l2_out/num_buckets)
     /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
     /// step_count   u64  (Ranger lookahead step counter)
+    /// lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
     /// num_groups   u64  (= 10、固定だが将来検証用)
     /// then for each of 10 groups (順序 = `raw_ckpt_groups()` = ft_w, ft_b, l1_w, l1_b,
     ///   l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b):
@@ -988,6 +989,7 @@ impl GpuTrainer {
         path: &Path,
         superbatch: usize,
         run_id: &str,
+        lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
@@ -1050,6 +1052,7 @@ impl GpuTrainer {
                 run_id,
                 superbatch as u64,
                 self.step_count,
+                lr_horizon,
                 total_groups,
             )?;
 
@@ -1149,11 +1152,13 @@ impl GpuTrainer {
     }
 
     /// raw checkpoint を読み戻す (`--resume` 用)。返り値は `(完了 superbatch 番号,
-    /// producer run id)` — superbatch は caller が通常その +1 から resume する。
-    /// producer run id は version 3+ の checkpoint なら `Some` (resume run の
-    /// `lineage.parent_id` に使う)、version 1/2 や run id 未記録なら `None`。
+    /// producer run id, LR-schedule horizon)` — superbatch は caller が通常その +1
+    /// から resume する。producer run id は version 3+ の checkpoint なら `Some`
+    /// (resume run の `lineage.parent_id` に使う)、version 1/2 や run id 未記録なら
+    /// `None`。LR-schedule horizon は version 5+ かつ horizon を持つ schedule で
+    /// 保存されていれば `Some` (caller が `--superbatches` より優先して curve に使う)。
     ///
-    /// magic 不一致、`version > 4`、arch kind / topology が LayerStack と不一致、group 数
+    /// magic 不一致、`version > 5`、arch kind / topology が LayerStack と不一致、group 数
     /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
     /// (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
@@ -1166,7 +1171,7 @@ impl GpuTrainer {
     pub(crate) fn load_raw_checkpoint(
         &mut self,
         path: &Path,
-    ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
+    ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let ft_out = self.ws.ft_out;
         let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
@@ -1187,6 +1192,7 @@ impl GpuTrainer {
         let superbatch = header.superbatch;
         let step_count = header.step_count;
         let producer_run_id = header.producer_run_id;
+        let lr_horizon = header.lr_horizon;
 
         // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
         let expected_groups: [(&'static str, usize); 9] = {
@@ -1288,7 +1294,7 @@ impl GpuTrainer {
         }
 
         self.step_count = step_count;
-        Ok((superbatch, producer_run_id))
+        Ok((superbatch, producer_run_id, lr_horizon))
     }
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
@@ -3029,8 +3035,9 @@ impl TrainerBackend for GpuTrainer {
         path: &Path,
         superbatch: usize,
         run_id: &str,
+        lr_horizon: Option<usize>,
     ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id)
+        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
             .map_err(|e| {
                 // 既に io::Error なら kind を保つ、それ以外は other で包む。
                 match e.downcast::<std::io::Error>() {

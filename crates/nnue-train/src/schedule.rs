@@ -24,6 +24,15 @@ pub trait LrScheduler: Clone + Debug + Display + Send + Sync + 'static {
     /// 現在の batch / superbatch に対する learning rate を返す。
     /// 多くの scheduler は `batch` に依存しない (Warmup のみ参照)。
     fn lr(&self, batch: usize, superbatch: usize) -> f32;
+
+    /// curve が終端値に到達する superbatch (horizon)。終端を持つ schedule
+    /// (linear / cosine / exponential decay の `final_superbatch`、one-cycle の
+    /// `total_superbatch`) は `Some` を、horizon を持たない schedule
+    /// (constant / step / drop) は `None` を返す。caller は resume 用 checkpoint に
+    /// 保存し、再開時に curve をその superbatch に固定するのに使う。
+    fn horizon(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 一定の learning rate。
@@ -114,6 +123,10 @@ impl LrScheduler for LinearDecayLR {
         let lambda = superbatch as f32 / self.final_superbatch as f32;
         self.initial_lr + lambda * (self.final_lr - self.initial_lr)
     }
+
+    fn horizon(&self) -> Option<usize> {
+        Some(self.final_superbatch)
+    }
 }
 
 impl Display for LinearDecayLR {
@@ -143,6 +156,10 @@ impl LrScheduler for CosineDecayLR {
         let lambda = 1.0 - 0.5 * (1.0 + (PI * progress).cos());
         self.initial_lr + lambda * (self.final_lr - self.initial_lr)
     }
+
+    fn horizon(&self) -> Option<usize> {
+        Some(self.final_superbatch)
+    }
 }
 
 impl Display for CosineDecayLR {
@@ -170,6 +187,10 @@ impl LrScheduler for ExponentialDecayLR {
         }
         let lambda = superbatch as f32 / self.final_superbatch as f32;
         self.initial_lr * (self.final_lr / self.initial_lr).powf(lambda)
+    }
+
+    fn horizon(&self) -> Option<usize> {
+        Some(self.final_superbatch)
     }
 }
 
@@ -252,6 +273,10 @@ impl LrScheduler for OneCycleLR {
             cosine_interp(self.max_lr, self.final_lr, p)
         }
     }
+
+    fn horizon(&self) -> Option<usize> {
+        Some(self.total_superbatch)
+    }
 }
 
 impl Display for OneCycleLR {
@@ -285,6 +310,11 @@ impl<LR: LrScheduler> LrScheduler for WarmupLR<LR> {
         } else {
             base_lr
         }
+    }
+
+    fn horizon(&self) -> Option<usize> {
+        // warmup wrapper は horizon を変えない (batch 単位の起動時 warmup のみ)。
+        self.inner.horizon()
     }
 }
 
@@ -363,6 +393,19 @@ impl LrScheduler for LrSchedulerEnum {
             Self::ExponentialDecay(s) => s.lr(batch, superbatch),
             Self::OneCycle(s) => s.lr(batch, superbatch),
             Self::Warmup(s) => s.lr(batch, superbatch),
+        }
+    }
+
+    fn horizon(&self) -> Option<usize> {
+        match self {
+            Self::Constant(s) => s.horizon(),
+            Self::Step(s) => s.horizon(),
+            Self::Drop(s) => s.horizon(),
+            Self::LinearDecay(s) => s.horizon(),
+            Self::CosineDecay(s) => s.horizon(),
+            Self::ExponentialDecay(s) => s.horizon(),
+            Self::OneCycle(s) => s.horizon(),
+            Self::Warmup(s) => s.horizon(),
         }
     }
 }
@@ -699,6 +742,74 @@ mod tests {
         assert!((warmed.lr(3, 1) - 1.0).abs() < EPS);
         // superbatch != 1 では warmup inactive。
         assert!((warmed.lr(0, 2) - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn horizon_reports_terminal_superbatch_for_horizon_schedules() {
+        // 終端を持つ schedule は final/total superbatch を返す。
+        assert_eq!(
+            LinearDecayLR {
+                initial_lr: 1.0,
+                final_lr: 0.0,
+                final_superbatch: 42,
+            }
+            .horizon(),
+            Some(42)
+        );
+        assert_eq!(
+            CosineDecayLR {
+                initial_lr: 1.0,
+                final_lr: 0.0,
+                final_superbatch: 7,
+            }
+            .horizon(),
+            Some(7)
+        );
+        assert_eq!(
+            ExponentialDecayLR {
+                initial_lr: 1.0,
+                final_lr: 0.01,
+                final_superbatch: 9,
+            }
+            .horizon(),
+            Some(9)
+        );
+        assert_eq!(
+            OneCycleLR::new(1.0, 0.2, 25.0, 100.0, 100).horizon(),
+            Some(100)
+        );
+
+        // horizon を持たない schedule は None。
+        assert_eq!(ConstantLR { value: 1e-3 }.horizon(), None);
+        assert_eq!(
+            StepLR {
+                start: 1.0,
+                gamma: 0.5,
+                step: 3,
+            }
+            .horizon(),
+            None
+        );
+        assert_eq!(
+            DropLR {
+                start: 1.0,
+                gamma: 0.1,
+                drop: 10,
+            }
+            .horizon(),
+            None
+        );
+
+        // enum / warmup wrapper は内側の horizon を透過する。
+        let oc = LrSchedulerEnum::OneCycle(OneCycleLR::new(1.0, 0.2, 25.0, 100.0, 50));
+        assert_eq!(oc.horizon(), Some(50));
+        assert_eq!(oc.with_warmup(4).horizon(), Some(50));
+        assert_eq!(
+            LrSchedulerEnum::Constant(ConstantLR { value: 1.0 })
+                .with_warmup(4)
+                .horizon(),
+            None
+        );
     }
 
     #[test]

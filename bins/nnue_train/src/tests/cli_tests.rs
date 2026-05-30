@@ -141,7 +141,7 @@ fn lr_schedule_defaults_to_step_bit_identical() {
     // `--lr-schedule` 省略時は従来の StepLR と一致する (default step、bit-identical)。
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack");
     assert_eq!(cli.lr_schedule, LrScheduleArg::Step);
-    let sched = crate::training::build_lr_scheduler(&cli).expect("build step scheduler");
+    let sched = crate::training::build_lr_scheduler(&cli, None).expect("build step scheduler");
     assert!(matches!(sched, LrSchedulerEnum::Step(_)));
 
     let reference = StepLR {
@@ -171,7 +171,7 @@ fn lr_schedule_one_cycle_builds_and_records_warmup_boundary() {
         "layerstack",
     ])
     .expect("one-cycle parse");
-    let sched = crate::training::build_lr_scheduler(&cli).expect("build one-cycle");
+    let sched = crate::training::build_lr_scheduler(&cli, None).expect("build one-cycle");
     match sched {
         LrSchedulerEnum::OneCycle(oc) => {
             assert_eq!(oc.total_superbatch, 10);
@@ -198,12 +198,88 @@ fn lr_schedule_cosine_defaults_final_superbatch_to_superbatches() {
         "layerstack",
     ])
     .expect("cosine parse");
-    match crate::training::build_lr_scheduler(&cli).expect("build cosine") {
+    match crate::training::build_lr_scheduler(&cli, None).expect("build cosine") {
         LrSchedulerEnum::CosineDecay(c) => {
             assert_eq!(c.final_superbatch, 400);
             assert_eq!(c.final_lr, 1e-6);
         }
         other => panic!("expected CosineDecay, got {other}"),
+    }
+}
+
+#[test]
+fn resumed_horizon_overrides_superbatches_default_for_decay_and_one_cycle() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    // cosine: --lr-final-superbatch 省略 + --superbatches 400 でも、resume した
+    // 保存 horizon 100 が default を上書きして curve を pin する。
+    let cosine = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "cosine",
+        "--superbatches",
+        "400",
+        "layerstack",
+    ])
+    .expect("cosine parse");
+    match crate::training::build_lr_scheduler(&cosine, Some(100)).expect("build cosine") {
+        LrSchedulerEnum::CosineDecay(c) => assert_eq!(c.final_superbatch, 100),
+        other => panic!("expected CosineDecay, got {other}"),
+    }
+
+    // one-cycle: 専用 horizon flag が無いので、保存 horizon が --superbatches を
+    // 上書きして total を pin する。
+    let one_cycle = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "one-cycle",
+        "--superbatches",
+        "400",
+        "layerstack",
+    ])
+    .expect("one-cycle parse");
+    match crate::training::build_lr_scheduler(&one_cycle, Some(100)).expect("build one-cycle") {
+        LrSchedulerEnum::OneCycle(oc) => assert_eq!(oc.total_superbatch, 100),
+        other => panic!("expected OneCycle, got {other}"),
+    }
+}
+
+#[test]
+fn explicit_final_superbatch_flag_wins_over_resumed_horizon() {
+    use nnue_train::schedule::LrSchedulerEnum;
+
+    // 明示した --lr-final-superbatch は resume した保存 horizon より優先される。
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--lr-schedule",
+        "linear",
+        "--superbatches",
+        "400",
+        "--lr-final-superbatch",
+        "250",
+        "layerstack",
+    ])
+    .expect("linear parse");
+    match crate::training::build_lr_scheduler(&cli, Some(100)).expect("build linear") {
+        LrSchedulerEnum::LinearDecay(l) => assert_eq!(l.final_superbatch, 250),
+        other => panic!("expected LinearDecay, got {other}"),
+    }
+}
+
+#[test]
+fn resumed_horizon_does_not_affect_step_schedule() {
+    use nnue_train::schedule::{LrScheduler, LrSchedulerEnum};
+
+    // step は horizon を持たないので、resume した保存 horizon を渡しても curve は
+    // 不変 (--lr-step / --lr-gamma のみで決まる)。
+    let cli = Cli::try_parse_from(["nnue-train", "--lr-schedule", "step", "layerstack"])
+        .expect("step parse");
+    let with_horizon =
+        crate::training::build_lr_scheduler(&cli, Some(100)).expect("build step (resumed)");
+    let without = crate::training::build_lr_scheduler(&cli, None).expect("build step (fresh)");
+    assert!(matches!(with_horizon, LrSchedulerEnum::Step(_)));
+    for (batch, sb) in [(0, 1), (0, 5), (3, 50), (0, 400)] {
+        assert_eq!(with_horizon.lr(batch, sb), without.lr(batch, sb));
     }
 }
 
@@ -214,14 +290,14 @@ fn lr_schedule_drop_and_linear_build_expected_variants() {
     let drop = Cli::try_parse_from(["nnue-train", "--lr-schedule", "drop", "layerstack"])
         .expect("drop parse");
     assert!(matches!(
-        crate::training::build_lr_scheduler(&drop).expect("build drop"),
+        crate::training::build_lr_scheduler(&drop, None).expect("build drop"),
         LrSchedulerEnum::Drop(_)
     ));
 
     let linear = Cli::try_parse_from(["nnue-train", "--lr-schedule", "linear", "layerstack"])
         .expect("linear parse");
     assert!(matches!(
-        crate::training::build_lr_scheduler(&linear).expect("build linear"),
+        crate::training::build_lr_scheduler(&linear, None).expect("build linear"),
         LrSchedulerEnum::LinearDecay(_)
     ));
 }
@@ -233,7 +309,7 @@ fn lr_warmup_steps_wraps_in_warmup() {
     let cli = Cli::try_parse_from(["nnue-train", "--lr-warmup-steps", "200", "layerstack"])
         .expect("warmup-steps parse");
     assert!(matches!(
-        crate::training::build_lr_scheduler(&cli).expect("build warmup"),
+        crate::training::build_lr_scheduler(&cli, None).expect("build warmup"),
         LrSchedulerEnum::Warmup(_)
     ));
 }
@@ -250,7 +326,7 @@ fn lr_warmup_steps_rejected_with_one_cycle() {
         "layerstack",
     ])
     .expect("parse ok");
-    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+    assert!(crate::training::build_lr_scheduler(&cli, None).is_err());
 }
 
 #[test]
@@ -265,7 +341,7 @@ fn lr_schedule_exponential_rejects_zero_final() {
         "layerstack",
     ])
     .expect("parse ok");
-    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+    assert!(crate::training::build_lr_scheduler(&cli, None).is_err());
 }
 
 #[test]
@@ -281,7 +357,7 @@ fn lr_schedule_one_cycle_rejects_div_factor_below_one() {
         "layerstack",
     ])
     .expect("parse ok");
-    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+    assert!(crate::training::build_lr_scheduler(&cli, None).is_err());
 }
 
 #[test]
@@ -295,7 +371,7 @@ fn lr_schedule_one_cycle_rejects_out_of_range_warmup_pct() {
         "layerstack",
     ])
     .expect("parse ok");
-    assert!(crate::training::build_lr_scheduler(&cli).is_err());
+    assert!(crate::training::build_lr_scheduler(&cli, None).is_err());
 }
 
 #[test]

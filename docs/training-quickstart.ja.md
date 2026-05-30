@@ -224,6 +224,10 @@ target/release/nnue-train \
 `--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から再開、
 `--start-superbatch N` 明示で過去 sb をやり直すことも可。
 
+horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存され、resume
+時に `--superbatches` に依らず curve が再現される。優先順位の詳細は
+[Horizon と resume](training-schedule.ja.md#horizon-と-resume) を参照。
+
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
