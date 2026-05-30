@@ -95,6 +95,8 @@ For building the kernels and running the smoke test, see
   setup, supported-GPU matrix, CUDA toolkit root resolution
 - [Training quickstart](docs/training-quickstart.md) — per-architecture training
   examples + key CLI options + resume / checkpoint workflow
+- [Training schedules](docs/training-schedule.md) — scheduling the WDL lambda
+  (constant `--wdl` vs linear `--start-wdl` / `--end-wdl` taper) across a run
 - [ADR (Architecture Decision Records)](docs/decisions/) — design decisions and
   their rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — which kernel
