@@ -95,6 +95,8 @@ For building the kernels and running the smoke test, see
   setup, supported-GPU matrix, CUDA toolkit root resolution
 - [Training quickstart](docs/training-quickstart.md) — per-architecture training
   examples + key CLI options + resume / checkpoint workflow
+- [Training schedules](docs/training-schedule.md) — scheduling the WDL lambda
+  (constant `--wdl` vs linear `--start-wdl` / `--end-wdl` taper) across a run
 - [ADR (Architecture Decision Records)](docs/decisions/) — design decisions and
   their rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — which kernel
@@ -125,6 +127,7 @@ own net, see the [setup guide](docs/setup.md).
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
+| **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
 | **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |
 | **PTX** | Parallel Thread Execution — a virtual ISA for NVIDIA GPUs. CUDA C++ / Rust → PTX (`.ptx` text) → the CUDA driver's JIT compiles it to SASS (real machine code) for execution. It is portable across generations (PTX built for sm_80 runs forward-compatibly on sm_86/89/90). See the supported-GPU matrix in `docs/setup.md` |

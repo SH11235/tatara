@@ -83,6 +83,8 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
   セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.ja.md) — アーキ別の学習例 + 主要
   CLI option + resume / checkpoint 運用
+- [Training schedules](docs/training-schedule.ja.md) — WDL lambda のスケジューリング
+  (一定 `--wdl` / 線形 `--start-wdl` / `--end-wdl` taper) の使い分け
 - [ADR (Architecture Decision Records)](docs/decisions/) — 設計判断とその
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
@@ -112,6 +114,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
+| **WDL** | Win/Draw/Loss — 対局結果ターゲット (1.0 / 0.5 / 0.0)。WDL lambda で教師 score と blend する。[docs/training-schedule.ja.md](docs/training-schedule.ja.md) を参照 |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.ja.md` のサポート GPU マトリクス参照 |

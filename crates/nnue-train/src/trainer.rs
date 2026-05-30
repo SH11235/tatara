@@ -1247,6 +1247,8 @@ mod tests {
             superbatches: 3,
             start_superbatch: 1,
             wdl: 0.0,
+            start_wdl: None,
+            end_wdl: None,
             scale: 290.0,
             weight_decay: 0.0,
             qa: 127,

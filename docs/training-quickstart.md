@@ -215,9 +215,11 @@ target/release/nnue-train \
 
 ### Reading the metrics
 
-`test_loss` uses the same loss kernel (sigmoid-MSE or WRM) and the same
-`--wdl` blend as `train_loss`, so the two are on the same scale and can be
-compared directly within a superbatch. A widening `test_loss − train_loss`
+`test_loss` uses the same loss kernel (sigmoid-MSE or WRM) and the same WDL
+lambda blend as `train_loss`, so the two are on the same scale and can be
+compared directly within a superbatch. For how to set that blend — a constant
+`--wdl` or a linear `--start-wdl` / `--end-wdl` taper — see
+[Training schedules](training-schedule.md). A widening `test_loss − train_loss`
 gap signals overfitting; an early `test_loss` divergence often catches NaN
 issues before `train_loss` looks abnormal.
 

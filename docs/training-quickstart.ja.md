@@ -195,8 +195,10 @@ target/release/nnue-train \
 ### 指標の読み方
 
 `test_loss` は `train_loss` と同じ loss kernel (sigmoid-MSE または WRM) +
-同じ `--wdl` blend で計算するため、両者は単位・スケールが揃い同 superbatch 内
-で直接比較できる。`test_loss − train_loss` の差が広がっていけば過学習の兆候、
+同じ WDL lambda blend で計算するため、両者は単位・スケールが揃い同 superbatch 内
+で直接比較できる。この blend の設定方法（一定の `--wdl` か、線形の
+`--start-wdl` / `--end-wdl` taper か）は
+[学習スケジュール](training-schedule.ja.md) を参照。`test_loss − train_loss` の差が広がっていけば過学習の兆候、
 `test_loss` が `train_loss` より早く異常値に飛ぶようなら NaN 発散の早期検知に
 なる。
 

@@ -96,9 +96,21 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1, global = true)]
     pub(crate) lr_step: usize,
 
-    /// WDL blend lambda (constant).
+    /// WDL blend lambda (constant). Mutually exclusive with the linear-taper
+    /// pair `--start-wdl` / `--end-wdl`.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) wdl: f32,
+
+    /// Start of a linear WDL lambda taper, used at the first superbatch. Requires
+    /// `--end-wdl`; the lambda interpolates linearly from `--start-wdl` to
+    /// `--end-wdl` across superbatches. Conflicts with `--wdl`.
+    #[arg(long, global = true, conflicts_with = "wdl")]
+    pub(crate) start_wdl: Option<f32>,
+
+    /// End of a linear WDL lambda taper, reached at the final superbatch. Requires
+    /// `--start-wdl`. Conflicts with `--wdl`.
+    #[arg(long, global = true, conflicts_with = "wdl")]
+    pub(crate) end_wdl: Option<f32>,
 
     /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). Not used
     /// when `--win-rate-model` is set (WRM loss uses the `--wrm-*` scaling
