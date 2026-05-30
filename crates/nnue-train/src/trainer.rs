@@ -19,7 +19,7 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id)  # raw f32 + Ranger state (resume 用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + Ranger state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
@@ -261,11 +261,16 @@ pub trait TrainerBackend {
     /// backend 任せ。`run_id` はこの checkpoint を書き出す学習 run の experiment.json
     /// `id` で、`*.ckpt` に producer run id として埋め込まれ、resume 時に lineage の
     /// 親参照になる (空文字列なら埋め込まない)。
+    ///
+    /// `lr_horizon` は LR schedule の終端 superbatch ([`LrScheduler::horizon`])。
+    /// `*.ckpt` に埋め込まれ、resume 時に curve を `--superbatches` から独立に
+    /// 再現するのに使う。horizon を持たない schedule では `None`。
     fn save_resume_checkpoint(
         &mut self,
         path: &Path,
         superbatch: usize,
         run_id: &str,
+        lr_horizon: Option<usize>,
     ) -> io::Result<()>;
 
     /// 累積 FP16 clamp event count + 累積処理要素数を device から読み出す。
@@ -774,7 +779,7 @@ where
                 .as_deref()
                 .map(ExperimentLogger::id)
                 .unwrap_or("");
-            backend.save_resume_checkpoint(&raw_path, sb, run_id)?;
+            backend.save_resume_checkpoint(&raw_path, sb, run_id, lr_scheduler.horizon())?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
 
             if let Some(keep) = cfg.keep_raw_checkpoints {
@@ -1038,6 +1043,7 @@ mod tests {
             path: &Path,
             superbatch: usize,
             run_id: &str,
+            _lr_horizon: Option<usize>,
         ) -> io::Result<()> {
             self.resume_saves.push((path.to_path_buf(), superbatch));
             self.resume_run_ids.push(run_id.to_string());

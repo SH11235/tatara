@@ -248,6 +248,16 @@ With `--resume` (and `--start-superbatch` omitted), it resumes from the
 checkpoint's sb + 1; specifying `--start-superbatch N` explicitly lets you redo
 past superbatches.
 
+For LR schedules with a horizon (`linear` / `cosine` / `exponential` decay and
+`one-cycle`), the checkpoint also records the resolved horizon (the superbatch
+at which the curve reaches its terminal LR). On resume it is restored so the
+curve is reproduced even if you pass a different `--superbatches`. Precedence:
+an explicit `--lr-final-superbatch` wins; otherwise the saved horizon wins;
+otherwise `--superbatches` is the fallback. `one-cycle` has no explicit horizon
+flag, so on resume its saved horizon always wins over `--superbatches`.
+Checkpoints written before this format version (or by `step` / `constant` /
+`drop`, which have no horizon) carry none and fall back to `--superbatches`.
+
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state
 > (fine-tuning / continued training); `--resume` restores both weights and

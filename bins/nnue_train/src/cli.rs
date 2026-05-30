@@ -125,10 +125,14 @@ pub(crate) struct Cli {
     pub(crate) lr_final: f32,
 
     /// Superbatch by which the linear / cosine / exponential decay reaches
-    /// --lr-final. When omitted, defaults to --superbatches (decay spans the
-    /// whole run), so resuming with a different --superbatches rescales the
-    /// decay curve; pass it explicitly to pin the horizon. one-cycle likewise
-    /// uses --superbatches as its horizon. Ignored by the other schedules.
+    /// --lr-final. When omitted, the horizon is taken from (in priority order):
+    /// the saved horizon in a v5+ --resume checkpoint, else --superbatches.
+    /// Passing this flag explicitly always wins, even over a resumed
+    /// checkpoint's saved horizon. one-cycle uses the same precedence for its
+    /// total horizon but has no explicit flag, so on resume its saved horizon
+    /// wins over --superbatches. A checkpoint written before v5 (or by a
+    /// schedule without a horizon) carries none, so resume falls back to
+    /// --superbatches. Ignored by the other schedules.
     #[arg(long, global = true)]
     pub(crate) lr_final_superbatch: Option<usize>,
 
@@ -195,7 +199,10 @@ pub(crate) struct Cli {
     /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
     /// resume. Mutually exclusive with `--init-from` (which injects weights only
     /// and resets the optimizer). When `--start-superbatch` is omitted, resumes
-    /// from the superbatch recorded in the checkpoint + 1.
+    /// from the superbatch recorded in the checkpoint + 1. A v5+ checkpoint also
+    /// stores the LR-schedule horizon; on resume the saved horizon is restored
+    /// so the LR curve is reproduced independently of --superbatches (see
+    /// --lr-final-superbatch for the full precedence).
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 

@@ -224,6 +224,15 @@ target/release/nnue-train \
 `--resume` あり (`--start-superbatch` 省略) なら checkpoint の sb +1 から再開、
 `--start-superbatch N` 明示で過去 sb をやり直すことも可。
 
+horizon を持つ LR schedule (`linear` / `cosine` / `exponential` 減衰と
+`one-cycle`) では、checkpoint に解決済 horizon (curve が終端 LR に到達する
+superbatch) も保存される。resume 時に復元されるので、`--superbatches` を変えても
+同じ curve が再現される。優先順位: 明示した `--lr-final-superbatch` が最優先、
+次に保存された horizon、最後に `--superbatches`。`one-cycle` は専用の horizon
+flag を持たないため、resume では保存 horizon が `--superbatches` を常に上書き
+する。この format version より前に書かれた checkpoint (や horizon を持たない
+`step` / `constant` / `drop`) は horizon を持たず `--superbatches` に fallback する。
+
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する

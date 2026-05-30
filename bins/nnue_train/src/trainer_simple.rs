@@ -2207,6 +2207,7 @@ impl SimpleGpuTrainer {
         path: &Path,
         superbatch: usize,
         run_id: &str,
+        lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
 
@@ -2256,6 +2257,7 @@ impl SimpleGpuTrainer {
                 run_id,
                 superbatch as u64,
                 self.step_count,
+                lr_horizon,
                 (groups.len() + 1) as u64,
             )?;
 
@@ -2327,7 +2329,8 @@ impl SimpleGpuTrainer {
     }
 
     /// `--resume` 用に raw f32 checkpoint を読み戻す。返り値は完了 `(superbatch,
-    /// producer run id)` で、caller は通常 `superbatch + 1` から resume する。
+    /// producer run id, LR-schedule horizon)` で、caller は通常 `superbatch + 1`
+    /// から resume する。horizon は version 5+ で保存されていれば `Some`。
     ///
     /// header (`arch_kind=Simple`, `topology=[ft_out, l1_out, l2_out]`, feature set)
     /// は [`read_raw_ckpt_header`] が照合する。8 group 各 `(w, m, v, slow)` を
@@ -2336,7 +2339,7 @@ impl SimpleGpuTrainer {
     pub(crate) fn load_raw_checkpoint(
         &mut self,
         path: &Path,
-    ) -> Result<(usize, Option<String>), Box<dyn std::error::Error>> {
+    ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let topology: [u64; 3] = [
             self.id.ft_out as u64,
@@ -2434,7 +2437,7 @@ impl SimpleGpuTrainer {
         up!(6, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = header.step_count;
-        Ok((header.superbatch, header.producer_run_id))
+        Ok((header.superbatch, header.producer_run_id, header.lr_horizon))
     }
 
     /// `save_raw_checkpoint` / `load_raw_checkpoint` で iterate する 7 weight group の
@@ -2614,8 +2617,9 @@ impl TrainerBackend for SimpleGpuTrainer {
         path: &Path,
         superbatch: usize,
         run_id: &str,
+        lr_horizon: Option<usize>,
     ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id)
+        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
             .map_err(|e| match e.downcast::<std::io::Error>() {
                 Ok(io_err) => *io_err,
                 Err(other) => std::io::Error::other(format!(

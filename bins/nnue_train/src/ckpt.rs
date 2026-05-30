@@ -27,12 +27,19 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   id. They pin which architecture and layer shape the checkpoint belongs
 ///   to, so a checkpoint written by one architecture cannot be resumed by
 ///   another.
+/// - `5`: a `u64` LR-schedule horizon (the superbatch at which the LR curve
+///   reaches its terminal value — the decay `final_superbatch` or one-cycle
+///   `total_superbatch`) follows `step_count`. `0` means "no horizon recorded"
+///   (the producing schedule had none, e.g. step / constant / drop). `--resume`
+///   prefers it over the `--superbatches`-derived default so the curve is
+///   reproduced independently of `--superbatches`.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=4. Version 1 is interpreted as
+/// `load_raw_checkpoint` accepts versions 1..=5. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 4 are rejected. The producer
-/// run id is absent (`None`) for versions 1 and 2.
-pub(crate) const RAW_CKPT_VERSION: u32 = 4;
+/// interpreted as `layerstack`. Versions above 5 are rejected. The producer
+/// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
+/// (`None`) for versions 1..=4.
+pub(crate) const RAW_CKPT_VERSION: u32 = 5;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -40,6 +47,11 @@ pub(crate) const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
 pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer run id,
+/// LR-schedule horizon)`。caller は superbatch+1 から resume し、horizon を
+/// `build_lr_scheduler` に渡す。
+pub(crate) type RawCkptResumeState = (usize, Option<String>, Option<usize>);
 
 /// `SimpleGpuTrainer::raw_ckpt_groups` の 1 要素。weight name + element count + 各
 /// `(weight, m, v, slow)` device buffer の借用 tuple。
@@ -115,6 +127,9 @@ pub(crate) struct RawCkptHeader {
     pub(crate) num_groups: u64,
     /// producer run の experiment.json id (version 3+ かつ記録ありなら `Some`)。
     pub(crate) producer_run_id: Option<String>,
+    /// LR-schedule horizon (version 5+ かつ horizon を持つ schedule なら `Some`)。
+    /// version 1..=4 や horizon を持たない schedule では `None`。
+    pub(crate) lr_horizon: Option<usize>,
 }
 
 /// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
@@ -125,6 +140,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     run_id: &str,
     superbatch: u64,
     step_count: u64,
+    lr_horizon: Option<usize>,
     num_groups: u64,
 ) -> std::io::Result<()> {
     w.write_all(&RAW_CKPT_MAGIC)?;
@@ -149,15 +165,18 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     }
     w.write_all(&superbatch.to_le_bytes())?;
     w.write_all(&step_count.to_le_bytes())?;
+    // LR-schedule horizon (v5+)。0 = horizon 無し (step / constant / drop)。
+    w.write_all(&(lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
     w.write_all(&num_groups.to_le_bytes())?;
     Ok(())
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=4 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=5 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
-/// arch_kind 名と topology 次元列を `expected` と照合する。
+/// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
+/// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -320,6 +339,24 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     })?;
     read_exact_or_invalid(r, &mut buf8, "step_count")?;
     let step_count = u64::from_le_bytes(buf8);
+
+    // LR-schedule horizon は version 5+。0 は「horizon 未記録」扱いで `None`。
+    let lr_horizon: Option<usize> = if version >= 5 {
+        read_exact_or_invalid(r, &mut buf8, "lr_horizon")?;
+        let horizon_u64 = u64::from_le_bytes(buf8);
+        if horizon_u64 == 0 {
+            None
+        } else {
+            Some(horizon_u64.try_into().map_err(|_| {
+                invalid_data(format!(
+                    "raw checkpoint lr_horizon {horizon_u64} exceeds usize::MAX"
+                ))
+            })?)
+        }
+    } else {
+        None
+    };
+
     read_exact_or_invalid(r, &mut buf8, "num_groups")?;
     let num_groups = u64::from_le_bytes(buf8);
 
@@ -328,6 +365,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         step_count,
         num_groups,
         producer_run_id,
+        lr_horizon,
     })
 }
 
