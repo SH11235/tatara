@@ -386,7 +386,13 @@ impl SimpleWeights {
         writer.write_all(&ft_hash(id.feature_set.feature_hash(), id.ft_out).to_le_bytes())?;
 
         // ---- FT biases / weights (i16, scale = QA) ----
+        // FT weight/bias は training 中 clamp されない (i16 飽和域 ±i16::MAX/QA まで
+        // 開放) ため、recipe によっては量子化で silent clip されうる。export 側で
+        // 飽和件数を数え、発生していれば警告する (clamp 自体は write_i16_quantised が
+        // 行うので数値破綻はしないが、無言の情報損失に気付けるようにする)。
         let qa = id.activation.qa() as f64;
+        warn_if_i16_saturates("ft_b", &self.ft_b, qa);
+        warn_if_i16_saturates("ft_w", &self.ft_w, qa);
         write_i16_quantised(writer, &self.ft_b, qa)?;
         write_i16_quantised(writer, &self.ft_w, qa)?;
 
@@ -550,6 +556,36 @@ fn write_i16_quantised<W: Write>(writer: &mut W, values: &[f32], scale: f64) -> 
     Ok(())
 }
 
+/// `round(scale·v)` が i16 範囲 `[-32768, 32767]` を超える要素数を数える。`scale`
+/// は FT 量子化スケール QA。値域に収まれば 0。`write_i16_quantised` の clamp が
+/// 情報を落とす要素を export 前に把握するための pure helper。
+fn count_i16_saturations(values: &[f32], scale: f64) -> usize {
+    values
+        .iter()
+        .filter(|&&v| {
+            let q = (scale * v as f64).round();
+            q < i16::MIN as f64 || q > i16::MAX as f64
+        })
+        .count()
+}
+
+/// FT テンソルの i16 量子化で飽和が起きていれば stderr に警告する。発生件数 0 なら
+/// 無出力。飽和は `write_i16_quantised` が i16 範囲に clamp するため数値破綻には
+/// ならないが、weight が i16 表現域 (±i16::MAX/QA) を超えて育った場合に silent な
+/// 情報損失となるので気付けるようにする。
+fn warn_if_i16_saturates(name: &str, values: &[f32], scale: f64) {
+    let n = count_i16_saturations(values, scale);
+    if n > 0 {
+        let bound = i16::MAX as f64 / scale;
+        eprintln!(
+            "[nnue-format] warning: {name} has {n}/{} elements saturating i16 quantisation \
+             (|w| > {bound:.4}); values are clamped on export (silent precision loss). \
+             Consider tightening the training-time weight clamp for this tensor.",
+            values.len()
+        );
+    }
+}
+
 /// `n` 個の i16 (raw LE) を読み、`scale` で割って f32 列に戻す。
 fn read_i16_quantised<R: Read>(reader: &mut R, n: usize, scale: f32) -> io::Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
@@ -634,6 +670,43 @@ fn read_i8_weight<R: Read>(
 mod tests {
     use super::*;
     use shogi_features::FeatureSet;
+
+    #[test]
+    fn count_i16_saturations_counts_only_out_of_range() {
+        // scale = QA = 127。|round(127·w)| > 32767 ⇔ |w| ≳ 258.0 のみ飽和。
+        let qa = FT_OUTPUT_QA as f64;
+        assert_eq!(
+            count_i16_saturations(&[0.0, 1.98, -1.98, 100.0, -257.9], qa),
+            0
+        );
+        assert_eq!(count_i16_saturations(&[300.0, -300.0, 1.0], qa), 2);
+        assert_eq!(count_i16_saturations(&[], qa), 0);
+    }
+
+    #[test]
+    fn count_i16_saturations_boundary_exact() {
+        // round(scale·w) が i16 端点ちょうどに乗るケース。scale=1.0 で w を量子化値
+        // そのものに使う。32767 / -32768 は範囲内 (0 件)、32768 / -32769 は飽和。
+        assert_eq!(count_i16_saturations(&[32767.0, -32768.0], 1.0), 0);
+        assert_eq!(count_i16_saturations(&[32768.0, -32769.0], 1.0), 2);
+        // round 後判定: 32767.4→32767 (範囲内)、32767.5→32768 (飽和)。
+        assert_eq!(count_i16_saturations(&[32767.4], 1.0), 0);
+        assert_eq!(count_i16_saturations(&[32767.5], 1.0), 1);
+    }
+
+    #[test]
+    fn count_i16_saturations_screlu_scale_255() {
+        // SCReLU は FT scale = QA = 255。飽和境界は |w| ≈ 32767/255 ≈ 128.5。
+        // 同じ |w| でも scale=127 では飽和しないが scale=255 では飽和しうる。
+        let qa = SimpleActivation::SCReLU.qa() as f64;
+        assert_eq!(qa, 255.0);
+        // round(255·128.4)=32742 ≤ 32767 で範囲内、round(255·129.0)=32895 で飽和。
+        assert_eq!(count_i16_saturations(&[128.4, -128.4], qa), 0);
+        assert_eq!(count_i16_saturations(&[129.0, -129.0], qa), 2);
+        // 端点ちょうど: 32767/255 は範囲内、32768/255 は飽和。
+        assert_eq!(count_i16_saturations(&[(32767.0 / 255.0) as f32], qa), 0);
+        assert_eq!(count_i16_saturations(&[(32768.0 / 255.0) as f32], qa), 1);
+    }
 
     fn test_id(activation: SimpleActivation) -> SimpleId {
         SimpleId {
