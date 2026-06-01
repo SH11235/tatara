@@ -142,6 +142,15 @@ pub(crate) struct GpuTrainer {
     /// に一律 `decay` 引数として渡す。`--weight-decay` から起動時に決まり、
     /// 以降不変。既定 0.0 で decay 無し。
     weight_decay: f32,
+    /// Norm loss (per-weight-group L2-norm 正則化) の強度係数。`Some(factor)` で
+    /// 有効 (`--norm-loss` + `--norm-loss-factor`)、`None` で無効。無効時は
+    /// optimizer step で norm loss kernel を一切 launch しないため baseline と
+    /// bit-identical。`--weight-decay` とは独立に併用可。
+    norm_loss_factor: Option<f32>,
+    /// norm loss reduce pass の per-group L2 norm 出力 (apply pass が読む作業領域)。
+    /// 長さは対象テンソル中の最大 group 数。`norm_loss_factor` が `None` のときは
+    /// 1 要素の dummy (launch されないので未使用)。
+    norm_scratch: DeviceBuffer<f32>,
     /// LayerStack output bucket count (`--num-buckets`)。per-bucket weight
     /// buffer (`l1_w` / `l1_b` / `l2_w` / `l2_b` / `l3_w` / `l3_b` / `psqt`)
     /// の bucket 軸長と、kernel launch args の `num_buckets` を駆動する。
@@ -489,6 +498,7 @@ impl GpuTrainer {
         fp16_opt_state: bool,
         feature_set: FeatureSetSpec,
         weight_decay: f32,
+        norm_loss_factor: Option<f32>,
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -567,6 +577,23 @@ impl GpuTrainer {
                 Some(PsqtState::new(&stream, init)?)
             }
             None => None,
+        };
+
+        // norm loss reduce pass の per-group norm scratch。長さは対象テンソル中の
+        // 最大 group 数 (= 1 launch あたりの最大 n_groups)。対象とその group 数は
+        // optimizer step の norm loss 配線と一致させる:
+        //   FT weight   ft_out        L1f weight l1_out
+        //   L1 weight   buckets*l1_out L2 weight  buckets*l2_out
+        //   L3 weight   buckets        bias 各    1
+        let norm_scratch_len = if norm_loss_factor.is_some() {
+            ft_out
+                .max(l1_out)
+                .max(num_buckets * l1_out)
+                .max(num_buckets * l2_out)
+                .max(num_buckets)
+                .max(1)
+        } else {
+            1
         };
 
         // Ranger Lookahead の slow weight は **0 初期化**。初回 lerp (`step % k == 0`)
@@ -661,6 +688,8 @@ impl GpuTrainer {
             fp16_opt_state,
             feature_set,
             weight_decay,
+            norm_loss_factor,
+            norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             step_count: 0,
         })
@@ -2748,6 +2777,54 @@ impl GpuTrainer {
             let _ = total_pairs; // unused yet
         }
         prof_tick!("bwd_ftbwd");
+
+        // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
+        // radam step の **前** に適用する。理由: (1) radam の per-layer clamp が最後の
+        // 演算になり clamp 不変条件を保つ、(2) FT の FP16 mirror (`ft_w_h`) は後続の
+        // radam / lookahead が master から再同期するので norm loss 側で mirror を
+        // 触る必要がない。各テンソルで reduce (per-group L2 norm) → apply (補正乗算)
+        // の 2 launch。`norm_scratch` は per-group norm の作業領域で、stream 順序に
+        // より次テンソルの reduce 前に当該 apply が norm を読み終える。group の
+        // (n_groups, group_pitch, elem_stride, group_len) は weight のレイアウトで
+        // 決まる (`norm_loss_reduce` doc 参照): dense weight は per-output-neuron
+        // (row / strided column)、bias は per-tensor scalar (`n_groups=1`)。PSQT は
+        // 対象外 (reference の nnue-pytorch に存在しない層)。
+        if let Some(nl_factor) = self.norm_loss_factor {
+            macro_rules! norm_loss_group {
+                ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
+                    cuda_launch! {
+                        kernel: norm_loss_reduce,
+                        stream: self.stream, module: self.module,
+                        config: cfg_1d($ng),
+                        args: [slice($w), slice_mut(self.norm_scratch),
+                               ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                    }?;
+                    cuda_launch! {
+                        kernel: norm_loss_apply,
+                        stream: self.stream, module: self.module,
+                        config: cfg_1d(($ng) * ($len)),
+                        args: [slice_mut($w), slice(self.norm_scratch),
+                               nl_factor, lr, EPS,
+                               ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                    }?;
+                }};
+            }
+            // dense weight: per-output-neuron。FT / L1f は [in, out] strided column
+            // (pitch=1, stride=out)、L1 / L2 / L3 は [bucket*out, in] contiguous row
+            // (pitch=in, stride=1)。
+            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_in);
+            norm_loss_group!(self.l1f_w, l1_out, 1, l1_out, ft_out);
+            norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
+            norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
+            norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
+            // bias: per-tensor scalar (テンソル全体で 1 norm、bucket 軸も畳む)。
+            norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
+            norm_loss_group!(self.l1_b, 1, 0, 1, l1_b_n);
+            norm_loss_group!(self.l1f_b, 1, 0, 1, l1f_b_n);
+            norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
+            norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
+            prof_tick!("norm_loss");
+        }
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
         self.step_count += 1;

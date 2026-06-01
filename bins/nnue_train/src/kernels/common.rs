@@ -422,6 +422,88 @@ pub fn radam_step_fp16_mirror(
     }
 }
 
+/// Norm loss (Georgiou et al. 2021) の per-weight-group L2-norm 計算 (reduce pass)。
+///
+/// 1 thread = 1 group。group `g` の element offset は `g*group_pitch +
+/// pos*elem_stride` (`pos < group_len`)、その L2 norm を `norms[g]` に書く。集計順
+/// は reference CPU (`gpu_kernels::pointwise::norm_loss`) と同一 (pos 昇順) で、
+/// 後段 `norm_loss_apply` が同 stream で読む。
+///
+/// `(group_pitch, elem_stride, group_len, n_groups)` で 3 レイアウトを統一表現する:
+/// contiguous row (dense weight `[n_groups, group_len]`、`pitch=group_len,
+/// stride=1`)、strided column (FT/L1f weight `[group_len, n_groups]`、`pitch=1,
+/// stride=n_groups`)、per-tensor scalar (bias、`n_groups=1, pitch=0, stride=1`)。
+#[kernel]
+pub fn norm_loss_reduce(
+    weight: &[f32],
+    mut norms: DisjointSlice<f32>,
+    n_groups: u32,
+    group_pitch: u32,
+    elem_stride: u32,
+    group_len: u32,
+) {
+    let g = thread::index_1d();
+    if g.get() >= n_groups as usize {
+        return;
+    }
+    let base = g.get() * group_pitch as usize;
+    let stride = elem_stride as usize;
+    let len = group_len as usize;
+    // SAFETY: caller (`GpuTrainer::step_impl`) が対象 tensor のレイアウト
+    // (n_groups/group_pitch/elem_stride/group_len) を `weight.len()` に整合する値で
+    // 渡す。3 レイアウトいずれも `base + pos*stride` は weight 範囲内の単射。
+    let wptr = weight.as_ptr();
+    let mut sumsq = 0.0_f32;
+    let mut pos: usize = 0;
+    while pos < len {
+        let w = unsafe { wptr.add(base + pos * stride).read() };
+        sumsq += w * w;
+        pos += 1;
+    }
+    if let Some(o) = norms.get_mut(g) {
+        *o = sumsq.sqrt();
+    }
+}
+
+/// Norm loss 補正の適用 (apply pass)。1 thread = 1 weight element。
+///
+/// element 番号 `t` を `(g, pos) = (t/group_len, t%group_len)` に分解し、offset
+/// `g*group_pitch + pos*elem_stride` の weight に `*= 1 - lr*2*factor*(1 -
+/// 1/(norms[g]+eps))` を掛ける。`norms` は先行 [`norm_loss_reduce`] が書込済。
+/// indexing は [`norm_loss_reduce`] と同一。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn norm_loss_apply(
+    mut weight: DisjointSlice<f32>,
+    norms: &[f32],
+    factor: f32,
+    lr: f32,
+    eps: f32,
+    n_groups: u32,
+    group_pitch: u32,
+    elem_stride: u32,
+    group_len: u32,
+) {
+    let t = thread::index_1d();
+    let len = group_len as usize;
+    let total = (n_groups as usize) * len;
+    if t.get() >= total {
+        return;
+    }
+    let g = t.get() / len;
+    let pos = t.get() % len;
+    let off = g * group_pitch as usize + pos * elem_stride as usize;
+    let correction = 2.0_f32 * factor * (1.0_f32 - 1.0_f32 / (norms[g] + eps));
+    let mult = 1.0_f32 - lr * correction;
+    // SAFETY: `off` は `t` の単射 (各 thread 一意 offset)、caller がレイアウト整合を
+    // 保証 (`norm_loss_reduce` と同じ契約)。
+    let wptr = weight.as_mut_ptr();
+    unsafe {
+        let cur = wptr.add(off).read();
+        wptr.add(off).write(cur * mult);
+    }
+}
+
 /// `radam_step` の 1st/2nd moment (`m` / `v`) を `f16` で保持する variant
 /// (`--fp16-opt-state` の `ft_w` 専用)。
 ///

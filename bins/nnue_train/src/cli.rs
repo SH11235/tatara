@@ -285,6 +285,22 @@ pub(crate) struct Cli {
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) weight_decay: f32,
+    /// Enable norm loss (per-weight-group L2-norm regularisation, Georgiou et
+    /// al. 2021). With the default `false`, the optimizer step is bit-identical
+    /// to the baseline. When enabled, each step (just before the Ranger update)
+    /// every targeted weight group is nudged so its L2 norm relaxes toward 1
+    /// (the oblique manifold): the 2D layer weights per output neuron (FT /
+    /// L1f / L1 / L2 / L3), and 1D biases by their whole-tensor norm. PSQT is
+    /// excluded. Strength is set by --norm-loss-factor. An opt-in regularizer
+    /// whose playing-strength effect must be confirmed by SPRT.
+    #[arg(long, global = true)]
+    pub(crate) norm_loss: bool,
+    /// Norm loss strength (only used when --norm-loss is set). Each step every
+    /// targeted weight w is multiplied by
+    /// `1 - lr * 2 * factor * (1 - 1 / (||w_group||_2 + eps))`. The default 1e-4
+    /// matches the Ranger21 reference.
+    #[arg(long, default_value_t = 1e-4, global = true)]
+    pub(crate) norm_loss_factor: f32,
     /// Number of dataloader prefetch workers. Each worker does PSV parsing +
     /// HalfKA_hm sparse extraction + progress8kpabs bucket computation in a
     /// single `decode()` call and supplies positions ahead of time. `1` gives

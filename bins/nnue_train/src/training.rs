@@ -80,6 +80,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
+        return Err(format!(
+            "--norm-loss-factor must be finite and >= 0 (got {})",
+            cli.norm_loss_factor
+        )
+        .into());
+    }
     // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` / `dense_mm_fwd_tiled_l1f`
     // / `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
     // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
@@ -194,6 +201,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
              fp16_opt_state={fp16_opt_state} tf32={tf32}"
         );
     }
+    let norm_loss_factor = if cli.norm_loss {
+        println!(
+            "[train] norm loss active (factor = {})",
+            cli.norm_loss_factor
+        );
+        Some(cli.norm_loss_factor)
+    } else {
+        None
+    };
     // PSQT shortcut の初期 weight (`--psqt` 有効時のみ確保)。`zeroed` は全 0、`material`
     // は piece centipawn / out_scaling で全 bucket 同値を書く (Stockfish 系の prior)。
     // out_scaling 規約: WRM 有効時は `wrm_nnue2score` (= net_output が logit(WRM(cp)) の
@@ -259,6 +275,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         fp16_opt_state,
         feature_set,
         cli.weight_decay,
+        norm_loss_factor,
         psqt_init_vec.as_deref(),
         &init_spec,
     )?;
@@ -865,6 +882,10 @@ pub(crate) fn build_experiment_logger(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
+        norm_loss_factor: cli
+            .norm_loss
+            .then_some(cli.norm_loss_factor)
+            .map(finite_or_zero),
         qa: nnue_format::layerstack_weights::QA,
         qb: nnue_format::layerstack_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
@@ -1011,6 +1032,8 @@ pub(crate) fn build_experiment_logger_simple(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
+        // simple subcommand は norm loss 非対応 (`run_training_simple` で reject 済)。
+        norm_loss_factor: None,
         qa: id.activation.qa(),
         qb: nnue_format::simple_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
@@ -1166,6 +1189,12 @@ pub(crate) fn run_simple_training(
             cli.weight_decay
         )
         .into());
+    }
+    if cli.norm_loss {
+        return Err(
+            "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
+                .into(),
+        );
     }
     if !cli.batch_size.is_multiple_of(16) {
         return Err(format!(

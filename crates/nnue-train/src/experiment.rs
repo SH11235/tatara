@@ -127,6 +127,10 @@ pub struct Params {
     pub end_wdl: Option<f32>,
     pub scale: f32,
     pub weight_decay: f32,
+    /// norm loss (per-weight-group L2-norm 正則化) の強度係数。`--norm-loss` 有効時
+    /// のみ `Some(factor)`、無効な run では省略する (`--norm-loss-factor`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub norm_loss_factor: Option<f32>,
     pub qa: i32,
     pub qb: i32,
     /// `"sigmoid"` または `"wrm"`。
@@ -568,6 +572,7 @@ mod tests {
             end_wdl: None,
             scale: 290.0,
             weight_decay: 0.0,
+            norm_loss_factor: None,
             qa: 127,
             qb: 64,
             loss_kind: "wrm".to_string(),

@@ -40,6 +40,7 @@ use gpu_kernels::layerstack::{
     slice2d::{slice_extract_2d_cpu, slice_scatter_2d_cpu},
 };
 use gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu;
+use gpu_kernels::pointwise::norm_loss::{norm_loss_apply_cpu, norm_loss_compute_norms_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
 
 /// forward / gradient の f32 tolerance。
@@ -2396,5 +2397,183 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         diff <= 2e-4 * (1.0 + loss_cpu.abs()),
         "loss_wrm/extended loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
     );
+    Ok(())
+}
+
+// -- norm_loss ----------------------------------------------------------
+
+/// 3 つの weight レイアウト (contiguous row / strided column / per-tensor scalar)
+/// を (n_groups, group_pitch, elem_stride, group_len) で表した norm loss テスト
+/// fixture。`step_impl` の norm loss 配線が渡す indexing と同じ形を踏む。
+struct NormLossLayout {
+    label: &'static str,
+    n_groups: usize,
+    group_pitch: usize,
+    elem_stride: usize,
+    group_len: usize,
+}
+
+fn norm_loss_layouts() -> Vec<NormLossLayout> {
+    vec![
+        // contiguous row [n_groups, group_len]: dense L1/L2/L3 weight 相当。
+        NormLossLayout {
+            label: "row",
+            n_groups: 5,
+            group_pitch: 8,
+            elem_stride: 1,
+            group_len: 8,
+        },
+        // strided column [group_len, n_groups]: FT / L1f weight 相当。
+        NormLossLayout {
+            label: "column",
+            n_groups: 6,
+            group_pitch: 1,
+            elem_stride: 6,
+            group_len: 7,
+        },
+        // per-tensor scalar: bias 相当 (テンソル全体で 1 norm)。
+        NormLossLayout {
+            label: "scalar",
+            n_groups: 1,
+            group_pitch: 0,
+            elem_stride: 1,
+            group_len: 23,
+        },
+    ]
+}
+
+#[test]
+fn norm_loss_reduce_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for lo in norm_loss_layouts() {
+        let total = lo.n_groups * lo.group_len;
+        let w = deterministic_floats(total, 2.0);
+        let mut norms_cpu = vec![0.0_f32; lo.n_groups];
+        norm_loss_compute_norms_cpu(
+            &w,
+            &mut norms_cpu,
+            lo.n_groups,
+            lo.group_pitch,
+            lo.elem_stride,
+            lo.group_len,
+        );
+
+        let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, lo.n_groups)?;
+        cuda_launch! {
+            kernel: norm_loss_reduce, stream: stream, module: module,
+            config: cfg_1d(lo.n_groups),
+            args: [slice(w_dev), slice_mut(norms_dev),
+                   lo.n_groups as u32, lo.group_pitch as u32,
+                   lo.elem_stride as u32, lo.group_len as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("norm_loss_reduce/{}", lo.label),
+            &norms_dev.to_host_vec(&stream)?,
+            &norms_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn norm_loss_apply_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let factor = 1e-4_f32;
+    let lr = 8.75e-4_f32;
+    let eps = EPS;
+    for lo in norm_loss_layouts() {
+        let total = lo.n_groups * lo.group_len;
+        let w = deterministic_floats(total, 2.0);
+        // CPU: norm を先に計算し、その norm で apply。
+        let mut norms = vec![0.0_f32; lo.n_groups];
+        norm_loss_compute_norms_cpu(
+            &w,
+            &mut norms,
+            lo.n_groups,
+            lo.group_pitch,
+            lo.elem_stride,
+            lo.group_len,
+        );
+        let mut w_cpu = w.clone();
+        norm_loss_apply_cpu(
+            &mut w_cpu,
+            &norms,
+            factor,
+            lr,
+            eps,
+            lo.n_groups,
+            lo.group_pitch,
+            lo.elem_stride,
+            lo.group_len,
+        );
+
+        // GPU: 同じ norm を device に渡して apply のみ実行 (reduce は別 test で検証済)。
+        let mut w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let norms_dev = DeviceBuffer::from_host(&stream, &norms)?;
+        cuda_launch! {
+            kernel: norm_loss_apply, stream: stream, module: module,
+            config: cfg_1d(total),
+            args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
+                   lo.n_groups as u32, lo.group_pitch as u32,
+                   lo.elem_stride as u32, lo.group_len as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("norm_loss_apply/{}", lo.label),
+            &w_dev.to_host_vec(&stream)?,
+            &w_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+/// 全零 group (norm=0 → `1/(0+eps)` の巨大負補正) を含む degenerate ケースで、
+/// 対象 weight が 0 のまま (NaN/Inf 汚染しない) かつ非零 group は通常補正される
+/// ことを GPU↔CPU で確認する (CPU unit test `zero_group_stays_zero` の GPU 版)。
+#[test]
+fn norm_loss_zero_norm_group_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (n_groups, group_len) = (3_usize, 4_usize);
+    // contiguous row layout、group 1 を全零にする。
+    let mut w = deterministic_floats(n_groups * group_len, 1.0);
+    for x in w.iter_mut().take(2 * group_len).skip(group_len) {
+        *x = 0.0;
+    }
+    let factor = 1e-4_f32;
+    let lr = 8.75e-4_f32;
+    let eps = EPS;
+
+    let mut w_cpu = w.clone();
+    let mut norms_cpu = vec![0.0_f32; n_groups];
+    norm_loss_compute_norms_cpu(&w_cpu, &mut norms_cpu, n_groups, group_len, 1, group_len);
+    norm_loss_apply_cpu(
+        &mut w_cpu, &norms_cpu, factor, lr, eps, n_groups, group_len, 1, group_len,
+    );
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, n_groups)?;
+    cuda_launch! {
+        kernel: norm_loss_reduce, stream: stream, module: module,
+        config: cfg_1d(n_groups),
+        args: [slice(w_dev), slice_mut(norms_dev),
+               n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+    }?;
+    cuda_launch! {
+        kernel: norm_loss_apply, stream: stream, module: module,
+        config: cfg_1d(n_groups * group_len),
+        args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
+               n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+    }?;
+    stream.synchronize()?;
+    let w_gpu = w_dev.to_host_vec(&stream)?;
+    // 零 group は 0 のまま (NaN/Inf でない)。
+    for &x in w_gpu.iter().take(2 * group_len).skip(group_len) {
+        assert_eq!(x, 0.0, "zero group must stay exactly 0 (no NaN/Inf)");
+    }
+    assert_close_rel("norm_loss/zero-norm", &w_gpu, &w_cpu, TOL);
     Ok(())
 }

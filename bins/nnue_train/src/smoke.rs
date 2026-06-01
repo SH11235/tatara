@@ -370,6 +370,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         feature_set,
         0.0,
         None,
+        None,
         &LayerStackInit::default_uniform(),
     )?;
     // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。

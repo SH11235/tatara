@@ -1329,6 +1329,7 @@ mod tests {
             end_wdl: None,
             scale: 290.0,
             weight_decay: 0.0,
+            norm_loss_factor: None,
             qa: 127,
             qb: 64,
             loss_kind: "sigmoid".to_string(),
