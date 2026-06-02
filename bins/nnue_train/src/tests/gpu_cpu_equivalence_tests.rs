@@ -2431,6 +2431,15 @@ fn norm_loss_layouts() -> Vec<NormLossLayout> {
             elem_stride: 6,
             group_len: 7,
         },
+        // strided column (PSQT weight 相当): psqt_w[feat*num_buckets + bucket] を
+        // bucket 列ごとに ft_in 要素で reduce する。n_groups=num_buckets。
+        NormLossLayout {
+            label: "psqt-column",
+            n_groups: 9,
+            group_pitch: 1,
+            elem_stride: 9,
+            group_len: 11,
+        },
         // per-tensor scalar: bias 相当 (テンソル全体で 1 norm)。
         NormLossLayout {
             label: "scalar",

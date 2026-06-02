@@ -2787,8 +2787,9 @@ impl GpuTrainer {
         // より次テンソルの reduce 前に当該 apply が norm を読み終える。group の
         // (n_groups, group_pitch, elem_stride, group_len) は weight のレイアウトで
         // 決まる (`norm_loss_reduce` doc 参照): dense weight は per-output-neuron
-        // (row / strided column)、bias は per-tensor scalar (`n_groups=1`)。PSQT は
-        // 対象外 (reference の nnue-pytorch に存在しない層)。
+        // (row / strided column)、bias は per-tensor scalar (`n_groups=1`)。PSQT も
+        // dense weight 同様に対象 (reference の nnue-pytorch では PSQT は FT 出力の
+        // 追加列として input weight に融合し、その FT weight が norm loss を受ける)。
         if let Some(nl_factor) = self.norm_loss_factor {
             macro_rules! norm_loss_group {
                 ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
@@ -2817,6 +2818,15 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
             norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
+            // PSQT shortcut weight (任意): reference の nnue-pytorch では PSQT は FT
+            // 出力の追加列として input weight に融合し、その FT weight が norm loss を
+            // 受ける。tatara は PSQT を独立テンソル (psqt_w[feat*num_buckets + bucket])
+            // で保持するため、FT と同じ per-output-neuron (bucket 列ごとに ft_in 要素、
+            // pitch=1 / elem_stride=num_buckets) で適用して reference 挙動に揃える。
+            let psqt_num_buckets = self.num_buckets;
+            if let Some(psqt) = self.psqt.as_mut() {
+                norm_loss_group!(psqt.w, psqt_num_buckets, 1, psqt_num_buckets, ft_in);
+            }
             // bias: per-tensor scalar (テンソル全体で 1 norm、bucket 軸も畳む)。
             norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
             norm_loss_group!(self.l1_b, 1, 0, 1, l1_b_n);
