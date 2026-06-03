@@ -1,0 +1,138 @@
+# optimizer の per-param-group 化 (FT / dense / bias で weight_decay と LR を別値)
+
+- **Status**: Accepted
+- **Date**: 2026-06-04
+
+## Context
+
+LayerStack trainer の Ranger optimizer は、全 weight group に `--weight-decay` の
+単一値と `--lr` 由来の単一 learning rate を一律に適用している。FT weight
+(`ft_w` ≈ 110M params) と出力側の dense weight / bias (合計 ≪ 1k params) が同じ
+weight decay・同じ LR で更新される。パラメータ規模も役割も大きく違う層に同一の
+正則化・学習率を強制するのは粗く、NNUE 学習の標準的な調整余地を塞いでいる。
+
+nnue-pytorch は optimizer を **param-group 単位**で構成し、入力 (feature transformer)
+weight / hidden dense weight / bias を別グループとして `weight_decay` と `lr` を
+独立に与える。とくに **全 bias は `weight_decay = 0`** にするのが定石である
+(bias に decay をかけると表現力を不必要に削る、というのが一般的な理解)。tatara には
+この粒度が無い。
+
+直前に landed した optimizer launch の table-drive 化 (Issue #278) で、`radam_step` /
+`ranger_lookahead_lerp` の launch は `UniformOptimGroup` 配列を回す形に集約された。
+`radam_step` kernel は `lr` と `decay` (weight_decay) を **per-launch の scalar 引数**
+として既に受け取るため、per-group の値を流すのに kernel ABI 変更は要らない。
+per-group 化を入れる素地が整っている。
+
+本 ADR は、この per-param-group optimizer をどの粒度・どの scope・どの既定挙動で
+入れるかの設計判断を記録する。Elo 効果そのものの可否は SPRT で別途検証する
+(本 ADR は「どう作るか」を確定し、「効くか」は計測に委ねる)。
+
+## Decision
+
+### 1. param-group は FT / dense / bias の 3 分類
+
+全学習対象テンソルを次の 3 group に静的に割り当てる。nnue-pytorch の
+input-weights / hidden-weights / biases モデルに対応する。
+
+| group | 含むテンソル | 役割 |
+|---|---|---|
+| **ft** | `ft_w`, `psqt_w` | feature-indexed な入力側 weight (大規模) |
+| **dense** | `l1_w`, `l1f_w`, `l2_w`, `l3_w` | hidden dense layer weight |
+| **bias** | `ft_b`, `l1_b`, `l1f_b`, `l2_b`, `l3_b` | 全層の bias |
+
+`psqt_w` は shape `(ft_in, num_buckets)` の feature-indexed な shortcut weight で
+性質が `ft_w` に近いため **ft group** に置く。per-layer の細粒度 (l1/l1f/l2/l3 を
+個別) は flag 数と探索空間が膨らみ SPRT で寄与を切り分けにくいため採らない
+(§Alternatives)。
+
+### 2. group ごとに weight_decay と LR 倍率の両方を可変化
+
+各 group に独立した:
+
+- **weight_decay** (絶対値)
+- **lr_mult** (scheduled LR への相対倍率)
+
+を持たせる。per-group LR は `lr_for(group) = scheduled_lr × lr_mult(group)` とし、
+LR schedule (`--lr-schedule`) が決めた毎 step の LR に group 倍率を掛ける
+(schedule の後段に倍率を適用)。`radam_step` / lerp の step_size・denom は step と
+beta のみから決まり LR 非依存なので group 間で共有する。lerp pass は `RANGER_ALPHA`
+のみを使い lr/weight_decay を取らないため本変更の影響を受けない (radam pass のみ)。
+
+### 3. CLI
+
+per-group の上書き flag を追加する (いずれも `Option`、未指定で従来挙動)。
+
+- `--ft-weight-decay` / `--dense-weight-decay` / `--bias-weight-decay`
+- `--ft-lr-mult` / `--dense-lr-mult` / `--bias-lr-mult`
+
+未指定の group は **大域 `--weight-decay` の値** と **lr_mult = 1.0** にフォール
+バックする。
+
+### 4. 既定挙動は bit-identical
+
+per-group flag を一つも指定しなければ、全 group が大域 `--weight-decay` と
+`lr_mult = 1.0` を使い、現状と**完全に同じ launch 引数**になる。これにより既定経路は
+従来と bit-identical を保つ。検証は raw `.ckpt` ではなく **量子化 `.bin` の
+bit-identical** で行う (backward の atomicAdd で `.ckpt` は run-to-run 非決定だが、
+量子化出力は決定論的; Issue #278 で確立した手法)。psqt 有無の両構成で確認する。
+
+### 5. bias の weight_decay=0 は opt-in (既定にしない)
+
+nnue-pytorch 流の「全 bias を `weight_decay = 0`」は **既定にはしない** (§4 の
+bit-identical 既定と両立しないため)。`--bias-weight-decay 0` の明示指定で有効化する
+位置づけとし、ADR としては **SPRT で最初に試す推奨構成**として bias wd=0 を挙げる
+(下記 §SPRT)。
+
+### 6. 実装は #278 の launch 経路に載せる。state 構造は変えない
+
+per-group の `(weight_decay, lr)` を resolve し、#278 の `UniformOptimGroup` に
+per-group の weight_decay / lr を持たせて radam loop で `g.weight_decay` /
+`g.lr` を渡す。FT (`ft_w`) は table 外の特殊ケース (fp16 / fp16-opt-state の 4 variant)
+なので、ft group の値を個別に配線する。per-group の lr/weight_decay は**静的 config
+であって stateful ではない**ため、`RangerHostState` / optimizer state の構造変更は
+不要 (Issue 本文の「state を group ベクトル化」は本設計では発生しない)。
+
+### 7. checkpoint / resume
+
+lr_mult / weight_decay は実行ごとに CLI から供給される hyperparameter であり、
+optimizer の m/v state (既に group ごとの device buffer) とは別物。`.bin` / raw
+`.ckpt` の format は変更せず、resume 時は CLI で同じ per-group 値を再供給する運用と
+する (LR schedule horizon のような「再供給が要る hyperparameter」と同じ扱い)。
+experiment.json には有効な per-group 値を記録する。
+
+## Alternatives considered
+
+- **per-layer の細粒度 (ft/l1/l1f/l2/l3 + bias を個別)**: 柔軟だが flag が 10+ に
+  増え、SPRT で各 knob の寄与を切り分けるのが現実的でない。3 分類で nnue-pytorch
+  相当の調整力は得られる。却下。
+- **FT vs rest の 2 分類**: 最小実装だが bias を独立させられず、定石の bias wd=0 を
+  表現できない。却下。
+- **weight_decay のみ (LR-mult なし)**: scope は小さいが、`radam_step` が既に `lr` を
+  per-launch で受けるため LR-mult の追加コストは小さく、分割すると 2 度手間になる。
+  両方を一度に入れる。却下。
+- **bias wd=0 を既定にする**: nnue-pytorch の定石に寄せられるが、既定経路の
+  bit-identical (§4、Issue 受け入れ条件) を破る。opt-in に留める。却下。
+- **optimizer state の group ベクトル化**: per-group 値が stateful なら必要だが、
+  lr/weight_decay は静的 config なので不要。採らない。
+
+## Consequences
+
+- FT と出力層・bias を別の正則化 / 学習率で調整でき、nnue-pytorch 流の recipe
+  (とくに bias wd=0、FT と dense で別 LR 倍率) を tatara で試せるようになる。
+- 既定経路は bit-identical を維持するため、既存 recipe・既存 net への影響はない。
+- 実装は #278 の launch 経路の上で完結し、kernel ABI 変更・optimizer state 構造変更を
+  伴わない (host plumbing + CLI + per-group 値の resolve)。
+- CLI surface が 6 flag 増える。help / experiment.json / quickstart doc の更新が要る。
+- **Elo 効果は未検証**: 本 ADR は設計確定まで。価値検証は SPRT に委ねる。SPRT は
+  RTX 3080 Ti を要し、現在 norm-loss 本学習が専有中のため、実装 + bit-identical
+  検証を先行し、GPU 解放後に SPRT を回す。
+
+## SPRT 計画 (実装後)
+
+baseline = 既定 (全 group 一律、bit-identical) に対し、段階的に:
+
+1. **bias wd=0** (`--bias-weight-decay 0`) のみ — 最も確立した lever、単独効果を測る。
+2. FT と dense で weight_decay / lr_mult を変える構成 — 1 で得た知見の上で振る。
+
+neutral / regression なら当該構成は不採用 (flag は残すが既定は据え置き)、有意な
++Elo が出た構成を recipe に反映し、効果値をこの ADR か experiment doc に追記する。
