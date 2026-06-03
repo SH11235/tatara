@@ -290,9 +290,10 @@ pub(crate) struct Cli {
     /// to the baseline. When enabled, each step (just before the Ranger update)
     /// every targeted weight group is nudged so its L2 norm relaxes toward 1
     /// (the oblique manifold): the 2D layer weights per output neuron (FT /
-    /// L1f / L1 / L2 / L3), and 1D biases by their whole-tensor norm. PSQT is
-    /// excluded. Strength is set by --norm-loss-factor. An opt-in regularizer
-    /// whose playing-strength effect must be confirmed by SPRT.
+    /// L1f / L1 / L2 / L3), the PSQT shortcut weights per output bucket (when
+    /// --psqt is enabled), and 1D biases by their whole-tensor norm. Strength
+    /// is set by --norm-loss-factor. An opt-in regularizer whose playing-strength
+    /// effect must be confirmed by SPRT.
     #[arg(long, global = true)]
     pub(crate) norm_loss: bool,
     /// Norm loss strength (only used when --norm-loss is set). Each step every
