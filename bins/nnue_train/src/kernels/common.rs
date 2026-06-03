@@ -422,31 +422,35 @@ pub fn radam_step_fp16_mirror(
     }
 }
 
-/// Norm loss (Georgiou et al. 2021) の per-weight-group L2-norm 計算 (reduce pass)。
+/// Norm loss (Georgiou et al. 2021) の per-weight-group sumsq 計算 (reduce pass)。
 ///
-/// 1 thread = 1 group。group `g` の element offset は `g*group_pitch +
-/// pos*elem_stride` (`pos < group_len`)、その L2 norm を `norms[g]` に書く。集計順
-/// は reference CPU (`gpu_kernels::pointwise::norm_loss`) と同一 (pos 昇順) で、
-/// 後段 `norm_loss_apply` が同 stream で読む。
+/// 2D grid: x 軸 = group (隣接 thread = 隣接 group)、y 軸 = pos チャンク。group `g` の
+/// element offset は `g*group_pitch + pos*elem_stride` (`pos < group_len`)。各 thread は
+/// 担当 pos チャンク (`blockIdx_y` 始点、`gridDim_y` stride) の Σ w² を計算し `norms[g]`
+/// へ atomicAdd する。呼び出し側は launch 前に `norms` を 0 fill し、後段
+/// [`norm_loss_finalize`] が sqrt して L2 norm にする。strided column (FT/L1f,
+/// `group_pitch=1`) では同一 pos の隣接 g が連続アドレスなので x 軸 thread で coalesce する。
 ///
-/// `(group_pitch, elem_stride, group_len, n_groups)` で 3 レイアウトを統一表現する:
-/// contiguous row (dense weight `[n_groups, group_len]`、`pitch=group_len,
-/// stride=1`)、strided column (FT/L1f weight `[group_len, n_groups]`、`pitch=1,
-/// stride=n_groups`)、per-tensor scalar (bias、`n_groups=1, pitch=0, stride=1`)。
+/// `(group_pitch, elem_stride, group_len, n_groups)` の 3 レイアウト統一表現は
+/// [`norm_loss_finalize`] / [`norm_loss_apply`] と共通: contiguous row (dense weight
+/// `[n_groups, group_len]`、`pitch=group_len, stride=1`)、strided column (FT/L1f weight
+/// `[group_len, n_groups]`、`pitch=1, stride=n_groups`)、per-tensor scalar (bias、
+/// `n_groups=1, pitch=0, stride=1`)。
 #[kernel]
 pub fn norm_loss_reduce(
     weight: &[f32],
-    mut norms: DisjointSlice<f32>,
+    norms: &[f32],
     n_groups: u32,
     group_pitch: u32,
     elem_stride: u32,
     group_len: u32,
 ) {
-    let g = thread::index_1d();
-    if g.get() >= n_groups as usize {
+    let g = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
+    if g >= n_groups as usize {
         return;
     }
-    let base = g.get() * group_pitch as usize;
+    let base = g * group_pitch as usize;
     let stride = elem_stride as usize;
     let len = group_len as usize;
     // SAFETY: caller (`GpuTrainer::step_impl`) が対象 tensor のレイアウト
@@ -454,14 +458,33 @@ pub fn norm_loss_reduce(
     // 渡す。3 レイアウトいずれも `base + pos*stride` は weight 範囲内の単射。
     let wptr = weight.as_ptr();
     let mut sumsq = 0.0_f32;
-    let mut pos: usize = 0;
+    let mut pos = thread::blockIdx_y() as usize;
+    let ystep = thread::gridDim_y() as usize;
     while pos < len {
         let w = unsafe { wptr.add(base + pos * stride).read() };
         sumsq += w * w;
-        pos += 1;
+        pos += ystep;
+    }
+    if sumsq != 0.0_f32 {
+        // SAFETY: `norms.len() >= n_groups` (norm_scratch は対象 tensor 群の最大 group 数で
+        // 確保され、小さい group では余剰あり)、`g < n_groups`。`DeviceAtomicF32` は f32 と
+        // 同 layout。本 kernel 起動中 `norms` を non-atomic で書く path は無く (0 fill は
+        // 先行 launch で完了)、atomicAdd 同士のみ GPU が serialize する。
+        let cell = unsafe { &*(norms.as_ptr().add(g) as *const DeviceAtomicF32) };
+        cell.fetch_add(sumsq, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Norm loss reduce の最終 pass。[`norm_loss_reduce`] が atomicAdd で貯めた Σ w² を
+/// sqrt して L2 norm に変換する。1 thread = 1 group。
+#[kernel]
+pub fn norm_loss_finalize(mut norms: DisjointSlice<f32>, n_groups: u32) {
+    let g = thread::index_1d();
+    if g.get() >= n_groups as usize {
+        return;
     }
     if let Some(o) = norms.get_mut(g) {
-        *o = sumsq.sqrt();
+        *o = (*o).sqrt();
     }
 }
 

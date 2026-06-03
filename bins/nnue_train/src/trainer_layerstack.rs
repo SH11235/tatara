@@ -2792,12 +2792,21 @@ impl GpuTrainer {
         if let Some(nl_factor) = self.norm_loss_factor {
             macro_rules! norm_loss_group {
                 ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
+                    // norm_scratch を sumsq accumulator として使い回すため group ごとに 0 fill
+                    // → 2D reduce で atomicAdd → finalize で sqrt → apply。
+                    memset_zero(&self.stream, &self.norm_scratch)?;
                     cuda_launch! {
                         kernel: norm_loss_reduce,
                         stream: self.stream, module: self.module,
-                        config: cfg_1d($ng),
-                        args: [slice($w), slice_mut(self.norm_scratch),
+                        config: cfg_norm_loss_reduce($ng, $len),
+                        args: [slice($w), slice(self.norm_scratch),
                                ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                    }?;
+                    cuda_launch! {
+                        kernel: norm_loss_finalize,
+                        stream: self.stream, module: self.module,
+                        config: cfg_1d($ng),
+                        args: [slice_mut(self.norm_scratch), ($ng) as u32]
                     }?;
                     cuda_launch! {
                         kernel: norm_loss_apply,

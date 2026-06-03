@@ -2468,13 +2468,19 @@ fn norm_loss_reduce_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        // norms_dev は 0 init: reduce が sumsq を atomicAdd、finalize で sqrt。
         let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, lo.n_groups)?;
         cuda_launch! {
             kernel: norm_loss_reduce, stream: stream, module: module,
-            config: cfg_1d(lo.n_groups),
-            args: [slice(w_dev), slice_mut(norms_dev),
+            config: cfg_norm_loss_reduce(lo.n_groups, lo.group_len),
+            args: [slice(w_dev), slice(norms_dev),
                    lo.n_groups as u32, lo.group_pitch as u32,
                    lo.elem_stride as u32, lo.group_len as u32]
+        }?;
+        cuda_launch! {
+            kernel: norm_loss_finalize, stream: stream, module: module,
+            config: cfg_1d(lo.n_groups),
+            args: [slice_mut(norms_dev), lo.n_groups as u32]
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -2567,9 +2573,14 @@ fn norm_loss_zero_norm_group_matches_cpu() -> Result<(), Box<dyn std::error::Err
     let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, n_groups)?;
     cuda_launch! {
         kernel: norm_loss_reduce, stream: stream, module: module,
-        config: cfg_1d(n_groups),
-        args: [slice(w_dev), slice_mut(norms_dev),
+        config: cfg_norm_loss_reduce(n_groups, group_len),
+        args: [slice(w_dev), slice(norms_dev),
                n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+    }?;
+    cuda_launch! {
+        kernel: norm_loss_finalize, stream: stream, module: module,
+        config: cfg_1d(n_groups),
+        args: [slice_mut(norms_dev), n_groups as u32]
     }?;
     cuda_launch! {
         kernel: norm_loss_apply, stream: stream, module: module,

@@ -221,6 +221,19 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
     }
 }
 
+/// `norm_loss_reduce` 用 2D launch。x = group (`BLOCK_DIM` 単位)、y = pos チャンク
+/// (`group_len` を ~1024 要素/thread 目安で最大 64 分割し atomic 部分和を並列化)。FT の
+/// ように group_len が巨大な層で occupancy を稼ぐのが狙いで、小さい group は y=1。
+pub(crate) fn cfg_norm_loss_reduce(n_groups: usize, group_len: usize) -> LaunchConfig {
+    let grid_x = (n_groups as u32).div_ceil(BLOCK_DIM);
+    let chunks = group_len.div_ceil(1024).clamp(1, 64) as u32;
+    LaunchConfig {
+        grid_dim: (grid_x, chunks, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
 /// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
 /// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
