@@ -483,7 +483,8 @@ struct UniformOptimGroup<'a> {
 /// 一様 optimizer group の launch 順と clamp 設定 (FT を除く)。`(label, clamp_min,
 /// clamp_max)` を radam / lerp pass が回す順序で返す。実 buffer を束ねる
 /// [`UniformOptimGroup`] 配列の組立てはこの表と同順・同 clamp でなければならず、
-/// `step_impl` の `debug_assert` と `uniform_optim_group_layout_matches` test が照合する。
+/// `step_impl` の `debug_assert` と `uniform_optim_group_layout_matches_handwritten_order`
+/// test が照合する。
 /// dense weight (L1/L1f/L2/L3 weight + L1/L1f/L2 bias) は i8@QB 量子化由来の対称 clamp、
 /// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
 fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, f32, f32)> {
