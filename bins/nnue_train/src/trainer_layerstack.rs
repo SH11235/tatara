@@ -459,6 +459,51 @@ impl GpuWorkspace {
     }
 }
 
+/// optimizer step の一様 (非 FT) weight group。`radam_step` と
+/// `ranger_lookahead_lerp` は group 間で buffer 4〜5 本と要素数・clamp 範囲だけが
+/// 異なり、scalar hyperparameter (lr / step_size / decay / beta / alpha 等) と kernel
+/// は共通。group を配列に集約して launch を pass ごと 1 loop に畳むことで、kernel ABI
+/// 変更時に各 group の引数列を個別に揃える必要を無くす。
+///
+/// FT weight (`ft_w`) は `--ft-fp16` / `--fp16-opt-state` で kernel variant が分岐する
+/// ため本表に含めず、呼び出し側で個別に launch する。clamp は対象テンソルの量子化
+/// dtype で決まる ([`W_CLAMP_QUANT_MIN`] / [`W_CLAMP_NONE_MIN`] の定義参照)。
+struct UniformOptimGroup<'a> {
+    label: &'static str,
+    weight: &'a mut DeviceBuffer<f32>,
+    m: &'a mut DeviceBuffer<f32>,
+    v: &'a mut DeviceBuffer<f32>,
+    grad: &'a mut DeviceBuffer<f32>,
+    slow: &'a mut DeviceBuffer<f32>,
+    n: usize,
+    clamp_min: f32,
+    clamp_max: f32,
+}
+
+/// 一様 optimizer group の launch 順と clamp 設定 (FT を除く)。`(label, clamp_min,
+/// clamp_max)` を radam / lerp pass が回す順序で返す。実 buffer を束ねる
+/// [`UniformOptimGroup`] 配列の組立てはこの表と同順・同 clamp でなければならず、
+/// `step_impl` の `debug_assert` と `uniform_optim_group_layout_matches` test が照合する。
+/// dense weight (L1/L1f/L2/L3 weight + L1/L1f/L2 bias) は i8@QB 量子化由来の対称 clamp、
+/// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
+fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, f32, f32)> {
+    let mut groups = vec![
+        ("ft_b", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
+        ("l1_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1f_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1f_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l2_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l2_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l3_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l3_b", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
+    ];
+    if psqt_enabled {
+        groups.push(("psqt_w", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX));
+    }
+    groups
+}
+
 impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
@@ -2810,82 +2855,142 @@ impl GpuTrainer {
             // 精度が食い違うことはない。
             _ => unreachable!("ft_w m and v moment buffers always share precision"),
         }
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
-            args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
-                   slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n as u32]
-        }?;
-        // L1
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l1_w_n),
-            args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
-                   slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n as u32]
-        }?;
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
-            args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
-                   slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n as u32]
-        }?;
-        // L1f
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l1f_w_n),
-            args: [slice_mut(self.l1f_w), slice_mut(self.l1f_w_m), slice_mut(self.l1f_w_v),
-                   slice_mut(self.l1f_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1f_w_n as u32]
-        }?;
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
-            args: [slice_mut(self.l1f_b), slice_mut(self.l1f_b_m), slice_mut(self.l1f_b_v),
-                   slice_mut(self.l1f_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1f_b_n as u32]
-        }?;
-        // L2
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l2_w_n),
-            args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
-                   slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n as u32]
-        }?;
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
-            args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
-                   slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n as u32]
-        }?;
-        // L3
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l3_w_n),
-            args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
-                   slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n as u32]
-        }?;
-        cuda_launch! {
-            kernel: radam_step,
-            stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
-            args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
-                   slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2, EPS,
-                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n as u32]
-        }?;
-        // PSQT (任意): radam_step を psqt_w に適用。`m`/`v` は f32 固定 (FP16 mirror なし)。
+        // 一様 (非 FT) weight group を 1 配列に集約し、radam pass / lerp pass をそれぞれ
+        // loop 1 本に畳む。各 group は buffer と要素数・clamp だけが異なり、scalar
+        // hyperparameter と kernel は共通。FT (`ft_w`) は fp16 / fp16-opt-state 分岐の
+        // ため上で個別 launch 済。
+        let psqt_enabled = self.psqt.is_some();
+        let psqt_n = self.feature_set.ft_in() * self.num_buckets;
+        let mut uniform_groups = vec![
+            UniformOptimGroup {
+                label: "ft_b",
+                weight: &mut self.ft_b,
+                m: &mut self.ft_b_m,
+                v: &mut self.ft_b_v,
+                grad: &mut self.ft_b_grad,
+                slow: &mut self.ft_b_slow,
+                n: ft_b_n,
+                clamp_min: W_CLAMP_NONE_MIN,
+                clamp_max: W_CLAMP_NONE_MAX,
+            },
+            UniformOptimGroup {
+                label: "l1_w",
+                weight: &mut self.l1_w,
+                m: &mut self.l1_w_m,
+                v: &mut self.l1_w_v,
+                grad: &mut self.l1_w_grad,
+                slow: &mut self.l1_w_slow,
+                n: l1_w_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l1_b",
+                weight: &mut self.l1_b,
+                m: &mut self.l1_b_m,
+                v: &mut self.l1_b_v,
+                grad: &mut self.l1_b_grad,
+                slow: &mut self.l1_b_slow,
+                n: l1_b_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l1f_w",
+                weight: &mut self.l1f_w,
+                m: &mut self.l1f_w_m,
+                v: &mut self.l1f_w_v,
+                grad: &mut self.l1f_w_grad,
+                slow: &mut self.l1f_w_slow,
+                n: l1f_w_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l1f_b",
+                weight: &mut self.l1f_b,
+                m: &mut self.l1f_b_m,
+                v: &mut self.l1f_b_v,
+                grad: &mut self.l1f_b_grad,
+                slow: &mut self.l1f_b_slow,
+                n: l1f_b_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l2_w",
+                weight: &mut self.l2_w,
+                m: &mut self.l2_w_m,
+                v: &mut self.l2_w_v,
+                grad: &mut self.l2_w_grad,
+                slow: &mut self.l2_w_slow,
+                n: l2_w_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l2_b",
+                weight: &mut self.l2_b,
+                m: &mut self.l2_b_m,
+                v: &mut self.l2_b_v,
+                grad: &mut self.l2_b_grad,
+                slow: &mut self.l2_b_slow,
+                n: l2_b_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l3_w",
+                weight: &mut self.l3_w,
+                m: &mut self.l3_w_m,
+                v: &mut self.l3_w_v,
+                grad: &mut self.l3_w_grad,
+                slow: &mut self.l3_w_slow,
+                n: l3_w_n,
+                clamp_min: W_CLAMP_QUANT_MIN,
+                clamp_max: W_CLAMP_QUANT_MAX,
+            },
+            UniformOptimGroup {
+                label: "l3_b",
+                weight: &mut self.l3_b,
+                m: &mut self.l3_b_m,
+                v: &mut self.l3_b_v,
+                grad: &mut self.l3_b_grad,
+                slow: &mut self.l3_b_slow,
+                n: l3_b_n,
+                clamp_min: W_CLAMP_NONE_MIN,
+                clamp_max: W_CLAMP_NONE_MAX,
+            },
+        ];
+        // PSQT (任意): `m`/`v` は f32 固定 (FP16 mirror なし)、clamp 無し。
         if let Some(psqt) = self.psqt.as_mut() {
-            let psqt_n = self.feature_set.ft_in() * self.num_buckets;
+            uniform_groups.push(UniformOptimGroup {
+                label: "psqt_w",
+                weight: &mut psqt.w,
+                m: &mut psqt.w_m,
+                v: &mut psqt.w_v,
+                grad: &mut psqt.w_grad,
+                slow: &mut psqt.w_slow,
+                n: psqt_n,
+                clamp_min: W_CLAMP_NONE_MIN,
+                clamp_max: W_CLAMP_NONE_MAX,
+            });
+        }
+        // 配列の launch 順 / clamp が layout 表 (test が gold と照合) と一致することを保証。
+        debug_assert!(
+            uniform_groups
+                .iter()
+                .map(|g| (g.label, g.clamp_min, g.clamp_max))
+                .eq(uniform_optim_group_layout(psqt_enabled)),
+            "uniform optim group 配列が uniform_optim_group_layout と不一致 (順序 / clamp のドリフト)"
+        );
+        for g in uniform_groups.iter_mut() {
             cuda_launch! {
                 kernel: radam_step,
-                stream: self.stream, module: self.module, config: cfg_1d(psqt_n),
-                args: [slice_mut(psqt.w), slice_mut(psqt.w_m), slice_mut(psqt.w_v),
-                       slice_mut(psqt.w_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, psqt_n as u32]
+                stream: self.stream, module: self.module, config: cfg_1d(g.n),
+                args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
+                       slice_mut(*g.grad), lr, step_size, denom, self.weight_decay,
+                       BETA1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
             }?;
         }
 
@@ -2907,57 +3012,12 @@ impl GpuTrainer {
                     args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n as u32]
                 }?;
             }
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(ft_b_n),
-                args: [slice_mut(self.ft_b), slice_mut(self.ft_b_slow), RANGER_ALPHA, ft_b_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l1_w_n),
-                args: [slice_mut(self.l1_w), slice_mut(self.l1_w_slow), RANGER_ALPHA, l1_w_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l1_b_n),
-                args: [slice_mut(self.l1_b), slice_mut(self.l1_b_slow), RANGER_ALPHA, l1_b_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l1f_w_n),
-                args: [slice_mut(self.l1f_w), slice_mut(self.l1f_w_slow), RANGER_ALPHA, l1f_w_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l1f_b_n),
-                args: [slice_mut(self.l1f_b), slice_mut(self.l1f_b_slow), RANGER_ALPHA, l1f_b_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l2_w_n),
-                args: [slice_mut(self.l2_w), slice_mut(self.l2_w_slow), RANGER_ALPHA, l2_w_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l2_b_n),
-                args: [slice_mut(self.l2_b), slice_mut(self.l2_b_slow), RANGER_ALPHA, l2_b_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l3_w_n),
-                args: [slice_mut(self.l3_w), slice_mut(self.l3_w_slow), RANGER_ALPHA, l3_w_n as u32]
-            }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp,
-                stream: self.stream, module: self.module, config: cfg_1d(l3_b_n),
-                args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n as u32]
-            }?;
-            if let Some(psqt) = self.psqt.as_mut() {
-                let psqt_n = self.feature_set.ft_in() * self.num_buckets;
+            // 一様 group の lerp も radam と同じ配列を回す (FT は上で個別 launch 済)。
+            for g in uniform_groups.iter_mut() {
                 cuda_launch! {
                     kernel: ranger_lookahead_lerp,
-                    stream: self.stream, module: self.module, config: cfg_1d(psqt_n),
-                    args: [slice_mut(psqt.w), slice_mut(psqt.w_slow), RANGER_ALPHA, psqt_n as u32]
+                    stream: self.stream, module: self.module, config: cfg_1d(g.n),
+                    args: [slice_mut(*g.weight), slice_mut(*g.slow), RANGER_ALPHA, g.n as u32]
                 }?;
             }
         }
@@ -3090,5 +3150,36 @@ impl TrainerBackend for GpuTrainer {
             .to_host_vec(&self.stream)
             .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
         Ok((host[0], self.fp16_clamp_elems_written))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一様 optimizer group の launch 順 / clamp が、table-drive 化前の手書き列挙
+    /// (radam_step / ranger_lookahead_lerp pass) と一致することを固定する gold test。
+    /// 順序や clamp がずれると weight clamp 範囲が変わって optimizer 挙動が壊れるため、
+    /// `uniform_optim_group_layout` の手書き gold 照合で回帰を検出する。
+    #[test]
+    fn uniform_optim_group_layout_matches_handwritten_order() {
+        let q = (W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX);
+        let none = (W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX);
+        let expected_no_psqt = vec![
+            ("ft_b", none.0, none.1),
+            ("l1_w", q.0, q.1),
+            ("l1_b", q.0, q.1),
+            ("l1f_w", q.0, q.1),
+            ("l1f_b", q.0, q.1),
+            ("l2_w", q.0, q.1),
+            ("l2_b", q.0, q.1),
+            ("l3_w", q.0, q.1),
+            ("l3_b", none.0, none.1),
+        ];
+        assert_eq!(uniform_optim_group_layout(false), expected_no_psqt);
+
+        let mut expected_psqt = expected_no_psqt.clone();
+        expected_psqt.push(("psqt_w", none.0, none.1));
+        assert_eq!(uniform_optim_group_layout(true), expected_psqt);
     }
 }
