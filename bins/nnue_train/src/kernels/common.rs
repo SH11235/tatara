@@ -490,10 +490,12 @@ pub fn norm_loss_finalize(mut norms: DisjointSlice<f32>, n_groups: u32) {
 
 /// Norm loss 補正の適用 (apply pass)。1 thread = 1 weight element。
 ///
-/// element 番号 `t` を `(g, pos) = (t/group_len, t%group_len)` に分解し、offset
-/// `g*group_pitch + pos*elem_stride` の weight に `*= 1 - lr*2*factor*(1 -
-/// 1/(norms[g]+eps))` を掛ける。`norms` は先行 [`norm_loss_reduce`] が書込済。
-/// indexing は [`norm_loss_reduce`] と同一。
+/// thread `t` を、stride==1 の連続軸が最内になるよう `(g, pos)` へ分解して coalesce する:
+/// strided column (FT/L1f、`group_pitch==1`) は `g` 最内 (`g=t%n_groups, pos=t/n_groups`)
+/// で連続 thread が連続 g (同 pos) を触り、contiguous row / scalar は `pos` 最内
+/// (`g=t/group_len, pos=t%group_len`)。どちらも offset は `g*group_pitch + pos*elem_stride`
+/// で、weight に `*= 1 - lr*2*factor*(1 - 1/(norms[g]+eps))` を掛ける。各要素が受ける補正は
+/// 分解方法に依らず同一 (norms[g] は同じ) なので結果は不変、メモリアクセスのみ coalesced 化。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn norm_loss_apply(
@@ -507,14 +509,19 @@ pub fn norm_loss_apply(
     elem_stride: u32,
     group_len: u32,
 ) {
-    let t = thread::index_1d();
+    let t = thread::index_1d().get();
+    let ng = n_groups as usize;
     let len = group_len as usize;
-    let total = (n_groups as usize) * len;
-    if t.get() >= total {
+    if t >= ng * len {
         return;
     }
-    let g = t.get() / len;
-    let pos = t.get() % len;
+    // 連続 thread が連続メモリを触るよう、stride==1 の軸を最内にする。strided column
+    // (group_pitch==1, FT/L1f) は g を、それ以外 (contiguous row / scalar) は pos を最内に。
+    let (g, pos) = if group_pitch == 1 {
+        (t % ng, t / ng)
+    } else {
+        (t / len, t % len)
+    };
     let off = g * group_pitch as usize + pos * elem_stride as usize;
     let correction = 2.0_f32 * factor * (1.0_f32 - 1.0_f32 / (norms[g] + eps));
     let mult = 1.0_f32 - lr * correction;
