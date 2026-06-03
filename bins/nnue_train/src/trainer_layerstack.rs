@@ -2857,11 +2857,12 @@ impl GpuTrainer {
         }
         // 一様 (非 FT) weight group を 1 配列に集約し、radam pass / lerp pass をそれぞれ
         // loop 1 本に畳む。各 group は buffer と要素数・clamp だけが異なり、scalar
-        // hyperparameter と kernel は共通。FT (`ft_w`) は fp16 / fp16-opt-state 分岐の
-        // ため上で個別 launch 済。
+        // hyperparameter と kernel は共通。FT (`ft_w`) は fp16 / fp16-opt-state で kernel
+        // variant が分岐するため上で個別に launch する。always-on の 9 group は stack 上の
+        // 固定長 array、任意の psqt は Option で chain し、per-step のヒープ確保を避ける。
         let psqt_enabled = self.psqt.is_some();
         let psqt_n = self.feature_set.ft_in() * self.num_buckets;
-        let mut uniform_groups = vec![
+        let mut uniform_groups: [UniformOptimGroup<'_>; 9] = [
             UniformOptimGroup {
                 label: "ft_b",
                 weight: &mut self.ft_b,
@@ -2963,8 +2964,8 @@ impl GpuTrainer {
             },
         ];
         // PSQT (任意): `m`/`v` は f32 固定 (FP16 mirror なし)、clamp 無し。
-        if let Some(psqt) = self.psqt.as_mut() {
-            uniform_groups.push(UniformOptimGroup {
+        let mut psqt_group: Option<UniformOptimGroup<'_>> = match self.psqt.as_mut() {
+            Some(psqt) => Some(UniformOptimGroup {
                 label: "psqt_w",
                 weight: &mut psqt.w,
                 m: &mut psqt.w_m,
@@ -2974,17 +2975,19 @@ impl GpuTrainer {
                 n: psqt_n,
                 clamp_min: W_CLAMP_NONE_MIN,
                 clamp_max: W_CLAMP_NONE_MAX,
-            });
-        }
-        // 配列の launch 順 / clamp が layout 表 (test が gold と照合) と一致することを保証。
+            }),
+            None => None,
+        };
+        // launch 順 / clamp が layout 表 (test が gold と照合) と一致することを保証。
         debug_assert!(
             uniform_groups
                 .iter()
+                .chain(psqt_group.iter())
                 .map(|g| (g.label, g.clamp_min, g.clamp_max))
                 .eq(uniform_optim_group_layout(psqt_enabled)),
-            "uniform optim group 配列が uniform_optim_group_layout と不一致 (順序 / clamp のドリフト)"
+            "uniform optim group が uniform_optim_group_layout と不一致 (順序 / clamp のドリフト)"
         );
-        for g in uniform_groups.iter_mut() {
+        for g in uniform_groups.iter_mut().chain(psqt_group.iter_mut()) {
             cuda_launch! {
                 kernel: radam_step,
                 stream: self.stream, module: self.module, config: cfg_1d(g.n),
@@ -3012,8 +3015,8 @@ impl GpuTrainer {
                     args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n as u32]
                 }?;
             }
-            // 一様 group の lerp も radam と同じ配列を回す (FT は上で個別 launch 済)。
-            for g in uniform_groups.iter_mut() {
+            // 一様 group の lerp も radam と同じ group 集合を回す (FT は上で個別に launch)。
+            for g in uniform_groups.iter_mut().chain(psqt_group.iter_mut()) {
                 cuda_launch! {
                     kernel: ranger_lookahead_lerp,
                     stream: self.stream, module: self.module, config: cfg_1d(g.n),
@@ -3157,10 +3160,10 @@ impl TrainerBackend for GpuTrainer {
 mod tests {
     use super::*;
 
-    /// 一様 optimizer group の launch 順 / clamp が、table-drive 化前の手書き列挙
-    /// (radam_step / ranger_lookahead_lerp pass) と一致することを固定する gold test。
-    /// 順序や clamp がずれると weight clamp 範囲が変わって optimizer 挙動が壊れるため、
-    /// `uniform_optim_group_layout` の手書き gold 照合で回帰を検出する。
+    /// radam_step / ranger_lookahead_lerp pass が回す一様 weight group の launch 順と
+    /// per-group clamp 範囲を gold 値で固定する test。順序や clamp がずれると weight が
+    /// 受ける clamp 範囲が変わり optimizer 挙動が壊れるため、`uniform_optim_group_layout`
+    /// を期待値と照合して回帰を検出する。
     #[test]
     fn uniform_optim_group_layout_matches_handwritten_order() {
         let q = (W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX);
