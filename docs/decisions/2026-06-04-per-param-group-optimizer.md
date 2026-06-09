@@ -151,6 +151,10 @@ per-group lr_mult を norm loss の pull にまで波及させると「optimizer
 - CLI surface が 6 flag 増える。help / experiment.json / quickstart doc の更新が要る。
 - **Elo 効果は未検証**: 実装 + 既定 bit-identical 検証を先行し、価値検証は SPRT に
   委ねる。
+- 将来拡張: 本 group 機構は per-group の *optimizer algorithm* 切り替え (例: dense 層
+  のみ Muon、FT/bias は Ranger) にも一般化し得る。ただし dense は全 param の ~0.2% で
+  upside が限定的、かつ Newton-Schulz 反復の実装コストがあるため、本 ADR の scope 外の
+  研究課題として別 backlog で追跡する。
 
 ## SPRT 計画 (実装後)
 
