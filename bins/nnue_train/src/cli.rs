@@ -285,6 +285,43 @@ pub(crate) struct Cli {
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) weight_decay: f32,
+    /// Weight decay override for the FT param group (the feature-transformer
+    /// input weights, plus the PSQT shortcut weights when --psqt is set). When
+    /// unset, this group uses the global --weight-decay. The optimizer splits
+    /// all trainable parameters into three param groups — FT (input-side
+    /// weights), dense (the L1/L1f/L2/L3 hidden-layer weights), and bias (every
+    /// layer's bias) — each with its own weight decay and learning-rate
+    /// multiplier. Leaving all six per-group flags unset is bit-identical to
+    /// the single --weight-decay path.
+    #[arg(long, global = true)]
+    pub(crate) ft_weight_decay: Option<f32>,
+    /// Weight decay override for the dense param group (the L1/L1f/L2/L3
+    /// hidden-layer weights). Unset falls back to the global --weight-decay.
+    #[arg(long, global = true)]
+    pub(crate) dense_weight_decay: Option<f32>,
+    /// Weight decay override for the bias param group (every layer's bias).
+    /// Unset falls back to the global --weight-decay. Pass `0` to disable
+    /// weight decay on biases (the common deep-learning default; opt-in here so
+    /// the no-flag path stays bit-identical).
+    #[arg(long, global = true)]
+    pub(crate) bias_weight_decay: Option<f32>,
+    /// Learning-rate multiplier for the FT param group: this group's per-step
+    /// learning rate is the scheduled learning rate times this value. Unset
+    /// means 1.0 (no scaling). Note: decoupled weight decay scales with the
+    /// effective learning rate, so this multiplier also scales the group's
+    /// effective weight decay.
+    #[arg(long, global = true)]
+    pub(crate) ft_lr_mult: Option<f32>,
+    /// Learning-rate multiplier for the dense param group: this group's per-step
+    /// learning rate is the scheduled learning rate times this value. Unset
+    /// means 1.0.
+    #[arg(long, global = true)]
+    pub(crate) dense_lr_mult: Option<f32>,
+    /// Learning-rate multiplier for the bias param group: this group's per-step
+    /// learning rate is the scheduled learning rate times this value. Unset
+    /// means 1.0.
+    #[arg(long, global = true)]
+    pub(crate) bias_lr_mult: Option<f32>,
     /// Enable norm loss (per-weight-group L2-norm regularisation, Georgiou et
     /// al. 2021). With the default `false`, the optimizer step is bit-identical
     /// to the baseline. When enabled, each step (just before the Ranger update)

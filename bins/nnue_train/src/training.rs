@@ -80,6 +80,22 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
+    // はその group を凍結する opt-in、bias wd=0 と同様に許容する。
+    for (name, v) in [
+        ("--ft-weight-decay", cli.ft_weight_decay),
+        ("--dense-weight-decay", cli.dense_weight_decay),
+        ("--bias-weight-decay", cli.bias_weight_decay),
+        ("--ft-lr-mult", cli.ft_lr_mult),
+        ("--dense-lr-mult", cli.dense_lr_mult),
+        ("--bias-lr-mult", cli.bias_lr_mult),
+    ] {
+        if let Some(v) = v
+            && (!v.is_finite() || v < 0.0)
+        {
+            return Err(format!("{name} must be finite and >= 0 (got {v})").into());
+        }
+    }
     if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
             "--norm-loss-factor must be finite and >= 0 (got {})",
@@ -261,6 +277,31 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let init_spec = build_layerstack_init_spec(cli);
+    // optimizer の param-group (ft / dense / bias) ごとの weight_decay と lr_mult を
+    // CLI から resolve する。per-group flag 未指定の group は大域 --weight-decay と
+    // lr_mult=1.0 にフォールバック → 全 flag 未指定なら従来挙動と bit-identical。
+    let optim_groups = OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    );
+    let per_group_recorded = per_group_optim_overridden(cli);
+    if per_group_recorded {
+        println!(
+            "[train] per-group optim: ft(wd={}, lr_mult={}) dense(wd={}, lr_mult={}) \
+             bias(wd={}, lr_mult={})",
+            optim_groups.ft.weight_decay,
+            optim_groups.ft.lr_mult,
+            optim_groups.dense.weight_decay,
+            optim_groups.dense.lr_mult,
+            optim_groups.bias.weight_decay,
+            optim_groups.bias.lr_mult,
+        );
+    }
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
@@ -274,7 +315,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ft_fp16_out,
         fp16_opt_state,
         feature_set,
-        cli.weight_decay,
+        optim_groups,
         norm_loss_factor,
         psqt_init_vec.as_deref(),
         &init_spec,
@@ -599,6 +640,18 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
+/// per-group optimizer override flag が一つでも指定されているか。`true` のとき
+/// log と experiment.json に有効 per-group 値を記録する (全 `None` の既定 run では
+/// 記録を省き、大域 `weight_decay` フィールドのみで足りる)。
+pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
+    cli.ft_weight_decay.is_some()
+        || cli.dense_weight_decay.is_some()
+        || cli.bias_weight_decay.is_some()
+        || cli.ft_lr_mult.is_some()
+        || cli.dense_lr_mult.is_some()
+        || cli.bias_lr_mult.is_some()
+}
+
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
 /// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
 /// layerstack / simple 両 entry で共有するこの helper で前段に行う。
@@ -852,6 +905,18 @@ pub(crate) fn build_experiment_logger(
     });
 
     let is_wrm = cli.win_rate_model;
+    // per-group override 指定時のみ experiment.json に有効 per-group 値を記録する。
+    // resolve は CLI のみに依存する純関数 (`run_training` の trainer 構築と同じ入力)。
+    let per_group_recorded = per_group_optim_overridden(cli);
+    let optim_groups = OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    );
     let params = Params {
         architecture: layerstack_architecture(
             layerstack.ft_out,
@@ -882,6 +947,14 @@ pub(crate) fn build_experiment_logger(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
+        // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
+        // では省略、大域 weight_decay フィールドで足りる)。
+        ft_weight_decay: per_group_recorded.then_some(optim_groups.ft.weight_decay),
+        dense_weight_decay: per_group_recorded.then_some(optim_groups.dense.weight_decay),
+        bias_weight_decay: per_group_recorded.then_some(optim_groups.bias.weight_decay),
+        ft_lr_mult: per_group_recorded.then_some(optim_groups.ft.lr_mult),
+        dense_lr_mult: per_group_recorded.then_some(optim_groups.dense.lr_mult),
+        bias_lr_mult: per_group_recorded.then_some(optim_groups.bias.lr_mult),
         norm_loss_factor: cli
             .norm_loss
             .then_some(cli.norm_loss_factor)
@@ -1032,6 +1105,13 @@ pub(crate) fn build_experiment_logger_simple(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
+        // simple subcommand は per-group optimizer 非対応 (layerstack trainer 専用)。
+        ft_weight_decay: None,
+        dense_weight_decay: None,
+        bias_weight_decay: None,
+        ft_lr_mult: None,
+        dense_lr_mult: None,
+        bias_lr_mult: None,
         // simple subcommand は norm loss 非対応 (`run_training_simple` で reject 済)。
         norm_loss_factor: None,
         qa: id.activation.qa(),

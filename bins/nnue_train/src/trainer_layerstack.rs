@@ -138,10 +138,12 @@ pub(crate) struct GpuTrainer {
     /// (`max_active`) / artifact identity の単一の真実源。起動時に
     /// `--feature-set` から一度だけ決まり、以降不変。
     feature_set: FeatureSetSpec,
-    /// Ranger optimizer の weight decay 係数。各 weight group の `radam_step`
-    /// に一律 `decay` 引数として渡す。`--weight-decay` から起動時に決まり、
-    /// 以降不変。既定 0.0 で decay 無し。
-    weight_decay: f32,
+    /// Ranger optimizer の param-group (FT / dense / bias) ごとの weight_decay と
+    /// lr 倍率。各 `radam_step` launch に group の `decay` 引数と
+    /// `scheduled_lr × lr_mult` の lr を渡す。CLI から起動時に決まり、以降不変。
+    /// per-group flag 未指定の group は大域 `--weight-decay` と lr_mult=1.0 に
+    /// フォールバックし、その場合 launch 引数は単一 weight_decay 時と bit-identical。
+    optim_groups: OptimGroupConfig,
     /// Norm loss (per-weight-group L2-norm 正則化) の強度係数。`Some(factor)` で
     /// 有効 (`--norm-loss` + `--norm-loss-factor`)、`None` で無効。無効時は
     /// optimizer step で norm loss kernel を一切 launch しないため baseline と
@@ -468,6 +470,77 @@ impl GpuWorkspace {
     }
 }
 
+/// optimizer の param-group。全学習対象テンソルを規模と役割でこの 3 分類に静的に
+/// 割り当て、group ごとに weight_decay と lr 倍率を変える。`ft` は入力側 weight
+/// (`ft_w` / `psqt_w`)、`dense` は hidden dense weight (`l1_w` / `l1f_w` / `l2_w`
+/// / `l3_w`)、`bias` は全層の bias (`ft_b` / `l1_b` / `l1f_b` / `l2_b` / `l3_b`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptimGroupKind {
+    Ft,
+    Dense,
+    Bias,
+}
+
+/// 1 param-group の weight_decay (絶対値) と lr_mult (scheduled lr への倍率)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OptimGroupParams {
+    pub(crate) weight_decay: f32,
+    pub(crate) lr_mult: f32,
+}
+
+/// FT / dense / bias 3 group それぞれの [`OptimGroupParams`]。`radam_step` の
+/// per-launch scalar (lr / decay) に group の値を流す静的 config で、optimizer
+/// state とは独立 (stateful ではない)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OptimGroupConfig {
+    pub(crate) ft: OptimGroupParams,
+    pub(crate) dense: OptimGroupParams,
+    pub(crate) bias: OptimGroupParams,
+}
+
+impl OptimGroupConfig {
+    /// 大域 weight_decay と per-group override (いずれも `Option`) から resolve する。
+    /// override 未指定の group は weight_decay = 大域値・lr_mult = 1.0 にフォール
+    /// バックする。全 override が `None` なら 3 group とも (大域 wd, 1.0) になり、
+    /// `effective` の lr は `scheduled_lr × 1.0 == scheduled_lr` で baseline と
+    /// bit-identical。
+    pub(crate) fn resolve(
+        global_weight_decay: f32,
+        ft_weight_decay: Option<f32>,
+        dense_weight_decay: Option<f32>,
+        bias_weight_decay: Option<f32>,
+        ft_lr_mult: Option<f32>,
+        dense_lr_mult: Option<f32>,
+        bias_lr_mult: Option<f32>,
+    ) -> Self {
+        let group = |wd: Option<f32>, lr_mult: Option<f32>| OptimGroupParams {
+            weight_decay: wd.unwrap_or(global_weight_decay),
+            lr_mult: lr_mult.unwrap_or(1.0),
+        };
+        OptimGroupConfig {
+            ft: group(ft_weight_decay, ft_lr_mult),
+            dense: group(dense_weight_decay, dense_lr_mult),
+            bias: group(bias_weight_decay, bias_lr_mult),
+        }
+    }
+
+    fn params(&self, kind: OptimGroupKind) -> OptimGroupParams {
+        match kind {
+            OptimGroupKind::Ft => self.ft,
+            OptimGroupKind::Dense => self.dense,
+            OptimGroupKind::Bias => self.bias,
+        }
+    }
+
+    /// group の `radam_step` launch に渡す `(weight_decay, lr)` を返す。lr は
+    /// schedule が決めた毎 step の `scheduled_lr` に group の lr_mult を掛けた値
+    /// (`lr_for(group) = scheduled_lr × lr_mult`)。
+    fn effective(&self, kind: OptimGroupKind, scheduled_lr: f32) -> (f32, f32) {
+        let p = self.params(kind);
+        (p.weight_decay, scheduled_lr * p.lr_mult)
+    }
+}
+
 /// optimizer step の一様 (非 FT) weight group。`radam_step` と
 /// `ranger_lookahead_lerp` は group 間で buffer 4〜5 本と要素数・clamp 範囲だけが
 /// 異なり、scalar hyperparameter (lr / step_size / decay / beta / alpha 等) と kernel
@@ -479,6 +552,9 @@ impl GpuWorkspace {
 /// dtype で決まる ([`W_CLAMP_QUANT_MIN`] / [`W_CLAMP_NONE_MIN`] の定義参照)。
 struct UniformOptimGroup<'a> {
     label: &'static str,
+    /// この weight group が属する param-group。radam launch の weight_decay / lr を
+    /// `OptimGroupConfig` から resolve するのに使う (lerp pass は lr/wd 非依存で不使用)。
+    kind: OptimGroupKind,
     weight: &'a mut DeviceBuffer<f32>,
     m: &'a mut DeviceBuffer<f32>,
     v: &'a mut DeviceBuffer<f32>,
@@ -489,27 +565,30 @@ struct UniformOptimGroup<'a> {
     clamp_max: f32,
 }
 
-/// 一様 optimizer group の launch 順と clamp 設定 (FT を除く)。`(label, clamp_min,
-/// clamp_max)` を radam / lerp pass が回す順序で返す。実 buffer を束ねる
-/// [`UniformOptimGroup`] 配列の組立てはこの表と同順・同 clamp でなければならず、
-/// `step_impl` の `debug_assert` と `uniform_optim_group_layout_matches_handwritten_order`
-/// test が照合する。
+/// 一様 optimizer group の launch 順・param-group・clamp 設定 (FT を除く)。
+/// `(label, kind, clamp_min, clamp_max)` を radam / lerp pass が回す順序で返す。実
+/// buffer を束ねる [`UniformOptimGroup`] 配列の組立てはこの表と同順・同 kind・同
+/// clamp でなければならず、`step_impl` の `debug_assert` と
+/// `uniform_optim_group_layout_matches_handwritten_order` test が照合する。
+/// `kind` は radam の weight_decay / lr を resolve する param-group: dense weight は
+/// `Dense`、全 bias は `Bias`、PSQT shortcut weight は入力側 weight なので `Ft`。
 /// dense weight (L1/L1f/L2/L3 weight + L1/L1f/L2 bias) は i8@QB 量子化由来の対称 clamp、
 /// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
-fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, f32, f32)> {
+fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGroupKind, f32, f32)> {
+    use OptimGroupKind::{Bias, Dense, Ft};
     let mut groups = vec![
-        ("ft_b", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
-        ("l1_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1f_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1f_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l2_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l2_b", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l3_w", W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l3_b", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
+        ("ft_b", Bias, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
+        ("l1_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1f_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1f_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l2_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l2_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l3_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l3_b", Bias, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
     ];
     if psqt_enabled {
-        groups.push(("psqt_w", W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX));
+        groups.push(("psqt_w", Ft, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX));
     }
     groups
 }
@@ -543,7 +622,7 @@ impl GpuTrainer {
         ft_fp16_out: bool,
         fp16_opt_state: bool,
         feature_set: FeatureSetSpec,
-        weight_decay: f32,
+        optim_groups: OptimGroupConfig,
         norm_loss_factor: Option<f32>,
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
@@ -733,7 +812,7 @@ impl GpuTrainer {
             ft_fp16_out,
             fp16_opt_state,
             feature_set,
-            weight_decay,
+            optim_groups,
             norm_loss_factor,
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
@@ -2892,6 +2971,10 @@ impl GpuTrainer {
         self.step_count += 1;
         let (step_size, denom) =
             radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+        // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
+        // `&mut self.*` を保持するので、loop 内で `self.optim_groups` を参照すると
+        // borrow が衝突する。先に局所へ退避して resolve に使う。
+        let optim_groups = self.optim_groups;
 
         // 10 weight groups × radam_step。FT weight (`ft_w`) の radam は 2 つの opt-in
         // flag で 4 通りに分岐する:
@@ -2901,7 +2984,9 @@ impl GpuTrainer {
         //  - `--fp16-opt-state`: m / v を `f16` で読み書きする `*_f16state` variant
         //    (DRAM traffic 半減、scale 付き格納)。
         // 他 9 group は moment が小さく `f16` 化の意味が無いので常に `radam_step`。
-        // FT
+        // FT (`ft_w`) は ft param-group の weight_decay と lr (= scheduled_lr ×
+        // ft lr_mult) を使う。psqt_w / dense / bias は uniform loop 側で resolve する。
+        let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
         match (&mut self.ft_w_m, &mut self.ft_w_v) {
             (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
@@ -2910,8 +2995,8 @@ impl GpuTrainer {
                         kernel: radam_step_f16state_mirror,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
+                               ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                     }?;
                 } else {
@@ -2919,8 +3004,8 @@ impl GpuTrainer {
                         kernel: radam_step_f16state,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                               slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
+                               ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                     }?;
                 }
@@ -2932,15 +3017,15 @@ impl GpuTrainer {
                         kernel: radam_step_fp16_mirror,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
+                               ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                     }?;
                 } else {
                     cuda_launch! {
                         kernel: radam_step,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                         args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay, BETA1, BETA2,
+                               slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, BETA1, BETA2,
                                EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                     }?;
                 }
@@ -2959,6 +3044,7 @@ impl GpuTrainer {
         let mut uniform_groups: [UniformOptimGroup<'_>; 9] = [
             UniformOptimGroup {
                 label: "ft_b",
+                kind: OptimGroupKind::Bias,
                 weight: &mut self.ft_b,
                 m: &mut self.ft_b_m,
                 v: &mut self.ft_b_v,
@@ -2970,6 +3056,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1_w",
+                kind: OptimGroupKind::Dense,
                 weight: &mut self.l1_w,
                 m: &mut self.l1_w_m,
                 v: &mut self.l1_w_v,
@@ -2981,6 +3068,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1_b",
+                kind: OptimGroupKind::Bias,
                 weight: &mut self.l1_b,
                 m: &mut self.l1_b_m,
                 v: &mut self.l1_b_v,
@@ -2992,6 +3080,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1f_w",
+                kind: OptimGroupKind::Dense,
                 weight: &mut self.l1f_w,
                 m: &mut self.l1f_w_m,
                 v: &mut self.l1f_w_v,
@@ -3003,6 +3092,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1f_b",
+                kind: OptimGroupKind::Bias,
                 weight: &mut self.l1f_b,
                 m: &mut self.l1f_b_m,
                 v: &mut self.l1f_b_v,
@@ -3014,6 +3104,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l2_w",
+                kind: OptimGroupKind::Dense,
                 weight: &mut self.l2_w,
                 m: &mut self.l2_w_m,
                 v: &mut self.l2_w_v,
@@ -3025,6 +3116,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l2_b",
+                kind: OptimGroupKind::Bias,
                 weight: &mut self.l2_b,
                 m: &mut self.l2_b_m,
                 v: &mut self.l2_b_v,
@@ -3036,6 +3128,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l3_w",
+                kind: OptimGroupKind::Dense,
                 weight: &mut self.l3_w,
                 m: &mut self.l3_w_m,
                 v: &mut self.l3_w_v,
@@ -3047,6 +3140,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l3_b",
+                kind: OptimGroupKind::Bias,
                 weight: &mut self.l3_b,
                 m: &mut self.l3_b_m,
                 v: &mut self.l3_b_v,
@@ -3061,6 +3155,7 @@ impl GpuTrainer {
         let mut psqt_group: Option<UniformOptimGroup<'_>> = match self.psqt.as_mut() {
             Some(psqt) => Some(UniformOptimGroup {
                 label: "psqt_w",
+                kind: OptimGroupKind::Ft,
                 weight: &mut psqt.w,
                 m: &mut psqt.w_m,
                 v: &mut psqt.w_v,
@@ -3072,21 +3167,26 @@ impl GpuTrainer {
             }),
             None => None,
         };
-        // launch 順 / clamp が layout 表 (test が gold と照合) と一致することを保証。
+        // launch 順 / param-group / clamp が layout 表 (test が gold と照合) と一致する
+        // ことを保証。
         debug_assert!(
             uniform_groups
                 .iter()
                 .chain(psqt_group.iter())
-                .map(|g| (g.label, g.clamp_min, g.clamp_max))
+                .map(|g| (g.label, g.kind, g.clamp_min, g.clamp_max))
                 .eq(uniform_optim_group_layout(psqt_enabled)),
-            "uniform optim group が uniform_optim_group_layout と不一致 (順序 / clamp のドリフト)"
+            "uniform optim group が uniform_optim_group_layout と不一致 (順序 / kind / clamp のドリフト)"
         );
         for g in uniform_groups.iter_mut().chain(psqt_group.iter_mut()) {
+            // group の param-group から weight_decay と lr (= scheduled_lr × lr_mult)
+            // を resolve する。全 group 既定 (override 無し) なら decay = 大域値・
+            // lr = scheduled_lr で単一 weight_decay 経路と bit-identical。
+            let (wd, lr_g) = optim_groups.effective(g.kind, lr);
             cuda_launch! {
                 kernel: radam_step,
                 stream: self.stream, module: self.module, config: cfg_1d(g.n),
                 args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
-                       slice_mut(*g.grad), lr, step_size, denom, self.weight_decay,
+                       slice_mut(*g.grad), lr_g, step_size, denom, wd,
                        BETA1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
             }?;
         }
@@ -3254,29 +3354,98 @@ impl TrainerBackend for GpuTrainer {
 mod tests {
     use super::*;
 
-    /// radam_step / ranger_lookahead_lerp pass が回す一様 weight group の launch 順と
-    /// per-group clamp 範囲を gold 値で固定する test。順序や clamp がずれると weight が
-    /// 受ける clamp 範囲が変わり optimizer 挙動が壊れるため、`uniform_optim_group_layout`
-    /// を期待値と照合して回帰を検出する。
+    /// radam_step / ranger_lookahead_lerp pass が回す一様 weight group の launch 順・
+    /// param-group・clamp 範囲を gold 値で固定する test。順序や kind / clamp がずれると
+    /// weight が受ける weight_decay / lr / clamp 範囲が変わり optimizer 挙動が壊れるため、
+    /// `uniform_optim_group_layout` を期待値と照合して回帰を検出する。
     #[test]
     fn uniform_optim_group_layout_matches_handwritten_order() {
+        use OptimGroupKind::{Bias, Dense, Ft};
         let q = (W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX);
         let none = (W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX);
         let expected_no_psqt = vec![
-            ("ft_b", none.0, none.1),
-            ("l1_w", q.0, q.1),
-            ("l1_b", q.0, q.1),
-            ("l1f_w", q.0, q.1),
-            ("l1f_b", q.0, q.1),
-            ("l2_w", q.0, q.1),
-            ("l2_b", q.0, q.1),
-            ("l3_w", q.0, q.1),
-            ("l3_b", none.0, none.1),
+            ("ft_b", Bias, none.0, none.1),
+            ("l1_w", Dense, q.0, q.1),
+            ("l1_b", Bias, q.0, q.1),
+            ("l1f_w", Dense, q.0, q.1),
+            ("l1f_b", Bias, q.0, q.1),
+            ("l2_w", Dense, q.0, q.1),
+            ("l2_b", Bias, q.0, q.1),
+            ("l3_w", Dense, q.0, q.1),
+            ("l3_b", Bias, none.0, none.1),
         ];
         assert_eq!(uniform_optim_group_layout(false), expected_no_psqt);
 
         let mut expected_psqt = expected_no_psqt.clone();
-        expected_psqt.push(("psqt_w", none.0, none.1));
+        expected_psqt.push(("psqt_w", Ft, none.0, none.1));
         assert_eq!(uniform_optim_group_layout(true), expected_psqt);
+    }
+
+    /// per-group flag を一つも指定しない (`None`) と、3 group とも weight_decay = 大域値・
+    /// lr_mult = 1.0 に resolve され、`effective` の lr は `scheduled_lr × 1.0` で
+    /// scheduled_lr と bit-identical (= 既定 launch 引数が単一 weight_decay 経路と一致)。
+    #[test]
+    fn resolve_without_overrides_falls_back_to_global() {
+        let cfg = OptimGroupConfig::resolve(0.125, None, None, None, None, None, None);
+        let expected = OptimGroupParams {
+            weight_decay: 0.125,
+            lr_mult: 1.0,
+        };
+        assert_eq!(cfg.ft, expected);
+        assert_eq!(cfg.dense, expected);
+        assert_eq!(cfg.bias, expected);
+        let scheduled_lr = 0.0123_f32;
+        for kind in [
+            OptimGroupKind::Ft,
+            OptimGroupKind::Dense,
+            OptimGroupKind::Bias,
+        ] {
+            let (wd, lr) = cfg.effective(kind, scheduled_lr);
+            assert_eq!(wd, 0.125);
+            // `× 1.0` は finite f32 で恒等なので scheduled_lr と bit-identical。
+            assert_eq!(lr.to_bits(), scheduled_lr.to_bits());
+        }
+    }
+
+    /// per-group override は group ごとに resolve され、未指定 group のみ大域値 /
+    /// lr_mult=1.0 に落ちる。`effective` の lr は `scheduled_lr × lr_mult`。
+    #[test]
+    fn resolve_with_overrides_is_per_group() {
+        // ft: wd 上書きのみ (lr_mult は default 1.0)、dense: lr_mult 上書きのみ
+        // (wd は大域)、bias: wd=0 opt-in + lr_mult 上書き。
+        let cfg = OptimGroupConfig::resolve(
+            0.1,        // global weight_decay
+            Some(0.5),  // ft_weight_decay
+            None,       // dense_weight_decay → 大域 0.1
+            Some(0.0),  // bias_weight_decay (opt-in wd=0)
+            None,       // ft_lr_mult → 1.0
+            Some(2.0),  // dense_lr_mult
+            Some(0.25), // bias_lr_mult
+        );
+        assert_eq!(
+            cfg.ft,
+            OptimGroupParams {
+                weight_decay: 0.5,
+                lr_mult: 1.0
+            }
+        );
+        assert_eq!(
+            cfg.dense,
+            OptimGroupParams {
+                weight_decay: 0.1,
+                lr_mult: 2.0
+            }
+        );
+        assert_eq!(
+            cfg.bias,
+            OptimGroupParams {
+                weight_decay: 0.0,
+                lr_mult: 0.25
+            }
+        );
+        let lr = 0.01_f32;
+        assert_eq!(cfg.effective(OptimGroupKind::Ft, lr), (0.5, 0.01));
+        assert_eq!(cfg.effective(OptimGroupKind::Dense, lr), (0.1, 0.02));
+        assert_eq!(cfg.effective(OptimGroupKind::Bias, lr), (0.0, 0.0025));
     }
 }

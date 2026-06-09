@@ -368,7 +368,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         false,
         false,
         feature_set,
-        0.0,
+        // smoke は per-group override 無し (全 group weight_decay=0 / lr_mult=1.0)。
+        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
         None,
         &LayerStackInit::default_uniform(),

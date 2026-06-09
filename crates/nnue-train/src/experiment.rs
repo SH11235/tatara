@@ -127,6 +127,23 @@ pub struct Params {
     pub end_wdl: Option<f32>,
     pub scale: f32,
     pub weight_decay: f32,
+    /// optimizer の param-group (ft / dense / bias) ごとの有効 weight_decay と
+    /// lr_mult。per-group override flag を一つでも指定した run でのみ 6 値すべてを
+    /// `Some` で記録し、全未指定の既定 run では省略する (大域 `weight_decay` と
+    /// lr_mult=1.0 が全 group に適用され、`weight_decay` フィールドで足りるため)。
+    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1f/L2/L3 weight、`bias` は全 bias。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ft_weight_decay: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_weight_decay: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bias_weight_decay: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ft_lr_mult: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_lr_mult: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bias_lr_mult: Option<f32>,
     /// norm loss (per-weight-group L2-norm 正則化) の強度係数。`--norm-loss` 有効時
     /// のみ `Some(factor)`、無効な run では省略する (`--norm-loss-factor`)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,6 +589,12 @@ mod tests {
             end_wdl: None,
             scale: 290.0,
             weight_decay: 0.0,
+            ft_weight_decay: None,
+            dense_weight_decay: None,
+            bias_weight_decay: None,
+            ft_lr_mult: None,
+            dense_lr_mult: None,
+            bias_lr_mult: None,
             norm_loss_factor: None,
             qa: 127,
             qb: 64,
