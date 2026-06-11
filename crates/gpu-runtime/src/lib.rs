@@ -2,7 +2,8 @@
 //!
 //! GPU カーネルは cuda-oxide で書く (docs/decisions/ 参照)。`cuda-core` と
 //! `cuda-host` の主要 type を再 export しつつ、`Error` で `DriverError` /
-//! `LtoirError` を `thiserror` 経由でラップする。
+//! `LtoirError` を `thiserror` 経由でラップする。kernel artifact の探索と
+//! `.ll`→`.ptx` 変換は [`kernel_loader`] に置く。
 //!
 //! ## 設計方針
 //!
@@ -22,11 +23,14 @@
 //!   するが、本 crate は `cuda-async` を dep にしていない。非同期 launch が
 //!   必要になった段階で `cuda-async` 込みで再公開する。
 
+pub mod kernel_loader;
+
 pub use cuda_core::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError,
     LaunchConfig,
 };
 pub use cuda_host::{LtoirError, cuda_launch};
+pub use kernel_loader::{BLOCK_DIM, grid_dim_1d, load_kernel_module_with_fallback};
 
 /// `cuda_host::load_kernel_module` の再 export。
 ///
@@ -60,6 +64,9 @@ pub enum Error {
     Cuda(#[from] DriverError),
     #[error(transparent)]
     Ltoir(#[from] LtoirError),
+    /// kernel artifact の探索 / `.ll`→`.ptx` 変換の失敗 (`kernel_loader` 参照)。
+    #[error("{0}")]
+    KernelArtifact(String),
 }
 
 /// `Result<T, gpu_runtime::Error>` の alias。

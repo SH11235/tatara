@@ -1,9 +1,10 @@
 //! cuBLAS の dynamic link 設定。`dense_mm_bwd_weight_tiled` (L1f weight bwd) を
 //! `cublasSgemm_v2` で置換するため。
 //!
-//! CUDA toolkit root 解決順 (本 bin runtime 側 `find_libdevice_bc` (`CUDA_HOME` /
-//! `CUDA_PATH` + default 4 path) を踏襲しつつ、build script 専用の legacy alias
-//! `CUDA_TOOLKIT_PATH` を最優先で追加):
+//! CUDA toolkit root 解決順 (gpu-runtime `kernel_loader` の `find_libdevice_bc`
+//! (`CUDA_HOME` / `CUDA_PATH` + default 4 path) を踏襲しつつ、build script 専用の
+//! legacy alias `CUDA_TOOLKIT_PATH` を最優先で追加。build script からは
+//! gpu-runtime を参照できないため候補 list は重複定義):
 //! 1. `CUDA_TOOLKIT_PATH` env (build.rs only)
 //! 2. `CUDA_HOME` env (runtime と共通)
 //! 3. `CUDA_PATH` env (runtime と共通)

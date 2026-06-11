@@ -39,8 +39,9 @@
 //!     CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 //! ```
 //!
-//! 出力先 (workspace root の `progress_kpabs_train.ll`) は `KernelLoader`
-//! が自動で probe する (CARGO_MANIFEST_DIR と workspace root の両方)。
+//! 出力先 (workspace root の `progress_kpabs_train.ll`) は
+//! `load_kernel_module_with_fallback` が自動で probe する (CARGO_MANIFEST_DIR
+//! と workspace root の両方)。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,7 +51,9 @@ use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{
+    BLOCK_DIM, CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, grid_dim_1d,
+};
 use progress_kpabs_train::host::{
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MAX_INDS_PER_POS,
     batch::Batch,
@@ -290,268 +293,14 @@ pub fn eval(preds: &[f32], targets: &[f32], loss_acc: &[f64], hist: &[u64], n_po
 // Host driver (GpuTrainer + main)
 // ---------------------------------------------------------------------------
 
-/// 1 D launch の grid 数を計算する (= ceil(n / block)、n=0 は block=1 個 launch)。
-fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
-    let blocks = ((n as u32).max(1)).div_ceil(block);
-    (blocks, 1, 1)
-}
-
-const BLOCK_DIM: u32 = 256;
-
-/// `cargo-oxide build` が出力した kernel `.ll` を見つけ、`.ptx` に変換した上で
-/// CudaModule を load する。
-///
-/// ## 探索順序
-///
-/// `<name>.cubin` → `<name>.ptx` → `<name>.ll` の順で、CARGO_MANIFEST_DIR と
-/// workspace root の両方を見る。cargo-oxide rev `6de0509` は cwd 依存で `.ll` を
-/// 後者に書くことがある (実機確認済)。
-///
-/// ## .ll → .ptx の変換
-///
-/// `cuda_host::ltoir::build_cubin_from_ll` (libNVVM 経由) は cuda-oxide が出力
-/// する opaque pointer 形式の NVVM IR を parse できない (libNVVM 内蔵 LLVM が
-/// 古く、`define void @grad(ptr ...)` 形式を `libnvvm error 9: parse expected
-/// type` で reject する)。代わりに **`llc`** で素直に NVPTX backend を回す。
-/// `__nv_sqrtf` 等 libdevice intrinsic は `.extern .func` 宣言として残るが、
-/// CUDA driver の JIT linker が module load 時に libdevice と link する。
+/// `gpu_runtime::load_kernel_module_with_fallback` の本 bin 向け wrapper。
+/// `env!("CARGO_MANIFEST_DIR")` はコンパイル中の crate で評価されるため、
+/// kernel artifact を持つ bin 側で固定して渡す。
 fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
-) -> Result<std::sync::Arc<CudaModule>, Box<dyn std::error::Error>> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.clone());
-
-    // `.ll` を最優先で probe する: kernel source を更新したら必ず `cargo-oxide build`
-    // で `.ll` が再生成されるが、`.ptx`/`.cubin` は前回の build から残ったものが
-    // 古いまま居座ることがある。`.ll` を見つけたら `compile_ll_to_ptx_via_llc` 内の
-    // mtime キャッシュで `.ptx` 鮮度を判断できる。`.ll` が無い場合のみ既製 `.ptx` /
-    // `.cubin` (例: 別ツールで事前生成したもの) を fallback で受ける。
-    let probe = |dir: &PathBuf| {
-        for ext in ["ll", "cubin", "ptx"] {
-            let p = dir.join(format!("{name}.{ext}"));
-            if p.exists() {
-                return Some(p);
-            }
-        }
-        None
-    };
-
-    let path = probe(&manifest_dir)
-        .or_else(|| probe(&workspace_root))
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!(
-                "kernel artifact `{name}.{{cubin,ptx,ll}}` not found in {} or {}.\n\
-                 Run cargo-oxide build first:\n  \
-                 cd {} && CUDA_OXIDE_TARGET=sm_75 cargo-oxide build",
-                manifest_dir.display(),
-                workspace_root.display(),
-                manifest_dir.display(),
-            )
-            .into()
-        })?;
-
-    let to_load = if path.extension().and_then(|s| s.to_str()) == Some("ll") {
-        compile_ll_to_ptx_via_llc(&path)?
-    } else {
-        path
-    };
-
-    let module = ctx.load_module_from_file(
-        to_load
-            .to_str()
-            .ok_or("kernel artifact path not valid UTF-8")?,
-    )?;
-    Ok(module)
-}
-
-/// `.ll` を libdevice と link、不要 symbol を internalize/dce、nvvm-reflect で
-/// `__nvvm_reflect` を畳み込んで `.ptx` に変換して返す。
-///
-/// パイプライン (NVCC の `compileToCubin` と同等):
-///
-/// 1. **`llvm-link <ll> libdevice.10.bc → linked.bc`** で `__nv_sqrtf` 等の
-///    libdevice intrinsic を IR レベルで取り込み
-/// 2. **`opt --passes='nvvm-reflect,internalize,globaldce'
-///    --internalize-public-api-list=<kernel symbols> linked.bc → opt.bc`** で:
-///    - kernel 以外の libdevice 関数を `internal` にして dead-code-elim 対象化
-///    - `__nvvm_reflect()` 呼び出しを 0/1 const に置換 (libdevice 内 `__CUDA_FTZ`
-///      等の query を解決)
-///    - `globaldce` で未参照の libdevice 関数を削除
-/// 3. **`llc --mtriple=nvptx64-nvidia-cuda --mcpu=<arch> -O2 opt.bc → .ptx`**
-///    で NVPTX backend が PTX 生成
-///
-/// 結果の `.ptx` は `.extern .func` 宣言を含まず、`ptxas` / driver JIT が完結する。
-///
-/// **なぜ `cuda-host::build_cubin_from_ll` (libNVVM 経由) を使わないか**:
-/// cuda-oxide が出力する NVVM IR は opaque pointer 形式 (`define void @grad(ptr
-/// ...)`) で、libNVVM は古い LLVM 版を内蔵していて opaque pointer を parse
-/// できず `nvvmCompileProgram error 9: parse expected type` で reject される。
-/// `llvm-link + opt + llc` (LLVM 21+) の組合せは opaque pointer をネイティブに
-/// 扱うため成功する。
-fn compile_ll_to_ptx_via_llc(ll_path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let stem = ll_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("ll path has no stem")?;
-    let dir = ll_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let linked_bc = dir.join(format!("{stem}.linked.bc"));
-    let opt_bc = dir.join(format!("{stem}.opt.bc"));
-    let ptx_path = dir.join(format!("{stem}.ptx"));
-
-    // `.ll`→`.ptx` の中間/出力ファイル (linked.bc / opt.bc / .ptx) は stem 固定
-    // パスのため、複数スレッドが同時に compile すると `llc` が書き込み途中の
-    // `.bc` を読んで crash する。`cargo test` は 1 binary のテストを同一プロセスの
-    // 複数スレッドで走らせるので、プロセス内 Mutex で直列化すれば足りる。最初の
-    // スレッドが compile し、後続は lock 取得後に下の mtime cache で skip する。
-    static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // cache: skip rebuild if .ptx is newer than .ll
-    if let (Ok(ll_meta), Ok(ptx_meta)) = (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
-        && let (Ok(ll_mtime), Ok(ptx_mtime)) = (ll_meta.modified(), ptx_meta.modified())
-        && ptx_mtime > ll_mtime
-    {
-        return Ok(ptx_path);
-    }
-
-    let arch = std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_75".to_string());
-    let llvm_link =
-        std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| discover_llvm_tool("llvm-link"));
-    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| discover_llvm_tool("opt"));
-    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| discover_llvm_tool("llc"));
-    let libdevice = find_libdevice_bc()?;
-
-    // 本 binary に inline 定義した kernel 名。`@<name>` として `.ll` 側に
-    // 出ているものをそのまま渡す。順番は問わない。
-    let kernel_names = "grad,forward,adam_step,eval";
-
-    // Step 1: llvm-link <ll> libdevice → linked.bc
-    run_or_err(
-        &llvm_link,
-        &[
-            ll_path.as_os_str(),
-            libdevice.as_os_str(),
-            "-o".as_ref(),
-            linked_bc.as_os_str(),
-        ],
-    )?;
-
-    // Step 2: opt --passes='nvvm-reflect,internalize,globaldce'
-    // pass 順序は NVCC の compileToCubin 慣例 (reflect 先 → 定数畳み込み →
-    // internalize → DCE) に合わせる。reflect が `__nvvm_reflect()` を 0/1 に
-    // 畳み込んだ後で internalize/DCE を回すと、libdevice 内 dead branch が
-    // 確実に削除される。
-    let api = format!("--internalize-public-api-list={kernel_names}");
-    run_or_err(
-        &opt_bin,
-        &[
-            "--passes=nvvm-reflect,internalize,globaldce".as_ref(),
-            api.as_ref(),
-            linked_bc.as_os_str(),
-            "-o".as_ref(),
-            opt_bc.as_os_str(),
-        ],
-    )?;
-
-    // Step 3: llc -mcpu=<arch> -O2 opt.bc → .ptx
-    let mcpu = format!("--mcpu={arch}");
-    run_or_err(
-        &llc_bin,
-        &[
-            "--mtriple=nvptx64-nvidia-cuda".as_ref(),
-            mcpu.as_ref(),
-            "-O2".as_ref(),
-            "-o".as_ref(),
-            ptx_path.as_os_str(),
-            opt_bc.as_os_str(),
-        ],
-    )?;
-
-    Ok(ptx_path)
-}
-
-/// `.ll`→`.ptx` 変換に使う LLVM tool 名を解決する。`<tool>-22` → `<tool>-21`
-/// → 無印 `<tool>` の順で `--version` が通る最初の名前を返す (cuda-oxide 本体の
-/// `llc-22 → llc-21` 探索順に揃える)。どれも無ければ `<tool>-21` を返し、spawn
-/// 失敗時に `run_or_err` が導入方法を案内する。`LLVM_LINK_BIN` / `OPT_BIN` /
-/// `LLC_BIN` env が設定されていればそちらが優先される。
-fn discover_llvm_tool(tool: &str) -> String {
-    for suffix in ["-22", "-21", ""] {
-        let name = format!("{tool}{suffix}");
-        let ok = std::process::Command::new(&name)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if ok {
-            return name;
-        }
-    }
-    format!("{tool}-21")
-}
-
-/// `Command::new` + `args` + `status` を 1 行にまとめる helper。
-fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = std::process::Command::new(bin)
-        .args(args)
-        .status()
-        .map_err(|e| {
-            format!(
-                "failed to spawn {bin}: {e}. \
-                 .ll→.ptx conversion uses the LLVM 21+ llvm-link / opt / llc tools \
-                 (the llc path, because libNVVM cannot parse opaque-pointer IR). \
-                 The -22 / -21 binaries are auto-discovered; if none are found, \
-                 set them explicitly via the LLVM_LINK_BIN / OPT_BIN / LLC_BIN env vars."
-            )
-        })?;
-    if !status.success() {
-        return Err(format!("{bin} failed with status {status}").into());
-    }
-    Ok(())
-}
-
-/// `libdevice.10.bc` を CUDA Toolkit から探す (cuda-oxide の `find_libdevice` と同等)。
-fn find_libdevice_bc() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Ok(p) = std::env::var("CUDA_OXIDE_LIBDEVICE") {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    let mut tried = Vec::new();
-    let roots: Vec<PathBuf> = std::env::var("CUDA_HOME")
-        .ok()
-        .into_iter()
-        .chain(std::env::var("CUDA_PATH").ok())
-        .map(PathBuf::from)
-        .chain([
-            PathBuf::from("/usr/local/cuda"),
-            PathBuf::from("/usr/local/cuda-13.2"),
-            PathBuf::from("/usr/local/cuda-12.9"),
-            PathBuf::from("/opt/cuda"),
-        ])
-        .collect();
-    for root in roots {
-        let candidate = root.join("nvvm/libdevice/libdevice.10.bc");
-        tried.push(candidate.display().to_string());
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(format!(
-        "libdevice.10.bc not found. Set CUDA_OXIDE_LIBDEVICE or CUDA_HOME, \
-         or install the CUDA Toolkit. Tried:\n  {}",
-        tried.join("\n  ")
-    )
-    .into())
+) -> gpu_runtime::Result<std::sync::Arc<CudaModule>> {
+    gpu_runtime::load_kernel_module_with_fallback(ctx, name, Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
 /// GPU 上で 4 kernel を順次起動する trainer。cuda-oxide の `cuda_launch!`
