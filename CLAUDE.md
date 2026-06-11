@@ -3,8 +3,8 @@
 ## CI 規約 (PR push 前必須)
 
 PR 作成 / `git push` の前に `bash scripts/local-ci.sh` を必ず走らせ、exit 0
-(`PASS` 表示) を確認する。3 step (fmt / clippy / test) が **全 crate (GPU 依存
-含む) で pass** しない限り push 禁止。
+(`PASS` 表示) を確認する。4 step (fmt / clippy / kernel build / test) が **全
+crate (GPU 依存含む) で pass** しない限り push 禁止。
 
 ```bash
 bash scripts/local-ci.sh
@@ -20,7 +20,10 @@ test fail が溜まる)。
 `scripts/local-ci.sh` の test step は `--release` で実行する。`nnue-trainer` の
 GPU 数値同等性テスト (`gpu_cpu_equivalence_tests::*`) は debug build の f32 fma
 off で tolerance を満たさず fail するが、release では本番経路と同じ codegen に
-なって pass する (warm cache で fmt + clippy + test 計 ~20s)。
+なって pass する。kernel build step (`scripts/build-kernels.sh`) は kernel
+source と artifact の silent 不整合を防ぐためのもので、cargo-oxide が build の
+たびに bin の main.rs を touch して再 codegen を強制するため、warm cache でも
+全体で ~40s 掛かる (kernel build + 後続 test の bin 再ビルド分)。
 
 ## rust-version (MSRV) 規約
 

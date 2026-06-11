@@ -20,24 +20,29 @@ if ! command -v cargo-oxide >/dev/null 2>&1; then
   exit 1
 fi
 
-# GPU の compute capability を取得 (例: "8.6")。取得できた値が sub-Ampere
-# (sm < 80) のときだけ CUDA_OXIDE_TARGET を設定する。
-cc=""
-if command -v nvidia-smi >/dev/null 2>&1; then
-  cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ' || true)
-fi
-
-if [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]]; then
-  sm=${cc//./}
-  if [ "$sm" -lt 80 ]; then
-    export CUDA_OXIDE_TARGET="sm_$sm"
-    echo "[build-kernels] compute_cap $cc (sub-Ampere) → CUDA_OXIDE_TARGET=sm_$sm を設定"
-  else
-    echo "[build-kernels] compute_cap $cc (Ampere+) → 既定 (sm_80 PTX、前方互換) でビルド"
-  fi
+# CUDA_OXIDE_TARGET が既に設定済みならそれを尊重する (local-ci.sh 等の呼び出し
+# 元が export してくる)。未設定のときだけ GPU の compute capability (例: "8.6")
+# を取得し、sub-Ampere (sm < 80) の場合に限り自動設定する。
+if [ -n "${CUDA_OXIDE_TARGET:-}" ]; then
+  echo "[build-kernels] CUDA_OXIDE_TARGET=$CUDA_OXIDE_TARGET (既設の環境変数) でビルド"
 else
-  echo "[build-kernels] warning: GPU 世代を判定できず、既定 (sm_80) でビルドする。" \
-       "Turing 等 sub-Ampere GPU では CUDA_OXIDE_TARGET=sm_75 を手動指定すること。" >&2
+  cc=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ' || true)
+  fi
+
+  if [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    sm=${cc//./}
+    if [ "$sm" -lt 80 ]; then
+      export CUDA_OXIDE_TARGET="sm_$sm"
+      echo "[build-kernels] compute_cap $cc (sub-Ampere) → CUDA_OXIDE_TARGET=sm_$sm を設定"
+    else
+      echo "[build-kernels] compute_cap $cc (Ampere+) → 既定 (sm_80 PTX、前方互換) でビルド"
+    fi
+  else
+    echo "[build-kernels] warning: GPU 世代を判定できず、既定 (sm_80) でビルドする。" \
+         "Turing 等 sub-Ampere GPU では CUDA_OXIDE_TARGET=sm_75 を手動指定すること。" >&2
+  fi
 fi
 
 # kernel を持つ bin をすべてビルドする。
