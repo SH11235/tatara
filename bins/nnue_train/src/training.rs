@@ -1093,10 +1093,7 @@ pub(crate) fn parse_simple_preset(
     let (head, tail) = s
         .split_once('-')
         .ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!(
-                "--arch '{s}' must look like '<l1>x2-<l2>-<l3>' (e.g. '256x2-32-32')"
-            )
-            .into()
+            format!("--arch '{s}' must look like '<l1>x2-<l2>-<l3>' (e.g. '256x2-32-32')").into()
         })?;
     let ft_out_str = head
         .strip_suffix("x2")
@@ -1114,10 +1111,8 @@ pub(crate) fn parse_simple_preset(
     let (l1_out_str, l2_out_str) =
         tail.split_once('-')
             .ok_or_else(|| -> Box<dyn std::error::Error> {
-                format!(
-                    "--arch '{s}': trailing block must look like '<l2>-<l3>' (got '{tail}')"
-                )
-                .into()
+                format!("--arch '{s}': trailing block must look like '<l2>-<l3>' (got '{tail}')")
+                    .into()
             })?;
     let l1_out: usize = l1_out_str
         .parse()
