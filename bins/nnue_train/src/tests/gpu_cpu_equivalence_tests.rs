@@ -2608,8 +2608,11 @@ fn norm_loss_zero_norm_group_matches_cpu() -> Result<(), Box<dyn std::error::Err
 
 /// sparse index fixture: 有効 idx (position 内重複・position 間共有あり)、`-1`
 /// padding、`>= cols` の defensive skip 対象を混ぜた決定論的な列。`seed` でパターン
-/// をずらす (stm / nstm で別系列を作る)。`r % 6 == 2` の枝が feature 0 を全 batch に
-/// 撒くため、inverse-index gather の 4-way unroll 本体と端数 tail の両方を踏む。
+/// をずらす (stm / nstm で別系列を作る)。`r % 6 == 2` の枝だけが feature 0 を出し
+/// (他の有効枝は `1..=cols-2`)、出現を feature 0 へ集めて高頻度 feature を作る。
+/// feature `cols-1` はどの枝からも出ず出現 0 になる。inverse-index gather では
+/// 前者が 4-way unroll 本体から端数 tail への同一区間内継続を、後者が空区間の
+/// sum=0 書き切り経路を踏む (発火を guard する assert は pipeline テスト側)。
 fn sparse_indices_fixture(batch: usize, nnz: usize, cols: usize, seed: usize) -> Vec<i32> {
     let mut v = Vec::with_capacity(batch * nnz);
     for bi in 0..batch {
@@ -2619,7 +2622,7 @@ fn sparse_indices_fixture(batch: usize, nnz: usize, cols: usize, seed: usize) ->
                 0 => -1,
                 1 => (cols + r) as i32,
                 2 => 0,
-                _ => (r % cols) as i32,
+                _ => (1 + r % (cols - 2)) as i32,
             };
             v.push(idx);
         }
@@ -2863,6 +2866,21 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
     let (batch, ft_out, ft_in, nnz) = (6_usize, 8_usize, 9_usize, 6_usize);
     let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
     let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    // fixture 前提の guard: feature 0 の区間は 4-way unroll 本体 (4 個) を通過した後
+    // 端数 tail に継続する出現数 (> 4 かつ非 4 倍数)、feature ft_in-1 の区間は空
+    // (overwrite kernel の sum=0 書き切り経路)。fixture を変えてこの前提が崩れたら
+    // ここで気付く。
+    for idx in [&stm_indices, &nstm_indices] {
+        let count0 = idx.iter().filter(|&&i| i == 0).count();
+        assert!(
+            count0 > 4 && !count0.is_multiple_of(4),
+            "fixture must hit unroll body + tail in one segment (feature 0 count = {count0})"
+        );
+        assert!(
+            !idx.contains(&((ft_in - 1) as i32)),
+            "fixture must leave feature ft_in-1 empty"
+        );
+    }
     let dft_stm = deterministic_floats(batch * ft_out, 5.0);
     let dft_nstm = deterministic_floats(batch * ft_out, 6.0);
 
