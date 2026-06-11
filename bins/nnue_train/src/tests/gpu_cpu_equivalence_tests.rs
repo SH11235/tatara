@@ -3805,3 +3805,117 @@ fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
     );
     Ok(())
 }
+
+// =========================================================================
+// raw checkpoint save → load roundtrip (LayerStack、PSQT あり / なし)
+// =========================================================================
+
+/// LayerStack trainer を数 step 進めて optimizer state (m/v/slow) を非零にし、
+/// raw checkpoint save → 別 instance load → 全 group bit 一致 + resume metadata
+/// (superbatch / producer run id / lr_horizon) 復元を確認する。PSQT 有無で group
+/// 数 (10/11) と topology 次元数 (4/5) が変わる分岐を両方踏む。
+fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+    use nnue_train::init::LayerStackInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    // halfkp は公開 feature set 中最小の ft_in。ft_out は gather kernel の
+    // grid y 軸単位である 128 の最小値で、buffer 容量を test 向けに抑える。
+    let feature_set = FeatureSet::HalfKp.spec();
+    let ft_out = 128;
+    let psqt_init: Option<Vec<f32>> =
+        with_psqt.then(|| deterministic_floats(feature_set.ft_in() * DEFAULT_NUM_BUCKETS, 7.0));
+    let new_trainer = || -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+        GpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+            false,
+            false,
+            false,
+            false,
+            feature_set,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            psqt_init.as_deref(),
+            &LayerStackInit::default_uniform(),
+        )
+    };
+
+    let mut saver = new_trainer()?;
+    // Ranger lookahead の lerp (`step % k == 0`) を 1 回踏ませて slow weight も
+    // 非零にする (k = RANGER_K)。
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    for _ in 0..RANGER_K {
+        let loss = saver.step(&batch.as_ref(), 1e-3, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
+        assert!(loss.is_finite(), "training step loss must be finite");
+    }
+
+    let suffix = if with_psqt { "psqt" } else { "nopsqt" };
+    let path = std::env::temp_dir().join(format!(
+        "layerstack-roundtrip-{suffix}-{}.ckpt",
+        std::process::id()
+    ));
+    saver.save_raw_checkpoint(&path, 3, "roundtrip-test", Some(42))?;
+
+    let mut loader = new_trainer()?;
+    let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
+    assert_eq!(superbatch, 3);
+    assert_eq!(producer.as_deref(), Some("roundtrip-test"));
+    assert_eq!(lr_horizon, Some(42));
+
+    // 全 group (PSQT 有効時は psqt_w 含む 11、無効時 10) の w/m/v/slow が bit 一致。
+    let src_a = saver.raw_ckpt_group_sources();
+    let src_b = loader.raw_ckpt_group_sources();
+    assert_eq!(src_a.len(), if with_psqt { 11 } else { 10 });
+    assert_eq!(src_b.len(), src_a.len());
+    for (a, b) in src_a.iter().zip(src_b.iter()) {
+        assert_eq!(a.name, b.name);
+        let (aw, am, av, aslow) = a.to_host(&stream)?;
+        let (bw, bm, bv, bslow) = b.to_host(&stream)?;
+        for (label, x, y) in [
+            ("w", &aw, &bw),
+            ("m", &am, &bm),
+            ("v", &av, &bv),
+            ("slow", &aslow, &bslow),
+        ] {
+            assert_eq!(x.len(), y.len(), "group {} {label}: len mismatch", a.name);
+            for (i, (xa, xb)) in x.iter().zip(y.iter()).enumerate() {
+                assert!(
+                    xa.to_bits() == xb.to_bits(),
+                    "group {} {label}[{i}]: saver={xa:?} loader={xb:?} (bit mismatch)",
+                    a.name
+                );
+            }
+        }
+    }
+
+    // load 後に同条件で書き戻すと file が byte 一致する (`step_count` を含む header
+    // と全 group の roundtrip が format 上も無損失である検証)。
+    let path2 = std::env::temp_dir().join(format!(
+        "layerstack-roundtrip-{suffix}-resave-{}.ckpt",
+        std::process::id()
+    ));
+    loader.save_raw_checkpoint(&path2, 3, "roundtrip-test", Some(42))?;
+    let bytes1 = std::fs::read(&path)?;
+    let bytes2 = std::fs::read(&path2)?;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&path2);
+    assert_eq!(bytes1, bytes2, "save → load → save must be byte-identical");
+    Ok(())
+}
+
+#[test]
+fn layerstack_raw_ckpt_roundtrips_without_psqt() -> Result<(), Box<dyn std::error::Error>> {
+    layerstack_raw_ckpt_roundtrip(false)
+}
+
+#[test]
+fn layerstack_raw_ckpt_roundtrips_with_psqt() -> Result<(), Box<dyn std::error::Error>> {
+    layerstack_raw_ckpt_roundtrip(true)
+}
