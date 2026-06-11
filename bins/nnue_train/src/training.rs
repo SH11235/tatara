@@ -1223,6 +1223,24 @@ pub(crate) fn run_simple_training(
     let ft_out = simple_args.l1.unwrap_or(preset_ft_out);
     let l1_out = simple_args.l2.unwrap_or(preset_l1_out);
     let l2_out = simple_args.l3.unwrap_or(preset_l2_out);
+    // `SimpleGpuTrainer::new` の検査は `ft_out % 4 == 0` のみで 0 を素通しする
+    // (`0 % 4 == 0`)。0 次元は空 weight buffer のまま学習が走り、
+    // `--init-l1 uniform:fanin` では fan_in = 0 の除算で非有限の初期重みになる
+    // ため、ここで明示 reject する。
+    if ft_out == 0 || !ft_out.is_multiple_of(4) {
+        return Err(format!(
+            "Simple FT output dimension must be a positive multiple of 4 (got {ft_out}); \
+             set it via --arch '<ft_out>x2-<l1>-<l2>' or --l1"
+        )
+        .into());
+    }
+    if l1_out == 0 || l2_out == 0 {
+        return Err(format!(
+            "Simple hidden layer dimensions must be >= 1 (got L1={l1_out}, L2={l2_out}); \
+             set them via --arch '<ft_out>x2-<l1>-<l2>' or --l2 / --l3"
+        )
+        .into());
+    }
     let activation = SimpleActivation::from_canonical_name(&simple_args.activation).ok_or_else(
         || -> Box<dyn std::error::Error> {
             format!(
@@ -1420,6 +1438,34 @@ mod tests {
         // global init flag を subcommand の前に置く。layerstack は追加必須引数なし。
         argv.push("layerstack");
         Cli::try_parse_from(argv).expect("cli parse")
+    }
+
+    #[test]
+    fn parse_simple_preset_accepts_valid_presets() {
+        assert_eq!(parse_simple_preset("256x2-32-32").unwrap(), (256, 32, 32));
+        assert_eq!(
+            parse_simple_preset("1024x2-128-64").unwrap(),
+            (1024, 128, 64)
+        );
+        assert_eq!(parse_simple_preset("512x2-8-64").unwrap(), (512, 8, 64));
+    }
+
+    #[test]
+    fn parse_simple_preset_rejects_malformed_input() {
+        // 'x2' suffix 欠落 / block 不足 / 非整数 / 空文字列。
+        assert!(parse_simple_preset("256-32-32").is_err());
+        assert!(parse_simple_preset("256x2-32").is_err());
+        assert!(parse_simple_preset("ax2-32-32").is_err());
+        assert!(parse_simple_preset("256x2-a-32").is_err());
+        assert!(parse_simple_preset("256x2-32-a").is_err());
+        assert!(parse_simple_preset("").is_err());
+    }
+
+    #[test]
+    fn parse_simple_preset_passes_zero_dims_to_caller_validation() {
+        // parse 自体は 0 を通す (型上は非負整数)。0 次元の reject は
+        // `run_simple_training` の次元検証が担う。
+        assert_eq!(parse_simple_preset("0x2-0-0").unwrap(), (0, 0, 0));
     }
 
     #[test]

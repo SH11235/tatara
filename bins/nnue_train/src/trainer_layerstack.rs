@@ -1562,7 +1562,8 @@ impl GpuTrainer {
         }
         // defense-in-depth: tiled kernels (grid=b/16) は b % 16 == 0 を要求する。
         // CLI で `--batch-size` を 16 倍数に reject 済 (`run_training`)、`BucketedPrefetchedLoader`
-        // も `n_positions == batch_size` を保証する (`dataloader.rs:572`) ため通常到達しない。
+        // も `n_positions == batch_size` を保証する (`BucketedPrefetchedLoader::next_batch` の
+        // 契約) ため通常到達しない。
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
         if !b.is_multiple_of(16) {
@@ -2695,7 +2696,6 @@ impl GpuTrainer {
         // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
         let ft_in = self.ws.ft_in;
         let max_active = self.ws.max_active;
-        let total_pairs = (b * max_active) as u32;
         for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
             .into_iter()
             .enumerate()
@@ -2820,7 +2820,6 @@ impl GpuTrainer {
                 }
                 prof_tick!("phD_nstm");
             }
-            let _ = total_pairs; // unused yet
         }
         prof_tick!("bwd_ftbwd");
 

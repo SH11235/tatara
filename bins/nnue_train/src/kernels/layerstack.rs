@@ -2335,8 +2335,8 @@ pub fn crelu_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, n: u32) {
 
 /// SCReLU forward — `y[i] = clip(x[i], 0, 1)²`。1 thread = 1 element。
 ///
-/// `screlu_grad` と対の forward。host から未 launch だが、`#[kernel]` 定義は
-/// cuda-oxide が kernel artifact (PTX) に出力するため定義のまま残す。
+/// `screlu_grad` と対の forward。Simple アーキの dense 層活性化
+/// (`--activation screlu`、`SimpleGpuTrainer` の forward 経路) で launch される。
 #[kernel]
 pub fn screlu_fwd(x: &[f32], mut y: DisjointSlice<f32>, n: u32) {
     let i = thread::index_1d();

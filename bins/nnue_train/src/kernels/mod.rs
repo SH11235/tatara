@@ -5,10 +5,12 @@
 //! 3 file に分ける: [`common`] (損失 / optimizer 等の共通)、[`layerstack`]
 //! (LayerStack 専用)、[`simple`] (Simple アーキ専用)。
 //!
-//! ## LayerStack アーキテクチャ (FT → L1 16 → L2 32 + progress8kpabs 9 buckets)
+//! ## LayerStack アーキテクチャ (FT → L1 → L2 → L3 + progress bucket)
 //!
-//! PSQT 無し、hand_count_dense 無し。FT 入力次元 `ft_in` は feature set 依存、
-//! FT 出力次元 `ft_out` は `--ft-out` 依存の runtime 値。
+//! PSQT は `--psqt` の opt-in (`psqt_diff_sparse_*`)、hand_count_dense 無し。
+//! FT 入力次元 `ft_in` は feature set 依存。FT 出力・L1 / L2 次元・bucket 数は
+//! CLI (`--ft-out` / `--l1` / `--l2` / `--num-buckets`) で決まる runtime 値で、
+//! 以下の数値は既定値 (1536 / 16 / 32 / 9 bucket) での例:
 //!
 //! - **L0 (FT)**: sparse_ft_forward — weight (ft_in × ft_out), bias (ft_out, 共有)
 //! - **per-perspective post**: bias add → CReLU → pairwise_mul (ft_out→ft_out/2) → ×127/128

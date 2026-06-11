@@ -1,7 +1,7 @@
 //! `concat(l1_sqr, l1_main)` forward / gradient kernel の reference CPU 実装。
 //!
 //! GPU 側 (`#[kernel] fn concat_l1sqr_main_fwd` / `_grad`) は `bins/nnue_train/
-//! src/main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。`l2_input` を作る
+//! src/kernels/` に定義 (cuda-oxide bin-entry 制約)。`l2_input` を作る
 //! 前段の `l1_sqr.concat(l1_main)`。`a_dim == b_dim == l1_effective` (=
 //! `l1_out - 1`)、`out_dim = l2_in`。
 //!

@@ -546,6 +546,13 @@ fn civil_from_epoch(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
+    /// 持ち直した定数 (定義箇所の doc 参照) が `nnue-format` 側と乖離すると
+    /// experiment.json が誤った `fv_scale` を記録するため、同値性を固定する。
+    #[test]
+    fn fv_scale_matches_nnue_format() {
+        assert_eq!(FV_SCALE, nnue_format::layerstack_weights::FV_SCALE);
+    }
+
     fn sample_params() -> Params {
         Params {
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),

@@ -1,8 +1,8 @@
 //! Sparse feature transform backward kernel (HalfKA_hm 用、atomic scatter) の
 //! reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn sparse_ft_backward`) は `bins/nnue_train/src/main.rs` に
-//! inline 定義されている (cuda-oxide rustc-codegen-cuda backend は bin entry
+//! GPU 側 (`#[kernel] fn sparse_ft_backward`) は `bins/nnue_train/src/kernels/` に
+//! 定義されている (cuda-oxide rustc-codegen-cuda backend は bin entry
 //! 経由で到達可能な kernel しか PTX 化しないため)。本 module の
 //! `sparse_ft_backward_cpu` は GPU と同じロジックを host に書き写したもので、
 //! GPU↔CPU 数値同等性テストの reference に使う。
