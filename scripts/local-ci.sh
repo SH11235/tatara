@@ -21,6 +21,18 @@ cargo fmt --all -- --check
 echo "== cargo clippy --workspace --all-targets -- -D warnings =="
 cargo clippy --workspace --all-targets -- -D warnings
 
+# kernel source を編集したあと `cargo-oxide build` を忘れると、kernel loader の
+# 鮮度チェックが `.ptx` vs `.ll` の mtime しか見ないため、test も本番 run も古い
+# kernel のまま silent に走る。test の前に必ず再生成して artifact を source と
+# 同期させる (warm cache なら数秒)。
+echo "== cargo-oxide build (kernel artifacts) =="
+if ! command -v cargo-oxide >/dev/null 2>&1; then
+  echo "error: cargo-oxide not found — run 'bash scripts/setup-cuda-oxide.sh' first" >&2
+  exit 1
+fi
+(cd bins/nnue_train && cargo-oxide build)
+(cd bins/progress_kpabs_train && cargo-oxide build)
+
 echo "== cargo test --workspace --release =="
 cargo test --workspace --release
 
