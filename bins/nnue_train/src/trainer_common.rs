@@ -126,14 +126,17 @@ impl BatchData<'_> {
     /// index の範囲 `[0, ft_in)` が決まる。
     pub(crate) fn smoke_dummy(n_pos: usize, feature_set: FeatureSetSpec) -> BatchDataOwned {
         let ft_in = feature_set.ft_in();
-        let max_active = feature_set.max_active();
+        let base_active = feature_set.max_active();
+        let max_active = feature_set.train_max_active();
         let mut stm_indices = vec![-1_i32; n_pos * max_active];
         let mut nstm_indices = vec![-1_i32; n_pos * max_active];
-        // 各 position に max_active 個の deterministic indices を入れる。
-        // range [0, ft_in) で seed-based に分散。
+        // 各 position に base_active 個の deterministic 実 index を入れる。
+        // range [0, ft_in) で seed-based に分散。実 index 列の生成は factorizer
+        // 非依存 (同じ乱数列) で、有効時のみ dataloader と同じ post-pass で
+        // 仮想 index (`ft_in + idx % piece_inputs`) を append する。
         let mut s: u64 = 0xdead_beef;
         for b in 0..n_pos {
-            for k in 0..max_active {
+            for k in 0..base_active {
                 // xorshift
                 s ^= s << 13;
                 s ^= s >> 7;
@@ -145,6 +148,15 @@ impl BatchData<'_> {
                 s ^= s << 17;
                 let idx2 = (s as usize % ft_in) as i32;
                 nstm_indices[b * max_active + k] = idx2;
+            }
+            if feature_set.ft_factorize() {
+                let pi = feature_set.piece_inputs() as i32;
+                let base = ft_in as i32;
+                for k in 0..base_active {
+                    let row = b * max_active;
+                    stm_indices[row + base_active + k] = base + stm_indices[row + k] % pi;
+                    nstm_indices[row + base_active + k] = base + nstm_indices[row + k] % pi;
+                }
             }
         }
         BatchDataOwned {

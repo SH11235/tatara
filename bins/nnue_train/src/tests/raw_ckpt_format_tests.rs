@@ -56,7 +56,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=4 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 5);
+    assert_eq!(RAW_CKPT_VERSION, 6);
 }
 
 #[test]
@@ -144,6 +144,51 @@ fn layerstack_arch() -> RawCkptArch<'static> {
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
+}
+
+/// `layerstack_arch` の FT factorizer 有効版。
+fn layerstack_arch_factorized() -> RawCkptArch<'static> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
+        arch_kind: ArchKind::LayerStack,
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+#[test]
+fn raw_ckpt_header_ft_factorize_round_trips() {
+    let arch = layerstack_arch_factorized();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "run-1", 2, 20, None, 10).unwrap();
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+}
+
+#[test]
+fn raw_ckpt_header_rejects_ft_factorize_mismatch() {
+    // on で書いた header を off expected で読む / その逆 — どちらも次元照合より
+    // 先に ft-factorize mismatch として reject される (原因が読めるエラー)。
+    let on = layerstack_arch_factorized();
+    let off = layerstack_arch();
+
+    let mut buf_on = Vec::new();
+    write_raw_ckpt_header(&mut buf_on, &on, "", 1, 0, None, 10).unwrap();
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf_on), &off)
+        .expect_err("on ckpt + off expected must be rejected");
+    assert!(
+        err.to_string().contains("ft-factorize"),
+        "error should mention ft-factorize: {err}"
+    );
+
+    let mut buf_off = Vec::new();
+    write_raw_ckpt_header(&mut buf_off, &off, "", 1, 0, None, 10).unwrap();
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf_off), &on)
+        .expect_err("off ckpt + on expected must be rejected");
+    assert!(
+        err.to_string().contains("ft-factorize"),
+        "error should mention ft-factorize: {err}"
+    );
 }
 
 #[test]

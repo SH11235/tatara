@@ -34,12 +34,19 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   prefers it over the `--superbatches`-derived default so the curve is
 ///   reproduced independently of `--superbatches`.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=5. Version 1 is interpreted as
+/// - `6`: a FT-factorizer flag byte follows `max_active` in the feature-set
+///   header. It pins whether the checkpoint's FT weight rows include the
+///   training-time virtual factorizer block (the `ft_in` / `max_active`
+///   fields hold the training-side values, so they also differ across
+///   on/off); resuming across `--ft-factorize` on/off is rejected.
+///
+/// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 5 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 6 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
-/// (`None`) for versions 1..=4.
-pub(crate) const RAW_CKPT_VERSION: u32 = 5;
+/// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
+/// versions 1..=5.
+pub(crate) const RAW_CKPT_VERSION: u32 = 6;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -149,9 +156,11 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     let fs_name = arch.feature_set.canonical_name();
     w.write_all(&(fs_name.len() as u32).to_le_bytes())?;
     w.write_all(fs_name.as_bytes())?;
-    w.write_all(&(arch.feature_set.ft_in() as u64).to_le_bytes())?;
+    w.write_all(&(arch.feature_set.train_ft_in() as u64).to_le_bytes())?;
     w.write_all(&arch.ft_out.to_le_bytes())?;
-    w.write_all(&(arch.feature_set.max_active() as u64).to_le_bytes())?;
+    w.write_all(&(arch.feature_set.train_max_active() as u64).to_le_bytes())?;
+    // FT factorizer flag (v6+)。
+    w.write_all(&[arch.feature_set.ft_factorize() as u8])?;
     // producer run id (v3+)。
     w.write_all(&(run_id.len() as u32).to_le_bytes())?;
     w.write_all(run_id.as_bytes())?;
@@ -220,6 +229,15 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         let ckpt_ft_out = u64::from_le_bytes(buf8);
         read_exact_or_invalid(r, &mut buf8, "max_active")?;
         let ckpt_max_active = u64::from_le_bytes(buf8);
+        // FT factorizer flag は version 6+。旧版は factorizer 以前の checkpoint
+        // なので false 扱い (factorize 有効側との不一致は下の照合で reject)。
+        let ckpt_ft_factorize = if version >= 6 {
+            let mut buf1 = [0u8; 1];
+            read_exact_or_invalid(r, &mut buf1, "ft_factorize flag")?;
+            buf1[0] != 0
+        } else {
+            false
+        };
 
         let want = expected.feature_set;
         if fs_name != want_name {
@@ -228,10 +246,19 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                  requested '{want_name}' (cannot resume across feature sets)"
             )));
         }
-        if ckpt_ft_in != want.ft_in() as u64 {
+        // 次元照合より先に factorize 状態を見る (on/off 跨ぎは ft_in /
+        // max_active も必ずずれるが、原因が読めるエラーを先に出す)。
+        if ckpt_ft_factorize != want.ft_factorize() {
+            return Err(invalid_data(format!(
+                "raw checkpoint ft-factorize mismatch: checkpoint {ckpt_ft_factorize}, \
+                 requested {} (cannot resume across --ft-factorize on/off)",
+                want.ft_factorize()
+            )));
+        }
+        if ckpt_ft_in != want.train_ft_in() as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint ft_in mismatch: got {ckpt_ft_in}, want {}",
-                want.ft_in()
+                want.train_ft_in()
             )));
         }
         if ckpt_ft_out != expected.ft_out {
@@ -240,10 +267,10 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.ft_out
             )));
         }
-        if ckpt_max_active != want.max_active() as u64 {
+        if ckpt_max_active != want.train_max_active() as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
-                want.max_active()
+                want.train_max_active()
             )));
         }
     } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {

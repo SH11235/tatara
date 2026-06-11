@@ -39,6 +39,24 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         })?
         .spec();
 
+    // FT factorizer modifier の適用 (spec 確定はこの 1 箇所)。`--psqt` 併用は
+    // clap の conflicts_with で reject 済み。`--init-from` は量子化 .bin 由来で
+    // 仮想行を持たないため併用不可 (LayerStackWeights の spec 照合でも弾かれる
+    // が、CLI 段で明示エラーにする)。
+    let feature_set = if layerstack.ft_factorize {
+        if cli.init_from.is_some() {
+            return Err(
+                "--ft-factorize is incompatible with --init-from (a quantised .bin has \
+                        no virtual factorizer rows; start from scratch or --resume a \
+                        factorized checkpoint)"
+                    .into(),
+            );
+        }
+        feature_set.with_ft_factorize()
+    } else {
+        feature_set
+    };
+
     // --- 未実装オプション値の reject ---
     if layerstack.bucket_mode != "progress8kpabs" {
         return Err(format!(
@@ -928,6 +946,7 @@ pub(crate) fn build_experiment_logger(
         ),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
+        ft_factorize: feature_set.ft_factorize().then_some(true),
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
@@ -1086,6 +1105,7 @@ pub(crate) fn build_experiment_logger_simple(
         architecture,
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
+        ft_factorize: None,
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,

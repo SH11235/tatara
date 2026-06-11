@@ -343,8 +343,8 @@ impl GpuWorkspace {
             (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuWorkspace requires num_buckets in [1, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
-        let ft_in = feature_set.ft_in();
-        let max_active = feature_set.max_active();
+        let ft_in = feature_set.train_ft_in();
+        let max_active = feature_set.train_max_active();
         // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
         // L2 入力次元。どちらも `l1_out` から導出する (struct method と同式)。
         let l1_effective = l1_out - L1_SKIP;
@@ -641,7 +641,8 @@ impl GpuTrainer {
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
-        let ft_in = feature_set.ft_in();
+        let base_ft_in = feature_set.ft_in();
+        let ft_in = feature_set.train_ft_in();
         let l1_effective = l1_out - L1_SKIP;
         let l2_in = l1_effective * 2;
         let ft_w_n = ft_in * ft_out;
@@ -661,8 +662,17 @@ impl GpuTrainer {
         // bucket 付き層 (l1/l2/l3) は bucket-major layout なので `bucketed` で渡し、
         // `per_bucket_repeat` が立つと block_len = n/num_buckets 分を 1 回生成して
         // num_buckets 回 tile する。
-        let ft_w_init = init::sample(WeightShape::flat(ft_w_n, ft_in), &init_spec.ft_w);
-        let ft_b_init = init::sample(WeightShape::flat(ft_b_n, ft_in), &init_spec.ft_b);
+        // FT weight は実 block を base 形状・base fan_in で sample し、factorizer の
+        // 仮想 block は zero を append する。train 形状で一括 sample すると (a) 仮想行に
+        // noise が入り step-0 の forward が OFF 構成と一致しない、(b) fan_in が変わり
+        // 実 row の半値幅がずれる、(c) RNG 消費数が変わり実 row の乱数列が OFF と
+        // 不一致になる。bias に仮想部は無いが fan_in は同じ理由で base を使う。
+        let mut ft_w_init = init::sample(
+            WeightShape::flat(base_ft_in * ft_out, base_ft_in),
+            &init_spec.ft_w,
+        );
+        ft_w_init.resize(ft_w_n, 0.0);
+        let ft_b_init = init::sample(WeightShape::flat(ft_b_n, base_ft_in), &init_spec.ft_b);
         let l1_w_init = init::sample(
             WeightShape::bucketed(l1_w_n, num_buckets, ft_out),
             &init_spec.l1_w,
@@ -806,7 +816,11 @@ impl GpuTrainer {
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
-            input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
+            input_ring: InputUploadRing::new(
+                ctx,
+                batch_size.max(1),
+                feature_set.train_max_active(),
+            )?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
             ft_fp16_out,
@@ -849,9 +863,12 @@ impl GpuTrainer {
         // なり optimizer step が out-of-bounds になるため、ここで弾く。
         if w.feature_set != self.feature_set {
             return Err(invalid_data(format!(
-                "weight feature set '{}' does not match trainer feature set '{}'",
+                "weight feature set '{}' (ft-factorize {}) does not match trainer feature \
+                 set '{}' (ft-factorize {})",
                 w.feature_set.canonical_name(),
-                self.feature_set.canonical_name()
+                w.feature_set.ft_factorize(),
+                self.feature_set.canonical_name(),
+                self.feature_set.ft_factorize()
             )));
         }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
@@ -971,9 +988,29 @@ impl GpuTrainer {
             None => None,
         };
         Ok(LayerStackWeights {
-            feature_set: self.feature_set,
+            // factorizer 有効時は ft_w を畳み込んで返すため、weight としての
+            // 形状は base feature set そのもの — spec も base に落とす
+            // (consumer が train 次元を観測しない不変条件)。
+            feature_set: if self.feature_set.ft_factorize() {
+                self.feature_set.feature_set().spec()
+            } else {
+                self.feature_set
+            },
             num_buckets: self.num_buckets,
-            ft_w: self.ft_w.to_host_vec(&self.stream)?,
+            ft_w: {
+                // factorizer 有効時は仮想 P 行を実行へ畳み込み、base 形状で返す
+                // (`save_quantised` の飽和検査・量子化は畳み込み後の値に掛かる)。
+                let ft_w = self.ft_w.to_host_vec(&self.stream)?;
+                if self.feature_set.ft_factorize() {
+                    nnue_format::layerstack_weights::coalesce_ft_factorized(
+                        &self.feature_set,
+                        self.ws.ft_out,
+                        &ft_w,
+                    )
+                } else {
+                    ft_w
+                }
+            },
             ft_b: self.ft_b.to_host_vec(&self.stream)?,
             l1_w: self.l1_w.to_host_vec(&self.stream)?,
             l1_b: self.l1_b.to_host_vec(&self.stream)?,
@@ -1218,7 +1255,7 @@ impl GpuTrainer {
             // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
             // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
             // resume 時に当該 run の精度へ再 quantize される)。
-            let ft_w_n = self.feature_set.ft_in() * ft_out;
+            let ft_w_n = self.feature_set.train_ft_in() * ft_out;
             {
                 let w_host = self.ft_w.to_host_vec(&self.stream)?;
                 let m_host = self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)?;
@@ -1405,7 +1442,7 @@ impl GpuTrainer {
 
         // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
         // upload して途中 fail だと中途半端な state になるため)。group 0 は ft_w。
-        let ft_w_loaded = read_group(&mut r, "ft_w", self.feature_set.ft_in() * ft_out)?;
+        let ft_w_loaded = read_group(&mut r, "ft_w", self.feature_set.train_ft_in() * ft_out)?;
         let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
         for (name, expected_len) in expected_groups {
             loaded.push(read_group(&mut r, name, expected_len)?);
@@ -1503,7 +1540,7 @@ impl GpuTrainer {
     /// 一度だけ明示同期する。`ft_fp16` 無効時 (`ft_w_h` が `None`) は no-op。
     pub(crate) fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-            let ft_w_n = self.feature_set.ft_in() * self.ws.ft_out;
+            let ft_w_n = self.feature_set.train_ft_in() * self.ws.ft_out;
             cuda_launch! {
                 kernel: cast_f32_to_f16,
                 stream: self.stream,
@@ -2257,7 +2294,7 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_w_n = self.feature_set.ft_in() * ft_out;
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;

@@ -110,6 +110,7 @@ impl FeatureSet {
                 max_active: MAX_ACTIVE_NO_KING,
                 feature_hash: FEATURE_HASH_HALFKP,
                 arch_feature_name: "HalfKP",
+                ft_factorize: false,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
                 feature_set: self,
@@ -120,6 +121,7 @@ impl FeatureSet {
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_SPLIT,
                 arch_feature_name: "HalfKaSplit",
+                ft_factorize: false,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
                 feature_set: self,
@@ -130,6 +132,7 @@ impl FeatureSet {
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_MERGED,
                 arch_feature_name: "HalfKaMerged",
+                ft_factorize: false,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
                 feature_set: self,
@@ -140,6 +143,7 @@ impl FeatureSet {
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_HM_SPLIT,
                 arch_feature_name: "HalfKaHmSplit",
+                ft_factorize: false,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
                 feature_set: self,
@@ -150,6 +154,7 @@ impl FeatureSet {
                 max_active: MAX_ACTIVE_WITH_KING,
                 feature_hash: FEATURE_HASH_HALFKA_HM_MERGED,
                 arch_feature_name: "HalfKaHmMerged",
+                ft_factorize: false,
             },
         }
     }
@@ -218,6 +223,13 @@ pub struct FeatureSetSpec {
     max_active: usize,
     feature_hash: u32,
     arch_feature_name: &'static str,
+    /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴
+    /// `kb * piece_inputs + p` ごとに king-bucket 非依存の仮想特徴
+    /// `ft_in + p` を追加 emit し、export 時に実行へ畳み込む。export 後の
+    /// artifact (次元 / hash / arch 名) は base と同一なので、base 次元を返す
+    /// getter (`ft_in` / `max_active`) はこのフラグの影響を受けず、学習側の
+    /// 消費者だけが `train_ft_in` / `train_max_active` を参照する。
+    ft_factorize: bool,
 }
 
 impl FeatureSetSpec {
@@ -244,6 +256,51 @@ impl FeatureSetSpec {
     /// 1 局面で同時に active になる最大特徴数。
     pub const fn max_active(&self) -> usize {
         self.max_active
+    }
+
+    /// FT factorizer を有効にした spec を返す (modifier 適用の唯一の経路)。
+    ///
+    /// 有効化しても base 次元 getter (`ft_in` / `max_active` / `feature_hash` /
+    /// `arch_feature_name`) は変わらない — export される artifact が base と
+    /// 同一形であることを型レベルで表す。学習側の buffer / kernel / checkpoint
+    /// だけが `train_ft_in` / `train_max_active` を参照する。
+    pub const fn with_ft_factorize(self) -> Self {
+        FeatureSetSpec {
+            feature_set: self.feature_set,
+            king_encoding: self.king_encoding,
+            king_square_mode: self.king_square_mode,
+            king_buckets: self.king_buckets,
+            piece_inputs: self.piece_inputs,
+            max_active: self.max_active,
+            feature_hash: self.feature_hash,
+            arch_feature_name: self.arch_feature_name,
+            ft_factorize: true,
+        }
+    }
+
+    /// FT factorizer が有効か。
+    pub const fn ft_factorize(&self) -> bool {
+        self.ft_factorize
+    }
+
+    /// 学習時の FT 入力次元。factorizer 有効時は仮想 P plane (`piece_inputs`
+    /// 行) が base の後ろに連結される。無効時は `ft_in` と同値。
+    pub const fn train_ft_in(&self) -> usize {
+        if self.ft_factorize {
+            self.ft_in() + self.piece_inputs
+        } else {
+            self.ft_in()
+        }
+    }
+
+    /// 学習時の最大 active 特徴数。factorizer 有効時は実特徴 1 つにつき仮想
+    /// 特徴 1 つを追加 emit するため 2 倍になる。無効時は `max_active` と同値。
+    pub const fn train_max_active(&self) -> usize {
+        if self.ft_factorize {
+            self.max_active * 2
+        } else {
+            self.max_active
+        }
     }
 
     /// feature 定数 (artifact identity の `FT_HASH` 導出に使う feature 部分)。
@@ -290,6 +347,38 @@ impl FeatureSetSpec {
     /// 2 軸の解釈 (king bucket / 筋ミラー要否) は 1 局面につき 1 回だけ
     /// `PerspectiveCtx` に畳み、内側の駒走査ループには分岐を持ち込まない。
     pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, mut f: F) {
+        self.map_features_board_dyn(board, &mut f);
+    }
+
+    /// [`map_features_board`] の非 generic 本体。factorizer 有効時に実特徴の
+    /// 再列挙を自己呼び出しするため、`&mut dyn FnMut` で単相化の再帰を断つ。
+    ///
+    /// [`map_features_board`]: Self::map_features_board
+    fn map_features_board_dyn(&self, board: &ShogiBoard, f: &mut dyn FnMut(usize, usize)) {
+        if self.ft_factorize {
+            // 実特徴を一旦集め、「実すべて → 仮想すべて」の順で emit する
+            // ([`extract_active_features`] の post-pass append と同順)。仮想
+            // index は実 index から `p = idx % piece_inputs` で導出する
+            // (実 index = `kb * piece_inputs + p` のため)。
+            let base = self.ft_in();
+            let mut reals: Vec<(usize, usize)> = Vec::with_capacity(self.max_active);
+            let real_spec = FeatureSetSpec {
+                ft_factorize: false,
+                ..*self
+            };
+            real_spec.map_features_board_dyn(board, &mut |stm, nstm| reals.push((stm, nstm)));
+            for &(stm, nstm) in &reals {
+                f(stm, nstm);
+            }
+            for &(stm, nstm) in &reals {
+                f(
+                    base + stm % self.piece_inputs,
+                    base + nstm % self.piece_inputs,
+                );
+            }
+            return;
+        }
+
         let stm = board.side_to_move;
         let nstm = stm.opponent();
 
@@ -345,9 +434,10 @@ impl FeatureSetSpec {
 
     /// 特徴インデックスを `Vec<(stm_idx, nstm_idx)>` として収集する。
     ///
-    /// 容量は `max_active` で事前確保する。
+    /// 容量は `train_max_active` (factorizer 無効時は `max_active` と同値) で
+    /// 事前確保する。
     pub fn collect_active_indices(&self, pos: &PackedSfenValue) -> Vec<(usize, usize)> {
-        let mut out = Vec::with_capacity(self.max_active);
+        let mut out = Vec::with_capacity(self.train_max_active());
         self.map_features(pos, |stm, nstm| out.push((stm, nstm)));
         out
     }
@@ -477,6 +567,22 @@ impl FeatureSetSpec {
                         count += 1;
                     }
                 }
+            }
+        }
+
+        // FT factorizer: 実特徴列への post-pass で仮想 P 特徴を追加する。
+        // 実 index = `kb * piece_inputs + p` なので `p = idx % piece_inputs` で
+        // 導出でき、3 phase の走査自体は factorizer 非依存に保てる。
+        if self.ft_factorize {
+            let base = self.ft_in() as i32;
+            let pi = self.piece_inputs as i32;
+            let n_real = count;
+            let mut k = 0;
+            while k < n_real && count < cap {
+                stm_out[count] = base + stm_out[k] % pi;
+                nstm_out[count] = base + nstm_out[k] % pi;
+                count += 1;
+                k += 1;
             }
         }
 
@@ -684,6 +790,82 @@ mod tests {
                     fs.canonical_name(),
                     i
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn factorized_spec_train_dimensions() {
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            let fact = fs.spec().with_ft_factorize();
+            // base getter は modifier の影響を受けない (export 形状の不変条件)。
+            assert_eq!(fact.ft_in(), base.ft_in());
+            assert_eq!(fact.max_active(), base.max_active());
+            assert_eq!(fact.feature_hash(), base.feature_hash());
+            assert_eq!(fact.arch_feature_name(), base.arch_feature_name());
+            // train getter は OFF では base と同値、ON で P plane 連結 / 2 倍。
+            assert_eq!(base.train_ft_in(), base.ft_in());
+            assert_eq!(base.train_max_active(), base.max_active());
+            assert_eq!(fact.train_ft_in(), base.ft_in() + base.piece_inputs());
+            assert_eq!(fact.train_max_active(), base.max_active() * 2);
+            // modifier は PartialEq で弁別される (Batch / trainer / weight の
+            // spec 照合が on/off 混在を自動 reject する根拠)。
+            assert_ne!(fact, base);
+        }
+    }
+
+    #[test]
+    fn factorized_emission_appends_virtual_p_features() {
+        // ON の emit 列 = OFF の実特徴列 + 仮想列 (実 1 つにつき
+        // `ft_in + real % piece_inputs` を 1 つ、実列と同順)。direct-write 経路
+        // (`extract_active_features`) と closure 経路の一致も ON で確認する。
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (size_of test で 40 byte 確認済、align 1)、`bytes.len() % 40 == 0` を
+        // 直前で assert。`bytes` の所有 lifetime 内に閉じる slice。
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            let spec = fs.spec().with_ft_factorize();
+            for (i, psv) in records.iter().take(20).enumerate() {
+                let board = psv.decode();
+                let mut real = Vec::new();
+                base.map_features_board(&board, |s, n| real.push((s, n)));
+                let mut on = Vec::new();
+                spec.map_features_board(&board, |s, n| on.push((s, n)));
+
+                assert_eq!(
+                    on.len(),
+                    real.len() * 2,
+                    "{} record {i}",
+                    fs.canonical_name()
+                );
+                assert_eq!(&on[..real.len()], &real[..]);
+                for (k, &(s, n)) in on[real.len()..].iter().enumerate() {
+                    let (rs, rn) = real[k];
+                    assert_eq!(s, base.ft_in() + rs % base.piece_inputs());
+                    assert_eq!(n, base.ft_in() + rn % base.piece_inputs());
+                    assert!((base.ft_in()..spec.train_ft_in()).contains(&s));
+                    assert!((base.ft_in()..spec.train_ft_in()).contains(&n));
+                }
+
+                let mut stm_buf = vec![0i32; spec.train_max_active()];
+                let mut nstm_buf = vec![0i32; spec.train_max_active()];
+                let cnt = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
+                let direct: Vec<(usize, usize)> = (0..cnt)
+                    .map(|k| (stm_buf[k] as usize, nstm_buf[k] as usize))
+                    .collect();
+                assert_eq!(direct, on, "{} record {i}", fs.canonical_name());
             }
         }
     }

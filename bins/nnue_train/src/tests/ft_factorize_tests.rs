@@ -1,0 +1,126 @@
+//! FT factorizer の trainer 結合テスト (GPU 必要)。
+//!
+//! 仮想行 zero-init の不変条件 (step-1 の forward が OFF 構成と一致する) と、
+//! export coalesce (`to_layerstack_weights` が base 形状 + base spec を返す) を
+//! 実 GPU trainer で検証する。
+
+use gpu_runtime::CudaContext;
+use nnue_train::init::LayerStackInit;
+use nnue_train::trainer::LossKind;
+use shogi_features::FeatureSet;
+
+use crate::arch::*;
+use crate::trainer_common::BatchData;
+use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+
+const B: usize = 64;
+const LOSS: LossKind = LossKind::Sigmoid { scale: 290.0 };
+
+fn make_trainer(
+    ctx: &std::sync::Arc<CudaContext>,
+    feature_set: shogi_features::FeatureSetSpec,
+) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+    GpuTrainer::new(
+        ctx,
+        B,
+        DEFAULT_FT_OUT,
+        DEFAULT_L1_OUT,
+        DEFAULT_L2_OUT,
+        DEFAULT_NUM_BUCKETS,
+        false,
+        false,
+        false,
+        false,
+        feature_set,
+        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+        None,
+        None,
+        &LayerStackInit::default_uniform(),
+    )
+}
+
+#[test]
+fn ft_factorize_init_export_is_bit_identical_to_off() -> Result<(), Box<dyn std::error::Error>> {
+    // 仮想行 zero-init + 実 block の base 形状 sample により、学習前の export は
+    // OFF 構成と bit-identical (zero の畳み込みは +0.0)。spec も base に落ちる。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let t_off = make_trainer(&ctx, base)?;
+    let t_on = make_trainer(&ctx, base.with_ft_factorize())?;
+
+    let w_off = t_off.to_layerstack_weights()?;
+    let w_on = t_on.to_layerstack_weights()?;
+    assert_eq!(
+        w_on.feature_set, base,
+        "coalesce 後の spec は base に落ちる"
+    );
+    assert_eq!(w_on.ft_w.len(), base.ft_in() * DEFAULT_FT_OUT);
+    assert_eq!(
+        w_on.ft_w, w_off.ft_w,
+        "学習前の coalesced ft_w は OFF と一致"
+    );
+    assert_eq!(w_on.ft_b, w_off.ft_b);
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let fact = base.with_ft_factorize();
+    let mut t_off = make_trainer(&ctx, base)?;
+    let mut t_on = make_trainer(&ctx, fact)?;
+
+    // smoke_dummy は実 index 列を factorizer 非依存に生成し、ON では仮想 index を
+    // append する — ON / OFF の batch は同じ実特徴を持つ。
+    let b_off = BatchData::smoke_dummy(B, base);
+    let b_on = BatchData::smoke_dummy(B, fact);
+    let loss_off = t_off.step(&b_off.as_ref(), 1e-3, 0.5, LOSS)?;
+    let loss_on = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
+
+    // 仮想行は zero-init なので step-1 の forward / loss は一致する
+    // (loss_acc の atomic 加算順による揺らぎのみ許容)。
+    let tol = loss_off.abs() * 1e-6 + 1e-12;
+    assert!(
+        (loss_on - loss_off).abs() <= tol,
+        "step-1 loss must match: on={loss_on:e} off={loss_off:e}"
+    );
+
+    // optimizer 1 step 後: 仮想行は勾配を受けて動くため、coalesce 済み export は
+    // OFF と一致しなくなる (実 block の更新は同一勾配なので、差分 = 仮想行の学習)。
+    let w_off = t_off.to_layerstack_weights()?;
+    let w_on = t_on.to_layerstack_weights()?;
+    assert_eq!(w_on.ft_w.len(), w_off.ft_w.len());
+    assert!(
+        w_on.ft_w != w_off.ft_w,
+        "仮想行が学習されていれば coalesced ft_w は OFF と異なる"
+    );
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::error::Error>> {
+    // ON trainer の量子化 export が base feature set の .bin としてそのまま
+    // load できる (= 推論エンジン側変更ゼロの根拠)。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let mut t_on = make_trainer(&ctx, base.with_ft_factorize())?;
+    let b_on = BatchData::smoke_dummy(B, base.with_ft_factorize());
+    let _ = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
+
+    let w = t_on.to_layerstack_weights()?;
+    let mut buf = Vec::new();
+    w.save_quantised(&mut buf)?;
+    let loaded = nnue_format::LayerStackWeights::load_quantised(
+        &mut std::io::Cursor::new(&buf),
+        base,
+        DEFAULT_FT_OUT,
+        DEFAULT_L1_OUT,
+        DEFAULT_L2_OUT,
+        DEFAULT_NUM_BUCKETS,
+    )?;
+    assert_eq!(loaded.feature_set, base);
+    assert_eq!(loaded.ft_w.len(), base.ft_in() * DEFAULT_FT_OUT);
+    Ok(())
+}
