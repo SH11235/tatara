@@ -305,11 +305,12 @@ pub(crate) fn copy_host_to_device_async_i32(
     if bytes == 0 {
         return Ok(());
     }
-    // SAFETY: `src` は呼び出し中有効な host slice で、直上の assert により
-    // `bytes` は `buf` の容量内。`src` は pageable host memory のため
-    // `cuMemcpyHtoDAsync` は staging buffer への copy 完了後に return する
-    // (CUDA の API 契約) — return 後に `src` を解放してよい。`buf` は確保済みの
-    // 有効 device ptr、`stream` は同 context。
+    // SAFETY: `buf.cu_deviceptr()` は確保済みの有効 device ptr で、直上の assert
+    // により `bytes` は容量内。`stream` は同 context。copy は async のため `src`
+    // の生存は caller が保証する: pinned 経路 (`InputUploadRing`) は h2d 完了
+    // event で slot 再利用を gate し、pageable 経路 (`BatchData` の slice) は
+    // 「pageable src は staging へ copy してから return する」という CUDA Driver
+    // API の同期挙動 (API synchronization behavior) に依る。
     unsafe {
         cuda_core::memory::memcpy_htod_async(
             buf.cu_deviceptr(),
@@ -337,7 +338,7 @@ pub(crate) fn copy_host_to_device_async_f32(
         return Ok(());
     }
     // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
-    // pageable HtoD は staging copy 後 return + 同 context)。
+    // 同 context + `src` 生存は caller 保証)。
     unsafe {
         cuda_core::memory::memcpy_htod_async(
             buf.cu_deviceptr(),

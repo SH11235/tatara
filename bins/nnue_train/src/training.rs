@@ -1224,20 +1224,19 @@ pub(crate) fn run_simple_training(
     let l1_out = simple_args.l2.unwrap_or(preset_l1_out);
     let l2_out = simple_args.l3.unwrap_or(preset_l2_out);
     // `SimpleGpuTrainer::new` の検査は `ft_out % 4 == 0` のみで 0 を素通しする
-    // (`0 % 4 == 0`)。0 次元は空 weight buffer のまま学習が走り、
-    // `--init-l1 uniform:fanin` では fan_in = 0 の除算で非有限の初期重みになる
-    // ため、ここで明示 reject する。
+    // (`0 % 4 == 0`)。0 次元は層が機能しない退化アーキのまま学習が走ってしまう
+    // ので、CLI で分かる error にして reject する。
     if ft_out == 0 || !ft_out.is_multiple_of(4) {
         return Err(format!(
             "Simple FT output dimension must be a positive multiple of 4 (got {ft_out}); \
-             set it via --arch '<ft_out>x2-<l1>-<l2>' or --l1"
+             set it via --arch '<l1>x2-<l2>-<l3>' (the <l1> block) or --l1"
         )
         .into());
     }
     if l1_out == 0 || l2_out == 0 {
         return Err(format!(
-            "Simple hidden layer dimensions must be >= 1 (got L1={l1_out}, L2={l2_out}); \
-             set them via --arch '<ft_out>x2-<l1>-<l2>' or --l2 / --l3"
+            "Simple hidden layer dimensions must be >= 1 (got <l2>={l1_out}, <l3>={l2_out}); \
+             set them via --arch '<l1>x2-<l2>-<l3>' or --l2 / --l3"
         )
         .into());
     }

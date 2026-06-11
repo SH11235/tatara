@@ -40,7 +40,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 
 /// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
 /// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
-/// 依存しないため定数を持ち直す。
+/// 本体依存しないため定数を持ち直す (同値性は dev-dependency 経由のテストで固定)。
 const FV_SCALE: i32 = 28;
 
 // =============================================================================
