@@ -36,7 +36,9 @@ build-time に hand-code すれば bullet runtime-fused 相当の memory traffic
 
 - 性能ギャップ ~±0% を狙える。「runtime fusion 喪失で −20〜−40%」の懸念は
   naive port 限定の話で、設計でカバーする。
-- 実装は `crates/gpu-kernels/pointwise/` 配下に Pattern 1 個 = 1 ファイルで配置
+- reference CPU 実装は `crates/gpu-kernels/src/pointwise/` 配下に Pattern 1 個 =
+  1 ファイルで配置。device `#[kernel]` 実装は cuda-oxide の bin-entry
+  reachability 制約により bin crate (`bins/*/src/kernels/`) に置く
 - 各 fused kernel に CPU reference 実装と数値同等性テストを併設する
 - 新しい optimizer や activation を試すときはパターンを追加する必要がある
   (固定コスト)

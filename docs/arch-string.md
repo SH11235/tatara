@@ -14,7 +14,7 @@
 
 組み立ては `crates/nnue-format` の 2 箇所:
 
-- `layerstack_weights::build_arch_str` — 9-bucket LayerStack アーキ
+- `layerstack_weights::build_arch_str` — N-bucket (`--num-buckets`、既定 9) LayerStack アーキ
 - `simple_weights::build_arch_str` — bucket 無し Simple 4 層アーキ
 
 ## 全体構造
@@ -23,6 +23,14 @@ arch string は 3 部をカンマで連結した 1 行:
 
 ```
 Features=<...>,Network=<...>,fv_scale=<N>
+```
+
+LayerStack で `--psqt` を有効にした場合のみ、Features と Network の間に
+`PSQT=<num_buckets>,` トークンが挿入される (`.bin` 末尾の PSQT block の存在と
+bucket 数を自己記述する):
+
+```
+Features=<...>,PSQT=<N>,Network=<...>,fv_scale=<N>
 ```
 
 ### Features トークン
@@ -37,6 +45,16 @@ Features=<feature_name>(Friend)[<input_size>-><ft_out>x2]
 - `(Friend)`: FT を視点ごとに適用することを示す marker。
 - `[<input_size>-><ft_out>x2]`: FT 入力次元 → FT 出力次元。`x2` は手番側 (stm) と
   相手側 (nstm) の 2 視点ぶんの FT 出力を concat することを表す。
+
+Simple の `--activation pairwise` のみ FT ブロックが別形式になる:
+
+```
+Features=<feature_name>(Friend)[<input_size>-><ft_out>/2x2]-Pairwise
+```
+
+pairwise 乗算で FT 出力が半減することを `/2` と `-Pairwise` suffix で表し、
+推論エンジンはこの suffix で pairwise を識別する
+(`simple_weights::arch_identity`)。
 
 ### Network 式
 
@@ -78,7 +96,8 @@ Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Cl
 | `AffineTransform[1<-32]` | 出力層、32 → 1 |
 
 LayerStack の arch string は dense 層チェーンの要約で、L1f skip 接続や
-pairwise・per-bucket 構造は文字列に現れない。LayerStack の完全なアーキ記述は
+pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 有効時の
+`PSQT=<N>` トークンにのみ現れる)。LayerStack の完全なアーキ記述は
 `crates/nnue-format/src/layerstack_weights.rs` の module doc を参照。
 
 ## Simple の例
@@ -113,6 +132,9 @@ Simple 固有の点:
 
 - 活性化トークンは `--activation` で決まる。`crelu` → `ClippedReLU`、`screlu` →
   `SqrClippedReLU`。LayerStack と違い 2 つの活性化位置とも同じトークンになる。
+  `pairwise` は dense 層を CReLU で活性化するため Network 式のトークンは
+  `ClippedReLU` のままで、Features トークンの `-Pairwise` suffix だけが弁別点
+  (上記「Features トークン」参照)。
 - FT 直後の第 1 dense 層を `AffineTransformSparseInput` と書く (LayerStack は同位置を
   `AffineTransform` と書く)。
 

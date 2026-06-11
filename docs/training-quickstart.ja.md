@@ -68,7 +68,7 @@ target/release/nnue-train \
 | `--superbatches` | 10 | 学習する superbatch 数。既定 10 は smoke 用、本番はもっと大きくする (下記「学習量の目安」) |
 | `--batch-size` | 16384 | 勾配更新 1 回あたりの局面数。GPU throughput と学習特性 (勾配のばらつき・更新回数) の両方に効く学習ハイパーパラメータ |
 | `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.ja.md) 参照) |
-| `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 100 MB ≈ 2 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
+| `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
 | `--win-rate-model` | OFF | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。量子化推論向けの net を学習するなら追加する (未指定なら plain sigmoid-MSE)。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
@@ -144,7 +144,7 @@ horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存
 
 ```bash
 target/release/nnue-train simple
-# → "[smoke] forward + backward OK" の趣旨のログが出れば GPU 経路は健全
+# → 末尾に "[smoke/simple] PASSED" の行が出れば GPU 経路は健全
 ```
 
 または小規模 run (1 sb × 3 batches) で全 pipeline を数秒で回す:
@@ -164,8 +164,8 @@ target/release/nnue-train --data <PSV> \
 | `kernel artifact nnue_train.{cubin,ptx,ll} not found` | 初回ビルド時 `cd bins/nnue_train && cargo-oxide build` で `.ll` を生成する必要がある。詳細は [docs/setup.ja.md](setup.ja.md) |
 | `libcublas.so` 系の link / load エラー | CUDA Toolkit が `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH` のいずれにも無い。`CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` で明示する (build.rs / runtime 両方が同じ chain で解決) |
 | `CUDA_ERROR_INVALID_PTX` (driver error 218) | sub-Ampere GPU (sm_75) で `CUDA_OXIDE_TARGET` 未設定。`CUDA_OXIDE_TARGET=sm_75` を export してから再ビルド + 実行 |
-| pos/s が極端に低い (< 500K on RTX 3080 Ti) | `--threads` を CPU コア数の半分程度に設定、dataloader の prefetch が間に合っているか確認。`NNUE_TRAIN_STEP_PROFILE=1` で各 phase (h2d / fwd / bwd / optimizer) の所要 ms を stderr に出して内訳を確認できる |
-| `--batch-size % 16 != 0` で reject | tiled L1 kernel が `b % 16 == 0` を要求 (`debug_assert!` で fail)。16 の倍数を渡す (既定の 16384 は条件を満たす) |
+| pos/s が極端に低い (< 500K on RTX 3080 Ti) | `--threads` を増やし (CPU 物理コア数を目安に、上記「主な option」参照)、dataloader の prefetch が間に合っているか確認。`NNUE_TRAIN_STEP_PROFILE=1` で各 phase (h2d / fwd / bwd / optimizer) の所要 ms を stderr に出して内訳を確認できる |
+| `--batch-size must be a multiple of 16` で reject | tiled dense matmul kernel が `b % 16 == 0` を要求するため、CLI が起動時に明示エラーで reject する。16 の倍数を渡す (既定の 16384 は条件を満たす) |
 
 ## 関連
 
