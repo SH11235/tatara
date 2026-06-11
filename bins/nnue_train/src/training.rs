@@ -81,7 +81,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
-    // はその group を凍結する opt-in、bias wd=0 と同様に許容する。
+    // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
+    // 非依存に掛かる)、bias wd=0 と同様に許容する。
     for (name, v) in per_group_optim_flags(cli) {
         if let Some(v) = v
             && (!v.is_finite() || v < 0.0)
@@ -1556,5 +1557,27 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(specified, ["--bias-weight-decay"]);
+
+        // 6 flag 全指定で表の (CLI 名 → Cli field) 配線を値で照合する (table の
+        // copy-paste 取り違えを検出)。
+        let cli = parse(&[
+            "--ft-weight-decay",
+            "0.1",
+            "--dense-weight-decay",
+            "0.2",
+            "--bias-weight-decay",
+            "0.3",
+            "--ft-lr-mult",
+            "1.5",
+            "--dense-lr-mult",
+            "2.0",
+            "--bias-lr-mult",
+            "0.5",
+        ]);
+        let values: Vec<f32> = per_group_optim_flags(&cli)
+            .iter()
+            .map(|(_, v)| v.expect("all six flags set"))
+            .collect();
+        assert_eq!(values, [0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
     }
 }
