@@ -1,11 +1,46 @@
 use std::io::Write;
+use std::path::Path;
 
-use gpu_runtime::DeviceBuffer;
+use gpu_runtime::{CudaStream, DeviceBuffer};
 use nnue_format::ArchKind;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
+use crate::arch::{FT_OPT_M_SCALE, FT_OPT_V_SCALE};
+use crate::trainer_common::MomentBuf;
+
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
+//
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 5):
+//
+//   magic        b"RNRC"             (4 bytes)
+//   version      u32 (5)             (4 bytes)
+//   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
+//   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
+//   ft_in        u64                 (FT 入力次元、feature set 依存)
+//   ft_out       u64                 (FT 出力次元、`--ft-out`)
+//   max_active   u64                 (1 perspective あたり active feature 数)
+//   run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
+//   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
+//   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
+//   arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、例 "layerstack")
+//   topo_count   u64                 (topology 次元の個数)
+//   topology     u64 [topo_count]     (arch 固有の層次元列)
+//   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
+//   step_count   u64  (Ranger lookahead step counter)
+//   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
+//   num_groups   u64
+//   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
+//   固有 — 各 trainer の `raw_ckpt_group_sources` を参照):
+//     len u64
+//     w[f32 × len]
+//     m[f32 × len]
+//     v[f32 × len]
+//     slow[f32 × len]
+//
+// header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
+// group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
+// version 互換規則 (1..=5 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -60,16 +95,57 @@ pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 /// `build_lr_scheduler` に渡す。
 pub(crate) type RawCkptResumeState = (usize, Option<String>, Option<usize>);
 
-/// `SimpleGpuTrainer::raw_ckpt_groups` の 1 要素。weight name + element count + 各
-/// `(weight, m, v, slow)` device buffer の借用 tuple。
-pub(crate) type SimpleRawCkptGroupEntry<'a> = (
-    &'static str,
-    usize,
-    &'a DeviceBuffer<f32>,
-    &'a DeviceBuffer<f32>,
-    &'a DeviceBuffer<f32>,
-    &'a DeviceBuffer<f32>,
-);
+/// raw checkpoint 1 group 分の device-side 参照。weight name + 要素数 +
+/// `(w, m, v, slow)` device buffer の借用。trainer が format の group 順に並べた
+/// 列を [`save_raw_checkpoint_file`] / [`load_raw_checkpoint_file`] へ渡す。
+pub(crate) struct RawCkptGroupSource<'a> {
+    pub(crate) name: &'static str,
+    pub(crate) len: usize,
+    pub(crate) bufs: RawCkptGroupBufs<'a>,
+}
+
+/// [`RawCkptGroupSource`] の buffer 借用部。`Uniform` は w/m/v/slow 全部
+/// `DeviceBuffer<f32>` の group、`FtMoment` は `m` / `v` が [`MomentBuf`]
+/// (`--fp16-opt-state` で `f16` 格納) の ft_w group。
+pub(crate) enum RawCkptGroupBufs<'a> {
+    Uniform {
+        w: &'a DeviceBuffer<f32>,
+        m: &'a DeviceBuffer<f32>,
+        v: &'a DeviceBuffer<f32>,
+        slow: &'a DeviceBuffer<f32>,
+    },
+    FtMoment {
+        w: &'a DeviceBuffer<f32>,
+        m: &'a MomentBuf,
+        v: &'a MomentBuf,
+        slow: &'a DeviceBuffer<f32>,
+    },
+}
+
+impl RawCkptGroupSource<'_> {
+    /// device → host download。`FtMoment` の `m` / `v` は格納精度 (`f32`/`f16`) に
+    /// 依らず**真値 `f32`** に戻す — checkpoint format は mode 非依存で、resume 時に
+    /// 当該 run の精度へ再 quantize される。
+    pub(crate) fn to_host(
+        &self,
+        stream: &CudaStream,
+    ) -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
+        Ok(match self.bufs {
+            RawCkptGroupBufs::Uniform { w, m, v, slow } => (
+                w.to_host_vec(stream)?,
+                m.to_host_vec(stream)?,
+                v.to_host_vec(stream)?,
+                slow.to_host_vec(stream)?,
+            ),
+            RawCkptGroupBufs::FtMoment { w, m, v, slow } => (
+                w.to_host_vec(stream)?,
+                m.to_host_f32(stream, FT_OPT_M_SCALE)?,
+                v.to_host_f32(stream, FT_OPT_V_SCALE)?,
+                slow.to_host_vec(stream)?,
+            ),
+        })
+    }
+}
 
 /// LayerStack アーキの topology header (v4+、PSQT 無し): FT 出力次元・L1 出力次元・
 /// L2 出力次元・bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
@@ -121,6 +197,20 @@ pub(crate) struct RawCkptArch<'a> {
     pub(crate) ft_out: u64,
     /// arch 固有の層次元列 (v4 topology header)。
     pub(crate) topology: &'a [u64],
+}
+
+/// raw checkpoint header の counter / lineage 部 (arch identity 以外の可変 field)。
+/// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
+pub(crate) struct RawCkptMeta<'a> {
+    /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
+    /// `lineage.parent_id` に使う)。空文字列は「未記録」。
+    pub(crate) run_id: &'a str,
+    /// この checkpoint が表す完了 superbatch 番号 (resume はこの +1 から)。
+    pub(crate) superbatch: usize,
+    /// Ranger lookahead step counter。
+    pub(crate) step_count: u64,
+    /// LR-schedule horizon (horizon を持たない schedule では `None`)。
+    pub(crate) lr_horizon: Option<usize>,
 }
 
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
@@ -396,6 +486,157 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     })
 }
 
+/// raw checkpoint を `path` に atomic に書き出す。header (arch identity + counters +
+/// `num_groups` = `groups.len()`) に続けて `groups` を列挙順に書く。group 本体の
+/// layout は各 group につき `len u64 + w[f32×len] + m[f32×len] + v[f32×len] +
+/// slow[f32×len]` (全 little-endian)。device → host download は group 単位で write と
+/// interleave するので、host 側のピークは最大 group (ft_w、~113M f32 = ~450MB) 1 個分。
+///
+/// `<path>.tmp` へ `BufWriter` で書いてから `std::fs::rename` で atomic に置換する
+/// (書き込み途中で crash しても `<path>` は前回の完全な checkpoint のまま)。
+///
+/// `meta.run_id` が空文字列、または [`MAX_RUN_ID_BYTES`] 超過 (warning を出して
+/// 省略) のときは run id を持たない checkpoint になり、resume 時の
+/// `lineage.parent_id` は解決されない。
+pub(crate) fn save_raw_checkpoint_file(
+    path: &Path,
+    stream: &CudaStream,
+    arch: &RawCkptArch,
+    meta: &RawCkptMeta,
+    groups: &[RawCkptGroupSource<'_>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 過長な run id (`{net_id}-{時刻}-{pid}`、通常数十バイト) は lineage という
+    // メタデータのために学習を中断させる価値がない。上限超過時は埋め込みを
+    // 省略 (長さ 0) し、warning を出して checkpoint 保存は続行する。
+    let run_id = if meta.run_id.len() > MAX_RUN_ID_BYTES {
+        eprintln!(
+            "[train] warning: producer run id ({} bytes) exceeds {MAX_RUN_ID_BYTES}; \
+             omitting it from {} (resume lineage parent will be unresolved)",
+            meta.run_id.len(),
+            path.display()
+        );
+        ""
+    } else {
+        meta.run_id
+    };
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".tmp");
+        std::path::PathBuf::from(p)
+    };
+
+    // write+flush 本体を closure に括り、`fs::rename` 前の error path で
+    // 中途半端な `<path>.tmp` を best-effort で消す (device→host download / write /
+    // flush 失敗で残骸を残さないため)。
+    let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+        write_raw_ckpt_header(
+            &mut w,
+            arch,
+            run_id,
+            meta.superbatch as u64,
+            meta.step_count,
+            meta.lr_horizon,
+            groups.len() as u64,
+        )?;
+        for g in groups {
+            let (w_host, m_host, v_host, slow_host) = g.to_host(stream)?;
+            // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。
+            for (label, got) in [
+                ("w", w_host.len()),
+                ("m", m_host.len()),
+                ("v", v_host.len()),
+                ("slow", slow_host.len()),
+            ] {
+                if got != g.len {
+                    return Err(format!(
+                        "raw checkpoint: group {} {label} buffer len {got} != expected {}",
+                        g.name, g.len
+                    )
+                    .into());
+                }
+            }
+            w.write_all(&(g.len as u64).to_le_bytes())?;
+            write_f32_slice(&mut w, &w_host)?;
+            write_f32_slice(&mut w, &m_host)?;
+            write_f32_slice(&mut w, &v_host)?;
+            write_f32_slice(&mut w, &slow_host)?;
+        }
+        w.flush()?;
+        Ok(())
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// raw checkpoint を読み、header 照合 + 全 group の host `Vec` を返す (`--resume` 用)。
+/// `expected_groups` は format の group 順の `(name, 要素数)` で、header の
+/// `num_groups` / 各 group の `len` をこれと照合し、不一致は `InvalidData` で
+/// reject する。全 group を読み切ってから返すので、caller は読み途中の失敗で
+/// device 側が中途半端な state になる心配なく upload できる (trailing garbage は
+/// 許容、足りないのは `read_exact` が弾く)。
+pub(crate) fn load_raw_checkpoint_file(
+    path: &Path,
+    expected_arch: &RawCkptArch,
+    expected_groups: &[(&'static str, usize)],
+) -> Result<(RawCkptHeader, Vec<RawCkptGroup>), Box<dyn std::error::Error>> {
+    let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+    let header = read_raw_ckpt_header(&mut r, expected_arch)?;
+    if header.num_groups != expected_groups.len() as u64 {
+        return Err(invalid_data(format!(
+            "raw checkpoint num_groups {} != expected {}",
+            header.num_groups,
+            expected_groups.len()
+        )));
+    }
+    let mut groups = Vec::with_capacity(expected_groups.len());
+    for &(name, expected_len) in expected_groups {
+        groups.push(read_raw_ckpt_group(&mut r, name, expected_len)?);
+    }
+    Ok((header, groups))
+}
+
+/// 1 group 分 (len + w/m/v/slow の f32 × len) を読む。file 記載 `len` と
+/// `expected_len` の不一致 / `u64 → usize` overflow は `InvalidData` で reject。
+fn read_raw_ckpt_group<R: std::io::Read>(
+    r: &mut R,
+    name: &str,
+    expected_len: usize,
+) -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
+    let mut buf8 = [0u8; 8];
+    read_exact_or_invalid(r, &mut buf8, &format!("group {name} len"))?;
+    let len_u64 = u64::from_le_bytes(buf8);
+    let len: usize = len_u64.try_into().map_err(|_| {
+        invalid_data(format!(
+            "raw checkpoint group {name} len {len_u64} exceeds usize::MAX"
+        ))
+    })?;
+    if len != expected_len {
+        return Err(invalid_data(format!(
+            "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} \
+             (network architecture mismatch)"
+        )));
+    }
+    let w_host = read_f32_vec_io(r, len, &format!("group {name} w"))?;
+    let m_host = read_f32_vec_io(r, len, &format!("group {name} m"))?;
+    let v_host = read_f32_vec_io(r, len, &format!("group {name} v"))?;
+    let slow_host = read_f32_vec_io(r, len, &format!("group {name} slow"))?;
+    Ok((w_host, m_host, v_host, slow_host))
+}
+
 /// `io::ErrorKind::InvalidData` の `Box<dyn Error>` を作る短縮 helper (raw checkpoint
 /// の magic/version/dim 検証で使う、`RangerHostState::load_from_reader` と同方針)。
 pub(crate) fn invalid_data(msg: String) -> Box<dyn std::error::Error> {
@@ -405,7 +646,7 @@ pub(crate) fn invalid_data(msg: String) -> Box<dyn std::error::Error> {
 /// f32 slice を little-endian で `w` に書き出す (`bytemuck` 不使用、依存を増やさない)。
 pub(crate) fn write_f32_slice<W: std::io::Write>(w: &mut W, data: &[f32]) -> std::io::Result<()> {
     // 4 byte ずつの write_all は遅いので、一旦 byte Vec に詰めてから 1 回で書く
-    // (`raw_ckpt_groups` 最大 113M f32 = ~450MB、呼び出し側は BufWriter で wrap 済だが
+    // (group は最大 113M f32 = ~450MB (ft_w)、呼び出し側は BufWriter で wrap 済だが
     //  chunk write の方が更に system call が減る)。
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for &x in data {

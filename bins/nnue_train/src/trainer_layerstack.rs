@@ -1024,29 +1024,34 @@ impl GpuTrainer {
         })
     }
 
-    /// `ft_w` を **除く** 9 weight group の `(name, expected_len, &w, &m, &v, &slow)` を
-    /// 固定順で返す (raw checkpoint の save/load で iterate するための immutable view)。
-    /// `grad` は resume に不要なので含めない。順序 = ft_b, l1_w, l1_b, l1f_w, l1f_b,
-    /// l2_w, l2_b, l3_w, l3_b。
+    /// raw checkpoint format の全 weight group を format の group 順 (= ft_w, ft_b,
+    /// l1_w, l1_b, l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b, PSQT 有効時は末尾に psqt_w)
+    /// で返す (save / load / roundtrip 比較で iterate する immutable view)。`grad` は
+    /// resume に不要なので含めない。
     ///
     /// `ft_w` は `m` / `v` が `--fp16-opt-state` で `f16` ([`MomentBuf`]) になり buffer
-    /// 型が他 group と揃わないため本配列から外し、checkpoint format 上 1 番目の group
-    /// として save/load 側で個別に処理する (format の group 順は ft_w が先頭で不変)。
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn raw_ckpt_groups(
-        &self,
-    ) -> [(
-        &'static str,
-        usize,
-        &DeviceBuffer<f32>,
-        &DeviceBuffer<f32>,
-        &DeviceBuffer<f32>,
-        &DeviceBuffer<f32>,
-    ); 9] {
+    /// 型が他 group と揃わないため [`RawCkptGroupBufs::FtMoment`]、他は全 buffer
+    /// `f32` の [`RawCkptGroupBufs::Uniform`]。
+    pub(crate) fn raw_ckpt_group_sources(&self) -> Vec<RawCkptGroupSource<'_>> {
+        macro_rules! uniform {
+            ($name:literal, $len:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {
+                RawCkptGroupSource {
+                    name: $name,
+                    len: $len,
+                    bufs: RawCkptGroupBufs::Uniform {
+                        w: &self.$w,
+                        m: &self.$m,
+                        v: &self.$v,
+                        slow: &self.$slow,
+                    },
+                }
+            };
+        }
         let ft_out = self.ws.ft_out;
         let l1_out = self.ws.l1_out;
         let l2_out = self.ws.l2_out;
         let l2_in = self.ws.l2_in();
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
@@ -1056,130 +1061,53 @@ impl GpuTrainer {
         let l2_b_n = self.num_buckets * l2_out;
         let l3_w_n = self.num_buckets * l2_out;
         let l3_b_n = self.num_buckets;
-        [
-            (
-                "ft_b",
-                ft_b_n,
-                &self.ft_b,
-                &self.ft_b_m,
-                &self.ft_b_v,
-                &self.ft_b_slow,
-            ),
-            (
-                "l1_w",
-                l1_w_n,
-                &self.l1_w,
-                &self.l1_w_m,
-                &self.l1_w_v,
-                &self.l1_w_slow,
-            ),
-            (
-                "l1_b",
-                l1_b_n,
-                &self.l1_b,
-                &self.l1_b_m,
-                &self.l1_b_v,
-                &self.l1_b_slow,
-            ),
-            (
-                "l1f_w",
-                l1f_w_n,
-                &self.l1f_w,
-                &self.l1f_w_m,
-                &self.l1f_w_v,
-                &self.l1f_w_slow,
-            ),
-            (
-                "l1f_b",
-                l1f_b_n,
-                &self.l1f_b,
-                &self.l1f_b_m,
-                &self.l1f_b_v,
-                &self.l1f_b_slow,
-            ),
-            (
-                "l2_w",
-                l2_w_n,
-                &self.l2_w,
-                &self.l2_w_m,
-                &self.l2_w_v,
-                &self.l2_w_slow,
-            ),
-            (
-                "l2_b",
-                l2_b_n,
-                &self.l2_b,
-                &self.l2_b_m,
-                &self.l2_b_v,
-                &self.l2_b_slow,
-            ),
-            (
-                "l3_w",
-                l3_w_n,
-                &self.l3_w,
-                &self.l3_w_m,
-                &self.l3_w_v,
-                &self.l3_w_slow,
-            ),
-            (
-                "l3_b",
-                l3_b_n,
-                &self.l3_b,
-                &self.l3_b_m,
-                &self.l3_b_v,
-                &self.l3_b_slow,
-            ),
-        ]
+        let mut groups = vec![
+            RawCkptGroupSource {
+                name: "ft_w",
+                len: ft_w_n,
+                bufs: RawCkptGroupBufs::FtMoment {
+                    w: &self.ft_w,
+                    m: &self.ft_w_m,
+                    v: &self.ft_w_v,
+                    slow: &self.ft_w_slow,
+                },
+            },
+            uniform!("ft_b", ft_b_n, ft_b, ft_b_m, ft_b_v, ft_b_slow),
+            uniform!("l1_w", l1_w_n, l1_w, l1_w_m, l1_w_v, l1_w_slow),
+            uniform!("l1_b", l1_b_n, l1_b, l1_b_m, l1_b_v, l1_b_slow),
+            uniform!("l1f_w", l1f_w_n, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow),
+            uniform!("l1f_b", l1f_b_n, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow),
+            uniform!("l2_w", l2_w_n, l2_w, l2_w_m, l2_w_v, l2_w_slow),
+            uniform!("l2_b", l2_b_n, l2_b, l2_b_m, l2_b_v, l2_b_slow),
+            uniform!("l3_w", l3_w_n, l3_w, l3_w_m, l3_w_v, l3_w_slow),
+            uniform!("l3_b", l3_b_n, l3_b, l3_b_m, l3_b_v, l3_b_slow),
+        ];
+        if let Some(psqt) = self.psqt.as_ref() {
+            groups.push(RawCkptGroupSource {
+                name: "psqt_w",
+                len: self.feature_set.ft_in() * self.num_buckets,
+                bufs: RawCkptGroupBufs::Uniform {
+                    w: &psqt.w,
+                    m: &psqt.w_m,
+                    v: &psqt.w_v,
+                    slow: &psqt.w_slow,
+                },
+            });
+        }
+        groups
     }
 
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_layerstack_weights` → `save_quantised`)
     /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
-    /// `*.ckpt` file に、全 10 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
+    /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
     /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
     /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
     ///
-    /// header の write / read は [`write_raw_ckpt_header`] / [`read_raw_ckpt_header`]
-    /// に切り出してある。layout (全 little-endian、現行 [`RAW_CKPT_VERSION`] = 5):
-    /// ```text
-    /// magic        b"RNRC"             (4 bytes)
-    /// version      u32 (4)             (4 bytes)
-    /// fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
-    /// fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
-    /// ft_in        u64                 (FT 入力次元、feature set 依存)
-    /// ft_out       u64                 (FT 出力次元、`--ft-out`)
-    /// max_active   u64                 (1 perspective あたり active feature 数)
-    /// run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
-    /// run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
-    /// arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
-    /// arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、LayerStack は "layerstack")
-    /// topo_count   u64                 (topology 次元の個数)
-    /// topology     u64 [topo_count]     (層次元列、LayerStack は ft_out/l1_out/l2_out/num_buckets)
-    /// superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
-    /// step_count   u64  (Ranger lookahead step counter)
-    /// lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
-    /// num_groups   u64  (= 10、固定だが将来検証用)
-    /// then for each of 10 groups (順序 = `raw_ckpt_groups()` = ft_w, ft_b, l1_w, l1_b,
-    ///   l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b):
-    ///   len u64
-    ///   w[f32 × len]
-    ///   m[f32 × len]
-    ///   v[f32 × len]
-    ///   slow[f32 × len]
-    /// ```
-    ///
-    /// version 1 file には feature set header も run id も arch header も無く、weights
-    /// は常に `halfka-hm-merged` / `layerstack` として解釈される。version 2/3 file は
-    /// arch header を持たず `layerstack` 扱い。writer は常に最新 version を書く。
-    ///
-    /// device → host download (`DeviceBuffer::to_host_vec`) → `<path>.tmp` へ `BufWriter`
-    /// で書く → `std::fs::rename(<path>.tmp, <path>)` で atomic に置換 (書き込み途中で
-    /// crash しても `<path>` は前回の完全な checkpoint のまま)。
-    ///
-    /// `run_id` はこの checkpoint を書き出す run の experiment.json `id`。空文字列、
-    /// または `MAX_RUN_ID_BYTES` 超過 (warning を出して省略) のときは run id を持た
-    /// ない checkpoint になり、resume 時の `lineage.parent_id` は解決されない。
+    /// file layout と atomic 書き出しは [`save_raw_checkpoint_file`] が担い、本 method
+    /// は arch identity と group 列 ([`Self::raw_ckpt_group_sources`]、PSQT 無し 10 /
+    /// 有り 11 group) を組んで渡すだけ。
     pub(crate) fn save_raw_checkpoint(
         &self,
         path: &Path,
@@ -1187,164 +1115,31 @@ impl GpuTrainer {
         run_id: &str,
         lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
-
-        // 過長な run id (`{net_id}-{時刻}-{pid}`、通常数十バイト) は lineage という
-        // メタデータのために学習を中断させる価値がない。上限超過時は埋め込みを
-        // 省略 (長さ 0) し、warning を出して checkpoint 保存は続行する。
-        let run_id = if run_id.len() > MAX_RUN_ID_BYTES {
-            eprintln!(
-                "[train] warning: producer run id ({} bytes) exceeds {MAX_RUN_ID_BYTES}; \
-                 omitting it from {} (resume lineage parent will be unresolved)",
-                run_id.len(),
-                path.display()
-            );
-            ""
-        } else {
-            run_id
-        };
-
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = {
-            let mut p = path.as_os_str().to_os_string();
-            p.push(".tmp");
-            std::path::PathBuf::from(p)
-        };
-
-        // write+flush 本体を closure に括り、`fs::rename` 前の error path で
-        // 中途半端な `<path>.tmp` を best-effort で消す (device→host download / write /
-        // flush 失敗で残骸を残さないため)。
-        let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
-            let groups = self.raw_ckpt_groups();
-            let ft_out = self.ws.ft_out;
-            // PSQT 有り ckpt は `[..., num_buckets, num_buckets]` (5 dims) で PSQT 無し
-            // (4 dims) と弁別する。PSQT 無し ckpt を PSQT 有り設定で `--resume` すると
-            // `topo_count` 不一致で reject される (PSQT bootstrap path は `--init-from`)。
-            let topo4 =
-                layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
-            let topo5 = layerstack_topology_with_psqt(
-                ft_out,
-                self.ws.l1_out,
-                self.ws.l2_out,
-                self.num_buckets,
-            );
-            let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
-            // format 上の group 数: ft_w (個別処理) + raw_ckpt_groups の 9 + PSQT 有効
-            // なら +1 = 10 or 11。
-            let total_groups = (groups.len() + 1 + usize::from(self.psqt.is_some())) as u64;
-            write_raw_ckpt_header(
-                &mut w,
-                &RawCkptArch {
-                    feature_set: self.feature_set,
-                    arch_kind: ArchKind::LayerStack,
-                    ft_out: ft_out as u64,
-                    topology,
-                },
+        let ft_out = self.ws.ft_out;
+        // PSQT 有り ckpt は `[..., num_buckets, num_buckets]` (5 dims) で PSQT 無し
+        // (4 dims) と弁別する。PSQT 無し ckpt を PSQT 有り設定で `--resume` すると
+        // `topo_count` 不一致で reject される (PSQT bootstrap path は `--init-from`)。
+        let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
+        let topo5 =
+            layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
+        let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        save_raw_checkpoint_file(
+            path,
+            &self.stream,
+            &RawCkptArch {
+                feature_set: self.feature_set,
+                arch_kind: ArchKind::LayerStack,
+                ft_out: ft_out as u64,
+                topology,
+            },
+            &RawCkptMeta {
                 run_id,
-                superbatch as u64,
-                self.step_count,
+                superbatch,
+                step_count: self.step_count,
                 lr_horizon,
-                total_groups,
-            )?;
-
-            // group 0: ft_w。`m` / `v` は `--fp16-opt-state` で `f16` 格納だが、
-            // checkpoint は常に真値 `f32` で書く (mode 非依存・format version 不変、
-            // resume 時に当該 run の精度へ再 quantize される)。
-            let ft_w_n = self.feature_set.train_ft_in() * ft_out;
-            {
-                let w_host = self.ft_w.to_host_vec(&self.stream)?;
-                let m_host = self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)?;
-                let v_host = self.ft_w_v.to_host_f32(&self.stream, FT_OPT_V_SCALE)?;
-                let slow_host = self.ft_w_slow.to_host_vec(&self.stream)?;
-                for (label, got) in [
-                    ("w", w_host.len()),
-                    ("m", m_host.len()),
-                    ("v", v_host.len()),
-                    ("slow", slow_host.len()),
-                ] {
-                    if got != ft_w_n {
-                        return Err(format!(
-                            "raw checkpoint: group ft_w {label} buffer len {got} != expected {ft_w_n}"
-                        )
-                        .into());
-                    }
-                }
-                w.write_all(&(ft_w_n as u64).to_le_bytes())?;
-                write_f32_slice(&mut w, &w_host)?;
-                write_f32_slice(&mut w, &m_host)?;
-                write_f32_slice(&mut w, &v_host)?;
-                write_f32_slice(&mut w, &slow_host)?;
-            }
-
-            for (name, expected_len, w_buf, m_buf, v_buf, slow_buf) in groups {
-                // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。
-                let w_host = w_buf.to_host_vec(&self.stream)?;
-                let m_host = m_buf.to_host_vec(&self.stream)?;
-                let v_host = v_buf.to_host_vec(&self.stream)?;
-                let slow_host = slow_buf.to_host_vec(&self.stream)?;
-                for (label, got) in [
-                    ("w", w_host.len()),
-                    ("m", m_host.len()),
-                    ("v", v_host.len()),
-                    ("slow", slow_host.len()),
-                ] {
-                    if got != expected_len {
-                        return Err(format!(
-                            "raw checkpoint: group {name} {label} buffer len {got} != expected {expected_len}"
-                        )
-                        .into());
-                    }
-                }
-                w.write_all(&(expected_len as u64).to_le_bytes())?;
-                write_f32_slice(&mut w, &w_host)?;
-                write_f32_slice(&mut w, &m_host)?;
-                write_f32_slice(&mut w, &v_host)?;
-                write_f32_slice(&mut w, &slow_host)?;
-            }
-            // PSQT (任意): 最後の group として書く。format の group 順は
-            // ft_w → raw_ckpt_groups の 9 → (psqt_w)。
-            if let Some(psqt) = self.psqt.as_ref() {
-                let psqt_n = self.feature_set.ft_in() * self.num_buckets;
-                let w_host = psqt.w.to_host_vec(&self.stream)?;
-                let m_host = psqt.w_m.to_host_vec(&self.stream)?;
-                let v_host = psqt.w_v.to_host_vec(&self.stream)?;
-                let slow_host = psqt.w_slow.to_host_vec(&self.stream)?;
-                for (label, got) in [
-                    ("w", w_host.len()),
-                    ("m", m_host.len()),
-                    ("v", v_host.len()),
-                    ("slow", slow_host.len()),
-                ] {
-                    if got != psqt_n {
-                        return Err(format!(
-                            "raw checkpoint: group psqt_w {label} buffer len {got} != expected {psqt_n}"
-                        )
-                        .into());
-                    }
-                }
-                w.write_all(&(psqt_n as u64).to_le_bytes())?;
-                write_f32_slice(&mut w, &w_host)?;
-                write_f32_slice(&mut w, &m_host)?;
-                write_f32_slice(&mut w, &v_host)?;
-                write_f32_slice(&mut w, &slow_host)?;
-            }
-            w.flush()?;
-            Ok(())
-        };
-        if let Err(e) = write_tmp() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-        Ok(())
+            },
+            &self.raw_ckpt_group_sources(),
+        )
     }
 
     /// raw checkpoint を読み戻す (`--resume` 用)。返り値は `(完了 superbatch 番号,
@@ -1359,99 +1154,39 @@ impl GpuTrainer {
     /// (32-bit / 破損 file) は `InvalidData` で reject
     /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
     ///
-    /// header の解析 (feature set / arch kind / topology の照合) は
-    /// [`read_raw_ckpt_header`] が担当する。version 1 file は feature set header を
-    /// 持たず weights を `halfka-hm-merged` とみなす。version 1..=3 は arch header を
-    /// 持たず `layerstack` とみなす。読み込んだ raw f32 を host → device upload し、
-    /// `self.step_count` を復元する。`grad` buffer は触らない (step ごとに memset される)。
+    /// header / group 本体の読み出しと照合は [`load_raw_checkpoint_file`] が担当する
+    /// (version 互換規則は [`read_raw_ckpt_header`] を参照)。本 method は読み込んだ
+    /// raw f32 を host → device upload し、`self.step_count` を復元する。`grad`
+    /// buffer は触らない (step ごとに memset される)。
     pub(crate) fn load_raw_checkpoint(
         &mut self,
         path: &Path,
     ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
-        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let ft_out = self.ws.ft_out;
         let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
         let topo5 =
             layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
         let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
-
-        // header (magic 〜 num_groups) を読み、feature set / arch / topology を照合する。
-        let header = read_raw_ckpt_header(
-            &mut r,
+        let expected_groups: Vec<(&'static str, usize)> = self
+            .raw_ckpt_group_sources()
+            .iter()
+            .map(|g| (g.name, g.len))
+            .collect();
+        let (header, loaded) = load_raw_checkpoint_file(
+            path,
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
                 ft_out: ft_out as u64,
                 topology,
             },
+            &expected_groups,
         )?;
-        let superbatch = header.superbatch;
-        let step_count = header.step_count;
-        let producer_run_id = header.producer_run_id;
-        let lr_horizon = header.lr_horizon;
 
-        // format 上の group 数は ft_w (個別処理) + `raw_ckpt_groups` の 9 = 10。
-        let expected_groups: [(&'static str, usize); 9] = {
-            let g = self.raw_ckpt_groups();
-            [
-                (g[0].0, g[0].1),
-                (g[1].0, g[1].1),
-                (g[2].0, g[2].1),
-                (g[3].0, g[3].1),
-                (g[4].0, g[4].1),
-                (g[5].0, g[5].1),
-                (g[6].0, g[6].1),
-                (g[7].0, g[7].1),
-                (g[8].0, g[8].1),
-            ]
-        };
-        let total_groups = expected_groups.len() + 1 + usize::from(self.psqt.is_some());
-        if header.num_groups != total_groups as u64 {
-            return Err(invalid_data(format!(
-                "raw checkpoint num_groups {} != expected {total_groups}",
-                header.num_groups
-            )));
-        }
-
-        // 1 group 分 (len + w/m/v/slow の f32 × len) を読む helper。`expected_len` と
-        // file 記載 len の不一致 / overflow は `InvalidData` で reject。
-        let read_group = |r: &mut std::io::BufReader<std::fs::File>,
-                          name: &str,
-                          expected_len: usize|
-         -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
-            let mut buf8 = [0u8; 8];
-            read_exact_or_invalid(r, &mut buf8, &format!("group {name} len"))?;
-            let len_u64 = u64::from_le_bytes(buf8);
-            let len: usize = len_u64.try_into().map_err(|_| {
-                invalid_data(format!(
-                    "raw checkpoint group {name} len {len_u64} exceeds usize::MAX"
-                ))
-            })?;
-            if len != expected_len {
-                return Err(invalid_data(format!(
-                    "raw checkpoint group {name} len mismatch: got {len}, want {expected_len} \
-                     (network architecture mismatch)"
-                )));
-            }
-            let w_host = read_f32_vec_io(r, len, &format!("group {name} w"))?;
-            let m_host = read_f32_vec_io(r, len, &format!("group {name} m"))?;
-            let v_host = read_f32_vec_io(r, len, &format!("group {name} v"))?;
-            let slow_host = read_f32_vec_io(r, len, &format!("group {name} slow"))?;
-            Ok((w_host, m_host, v_host, slow_host))
-        };
-
-        // 各 group を読み出し → host Vec に保持 (全部読んでから upload する。途中で
-        // upload して途中 fail だと中途半端な state になるため)。group 0 は ft_w。
-        let ft_w_loaded = read_group(&mut r, "ft_w", self.feature_set.train_ft_in() * ft_out)?;
-        let mut loaded: Vec<RawCkptGroup> = Vec::with_capacity(expected_groups.len());
-        for (name, expected_len) in expected_groups {
-            loaded.push(read_group(&mut r, name, expected_len)?);
-        }
-        // EOF 確認 (trailing garbage は許容するが、足りないのは上で read_exact が弾く)。
-
-        // host → device upload。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ
-        // 量子化して載せ直す (checkpoint は真値 f32、mode 非依存)。
-        let (ftw_w, ftw_m, ftw_v, ftw_slow) = &ft_w_loaded;
+        // host → device upload (`loaded` の順序は `raw_ckpt_group_sources` = format の
+        // group 順)。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ量子化して
+        // 載せ直す (checkpoint は真値 f32、mode 非依存)。
+        let (ftw_w, ftw_m, ftw_v, ftw_slow) = &loaded[0];
         self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
         self.ft_w_m =
             MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
@@ -1459,7 +1194,6 @@ impl GpuTrainer {
             MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
         self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
 
-        // 残り 9 group (順序は `raw_ckpt_groups` = ft_b, l1_w, ..., l3_b)。
         macro_rules! up {
             ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                 let (w, m, v, s) = &loaded[$idx];
@@ -1469,28 +1203,27 @@ impl GpuTrainer {
                 self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
             }};
         }
-        up!(0, ft_b, ft_b_m, ft_b_v, ft_b_slow);
-        up!(1, l1_w, l1_w_m, l1_w_v, l1_w_slow);
-        up!(2, l1_b, l1_b_m, l1_b_v, l1_b_slow);
-        up!(3, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
-        up!(4, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
-        up!(5, l2_w, l2_w_m, l2_w_v, l2_w_slow);
-        up!(6, l2_b, l2_b_m, l2_b_v, l2_b_slow);
-        up!(7, l3_w, l3_w_m, l3_w_v, l3_w_slow);
-        up!(8, l3_b, l3_b_m, l3_b_v, l3_b_slow);
+        up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
+        up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
+        up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
+        up!(4, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
+        up!(5, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
+        up!(6, l2_w, l2_w_m, l2_w_v, l2_w_slow);
+        up!(7, l2_b, l2_b_m, l2_b_v, l2_b_slow);
+        up!(8, l3_w, l3_w_m, l3_w_v, l3_w_slow);
+        up!(9, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
-        // PSQT (任意): 最後の group として読む (save 側と対称)。
+        // PSQT (任意): 末尾 group (save 側と対称)。
         if let Some(psqt) = self.psqt.as_mut() {
-            let psqt_n = self.feature_set.ft_in() * self.num_buckets;
-            let (w_host, m_host, v_host, slow_host) = read_group(&mut r, "psqt_w", psqt_n)?;
-            psqt.w = DeviceBuffer::from_host(&self.stream, &w_host)?;
-            psqt.w_m = DeviceBuffer::from_host(&self.stream, &m_host)?;
-            psqt.w_v = DeviceBuffer::from_host(&self.stream, &v_host)?;
-            psqt.w_slow = DeviceBuffer::from_host(&self.stream, &slow_host)?;
+            let (w_host, m_host, v_host, slow_host) = &loaded[10];
+            psqt.w = DeviceBuffer::from_host(&self.stream, w_host)?;
+            psqt.w_m = DeviceBuffer::from_host(&self.stream, m_host)?;
+            psqt.w_v = DeviceBuffer::from_host(&self.stream, v_host)?;
+            psqt.w_slow = DeviceBuffer::from_host(&self.stream, slow_host)?;
         }
 
-        self.step_count = step_count;
-        Ok((superbatch, producer_run_id, lr_horizon))
+        self.step_count = header.step_count;
+        Ok((header.superbatch, header.producer_run_id, header.lr_horizon))
     }
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
