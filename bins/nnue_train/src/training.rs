@@ -1081,7 +1081,8 @@ pub(crate) fn build_experiment_logger_simple(
     ExperimentLogger::new(json_path, doc)
 }
 
-/// Simple アーキの層次元 preset 文字列 (`"<ft_out>x2-<l1_out>-<l2_out>"`) を
+/// Simple アーキの層次元 preset 文字列 (`"<l1>x2-<l2>-<l3>"`、`<l1>` = FT 出力、
+/// `<l2>` / `<l3>` = 隠れ層。`--arch` の help と同表記) を
 /// `(ft_out, l1_out, l2_out)` にパースする。
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
@@ -1093,7 +1094,7 @@ pub(crate) fn parse_simple_preset(
         .split_once('-')
         .ok_or_else(|| -> Box<dyn std::error::Error> {
             format!(
-                "--arch '{s}' must look like '<ft_out>x2-<l1_out>-<l2_out>' (e.g. '256x2-32-32')"
+                "--arch '{s}' must look like '<l1>x2-<l2>-<l3>' (e.g. '256x2-32-32')"
             )
             .into()
         })?;
@@ -1105,27 +1106,29 @@ pub(crate) fn parse_simple_preset(
     let ft_out: usize = ft_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{ft_out_str}' is not a non-negative integer FT dimension")
-                .into()
+            format!(
+                "--arch '{s}': '{ft_out_str}' is not a non-negative integer for the <l1> (FT) block"
+            )
+            .into()
         })?;
     let (l1_out_str, l2_out_str) =
         tail.split_once('-')
             .ok_or_else(|| -> Box<dyn std::error::Error> {
                 format!(
-                    "--arch '{s}': trailing block must look like '<l1_out>-<l2_out>' (got '{tail}')"
+                    "--arch '{s}': trailing block must look like '<l2>-<l3>' (got '{tail}')"
                 )
                 .into()
             })?;
     let l1_out: usize = l1_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{l1_out_str}' is not a non-negative integer L1 dimension")
+            format!("--arch '{s}': '{l1_out_str}' is not a non-negative integer for the <l2> block")
                 .into()
         })?;
     let l2_out: usize = l2_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{l2_out_str}' is not a non-negative integer L2 dimension")
+            format!("--arch '{s}': '{l2_out_str}' is not a non-negative integer for the <l3> block")
                 .into()
         })?;
     Ok((ft_out, l1_out, l2_out))
