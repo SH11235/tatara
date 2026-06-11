@@ -9,11 +9,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-: "${CUDA_OXIDE_TARGET:=sm_86}"
+# CUDA_OXIDE_TARGET はここでは既定値を与えない: kernel build は
+# `scripts/build-kernels.sh` が GPU 世代を auto-detect し、test 側の kernel
+# loader も env 未設定なら sm_75 (全世代で前方互換に動く既定) を使う。ここで
+# sm_86 等を埋めると sub-Ampere host で auto-detect が無効化され invalid PTX に
+# なる。特定 target を試すときだけ呼び出し側の環境変数で明示する。
 : "${LLVM_LINK_BIN:=/usr/bin/llvm-link-22}"
 : "${OPT_BIN:=/usr/bin/opt-22}"
 : "${LLC_BIN:=/usr/bin/llc-22}"
-export CUDA_OXIDE_TARGET LLVM_LINK_BIN OPT_BIN LLC_BIN
+export LLVM_LINK_BIN OPT_BIN LLC_BIN
 
 echo "== cargo fmt --all -- --check =="
 cargo fmt --all -- --check
