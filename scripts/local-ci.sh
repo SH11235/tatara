@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CUDA + LLVM が揃った開発機で workspace 全体 (GPU crate 含む) の fmt / clippy /
-# test を回すスクリプト。GitHub Actions 側 (`.github/workflows/checks.yaml`) は
+# kernel build / test を回すスクリプト。GitHub Actions 側 (`.github/workflows/checks.yaml`) は
 # GPU crate を exclude しているため、push 前にここで full check を回す必要がある。
 #
 # test は `--release` で実行する: GPU 数値同等性テストが debug build の f32 fma
