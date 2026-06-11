@@ -2256,10 +2256,12 @@ impl SimpleGpuTrainer {
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
             },
-            run_id,
-            superbatch,
-            self.step_count,
-            lr_horizon,
+            &RawCkptMeta {
+                run_id,
+                superbatch,
+                step_count: self.step_count,
+                lr_horizon,
+            },
             &self.raw_ckpt_group_sources(),
         )
     }

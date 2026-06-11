@@ -1095,10 +1095,12 @@ impl GpuTrainer {
                 ft_out: ft_out as u64,
                 topology,
             },
-            run_id,
-            superbatch,
-            self.step_count,
-            lr_horizon,
+            &RawCkptMeta {
+                run_id,
+                superbatch,
+                step_count: self.step_count,
+                lr_horizon,
+            },
             &self.raw_ckpt_group_sources(),
         )
     }

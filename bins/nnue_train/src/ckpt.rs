@@ -192,6 +192,20 @@ pub(crate) struct RawCkptArch<'a> {
     pub(crate) topology: &'a [u64],
 }
 
+/// raw checkpoint header の counter / lineage 部 (arch identity 以外の可変 field)。
+/// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
+pub(crate) struct RawCkptMeta<'a> {
+    /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
+    /// `lineage.parent_id` に使う)。空文字列は「未記録」。
+    pub(crate) run_id: &'a str,
+    /// この checkpoint が表す完了 superbatch 番号 (resume はこの +1 から)。
+    pub(crate) superbatch: usize,
+    /// Ranger lookahead step counter。
+    pub(crate) step_count: u64,
+    /// LR-schedule horizon (horizon を持たない schedule では `None`)。
+    pub(crate) lr_horizon: Option<usize>,
+}
+
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
 #[derive(Debug)]
 pub(crate) struct RawCkptHeader {
@@ -454,33 +468,29 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
 /// `<path>.tmp` へ `BufWriter` で書いてから `std::fs::rename` で atomic に置換する
 /// (書き込み途中で crash しても `<path>` は前回の完全な checkpoint のまま)。
 ///
-/// `run_id` はこの checkpoint を書き出す run の experiment.json `id`。空文字列、
-/// または [`MAX_RUN_ID_BYTES`] 超過 (warning を出して省略) のときは run id を持た
-/// ない checkpoint になり、resume 時の `lineage.parent_id` は解決されない。
-#[allow(clippy::too_many_arguments)]
+/// `meta.run_id` が空文字列、または [`MAX_RUN_ID_BYTES`] 超過 (warning を出して
+/// 省略) のときは run id を持たない checkpoint になり、resume 時の
+/// `lineage.parent_id` は解決されない。
 pub(crate) fn save_raw_checkpoint_file(
     path: &Path,
     stream: &CudaStream,
     arch: &RawCkptArch,
-    run_id: &str,
-    superbatch: usize,
-    step_count: u64,
-    lr_horizon: Option<usize>,
+    meta: &RawCkptMeta,
     groups: &[RawCkptGroupSource<'_>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 過長な run id (`{net_id}-{時刻}-{pid}`、通常数十バイト) は lineage という
     // メタデータのために学習を中断させる価値がない。上限超過時は埋め込みを
     // 省略 (長さ 0) し、warning を出して checkpoint 保存は続行する。
-    let run_id = if run_id.len() > MAX_RUN_ID_BYTES {
+    let run_id = if meta.run_id.len() > MAX_RUN_ID_BYTES {
         eprintln!(
             "[train] warning: producer run id ({} bytes) exceeds {MAX_RUN_ID_BYTES}; \
              omitting it from {} (resume lineage parent will be unresolved)",
-            run_id.len(),
+            meta.run_id.len(),
             path.display()
         );
         ""
     } else {
-        run_id
+        meta.run_id
     };
 
     if let Some(parent) = path.parent()
@@ -503,9 +513,9 @@ pub(crate) fn save_raw_checkpoint_file(
             &mut w,
             arch,
             run_id,
-            superbatch as u64,
-            step_count,
-            lr_horizon,
+            meta.superbatch as u64,
+            meta.step_count,
+            meta.lr_horizon,
             groups.len() as u64,
         )?;
         for g in groups {
