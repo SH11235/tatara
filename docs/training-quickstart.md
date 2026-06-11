@@ -75,7 +75,7 @@ change for real training are:
 | `--superbatches` | 10 | Number of superbatches to train. The default 10 is for smoke testing; use a much larger value for real training (see "How much to train" below) |
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
-| `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~100 MB ≈ 2 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
+| `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~1.8 GB (default LayerStack arch) ≈ 36 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
 | `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE). See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
@@ -160,7 +160,7 @@ architecture subcommand and omit `--data`: a smoke test runs that executes the
 
 ```bash
 target/release/nnue-train simple
-# → if a log to the effect of "[smoke] forward + backward OK" appears, the GPU path is healthy
+# → if the run ends with a "[smoke/simple] PASSED" line, the GPU path is healthy
 ```
 
 Or run the whole pipeline in a few seconds with a small run (1 sb × 3 batches):
@@ -180,8 +180,8 @@ target/release/nnue-train --data <PSV> \
 | `kernel artifact nnue_train.{cubin,ptx,ll} not found` | On the first build you need to generate the `.ll` with `cd bins/nnue_train && cargo-oxide build`. For details, see [docs/setup.md](setup.md) |
 | `libcublas.so` link / load errors | The CUDA Toolkit is in none of `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH`. Specify it explicitly with `CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` (both build.rs and runtime resolve via the same chain) |
 | `CUDA_ERROR_INVALID_PTX` (driver error 218) | On a sub-Ampere GPU (sm_75) with `CUDA_OXIDE_TARGET` unset. Export `CUDA_OXIDE_TARGET=sm_75`, then rebuild and rerun |
-| pos/s extremely low (< 500K on an RTX 3080 Ti) | Set `--threads` to about half your CPU core count and check whether the dataloader's prefetch is keeping up. `NNUE_TRAIN_STEP_PROFILE=1` prints the ms spent in each phase (h2d / fwd / bwd / optimizer) to stderr so you can see the breakdown |
-| rejected with `--batch-size % 16 != 0` | The tiled L1 kernel requires `b % 16 == 0` (fails via `debug_assert!`). Pass a multiple of 16 (the default 16384 satisfies the condition) |
+| pos/s extremely low (< 500K on an RTX 3080 Ti) | Increase `--threads` (start from your physical core count, see "Key options") and check whether the dataloader's prefetch is keeping up. `NNUE_TRAIN_STEP_PROFILE=1` prints the ms spent in each phase (h2d / fwd / bwd / optimizer) to stderr so you can see the breakdown |
+| rejected with `--batch-size must be a multiple of 16` | The tiled dense matmul kernels require `b % 16 == 0`, so the CLI rejects other values at startup. Pass a multiple of 16 (the default 16384 satisfies the condition) |
 
 ## Related
 

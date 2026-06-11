@@ -32,7 +32,7 @@ bullet-shogi 比 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×
 
 | アーキ | サブコマンド | 構造 |
 |---|---|---|
-| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(9 bucket、Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ 16 → 32 |
+| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(`--num-buckets`、既定 9。Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ `--l1`(既定 16)→ `--l2`(既定 32)|
 | **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <l1>x2-<l2>-<l3>` で指定(`l1` = FT 出力、`l2`/`l3` = 隠れ層、既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
 
 ### 入力 feature set
@@ -94,7 +94,7 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
-  記述文字列の組み立てと load 時照合
+  記述文字列の組み立てと load 時照合 (日本語のみ)
 
 ## 学習した net の使い方
 
@@ -112,12 +112,15 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 |---|---|
 | **NNUE** | Efficiently Updatable Neural Network — 将棋 / チェスエンジンで使われる軽量評価関数 |
 | **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
+| **L1f** | LayerStack アーキの bucket 非依存 (全 bucket 共有) L1 dense 層。出力は per-bucket L1 の出力に加算される |
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
 | **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
+| **PSQT** | Piece-Square Table — 駒種×マスごとの線形評価テーブル。LayerStack の `--psqt` で per-bucket PSQT 出力を network 出力に加算し、dense 経路は非マテリアル構造の学習に専念できる |
 | **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
+| **QA / QB / FV_SCALE** | 量子化スケール定数。QA = FT weight / bias の量子化 multiplier (`simple` アーキでは活性化で決まる: CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)。活性化出力は活性化関数に依らず常に 127-scale のため、FV_SCALE = `round(127 × QB / 学習 scale)` が net 出力を centipawn 評価値へ戻す係数になる |
 | **WDL** | Win/Draw/Loss — 対局結果ターゲット (1.0 / 0.5 / 0.0)。WDL lambda で教師 score と blend する。[docs/training-schedule.ja.md](docs/training-schedule.ja.md) を参照 |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |

@@ -13,8 +13,7 @@ can't: what each scheduler does and how it interacts with `--resume`.
 
 ## Learning rate schedule (`--lr-schedule`)
 
-`--lr-schedule` selects how the learning rate moves across the run. The default
-`step` is bit-identical to the historical `StepLR`. The options:
+`--lr-schedule` selects how the learning rate moves across the run. The options:
 
 - `step` (default) — multiply the LR by `--lr-gamma` every `--lr-step`
   superbatches.

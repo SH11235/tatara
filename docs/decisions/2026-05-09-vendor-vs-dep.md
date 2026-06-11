@@ -17,7 +17,7 @@ bullet-shogi 由来コード (PSV reader、ShogiBoard 等) と cuda-oxide では
 
 - **bullet-shogi 由来のコードは vendor**
   - 必要 file だけ手動 copy、最初の commit に元 commit hash を記載
-  - `ATTRIBUTION.md` に取り込み元・元ライセンス・取り込み済 file 一覧
+  - `ATTRIBUTION.md` に取り込み元・元ライセンスを記載
 - **cuda-oxide 由来は git dependency + rev pin**
   - `[dependencies] cuda-core = { git = "...", rev = "..." }`
   - alpha 期間は API 不安定なので **rev pin 必須**

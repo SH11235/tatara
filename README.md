@@ -38,7 +38,7 @@ vector.
 
 | Architecture | Subcommand | Structure |
 |---|---|---|
-| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (9 buckets; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → 16 → 32 |
+| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (`--num-buckets`, default 9; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
 | **Simple** | `simple` | A plain NNUE with no bucket split (FT → 2 hidden layers → single output). Layer dimensions are set with `--arch <l1>x2-<l2>-<l3>` (`l1` = FT output, `l2`/`l3` = hidden layers; default `256x2-32-32`); activation crelu / screlu / pairwise |
 
 ### Input feature set
@@ -108,6 +108,7 @@ For building the kernels and running the smoke test, see
   does what
 - [Arch string](docs/arch-string.md) — how the architecture-description string
   embedded in the quantised `.bin` header is assembled and checked at load time
+  (Japanese only)
 
 ## Using the trained net
 
@@ -126,12 +127,15 @@ own net, see the [setup guide](docs/setup.md).
 |---|---|
 | **NNUE** | Efficiently Updatable Neural Network — a lightweight evaluation function used by shogi / chess engines |
 | **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
+| **L1f** | The bucket-independent (shared across all buckets) L1 dense layer of the LayerStack architecture; its output is added to the per-bucket L1 output |
 | **PSV** | PackedSfenValue — a training-data format from bullet-shogi (one position + score + WDL) |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
+| **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
+| **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). Activation outputs are always on a 127 scale regardless of activation, so FV_SCALE = `round(127 × QB / training scale)` is the factor that converts the net output back to a centipawn evaluation |
 | **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
 | **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |
