@@ -97,6 +97,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **実験ログ doc は `docs/experiments/` に置く。同 directory は `.gitignore` 済み**
   で git 管理外 (頻繁に更新する作業記録のため)。worktree / PR の対象外、checkout 内
   で直接編集する。`docs/decisions/` (ADR) 等 tracked な doc は通常どおり PR。
+- **GitHub Issue を立てない課題の spec は `docs/issue/` に置く。同 directory も
+  `.gitignore` 済み**で git 管理外。1 file = 1 issue とし、対応 PR の merge 後に
+  file を削除する (= close)。運用詳細は同 directory の README.md。
 - **directory tree / 構成図は現状を反映**。「将来こうする」予定や削除済 directory
   を残さない。
 - **dated 検証ブロック禁止**: 「2026-05-11 に X 環境で確認」型の log は
