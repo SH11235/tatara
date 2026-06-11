@@ -14,6 +14,9 @@ use crate::trainer_common::BatchData;
 use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
 
 const B: usize = 64;
+// 重み buffer (w/m/v/slow/grad × ft_in) が VRAM を支配するため、テストは
+// FT 出力次元を縮小して並列実行時の他 GPU テストとの競合を避ける。
+const FT_OUT_TEST: usize = 256;
 const LOSS: LossKind = LossKind::Sigmoid { scale: 290.0 };
 
 fn make_trainer(
@@ -23,7 +26,7 @@ fn make_trainer(
     GpuTrainer::new(
         ctx,
         B,
-        DEFAULT_FT_OUT,
+        FT_OUT_TEST,
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
@@ -45,16 +48,20 @@ fn ft_factorize_init_export_is_bit_identical_to_off() -> Result<(), Box<dyn std:
     // OFF 構成と bit-identical (zero の畳み込みは +0.0)。spec も base に落ちる。
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
-    let t_off = make_trainer(&ctx, base)?;
-    let t_on = make_trainer(&ctx, base.with_ft_factorize())?;
-
-    let w_off = t_off.to_layerstack_weights()?;
-    let w_on = t_on.to_layerstack_weights()?;
+    // VRAM 節約のため trainer は逐次生成し同時保持しない。
+    let w_off = {
+        let t_off = make_trainer(&ctx, base)?;
+        t_off.to_layerstack_weights()?
+    };
+    let w_on = {
+        let t_on = make_trainer(&ctx, base.with_ft_factorize())?;
+        t_on.to_layerstack_weights()?
+    };
     assert_eq!(
         w_on.feature_set, base,
         "coalesce 後の spec は base に落ちる"
     );
-    assert_eq!(w_on.ft_w.len(), base.ft_in() * DEFAULT_FT_OUT);
+    assert_eq!(w_on.ft_w.len(), base.ft_in() * FT_OUT_TEST);
     assert_eq!(
         w_on.ft_w, w_off.ft_w,
         "学習前の coalesced ft_w は OFF と一致"
@@ -69,15 +76,21 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
     let fact = base.with_ft_factorize();
-    let mut t_off = make_trainer(&ctx, base)?;
-    let mut t_on = make_trainer(&ctx, fact)?;
-
     // smoke_dummy は実 index 列を factorizer 非依存に生成し、ON では仮想 index を
-    // append する — ON / OFF の batch は同じ実特徴を持つ。
+    // append する — ON / OFF の batch は同じ実特徴を持つ。VRAM 節約のため
+    // trainer は逐次生成し同時保持しない。
     let b_off = BatchData::smoke_dummy(B, base);
     let b_on = BatchData::smoke_dummy(B, fact);
-    let loss_off = t_off.step(&b_off.as_ref(), 1e-3, 0.5, LOSS)?;
-    let loss_on = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
+    let (loss_off, w_off) = {
+        let mut t_off = make_trainer(&ctx, base)?;
+        let loss = t_off.step(&b_off.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t_off.to_layerstack_weights()?)
+    };
+    let (loss_on, w_on) = {
+        let mut t_on = make_trainer(&ctx, fact)?;
+        let loss = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t_on.to_layerstack_weights()?)
+    };
 
     // 仮想行は zero-init なので step-1 の forward / loss は一致する
     // (loss_acc の atomic 加算順による揺らぎのみ許容)。
@@ -89,8 +102,6 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
 
     // optimizer 1 step 後: 仮想行は勾配を受けて動くため、coalesce 済み export は
     // OFF と一致しなくなる (実 block の更新は同一勾配なので、差分 = 仮想行の学習)。
-    let w_off = t_off.to_layerstack_weights()?;
-    let w_on = t_on.to_layerstack_weights()?;
     assert_eq!(w_on.ft_w.len(), w_off.ft_w.len());
     assert!(
         w_on.ft_w != w_off.ft_w,
@@ -115,12 +126,12 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     let loaded = nnue_format::LayerStackWeights::load_quantised(
         &mut std::io::Cursor::new(&buf),
         base,
-        DEFAULT_FT_OUT,
+        FT_OUT_TEST,
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
     )?;
     assert_eq!(loaded.feature_set, base);
-    assert_eq!(loaded.ft_w.len(), base.ft_in() * DEFAULT_FT_OUT);
+    assert_eq!(loaded.ft_w.len(), base.ft_in() * FT_OUT_TEST);
     Ok(())
 }
