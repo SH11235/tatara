@@ -338,6 +338,7 @@ name = "nnue-train"
 version = "0.4.0"
 dependencies = [
  "gpu-kernels",
+ "nnue-format",
  "serde",
  "serde_json",
  "shogi-features",

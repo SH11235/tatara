@@ -483,6 +483,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");
     }
 
-    println!("[smoke] PASSED — GpuTrainer skeleton OK (LayerStack arch full path)");
+    println!(
+        "[smoke] PASSED — GpuTrainer forward / backward / save OK (LayerStack arch full path)"
+    );
     Ok(())
 }

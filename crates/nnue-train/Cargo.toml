@@ -14,8 +14,8 @@ workspace = true
 [dependencies]
 # CPU-only training pipeline (schedule / dataloader / optimizer host state)。
 # GPU `#[kernel]` 定義は cuda-oxide の bin-entry inline 制約で
-# `bins/nnue_train/src/main.rs` 側に置く必要があり、本 crate は kernel launch を
-#持たず host 側ロジックのみに留める (GPU 非依存の test を CI に通すため
+# `bins/nnue_train/src/kernels/` 側に置く必要があり、本 crate は kernel launch を
+# 持たず host 側ロジックのみに留める (GPU 非依存の test を CI に通すため
 # `gpu-runtime` も非依存)。`gpu-kernels` は CPU reference 実装の流用のみ。
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
@@ -23,3 +23,8 @@ gpu-kernels = { workspace = true }
 # experiment.json (構造化実験ログ) の serialise。host-only、GPU build chain 非依存。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# `experiment::FV_SCALE` (本体依存を避けて持ち直した定数) が
+# `nnue_format::layerstack_weights::FV_SCALE` と同値であることをテストで担保する。
+nnue-format = { workspace = true }

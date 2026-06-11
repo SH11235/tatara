@@ -13,13 +13,13 @@
 //!   - `progress::adam_step::adam_step_cpu` — Adam optimizer 1 step (1 weight = 1 thread の reference)
 //!   - `progress::eval::eval_cpu` — validation/test 時の loss + histogram
 //! - `pointwise`: pointwise fused kernel suite の reference CPU 置き場
-//!   (SCReLU grad / WDL loss / WRM loss / AdamW / RAdam / Ranger)
+//!   (SCReLU fwd / grad、WDL loss、WRM loss、norm loss、AdamW / RAdam / Ranger)
 //! - `sparse`: sparse FT kernel suite (forward / backward) の reference CPU
-//! - `layerstack`: LayerStack arch 用 ~19 kernel
+//! - `layerstack`: LayerStack arch 用 kernel 群
 //!   (`ft_post_perspective` / `dense_mm` (+ bucket) / `crelu` /
-//!   `abs_pow2_scale` / `concat_l1sqr_main` / `elementwise` / `slice2d`) の
-//!   reference CPU。`bins/nnue_train` の `gpu_cpu_equivalence_tests` が使う。
-//!   kernel ↔ CPU ref 対応表は [`layerstack`] module doc 参照
+//!   `abs_pow2_scale` / `concat_l1sqr_main` / `elementwise` / `slice2d` /
+//!   `psqt`) の reference CPU。`bins/nnue_train` の `gpu_cpu_equivalence_tests`
+//!   が使う。kernel ↔ CPU ref 対応表は [`layerstack`] module doc 参照
 //!
 //! GPU kernel は呼び出し側 bin / experiment crate ごとに `#[kernel]` を inline
 //! 定義する (cuda-oxide 制約)。

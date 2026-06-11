@@ -2,7 +2,7 @@
 //! reference CPU 実装。
 //!
 //! GPU 側 (`#[kernel] fn dense_mm_fwd` / `dense_mm_bwd_input` / `dense_mm_bwd_weight`
-//! / `bias_grad`) は `bins/nnue_train/src/main.rs` に inline 定義 (cuda-oxide
+//! / `bias_grad`) は `bins/nnue_train/src/kernels/` に定義 (cuda-oxide
 //! bin-entry 制約)。**shared factorized L1f** layer
 //! (`combined (B×1536) → l1f_out (B×16)`) の forward / backward に使われる。
 //!

@@ -1163,7 +1163,8 @@ pub(crate) fn build_experiment_logger_simple(
     ExperimentLogger::new(json_path, doc)
 }
 
-/// Simple アーキの層次元 preset 文字列 (`"<ft_out>x2-<l1_out>-<l2_out>"`) を
+/// Simple アーキの層次元 preset 文字列 (`"<l1>x2-<l2>-<l3>"`、`<l1>` = FT 出力、
+/// `<l2>` / `<l3>` = 隠れ層。`--arch` の help と同表記) を
 /// `(ft_out, l1_out, l2_out)` にパースする。
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
@@ -1174,10 +1175,7 @@ pub(crate) fn parse_simple_preset(
     let (head, tail) = s
         .split_once('-')
         .ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!(
-                "--arch '{s}' must look like '<ft_out>x2-<l1_out>-<l2_out>' (e.g. '256x2-32-32')"
-            )
-            .into()
+            format!("--arch '{s}' must look like '<l1>x2-<l2>-<l3>' (e.g. '256x2-32-32')").into()
         })?;
     let ft_out_str = head
         .strip_suffix("x2")
@@ -1187,27 +1185,27 @@ pub(crate) fn parse_simple_preset(
     let ft_out: usize = ft_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{ft_out_str}' is not a non-negative integer FT dimension")
-                .into()
+            format!(
+                "--arch '{s}': '{ft_out_str}' is not a non-negative integer for the <l1> (FT) block"
+            )
+            .into()
         })?;
     let (l1_out_str, l2_out_str) =
         tail.split_once('-')
             .ok_or_else(|| -> Box<dyn std::error::Error> {
-                format!(
-                    "--arch '{s}': trailing block must look like '<l1_out>-<l2_out>' (got '{tail}')"
-                )
-                .into()
+                format!("--arch '{s}': trailing block must look like '<l2>-<l3>' (got '{tail}')")
+                    .into()
             })?;
     let l1_out: usize = l1_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{l1_out_str}' is not a non-negative integer L1 dimension")
+            format!("--arch '{s}': '{l1_out_str}' is not a non-negative integer for the <l2> block")
                 .into()
         })?;
     let l2_out: usize = l2_out_str
         .parse()
         .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("--arch '{s}': '{l2_out_str}' is not a non-negative integer L2 dimension")
+            format!("--arch '{s}': '{l2_out_str}' is not a non-negative integer for the <l3> block")
                 .into()
         })?;
     Ok((ft_out, l1_out, l2_out))
@@ -1314,6 +1312,23 @@ pub(crate) fn run_simple_training(
     let ft_out = simple_args.l1.unwrap_or(preset_ft_out);
     let l1_out = simple_args.l2.unwrap_or(preset_l1_out);
     let l2_out = simple_args.l3.unwrap_or(preset_l2_out);
+    // `SimpleGpuTrainer::new` の検査は `ft_out % 4 == 0` のみで 0 を素通しする
+    // (`0 % 4 == 0`)。0 次元は層が機能しない退化アーキのまま学習が走ってしまう
+    // ので、CLI で分かる error にして reject する。
+    if ft_out == 0 || !ft_out.is_multiple_of(4) {
+        return Err(format!(
+            "Simple FT output dimension must be a positive multiple of 4 (got {ft_out}); \
+             set it via --arch '<l1>x2-<l2>-<l3>' (the <l1> block) or --l1"
+        )
+        .into());
+    }
+    if l1_out == 0 || l2_out == 0 {
+        return Err(format!(
+            "Simple hidden layer dimensions must be >= 1 (got <l2>={l1_out}, <l3>={l2_out}); \
+             set them via --arch '<l1>x2-<l2>-<l3>' or --l2 / --l3"
+        )
+        .into());
+    }
     let activation = SimpleActivation::from_canonical_name(&simple_args.activation).ok_or_else(
         || -> Box<dyn std::error::Error> {
             format!(
@@ -1511,6 +1526,34 @@ mod tests {
         // global init flag を subcommand の前に置く。layerstack は追加必須引数なし。
         argv.push("layerstack");
         Cli::try_parse_from(argv).expect("cli parse")
+    }
+
+    #[test]
+    fn parse_simple_preset_accepts_valid_presets() {
+        assert_eq!(parse_simple_preset("256x2-32-32").unwrap(), (256, 32, 32));
+        assert_eq!(
+            parse_simple_preset("1024x2-128-64").unwrap(),
+            (1024, 128, 64)
+        );
+        assert_eq!(parse_simple_preset("512x2-8-64").unwrap(), (512, 8, 64));
+    }
+
+    #[test]
+    fn parse_simple_preset_rejects_malformed_input() {
+        // 'x2' suffix 欠落 / block 不足 / 非整数 / 空文字列。
+        assert!(parse_simple_preset("256-32-32").is_err());
+        assert!(parse_simple_preset("256x2-32").is_err());
+        assert!(parse_simple_preset("ax2-32-32").is_err());
+        assert!(parse_simple_preset("256x2-a-32").is_err());
+        assert!(parse_simple_preset("256x2-32-a").is_err());
+        assert!(parse_simple_preset("").is_err());
+    }
+
+    #[test]
+    fn parse_simple_preset_passes_zero_dims_to_caller_validation() {
+        // parse 自体は 0 を通す (型上は非負整数)。0 次元の reject は
+        // `run_simple_training` の次元検証が担う。
+        assert_eq!(parse_simple_preset("0x2-0-0").unwrap(), (0, 0, 0));
     }
 
     #[test]

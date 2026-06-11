@@ -40,7 +40,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 
 /// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
 /// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
-/// 依存しないため定数を持ち直す。
+/// 本体依存しないため定数を持ち直す (同値性は dev-dependency 経由のテストで固定)。
 const FV_SCALE: i32 = 28;
 
 // =============================================================================
@@ -562,6 +562,13 @@ fn civil_from_epoch(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 持ち直した定数 (定義箇所の doc 参照) が `nnue-format` 側と乖離すると
+    /// experiment.json が誤った `fv_scale` を記録するため、同値性を固定する。
+    #[test]
+    fn fv_scale_matches_nnue_format() {
+        assert_eq!(FV_SCALE, nnue_format::layerstack_weights::FV_SCALE);
+    }
 
     fn sample_params() -> Params {
         Params {

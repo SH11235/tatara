@@ -263,6 +263,9 @@ pub(crate) fn memset_minus_one_i32(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = buf.num_bytes();
     if bytes > 0 {
+        // SAFETY: [`memset_zero`] と同じ前提 — `buf.cu_deviceptr()` は本
+        // `DeviceBuffer` が確保した `bytes` byte の有効 device ptr、`stream` は
+        // 同 context。0xFF fill が i32 の -1 になる根拠は関数 doc を参照。
         unsafe {
             cuda_core::memory::memset_d8_async(
                 buf.cu_deviceptr(),
@@ -302,6 +305,12 @@ pub(crate) fn copy_host_to_device_async_i32(
     if bytes == 0 {
         return Ok(());
     }
+    // SAFETY: `buf.cu_deviceptr()` は確保済みの有効 device ptr で、直上の assert
+    // により `bytes` は容量内。`stream` は同 context。copy は async のため `src`
+    // の生存は caller が保証する: pinned 経路 (`InputUploadRing`) は h2d 完了
+    // event で slot 再利用を gate し、pageable 経路 (`BatchData` の slice) は
+    // 「pageable src は staging へ copy してから return する」という CUDA Driver
+    // API の同期挙動 (API synchronization behavior) に依る。
     unsafe {
         cuda_core::memory::memcpy_htod_async(
             buf.cu_deviceptr(),
@@ -328,6 +337,8 @@ pub(crate) fn copy_host_to_device_async_f32(
     if bytes == 0 {
         return Ok(());
     }
+    // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
+    // 同 context + `src` 生存は caller 保証)。
     unsafe {
         cuda_core::memory::memcpy_htod_async(
             buf.cu_deviceptr(),

@@ -586,8 +586,8 @@ pub(crate) struct LayerstackArgs {
     /// non-material structure on top of the material prior carried by PSQT.
     ///
     /// Default OFF for bit-identical compatibility with non-PSQT checkpoints.
-    /// When enabled the saved `.bin` carries an extra `PSQT=9,` token in the
-    /// arch string plus an i32 PSQT block (scale `QA * QB = 8128`).
+    /// When enabled the saved `.bin` carries an extra `PSQT=<num-buckets>,`
+    /// token in the arch string plus an i32 PSQT block (scale `QA * QB = 8128`).
     #[arg(long)]
     pub(crate) psqt: bool,
 
