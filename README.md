@@ -135,7 +135,7 @@ own net, see the [setup guide](docs/setup.md).
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
-| **QA / QB / FV_SCALE** | Quantisation scale constants: QA = activation-output scale (127 for CReLU / Pairwise, 255 for SCReLU), QB = dense-weight scale (64), FV_SCALE = the factor that converts the net output back to a centipawn evaluation (`round(QA*QB / training scale)`) |
+| **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). Activation outputs are always on a 127 scale regardless of activation, so FV_SCALE = `round(127 × QB / training scale)` is the factor that converts the net output back to a centipawn evaluation |
 | **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
 | **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |

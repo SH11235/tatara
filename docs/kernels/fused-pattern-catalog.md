@@ -10,10 +10,12 @@ crate 内に置く: `nnue-train` は `bins/nnue_train/src/kernels/` の 3 file
 (`common` / `layerstack` / `simple`)、`progress-kpabs-train` は
 `bins/progress_kpabs_train/src/main.rs`。主要 kernel には `crates/gpu-kernels/`
 配下に reference CPU 実装があり、GPU↔CPU の数値同等性テストは
-`bins/nnue_train/src/tests/gpu_cpu_equivalence_tests.rs` が持つ。ただし
-**全 kernel が同等性テストで照合されているわけではない** (FP16 variant・
-sort / permute 系・Simple 専用 kernel の多くは smoke と学習 run での検証のみ)。
-照合カバレッジの真実源は同テストファイル。
+`bins/nnue_train/src/tests/gpu_cpu_equivalence_tests.rs` が持つ
+(progress trainer kernel の同等性テストは `bins/progress_kpabs_train/src/main.rs`
+内のテスト)。ただし **全 kernel が同等性テストで照合されているわけではない**
+(optimizer step 系・`loss_wdl`・sparse FT forward / backward・PSQT 系・
+Simple 専用 kernel の多くは smoke と学習 run での検証のみ)。照合カバレッジの
+真実源は同テストファイル。
 
 ## Pointwise fused kernels
 
@@ -26,7 +28,7 @@ reference CPU: `crates/gpu-kernels/src/pointwise/`。
 | `loss_wrm` / `wrm_weight_sum` | WRM (win-rate-model) loss、prediction / target 双方に WRM 適用。重み付き loss の分母は `wrm_weight_sum` が集計 |
 | `adamw_step` | AdamW (decay + clip 込み) |
 | `radam_step` | RAdam (AdamW + bias correction + denom switch)。FP16 mirror / FP16 opt-state の variant (`_fp16_mirror` / `_f16state` / `_f16state_mirror`) を持つ |
-| `ranger_lookahead_lerp` | Ranger の lookahead (slow params lerp、k-step periodic)。`radam_step` と 2 kernel の組で Ranger を構成する |
+| `ranger_lookahead_lerp` | Ranger の lookahead (slow params lerp、k-step periodic)。FP16 mirror variant (`_fp16_mirror`) を持ち、`radam_step` と 2 kernel の組で Ranger を構成する |
 | `norm_loss_reduce` / `norm_loss_finalize` / `norm_loss_apply` | per-weight-group L2-norm 正則化 (`--norm-loss`) の norm 集計 → 係数化 → weight への適用 |
 
 ## Sparse FT kernels

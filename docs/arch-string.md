@@ -26,7 +26,7 @@ Features=<...>,Network=<...>,fv_scale=<N>
 ```
 
 LayerStack で `--psqt` を有効にした場合のみ、Features と Network の間に
-`PSQT=<num_buckets>,` トークンが挿入される (`.bin` 末尾の PSQT block の存在と
+`PSQT=<num_buckets>,` トークンが挿入される (`.bin` 内の PSQT block の存在と
 bucket 数を自己記述する):
 
 ```
@@ -72,7 +72,8 @@ pairwise 乗算で FT 出力が半減することを `/2` と `-Pairwise` suffix
 
 ### fv_scale
 
-`fv_scale=<N>` は推論時に評価値スケールへ戻す係数 (`round(QA*QB / 学習 scale)`)。
+`fv_scale=<N>` は推論時に評価値スケールへ戻す係数 (`round(127 × QB / 学習 scale)`。
+活性化出力が常に 127-scale のため活性化非依存)。
 学習の `--scale` 由来なので、同じ topology でも学習設定が違えば値が変わる。この
 ため **identity 照合には含めない** (後述)。
 

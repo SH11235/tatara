@@ -94,7 +94,7 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
-  記述文字列の組み立てと load 時照合
+  記述文字列の組み立てと load 時照合 (日本語のみ)
 
 ## 学習した net の使い方
 
@@ -120,7 +120,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
-| **QA / QB / FV_SCALE** | 量子化スケール定数。QA = 活性化出力の scale (CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)、FV_SCALE = net 出力を centipawn 評価値へ戻す係数 (`round(QA*QB / 学習 scale)`) |
+| **QA / QB / FV_SCALE** | 量子化スケール定数。QA = FT weight / bias の量子化 multiplier (`simple` アーキでは活性化で決まる: CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)。活性化出力は活性化関数に依らず常に 127-scale のため、FV_SCALE = `round(127 × QB / 学習 scale)` が net 出力を centipawn 評価値へ戻す係数になる |
 | **WDL** | Win/Draw/Loss — 対局結果ターゲット (1.0 / 0.5 / 0.0)。WDL lambda で教師 score と blend する。[docs/training-schedule.ja.md](docs/training-schedule.ja.md) を参照 |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
