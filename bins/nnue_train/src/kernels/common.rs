@@ -1012,10 +1012,10 @@ pub fn ft_fold_virtual(
 
 /// [`ft_fold_virtual`] の f16 出力版 (`--ft-fp16` 系列の forward 用 mirror を畳み
 /// 込みと同時に生成する)。f32 で加算してから 1 回だけ f16 へ丸める。和の f16
-/// clamp はしない: ここで丸める和 (実行 + 仮想行) は export の coalesce が
-/// i16 飽和検査に掛ける値と同一で、その飽和閾値は f16 有限上限 (65504) より
-/// 2 桁以上小さい — overflow に至る重み成長は checkpoint 保存のたびに先に
-/// 検出される。
+/// clamp はしない: ここで丸める和 (実行 + 仮想行) は量子化 export
+/// (`save_quantised`) の coalesce が i16 飽和検査に掛ける値と同一で、その飽和
+/// 閾値は f16 有限上限 (65504) より 2 桁以上小さい — overflow に至る重み成長は
+/// 量子化 `.bin` 保存のたびに先に検出される。
 #[kernel]
 pub fn ft_fold_virtual_f16(
     w: &[f32],

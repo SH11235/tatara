@@ -79,10 +79,11 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   through dense fold / reduce kernels, not through sparse indices). The
 ///   flag pins whether the checkpoint's FT weight rows include the
 ///   training-time virtual factorizer block; resuming across
-///   `--ft-factorize` on/off is rejected. Factorized v6 files written while
-///   virtual features still went through the sparse index stream recorded
-///   `2 × max_active` in this field; the reader accepts that legacy value
-///   too, because the tensor payload of both layouts is identical.
+///   `--ft-factorize` on/off is rejected. Some factorized v6 files record
+///   `2 × max_active` in this field (written by an implementation that
+///   routed virtual features through the sparse index stream); the reader
+///   accepts that value too, because the tensor payload is identical either
+///   way.
 ///
 /// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
@@ -366,12 +367,12 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.ft_out
             )));
         }
-        // factorize 有効時は base に加え 2×base も受理する: 仮想特徴を sparse
-        // index 列に流していた旧 v6 writer は train 値 (= 2×base) を書いたが、
-        // tensor payload (group 長は train_ft_in 由来) は現 layout と完全同一
-        // で、この field の差だけで読める checkpoint を弾く理由がない。両
-        // layout とも version 6 を名乗って存在するため、version でなく値で
-        // 弁別するしかない。
+        // factorize 有効時は base に加え 2×base も受理する: v6 の factorized
+        // file には、仮想特徴を sparse index 列に流す実装が書いた 2×base 値の
+        // 個体が存在する (RAW_CKPT_VERSION doc 参照)。tensor payload (group 長
+        // は train_ft_in 由来) は max_active 値に依らず同一で、この field の差
+        // だけで読める checkpoint を弾く理由がない。version 番号では弁別でき
+        // ないため値で受理する。
         let legacy_factorized_max_active =
             want.ft_factorize() && ckpt_max_active == 2 * want.max_active() as u64;
         if ckpt_max_active != want.max_active() as u64 && !legacy_factorized_max_active {

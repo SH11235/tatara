@@ -623,8 +623,9 @@ pub(crate) struct LayerstackArgs {
     /// The sparse input stream is unchanged (the active-feature count stays
     /// the base value); virtual rows are wired through two dense kernels per
     /// optimizer step (a forward weight fold and a backward gradient
-    /// reduction), costing a few percent of training throughput and zero
-    /// inference cost. Default OFF is bit-identical to the non-factorized
+    /// reduction), costing a single-digit percentage of training throughput
+    /// and zero inference cost. Default OFF is bit-identical to the
+    /// non-factorized
     /// path. Resume across on/off is rejected (checkpoint dimensions differ).
     /// Incompatible with `--psqt` (the PSQT table has no virtual-row fold or
     /// export design) and with `--init-from` (a quantised `.bin` has no

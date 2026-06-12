@@ -1313,7 +1313,8 @@ impl GpuTrainer {
     /// 現在の `ft_w` (FP32 master) から再生成する。
     ///
     /// 構築時 (`GpuTrainer::new` 末尾) の初期同期と、master を後から上書きする
-    /// 経路 (`--resume` の load 後) の再同期が役目。学習中は factorizer 無効 +
+    /// 経路 (`--init-from` / `--resume` の load 後) の再同期が役目。学習中は
+    /// factorizer 無効 +
     /// `--ft-fp16` の mirror を optimizer (`radam_step_fp16_mirror` /
     /// `ranger_lookahead_lerp_fp16_mirror`) が `ft_w` 更新と同時に書き、
     /// factorizer 有効時の comb は毎 step 末の
@@ -1344,7 +1345,10 @@ impl GpuTrainer {
     /// (constructor が「factorize ⇒ comb buffer がちょうど 1 つ」を確立済みで、
     /// buffer 欠落は配線バグなので silent skip せず fail-fast にする)。
     fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        debug_assert!(self.feature_set.ft_factorize());
+        // release でも検査する: 非 factorize で誤呼び出しされると ft_fp16 構成
+        // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
+        // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
+        assert!(self.feature_set.ft_factorize());
         let base_ft_in = self.feature_set.ft_in();
         let pi = self.feature_set.piece_inputs();
         let n = base_ft_in * self.ws.ft_out;

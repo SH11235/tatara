@@ -167,9 +167,10 @@ fn raw_ckpt_header_ft_factorize_round_trips() {
 
 #[test]
 fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
-    // 仮想特徴を sparse index 列に流していた旧 v6 writer は max_active に
-    // train 値 (= 2×base) を書いた。tensor payload は現 layout と完全同一の
-    // ため reader は両値を受理する (base 値側は round-trip テストが担保)。
+    // v6 の factorized file には max_active = 2×base の個体が存在する (仮想
+    // 特徴を sparse index 列に流す実装が書いたもの、RAW_CKPT_VERSION doc 参照)。
+    // tensor payload は max_active 値に依らず同一のため reader は両値を受理
+    // する (base 値側は round-trip テストが担保)。
     let arch = layerstack_arch_factorized();
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &arch, "run-legacy", 3, 30, None, 10).unwrap();
