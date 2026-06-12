@@ -1,10 +1,12 @@
-//! FT factorizer の trainer 結合テスト (GPU 必要)。
+//! FT factorizer の trainer 結合テスト (大半は GPU 必要)。
 //!
 //! 仮想行 zero-init の不変条件 (step-1 の forward が OFF 構成と一致する) と、
 //! export coalesce (`to_layerstack_weights` が base 形状 + base spec を返す) を
-//! 実 GPU trainer で検証する。
+//! 実 GPU trainer で検証する。dataloader `Batch` → `BatchData` の stride 整合
+//! のみ CPU で検証する。
 
 use gpu_runtime::CudaContext;
+use nnue_train::dataloader::Batch;
 use nnue_train::init::LayerStackInit;
 use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSet;
@@ -12,6 +14,22 @@ use shogi_features::FeatureSet;
 use crate::arch::*;
 use crate::trainer_common::BatchData;
 use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+
+#[test]
+fn ft_factorize_batch_to_batchdata_uses_train_stride() {
+    // 本番 dataloader 経路 (`Batch` → `BatchData::from_batch_ref`) の stride
+    // 照合が factorized spec の train 値で整合することを検証する (GPU 不要)。
+    // GPU テスト群は `BatchData::smoke_dummy` で `Batch` 型を bypass するため、
+    // この変換だけは単体で押さえる。
+    let fact = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
+    let mut batch = Batch::with_capacity(4, fact);
+    batch.n_positions = 2;
+    let bucket_idx = [0_i32, 0];
+    let data = BatchData::from_batch_ref(&batch, &bucket_idx);
+    assert_eq!(data.n_pos, 2);
+    assert_eq!(data.stm_indices.len(), 2 * fact.train_max_active());
+    assert_eq!(data.nstm_indices.len(), 2 * fact.train_max_active());
+}
 
 const B: usize = 64;
 // 重み buffer (w/m/v/slow/grad × ft_in) が VRAM を支配するため、テストは

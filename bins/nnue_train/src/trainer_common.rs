@@ -197,11 +197,11 @@ impl BatchData<'_> {
 
     pub(crate) fn from_batch_inner<'a>(batch: &'a Batch, bucket_idx: &'a [i32]) -> BatchData<'a> {
         let n_pos = batch.n_positions;
-        let max_active = batch.feature_set.max_active();
+        let max_active = batch.feature_set.train_max_active();
         assert_eq!(
             batch.max_active,
             max_active,
-            "Batch::max_active ({}) must equal feature set '{}' max_active ({})",
+            "Batch::max_active ({}) must equal feature set '{}' train_max_active ({})",
             batch.max_active,
             batch.feature_set.canonical_name(),
             max_active
