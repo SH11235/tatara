@@ -14,12 +14,13 @@ use crate::trainer_common::MomentBuf;
 // layout (全 little-endian、現行 RAW_CKPT_VERSION = 6):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (5)             (4 bytes)
+//   version      u32 (6)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
-//   ft_in        u64                 (FT 入力次元、feature set 依存)
+//   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
 //   ft_out       u64                 (FT 出力次元、`--ft-out`)
-//   max_active   u64                 (1 perspective あたり active feature 数)
+//   max_active   u64                 (学習側の 1 perspective あたり active feature 数)
+//   ft_factorize u8                  (v6+、FT factorizer 有効 flag)
 //   run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
 //   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
@@ -82,7 +83,7 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// interpreted as `layerstack`. Versions above 6 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
-/// versions 1..=6.
+/// versions 1..=5.
 pub(crate) const RAW_CKPT_VERSION: u32 = 6;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
