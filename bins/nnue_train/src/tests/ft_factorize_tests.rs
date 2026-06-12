@@ -90,28 +90,52 @@ fn ft_factorize_init_export_is_bit_identical_to_off() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn ft_fold_virtual_cpu_matches_export_coalesce() {
+    // 学習時 forward が読む comb (fold) と export の畳み込み (coalesce) は同じ
+    // 「実行 + 同 p の仮想行」の和。数式は GPU kernel ×2 / CPU reference /
+    // export の 4 実装に分散しているため、CPU reference と export 実装を直接
+    // 照合して片側だけの仕様変更 (学習時 forward と export 重みが乖離する
+    // silent drift) を能動検出する。GPU kernel 側は gpu_cpu_equivalence_tests
+    // が CPU reference へ照合済みなので、この 1 本で 4 実装が鎖で繋がる。
+    // どちらも 1 要素 1 加算で演算列が同一なので比較は bit 一致 (GPU 不要)。
+    let spec = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
+    let ft_out = 4;
+    let train_n = spec.train_ft_in() * ft_out;
+    let w: Vec<f32> = (0..train_n)
+        .map(|i| ((i * 31 % 197) as f32 - 98.0) * 0.011)
+        .collect();
+
+    let mut comb = vec![0.0_f32; spec.ft_in() * ft_out];
+    gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
+        &w,
+        &mut comb,
+        spec.ft_in(),
+        ft_out,
+        spec.piece_inputs(),
+    );
+    let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
+    assert_eq!(comb, coalesced);
+}
+
+#[test]
 fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
     let fact = base.with_ft_factorize();
-    // index 列は factorizer 非依存 (smoke_dummy も ON / OFF で同一の実 index 列を
-    // 返す) — ON の仮想行は trainer の fold / reduce kernel だけが配線する。VRAM
-    // 節約のため trainer は逐次生成し同時保持しない。`sync_ft_forward_weights` は
-    // production (`run_training`) と同じく最初の forward 前に必須 (ON の forward
-    // が読む comb は constructor では zero のまま)。
-    let b_off = BatchData::smoke_dummy(B, base);
-    let b_on = BatchData::smoke_dummy(B, fact);
+    // index 列は factorizer 非依存なので ON / OFF で同一 batch を共有する —
+    // 「両者が同じ実特徴を見る」前提を fixture の同一性で構造的に保証する。
+    // ON の仮想行は trainer の fold / reduce kernel だけが配線する。VRAM
+    // 節約のため trainer は逐次生成し同時保持しない。
+    let batch = BatchData::smoke_dummy(B, base);
     let (loss_off, w_off) = {
         let mut t_off = make_trainer(&ctx, base)?;
-        t_off.sync_ft_forward_weights()?;
-        let loss = t_off.step(&b_off.as_ref(), 1e-3, 0.5, LOSS)?;
+        let loss = t_off.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
         (loss, t_off.to_layerstack_weights()?)
     };
     let (loss_on, w_on) = {
         let mut t_on = make_trainer(&ctx, fact)?;
-        t_on.sync_ft_forward_weights()?;
-        let loss = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
+        let loss = t_on.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
         (loss, t_on.to_layerstack_weights()?)
     };
 
@@ -152,7 +176,6 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
     let mut t_on = make_trainer(&ctx, base.with_ft_factorize())?;
-    t_on.sync_ft_forward_weights()?;
     let b_on = BatchData::smoke_dummy(B, base.with_ft_factorize());
     let _ = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
 

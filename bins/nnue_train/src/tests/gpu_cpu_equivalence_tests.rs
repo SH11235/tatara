@@ -3179,7 +3179,6 @@ fn ft_fold_virtual_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let (ft_in, ft_out, pi, grad_init) = ft_factorize_fixture();
-    let train_n = (ft_in + pi) * ft_out;
 
     let mut grad_cpu = grad_init.clone();
     ft_reduce_virtual_grad_cpu(&mut grad_cpu, ft_in, ft_out, pi);
@@ -3203,7 +3202,6 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
         &grad_cpu[ft_in * ft_out..],
         TOL,
     );
-    assert_eq!(got.len(), train_n);
     Ok(())
 }
 

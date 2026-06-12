@@ -166,6 +166,41 @@ fn raw_ckpt_header_ft_factorize_round_trips() {
 }
 
 #[test]
+fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
+    // 仮想特徴を sparse index 列に流していた旧 v6 writer は max_active に
+    // train 値 (= 2×base) を書いた。tensor payload は現 layout と完全同一の
+    // ため reader は両値を受理する (base 値側は round-trip テストが担保)。
+    let arch = layerstack_arch_factorized();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "run-legacy", 3, 30, None, 10).unwrap();
+    let base = arch.feature_set.max_active() as u64;
+    // max_active field の offset = magic(4) + version(4) + name_len(4) +
+    // name + ft_in(8) + ft_out(8)。書き換え前に base 値が居ることを確認して
+    // fixture が field を正しく指していることを固定する。
+    let off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8;
+    assert_eq!(
+        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()),
+        base,
+        "fixture must point at the max_active field"
+    );
+    buf[off..off + 8].copy_from_slice(&(2 * base).to_le_bytes());
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (3, 30, 10));
+
+    // 互換受理は factorize 限定: 非 factorize の 2×base は従来どおり reject。
+    let off_arch = layerstack_arch();
+    let mut buf_off = Vec::new();
+    write_raw_ckpt_header(&mut buf_off, &off_arch, "", 1, 0, None, 10).unwrap();
+    buf_off[off..off + 8].copy_from_slice(&(2 * base).to_le_bytes());
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf_off), &off_arch)
+        .expect_err("non-factorize header with 2x max_active must be rejected");
+    assert!(
+        err.to_string().contains("max_active"),
+        "error should mention max_active: {err}"
+    );
+}
+
+#[test]
 fn raw_ckpt_header_rejects_ft_factorize_mismatch() {
     // on で書いた header を off expected で読む / その逆 — どちらも次元照合より
     // 先に ft-factorize mismatch として reject される (原因が読めるエラー)。

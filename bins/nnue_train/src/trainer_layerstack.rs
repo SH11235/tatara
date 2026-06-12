@@ -610,10 +610,17 @@ impl GpuTrainer {
     /// `enable_tf32` は cuBLAS の `cublasSetMathMode` 引数を切替 ([`CublasHandle::new`])、
     /// `true` で Ampere+ TC TF32 mode、`false` で純 FP32。default は CLI 側で OFF。
     ///
-    /// `ft_fp16` が true なら FP16 weight mirror (`ft_w_h`) を確保し、forward の
-    /// `sparse_ft_forward` を FP16 版に切替える。false なら mirror は未確保で従来 path。
+    /// `ft_fp16` が true なら forward 用 f16 weight (`ft_w_h` — factorizer 無効時は
+    /// master の cast mirror、有効時は base 形状の畳み込み済み comb、field doc 参照)
+    /// を確保し、forward を FP16 版に切替える。false なら未確保で従来 path。
     /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
     /// caller が validation 済)。
+    ///
+    /// forward 用 FT weight (mirror / comb) は構築時に初期重みと同期されるため、
+    /// 返った trainer はそのまま `step` / `validate` できる。`--init-from` /
+    /// `--resume` で master を後から上書きする経路だけが
+    /// [`sync_ft_forward_weights`](Self::sync_ft_forward_weights) の再呼び出しを
+    /// 必要とする。
     ///
     /// `ft_out` は FT 出力次元 (1 perspective あたり、`--ft-out`)、`l1_out` は L1
     /// (per-bucket dense) 層の出力次元 (`--l1`)、`l2_out` は L2 (per-bucket dense)
@@ -745,7 +752,7 @@ impl GpuTrainer {
 
         // Ranger Lookahead の slow weight は **0 初期化**。初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
-        Ok(Self {
+        let mut trainer = Self {
             stream: stream.clone(),
             module,
             // FT
@@ -852,7 +859,13 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             step_count: 0,
-        })
+        };
+        // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
+        // step / validate 可能にする (zero のままの buffer を初回 forward が読む
+        // 呼び出し順依存を持たない)。master を後から上書きする経路 (--init-from /
+        // --resume) は load 後に caller が再同期する。
+        trainer.sync_ft_forward_weights()?;
+        Ok(trainer)
     }
 
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
@@ -1299,13 +1312,13 @@ impl GpuTrainer {
     /// forward が読む FT weight buffer (`ft_w_h` mirror / factorizer の comb) を
     /// 現在の `ft_w` (FP32 master) から再生成する。
     ///
-    /// factorizer 無効 + `--ft-fp16` の mirror は学習中 optimizer
-    /// (`radam_step_fp16_mirror` / `ranger_lookahead_lerp_fp16_mirror`) が `ft_w`
-    /// 更新と同時に書く。ただし学習開始時は optimizer 未実行で mirror が初期 0 の
-    /// ままなので、最初の forward の前に一度だけ明示同期する。factorizer 有効時の
-    /// comb は毎 step 末の [`launch_ft_fold`](Self::launch_ft_fold) が維持するが、
-    /// 初回 forward 前の生成は同じくここが担う。どちらにも該当しない構成
-    /// (FP32 + factorizer 無効) は no-op。
+    /// 構築時 (`GpuTrainer::new` 末尾) の初期同期と、master を後から上書きする
+    /// 経路 (`--resume` の load 後) の再同期が役目。学習中は factorizer 無効 +
+    /// `--ft-fp16` の mirror を optimizer (`radam_step_fp16_mirror` /
+    /// `ranger_lookahead_lerp_fp16_mirror`) が `ft_w` 更新と同時に書き、
+    /// factorizer 有効時の comb は毎 step 末の
+    /// [`launch_ft_fold`](Self::launch_ft_fold) が維持する。どちらにも該当しない
+    /// 構成 (FP32 + factorizer 無効) は forward が master を直接読むため no-op。
     pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.feature_set.ft_factorize() {
             return self.launch_ft_fold();
@@ -1327,15 +1340,19 @@ impl GpuTrainer {
     /// base 形状) を `ft_w` (train 形状の FP32 master) から再生成する。
     /// `--ft-fp16` 系列では f16 comb (`ft_w_h`)、FP32 では f32 comb (`ft_w_fold32`)。
     /// optimizer / lookahead / norm loss が master を書き換えた後、次の forward が
-    /// 読む前に毎 step 1 回呼ぶ。factorizer 無効時は no-op。
+    /// 読む前に毎 step 1 回呼ぶ。caller が factorizer 有効を保証する
+    /// (constructor が「factorize ⇒ comb buffer がちょうど 1 つ」を確立済みで、
+    /// buffer 欠落は配線バグなので silent skip せず fail-fast にする)。
     fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.feature_set.ft_factorize() {
-            return Ok(());
-        }
+        debug_assert!(self.feature_set.ft_factorize());
         let base_ft_in = self.feature_set.ft_in();
         let pi = self.feature_set.piece_inputs();
         let n = base_ft_in * self.ws.ft_out;
-        if let Some(mut comb) = self.ft_w_h.as_mut() {
+        if self.ft_fp16 {
+            let mut comb = self
+                .ft_w_h
+                .as_mut()
+                .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled");
             cuda_launch! {
                 kernel: ft_fold_virtual_f16,
                 stream: self.stream,
@@ -1344,7 +1361,11 @@ impl GpuTrainer {
                 args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
                        self.ws.ft_out as u32, pi as u32, n as u32]
             }?;
-        } else if let Some(mut comb) = self.ft_w_fold32.as_mut() {
+        } else {
+            let mut comb = self
+                .ft_w_fold32
+                .as_mut()
+                .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16");
             cuda_launch! {
                 kernel: ft_fold_virtual,
                 stream: self.stream,

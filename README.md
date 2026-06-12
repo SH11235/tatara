@@ -132,6 +132,7 @@ own net, see the [setup guide](docs/setup.md).
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
 | **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
+| **FT factorizer** | Training-time virtual FT rows shared across king buckets (LayerStack `--ft-factorize`). Each virtual row learns the king-bucket-independent component of one piece plane and is folded into the real rows on export, so the `.bin` shape and inference are unchanged. The same idea as nnue-pytorch's feature factorizer |
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |

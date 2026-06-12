@@ -983,8 +983,9 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
 /// column-major で `w[feature * ft_out + ri]`)。線形性により
 /// `Σ_active (w_real + w_virt) = Σ_active comb` なので、sparse forward は仮想
 /// index 無しの base 経路のまま factorizer の forward 寄与を得る。
-/// 1 thread = 1 出力要素 (`i = feature * ft_out + ri`)、仮想要素は
-/// `(ft_in + feature % piece_inputs) * ft_out + ri`。
+/// 1 thread = 1 出力要素。`i = (kb·pi + p)·ft_out + ri` の仮想要素 offset は
+/// 恒等式 `(ft_in + p)·ft_out + ri == ft_in·ft_out + (i mod pi·ft_out)` で
+/// mod 1 回で導出する (`i mod pi·ft_out = p·ft_out + ri`)。
 #[kernel]
 pub fn ft_fold_virtual(
     w: &[f32],
@@ -998,13 +999,11 @@ pub fn ft_fold_virtual(
     if i.get() >= n as usize {
         return;
     }
-    let ft_out_u = ft_out as usize;
-    let feature = i.get() / ft_out_u;
-    let ri = i.get() - feature * ft_out_u;
-    let p = feature % (piece_inputs as usize);
+    let virt_block = (piece_inputs as usize) * (ft_out as usize);
+    let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
     // `comb.len() == n` を保証。
-    let v = w[i.get()] + w[(ft_in as usize + p) * ft_out_u + ri];
+    let v = w[i.get()] + w[virt];
     let comb_ptr = comb.as_mut_ptr();
     unsafe {
         comb_ptr.add(i.get()).write(v);
@@ -1012,7 +1011,11 @@ pub fn ft_fold_virtual(
 }
 
 /// [`ft_fold_virtual`] の f16 出力版 (`--ft-fp16` 系列の forward 用 mirror を畳み
-/// 込みと同時に生成する)。f32 で加算してから 1 回だけ f16 へ丸める。
+/// 込みと同時に生成する)。f32 で加算してから 1 回だけ f16 へ丸める。和の f16
+/// clamp はしない: ここで丸める和 (実行 + 仮想行) は export の coalesce が
+/// i16 飽和検査に掛ける値と同一で、その飽和閾値は f16 有限上限 (65504) より
+/// 2 桁以上小さい — overflow に至る重み成長は checkpoint 保存のたびに先に
+/// 検出される。
 #[kernel]
 pub fn ft_fold_virtual_f16(
     w: &[f32],
@@ -1026,13 +1029,11 @@ pub fn ft_fold_virtual_f16(
     if i.get() >= n as usize {
         return;
     }
-    let ft_out_u = ft_out as usize;
-    let feature = i.get() / ft_out_u;
-    let ri = i.get() - feature * ft_out_u;
-    let p = feature % (piece_inputs as usize);
+    let virt_block = (piece_inputs as usize) * (ft_out as usize);
+    let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
     // `comb.len() == n` を保証。
-    let v = w[i.get()] + w[(ft_in as usize + p) * ft_out_u + ri];
+    let v = w[i.get()] + w[virt];
     let comb_ptr = comb.as_mut_ptr();
     unsafe {
         comb_ptr.add(i.get()).write(v as f16);
