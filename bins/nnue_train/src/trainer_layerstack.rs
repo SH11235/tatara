@@ -858,6 +858,16 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // 本経路は companion buffer (`ft_w_m`/`v`/`grad`/`slow`) を base 長で
+        // 再確保するため、factorize 有効 trainer (train 長の `ft_w`) には適用
+        // できない (spec 等値性でも弾かれるが、長さ不変条件をここで閉じる)。
+        if self.feature_set.ft_factorize() {
+            return Err(invalid_data(
+                "load_layerstack_weights does not support an ft-factorize trainer (a \
+                 quantised .bin has no virtual factorizer rows)"
+                    .to_string(),
+            ));
+        }
         // optimizer companion buffer (`ft_w_m`/`v`/`grad`/`slow`) は trainer の
         // feature set で確保済。weight の feature set が異なると `ft_w` だけ別長に
         // なり optimizer step が out-of-bounds になるため、ここで弾く。

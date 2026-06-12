@@ -107,6 +107,18 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
         w_on.ft_w != w_off.ft_w,
         "仮想行が学習されていれば coalesced ft_w は OFF と異なる"
     );
+    // 「差分 = 仮想行の寄与」の裏付け: coalesce は加算で、実 block の更新勾配は
+    // 仮想行の有無に依存しないため、ON−OFF の残差は同一 p を持つ feature 間で
+    // 一致する (仮想行 1 本分)。先頭の数 p で確認する。
+    let pi = base.piece_inputs();
+    for p in 0..8 {
+        let d0 = w_on.ft_w[p * FT_OUT_TEST] - w_off.ft_w[p * FT_OUT_TEST];
+        let d1 = w_on.ft_w[(pi + p) * FT_OUT_TEST] - w_off.ft_w[(pi + p) * FT_OUT_TEST];
+        assert!(
+            (d0 - d1).abs() <= d0.abs().max(d1.abs()) * 1e-5 + 1e-7,
+            "残差が仮想行由来なら plane 間で一致する: p={p} d0={d0:e} d1={d1:e}"
+        );
+    }
     Ok(())
 }
 

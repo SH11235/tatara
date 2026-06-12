@@ -810,8 +810,9 @@ mod tests {
             assert_eq!(fact.train_ft_in(), base.ft_in() + base.piece_inputs());
             assert_eq!(fact.train_max_active(), base.max_active() * 2);
             // modifier は PartialEq で弁別される (Batch / trainer / weight の
-            // spec 照合が on/off 混在を自動 reject する根拠)。
+            // spec 照合が on/off 混在を自動 reject する根拠)。適用は冪等。
             assert_ne!(fact, base);
+            assert_eq!(fact.with_ft_factorize(), fact);
         }
     }
 

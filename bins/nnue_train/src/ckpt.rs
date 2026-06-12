@@ -70,10 +70,12 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   reproduced independently of `--superbatches`.
 ///
 /// - `6`: a FT-factorizer flag byte follows `max_active` in the feature-set
-///   header. It pins whether the checkpoint's FT weight rows include the
-///   training-time virtual factorizer block (the `ft_in` / `max_active`
-///   fields hold the training-side values, so they also differ across
-///   on/off); resuming across `--ft-factorize` on/off is rejected.
+///   header, and the `ft_in` / `max_active` fields hold the **training-side**
+///   dimensions (`train_ft_in` / `train_max_active`; equal to the base values
+///   whenever the factorizer is off, so v6 files written without the
+///   factorizer keep the v2 field semantics). The flag pins whether the
+///   checkpoint's FT weight rows include the training-time virtual factorizer
+///   block; resuming across `--ft-factorize` on/off is rejected.
 ///
 /// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
