@@ -14,11 +14,11 @@
 //! ```
 //!
 //! 各テストは小規模 batch (b = 3〜4) で GPU kernel を launch → download → reference
-//! `gpu_kernels::layerstack::*_cpu` と比較。`-1` padding (sparse index / bucket_idx)、
-//! 全 9 bucket、CReLU 境界値 (ちょうど 0.0 / 1.0 / 負)、NaN 伝搬を含む。tolerance:
-//! forward / gradient 1e-5、整数/index 出力は完全一致。
+//! `gpu_kernels::{layerstack, pointwise, sparse}::*_cpu` と比較。`-1` padding
+//! (sparse index / bucket_idx)、全 9 bucket、CReLU 境界値 (ちょうど 0.0 / 1.0 / 負)、
+//! NaN 伝搬を含む。tolerance: forward / gradient 1e-5、整数/index 出力は完全一致。
 //!
-//! kernel ↔ CPU ref 対応表は `gpu_kernels::layerstack` の module doc 参照。
+//! kernel ↔ CPU ref 対応表は `gpu_kernels` 各 module の doc 参照。
 
 use cuda_host::cuda_launch;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
@@ -26,6 +26,7 @@ use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfi
 use crate::*;
 use crate::{arch::*, kernel_module::*, trainer_common::*};
 
+use gpu_kernels::layerstack::psqt::{psqt_diff_sparse_bwd_cpu, psqt_diff_sparse_fwd_inplace_cpu};
 use gpu_kernels::layerstack::{
     abs_pow2_scale::{abs_pow2_scale_fwd_cpu, abs_pow2_scale_grad_cpu},
     concat_l1sqr_main::{concat_l1sqr_main_fwd_cpu, concat_l1sqr_main_grad_cpu},
@@ -39,9 +40,14 @@ use gpu_kernels::layerstack::{
     ft_post_perspective::{ft_post_perspective_fwd_cpu, ft_post_perspective_grad_cpu},
     slice2d::{slice_extract_2d_cpu, slice_scatter_2d_cpu},
 };
+use gpu_kernels::pointwise::loss_wdl::loss_wdl_cpu;
 use gpu_kernels::pointwise::loss_wrm::loss_wrm_cpu;
 use gpu_kernels::pointwise::norm_loss::{norm_loss_apply_cpu, norm_loss_compute_norms_cpu};
+use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_step_cpu};
+use gpu_kernels::pointwise::ranger_step::{ranger_lookahead_lerp_cpu, ranger_step_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
+use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
+use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
 
 /// forward / gradient の f32 tolerance。
 const TOL: f32 = 1e-5;
@@ -2595,6 +2601,1208 @@ fn norm_loss_zero_norm_group_matches_cpu() -> Result<(), Box<dyn std::error::Err
         assert_eq!(x, 0.0, "zero group must stay exactly 0 (no NaN/Inf)");
     }
     assert_close_rel("norm_loss/zero-norm", &w_gpu, &w_cpu, TOL);
+    Ok(())
+}
+
+// -- sparse FT forward / backward ----------------------------------------
+
+/// sparse index fixture: 有効 idx (position 内重複・position 間共有あり)、`-1`
+/// padding、`>= cols` の defensive skip 対象を混ぜた決定論的な列。`seed` でパターン
+/// をずらす (stm / nstm で別系列を作る)。`r % 6 == 2` の枝だけが feature 0 を出し
+/// (他の有効枝は `1..=cols-2`)、出現を feature 0 へ集めて高頻度 feature を作る。
+/// feature `cols-1` はどの枝からも出ず出現 0 になる。inverse-index gather では
+/// 前者が 4-way unroll 本体から端数 tail への同一区間内継続を、後者が空区間の
+/// sum=0 書き切り経路を踏む (発火を guard する assert は pipeline テスト側)。
+fn sparse_indices_fixture(batch: usize, nnz: usize, cols: usize, seed: usize) -> Vec<i32> {
+    let mut v = Vec::with_capacity(batch * nnz);
+    for bi in 0..batch {
+        for ni in 0..nnz {
+            let r = bi * 7 + ni * 3 + seed;
+            let idx = match r % 6 {
+                0 => -1,
+                1 => (cols + r) as i32,
+                2 => 0,
+                _ => (1 + r % (cols - 2)) as i32,
+            };
+            v.push(idx);
+        }
+    }
+    v
+}
+
+#[test]
+fn sparse_ft_forward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    // rows は kernel 規約 (1 thread = 4 連続 row) の最小単位 4 の倍数。
+    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let weight = deterministic_floats(rows * cols, 3.0);
+    let indices = sparse_indices_fixture(batch, nnz, cols, 0);
+    let mut out_cpu = vec![0.0_f32; batch * rows];
+    sparse_ft_forward_cpu(&weight, &indices, &mut out_cpu, batch, rows, cols, nnz);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &weight)?;
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
+    cuda_launch! {
+        kernel: sparse_ft_forward, stream: stream, module: module,
+        config: cfg_1d(batch * rows / 4),
+        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+               batch as u32, rows as u32, cols as u32, nnz as u32]
+    }?;
+    stream.synchronize()?;
+    // 各出力 cell は weight の純加算を ni 順に積むだけで GPU/CPU の演算列が一致する
+    // (乗算が無く fma 縮約も起きない) ため bit-exact。
+    assert_close(
+        "sparse_ft_forward",
+        &out_dev.to_host_vec(&stream)?,
+        &out_cpu,
+        0.0,
+    );
+    Ok(())
+}
+
+#[test]
+fn sparse_ft_forward_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let weight = deterministic_floats(rows * cols, 3.5);
+    let (weight_h, weight_q) = quantize_f16(&weight);
+    let indices = sparse_indices_fixture(batch, nnz, cols, 1);
+    // CPU reference は GPU が読むのと同じ f16→f32 値で計算する (f16→f32 は無損失)。
+    let mut out_cpu = vec![0.0_f32; batch * rows];
+    sparse_ft_forward_cpu(&weight_q, &indices, &mut out_cpu, batch, rows, cols, nnz);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
+    cuda_launch! {
+        kernel: sparse_ft_forward_fp16, stream: stream, module: module,
+        config: cfg_1d(batch * rows / 4),
+        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+               batch as u32, rows as u32, cols as u32, nnz as u32]
+    }?;
+    stream.synchronize()?;
+    assert_close(
+        "sparse_ft_forward_fp16",
+        &out_dev.to_host_vec(&stream)?,
+        &out_cpu,
+        0.0,
+    );
+    Ok(())
+}
+
+#[test]
+fn sparse_ft_forward_fp16_out_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let weight = deterministic_floats(rows * cols, 4.0);
+    let (weight_h, weight_q) = quantize_f16(&weight);
+    let indices = sparse_indices_fixture(batch, nnz, cols, 2);
+    // f32 累算結果は GPU と bit 一致するため、出力の round-to-nearest f16 量子化も
+    // 同値になる。CPU 側も f16 量子化して bit-exact 比較する。
+    let mut out_cpu = vec![0.0_f32; batch * rows];
+    sparse_ft_forward_cpu(&weight_q, &indices, &mut out_cpu, batch, rows, cols, nnz);
+    let (_, out_cpu_q) = quantize_f16(&out_cpu);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let mut out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * rows)?;
+    cuda_launch! {
+        kernel: sparse_ft_forward_fp16_out, stream: stream, module: module,
+        config: cfg_1d(batch * rows / 4),
+        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+               batch as u32, rows as u32, cols as u32, nnz as u32]
+    }?;
+    stream.synchronize()?;
+    let out_gpu: Vec<f32> = out_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    assert_close("sparse_ft_forward_fp16_out", &out_gpu, &out_cpu_q, 0.0);
+    Ok(())
+}
+
+#[test]
+fn sparse_ft_backward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let grad_out = deterministic_floats(batch * rows, 4.5);
+    let indices = sparse_indices_fixture(batch, nnz, cols, 3);
+    let mut grad_w_cpu = vec![0.0_f32; rows * cols];
+    sparse_ft_backward_cpu(&grad_out, &indices, &mut grad_w_cpu, batch, rows, cols, nnz);
+
+    let gout_dev = DeviceBuffer::from_host(&stream, &grad_out)?;
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let grad_w_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * cols)?;
+    cuda_launch! {
+        kernel: sparse_ft_backward, stream: stream, module: module,
+        config: cfg_1d(batch * rows),
+        args: [slice(gout_dev), slice(idx_dev), slice(grad_w_dev),
+               batch as u32, rows as u32, cols as u32, nnz as u32]
+    }?;
+    stream.synchronize()?;
+    // atomic scatter の加算順は非決定的なので relative tolerance。
+    assert_close_rel(
+        "sparse_ft_backward",
+        &grad_w_dev.to_host_vec(&stream)?,
+        &grad_w_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+// -- inverse-index sparse FT backward pipeline ---------------------------
+
+/// 中間 kernel (`build_feature_counts` / `exclusive_prefix_sum_small` /
+/// `scatter_positions`) を単体照合する。counts / offsets は決定論的 (u32 完全一致)。
+/// positions は feature 区間内の並びが atomic write counter の獲得順に依存して
+/// 非決定的なため、区間ごとに sort して多重集合として比較する。
+#[test]
+fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, nnz, ft_in) = (6_usize, 6_usize, 9_usize);
+    let indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+
+    let mut counts_cpu = vec![0_u32; ft_in];
+    let mut segments_cpu: Vec<Vec<u32>> = vec![Vec::new(); ft_in];
+    for bi in 0..batch {
+        for ni in 0..nnz {
+            let idx = indices[bi * nnz + ni];
+            if idx >= 0 && (idx as usize) < ft_in {
+                counts_cpu[idx as usize] += 1;
+                segments_cpu[idx as usize].push(bi as u32);
+            }
+        }
+    }
+    let mut offsets_cpu = vec![0_u32; ft_in + 1];
+    for f in 0..ft_in {
+        offsets_cpu[f + 1] = offsets_cpu[f] + counts_cpu[f];
+    }
+    for seg in &mut segments_cpu {
+        seg.sort_unstable();
+    }
+
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
+    let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    cuda_launch! {
+        kernel: build_feature_counts, stream: stream, module: module,
+        config: cfg_1d(batch * nnz),
+        args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+    }?;
+    cuda_launch! {
+        kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+        config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+        args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+    }?;
+    cuda_launch! {
+        kernel: scatter_positions, stream: stream, module: module,
+        config: cfg_1d(batch * nnz),
+        args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+               batch as u32, nnz as u32, ft_in as u32]
+    }?;
+    stream.synchronize()?;
+
+    assert_eq!(
+        counts_dev.to_host_vec(&stream)?,
+        counts_cpu,
+        "build_feature_counts"
+    );
+    assert_eq!(
+        offsets_dev.to_host_vec(&stream)?,
+        offsets_cpu,
+        "exclusive_prefix_sum_small"
+    );
+    let positions = positions_dev.to_host_vec(&stream)?;
+    for f in 0..ft_in {
+        let mut seg = positions[offsets_cpu[f] as usize..offsets_cpu[f + 1] as usize].to_vec();
+        seg.sort_unstable();
+        assert_eq!(seg, segments_cpu[f], "scatter_positions feature {f}");
+    }
+    Ok(())
+}
+
+/// `exclusive_prefix_sum_small` の per-thread chunk 直列和経路 (n > 1024、本番
+/// ft_in ≈ 73K 相当) と、余剰 thread が出る n < 1024 の両方を照合する。
+#[test]
+fn exclusive_prefix_sum_small_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &n in &[300_usize, 5000] {
+        // 0 を含む決定論的な count 列。
+        let counts: Vec<u32> = (0..n).map(|i| ((i * 13 + 5) % 7) as u32).collect();
+        let mut offsets_cpu = vec![0_u32; n + 1];
+        for i in 0..n {
+            offsets_cpu[i + 1] = offsets_cpu[i] + counts[i];
+        }
+        let counts_dev = DeviceBuffer::from_host(&stream, &counts)?;
+        let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), n as u32]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            offsets_dev.to_host_vec(&stream)?,
+            offsets_cpu,
+            "exclusive_prefix_sum_small n={n}"
+        );
+    }
+    Ok(())
+}
+
+/// inverse-index pipeline (count → prefix sum → scatter → gather) の合成が素朴
+/// atomic scatter reference `sparse_ft_backward_cpu` と一致することを確認する。
+/// trainer と同じく stm を overwrite 版・nstm を add 版で 2 周し ft_w_grad に合算
+/// する。phase D の 4-way unroll partial sum で加算順が CPU と異なるため relative
+/// tolerance。
+#[test]
+fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, ft_out, ft_in, nnz) = (6_usize, 8_usize, 9_usize, 6_usize);
+    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    // fixture 前提の guard: feature 0 の区間は 4-way unroll 本体 (4 個) を通過した後
+    // 端数 tail に継続する出現数 (> 4 かつ非 4 倍数)、feature ft_in-1 の区間は空
+    // (overwrite kernel の sum=0 書き切り経路)。fixture を変えてこの前提が崩れたら
+    // ここで気付く。
+    for idx in [&stm_indices, &nstm_indices] {
+        let count0 = idx.iter().filter(|&&i| i == 0).count();
+        assert!(
+            count0 > 4 && !count0.is_multiple_of(4),
+            "fixture must hit unroll body + tail in one segment (feature 0 count = {count0})"
+        );
+        assert!(
+            !idx.contains(&((ft_in - 1) as i32)),
+            "fixture must leave feature ft_in-1 empty"
+        );
+    }
+    let dft_stm = deterministic_floats(batch * ft_out, 5.0);
+    let dft_nstm = deterministic_floats(batch * ft_out, 6.0);
+
+    let mut grad_w_cpu = vec![0.0_f32; ft_in * ft_out];
+    sparse_ft_backward_cpu(
+        &dft_stm,
+        &stm_indices,
+        &mut grad_w_cpu,
+        batch,
+        ft_out,
+        ft_in,
+        nnz,
+    );
+    sparse_ft_backward_cpu(
+        &dft_nstm,
+        &nstm_indices,
+        &mut grad_w_cpu,
+        batch,
+        ft_out,
+        ft_in,
+        nnz,
+    );
+
+    let grad_w_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * ft_out)?;
+    let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
+    let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    for (iter_idx, (idx_host, dft_host)) in [(&stm_indices, &dft_stm), (&nstm_indices, &dft_nstm)]
+        .into_iter()
+        .enumerate()
+    {
+        memset_zero(&stream, &counts_dev)?;
+        memset_zero(&stream, &write_ctr_dev)?;
+        let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
+        let dft_dev = DeviceBuffer::from_host(&stream, dft_host)?;
+        cuda_launch! {
+            kernel: build_feature_counts, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+        }?;
+        cuda_launch! {
+            kernel: scatter_positions, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+                   batch as u32, nnz as u32, ft_in as u32]
+        }?;
+        // production (block 128 × grid y = ft_out/128) と同じく ri 軸を blockIdx_y で
+        // tile する。ft_out=8 を 4 幅 × 2 tile に割って y 軸も exercise する。
+        if iter_idx == 0 {
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_overwrite, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       ft_in as u32, ft_out as u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_add, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       ft_in as u32, ft_out as u32]
+            }?;
+        }
+    }
+    stream.synchronize()?;
+    assert_close_rel(
+        "inverse_index_pipeline grad_w",
+        &grad_w_dev.to_host_vec(&stream)?,
+        &grad_w_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+/// inverse-index pipeline の FP16 dft 版 (`gather_and_sum_per_feature_{overwrite,add}
+/// _fp16`)。dft は loss scaling 済の値を f16 量子化して渡し、gather 側の
+/// `dft_inv_scale` が scale を打ち消す round-trip を検証する。CPU reference は
+/// GPU が読む f16→f32 値で合算し、最後に inv_scale を掛ける。
+#[test]
+fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, ft_out, ft_in, nnz) = (6_usize, 8_usize, 9_usize, 6_usize);
+    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    let dft_scale = 64.0_f32;
+    let dft_inv_scale = 1.0_f32 / dft_scale;
+    let dft_stm_scaled: Vec<f32> = deterministic_floats(batch * ft_out, 7.0)
+        .iter()
+        .map(|&x| x * dft_scale)
+        .collect();
+    let dft_nstm_scaled: Vec<f32> = deterministic_floats(batch * ft_out, 8.0)
+        .iter()
+        .map(|&x| x * dft_scale)
+        .collect();
+    let (dft_stm_h, dft_stm_q) = quantize_f16(&dft_stm_scaled);
+    let (dft_nstm_h, dft_nstm_q) = quantize_f16(&dft_nstm_scaled);
+
+    let mut grad_w_scaled_cpu = vec![0.0_f32; ft_in * ft_out];
+    sparse_ft_backward_cpu(
+        &dft_stm_q,
+        &stm_indices,
+        &mut grad_w_scaled_cpu,
+        batch,
+        ft_out,
+        ft_in,
+        nnz,
+    );
+    sparse_ft_backward_cpu(
+        &dft_nstm_q,
+        &nstm_indices,
+        &mut grad_w_scaled_cpu,
+        batch,
+        ft_out,
+        ft_in,
+        nnz,
+    );
+    let grad_w_cpu: Vec<f32> = grad_w_scaled_cpu
+        .iter()
+        .map(|&x| x * dft_inv_scale)
+        .collect();
+
+    let grad_w_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * ft_out)?;
+    let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
+    let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    for (iter_idx, (idx_host, dft_host)) in
+        [(&stm_indices, &dft_stm_h), (&nstm_indices, &dft_nstm_h)]
+            .into_iter()
+            .enumerate()
+    {
+        memset_zero(&stream, &counts_dev)?;
+        memset_zero(&stream, &write_ctr_dev)?;
+        let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
+        let dft_dev = DeviceBuffer::from_host(&stream, dft_host)?;
+        cuda_launch! {
+            kernel: build_feature_counts, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+        }?;
+        cuda_launch! {
+            kernel: scatter_positions, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+                   batch as u32, nnz as u32, ft_in as u32]
+        }?;
+        if iter_idx == 0 {
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_overwrite_fp16, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       ft_in as u32, ft_out as u32, dft_inv_scale]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       ft_in as u32, ft_out as u32, dft_inv_scale]
+            }?;
+        }
+    }
+    stream.synchronize()?;
+    // GPU は iter ごとに inv_scale を掛けてから加算、CPU は合算後に 1 回掛けるため
+    // 丸めが ~ulp 単位で異なる。atomic 加算順差と合わせ relative tolerance。
+    assert_close_rel(
+        "inverse_index_pipeline_fp16 grad_w",
+        &grad_w_dev.to_host_vec(&stream)?,
+        &grad_w_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+// -- cast_f32_to_f16 ------------------------------------------------------
+
+/// GPU の round-to-nearest f32→f16 変換が host の `as f16` cast と一致する。
+/// f16 有限域外 (±inf 化)・subnormal 域・NaN を含む。
+#[test]
+fn cast_f32_to_f16_matches_host_cast() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let mut src = deterministic_floats(257, 9.0);
+    src.extend_from_slice(&[70000.0, -70000.0, 65504.0, 1e-8, -1e-8, f32::NAN]);
+    let n = src.len();
+    let (_, expected) = quantize_f16(&src);
+
+    let src_dev = DeviceBuffer::from_host(&stream, &src)?;
+    let mut dst_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: cast_f32_to_f16, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice(src_dev), slice_mut(dst_dev), n as u32]
+    }?;
+    stream.synchronize()?;
+    let got: Vec<f32> = dst_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    // ±inf を含むため差分比較でなく値同値で比較する (NaN は payload 非規定なので
+    // is_nan のみ確認)。
+    for (i, (&g, &c)) in got.iter().zip(expected.iter()).enumerate() {
+        if c.is_nan() {
+            assert!(g.is_nan(), "cast_f32_to_f16[{i}]: cpu=NaN but gpu={g}");
+        } else {
+            assert_eq!(g, c, "cast_f32_to_f16[{i}]");
+        }
+    }
+    Ok(())
+}
+
+// -- optimizer (RAdam step / Ranger lookahead lerp) -----------------------
+
+/// optimizer テスト共通の決定論 fixture (weights / m / v / grad)。weights の先頭
+/// 2 cell は clamp が効く外れ値、grad の中央 1 cell は NaN (伝搬確認)。`v` は勾配
+/// 二乗の EMA なので非負。
+fn radam_fixture(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut weights = deterministic_floats(n, 11.0);
+    weights[0] = 5.0;
+    weights[1] = -5.0;
+    let m: Vec<f32> = (0..n)
+        .map(|i| -0.02_f32 + 0.0003_f32 * (i % 97) as f32)
+        .collect();
+    let v: Vec<f32> = (0..n)
+        .map(|i| 1e-6_f32 + 1e-7_f32 * (i % 89) as f32)
+        .collect();
+    let mut grad = deterministic_floats(n, 13.0);
+    grad[n / 2] = f32::NAN;
+    (weights, m, v, grad)
+}
+
+/// `radam_step` が CPU reference と一致する。学習初期 (step=1、denom=0 で variance
+/// 補正 off) と通常領域 (step=1000、denom=1) の両経路、weight decay、quantized
+/// dense weight の clamp (`W_CLAMP_QUANT_*`) を踏む。grad は kernel 内で 0 reset。
+#[test]
+fn radam_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &step in &[1_u64, 1000] {
+        let n = 259_usize;
+        let (weights, m, v, grad) = radam_fixture(n);
+        let (step_size, denom) = radam_compute_step_size_denom(step, BETA1, BETA2, N_SMA_THRESHOLD);
+        let lr = 8.75e-4_f32;
+        let decay = RANGER_DEFAULTS.decay;
+
+        let mut w_cpu = weights.clone();
+        let mut m_cpu = m.clone();
+        let mut v_cpu = v.clone();
+        let mut g_cpu = grad.clone();
+        radam_step_cpu(
+            &mut w_cpu,
+            &mut m_cpu,
+            &mut v_cpu,
+            &mut g_cpu,
+            lr,
+            step_size,
+            denom,
+            decay,
+            BETA1,
+            BETA2,
+            EPS,
+            W_CLAMP_QUANT_MIN,
+            W_CLAMP_QUANT_MAX,
+            n,
+        );
+
+        let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+        let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+        let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
+        cuda_launch! {
+            kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            &format!("radam_step/step{step} weights"),
+            &w_dev.to_host_vec(&stream)?,
+            &w_cpu,
+            TOL,
+        );
+        assert_close(
+            &format!("radam_step/step{step} m"),
+            &m_dev.to_host_vec(&stream)?,
+            &m_cpu,
+            TOL,
+        );
+        assert_close(
+            &format!("radam_step/step{step} v"),
+            &v_dev.to_host_vec(&stream)?,
+            &v_cpu,
+            TOL,
+        );
+        // grad は NaN cell も含め kernel 内で 0 reset。
+        assert_close(
+            &format!("radam_step/step{step} grad reset"),
+            &g_dev.to_host_vec(&stream)?,
+            &vec![0.0_f32; n],
+            0.0,
+        );
+    }
+    Ok(())
+}
+
+/// `radam_step_fp16_mirror` は `radam_step` と同 math + 確定 weight の f16 mirror
+/// 同時書き込み。weights / m / v は FP32 reference と照合し、mirror は GPU weights
+/// の round-to-nearest f16 量子化と同値 (NaN cell は NaN) であることを確認する。
+#[test]
+fn radam_step_fp16_mirror_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 259_usize;
+    let (weights, m, v, grad) = radam_fixture(n);
+    let (step_size, denom) = radam_compute_step_size_denom(1000, BETA1, BETA2, N_SMA_THRESHOLD);
+    let lr = 8.75e-4_f32;
+    let decay = RANGER_DEFAULTS.decay;
+
+    let mut w_cpu = weights.clone();
+    let mut m_cpu = m.clone();
+    let mut v_cpu = v.clone();
+    let mut g_cpu = grad.clone();
+    radam_step_cpu(
+        &mut w_cpu,
+        &mut m_cpu,
+        &mut v_cpu,
+        &mut g_cpu,
+        lr,
+        step_size,
+        denom,
+        decay,
+        BETA1,
+        BETA2,
+        EPS,
+        W_CLAMP_NONE_MIN,
+        W_CLAMP_NONE_MAX,
+        n,
+    );
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
+    let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
+    let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
+    let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: radam_step_fp16_mirror, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+               slice_mut(mirror_dev),
+               lr, step_size, denom, decay, BETA1, BETA2, EPS,
+               W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, n as u32]
+    }?;
+    stream.synchronize()?;
+    let w_gpu = w_dev.to_host_vec(&stream)?;
+    assert_close("radam_step_fp16_mirror weights", &w_gpu, &w_cpu, TOL);
+    assert_close(
+        "radam_step_fp16_mirror m",
+        &m_dev.to_host_vec(&stream)?,
+        &m_cpu,
+        TOL,
+    );
+    assert_close(
+        "radam_step_fp16_mirror v",
+        &v_dev.to_host_vec(&stream)?,
+        &v_cpu,
+        TOL,
+    );
+    // mirror は GPU 確定 weight の f16 量子化と同値のはず (GPU weight から host で
+    // 再量子化して比較、量子化器の差を排除)。
+    let mirror: Vec<f32> = mirror_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let (_, w_gpu_q) = quantize_f16(&w_gpu);
+    assert_close("radam_step_fp16_mirror mirror", &mirror, &w_gpu_q, 0.0);
+    Ok(())
+}
+
+/// `radam_step_f16state` の CPU mimic。GPU kernel と同じ f16 round-trip
+/// (scale → clamp ±65504 → f16 格納、読み出しで dequantize) を host で再現する。
+/// 引数は kernel signature と同順 (`clippy::too_many_arguments` は他 reference と
+/// 同じ理由で allow)。
+#[allow(clippy::too_many_arguments)]
+fn radam_step_f16state_mimic(
+    weights: &mut [f32],
+    m: &mut [f16],
+    v: &mut [f16],
+    grad: &mut [f32],
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    min_w: f32,
+    max_w: f32,
+    m_scale: f32,
+    v_scale: f32,
+    n: usize,
+) {
+    let rate = lr * step_size;
+    for i in 0..n {
+        let g = grad[i];
+        let mut p = weights[i];
+        p *= 1.0_f32 - decay * rate;
+        let m_prev = (m[i] as f32) / m_scale;
+        let v_prev = (v[i] as f32) / v_scale;
+        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
+        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
+        m[i] = (mi * m_scale).clamp(-65504.0, 65504.0) as f16;
+        let vs = vi * v_scale;
+        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
+        v[i] = vs_c as f16;
+        let mut val = mi;
+        if denom != 0 {
+            val /= vi.sqrt() + eps;
+        }
+        p -= rate * val;
+        weights[i] = p.clamp(min_w, max_w);
+        grad[i] = 0.0_f32;
+    }
+}
+
+/// `radam_step_f16state` 用の production スケール fixture: `|m| ~ 1e-9` /
+/// `v ~ 1e-15` / `|grad| ~ 1e-4` (FT weight の実測値域)。grad の先頭 2 cell は
+/// scale 後に f16 有限域 (±65504) を超えて m / v の格納時 clamp を踏む外れ値。
+#[allow(clippy::type_complexity)]
+fn f16state_fixture(n: usize) -> (Vec<f32>, Vec<f16>, Vec<f16>, [Vec<f32>; 2]) {
+    let weights = deterministic_floats(n, 17.0);
+    let m_h: Vec<f16> = (0..n)
+        .map(|i| (((i as f32) - 60.0) * 3e-11 * FT_OPT_M_SCALE) as f16)
+        .collect();
+    let v_h: Vec<f16> = (0..n)
+        .map(|i| ((1e-15_f32 + (i % 13) as f32 * 2e-16) * FT_OPT_V_SCALE) as f16)
+        .collect();
+    let mut g0: Vec<f32> = (0..n)
+        .map(|i| (((i * 7) % 23) as f32 - 11.0) * 1e-5)
+        .collect();
+    g0[0] = 0.05;
+    g0[1] = -0.05;
+    let g1: Vec<f32> = (0..n)
+        .map(|i| (((i * 5) % 19) as f32 - 9.0) * 2e-5)
+        .collect();
+    (weights, m_h, v_h, [g0, g1])
+}
+
+/// `radam_step_f16state` が CPU mimic と一致する。denom=0 (step=1) → denom=1
+/// (step=1000) の 2 step を同じ GPU state で回し、f16 格納値からの read-back 継続も
+/// 検証する。f16 state は GPU/CPU で同一演算列だが fma 縮約差が量子化境界で f16
+/// 1 ulp (相対 ~5e-4) の差になり得るため、dequantize 値を relative tolerance で比較。
+#[test]
+fn radam_step_f16state_matches_mimic() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 131_usize;
+    let (weights, m_h, v_h, grads) = f16state_fixture(n);
+    let lr = 8.75e-4_f32;
+    let decay = RANGER_DEFAULTS.decay;
+
+    let mut w_cpu = weights.clone();
+    let mut m_cpu = m_h.clone();
+    let mut v_cpu = v_h.clone();
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut m_dev = DeviceBuffer::from_host(&stream, &m_h)?;
+    let mut v_dev = DeviceBuffer::from_host(&stream, &v_h)?;
+    for (g, step) in grads.iter().zip([1_u64, 1000]) {
+        let (step_size, denom) = radam_compute_step_size_denom(step, BETA1, BETA2, N_SMA_THRESHOLD);
+        let mut g_cpu = g.clone();
+        radam_step_f16state_mimic(
+            &mut w_cpu,
+            &mut m_cpu,
+            &mut v_cpu,
+            &mut g_cpu,
+            lr,
+            step_size,
+            denom,
+            decay,
+            BETA1,
+            BETA2,
+            EPS,
+            W_CLAMP_NONE_MIN,
+            W_CLAMP_NONE_MAX,
+            FT_OPT_M_SCALE,
+            FT_OPT_V_SCALE,
+            n,
+        );
+        let mut g_dev = DeviceBuffer::from_host(&stream, g)?;
+        cuda_launch! {
+            kernel: radam_step_f16state, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+        }?;
+        stream.synchronize()?;
+        if step == 1 {
+            // 外れ値 grad cell の m / v は scale 後に f16 有限域を超え、step 1 の格納時
+            // clamp で両側とも ±65504 ちょうどに飽和する (step 2 の EMA decay で
+            // f16 max 未満へ戻るため、ここで確認する)。
+            let m_gpu: Vec<f16> = m_dev.to_host_vec(&stream)?;
+            let v_gpu: Vec<f16> = v_dev.to_host_vec(&stream)?;
+            assert_eq!(m_gpu[0] as f32, 65504.0, "m[0] must saturate at f16 max");
+            assert_eq!(m_gpu[1] as f32, -65504.0, "m[1] must saturate at f16 min");
+            assert_eq!(v_gpu[0] as f32, 65504.0, "v[0] must saturate at f16 max");
+        }
+    }
+    assert_close(
+        "radam_step_f16state weights",
+        &w_dev.to_host_vec(&stream)?,
+        &w_cpu,
+        TOL,
+    );
+    let m_gpu: Vec<f32> = m_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let m_exp: Vec<f32> = m_cpu.iter().map(|&x| x as f32).collect();
+    assert_close_rel("radam_step_f16state m", &m_gpu, &m_exp, 2e-3);
+    let v_gpu: Vec<f32> = v_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let v_exp: Vec<f32> = v_cpu.iter().map(|&x| x as f32).collect();
+    assert_close_rel("radam_step_f16state v", &v_gpu, &v_exp, 2e-3);
+    Ok(())
+}
+
+/// `radam_step_f16state_mirror` = f16 state + f16 mirror 同時書き込み。state 側は
+/// `radam_step_f16state` と同 math なので 1 step に絞り、mirror == f16(GPU weights)
+/// の同値性を中心に確認する。
+#[test]
+fn radam_step_f16state_mirror_matches_mimic() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 131_usize;
+    let (weights, m_h, v_h, grads) = f16state_fixture(n);
+    let (step_size, denom) = radam_compute_step_size_denom(1000, BETA1, BETA2, N_SMA_THRESHOLD);
+    let lr = 8.75e-4_f32;
+    let decay = RANGER_DEFAULTS.decay;
+
+    let mut w_cpu = weights.clone();
+    let mut m_cpu = m_h.clone();
+    let mut v_cpu = v_h.clone();
+    let mut g_cpu = grads[0].clone();
+    radam_step_f16state_mimic(
+        &mut w_cpu,
+        &mut m_cpu,
+        &mut v_cpu,
+        &mut g_cpu,
+        lr,
+        step_size,
+        denom,
+        decay,
+        BETA1,
+        BETA2,
+        EPS,
+        W_CLAMP_NONE_MIN,
+        W_CLAMP_NONE_MAX,
+        FT_OPT_M_SCALE,
+        FT_OPT_V_SCALE,
+        n,
+    );
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut m_dev = DeviceBuffer::from_host(&stream, &m_h)?;
+    let mut v_dev = DeviceBuffer::from_host(&stream, &v_h)?;
+    let mut g_dev = DeviceBuffer::from_host(&stream, &grads[0])?;
+    let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: radam_step_f16state_mirror, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+               slice_mut(mirror_dev),
+               lr, step_size, denom, decay, BETA1, BETA2, EPS,
+               W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+               FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+    }?;
+    stream.synchronize()?;
+    let w_gpu = w_dev.to_host_vec(&stream)?;
+    assert_close("radam_step_f16state_mirror weights", &w_gpu, &w_cpu, TOL);
+    let m_gpu: Vec<f32> = m_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let m_exp: Vec<f32> = m_cpu.iter().map(|&x| x as f32).collect();
+    assert_close_rel("radam_step_f16state_mirror m", &m_gpu, &m_exp, 2e-3);
+    let v_gpu: Vec<f32> = v_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let v_exp: Vec<f32> = v_cpu.iter().map(|&x| x as f32).collect();
+    assert_close_rel("radam_step_f16state_mirror v", &v_gpu, &v_exp, 2e-3);
+    let mirror: Vec<f32> = mirror_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let (_, w_gpu_q) = quantize_f16(&w_gpu);
+    assert_close("radam_step_f16state_mirror mirror", &mirror, &w_gpu_q, 0.0);
+    Ok(())
+}
+
+#[test]
+fn ranger_lookahead_lerp_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 257_usize;
+    let weights = deterministic_floats(n, 19.0);
+    let slow = deterministic_floats(n, 23.0);
+    let mut w_cpu = weights.clone();
+    let mut s_cpu = slow.clone();
+    ranger_lookahead_lerp_cpu(&mut w_cpu, &mut s_cpu, RANGER_ALPHA, n);
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut s_dev = DeviceBuffer::from_host(&stream, &slow)?;
+    cuda_launch! {
+        kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice_mut(w_dev), slice_mut(s_dev), RANGER_ALPHA, n as u32]
+    }?;
+    stream.synchronize()?;
+    let w_gpu = w_dev.to_host_vec(&stream)?;
+    let s_gpu = s_dev.to_host_vec(&stream)?;
+    assert_close("ranger_lookahead_lerp weights", &w_gpu, &w_cpu, TOL);
+    assert_close("ranger_lookahead_lerp slow", &s_gpu, &s_cpu, TOL);
+    // lerp 後は weights == slow で完全同期 (同じ new_w を両 buffer へ書く)。
+    assert_close("ranger_lookahead_lerp weights==slow", &w_gpu, &s_gpu, 0.0);
+    Ok(())
+}
+
+#[test]
+fn ranger_lookahead_lerp_fp16_mirror_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 257_usize;
+    let weights = deterministic_floats(n, 27.0);
+    let slow = deterministic_floats(n, 29.0);
+    let mut w_cpu = weights.clone();
+    let mut s_cpu = slow.clone();
+    ranger_lookahead_lerp_cpu(&mut w_cpu, &mut s_cpu, RANGER_ALPHA, n);
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut s_dev = DeviceBuffer::from_host(&stream, &slow)?;
+    let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: ranger_lookahead_lerp_fp16_mirror, stream: stream, module: module,
+        config: cfg_1d(n),
+        args: [slice_mut(w_dev), slice_mut(s_dev), slice_mut(mirror_dev),
+               RANGER_ALPHA, n as u32]
+    }?;
+    stream.synchronize()?;
+    let w_gpu = w_dev.to_host_vec(&stream)?;
+    assert_close(
+        "ranger_lookahead_lerp_fp16_mirror weights",
+        &w_gpu,
+        &w_cpu,
+        TOL,
+    );
+    assert_close(
+        "ranger_lookahead_lerp_fp16_mirror slow",
+        &s_dev.to_host_vec(&stream)?,
+        &s_cpu,
+        TOL,
+    );
+    let mirror: Vec<f32> = mirror_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    let (_, w_gpu_q) = quantize_f16(&w_gpu);
+    assert_close(
+        "ranger_lookahead_lerp_fp16_mirror mirror",
+        &mirror,
+        &w_gpu_q,
+        0.0,
+    );
+    Ok(())
+}
+
+/// RAdam step + `step % k == 0` での lookahead lerp の 2-kernel 構成 (trainer と
+/// 同じ host orchestration) が `ranger_step_cpu` と一致する。k=RANGER_K (6) で
+/// 7 step 回し、lerp 発火 step (6) と非発火 step の双方を踏む。
+#[test]
+fn ranger_two_kernel_sequence_matches_ranger_step_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let n = 64_usize;
+    let weights = deterministic_floats(n, 31.0);
+    let lr = 8.75e-4_f32;
+    let decay = RANGER_DEFAULTS.decay;
+
+    let mut w_cpu = weights.clone();
+    let mut m_cpu = vec![0.0_f32; n];
+    let mut v_cpu = vec![0.0_f32; n];
+    let mut slow_cpu = vec![0.0_f32; n];
+
+    let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
+    let mut m_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    let mut v_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    let mut slow_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    for step in 1..=(RANGER_K + 1) {
+        let grad: Vec<f32> = (0..n)
+            .map(|i| 0.01_f32 * ((i + step as usize) % 7) as f32 - 0.02)
+            .collect();
+        let mut g_cpu = grad.clone();
+        ranger_step_cpu(
+            &mut w_cpu,
+            &mut m_cpu,
+            &mut v_cpu,
+            &mut g_cpu,
+            &mut slow_cpu,
+            lr,
+            decay,
+            BETA1,
+            BETA2,
+            EPS,
+            W_CLAMP_QUANT_MIN,
+            W_CLAMP_QUANT_MAX,
+            N_SMA_THRESHOLD,
+            RANGER_ALPHA,
+            step,
+            RANGER_K,
+            n,
+        );
+
+        let (step_size, denom) = radam_compute_step_size_denom(step, BETA1, BETA2, N_SMA_THRESHOLD);
+        let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
+        cuda_launch! {
+            kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+        }?;
+        if step.is_multiple_of(RANGER_K) {
+            cuda_launch! {
+                kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice_mut(w_dev), slice_mut(slow_dev), RANGER_ALPHA, n as u32]
+            }?;
+        }
+    }
+    stream.synchronize()?;
+    assert_close(
+        "ranger_sequence weights",
+        &w_dev.to_host_vec(&stream)?,
+        &w_cpu,
+        TOL,
+    );
+    assert_close(
+        "ranger_sequence m",
+        &m_dev.to_host_vec(&stream)?,
+        &m_cpu,
+        TOL,
+    );
+    assert_close(
+        "ranger_sequence v",
+        &v_dev.to_host_vec(&stream)?,
+        &v_cpu,
+        TOL,
+    );
+    assert_close(
+        "ranger_sequence slow",
+        &slow_dev.to_host_vec(&stream)?,
+        &slow_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+// -- loss_wdl (sigmoid + WDL blend loss) ----------------------------------
+
+/// `loss_wdl` が CPU reference と一致する。lambda の両端 (純 score sigmoid / 純 WDL)
+/// と blend 中間値を踏む。GPU は `per_pos_norm` を scalar で受けるが CPU reference は
+/// per-position slice なので uniform fill で合わせる。
+#[test]
+fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let out = vec![0.3_f32, -0.8, 2.5, -0.05, 120.0];
+    let score = vec![150.0_f32, -1200.0, 30.0, 5000.0, -45.0];
+    let wdl = vec![1.0_f32, 0.0, 0.5, 1.0, 0.0];
+    let b = out.len();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let scale = 1.0_f32 / 290.0;
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    for &lambda in &[0.0_f32, 0.7, 1.0] {
+        let mut dl_cpu = vec![0.0_f32; b];
+        let mut loss_cpu = 0.0_f64;
+        loss_wdl_cpu(
+            &out,
+            &score,
+            &wdl,
+            &vec![per_pos_norm; b],
+            &mut dl_cpu,
+            &mut loss_cpu,
+            lambda,
+            scale,
+            b,
+        );
+
+        let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+        let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        cuda_launch! {
+            kernel: loss_wdl, stream: stream, module: module, config: cfg_1d(b),
+            args: [slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                   slice_mut(dl_dev), slice(loss_dev), lambda, scale, b as u32]
+        }?;
+        stream.synchronize()?;
+        // libdevice exp と std exp の差で ~ulp レベルずれるため relative tolerance
+        // (loss_wrm と同方針)。
+        assert_close_rel(
+            &format!("loss_wdl/lambda={lambda} grad"),
+            &dl_dev.to_host_vec(&stream)?,
+            &dl_cpu,
+            1e-4,
+        );
+        let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+        let diff = (loss_gpu - loss_cpu).abs();
+        assert!(
+            diff <= 1e-4 * (1.0 + loss_cpu.abs()),
+            "loss_wdl/lambda={lambda} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+        );
+    }
+    Ok(())
+}
+
+// -- PSQT shortcut (per-feature × per-bucket スカラー prior) ---------------
+
+#[test]
+fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, nnz, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let psqt_w = deterministic_floats(ft_in * nb, 33.0);
+    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    // 全 9 bucket + `-1` / `>= nb` の invalid bucket (skip) を踏む。
+    let bucket_idx = bucket_idx_with_padding(batch, nb);
+    let net0 = deterministic_floats(batch, 37.0);
+
+    let mut net_cpu = net0.clone();
+    psqt_diff_sparse_fwd_inplace_cpu(
+        &psqt_w,
+        &stm_indices,
+        &nstm_indices,
+        &bucket_idx,
+        &mut net_cpu,
+        batch,
+        nnz,
+        nb,
+        ft_in,
+    );
+
+    let w_dev = DeviceBuffer::from_host(&stream, &psqt_w)?;
+    let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
+    let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+    let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+    let mut net_dev = DeviceBuffer::from_host(&stream, &net0)?;
+    cuda_launch! {
+        kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
+        config: cfg_1d(batch),
+        args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
+               slice_mut(net_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+    }?;
+    stream.synchronize()?;
+    assert_close(
+        "psqt_diff_sparse_fwd_inplace",
+        &net_dev.to_host_vec(&stream)?,
+        &net_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+#[test]
+fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, nnz, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let dnet = deterministic_floats(batch, 41.0);
+    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    let bucket_idx = bucket_idx_with_padding(batch, nb);
+
+    let mut grad_cpu = vec![0.0_f32; ft_in * nb];
+    psqt_diff_sparse_bwd_cpu(
+        &dnet,
+        &stm_indices,
+        &nstm_indices,
+        &bucket_idx,
+        &mut grad_cpu,
+        batch,
+        nnz,
+        nb,
+        ft_in,
+    );
+
+    let dnet_dev = DeviceBuffer::from_host(&stream, &dnet)?;
+    let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
+    let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+    let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+    let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * nb)?;
+    cuda_launch! {
+        kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
+        config: cfg_1d(batch * nnz),
+        args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
+               slice(grad_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+    }?;
+    stream.synchronize()?;
+    // ±0.5*dnet の atomic scatter は加算順非決定 → relative tolerance。
+    assert_close_rel(
+        "psqt_diff_sparse_bwd",
+        &grad_dev.to_host_vec(&stream)?,
+        &grad_cpu,
+        TOL,
+    );
     Ok(())
 }
 
