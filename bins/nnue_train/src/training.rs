@@ -421,9 +421,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
     };
 
-    // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
-    // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
-    trainer.sync_ft_w_h_mirror()?;
+    // forward 用 FT weight (`--ft-fp16` の mirror / factorizer の comb) を学習
+    // 開始時の `ft_w` (init / --init-from / --resume いずれか) と一度同期する。
+    // 以降は optimizer (mirror) または step 末の fold (comb) が維持する。
+    trainer.sync_ft_forward_weights()?;
 
     let mut experiment = build_experiment_logger(
         cli,

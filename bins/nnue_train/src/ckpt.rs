@@ -71,12 +71,15 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   reproduced independently of `--superbatches`.
 ///
 /// - `6`: a FT-factorizer flag byte follows `max_active` in the feature-set
-///   header, and the `ft_in` / `max_active` fields hold the **training-side**
-///   dimensions (`train_ft_in` / `train_max_active`; equal to the base values
-///   whenever the factorizer is off, so v6 files written without the
-///   factorizer keep the v2 field semantics). The flag pins whether the
-///   checkpoint's FT weight rows include the training-time virtual factorizer
-///   block; resuming across `--ft-factorize` on/off is rejected.
+///   header, and the `ft_in` field holds the **training-side row count**
+///   (`train_ft_in`; equal to the base `ft_in` whenever the factorizer is
+///   off, so v6 files written without the factorizer keep the v2 field
+///   semantics). `max_active` stays the base per-position active count — the
+///   sparse index stream is factorizer-independent (virtual rows are wired
+///   through dense fold / reduce kernels, not through sparse indices). The
+///   flag pins whether the checkpoint's FT weight rows include the
+///   training-time virtual factorizer block; resuming across
+///   `--ft-factorize` on/off is rejected.
 ///
 /// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
@@ -251,7 +254,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(fs_name.as_bytes())?;
     w.write_all(&(arch.feature_set.train_ft_in() as u64).to_le_bytes())?;
     w.write_all(&arch.ft_out.to_le_bytes())?;
-    w.write_all(&(arch.feature_set.train_max_active() as u64).to_le_bytes())?;
+    w.write_all(&(arch.feature_set.max_active() as u64).to_le_bytes())?;
     // FT factorizer flag (v6+)。
     w.write_all(&[arch.feature_set.ft_factorize() as u8])?;
     // producer run id (v3+)。
@@ -360,10 +363,10 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.ft_out
             )));
         }
-        if ckpt_max_active != want.train_max_active() as u64 {
+        if ckpt_max_active != want.max_active() as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
-                want.train_max_active()
+                want.max_active()
             )));
         }
     } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {

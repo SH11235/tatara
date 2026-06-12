@@ -16,19 +16,20 @@ use crate::trainer_common::BatchData;
 use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
 
 #[test]
-fn ft_factorize_batch_to_batchdata_uses_train_stride() {
-    // 本番 dataloader 経路 (`Batch` → `BatchData::from_batch_ref`) の stride
-    // 照合が factorized spec の train 値で整合することを検証する (GPU 不要)。
-    // GPU テスト群は `BatchData::smoke_dummy` で `Batch` 型を bypass するため、
-    // この変換だけは単体で押さえる。
+fn ft_factorize_batch_to_batchdata_uses_base_stride() {
+    // 本番 dataloader 経路 (`Batch` → `BatchData::from_batch_ref`) の stride が
+    // factorized spec でも base `max_active` であることを検証する (sparse index
+    // 列は factorizer 非依存、GPU 不要)。GPU テスト群は
+    // `BatchData::smoke_dummy` で `Batch` 型を bypass するため、この変換だけは
+    // 単体で押さえる。
     let fact = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
     let mut batch = Batch::with_capacity(4, fact);
     batch.n_positions = 2;
     let bucket_idx = [0_i32, 0];
     let data = BatchData::from_batch_ref(&batch, &bucket_idx);
     assert_eq!(data.n_pos, 2);
-    assert_eq!(data.stm_indices.len(), 2 * fact.train_max_active());
-    assert_eq!(data.nstm_indices.len(), 2 * fact.train_max_active());
+    assert_eq!(data.stm_indices.len(), 2 * fact.max_active());
+    assert_eq!(data.nstm_indices.len(), 2 * fact.max_active());
 }
 
 const B: usize = 64;

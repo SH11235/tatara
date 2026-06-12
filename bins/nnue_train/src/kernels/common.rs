@@ -977,6 +977,122 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     }
 }
 
+/// FT factorizer の forward 用畳み込み: 実 block の各要素へ同じ piece plane の
+/// 仮想行を加算し、forward が読む畳み込み済み weight `comb` (base 形状
+/// `ft_in × ft_out`) を作る。`w` は train 形状 (`(ft_in + piece_inputs) × ft_out`、
+/// column-major で `w[feature * ft_out + ri]`)。線形性により
+/// `Σ_active (w_real + w_virt) = Σ_active comb` なので、sparse forward は仮想
+/// index 無しの base 経路のまま factorizer の forward 寄与を得る。
+/// 1 thread = 1 出力要素 (`i = feature * ft_out + ri`)、仮想要素は
+/// `(ft_in + feature % piece_inputs) * ft_out + ri`。
+#[kernel]
+pub fn ft_fold_virtual(
+    w: &[f32],
+    mut comb: DisjointSlice<f32>,
+    ft_in: u32,
+    ft_out: u32,
+    piece_inputs: u32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let ft_out_u = ft_out as usize;
+    let feature = i.get() / ft_out_u;
+    let ri = i.get() - feature * ft_out_u;
+    let p = feature % (piece_inputs as usize);
+    // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
+    // `comb.len() == n` を保証。
+    let v = w[i.get()] + w[(ft_in as usize + p) * ft_out_u + ri];
+    let comb_ptr = comb.as_mut_ptr();
+    unsafe {
+        comb_ptr.add(i.get()).write(v);
+    }
+}
+
+/// [`ft_fold_virtual`] の f16 出力版 (`--ft-fp16` 系列の forward 用 mirror を畳み
+/// 込みと同時に生成する)。f32 で加算してから 1 回だけ f16 へ丸める。
+#[kernel]
+pub fn ft_fold_virtual_f16(
+    w: &[f32],
+    mut comb: DisjointSlice<f16>,
+    ft_in: u32,
+    ft_out: u32,
+    piece_inputs: u32,
+    n: u32,
+) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let ft_out_u = ft_out as usize;
+    let feature = i.get() / ft_out_u;
+    let ri = i.get() - feature * ft_out_u;
+    let p = feature % (piece_inputs as usize);
+    // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
+    // `comb.len() == n` を保証。
+    let v = w[i.get()] + w[(ft_in as usize + p) * ft_out_u + ri];
+    let comb_ptr = comb.as_mut_ptr();
+    unsafe {
+        comb_ptr.add(i.get()).write(v as f16);
+    }
+}
+
+/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece plane を持つ全実
+/// 行の勾配和で埋める (`grad[(ft_in + p) * ft_out + ri] =
+/// Σ_kb grad[(kb * piece_inputs + p) * ft_out + ri]`)。各仮想特徴の出現列が
+/// 「同 p を持つ実特徴の出現列の合併」である (実特徴 1 つにつき仮想特徴
+/// ちょうど 1 つが対応する) ことから、仮想 index を sparse backward に流す
+/// 直接 gather と数学的に等価 (f32 加算順のみ異なる)。実 block の gather
+/// (`gather_and_sum_per_feature_*`) が stm / nstm 両方完了した後に launch する。
+/// 1 thread = 1 仮想要素 (`i = p * ft_out + ri`)、仮想 block は overwrite。
+#[kernel]
+pub fn ft_reduce_virtual_grad(grad: &[f32], ft_in: u32, ft_out: u32, piece_inputs: u32) {
+    let i = thread::index_1d();
+    let ft_out_u = ft_out as usize;
+    let pi_u = piece_inputs as usize;
+    if i.get() >= pi_u * ft_out_u {
+        return;
+    }
+    let p = i.get() / ft_out_u;
+    let ri = i.get() - p * ft_out_u;
+    let n_kb = (ft_in as usize) / pi_u;
+
+    // raw pointer 版 (PTX の bounds check 除去)。unsafe 妥当性: caller が
+    // `grad.len() == (ft_in + piece_inputs) * ft_out` と `ft_in % piece_inputs == 0`
+    // を保証し、読みは実 block (`feature < ft_in`)、書きは thread ごとに disjoint な
+    // 仮想 cell (`ft_in + p` 行) に閉じる。
+    // 4-way unroll: 1-load-1-fadd の依存 chain を 4 accumulator に分割して
+    // in-flight load を確保する (`gather_and_sum_per_feature_*` と同じ理由)。
+    // 加算順は kb 逐次和と異なるが f32 非結合則の丸め差のみ。
+    let grad_ptr = grad.as_ptr();
+    let row_stride = pi_u * ft_out_u;
+    let base = p * ft_out_u + ri;
+    let mut sum0 = 0.0_f32;
+    let mut sum1 = 0.0_f32;
+    let mut sum2 = 0.0_f32;
+    let mut sum3 = 0.0_f32;
+    let mut kb = 0;
+    let unroll_end = n_kb.saturating_sub(3);
+    while kb < unroll_end {
+        sum0 += unsafe { grad_ptr.add(base + kb * row_stride).read() };
+        sum1 += unsafe { grad_ptr.add(base + (kb + 1) * row_stride).read() };
+        sum2 += unsafe { grad_ptr.add(base + (kb + 2) * row_stride).read() };
+        sum3 += unsafe { grad_ptr.add(base + (kb + 3) * row_stride).read() };
+        kb += 4;
+    }
+    while kb < n_kb {
+        sum0 += unsafe { grad_ptr.add(base + kb * row_stride).read() };
+        kb += 1;
+    }
+    let sum = (sum0 + sum1) + (sum2 + sum3);
+    let out_ptr = grad_ptr as *mut f32;
+    unsafe {
+        out_ptr.add((ft_in as usize + p) * ft_out_u + ri).write(sum);
+    }
+}
+
 /// Phase 1 of inverse-index sparse_ft_backward: per-feature 出現回数を histogram。
 /// `counts[f]` に (b, slot) で `indices[b*nnz+slot] == f` の数を atomic accumulate。
 /// host が呼出前に `counts` を 0 reset。

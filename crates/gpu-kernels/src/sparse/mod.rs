@@ -8,6 +8,9 @@
 //!
 //! - `sparse_ft_forward` — HalfKA_hm sparse feature transform forward
 //! - `sparse_ft_backward` — 同 backward、atomics scatter
+//! - `ft_factorize` — FT factorizer の fold (forward 用畳み込み weight 生成) /
+//!   reduce (仮想行勾配の king-bucket 方向縮約)
 
+pub mod ft_factorize;
 pub mod sparse_ft_backward;
 pub mod sparse_ft_forward;

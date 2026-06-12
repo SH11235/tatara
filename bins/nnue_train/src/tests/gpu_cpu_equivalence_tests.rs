@@ -46,6 +46,7 @@ use gpu_kernels::pointwise::norm_loss::{norm_loss_apply_cpu, norm_loss_compute_n
 use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_step_cpu};
 use gpu_kernels::pointwise::ranger_step::{ranger_lookahead_lerp_cpu, ranger_step_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
+use gpu_kernels::sparse::ft_factorize::{ft_fold_virtual_cpu, ft_reduce_virtual_grad_cpu};
 use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
 use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
 
@@ -3099,6 +3100,108 @@ fn cast_f32_to_f16_matches_host_cast() -> Result<(), Box<dyn std::error::Error>>
             assert_eq!(g, c, "cast_f32_to_f16[{i}]");
         }
     }
+    Ok(())
+}
+
+// -- ft_fold_virtual / ft_reduce_virtual_grad (FT factorizer) -------------
+
+/// FT factorizer の fold / reduce テスト共通 fixture:
+/// (ft_in, ft_out, piece_inputs, train 形状の決定論 weight)。kb = 3 × pi = 5。
+fn ft_factorize_fixture() -> (usize, usize, usize, Vec<f32>) {
+    let ft_in = 15;
+    let ft_out = 8;
+    let pi = 5;
+    let w = deterministic_floats((ft_in + pi) * ft_out, 3.0);
+    (ft_in, ft_out, pi, w)
+}
+
+/// fold (f32 出力) が CPU reference と完全一致する (thread ごと 1 加算で
+/// 加算順差が無い)。
+#[test]
+fn ft_fold_virtual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (ft_in, ft_out, pi, w) = ft_factorize_fixture();
+    let n = ft_in * ft_out;
+
+    let mut comb_cpu = vec![0.0_f32; n];
+    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_out, pi);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_out as u32,
+               pi as u32, n as u32]
+    }?;
+    stream.synchronize()?;
+    assert_close(
+        "ft_fold_virtual",
+        &comb_dev.to_host_vec(&stream)?,
+        &comb_cpu,
+        0.0,
+    );
+    Ok(())
+}
+
+/// fold f16 出力版が「f32 で加算 → 1 回 f16 丸め」の host 計算と bit 一致する。
+#[test]
+fn ft_fold_virtual_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (ft_in, ft_out, pi, w) = ft_factorize_fixture();
+    let n = ft_in * ft_out;
+
+    let mut comb_cpu = vec![0.0_f32; n];
+    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_out, pi);
+    let (_, expected) = quantize_f16(&comb_cpu);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_out as u32,
+               pi as u32, n as u32]
+    }?;
+    stream.synchronize()?;
+    let got: Vec<f32> = comb_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    assert_close("ft_fold_virtual_f16", &got, &expected, 0.0);
+    Ok(())
+}
+
+/// reduce が CPU reference と一致し、実 block を変更しない。仮想 block は
+/// 4-way unroll の加算順差があるため relative tolerance。
+#[test]
+fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (ft_in, ft_out, pi, grad_init) = ft_factorize_fixture();
+    let train_n = (ft_in + pi) * ft_out;
+
+    let mut grad_cpu = grad_init.clone();
+    ft_reduce_virtual_grad_cpu(&mut grad_cpu, ft_in, ft_out, pi);
+
+    let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
+    cuda_launch! {
+        kernel: ft_reduce_virtual_grad, stream: stream, module: module,
+        config: cfg_1d(pi * ft_out),
+        args: [slice(grad_dev), ft_in as u32, ft_out as u32, pi as u32]
+    }?;
+    stream.synchronize()?;
+    let got = grad_dev.to_host_vec(&stream)?;
+    assert_eq!(
+        &got[..ft_in * ft_out],
+        &grad_init[..ft_in * ft_out],
+        "実 block は read-only"
+    );
+    assert_close_rel(
+        "ft_reduce_virtual_grad virtual block",
+        &got[ft_in * ft_out..],
+        &grad_cpu[ft_in * ft_out..],
+        TOL,
+    );
+    assert_eq!(got.len(), train_n);
     Ok(())
 }
 

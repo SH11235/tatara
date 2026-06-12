@@ -56,7 +56,7 @@ pub struct Batch {
     /// この batch を埋めた feature set。`push_decoded` の特徴抽出と
     /// `max_active` / `ft_in` の決定はすべてこの spec が単一の真実源。
     pub feature_set: FeatureSetSpec,
-    /// `feature_set.train_max_active()` のキャッシュ (sparse index の row stride)。
+    /// `feature_set.max_active()` のキャッシュ (sparse index の row stride)。
     pub max_active: usize,
     pub stm_indices: Vec<i32>,
     pub nstm_indices: Vec<i32>,
@@ -67,12 +67,10 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// `batch_size` × `feature_set.train_max_active()` の sparse 容量を持つ空
+    /// `batch_size` × `feature_set.max_active()` の sparse 容量を持つ空
     /// `Batch` を確保。全 index は `-1` (padding)、score/wdl/norm は `0.0`。
-    /// FT factorizer 有効 spec では仮想特徴の分だけ row stride が広がる
-    /// (無効時は `max_active()` と同値)。
     pub fn with_capacity(batch_size: usize, feature_set: FeatureSetSpec) -> Self {
-        let max_active = feature_set.train_max_active();
+        let max_active = feature_set.max_active();
         Self {
             batch_size,
             feature_set,

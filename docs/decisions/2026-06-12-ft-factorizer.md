@@ -33,19 +33,36 @@ reject する:
   到達しない (Simple の export に畳み込みが無いため)
 - **`--init-from`**: 量子化 `.bin` は仮想行を持たないため初期化元にできない
 
-### 2. 仮想特徴は P factor のみ
+### 2. 仮想特徴は P factor のみ、sparse path には流さない (fold + reduce)
 
 実特徴 index は全 feature set で `kb * piece_inputs + p` の形
-(筋ミラー / 敵玉 fold は p 側に折込済み) なので、emit 済み index から
-`p = idx % piece_inputs` で仮想 index `ft_in + p` を導出できる。特徴抽出の
-盤駒 / 玉 / 手駒の走査は factorizer 非依存のまま、emit 後の post-pass で
-仮想分を追加する。
+(筋ミラー / 敵玉 fold は p 側に折込済み) なので、実特徴と仮想特徴は
+`p = idx % piece_inputs` で 1:1 対応する。この対応を仮想 index として
+sparse path に流す (nnue-pytorch 方式、active ×2) 代わりに、dense kernel
+2 本で配線する:
 
-- 学習時次元: `train_ft_in = ft_in + piece_inputs`、
-  `train_max_active = max_active × 2`
-- nnue-pytorch HalfKP 系の第 3 因子 (玉マス単独、実特徴ごとの重複 emit で
-  active ×3) は採用しない — 現行 nnue-pytorch も piece-plane factor 単独で
-  運用しており、throughput 代金に見合わない
+- **forward (fold)**: `comb[(kb·pi+p)] = W_real[(kb·pi+p)] + W_virt[p]` を
+  optimizer step 後に毎 step 1 回 materialize し (`ft_fold_virtual` /
+  `--ft-fp16` 系では f16 cast を融合した `ft_fold_virtual_f16`)、sparse
+  forward は comb (base 形状) を base の index 列のまま読む。線形性により
+  `Σ_active (W_real + W_virt) = Σ_active comb` で出力は同一
+- **backward (reduce)**: 実特徴 1 つにつき仮想特徴ちょうど 1 つが対応する
+  ため、仮想行の勾配は `grad_virt[p] = Σ_kb grad_real[(kb·pi+p)]` で厳密に
+  求まる (`ft_reduce_virtual_grad`、inverse-index pipeline の実 block gather
+  完了後に 1 launch)
+
+これにより特徴 emit・dataloader・H2D 転送・sparse forward / backward は
+factorizer 非依存 (base 次元) のまま、仮想行のコストは dense pass 2 本
+(weight / grad の全行読み、計 ~1-2 ms/step @ 1536×73K) に置き換わる。
+active 数に比例する DRAM 飽和 phase (sparse forward / inverse-index phD) を
+2 倍にする方式と数学的に等価で、f32 加算順 / 丸め位置のみ異なる。
+
+- 学習時次元: `train_ft_in = ft_in + piece_inputs` (weight 行数のみ。active
+  数 / index 範囲は base のまま)
+- nnue-pytorch HalfKP 系の第 3 因子 (玉マス単独) は採用しない — 現行
+  nnue-pytorch も piece-plane factor 単独で運用しており、実績を優先する
+  (fold + reduce 構成では追加 factor の代金は dense kernel 1 組に下がるため、
+  必要になれば throughput とは独立に評価できる)
 
 ### 3. spec modifier — 公開 enum は増やさない
 
@@ -54,20 +71,21 @@ modifier (`with_ft_factorize`) を持たせる。export される artifact が b
 同一なので、名前空間を分裂させない。
 
 getter は fail-safe に命名する: `ft_in()` / `max_active()` は **base
-(export / format / checkpoint 互換層の意味)** のまま、学習側の消費者
-(dataloader 容量 / workspace / kernel 起動 / checkpoint header) だけが
-`train_ft_in()` / `train_max_active()` を参照する。既存の format 経路は
-無変更でコンパイルされ、train 側だけを意図的に書き換える形になる。spec は
-`PartialEq` で Batch / trainer / weight の照合に使われるため、modifier 込み
-の不一致は既存の照合がそのまま reject する。
+(export / format / checkpoint 互換層と sparse path の意味)** のまま、FT
+weight の行数を扱う消費者 (weight buffer / optimizer / norm loss /
+checkpoint header) だけが `train_ft_in()` を参照する。既存の format 経路は
+無変更でコンパイルされ、weight 行数側だけを意図的に書き換える形になる。
+spec は `PartialEq` で Batch / trainer / weight の照合に使われるため、
+modifier 込みの不一致は既存の照合がそのまま reject する。
 
 ### 4. checkpoint format に factorizer flag (寸法照合が primary guard)
 
 raw checkpoint header の feature-set 節に factorizer flag を追加する
 (format version bump、旧版読込みは flag 無し = 無効扱い)。header の
-`ft_in` / `max_active` には学習側の値を書くため、on/off を跨ぐ resume は
-寸法不一致としても必ず reject される — flag は原因が読めるエラーを先に出す
-ためのもの。experiment.json にも flag を記録する。
+`ft_in` には学習側の行数 (`train_ft_in`) を書くため、on/off を跨ぐ resume
+は寸法不一致としても必ず reject される — flag は原因が読めるエラーを先に
+出すためのもの。`max_active` は base 値 (sparse path が factorizer 非依存の
+ため学習側もこれが実値)。experiment.json にも flag を記録する。
 
 ### 5. export は量子化・飽和検査の前に畳み込む
 
@@ -106,20 +124,34 @@ step を実 / 仮想の 2 領域 launch に分けて仮想側にだけ別 scale 
 
 ## コスト
 
-- 学習 throughput: active 特徴数に比例する phase (sparse FT forward /
-  inverse-index backward) が ~2 倍になり、全体で 3〜4 割の低下を見込む。
-  推論側はゼロ (export 物が base と同形)
-- メモリ: FT 系 buffer が `piece_inputs / ft_in` (数 %) 増
-- kernel 改修: 不要 (sparse kernel は次元・active 数とも runtime 引数)
+- 学習 throughput: sparse path (forward / inverse-index backward / H2D /
+  dataloader emit) は base 次元のまま無増。仮想行の代金は dense pass 2 本
+  (fold: FT weight 全行読み + base 形状書き、reduce: FT grad 実 block 全行
+  読み + 仮想 block 書き、計 ~1-2 ms/step @ 1536×73K) と optimizer / norm
+  loss の行数 +`piece_inputs / ft_in` (数 %)。推論側はゼロ (export 物が
+  base と同形)
+- メモリ: FT 系 buffer が `piece_inputs / ft_in` (数 %) 増。加えて forward
+  用 comb (base 形状) — `--ft-fp16` 系では既存 mirror が comb を兼ねるため
+  追加なし、FP32 構成のみ f32 buffer 1 本 (`ft_in × ft_out`、1536×73K で
+  ~430 MB) を追加確保する
+- kernel 改修: fold / reduce の専用 kernel 2 種 3 本 (いずれも 1 thread =
+  1 要素の単純 dense kernel)。sparse kernel 群は無変更
 
 ## リスク / 検証
 
 - FT weight は学習中 clamp されない (quant 由来 clamp は dense 層のみ) ため、
   畳み込み後の和が i16 飽和域に入る可能性は export 時の飽和検査で監視する
-- sparse kernel は範囲外 index を silent skip する規約のため、配線ミスは
-  「仮想行が学習されない」型の静かな破綻になる — 学習開始時 export の
-  bit 一致 / 1 step 後の仮想行更新 / 量子化 export の base ロード可否を
-  テストで能動検出する (`ft_factorize_tests`)
+- 仮想行の配線は fold / reduce kernel に集約される — 配線ミスは「仮想行が
+  学習されない / forward に乗らない」型の静かな破綻になる。学習開始時
+  export の bit 一致 / 1 step 後の仮想行更新 / 量子化 export の base ロード
+  可否 (`ft_factorize_tests`) に加え、fold・reduce が仮想 index 方式の
+  sparse 計算と一致することを CPU reference 同士
+  (`gpu_kernels::sparse::ft_factorize`) と GPU↔CPU equivalence test で
+  能動検出する
+- fold / reduce 方式は仮想 index を sparse path に流す方式と f32 加算順 /
+  丸め位置が異なる (数学的には forward / 勾配とも等価)。bit 再現が要る
+  bisect 等では両実装の checkpoint は互換しない (header の `max_active` 値
+  も異なり resume は reject される)
 - 効果はサンプル効率型のため短期評価は過大に出やすく、採否は長期 run の
   対局評価で判定する
 
@@ -127,8 +159,13 @@ step を実 / 仮想の 2 領域 launch に分けて仮想側にだけ別 scale 
 
 - **新 FeatureSet variant の公開**: export 物が base と同一なのに名前が
   分裂し、「同じ .bin を指す名前が 2 つ」になる
-- **玉マス factor の同時実装**: active ×3 の throughput 代金に対し、現行
-  nnue-pytorch が piece-plane factor 単独で運用している実績を優先
+- **仮想 index を sparse path に流す (nnue-pytorch 方式)**: active ×2 で
+  DRAM 飽和 phase (sparse forward / inverse-index phD) がそのまま 2 倍になり
+  実測 ~37% の throughput 低下 (1.40M → 882K pos/s、RTX 3080 Ti、LayerStack
+  1536x16x32 hm-merged `--all-optim`)。fold + reduce は同じ最適化問題を
+  dense pass ~1-2 ms/step で配線できるため置き換えた
+- **玉マス factor の同時実装**: 現行 nnue-pytorch が piece-plane factor
+  単独で運用している実績を優先
 - **推論側で factorized arch を受理**: 推論エンジンは coalesced-only を
   要求する既存方針を維持する理由しかない
 - **PSQT との併用対応**: PSQT block の畳み込み + 量子化検査の追加設計が

@@ -32,9 +32,16 @@ pub(crate) struct GpuTrainer {
     ft_w_v: MomentBuf,
     ft_w_slow: DeviceBuffer<f32>,
     ft_w_grad: DeviceBuffer<f32>,
-    /// `ft_w` の FP16 mirror。`ft_fp16` が true のときだけ確保され、毎 step `ft_w`
-    /// (FP32 master) から変換される。`sparse_ft_forward_fp16` の weight 入力。
+    /// forward (`sparse_ft_forward_fp16` 系) が読む f16 weight。`ft_fp16` が true の
+    /// ときだけ確保される。factorizer 無効時は `ft_w` (FP32 master) の cast mirror
+    /// (train 形状、optimizer の mirror 同時更新 variant が毎 step 維持)。factorizer
+    /// 有効時は仮想行を実行へ畳み込んだ comb (base 形状、毎 step 末の
+    /// `ft_fold_virtual_f16` が master から再生成、optimizer は master のみ更新)。
     ft_w_h: Option<DeviceBuffer<f16>>,
+    /// factorizer 有効かつ `ft_fp16` 無効のときの forward 用畳み込み weight (comb、
+    /// base 形状の f32)。`ft_w_h` の f16 comb と同役で、FP32 forward が `ft_w` の
+    /// 代わりに読む。それ以外の構成では `None` (FP32 forward は `ft_w` を直接読む)。
+    ft_w_fold32: Option<DeviceBuffer<f32>>,
     ft_b: DeviceBuffer<f32>,
     ft_b_m: DeviceBuffer<f32>,
     ft_b_v: DeviceBuffer<f32>,
@@ -226,11 +233,14 @@ pub(crate) struct GpuWorkspace {
     /// この workspace が確保している batch (= position) 数。0 = 未確保。
     len_batch: usize,
 
-    /// FT 入力次元 (feature set ごとに異なる)。inverse-index scratch
-    /// (`feat_*`) と FT forward/backward kernel の launch arg に使う。
+    /// FT 入力次元 (feature set ごとに異なる base 値、factorizer 非依存)。
+    /// inverse-index scratch (`feat_*`) と FT forward/backward kernel の launch
+    /// arg に使う。factorizer の仮想行は sparse path に現れない (fold / reduce
+    /// kernel が train 形状の weight / grad 側で配線する) ため、ここは常に base。
     ft_in: usize,
-    /// 1 perspective あたりの active feature 数 (feature set ごとに異なる)。
-    /// 入力 index buffer (`stm_idx_dev` 等) の容量と FT kernel の launch arg。
+    /// 1 perspective あたりの active feature 数 (feature set ごとに異なる base 値、
+    /// factorizer 非依存)。入力 index buffer (`stm_idx_dev` 等) の容量と FT kernel
+    /// の launch arg。
     max_active: usize,
     /// FT 出力次元 (1 perspective あたり)。`--ft-out` から起動時に決まる。
     /// post-FT activation buffer の幅と FT forward/backward kernel の launch arg。
@@ -343,8 +353,8 @@ impl GpuWorkspace {
             (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuWorkspace requires num_buckets in [1, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
-        let ft_in = feature_set.train_ft_in();
-        let max_active = feature_set.train_max_active();
+        let ft_in = feature_set.ft_in();
+        let max_active = feature_set.max_active();
         // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
         // L2 入力次元。どちらも `l1_out` から導出する (struct method と同式)。
         let l1_effective = l1_out - L1_SKIP;
@@ -642,10 +652,10 @@ impl GpuTrainer {
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
         let base_ft_in = feature_set.ft_in();
-        let ft_in = feature_set.train_ft_in();
+        let train_ft_in = feature_set.train_ft_in();
         let l1_effective = l1_out - L1_SKIP;
         let l2_in = l1_effective * 2;
-        let ft_w_n = ft_in * ft_out;
+        let ft_w_n = train_ft_in * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = num_buckets * l1_out * ft_out;
         let l1_b_n = num_buckets * l1_out;
@@ -698,13 +708,15 @@ impl GpuTrainer {
         let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l2_out), &init_spec.l3_b);
 
         // PSQT shortcut の初期 weight (有効時のみ確保)。長さ `ft_in * num_buckets` を
-        // caller が validation 済の前提 (CLI / `run_training` 側で構築)。
+        // caller が validation 済の前提 (CLI / `run_training` 側で構築)。PSQT は
+        // sparse index (base 範囲) で引かれるため行数は base `ft_in` (factorizer
+        // との併用は CLI が reject 済)。
         let psqt = match psqt_init {
             Some(init) => {
-                let expected = ft_in * num_buckets;
+                let expected = base_ft_in * num_buckets;
                 if init.len() != expected {
                     return Err(format!(
-                        "psqt_init length {} != expected {expected} (= ft_in {ft_in} * num_buckets {num_buckets})",
+                        "psqt_init length {} != expected {expected} (= ft_in {base_ft_in} * num_buckets {num_buckets})",
                         init.len()
                     )
                     .into());
@@ -742,8 +754,21 @@ impl GpuTrainer {
             ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
             ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
+            // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
+            // = base と同値)。いずれも `sync_ft_forward_weights` が初期同期する。
             ft_w_h: if ft_fp16 {
-                Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
+                let n = if feature_set.ft_factorize() {
+                    base_ft_in * ft_out
+                } else {
+                    ft_w_n
+                };
+                Some(DeviceBuffer::<f16>::zeroed(&stream, n)?)
+            } else {
+                None
+            },
+            ft_w_fold32: if feature_set.ft_factorize() && !ft_fp16 {
+                Some(DeviceBuffer::<f32>::zeroed(&stream, base_ft_in * ft_out)?)
             } else {
                 None
             },
@@ -816,11 +841,7 @@ impl GpuTrainer {
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
-            input_ring: InputUploadRing::new(
-                ctx,
-                batch_size.max(1),
-                feature_set.train_max_active(),
-            )?,
+            input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
             cublas: CublasHandle::new(&stream, enable_tf32)?,
             ft_fp16,
             ft_fp16_out,
@@ -1275,13 +1296,20 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// `--ft-fp16` の FP16 weight mirror (`ft_w_h`) を現在の `ft_w` から再生成する。
+    /// forward が読む FT weight buffer (`ft_w_h` mirror / factorizer の comb) を
+    /// 現在の `ft_w` (FP32 master) から再生成する。
     ///
-    /// 学習中の mirror は optimizer (`radam_step_fp16_mirror` /
-    /// `ranger_lookahead_lerp_fp16_mirror`) が `ft_w` 更新と同時に書く。ただし学習
-    /// 開始時は optimizer 未実行で mirror が初期 0 のままなので、最初の forward の前に
-    /// 一度だけ明示同期する。`ft_fp16` 無効時 (`ft_w_h` が `None`) は no-op。
-    pub(crate) fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// factorizer 無効 + `--ft-fp16` の mirror は学習中 optimizer
+    /// (`radam_step_fp16_mirror` / `ranger_lookahead_lerp_fp16_mirror`) が `ft_w`
+    /// 更新と同時に書く。ただし学習開始時は optimizer 未実行で mirror が初期 0 の
+    /// ままなので、最初の forward の前に一度だけ明示同期する。factorizer 有効時の
+    /// comb は毎 step 末の [`launch_ft_fold`](Self::launch_ft_fold) が維持するが、
+    /// 初回 forward 前の生成は同じくここが担う。どちらにも該当しない構成
+    /// (FP32 + factorizer 無効) は no-op。
+    pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.feature_set.ft_factorize() {
+            return self.launch_ft_fold();
+        }
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
             let ft_w_n = self.feature_set.train_ft_in() * self.ws.ft_out;
             cuda_launch! {
@@ -1290,6 +1318,40 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(ft_w_n),
                 args: [slice(self.ft_w), slice_mut(ft_w_h), ft_w_n as u32]
+            }?;
+        }
+        Ok(())
+    }
+
+    /// factorizer の forward 用畳み込み weight (comb = 実 block + 仮想行 broadcast、
+    /// base 形状) を `ft_w` (train 形状の FP32 master) から再生成する。
+    /// `--ft-fp16` 系列では f16 comb (`ft_w_h`)、FP32 では f32 comb (`ft_w_fold32`)。
+    /// optimizer / lookahead / norm loss が master を書き換えた後、次の forward が
+    /// 読む前に毎 step 1 回呼ぶ。factorizer 無効時は no-op。
+    fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.feature_set.ft_factorize() {
+            return Ok(());
+        }
+        let base_ft_in = self.feature_set.ft_in();
+        let pi = self.feature_set.piece_inputs();
+        let n = base_ft_in * self.ws.ft_out;
+        if let Some(mut comb) = self.ft_w_h.as_mut() {
+            cuda_launch! {
+                kernel: ft_fold_virtual_f16,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(n),
+                args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
+                       self.ws.ft_out as u32, pi as u32, n as u32]
+            }?;
+        } else if let Some(mut comb) = self.ft_w_fold32.as_mut() {
+            cuda_launch! {
+                kernel: ft_fold_virtual,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(n),
+                args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
+                       self.ws.ft_out as u32, pi as u32, n as u32]
             }?;
         }
         Ok(())
@@ -1511,6 +1573,9 @@ impl GpuTrainer {
         //  - `ft_fp16` のみ: `sparse_ft_forward_fp16` — f16 weight read + f32 出力。
         //  - どちらも無し: `sparse_ft_forward` — FP32 path、bit-identical。
         // いずれも累算は f32、1 thread = 4 row なので grid は b * ft_out / 4。
+        // factorizer 有効時は weight 入力が畳み込み済み comb (`ft_w_h` / `ft_w_fold32`、
+        // base 形状) になるだけで、kernel・launch 次元 (`ws.ft_in` / `ws.max_active`
+        // は base 値) とも無効時と同一。
         debug_assert!(ft_out.is_multiple_of(4));
         if self.ft_fp16_out {
             let ft_w_h = self
@@ -1573,13 +1638,15 @@ impl GpuTrainer {
                 ]
             }?;
         } else {
+            // factorizer 有効時は畳み込み済み comb (`ft_w_fold32`)、無効時は master。
+            let ft_w_fwd = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
             cuda_launch! {
                 kernel: sparse_ft_forward,
                 stream: self.stream,
                 module: self.module,
                 config: cfg_1d(b * ft_out / 4),
                 args: [
-                    slice(self.ft_w),
+                    slice(ft_w_fwd),
                     slice(self.ws.stm_idx_dev),
                     slice_mut(self.ws.ft_stm_out),
                     b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
@@ -1591,7 +1658,7 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(b * ft_out / 4),
                 args: [
-                    slice(self.ft_w),
+                    slice(ft_w_fwd),
                     slice(self.ws.nstm_idx_dev),
                     slice_mut(self.ws.ft_nstm_out),
                     b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
@@ -2553,6 +2620,8 @@ impl GpuTrainer {
         // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
         // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
         // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
+        // factorizer 有効時も本 pipeline は実 block (base `ft_in`) のみを扱い、仮想
+        // block は loop 後の `ft_reduce_virtual_grad` が実 block の縮約で埋める。
         let ft_in = self.ws.ft_in;
         let max_active = self.ws.max_active;
         for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
@@ -2680,13 +2749,29 @@ impl GpuTrainer {
                 prof_tick!("phD_nstm");
             }
         }
+        // factorizer: 仮想行の勾配 = 同 piece plane を持つ実行の勾配和。stm / nstm
+        // 両方の gather が実 block を確定させた後に 1 launch で仮想 block を埋める
+        // (仮想 index を sparse pipeline に流す方式と数学的に等価、kernel doc 参照)。
+        if self.feature_set.ft_factorize() {
+            let pi = self.feature_set.piece_inputs();
+            cuda_launch! {
+                kernel: ft_reduce_virtual_grad,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(pi * ft_out),
+                args: [
+                    slice(self.ft_w_grad),
+                    ft_in as u32, ft_out as u32, pi as u32
+                ]
+            }?;
+        }
         prof_tick!("bwd_ftbwd");
 
         // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
         // radam step の **前** に適用する。理由: (1) radam の per-layer clamp が最後の
-        // 演算になり clamp 不変条件を保つ、(2) FT の FP16 mirror (`ft_w_h`) は後続の
-        // radam / lookahead が master から再同期するので norm loss 側で mirror を
-        // 触る必要がない。各テンソルで reduce (per-group L2 norm) → apply (補正乗算)
+        // 演算になり clamp 不変条件を保つ、(2) forward 用 FT weight (`ft_w_h` mirror /
+        // factorizer の comb) は後続の radam / lookahead (mirror 同時更新) または
+        // step 末の fold が master から再同期するので norm loss 側で触る必要がない。
+        // 各テンソルで reduce (per-group L2 norm) → apply (補正乗算)
         // の 2 launch。`norm_scratch` は per-group norm の作業領域で、stream 順序に
         // より次テンソルの reduce 前に当該 apply が norm を読み終える。group の
         // (n_groups, group_pitch, elem_stride, group_len) は weight のレイアウトで
@@ -2694,6 +2779,8 @@ impl GpuTrainer {
         // (row / strided column)、bias は per-tensor scalar (`n_groups=1`)。PSQT も
         // 同じく per-output-neuron で対象に含める (intended 仕様の全 weight 一様適用)。
         if let Some(nl_factor) = self.norm_loss_factor {
+            // FT weight の norm group 行数は train 値 (factorizer 有効時は仮想行込み)。
+            let ft_w_rows = self.feature_set.train_ft_in();
             macro_rules! norm_loss_group {
                 ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
                     // norm_scratch を sumsq accumulator として使い回すため group ごとに 0 fill
@@ -2724,8 +2811,10 @@ impl GpuTrainer {
             }
             // dense weight: per-output-neuron。FT / L1f は [in, out] strided column
             // (pitch=1, stride=out)、L1 / L2 / L3 は [bucket*out, in] contiguous row
-            // (pitch=in, stride=1)。
-            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_in);
+            // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
+            // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
+            // prior と整合する方向の intended 仕様、ADR 参照)。
+            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
             norm_loss_group!(self.l1f_w, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
@@ -2765,11 +2854,15 @@ impl GpuTrainer {
         // 他 9 group は moment が小さく `f16` 化の意味が無いので常に `radam_step`。
         // FT (`ft_w`) は ft param-group の weight_decay と lr (= scheduled_lr ×
         // ft lr_mult) を使う。psqt_w / dense / bias は uniform loop 側で resolve する。
+        // factorizer 有効時は mirror 同時更新 variant を使わない: `ft_w_h` は base
+        // 形状の comb で train 形状の elementwise step からは書けないため、master
+        // のみ更新し step 末の fold が comb を再生成する (`launch_ft_fold`)。
+        let ft_factorize = self.feature_set.ft_factorize();
         let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
         match (&mut self.ft_w_m, &mut self.ft_w_v) {
             (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                     cuda_launch! {
                         kernel: radam_step_f16state_mirror,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
@@ -2791,7 +2884,7 @@ impl GpuTrainer {
             }
             (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                     cuda_launch! {
                         kernel: radam_step_fp16_mirror,
                         stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
@@ -2972,9 +3065,10 @@ impl GpuTrainer {
 
         // Lookahead lerp every K steps。lerp は radam の後に FT weight を再度書き換える
         // ので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新 variant を使い、
-        // forward 用 `ft_w_h` を lerp 後の最終値で同期し直す。
+        // forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer 有効時は
+        // radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
         if self.step_count.is_multiple_of(RANGER_K) {
-            if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 cuda_launch! {
                     kernel: ranger_lookahead_lerp_fp16_mirror,
                     stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
@@ -2996,6 +3090,11 @@ impl GpuTrainer {
                     args: [slice_mut(*g.weight), slice_mut(*g.slow), RANGER_ALPHA, g.n as u32]
                 }?;
             }
+        }
+        // factorizer: master (`ft_w`) の本 step の全更新 (norm loss / radam /
+        // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
+        if ft_factorize {
+            self.launch_ft_fold()?;
         }
         prof_tick!("optimizer");
 
