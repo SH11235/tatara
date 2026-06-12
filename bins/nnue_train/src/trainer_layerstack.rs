@@ -2115,9 +2115,10 @@ impl GpuTrainer {
         let l3_w_n = self.num_buckets * l2_out;
         let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
-        // `gather_and_sum_per_feature_overwrite` が全 (feature, ri) cell を sum
-        // (off_start==off_end の時も sum=0) で書き切るため、ここで 450MB を reset
-        // するのは無意味 (毎 step の no-op を排除する論理整理)。
+        // `gather_and_sum_per_feature_overwrite` が実 block の全 (feature, ri) cell
+        // を sum (off_start==off_end の時も sum=0) で書き切り、factorizer の仮想
+        // block も `ft_reduce_virtual_grad` が overwrite で書き切るため、ここで
+        // 450MB を reset するのは無意味 (毎 step の no-op を排除する論理整理)。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;

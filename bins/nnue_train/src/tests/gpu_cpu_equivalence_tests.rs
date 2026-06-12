@@ -3106,9 +3106,11 @@ fn cast_f32_to_f16_matches_host_cast() -> Result<(), Box<dyn std::error::Error>>
 // -- ft_fold_virtual / ft_reduce_virtual_grad (FT factorizer) -------------
 
 /// FT factorizer の fold / reduce テスト共通 fixture:
-/// (ft_in, ft_out, piece_inputs, train 形状の決定論 weight)。kb = 3 × pi = 5。
+/// (ft_in, ft_out, piece_inputs, train 形状の決定論 weight)。kb = 7 × pi = 5 —
+/// `ft_reduce_virtual_grad` の 4-way unroll 本体 (kb 0..4) と tail (kb 4..7) の
+/// 両経路を踏む n_kb にする。
 fn ft_factorize_fixture() -> (usize, usize, usize, Vec<f32>) {
-    let ft_in = 15;
+    let ft_in = 35;
     let ft_out = 8;
     let pi = 5;
     let w = deterministic_floats((ft_in + pi) * ft_out, 3.0);
