@@ -14,6 +14,21 @@ fn cli_definition_is_valid() {
 }
 
 #[test]
+fn ft_factorize_flag_parses_and_conflicts_with_psqt() {
+    let cli = Cli::try_parse_from(["nnue-train", "layerstack", "--ft-factorize"])
+        .expect("layerstack should accept --ft-factorize");
+    match &cli.arch {
+        ArchCommand::LayerStack(args) => assert!(args.ft_factorize),
+        other => panic!("unexpected arch: {other:?}"),
+    }
+    // PSQT kernel は同じ sparse index 列を消費し仮想行の畳み込みを持たないため排他。
+    assert!(
+        Cli::try_parse_from(["nnue-train", "layerstack", "--ft-factorize", "--psqt"]).is_err(),
+        "--ft-factorize and --psqt must conflict"
+    );
+}
+
+#[test]
 fn layerstack_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::LayerStack);

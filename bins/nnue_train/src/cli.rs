@@ -608,6 +608,27 @@ pub(crate) struct LayerstackArgs {
     /// where `--scale` provides the conversion factor.
     #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
     pub(crate) psqt_init: PsqtInit,
+
+    /// Enable the FT factorizer (training-time virtual features).
+    ///
+    /// Every active feature `(king_bucket, piece)` additionally activates a
+    /// king-bucket-independent virtual feature for the same piece, so the
+    /// shared piece-plane component receives gradients from every king bucket
+    /// (~king-bucket-count times more data per row). Rarely visited king-square
+    /// cells inherit a sensible shared prior instead of staying near their
+    /// initial values. The virtual rows are folded into the real rows when the
+    /// quantised `.bin` is saved, so the exported net is identical in shape to
+    /// a non-factorized net and inference engines need no changes.
+    ///
+    /// Doubles the active-feature count during training (sparse-phase
+    /// throughput cost; zero inference cost). Default OFF is bit-identical to
+    /// the non-factorized path. Resume across on/off is rejected (checkpoint
+    /// dimensions differ). Incompatible with `--psqt` (the PSQT kernels consume
+    /// the same sparse index list and have no virtual-row fold) and with
+    /// `--init-from` (a quantised `.bin` has no virtual rows to initialise
+    /// from).
+    #[arg(long, conflicts_with = "psqt")]
+    pub(crate) ft_factorize: bool,
 }
 
 /// PSQT shortcut の初期化方式。

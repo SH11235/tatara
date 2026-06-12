@@ -337,6 +337,47 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
     compute_fc_hash(ft_out, l2_out) ^ ft_hash(feature_hash, ft_out)
 }
 
+/// FT factorizer の仮想行を実行へ畳み込み、base 形状
+/// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
+///
+/// 学習時の FT weight は base の実行 (`kb * piece_inputs + p` 行) の後ろに
+/// king-bucket 非依存の仮想 P plane (`piece_inputs` 行) を連結した
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。forward は
+/// 実行 + 仮想行の和を使うため、export では `W_real[(kb, p)] += W_virtual[p]`
+/// で同じ和を実行へ固定し、仮想行を捨てる。量子化と飽和検査
+/// (`warn_if_i16_saturates`) は畳み込み後の値に掛けること (caller は本関数の
+/// 戻り値で `LayerStackWeights::ft_w` を構築する)。
+///
+/// factorizer 無効の spec では入力をそのまま返す。
+pub fn coalesce_ft_factorized(
+    feature_set: &FeatureSetSpec,
+    ft_out: usize,
+    ft_w_train: &[f32],
+) -> Vec<f32> {
+    if !feature_set.ft_factorize() {
+        return ft_w_train.to_vec();
+    }
+    let base_ft_in = feature_set.ft_in();
+    let piece_inputs = feature_set.piece_inputs();
+    let train_ft_in = feature_set.train_ft_in();
+    assert_eq!(
+        ft_w_train.len(),
+        train_ft_in * ft_out,
+        "ft_w length must be train_ft_in * ft_out"
+    );
+    let virtual_base = base_ft_in * ft_out;
+    let mut out = ft_w_train[..virtual_base].to_vec();
+    for feat in 0..base_ft_in {
+        let p = feat % piece_inputs;
+        let dst = feat * ft_out;
+        let src = virtual_base + p * ft_out;
+        for o in 0..ft_out {
+            out[dst + o] += ft_w_train[src + o];
+        }
+    }
+    out
+}
+
 // =============================================================================
 // LayerStackWeights — トレーナー側 weight 表現 (f32、kernel と同 layout)
 // =============================================================================
@@ -1021,6 +1062,39 @@ fn warn_if_i16_saturates(name: &str, values: &[f32], scale: f64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesce_ft_factorized_folds_virtual_rows() {
+        use shogi_features::FeatureSet;
+        let base = FeatureSet::HalfKp.spec();
+        let spec = FeatureSet::HalfKp.spec().with_ft_factorize();
+        let ft_out = 2usize;
+        let pi = base.piece_inputs();
+        // 実行 (kb, p) に feat 番号、仮想行 p に 10_000 + p を入れて畳み込みを検証。
+        let mut w = vec![0.0f32; spec.train_ft_in() * ft_out];
+        for feat in 0..base.ft_in() {
+            for o in 0..ft_out {
+                w[feat * ft_out + o] = feat as f32 + o as f32 * 0.5;
+            }
+        }
+        for p in 0..pi {
+            for o in 0..ft_out {
+                w[(base.ft_in() + p) * ft_out + o] = 10_000.0 + p as f32 + o as f32 * 0.25;
+            }
+        }
+        let out = coalesce_ft_factorized(&spec, ft_out, &w);
+        assert_eq!(out.len(), base.ft_in() * ft_out);
+        for feat in [0usize, 1, pi - 1, pi, 2 * pi + 7, base.ft_in() - 1] {
+            let p = feat % pi;
+            for o in 0..ft_out {
+                let want = (feat as f32 + o as f32 * 0.5) + (10_000.0 + p as f32 + o as f32 * 0.25);
+                assert_eq!(out[feat * ft_out + o], want, "feat={feat} o={o}");
+            }
+        }
+        // 無効 spec は素通し。
+        let pass = coalesce_ft_factorized(&base, ft_out, &w[..base.ft_in() * ft_out]);
+        assert_eq!(pass, &w[..base.ft_in() * ft_out]);
+    }
+
     use super::*;
     use shogi_features::FeatureSet;
 
