@@ -195,13 +195,14 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// PSQT 有効の trainer を作る (psqt_init は base 形状 zeros)。factorize 有効 spec を
-/// 渡すと PSQT block も仮想 P 行を持つ。
-fn make_trainer_psqt(
+/// PSQT 有効の trainer を作る (psqt_init は base 形状)。factorize 有効 spec を
+/// 渡すと PSQT block も仮想 P 行を持ち、`psqt_init` の base 行を実 block に置いて
+/// 仮想 block は zero append される。
+fn make_trainer_psqt_init(
     ctx: &std::sync::Arc<CudaContext>,
     feature_set: shogi_features::FeatureSetSpec,
+    psqt_init: &[f32],
 ) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
-    let psqt_init = vec![0.0_f32; feature_set.ft_in() * DEFAULT_NUM_BUCKETS];
     GpuTrainer::new(
         ctx,
         B,
@@ -216,9 +217,43 @@ fn make_trainer_psqt(
         feature_set,
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
-        Some(&psqt_init),
+        Some(psqt_init),
         &LayerStackInit::default_uniform(),
     )
+}
+
+/// `make_trainer_psqt_init` の zeros init 版。
+fn make_trainer_psqt(
+    ctx: &std::sync::Arc<CudaContext>,
+    feature_set: shogi_features::FeatureSetSpec,
+) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+    let psqt_init = vec![0.0_f32; feature_set.ft_in() * DEFAULT_NUM_BUCKETS];
+    make_trainer_psqt_init(ctx, feature_set, &psqt_init)
+}
+
+#[test]
+fn ft_factorize_psqt_nonzero_init_virtual_block_is_zero() -> Result<(), Box<dyn std::error::Error>>
+{
+    // material 等の非 zero base init でも、factorize trainer の仮想 block は zero
+    // append される。よって学習前の coalesced psqt_w (= 実 block + zero 仮想) は
+    // base init そのもの・非 factorize psqt と一致する (step-0 forward 等価の根拠)。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let pn = base.ft_in() * DEFAULT_NUM_BUCKETS;
+    // 決定論的な非 zero base init (material prior の代わり)。
+    let init: Vec<f32> = (0..pn).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let w_off = make_trainer_psqt_init(&ctx, base, &init)?.to_layerstack_weights()?;
+    let w_on =
+        make_trainer_psqt_init(&ctx, base.with_ft_factorize(), &init)?.to_layerstack_weights()?;
+    let pw_on = w_on.psqt_w.expect("psqt on");
+    assert_eq!(pw_on.len(), pn, "coalesced psqt_w は base 形状");
+    assert_eq!(pw_on, init, "仮想 block zero なので coalesced = base init");
+    assert_eq!(
+        pw_on,
+        w_off.psqt_w.expect("psqt off"),
+        "factorize 有無で init export 一致"
+    );
+    Ok(())
 }
 
 #[test]
