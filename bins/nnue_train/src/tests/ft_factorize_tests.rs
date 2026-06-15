@@ -194,3 +194,126 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     assert_eq!(loaded.ft_w.len(), base.ft_in() * FT_OUT_TEST);
     Ok(())
 }
+
+/// PSQT 有効の trainer を作る (psqt_init は base 形状)。factorize 有効 spec を
+/// 渡すと PSQT block も仮想 P 行を持ち、`psqt_init` の base 行を実 block に置いて
+/// 仮想 block は zero append される。
+fn make_trainer_psqt_init(
+    ctx: &std::sync::Arc<CudaContext>,
+    feature_set: shogi_features::FeatureSetSpec,
+    psqt_init: &[f32],
+) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+    GpuTrainer::new(
+        ctx,
+        B,
+        FT_OUT_TEST,
+        DEFAULT_L1_OUT,
+        DEFAULT_L2_OUT,
+        DEFAULT_NUM_BUCKETS,
+        false,
+        false,
+        false,
+        false,
+        feature_set,
+        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+        None,
+        Some(psqt_init),
+        &LayerStackInit::default_uniform(),
+    )
+}
+
+/// `make_trainer_psqt_init` の zeros init 版。
+fn make_trainer_psqt(
+    ctx: &std::sync::Arc<CudaContext>,
+    feature_set: shogi_features::FeatureSetSpec,
+) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+    let psqt_init = vec![0.0_f32; feature_set.ft_in() * DEFAULT_NUM_BUCKETS];
+    make_trainer_psqt_init(ctx, feature_set, &psqt_init)
+}
+
+#[test]
+fn ft_factorize_psqt_nonzero_init_virtual_block_is_zero() -> Result<(), Box<dyn std::error::Error>>
+{
+    // material 等の非 zero base init でも、factorize trainer の仮想 block は zero
+    // append される。よって学習前の coalesced psqt_w (= 実 block + zero 仮想) は
+    // base init そのもの・非 factorize psqt と一致する (step-0 forward 等価の根拠)。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let pn = base.ft_in() * DEFAULT_NUM_BUCKETS;
+    // 決定論的な非 zero base init (material prior の代わり)。
+    let init: Vec<f32> = (0..pn).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let w_off = make_trainer_psqt_init(&ctx, base, &init)?.to_layerstack_weights()?;
+    let w_on =
+        make_trainer_psqt_init(&ctx, base.with_ft_factorize(), &init)?.to_layerstack_weights()?;
+    let pw_on = w_on.psqt_w.expect("psqt on");
+    assert_eq!(pw_on.len(), pn, "coalesced psqt_w は base 形状");
+    assert_eq!(pw_on, init, "仮想 block zero なので coalesced = base init");
+    assert_eq!(
+        pw_on,
+        w_off.psqt_w.expect("psqt off"),
+        "factorize 有無で init export 一致"
+    );
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_psqt_init_export_is_base_shape() -> Result<(), Box<dyn std::error::Error>> {
+    // factorize + psqt の trainer は psqt_w を train 形状で持つが、export coalesce で
+    // base 形状に畳む。psqt_init=zeros + 仮想行 zero なので、学習前の coalesced psqt_w
+    // は非 factorize psqt と一致する (zero の畳み込みは +0.0)。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let w_off = make_trainer_psqt(&ctx, base)?.to_layerstack_weights()?;
+    let w_on = make_trainer_psqt(&ctx, base.with_ft_factorize())?.to_layerstack_weights()?;
+    let pn = base.ft_in() * DEFAULT_NUM_BUCKETS;
+    assert_eq!(
+        w_on.psqt_w.as_ref().map(Vec::len),
+        Some(pn),
+        "coalesced psqt_w は base 形状"
+    );
+    assert_eq!(
+        w_on.psqt_w, w_off.psqt_w,
+        "学習前の coalesced psqt_w は OFF と一致"
+    );
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_psqt_virtual_rows_learn() -> Result<(), Box<dyn std::error::Error>> {
+    // 1 step 後: psqt 仮想行が grad を受けて動くため、coalesce 済み psqt_w は非
+    // factorize psqt と一致しなくなる。残差は同一 p を持つ feature 間で一致する
+    // (仮想行 1 本分の畳み込み、FT の同型テストと同じ裏取り)。psqt forward は
+    // 初期 zero なので実 block の grad は両構成で同一 → 差分 = 仮想行の寄与。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let fact = base.with_ft_factorize();
+    let batch = BatchData::smoke_dummy(B, base);
+    let w_off = {
+        let mut t = make_trainer_psqt(&ctx, base)?;
+        t.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        t.to_layerstack_weights()?
+    };
+    let w_on = {
+        let mut t = make_trainer_psqt(&ctx, fact)?;
+        t.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        t.to_layerstack_weights()?
+    };
+    let pw_off = w_off.psqt_w.expect("psqt off");
+    let pw_on = w_on.psqt_w.expect("psqt on");
+    assert_eq!(pw_on.len(), pw_off.len());
+    assert!(
+        pw_on != pw_off,
+        "psqt 仮想行が学習されていれば coalesced psqt_w は OFF と異なる"
+    );
+    let nb = DEFAULT_NUM_BUCKETS;
+    let pi = base.piece_inputs();
+    for p in 0..8 {
+        let d0 = pw_on[p * nb] - pw_off[p * nb];
+        let d1 = pw_on[(pi + p) * nb] - pw_off[(pi + p) * nb];
+        assert!(
+            (d0 - d1).abs() <= d0.abs().max(d1.abs()) * 1e-5 + 1e-7,
+            "psqt 残差が仮想行由来なら plane 間で一致する: p={p} d0={d0:e} d1={d1:e}"
+        );
+    }
+    Ok(())
+}

@@ -2542,7 +2542,9 @@ pub fn slice_scatter_2d(
 // =============================================================================
 //
 // 形式:
-//   psqt_w shape   = (ft_in, NUM_BUCKETS) row-major (`psqt_w[feat * NB + bucket]`)
+//   psqt_w shape   = (rows, NUM_BUCKETS) row-major (`psqt_w[feat * NB + bucket]`、
+//                    rows は base `ft_in`、factorizer 有効時は仮想 P 行込みの
+//                    `train_ft_in`。本 kernel は `feat < ft_in` の実 block のみ touch)
 //   forward 出力   = net_output[b] += 0.5 * (Σ_f∈stm_active psqt_w[f,bk]
 //                                            − Σ_f∈nstm_active psqt_w[f,bk])
 //   backward       = 各 (b, ni) で psqt_w_grad[stm_idx[b,ni], bk] += +0.5 * dnet[b]
@@ -2641,7 +2643,8 @@ pub fn psqt_diff_sparse_bwd(
     let half_g = 0.5_f32 * dnet[bi];
     let idx_s = stm_indices[bi * (nnz as usize) + ni];
     if idx_s >= 0 && (idx_s as u32) < ft_in {
-        // SAFETY: `psqt_w_grad.len() == ft_in * num_buckets` host invariant、
+        // SAFETY: `psqt_w_grad.len() >= ft_in * num_buckets` host invariant
+        // (factorizer 有効時は仮想行込みで train 長だが本 kernel は実 block のみ書く)、
         // `idx_s < ft_in` / `bucket_u < num_buckets` で範囲内。`f32` (align 4) と
         // `DeviceAtomicF32` (`#[repr(transparent)]`) は同 alignment、非 atomic 経路で
         // 同 memory に書く path は本 kernel + radam_step 以外無し。
