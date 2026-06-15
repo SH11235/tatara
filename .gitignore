@@ -36,7 +36,7 @@
 **/*.bc
 
 # local 計測ログ / 仮説検証メモ (commit せず手元で保管)
-/docs/experiments/
+/docs/experiments
 
 # local issue (GitHub Issue を立てない課題の spec、1 file = 1 issue)
 /docs/issue/
