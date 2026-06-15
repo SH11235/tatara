@@ -169,22 +169,32 @@ pub(crate) struct GpuTrainer {
 }
 
 /// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
-/// `Option<PsqtState>` で gated。`psqt_w` shape は `(ft_in, num_buckets)` row-major
-/// (`psqt_w[feat * num_buckets + bucket]`)。`m` / `v` は f32 固定 (PSQT weight 自体
-/// が ft_in * num_buckets ≤ ~660K f32 = 2.6MB と小さいため FP16 化の利得が小さく、
-/// 複雑さを避ける)。
+/// `Option<PsqtState>` で gated。`w` shape は `(train_ft_in, num_buckets)` row-major
+/// (`w[feat * num_buckets + bucket]`)。factorizer 無効時は `train_ft_in == ft_in`。
+/// `m` / `v` は f32 固定 (PSQT weight 自体が小さく FP16 化の利得が小さいため)。
+/// factorizer 有効時は FT と同じ仮想 P 行を持ち、forward は畳み込み済み comb
+/// (`w_fold`) を、backward は実 grad の king-bucket 方向縮約で仮想 grad を埋める。
 pub(crate) struct PsqtState {
     pub(crate) w: DeviceBuffer<f32>,
     pub(crate) w_m: DeviceBuffer<f32>,
     pub(crate) w_v: DeviceBuffer<f32>,
     pub(crate) w_slow: DeviceBuffer<f32>,
     pub(crate) w_grad: DeviceBuffer<f32>,
+    /// forward 用の畳み込み済み weight (base 形状 `ft_in * num_buckets`)。factorizer
+    /// 有効時のみ `Some`。FT の `ft_w_fold32` と同役で、psqt forward が `w` の代わりに
+    /// これを読む (sparse path を base 次元に保つ)。`launch_ft_fold` が毎 step 再生成。
+    pub(crate) w_fold: Option<DeviceBuffer<f32>>,
 }
 
 impl PsqtState {
-    /// 与えた初期 weight (長さ `ft_in * num_buckets`) で確保する。Ranger state は
-    /// `m`/`v` = 0、`slow` = 0、`grad` = 0。
-    fn new(stream: &CudaStream, initial_w: &[f32]) -> Result<Self, Box<dyn std::error::Error>> {
+    /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。Ranger state
+    /// は `m`/`v` = 0、`slow` = 0、`grad` = 0。`fold_len` が `Some(base_ft_in *
+    /// num_buckets)` のとき forward 用 comb (`w_fold`) を確保する (factorizer 有効時)。
+    fn new(
+        stream: &CudaStream,
+        initial_w: &[f32],
+        fold_len: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let n = initial_w.len();
         Ok(Self {
             w: DeviceBuffer::from_host(stream, initial_w)?,
@@ -192,6 +202,10 @@ impl PsqtState {
             w_v: DeviceBuffer::<f32>::zeroed(stream, n)?,
             w_slow: DeviceBuffer::<f32>::zeroed(stream, n)?,
             w_grad: DeviceBuffer::<f32>::zeroed(stream, n)?,
+            w_fold: match fold_len {
+                Some(fl) => Some(DeviceBuffer::<f32>::zeroed(stream, fl)?),
+                None => None,
+            },
         })
     }
 }
@@ -714,21 +728,27 @@ impl GpuTrainer {
         );
         let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l2_out), &init_spec.l3_b);
 
-        // PSQT shortcut の初期 weight (有効時のみ確保)。長さ `ft_in * num_buckets` を
-        // caller が validation 済の前提 (CLI / `run_training` 側で構築)。PSQT は
-        // sparse index (base 範囲) で引かれるため行数は base `ft_in` (factorizer
-        // との併用は CLI が reject 済)。
+        // PSQT shortcut の初期 weight (有効時のみ確保)。入力 `psqt_init` は base 形状
+        // (`base_ft_in * num_buckets`) を caller が validation 済 (CLI / `run_training`)。
+        // factorizer 有効時は FT weight と同じく実 block を base 形状で受けて仮想 block
+        // を zero append し、forward 用 comb を確保する (PSQT も同一の仮想 P 行を持つ)。
         let psqt = match psqt_init {
             Some(init) => {
-                let expected = base_ft_in * num_buckets;
-                if init.len() != expected {
+                let base_expected = base_ft_in * num_buckets;
+                if init.len() != base_expected {
                     return Err(format!(
-                        "psqt_init length {} != expected {expected} (= ft_in {base_ft_in} * num_buckets {num_buckets})",
+                        "psqt_init length {} != expected {base_expected} (= ft_in {base_ft_in} * num_buckets {num_buckets})",
                         init.len()
                     )
                     .into());
                 }
-                Some(PsqtState::new(&stream, init)?)
+                if feature_set.ft_factorize() {
+                    let mut w = init.to_vec();
+                    w.resize(train_ft_in * num_buckets, 0.0);
+                    Some(PsqtState::new(&stream, &w, Some(base_expected))?)
+                } else {
+                    Some(PsqtState::new(&stream, init, None)?)
+                }
             }
             None => None,
         };
@@ -1027,8 +1047,22 @@ impl GpuTrainer {
     pub(crate) fn to_layerstack_weights(
         &self,
     ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
+        // factorizer 有効時は psqt_w (train 形状) も仮想 P 行を実行へ畳み込み base
+        // 形状で返す (FT と同じ coalesce を「列 = num_buckets」で再利用)。量子化・
+        // 飽和検査は畳み込み後の値に掛かる。
         let psqt_w = match self.psqt.as_ref() {
-            Some(p) => Some(p.w.to_host_vec(&self.stream)?),
+            Some(p) => {
+                let w = p.w.to_host_vec(&self.stream)?;
+                if self.feature_set.ft_factorize() {
+                    Some(nnue_format::layerstack_weights::coalesce_ft_factorized(
+                        &self.feature_set,
+                        self.num_buckets,
+                        &w,
+                    ))
+                } else {
+                    Some(w)
+                }
+            }
             None => None,
         };
         Ok(LayerStackWeights {
@@ -1129,7 +1163,7 @@ impl GpuTrainer {
         if let Some(psqt) = self.psqt.as_ref() {
             groups.push(RawCkptGroupSource {
                 name: "psqt_w",
-                len: self.feature_set.ft_in() * self.num_buckets,
+                len: self.feature_set.train_ft_in() * self.num_buckets,
                 bufs: RawCkptGroupBufs::Uniform {
                     w: &psqt.w,
                     m: &psqt.w_m,
@@ -1377,6 +1411,24 @@ impl GpuTrainer {
                 config: cfg_1d(n),
                 args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
                        self.ws.ft_out as u32, pi as u32, n as u32]
+            }?;
+        }
+        // PSQT shortcut も factorizer 有効時は同じ仮想 P 行を持つ。FT と同じ
+        // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
+        // 適用する (kernel は列数 runtime 引数なので再利用)。
+        if let Some(psqt) = self.psqt.as_mut() {
+            let mut comb = psqt
+                .w_fold
+                .as_mut()
+                .expect("psqt.w_fold is Some when ft_factorize and psqt are enabled");
+            let psqt_n = base_ft_in * self.num_buckets;
+            cuda_launch! {
+                kernel: ft_fold_virtual,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(psqt_n),
+                args: [slice(psqt.w), slice_mut(comb), base_ft_in as u32,
+                       self.num_buckets as u32, pi as u32, psqt_n as u32]
             }?;
         }
         Ok(())
@@ -2018,14 +2070,17 @@ impl GpuTrainer {
 
         // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
         // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
+        // factorizer 有効時は畳み込み済み comb (`psqt.w_fold`、base 形状) を読む
+        // (sparse path は base 次元、`ws.ft_in` / `ws.max_active` は base のまま)。
         if let Some(psqt) = self.psqt.as_ref() {
+            let psqt_fwd = psqt.w_fold.as_ref().unwrap_or(&psqt.w);
             cuda_launch! {
                 kernel: psqt_diff_sparse_fwd_inplace,
                 stream: self.stream,
                 module: self.module,
                 config: cfg_1d(b),
                 args: [
-                    slice(psqt.w),
+                    slice(psqt_fwd),
                     slice(self.ws.stm_idx_dev),
                     slice(self.ws.nstm_idx_dev),
                     slice(self.ws.bucket_idx_dev),
@@ -2181,6 +2236,21 @@ impl GpuTrainer {
                     b_u32, max_active as u32, self.num_buckets as u32, ft_in_u
                 ]
             }?;
+            // factorizer 有効時: psqt_diff_sparse_bwd は実 block (base 行) のみ atomic
+            // add した。仮想行の grad を同 piece plane の実行 grad 和で埋める (FT と
+            // 同じ `ft_reduce_virtual_grad` を「列 = num_buckets」で再利用、overwrite)。
+            if self.feature_set.ft_factorize() {
+                let pi = self.feature_set.piece_inputs();
+                cuda_launch! {
+                    kernel: ft_reduce_virtual_grad,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(pi * self.num_buckets),
+                    args: [
+                        slice(psqt.w_grad),
+                        ft_in_u, self.num_buckets as u32, pi as u32
+                    ]
+                }?;
+            }
             prof_tick!("bwd_psqt");
         }
 
@@ -2846,11 +2916,12 @@ impl GpuTrainer {
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
             norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
             // PSQT shortcut weight (任意): psqt_w[feat*num_buckets + bucket] を
-            // bucket 列ごと (= per-output-neuron) に ft_in 要素で正規化する
-            // (pitch=1 / elem_stride=num_buckets)。他 weight と同じ intended 一様適用。
+            // bucket 列ごと (= per-output-neuron) に正規化する (pitch=1 /
+            // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —
+            // factorizer 有効時は仮想 P 行も同じ group に含める。
             let psqt_num_buckets = self.num_buckets;
             if let Some(psqt) = self.psqt.as_mut() {
-                norm_loss_group!(psqt.w, psqt_num_buckets, 1, psqt_num_buckets, ft_in);
+                norm_loss_group!(psqt.w, psqt_num_buckets, 1, psqt_num_buckets, ft_w_rows);
             }
             // bias: per-tensor scalar (テンソル全体で 1 norm、bucket 軸も畳む)。
             norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
@@ -2938,7 +3009,7 @@ impl GpuTrainer {
         // variant が分岐するため上で個別に launch する。always-on の 9 group は stack 上の
         // 固定長 array、任意の psqt は Option で chain し、per-step のヒープ確保を避ける。
         let psqt_enabled = self.psqt.is_some();
-        let psqt_n = self.feature_set.ft_in() * self.num_buckets;
+        let psqt_n = self.feature_set.train_ft_in() * self.num_buckets;
         let mut uniform_groups: [UniformOptimGroup<'_>; 9] = [
             UniformOptimGroup {
                 label: "ft_b",

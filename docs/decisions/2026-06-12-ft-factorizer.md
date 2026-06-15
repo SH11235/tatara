@@ -29,21 +29,20 @@ factorizer を本番 ON にしている (`model/features/__init__.py` の
 `--ft-factorize` は back-compat の明示 ON (既定と冗長)、`--no-ft-factorize` が
 opt-out。`overrides_with` で command-line 後勝ち。
 
-以下は factorizer と排他なので **auto-suppress** (起動 log に明記、silent では
-ない)。clap の `conflicts_with` ではなく `run_training` で実効解決する:
-
-- **`--psqt` 併用**: tatara の PSQT は別の per-bucket shortcut block
-  (`psqt_diff_sparse_*`) で、その仮想行 fold / export coalesce が**未実装**。
-  これは**原理的制約ではなく tatara のアーキ選択の結果**: nnue-pytorch は
-  PSQT を FT weight の出力列 (`L1 + num_psqt_buckets`) として持ち、
-  `coalesce_ft_weights_inplace` が全列を畳むので PSQT も自動で factorize され
-  併用できる。tatara で併用可にするには PSQT block 側に fold を足せばよい
-  (将来の拡張余地。現 production best recipe は PSQT OFF のため優先度は低い)
+- **`--psqt` 併用**: **併用可**。PSQT shortcut も FT と同じ仮想 P 行を持ち、
+  forward は畳み込み済み comb (`PsqtState::w_fold`、base 形状)、backward は
+  実 grad の king-bucket 方向縮約で仮想 grad を埋める。FT の fold/reduce kernel
+  (`ft_fold_virtual` / `ft_reduce_virtual_grad`) と export の
+  `coalesce_ft_factorized` は列数が runtime 引数なので、「列 = num_buckets」で
+  そのまま再利用する (新規 kernel 不要)。nnue-pytorch が PSQT を FT 出力列に
+  持ち `coalesce_ft_weights_inplace` で全列を畳むのと等価な配線を、tatara の
+  別 block PSQT に対して行ったもの
 - **Simple アーキ**: flag を layerstack subcommand 配下に置くことで構造的に
   到達しない (Simple の export に畳み込みが無いため)
-- **`--init-from`**: 量子化 `.bin` (coalesce 済) は仮想行を持たないため初期化元に
-  できない。これも from-scratch の「実 block sample + 仮想 block zero」と同型の
-  load 経路を足せば併用可能 (未実装、上記の PSQT 併用拡張と同じ範疇)
+- **`--init-from`**: factorizer と排他なので **auto-suppress** (起動 log に
+  明記、silent ではない)。量子化 `.bin` (coalesce 済) は仮想行を持たないため
+  初期化元にできない。from-scratch の「実 block sample + 仮想 block zero」と
+  同型の load 経路を足せば併用可能だが未実装 (将来の拡張余地)
 
 ### 2. 仮想特徴は P factor のみ、sparse path には流さない (fold + reduce)
 
@@ -180,5 +179,3 @@ step を実 / 仮想の 2 領域 launch に分けて仮想側にだけ別 scale 
   単独で運用している実績を優先
 - **推論側で factorized arch を受理**: 推論エンジンは coalesced-only を
   要求する既存方針を維持する理由しかない
-- **PSQT との併用対応**: PSQT block の畳み込み + 量子化検査の追加設計が
-  必要で、PSQT 自体の採用が見送られている現状ではコストに見合わない
