@@ -38,12 +38,12 @@ opt-out。`overrides_with` で command-line 後勝ち。
   PSQT を FT weight の出力列 (`L1 + num_psqt_buckets`) として持ち、
   `coalesce_ft_weights_inplace` が全列を畳むので PSQT も自動で factorize され
   併用できる。tatara で併用可にするには PSQT block 側に fold を足せばよい
-  (別 issue。現 production best recipe は PSQT OFF のため緊急度低)
+  (将来の拡張余地。現 production best recipe は PSQT OFF のため優先度は低い)
 - **Simple アーキ**: flag を layerstack subcommand 配下に置くことで構造的に
   到達しない (Simple の export に畳み込みが無いため)
 - **`--init-from`**: 量子化 `.bin` (coalesce 済) は仮想行を持たないため初期化元に
   できない。これも from-scratch の「実 block sample + 仮想 block zero」と同型の
-  load 経路を足せば併用可能 (未実装、上記 issue に含めうる)
+  load 経路を足せば併用可能 (未実装、上記の PSQT 併用拡張と同じ範疇)
 
 ### 2. 仮想特徴は P factor のみ、sparse path には流さない (fold + reduce)
 
