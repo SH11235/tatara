@@ -13,18 +13,33 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
-#[test]
-fn ft_factorize_flag_parses_and_conflicts_with_psqt() {
-    let cli = Cli::try_parse_from(["nnue-train", "layerstack", "--ft-factorize"])
-        .expect("layerstack should accept --ft-factorize");
-    match &cli.arch {
-        ArchCommand::LayerStack(args) => assert!(args.ft_factorize),
+fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
+    let mut full = vec!["nnue-train", "layerstack"];
+    full.extend_from_slice(argv);
+    match Cli::try_parse_from(full)
+        .expect("layerstack should parse")
+        .arch
+    {
+        ArchCommand::LayerStack(args) => args,
         other => panic!("unexpected arch: {other:?}"),
     }
-    // PSQT kernel は同じ sparse index 列を消費し仮想行の畳み込みを持たないため排他。
+}
+
+#[test]
+fn ft_factorize_defaults_on_and_no_flag_disables() {
+    // default は ON (flag 無し)。`--ft-factorize` は back-compat の明示 ON。
+    assert!(layerstack_args(&[]).ft_factorize_enabled());
+    assert!(layerstack_args(&["--ft-factorize"]).ft_factorize_enabled());
+    // `--no-ft-factorize` で OFF。
+    assert!(!layerstack_args(&["--no-ft-factorize"]).ft_factorize_enabled());
+    // overrides_with: command-line 後勝ち。
+    assert!(!layerstack_args(&["--ft-factorize", "--no-ft-factorize"]).ft_factorize_enabled());
+    assert!(layerstack_args(&["--no-ft-factorize", "--ft-factorize"]).ft_factorize_enabled());
+    // `--psqt` と併用しても clap では衝突しない (実効 OFF は run_training の
+    // auto-suppress が解決する)。
     assert!(
-        Cli::try_parse_from(["nnue-train", "layerstack", "--ft-factorize", "--psqt"]).is_err(),
-        "--ft-factorize and --psqt must conflict"
+        Cli::try_parse_from(["nnue-train", "layerstack", "--psqt"]).is_ok(),
+        "--psqt alone parses (factorizer auto-suppressed at run time)"
     );
 }
 

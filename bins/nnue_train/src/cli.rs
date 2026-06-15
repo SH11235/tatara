@@ -609,7 +609,8 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
     pub(crate) psqt_init: PsqtInit,
 
-    /// Enable the FT factorizer (training-time virtual features).
+    /// FT factorizer (training-time virtual features). **Default ON.** Pass
+    /// `--no-ft-factorize` to disable.
     ///
     /// The FT weight table gains a king-bucket-independent virtual row per
     /// piece plane. Each virtual row accumulates the gradients of every real
@@ -624,14 +625,33 @@ pub(crate) struct LayerstackArgs {
     /// the base value); virtual rows are wired through two dense kernels per
     /// optimizer step (a forward weight fold and a backward gradient
     /// reduction), costing a single-digit percentage of training throughput
-    /// and zero inference cost. Default OFF is bit-identical to the
-    /// non-factorized
-    /// path. Resume across on/off is rejected (checkpoint dimensions differ).
-    /// Incompatible with `--psqt` (the PSQT table has no virtual-row fold or
-    /// export design) and with `--init-from` (a quantised `.bin` has no
-    /// virtual rows to initialise from).
-    #[arg(long, conflicts_with = "psqt")]
+    /// and zero inference cost.
+    ///
+    /// This flag is accepted for explicitness/back-compat but is redundant
+    /// with the default. `--psqt` and `--init-from` automatically disable the
+    /// factorizer (logged at startup): the separate PSQT shortcut block has no
+    /// virtual-row fold yet, and a quantised `.bin` has no virtual rows to
+    /// initialise from. Resume across the resulting on/off is rejected
+    /// (checkpoint dimensions differ).
+    #[arg(long = "ft-factorize", overrides_with = "no_ft_factorize")]
     pub(crate) ft_factorize: bool,
+
+    /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
+    /// Use this to train the non-factorized network, or together with options
+    /// the factorizer is not yet compatible with.
+    #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
+    pub(crate) no_ft_factorize: bool,
+}
+
+impl LayerstackArgs {
+    /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
+    /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
+    /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は
+    /// 呼び出し側 (`run_training`) が auto-suppress で解決するため、ここには
+    /// 含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
+    pub(crate) fn ft_factorize_enabled(&self) -> bool {
+        !self.no_ft_factorize
+    }
 }
 
 /// PSQT shortcut の初期化方式。
