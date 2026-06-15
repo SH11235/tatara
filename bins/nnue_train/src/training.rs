@@ -39,20 +39,30 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         })?
         .spec();
 
-    // FT factorizer modifier の適用 (spec 確定はこの 1 箇所)。`--psqt` 併用は
-    // clap の conflicts_with で reject 済み。`--init-from` は量子化 .bin 由来で
-    // 仮想行を持たないため併用不可 (LayerStackWeights の spec 照合でも弾かれる
-    // が、CLI 段で明示エラーにする)。
-    let feature_set = if layerstack.ft_factorize {
-        if cli.init_from.is_some() {
-            return Err(
-                "--ft-factorize is incompatible with --init-from (a quantised .bin has \
-                        no virtual factorizer rows; start from scratch or --resume a \
-                        factorized checkpoint)"
-                    .into(),
+    // FT factorizer modifier の適用 (spec 確定はこの 1 箇所)。default ON で
+    // `--no-ft-factorize` が opt-out。`--psqt` / `--init-from` は factorizer と
+    // 排他なので auto-suppress する (起動 log に明記、silent ではない):
+    //  - `--psqt`: PSQT shortcut は別 block で、その仮想行 fold / export 設計が
+    //    未実装 (nnue-pytorch は PSQT を FT 列に持つので併用可。tatara は別 block
+    //    にした分の未実装。docs/decisions の ADR 参照)
+    //  - `--init-from`: 量子化 .bin (coalesce 済) は仮想行を持たないため初期化元に
+    //    できない (from-scratch か factorized raw checkpoint の --resume が必要)
+    let feature_set = if layerstack.ft_factorize_enabled() {
+        if layerstack.psqt {
+            println!(
+                "[train] --psqt set → ft-factorizer disabled (the PSQT shortcut block has \
+                 no virtual-row fold yet)"
             );
+            feature_set
+        } else if cli.init_from.is_some() {
+            println!(
+                "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \
+                 virtual factorizer rows)"
+            );
+            feature_set
+        } else {
+            feature_set.with_ft_factorize()
         }
-        feature_set.with_ft_factorize()
     } else {
         feature_set
     };

@@ -20,18 +20,30 @@ export 時に共有 prior を継承する。export で畳み込むため出力 a
 
 ## Decision
 
-### 1. CLI gate `--ft-factorize` (layerstack subcommand 限定、既定 OFF)
+### 1. CLI gate (layerstack subcommand 限定、**既定 ON** / `--no-ft-factorize` で OFF)
 
-既定 OFF は非 factorized 経路と bit-identical。以下の組合せは明示エラーで
-reject する:
+棋力評価で neutral〜微 + (回帰なし)・throughput +52.8%・収束加速が確認でき、
+chess 系 nnue-pytorch (Stockfish 系統) も default feature set `HalfKAv2_hm^` で
+factorizer を本番 ON にしている (`model/features/__init__.py` の
+`_default_feature_set_name`) ことから、tatara も **既定 ON** とする。
+`--ft-factorize` は back-compat の明示 ON (既定と冗長)、`--no-ft-factorize` が
+opt-out。`overrides_with` で command-line 後勝ち。
 
-- **`--psqt` 併用**: PSQT kernel は FT と同じ sparse index 列を消費するため、
-  仮想 index が PSQT 勾配バッファ範囲外への atomic write になるか、PSQT を
-  学習次元に広げると export PSQT block (`ft_in × num_buckets` 前提) の形式が
-  崩れる。両立には PSQT 側にも畳み込みの設計が要る (Rejected alternatives)
+以下は factorizer と排他なので **auto-suppress** (起動 log に明記、silent では
+ない)。clap の `conflicts_with` ではなく `run_training` で実効解決する:
+
+- **`--psqt` 併用**: tatara の PSQT は別の per-bucket shortcut block
+  (`psqt_diff_sparse_*`) で、その仮想行 fold / export coalesce が**未実装**。
+  これは**原理的制約ではなく tatara のアーキ選択の結果**: nnue-pytorch は
+  PSQT を FT weight の出力列 (`L1 + num_psqt_buckets`) として持ち、
+  `coalesce_ft_weights_inplace` が全列を畳むので PSQT も自動で factorize され
+  併用できる。tatara で併用可にするには PSQT block 側に fold を足せばよい
+  (別 issue。現 production best recipe は PSQT OFF のため緊急度低)
 - **Simple アーキ**: flag を layerstack subcommand 配下に置くことで構造的に
   到達しない (Simple の export に畳み込みが無いため)
-- **`--init-from`**: 量子化 `.bin` は仮想行を持たないため初期化元にできない
+- **`--init-from`**: 量子化 `.bin` (coalesce 済) は仮想行を持たないため初期化元に
+  できない。これも from-scratch の「実 block sample + 仮想 block zero」と同型の
+  load 経路を足せば併用可能 (未実装、上記 issue に含めうる)
 
 ### 2. 仮想特徴は P factor のみ、sparse path には流さない (fold + reduce)
 
