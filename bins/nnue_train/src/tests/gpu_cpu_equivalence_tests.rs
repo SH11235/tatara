@@ -50,8 +50,16 @@ use gpu_kernels::sparse::ft_factorize::{ft_fold_virtual_cpu, ft_reduce_virtual_g
 use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
 use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
 
-/// forward / gradient の f32 tolerance。
+/// forward / gradient の f32 tolerance。atomic reduce (`fetch_add`) で加算順序が
+/// GPU↔CPU で異なる出力向け (`assert_close_rel`)。順序差は和の項数に比例し得るため
+/// 広め (1e-5 ≈ 84 ULP) を許す。
 const TOL: f32 = 1e-5;
+
+/// per-row independent (加算順保持) な matmul kernel の GPU↔CPU 相対 tolerance。
+/// この経路は加算順序が一致するので drift 源は世代間 FMA 丸めのみ (~1 ULP) で、
+/// atomic-reduce の順序差より桁違いに小さい。回帰検出力を保つため `TOL` (≈84 ULP)
+/// より厳しい 1e-6 (≈8 ULP、実測 drift の ~8 倍) を使う。
+const TOL_FMA: f32 = 1e-6;
 
 // L1 系次元は `--l1` で runtime 可変だが、本 module の kernel は出力幅を runtime arg
 // で受けるため、ここでは既定次元 (`DEFAULT_L1_OUT`) に固定した test fixture を使う。
@@ -107,9 +115,12 @@ fn assert_close(label: &str, gpu: &[f32], cpu: &[f32], tol: f32) {
     }
 }
 
-/// `assert_close` の relative-tolerance 版。atomic reduce (`fetch_add`) で複数
-/// thread が 1 cell に加算する出力は加算順序が GPU と CPU で異なり、和の大きさに
-/// 比例した f32 round-off drift が出る。`|gpu - cpu| <= tol * (1 + |cpu|)` で判定する。
+/// `assert_close` の relative-tolerance 版。GPU↔CPU の f32 出力には和の大きさに
+/// 比例した round-off drift が出るため `|gpu - cpu| <= tol * (1 + |cpu|)` で判定する。
+/// drift の発生源は 2 つ: (1) atomic reduce (`fetch_add`) で複数 thread が 1 cell に
+/// 加算する出力は加算順序が GPU と CPU で異なる、(2) per-row independent (加算順保持) な
+/// kernel でも、同一 PTX を JIT した SASS の FMA 丸めが GPU 世代ごとに ~1 ULP 異なる
+/// (bit-exact 一致は開発・検証した特定の GPU 世代でのみ成立する)。
 fn assert_close_rel(label: &str, gpu: &[f32], cpu: &[f32], tol: f32) {
     assert_eq!(gpu.len(), cpu.len(), "{label}: len mismatch");
     for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
@@ -568,11 +579,11 @@ fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Erro
                    batch as u32, in_dim as u32, out_dim as u32]
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_bwd_input_tiled b={batch} in={in_dim}"),
             &dx_dev.to_host_vec(&stream)?,
             &dx_cpu,
-            TOL,
+            TOL_FMA,
         );
     }
     Ok(())
@@ -609,11 +620,11 @@ fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Err
                    batch as u32, in_dim as u32, out_dim as u32]
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_bwd_weight_tiled b={batch} in={in_dim}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
-            TOL,
+            TOL_FMA,
         );
     }
     Ok(())
@@ -732,11 +743,11 @@ fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
                batch as u32, in_dim as u32, out_dim as u32, nb as u32]
     }?;
     stream.synchronize()?;
-    assert_close(
+    assert_close_rel(
         "dense_mm_fwd_bucket",
         &y_dev.to_host_vec(&stream)?,
         &y_cpu,
-        TOL,
+        TOL_FMA,
     );
     Ok(())
 }
@@ -785,19 +796,21 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
                    batch as u32, in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_fwd_bucket_tiled_l1 b={batch} in={in_dim}"),
             &y_dev.to_host_vec(&stream)?,
             &y_cpu,
-            TOL,
+            TOL_FMA,
         );
     }
     Ok(())
 }
 
 /// 16-aligned bucket sort + sorted fwd_L1 + inverse permute の合成 pipeline が
-/// `dense_mm_fwd_bucket_cpu` と bit-exact 一致することを確認。fwd_L1 は per-row
-/// independent (k=0..15 加算順保持) のため sort stability に依らず tolerance=0 が成立。
+/// `dense_mm_fwd_bucket_cpu` と一致することを確認。fwd_L1 は per-row independent
+/// (k=0..15 加算順保持) で sort stability に依らない。一致は相対 tolerance で判定する:
+/// 同一 PTX でも GPU 世代ごとに JIT 後 SASS の FMA 丸めが ~1 ULP 異なり、bit-exact 一致は
+/// 開発・検証した特定の GPU 世代でのみ成立するため。
 #[test]
 fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -889,15 +902,12 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         }?;
         stream.synchronize()?;
 
-        let y_gpu = y_dev.to_host_vec(&stream)?;
-        for (i, (&g, &c)) in y_gpu.iter().zip(y_cpu.iter()).enumerate() {
-            if g != c {
-                panic!(
-                    "bucket_sort_fwd_l1 b={batch} in={in_dim} idx={i}: gpu={g} cpu={c} delta={}",
-                    g - c
-                );
-            }
-        }
+        assert_close_rel(
+            &format!("bucket_sort_fwd_l1 b={batch} in={in_dim}"),
+            &y_dev.to_host_vec(&stream)?,
+            &y_cpu,
+            TOL_FMA,
+        );
     }
     Ok(())
 }
@@ -938,11 +948,11 @@ fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Err
                batch as u32, in_dim as u32, out_dim as u32, nb as u32]
     }?;
     stream.synchronize()?;
-    assert_close(
+    assert_close_rel(
         "dense_mm_bwd_input_bucket",
         &dx_dev.to_host_vec(&stream)?,
         &dx_cpu,
-        TOL,
+        TOL_FMA,
     );
     Ok(())
 }
@@ -2114,11 +2124,11 @@ fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn 
                    batch as u32, in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_fwd_bucket nb={nb}"),
             &y_dev.to_host_vec(&stream)?,
             &y_cpu,
-            TOL,
+            TOL_FMA,
         );
     }
     Ok(())
@@ -2162,11 +2172,11 @@ fn dense_mm_bwd_input_bucket_matches_cpu_for_each_num_buckets()
                    batch as u32, in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_bwd_input_bucket nb={nb}"),
             &dx_dev.to_host_vec(&stream)?,
             &dx_cpu,
-            TOL,
+            TOL_FMA,
         );
     }
     Ok(())
