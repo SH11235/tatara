@@ -258,7 +258,8 @@ pub struct FeatureSetSpec {
     /// bit-identical。`Some(profile)` のとき base の `ft_in` 直後に
     /// `threat_dims(profile)` 行を連結し、`max_active` / `feature_hash` も
     /// 変える (factorizer の次元不変 modifier とは別カテゴリ = base 次元の拡張)。
-    /// factorizer とは排他 (両 ON の FT row layout は未検証、CLI が hard-error)。
+    /// factorizer とは併用可 (fold/reduce/coalesce が base row 限定で threat 行を
+    /// 跨がない)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
 }
 
@@ -329,8 +330,9 @@ impl FeatureSetSpec {
     ///
     /// `ft_factorize` とは違い base 次元を拡張する: `ft_in` / `max_active` /
     /// `feature_hash` がすべて変わる。base offset (`base_ft_in`) は不変で、
-    /// threat index の emit はその直後に連結される。factorizer との併用は FT row
-    /// layout が未検証のため呼び出し側 (CLI) が hard-error にする。
+    /// threat index の emit はその直後に連結される。`ft_factorize` とは併用可
+    /// (fold/reduce/coalesce が base row 限定で threat 行を跨がない)。PSQT との
+    /// 併用のみ呼び出し側 (CLI) が hard-error にする (base 限定 PSQT が未検証のため)。
     pub fn with_threat_profile(self, profile: ThreatProfile) -> Self {
         FeatureSetSpec {
             threat_profile: Some(profile),

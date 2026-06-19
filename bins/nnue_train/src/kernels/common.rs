@@ -977,19 +977,21 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     }
 }
 
-/// FT factorizer の forward 用畳み込み: 実 block の各要素へ同じ piece plane の
-/// 仮想行を加算し、forward が読む畳み込み済み weight `comb` (base 形状
-/// `ft_in × ft_out`) を作る。`w` は train 形状 (`(ft_in + piece_inputs) × ft_out`、
-/// column-major で `w[feature * ft_out + ri]`)。線形性により
-/// `Σ_active (w_real + w_virt) = Σ_active comb` なので、sparse forward は仮想
-/// index 無しの base 経路のまま factorizer の forward 寄与を得る。
-/// 1 thread = 1 出力要素。`i = (kb·pi + p)·ft_out + ri` の仮想要素 offset は
-/// 恒等式 `(ft_in + p)·ft_out + ri == ft_in·ft_out + (i mod pi·ft_out)` で
-/// mod 1 回で導出する (`i mod pi·ft_out = p·ft_out + ri`)。
+/// FT factorizer の forward 用畳み込み: base king-bucket セルの各要素へ同じ piece
+/// plane の仮想行を加算し、forward が読む畳み込み済み weight `comb` (export 形状
+/// `ft_in × ft_out` = base + threat) を作る。`w` は train 形状
+/// (`(ft_in + piece_inputs) × ft_out`、column-major で `w[feature * ft_out + ri]`)。
+/// 線形性により base 実行は `Σ_active (w_real + w_virt) = Σ_active comb`。
+/// `base_ft_in` が仮想行を持つ base セル数、`ft_in` (= base + threat) が仮想 P plane
+/// の手前。threat real 行 (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w`
+/// で素通しする。threat 無効時は `base_ft_in == ft_in` で全セルが畳まれ threat
+/// 連結前と bit-identical。1 thread = 1 出力要素。仮想要素 offset は恒等式
+/// `(ft_in + p)·ft_out + ri == ft_in·ft_out + (i mod pi·ft_out)` で mod 1 回。
 #[kernel]
 pub fn ft_fold_virtual(
     w: &[f32],
     mut comb: DisjointSlice<f32>,
+    base_ft_in: u32,
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
@@ -999,11 +1001,16 @@ pub fn ft_fold_virtual(
     if i.get() >= n as usize {
         return;
     }
-    let virt_block = (piece_inputs as usize) * (ft_out as usize);
-    let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
-    // `comb.len() == n` を保証。
-    let v = w[i.get()] + w[virt];
+    // `comb.len() == n`、`base_ft_in <= ft_in` を保証。
+    let feature = i.get() / (ft_out as usize);
+    let v = if feature < base_ft_in as usize {
+        let virt_block = (piece_inputs as usize) * (ft_out as usize);
+        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        w[i.get()] + w[virt]
+    } else {
+        w[i.get()] // threat real 行: 仮想行を持たない
+    };
     let comb_ptr = comb.as_mut_ptr();
     unsafe {
         comb_ptr.add(i.get()).write(v);
@@ -1020,6 +1027,7 @@ pub fn ft_fold_virtual(
 pub fn ft_fold_virtual_f16(
     w: &[f32],
     mut comb: DisjointSlice<f16>,
+    base_ft_in: u32,
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
@@ -1029,27 +1037,41 @@ pub fn ft_fold_virtual_f16(
     if i.get() >= n as usize {
         return;
     }
-    let virt_block = (piece_inputs as usize) * (ft_out as usize);
-    let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
-    // `comb.len() == n` を保証。
-    let v = w[i.get()] + w[virt];
+    // `comb.len() == n`、`base_ft_in <= ft_in` を保証。threat 行 (`feature >=
+    // base_ft_in`) は仮想行を持たないので素通し。
+    let feature = i.get() / (ft_out as usize);
+    let v = if feature < base_ft_in as usize {
+        let virt_block = (piece_inputs as usize) * (ft_out as usize);
+        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        w[i.get()] + w[virt]
+    } else {
+        w[i.get()]
+    };
     let comb_ptr = comb.as_mut_ptr();
     unsafe {
         comb_ptr.add(i.get()).write(v as f16);
     }
 }
 
-/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece plane を持つ全実
-/// 行の勾配和で埋める (`grad[(ft_in + p) * ft_out + ri] =
-/// Σ_kb grad[(kb * piece_inputs + p) * ft_out + ri]`)。各仮想特徴の出現列が
-/// 「同 p を持つ実特徴の出現列の合併」である (実特徴 1 つにつき仮想特徴
-/// ちょうど 1 つが対応する) ことから、仮想 index を sparse backward に流す
-/// 直接 gather と数学的に等価 (f32 加算順のみ異なる)。実 block の gather
-/// (`gather_and_sum_per_feature_*`) が stm / nstm 両方完了した後に launch する。
-/// 1 thread = 1 仮想要素 (`i = p * ft_out + ri`)、仮想 block は overwrite。
+/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece plane を持つ
+/// **base** 実行の勾配和で埋める (`grad[(ft_in + p) * ft_out + ri] =
+/// Σ_{kb < base_ft_in/pi} grad[(kb * piece_inputs + p) * ft_out + ri]`)。各仮想
+/// 特徴の出現列が「同 p を持つ base 実特徴の出現列の合併」である (base 実特徴 1 つ
+/// につき仮想特徴ちょうど 1 つが対応) ことから、仮想 index を sparse backward に
+/// 流す直接 gather と数学的に等価 (f32 加算順のみ異なる)。`base_ft_in` が縮約対象
+/// の king-bucket セル数、`ft_in` (= base + threat) が仮想 P plane の手前。threat
+/// real 行は仮想行に寄与しない。threat 無効時は `base_ft_in == ft_in` で threat
+/// 連結前と bit-identical。実 block の gather (`gather_and_sum_per_feature_*`) が stm / nstm
+/// 両方完了した後に launch する。1 thread = 1 仮想要素、仮想 block は overwrite。
 #[kernel]
-pub fn ft_reduce_virtual_grad(grad: &[f32], ft_in: u32, ft_out: u32, piece_inputs: u32) {
+pub fn ft_reduce_virtual_grad(
+    grad: &[f32],
+    base_ft_in: u32,
+    ft_in: u32,
+    ft_out: u32,
+    piece_inputs: u32,
+) {
     let i = thread::index_1d();
     let ft_out_u = ft_out as usize;
     let pi_u = piece_inputs as usize;
@@ -1058,12 +1080,13 @@ pub fn ft_reduce_virtual_grad(grad: &[f32], ft_in: u32, ft_out: u32, piece_input
     }
     let p = i.get() / ft_out_u;
     let ri = i.get() - p * ft_out_u;
-    let n_kb = (ft_in as usize) / pi_u;
+    let n_kb = (base_ft_in as usize) / pi_u;
 
     // raw pointer 版 (PTX の bounds check 除去)。unsafe 妥当性: caller が
-    // `grad.len() == (ft_in + piece_inputs) * ft_out` と `ft_in % piece_inputs == 0`
-    // を保証し、読みは実 block (`feature < ft_in`)、書きは thread ごとに disjoint な
-    // 仮想 cell (`ft_in + p` 行) に閉じる。
+    // `grad.len() == (ft_in + piece_inputs) * ft_out`、`base_ft_in <= ft_in`、
+    // `base_ft_in % piece_inputs == 0` を保証し、読みは base 実 block
+    // (`feature < base_ft_in`)、書きは thread ごとに disjoint な仮想 cell
+    // (`ft_in + p` 行) に閉じる。
     // 4-way unroll: 1-load-1-fadd の依存 chain を 4 accumulator に分割して
     // in-flight load を確保する (`gather_and_sum_per_feature_*` と同じ理由)。
     // 加算順は kb 逐次和と異なるが f32 非結合則の丸め差のみ。

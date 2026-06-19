@@ -345,16 +345,18 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
     compute_fc_hash(ft_out, l2_out) ^ ft_hash(feature_hash, ft_out)
 }
 
-/// FT factorizer の仮想行を実行へ畳み込み、base 形状
+/// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
-/// 学習時の FT weight は base の実行 (`kb * piece_inputs + p` 行) の後ろに
-/// king-bucket 非依存の仮想 P plane (`piece_inputs` 行) を連結した
-/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。forward は
-/// 実行 + 仮想行の和を使うため、export では `W_real[(kb, p)] += W_virtual[p]`
-/// で同じ和を実行へ固定し、仮想行を捨てる。量子化と飽和検査
-/// (`warn_if_i16_saturates`) は畳み込み後の値に掛けること (caller は本関数の
-/// 戻り値で `LayerStackWeights::ft_w` を構築する)。
+/// 学習時の FT weight は `[base real | threat real | 仮想 P plane]` の
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。仮想 P plane
+/// (`piece_inputs` 行) は **base 実行 (king-bucket セル `kb * piece_inputs + p`)
+/// のみ** に対応する king-bucket 非依存の prior。export では base 実行に
+/// `W_real[(kb, p)] += W_virtual[p]` で仮想行を畳み込んで固定し、仮想行を捨てる。
+/// threat real 行 (`[base_ft_in, ft_in())`) は仮想行を持たないので **そのまま
+/// 残す** (silent に切り落とさない)。戻り値は base 折り込み済み + threat 不可触の
+/// `ft_in() × ft_out`。量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の
+/// 値に掛けること (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
 ///
 /// factorizer 無効の spec では入力をそのまま返す。
 pub fn coalesce_ft_factorized(
@@ -365,10 +367,8 @@ pub fn coalesce_ft_factorized(
     if !feature_set.ft_factorize() {
         return ft_w_train.to_vec();
     }
-    // factorizer の仮想 P 行は **base 実行** の後ろに連結される。threat row (もし
-    // 将来併用するなら) は別領域なので、fold 境界は `ft_in` ではなく `base_ft_in`。
-    // 現状 factorizer × threat は CLI 排他なので両者は一致する。
     let base_ft_in = feature_set.base_ft_in();
+    let ft_in = feature_set.ft_in(); // base + threat (= 仮想行の手前まで)
     let piece_inputs = feature_set.piece_inputs();
     let train_ft_in = feature_set.train_ft_in();
     assert_eq!(
@@ -376,7 +376,9 @@ pub fn coalesce_ft_factorized(
         train_ft_in * ft_out,
         "ft_w length must be train_ft_in * ft_out"
     );
-    let virtual_base = base_ft_in * ft_out;
+    // 仮想 P plane は base+threat 実行の後ろ。export は実行部 (base + threat) を
+    // まず複製し、base king-bucket セルにのみ仮想行を加算する。
+    let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
     for feat in 0..base_ft_in {
         let p = feat % piece_inputs;
@@ -1189,6 +1191,129 @@ mod tests {
         // 無効 spec は素通し。
         let pass = coalesce_ft_factorized(&base, ft_out, &w[..base.ft_in() * ft_out]);
         assert_eq!(pass, &w[..base.ft_in() * ft_out]);
+    }
+
+    #[test]
+    fn coalesce_keeps_threat_rows_and_folds_only_base() {
+        use shogi_features::{FeatureSet, ThreatProfile};
+        // factorizer × threat 同居: export 形状 = ft_in() (base+threat)、base 行は
+        // 仮想行を畳み込み、threat 行は不可触で残る。最小 profile (cross-side) を使う。
+        let spec = FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide)
+            .with_ft_factorize();
+        let base_ft_in = spec.base_ft_in();
+        let ft_in = spec.ft_in(); // base + threat
+        let pi = spec.piece_inputs();
+        let ft_out = 2usize;
+        assert_eq!(spec.train_ft_in(), ft_in + pi);
+
+        let mut w = vec![0.0f32; spec.train_ft_in() * ft_out];
+        // base 実行 / threat 実行 / 仮想行を distinctive 値で埋める。
+        for feat in 0..ft_in {
+            for o in 0..ft_out {
+                w[feat * ft_out + o] = feat as f32 + o as f32 * 0.5;
+            }
+        }
+        for p in 0..pi {
+            for o in 0..ft_out {
+                w[(ft_in + p) * ft_out + o] = 10_000.0 + p as f32 + o as f32 * 0.25;
+            }
+        }
+        let out = coalesce_ft_factorized(&spec, ft_out, &w);
+        // export 形状は base + threat (仮想行を落とす)。
+        assert_eq!(out.len(), ft_in * ft_out);
+        // base 行は実行 + 同 p 仮想行。
+        for feat in [0usize, 1, pi, base_ft_in - 1] {
+            let p = feat % pi;
+            for o in 0..ft_out {
+                let want = (feat as f32 + o as f32 * 0.5) + (10_000.0 + p as f32 + o as f32 * 0.25);
+                assert_eq!(out[feat * ft_out + o], want, "base feat={feat} o={o}");
+            }
+        }
+        // threat 行は不可触 (元の値のまま、仮想行を加算しない)。
+        for feat in [base_ft_in, base_ft_in + 1, ft_in - 1] {
+            for o in 0..ft_out {
+                assert_eq!(
+                    out[feat * ft_out + o],
+                    feat as f32 + o as f32 * 0.5,
+                    "threat feat={feat} o={o} は不可触のはず"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalesce_coexist_boundary_all_profiles_and_featuresets() {
+        use shogi_features::{FeatureSet, ThreatProfile};
+        // boundary 網羅: 全 base featureset × 全 profile で同居 coalesce が
+        // (a) export 形状 = ft_in()*ft_out、(b) base 行 = 実行 + 同 p 仮想行、
+        // (c) threat 行不可触、を満たす。`base_ft_in % piece_inputs == 0` も確認。
+        let ft_out = 2usize;
+        for fs in FeatureSet::ALL {
+            for profile in [
+                ThreatProfile::Full,
+                ThreatProfile::SameClass,
+                ThreatProfile::SameClassMajorPawn,
+                ThreatProfile::CrossSide,
+            ] {
+                let spec = fs.spec().with_threat_profile(profile).with_ft_factorize();
+                let base_ft_in = spec.base_ft_in();
+                let ft_in = spec.ft_in();
+                let pi = spec.piece_inputs();
+                assert_eq!(
+                    base_ft_in % pi,
+                    0,
+                    "{} {profile}: base_ft_in % pi",
+                    fs.canonical_name()
+                );
+
+                // base+threat 実行は feat 番号、仮想行は plane ごと一定値。
+                let mut w = vec![0.0f32; spec.train_ft_in() * ft_out];
+                for feat in 0..ft_in {
+                    for o in 0..ft_out {
+                        w[feat * ft_out + o] = (feat % 97) as f32 + o as f32 * 0.5;
+                    }
+                }
+                for p in 0..pi {
+                    for o in 0..ft_out {
+                        w[(ft_in + p) * ft_out + o] = 1000.0 + (p % 13) as f32;
+                    }
+                }
+                let out = coalesce_ft_factorized(&spec, ft_out, &w);
+                assert_eq!(
+                    out.len(),
+                    ft_in * ft_out,
+                    "{} {profile}: export shape",
+                    fs.canonical_name()
+                );
+
+                // base 行先頭/末尾と threat 行先頭/末尾を spot-check (全要素は重いので端点)。
+                for &feat in &[0usize, base_ft_in - 1] {
+                    let p = feat % pi;
+                    for o in 0..ft_out {
+                        let want =
+                            ((feat % 97) as f32 + o as f32 * 0.5) + (1000.0 + (p % 13) as f32);
+                        assert_eq!(
+                            out[feat * ft_out + o],
+                            want,
+                            "{} {profile} base feat={feat}",
+                            fs.canonical_name()
+                        );
+                    }
+                }
+                for &feat in &[base_ft_in, ft_in - 1] {
+                    for o in 0..ft_out {
+                        assert_eq!(
+                            out[feat * ft_out + o],
+                            (feat % 97) as f32 + o as f32 * 0.5,
+                            "{} {profile} threat feat={feat} 不可触",
+                            fs.canonical_name()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     use super::*;
