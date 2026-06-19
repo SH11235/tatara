@@ -658,7 +658,7 @@ impl BucketedPrefetchedLoader {
                         drop(rdr);
                         if let Some(e) = failed {
                             // reader が exhausted: error を slot に置いて worker 終了
-                            // (借りた slot は捨てる; main は channel close で気付く)。
+                            // (借りた slot は捨てる; main は next_batch の err_slot 確認で気付く)。
                             let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
                             if slot.is_none() {
                                 *slot = Some(e);
@@ -684,8 +684,9 @@ impl BucketedPrefetchedLoader {
                             }
                             Err(e) => {
                                 // max_active 超過: reader error と同じく err_slot に
-                                // 積んで worker 終了。main の `next_batch` が channel
-                                // close を検知して明示エラーを返す (借りた slot は捨てる)。
+                                // 積んで worker 終了。単一 worker error なので channel は
+                                // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
+                                // 明示エラーを返す (借りた slot は捨てる)。
                                 overflow = Some(e);
                                 break;
                             }
@@ -732,6 +733,18 @@ impl BucketedPrefetchedLoader {
     ///
     /// 消費後は [`Self::recycle`] で `(batch, buckets)` を返すこと (ring buffer)。
     pub fn next_batch(&mut self) -> io::Result<Option<BatchSlot>> {
+        // 単一 worker でのみ起きる error (max_active 超過等) は、全 worker の exit
+        // = result channel close を待たずに surface する必要がある。生存 worker は
+        // epoch wrap で batch を供給し続け channel が閉じないため、recv 前に
+        // err_slot を確認する (確認漏れ時も channel close 経路が backstop)。
+        if let Some(e) = self
+            .err_slot
+            .lock()
+            .expect("err_slot mutex poisoned")
+            .take()
+        {
+            return Err(e);
+        }
         match self
             .result_rx
             .as_ref()
@@ -740,7 +753,7 @@ impl BucketedPrefetchedLoader {
         {
             Ok(slot) => Ok(Some(slot)),
             Err(_) => {
-                // 全 worker exit → result channel close。error slot を確認。
+                // 全 worker exit → result channel close。残った error を確認。
                 if let Some(e) = self
                     .err_slot
                     .lock()

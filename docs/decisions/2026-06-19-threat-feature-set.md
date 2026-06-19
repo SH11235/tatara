@@ -296,20 +296,21 @@ donor (read-only 参照): bullet-shogi
 - **export int8**: tatara FT 形式 (i16) と不整合。i16/LEB128 を継ぐ。
 - **可変長レコード**: dataloader 固定ストライド前提を全面改修するため不採用。
 
-## Open items
+## 既知の制約 (deferred design)
 
-1. [resolved] `THREAT_MAX_ACTIVE=320` (donor 値) + overflow hard-error (全 build)
-   を実装。cross-side E2E で hard-error 不発。Full 実 PSV の per-position max の
-   厳密確定は実運用で counter を監視 (越えれば即 hard-error で気付ける)。
-2. [resolved] 計測ゲート完了 ([Decision 8 計測結果](#8-gpu-メモリ試算-profile-が本機-3080-ti-で乗るか))。
-   GPU 律速 → **on-the-fly 確定・precompute 不要・データ形式変更なし**。
-3. [deferred] factorizer × threat / PSQT × threat は初期実装で **CLI 相互排他**。
-   FT レイアウト境界と fold/reduce/PSQT kernel の base-row 限定整合を test 確認して
-   から併用解禁する (棋力比較で base+factorizer や base+PSQT と threat を混ぜたく
-   なった時の課題)。
-4. [resolved] backward 込みの計測で GPU util 100% = GPU 律速。phase B 単一ブロック
-   prefix-sum は ft_in 拡大下でも全体 pos/s の支配要因ではなかった (FT gather/
-   scatter が支配)。専用最適化は不要。
+- **factorizer × threat / PSQT × threat は CLI 相互排他**。factorizer は dense な
+  fold/reduce (sparse 経路には virtual を出さず、weight 行列上で `feature % piece_inputs`
+  により縮約・畳み込み) で実装されており、現状 `ft_fold_virtual` / `ft_reduce_virtual_grad`
+  は bucketed 領域として `ft_in()` を渡す。threat 連結時は `ft_in()` が threat row を
+  含むため、virtual が threat row に modulo aliasing で漏れ込む / threat 勾配が virtual に
+  混ざる。併用解禁には fold/reduce/coalesce を **range-aware** にし (bucketed 領域 =
+  `base_ft_in`、`base_ft_in % piece_inputs == 0` を仮定、threat row `[base_ft_in, ft_in())`
+  は不可触で通す)、かつ **export/coalesce が threat row を保持** する (現状
+  `coalesce_ft_factorized` は base_ft_in 行しか返さず、threat+factorizer だと threat を
+  silent に切り落とす) よう atomic に修正する必要がある。等価性テスト (train 経路
+  forward == fold 後 forward, threat active 時) + 勾配/前向き分離テスト + export shape
+  で整合を確認してから解禁する。棋力比較で base+factorizer と threat を同条件で並べたい
+  時に必要。
 
 ## Golden / test 方針
 
