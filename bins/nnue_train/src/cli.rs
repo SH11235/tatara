@@ -641,6 +641,19 @@ pub(crate) struct LayerstackArgs {
     /// the factorizer is not yet compatible with.
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
+
+    /// Threat sparse feature profile. One of: off (default), full, same-class,
+    /// same-class-major-pawn, cross-side. When not `off`, threat edge features
+    /// (one piece attacking another) are concatenated after the base feature
+    /// transformer inputs, growing the FT input dimension and the active-feature
+    /// count. `off` is bit-identical to the base feature set.
+    ///
+    /// Threat is mutually exclusive with the FT factorizer: enabling a threat
+    /// profile requires `--no-ft-factorize` (the combined FT row layout is not
+    /// yet validated). The dimension increase makes higher profiles (full /
+    /// same-class) GPU-memory heavy — pick a smaller profile if training OOMs.
+    #[arg(long = "threat-profile", default_value = "off")]
+    pub(crate) threat_profile: String,
 }
 
 impl LayerstackArgs {

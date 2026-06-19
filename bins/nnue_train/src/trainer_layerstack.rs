@@ -672,6 +672,9 @@ impl GpuTrainer {
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
+        // `base_ft_in` = factorizer 仮想行を除いた実 FT row 数 = `ft_in()`
+        // (threat 連結時は base + threat、両者連結は CLI 排他なので factorizer の
+        // 仮想境界としても安全に流用できる)。
         let base_ft_in = feature_set.ft_in();
         let train_ft_in = feature_set.train_ft_in();
         let l1_effective = l1_out - L1_SKIP;

@@ -12,6 +12,8 @@ pub mod halfka_hm;
 pub mod progress_kpabs;
 pub mod psqt_material;
 mod simd;
+pub mod threat;
+pub mod threat_exclusion;
 
 pub use feature_set::{FeatureSet, FeatureSetSpec};
 pub use halfka_hm::{
@@ -20,3 +22,5 @@ pub use halfka_hm::{
 };
 pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};
+pub use threat::{THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, threat_dimensions_of};
+pub use threat_exclusion::ThreatProfile;

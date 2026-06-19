@@ -128,7 +128,7 @@ impl HeldoutSet {
                 continue;
             }
             let board = psv.decode();
-            let pushed = cur.push_decoded(&board);
+            let pushed = cur.push_decoded(&board)?;
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
             cur_buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
             if cur.n_positions == batch_size {

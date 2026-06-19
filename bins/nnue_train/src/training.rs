@@ -8,7 +8,7 @@ use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
 use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::{FeatureSet, FeatureSetSpec};
+use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
 
 use crate::{arch::*, cli::*, trainer_layerstack::*, trainer_simple::*};
 
@@ -39,13 +39,53 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         })?
         .spec();
 
+    // Threat profile の解決。`off` は base と bit-identical (None)。`off` 以外は
+    // factorizer と排他: 両 ON の FT row layout が未検証なので、factorizer を明示
+    // OFF (`--no-ft-factorize`) にしていない起動は hard-error にする (暗黙 disable
+    // は独立変数が黙って動くので採らない)。
+    let threat_profile = match layerstack.threat_profile.as_str() {
+        "off" => None,
+        name => Some(ThreatProfile::from_cli(name).ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                format!(
+                    "--threat-profile '{name}' is not a known profile (expected one of: off, {})",
+                    ThreatProfile::available()
+                )
+                .into()
+            },
+        )?),
+    };
+    if threat_profile.is_some() && layerstack.ft_factorize_enabled() {
+        return Err(
+            "--threat-profile requires --no-ft-factorize (the FT factorizer is ON by default \
+             and the combined factorizer + threat FT row layout is not yet validated)"
+                .into(),
+        );
+    }
+    // PSQT も threat と排他にする (初期実装で risk を切る)。PSQT shortcut は全 FT
+    // row に material prior を載せる設計で、threat row には material 概念が無い
+    // ため base row 限定の境界処理が要る (未検証)。併用解禁は後続。
+    if threat_profile.is_some() && layerstack.psqt {
+        return Err(
+            "--threat-profile is mutually exclusive with --psqt for now (the PSQT shortcut \
+             must be restricted to base FT rows when threat features are concatenated, which \
+             is not yet wired)"
+                .into(),
+        );
+    }
+
     // FT factorizer modifier の適用 (spec 確定はこの 1 箇所)。default ON で
     // `--no-ft-factorize` が opt-out。`--psqt` は FT と同じ仮想 P 行を PSQT block
     // にも持たせて併用する (trainer が fold/reduce を num_buckets 列で配線)。
     // `--init-from` だけは factorizer と排他で auto-suppress する (起動 log に明記):
     // 量子化 .bin (coalesce 済) は仮想行を持たないため初期化元にできない
     // (from-scratch か factorized raw checkpoint の --resume が必要)。
-    let feature_set = if layerstack.ft_factorize_enabled() {
+    let feature_set = if let Some(profile) = threat_profile {
+        // threat 有効時は (上の hard-error により) factorizer は OFF。base 次元拡張
+        // modifier を適用する。
+        println!("[train] --threat-profile {profile} → FT input extended by threat dims");
+        feature_set.with_threat_profile(profile)
+    } else if layerstack.ft_factorize_enabled() {
         if cli.init_from.is_some() {
             println!(
                 "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \

@@ -107,14 +107,14 @@ impl Batch {
         self.n_positions = 0;
     }
 
-    /// 1 position を batch に追加。`true` を返したら成功、`false` は batch 満杯。
-    /// `feature_set` の indexer で sparse index を slot に fill (残りは
-    /// `-1` padding)。
+    /// 1 position を batch に追加。`Ok(true)` 成功、`Ok(false)` は batch 満杯、
+    /// `Err` は active feature 数が `max_active` を超過 (下記参照)。`feature_set`
+    /// の indexer で sparse index を slot に fill (残りは `-1` padding)。
     ///
     /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
     /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
     /// 1 回だけ呼んで `ShogiBoard` を使い回すこと (decode-once 経路)。
-    pub fn push(&mut self, pos: &PackedSfenValue) -> bool {
+    pub fn push(&mut self, pos: &PackedSfenValue) -> io::Result<bool> {
         self.push_decoded(&pos.decode())
     }
 
@@ -124,9 +124,15 @@ impl Batch {
     /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と progress8kpabs
     /// bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で使い回すための
     /// 入口 (decode-once)。`push(&pos)` は `push_decoded(&pos.decode())` と等価。
-    pub fn push_decoded(&mut self, board: &ShogiBoard) -> bool {
+    ///
+    /// active feature 数が `max_active` を超えると `Err(io::Error)` を返す。base
+    /// 特徴は合法局面で必ず cap 内だが threat 連結時は `THREAT_MAX_ACTIVE` の
+    /// 見積りを edge 数が超え得る。超過を silent skip すると欠落 edge が loss だけ
+    /// 見ても気付けないため、利用者に「profile / 実 active 数 / max_active」を含む
+    /// 明示エラーを返して学習を止める (起点 320 不足なら定数を上げて再ビルド)。
+    pub fn push_decoded(&mut self, board: &ShogiBoard) -> io::Result<bool> {
         if self.n_positions >= self.batch_size {
-            return false;
+            return Ok(false);
         }
 
         let bi = self.n_positions;
@@ -136,9 +142,20 @@ impl Batch {
         let max_active = self.max_active;
         let stm_slice = &mut self.stm_indices[row_off..row_off + max_active];
         let nstm_slice = &mut self.nstm_indices[row_off..row_off + max_active];
-        // 戻り値の write 件数は使わない。`max_active` 越えは silent skip
-        // (合法局面の駒総数固定で実 PSV では到達不能、defensive)。
-        let _ = spec.extract_active_features(board, stm_slice, nstm_slice);
+        // `extract_active_features` は **実 active 数** を返す (cap 越えは書き込み
+        // しないが戻り値には反映)。
+        let written = spec.extract_active_features(board, stm_slice, nstm_slice);
+        if written > max_active {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "active feature count {written} exceeds max_active {max_active} \
+                     (feature set {}); raise THREAT_MAX_ACTIVE and rebuild — silent \
+                     truncation is not allowed",
+                    spec.canonical_name(),
+                ),
+            ));
+        }
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);
@@ -155,7 +172,7 @@ impl Batch {
         // per_pos_norm はデフォルト 1.0 (with_capacity 時に初期化済)。
 
         self.n_positions += 1;
-        true
+        Ok(true)
     }
 
     /// 詰めた position 数を返す (`n_positions` と同値)。
@@ -300,7 +317,7 @@ impl PsvFileLoader {
             }
             match self.next_psv()? {
                 Some(psv) => {
-                    let ok = batch.push(&psv);
+                    let ok = batch.push(&psv)?;
                     debug_assert!(ok, "batch.push should not refuse below batch_size");
                 }
                 None => break,
@@ -655,13 +672,34 @@ impl BucketedPrefetchedLoader {
                     // (Simple アーキ) では `progress.bucket_board` の per-position 推論
                     // (~30-40 KP-abs weight load + exp + clamp) を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
+                    let mut overflow: Option<io::Error> = None;
                     for psv in &scratch {
                         let board = psv.decode();
-                        let pushed = batch.push_decoded(&board);
-                        debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
+                        match batch.push_decoded(&board) {
+                            Ok(pushed) => {
+                                debug_assert!(
+                                    pushed,
+                                    "Batch::push_decoded refused below batch_size"
+                                );
+                            }
+                            Err(e) => {
+                                // max_active 超過: reader error と同じく err_slot に
+                                // 積んで worker 終了。main の `next_batch` が channel
+                                // close を検知して明示エラーを返す (借りた slot は捨てる)。
+                                overflow = Some(e);
+                                break;
+                            }
+                        }
                         if compute_bucket {
                             buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
                         }
+                    }
+                    if let Some(e) = overflow {
+                        let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
                     }
                     debug_assert_eq!(batch.n_positions, batch_size);
                     debug_assert!(!compute_bucket || buckets.len() == batch_size);
@@ -955,18 +993,18 @@ mod tests {
         assert_eq!(psv.game_result(), 0);
 
         let mut batch = Batch::with_capacity(1, test_spec());
-        assert!(batch.push(&psv));
+        assert!(batch.push(&psv).unwrap());
         assert_eq!(batch.wdl[0], 0.5, "Draw (result == 0) → wdl == 0.5");
 
         // Win / Loss も合わせて回帰確認 (同 record をパッチ)。
         psv.as_bytes_mut()[38] = 1i8 as u8;
         let mut b_win = Batch::with_capacity(1, test_spec());
-        assert!(b_win.push(&psv));
+        assert!(b_win.push(&psv).unwrap());
         assert_eq!(b_win.wdl[0], 1.0, "Win (result > 0) → wdl == 1.0");
 
         psv.as_bytes_mut()[38] = (-1i8) as u8;
         let mut b_loss = Batch::with_capacity(1, test_spec());
-        assert!(b_loss.push(&psv));
+        assert!(b_loss.push(&psv).unwrap());
         assert_eq!(b_loss.wdl[0], 0.0, "Loss (result < 0) → wdl == 0.0");
     }
 
@@ -995,9 +1033,12 @@ mod tests {
         let psv1 = loader.next_psv().unwrap().unwrap();
         let psv2 = loader.next_psv().unwrap().unwrap();
         let psv3 = loader.next_psv().unwrap().unwrap();
-        assert!(batch.push(&psv1));
-        assert!(batch.push(&psv2));
-        assert!(!batch.push(&psv3), "3 件目は batch_size=2 で reject");
+        assert!(batch.push(&psv1).unwrap());
+        assert!(batch.push(&psv2).unwrap());
+        assert!(
+            !batch.push(&psv3).unwrap(),
+            "3 件目は batch_size=2 で reject"
+        );
         assert_eq!(batch.n_positions, 2);
     }
 

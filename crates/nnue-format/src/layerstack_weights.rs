@@ -265,13 +265,20 @@ pub fn build_arch_str(
     l2_out: usize,
     fv_scale: i32,
     psqt_buckets: Option<usize>,
+    threat_profile: Option<&str>,
 ) -> String {
     let psqt_part = match psqt_buckets {
         Some(n) => format!("PSQT={n},"),
         None => String::new(),
     };
+    // Threat token は PSQT の直後 (Features と Network の間)。`off` 相当 (None) は
+    // 出さないので base / PSQT-only の arch_str は byte-identical のまま。
+    let threat_part = match threat_profile {
+        Some(name) => format!("Threat={name},"),
+        None => String::new(),
+    };
     format!(
-        "{},{}\
+        "{},{}{}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -281,6 +288,7 @@ pub fn build_arch_str(
          fv_scale={}",
         features_token(feature_name, input_size, ft_out),
         psqt_part,
+        threat_part,
         l2_out,     // Output input
         l2_out,     // L2 output / L3 input
         l2_out,     // L2 output
@@ -357,7 +365,10 @@ pub fn coalesce_ft_factorized(
     if !feature_set.ft_factorize() {
         return ft_w_train.to_vec();
     }
-    let base_ft_in = feature_set.ft_in();
+    // factorizer の仮想 P 行は **base 実行** の後ろに連結される。threat row (もし
+    // 将来併用するなら) は別領域なので、fold 境界は `ft_in` ではなく `base_ft_in`。
+    // 現状 factorizer × threat は CLI 排他なので両者は一致する。
+    let base_ft_in = feature_set.base_ft_in();
     let piece_inputs = feature_set.piece_inputs();
     let train_ft_in = feature_set.train_ft_in();
     assert_eq!(
@@ -504,6 +515,8 @@ impl LayerStackWeights {
         } else {
             None
         };
+        // arch_str の `Threat=` token 名は profile の CLI 名 (`Display`)。
+        let threat_name = self.feature_set.threat_profile().map(|p| p.to_string());
         let arch_str = build_arch_str(
             self.feature_set.arch_feature_name(),
             self.feature_set.ft_in(),
@@ -513,6 +526,7 @@ impl LayerStackWeights {
             l2_out,
             FV_SCALE,
             psqt_buckets,
+            threat_name.as_deref(),
         );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
@@ -543,11 +557,25 @@ impl LayerStackWeights {
         write_leb128_tensor_i16(writer, &ft_b_i16)?;
 
         // ---- FT weights LEB128 (i16, scale=QA) ----
-        // piece 部分 = ft_in * ft_out (threat 無し)。本 trainer の ft_w は (ft_in, ft_out)
-        // row-major (ft_w[feat * ft_out + out]) で、そのまま i16 quantize して書く。
-        warn_if_i16_saturates("ft_w", &self.ft_w, qa_f);
-        let ft_w_i16: Vec<i16> = self
-            .ft_w
+        // base 部分 = base_ft_in * ft_out のみを FT block に書く。threat 連結時の
+        // threat row は PSQT block の後ろの **Threat block** に分けて書く (engine が
+        // base FT block を threat 非対応のまま byte-identical に読めるように)。本
+        // trainer の ft_w は (ft_in, ft_out) row-major で base row が先頭に並ぶ。
+        let base_ft_w_n = self.feature_set.base_ft_in() * ft_out;
+        if self.ft_w.len() != self.feature_set.ft_in() * ft_out {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ft_w length {} != ft_in {} * ft_out {}",
+                    self.ft_w.len(),
+                    self.feature_set.ft_in(),
+                    ft_out,
+                ),
+            ));
+        }
+        let ft_w_base = &self.ft_w[..base_ft_w_n];
+        warn_if_i16_saturates("ft_w", ft_w_base, qa_f);
+        let ft_w_i16: Vec<i16> = ft_w_base
             .iter()
             .map(|&v| {
                 (qa_f * v as f64)
@@ -585,6 +613,24 @@ impl LayerStackWeights {
                 let val = (psqt_scale * w as f64).round() as i32;
                 writer.write_all(&val.to_le_bytes())?;
             }
+        }
+
+        // ---- Threat block (arch_str に Threat={profile}, があるときのみ) ----
+        // FT block の base row の続き (`ft_w[base_ft_in*ft_out ..]`) を base FT と
+        // 同じ i16/LEB128 で書く。PSQT block の直後・LayerStacks の直前に置く。
+        // PSQT と threat は CLI 排他なので両 block が同時に出ることはない。
+        if self.feature_set.threat_profile().is_some() {
+            let threat_w = &self.ft_w[base_ft_w_n..];
+            warn_if_i16_saturates("threat_ft_w", threat_w, qa_f);
+            let threat_w_i16: Vec<i16> = threat_w
+                .iter()
+                .map(|&v| {
+                    (qa_f * v as f64)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+                })
+                .collect();
+            write_leb128_tensor_i16(writer, &threat_w_i16)?;
         }
 
         // ---- LayerStacks (num_buckets × {fc_hash, L1, L2, L3}) ----
@@ -789,13 +835,36 @@ impl LayerStackWeights {
             v
         };
 
-        // Threat / HandCount は未対応。PSQT は caller の要求 (`with_psqt`) と一致する
-        // か検証する (要求 true なら `PSQT={file_num_buckets},` を要求、false なら
-        // PSQT 含む `.bin` を reject)。
-        if arch_str.contains("Threat=") || arch_str.contains("HandCount") {
+        // HandCount は未対応 (reject のまま)。Threat は `expected` の profile と
+        // arch_str の `Threat={profile},` token が一致するか検証する: token 有無 /
+        // profile 名のどちらが食い違っても InvalidData で弾く (profile compaction で
+        // row の意味が変わるため silent な row ずれを防ぐ)。
+        if arch_str.contains("HandCount") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("unsupported arch (Threat / HandCount not implemented): {arch_str}"),
+                format!("unsupported arch (HandCount not implemented): {arch_str}"),
+            ));
+        }
+        // arch_str を comma 分割し `Threat=<profile>` token を構造的に拾う。
+        // substring 照合では重複 / 余分 suffix token (`...Threat=fullX...`) を見逃す
+        // ので、token は **最大 1 個** + profile 名 **完全一致** を要求する。
+        let file_threat_profile = parse_single_arch_token(&arch_str, "Threat=").map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("arch_str has multiple Threat= tokens: `{arch_str}`"),
+            )
+        })?;
+        let expected_threat_profile = expected.threat_profile().map(|p| p.to_string());
+        if file_threat_profile != expected_threat_profile.as_deref() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "threat profile mismatch: file {}, expected {} (arch_str = `{arch_str}`)",
+                    file_threat_profile.map_or_else(|| "none".to_string(), |p| format!("`{p}`")),
+                    expected_threat_profile
+                        .as_deref()
+                        .map_or_else(|| "none".to_string(), |p| format!("`{p}`")),
+                ),
             ));
         }
         let psqt_token = format!("PSQT={file_num_buckets},");
@@ -879,9 +948,11 @@ impl LayerStackWeights {
         let qa_f = QA as f32;
         let ft_b: Vec<f32> = ft_b_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
-        // FT weights (LEB128 i16, ft_in * ft_out 個)
-        let ft_w_i16 = read_leb128_tensor_i16(reader, Some(expected.ft_in() * ft_out))?;
-        let ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
+        // FT weights (LEB128 i16, base_ft_in * ft_out 個)。threat row は PSQT block
+        // の後ろの Threat block で読む (save 側と対称)。
+        let base_ft_w_n = expected.base_ft_in() * ft_out;
+        let ft_w_i16 = read_leb128_tensor_i16(reader, Some(base_ft_w_n))?;
+        let mut ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
         // PSQT block (with_psqt = true のときのみ): bias i32 × num_buckets + weights
         // i32 × (ft_in * num_buckets) を feature-major row-major で読む。scale は
@@ -924,6 +995,14 @@ impl LayerStackWeights {
         } else {
             None
         };
+
+        // Threat block (threat profile 有効時のみ): threat_dims * ft_out 個を base
+        // FT と同じ i16/LEB128 で読み、ft_w の base row の後ろに連結する。
+        if expected.threat_profile().is_some() {
+            let threat_w_n = expected.threat_dims() * ft_out;
+            let threat_w_i16 = read_leb128_tensor_i16(reader, Some(threat_w_n))?;
+            ft_w.extend(threat_w_i16.iter().map(|&v| v as f32 / qa_f));
+        }
 
         // LayerStacks (num_buckets × {fc_hash, L1, L2, L3})
         let qb_f = QB as f32;
@@ -1024,6 +1103,23 @@ fn clamp_i8(v: f64) -> i8 {
     } else {
         v as i8
     }
+}
+
+/// arch_str を comma 分割し `prefix` (`"Threat="` 等) で始まる token の値を返す。
+/// token が無ければ `Ok(None)`、複数あれば `Err(())` (構造的に壊れた arch_str)。
+/// substring 照合と違い、`prefix` が token 先頭に厳密一致する 1 区切りのみ拾う
+/// (`Threat=fullX` のような余分 suffix も別 token として扱われ完全一致照合で弾く)。
+fn parse_single_arch_token<'a>(arch_str: &'a str, prefix: &str) -> Result<Option<&'a str>, ()> {
+    let mut found: Option<&'a str> = None;
+    for tok in arch_str.split(',') {
+        if let Some(value) = tok.strip_prefix(prefix) {
+            if found.is_some() {
+                return Err(());
+            }
+            found = Some(value);
+        }
+    }
+    Ok(found)
 }
 
 /// `round(scale·v)` が i16 範囲 `[-32768, 32767]` を超える要素数を数える。`scale`
@@ -1201,6 +1297,154 @@ mod tests {
         // 値も全 0
         assert!(loaded.ft_w.iter().all(|&x| x == 0.0));
         assert!(loaded.l1_w.iter().all(|&x| x == 0.0));
+    }
+
+    fn threat_spec(profile: shogi_features::ThreatProfile) -> FeatureSetSpec {
+        FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(profile)
+    }
+
+    #[test]
+    fn parse_single_arch_token_is_strict() {
+        // 正常: comma 区切りの 1 token を厳密一致で拾う。
+        let arch = "Features=X[1->2],PSQT=9,Threat=cross-side,Network=Y";
+        assert_eq!(
+            parse_single_arch_token(arch, "Threat="),
+            Ok(Some("cross-side"))
+        );
+        assert_eq!(parse_single_arch_token(arch, "PSQT="), Ok(Some("9")));
+        // token 無し。
+        assert_eq!(
+            parse_single_arch_token("Features=X,Network=Y", "Threat="),
+            Ok(None)
+        );
+        // substring だが token 先頭でない (`...XThreat=...`) は拾わない。
+        assert_eq!(
+            parse_single_arch_token("Features=XThreat=full,Network=Y", "Threat="),
+            Ok(None)
+        );
+        // 重複 token は Err。
+        assert_eq!(
+            parse_single_arch_token("Threat=full,Threat=cross-side", "Threat="),
+            Err(())
+        );
+        // suffix 違い (`Threat=fullX`) は完全一致照合で別値として扱われる。
+        assert_eq!(
+            parse_single_arch_token("Threat=fullX,Network=Y", "Threat="),
+            Ok(Some("fullX"))
+        );
+    }
+
+    #[test]
+    fn threat_save_load_roundtrip_preserves_base_and_threat_rows() {
+        use shogi_features::ThreatProfile;
+        // 最小 profile (cross-side) + 小 ft_out で base / threat 両 row を持つ FT を
+        // roundtrip する。base row 先頭と threat row 先頭に distinctive 値を入れ、
+        // FT block / Threat block が正しい順で保存・復元されることを確認する。
+        let profile = ThreatProfile::CrossSide;
+        let spec = threat_spec(profile);
+        let ft_out = 128;
+        let mut original = LayerStackWeights::zeroed(
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let base_ft_w_n = spec.base_ft_in() * ft_out;
+        assert_eq!(original.ft_w.len(), spec.ft_in() * ft_out);
+        // base row 0 col 0、threat row 0 (= base_ft_w_n) col 0/1 に i16 量子化
+        // (QA=127) で正確に復元できる値 (n/127) を置く。
+        original.ft_w[0] = 1.0; // 127/127
+        original.ft_w[base_ft_w_n] = -2.0; // -254/127
+        original.ft_w[base_ft_w_n + 1] = 5.0 / 127.0;
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+
+        // arch_str に Threat= token が入る。
+        let arch = String::from_utf8_lossy(&buf);
+        assert!(
+            arch.contains("Threat=cross-side,"),
+            "arch_str missing Threat token"
+        );
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let loaded = LayerStackWeights::load_quantised(
+            &mut cursor,
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.ft_w.len(), original.ft_w.len());
+        assert!((loaded.ft_w[0] - 1.0).abs() < 1e-6);
+        assert!((loaded.ft_w[base_ft_w_n] - (-2.0)).abs() < 1e-6);
+        assert!((loaded.ft_w[base_ft_w_n + 1] - 5.0 / 127.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn threat_load_rejects_profile_mismatch() {
+        use shogi_features::ThreatProfile;
+        // cross-side で save した `.bin` を same-class で load → reject。
+        let ft_out = 128;
+        let saved = threat_spec(ThreatProfile::CrossSide);
+        let original = LayerStackWeights::zeroed(
+            saved,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let err = LayerStackWeights::load_quantised(
+            &mut cursor,
+            threat_spec(ThreatProfile::SameClass),
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap_err();
+        // profile が変われば feature_hash も変わるので network_hash か threat token
+        // のどちらかで弾かれる (どちらも InvalidData)。
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn threat_load_rejects_threat_off_request_on_threat_bin() {
+        use shogi_features::ThreatProfile;
+        // threat-on で save した `.bin` を threat-off (base) spec で load → reject。
+        let ft_out = 128;
+        let saved = threat_spec(ThreatProfile::CrossSide);
+        let original = LayerStackWeights::zeroed(
+            saved,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let err = LayerStackWeights::load_quantised(
+            &mut cursor,
+            FeatureSet::HalfKaHmMerged.spec(),
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1566,6 +1810,7 @@ mod tests {
             DEFAULT_L2_OUT,
             FV_SCALE,
             None,
+            None,
         );
         assert!(s.contains("HalfKaHmMerged"));
         assert!(s.contains("73305->1536x2"));
@@ -1583,7 +1828,17 @@ mod tests {
     #[test]
     fn build_arch_str_with_psqt_inserts_token() {
         // psqt_buckets = Some(9) で `PSQT=9,` token が Features と Network の間に入る。
-        let s = build_arch_str("HalfKaHmMerged", 73_305, 1536, 16, 30, 32, 28, Some(9));
+        let s = build_arch_str(
+            "HalfKaHmMerged",
+            73_305,
+            1536,
+            16,
+            30,
+            32,
+            28,
+            Some(9),
+            None,
+        );
         assert!(s.contains("PSQT=9,"));
         // 順序: Features=...,PSQT=9,Network=...
         let psqt_pos = s.find("PSQT=9,").unwrap();

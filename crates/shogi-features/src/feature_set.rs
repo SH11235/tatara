@@ -20,6 +20,9 @@ use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
 use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
+use crate::threat::{THREAT_MAX_ACTIVE, ThreatIndexer};
+use crate::threat_exclusion::ThreatProfile;
+
 // =============================================================================
 // 軸 1 / 軸 2
 // =============================================================================
@@ -111,6 +114,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKP,
                 arch_feature_name: "HalfKP",
                 ft_factorize: false,
+                threat_profile: None,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
                 feature_set: self,
@@ -122,6 +126,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_SPLIT,
                 arch_feature_name: "HalfKaSplit",
                 ft_factorize: false,
+                threat_profile: None,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
                 feature_set: self,
@@ -133,6 +138,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_MERGED,
                 arch_feature_name: "HalfKaMerged",
                 ft_factorize: false,
+                threat_profile: None,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
                 feature_set: self,
@@ -144,6 +150,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_SPLIT,
                 arch_feature_name: "HalfKaHmSplit",
                 ft_factorize: false,
+                threat_profile: None,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
                 feature_set: self,
@@ -155,6 +162,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_MERGED,
                 arch_feature_name: "HalfKaHmMerged",
                 ft_factorize: false,
+                threat_profile: None,
             },
         }
     }
@@ -203,6 +211,20 @@ const fn fnv1a32(s: &str) -> u32 {
     hash
 }
 
+/// threat profile ごとの feature hash 定数。`feature_hash() = base ^ この値` で
+/// 合成する。`threat-{profile}` 文字列の FNV-1a 32bit hash を定数化したもので、
+/// 全 base × 全 profile の合成が衝突しないことを test で固定する。各 profile は
+/// row の意味を変える (compaction) ため、load 時に hash 不一致を弾いて silent な
+/// row ずれを防ぐ。
+const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
+    match profile {
+        ThreatProfile::Full => fnv1a32("threat-full"),
+        ThreatProfile::SameClass => fnv1a32("threat-same-class"),
+        ThreatProfile::SameClassMajorPawn => fnv1a32("threat-same-class-major-pawn"),
+        ThreatProfile::CrossSide => fnv1a32("threat-cross-side"),
+    }
+}
+
 // =============================================================================
 // FeatureSetSpec — feature 軸の単一の真実源
 // =============================================================================
@@ -232,6 +254,12 @@ pub struct FeatureSetSpec {
     /// 変わるのは weight 行数 (`train_ft_in`) だけ。export 後の artifact
     /// (次元 / hash / arch 名) も base と同一。
     ft_factorize: bool,
+    /// Threat sparse 特徴を base に連結する profile。`None` で base と
+    /// bit-identical。`Some(profile)` のとき base の `ft_in` 直後に
+    /// `threat_dims(profile)` 行を連結し、`max_active` / `feature_hash` も
+    /// 変える (factorizer の次元不変 modifier とは別カテゴリ = base 次元の拡張)。
+    /// factorizer とは排他 (両 ON の FT row layout は未検証、CLI が hard-error)。
+    threat_profile: Option<ThreatProfile>,
 }
 
 impl FeatureSetSpec {
@@ -250,14 +278,38 @@ impl FeatureSetSpec {
         self.piece_inputs
     }
 
-    /// 総入力次元 `ft_in` (`king_buckets * piece_inputs`)。
-    pub const fn ft_in(&self) -> usize {
+    /// base feature の入力次元 (`king_buckets * piece_inputs`、threat 連結前)。
+    /// threat index emit の offset と factorizer 仮想行の境界に使う。
+    pub const fn base_ft_in(&self) -> usize {
         self.king_buckets * self.piece_inputs
     }
 
-    /// 1 局面で同時に active になる最大特徴数。
+    /// 連結 threat profile (無効時 `None`)。
+    pub const fn threat_profile(&self) -> Option<ThreatProfile> {
+        self.threat_profile
+    }
+
+    /// 連結 threat 次元数 (threat 無効時 0)。
+    pub const fn threat_dims(&self) -> usize {
+        match self.threat_profile {
+            Some(p) => crate::threat::threat_dimensions_of(p),
+            None => 0,
+        }
+    }
+
+    /// 総入力次元 `ft_in`。base (`base_ft_in`) に threat 連結分を加える。
+    /// threat 無効時は base と同値。
+    pub const fn ft_in(&self) -> usize {
+        self.base_ft_in() + self.threat_dims()
+    }
+
+    /// 1 局面で同時に active になる最大特徴数。threat 有効時は両視点の threat
+    /// edge 上限 (`THREAT_MAX_ACTIVE`) を base に加える。
     pub const fn max_active(&self) -> usize {
-        self.max_active
+        match self.threat_profile {
+            Some(_) => self.max_active + THREAT_MAX_ACTIVE,
+            None => self.max_active,
+        }
     }
 
     /// FT factorizer を有効にした spec を返す (modifier 適用の唯一の経路)。
@@ -268,15 +320,21 @@ impl FeatureSetSpec {
     /// だけが `train_ft_in` を参照する。
     pub const fn with_ft_factorize(self) -> Self {
         FeatureSetSpec {
-            feature_set: self.feature_set,
-            king_encoding: self.king_encoding,
-            king_square_mode: self.king_square_mode,
-            king_buckets: self.king_buckets,
-            piece_inputs: self.piece_inputs,
-            max_active: self.max_active,
-            feature_hash: self.feature_hash,
-            arch_feature_name: self.arch_feature_name,
             ft_factorize: true,
+            ..self
+        }
+    }
+
+    /// Threat profile を連結した spec を返す (modifier 適用の唯一の経路)。
+    ///
+    /// `ft_factorize` とは違い base 次元を拡張する: `ft_in` / `max_active` /
+    /// `feature_hash` がすべて変わる。base offset (`base_ft_in`) は不変で、
+    /// threat index の emit はその直後に連結される。factorizer との併用は FT row
+    /// layout が未検証のため呼び出し側 (CLI) が hard-error にする。
+    pub fn with_threat_profile(self, profile: ThreatProfile) -> Self {
+        FeatureSetSpec {
+            threat_profile: Some(profile),
+            ..self
         }
     }
 
@@ -298,8 +356,14 @@ impl FeatureSetSpec {
     }
 
     /// feature 定数 (artifact identity の `FT_HASH` 導出に使う feature 部分)。
+    /// threat 連結時は base hash に profile hash を XOR 合成する (`off` は base
+    /// と bit-identical)。全 base × 全 profile の合成 hash が pairwise distinct で
+    /// あることは test (`threat_profile_hashes_keep_all_specs_distinct`) で固定。
     pub const fn feature_hash(&self) -> u32 {
-        self.feature_hash
+        match self.threat_profile {
+            Some(p) => self.feature_hash ^ threat_profile_hash(p),
+            None => self.feature_hash,
+        }
     }
 
     /// arch 文字列に埋める feature 名。
@@ -394,6 +458,18 @@ impl FeatureSetSpec {
                 }
             }
         }
+
+        // Threat 特徴 (profile 有効時のみ)。base の `ft_in` (= `base_ft_in`) 直後に
+        // 連結するので offset を足して emit する。
+        if let Some(profile) = self.threat_profile {
+            let base = self.base_ft_in();
+            ThreatIndexer::shared(profile).for_each_active_threat_index_pair(
+                board,
+                stm,
+                nstm,
+                |s, n| f(base + s, base + n),
+            );
+        }
     }
 
     /// 特徴インデックスを `Vec<(stm_idx, nstm_idx)>` として収集する。
@@ -409,8 +485,13 @@ impl FeatureSetSpec {
     /// closure 経由 [`map_features_board`] と byte-identical な出力を SIMD store
     /// と直接 fit する形で取り出す。
     ///
-    /// 玉位置が無効な局面 (片玉 / 詰将棋) は 0 を返して何も書込まない。出力
-    /// slice 長 `max_active` 越えの分は silent skip する。
+    /// 玉位置が無効な局面 (片玉 / 詰将棋) は 0 を返して何も書込まない。
+    ///
+    /// 戻り値は **実 active 数** で、出力 slice 長 `cap` を超え得る (threat 連結
+    /// 時に `THREAT_MAX_ACTIVE` の見積りを超えた場合)。書き込みは `cap` 以内に
+    /// 限るが、超過は silent truncation せず戻り値に反映するので、caller は
+    /// `count > cap` を overflow として hard-error 検出できる。base 特徴 (board /
+    /// king / hand) は合法局面で必ず `cap` 内なので超過は threat phase でのみ起こる。
     ///
     /// HalfKaHmMerged の board phase は [`crate::simd`] (runtime detect で
     /// scalar / AVX-2 / AVX-512 のいずれか)、それ以外 / king / hand phase は
@@ -533,7 +614,30 @@ impl FeatureSetSpec {
             }
         }
 
-        count
+        // Threat phase (profile 有効時のみ)。base は合法局面で必ず cap 内に収まる
+        // (king/hand 含め最大 `base max_active`) ため、ここに来る時点で base 分は
+        // 書き込み済。threat edge は `THREAT_MAX_ACTIVE` の見積りを超え得るので、
+        // 戻り値は cap で頭打ちにせず **真の総数** を返す: 書き込みは `count < cap`
+        // の範囲に限り、超過分は数えるだけにする。caller (dataloader) が
+        // `total > max_active` を hard-error 検出するための signal。
+        let mut total = count;
+        if let Some(profile) = self.threat_profile {
+            let base = self.base_ft_in();
+            ThreatIndexer::shared(profile).for_each_active_threat_index_pair(
+                board,
+                stm,
+                nstm,
+                |s, n| {
+                    if total < cap {
+                        stm_out[total] = (base + s) as i32;
+                        nstm_out[total] = (base + n) as i32;
+                    }
+                    total += 1;
+                },
+            );
+        }
+
+        total
     }
 
     /// `perspective_ctx` の crate 内 expose (parity test 用)。
@@ -824,5 +928,205 @@ mod tests {
         for (fs, name) in expected {
             assert_eq!(fs.spec().arch_feature_name(), name, "{:?}", fs);
         }
+    }
+
+    // ---- Threat 連結 ----
+
+    const ALL_PROFILES: [ThreatProfile; 4] = [
+        ThreatProfile::Full,
+        ThreatProfile::SameClass,
+        ThreatProfile::SameClassMajorPawn,
+        ThreatProfile::CrossSide,
+    ];
+
+    #[test]
+    fn threat_off_is_bit_identical_to_base() {
+        // `with_threat_profile` を呼ばない spec は base と全 getter 一致。
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            assert_eq!(base.threat_profile(), None);
+            assert_eq!(base.threat_dims(), 0);
+            assert_eq!(base.ft_in(), base.base_ft_in());
+        }
+    }
+
+    #[test]
+    fn threat_getters_extend_base_dimensions() {
+        let dims = [
+            (ThreatProfile::Full, 216_720usize),
+            (ThreatProfile::SameClass, 192_640),
+            (ThreatProfile::SameClassMajorPawn, 173_568),
+            (ThreatProfile::CrossSide, 96_320),
+        ];
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            for (profile, d) in dims {
+                let spec = base.with_threat_profile(profile);
+                assert_eq!(spec.threat_profile(), Some(profile));
+                assert_eq!(spec.threat_dims(), d);
+                assert_eq!(spec.base_ft_in(), base.ft_in());
+                assert_eq!(spec.ft_in(), base.ft_in() + d);
+                assert_eq!(spec.max_active(), base.max_active() + THREAT_MAX_ACTIVE);
+                // threat-only は factorizer 無効なので train_ft_in == ft_in。
+                assert_eq!(spec.train_ft_in(), spec.ft_in());
+            }
+        }
+    }
+
+    #[test]
+    fn threat_profile_hashes_keep_all_specs_distinct() {
+        // 全 base(5) × {off + 4 profile} = 25 通りの合成 feature_hash が pairwise
+        // distinct (profile compaction で row の意味が変わるため load 時に弾ける)。
+        let mut seen = Vec::new();
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            seen.push(base.feature_hash());
+            for profile in ALL_PROFILES {
+                let h = base.with_threat_profile(profile).feature_hash();
+                // off と各 profile も互いに distinct。
+                assert_ne!(
+                    h,
+                    base.feature_hash(),
+                    "{} {profile}",
+                    base.canonical_name()
+                );
+                seen.push(h);
+            }
+        }
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (25 通り)");
+    }
+
+    #[test]
+    fn threat_emit_appends_after_base_with_offset() {
+        // threat-on の emit 列 = base 実特徴列 + (base_ft_in offset を足した threat
+        // index 列)。closure 経路と direct-write 経路が一致し、全 index が
+        // `[0, ft_in())` 内であることを sample.psv で確認する。
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (size_of test で 40 byte 確認済、align 1)、`bytes.len() % 40 == 0` を
+        // 直前で assert。`bytes` の所有 lifetime 内に閉じる slice。
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+
+        let base = FeatureSet::HalfKaHmMerged.spec();
+        for profile in ALL_PROFILES {
+            let spec = base.with_threat_profile(profile);
+            let base_ft_in = base.ft_in();
+            for psv in records.iter().take(20) {
+                let board = psv.decode();
+
+                // base 実特徴のみ (closure)。
+                let mut base_only = Vec::new();
+                base.map_features_board(&board, |s, n| base_only.push((s, n)));
+
+                // threat-on の closure 列。
+                let mut on = Vec::new();
+                spec.map_features_board(&board, |s, n| on.push((s, n)));
+
+                // 先頭 base 個は base と一致。
+                assert_eq!(&on[..base_only.len()], &base_only[..], "{profile}");
+                // 残りは threat region (>= base_ft_in)、全体が ft_in 内。
+                for &(s, n) in &on {
+                    assert!(s < spec.ft_in() && n < spec.ft_in(), "{profile}");
+                }
+                for &(s, n) in &on[base_only.len()..] {
+                    assert!(
+                        s >= base_ft_in && n >= base_ft_in,
+                        "{profile} threat region"
+                    );
+                }
+
+                // direct-write 経路 (cap 内) が closure と一致。実 PSV は cap 内に
+                // 収まる前提 (収まらなければ overflow test 側で検出)。
+                let cap = spec.max_active();
+                let mut stm_buf = vec![0i32; cap];
+                let mut nstm_buf = vec![0i32; cap];
+                let total = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
+                assert!(
+                    total <= cap,
+                    "{profile}: total {total} > cap {cap} (sample.psv)"
+                );
+                let direct: Vec<(usize, usize)> = (0..total)
+                    .map(|k| (stm_buf[k] as usize, nstm_buf[k] as usize))
+                    .collect();
+                assert_eq!(direct, on, "{profile}: direct != closure");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_returns_true_total_on_threat_overflow() {
+        // cap を意図的に小さく (base+1) 渡し、threat edge の超過が silent truncate
+        // されず戻り値 (真の active 数) に反映されることを確認する (dataloader の
+        // hard-error signal)。startpos は threat edge が 0 でないので超過する。
+        let spec = FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::Full);
+        let board = startpos_for_overflow();
+
+        // 正規 cap での真の active 数。
+        let full_cap = spec.max_active();
+        let mut s = vec![0i32; full_cap];
+        let mut n = vec![0i32; full_cap];
+        let true_total = spec.extract_active_features(&board, &mut s, &mut n);
+        assert!(
+            true_total > 40,
+            "startpos should have threat edges beyond base"
+        );
+
+        // 小さい cap でも戻り値は真の総数 (cap で頭打ちにならない)。
+        let small_cap = 41usize;
+        let mut s2 = vec![0i32; small_cap];
+        let mut n2 = vec![0i32; small_cap];
+        let total = spec.extract_active_features(&board, &mut s2, &mut n2);
+        assert_eq!(total, true_total, "戻り値が cap で truncate されている");
+        assert!(total > small_cap, "overflow (cap 越え) を検出できる戻り値");
+    }
+
+    fn startpos_for_overflow() -> ShogiBoard {
+        use shogi_format::types::{Piece, PieceType};
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+        for file in 0..9u8 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+        board.board[Square::new(7, 7).index()] = Piece::new(Color::Black, PieceType::Bishop);
+        board.board[Square::new(1, 7).index()] = Piece::new(Color::Black, PieceType::Rook);
+        board.board[Square::new(1, 1).index()] = Piece::new(Color::White, PieceType::Bishop);
+        board.board[Square::new(7, 1).index()] = Piece::new(Color::White, PieceType::Rook);
+        for file in [0u8, 8] {
+            board.board[Square::new(file, 8).index()] = Piece::new(Color::Black, PieceType::Lance);
+            board.board[Square::new(file, 0).index()] = Piece::new(Color::White, PieceType::Lance);
+        }
+        for file in [1u8, 7] {
+            board.board[Square::new(file, 8).index()] = Piece::new(Color::Black, PieceType::Knight);
+            board.board[Square::new(file, 0).index()] = Piece::new(Color::White, PieceType::Knight);
+        }
+        for file in [2u8, 6] {
+            board.board[Square::new(file, 8).index()] = Piece::new(Color::Black, PieceType::Silver);
+            board.board[Square::new(file, 0).index()] = Piece::new(Color::White, PieceType::Silver);
+        }
+        for file in [3u8, 5] {
+            board.board[Square::new(file, 8).index()] = Piece::new(Color::Black, PieceType::Gold);
+            board.board[Square::new(file, 0).index()] = Piece::new(Color::White, PieceType::Gold);
+        }
+        board
     }
 }
