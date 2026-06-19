@@ -12,6 +12,49 @@ use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
 
 use crate::{arch::*, cli::*, trainer_layerstack::*, trainer_simple::*};
 
+/// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
+/// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
+/// ときだけ呼ぶ。`accumulator_flag` は FT 出力次元を下げる flag (LayerStack
+/// `--ft-out` / Simple `--l1`)、`threat_profile` は LayerStack のみ Some。
+/// `--ft-fp16` / `--ft-fp16-out` は棋力 trade-off のため remedy には挙げず
+/// (診断用に current 値だけ表示)、メモリ専用の `--fp16-opt-state` を推奨する。
+fn gpu_oom_error(
+    batch_size: usize,
+    ft_fp16: bool,
+    ft_fp16_out: bool,
+    fp16_opt_state: bool,
+    accumulator_flag: &str,
+    accumulator_dim: usize,
+    threat_profile: Option<&str>,
+) -> Box<dyn std::error::Error> {
+    use std::fmt::Write as _;
+    let mut msg = String::from("GPU out of memory while allocating training buffers (");
+    let _ = write!(msg, "batch-size={batch_size}");
+    let _ = write!(msg, ", {accumulator_flag}={accumulator_dim}");
+    let _ = write!(
+        msg,
+        ", ft-fp16={ft_fp16}, ft-fp16-out={ft_fp16_out}, fp16-opt-state={fp16_opt_state}"
+    );
+    if let Some(p) = threat_profile {
+        let _ = write!(msg, ", threat-profile={p}");
+    }
+    msg.push_str(").\nReduce GPU memory by one or more of:\n");
+    if !fp16_opt_state {
+        msg.push_str("  - add `--fp16-opt-state` (optimizer の moment buffer を f16 化し約半減)\n");
+    }
+    let _ = writeln!(
+        msg,
+        "  - lower `{accumulator_flag}` (FT 出力次元。buffer はこれに概ね線形)"
+    );
+    if matches!(threat_profile, Some(p) if p != "off") {
+        msg.push_str(
+            "  - smaller `--threat-profile` (full > same-class > same-class-major-pawn > cross-side、または off)\n",
+        );
+    }
+    msg.push_str("  - smaller `--batch-size`");
+    msg.into()
+}
+
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
@@ -365,7 +408,22 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         norm_loss_factor,
         psqt_init_vec.as_deref(),
         &init_spec,
-    )?;
+    )
+    .map_err(|e| {
+        if gpu_runtime::is_out_of_memory(e.as_ref()) {
+            gpu_oom_error(
+                cli.batch_size,
+                ft_fp16,
+                ft_fp16_out,
+                fp16_opt_state,
+                "--ft-out",
+                layerstack.ft_out,
+                Some(layerstack.threat_profile.as_str()),
+            )
+        } else {
+            e
+        }
+    })?;
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
@@ -1457,7 +1515,22 @@ pub(crate) fn run_simple_training(
         fp16_opt_state,
         tf32,
         &init_spec,
-    )?;
+    )
+    .map_err(|e| {
+        if gpu_runtime::is_out_of_memory(e.as_ref()) {
+            gpu_oom_error(
+                cli.batch_size,
+                ft_fp16,
+                ft_fp16_out,
+                fp16_opt_state,
+                "--l1",
+                ft_out,
+                None,
+            )
+        } else {
+            e
+        }
+    })?;
 
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
         Option<usize>,
@@ -1677,5 +1750,26 @@ mod tests {
             .map(|(_, v)| v.expect("all six flags set"))
             .collect();
         assert_eq!(values, [0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
+    }
+
+    #[test]
+    fn gpu_oom_error_lists_relevant_remedies() {
+        // fp16-opt-state off + threat on: current 値を出し、全 remedy を提示。
+        let m =
+            gpu_oom_error(65536, false, false, false, "--ft-out", 1536, Some("full")).to_string();
+        assert!(m.contains("--ft-out=1536"));
+        assert!(m.contains("threat-profile=full"));
+        assert!(m.contains("add `--fp16-opt-state`"));
+        assert!(m.contains("lower `--ft-out`"));
+        assert!(m.contains("smaller `--threat-profile`"));
+        assert!(m.contains("smaller `--batch-size`"));
+
+        // fp16-opt-state 既に on + threat off (Simple): 該当しない remedy は省く。
+        let m2 = gpu_oom_error(4096, true, false, true, "--l1", 256, None).to_string();
+        assert!(m2.contains("--l1=256"));
+        assert!(!m2.contains("add `--fp16-opt-state`"));
+        assert!(!m2.contains("smaller `--threat-profile`"));
+        assert!(m2.contains("lower `--l1`"));
+        assert!(m2.contains("smaller `--batch-size`"));
     }
 }
