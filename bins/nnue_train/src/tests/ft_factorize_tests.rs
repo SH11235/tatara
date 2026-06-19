@@ -109,6 +109,7 @@ fn ft_fold_virtual_cpu_matches_export_coalesce() {
     gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
         &w,
         &mut comb,
+        spec.base_ft_in(),
         spec.ft_in(),
         ft_out,
         spec.piece_inputs(),
@@ -192,6 +193,83 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     )?;
     assert_eq!(loaded.feature_set, base);
     assert_eq!(loaded.ft_w.len(), base.ft_in() * FT_OUT_TEST);
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_threat_coexist_export_keeps_threat_rows() -> Result<(), Box<dyn std::error::Error>>
+{
+    use shogi_features::ThreatProfile;
+    // factorizer × threat 同居: export は factorizer を畳んでも threat profile を
+    // 保持し、ft_w は base + threat 行 (= ft_in()) を残す。最小 profile を使う。
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged.spec();
+    let threat = base.with_threat_profile(ThreatProfile::CrossSide);
+    let coexist = threat.with_ft_factorize();
+
+    let w = {
+        let t = make_trainer(&ctx, coexist)?;
+        t.to_layerstack_weights()?
+    };
+    // export spec は factorizer を外しつつ threat を保持 (= threat-only spec)。
+    assert_eq!(
+        w.feature_set, threat,
+        "export spec は factorizer を外し threat を保持"
+    );
+    assert!(!w.feature_set.ft_factorize());
+    assert_eq!(
+        w.feature_set.threat_profile(),
+        Some(ThreatProfile::CrossSide)
+    );
+    // ft_w は base + threat 行 (threat を silent 切り落とししない)。
+    assert_eq!(w.ft_w.len(), threat.ft_in() * FT_OUT_TEST);
+    assert!(
+        threat.ft_in() > base.ft_in(),
+        "threat 連結で ft_in が伸びる"
+    );
+    Ok(())
+}
+
+#[test]
+fn ft_factorize_threat_coexist_first_step_matches_threat_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    use shogi_features::ThreatProfile;
+    // 仮想行 zero-init なので、threat-active な step-1 の forward/loss は
+    // threat-only (factorizer OFF) と一致する。同居の関数空間不変 (fold 後 weight の
+    // forward == train 経路 forward) を実 GPU で押さえる。index 列は factorizer 非
+    // 依存なので同一 batch を共有し「両者が同じ実特徴 (threat 含む) を見る」を保証。
+    let ctx = CudaContext::new(0)?;
+    let threat = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide);
+    let coexist = threat.with_ft_factorize();
+    // batch は threat-on spec で生成 (index は threat 範囲も踏む)。
+    let batch = BatchData::smoke_dummy(B, threat);
+
+    let (loss_only, w_only) = {
+        let mut t = make_trainer(&ctx, threat)?;
+        let loss = t.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t.to_layerstack_weights()?)
+    };
+    let (loss_coexist, w_coexist) = {
+        let mut t = make_trainer(&ctx, coexist)?;
+        let loss = t.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t.to_layerstack_weights()?)
+    };
+
+    // zero-init 仮想行: step-1 forward/loss は一致 (atomic 加算順揺らぎのみ)。
+    let tol = loss_only.abs() * 1e-6 + 1e-12;
+    assert!(
+        (loss_coexist - loss_only).abs() <= tol,
+        "threat 同居 step-1 loss は threat-only と一致: coexist={loss_coexist:e} only={loss_only:e}"
+    );
+    // export 形状は両者一致 (base + threat)。1 step 後の差分 = 仮想行の学習。
+    assert_eq!(w_coexist.ft_w.len(), w_only.ft_w.len());
+    assert_eq!(w_coexist.ft_w.len(), threat.ft_in() * FT_OUT_TEST);
+    assert!(
+        w_coexist.ft_w != w_only.ft_w,
+        "仮想行が学習されていれば coalesced ft_w は threat-only と異なる"
+    );
     Ok(())
 }
 

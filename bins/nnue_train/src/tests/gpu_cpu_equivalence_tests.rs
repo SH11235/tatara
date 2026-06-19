@@ -3136,14 +3136,15 @@ fn ft_fold_virtual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let n = ft_in * ft_out;
 
     let mut comb_cpu = vec![0.0_f32; n];
-    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_out, pi);
+    // threat 無し: base_ft_in == ft_in。
+    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_in, ft_out, pi);
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
     cuda_launch! {
         kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_out as u32,
-               pi as u32, n as u32]
+        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
+               ft_out as u32, pi as u32, n as u32]
     }?;
     stream.synchronize()?;
     assert_close(
@@ -3163,15 +3164,15 @@ fn ft_fold_virtual_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let n = ft_in * ft_out;
 
     let mut comb_cpu = vec![0.0_f32; n];
-    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_out, pi);
+    ft_fold_virtual_cpu(&w, &mut comb_cpu, ft_in, ft_in, ft_out, pi);
     let (_, expected) = quantize_f16(&comb_cpu);
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
     cuda_launch! {
         kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_out as u32,
-               pi as u32, n as u32]
+        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
+               ft_out as u32, pi as u32, n as u32]
     }?;
     stream.synchronize()?;
     let got: Vec<f32> = comb_dev
@@ -3191,13 +3192,13 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     let (ft_in, ft_out, pi, grad_init) = ft_factorize_fixture();
 
     let mut grad_cpu = grad_init.clone();
-    ft_reduce_virtual_grad_cpu(&mut grad_cpu, ft_in, ft_out, pi);
+    ft_reduce_virtual_grad_cpu(&mut grad_cpu, ft_in, ft_in, ft_out, pi);
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
     cuda_launch! {
         kernel: ft_reduce_virtual_grad, stream: stream, module: module,
         config: cfg_1d(pi * ft_out),
-        args: [slice(grad_dev), ft_in as u32, ft_out as u32, pi as u32]
+        args: [slice(grad_dev), ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
     }?;
     stream.synchronize()?;
     let got = grad_dev.to_host_vec(&stream)?;
@@ -3208,6 +3209,85 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     );
     assert_close_rel(
         "ft_reduce_virtual_grad virtual block",
+        &got[ft_in * ft_out..],
+        &grad_cpu[ft_in * ft_out..],
+        TOL,
+    );
+    Ok(())
+}
+
+/// threat 同居 fixture: base king-bucket セル (kb=7 × pi=5 = 35) の後ろに threat
+/// real 行 (12)、その後ろに仮想 P plane (pi=5)。base_ft_in=35 < ft_in=47。
+fn ft_factorize_coexist_fixture() -> (usize, usize, usize, usize, Vec<f32>) {
+    let base_ft_in = 35;
+    let threat = 12;
+    let ft_in = base_ft_in + threat;
+    let ft_out = 8;
+    let pi = 5;
+    let w = deterministic_floats((ft_in + pi) * ft_out, 3.0);
+    (base_ft_in, ft_in, ft_out, pi, w)
+}
+
+/// 同居 fold: base セルは仮想行を畳み、threat 行は素通し。GPU が range-aware CPU
+/// reference と完全一致する (1 加算/cell で加算順差なし)。
+#[test]
+fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (base_ft_in, ft_in, ft_out, pi, w) = ft_factorize_coexist_fixture();
+    let n = ft_in * ft_out;
+
+    let mut comb_cpu = vec![0.0_f32; n];
+    ft_fold_virtual_cpu(&w, &mut comb_cpu, base_ft_in, ft_in, ft_out, pi);
+    // threat 行 (`[base_ft_in, ft_in)`) は素通しのはず (reference の裏取り)。
+    for feat in base_ft_in..ft_in {
+        for ri in 0..ft_out {
+            assert_eq!(comb_cpu[feat * ft_out + ri], w[feat * ft_out + ri]);
+        }
+    }
+
+    let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+    cuda_launch! {
+        kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
+        args: [slice(w_dev), slice_mut(comb_dev), base_ft_in as u32, ft_in as u32,
+               ft_out as u32, pi as u32, n as u32]
+    }?;
+    stream.synchronize()?;
+    assert_close(
+        "ft_fold_virtual coexist",
+        &comb_dev.to_host_vec(&stream)?,
+        &comb_cpu,
+        0.0,
+    );
+    Ok(())
+}
+
+/// 同居 reduce: 仮想行は **base** king-bucket のみの和。base + threat 実 block は
+/// read-only、threat 行は仮想行に寄与しない。
+#[test]
+fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (base_ft_in, ft_in, ft_out, pi, grad_init) = ft_factorize_coexist_fixture();
+
+    let mut grad_cpu = grad_init.clone();
+    ft_reduce_virtual_grad_cpu(&mut grad_cpu, base_ft_in, ft_in, ft_out, pi);
+
+    let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
+    cuda_launch! {
+        kernel: ft_reduce_virtual_grad, stream: stream, module: module,
+        config: cfg_1d(pi * ft_out),
+        args: [slice(grad_dev), base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
+    }?;
+    stream.synchronize()?;
+    let got = grad_dev.to_host_vec(&stream)?;
+    // base + threat 実 block は read-only。
+    assert_eq!(
+        &got[..ft_in * ft_out],
+        &grad_init[..ft_in * ft_out],
+        "実 block (base + threat) は read-only"
+    );
+    assert_close_rel(
+        "ft_reduce_virtual_grad coexist virtual block",
         &got[ft_in * ft_out..],
         &grad_cpu[ft_in * ft_out..],
         TOL,

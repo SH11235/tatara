@@ -227,6 +227,66 @@ fn raw_ckpt_header_rejects_ft_factorize_mismatch() {
     );
 }
 
+/// `layerstack_arch` の threat (cross-side) + factorizer 同居版。
+fn layerstack_arch_threat_factorized() -> RawCkptArch<'static> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
+            .with_ft_factorize(),
+        arch_kind: ArchKind::LayerStack,
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+#[test]
+fn raw_ckpt_header_threat_factorize_coexist_round_trips() {
+    // 同居 (threat + factorizer) の header が round-trip する。train_ft_in /
+    // max_active が threat 連結分を含むことを identity に反映。
+    let arch = layerstack_arch_threat_factorized();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "coexist-run", 4, 40, None, 10).unwrap();
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (4, 40, 10));
+}
+
+#[test]
+fn raw_ckpt_header_rejects_threat_factorize_combo_mismatch() {
+    use shogi_features::ThreatProfile;
+    // 同居 ckpt を「threat-off + factorizer」「threat-only (factorizer-off)」「別
+    // profile + factorizer」で読むと、いずれも identity 不一致で reject される
+    // (ft-factorize flag か train_ft_in/feature-set 名のいずれかで弾く)。
+    let coexist = layerstack_arch_threat_factorized();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &coexist, "", 1, 0, None, 10).unwrap();
+
+    // threat-only (factorizer OFF): ft-factorize mismatch。
+    let threat_only = RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide),
+        ..coexist
+    };
+    read_raw_ckpt_header(&mut Cursor::new(&buf), &threat_only)
+        .expect_err("coexist ckpt read as threat-only must reject");
+
+    // 別 profile + factorizer: train_ft_in (threat dims) 不一致で reject。
+    let other_profile = RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::SameClass)
+            .with_ft_factorize(),
+        ..coexist
+    };
+    read_raw_ckpt_header(&mut Cursor::new(&buf), &other_profile)
+        .expect_err("coexist ckpt read as different threat profile must reject");
+
+    // threat-off + factorizer: train_ft_in 不一致で reject。
+    read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch_factorized())
+        .expect_err("coexist ckpt read as threat-off factorizer must reject");
+}
+
 #[test]
 fn raw_ckpt_header_v5_round_trips_with_lr_horizon() {
     let arch = layerstack_arch();

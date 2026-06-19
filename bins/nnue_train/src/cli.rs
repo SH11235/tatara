@@ -637,8 +637,9 @@ pub(crate) struct LayerstackArgs {
     pub(crate) ft_factorize: bool,
 
     /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
-    /// Use this to train the non-factorized network, or together with options
-    /// the factorizer is not yet compatible with.
+    /// Use this to train the non-factorized network. (The factorizer now
+    /// coexists with `--threat-profile`; `--psqt` and `--init-from` auto-disable
+    /// it.)
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
 
@@ -648,10 +649,13 @@ pub(crate) struct LayerstackArgs {
     /// transformer inputs, growing the FT input dimension and the active-feature
     /// count. `off` is bit-identical to the base feature set.
     ///
-    /// Threat is mutually exclusive with the FT factorizer: enabling a threat
-    /// profile requires `--no-ft-factorize` (the combined FT row layout is not
-    /// yet validated). The dimension increase makes higher profiles (full /
-    /// same-class) GPU-memory heavy — pick a smaller profile if training OOMs.
+    /// Threat coexists with the FT factorizer (the fold/reduce/coalesce paths
+    /// stay within the base rows and never touch the threat block); it is still
+    /// mutually exclusive with `--psqt` (base-only PSQT is not yet validated).
+    /// The dimension increase makes higher profiles (full / same-class)
+    /// GPU-memory heavy, and the factorizer fold buffer adds roughly one extra
+    /// FT-weight matrix — pick a smaller profile or lower `--ft-out` if training
+    /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
 }

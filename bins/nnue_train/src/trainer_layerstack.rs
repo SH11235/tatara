@@ -672,9 +672,11 @@ impl GpuTrainer {
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
-        // `base_ft_in` = factorizer 仮想行を除いた実 FT row 数 = `ft_in()`
-        // (threat 連結時は base + threat、両者連結は CLI 排他なので factorizer の
-        // 仮想境界としても安全に流用できる)。
+        // ここでの `base_ft_in` は実 FT row 数 = `ft_in()` (threat 連結時は
+        // base + threat)。FT weight init と buffer 確保の「実行部の行数」であり、
+        // **factorizer の仮想境界ではない**。fold/reduce が虚行を base king-bucket
+        // セルへ畳む境界は launch 側で別途 `feature_set.base_ft_in()` を使う
+        // (threat 行を跨がないため両者は別物)。
         let base_ft_in = feature_set.ft_in();
         let train_ft_in = feature_set.train_ft_in();
         let l1_effective = l1_out - L1_SKIP;
@@ -1069,11 +1071,18 @@ impl GpuTrainer {
             None => None,
         };
         Ok(LayerStackWeights {
-            // factorizer 有効時は ft_w を畳み込んで返すため、weight としての
-            // 形状は base feature set そのもの — spec も base に落とす
-            // (consumer が train 次元を観測しない不変条件)。
+            // factorizer 有効時は ft_w を畳み込んで返すため export spec から
+            // factorizer modifier を外す (consumer が train 次元を観測しない不変
+            // 条件)。ただし **threat profile は保持する**: threat real 行は coalesce
+            // 後も export 形状に残り、`save_quantised` が Threat block / hash /
+            // arch_str token に反映する必要がある (factorizer だけ落として base 名に
+            // 戻すと threat が silent に drop され次元不整合になる)。
             feature_set: if self.feature_set.ft_factorize() {
-                self.feature_set.feature_set().spec()
+                let base = self.feature_set.feature_set().spec();
+                match self.feature_set.threat_profile() {
+                    Some(profile) => base.with_threat_profile(profile),
+                    None => base,
+                }
             } else {
                 self.feature_set
             },
@@ -1386,9 +1395,21 @@ impl GpuTrainer {
         // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
         // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
         assert!(self.feature_set.ft_factorize());
-        let base_ft_in = self.feature_set.ft_in();
+        // `base_ft_in` = 仮想行を持つ base king-bucket セル数 (fold 対象)。
+        // `ft_in_total` = base + threat (= comb サイズ / 仮想 P plane の手前)。
+        // threat 無効時は両者一致。FT comb は base+threat 全行 (threat 行は素通し)。
+        let base_ft_in = self.feature_set.base_ft_in();
+        let ft_in_total = self.feature_set.ft_in();
         let pi = self.feature_set.piece_inputs();
-        let n = base_ft_in * self.ws.ft_out;
+        // fold/reduce kernel は base 実行を king-bucket (`p = feat % pi`) で仮想行へ
+        // 対応付ける。base 行が piece plane で割り切れない feature set は仮想行の
+        // 対応が崩れるので release でも弾く (全 feature set で成立する不変条件)。
+        assert_eq!(
+            base_ft_in % pi,
+            0,
+            "base_ft_in must be a multiple of piece_inputs for the factorizer"
+        );
+        let n = ft_in_total * self.ws.ft_out;
         if self.ft_fp16 {
             let mut comb = self
                 .ft_w_h
@@ -1400,7 +1421,7 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(n),
                 args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                       self.ws.ft_out as u32, pi as u32, n as u32]
+                       ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
             }?;
         } else {
             let mut comb = self
@@ -1413,12 +1434,13 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(n),
                 args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                       self.ws.ft_out as u32, pi as u32, n as u32]
+                       ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
             }?;
         }
         // PSQT shortcut も factorizer 有効時は同じ仮想 P 行を持つ。FT と同じ
         // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
-        // 適用する (kernel は列数 runtime 引数なので再利用)。
+        // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat と CLI
+        // 排他なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
         if let Some(psqt) = self.psqt.as_mut() {
             let mut comb = psqt
                 .w_fold
@@ -1431,7 +1453,7 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(psqt_n),
                 args: [slice(psqt.w), slice_mut(comb), base_ft_in as u32,
-                       self.num_buckets as u32, pi as u32, psqt_n as u32]
+                       base_ft_in as u32, self.num_buckets as u32, pi as u32, psqt_n as u32]
             }?;
         }
         Ok(())
@@ -2244,13 +2266,16 @@ impl GpuTrainer {
             // 同じ `ft_reduce_virtual_grad` を「列 = num_buckets」で再利用、overwrite)。
             if self.feature_set.ft_factorize() {
                 let pi = self.feature_set.piece_inputs();
+                // PSQT は threat と CLI 排他なので psqt_w に threat 行は無く、縮約
+                // 範囲 = 仮想 offset = base_ft_in (= ft_in_u と一致)。
+                let base_ft_in = self.feature_set.base_ft_in() as u32;
                 cuda_launch! {
                     kernel: ft_reduce_virtual_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(pi * self.num_buckets),
                     args: [
                         slice(psqt.w_grad),
-                        ft_in_u, self.num_buckets as u32, pi as u32
+                        base_ft_in, base_ft_in, self.num_buckets as u32, pi as u32
                     ]
                 }?;
             }
@@ -2848,18 +2873,20 @@ impl GpuTrainer {
                 prof_tick!("phD_nstm");
             }
         }
-        // factorizer: 仮想行の勾配 = 同 piece plane を持つ実行の勾配和。stm / nstm
-        // 両方の gather が実 block を確定させた後に 1 launch で仮想 block を埋める
-        // (仮想 index を sparse pipeline に流す方式と数学的に等価、kernel doc 参照)。
+        // factorizer: 仮想行の勾配 = 同 piece plane を持つ **base** 実行の勾配和。
+        // stm / nstm 両方の gather が実 block を確定させた後に 1 launch で仮想 block を
+        // 埋める (仮想 index を sparse pipeline に流す方式と数学的に等価、kernel doc
+        // 参照)。threat real 行は仮想行に寄与しないので縮約範囲は base_ft_in のみ。
         if self.feature_set.ft_factorize() {
             let pi = self.feature_set.piece_inputs();
+            let base_ft_in = self.feature_set.base_ft_in();
             cuda_launch! {
                 kernel: ft_reduce_virtual_grad,
                 stream: self.stream, module: self.module,
                 config: cfg_1d(pi * ft_out),
                 args: [
                     slice(self.ft_w_grad),
-                    ft_in as u32, ft_out as u32, pi as u32
+                    base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32
                 ]
             }?;
         }
