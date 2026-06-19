@@ -71,3 +71,41 @@ pub enum Error {
 
 /// `Result<T, gpu_runtime::Error>` の alias。
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `err` が CUDA out-of-memory (`CUDA_ERROR_OUT_OF_MEMORY`) を表すか判定する。
+///
+/// `DeviceBuffer` 確保失敗は `DriverError` として伝播する。本 crate の
+/// [`Error::Cuda`] 経由でも、呼び出し側が `Box<dyn Error>` に直接 box した
+/// `DriverError` でも検出できるよう `&dyn Error` を受ける。判定は driver の
+/// `cuGetErrorName` ([`DriverError::error_name`]) が返す symbolic name で行い、
+/// `cuda_bindings` の `CUresult` 内部表現に依存しない。OOM 以外では true を返さない。
+pub fn is_out_of_memory(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(e) = err.downcast_ref::<DriverError>() {
+        return driver_error_is_out_of_memory(e);
+    }
+    if let Some(Error::Cuda(e)) = err.downcast_ref::<Error>() {
+        return driver_error_is_out_of_memory(e);
+    }
+    false
+}
+
+fn driver_error_is_out_of_memory(e: &DriverError) -> bool {
+    e.error_name()
+        .map(|name| name.to_bytes() == b"CUDA_ERROR_OUT_OF_MEMORY")
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_cuda_error_is_not_out_of_memory() {
+        // CUDA 由来でない error は OOM 判定しない (false positive ゼロ)。
+        let io_err = std::io::Error::other("disk full");
+        assert!(!is_out_of_memory(&io_err));
+        assert!(!is_out_of_memory(&Error::KernelArtifact(
+            "missing .ptx".into()
+        )));
+    }
+}
