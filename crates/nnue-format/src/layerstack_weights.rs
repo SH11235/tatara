@@ -653,7 +653,7 @@ impl LayerStackWeights {
                 writer.write_all(&profile.profile_id().to_le_bytes())?;
             }
             for &v in threat_w {
-                let q = clamp_i8((qa_f * v as f64).round());
+                let q = clamp_i8_symmetric((qa_f * v as f64).round());
                 writer.write_all(&[q as u8])?;
             }
         }
@@ -1191,6 +1191,19 @@ fn clamp_i8(v: f64) -> i8 {
     }
 }
 
+/// threat block 用の symmetric clamp (`[-127, 127]`)。base FT と同じ QA=127 スケールで
+/// 量子化するため i8 の非対称下限 (-128) は使わず ±127 に揃える。飽和モニタ
+/// (`i8_saturation_stats` の ±127 判定) と契約コメント (「±127 に clamp」) を一致させる。
+fn clamp_i8_symmetric(v: f64) -> i8 {
+    if v < -127.0 {
+        -127
+    } else if v > 127.0 {
+        127
+    } else {
+        v as i8
+    }
+}
+
 /// arch_str を comma 分割し `prefix` (`"Threat="` 等) で始まる token の値を返す。
 /// token が無ければ `Ok(None)`、複数あれば `Err(())` (構造的に壊れた arch_str)。
 /// substring 照合と違い、`prefix` が token 先頭に厳密一致する 1 区切りのみ拾う
@@ -1247,7 +1260,9 @@ fn i8_saturation_stats(values: &[f32], scale: f64) -> (usize, f64) {
     for &v in values {
         let q = (scale * v as f64).round();
         max_abs = max_abs.max(q.abs());
-        if q < i8::MIN as f64 || q > i8::MAX as f64 {
+        // threat block は symmetric ±127 に clamp する (clamp_i8_symmetric) ので、
+        // |q| > 127 を飽和としてカウントする (非対称下限 -128 も飽和扱い)。
+        if q.abs() > i8::MAX as f64 {
             n += 1;
         }
     }
