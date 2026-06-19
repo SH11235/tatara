@@ -255,6 +255,15 @@ pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> S
     format!("Features={feature_name}(Friend)[{input_size}->{ft_out}x2]")
 }
 
+/// arch_str / stream に書く threat profile identity (rshogi 契約)。`dims` はその
+/// profile の THREAT_DIMENSIONS、`profile_id` は profile の数値 id (full=0 /
+/// same-class=1 / same-class-major-pawn=2 / cross-side=10)。
+#[derive(Clone, Copy, Debug)]
+pub struct ThreatArch {
+    pub dims: usize,
+    pub profile_id: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_arch_str(
     feature_name: &str,
@@ -265,16 +274,24 @@ pub fn build_arch_str(
     l2_out: usize,
     fv_scale: i32,
     psqt_buckets: Option<usize>,
-    threat_profile: Option<&str>,
+    threat: Option<ThreatArch>,
 ) -> String {
     let psqt_part = match psqt_buckets {
         Some(n) => format!("PSQT={n},"),
         None => String::new(),
     };
-    // Threat token は PSQT の直後 (Features と Network の間)。`off` 相当 (None) は
-    // 出さないので base / PSQT-only の arch_str は byte-identical のまま。
-    let threat_part = match threat_profile {
-        Some(name) => format!("Threat={name},"),
+    // Threat token は PSQT の直後 (Features と Network の間)。threat 無効 (None) は
+    // 出さないので base / PSQT-only の arch_str は byte-identical のまま。rshogi 契約:
+    // `Threat=<dims>` (その profile の次元数) は threat 有効時は必ず出す (rshogi は
+    // threat block の有無を `Threat=` の有無で判定するため、profile 0 でも必須)。
+    // `ThreatProfile=<id>` (と stream の u32 id) は profile id≠0 のときだけ付け、
+    // id 0 = full では `ThreatProfile=`/u32 のみ省略する (`Threat=<dims>` は残す →
+    // rshogi の「ThreatProfile= 無し = profile 0」経路で load される)。
+    let threat_part = match threat {
+        Some(t) if t.profile_id != 0 => {
+            format!("Threat={},ThreatProfile={},", t.dims, t.profile_id)
+        }
+        Some(t) => format!("Threat={},", t.dims),
         None => String::new(),
     };
     format!(
@@ -517,8 +534,12 @@ impl LayerStackWeights {
         } else {
             None
         };
-        // arch_str の `Threat=` token 名は profile の CLI 名 (`Display`)。
-        let threat_name = self.feature_set.threat_profile().map(|p| p.to_string());
+        // arch_str の threat token は rshogi 契約 = `Threat=<dims>` (+ id≠0 のとき
+        // `ThreatProfile=<id>`)。dims/id は spec の profile から導出する。
+        let threat_arch = self.feature_set.threat_profile().map(|p| ThreatArch {
+            dims: self.feature_set.threat_dims(),
+            profile_id: p.profile_id(),
+        });
         let arch_str = build_arch_str(
             self.feature_set.arch_feature_name(),
             self.feature_set.ft_in(),
@@ -528,7 +549,7 @@ impl LayerStackWeights {
             l2_out,
             FV_SCALE,
             psqt_buckets,
-            threat_name.as_deref(),
+            threat_arch,
         );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
@@ -617,22 +638,24 @@ impl LayerStackWeights {
             }
         }
 
-        // ---- Threat block (arch_str に Threat={profile}, があるときのみ) ----
-        // FT block の base row の続き (`ft_w[base_ft_in*ft_out ..]`) を base FT と
-        // 同じ i16/LEB128 で書く。PSQT block の直後・LayerStacks の直前に置く。
+        // ---- Threat block (threat profile 有効時のみ) ----
+        // rshogi 契約: profile id≠0 のとき **u32 LE id** を threat block 直前に書き、
+        // 続けて threat weight (`ft_w[base_ft_in*ft_out ..]`) を **raw i8 feature-major**
+        // で書く。id 0 (full) は u32 を省略 (rshogi の「id 無し = profile 0」経路)。
+        // **量子化スケールは base FT と同じ `qa_f` を据え置く** (rshogi は threat i8 を
+        // base FT と同一 i16 accumulator に sign-extend して直接加算するため、別係数を
+        // 入れると eval が破綻する)。i16 範囲ではなく **±127 に clamp** して i8 化する。
         // PSQT と threat は CLI 排他なので両 block が同時に出ることはない。
-        if self.feature_set.threat_profile().is_some() {
+        if let Some(profile) = self.feature_set.threat_profile() {
             let threat_w = &self.ft_w[base_ft_w_n..];
-            warn_if_i16_saturates("threat_ft_w", threat_w, qa_f);
-            let threat_w_i16: Vec<i16> = threat_w
-                .iter()
-                .map(|&v| {
-                    (qa_f * v as f64)
-                        .round()
-                        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
-                })
-                .collect();
-            write_leb128_tensor_i16(writer, &threat_w_i16)?;
+            warn_if_i8_saturates("threat_ft_w", threat_w, qa_f);
+            if profile.profile_id() != 0 {
+                writer.write_all(&profile.profile_id().to_le_bytes())?;
+            }
+            for &v in threat_w {
+                let q = clamp_i8_symmetric((qa_f * v as f64).round());
+                writer.write_all(&[q as u8])?;
+            }
         }
 
         // ---- LayerStacks (num_buckets × {fc_hash, L1, L2, L3}) ----
@@ -847,27 +870,69 @@ impl LayerStackWeights {
                 format!("unsupported arch (HandCount not implemented): {arch_str}"),
             ));
         }
-        // arch_str を comma 分割し `Threat=<profile>` token を構造的に拾う。
-        // substring 照合では重複 / 余分 suffix token (`...Threat=fullX...`) を見逃す
-        // ので、token は **最大 1 個** + profile 名 **完全一致** を要求する。
-        let file_threat_profile = parse_single_arch_token(&arch_str, "Threat=").map_err(|_| {
+        // rshogi 契約の threat token を構造的に検証する。`Threat=<dims>` (threat 有効
+        // 時必須) + `ThreatProfile=<id>` (id≠0 のみ)。`parse_single_arch_token` で
+        // comma 分割 + 先頭厳密一致 + 重複拒否。期待 profile の dims / id と完全一致を
+        // 要求 (id 0 は ThreatProfile token 無しが正しい状態)。
+        let file_threat_dims = parse_single_arch_token(&arch_str, "Threat=").map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("arch_str has multiple Threat= tokens: `{arch_str}`"),
             )
         })?;
-        let expected_threat_profile = expected.threat_profile().map(|p| p.to_string());
-        if file_threat_profile != expected_threat_profile.as_deref() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "threat profile mismatch: file {}, expected {} (arch_str = `{arch_str}`)",
-                    file_threat_profile.map_or_else(|| "none".to_string(), |p| format!("`{p}`")),
-                    expected_threat_profile
-                        .as_deref()
-                        .map_or_else(|| "none".to_string(), |p| format!("`{p}`")),
-                ),
-            ));
+        let file_threat_profile_id =
+            parse_single_arch_token(&arch_str, "ThreatProfile=").map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("arch_str has multiple ThreatProfile= tokens: `{arch_str}`"),
+                )
+            })?;
+        let expected_threat = expected
+            .threat_profile()
+            .map(|p| (expected.threat_dims(), p.profile_id()));
+        match expected_threat {
+            Some((dims, id)) => {
+                // dims token は数値で一致すること。
+                let file_dims: Option<usize> = file_threat_dims.and_then(|s| s.parse().ok());
+                if file_dims != Some(dims) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "threat dims mismatch: file Threat={}, expected Threat={dims} (arch_str = `{arch_str}`)",
+                            file_threat_dims.unwrap_or("none"),
+                        ),
+                    ));
+                }
+                // id≠0 は ThreatProfile token が数値一致、id 0 は token 不在が正しい。
+                let file_id: u32 = match file_threat_profile_id {
+                    Some(s) => s.parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid ThreatProfile= value `{s}` in arch_str"),
+                        )
+                    })?,
+                    None => 0,
+                };
+                if file_id != id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "threat profile id mismatch: file {file_id}, expected {id} (arch_str = `{arch_str}`)"
+                        ),
+                    ));
+                }
+            }
+            None => {
+                if file_threat_dims.is_some() || file_threat_profile_id.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "`.bin` has a Threat token but the requested feature set has no threat \
+                             profile: `{arch_str}`"
+                        ),
+                    ));
+                }
+            }
         }
         let psqt_token = format!("PSQT={file_num_buckets},");
         let file_has_psqt = arch_str.contains(&psqt_token);
@@ -998,12 +1063,31 @@ impl LayerStackWeights {
             None
         };
 
-        // Threat block (threat profile 有効時のみ): threat_dims * ft_out 個を base
-        // FT と同じ i16/LEB128 で読み、ft_w の base row の後ろに連結する。
-        if expected.threat_profile().is_some() {
+        // Threat block (threat profile 有効時のみ): rshogi 契約と対称に read する。
+        // id≠0 のとき u32 LE id を先に読んで照合し、続けて threat weight を **raw i8
+        // feature-major** で読み、base FT と同じ `qa_f` で割って ft_w の base row の
+        // 後ろに連結する (save 側と同一スケール、id 0 は u32 を読まない)。
+        if let Some(profile) = expected.threat_profile() {
+            if profile.profile_id() != 0 {
+                reader.read_exact(&mut buf4)?;
+                let file_id = u32::from_le_bytes(buf4);
+                if file_id != profile.profile_id() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "threat block profile id mismatch: stream {file_id}, expected {}",
+                            profile.profile_id()
+                        ),
+                    ));
+                }
+            }
             let threat_w_n = expected.threat_dims() * ft_out;
-            let threat_w_i16 = read_leb128_tensor_i16(reader, Some(threat_w_n))?;
-            ft_w.extend(threat_w_i16.iter().map(|&v| v as f32 / qa_f));
+            let mut byte = [0u8; 1];
+            ft_w.reserve(threat_w_n);
+            for _ in 0..threat_w_n {
+                reader.read_exact(&mut byte)?;
+                ft_w.push(byte[0] as i8 as f32 / qa_f);
+            }
         }
 
         // LayerStacks (num_buckets × {fc_hash, L1, L2, L3})
@@ -1107,6 +1191,19 @@ fn clamp_i8(v: f64) -> i8 {
     }
 }
 
+/// threat block 用の symmetric clamp (`[-127, 127]`)。base FT と同じ QA=127 スケールで
+/// 量子化するため i8 の非対称下限 (-128) は使わず ±127 に揃える。飽和モニタ
+/// (`i8_saturation_stats` の ±127 判定) と契約コメント (「±127 に clamp」) を一致させる。
+fn clamp_i8_symmetric(v: f64) -> i8 {
+    if v < -127.0 {
+        -127
+    } else if v > 127.0 {
+        127
+    } else {
+        v as i8
+    }
+}
+
 /// arch_str を comma 分割し `prefix` (`"Threat="` 等) で始まる token の値を返す。
 /// token が無ければ `Ok(None)`、複数あれば `Err(())` (構造的に壊れた arch_str)。
 /// substring 照合と違い、`prefix` が token 先頭に厳密一致する 1 区切りのみ拾う
@@ -1150,6 +1247,43 @@ fn warn_if_i16_saturates(name: &str, values: &[f32], scale: f64) {
              (|w| > {bound:.4}); values are clamped on export (silent precision loss). \
              Consider tightening the training-time weight clamp for this tensor.",
             values.len()
+        );
+    }
+}
+
+/// threat weight の i8 量子化 (`round(scale·v)` を `[-128, 127]` へ clamp) で飽和
+/// する要素数と最大 |round(scale·v)| を返す。threat は base FT と同じ `scale` (QA)
+/// で raw i8 にするため、i16 より狭い i8 表現域に収まるかを export 前に把握する。
+fn i8_saturation_stats(values: &[f32], scale: f64) -> (usize, f64) {
+    let mut n = 0;
+    let mut max_abs = 0.0_f64;
+    for &v in values {
+        let q = (scale * v as f64).round();
+        max_abs = max_abs.max(q.abs());
+        // threat block は symmetric ±127 に clamp する (clamp_i8_symmetric) ので、
+        // |q| > 127 を飽和としてカウントする (非対称下限 -128 も飽和扱い)。
+        if q.abs() > i8::MAX as f64 {
+            n += 1;
+        }
+    }
+    (n, max_abs)
+}
+
+/// threat weight の i8 量子化で飽和が起きていれば stderr に warn (発生 0 なら無出力)。
+/// clamp 発生率と max-abs を出して「i8 で表現力十分か」を実 run で裏取りできるように
+/// する (threat は base FT と同一スケールのため別係数で逃げられない)。
+fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
+    let (n, max_abs) = i8_saturation_stats(values, scale);
+    if n > 0 {
+        let bound = i8::MAX as f64 / scale;
+        let ratio = n as f64 / values.len().max(1) as f64;
+        eprintln!(
+            "[nnue-format] warning: {name} has {n}/{} ({:.4}%) elements saturating i8 quantisation \
+             (|w| > {bound:.4}, max |round(scale·w)| = {max_abs:.1}); values are clamped to ±127 on \
+             export (silent precision loss). Threat shares the base-FT scale (no separate factor), \
+             so confirm i8 has enough range for this profile.",
+            values.len(),
+            ratio * 100.0,
         );
     }
 }
@@ -1479,20 +1613,30 @@ mod tests {
         );
         let base_ft_w_n = spec.base_ft_in() * ft_out;
         assert_eq!(original.ft_w.len(), spec.ft_in() * ft_out);
-        // base row 0 col 0、threat row 0 (= base_ft_w_n) col 0/1 に i16 量子化
-        // (QA=127) で正確に復元できる値 (n/127) を置く。
-        original.ft_w[0] = 1.0; // 127/127
-        original.ft_w[base_ft_w_n] = -2.0; // -254/127
-        original.ft_w[base_ft_w_n + 1] = 5.0 / 127.0;
+        // base row は i16 量子化 (QA=127) で復元できる値、threat row は **i8 範囲**
+        // (|round(QA·v)| <= 127、すなわち |v| <= 1.0) の値を置く (threat は raw i8)。
+        original.ft_w[0] = 1.0; // base: 127/127 (i16 path)
+        original.ft_w[base_ft_w_n] = -1.0; // threat: -127/127 (i8 端値)
+        original.ft_w[base_ft_w_n + 1] = 5.0 / 127.0; // threat: 5/127
 
         let mut buf = Vec::new();
         original.save_quantised(&mut buf).unwrap();
 
-        // arch_str に Threat= token が入る。
+        // arch_str は rshogi 契約: `Threat=<dims>` + cross-side (id 10≠0) は
+        // `ThreatProfile=10` も付く。token は dims 値で、profile 名は使わない。
         let arch = String::from_utf8_lossy(&buf);
+        let dims = spec.threat_dims();
         assert!(
-            arch.contains("Threat=cross-side,"),
-            "arch_str missing Threat token"
+            arch.contains(&format!("Threat={dims},")),
+            "arch_str missing Threat=<dims> token: {arch}"
+        );
+        assert!(
+            arch.contains("ThreatProfile=10,"),
+            "arch_str missing ThreatProfile=<id> token: {arch}"
+        );
+        assert!(
+            !arch.contains("Threat=cross-side"),
+            "Threat token must be dims-based, not a profile name"
         );
 
         let mut cursor = std::io::Cursor::new(&buf);
@@ -1508,7 +1652,7 @@ mod tests {
 
         assert_eq!(loaded.ft_w.len(), original.ft_w.len());
         assert!((loaded.ft_w[0] - 1.0).abs() < 1e-6);
-        assert!((loaded.ft_w[base_ft_w_n] - (-2.0)).abs() < 1e-6);
+        assert!((loaded.ft_w[base_ft_w_n] - (-1.0)).abs() < 1e-6);
         assert!((loaded.ft_w[base_ft_w_n + 1] - 5.0 / 127.0).abs() < 1e-6);
     }
 
@@ -1570,6 +1714,96 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn threat_full_profile_omits_threatprofile_token_and_u32_id() {
+        use shogi_features::ThreatProfile;
+        // full = profile id 0: arch_str に `Threat=<dims>` は出すが `ThreatProfile=`
+        // token は省き、stream の u32 id も書かない (rshogi の「id 無し = profile 0」
+        // 経路)。i8 threat block は u32 を挟まず arch_str (+ num_buckets/ft_hash/FT/
+        // PSQT) の直後から始まる。round-trip で threat row が復元できることも確認。
+        let spec = threat_spec(ThreatProfile::Full);
+        assert_eq!(spec.threat_profile().unwrap().profile_id(), 0);
+        let ft_out = 128;
+        let mut original = LayerStackWeights::zeroed(
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let base_ft_w_n = spec.base_ft_in() * ft_out;
+        original.ft_w[base_ft_w_n] = 1.0; // threat row 端値 (127/127)
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+        let arch = String::from_utf8_lossy(&buf);
+        assert!(
+            arch.contains(&format!("Threat={},", spec.threat_dims())),
+            "{arch}"
+        );
+        assert!(
+            !arch.contains("ThreatProfile="),
+            "id 0 は ThreatProfile token を省く: {arch}"
+        );
+
+        let loaded = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap();
+        assert_eq!(loaded.ft_w.len(), spec.ft_in() * ft_out);
+        assert!((loaded.ft_w[base_ft_w_n] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn threat_block_is_raw_i8_feature_major() {
+        use shogi_features::ThreatProfile;
+        // threat block が raw i8 (LEB128 でない) で書かれることを byte で固定する。
+        // cross-side (id 10) の stream: ... → PSQT 無し → **u32 LE id (10)** →
+        // threat_dims*ft_out 個の i8。weight をスケール (QA=127) で割り切れる i8 値に
+        // 設定し、対応 byte を直接検証する。
+        let spec = threat_spec(ThreatProfile::CrossSide);
+        let ft_out = 128;
+        let mut original = LayerStackWeights::zeroed(
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let base_ft_w_n = spec.base_ft_in() * ft_out;
+        original.ft_w[base_ft_w_n] = 3.0 / 127.0; // → i8 3
+        original.ft_w[base_ft_w_n + 1] = -5.0 / 127.0; // → i8 -5
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+
+        // threat block は末尾 (LayerStacks の前) ではなく、save 順では PSQT(無)→
+        // Threat(u32 id + i8...)→LayerStacks。threat block の長さは 4 (u32) +
+        // threat_dims*ft_out (i8) なので、その先頭を末尾から逆算して u32 id と
+        // 最初の 2 byte を確認する。
+        let threat_i8_n = spec.threat_dims() * ft_out;
+        // LayerStacks 部の長さは threat に依らないので、threat block 開始位置を
+        // 「u32 + i8 列」の構造で前方から特定するのは複雑。代わりに u32 id (10) が
+        // little-endian で stream 内に存在し、その直後 2 byte が 3, -5(=251) である
+        // 連続パターンを検索して raw i8 配置を確認する。
+        let needle = [10u8, 0, 0, 0, 3u8, (-5i8) as u8];
+        let found = buf.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            found,
+            "u32 id(10 LE) + raw i8 (3, -5) のパターンが見つからない (i8 raw でない?)"
+        );
+        // i8 block 長の健全性: buf は header+...+threat(4+i8_n)+layerstacks。
+        assert!(
+            buf.len() > 4 + threat_i8_n,
+            "stream too short for i8 threat block"
+        );
     }
 
     #[test]
@@ -1972,6 +2206,50 @@ mod tests {
         // 既存 token は維持。
         assert!(s.contains("Features=HalfKaHmMerged(Friend)[73305->1536x2]"));
         assert!(s.contains("fv_scale=28"));
+    }
+
+    #[test]
+    fn build_arch_str_threat_token_uses_dims_and_id() {
+        // rshogi 契約: profile id≠0 は `Threat=<dims>,ThreatProfile=<id>`、
+        // id 0 (full) は `Threat=<dims>` のみ (ThreatProfile token は省略)。
+        let with_id = build_arch_str(
+            "HalfKaHmMerged",
+            169_625,
+            1536,
+            16,
+            30,
+            32,
+            28,
+            None,
+            Some(ThreatArch {
+                dims: 96_320,
+                profile_id: 10,
+            }),
+        );
+        assert!(with_id.contains("Threat=96320,"), "{with_id}");
+        assert!(with_id.contains("ThreatProfile=10,"), "{with_id}");
+        // dims token は Network より前 (Features と Network の間)。
+        assert!(with_id.find("Threat=96320,").unwrap() < with_id.find("Network=").unwrap());
+
+        let id_zero = build_arch_str(
+            "HalfKaHmMerged",
+            290_025,
+            1536,
+            16,
+            30,
+            32,
+            28,
+            None,
+            Some(ThreatArch {
+                dims: 216_720,
+                profile_id: 0,
+            }),
+        );
+        assert!(id_zero.contains("Threat=216720,"), "{id_zero}");
+        assert!(
+            !id_zero.contains("ThreatProfile="),
+            "id 0 は ThreatProfile token を省く: {id_zero}"
+        );
     }
 
     #[test]
