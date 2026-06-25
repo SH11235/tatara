@@ -41,7 +41,15 @@ pub(crate) use kernels::*;
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let result = if cli.data.is_some() {
+    // 診断 flag (--eval-only / --threat-ablate / --threat-norm-dump) は学習データを
+    // 読まない経路 (norm-dump / --test-data 評価) を持つため、--data 不在でも
+    // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
+    // smoke test に落ちて何もせず成功扱いになる。
+    let result = if cli.data.is_some()
+        || cli.eval_only
+        || cli.threat_ablate.is_some()
+        || cli.threat_norm_dump
+    {
         run_training(&cli)
     } else {
         smoke_test(cli.arch.kind())

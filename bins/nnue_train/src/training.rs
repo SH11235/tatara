@@ -76,7 +76,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
     };
 
-    let data = cli.data.as_ref().expect("run_training called with --data");
+    // --data は通常学習と --eval-only --test-tail-positions では必須だが、
+    // --threat-norm-dump と --eval-only --test-data は学習データを読まないので任意。
+    // 必須経路では参照点で明示 error にする (None のまま誤って学習に進ませない)。
+    let data = cli.data.as_ref();
 
     if (cli.threat_ablate.is_some() || cli.threat_norm_dump) && cli.init_from.is_none() {
         return Err(
@@ -559,9 +562,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     trainer.sync_ft_forward_weights()?;
 
     if cli.eval_only {
-        // PackedSfenValue 固定長レコード (= dataloader の PSV record size)。tail
-        // 開始 offset を出すためだけに使う。
-        const PSV_RECORD_BYTES: u64 = 40;
+        // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
+        // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
+        // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
+        if cfg.test_positions == 0 {
+            return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
+        }
         let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
             (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
@@ -574,6 +580,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 cfg.num_buckets,
             )?,
             (None, Some(n)) => {
+                if n == 0 {
+                    return Err("--test-tail-positions must be >= 1".into());
+                }
+                let data = data.ok_or(
+                    "--eval-only --test-tail-positions requires --data (the file whose tail is the held-out set)",
+                )?;
                 let file_size = std::fs::metadata(data)?.len();
                 let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
                     std::io::Error::other("--test-tail-positions * PSV record size overflows u64")
@@ -608,6 +620,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
         return Ok(());
     }
+
+    // ここに到達 = 通常学習 (eval-only / norm-dump は上で return 済)。学習には --data が要る。
+    let data = data.ok_or("training requires --data")?;
 
     let mut experiment = build_experiment_logger(
         cli,
