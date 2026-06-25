@@ -22,6 +22,7 @@ mod cli;
 mod kernel_module;
 mod kernels;
 mod smoke;
+mod threat_ablate;
 mod trainer_common;
 mod trainer_layerstack;
 mod trainer_simple;

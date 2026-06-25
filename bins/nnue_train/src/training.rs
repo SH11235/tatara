@@ -5,7 +5,7 @@ use nnue_format::LayerStackWeights;
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
+use nnue_train::schedule::{LrSchedulerEnum, WdlScheduler, WdlSchedulerEnum};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
@@ -64,6 +64,17 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let data = cli.data.as_ref().expect("run_training called with --data");
+
+    if (cli.threat_ablate.is_some() || cli.threat_norm_dump) && cli.init_from.is_none() {
+        return Err(
+            "--threat-ablate / --threat-norm-dump require --init-from (a quantised \
+                    threat .bin to load and mask)"
+                .into(),
+        );
+    }
+    if cli.eval_only && cli.init_from.is_none() && cli.resume.is_none() {
+        return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
+    }
 
     // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
     // dataloader / checkpoint identity が参照する単一の真実源)。
@@ -436,7 +447,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = LayerStackWeights::load_quantised_with_psqt(
+        let mut weights = LayerStackWeights::load_quantised_with_psqt(
             &mut reader,
             feature_set,
             layerstack.ft_out,
@@ -445,6 +456,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.num_buckets,
             layerstack.psqt,
         )?;
+        if cli.threat_norm_dump {
+            crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
+            return Ok(());
+        }
+        if let Some(spec) = cli.threat_ablate.as_deref() {
+            let stats = crate::threat_ablate::apply(&mut weights, layerstack.ft_out, spec)
+                .map_err(std::io::Error::other)?;
+            println!(
+                "[ablate] spec={spec} zeroed_dims={} zeroed_pairs={} (threat_dims={})",
+                stats.zeroed_dims,
+                stats.zeroed_pairs,
+                weights.feature_set.threat_dims(),
+            );
+        }
         trainer.load_layerstack_weights(&weights)?;
         (None, None, None)
     } else if let Some(ckpt) = &cli.resume {
@@ -517,6 +542,57 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 開始時の `ft_w` (init / --init-from / --resume いずれか) と一度同期する。
     // 以降は optimizer (mirror) または step 末の fold (comb) が維持する。
     trainer.sync_ft_forward_weights()?;
+
+    if cli.eval_only {
+        // PackedSfenValue 固定長レコード (= dataloader の PSV record size)。tail
+        // 開始 offset を出すためだけに使う。
+        const PSV_RECORD_BYTES: u64 = 40;
+        let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
+        let set = match (&cfg.test_data, cfg.test_tail_positions) {
+            (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
+                test_path,
+                cfg.batch_size,
+                cfg.score_drop_abs,
+                cfg.test_positions,
+                &progress,
+                cfg.feature_set,
+                cfg.num_buckets,
+            )?,
+            (None, Some(n)) => {
+                let file_size = std::fs::metadata(data)?.len();
+                let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
+                    std::io::Error::other("--test-tail-positions * PSV record size overflows u64")
+                })?;
+                if tail_bytes >= file_size {
+                    return Err("--test-tail-positions leaves no data to evaluate".into());
+                }
+                nnue_train::validation::HeldoutSet::load_from_range(
+                    data,
+                    file_size - tail_bytes,
+                    file_size,
+                    cfg.batch_size,
+                    cfg.score_drop_abs,
+                    cfg.test_positions,
+                    &progress,
+                    cfg.feature_set,
+                    cfg.num_buckets,
+                )?
+            }
+            _ => {
+                return Err(
+                    "--eval-only requires exactly one of --test-tail-positions / --test-data"
+                        .into(),
+                );
+            }
+        };
+        let report = set.evaluate(&mut trainer, wdl_lambda, loss)?;
+        println!(
+            "[eval-only] test_loss={:.8} test_accuracy={:.6} n_positions={} n_counted={} \
+             wdl_lambda={wdl_lambda}",
+            report.mean_loss, report.accuracy, report.n_positions, report.n_counted,
+        );
+        return Ok(());
+    }
 
     let mut experiment = build_experiment_logger(
         cli,

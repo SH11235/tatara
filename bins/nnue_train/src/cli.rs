@@ -195,6 +195,24 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) init_from: Option<PathBuf>,
 
+    /// Load weights (via --init-from / --resume), evaluate held-out test_loss /
+    /// test_accuracy once, and exit without training. Requires held-out data
+    /// (--test-tail-positions or --test-data).
+    #[arg(long, global = true)]
+    pub(crate) eval_only: bool,
+
+    /// Zero a subset of the loaded threat FT rows before eval/train, to measure
+    /// that subset's eval contribution (threat net + --init-from only). One of:
+    /// all | slider-attacker | step-attacker | bigslider-attacker | defense |
+    /// attack | same-class | random:<seed>:<dims>.
+    #[arg(long, global = true)]
+    pub(crate) threat_ablate: Option<String>,
+
+    /// Print a pair-class L2-norm breakdown of the loaded threat FT weights and
+    /// exit (no eval; threat net + --init-from only).
+    #[arg(long, global = true)]
+    pub(crate) threat_norm_dump: bool,
+
     /// Resume training by restoring weights + Ranger optimizer state
     /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
     /// resume. Mutually exclusive with `--init-from` (which injects weights only
