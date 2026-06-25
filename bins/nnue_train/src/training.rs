@@ -48,7 +48,7 @@ fn gpu_oom_error(
     );
     if matches!(threat_profile, Some(p) if p != "off") {
         msg.push_str(
-            "  - smaller `--threat-profile` (full > same-class > same-class-major-pawn > cross-side、または off)\n",
+            "  - smaller `--threat-profile` (dims 降順: full > same-class > same-class-major-pawn > cross-side > step-attacker、または off)\n",
         );
     }
     msg.push_str("  - smaller `--batch-size`");

@@ -1389,6 +1389,7 @@ mod tests {
                 ThreatProfile::Full,
                 ThreatProfile::SameClass,
                 ThreatProfile::SameClassMajorPawn,
+                ThreatProfile::StepAttacker,
                 ThreatProfile::CrossSide,
             ] {
                 let spec = fs.spec().with_threat_profile(profile).with_ft_factorize();

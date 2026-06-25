@@ -78,7 +78,7 @@ base feature set (`--feature-set`) はそのまま。Threat は独立 flag
 する (nnue-pytorch ComposedFeatureTransformer / bullet-shogi append と同型)。
 
 ```
---threat-profile {off, full, same-class, same-class-major-pawn, cross-side}
+--threat-profile {off, full, same-class, same-class-major-pawn, step-attacker, cross-side}
 ```
 
 default は `off` (base と bit-identical)。profile は **runtime enum dispatch**
@@ -113,11 +113,18 @@ threat_index =
   - `full` (id 0): 除外なし → 216,720 dims
   - `same-class` (id 1): `ac == dc` → 192,640 dims
   - `same-class-major-pawn` (id 2): `ac == dc || (ac >= 5 && dc == 0)` → 173,568 dims
+  - `step-attacker` (id 3): `ac == 1 || ac >= 5` (occupancy 依存 slider = 香角飛馬竜 を
+    attacker から全除外、単発利き駒 歩桂銀金 のみ attacker に残す) → 33,408 dims
   - `cross-side` (id 10): `as == ds || ac == dc` → 96,320 dims
 - normalize (perspective swap → HM mirror、from/to に同一適用) も donor に合わせる。
   STM / NSTM 両視点で別 index を出す。
 - profile 命名・id は donor (`shogi_threat_exclusion.rs`) に合わせる
-  (full:0 / same-class:1 / same-class-major-pawn:2 / cross-side:10)。
+  (full:0 / same-class:1 / same-class-major-pawn:2 / cross-side:10)。`step-attacker`
+  (id 3) は donor に無い engine-native profile: slider attacker を列挙対象から外すと
+  利き ray 列挙 (利き計算の主コスト) を丸ごと省け、engine の threat NPS overhead を
+  pair-class late filter では届かない (a) 列挙 floor から削れる。eval 寄与の根拠は
+  attacker-class 別 ablation 診断 (slider attacker は per-dim eval 効率が最低、step 駒は
+  最高密)。golden は donor に無いため tatara ↔ rshogi 間で index 一致を直接検証する。
 
 ### 3. on-the-fly 移植 = PoC、forward+backward+GPU メモリを計測して方式確定
 
