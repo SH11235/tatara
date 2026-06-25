@@ -56,6 +56,19 @@ fn gpu_oom_error(
 }
 
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
+    // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
+    // 取り違えを避けて明示的に弾く (dispatch より前)。
+    if matches!(cli.arch, ArchCommand::Simple(_))
+        && (cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump)
+    {
+        return Err(
+            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
+             layerstack subcommand"
+                .into(),
+        );
+    }
+
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
@@ -502,7 +515,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     if start_superbatch == 0 {
         return Err("--start-superbatch must be >= 1 (1-indexed)".into());
     }
-    if start_superbatch > cli.superbatches {
+    // eval-only は学習しないので train-range 制約を課さない。これを課すと最終
+    // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価できない。
+    if start_superbatch > cli.superbatches && !cli.eval_only {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
             cli.superbatches
