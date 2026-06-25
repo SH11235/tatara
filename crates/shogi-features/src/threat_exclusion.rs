@@ -62,8 +62,10 @@ impl ThreatProfile {
     /// `as_` / `ds` は side (0=味方, 1=敵)、`ac` / `dc` は class index (0..=8)。
     /// `SameClassMajorPawn` の `ac >= 5` は `ThreatClass::Bishop` 以降 (大駒)、
     /// `dc == 0` は `ThreatClass::Pawn` を指す。`StepAttacker` の `ac == 1 || ac >= 5`
-    /// は占有依存 slider (Lance=1 + Bishop/Rook/Horse/Dragon=5..8) で、これらを
-    /// attacker から外すと利き ray 列挙を丸ごと省ける。
+    /// は占有依存 slider (Lance=1 + Bishop/Rook/Horse/Dragon=5..8) を attacker から外す。
+    /// 本 trainer では該当 pair を index 空間から除く (active feature として emit されない)
+    /// だけで、利き ray 列挙自体は他 profile と同様に行う。engine 側は同 profile で slider
+    /// attacker を early-prune し ray 列挙を省いて NPS を削れる (本 crate の責務外)。
     #[inline]
     pub fn is_excluded(self, as_: usize, ac: usize, ds: usize, dc: usize) -> bool {
         match self {

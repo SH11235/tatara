@@ -257,7 +257,7 @@ pub fn features_token(feature_name: &str, input_size: usize, ft_out: usize) -> S
 
 /// arch_str / stream に書く threat profile identity (rshogi 契約)。`dims` はその
 /// profile の THREAT_DIMENSIONS、`profile_id` は profile の数値 id (full=0 /
-/// same-class=1 / same-class-major-pawn=2 / cross-side=10)。
+/// same-class=1 / same-class-major-pawn=2 / step-attacker=3 / cross-side=10)。
 #[derive(Clone, Copy, Debug)]
 pub struct ThreatArch {
     pub dims: usize,

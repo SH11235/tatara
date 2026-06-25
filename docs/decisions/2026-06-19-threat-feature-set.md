@@ -120,9 +120,11 @@ threat_index =
   STM / NSTM 両視点で別 index を出す。
 - profile 命名・id は donor (`shogi_threat_exclusion.rs`) に合わせる
   (full:0 / same-class:1 / same-class-major-pawn:2 / cross-side:10)。`step-attacker`
-  (id 3) は donor に無い engine-native profile: slider attacker を列挙対象から外すと
-  利き ray 列挙 (利き計算の主コスト) を丸ごと省け、engine の threat NPS overhead を
-  pair-class late filter では届かない (a) 列挙 floor から削れる。eval 寄与の根拠は
+  (id 3) は donor に無い engine-native profile: slider attacker pair を index 空間から
+  除く (dims 33,408)。狙いは engine 側で slider attacker を early-prune し利き ray 列挙
+  (利き計算の主コスト) を省くこと — pair-class late filter では届かない利き列挙 floor を
+  NPS から削れる。trainer 自体は他 profile と同様 emit を間引くだけで ray 列挙は省かない
+  (engine 対応は follow-up)。eval 寄与の根拠は
   attacker-class 別 ablation 診断 (slider attacker は per-dim eval 効率が最低、step 駒は
   最高密)。golden は donor に無いため tatara ↔ rshogi 間で index 一致を直接検証する。
 
@@ -221,6 +223,7 @@ base HM-merged ft_in=73,305、ft_out=1536 default。FT 系は {w, m, v, slow, gr
 | profile | threat dims | 連結 ft_in | 倍率 | FT 5buffer 概算 | 3080 Ti (12GB) |
 |---------|------------:|-----------:|-----:|----------------:|----------------|
 | off     | 0           | 73,305     | 1.0× | ~2.2GB          | 余裕 |
+| step-attacker | 33,408 | 106,713    | 1.46× | ~3.2GB         | 余裕 (最小 profile) |
 | cross-side | 96,320   | 169,625    | 2.3× | ~5.2GB          | 乗る見込み |
 | same-class-major-pawn | 173,568 | 246,873 | 3.4× | ~7.5GB | 要実測 (L1/L2/workspace 込みで tight) |
 | same-class | 192,640  | 265,945    | 3.6× | ~8.0GB          | 要実測 (OOM 懸念) |
@@ -236,14 +239,17 @@ trade-off) と整合する。
 | profile | 連結 ft_in | pos/s | peak GPU | fp32 opt-state で fit |
 |---------|-----------:|------:|---------:|---------------------|
 | off (base) | 73,305 | ~957K | 5.67GB | ✓ |
+| step-attacker | 106,713 | 未計測 | 未計測 | ✓ (cross-side より小、fp32 で確実) |
 | cross-side | 169,625 | ~721K (−25%) | 8.90GB | ✓ |
 | same-class-major-pawn | 246,873 | ~524K (−45%) | 11.17GB | ✓ (tight) |
 | same-class | 265,945 | — | OOM | ✗ |
 | full | 290,025 | — | OOM | ✗ |
 
-`--fp16-opt-state` (Ranger m/v を f16、過去 allfp16 実験で NaN 無実証明済) で **全
-profile が ft-out 1536 で fit**: same-class ~10.15GB/~504K、full ~10.73GB/~493K。
-逃げ道 `--ft-out 512` では full が 4.71GB/~1.39M (容量は下がる)。
+`--fp16-opt-state` (Ranger m/v を f16、過去 allfp16 実験で NaN 無実証明済) が必要なのは
+連結 ft_in が大きい same-class / full (~10.15GB/~504K、~10.73GB/~493K) で、これらも
+**ft-out 1536 で fit**。step-attacker / cross-side / same-class-major-pawn はより小さく
+**fp32 opt-state のまま fit** (step-attacker は最小ゆえ最も余裕)。逃げ道 `--ft-out 512`
+では full が 4.71GB/~1.39M (容量は下がる)。
 
 **結論 (計測ゲート)**:
 - GPU util は cross-side で median/max 100% = **GPU 律速**。pos/s 低下は ft_in 増に

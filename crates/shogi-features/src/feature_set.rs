@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn threat_profile_hashes_keep_all_specs_distinct() {
-        // 全 base(5) × {off + 4 profile} = 25 通りの合成 feature_hash が pairwise
+        // 全 base(5) × {off + 5 profile} = 30 通りの合成 feature_hash が pairwise
         // distinct (profile compaction で row の意味が変わるため load 時に弾ける)。
         let mut seen = Vec::new();
         for fs in FeatureSet::ALL {
@@ -1001,7 +1001,7 @@ mod tests {
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (25 通り)");
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (30 通り)");
     }
 
     #[test]
