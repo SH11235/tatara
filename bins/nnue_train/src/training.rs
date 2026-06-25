@@ -5,7 +5,7 @@ use nnue_format::LayerStackWeights;
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
+use nnue_train::schedule::{LrSchedulerEnum, WdlScheduler, WdlSchedulerEnum};
 use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
@@ -56,6 +56,19 @@ fn gpu_oom_error(
 }
 
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
+    // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
+    // 取り違えを避けて明示的に弾く (dispatch より前)。
+    if matches!(cli.arch, ArchCommand::Simple(_))
+        && (cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump)
+    {
+        return Err(
+            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
+             layerstack subcommand"
+                .into(),
+        );
+    }
+
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
@@ -63,7 +76,21 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
     };
 
-    let data = cli.data.as_ref().expect("run_training called with --data");
+    // --data は通常学習と --eval-only --test-tail-positions では必須だが、
+    // --threat-norm-dump と --eval-only --test-data は学習データを読まないので任意。
+    // 必須経路では参照点で明示 error にする (None のまま誤って学習に進ませない)。
+    let data = cli.data.as_ref();
+
+    if (cli.threat_ablate.is_some() || cli.threat_norm_dump) && cli.init_from.is_none() {
+        return Err(
+            "--threat-ablate / --threat-norm-dump require --init-from (a quantised \
+                    threat .bin to load and mask)"
+                .into(),
+        );
+    }
+    if cli.eval_only && cli.init_from.is_none() && cli.resume.is_none() {
+        return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
+    }
 
     // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
     // dataloader / checkpoint identity が参照する単一の真実源)。
@@ -436,7 +463,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             init.display()
         );
         let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let weights = LayerStackWeights::load_quantised_with_psqt(
+        let mut weights = LayerStackWeights::load_quantised_with_psqt(
             &mut reader,
             feature_set,
             layerstack.ft_out,
@@ -445,6 +472,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.num_buckets,
             layerstack.psqt,
         )?;
+        if cli.threat_norm_dump {
+            crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
+            return Ok(());
+        }
+        if let Some(spec) = cli.threat_ablate.as_deref() {
+            let stats = crate::threat_ablate::apply(&mut weights, layerstack.ft_out, spec)
+                .map_err(std::io::Error::other)?;
+            println!(
+                "[ablate] spec={spec} zeroed_dims={} zeroed_pairs={} (threat_dims={})",
+                stats.zeroed_dims,
+                stats.zeroed_pairs,
+                weights.feature_set.threat_dims(),
+            );
+        }
         trainer.load_layerstack_weights(&weights)?;
         (None, None, None)
     } else if let Some(ckpt) = &cli.resume {
@@ -477,7 +518,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     if start_superbatch == 0 {
         return Err("--start-superbatch must be >= 1 (1-indexed)".into());
     }
-    if start_superbatch > cli.superbatches {
+    // eval-only は学習しないので train-range 制約を課さない。これを課すと最終
+    // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価できない。
+    if start_superbatch > cli.superbatches && !cli.eval_only {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
             cli.superbatches
@@ -517,6 +560,69 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 開始時の `ft_w` (init / --init-from / --resume いずれか) と一度同期する。
     // 以降は optimizer (mirror) または step 末の fold (comb) が維持する。
     trainer.sync_ft_forward_weights()?;
+
+    if cli.eval_only {
+        // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
+        // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
+        // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
+        if cfg.test_positions == 0 {
+            return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
+        }
+        let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
+        let set = match (&cfg.test_data, cfg.test_tail_positions) {
+            (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
+                test_path,
+                cfg.batch_size,
+                cfg.score_drop_abs,
+                cfg.test_positions,
+                &progress,
+                cfg.feature_set,
+                cfg.num_buckets,
+            )?,
+            (None, Some(n)) => {
+                if n == 0 {
+                    return Err("--test-tail-positions must be >= 1".into());
+                }
+                let data = data.ok_or(
+                    "--eval-only --test-tail-positions requires --data (the file whose tail is the held-out set)",
+                )?;
+                let file_size = std::fs::metadata(data)?.len();
+                let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
+                    std::io::Error::other("--test-tail-positions * PSV record size overflows u64")
+                })?;
+                if tail_bytes >= file_size {
+                    return Err("--test-tail-positions leaves no data to evaluate".into());
+                }
+                nnue_train::validation::HeldoutSet::load_from_range(
+                    data,
+                    file_size - tail_bytes,
+                    file_size,
+                    cfg.batch_size,
+                    cfg.score_drop_abs,
+                    cfg.test_positions,
+                    &progress,
+                    cfg.feature_set,
+                    cfg.num_buckets,
+                )?
+            }
+            _ => {
+                return Err(
+                    "--eval-only requires exactly one of --test-tail-positions / --test-data"
+                        .into(),
+                );
+            }
+        };
+        let report = set.evaluate(&mut trainer, wdl_lambda, loss)?;
+        println!(
+            "[eval-only] test_loss={:.8} test_accuracy={:.6} n_positions={} n_counted={} \
+             wdl_lambda={wdl_lambda}",
+            report.mean_loss, report.accuracy, report.n_positions, report.n_counted,
+        );
+        return Ok(());
+    }
+
+    // ここに到達 = 通常学習 (eval-only / norm-dump は上で return 済)。学習には --data が要る。
+    let data = data.ok_or("training requires --data")?;
 
     let mut experiment = build_experiment_logger(
         cli,

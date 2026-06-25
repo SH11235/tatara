@@ -170,6 +170,41 @@ fn lookup_pair_base(
     }
 }
 
+/// profile に残る pair ごとに `(attacker_side, attacker_class, attacked_side,
+/// attacked_class, base, width)` を呼ぶ。`base` は threat block 内の先頭 feature
+/// index、`width` はその pair が占める feature 数 (`ATTACKS_PER_COLOR[attacker_class]`)。
+/// 除外 pair は飛ばす。
+///
+/// 盤面依存の [`ThreatIndexer::for_each_active_threat_index`] と異なり index 空間の
+/// 静的構造だけを返すので、threat FT row を pair-class 単位で操作する外部処理 (重み
+/// ablation 診断 / pair 別ノルム分解) が index→pair の逆引きなしに使える。
+pub fn for_each_threat_pair_range<F>(profile: ThreatProfile, mut f: F)
+where
+    F: FnMut(usize, ThreatClass, usize, ThreatClass, usize, usize),
+{
+    let (table, _dims) = build_pair_base(profile);
+    for attacker_side in 0..2 {
+        for &ac in &ALL_CLASSES {
+            for attacked_side in 0..2 {
+                for &dc in &ALL_CLASSES {
+                    if let Some(base) =
+                        lookup_pair_base(&table, attacker_side, ac, attacked_side, dc)
+                    {
+                        f(
+                            attacker_side,
+                            ac,
+                            attacked_side,
+                            dc,
+                            base,
+                            ATTACKS_PER_COLOR[ac as usize],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // attack pattern / 空盤面利き
 // =============================================================================
