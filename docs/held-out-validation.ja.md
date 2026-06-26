@@ -63,3 +63,41 @@ target/release/nnue-train \
 `test_acc` / `test_accuracy` はモデル出力の符号と実対局結果の一致率 (引き分け
 は分母から除外)。scale 不変なので、loss スケールが異なる run / 設定の間でも直接
 比較できる。
+
+## 単発評価と threat ablation (診断)
+
+上記 held-out の仕組みを再利用し、**学習済**ネットを再学習なしで診断する flag。
+`layerstack` subcommand 専用。
+
+| flag | 動作 |
+|---|---|
+| `--eval-only` | 重みを load (`--init-from` か `--resume`) し、held-out を 1 回評価して `test_loss` / `test_accuracy` を出して終了。学習ループに入らない。 |
+| `--threat-ablate <spec>` | 評価前に threat 特徴 row の pair-class 部分集合を 0 化し、その結果の `test_loss` 増加分でその部分集合の寄与を測る。threat ネット + `--init-from` 限定。 |
+| `--threat-norm-dump` | load した threat 特徴重みの pair-class 別 L2 ノルム分解を出して終了。評価なし・GPU 不要・`--init-from` だけでよい。 |
+
+`--eval-only` は held-out source (`--test-tail-positions` か `--test-data`) と
+`--test-positions >= 1` が要る。source が `--test-data` のときは `--data` は不要
+(`--test-tail-positions` は末尾を `--data` から取るので必須)。`--init-from` ネットの
+feature set (`--threat-profile` 含む) は load 対象のネットと一致させること。
+
+`--threat-ablate <spec>` の spec: `all` / `slider-attacker` / `step-attacker` /
+`bigslider-attacker` / `defense` (攻撃側と対象が同 side) / `attack` (逆 side) /
+`same-class` (攻撃 class == 対象 class) / `random:<seed>:<dims>` (threat 列を指定
+本数だけ無作為に 0 化する再現可能な null baseline。構造的 spec の校正用)。
+`--eval-only` を付けないと 0 化後に**学習**へ進むので、寄与測定には `--eval-only`
+と併用する。
+
+```bash
+# slider-attacker threat block の寄与: 有無での held-out loss を比較。
+target/release/nnue-train --init-from <threat.bin> --eval-only \
+  --data <psv> --test-tail-positions 1000000 --test-positions 100000 \
+  layerstack --threat-profile <profile> --progress-coeff <progress.bin>
+
+target/release/nnue-train --init-from <threat.bin> --eval-only --threat-ablate slider-attacker \
+  --data <psv> --test-tail-positions 1000000 --test-positions 100000 \
+  layerstack --threat-profile <profile> --progress-coeff <progress.bin>
+
+# モデルが threat 容量をどこに張ったか (host-only、GPU 不要、held-out データ不要):
+target/release/nnue-train --init-from <threat.bin> --threat-norm-dump \
+  layerstack --threat-profile <profile>
+```
