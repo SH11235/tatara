@@ -319,6 +319,28 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
 
+    // norm-dump は load した threat FT 重みの host 側 L2 分解だけで GPU を要さない。
+    // CUDA context / GpuTrainer の構築前に load → dump → return し、GPU 非搭載の
+    // ホストでも回せるようにする (--threat-ablate / --eval-only は GPU で評価するため対象外)。
+    if cli.threat_norm_dump {
+        let init = cli
+            .init_from
+            .as_ref()
+            .ok_or("--threat-norm-dump requires --init-from")?;
+        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+        let weights = LayerStackWeights::load_quantised_with_psqt(
+            &mut reader,
+            feature_set,
+            layerstack.ft_out,
+            layerstack.l1,
+            layerstack.l2,
+            layerstack.num_buckets,
+            layerstack.psqt,
+        )?;
+        crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
+        return Ok(());
+    }
+
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
@@ -472,10 +494,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.num_buckets,
             layerstack.psqt,
         )?;
-        if cli.threat_norm_dump {
-            crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
-            return Ok(());
-        }
         if let Some(spec) = cli.threat_ablate.as_deref() {
             let stats = crate::threat_ablate::apply(&mut weights, layerstack.ft_out, spec)
                 .map_err(std::io::Error::other)?;

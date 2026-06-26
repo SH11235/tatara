@@ -69,3 +69,43 @@ issues before `train_loss` looks abnormal.
 game result (draws excluded from the denominator). It is scale-invariant, so
 it can be compared across runs and configurations that have different loss
 scales.
+
+## One-shot evaluation and threat ablation (diagnostics)
+
+These flags reuse the held-out machinery above to diagnose a *trained* net
+without retraining. They operate on the `layerstack` subcommand only.
+
+| Flag | What it does |
+|---|---|
+| `--eval-only` | Load weights (`--init-from` or `--resume`), run a single held-out pass, print `test_loss` / `test_accuracy`, and exit — no training loop. |
+| `--threat-ablate <spec>` | Before the eval pass, zero a pair-class subset of the loaded threat feature rows, so the resulting `test_loss` increase measures that subset's contribution. Threat-enabled net + `--init-from` only. |
+| `--threat-norm-dump` | Print a pair-class L2-norm breakdown of the loaded threat feature weights and exit. No eval, no GPU — just `--init-from`. |
+
+`--eval-only` still needs a held-out source (`--test-tail-positions` or
+`--test-data`) and `--test-positions >= 1`. It does **not** require `--data`
+when the source is `--test-data`; `--test-tail-positions` does, because the
+tail comes from `--data`. The `--init-from` net's feature set (including
+`--threat-profile`) must match the net being loaded.
+
+`--threat-ablate <spec>` accepts: `all`, `slider-attacker`, `step-attacker`,
+`bigslider-attacker`, `defense` (attacker and target on the same side),
+`attack` (opposite sides), `same-class` (attacker class == target class), or
+`random:<seed>:<dims>` (a reproducible null baseline that zeroes that many
+threat columns at random, to calibrate against the structural specs). Without
+`--eval-only` it zeroes the rows and then *trains*, so pair it with
+`--eval-only` for contribution measurement.
+
+```bash
+# Contribution of the slider-attacker threat block: held-out loss with vs. without it.
+target/release/nnue-train --init-from <threat.bin> --eval-only \
+  --data <psv> --test-tail-positions 1000000 --test-positions 100000 \
+  layerstack --threat-profile <profile> --progress-coeff <progress.bin>
+
+target/release/nnue-train --init-from <threat.bin> --eval-only --threat-ablate slider-attacker \
+  --data <psv> --test-tail-positions 1000000 --test-positions 100000 \
+  layerstack --threat-profile <profile> --progress-coeff <progress.bin>
+
+# Where the model put its threat capacity (host-only, no GPU, no held-out data):
+target/release/nnue-train --init-from <threat.bin> --threat-norm-dump \
+  layerstack --threat-profile <profile>
+```
