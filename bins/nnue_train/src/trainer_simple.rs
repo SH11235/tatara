@@ -86,16 +86,20 @@ pub(crate) struct SimpleGpuWorkspace {
     /// 同 nstm。
     dft_nstm_out_h: Option<DeviceBuffer<f16>>,
 
-    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` →
-    //    `exclusive_prefix_sum_small` → `scatter_positions` → `gather_and_sum_per_feature_*`
+    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` → exclusive
+    //    prefix sum (multi-block scan) → `scatter_positions` → `gather_and_sum_per_feature_*`
     //    pipeline 用)。per-feature gather で `dft_*_out` の DRAM read を 1 perspective につき
     //    各 (feature, ft_out) cell ちょうど 1 回に抑え、global atomic 数も `b * ft_out *
     //    max_active` から `b * max_active` (histogram + scatter) まで圧縮する。サイズは
     //    feature set ごとに固定 (`ft_in` / `max_active` で決まる)。
     /// per-feature 出現回数 histogram (`ft_in`、`build_feature_counts` で atomic build)。
     feat_counts: DeviceBuffer<u32>,
-    /// `feat_counts` の exclusive prefix sum (`ft_in + 1`、`exclusive_prefix_sum_small` で構築)。
+    /// `feat_counts` の exclusive prefix sum (`ft_in + 1`、multi-block scan で構築)。
     feat_offsets: DeviceBuffer<u32>,
+    /// multi-block scan level 1 の per-block 総和 (`ceil(ft_in/1024)`、`prefix_sum_block_local` が書く)。
+    feat_block_sums: DeviceBuffer<u32>,
+    /// `feat_block_sums` の exclusive prefix sum (`ceil(ft_in/1024)+1`、level 2 = `exclusive_prefix_sum_small`)。
+    feat_block_offsets: DeviceBuffer<u32>,
     /// `scatter_positions` 中の per-feature 書き込み位置カウンタ (`ft_in`、atomic incremented)。
     feat_write_ctr: DeviceBuffer<u32>,
     /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
@@ -169,6 +173,8 @@ impl SimpleGpuWorkspace {
             dft_nstm_out_h: alloc_h(ft_fp16_out)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024))?,
+            feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
@@ -1710,8 +1716,8 @@ impl SimpleGpuTrainer {
         }
 
         // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
-        // 各 perspective につき (A) `build_feature_counts` で histogram、(B)
-        // `exclusive_prefix_sum_small` で offset、(C) `scatter_positions` で sorted position 列を
+        // 各 perspective につき (A) `build_feature_counts` で histogram、(B) multi-block
+        // exclusive prefix sum で offset、(C) `scatter_positions` で sorted position 列を
         // 構築し、(D) `gather_and_sum_per_feature_overwrite` (1 回目 = stm) /
         // `gather_and_sum_per_feature_add` (2 回目 = nstm) が `(feature, ri)` cell ごとに
         // sum を書く。FP16 path は同 pipeline で `_fp16` 変種に dft_inv_scale を渡す。
@@ -1740,7 +1746,26 @@ impl SimpleGpuTrainer {
                     b_u32, max_active_u32, ft_in_u32
                 ]
             }?;
-            // B: exclusive prefix sum (1 block × 1024 threads、`ft_in` ~73K-138K に対応)。
+            // B: feat_counts の exclusive prefix sum (multi-block scan で全 SM を使う)。
+            // 単一 block scan は 1 SM 律速 (`ft_in` ~73K-138K で大半 idle) のため 3 段に分割。
+            let prefix_blocks = ft_in_u32.div_ceil(1024);
+            // level 1: 各 block が連続 1024 要素を block-local scan、block 総和を emit。
+            cuda_launch! {
+                kernel: prefix_sum_block_local,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_block_sums),
+                    ft_in_u32
+                ]
+            }?;
+            // level 2: block 総和列 (prefix_blocks ≲ 135 要素) を単一 block で scan。
             cuda_launch! {
                 kernel: exclusive_prefix_sum_small,
                 stream: self.stream, module: self.module,
@@ -1750,9 +1775,25 @@ impl SimpleGpuTrainer {
                     shared_mem_bytes: 0,
                 },
                 args: [
-                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_block_sums),
+                    slice(self.ws.feat_block_offsets),
+                    prefix_blocks
+                ]
+            }?;
+            // level 3: block-local offsets へ block offset を加算 + offsets[n]=total。
+            cuda_launch! {
+                kernel: prefix_sum_add_block_offset,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
                     slice(self.ws.feat_offsets),
-                    ft_in_u32
+                    slice(self.ws.feat_block_offsets),
+                    ft_in_u32,
+                    prefix_blocks
                 ]
             }?;
             // C: 各 (b, ni) sparse index について feat_positions の per-feature slot に
