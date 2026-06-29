@@ -397,12 +397,18 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
-        // FT bias grad の per-output tile reduction は `block_dim == ft_out` で起動するため
-        // ft_out が CUDA の block 上限 1024 を超えると launch できない (opaque な
-        // CUDA_ERROR_INVALID_VALUE になる前に release でも明示 reject する)。preset 上限は 1024。
-        if ft_out > 1024 {
+        // FT bias grad の per-output tile reduction (`simple_bias_grad_dual[_fp16]`、CReLU /
+        // SCReLU 経路のみ) は `block_dim == ft_out` で起動するため、ft_out が CUDA の block 上限
+        // 1024 を超えると launch できない (opaque な CUDA_ERROR_INVALID_VALUE になる前に明示
+        // reject する)。Pairwise は FT bias grad を `ft_post_perspective_grad[_fp16]` に融合し本
+        // launch を使わないため、この制約は課さない。
+        if matches!(
+            id.activation,
+            SimpleActivation::CReLU | SimpleActivation::SCReLU
+        ) && ft_out > 1024
+        {
             return Err(format!(
-                "SimpleGpuTrainer: ft_out {ft_out} must be <= 1024 \
+                "SimpleGpuTrainer: ft_out {ft_out} must be <= 1024 for CReLU/SCReLU \
                  (FT bias grad reduction launches one thread per output)"
             )
             .into());
