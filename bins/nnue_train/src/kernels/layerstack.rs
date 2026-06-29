@@ -1843,6 +1843,110 @@ pub fn dense_mm_bwd_input_bucket(
     }
 }
 
+/// Sorted layout 版の per-bucket dense backward-input matmul (L1 用)。
+/// `dx[b][i] = sum_o dy[b][o] * w[bucket_idx[b_start]][o][i]`。caller が batch を bucket で sort 済
+/// かつ各 bucket の開始 offset が TILE_B = 16 境界に align 済を保証する前提 (block 内 16 row は
+/// uniform bucket、boundary block 無し)。[`dense_mm_bwd_input_bucket`] の tiled variant:
+/// dy_tile[16 b × 16 o] / w_tile[16 o × 16 i] を shared に coalesced load し、各 thread が 1 (b, i)
+/// cell を out_dim 軸 (= 縮約 K) の reduction で完成する。非 tiled 版が同 bucket の row ごとに
+/// w[bucket] を global から重複 read していたのを、16-row tile あたり 1 回の shared load に集約する。
+///
+/// w_tile は [o][i] の row stride 16。reduction read `w_tile[o*16 + tid_i]` は i (in-index) が
+/// warp 内 stride 1 = fast index なので bank conflict 無し (pad 不要)。`in_dim % 16 == 0` /
+/// `batch % 16 == 0` / `num_buckets <= 9` が caller 契約。out_dim は 16 幅の K-tile に分割するため
+/// 任意 (末尾 tile は 0 padding)。padding 行 (bucket_idx=-1) は dx=0 を書き、後段の inverse permute
+/// が perm=-1 で skip する。
+///
+/// 数値同等性: per (b,i) で o=0.. の加算順を保持するため非 tiled 版と bit-exact。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_input_bucket_tiled_sorted(
+    dy: &[f32],
+    w: &[f32],
+    bucket_idx: &[i32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    in_dim: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 b × 16 o
+    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 o × 16 i
+
+    let tid_local = thread::threadIdx_x() as usize;
+    let block_b = thread::blockIdx_y() as usize; // batch-tile
+    let in_tile = thread::blockIdx_x() as usize; // in-tile
+    let tid_b = tid_local >> 4; // 0..15 (batch within tile)
+    let tid_i = tid_local & 15; // 0..15 (in within tile)
+    let b_start = block_b << 4;
+    let i_start = in_tile << 4;
+    let global_bi = b_start + tid_b;
+    let global_ii = i_start + tid_i;
+
+    let in_dim_u = in_dim as usize;
+    let out_dim_u = out_dim as usize;
+    let batch_u = batch as usize;
+    let bi_ok = global_bi < batch_u;
+    let ii_ok = global_ii < in_dim_u;
+
+    let block_buc = if b_start < batch_u {
+        bucket_idx[b_start]
+    } else {
+        -1_i32
+    };
+    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
+    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
+
+    let mut acc: f32 = 0.0_f32;
+    let n_o_tiles = (out_dim_u + 15) >> 4;
+    let mut o_tile: usize = 0;
+    while o_tile < n_o_tiles {
+        let o_start = o_tile << 4;
+        unsafe {
+            // DY_TILE[b][o] = dy[(b_start+b)][o_start+o]、thread → (b=tid_b, o=tid_i)、coalesced。
+            let bb = b_start + tid_b;
+            let oo = o_start + tid_i;
+            DY_TILE[tid_local] = if bb < batch_u && oo < out_dim_u {
+                dy[bb * out_dim_u + oo]
+            } else {
+                0.0_f32
+            };
+            // W_TILE[o][i] = w[buc][o_start+o][i_start+i]、thread → (o=tid_b, i=tid_i)、coalesced。
+            let oo2 = o_start + tid_b;
+            let ii2 = i_start + tid_i;
+            W_TILE[tid_local] = if block_buc_ok && oo2 < out_dim_u && ii2 < in_dim_u {
+                w[block_buc_u * out_dim_u * in_dim_u + oo2 * in_dim_u + ii2]
+            } else {
+                0.0_f32
+            };
+        }
+        thread::sync_threads();
+
+        if bi_ok && ii_ok && block_buc_ok {
+            let mut o: usize = 0;
+            while o < 16 {
+                unsafe {
+                    acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(o << 4) | tid_i];
+                }
+                o += 1;
+            }
+        }
+        thread::sync_threads();
+        o_tile += 1;
+    }
+
+    if bi_ok && ii_ok {
+        // 2D tile grid のため cell index は thread::index_1d() と一致しない。各 thread は
+        // disjoint な (global_bi, global_ii) cell を担当する。
+        // SAFETY: global_bi < batch、global_ii < in_dim ⇒ cell_idx < dx.len() (= batch*in_dim)。
+        let cell_idx = global_bi * in_dim_u + global_ii;
+        let val = if block_buc_ok { acc } else { 0.0_f32 };
+        unsafe {
+            *dx.as_mut_ptr().add(cell_idx) = val;
+        }
+    }
+}
+
 /// Per-bucket dense matmul backward (wrt weight)。
 /// `grad_w[bucket][o][i] = sum_{b: bucket_idx[b]==bucket} x[b][i] * dy[b][o]` (overwrite、atomics 不要)。
 ///

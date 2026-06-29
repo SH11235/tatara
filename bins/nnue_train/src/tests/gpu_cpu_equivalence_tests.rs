@@ -1223,6 +1223,122 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    // out_dim は 16 幅 K-tile で消化する (16 / 16 倍数 / 非倍数を網羅)。in_dim % 16 == 0 が契約。
+    for &(batch, in_dim, out_dim) in &[
+        (16_usize, 16_usize, 16_usize),
+        (32, 64, 32),
+        (48, 96, 24),
+        (64, 32, 8),
+        (32, 48, 17),
+    ] {
+        let nb = DEFAULT_NUM_BUCKETS;
+        let padded = padded_sort_batch(batch, nb);
+        let dy: Vec<f32> = (0..batch * out_dim)
+            .map(|i| i as f32 * 0.013 - 0.4)
+            .collect();
+        let w: Vec<f32> = (0..nb * out_dim * in_dim)
+            .map(|i| i as f32 * 0.0007 + 0.05)
+            .collect();
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+
+        let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+        dense_mm_bwd_input_bucket_cpu(
+            &dy,
+            &w,
+            &bucket_idx,
+            &mut dx_cpu,
+            batch,
+            in_dim,
+            out_dim,
+            nb,
+        );
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+
+        let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, nb + 1)?;
+        let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+        let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
+        let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
+        let mut dx_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * in_dim)?;
+        let dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+
+        memset_minus_one_i32(&stream, &perm_dev)?;
+        memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
+
+        cuda_launch! {
+            kernel: count_buckets, stream: stream, module: module,
+            config: cfg_1d(batch),
+            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_scan_aligned, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        }?;
+        cuda_launch! {
+            kernel: scatter_bucket_perm, stream: stream, module: module,
+            config: cfg_1d(batch),
+            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        }?;
+        cuda_launch! {
+            kernel: permute_rows_f32, stream: stream, module: module,
+            config: cfg_1d(padded * out_dim),
+            args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                   padded as u32, out_dim as u32]
+        }?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted, stream: stream, module: module,
+            config: LaunchConfig {
+                grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev),
+                   slice_mut(dx_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        cuda_launch! {
+            kernel: inverse_permute_rows_f32, stream: stream, module: module,
+            config: cfg_1d(padded * in_dim),
+            args: [slice(dx_sorted_dev), slice(perm_dev), slice(dx_dev),
+                   padded as u32, in_dim as u32]
+        }?;
+        stream.synchronize()?;
+
+        let tiled_host = dx_dev.to_host_vec(&stream)?;
+        assert_close_rel(
+            &format!("bucket_sort_bwd_input_l1 b={batch} in={in_dim} out={out_dim}"),
+            &tiled_host,
+            &dx_cpu,
+            TOL_FMA,
+        );
+        // 非 tiled `dense_mm_bwd_input_bucket` と GPU 上で bit-exact (同 dy/w・同 o-order の FMA、
+        // sort/inverse-permute は値を変えない gather/scatter)。tiled 化が数値経路を変えないことを
+        // CPU tolerance ではなく完全一致で裏付ける。
+        let mut dx_nontiled_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
+            config: cfg_1d(batch * in_dim),
+            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_nontiled_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            tiled_host,
+            dx_nontiled_dev.to_host_vec(&stream)?,
+            "tiled vs non-tiled bit-exact b={batch} in={in_dim} out={out_dim}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let batch = 13_usize;

@@ -2572,27 +2572,9 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1f");
 
-        // -- Backward 4 reverse: L1 per-bucket dense grad (input)。`dense_mm_bwd_input_bucket`
-        //    は out_dim を runtime arg で受ける汎用 kernel なので l1_out 不問で分岐不要。
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * ft_out),
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1_w),
-                slice(self.ws.bucket_idx_dev),
-                slice_mut(self.ws.dcombined_from_l1),
-                b_u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-            ]
-        }?;
-        prof_tick!("bwd_L1_inB");
-        // L1 weight backward (sorted layout): dl1_total を bucket_perm_dev で gather →
-        // dl1_total_sorted。combined_sorted / bucket_offsets_dev は fwd_L1 で構築済。各 block
-        // は uniform-by-construction で 1 bucket の slice のみ accumulate する。grid_x は
-        // in-tile (`ft_out/16`) と out-tile (`n_out_tiles`) を畳んだ 1 軸、grid_y は split-K、
-        // grid_z は bucket。
+        // -- Backward 4 reverse: L1 per-bucket dense grad (weight → input、sorted layout)。
+        //    dl1_total を bucket_perm_dev で gather → dl1_total_sorted (weight/input/bias 共通)。
+        //    combined_sorted / bucket_offsets_dev / bucket_idx_sorted_dev は fwd_L1 で構築済。
         debug_assert!(
             ft_out.is_multiple_of(16)
                 && self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS
@@ -2609,6 +2591,9 @@ impl GpuTrainer {
                 padded_b as u32, l1_out as u32
             ]
         }?;
+        // L1 weight backward (sorted): 各 block は uniform-by-construction で 1 bucket の slice
+        // のみ accumulate。grid_x は in-tile (`ft_out/16`) と out-tile (`n_out_tiles`) を畳んだ
+        // 1 軸、grid_y は split-K、grid_z は bucket。
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted,
             stream: self.stream,
@@ -2627,6 +2612,43 @@ impl GpuTrainer {
             ]
         }?;
         prof_tick!("bwd_L1_wB");
+        // L1 input backward (sorted tiled): dx_sorted[b][i] = Σ_o dl1_total_sorted[b][o] *
+        // w[bucket][o][i]。weight grad が combined_sorted を read し終えた後 (同 stream serialize)
+        // なので、その buffer を dx_sorted の出力先に再利用する (別途 padded_b×ft_out の確保を避ける)。
+        // 16-row tile あたり w[bucket] を 1 回 shared load して L2 trip を削減する。
+        // grid = (in-tile = ft_out/16, batch-tile = padded_b/16)。
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted,
+            stream: self.stream,
+            module: self.module,
+            config: LaunchConfig {
+                grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [
+                slice(self.ws.dl1_total_sorted),
+                slice(self.l1_w),
+                slice(self.ws.bucket_idx_sorted_dev),
+                slice_mut(self.ws.combined_sorted),
+                padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+            ]
+        }?;
+        // sorted dx を bucket_perm で original order に inverse-scatter → dcombined_from_l1。
+        // padding 行 (perm=-1) は skip。dcombined_from_l1 は全 real row が書かれる (perm は
+        // 全 batch row を覆う bijection)。
+        cuda_launch! {
+            kernel: inverse_permute_rows_f32,
+            stream: self.stream, module: self.module,
+            config: cfg_1d(padded_b * ft_out),
+            args: [
+                slice(self.ws.combined_sorted),
+                slice(self.ws.bucket_perm_dev),
+                slice(self.ws.dcombined_from_l1),
+                padded_b as u32, ft_out as u32
+            ]
+        }?;
+        prof_tick!("bwd_L1_inB");
         // L1 bias backward (sorted): 1 block = sorted batch の連続 16 行の per-block
         // shared-mem reduce で global atomic 数を削減する。dl1_total_sorted /
         // bucket_idx_sorted_dev は同 step 内で構築済 (fwd_L1 + 直前 permute)。
