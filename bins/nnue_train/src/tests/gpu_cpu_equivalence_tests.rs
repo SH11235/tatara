@@ -1995,6 +1995,7 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
         kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
@@ -2043,6 +2044,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
         kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
@@ -2058,6 +2060,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
         kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+               ft_dim as u32, 0_u32,
                slice_mut(dft_out_dev), slice(clamp_counter_dev),
                batch as u32, ft_dim as u32, dft_scale]
     }?;
