@@ -120,9 +120,13 @@ pub fn loss_wdl(
 /// (= host が f32 で計算した `1/n`) と最終 bit が一致しない。extended の既定値
 /// (`pow_exp=2 / qp_asymmetry=0 / w1=0`) では caller が `extended=0` を渡す。
 ///
-/// 1 thread = 1 position。`dl_dout` は排他更新 (atomics 不要)、`loss_acc` は f64 単一
-/// cell の `DeviceAtomicF64::fetch_add` (`loss_wdl` と同型)。`f32::exp` / `f32::powf` /
-/// `f32::abs` は libdevice (`__nv_expf` / `__nv_powf` / `__nv_fabsf`) に lowering OK。
+/// 1 thread = 1 position。`dl_dout` (= 訓練に使う勾配) は per-position 排他更新 (atomics 不要)。
+/// `loss_acc` (ログ表示用の loss 値) は block 内 partial を shared-mem tree reduction で集約し
+/// block あたり 1 回だけ `DeviceAtomicF64::fetch_add` する (single-cell への atomic 競合回避)。
+/// f64 reduction は加算順に依存し loss 値の最下位 bit (~1e-15 rel) が動くが、grad は `loss_acc` を
+/// 読まない (per-position に別書き) ので影響を受けない。`f32::exp` / `f32::powf` / `f32::abs` は
+/// libdevice (`__nv_expf` / `__nv_powf` / `__nv_fabsf`) に lowering OK。block_dim は BLOCK_DIM (256)
+/// の 2 冪前提 (tree reduction が完全に畳める)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn loss_wrm(
@@ -146,68 +150,102 @@ pub fn loss_wrm(
     extended: u32,     // 0 = 二乗誤差 (bit-identical)、1 = nnue-pytorch 一般化 loss
     n: u32,
 ) {
+    use core::ptr::addr_of_mut;
+    // block 内 partial loss を shared-mem tree reduction で集約し、`loss_acc` への atomic は
+    // block あたり 1 回だけにする (block_dim == BLOCK_DIM = 256)。out-of-range thread は寄与 0 で
+    // reduction に参加する (sync_threads を全 thread が一様に通すため early return しない)。
+    static mut PARTIAL: SharedArray<f64, 256> = SharedArray::UNINIT;
     let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    // --- target (WRM applied to teacher score、offset/scaling は caller 指定) ---
-    let s = score[i.get()];
-    let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
-    let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
-    let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
-    let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
+    let tid = thread::threadIdx_x() as usize;
+    let valid = i.get() < n as usize;
 
-    // --- prediction (WRM applied to net output) ---
-    let scorenet = out[i.get()] * nnue2score;
-    let q = 1.0_f32 / (1.0_f32 + (-((scorenet - in_offset) / in_scaling)).exp());
-    let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - in_offset) / in_scaling)).exp());
-    let qf = 0.5_f32 * (1.0_f32 + q - qm);
+    // 本 thread の loss 寄与 (out-of-range は 0)。grad `dl_dout` は valid thread のみ排他更新で
+    // atomics 不要、loss reduction とは独立 (loss_acc を読まない)。
+    let mut contrib = 0.0_f64;
+    if valid {
+        // --- target (WRM applied to teacher score、offset/scaling は caller 指定) ---
+        let s = score[i.get()];
+        let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
+        let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
+        let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
+        let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
 
-    let err = qf - target;
+        // --- prediction (WRM applied to net output) ---
+        let scorenet = out[i.get()] * nnue2score;
+        let q = 1.0_f32 / (1.0_f32 + (-((scorenet - in_offset) / in_scaling)).exp());
+        let qm = 1.0_f32 / (1.0_f32 + (-((-scorenet - in_offset) / in_scaling)).exp());
+        let qf = 0.5_f32 * (1.0_f32 + q - qm);
 
-    // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (`loss_wdl` と同型)。
-    let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+        let err = qf - target;
 
-    if extended == 0 {
-        // default 経路は元の二乗誤差式をそのまま保持する (f32 乗算は非結合則なので項を
-        // くくり出すと最終 bit が変わる、bit-identical 要件のため式を変えない)。
-        let norm = per_pos_norm;
-        if let Some(g) = dl_dout.get_mut(i) {
-            *g = err * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm)) * norm;
+        if extended == 0 {
+            // 二乗誤差 grad は項の順序・grouping をそのまま評価する (f32 乗算は非結合則で、
+            // くくり出すと最終 bit が変わり量子化出力の bit 再現に効くため)。
+            let norm = per_pos_norm;
+            if let Some(g) = dl_dout.get_mut(i) {
+                *g = err
+                    * (nnue2score / in_scaling)
+                    * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm))
+                    * norm;
+            }
+            contrib = (err as f64) * (err as f64);
+        } else {
+            // --- extended: nnue-pytorch 一般化 loss (weight boost / pow_exp / asymmetry) ---
+            let pf = target_wrm;
+            let wb_base = (pf - 0.5_f32) * (pf - 0.5_f32) * pf * (1.0_f32 - pf);
+            let weight =
+                1.0_f32 + (2.0_f32.powf(weight_boost_w1) - 1.0_f32) * wb_base.powf(weight_boost_w2);
+            let asym = if qf > target {
+                1.0_f32 + qp_asymmetry
+            } else {
+                1.0_f32
+            };
+            let abs_err = err.abs();
+            // sign(err) * |err|^(pow_exp-1): err=0 では pow_exp>1 で 0、符号は err の符号。
+            // pow_exp=1 (L1) は原点で subgradient +1 を返す (実害は測度 0 の点のみ)。
+            let pow_abs = abs_err.powf(pow_exp - 1.0_f32);
+            let signed_pow = if err < 0.0_f32 { -pow_abs } else { pow_abs };
+
+            // Σw を読む (先行 launch の wrm_weight_sum が書込済、本 kernel では read only)。
+            // host validation が w1,w2 >= 0 を保証するので weight >= 1、Σw >= n > 0 (n は本
+            // kernel が launch される batch サイズで >= 1) ゆえ除算は安全。
+            let inv_sum_w = (1.0_f64 / sum_w_acc[0]) as f32;
+            // dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q)+qm(1-qm))。
+            let dqf_dout =
+                0.5_f32 * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm));
+
+            if let Some(g) = dl_dout.get_mut(i) {
+                *g = (weight * inv_sum_w) * (asym * pow_exp * signed_pow) * dqf_dout;
+            }
+
+            contrib = (asym * abs_err.powf(pow_exp) * weight * (n as f32) * inv_sum_w) as f64;
         }
-        loss_atom.fetch_add((err as f64) * (err as f64), AtomicOrdering::Relaxed);
-        return;
     }
 
-    // --- extended: nnue-pytorch 一般化 loss (weight boost / pow_exp / asymmetry) ---
-    let pf = target_wrm;
-    let wb_base = (pf - 0.5_f32) * (pf - 0.5_f32) * pf * (1.0_f32 - pf);
-    let weight =
-        1.0_f32 + (2.0_f32.powf(weight_boost_w1) - 1.0_f32) * wb_base.powf(weight_boost_w2);
-    let asym = if qf > target {
-        1.0_f32 + qp_asymmetry
-    } else {
-        1.0_f32
-    };
-    let abs_err = err.abs();
-    // sign(err) * |err|^(pow_exp-1): err=0 では pow_exp>1 で 0、符号は err の符号。
-    // pow_exp=1 (L1) は原点で subgradient +1 を返す (実害は測度 0 の点のみ)。
-    let pow_abs = abs_err.powf(pow_exp - 1.0_f32);
-    let signed_pow = if err < 0.0_f32 { -pow_abs } else { pow_abs };
-
-    // Σw を読む (先行 launch の wrm_weight_sum が書込済、本 kernel では read only)。
-    // host validation が w1,w2 >= 0 を保証するので weight >= 1、Σw >= n > 0 (n は本 kernel
-    // が launch される batch サイズで >= 1) ゆえ除算は安全。
-    let inv_sum_w = (1.0_f64 / sum_w_acc[0]) as f32;
-    // dqf/dout = 0.5 * (nnue2score/in_scaling) * (q(1-q)+qm(1-qm))。
-    let dqf_dout = 0.5_f32 * (nnue2score / in_scaling) * (q * (1.0_f32 - q) + qm * (1.0_f32 - qm));
-
-    if let Some(g) = dl_dout.get_mut(i) {
-        *g = (weight * inv_sum_w) * (asym * pow_exp * signed_pow) * dqf_dout;
+    // loss_acc は単一 cell ゆえ全 thread が直接 atomic add すると競合する。block 内で contrib を
+    // tree reduction し、block 0 番 thread が block あたり 1 atomic だけ打って競合を block 数に抑える。
+    let partial_ptr: *mut f64 = addr_of_mut!(PARTIAL) as *mut f64;
+    unsafe {
+        partial_ptr.add(tid).write(contrib);
     }
-
-    let loss_i = asym * abs_err.powf(pow_exp) * weight * (n as f32) * inv_sum_w;
-    loss_atom.fetch_add(loss_i as f64, AtomicOrdering::Relaxed);
+    thread::sync_threads();
+    let mut stride = (thread::blockDim_x() as usize) / 2;
+    while stride >= 1 {
+        if tid < stride {
+            let v = unsafe { partial_ptr.add(tid).read() + partial_ptr.add(tid + stride).read() };
+            unsafe {
+                partial_ptr.add(tid).write(v);
+            }
+        }
+        thread::sync_threads();
+        stride /= 2;
+    }
+    if tid == 0 {
+        // SAFETY: `loss_acc.len() == 1`、host 側で f64 単一 cell 確保済 (`loss_wdl` と同型)。
+        let loss_atom = unsafe { &*(loss_acc.as_ptr() as *const DeviceAtomicF64) };
+        let block_sum = unsafe { partial_ptr.add(0).read() };
+        loss_atom.fetch_add(block_sum, AtomicOrdering::Relaxed);
+    }
 }
 
 /// extended WRM loss の per-position weight `w = 1 + (2^w1 - 1) * ((pf-0.5)^2 *
