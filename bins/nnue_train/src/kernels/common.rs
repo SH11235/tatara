@@ -414,9 +414,9 @@ pub fn radam_step_fp16_mirror(
             p
         };
         *w_ref = p_clamped;
-        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
-        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
-        // 上書きされ DRAM 書き込みを浪費するだけ)。
+        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
+        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
+        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
         let mirror_ptr = mirror.as_mut_ptr();
         unsafe {
             mirror_ptr.add(i.get()).write(p_clamped as f16);
@@ -616,9 +616,9 @@ pub fn radam_step_f16state(
             p
         };
         *w_ref = p_clamped;
-        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
-        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
-        // 上書きされ DRAM 書き込みを浪費するだけ)。
+        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
+        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
+        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
     }
 }
 
@@ -690,9 +690,9 @@ pub fn radam_step_f16state_mirror(
             p
         };
         *w_ref = p_clamped;
-        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
-        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
-        // 上書きされ DRAM 書き込みを浪費するだけ)。
+        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
+        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
+        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
         // SAFETY: `mirror` は `weights` / `m` / `v` / `grad` と同要素数 `n` (caller が
         // `ft_w` の要素数 `ft_w_n` を渡す)。kernel 冒頭で `i < n` を確認済みなので
         // `mirror.add(i)` は in-bounds。各 thread は自分の `i` のみ書くため thread 間で
