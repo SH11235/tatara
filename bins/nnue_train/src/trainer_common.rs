@@ -222,6 +222,43 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
     }
 }
 
+/// `dense_bias_grad_tiled` が扱える out_dim の上限。kernel の shared `PARTIAL` 容量
+/// (= block_dim 上限) と一致させる。`block_dim = R * out_dim <= 256` を保証するため、
+/// caller は out_dim がこれを超える層では generic `bias_grad` に fall back する。
+pub(crate) const DENSE_BIAS_GRAD_MAX_OUT: u32 = 256;
+
+/// grid-stride bias-grad reduction (`dense_bias_grad_tiled`) の grid 上限。grid を
+/// 増やすと per-cell の global atomic contention (= gridDim) が増えるため、SM を埋める
+/// 範囲でクランプする。RTX 3080 Ti (80 SM) で block 256 thread を 6 block/SM
+/// (= 1536 thread/SM、full occupancy) 載せる固定値。SM 数の多い GPU では占有率を取り
+/// きれず under-occupy し得る (grid-stride は全 row を覆うので正しさには無関係、
+/// atomic contention / occupancy の trade-off だけが動く)。
+const DENSE_BIAS_GRAD_BLOCKS: u32 = 480;
+
+/// `dense_bias_grad_tiled` の launch config。`block_dim = R * out_dim` で `R` は
+/// `floor(DENSE_BIAS_GRAD_MAX_OUT / out_dim)` を超えない最大 2 冪 (kernel の tree
+/// reduction が `R` を完全に畳める前提、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT` も満たす)。
+/// grid は batch を `R` 行/thread で覆う上限 `ceil(batch / R)` と `DENSE_BIAS_GRAD_BLOCKS`
+/// の小さい方。caller は `1 <= out_dim <= DENSE_BIAS_GRAD_MAX_OUT` を保証する。
+pub(crate) fn cfg_dense_bias_grad(batch: u32, out_dim: u32) -> LaunchConfig {
+    debug_assert!(
+        (1..=DENSE_BIAS_GRAD_MAX_OUT).contains(&out_dim),
+        "cfg_dense_bias_grad requires 1 <= out_dim <= {DENSE_BIAS_GRAD_MAX_OUT}, got {out_dim}"
+    );
+    let cap = (DENSE_BIAS_GRAD_MAX_OUT / out_dim).max(1);
+    let mut r = 1_u32;
+    while r * 2 <= cap {
+        r *= 2;
+    }
+    let block = r * out_dim;
+    let grid = batch.div_ceil(r).clamp(1, DENSE_BIAS_GRAD_BLOCKS);
+    LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// `norm_loss_reduce` 用 2D launch。x = group (`BLOCK_DIM` 単位)、y = pos チャンク
 /// (`group_len` を ~1024 要素/thread 目安で最大 64 分割し atomic 部分和を並列化)。FT の
 /// ように group_len が巨大な層で occupancy を稼ぐのが狙いで、小さい group は y=1。

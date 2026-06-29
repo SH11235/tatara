@@ -1,7 +1,7 @@
 //! Simple アーキ専用 kernel (`simple_*`)。
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU64};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// Simple FP16 FT activation forward (CReLU): f16 FT 出力 + f32 bias → f32 acted。
 ///
@@ -376,6 +376,84 @@ pub fn simple_bias_grad_dual_fp16(
     // oi < ft_dim = block_dim、`DeviceAtomicF32` alignment 共有、atomic add 同士のみ serialize)。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
     cell.fetch_add(acc, AtomicOrdering::Relaxed);
+}
+
+/// Dense 層 (小 out_dim) の bias 勾配 `grad_bias[oi] += Σ_b dy[b][oi]` を grid-stride の
+/// per-column register 累積 + shared-mem tree reduction で求める。
+///
+/// 素朴版 ([`super::layerstack::bias_grad`]) は 1 thread = 1 `(b, oi)` cell が `grad_bias[oi]`
+/// へ直接 atomic add し、`out_dim` cell に batch 本の atomicAdd が集中する (batch-way
+/// contention)。out_dim が小さい dense 層では SM がほぼ atomic 直列化待ちになる。
+///
+/// 集約構造: thread `oi = tid % out_dim` が出力 `oi` を専有し、`r = tid / out_dim`
+/// (block あたり `R = block_dim / out_dim` thread/列) が grid-stride で担当 row を register
+/// 累積する。block 内で R 個の部分和を shared-mem tree reduction (r 軸を半分ずつ畳む) で 1 本に
+/// し、`grad_bias[oi]` への global atomic を block あたり 1 回に減らす。contention は
+/// `batch * out_dim` → `gridDim * out_dim`。各 iteration で block の R 行 × out_dim 列が連続
+/// `block_dim` cell (`dy[block_base + tid]`) を読むため coalesced を保つ。
+///
+/// register 累積 → tree reduction → block 跨ぎ atomic で同じ項を別順序に足すため FP32
+/// 加算の非結合性で最下位 bit が変わり得る (素朴版の global atomic も順序非決定)。和の値は
+/// 同一で、全部分和が 2^24 未満に収まる整数値入力では各 f32 加算が exact かつ順序非依存に
+/// なり CPU 参照と bit 一致する (単体テストがこの条件下で exact 検証)。`grad_bias` は
+/// 呼出前に host が 0 reset 済。
+///
+/// caller invariant: `block_dim % out_dim == 0`、`R = block_dim / out_dim` は 2 冪 (tree
+/// reduction が R を完全に畳める前提)、`block_dim <= 256` (`PARTIAL` 固定容量、ゆえに
+/// `out_dim <= 256`)。
+#[kernel]
+pub fn dense_bias_grad_tiled(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+    use core::ptr::addr_of_mut;
+    // block_dim <= 256 を host が保証。1 KB、occupancy への影響は無視できる。
+    static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
+    let out = out_dim as usize;
+    let oi = tid % out;
+    let r = tid / out;
+    // R = block_dim / out_dim: 1 列あたりの thread 数。host が block_dim % out_dim == 0 を保証。
+    let rows_per_iter = block_dim / out;
+    let batch_u = batch as usize;
+
+    // grid-stride: block bx の thread (r, oi) は row {bx*R + r, + gridDim*R, ...} を担当。
+    let grid = thread::gridDim_x() as usize;
+    let stride = grid * rows_per_iter;
+    let mut row = thread::blockIdx_x() as usize * rows_per_iter + r;
+    let mut acc = 0.0_f32;
+    while row < batch_u {
+        acc += dy[row * out + oi];
+        row += stride;
+    }
+
+    let partial_ptr: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+    unsafe {
+        partial_ptr.add(tid).write(acc);
+    }
+    thread::sync_threads();
+
+    // r 軸の tree reduction: stride を半分ずつ畳む。partner は同 oi の `r + s` 行
+    // (`tid + s * out`)。R が 2 冪なので s=R/2..1 で R 本の部分和が r==0 に集まる。
+    let mut s = rows_per_iter / 2;
+    while s >= 1 {
+        if r < s {
+            let v = unsafe { partial_ptr.add(tid).read() + partial_ptr.add(tid + s * out).read() };
+            unsafe {
+                partial_ptr.add(tid).write(v);
+            }
+        }
+        thread::sync_threads();
+        s /= 2;
+    }
+
+    // r==0 の thread (tid < out_dim) が列 oi の block 総和を持つ。block あたり 1 atomic。
+    if r == 0 {
+        let v = unsafe { partial_ptr.add(tid).read() };
+        // SAFETY: `grad_bias.len() == out_dim` を host が保証、`oi < out_dim`。`f32` (align 4) と
+        // `DeviceAtomicF32` は同 alignment。本 kernel 起動中に `grad_bias` を non-atomic で書く
+        // path は無く、atomic add 同士は GPU が serialize する。
+        let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
+        cell.fetch_add(v, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +

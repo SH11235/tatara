@@ -745,6 +745,109 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// `dense_bias_grad_tiled` (grid-stride per-column register 累積 + shared-mem tree reduction)
+/// が `Σ_b dy[b][oi]` の CPU 参照と一致する。dy を整数値かつ全部分和が 2^24 未満 (各
+/// |dy| <= 6) に収め、f32 加算を exact・順序非依存にして **bit 一致** で検証する。
+/// grid-stride の partial (grid*R が batch を割り切らない) / idle thread (grid*R > batch) /
+/// 単一 block grid-stride / R=1 (reduction loop skip) ・2・4・8・16・256 / out_dim
+/// 1・16・32・64・128・256 (block_dim 上限) を網羅。末尾は本番 helper `cfg_dense_bias_grad`
+/// の config でも一致することを確認する。
+#[test]
+fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    // (batch, out_dim, grid, R): block_dim = R * out_dim、R は 2 冪。
+    for &(batch, out_dim, grid, r) in &[
+        (5usize, 1u32, 2u32, 4u32), // idle threads (grid*R=8 > batch)、out=1
+        (1000, 1, 1, 256),          // 単一 block grid-stride、out=1
+        (1000, 1, 7, 256),          // idle threads、out=1 reduction
+        (5, 16, 1, 8),              // 小 batch、out=16
+        (300, 16, 4, 16),           // R=16、partial
+        (130, 32, 3, 8),            // partial (130 % (grid*R=24) != 0)、out=32
+        (256, 64, 5, 4),            // out=64、R=4
+        (300, 128, 4, 2),           // out=128、R=2 (tree reduction 1 step)
+        (513, 256, 3, 1),           // out=256、R=1 (reduction loop skip、block_dim 上限)
+        (4096, 32, 240, 8),         // 多 block、out=32
+        (65536, 1, 240, 256),       // 本番 L3 shape
+        (65536, 32, 240, 8),        // 本番 L1/L2 shape
+    ] {
+        let n = batch * out_dim as usize;
+        let dy: Vec<f32> = (0..n).map(|i| ((i % 13) as i32 - 6) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; out_dim as usize];
+        bias_grad_cpu(&dy, &mut gb_cpu, batch, out_dim as usize);
+
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
+        let block = r * out_dim;
+        cuda_launch! {
+            kernel: dense_bias_grad_tiled, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            gb_dev.to_host_vec(&stream)?,
+            gb_cpu,
+            "dense_bias_grad_tiled b={batch} out={out_dim} grid={grid} r={r}"
+        );
+    }
+
+    for &(batch, out_dim) in &[(65536u32, 1u32), (65536, 32), (4096, 32), (1024, 256)] {
+        let n = batch as usize * out_dim as usize;
+        let dy: Vec<f32> = (0..n).map(|i| ((i % 13) as i32 - 6) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; out_dim as usize];
+        bias_grad_cpu(&dy, &mut gb_cpu, batch as usize, out_dim as usize);
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
+        cuda_launch! {
+            kernel: dense_bias_grad_tiled, stream: stream, module: module,
+            config: cfg_dense_bias_grad(batch, out_dim),
+            args: [slice(dy_dev), slice(gb_dev), batch, out_dim]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            gb_dev.to_host_vec(&stream)?,
+            gb_cpu,
+            "dense_bias_grad_tiled(helper) b={batch} out={out_dim}"
+        );
+    }
+    Ok(())
+}
+
+/// `cfg_dense_bias_grad` が kernel の不変条件 (`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`、
+/// `block_dim % out_dim == 0`、`R = block_dim / out_dim` は 2 冪、`grid >= 1`) を out_dim
+/// の全許容域 (1..=256) で満たすことを確認する。これを破ると kernel が shared `PARTIAL`
+/// を OOB write し得る (caller は out_dim > 256 で generic `bias_grad` に fall back する)。
+#[test]
+fn cfg_dense_bias_grad_invariants() {
+    for out_dim in 1..=DENSE_BIAS_GRAD_MAX_OUT {
+        let cfg = cfg_dense_bias_grad(65536, out_dim);
+        let block = cfg.block_dim.0;
+        let grid = cfg.grid_dim.0;
+        assert!(
+            block <= DENSE_BIAS_GRAD_MAX_OUT,
+            "out_dim={out_dim} block={block} exceeds shared PARTIAL capacity"
+        );
+        assert_eq!(
+            block % out_dim,
+            0,
+            "out_dim={out_dim} block={block} not divisible"
+        );
+        let r = block / out_dim;
+        assert!(
+            r.is_power_of_two(),
+            "out_dim={out_dim} R={r} not power of two"
+        );
+        // R は floor(MAX/out_dim) を超えない最大 2 冪であること (R=1 へ縮退して occupancy を
+        // 落とす実装を弾く)。cap は out_dim in 1..=256 で >= 1。
+        let cap = DENSE_BIAS_GRAD_MAX_OUT / out_dim;
+        assert!(
+            r <= cap && 2 * r > cap,
+            "out_dim={out_dim} R={r} not largest pow2 <= {cap}"
+        );
+        assert!(grid >= 1, "out_dim={out_dim} grid={grid} must be >= 1");
+    }
+}
+
 /// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
 /// tolerance 内で一致することを確認。out_dim (= l1_out) を 16 / 16 倍数 / 非倍数 /
 /// 上限 256 で網羅する。

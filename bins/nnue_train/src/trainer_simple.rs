@@ -1284,8 +1284,9 @@ impl SimpleGpuTrainer {
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
 
-        // bias_grad は atomic add で累積するため host で 0 初期化必須。`ft_w_grad` は
-        // 後段の `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
+        // bias grad kernel (`dense_bias_grad_tiled` / `simple_bias_grad_dual`) は atomic add で
+        // 累積するため host で 0 初期化必須。`ft_w_grad` は後段の
+        // `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
         // iter 0 = stm) が全 `(feature, ri)` cell を書き切るため reset 不要。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
@@ -1328,8 +1329,8 @@ impl SimpleGpuTrainer {
             )?;
         }
         cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(b),
+            kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+            config: cfg_dense_bias_grad(b_u32, 1),
             args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
         }?;
         tick("L3_dense", &self.stream, &mut prof_t0)?;
@@ -1386,11 +1387,22 @@ impl SimpleGpuTrainer {
                 self.l2_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(l2_n),
-            args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
-        }?;
+        // `dense_bias_grad_tiled` の shared PARTIAL 容量 (block_dim <= 256) を超える out_dim
+        // (`--arch`/`--l3` で l2_out > 256 を指定した層) では任意幅で動く generic `bias_grad`
+        // に fall back する。常用 arch は l2_out <= 256 で tiled path を通る。
+        if l2_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                config: cfg_dense_bias_grad(b_u32, l2_out_u32),
+                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l2_n),
+                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            }?;
+        }
         tick("L2_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
@@ -1445,11 +1457,20 @@ impl SimpleGpuTrainer {
                 self.l1_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_grad, stream: self.stream, module: self.module,
-            config: cfg_1d(l1_n),
-            args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
-        }?;
+        // l2_out と同じく out_dim > 256 では generic `bias_grad` に fall back する。
+        if l1_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                config: cfg_dense_bias_grad(b_u32, l1_out_u32),
+                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: bias_grad, stream: self.stream, module: self.module,
+                config: cfg_1d(l1_n),
+                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            }?;
+        }
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
         // ---- Concat inverse + activation grad の融合 ----
