@@ -379,7 +379,11 @@ impl SimpleGpuTrainer {
         // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
         // invariant を成立させる。
         debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
-        let stream = ctx.default_stream();
+        // 専用 non-blocking stream。per-context default (legacy null) stream は
+        // CUDA stream capture を開始できないため、graph 化の前提として全 compute を
+        // 専用 stream に乗せる。cross-stream 依存 (入力 H2D の copy stream / loss D2H)
+        // は event で明示順序付けしているため non-blocking でも安全。
+        let stream = ctx.new_stream()?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         // `tf32` (CLI の `--tf32`) で cuBLAS math mode 切替。default OFF は
         // `CUBLAS_DEFAULT_MATH` (純 FP32 path、L1/L2/L3 dense Sgemm bit-identical)。
@@ -696,7 +700,7 @@ impl SimpleGpuTrainer {
     /// [`InputUploadRing`] で `ws.{stm,nstm}_idx_dev` / `ws.{score,wdl}_dev` への H2D
     /// を queue 済とみなし、本 method 内では H2D を発行しない (compute stream は ring
     /// の `h2d_done` event 経由で H2D 完了を既に待つ)。`false` のとき (`forward` /
-    /// `validate` 経路) は同期 H2D を default stream 上で発行する。
+    /// `validate` 経路) は同期 H2D を compute stream 上で発行する。
     pub(crate) fn run_forward_kernels(
         &mut self,
         batch: &BatchData,
@@ -736,7 +740,7 @@ impl SimpleGpuTrainer {
         let l2_out_u32 = self.id.l2_out as u32;
         let ft_n = b * self.id.ft_out;
 
-        // -- H2D upload (default stream 上の async memcpy、launch 列に直列で並ぶ) --
+        // -- H2D upload (compute stream 上の async memcpy、launch 列に直列で並ぶ) --
         // ring 経路では caller (= `step`) が swap + `input_ring.upload_simple` で
         // copy stream に H2D を発行済で、`compute_stream.wait(h2d_done)` で本 stream に
         // 完了待ちが乗っているため、ここでの H2D は不要。
