@@ -700,7 +700,10 @@ pub fn dense_mm_bwd_input_tiled(
     in_dim: u32,
     out_dim: u32,
 ) {
-    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_IN × TILE_OUT (16×16)
+    // W_TILE[ii_local][o] は row stride 17 で pad する。reduction の FMA read
+    // `W_TILE[tid_i * 17 + o]` は tid_i (in-index) が warp 内で変化するため、stride 16 だと
+    // 16 lane が 2 bank に集中して 8-way bank conflict になる。stride 17 で 16 bank に散る。
+    static mut W_TILE: SharedArray<f32, 272> = SharedArray::UNINIT; // 16 ii × (16 o + 1 pad)
     static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // TILE_B × TILE_OUT (16×16)
 
     let tid_local = thread::threadIdx_x() as usize;
@@ -733,10 +736,10 @@ pub fn dense_mm_bwd_input_tiled(
     while ot < n_out_tiles {
         let o_load = (ot << 4) + tid_i;
         unsafe {
-            // W_TILE[ii_local * 16 + o] = w[(ii_start + ii_local) * out_dim + (ot*16 + o)]。
+            // W_TILE[ii_local * 17 + o] = w[(ii_start + ii_local) * out_dim + (ot*16 + o)]。
             // tid 0..31 内で 16-thread sub-group が 16 連続 o を読む → coalesced。
             let ii_global_load = ii_start + tid_b;
-            W_TILE[tid_local] = if ii_global_load < in_dim_u && o_load < out_dim_u {
+            W_TILE[tid_b * 17 + tid_i] = if ii_global_load < in_dim_u && o_load < out_dim_u {
                 w[ii_global_load * out_dim_u + o_load]
             } else {
                 0.0_f32
@@ -755,7 +758,7 @@ pub fn dense_mm_bwd_input_tiled(
             let mut o: usize = 0;
             while o < 16 {
                 unsafe {
-                    acc += DY_TILE[(tid_b << 4) | o] * W_TILE[(tid_i << 4) | o];
+                    acc += DY_TILE[(tid_b << 4) | o] * W_TILE[tid_i * 17 + o];
                 }
                 o += 1;
             }
@@ -1683,7 +1686,8 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
 /// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
 /// (`exclusive_scan_aligned` 経由) を保証する前提。block 内全 TILE_B = 16 row は同一 bucket
 /// (uniform-by-construction、boundary block は存在しない)、per-K-tile の W_TILE shared-mem
-/// は 1 bucket 分 (16 × 16 = 256 cell) のみ load する分岐なし実装。padding 行は
+/// は 1 bucket 分 (16 oi × 16 k、shared は bank conflict 回避で row stride 17) のみ load する
+/// 分岐なし実装。sorted padding 行は
 /// `bucket_idx = -1` で kernel が y=0 を書き、後段の inverse permute が perm=-1 sentinel で
 /// skip して original 配列には戻らない。
 ///
@@ -1708,7 +1712,10 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
     num_buckets: u32,
 ) {
     static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
-    static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 1 bucket × 16 oi × 16 k
+    // W_TILE[oi_local][k] は row stride 17 で pad する。reduction の FMA read
+    // `W_TILE[tid_o * 17 + k]` は tid_o (output-index) が warp 内で変化するため、stride 16 だと
+    // 16 lane が 2 bank に集中して 8-way bank conflict になる。stride 17 で 16 bank に散る。
+    static mut W_TILE: SharedArray<f32, 272> = SharedArray::UNINIT; // 1 bucket × 16 oi × (16 k + 1 pad)
 
     let tid_local = thread::threadIdx_x() as usize;
     let block_b = thread::blockIdx_x() as usize;
@@ -1765,7 +1772,7 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
             } else {
                 0.0_f32
             };
-            W_TILE[(oi_local << 4) | k_local] = val;
+            W_TILE[oi_local * 17 + k_local] = val;
         }
         thread::sync_threads();
 
@@ -1773,7 +1780,7 @@ pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
             let mut k: usize = 0;
             while k < 16 {
                 unsafe {
-                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[(tid_o << 4) | k];
+                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[tid_o * 17 + k];
                 }
                 k += 1;
             }
