@@ -311,7 +311,9 @@ pub(crate) struct GpuWorkspace {
 
     // -- inverse-index sparse_ft_backward scratch (sized by feature set) --
     feat_counts: DeviceBuffer<u32>, // ft_in: per-feature histogram (atomic build)
-    feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum
+    feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum (multi-block scan)
+    feat_block_sums: DeviceBuffer<u32>, // ceil(ft_in/1024): scan level 1 per-block total
+    feat_block_offsets: DeviceBuffer<u32>, // ceil(ft_in/1024)+1: scan level 2 (block totals)
     feat_write_ctr: DeviceBuffer<u32>, // ft_in: scatter atomic counter
     feat_positions: DeviceBuffer<u32>, // up to batch * max_active: sorted positions
 
@@ -428,6 +430,8 @@ impl GpuWorkspace {
             dft_nstm_out: z(ft_act_f32_n)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024))?,
+            feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
@@ -2769,7 +2773,26 @@ impl GpuTrainer {
                 ]
             }?;
             prof_tick!("phA_count");
-            // B: exclusive_prefix_sum_small (1 block × 1024 threads, ft_in ≈ 73K)
+            // B: feat_counts の exclusive prefix sum (multi-block scan で全 SM を使う)。
+            // 単一 block scan は 1 SM 律速 (ft_in ≈ 73K-138K で大半 idle) のため 3 段に分割。
+            let prefix_blocks = ft_in.div_ceil(1024) as u32;
+            // level 1: 各 block が連続 1024 要素を block-local scan、block 総和を emit。
+            cuda_launch! {
+                kernel: prefix_sum_block_local,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
+                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_offsets),
+                    slice(self.ws.feat_block_sums),
+                    ft_in as u32
+                ]
+            }?;
+            // level 2: block 総和列 (prefix_blocks ≲ 135 要素) を単一 block で scan。
             cuda_launch! {
                 kernel: exclusive_prefix_sum_small,
                 stream: self.stream, module: self.module,
@@ -2779,9 +2802,25 @@ impl GpuTrainer {
                     shared_mem_bytes: 0,
                 },
                 args: [
-                    slice(self.ws.feat_counts),
+                    slice(self.ws.feat_block_sums),
+                    slice(self.ws.feat_block_offsets),
+                    prefix_blocks
+                ]
+            }?;
+            // level 3: block-local offsets へ block offset を加算 + offsets[n]=total。
+            cuda_launch! {
+                kernel: prefix_sum_add_block_offset,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (prefix_blocks, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [
                     slice(self.ws.feat_offsets),
-                    ft_in as u32
+                    slice(self.ws.feat_block_offsets),
+                    ft_in as u32,
+                    prefix_blocks
                 ]
             }?;
             prof_tick!("phB_psum");

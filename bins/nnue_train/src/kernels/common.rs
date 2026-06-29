@@ -1140,8 +1140,10 @@ pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u3
     }
 }
 
-/// Phase 2 of inverse-index: exclusive prefix sum over `counts[0..n]` → `offsets[0..=n]`。
-/// 73K elements、1 block × 1024 threads で **並列** Hillis-Steele scan:
+/// Exclusive prefix sum over `counts[0..n]` → `offsets[0..=n]`、単一 block × 1024
+/// threads の **並列** Hillis-Steele scan (小 `n` 用)。inverse-index pipeline では
+/// multi-block scan の level 2 = block 総和列 (`num_blocks` ≲ 135 要素) の scan に使う
+/// (feature 数本体の分割は [`prefix_sum_block_local`] / [`prefix_sum_add_block_offset`])。
 /// 1. 各 thread が n/1024 個の chunk を直列和算 → shared PARTIALS[tid] (per-thread total)
 /// 2. block 内で PARTIALS の exclusive scan (sync_threads × log2(1024) = 10 round)
 /// 3. 各 thread が chunk_offset を起点に再走査して `offsets[j]` を書き出す
@@ -1218,6 +1220,105 @@ pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
     if tid == block_dim_u - 1 {
         unsafe {
             out_ptr.add(n_u).write(acc);
+        }
+    }
+}
+
+/// Phase 2 of inverse-index, multi-block scan level 1: 各 block が `counts` の連続
+/// `blockDim` 要素 (`blockIdx*blockDim ..`) を block 内 exclusive scan し、**block 内
+/// local** な exclusive 値を `offsets` へ書く (block をまたぐ global offset は level 3
+/// `prefix_sum_add_block_offset` で加算)。block の総和を `block_sums[blockIdx]` へ emit。
+/// 単一 block scan ([`exclusive_prefix_sum_small`]) が 1 SM しか使えず大 `n` で律速に
+/// なるため、feature 数を block 群へ分割して全 SM を使う。
+///
+/// host: block_dim=(1024,1,1), grid_dim=(num_blocks,1,1)、num_blocks=ceil(n/1024)。
+#[kernel]
+pub fn prefix_sum_block_local(counts: &[u32], offsets: &[u32], block_sums: &[u32], n: u32) {
+    static mut PARTIALS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let blk = thread::blockIdx_x() as usize;
+    let idx = blk * block_dim_u + tid;
+    let n_u = n as usize;
+
+    // 範囲外 thread は 0 を寄与 (末尾 block の partial 対応)。
+    let val: u32 = if idx < n_u { counts[idx] } else { 0 };
+    unsafe {
+        PARTIALS[tid] = val;
+    }
+    thread::sync_threads();
+
+    // Hillis-Steele inclusive scan
+    let mut offset_step: usize = 1;
+    while offset_step < block_dim_u {
+        let add: u32 = if tid >= offset_step {
+            unsafe { PARTIALS[tid - offset_step] }
+        } else {
+            0
+        };
+        thread::sync_threads();
+        unsafe {
+            PARTIALS[tid] += add;
+        }
+        thread::sync_threads();
+        offset_step <<= 1;
+    }
+
+    // 自要素の block-local exclusive 値 (= 1 つ前の inclusive)。
+    let excl: u32 = if tid == 0 {
+        0
+    } else {
+        unsafe { PARTIALS[tid - 1] }
+    };
+    if idx < n_u {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            out_ptr.add(idx).write(excl);
+        }
+    }
+    // block 総和 = inclusive scan 最終値。tid=block_dim-1 が代表して書く。
+    if tid == block_dim_u - 1 {
+        let bs_ptr = block_sums.as_ptr() as *mut u32;
+        unsafe {
+            bs_ptr.add(blk).write(PARTIALS[block_dim_u - 1]);
+        }
+    }
+}
+
+/// Phase 2 of inverse-index, multi-block scan level 3: [`prefix_sum_block_local`] が
+/// 書いた block-local exclusive offsets に、level 2 で求めた `block_offsets[blockIdx]`
+/// (先行 block 群の総和) を in-place 加算し global exclusive prefix sum を確定する。
+/// `offsets[n]` (= 全総和 = `block_offsets[num_blocks]`) も 1 thread が書く。
+///
+/// host: block_dim=(1024,1,1), grid_dim=(num_blocks,1,1)。`block_offsets` は
+/// `block_sums` を [`exclusive_prefix_sum_small`] で scan した `num_blocks+1` 要素。
+#[kernel]
+pub fn prefix_sum_add_block_offset(
+    offsets: &[u32],
+    block_offsets: &[u32],
+    n: u32,
+    num_blocks: u32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim_u = thread::blockDim_x() as usize;
+    let blk = thread::blockIdx_x() as usize;
+    let idx = blk * block_dim_u + tid;
+    let n_u = n as usize;
+
+    let add = block_offsets[blk];
+    if idx < n_u {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            let p = out_ptr.add(idx);
+            p.write(p.read() + add);
+        }
+    }
+    // 全総和を offsets[n] へ。block 0 の tid 0 が代表。
+    if blk == 0 && tid == 0 {
+        let out_ptr = offsets.as_ptr() as *mut u32;
+        unsafe {
+            out_ptr.add(n_u).write(block_offsets[num_blocks as usize]);
         }
     }
 }

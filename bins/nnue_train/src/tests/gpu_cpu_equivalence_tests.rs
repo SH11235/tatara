@@ -2869,6 +2869,48 @@ fn exclusive_prefix_sum_small_matches_cpu() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// multi-block exclusive scan (`prefix_sum_block_local` → `exclusive_prefix_sum_small`
+/// → `prefix_sum_add_block_offset`) が単一 block scan と同じ exclusive prefix sum を
+/// 出す。1024 倍数でない n / block 跨ぎ / 末尾 partial block を含めて u32 完全一致を照合。
+#[test]
+fn prefix_sum_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &n in &[1_usize, 1023, 1024, 1025, 73_305, 125_388] {
+        let counts: Vec<u32> = (0..n).map(|i| ((i * 13 + 5) % 7) as u32).collect();
+        let mut offsets_cpu = vec![0_u32; n + 1];
+        for i in 0..n {
+            offsets_cpu[i + 1] = offsets_cpu[i] + counts[i];
+        }
+        let num_blocks = n.div_ceil(1024);
+        let counts_dev = DeviceBuffer::from_host(&stream, &counts)?;
+        let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
+        let block_sums_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks)?;
+        let block_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks + 1)?;
+        cuda_launch! {
+            kernel: prefix_sum_block_local, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), slice(block_sums_dev), n as u32]
+        }?;
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(block_sums_dev), slice(block_offsets_dev), num_blocks as u32]
+        }?;
+        cuda_launch! {
+            kernel: prefix_sum_add_block_offset, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(offsets_dev), slice(block_offsets_dev), n as u32, num_blocks as u32]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(
+            offsets_dev.to_host_vec(&stream)?,
+            offsets_cpu,
+            "prefix_sum_multiblock n={n}"
+        );
+    }
+    Ok(())
+}
+
 /// inverse-index pipeline (count → prefix sum → scatter → gather) の合成が素朴
 /// atomic scatter reference `sparse_ft_backward_cpu` と一致することを確認する。
 /// trainer と同じく stm を overwrite 版・nstm を add 版で 2 周し ft_w_grad に合算
