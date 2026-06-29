@@ -754,7 +754,8 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
 /// の config でも一致することを確認する。
 #[test]
 fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
-    let (_ctx, module, stream) = open_module()?;
+    let (ctx, module, stream) = open_module()?;
+    let occ = DeviceOccupancy::query(&ctx)?;
     // (batch, out_dim, grid, R): block_dim = R * out_dim、R は 2 冪。
     for &(batch, out_dim, grid, r) in &[
         (5usize, 1u32, 2u32, 4u32), // idle threads (grid*R=8 > batch)、out=1
@@ -800,7 +801,7 @@ fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
         cuda_launch! {
             kernel: dense_bias_grad_tiled, stream: stream, module: module,
-            config: cfg_dense_bias_grad(batch, out_dim),
+            config: cfg_dense_bias_grad(occ, batch, out_dim),
             args: [slice(dy_dev), slice(gb_dev), batch, out_dim]
         }?;
         stream.synchronize()?;
@@ -813,39 +814,76 @@ fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// `cfg_dense_bias_grad` が kernel の不変条件 (`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`、
-/// `block_dim % out_dim == 0`、`R = block_dim / out_dim` は 2 冪、`grid >= 1`) を out_dim
-/// の全許容域 (1..=256) で満たすことを確認する。これを破ると kernel が shared `PARTIAL`
-/// を OOB write し得る (caller は out_dim > 256 で generic `bias_grad` に fall back する)。
+/// `cfg_dense_bias_grad` の launch geometry を検証する。out_dim の全許容域 (1..=256) で
+/// kernel の構造不変条件 (`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`、`block_dim % out_dim == 0`、
+/// `R = block_dim / out_dim` は 2 冪) を満たし、かつ grid が
+/// `min(ceil(batch / R), sm_count * floor(max_threads_per_sm / block_dim))` と**厳密一致**
+/// すること (固定値や定数 1 へ縮退する回帰を弾く) を、SM 数の異なる複数 device 形状で
+/// 確認する。構造不変条件を破ると kernel が shared `PARTIAL` を OOB write し得る (caller は
+/// out_dim > 256 で generic `bias_grad` に fall back する)。
 #[test]
 fn cfg_dense_bias_grad_invariants() {
-    for out_dim in 1..=DENSE_BIAS_GRAD_MAX_OUT {
-        let cfg = cfg_dense_bias_grad(65536, out_dim);
-        let block = cfg.block_dim.0;
-        let grid = cfg.grid_dim.0;
-        assert!(
-            block <= DENSE_BIAS_GRAD_MAX_OUT,
-            "out_dim={out_dim} block={block} exceeds shared PARTIAL capacity"
-        );
-        assert_eq!(
-            block % out_dim,
-            0,
-            "out_dim={out_dim} block={block} not divisible"
-        );
-        let r = block / out_dim;
-        assert!(
-            r.is_power_of_two(),
-            "out_dim={out_dim} R={r} not power of two"
-        );
-        // R は floor(MAX/out_dim) を超えない最大 2 冪であること (R=1 へ縮退して occupancy を
-        // 落とす実装を弾く)。cap は out_dim in 1..=256 で >= 1。
-        let cap = DENSE_BIAS_GRAD_MAX_OUT / out_dim;
-        assert!(
-            r <= cap && 2 * r > cap,
-            "out_dim={out_dim} R={r} not largest pow2 <= {cap}"
-        );
-        assert!(grid >= 1, "out_dim={out_dim} grid={grid} must be >= 1");
+    const BATCH: u32 = 65536;
+    // (sm_count, max_threads_per_sm): RTX 3080 Ti / RTX 5090 (どちらも実測値) / 極小 SM。
+    for &(sm_count, max_threads_per_sm) in &[(80u32, 1536u32), (170, 1536), (1, 1536)] {
+        let occ = DeviceOccupancy::from_counts(sm_count, max_threads_per_sm);
+        for out_dim in 1..=DENSE_BIAS_GRAD_MAX_OUT {
+            let cfg = cfg_dense_bias_grad(occ, BATCH, out_dim);
+            let block = cfg.block_dim.0;
+            let grid = cfg.grid_dim.0;
+            assert!(
+                block <= DENSE_BIAS_GRAD_MAX_OUT,
+                "out_dim={out_dim} block={block} exceeds shared PARTIAL capacity"
+            );
+            assert_eq!(
+                block % out_dim,
+                0,
+                "out_dim={out_dim} block={block} not divisible"
+            );
+            let r = block / out_dim;
+            assert!(
+                r.is_power_of_two(),
+                "out_dim={out_dim} R={r} not power of two"
+            );
+            // R は floor(MAX/out_dim) を超えない最大 2 冪であること (R=1 へ縮退して occupancy を
+            // 落とす実装を弾く)。cap は out_dim in 1..=256 で >= 1。
+            let cap = DENSE_BIAS_GRAD_MAX_OUT / out_dim;
+            assert!(
+                r <= cap && 2 * r > cap,
+                "out_dim={out_dim} R={r} not largest pow2 <= {cap}"
+            );
+            // grid は formula 値と厳密一致する (定数や SM 非依存の固定値へ縮退しない
+            // ことを保証)。SM 占有を埋める cap と batch 被覆 cap の小さい方。oracle は
+            // 本番 `DeviceOccupancy::fill_blocks` と同じ境界条件 (block.max(1) / per_sm.max(1) /
+            // saturating_mul / 全体 max(1)) で計算し、`clamp(1, fill)` が `min > max` で panic
+            // しない・overflow しないことを保証する。
+            let per_sm = (max_threads_per_sm / block.max(1)).max(1);
+            let fill = sm_count.saturating_mul(per_sm).max(1);
+            let expected = BATCH.div_ceil(r).clamp(1, fill);
+            assert_eq!(
+                grid, expected,
+                "sm={sm_count} out_dim={out_dim} grid={grid} != expected {expected}"
+            );
+        }
     }
+
+    // 文書化した代表 shape の grid を直接固定する (実機 launch geometry の回帰ガード)。
+    let occ_3080ti = DeviceOccupancy::from_counts(80, 1536);
+    let occ_5090 = DeviceOccupancy::from_counts(170, 1536);
+    // L1/L2 (out_dim=32, block_dim=256): SM 占有 cap = sm * floor(1536/256) = sm * 6。
+    // 3080 Ti = 480、5090 = 1020。
+    assert_eq!(cfg_dense_bias_grad(occ_3080ti, BATCH, 32).grid_dim.0, 480);
+    assert_eq!(cfg_dense_bias_grad(occ_5090, BATCH, 32).grid_dim.0, 1020);
+    // L3 (out_dim=1, block_dim=256): R=256 で batch 被覆 cap = ceil(65536/256) = 256 が
+    // SM cap より小さく、どちらの device も 256 (batch 律速で不変)。
+    assert_eq!(cfg_dense_bias_grad(occ_3080ti, BATCH, 1).grid_dim.0, 256);
+    assert_eq!(cfg_dense_bias_grad(occ_5090, BATCH, 1).grid_dim.0, 256);
+    // SM 数が増えれば cap も比例して上がる (特定 GPU 固定値へ縮退しないことの明示確認)。
+    assert!(
+        cfg_dense_bias_grad(occ_5090, BATCH, 32).grid_dim.0
+            > cfg_dense_bias_grad(occ_3080ti, BATCH, 32).grid_dim.0,
+        "larger SM count must raise the grid cap"
+    );
 }
 
 /// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
