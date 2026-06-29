@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use cuda_core::IntoResult as _;
 use cuda_host::cuda_launch;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
@@ -349,15 +350,57 @@ pub(crate) struct SimpleGpuTrainer {
     /// 推論時の評価値スケール (`round(QA * QB / 学習 scale)`)。量子化 checkpoint
     /// 出力の arch 文字列に書く (`SimpleWeights::fv_scale`)。
     fv_scale: i32,
+
+    /// 入力 double-buffer の parity 別に capture した forward+backward graph。
+    /// `graph_step % 2` で選ぶ (入力 buffer の swap は step ごとに無条件なので
+    /// parity と物理 buffer が一致する)。`None` は未 capture。
+    step_graphs: [Option<StepGraph>; 2],
+    /// graph を使う full batch size。最初の step (eager warmup) の batch 数で確定し、
+    /// 以降 `b` がこれと一致する step だけ graph 化する (partial batch は eager)。
+    graph_batch_size: usize,
+    /// step ごとに増える counter。`% 2` で parity、`== 0` で warmup 判定に使う。
+    graph_step: usize,
 }
 
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
         // device buffer 解放前に compute / copy 両 stream の in-flight 操作を排出する
         // (GpuTrainer と同じ規約: field drop 順による race を回避)。`input_ring` の
-        // copy stream H2D が `ws` の入力 buffer を write 中の解放を防ぐため。
+        // copy stream H2D が `ws` の入力 buffer を write 中の解放を防ぐため。in-flight
+        // graph launch もこの sync で完了するので、後続の `step_graphs` field drop
+        // (`StepGraph::drop` が graph/exec を破棄) は安全。
         let _ = self.stream.synchronize();
         let _ = self.input_ring.copy_stream.synchronize();
+    }
+}
+
+/// forward+backward kernel 列を capture した CUDA graph と、その実行可能 instance。
+/// 入力 double-buffer の parity ごとに 1 個持ち、同じ `wdl_lambda` の step では
+/// replay する。raw CUDA handle は本型が単独所有し、`Drop` で破棄する。
+struct StepGraph {
+    graph: cuda_core::sys::CUgraph,
+    exec: cuda_core::sys::CUgraphExec,
+    /// capture 時の `wdl_lambda`。loss kernel に焼かれるため、異なる値の step では
+    /// この graph を捨てて再 capture する (WDL schedule 対応、node patch 不要)。
+    captured_wdl: f32,
+}
+
+// SAFETY: `graph` / `exec` は raw CUDA handle。所有は `StepGraph` 単独で、全アクセスは
+// `SimpleGpuTrainer` の `&mut self` method 経由で直列化される (InputUploadRing と同じ理由)。
+unsafe impl Send for StepGraph {}
+
+impl Drop for StepGraph {
+    fn drop(&mut self) {
+        // exec を先に破棄してから graph。in-flight launch は caller (SimpleGpuTrainer::drop)
+        // の stream sync で完了済みである前提。
+        unsafe {
+            if !self.exec.is_null() {
+                let _ = cuda_core::sys::cuGraphExecDestroy(self.exec).result();
+            }
+            if !self.graph.is_null() {
+                let _ = cuda_core::sys::cuGraphDestroy(self.graph).result();
+            }
+        }
     }
 }
 
@@ -520,6 +563,9 @@ impl SimpleGpuTrainer {
             ft_fp16,
             ft_fp16_out,
             fp16_opt_state,
+            step_graphs: [None, None],
+            graph_batch_size: 0,
+            graph_step: 0,
         })
     }
 
@@ -631,29 +677,45 @@ impl SimpleGpuTrainer {
             &batch.wdl[..b],
         )?;
 
-        self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
-        if let Some(ref mut t0) = prof_t0 {
-            self.stream.synchronize()?;
-            let now = std::time::Instant::now();
-            eprintln!(
-                "[step-profile] {:<14} {:8.3} ms",
-                "forward",
-                now.duration_since(*t0).as_secs_f64() * 1000.0
-            );
-            *t0 = now;
-        }
+        // forward + backward。profiling OFF かつ warmup 後・full batch のときは parity
+        // 別 graph を replay (launch overhead 回収)、それ以外は eager。profiling 有効時は
+        // capture 区間に stream.synchronize が混入するため必ず eager。
+        let use_graph = prof_t0.is_none()
+            && std::env::var_os("NNUE_TRAIN_DISABLE_GRAPH").is_none()
+            && self.graph_step >= 1
+            && b == self.graph_batch_size;
+        if use_graph {
+            self.run_forward_backward_graph(batch, wdl_lambda, loss, b)?;
+        } else {
+            self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
+            if let Some(ref mut t0) = prof_t0 {
+                self.stream.synchronize()?;
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[step-profile] {:<14} {:8.3} ms",
+                    "forward",
+                    now.duration_since(*t0).as_secs_f64() * 1000.0
+                );
+                *t0 = now;
+            }
 
-        self.run_backward_kernels(b)?;
-        if let Some(ref mut t0) = prof_t0 {
-            self.stream.synchronize()?;
-            let now = std::time::Instant::now();
-            eprintln!(
-                "[step-profile] {:<14} {:8.3} ms",
-                "backward",
-                now.duration_since(*t0).as_secs_f64() * 1000.0
-            );
-            *t0 = now;
+            self.run_backward_kernels(b)?;
+            if let Some(ref mut t0) = prof_t0 {
+                self.stream.synchronize()?;
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[step-profile] {:<14} {:8.3} ms",
+                    "backward",
+                    now.duration_since(*t0).as_secs_f64() * 1000.0
+                );
+                *t0 = now;
+            }
         }
+        // 最初の (eager) step の batch 数を graph 対象 full batch size として確定する。
+        if self.graph_step == 0 {
+            self.graph_batch_size = b;
+        }
+        self.graph_step += 1;
 
         self.run_optimizer_step(lr)?;
         if let Some(ref mut t0) = prof_t0 {
@@ -690,6 +752,94 @@ impl SimpleGpuTrainer {
         }
 
         Ok(loss)
+    }
+
+    /// forward+backward を parity 別 CUDA graph で実行する。capture 済かつ同
+    /// `wdl_lambda` なら replay、未 capture / WDL 変化なら capture → instantiate →
+    /// launch する。caller (`step`) が直前に `input_ring.upload_simple` で入力 H2D と
+    /// compute stream への h2d 完了待ちを enqueue 済の前提で、capture 区間には H2D を
+    /// 含めない (`inputs_uploaded_externally = true`)。
+    fn run_forward_backward_graph(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+        b: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let parity = self.graph_step % 2;
+
+        // 同 parity・同 WDL の graph があれば replay。
+        if let Some(g) = &self.step_graphs[parity]
+            && g.captured_wdl == wdl_lambda
+        {
+            let exec = g.exec;
+            // SAFETY: exec は instantiate 済の有効な CUgraphExec、self.stream は capture 元
+            // と同一 compute stream。
+            unsafe { cuda_core::sys::cuGraphLaunch(exec, self.stream.cu_stream()).result()? };
+            return Ok(());
+        }
+
+        // WDL が変わった等で stale な graph は捨ててから再 capture する。
+        self.step_graphs[parity] = None;
+
+        // SAFETY: self.stream は専用 non-blocking stream (legacy null stream は capture 不可
+        // の制約を満たす)。THREAD_LOCAL mode は本 host thread の capture 中 unsafe API のみ
+        // 制限する。
+        unsafe {
+            cuda_core::sys::cuStreamBeginCapture_v2(
+                self.stream.cu_stream(),
+                cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()?;
+        }
+
+        // capture 区間: forward + backward を compute stream に enqueue (実行はされない)。
+        // 失敗しても下で必ず EndCapture して capture 状態を終了させる。
+        let fwd = self.run_forward_kernels(batch, wdl_lambda, loss, true);
+        let bwd = if fwd.is_ok() {
+            self.run_backward_kernels(b)
+        } else {
+            Ok(())
+        };
+
+        let mut graph: cuda_core::sys::CUgraph = std::ptr::null_mut();
+        // SAFETY: capture を開始した同一 stream・同一 thread で終了する。
+        let end = unsafe {
+            cuda_core::sys::cuStreamEndCapture(self.stream.cu_stream(), &mut graph).result()
+        };
+        // capture body の error を先に伝播 (EndCapture は実施済)。
+        fwd?;
+        bwd?;
+        end?;
+        if graph.is_null() {
+            return Err(
+                "CUDA stream capture invalidated (null graph) during forward+backward".into(),
+            );
+        }
+
+        // instantiate。失敗時は graph を破棄してから error。
+        let mut exec: cuda_core::sys::CUgraphExec = std::ptr::null_mut();
+        // SAFETY: graph は EndCapture が返した有効な CUgraph、flags=0 は default。
+        let inst =
+            unsafe { cuda_core::sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0).result() };
+        if let Err(e) = inst {
+            // SAFETY: graph は有効、exec は未生成。
+            unsafe {
+                let _ = cuda_core::sys::cuGraphDestroy(graph).result();
+            }
+            return Err(e.into());
+        }
+
+        self.step_graphs[parity] = Some(StepGraph {
+            graph,
+            exec,
+            captured_wdl: wdl_lambda,
+        });
+
+        // capture は実行ではないので、この step 分を launch する。
+        // SAFETY: exec は直上で instantiate 済、self.stream は capture 元 stream。
+        unsafe { cuda_core::sys::cuGraphLaunch(exec, self.stream.cu_stream()).result()? };
+        Ok(())
     }
 
     /// forward kernel 列のみを走らせる (loss は host 同期 read しない)。`forward` /
