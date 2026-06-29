@@ -7,18 +7,20 @@ use cuda_device::{DisjointSlice, kernel, thread};
 ///
 /// `--ft-fp16-out` 経路の融合 kernel。`sparse_ft_forward_fp16_out` の f16 出力
 /// `ft_*_out_h` を直接 read (bias は別 buffer)、bias 加算と CReLU clamp を 1 pass で
-/// 完了して f32 `ft_*_acted` を書く。FP32 path の `bias_add_per_row` + `crelu_fwd`
-/// 2 launch を 1 launch に置き換え、`ft_*_out` (b × ft_dim) の DRAM read を f16 化
-/// して帯域を半減する。
+/// 完了して f32 `combined` の per-perspective 列範囲 (`col_offset`) へ直接書く。FP32
+/// path の `bias_add_per_row` + `crelu_fwd` 2 launch を 1 launch に置き換え、`ft_*_out`
+/// (b × ft_dim) の DRAM read を f16 化して帯域を半減する。
 ///
-/// 1 thread = 1 (batch, row) cell、atomic 不要。`ft_acted` 出力は f32 のまま
-/// (後続 `slice_scatter_2d` / cuBLAS Sgemm が f32 を要求)。bias は perspective 共有
+/// 1 thread = 1 (batch, row) cell、atomic 不要。出力 `combined` は f32 のまま
+/// (cuBLAS Sgemm が f32 を要求、中間 `ft_acted` + `slice_scatter_2d` 段は融合で除去)。bias は perspective 共有
 /// で行内で同じ `ri` を warp 内で共有するため L1 hit pattern が良好。
 #[kernel]
 pub fn simple_bias_act_fwd_fp16_in_crelu(
     ft_out: &[f16],
     bias: &[f32],
-    mut ft_acted: DisjointSlice<f32>,
+    mut combined: DisjointSlice<f32>,
+    combined_stride: u32,
+    col_offset: u32,
     batch: u32,
     ft_dim: u32,
 ) {
@@ -28,6 +30,7 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
     let x = ft_out[tid.get()] as f32 + bias[ri];
     #[allow(clippy::manual_clamp)]
     let y = if x < 0.0_f32 {
@@ -37,8 +40,13 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
     } else {
         x
     };
-    if let Some(o) = ft_acted.get_mut(tid) {
-        *o = y;
+    // combined (batch × combined_stride) の per-perspective 列範囲へ直接 scatter
+    // (中間 ft_acted + slice_scatter_2d の DRAM round-trip を融合で省く)。
+    let idx = bi * (combined_stride as usize) + (col_offset as usize) + ri;
+    // SAFETY: 各 thread が unique (bi, ri) → unique idx に書く。host が
+    // `2*ft_out <= combined_dim` を call site の debug_assert で保証。
+    unsafe {
+        *combined.get_unchecked_mut(idx) = y;
     }
 }
 
@@ -116,7 +124,9 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
 pub fn simple_bias_act_fwd_fp16_in_screlu(
     ft_out: &[f16],
     bias: &[f32],
-    mut ft_acted: DisjointSlice<f32>,
+    mut combined: DisjointSlice<f32>,
+    combined_stride: u32,
+    col_offset: u32,
     batch: u32,
     ft_dim: u32,
 ) {
@@ -126,6 +136,7 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let a = if x < 0.0_f32 {
         0.0_f32
@@ -134,8 +145,13 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
     } else {
         x
     };
-    if let Some(o) = ft_acted.get_mut(tid) {
-        *o = a * a;
+    // combined (batch × combined_stride) の per-perspective 列範囲へ直接 scatter
+    // (中間 ft_acted + slice_scatter_2d の DRAM round-trip を融合で省く)。
+    let idx = bi * (combined_stride as usize) + (col_offset as usize) + ri;
+    // SAFETY: 各 thread が unique (bi, ri) → unique idx に書く。host が
+    // `2*ft_out <= combined_dim` を call site の debug_assert で保証。
+    unsafe {
+        *combined.get_unchecked_mut(idx) = a * a;
     }
 }
 

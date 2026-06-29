@@ -39,10 +39,6 @@ pub(crate) struct SimpleGpuWorkspace {
     ft_stm_out: DeviceBuffer<f32>,
     /// 同 nstm。
     ft_nstm_out: DeviceBuffer<f32>,
-    /// stm bias add + 活性化後 (`b × ft_out`)、concat 元の tmp。
-    ft_stm_acted: DeviceBuffer<f32>,
-    /// 同 nstm。
-    ft_nstm_acted: DeviceBuffer<f32>,
     /// stm/nstm の FT post 出力を concat した L1 dense 入力 (`b × combined_dim`、
     /// CReLU/SCReLU は `2*ft_out`・Pairwise は `ft_out`)。
     combined: DeviceBuffer<f32>,
@@ -153,8 +149,6 @@ impl SimpleGpuWorkspace {
             max_active,
             ft_stm_out: z(batch * ft_out)?,
             ft_nstm_out: z(batch * ft_out)?,
-            ft_stm_acted: z(batch * ft_out)?,
-            ft_nstm_acted: z(batch * ft_out)?,
             combined: z(batch * id.combined_dim())?,
             l1_pre: z(batch * l1_out)?,
             l1_acted: z(batch * l1_out)?,
@@ -858,11 +852,21 @@ impl SimpleGpuTrainer {
 
         // -- FT post = bias add + 活性化 + concat。
         // `ft_fp16_out` 時は f16 `ft_*_out_h` を読む活性化別 kernel で `combined` を作る。
-        // CReLU / SCReLU は f32 `ft_*_acted` を経由して `slice_scatter_2d` で concat、
-        // Pairwise は `ft_post_perspective_fwd_fp16` が両 perspective まとめて `combined`
-        // を直書きする (slice_scatter 不要)。既定 (FP32) 経路は bias_add + 活性化 +
-        // slice_scatter を融合した kernel 群で合成する。
+        // CReLU / SCReLU / Pairwise いずれも活性化 kernel が `combined` の per-perspective
+        // 列範囲 (`col_offset`) へ直接書く (中間 `ft_*_acted` + `slice_scatter_2d` は融合で除去)。
+        // 既定 (FP32) 経路は bias_add + 活性化 + slice_scatter を融合した kernel 群で合成する。
         if self.ft_fp16_out {
+            // CReLU / SCReLU は nstm を `col_offset = ft_out` で combined に直書きするため
+            // `2*ft_out <= combined_dim` (= row stride) が成立しないと OOB write になる。
+            // CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
+            debug_assert!(
+                !matches!(
+                    self.id.activation,
+                    SimpleActivation::CReLU | SimpleActivation::SCReLU
+                ) || 2 * ft_out_u32 <= l1_in_u32,
+                "fp16-out CReLU/SCReLU fwd needs 2*ft_out <= combined_dim (got 2*{ft_out_u32} vs {l1_in_u32})"
+            );
             match self.id.activation {
                 SimpleActivation::CReLU => {
                     let ft_stm_out_h = self
@@ -875,7 +879,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
                         ]
                     }?;
                     let ft_nstm_out_h = self
@@ -888,7 +892,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
                         ]
                     }?;
                 }
@@ -903,7 +907,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_stm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
                         ]
                     }?;
                     let ft_nstm_out_h = self
@@ -916,7 +920,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.ft_nstm_acted), b_u32, ft_out_u32
+                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
                         ]
                     }?;
                 }
@@ -1016,34 +1020,6 @@ impl SimpleGpuTrainer {
             }
         }
 
-        // `ft_fp16_out` の CReLU / SCReLU 経路は活性化 kernel が `ft_*_acted` までしか
-        // 書かないため `combined` へ slice_scatter する。Pairwise + `ft_fp16_out` は
-        // `ft_post_perspective_fwd_fp16` が `combined` を直書き済なので skip。DEFAULT 経路は
-        // `simple_ft_post_fused_*` / `ft_post_perspective_fwd` が `combined` 直書きで同様に skip。
-        if self.ft_fp16_out && self.id.activation != SimpleActivation::Pairwise {
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(self.ws.ft_stm_acted),
-                    slice_mut(self.ws.combined),
-                    b_u32, ft_out_u32, l1_in_u32, 0_u32
-                ]
-            }?;
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_n),
-                args: [
-                    slice(self.ws.ft_nstm_acted),
-                    slice_mut(self.ws.combined),
-                    b_u32, ft_out_u32, l1_in_u32, ft_out_u32
-                ]
-            }?;
-        }
         tick("fwd_ft_post", &self.stream, &mut prof_t0)?;
 
         // -- L1 dense (combined → l1_pre) cuBLAS Sgemm + bias_add_per_row --

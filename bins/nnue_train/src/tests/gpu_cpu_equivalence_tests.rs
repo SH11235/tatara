@@ -1942,6 +1942,7 @@ fn simple_bias_act_fwd_fp16_in_screlu_matches_cpu() -> Result<(), Box<dyn std::e
         kernel: simple_bias_act_fwd_fp16_in_screlu, stream: stream, module: module,
         config: cfg_1d(batch * ft_dim),
         args: [slice(ft_out_dev), slice(bias_dev), slice_mut(acted_dev),
+               ft_dim as u32, 0_u32,
                batch as u32, ft_dim as u32]
     }?;
     stream.synchronize()?;
