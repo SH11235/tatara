@@ -61,7 +61,9 @@ pub fn simple_bias_act_fwd_fp16_in_crelu(
 pub fn simple_act_grad_to_fp16_crelu_with_scale(
     ft_out: &[f16],
     bias: &[f32],
-    dft_acted: &[f32],
+    dcombined: &[f32],
+    combined_stride: u32,
+    col_offset: u32,
     mut dft_out: DisjointSlice<f16>,
     clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
@@ -74,9 +76,13 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
+    // dcombined (batch × combined_stride) の per-perspective 列範囲を直接読む
+    // (slice_extract_2d で中間 buffer に取り出す DRAM round-trip を融合で省く)。
+    let dft = dcombined[bi * (combined_stride as usize) + (col_offset as usize) + ri];
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let g = if x > 0.0_f32 && x < 1.0_f32 {
-        dft_acted[tid.get()]
+        dft
     } else {
         0.0_f32
     };
@@ -144,7 +150,9 @@ pub fn simple_bias_act_fwd_fp16_in_screlu(
 pub fn simple_act_grad_to_fp16_screlu_with_scale(
     ft_out: &[f16],
     bias: &[f32],
-    dft_acted: &[f32],
+    dcombined: &[f32],
+    combined_stride: u32,
+    col_offset: u32,
     mut dft_out: DisjointSlice<f16>,
     clamp_counter: &[u64], // len=1、clamp 発火数の cumulative atomic counter
     batch: u32,
@@ -157,6 +165,10 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
         return;
     }
     let ri = tid.get() % (ft_dim as usize);
+    let bi = tid.get() / (ft_dim as usize);
+    // dcombined (batch × combined_stride) の per-perspective 列範囲を直接読む
+    // (slice_extract_2d で中間 buffer に取り出す DRAM round-trip を融合で省く)。
+    let dft = dcombined[bi * (combined_stride as usize) + (col_offset as usize) + ri];
     let x = ft_out[tid.get()] as f32 + bias[ri];
     let a = if x < 0.0_f32 {
         0.0_f32
@@ -170,7 +182,7 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
     } else {
         0.0_f32
     };
-    let g = dft_acted[tid.get()] * dydx;
+    let g = dft * dydx;
     let s = g * dft_scale;
     let mut local_clamps: u64 = 0;
     let s_c = if s > 65504.0_f32 {

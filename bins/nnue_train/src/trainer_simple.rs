@@ -70,10 +70,6 @@ pub(crate) struct SimpleGpuWorkspace {
     dl1_pre: DeviceBuffer<f32>,
     /// concat 後 (`b × combined_dim`) への grad。L1 dense backward の入力 grad 先。
     dcombined: DeviceBuffer<f32>,
-    /// stm 活性化後への grad (`b × ft_out`)、concat 逆 (`slice_extract_2d`) の出力。
-    dft_stm_acted: DeviceBuffer<f32>,
-    /// 同 nstm。
-    dft_nstm_acted: DeviceBuffer<f32>,
     /// stm FT 出力 (= bias add 直後 / 活性化直前) への grad (`b × ft_out`)。
     /// `sparse_ft_backward` の入力 grad + `ft_b` bias grad の reduce 対象。
     dft_stm_out: DeviceBuffer<f32>,
@@ -171,8 +167,6 @@ impl SimpleGpuWorkspace {
             dl1_acted: z(batch * l1_out)?,
             dl1_pre: z(batch * l1_out)?,
             dcombined: z(batch * id.combined_dim())?,
-            dft_stm_acted: z(batch * ft_out)?,
-            dft_nstm_acted: z(batch * ft_out)?,
             dft_stm_out: z(batch * ft_out)?,
             dft_nstm_out: z(batch * ft_out)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
@@ -1461,28 +1455,28 @@ impl SimpleGpuTrainer {
         tick("L1_dense", &self.stream, &mut prof_t0)?;
 
         // ---- Concat inverse + activation grad の融合 ----
-        // dcombined (b × combined_dim) の per-perspective 半分を `src_offset` で切り出して
-        // 読み、pre-activation `ft_*_out` で gate した値を `dft_*_out` に直接書く融合 kernel。
-        // 中間 `dft_*_acted` buffer の DRAM round-trip (b × ft_out × 4 byte の write+read) を
-        // 消す。`ft_fp16_out` 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む。
-        // CReLU / SCReLU は `slice_extract_2d` + `simple_act_grad_to_fp16_*_with_scale`、
-        // Pairwise は `ft_post_perspective_grad_fp16` (`dcombined` を直接 offset 読み)。
+        // dcombined (b × combined_dim) の per-perspective 半分を `col_offset` で直接 offset
+        // 読みし、pre-activation `ft_*_out` で gate した値を `dft_*_out` に書く融合 kernel。
+        // 中間 buffer への取り出し (`slice_extract_2d`) を介さず `dcombined` を直接 offset
+        // 読みすることで、b × ft_out × 4 byte の DRAM round-trip を消す。`ft_fp16_out`
+        // 経路は f16 dft buffer + loss scaling + clamp + f16 cast を含む。CReLU / SCReLU は
+        // `simple_act_grad_to_fp16_*_with_scale`、Pairwise は `ft_post_perspective_grad_fp16`
+        // がいずれも `dcombined` を `combined_stride` / `col_offset` で直接読む。
         if self.ft_fp16_out {
             let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
+            // CReLU / SCReLU は nstm を `col_offset = ft_out` で dcombined から直接読むため
+            // `2*ft_out <= combined_dim` (= dcombined row stride) が成立しないと OOB read に
+            // なる。CReLU/SCReLU は両 perspective 連結で combined_dim = 2*ft_out なので常に成立。
+            // Pairwise は combined_dim = ft_out で別 kernel を使うため対象外 (matches! で除外)。
+            debug_assert!(
+                !matches!(
+                    self.id.activation,
+                    SimpleActivation::CReLU | SimpleActivation::SCReLU
+                ) || 2 * ft_out_u32 <= l1_in_u32,
+                "fp16-out CReLU/SCReLU grad needs 2*ft_out <= combined_dim (got 2*{ft_out_u32} vs {l1_in_u32})"
+            );
             match self.id.activation {
                 SimpleActivation::CReLU => {
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
-                    }?;
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-                    }?;
                     let ft_stm_out_h = self
                         .ws
                         .ft_stm_out_h
@@ -1498,7 +1492,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1518,7 +1512,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1530,18 +1524,6 @@ impl SimpleGpuTrainer {
                         .saturating_add(2_u64 * ft_n as u64);
                 }
                 SimpleActivation::SCReLU => {
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_stm_acted),
-                               b_u32, l1_in_u32, 0_u32, ft_out_u32]
-                    }?;
-                    cuda_launch! {
-                        kernel: slice_extract_2d, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice_mut(self.ws.dft_nstm_acted),
-                               b_u32, l1_in_u32, ft_out_u32, ft_out_u32]
-                    }?;
                     let ft_stm_out_h = self
                         .ws
                         .ft_stm_out_h
@@ -1557,7 +1539,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_stm_acted), slice_mut(dft_stm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
@@ -1577,7 +1559,7 @@ impl SimpleGpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(ft_n),
                         args: [
                             slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dft_nstm_acted), slice_mut(dft_nstm_out_h),
+                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
                             slice(self.fp16_clamp_counter),
                             b_u32, ft_out_u32, dft_scale
                         ]
