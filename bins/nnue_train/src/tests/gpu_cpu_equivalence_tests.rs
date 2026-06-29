@@ -2615,6 +2615,153 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `loss_wrm` の loss_acc 集約が **複数 block** (grid > 1) を跨いで正しく総和されることを確認する。
+/// 各 block は block 内 reduction の結果を 1 atomic で寄与するため、ある block の総和が欠けると
+/// loss は `loss/num_blocks` 規模でずれる (本テストが検出)。b=1000 で grid=4 block (block 256)、
+/// 末尾 block は partial (1000 % 256 != 0、out-of-range thread は寄与 0)。grad (per-position) も
+/// CPU 参照と一致することを併せて検証する (extended=0)。
+#[test]
+fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let b = 1000usize;
+    let out: Vec<f32> = (0..b).map(|i| ((i % 41) as f32 - 20.0) * 0.05).collect();
+    let score: Vec<f32> = (0..b).map(|i| ((i % 401) as f32 - 200.0) * 5.0).collect();
+    let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        2.0,
+        0.0,
+        0.0,
+        0.5,
+        false,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    assert_close_rel(
+        "loss_wrm/multiblock grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        1e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 1e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/multiblock loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
+    Ok(())
+}
+
+/// extended 経路 (`extended=1`) の loss_acc 集約を **複数 block** で検証する。`wrm_weight_sum`
+/// で Σw を先に reduce し、`loss_wrm` が `L_i·w_i·n/Σw` を block 跨ぎで総和する経路を b=1000
+/// (grid 4 block、末尾 partial) で CPU 参照と比較する。
+#[test]
+fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let b = 1000usize;
+    let out: Vec<f32> = (0..b).map(|i| ((i % 37) as f32 - 18.0) * 0.06).collect();
+    let score: Vec<f32> = (0..b).map(|i| ((i % 433) as f32 - 216.0) * 6.0).collect();
+    let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
+    let per_pos_norm = 1.0_f32 / b as f32;
+    let lambda = 0.0_f32;
+    let pow_exp = 2.5_f32;
+    let qp = 0.3_f32;
+    let w1 = 1.0_f32;
+    let w2 = 0.5_f32;
+
+    let mut dl_cpu = vec![0.0_f32; b];
+    let mut loss_cpu = 0.0_f64;
+    loss_wrm_cpu(
+        &out,
+        &score,
+        &wdl,
+        &vec![per_pos_norm; b],
+        &mut dl_cpu,
+        &mut loss_cpu,
+        lambda,
+        WRM_NNUE2SCORE,
+        WRM_IN_SCALING,
+        WRM_IN_OFFSET,
+        WRM_TARGET_OFFSET,
+        WRM_TARGET_SCALING,
+        pow_exp,
+        qp,
+        w1,
+        w2,
+        true,
+        b,
+    );
+
+    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    cuda_launch! {
+        kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(score_dev), slice(sum_w_dev), w1, w2,
+            WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
+        ]
+    }?;
+    cuda_launch! {
+        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+        args: [
+            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+            slice_mut(dl_dev), slice(loss_dev), lambda,
+            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+            pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+        ]
+    }?;
+    stream.synchronize()?;
+    assert_close_rel(
+        "loss_wrm/extended-multiblock grad",
+        &dl_dev.to_host_vec(&stream)?,
+        &dl_cpu,
+        2e-4,
+    );
+    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+    let diff = (loss_gpu - loss_cpu).abs();
+    assert!(
+        diff <= 2e-4 * (1.0 + loss_cpu.abs()),
+        "loss_wrm/extended-multiblock loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+    );
+    Ok(())
+}
+
 // -- norm_loss ----------------------------------------------------------
 
 /// 3 つの weight レイアウト (contiguous row / strided column / per-tensor scalar)
