@@ -304,13 +304,14 @@ pub fn simple_sparse_ft_backward_fp16(
 ///
 /// **per-output tile reduction**: `block_dim == ft_dim` で thread `oi` が出力 `oi` を専有し、
 /// 自 block 担当の `items` positions を register に直列累積してから global atomic を 1 回打つ。
-/// global atomic contention は `B * ft_dim` (1 thread 1 cell の素朴版) から
-/// `ceil(B/items) * ft_dim` に下がる。block 内 read は iteration ごとに `ft_dim` thread が
+/// global atomic contention は `ceil(B/items) * ft_dim` で、1 thread 1 cell が直接 atomic add
+/// する素朴版 (`B * ft_dim`) より少ない。block 内 read は iteration ごとに `ft_dim` thread が
 /// 連続 cell を読むため coalesced を保つ。
 ///
-/// atomic add は可換・結合的で launch 順非依存 (FP32 非結合性で bit pattern は同一とは
-/// 限らないが CPU 参照との許容差内)。`grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。
-/// caller は `block_dim == ft_dim`・`grid == ceil(batch/items)` を保証する。
+/// atomic add は可換だが FP32 加算は非結合のため、block 内 register 和の順序で rounding が
+/// 変わる (1 thread 1 cell の atomic 版と bit pattern は同一とは限らないが CPU 参照との許容差内)。
+/// `grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。caller は `block_dim == ft_dim`・
+/// `grid == ceil(batch/items)` を保証する。
 #[kernel]
 pub fn simple_bias_grad_dual(
     dft_stm: &[f32],

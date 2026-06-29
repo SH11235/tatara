@@ -397,6 +397,16 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
+        // FT bias grad の per-output tile reduction は `block_dim == ft_out` で起動するため
+        // ft_out が CUDA の block 上限 1024 を超えると launch できない (opaque な
+        // CUDA_ERROR_INVALID_VALUE になる前に release でも明示 reject する)。preset 上限は 1024。
+        if ft_out > 1024 {
+            return Err(format!(
+                "SimpleGpuTrainer: ft_out {ft_out} must be <= 1024 \
+                 (FT bias grad reduction launches one thread per output)"
+            )
+            .into());
+        }
         // pairwise の `half = ft_out / 2` 分割が割り切れることを明示確認する
         // (上の 4 の倍数チェックで保証済の不変条件、将来 4→2 緩和時の保険)。
         debug_assert!(
@@ -1672,8 +1682,9 @@ impl SimpleGpuTrainer {
         };
         // FT bias grad: per-output tile reduction。thread `oi` が出力 oi を専有し、自 block の
         // `items` positions を register 累積してから `ft_b_grad[oi]` へ atomic 1 回
-        // (`simple_bias_grad_dual[_fp16]`)。global atomic contention は素朴版の B * ft_dim から
-        // ceil(B/items) * ft_dim に下がる。Pairwise は `ft_post_perspective_grad[_fp16]` が
+        // (`simple_bias_grad_dual[_fp16]`)。global atomic contention は ceil(B/items) * ft_dim で、
+        // 1 thread 1 cell が直接 atomic add する素朴版 (B * ft_dim) より少ない。Pairwise は
+        // `ft_post_perspective_grad[_fp16]` が
         // `dft_*_out` 書き込みと同 pass で同値を `ft_b_grad` へ accumulate 済 (FT bias grad =
         // pre-activation 勾配 dft の batch 和) のため、別 launch しない。
         // block_dim == ft_out で thread→output を対応付ける (ft_out ≤ 1024 を前提)。

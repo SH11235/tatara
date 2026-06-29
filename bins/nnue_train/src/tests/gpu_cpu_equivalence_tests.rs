@@ -665,6 +665,8 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         (130, 32, 64),
         (128, 256, 64),
         (300, 256, 64),
+        (256, 512, 64),
+        (1024, 1024, 256),
     ] {
         let n = batch * ft as usize;
         // 整数値 (f32/f16 で exact) なので和の順序に依らず一致する。
@@ -704,7 +706,12 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
 fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let scale = 0.5_f32;
-    for &(batch, ft, items) in &[(5usize, 16u32, 8u32), (130, 256, 64), (128, 256, 64)] {
+    for &(batch, ft, items) in &[
+        (5usize, 16u32, 8u32),
+        (130, 256, 64),
+        (128, 256, 64),
+        (256, 512, 64),
+    ] {
         let n = batch * ft as usize;
         let stm_f: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
         let nstm_f: Vec<f32> = (0..n).map(|i| ((i % 5) as i32 - 2) as f32).collect();
