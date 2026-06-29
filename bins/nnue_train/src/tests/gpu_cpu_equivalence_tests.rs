@@ -654,9 +654,11 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `simple_bias_grad_dual` (per-output tile reduction) が `Σ_b (stm + nstm)` の CPU 参照と
-/// 一致する。整数値 dft で reduction を exact 化し、items > batch (1 block) / batch 倍数 /
-/// 末尾 partial block / ft_dim 16・32・256・512・1024 (大 block_dim 境界) を網羅。`block_dim == ft_dim`。
+/// `simple_bias_grad_dual` (2D-grid per-output tile reduction) が `Σ_b (stm + nstm)` の CPU
+/// 参照と一致する。整数値 dft で reduction を exact 化し、items > batch (1 block) / batch 倍数 /
+/// 末尾 partial block / ft_dim 16・32・256・512・1024 (block 上限境界)・1536 (block_dim=1024、
+/// grid.y=2 で末尾 output tile が partial)・2048 (block_dim=1024、grid.y=2 で full output tile)
+/// を網羅。launch は trainer と同じ `block_dim = min(ft, 1024)`・`grid.y = ceil(ft/block_dim)`。
 #[test]
 fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -667,6 +669,8 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         (300, 256, 64),
         (256, 512, 64),
         (1024, 1024, 256),
+        (200, 1536, 64),
+        (300, 2048, 64),
     ] {
         let n = batch * ft as usize;
         // 整数値 (f32/f16 で exact) なので和の順序に依らず一致する。
@@ -684,9 +688,11 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         let nstm_dev = DeviceBuffer::from_host(&stream, &nstm)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
         let blocks = (batch as u32).div_ceil(items);
+        let block_dim = ft.min(1024);
+        let out_tiles = ft.div_ceil(block_dim);
         cuda_launch! {
             kernel: simple_bias_grad_dual, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (ft, 1, 1), shared_mem_bytes: 0 },
+            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
             args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, items]
         }?;
         stream.synchronize()?;
@@ -701,7 +707,8 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// `simple_bias_grad_dual_fp16` (FP16 入力 + `dft_inv_scale`) が CPU 参照と一致する。
-/// 整数値 dft × scale=0.5 (f16/f32 で exact) で reduction を exact 化。
+/// 整数値 dft × scale=0.5 (f16/f32 で exact) で reduction を exact 化。ft_dim 1536 (partial
+/// output tile) / 2048 で 2D-grid (`block_dim = min(ft, 1024)`・`grid.y > 1`) 経路も網羅。
 #[test]
 fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -711,6 +718,8 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
         (130, 256, 64),
         (128, 256, 64),
         (256, 512, 64),
+        (200, 1536, 64),
+        (300, 2048, 64),
     ] {
         let n = batch * ft as usize;
         let stm_f: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
@@ -729,9 +738,11 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
         let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_h)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
         let blocks = (batch as u32).div_ceil(items);
+        let block_dim = ft.min(1024);
+        let out_tiles = ft.div_ceil(block_dim);
         cuda_launch! {
             kernel: simple_bias_grad_dual_fp16, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (ft, 1, 1), shared_mem_bytes: 0 },
+            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
             args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, scale, items]
         }?;
         stream.synchronize()?;
@@ -741,6 +752,73 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
             &gb_cpu,
             TOL,
         );
+    }
+    Ok(())
+}
+
+/// FT bias grad の 2D-grid 化で ft_out > 1024 の CReLU / SCReLU が `SimpleGpuTrainer::new` で
+/// reject されず、trainer の backward 経路 (`simple_bias_grad_dual[_fp16]` の grid.y > 1 launch
+/// を含む) が step 後に finite な weight を生成することを確認する。ft_out=1536 は
+/// `block_dim = min(ft, 1024) = 1024`・`grid.y = ceil(1536/1024) = 2` で末尾 output tile が
+/// partial (oi 1024..1535 valid、1536..2047 padding) になる boundary。CReLU/SCReLU ×
+/// FP32/FP16-out 経路を網羅する。
+#[test]
+fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let ft_out = 1536_usize;
+    for activation in [SimpleActivation::CReLU, SimpleActivation::SCReLU] {
+        for &(ft_fp16, ft_fp16_out) in &[(false, false), (true, true)] {
+            let id = SimpleId {
+                feature_set: FeatureSet::HalfKaHmMerged.spec(),
+                activation,
+                ft_out,
+                l1_out: 32,
+                l2_out: 32,
+            };
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                1e-7,
+                16,
+                ft_fp16,
+                ft_fp16_out,
+                false,
+                false,
+                &init,
+            )?;
+            // smoke_dummy は target=0.5 近傍で学習信号が無いため score / wdl を動かす
+            // (backward が走り finite な grad を出すことを見るので値は任意の非ゼロでよい)。
+            let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+            for s in batch.score.iter_mut() {
+                *s = 200.0;
+            }
+            for w in batch.wdl.iter_mut() {
+                *w = 0.8;
+            }
+            // step の戻り値 loss は更新前 weight の forward 値なので、backward (2D bias grad
+            // launch) が NaN/Inf を出してもこれ単体では捕捉できない。optimizer 適用後に全
+            // weight (2D grad で更新される ft_b を含む) が finite であることで backward 出力の
+            // 健全性を確認する。
+            let loss = trainer.step(&batch.as_ref(), 1e-1, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(
+                loss.is_finite(),
+                "ft_out={ft_out} {} ft_fp16_out={ft_fp16_out}: forward loss {loss} not finite",
+                activation.canonical_name(),
+            );
+            trainer.assert_all_weights_finite().map_err(|e| {
+                format!(
+                    "ft_out={ft_out} {} ft_fp16_out={ft_fp16_out}: non-finite weight after step: {e}",
+                    activation.canonical_name(),
+                )
+            })?;
+        }
     }
     Ok(())
 }

@@ -302,16 +302,21 @@ pub fn simple_sparse_ft_backward_fp16(
 /// gradient) を 1 launch で読み、`grad_bias[oi] += Σ_b (dft_stm[b][oi] + dft_nstm[b][oi])`
 /// を計算する。
 ///
-/// **per-output tile reduction**: `block_dim == ft_dim` で thread `oi` が出力 `oi` を専有し、
-/// 自 block 担当の `items` positions を register に直列累積してから global atomic を 1 回打つ。
+/// **2D-grid per-output tile reduction**: thread が出力 `oi = blockIdx_y * blockDim_x +
+/// threadIdx_x` を専有する。grid.x = position tile (各 block が `items` positions を担当)、
+/// grid.y = output tile。`block_dim = min(ft_dim, 1024)`・`grid.y = ceil(ft_dim / block_dim)`
+/// なので CUDA の block 上限 1024 を超える ft_dim でも output を y タイルに割って起動できる
+/// (`ft_dim <= 1024` では block_dim = ft_dim・grid.y = 1 で 1D 起動と等価)。末尾 output tile の
+/// padding (`oi >= ft_dim`) は早期 return で捨てる。thread `oi` は自 block 担当の `items`
+/// positions を register に直列累積してから `grad_bias[oi]` へ global atomic を 1 回打つ。
 /// global atomic contention は `ceil(B/items) * ft_dim` で、1 thread 1 cell が直接 atomic add
-/// する素朴版 (`B * ft_dim`) より少ない。block 内 read は iteration ごとに `ft_dim` thread が
-/// 連続 cell を読むため coalesced を保つ。
+/// する素朴版 (`B * ft_dim`) より少ない。固定 position で block 内 thread は連続 cell
+/// (`p * ft_dim + oi`) を読むため coalesced を保つ。
 ///
 /// atomic add は可換だが FP32 加算は非結合のため、block 内 register 和の順序で rounding が
 /// 変わる (1 thread 1 cell の atomic 版と bit pattern は同一とは限らないが CPU 参照との許容差内)。
-/// `grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。caller は `block_dim == ft_dim`・
-/// `grid == ceil(batch/items)` を保証する。
+/// `grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。caller は `block_dim ==
+/// min(ft_dim, 1024)`・`grid.x == ceil(batch/items)`・`grid.y == ceil(ft_dim/block_dim)` を保証する。
 #[kernel]
 pub fn simple_bias_grad_dual(
     dft_stm: &[f32],
@@ -321,7 +326,8 @@ pub fn simple_bias_grad_dual(
     ft_dim: u32,
     items: u32,
 ) {
-    let oi = thread::threadIdx_x() as usize;
+    let oi = thread::blockIdx_y() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
     let ft = ft_dim as usize;
     if oi >= ft {
         return;
@@ -336,8 +342,8 @@ pub fn simple_bias_grad_dual(
         acc += dft_stm[idx] + dft_nstm[idx];
         p += 1;
     }
-    // SAFETY: `grad_bias.len() == ft_dim` を host が保証、`oi < ft_dim` は `block_dim ==
-    // ft_dim` で保証。`f32` (align 4) と `DeviceAtomicF32` は同 alignment。本 kernel 起動中に
+    // SAFETY: `grad_bias.len() == ft_dim` を host が保証、`oi < ft_dim` は冒頭の early return
+    // で保証。`f32` (align 4) と `DeviceAtomicF32` は同 alignment。本 kernel 起動中に
     // `grad_bias` を non-atomic で書く path は無く、atomic add 同士は GPU が serialize する。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
     cell.fetch_add(acc, AtomicOrdering::Relaxed);
@@ -345,8 +351,9 @@ pub fn simple_bias_grad_dual(
 
 /// Simple FT bias grad dual の FP16 入力版 (`--ft-fp16-out` 経路)。stm / nstm 両 dft
 /// (`f16`、loss scaling 済) を読み `dft_inv_scale` で打ち消した値を accumulate する。
-/// reduction 構造は [`simple_bias_grad_dual`] と同一 (per-output tile、`block_dim == ft_dim`、
-/// thread `oi` が `items` positions を register 累積 → global atomic 1 回)。
+/// reduction 構造は [`simple_bias_grad_dual`] と同一 (2D-grid per-output tile、`oi =
+/// blockIdx_y * blockDim_x + threadIdx_x`、thread `oi` が `items` positions を register 累積
+/// → global atomic 1 回)。
 #[kernel]
 pub fn simple_bias_grad_dual_fp16(
     dft_stm: &[f16],
@@ -357,7 +364,8 @@ pub fn simple_bias_grad_dual_fp16(
     dft_inv_scale: f32,
     items: u32,
 ) {
-    let oi = thread::threadIdx_x() as usize;
+    let oi = thread::blockIdx_y() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
     let ft = ft_dim as usize;
     if oi >= ft {
         return;
@@ -373,7 +381,8 @@ pub fn simple_bias_grad_dual_fp16(
         p += 1;
     }
     // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件 (grad_bias.len() == ft_dim、
-    // oi < ft_dim = block_dim、`DeviceAtomicF32` alignment 共有、atomic add 同士のみ serialize)。
+    // oi < ft_dim は冒頭の early return で保証、`DeviceAtomicF32` alignment 共有、
+    // atomic add 同士のみ serialize)。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
     cell.fetch_add(acc, AtomicOrdering::Relaxed);
 }
