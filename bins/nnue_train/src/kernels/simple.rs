@@ -299,14 +299,18 @@ pub fn simple_sparse_ft_backward_fp16(
 }
 
 /// Simple FT bias grad の dual variant: stm / nstm 両 perspective の dft (post-activation
-/// gradient) を 1 launch で読み込み、`grad_bias[oi]` への atomic add を per-thread に 1 回
-/// にまとめる kernel。1 thread = 1 (batch, ft_oi) cell、stm + nstm のローカル和を作って
-/// から atomic add するため、ft_b_grad への atomic contention 数は B * ft_dim 回 (per-cell
-/// 単発の bias_grad を 2 perspective 別 launch で 2 回打つ場合の半分)。
+/// gradient) を 1 launch で読み、`grad_bias[oi] += Σ_b (dft_stm[b][oi] + dft_nstm[b][oi])`
+/// を計算する。
 ///
-/// atomic add の演算は可換・結合的で、launch 順を入れ替えても per-FP32 cell の最終値は
-/// 同等 (FP32 加算の非結合性で bit pattern は同一とは限らないが、CPU 参照との許容差
-/// 範囲には収まる)。`grad_bias` は呼出前に host が 0 にリセット済 (`ws.ft_b_grad`)。
+/// **per-output tile reduction**: `block_dim == ft_dim` で thread `oi` が出力 `oi` を専有し、
+/// 自 block 担当の `items` positions を register に直列累積してから global atomic を 1 回打つ。
+/// global atomic contention は `B * ft_dim` (1 thread 1 cell の素朴版) から
+/// `ceil(B/items) * ft_dim` に下がる。block 内 read は iteration ごとに `ft_dim` thread が
+/// 連続 cell を読むため coalesced を保つ。
+///
+/// atomic add は可換・結合的で launch 順非依存 (FP32 非結合性で bit pattern は同一とは
+/// 限らないが CPU 参照との許容差内)。`grad_bias` は呼出前に host が 0 reset 済 (`ws.ft_b_grad`)。
+/// caller は `block_dim == ft_dim`・`grid == ceil(batch/items)` を保証する。
 #[kernel]
 pub fn simple_bias_grad_dual(
     dft_stm: &[f32],
@@ -314,29 +318,34 @@ pub fn simple_bias_grad_dual(
     grad_bias: &[f32],
     batch: u32,
     ft_dim: u32,
+    items: u32,
 ) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (ft_dim as usize);
-    if tid.get() >= total {
+    let oi = thread::threadIdx_x() as usize;
+    let ft = ft_dim as usize;
+    if oi >= ft {
         return;
     }
-    let oi = tid.get() % (ft_dim as usize);
-    let stm_val = dft_stm[tid.get()];
-    let nstm_val = dft_nstm[tid.get()];
-    let sum = stm_val + nstm_val;
-    // SAFETY: `grad_bias.len() == ft_dim` を host が保証 (workspace の `ft_b_grad` は
-    // ft_dim で固定)、`oi < ft_dim` は `tid % ft_dim` で保証。`f32` (align 4) と
-    // `DeviceAtomicF32` (`#[repr(transparent)]` over UnsafeCell<f32>) は同 alignment。
-    // 本 kernel 起動中に `grad_bias` を non-atomic 経路で書く path は無く (forward は
-    // bias を READ のみ、本関数より先に走る同 step backward 段も `ft_b_grad` を書かない)、
-    // atomic add 同士の競合は GPU が serialize する。
+    let batch_u = batch as usize;
+    let pos_start = thread::blockIdx_x() as usize * items as usize;
+    let pos_end = (pos_start + items as usize).min(batch_u);
+    let mut acc = 0.0_f32;
+    let mut p = pos_start;
+    while p < pos_end {
+        let idx = p * ft + oi;
+        acc += dft_stm[idx] + dft_nstm[idx];
+        p += 1;
+    }
+    // SAFETY: `grad_bias.len() == ft_dim` を host が保証、`oi < ft_dim` は `block_dim ==
+    // ft_dim` で保証。`f32` (align 4) と `DeviceAtomicF32` は同 alignment。本 kernel 起動中に
+    // `grad_bias` を non-atomic で書く path は無く、atomic add 同士は GPU が serialize する。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
-    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+    cell.fetch_add(acc, AtomicOrdering::Relaxed);
 }
 
 /// Simple FT bias grad dual の FP16 入力版 (`--ft-fp16-out` 経路)。stm / nstm 両 dft
-/// (`f16`、loss scaling 済) を読み、`dft_inv_scale` で打ち消した値を per-thread に 1 atomic
-/// で `ft_b_grad[oi]` に accumulate。FP32 版と同じ atomic 半減効果がある。
+/// (`f16`、loss scaling 済) を読み `dft_inv_scale` で打ち消した値を accumulate する。
+/// reduction 構造は [`simple_bias_grad_dual`] と同一 (per-output tile、`block_dim == ft_dim`、
+/// thread `oi` が `items` positions を register 累積 → global atomic 1 回)。
 #[kernel]
 pub fn simple_bias_grad_dual_fp16(
     dft_stm: &[f16],
@@ -345,21 +354,27 @@ pub fn simple_bias_grad_dual_fp16(
     batch: u32,
     ft_dim: u32,
     dft_inv_scale: f32,
+    items: u32,
 ) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (ft_dim as usize);
-    if tid.get() >= total {
+    let oi = thread::threadIdx_x() as usize;
+    let ft = ft_dim as usize;
+    if oi >= ft {
         return;
     }
-    let oi = tid.get() % (ft_dim as usize);
-    let stm_val = dft_stm[tid.get()] as f32 * dft_inv_scale;
-    let nstm_val = dft_nstm[tid.get()] as f32 * dft_inv_scale;
-    let sum = stm_val + nstm_val;
-    // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件
-    // (grad_bias.len() == ft_dim、oi < ft_dim、`DeviceAtomicF32` alignment 共有、
-    // non-atomic 競合 path 無し、atomic add 同士のみ GPU serialize)。
+    let batch_u = batch as usize;
+    let pos_start = thread::blockIdx_x() as usize * items as usize;
+    let pos_end = (pos_start + items as usize).min(batch_u);
+    let mut acc = 0.0_f32;
+    let mut p = pos_start;
+    while p < pos_end {
+        let idx = p * ft + oi;
+        acc += dft_stm[idx] as f32 * dft_inv_scale + dft_nstm[idx] as f32 * dft_inv_scale;
+        p += 1;
+    }
+    // SAFETY: FP32 版 `simple_bias_grad_dual` と同一の不変条件 (grad_bias.len() == ft_dim、
+    // oi < ft_dim = block_dim、`DeviceAtomicF32` alignment 共有、atomic add 同士のみ serialize)。
     let cell = unsafe { &*(grad_bias.as_ptr().add(oi) as *const DeviceAtomicF32) };
-    cell.fetch_add(sum, AtomicOrdering::Relaxed);
+    cell.fetch_add(acc, AtomicOrdering::Relaxed);
 }
 
 /// Simple fwd_ft_post の fused kernel (CReLU 版): `bias_add_per_row` + `crelu_fwd` +

@@ -654,6 +654,90 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `simple_bias_grad_dual` (per-output tile reduction) が `Σ_b (stm + nstm)` の CPU 参照と
+/// 一致する。整数値 dft で reduction を exact 化し、items > batch (1 block) / batch 倍数 /
+/// 末尾 partial block / ft_dim 16・32・256 を網羅。`block_dim == ft_dim`。
+#[test]
+fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for &(batch, ft, items) in &[
+        (5usize, 16u32, 8u32),
+        (130, 32, 64),
+        (128, 256, 64),
+        (300, 256, 64),
+    ] {
+        let n = batch * ft as usize;
+        // 整数値 (f32/f16 で exact) なので和の順序に依らず一致する。
+        let stm: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
+        let nstm: Vec<f32> = (0..n).map(|i| ((i % 5) as i32 - 2) as f32).collect();
+        let mut gb_cpu = vec![0.0_f32; ft as usize];
+        for b in 0..batch {
+            let row = &stm[b * ft as usize..(b + 1) * ft as usize];
+            let nrow = &nstm[b * ft as usize..(b + 1) * ft as usize];
+            for (g, (s, n)) in gb_cpu.iter_mut().zip(row.iter().zip(nrow)) {
+                *g += *s + *n;
+            }
+        }
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
+        let blocks = (batch as u32).div_ceil(items);
+        cuda_launch! {
+            kernel: simple_bias_grad_dual, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (ft, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, items]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("simple_bias_grad_dual b={batch} ft={ft} items={items}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
+/// `simple_bias_grad_dual_fp16` (FP16 入力 + `dft_inv_scale`) が CPU 参照と一致する。
+/// 整数値 dft × scale=0.5 (f16/f32 で exact) で reduction を exact 化。
+#[test]
+fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let scale = 0.5_f32;
+    for &(batch, ft, items) in &[(5usize, 16u32, 8u32), (130, 256, 64), (128, 256, 64)] {
+        let n = batch * ft as usize;
+        let stm_f: Vec<f32> = (0..n).map(|i| ((i % 7) as i32 - 3) as f32).collect();
+        let nstm_f: Vec<f32> = (0..n).map(|i| ((i % 5) as i32 - 2) as f32).collect();
+        let (stm_h, stm_rt) = quantize_f16(&stm_f);
+        let (nstm_h, nstm_rt) = quantize_f16(&nstm_f);
+        let mut gb_cpu = vec![0.0_f32; ft as usize];
+        for b in 0..batch {
+            let row = &stm_rt[b * ft as usize..(b + 1) * ft as usize];
+            let nrow = &nstm_rt[b * ft as usize..(b + 1) * ft as usize];
+            for (g, (s, n)) in gb_cpu.iter_mut().zip(row.iter().zip(nrow)) {
+                *g += *s * scale + *n * scale;
+            }
+        }
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm_h)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_h)?;
+        let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, ft as usize)?;
+        let blocks = (batch as u32).div_ceil(items);
+        cuda_launch! {
+            kernel: simple_bias_grad_dual_fp16, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (ft, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, scale, items]
+        }?;
+        stream.synchronize()?;
+        assert_close_rel(
+            &format!("simple_bias_grad_dual_fp16 b={batch} ft={ft} items={items}"),
+            &gb_dev.to_host_vec(&stream)?,
+            &gb_cpu,
+            TOL,
+        );
+    }
+    Ok(())
+}
+
 /// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
 /// tolerance 内で一致することを確認。out_dim (= l1_out) を 16 / 16 倍数 / 非倍数 /
 /// 上限 256 で網羅する。
