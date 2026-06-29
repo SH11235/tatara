@@ -274,16 +274,18 @@ impl PsvFileLoader {
             self.eof = true;
             return Ok(None);
         }
-        let mut buf = [0u8; PSV_RECORD_BYTES as usize];
-        match self.reader.read(&mut buf)? {
+        // record の byte 列を直接 `PackedSfenValue` のバッキングへ read する
+        // (中間 stack buffer + copy を経由しない)。`as_bytes_mut` は丁度
+        // `PSV_RECORD_BYTES` 長の `[u8; 40]`。
+        let mut psv = PackedSfenValue::default();
+        let buf = psv.as_bytes_mut();
+        match self.reader.read(buf)? {
             0 => {
                 self.eof = true;
                 Ok(None)
             }
             n if n == PSV_RECORD_BYTES as usize => {
                 self.remaining_bytes -= PSV_RECORD_BYTES;
-                let mut psv = PackedSfenValue::default();
-                psv.as_bytes_mut().copy_from_slice(&buf);
                 Ok(Some(psv))
             }
             n => {
@@ -300,8 +302,6 @@ impl PsvFileLoader {
                     total += got;
                 }
                 self.remaining_bytes -= PSV_RECORD_BYTES;
-                let mut psv = PackedSfenValue::default();
-                psv.as_bytes_mut().copy_from_slice(&buf);
                 Ok(Some(psv))
             }
         }
