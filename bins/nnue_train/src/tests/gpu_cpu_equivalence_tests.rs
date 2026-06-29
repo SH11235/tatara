@@ -2875,11 +2875,27 @@ fn exclusive_prefix_sum_small_matches_cpu() -> Result<(), Box<dyn std::error::Er
 #[test]
 fn prefix_sum_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for &n in &[1_usize, 1023, 1024, 1025, 73_305, 125_388] {
-        let counts: Vec<u32> = (0..n).map(|i| ((i * 13 + 5) % 7) as u32).collect();
+    // `small` は典型的な per-feature occurrence count、`large` は full-range u32 で
+    // exclusive sum が 2^32 を跨ぐパターン (加算が順序非依存 = overflow 下でも分解と
+    // 単一 block scan が一致することを確認)。n は block 境界 / 末尾 partial /
+    // exact-multiple multi-block を網羅。
+    let small: fn(usize) -> u32 = |i| ((i * 13 + 5) % 7) as u32;
+    let large: fn(usize) -> u32 = |i| (i as u32).wrapping_mul(2_654_435_761);
+    for &(n, gen_fn) in &[
+        (1_usize, small),
+        (1023, small),
+        (1024, small),
+        (1025, small),
+        (2048, small),
+        (4096, small),
+        (73_305, small),
+        (125_388, small),
+        (125_388, large),
+    ] {
+        let counts: Vec<u32> = (0..n).map(gen_fn).collect();
         let mut offsets_cpu = vec![0_u32; n + 1];
         for i in 0..n {
-            offsets_cpu[i + 1] = offsets_cpu[i] + counts[i];
+            offsets_cpu[i + 1] = offsets_cpu[i].wrapping_add(counts[i]);
         }
         let num_blocks = n.div_ceil(1024);
         let counts_dev = DeviceBuffer::from_host(&stream, &counts)?;
