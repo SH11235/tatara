@@ -386,6 +386,12 @@ impl SimpleGpuTrainer {
         let ft_out = id.ft_out;
         let l1_out = id.l1_out;
         let l2_out = id.l2_out;
+        // ft_out == 0 は FT 出力が無い退化アーキ。`is_multiple_of(4)` は 0 を通すため
+        // 明示的に弾く。FT bias grad launch の grid.y = ceil(ft_out / min(ft_out, 1024)) が
+        // 0 除算 panic になるのも防ぐ (CLI 経由でなく new を直接呼ぶ test / smoke 経路の保険)。
+        if ft_out == 0 {
+            return Err("SimpleGpuTrainer: ft_out must be greater than 0".into());
+        }
         // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
         // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
         // 4 の倍数でない値が来る可能性があるので early reject する。4 の倍数性は
