@@ -227,20 +227,77 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
 /// caller は out_dim がこれを超える層では generic `bias_grad` に fall back する。
 pub(crate) const DENSE_BIAS_GRAD_MAX_OUT: u32 = 256;
 
-/// grid-stride bias-grad reduction (`dense_bias_grad_tiled`) の grid 上限。grid を
-/// 増やすと per-cell の global atomic contention (= gridDim) が増えるため、SM を埋める
-/// 範囲でクランプする。RTX 3080 Ti (80 SM) で block 256 thread を 6 block/SM
-/// (= 1536 thread/SM、full occupancy) 載せる固定値。SM 数の多い GPU では占有率を取り
-/// きれず under-occupy し得る (grid-stride は全 row を覆うので正しさには無関係、
-/// atomic contention / occupancy の trade-off だけが動く)。
-const DENSE_BIAS_GRAD_BLOCKS: u32 = 480;
+/// Grid sizing 用の device occupancy パラメータ。`dense_bias_grad_tiled` の grid 上限を
+/// 実機の SM 数から導出するため、trainer 構築時に 1 度だけ問い合わせて保持する。特定
+/// GPU 固定の grid 上限を避けるためのもの。
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceOccupancy {
+    /// SM 数 (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`)。
+    sm_count: u32,
+    /// SM あたり常駐 thread 上限 (`CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR`)。
+    max_threads_per_sm: u32,
+}
+
+impl DeviceOccupancy {
+    /// `ctx` の device から SM 数 / SM あたり thread 上限を問い合わせる。driver attribute
+    /// 照会で kernel launch には非依存 (`CudaContext::compute_capability` と同経路)。
+    pub(crate) fn query(ctx: &CudaContext) -> Result<Self, Box<dyn std::error::Error>> {
+        ctx.bind_to_thread()?;
+        let dev = ctx.cu_device();
+        let mut sm = std::mem::MaybeUninit::<i32>::uninit();
+        let mut threads = std::mem::MaybeUninit::<i32>::uninit();
+        // SAFETY: 出力先は MaybeUninit の有効ポインタ、属性 enum は driver の有効な ID、
+        // `dev` は `ctx` 由来の有効な CUdevice。`result()?` 成功時のみ assume_init する。
+        unsafe {
+            cuda_core::sys::cuDeviceGetAttribute(
+                sm.as_mut_ptr(),
+                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                dev,
+            )
+            .result()?;
+            cuda_core::sys::cuDeviceGetAttribute(
+                threads.as_mut_ptr(),
+                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                dev,
+            )
+            .result()?;
+            Ok(Self {
+                sm_count: sm.assume_init().max(1) as u32,
+                max_threads_per_sm: threads.assume_init().max(1) as u32,
+            })
+        }
+    }
+
+    /// `block_dim` thread の block で全 SM を thread 占有上限まで埋める block 数
+    /// `sm_count * floor(max_threads_per_sm / block_dim)`。grid をこれ以上に増やしても
+    /// occupancy は頭打ちで、`dense_bias_grad_tiled` では per-cell global atomic contention
+    /// (= gridDim) だけが増える。本 kernel の `block_dim` は常に ~128 以上 (`R * out_dim`、
+    /// `R` は 2 冪、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`) なので thread 占有が SM あたり
+    /// 常駐 block 数のハード上限より先に効き、その上限の別途クランプは要らない。
+    fn fill_blocks(self, block_dim: u32) -> u32 {
+        let per_sm = (self.max_threads_per_sm / block_dim.max(1)).max(1);
+        self.sm_count.saturating_mul(per_sm).max(1)
+    }
+
+    /// SM 数 / SM thread 上限を直接与えて構築する (CUDA device 非依存の単体テスト用)。
+    #[cfg(test)]
+    pub(crate) const fn from_counts(sm_count: u32, max_threads_per_sm: u32) -> Self {
+        Self {
+            sm_count,
+            max_threads_per_sm,
+        }
+    }
+}
 
 /// `dense_bias_grad_tiled` の launch config。`block_dim = R * out_dim` で `R` は
 /// `floor(DENSE_BIAS_GRAD_MAX_OUT / out_dim)` を超えない最大 2 冪 (kernel の tree
 /// reduction が `R` を完全に畳める前提、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT` も満たす)。
-/// grid は batch を `R` 行/thread で覆う上限 `ceil(batch / R)` と `DENSE_BIAS_GRAD_BLOCKS`
-/// の小さい方。caller は `1 <= out_dim <= DENSE_BIAS_GRAD_MAX_OUT` を保証する。
-pub(crate) fn cfg_dense_bias_grad(batch: u32, out_dim: u32) -> LaunchConfig {
+/// grid は batch を `R` 行/thread で覆う上限 `ceil(batch / R)` と、実機 SM を thread 占有
+/// 上限まで埋める `occ.fill_blocks(block_dim)` の小さい方。後者で grid を occupancy が
+/// 頭打ちになる点に抑え、余分な global atomic contention を避ける (SM 数を実機問い合わせ
+/// 値から導くので特定 GPU 非依存)。caller は `1 <= out_dim <= DENSE_BIAS_GRAD_MAX_OUT`
+/// を保証する。
+pub(crate) fn cfg_dense_bias_grad(occ: DeviceOccupancy, batch: u32, out_dim: u32) -> LaunchConfig {
     debug_assert!(
         (1..=DENSE_BIAS_GRAD_MAX_OUT).contains(&out_dim),
         "cfg_dense_bias_grad requires 1 <= out_dim <= {DENSE_BIAS_GRAD_MAX_OUT}, got {out_dim}"
@@ -251,7 +308,7 @@ pub(crate) fn cfg_dense_bias_grad(batch: u32, out_dim: u32) -> LaunchConfig {
         r *= 2;
     }
     let block = r * out_dim;
-    let grid = batch.div_ceil(r).clamp(1, DENSE_BIAS_GRAD_BLOCKS);
+    let grid = batch.div_ceil(r).clamp(1, occ.fill_blocks(block));
     LaunchConfig {
         grid_dim: (grid, 1, 1),
         block_dim: (block, 1, 1),

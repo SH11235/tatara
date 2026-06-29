@@ -222,6 +222,9 @@ impl SimpleGpuWorkspace {
 pub(crate) struct SimpleGpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
+    /// `dense_bias_grad_tiled` の grid 上限を実機 SM 数から導出するための occupancy
+    /// パラメータ (`new` で 1 度問い合わせ、特定 GPU 固定値を避ける)。
+    dense_bias_grad_occ: DeviceOccupancy,
     /// L1 dense (FP32) 用 cuBLAS handle (TF32 不使用、`CUBLAS_DEFAULT_MATH`)。
     /// stream に bind 済で同一 stream 内 in-order 実行。
     cublas: CublasHandle,
@@ -375,6 +378,7 @@ impl SimpleGpuTrainer {
         debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
+        let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
         // `tf32` (CLI の `--tf32`) で cuBLAS math mode 切替。default OFF は
         // `CUBLAS_DEFAULT_MATH` (純 FP32 path、L1/L2/L3 dense Sgemm bit-identical)。
         // `true` で `CUBLAS_TF32_TENSOR_OP_MATH` を有効化し Ampere+ TC を使う (Sgemm 高速化、
@@ -518,6 +522,7 @@ impl SimpleGpuTrainer {
             },
             stream,
             module,
+            dense_bias_grad_occ,
             id,
             step_count: 0,
             weight_decay,
@@ -1330,7 +1335,7 @@ impl SimpleGpuTrainer {
         }
         cuda_launch! {
             kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-            config: cfg_dense_bias_grad(b_u32, 1),
+            config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, 1),
             args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
         }?;
         tick("L3_dense", &self.stream, &mut prof_t0)?;
@@ -1393,7 +1398,7 @@ impl SimpleGpuTrainer {
         if l2_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
             cuda_launch! {
                 kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-                config: cfg_dense_bias_grad(b_u32, l2_out_u32),
+                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l2_out_u32),
                 args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
             }?;
         } else {
@@ -1461,7 +1466,7 @@ impl SimpleGpuTrainer {
         if l1_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
             cuda_launch! {
                 kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-                config: cfg_dense_bias_grad(b_u32, l1_out_u32),
+                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l1_out_u32),
                 args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
             }?;
         } else {
