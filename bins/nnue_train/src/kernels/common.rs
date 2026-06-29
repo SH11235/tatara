@@ -414,7 +414,9 @@ pub fn radam_step_fp16_mirror(
             p
         };
         *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
+        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
+        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
+        // 上書きされ DRAM 書き込みを浪費するだけ)。
         let mirror_ptr = mirror.as_mut_ptr();
         unsafe {
             mirror_ptr.add(i.get()).write(p_clamped as f16);
@@ -614,7 +616,9 @@ pub fn radam_step_f16state(
             p
         };
         *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
+        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
+        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
+        // 上書きされ DRAM 書き込みを浪費するだけ)。
     }
 }
 
@@ -686,7 +690,9 @@ pub fn radam_step_f16state_mirror(
             p
         };
         *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
+        // ft_w_grad は毎 step overwrite-gather (`gather_and_sum_per_feature_overwrite*`)
+        // が全 cell を書き直すため、ここで grad を 0 に戻さない (戻しても次 read 前に
+        // 上書きされ DRAM 書き込みを浪費するだけ)。
         // SAFETY: `mirror` は `weights` / `m` / `v` / `grad` と同要素数 `n` (caller が
         // `ft_w` の要素数 `ft_w_n` を渡す)。kernel 冒頭で `i < n` を確認済みなので
         // `mirror.add(i)` は in-bounds。各 thread は自分の `i` のみ書くため thread 間で
@@ -1253,7 +1259,8 @@ pub fn scatter_positions(
 ///
 /// block 構成: blockIdx_x = feature_id (`cols`)、blockIdx_y = ri tile (`ft_out / blockDim`)。
 /// block_dim threads (各 1 ri cell、cell 境界は block 内で disjoint なため atomic 不要)。
-/// 呼出 host は呼出前に grad_w を 0 reset (`memset_zero`)、書かなかった cell は 0 のまま。
+/// launch grid の全 `(feature, ri)` cell を必ず書く (`off_start == off_end` の feature でも
+/// sum=0 を書く) ため、caller は grad_w を事前 0-reset しなくてよい。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn gather_and_sum_per_feature_overwrite(

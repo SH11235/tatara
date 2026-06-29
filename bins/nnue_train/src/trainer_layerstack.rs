@@ -2740,7 +2740,8 @@ impl GpuTrainer {
         // 各 (b, ri) thread が直接 38 atomic add する素朴版は atomic contention で memory
         // bandwidth が飽和するため、phase A (count) → B (prefix sum) → C (scatter) →
         // D (per-feature gather+sum) の inverse-index 構成にして atomic を D だけに局所化する。
-        // ft_w_grad は host が memset_zero 済、phase D は atomic add で stm/nstm を合算。
+        // phase D iter 0 (stm) は overwrite で全 cell を書き、iter 1 (nstm) が atomic add で
+        // 合算するため、ft_w_grad は host 事前 memset 不要 (overwrite が前回値を上書きする)。
         // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
         // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
         // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
@@ -2800,7 +2801,7 @@ impl GpuTrainer {
             prof_tick!("phC_scat");
             // D: gather_and_sum_per_feature。block grid = (ft_in, ft_out/128), block_dim=128.
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
-            // host は grad_w を memset_zero 済みだが、overwrite kernel は全 cell を書き切る。
+            // overwrite kernel が全 cell を書き切るため grad_w の host 事前 memset は不要。
             let d_config = LaunchConfig {
                 grid_dim: (ft_in as u32, (ft_out / 128) as u32, 1),
                 block_dim: (128, 1, 1),
