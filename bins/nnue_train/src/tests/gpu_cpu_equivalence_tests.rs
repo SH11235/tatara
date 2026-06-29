@@ -656,7 +656,7 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `simple_bias_grad_dual` (per-output tile reduction) が `Σ_b (stm + nstm)` の CPU 参照と
 /// 一致する。整数値 dft で reduction を exact 化し、items > batch (1 block) / batch 倍数 /
-/// 末尾 partial block / ft_dim 16・32・256 を網羅。`block_dim == ft_dim`。
+/// 末尾 partial block / ft_dim 16・32・256・512・1024 (大 block_dim 境界) を網羅。`block_dim == ft_dim`。
 #[test]
 fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
