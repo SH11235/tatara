@@ -86,8 +86,8 @@ pub(crate) struct SimpleGpuWorkspace {
     /// 同 nstm。
     dft_nstm_out_h: Option<DeviceBuffer<f16>>,
 
-    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` →
-    //    `exclusive_prefix_sum_small` → `scatter_positions` → `gather_and_sum_per_feature_*`
+    // -- inverse-index sparse_ft_backward scratch (`build_feature_counts` → exclusive
+    //    prefix sum (multi-block scan) → `scatter_positions` → `gather_and_sum_per_feature_*`
     //    pipeline 用)。per-feature gather で `dft_*_out` の DRAM read を 1 perspective につき
     //    各 (feature, ft_out) cell ちょうど 1 回に抑え、global atomic 数も `b * ft_out *
     //    max_active` から `b * max_active` (histogram + scatter) まで圧縮する。サイズは
@@ -1716,8 +1716,8 @@ impl SimpleGpuTrainer {
         }
 
         // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
-        // 各 perspective につき (A) `build_feature_counts` で histogram、(B)
-        // `exclusive_prefix_sum_small` で offset、(C) `scatter_positions` で sorted position 列を
+        // 各 perspective につき (A) `build_feature_counts` で histogram、(B) multi-block
+        // exclusive prefix sum で offset、(C) `scatter_positions` で sorted position 列を
         // 構築し、(D) `gather_and_sum_per_feature_overwrite` (1 回目 = stm) /
         // `gather_and_sum_per_feature_add` (2 回目 = nstm) が `(feature, ri)` cell ごとに
         // sum を書く。FP16 path は同 pipeline で `_fp16` 変種に dft_inv_scale を渡す。
