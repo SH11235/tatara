@@ -2612,13 +2612,15 @@ impl GpuTrainer {
             ]
         }?;
         prof_tick!("bwd_L1_wB");
-        // L1 input backward (sorted tiled): dx_sorted[b][i] = Σ_o dl1_total_sorted[b][o] *
-        // w[bucket][o][i]。weight grad が combined_sorted を read し終えた後 (同 stream serialize)
-        // なので、その buffer を dx_sorted の出力先に再利用する (別途 padded_b×ft_out の確保を避ける)。
+        // L1 input backward (sorted tiled, inverse-scatter 融合): dx[perm[b]][i] =
+        // Σ_o dl1_total_sorted[b][o] * w[bucket][o][i]。sorted で計算した dx を bucket_perm で
+        // original order に直接 scatter して dcombined_from_l1 へ書き、sorted dx の materialize +
+        // 別 inverse-permute kernel の DRAM roundtrip を省く。padding 行 (perm=-1) は write skip。
+        // dcombined_from_l1 は全 real row が書かれる (perm は全 batch row を覆う bijection)。
         // 16-row tile あたり w[bucket] を 1 回 shared load して L2 trip を削減する。
         // grid = (in-tile = ft_out/16, batch-tile = padded_b/16)。
         cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket_tiled_sorted,
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
@@ -2630,22 +2632,9 @@ impl GpuTrainer {
                 slice(self.ws.dl1_total_sorted),
                 slice(self.l1_w),
                 slice(self.ws.bucket_idx_sorted_dev),
-                slice_mut(self.ws.combined_sorted),
-                padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-            ]
-        }?;
-        // sorted dx を bucket_perm で original order に inverse-scatter → dcombined_from_l1。
-        // padding 行 (perm=-1) は skip。dcombined_from_l1 は全 real row が書かれる (perm は
-        // 全 batch row を覆う bijection)。
-        cuda_launch! {
-            kernel: inverse_permute_rows_f32,
-            stream: self.stream, module: self.module,
-            config: cfg_1d(padded_b * ft_out),
-            args: [
-                slice(self.ws.combined_sorted),
                 slice(self.ws.bucket_perm_dev),
-                slice(self.ws.dcombined_from_l1),
-                padded_b as u32, ft_out as u32
+                slice_mut(self.ws.dcombined_from_l1),
+                padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
             ]
         }?;
         prof_tick!("bwd_L1_inB");
