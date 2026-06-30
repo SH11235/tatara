@@ -1517,11 +1517,17 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
-        let num_splits = 8_usize;
-        // block_dim は in_dim (= L2 出力次元) に一致させる (kernel は 1 thread = 1 ii cell)。
+        let num_splits = 8_usize; // 小 grid。kernel は grid-stride で全 batch を覆う。
+        // 列あたり R lane (= block_dim / in_dim) で batch reduction を並列化 (production と同じ
+        // 算出)。R = in_dim を掛けて 256 を超えない最大 2 冪、block_dim = R*in_dim。
+        let mut lanes = 1_usize;
+        while lanes * 2 * in_dim <= 256 {
+            lanes *= 2;
+        }
+        let block_dim = (lanes * in_dim) as u32;
         let config = LaunchConfig {
             grid_dim: (num_splits as u32, 1, 1),
-            block_dim: (in_dim as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
         cuda_launch! {

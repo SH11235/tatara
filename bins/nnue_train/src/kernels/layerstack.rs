@@ -2013,21 +2013,27 @@ pub fn dense_mm_bwd_weight_bucket(
     }
 }
 
-/// L3 weight backward (specialized: `out_dim=1`, `num_buckets=9`; `in_dim` は L2 の
-/// 出力次元で runtime arg)。
+/// L3 weight backward (specialized: `out_dim=1`, `num_buckets<=9`; `in_dim` は L2 の
+/// 出力次元で runtime arg)。`grad_w[buc][0][ii] = Σ_{b: bucket[b]==buc} x[b][ii] * dy[b][0]`。
 ///
-/// split-K + 9 bucket register accumulator で並列度を確保する:
-/// - block dim = in_dim (1 thread = 1 ii cell)。`ii >= in_dim` の thread は return
-///   するため、caller は block_dim を in_dim に一致させる (小さいと末尾 cell が未計算)。
-/// - grid = num_batch_splits (e.g., 64)
-/// - 各 thread が 9 bucket × 1 ii の partial sum を batch_slice 内で集計
-/// - 完了後、9 cell ぶん atomicAdd で global grad_w に flush
+/// 列 `ii` を専有する thread を `R = block_dim / in_dim` 本持ち (`r = tid / in_dim`、`ii =
+/// tid % in_dim`)、R 本が grid-stride で別々の batch row を 9 bucket register に集計してから、
+/// block 内で r 軸を shared-mem tree reduction (各 bucket plane ごと) で 1 本に畳み、列あたり
+/// block で 1 回だけ global atomicAdd する。`block_dim = in_dim` 固定 (= 列あたり 1 thread・
+/// 1 warp/block) だと batch reduction が直列かつ block が 1 warp で SM をほぼ遊ばせる
+/// (occupancy 数%) ため、列あたり R thread に並列化して warp/block と batch 並列度を上げる。
 ///
-/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では (in_dim * num_buckets) cells
-/// 分の threads しか使えず並列度が極小になるため、本 specialized kernel を使う。
+/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では (in_dim * num_buckets) cells 分の
+/// threads しか使えず並列度が極小になるため、本 specialized kernel を使う。
 ///
-/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。out_dim==1,
-/// num_buckets==9、block_dim==in_dim を満たすこと。
+/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。`out_dim == 1`、
+/// `num_buckets <= 9`、`block_dim == R * in_dim` で `R` は 2 冪 (tree reduction が R を完全に
+/// 畳める前提)、`block_dim <= 256` (`PARTIAL` 固定容量 = 9 plane × 256)。
+///
+/// 数値: register 累積 → tree reduction → block 跨ぎ atomic で和の項順が baseline 配列順と
+/// 変わるため FP32 非結合性で最下位 bit が動き得る (旧版 global atomic も順序非決定)。和の値は
+/// 同一で、全部分和が 2^24 未満の整数値入力では各 f32 加算が exact かつ順序非依存になり CPU
+/// 参照と bit 一致する (単体テストがこの条件下で検証)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn dense_mm_bwd_weight_bucket_tiled_l3(
@@ -2040,31 +2046,22 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
     out_dim: u32,
     num_buckets: u32,
 ) {
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_split = thread::blockIdx_x() as usize;
-    let num_splits = thread::gridDim_x() as usize;
+    use core::ptr::addr_of_mut;
+    // 9 bucket plane × block_dim(<=256)。9 KB、GA102 (48 KB/block 上限) で occupancy へ影響軽微。
+    static mut PARTIAL: SharedArray<f32, 2304> = SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_dim = thread::blockDim_x() as usize;
     let in_dim_u = in_dim as usize;
     let out_dim_u = out_dim as usize;
     let batch_u = batch as usize;
-    let ii = tid_local;
-    if ii >= in_dim_u {
-        return;
-    }
+    let ii = tid % in_dim_u; // 担当列
+    let r = tid / in_dim_u; // 列内の batch-lane (0..R)
+    let rows_per_iter = block_dim / in_dim_u; // R: host が block_dim % in_dim == 0 を保証
 
-    // 各 block が均等な batch slice を担当 (端数は block 0 に寄せず ceil で配分し overflow check)。
-    // ceil(batch / num_splits)、cuda-oxide は usize の `min()` / `div_ceil` で drop_in_place を
-    // 出してしまうので素朴な式で書く。
-    let positions_per_block = batch_u.div_ceil(num_splits);
-    let b_start = block_split * positions_per_block;
-    if b_start >= batch_u {
-        return;
-    }
-    let b_end_candidate = b_start + positions_per_block;
-    let b_end = if b_end_candidate < batch_u {
-        b_end_candidate
-    } else {
-        batch_u
-    };
+    // grid-stride: block bx の lane r は row {bx*R + r, + gridDim*R, ...} を担当。
+    let grid = thread::gridDim_x() as usize;
+    let stride = grid * rows_per_iter;
+    let mut row = thread::blockIdx_x() as usize * rows_per_iter + r;
 
     let mut a0 = 0.0_f32;
     let mut a1 = 0.0_f32;
@@ -2076,13 +2073,11 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
     let mut a7 = 0.0_f32;
     let mut a8 = 0.0_f32;
 
-    let mut bb = b_start;
-    while bb < b_end {
-        let buc = bucket_idx[bb];
-        let xv = x[bb * in_dim_u + ii];
-        // out_dim=1 想定 (oi=0 のみ)。dy[bb][0] を読む。
-        let dyv = dy[bb * out_dim_u];
-        let mul = xv * dyv;
+    while row < batch_u {
+        let buc = bucket_idx[row];
+        let xv = x[row * in_dim_u + ii];
+        // out_dim=1 想定 (oi=0 のみ)。dy[row][0] を読む。
+        let mul = xv * dy[row * out_dim_u];
         if buc == 0 {
             a0 += mul;
         } else if buc == 1 {
@@ -2102,64 +2097,60 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l3(
         } else if buc == 8 {
             a8 += mul;
         }
-        bb += 1;
+        row += stride;
     }
 
-    // 9 cell flush。layout は buc * (out_dim * in_dim) + oi * in_dim + ii、oi=0 なので buc * in_dim + ii。
-    let num_buc_u = num_buckets as usize;
-    let raw = grad_w.as_ptr();
-    if num_buc_u >= 1 {
-        unsafe {
-            let c = &*(raw.add(ii) as *const DeviceAtomicF32);
-            c.fetch_add(a0, AtomicOrdering::Relaxed);
-        }
+    // 各 bucket plane を PARTIAL[buc * block_dim + tid] に置く。
+    let pp: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
+    unsafe {
+        pp.add(tid).write(a0);
+        pp.add(block_dim + tid).write(a1);
+        pp.add(2 * block_dim + tid).write(a2);
+        pp.add(3 * block_dim + tid).write(a3);
+        pp.add(4 * block_dim + tid).write(a4);
+        pp.add(5 * block_dim + tid).write(a5);
+        pp.add(6 * block_dim + tid).write(a6);
+        pp.add(7 * block_dim + tid).write(a7);
+        pp.add(8 * block_dim + tid).write(a8);
     }
-    if num_buc_u >= 2 {
-        unsafe {
-            let c = &*(raw.add(in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a1, AtomicOrdering::Relaxed);
+    thread::sync_threads();
+
+    // r 軸 tree reduction: partner は同 ii の `r + s` lane (`tid + s * in_dim`)。R が 2 冪なので
+    // s=R/2..1 で R 本の部分和が r==0 に集まる。各 step で 9 plane すべてを畳む。
+    let mut s = rows_per_iter / 2;
+    while s >= 1 {
+        if r < s {
+            let off = s * in_dim_u;
+            unsafe {
+                let mut p = 0;
+                while p < 9 {
+                    let base = p * block_dim + tid;
+                    let v = pp.add(base).read() + pp.add(base + off).read();
+                    pp.add(base).write(v);
+                    p += 1;
+                }
+            }
         }
+        thread::sync_threads();
+        s /= 2;
     }
-    if num_buc_u >= 3 {
-        unsafe {
-            let c = &*(raw.add(2 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a2, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 4 {
-        unsafe {
-            let c = &*(raw.add(3 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a3, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 5 {
-        unsafe {
-            let c = &*(raw.add(4 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a4, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 6 {
-        unsafe {
-            let c = &*(raw.add(5 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a5, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 7 {
-        unsafe {
-            let c = &*(raw.add(6 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a6, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 8 {
-        unsafe {
-            let c = &*(raw.add(7 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a7, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 9 {
-        unsafe {
-            let c = &*(raw.add(8 * in_dim_u + ii) as *const DeviceAtomicF32);
-            c.fetch_add(a8, AtomicOrdering::Relaxed);
+
+    // r==0 (tid < in_dim) が列 ii の block 総和を持つ。列あたり block で 1 atomic/bucket。
+    // layout は buc * (out_dim * in_dim) + oi * in_dim + ii、oi=0 なので buc * in_dim + ii。
+    if r == 0 {
+        let num_buc_u = num_buckets as usize;
+        let raw = grad_w.as_ptr();
+        let mut p = 0;
+        while p < num_buc_u {
+            // SAFETY: r==0 ⇒ p*block_dim+tid は plane p の lane0 slot (tid==ii<in_dim)。grad_w
+            // index buc*in_dim+ii < num_buckets*in_dim == grad_w.len() (host 契約、out_dim=1)。
+            // `f32`/`DeviceAtomicF32` 同 align、atomic add 同士のみ serialize。
+            unsafe {
+                let v = pp.add(p * block_dim + tid).read();
+                let c = &*(raw.add(p * in_dim_u + ii) as *const DeviceAtomicF32);
+                c.fetch_add(v, AtomicOrdering::Relaxed);
+            }
+            p += 1;
         }
     }
 }

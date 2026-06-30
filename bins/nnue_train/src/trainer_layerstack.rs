@@ -2304,22 +2304,26 @@ impl GpuTrainer {
             ]
         }?;
         // L3 weight bwd: in_dim=l2_out, out_dim=1, num_buckets<=9。
-        // 元 kernel は (out_dim*in_dim*num_buckets) cells × scan batch で並列度小。
-        // split-K + 9-register bucket accumulator (`dense_mm_bwd_weight_bucket_tiled_l3`)
-        // に切替。kernel の register accumulator (`a0..a8`) は `num_buckets` を runtime
-        // 引数で受け、`buc >= num_buckets` は flush も accumulate もされない silent skip
-        // で動く。1 thread = 1 in_dim cell なので block_dim は in_dim (= l2_out) と一致
-        // させる (kernel は `ii >= in_dim` を return するため block_dim < in_dim だと
-        // 末尾 cell が未計算になる)。num_splits=64 → 64 blocks × l2_out threads。
-        // `--l2 <= 256` を CLI が保証するので block_dim は 1024 上限を超えない。
+        // 列 (= l2_out) あたり R lane で batch reduction を並列化する
+        // `dense_mm_bwd_weight_bucket_tiled_l3`。`buc >= num_buckets` は flush も accumulate も
+        // されない silent skip で動く。R = l2_out を掛けて 256 を超えない最大 2 冪 (kernel の
+        // PARTIAL = 9 plane × 256 上限、tree reduction が畳めるよう 2 冪)。block_dim = R*l2_out
+        // で warp/block を増やし (block_dim=l2_out の 1 warp/block だと occupancy 数%)、grid は
+        // grid-stride で全 SM を埋める数にする (kernel は任意 grid で正しく、grid は occupancy/
+        // atomic 数の調整のみ)。`--l2 <= 256` を CLI が保証するので block_dim は 256 上限内。
         debug_assert!(self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS);
+        let mut l3_lanes = 1_usize;
+        while l3_lanes * 2 * l2_out <= 256 {
+            l3_lanes *= 2;
+        }
+        let l3_block = (l3_lanes * l2_out) as u32;
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l3,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: (64, 1, 1),
-                block_dim: (l2_out as u32, 1, 1),
+                grid_dim: (256, 1, 1),
+                block_dim: (l3_block, 1, 1),
                 shared_mem_bytes: 0,
             },
             args: [
@@ -2376,13 +2380,16 @@ impl GpuTrainer {
         // L2 weight backward: split-K + 9 bucket register accumulator。weight cell 空間
         // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
         // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
-        // 超えるため)。
+        // 超えるため)。grid_y (= batch split 数) は per-thread の直列 batch reduction を短くし
+        // SM を埋めるため大きめに取る (cell 数が少ない既定形状では grid_y=64 だと occupancy 50%
+        // 止まりで latency-bound)。kernel は任意の grid_y で正しく、grid_y は occupancy/atomic
+        // 数の調整のみ。
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l2,
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 64, 1),
+                grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 256, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
