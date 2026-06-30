@@ -2308,7 +2308,7 @@ impl GpuTrainer {
         // `dense_mm_bwd_weight_bucket_tiled_l3`。`buc >= num_buckets` は flush も accumulate も
         // されない silent skip で動く。R = l2_out を掛けて 256 を超えない最大 2 冪 (kernel の
         // PARTIAL = 9 plane × 256 上限、tree reduction が畳めるよう 2 冪)。block_dim = R*l2_out
-        // で warp/block を増やし (block_dim=l2_out の 1 warp/block だと occupancy 数%)、grid は
+        // で 1 列あたり R thread (= 複数 warp/block) にして warp/block と batch 並列度を上げ、grid は
         // grid-stride で全 SM を埋める数にする (kernel は任意 grid で正しく、grid は occupancy/
         // atomic 数の調整のみ)。`--l2 <= 256` を CLI が保証するので block_dim は 256 上限内。
         debug_assert!(self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS);
@@ -2381,9 +2381,9 @@ impl GpuTrainer {
         // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
         // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
         // 超えるため)。grid_y (= batch split 数) は per-thread の直列 batch reduction を短くし
-        // SM を埋めるため大きめに取る (cell 数が少ない既定形状では grid_y=64 だと occupancy 50%
-        // 止まりで latency-bound)。kernel は任意の grid_y で正しく、grid_y は occupancy/atomic
-        // 数の調整のみ。
+        // SM を埋めるため大きめに取る (weight cell 数が少ない形状では split が少ないと走る warp が
+        // SM slot に足りず latency-bound になる)。kernel は任意の grid_y で正しく、grid_y は
+        // occupancy/atomic 数の調整のみ。
         cuda_launch! {
             kernel: dense_mm_bwd_weight_bucket_tiled_l2,
             stream: self.stream,
