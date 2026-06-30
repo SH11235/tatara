@@ -1952,8 +1952,9 @@ pub fn dense_mm_bwd_input_bucket_tiled_sorted_scatter(
         if dst_row >= 0 {
             // 2D tile grid のため index は thread::index_1d() と一致しない。perm は real row の
             // bijection なので (dst_row, global_ii) は thread 間で disjoint かつ全 real cell を覆う。
-            // SAFETY: dst_row は perm の real entry ⇒ dst_row < batch_orig (= dx の row 数)、
-            // global_ii < in_dim ⇒ cell_idx < dx.len() (= batch_orig * in_dim)。
+            // SAFETY: dst_row は perm の real entry ⇒ dst_row < dx の row 数 (= original batch、
+            // kernel 引数 `batch` = padded sorted 長とは別) で global_ii < in_dim なので
+            // cell_idx < dx.len()。
             let cell_idx = (dst_row as usize) * in_dim_u + global_ii;
             unsafe {
                 *dx.as_mut_ptr().add(cell_idx) = acc;

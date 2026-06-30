@@ -336,12 +336,12 @@ pub(crate) struct GpuWorkspace {
     bucket_counts_dev: DeviceBuffer<u32>, // num_buckets + 1 (histogram + invalid bin)
     bucket_offsets_dev: DeviceBuffer<u32>, // num_buckets + 1 (exclusive scan)
     bucket_write_ctr_dev: DeviceBuffer<u32>, // num_buckets + 1 (scatter ranking counter)
-    bucket_perm_dev: DeviceBuffer<i32>,   // batch (perm[i] = original row index)
+    bucket_perm_dev: DeviceBuffer<i32>, // padded_sort_batch 長、perm[sorted i] = original row index (padding は -1)
     bucket_idx_sorted_dev: DeviceBuffer<i32>, // batch (sorted bucket values)
-    combined_sorted: DeviceBuffer<f32>,   // batch × ft_out (combined を perm で gather)
-    l1_bucket_sorted: DeviceBuffer<f32>,  // batch × l1_out (sorted fwd_L1 出力)
-    dl1_total_sorted: DeviceBuffer<f32>,  // batch × l1_out (dl1_total を perm で gather)
-    dl2_out_sorted: DeviceBuffer<f32>,    // batch × l2_out (dl2_out を perm で gather、L2 bias 用)
+    combined_sorted: DeviceBuffer<f32>, // batch × ft_out (combined を perm で gather)
+    l1_bucket_sorted: DeviceBuffer<f32>, // batch × l1_out (sorted fwd_L1 出力)
+    dl1_total_sorted: DeviceBuffer<f32>, // batch × l1_out (dl1_total を perm で gather)
+    dl2_out_sorted: DeviceBuffer<f32>,  // batch × l2_out (dl2_out を perm で gather、L2 bias 用)
 }
 
 impl GpuWorkspace {
