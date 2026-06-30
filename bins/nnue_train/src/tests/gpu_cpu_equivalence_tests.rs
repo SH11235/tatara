@@ -1265,8 +1265,7 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
         let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
         let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
         let mut dy_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
-        let mut dx_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * in_dim)?;
-        let dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
 
         memset_minus_one_i32(&stream, &perm_dev)?;
         memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
@@ -1293,21 +1292,17 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
             args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
                    padded as u32, out_dim as u32]
         }?;
+        // sorted で計算した dx を perm で original order に直接 scatter して dx_dev へ書く。
+        // 下の CPU 参照 / 非 tiled kernel との一致で scatter 込みの値が正しいことを確認する。
         cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket_tiled_sorted, stream: stream, module: module,
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter, stream: stream, module: module,
             config: LaunchConfig {
                 grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },
-            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev),
-                   slice_mut(dx_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
-        }?;
-        cuda_launch! {
-            kernel: inverse_permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * in_dim),
-            args: [slice(dx_sorted_dev), slice(perm_dev), slice(dx_dev),
-                   padded as u32, in_dim as u32]
+            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev), slice(perm_dev),
+                   slice_mut(dx_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
         }?;
         stream.synchronize()?;
 

@@ -1843,27 +1843,36 @@ pub fn dense_mm_bwd_input_bucket(
     }
 }
 
-/// Sorted layout 版の per-bucket dense backward-input matmul (L1 用)。
-/// `dx[b][i] = sum_o dy[b][o] * w[bucket_idx[b_start]][o][i]`。caller が batch を bucket で sort 済
-/// かつ各 bucket の開始 offset が TILE_B = 16 境界に align 済を保証する前提 (block 内 16 row は
-/// uniform bucket、boundary block 無し)。[`dense_mm_bwd_input_bucket`] の tiled variant:
+/// Sorted layout 版の per-bucket dense backward-input matmul (L1 用)、出力を `perm` で
+/// original row order に inverse-scatter しながら書く融合版。
+/// `dx[perm[bs]][i] = sum_o dy[bs][o] * w[bucket_idx[bs_start]][o][i]` (`bs` = sorted row、
+/// `perm[bs]` = original row、`perm[bs] < 0` は padding で write skip)。caller が batch を bucket で
+/// sort 済かつ各 bucket の開始 offset が TILE_B = 16 境界に align 済を保証する前提 (block 内 16 row
+/// は uniform bucket、boundary block 無し)。[`dense_mm_bwd_input_bucket`] の tiled variant:
 /// dy_tile[16 b × 16 o] / w_tile[16 o × 16 i] を shared に coalesced load し、各 thread が 1 (b, i)
 /// cell を out_dim 軸 (= 縮約 K) の reduction で完成する。非 tiled 版が同 bucket の row ごとに
 /// w[bucket] を global から重複 read していたのを、16-row tile あたり 1 回の shared load に集約する。
 ///
+/// 出力 write に `perm` を噛ませることで、sorted dx を一旦 materialize して別 kernel で
+/// inverse-permute する DRAM roundtrip (sorted dx の write + read + 原本への write のうち
+/// 中間 2 本) を省く。sorted の連続 16 row が散らばる原本 row に scatter するが、各 row 内の
+/// in-tile (16 cell = 64B) は連続なので per-row coalescing は保たれる。`dx` は original-order
+/// buffer (`batch_orig × in_dim`)。
+///
 /// w_tile は [o][i] の row stride 16。reduction read `w_tile[o*16 + tid_i]` は i (in-index) が
 /// warp 内 stride 1 = fast index なので bank conflict 無し (pad 不要)。`in_dim % 16 == 0` /
 /// `batch % 16 == 0` / `num_buckets <= 9` が caller 契約。out_dim は 16 幅の K-tile に分割するため
-/// 任意 (末尾 tile は 0 padding)。padding 行 (bucket_idx=-1) は dx=0 を書き、後段の inverse permute
-/// が perm=-1 で skip する。
+/// 任意 (末尾 tile は 0 padding)。padding 行 (`perm[bs] < 0`) は write を skip するので original
+/// buffer には触れない (perm は real row の bijection で全 real row をちょうど 1 回ずつ覆う)。
 ///
 /// 数値同等性: per (b,i) で o=0.. の加算順を保持するため非 tiled 版と bit-exact。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
-pub fn dense_mm_bwd_input_bucket_tiled_sorted(
+pub fn dense_mm_bwd_input_bucket_tiled_sorted_scatter(
     dy: &[f32],
     w: &[f32],
     bucket_idx: &[i32],
+    perm: &[i32],
     mut dx: DisjointSlice<f32>,
     batch: u32,
     in_dim: u32,
@@ -1936,13 +1945,20 @@ pub fn dense_mm_bwd_input_bucket_tiled_sorted(
     }
 
     if bi_ok && ii_ok {
-        // 2D tile grid のため cell index は thread::index_1d() と一致しない。各 thread は
-        // disjoint な (global_bi, global_ii) cell を担当する。
-        // SAFETY: global_bi < batch、global_ii < in_dim ⇒ cell_idx < dx.len() (= batch*in_dim)。
-        let cell_idx = global_bi * in_dim_u + global_ii;
-        let val = if block_buc_ok { acc } else { 0.0_f32 };
-        unsafe {
-            *dx.as_mut_ptr().add(cell_idx) = val;
+        // 出力は perm で original row order に scatter する。padding 行 (perm<0) は原本に
+        // 対応 row が無いので write skip (acc はこの場合 dy_sorted=0 由来で 0、書いても無害
+        // だが原本 buffer 範囲外なので必ず skip する)。
+        let dst_row = perm[global_bi];
+        if dst_row >= 0 {
+            // 2D tile grid のため index は thread::index_1d() と一致しない。perm は real row の
+            // bijection なので (dst_row, global_ii) は thread 間で disjoint かつ全 real cell を覆う。
+            // SAFETY: dst_row は perm の real entry ⇒ dst_row < dx の row 数 (= original batch、
+            // kernel 引数 `batch` = padded sorted 長とは別) で global_ii < in_dim なので
+            // cell_idx < dx.len()。
+            let cell_idx = (dst_row as usize) * in_dim_u + global_ii;
+            unsafe {
+                *dx.as_mut_ptr().add(cell_idx) = acc;
+            }
         }
     }
 }
