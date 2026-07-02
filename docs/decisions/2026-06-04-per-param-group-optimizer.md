@@ -101,7 +101,7 @@ resolve し、`UniformOptimGroup` には所属 param-group の識別子を持た
 launch ごとに config から `(weight_decay, lr)` を引く。FT
 (`ft_w`) は table 外の特殊ケース (fp16 / fp16-opt-state の 4 variant) なので、ft group
 の値を個別に配線する。per-group の lr/weight_decay は**静的 config であって stateful
-ではない**ため、`RangerHostState` / optimizer state の構造変更は不要 (per-group 値を
+ではない**ため、optimizer の host 側 state の構造変更は不要 (per-group 値を
 stateful に持つ設計なら state のベクトル化が要るが、本設計では発生しない)。
 
 ### 7. checkpoint / resume

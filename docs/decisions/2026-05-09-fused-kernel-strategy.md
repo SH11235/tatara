@@ -28,7 +28,6 @@ build-time に hand-code すれば bullet runtime-fused 相当の memory traffic
 | `fused_ranger_step` | RAdam + lookahead | Ranger optimizer (RAdam + slow params の lerp) |
 | `fused_loss_wdl` | 3-5 | sigmoid + WDL blend + scale |
 | `fused_screlu_grad` | 2-3 | activation gradient (forward 経路と組合せ) |
-| `fused_adamw_step` | 5 | AdamW (decay 込み) |
 
 ハンドコード労力は合計 100〜300 行程度。
 
