@@ -17,10 +17,9 @@
 //! - `dataloader`: PSV file → HalfKA_hm sparse batch + prefetch
 //!   (`Batch { stm_indices, nstm_indices, score, wdl, per_pos_norm, n_positions }`、
 //!   `PsvFileLoader` / `PrefetchedLoader` / `BucketedPrefetchedLoader`)
-//! - `optimizer`: Ranger (RAdam + Lookahead) の host-side state
-//!   (`RAdamHostState` / `RangerHostState`) + パラメータ + checkpoint
-//!   serialise。GPU `#[kernel]` 本体は bin 側 (`bins/nnue_train`) inline、本
-//!   module は host state + `radam_compute_step_size_denom` host helper のみ
+//! - `optimizer`: `RangerParams` (Ranger optimizer のハイパーパラメータ) と
+//!   `radam_compute_step_size_denom` (GPU `radam_step` kernel に渡す値の host 側
+//!   事前計算 helper)
 //! - `trainer`: superbatch training loop driver (`TrainerBackend` trait +
 //!   `TrainingConfig` + `run`)。1 batch 分の GPU step は `bins/nnue_train::
 //!   GpuTrainer` (= `TrainerBackend` impl) が担う

@@ -287,57 +287,6 @@ pub fn wrm_weight_sum(
     sum_atom.fetch_add(weight as f64, AtomicOrdering::Relaxed);
 }
 
-/// Fused AdamW optimizer step。
-///
-/// LayerStack path では **未使用** (Ranger 使用)。cuda-oxide の bin-entry constraint に従い
-/// compile-reach のため preserve。
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::manual_clamp)]
-#[kernel]
-pub fn adamw_step(
-    mut weights: DisjointSlice<f32>,
-    mut m: DisjointSlice<f32>,
-    mut v: DisjointSlice<f32>,
-    mut grad: DisjointSlice<f32>,
-    lr: f32,
-    decay: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    min_w: f32,
-    max_w: f32,
-    n: u32,
-) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * lr;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let val = mi / (vi.sqrt() + eps);
-        p -= lr * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-    }
-}
-
 /// Fused RAdam optimizer step。
 ///
 /// `step_size` / `denom` は host 側 (`gpu_kernels::pointwise::radam_step::
@@ -1721,60 +1670,6 @@ pub fn sparse_ft_backward(
                     as *const DeviceAtomicF32)
             };
             cell.fetch_add(g, AtomicOrdering::Relaxed);
-        }
-        ni += 1;
-    }
-}
-
-/// Fused stm+nstm sparse_ft_backward。2 回呼び出しを 1 kernel に統合し、kernel launch
-/// オーバーヘッドと per-thread setup を削減 (`bi` / `ri` / 計算は thread 共有)。
-/// per-thread の atomic add ops 数は変わらない (38 stm + 38 nstm = 76)。
-/// host が呼出前に `grad_weight` を 0 で初期化。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn sparse_ft_backward_dual(
-    grad_out_stm: &[f32],
-    grad_out_nstm: &[f32],
-    indices_stm: &[i32],
-    indices_nstm: &[i32],
-    grad_weight: &[f32],
-    batch: u32,
-    rows: u32,
-    cols: u32,
-    nnz: u32,
-) {
-    let tid = thread::index_1d();
-    let total = (batch as usize) * (rows as usize);
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / (rows as usize);
-    let ri = tid.get() % (rows as usize);
-    let rows_u = rows as usize;
-    let nnz_u = nnz as usize;
-    let cols_u = cols as usize;
-
-    let g_stm = grad_out_stm[tid.get()];
-    let g_nstm = grad_out_nstm[tid.get()];
-    let base = bi * nnz_u;
-
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx_s = indices_stm[base + (ni as usize)];
-        if idx_s >= 0 && (idx_s as usize) < cols_u {
-            let cell = unsafe {
-                &*(grad_weight.as_ptr().add((idx_s as usize) * rows_u + ri)
-                    as *const DeviceAtomicF32)
-            };
-            cell.fetch_add(g_stm, AtomicOrdering::Relaxed);
-        }
-        let idx_n = indices_nstm[base + (ni as usize)];
-        if idx_n >= 0 && (idx_n as usize) < cols_u {
-            let cell = unsafe {
-                &*(grad_weight.as_ptr().add((idx_n as usize) * rows_u + ri)
-                    as *const DeviceAtomicF32)
-            };
-            cell.fetch_add(g_nstm, AtomicOrdering::Relaxed);
         }
         ni += 1;
     }

@@ -1245,8 +1245,7 @@ impl GpuTrainer {
     ///
     /// magic 不一致、`version > 5`、arch kind / topology が LayerStack と不一致、group 数
     /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
-    /// (32-bit / 破損 file) は `InvalidData` で reject
-    /// (`crates/nnue-train::optimizer::RangerHostState::load_from_reader` と同方針)。
+    /// (32-bit / 破損 file) は `InvalidData` で reject。
     ///
     /// header / group 本体の読み出しと照合は [`load_raw_checkpoint_file`] が担当する
     /// (version 互換規則は [`read_raw_ckpt_header`] を参照)。本 method は読み込んだ
