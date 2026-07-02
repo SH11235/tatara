@@ -34,10 +34,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     let params = id.ft_in() * id.ft_out
@@ -78,10 +75,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_screlu,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -150,10 +144,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
@@ -181,10 +172,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
@@ -219,10 +207,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_pairwise,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     let loss_pw = trainer_pw.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
@@ -262,10 +247,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         id_pairwise,
         smoke_weight_decay,
         smoke_fv_scale,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
     )?;
     trainer_pw_q.load_simple_weights(&pw_reloaded)?;
@@ -303,10 +285,12 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             id_fp16,
             smoke_weight_decay,
             smoke_fv_scale,
-            true,  // ft_fp16 (ft_fp16_out が要求する)
-            true,  // ft_fp16_out
-            false, // fp16_opt_state
-            false, // tf32
+            PrecisionFlags {
+                ft_fp16: true, // ft_fp16_out requires this
+                ft_fp16_out: true,
+                fp16_opt_state: false,
+                tf32: false,
+            },
             &SimpleInit::default_uniform(),
         )?;
         trainer_fp16.sync_ft_w_h_mirror()?;
@@ -363,10 +347,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         feature_set,
         // smoke は per-group override 無し (全 group weight_decay=0 / lr_mult=1.0)。
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),

@@ -787,10 +787,12 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 id,
                 1e-7,
                 16,
-                ft_fp16,
-                ft_fp16_out,
-                false,
-                false,
+                PrecisionFlags {
+                    ft_fp16,
+                    ft_fp16_out,
+                    fp16_opt_state: false,
+                    tf32: false,
+                },
                 &init,
             )?;
             // smoke_dummy は target=0.5 近傍で学習信号が無いため score / wdl を動かす
@@ -4664,10 +4666,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
-            false,
-            false,
-            false,
-            false,
+            PrecisionFlags::default(),
             feature_set,
             OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
             None,

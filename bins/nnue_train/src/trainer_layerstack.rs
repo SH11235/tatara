@@ -625,14 +625,7 @@ impl GpuTrainer {
     /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
     ///
-    /// `enable_tf32` は cuBLAS の `cublasSetMathMode` 引数を切替 ([`CublasHandle::new`])、
-    /// `true` で Ampere+ TC TF32 mode、`false` で純 FP32。default は CLI 側で OFF。
-    ///
-    /// `ft_fp16` が true なら forward 用 f16 weight (`ft_w_h` — factorizer 無効時は
-    /// master の cast mirror、有効時は base 形状の畳み込み済み comb、field doc 参照)
-    /// を確保し、forward を FP16 版に切替える。false なら未確保で従来 path。
-    /// `ft_fp16_out` が true なら FT activation も FP16 で持つ (`ft_fp16` を要求、
-    /// caller が validation 済)。
+    /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     ///
     /// forward 用 FT weight (mirror / comb) は構築時に初期重みと同期されるため、
     /// 返った trainer はそのまま `step` / `validate` できる。`--init-from` /
@@ -652,10 +645,7 @@ impl GpuTrainer {
         l1_out: usize,
         l2_out: usize,
         num_buckets: usize,
-        enable_tf32: bool,
-        ft_fp16: bool,
-        ft_fp16_out: bool,
-        fp16_opt_state: bool,
+        precision: PrecisionFlags,
         feature_set: FeatureSetSpec,
         optim_groups: OptimGroupConfig,
         norm_loss_factor: Option<f32>,
@@ -666,10 +656,10 @@ impl GpuTrainer {
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
-        // `ft_fp16_out` は weight FP16 path の拡張なので `ft_fp16` を含意する。CLI 検証
-        // (`run_training`) で reject 済だが、forward 分岐の各 `.expect()` がこの不変条件を
-        // 前提にするため constructor でも明示する。
-        debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
+        debug_assert!(
+            !precision.ft_fp16_out || precision.ft_fp16,
+            "ft_fp16_out requires ft_fp16"
+        );
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
 
@@ -786,14 +776,14 @@ impl GpuTrainer {
             module,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
-            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
             ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
             // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
             // = base と同値)。いずれも `sync_ft_forward_weights` が初期同期する。
-            ft_w_h: if ft_fp16 {
+            ft_w_h: if precision.ft_fp16 {
                 let n = if feature_set.ft_factorize() {
                     base_ft_in * ft_out
                 } else {
@@ -803,7 +793,7 @@ impl GpuTrainer {
             } else {
                 None
             },
-            ft_w_fold32: if feature_set.ft_factorize() && !ft_fp16 {
+            ft_w_fold32: if feature_set.ft_factorize() && !precision.ft_fp16 {
                 Some(DeviceBuffer::<f32>::zeroed(&stream, base_ft_in * ft_out)?)
             } else {
                 None
@@ -868,7 +858,7 @@ impl GpuTrainer {
                 l1_out,
                 l2_out,
                 num_buckets,
-                ft_fp16_out,
+                precision.ft_fp16_out,
                 feature_set,
             )?,
             // loss + step
@@ -878,10 +868,10 @@ impl GpuTrainer {
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
-            cublas: CublasHandle::new(&stream, enable_tf32)?,
-            ft_fp16,
-            ft_fp16_out,
-            fp16_opt_state,
+            cublas: CublasHandle::new(&stream, precision.tf32)?,
+            ft_fp16: precision.ft_fp16,
+            ft_fp16_out: precision.ft_fp16_out,
+            fp16_opt_state: precision.fp16_opt_state,
             feature_set,
             optim_groups,
             norm_loss_factor,
