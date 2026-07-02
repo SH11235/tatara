@@ -287,6 +287,126 @@ pub fn wrm_weight_sum(
     sum_atom.fetch_add(weight as f64, AtomicOrdering::Relaxed);
 }
 
+macro_rules! radam_update_moments {
+    (f32, $m_ref:ident, $v_ref:ident, $g:ident, $beta1:ident, $beta2:ident) => {{
+        let mi = $beta1 * *$m_ref + (1.0_f32 - $beta1) * $g;
+        let vi = $beta2 * *$v_ref + (1.0_f32 - $beta2) * $g * $g;
+        *$m_ref = mi;
+        *$v_ref = vi;
+        (mi, vi)
+    }};
+    (
+        f16,
+        $m_ref:ident,
+        $v_ref:ident,
+        $g:ident,
+        $beta1:ident,
+        $beta2:ident,
+        $m_scale:ident,
+        $v_scale:ident
+    ) => {{
+        // f16 格納値を真値へ割り戻す (scale は power-of-2 なので除算は無誤差)。
+        let m_prev = (*$m_ref as f32) / $m_scale;
+        let v_prev = (*$v_ref as f32) / $v_scale;
+        let mi = $beta1 * m_prev + (1.0_f32 - $beta1) * $g;
+        let vi = $beta2 * v_prev + (1.0_f32 - $beta2) * $g * $g;
+        // 格納: scale 後 f16 有限域に clamp してから半精度化。
+        let ms = mi * $m_scale;
+        let ms_c = if ms > 65504.0_f32 {
+            65504.0_f32
+        } else if ms < -65504.0_f32 {
+            -65504.0_f32
+        } else {
+            ms
+        };
+        *$m_ref = ms_c as f16;
+        let vs = vi * $v_scale;
+        let vs_c = if vs > 65504.0_f32 {
+            65504.0_f32
+        } else {
+            vs
+        };
+        *$v_ref = vs_c as f16;
+        // val は本 step の真値 mi / vi で計算する (f16 丸めは次 step の read で 1 回だけ入る)。
+        (mi, vi)
+    }};
+}
+
+macro_rules! radam_finish {
+    (reset, $i:ident, $g_ref:ident, $p_clamped:ident) => {
+        *$g_ref = 0.0_f32;
+    };
+    (keep_grad, $i:ident, $g_ref:ident, $p_clamped:ident) => {
+        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
+        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
+        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
+    };
+    (mirror, $i:ident, $g_ref:ident, $p_clamped:ident, $mirror:ident) => {
+        // SAFETY: `mirror` は他の buffer と同要素数で別 alloc (caller 保証)。
+        // kernel 冒頭で `i < n` を確認し、各 thread は自分の `i` のみ書く。
+        let mirror_ptr = $mirror.as_mut_ptr();
+        unsafe {
+            mirror_ptr.add($i.get()).write($p_clamped as f16);
+        }
+    };
+}
+
+// RAdam kernel 4 変種で decay、moment 更新、denom 分岐、clamp のコアを共有する。
+macro_rules! radam_step_body {
+    (
+        $weights:ident,
+        $m:ident,
+        $v:ident,
+        $grad:ident,
+        $lr:ident,
+        $step_size:ident,
+        $denom:ident,
+        $decay:ident,
+        $beta1:ident,
+        $beta2:ident,
+        $eps:ident,
+        $min_w:ident,
+        $max_w:ident,
+        $n:ident;
+        $state:ident $(, $m_scale:ident, $v_scale:ident)?;
+        $finish:ident $(, $mirror:ident)?
+    ) => {
+        let i = thread::index_1d();
+        if i.get() >= $n as usize {
+            return;
+        }
+        let g_opt = $grad.get_mut(i);
+        let m_opt = $m.get_mut(i);
+        let v_opt = $v.get_mut(i);
+        let w_opt = $weights.get_mut(i);
+        if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) =
+            (g_opt, m_opt, v_opt, w_opt)
+        {
+            let g = *g_ref;
+            let rate = $lr * $step_size;
+            let mut p = *w_ref;
+            p *= 1.0_f32 - $decay * rate;
+            let (mi, vi) = radam_update_moments!(
+                $state, m_ref, v_ref, g, $beta1, $beta2 $(, $m_scale, $v_scale)?
+            );
+            let mut val = mi;
+            if $denom != 0 {
+                val /= vi.sqrt() + $eps;
+            }
+            p -= rate * val;
+            let p_clamped = if p < $min_w {
+                $min_w
+            } else if p > $max_w {
+                $max_w
+            } else {
+                p
+            };
+            *w_ref = p_clamped;
+            radam_finish!($finish, i, g_ref, p_clamped $(, $mirror)?);
+        }
+    };
+}
+
 /// Fused RAdam optimizer step。
 ///
 /// `step_size` / `denom` は host 側 (`gpu_kernels::pointwise::radam_step::
@@ -310,38 +430,11 @@ pub fn radam_step(
     max_w: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        *g_ref = 0.0_f32;
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f32;
+        reset
+    );
 }
 
 /// `radam_step` の FP16 mirror 同時更新 variant (`--ft-fp16` の `ft_w` 専用)。
@@ -371,44 +464,11 @@ pub fn radam_step_fp16_mirror(
     max_w: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let mi = beta1 * *m_ref + (1.0_f32 - beta1) * g;
-        let vi = beta2 * *v_ref + (1.0_f32 - beta2) * g * g;
-        *m_ref = mi;
-        *v_ref = vi;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
-        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
-        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
-        let mirror_ptr = mirror.as_mut_ptr();
-        unsafe {
-            mirror_ptr.add(i.get()).write(p_clamped as f16);
-        }
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f32;
+        mirror, mirror
+    );
 }
 
 /// Norm loss (Georgiou et al. 2021) の per-weight-group sumsq 計算 (reduce pass)。
@@ -558,55 +618,11 @@ pub fn radam_step_f16state(
     v_scale: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        // f16 格納値を真値へ割り戻す (scale は power-of-2 なので除算は無誤差)。
-        let m_prev = (*m_ref as f32) / m_scale;
-        let v_prev = (*v_ref as f32) / v_scale;
-        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
-        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
-        // 格納: scale 後 f16 有限域に clamp してから半精度化。
-        let ms = mi * m_scale;
-        let ms_c = if ms > 65504.0_f32 {
-            65504.0_f32
-        } else if ms < -65504.0_f32 {
-            -65504.0_f32
-        } else {
-            ms
-        };
-        *m_ref = ms_c as f16;
-        let vs = vi * v_scale;
-        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
-        *v_ref = vs_c as f16;
-        // val は本 step の真値 mi / vi で計算する (f16 丸めは次 step の read で 1 回だけ入る)。
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
-        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
-        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f16, m_scale, v_scale;
+        keep_grad
+    );
 }
 
 /// [`radam_step_f16state`] に FP16 weight mirror 同時更新を足した variant
@@ -635,60 +651,11 @@ pub fn radam_step_f16state_mirror(
     v_scale: f32,
     n: u32,
 ) {
-    let i = thread::index_1d();
-    if i.get() >= n as usize {
-        return;
-    }
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
-    if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
-        let g = *g_ref;
-        let rate = lr * step_size;
-        let mut p = *w_ref;
-        p *= 1.0_f32 - decay * rate;
-        let m_prev = (*m_ref as f32) / m_scale;
-        let v_prev = (*v_ref as f32) / v_scale;
-        let mi = beta1 * m_prev + (1.0_f32 - beta1) * g;
-        let vi = beta2 * v_prev + (1.0_f32 - beta2) * g * g;
-        let ms = mi * m_scale;
-        let ms_c = if ms > 65504.0_f32 {
-            65504.0_f32
-        } else if ms < -65504.0_f32 {
-            -65504.0_f32
-        } else {
-            ms
-        };
-        *m_ref = ms_c as f16;
-        let vs = vi * v_scale;
-        let vs_c = if vs > 65504.0_f32 { 65504.0_f32 } else { vs };
-        *v_ref = vs_c as f16;
-        let mut val = mi;
-        if denom != 0 {
-            val /= vi.sqrt() + eps;
-        }
-        p -= rate * val;
-        let p_clamped = if p < min_w {
-            min_w
-        } else if p > max_w {
-            max_w
-        } else {
-            p
-        };
-        *w_ref = p_clamped;
-        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
-        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
-        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
-        // SAFETY: `mirror` は `weights` / `m` / `v` / `grad` と同要素数 `n` (caller が
-        // `ft_w` の要素数 `ft_w_n` を渡す)。kernel 冒頭で `i < n` を確認済みなので
-        // `mirror.add(i)` は in-bounds。各 thread は自分の `i` のみ書くため thread 間で
-        // aliasing は無い。`mirror` は他 buffer と別 alloc (caller 保証)。
-        let mirror_ptr = mirror.as_mut_ptr();
-        unsafe {
-            mirror_ptr.add(i.get()).write(p_clamped as f16);
-        }
-    }
+    radam_step_body!(
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        f16, m_scale, v_scale;
+        mirror, mirror
+    );
 }
 
 /// Ranger Lookahead lerp。
