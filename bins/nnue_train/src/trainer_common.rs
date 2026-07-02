@@ -5,6 +5,20 @@ use shogi_features::FeatureSetSpec;
 
 use crate::kernel_module::*;
 
+/// GPU trainer の数値精度と optimizer state の形式を選択する。既定値はすべて無効。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PrecisionFlags {
+    /// cuBLAS の dense 演算で TF32 Tensor Core math mode を使う。無効時は FP32。
+    /// 詳細は [`CublasHandle::new`] を参照。
+    pub(crate) tf32: bool,
+    /// FT forward weight を FP16 mirror または factorized comb から読み込む。
+    pub(crate) ft_fp16: bool,
+    /// FT activation とその gradient を FP16 で保持する。`ft_fp16` を必要とする。
+    pub(crate) ft_fp16_out: bool,
+    /// FT weight の optimizer moment を scale 付き FP16 で保持する。
+    pub(crate) fp16_opt_state: bool,
+}
+
 /// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
 /// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
 /// optimizer phase の DRAM traffic を占めるため `f16` 化の効果がある一方、他 9 group

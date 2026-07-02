@@ -359,32 +359,26 @@ impl Drop for SimpleGpuTrainer {
 }
 
 impl SimpleGpuTrainer {
-    #[allow(clippy::too_many_arguments)]
+    /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
         weight_decay: f32,
         fv_scale: i32,
-        ft_fp16: bool,
-        ft_fp16_out: bool,
-        fp16_opt_state: bool,
-        tf32: bool,
+        precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // `--ft-fp16-out` は weight FP16 path の拡張なので `--ft-fp16` を含意する。CLI
-        // 検証で reject 済だが、`SimpleGpuTrainer::new` を直接呼ぶ smoke / test 経路でも
-        // invariant を成立させる。
-        debug_assert!(!ft_fp16_out || ft_fp16, "ft_fp16_out requires ft_fp16");
+        // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
+        // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
+        debug_assert!(
+            !precision.ft_fp16_out || precision.ft_fp16,
+            "ft_fp16_out requires ft_fp16"
+        );
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
-        // `tf32` (CLI の `--tf32`) で cuBLAS math mode 切替。default OFF は
-        // `CUBLAS_DEFAULT_MATH` (純 FP32 path、L1/L2/L3 dense Sgemm bit-identical)。
-        // `true` で `CUBLAS_TF32_TENSOR_OP_MATH` を有効化し Ampere+ TC を使う (Sgemm 高速化、
-        // 仮数 23-bit → 10-bit 丸めで数値挙動が変わる、棋力 risk opt-in)。LayerStack
-        // `--tf32` と同方針。
-        let cublas = CublasHandle::new(&stream, tf32)?;
+        let cublas = CublasHandle::new(&stream, precision.tf32)?;
 
         let ft_in = id.ft_in();
         let ft_out = id.ft_out;
@@ -474,8 +468,8 @@ impl SimpleGpuTrainer {
             l2_b_grad: z(l2_b_n)?,
             l3_w_grad: z(l3_w_n)?,
             l3_b_grad: z(l3_b_n)?,
-            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, fp16_opt_state)?,
+            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
             ft_w_slow,
             ft_b_m: z(ft_b_n)?,
             ft_b_v: z(ft_b_n)?,
@@ -498,14 +492,14 @@ impl SimpleGpuTrainer {
             l3_b_m: z(l3_b_n)?,
             l3_b_v: z(l3_b_n)?,
             l3_b_slow,
-            ws: SimpleGpuWorkspace::new(&stream, batch, id, ft_fp16_out)?,
+            ws: SimpleGpuWorkspace::new(&stream, batch, id, precision.ft_fp16_out)?,
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             weight_sum_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
-            ft_w_h: if ft_fp16 {
+            ft_w_h: if precision.ft_fp16 {
                 Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
             } else {
                 None
@@ -518,9 +512,9 @@ impl SimpleGpuTrainer {
             weight_decay,
             fv_scale,
             cublas,
-            ft_fp16,
-            ft_fp16_out,
-            fp16_opt_state,
+            ft_fp16: precision.ft_fp16,
+            ft_fp16_out: precision.ft_fp16_out,
+            fp16_opt_state: precision.fp16_opt_state,
         })
     }
 

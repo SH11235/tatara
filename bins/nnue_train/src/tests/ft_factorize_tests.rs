@@ -12,7 +12,7 @@ use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSet;
 
 use crate::arch::*;
-use crate::trainer_common::BatchData;
+use crate::trainer_common::{BatchData, PrecisionFlags};
 use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
 
 #[test]
@@ -49,10 +49,7 @@ fn make_trainer(
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         feature_set,
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
@@ -288,10 +285,7 @@ fn make_trainer_psqt_init(
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
-        false,
-        false,
-        false,
-        false,
+        PrecisionFlags::default(),
         feature_set,
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
