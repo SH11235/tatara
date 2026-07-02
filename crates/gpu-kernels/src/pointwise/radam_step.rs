@@ -42,10 +42,10 @@
 //!     grad[i]    = 0                             # 次 batch 用に reset
 //! ```
 //!
-//! - **bias correction を `step_size` に畳み込む**: `adamw_step` (bias correction
-//!   なし) との最大の差分。`step_size` に `bc1 = 1 - beta1^t` の inverse +
-//!   variance 補正係数 `sqrt((1-beta2_t)*...)` を取り込み、kernel 側は
-//!   `rate = lr * step_size` 1 個で受ける
+//! - **bias correction を `step_size` に畳み込む**: `step_size` に
+//!   `bc1 = 1 - beta1^t` の inverse + variance 補正係数
+//!   `sqrt((1-beta2_t)*...)` を取り込み、kernel 側は `rate = lr * step_size`
+//!   1 個で受ける
 //! - **denom switch**: 学習初期で variance が不安定なときは `denom = 0` で
 //!   `1/sqrt(v)` を **off**、十分に accumulate された後 (n_sma > threshold) は
 //!   `denom = 1` で通常 Adam-like update
@@ -293,7 +293,7 @@ mod tests {
     }
 
     /// `decay = 0`、`g = 0`、clip 有効で **clip がかかるとき** weights は
-    /// `[min_w, max_w]` の範囲外に出ない (`adamw_step` と同型ガード)。
+    /// `[min_w, max_w]` の範囲外に出ない。
     #[test]
     fn clamp_pulls_weights_into_range() {
         let mut weights = vec![100.0_f32, -100.0, 0.5];
@@ -321,7 +321,7 @@ mod tests {
 
     /// 5 step の RAdam を host orchestration で回し、`step_size` / `denom` を
     /// 1 step ずつ更新しながら weights が target = 0 に向かって monotonic に
-    /// 近づくことを確認 (簡易 convergence、`adamw_step` と同型)。
+    /// 近づくことを確認する簡易 convergence test。
     #[test]
     fn five_step_monotonic_descent_with_radam_schedule() {
         let mut weights = vec![1.0_f32];
@@ -356,8 +356,8 @@ mod tests {
         }
     }
 
-    /// NaN 入力 (grad = NaN) で weights が NaN に汚染される (`adamw_step` と同型、
-    /// optimizer は NaN を握り潰さず伝搬する)。
+    /// NaN 入力 (grad = NaN) で weights が NaN に汚染されることを確認する。
+    /// optimizer は NaN を握り潰さず伝搬する。
     #[test]
     fn nan_grad_propagates_into_weights() {
         let mut weights = vec![0.5_f32];
@@ -386,9 +386,8 @@ mod tests {
         assert_eq!(grad, vec![0.0_f32]);
     }
 
-    /// `min_w == max_w` で weights が単一値に collapse する degenerate clip
-    /// (`adamw_step` と同型ガード、kernel 側 if-else ladder の境界扱いが CPU
-    /// `f32::clamp` と一致するか)。
+    /// `min_w == max_w` で weights が単一値に collapse する degenerate clip。
+    /// kernel 側 if-else ladder の境界扱いが CPU `f32::clamp` と一致するかを確認する。
     #[test]
     fn collapsed_clip_range_pins_weights_to_single_value() {
         let mut weights = vec![100.0_f32, -100.0, 0.0, 0.5];

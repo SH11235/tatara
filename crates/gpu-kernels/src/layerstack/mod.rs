@@ -37,8 +37,8 @@
 //! | `psqt_diff_sparse_bwd`        | [`psqt::psqt_diff_sparse_bwd_cpu`] |
 //!
 //! その他の reference (`loss_wdl` / `loss_wrm` / `sparse_ft_forward` /
-//! `sparse_ft_backward` / `screlu_grad` / `radam_step` / `ranger_step` /
-//! `adamw_step`) は `pointwise/` / `sparse/` 配下にある。
+//! `sparse_ft_backward` / `screlu_grad` / `radam_step` / `ranger_step`) は
+//! `pointwise/` / `sparse/` 配下にある。
 //!
 //! ## アーキテクチャ定数
 //!

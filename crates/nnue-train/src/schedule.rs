@@ -1,8 +1,8 @@
 //! Learning rate / WDL lambda scheduling。
 //!
 //! superbatch loop が `superbatch` / `batch` index ごとに `LrScheduler::lr` /
-//! `WdlScheduler::blend` を呼び、optimizer kernel (`adamw_step` / `radam_step`)
-//! と loss kernel (`loss_wdl` / `loss_wrm`) の `lr` / `lambda` 引数として渡す
+//! `WdlScheduler::blend` を呼び、optimizer kernel (`radam_step`) と loss kernel
+//! (`loss_wdl` / `loss_wrm`) の `lr` / `lambda` 引数として渡す
 //! host-side state を提供する。
 //!
 //! ANSI 色付き terminal 出力は持たず、`std::fmt::Display` で plain string を

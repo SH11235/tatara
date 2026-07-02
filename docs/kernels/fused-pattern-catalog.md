@@ -25,7 +25,6 @@ reference CPU: `crates/gpu-kernels/src/pointwise/`。
 | `screlu_grad` | SCReLU activation gradient (forward 経路と組合せ) |
 | `loss_wdl` | sigmoid + WDL blend + scale (`--win-rate-model` 未指定時の loss) |
 | `loss_wrm` / `wrm_weight_sum` | WRM (win-rate-model) loss、prediction / target 双方に WRM 適用。重み付き loss の分母は `wrm_weight_sum` が集計 |
-| `adamw_step` | AdamW (decay + clip 込み) |
 | `radam_step` | RAdam (AdamW + bias correction + denom switch)。FP16 mirror / FP16 opt-state の variant (`_fp16_mirror` / `_f16state` / `_f16state_mirror`) を持つ |
 | `ranger_lookahead_lerp` | Ranger の lookahead (slow params lerp、k-step periodic)。FP16 mirror variant (`_fp16_mirror`) を持ち、`radam_step` と 2 kernel の組で Ranger を構成する |
 | `norm_loss_reduce` / `norm_loss_finalize` / `norm_loss_apply` | per-weight-group L2-norm 正則化 (`--norm-loss`) の norm 集計 → 係数化 → weight への適用 |

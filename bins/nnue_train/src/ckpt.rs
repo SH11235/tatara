@@ -45,9 +45,8 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
-/// `crates/nnue-train::optimizer` の `b"RNGR"` (RangerHostState single-file format) とは
-/// 別物 — こちらは weight group raw f32 + Ranger state + step + superbatch を 1 file に
-/// まとめた self-contained format (`RNGR` は optimizer state だけ、weight は持たない)。
+/// weight group raw f32 + Ranger optimizer state + step + superbatch を 1 file に
+/// まとめた self-contained format。
 pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 
 /// raw checkpoint format version。
@@ -655,8 +654,8 @@ fn read_raw_ckpt_group<R: std::io::Read>(
     Ok((w_host, m_host, v_host, slow_host))
 }
 
-/// `io::ErrorKind::InvalidData` の `Box<dyn Error>` を作る短縮 helper (raw checkpoint
-/// の magic/version/dim 検証で使う、`RangerHostState::load_from_reader` と同方針)。
+/// raw checkpoint の magic/version/dim 検証で使う
+/// `io::ErrorKind::InvalidData` の `Box<dyn Error>` を作る短縮 helper。
 pub(crate) fn invalid_data(msg: String) -> Box<dyn std::error::Error> {
     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
 }
@@ -694,9 +693,9 @@ pub(crate) fn read_exact_or_invalid<R: std::io::Read>(
     })
 }
 
-/// little-endian f32 を `n` 個読む (`RangerHostState::load_from_reader` の `read_f32_vec`
-/// と同型だが本 module 内ローカル版、`io::Result` を返す)。`what` は短読み (破損 file) 時の
-/// context message に使う (`UnexpectedEof` → `InvalidData` に正規化、`read_exact_or_invalid` 経由)。
+/// little-endian f32 を `n` 個読み、`io::Result` を返す。`what` は短読み
+/// (破損 file) 時の context message に使う (`UnexpectedEof` → `InvalidData` に
+/// 正規化、`read_exact_or_invalid` 経由)。
 pub(crate) fn read_f32_vec_io<R: std::io::Read>(
     r: &mut R,
     n: usize,

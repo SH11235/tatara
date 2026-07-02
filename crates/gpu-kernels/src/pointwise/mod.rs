@@ -9,13 +9,11 @@
 //! - `screlu_fwd` — SCReLU activation forward
 //! - `screlu_grad` — SCReLU activation gradient
 //! - `loss_wdl` — sigmoid + WDL blend + scale
-//! - `adamw_step` — AdamW with decay + clip
 //! - `radam_step` — RAdam (AdamW + bias correction + denom switch)
 //! - `ranger_step` — RAdam + lookahead lerp
 //! - `norm_loss` — per-weight-group L2-norm regularisation
 //! - `loss_wrm` — win-rate-model loss
 
-pub mod adamw_step;
 pub mod loss_wdl;
 pub mod loss_wrm;
 pub mod norm_loss;
