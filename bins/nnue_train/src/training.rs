@@ -10,7 +10,9 @@ use nnue_train::trainer::{LossKind, TrainingConfig};
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
 
-use crate::{arch::*, cli::*, trainer_layerstack::*, trainer_simple::*};
+use crate::{
+    arch::*, cli::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*,
+};
 
 /// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
 /// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
@@ -448,10 +450,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.l1,
         layerstack.l2,
         layerstack.num_buckets,
-        tf32,
-        ft_fp16,
-        ft_fp16_out,
-        fp16_opt_state,
+        PrecisionFlags {
+            tf32,
+            ft_fp16,
+            ft_fp16_out,
+            fp16_opt_state,
+        },
         feature_set,
         optim_groups,
         norm_loss_factor,
@@ -1634,10 +1638,12 @@ pub(crate) fn run_simple_training(
         id,
         cli.weight_decay,
         fv_scale,
-        ft_fp16,
-        ft_fp16_out,
-        fp16_opt_state,
-        tf32,
+        PrecisionFlags {
+            tf32,
+            ft_fp16,
+            ft_fp16_out,
+            fp16_opt_state,
+        },
         &init_spec,
     )
     .map_err(|e| {
