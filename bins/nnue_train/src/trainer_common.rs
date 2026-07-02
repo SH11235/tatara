@@ -9,6 +9,7 @@ use crate::kernel_module::*;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PrecisionFlags {
     /// cuBLAS の dense 演算で TF32 Tensor Core math mode を使う。無効時は FP32。
+    /// 詳細は [`CublasHandle::new`] を参照。
     pub(crate) tf32: bool,
     /// FT forward weight を FP16 mirror または factorized comb から読み込む。
     pub(crate) ft_fp16: bool,

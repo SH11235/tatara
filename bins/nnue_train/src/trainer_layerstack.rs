@@ -656,6 +656,8 @@ impl GpuTrainer {
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
+        // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
+        // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
         debug_assert!(
             !precision.ft_fp16_out || precision.ft_fp16,
             "ft_fp16_out requires ft_fp16"
