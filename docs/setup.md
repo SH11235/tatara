@@ -175,6 +175,9 @@ The script does the following:
 - Checks for the host prerequisites (rustup / cargo / llc / clang / nvcc) and
   reports their presence (it does not install system packages)
 - Runs `cargo install --git ... cargo-oxide` at that rev
+- Verifies the **codegen backend cache** (`~/.cargo/cuda-oxide/`) is also on
+  that rev, and rebuilds it from the pinned rev if not (see "Troubleshooting"
+  below for why this matters)
 - Diagnoses the environment with `cargo-oxide doctor`
 
 To install manually without the script, match the cuda-oxide rev in
@@ -185,10 +188,11 @@ rev=$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//
 cargo install --git https://github.com/NVlabs/cuda-oxide.git --rev "$rev" --force cargo-oxide
 ```
 
-Make sure `~/.cargo/bin` is on your PATH. The script reinstalls `cargo-oxide` at
-the pinned rev every time, so when you bump the cuda-oxide rev (when you update
-the library-side `Cargo.toml`), just rerun `bash scripts/setup-cuda-oxide.sh` the
-same way.
+Make sure `~/.cargo/bin` is on your PATH. The script re-syncs both `cargo-oxide`
+and its backend cache to the pinned rev every time (a no-op if already in
+sync), so when you bump the cuda-oxide rev (when you update the library-side
+`Cargo.toml`) — or if you hit the codegen-backend version-skew issue described
+in "Troubleshooting" — just rerun `bash scripts/setup-cuda-oxide.sh`.
 
 ## Smoke test
 
@@ -303,6 +307,34 @@ The cuda-oxide rev is pinned in this repository's `Cargo.toml`
 
 ## Troubleshooting
 
+### Device codegen errors that don't reproduce for others (cuda-oxide backend cache version skew)
+
+Symptom: `cargo-oxide build` fails inside `rustc_codegen_cuda` with a device
+codegen error (e.g. an "Unsupported construct" translation failure), but the
+same source builds fine for other contributors or CI, and nothing about your
+OS/GPU/LLVM setup looks different.
+
+Root cause: `cargo-oxide`'s codegen backend
+(`~/.cargo/cuda-oxide/librustc_codegen_cuda.so`) is fetched **once, unpinned**
+— the first time you ever run any `cargo-oxide` subcommand on a machine, it
+shallow-clones whatever `main` HEAD of upstream cuda-oxide happens to be at
+that moment, builds it, and caches it forever. It is never re-validated
+against this repo's `Cargo.lock`-pinned rev, even when `cargo install --rev`
+reinstalls the `cargo-oxide` CLI itself at the correct rev — the CLI binary
+and the backend `.so` it drives are two independent artifacts. If your
+backend cache happened to be populated from a `main` HEAD that has since
+diverged structurally from the pinned rev (cuda-oxide's MIR-translation layer
+changes frequently), you can hit translation failures that a properly
+rev-matched environment never sees.
+
+Fix: `bash scripts/setup-cuda-oxide.sh` now detects and repairs this — it
+stamps the backend cache with the pinned rev + your rustc nightly version,
+and rebuilds the cache from the pinned rev whenever that stamp doesn't match
+(see [the ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) for the
+mechanism). Re-running it is a no-op if everything already matches. As a
+last resort, if the script doesn't get you unstuck, `rm -rf
+~/.cargo/cuda-oxide` and re-run the script.
+
 ### `cargo build` ICE: "Missing SyntaxContext NN for crate alloc/core/std"
 
 Symptom: `cargo build` panics inside `rustc` with `Missing SyntaxContext NN for
@@ -330,6 +362,8 @@ the broken `rust-std` / `rustc-dev` archives. There is no need to delete
 
 - [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
   the adoption decision and its Consequences
+- [cuda-oxide backend cache pin ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) —
+  why `setup-cuda-oxide.sh` also validates the codegen backend cache
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)
 - [cuda-oxide atomics example README (the basis for LLVM 22 syncscope)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)
