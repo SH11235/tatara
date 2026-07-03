@@ -113,6 +113,7 @@ fn validate_shared_cli(
         )
         .into());
     }
+    // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
     if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
         return Err(
             "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
@@ -120,6 +121,7 @@ fn validate_shared_cli(
                 .into(),
         );
     }
+    // NaN / 範囲外を kernel に流さない。WDL 値の範囲は [`build_wdl_scheduler`] が検証する。
     if !(cli.lr.is_finite() && cli.lr > 0.0) {
         return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
     }
@@ -1802,7 +1804,7 @@ mod tests {
         assert!(shared_cli_error(&[], true).contains("--ft-fp16-out requires --ft-fp16"));
 
         let shared =
-            validate_shared_cli(&parse(&["--all-optim"]), true, true).expect("valid shared CLI");
+            validate_shared_cli(&parse(&["--all-optim"]), false, false).expect("valid shared CLI");
         assert!(shared.precision.ft_fp16);
         assert!(shared.precision.ft_fp16_out);
         assert!(shared.precision.fp16_opt_state);
