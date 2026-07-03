@@ -2565,10 +2565,11 @@ pub fn psqt_diff_sparse_fwd_inplace(
     psqt_w: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     mut net_output: DisjointSlice<f32>,
     batch: u32,
-    nnz: u32,
+    max_active: u32,
     num_buckets: u32,
     ft_in: u32,
 ) {
@@ -2582,11 +2583,12 @@ pub fn psqt_diff_sparse_fwd_inplace(
     }
     let bucket_u = bucket as usize;
     let nb_u = num_buckets as usize;
-    let base = b.get() * (nnz as usize);
+    let base = b.get() * (max_active as usize);
+    let row_nnz = nnz_arr[b.get()];
     let mut sum_stm: f32 = 0.0;
     let mut sum_nstm: f32 = 0.0;
-    let mut ni: u32 = 0;
-    while ni < nnz {
+    let mut ni: i32 = 0;
+    while ni < row_nnz {
         let idx_s = stm_indices[base + (ni as usize)];
         if idx_s >= 0 && (idx_s as u32) < ft_in {
             sum_stm += psqt_w[(idx_s as usize) * nb_u + bucket_u];

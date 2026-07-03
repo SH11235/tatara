@@ -786,11 +786,12 @@ macro_rules! sparse_ft_forward_body {
     (
         $weight:ident,
         $indices:ident,
+        $nnz_arr:ident,
         $out:ident,
         $batch:ident,
         $rows:ident,
         $cols:ident,
-        $nnz:ident,
+        $max_active:ident,
         $tid:ident;
         $weight_type:ident,
         $out_type:ident
@@ -805,7 +806,8 @@ macro_rules! sparse_ft_forward_body {
         let ri_q = $tid.get() % rows_q;
         let ri_base = ri_q * 4;
 
-        // caller は indices.len() == batch * nnz、weight.len() == cols * rows、
+        // caller は indices.len() == batch * max_active、nnz_arr.len() == batch、
+        // 0 <= nnz_arr[bi] <= max_active、weight.len() == cols * rows、
         // out.len() == batch * rows、rows % 4 == 0 を保証する。idx の範囲検査は
         // padding と異常入力を除外する。idx*rows は 4 の倍数 (rows は 128 の倍数)、
         // ri_base も 4 の倍数なので、4 連続 row は最低 8-byte 境界に整列する。
@@ -815,9 +817,10 @@ macro_rules! sparse_ft_forward_body {
         let mut s1: f32 = 0.0;
         let mut s2: f32 = 0.0;
         let mut s3: f32 = 0.0;
-        let base = bi * ($nnz as usize);
-        let mut ni: u32 = 0;
-        while ni < $nnz {
+        let base = bi * ($max_active as usize);
+        let row_nnz = $nnz_arr[bi];
+        let mut ni: i32 = 0;
+        while ni < row_nnz {
             let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
             if idx >= 0 && (idx as u32) < $cols {
                 let off = (idx as usize) * rows_u + ri_base;
@@ -855,14 +858,18 @@ macro_rules! sparse_ft_forward_body {
 pub fn sparse_ft_forward(
     weight: &[f32],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f32>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f32, f32);
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f32, f32
+    );
 }
 
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
@@ -880,14 +887,18 @@ pub fn sparse_ft_forward(
 pub fn sparse_ft_forward_fp16(
     weight: &[f16],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f32>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f16, f32);
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f16, f32
+    );
 }
 
 /// [`sparse_ft_forward_fp16`] の出力も `f16` にした版 (`--ft-fp16-out`)。`weight` を
@@ -903,14 +914,18 @@ pub fn sparse_ft_forward_fp16(
 pub fn sparse_ft_forward_fp16_out(
     weight: &[f16],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f16>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f16, f16);
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f16, f16
+    );
 }
 
 /// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。

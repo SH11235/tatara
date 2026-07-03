@@ -39,10 +39,11 @@ pub fn psqt_diff_sparse_fwd_inplace_cpu(
     psqt_w: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     net_output: &mut [f32],
     batch: usize,
-    nnz: usize,
+    max_active: usize,
     num_buckets: usize,
     ft_in: usize,
 ) {
@@ -52,10 +53,10 @@ pub fn psqt_diff_sparse_fwd_inplace_cpu(
             continue;
         }
         let bucket_u = bucket as usize;
-        let base = b * nnz;
+        let base = b * max_active;
         let mut sum_stm = 0.0_f32;
         let mut sum_nstm = 0.0_f32;
-        for ni in 0..nnz {
+        for ni in 0..nnz_arr[b] as usize {
             let idx_s = stm_indices[base + ni];
             if idx_s >= 0 && (idx_s as usize) < ft_in {
                 sum_stm += psqt_w[(idx_s as usize) * num_buckets + bucket_u];
@@ -124,7 +125,7 @@ mod tests {
         let nstm = vec![0_i32]; // feat 0
         let bucket = vec![1_i32]; // bucket=1
         let mut out = vec![10.0_f32]; // pre-existing net_output value
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 1, 2, 3);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[1], &bucket, &mut out, 1, 1, 2, 3);
         // delta = 0.5 * (psqt_w[1,1] - psqt_w[0,1]) = 0.5 * (8 - 2) = 3
         assert_eq!(out[0], 13.0);
     }
@@ -137,7 +138,7 @@ mod tests {
         let nstm = vec![-1_i32, 99];
         let bucket = vec![0_i32];
         let mut out = vec![5.0_f32];
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 2, 2, 2);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[2], &bucket, &mut out, 1, 2, 2, 2);
         assert_eq!(out[0], 5.0, "delta = 0 when all indices invalid");
     }
 
@@ -155,6 +156,7 @@ mod tests {
             &psqt_w,
             &stm,
             &nstm,
+            &[1],
             &bucket_neg,
             &mut out_neg,
             1,
@@ -166,6 +168,7 @@ mod tests {
             &psqt_w,
             &stm,
             &nstm,
+            &[1],
             &bucket_oob,
             &mut out_oob,
             1,
@@ -218,7 +221,7 @@ mod tests {
         let nstm = vec![1_i32];
         let bucket = vec![1_i32];
         let mut out = vec![0.0_f32];
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 1, 2, 2);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[1], &bucket, &mut out, 1, 1, 2, 2);
         // delta = 0.5 * (psqt_w[0,1] - psqt_w[1,1]) = 0.5 * (-2 - 4) = -3
         assert_eq!(out[0], -3.0);
         // backward に dnet=delta を入れると stm 側 += 0.5*-3 = -1.5、nstm 側 += +1.5。

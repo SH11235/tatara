@@ -398,11 +398,13 @@ pub(crate) struct GpuWorkspace {
     // stream で先行 H2D する ([`InputUploadRing`])。
     stm_idx_dev: DeviceBuffer<i32>,         // batch * max_active
     nstm_idx_dev: DeviceBuffer<i32>,        // batch * max_active
+    nnz_dev: DeviceBuffer<i32>,             // batch
     bucket_idx_dev: DeviceBuffer<i32>,      // batch
     score_dev: DeviceBuffer<f32>,           // batch
     wdl_dev: DeviceBuffer<f32>,             // batch
     stm_idx_dev_back: DeviceBuffer<i32>,    // batch * max_active
     nstm_idx_dev_back: DeviceBuffer<i32>,   // batch * max_active
+    nnz_dev_back: DeviceBuffer<i32>,        // batch
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
     score_dev_back: DeviceBuffer<f32>,      // batch
     wdl_dev_back: DeviceBuffer<f32>,        // batch
@@ -511,11 +513,13 @@ impl GpuWorkspace {
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             bucket_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
@@ -1728,6 +1732,7 @@ impl GpuTrainer {
         // は ring 内の pinned host buffer 経由で copy engine の DMA に載る。
         std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
         std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
         std::mem::swap(
             &mut self.ws.bucket_idx_dev,
             &mut self.ws.bucket_idx_dev_back,
@@ -1740,6 +1745,8 @@ impl GpuTrainer {
             batch.stm_indices,
             &self.ws.nstm_idx_dev,
             batch.nstm_indices,
+            &self.ws.nnz_dev,
+            batch.nnz,
             &self.ws.bucket_idx_dev,
             batch.bucket_idx,
             &self.ws.score_dev,
@@ -1785,6 +1792,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out_h.as_mut()
                             .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
@@ -1802,6 +1810,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out_h.as_mut()
                             .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
@@ -1824,6 +1833,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -1840,6 +1850,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -1859,6 +1870,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_fwd),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -1875,6 +1887,7 @@ impl GpuTrainer {
                     args: [
                         slice(ft_w_fwd),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out),
                         b_u32, ft_out as u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -2301,6 +2314,7 @@ impl GpuTrainer {
                         slice(psqt_fwd),
                         slice(self.ws.stm_idx_dev),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.bucket_idx_dev),
                         slice_mut(self.ws.net_output),
                         b_u32, self.ws.max_active as u32, self.num_buckets as u32, self.ws.ft_in as u32

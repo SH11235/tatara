@@ -170,7 +170,16 @@ mod tests {
         let nnz = 4;
 
         let mut out = vec![0.0_f32; batch * rows];
-        sparse_ft_forward_cpu(&weight, &indices, &mut out, batch, rows, cols, nnz);
+        sparse_ft_forward_cpu(
+            &weight,
+            &indices,
+            &[nnz as i32; 2],
+            &mut out,
+            batch,
+            rows,
+            cols,
+            nnz,
+        );
         // forward の結果を grad_out として backward に渡し、grad_weight を計算
         let mut grad_weight = vec![0.0_f32; rows * cols];
         sparse_ft_backward_cpu(&out, &indices, &mut grad_weight, batch, rows, cols, nnz);

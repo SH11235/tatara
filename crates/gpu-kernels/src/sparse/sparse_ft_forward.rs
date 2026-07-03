@@ -15,8 +15,8 @@
 //! ```text
 //! per (batch_index bi, row_index ri):
 //!     sum = 0
-//!     for ni in 0..nnz:
-//!         idx = indices[bi * nnz + ni]
+//!     for ni in 0..nnz_arr[bi]:
+//!         idx = indices[bi * max_active + ni]
 //!         if idx >= 0 && (idx as usize) < cols:
 //!             sum += weight[idx * rows + ri]      # column-major
 //!     out[bi * rows + ri] = sum
@@ -24,8 +24,9 @@
 //!
 //! - `weight` (size `rows * cols`): **column-major**。column j の row i は
 //!   `weight[j * rows + i]` 位置
-//! - `indices` (size `batch * nnz`): per position の active feature index、
+//! - `indices` (size `batch * max_active`): per position の active feature index、
 //!   `-1` は padding (skip)。`>= cols` の値も defensive に silent skip
+//! - `nnz_arr` (size `batch`): position ごとの実 active feature 数
 //! - `out` (size `batch * rows`): per position の FT output、row-major で
 //!   `out[bi * rows + ri]` 位置
 //!
@@ -43,7 +44,8 @@
 ///
 /// 入力前提:
 /// - `weight.len() == rows * cols` (column-major、`weight[col * rows + row]`)
-/// - `indices.len() == batch * nnz` (`-1` padding 許容、`>= cols` も silent skip)
+/// - `indices.len() == batch * max_active` (`-1` padding 許容、`>= cols` も silent skip)
+/// - `nnz_arr.len() == batch`、各値は `0..=max_active`
 /// - `out.len() == batch * rows` (row-major、`out[batch * rows + row]`)
 ///
 /// 引数数 (7) は入出力 + sparse 形状を漏れなく渡すため
@@ -52,17 +54,18 @@
 pub fn sparse_ft_forward_cpu(
     weight: &[f32],
     indices: &[i32],
+    nnz_arr: &[i32],
     out: &mut [f32],
     batch: usize,
     rows: usize,
     cols: usize,
-    nnz: usize,
+    max_active: usize,
 ) {
     for bi in 0..batch {
         for ri in 0..rows {
             let mut sum = 0.0_f32;
-            for ni in 0..nnz {
-                let idx = indices[bi * nnz + ni];
+            for ni in 0..nnz_arr[bi] as usize {
+                let idx = indices[bi * max_active + ni];
                 if idx >= 0 && (idx as usize) < cols {
                     sum += weight[(idx as usize) * rows + ri];
                 }
@@ -86,7 +89,7 @@ mod tests {
         let indices = vec![0_i32, 1, -1, -1, 2, 2, 1, 0];
         let mut out = vec![0.0_f32; 4]; // batch * rows = 2*2
 
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 2, 2, 3, 4);
+        sparse_ft_forward_cpu(&weights, &indices, &[2, 4], &mut out, 2, 2, 3, 4);
 
         assert_eq!(out, vec![2.0_f32, 4.0, 10.0, 14.0]);
     }
@@ -97,7 +100,7 @@ mod tests {
         let weights = vec![1.0_f32, 2.0, 3.0, 4.0]; // rows=2, cols=2
         let indices = vec![-1_i32; 6]; // 1 batch × 6 nnz、全 padding
         let mut out = vec![999.0_f32, 999.0]; // 初期値で汚染、kernel が上書きする
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 1, 2, 2, 6);
+        sparse_ft_forward_cpu(&weights, &indices, &[6], &mut out, 1, 2, 2, 6);
         assert_eq!(out, vec![0.0_f32, 0.0]);
     }
 
@@ -108,7 +111,7 @@ mod tests {
         // idx=5 は cols=2 を超える → skip される
         let indices = vec![0_i32, 5, -1];
         let mut out = vec![0.0_f32; 2];
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 1, 2, 2, 3);
+        sparse_ft_forward_cpu(&weights, &indices, &[3], &mut out, 1, 2, 2, 3);
         // idx=0 だけが効く: row 0 → w[0*2+0] = 1.0、row 1 → w[0*2+1] = 2.0
         assert_eq!(out, vec![1.0_f32, 2.0]);
     }
@@ -121,7 +124,7 @@ mod tests {
         // 1 batch × 3 nnz、idx=0 を 2 回 + idx=1 を 1 回
         let indices = vec![0_i32, 0, 1];
         let mut out = vec![0.0_f32; 2];
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 1, 2, 2, 3);
+        sparse_ft_forward_cpu(&weights, &indices, &[3], &mut out, 1, 2, 2, 3);
         // row 0: w[0*2+0]*2 + w[1*2+0] = 1*2 + 2 = 4
         // row 1: w[0*2+1]*2 + w[1*2+1] = 10*2 + 20 = 40
         assert_eq!(out, vec![4.0_f32, 40.0]);
@@ -134,14 +137,14 @@ mod tests {
         let weights: Vec<f32> = vec![];
         let indices: Vec<i32> = vec![];
         let mut out: Vec<f32> = vec![];
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 0, 0, 0, 0);
+        sparse_ft_forward_cpu(&weights, &indices, &[], &mut out, 0, 0, 0, 0);
         assert!(out.is_empty());
 
         // nnz=0 のみ: padding ループが 0 周で sum = 0 になる
         let weights = vec![1.0_f32, 2.0];
         let indices: Vec<i32> = vec![];
         let mut out = vec![999.0_f32, 999.0];
-        sparse_ft_forward_cpu(&weights, &indices, &mut out, 1, 2, 1, 0);
+        sparse_ft_forward_cpu(&weights, &indices, &[0], &mut out, 1, 2, 1, 0);
         assert_eq!(out, vec![0.0_f32, 0.0]);
     }
 }
