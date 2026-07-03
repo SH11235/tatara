@@ -333,15 +333,29 @@ macro_rules! radam_update_moments {
 }
 
 macro_rules! radam_finish {
-    (reset, $i:ident, $g_ref:ident, $p_clamped:ident) => {
+    (
+        $grad_mode:ident,
+        $mirror_mode:ident,
+        $i:ident,
+        $g_ref:ident,
+        $p_clamped:ident
+        $(, $mirror:ident)?
+    ) => {
+        radam_finish!(@grad $grad_mode, $g_ref);
+        radam_finish!(@mirror $mirror_mode, $i, $p_clamped $(, $mirror)?);
+    };
+    (@grad reset, $g_ref:ident) => {
         *$g_ref = 0.0_f32;
     };
-    (keep_grad, $i:ident, $g_ref:ident, $p_clamped:ident) => {
+    (@grad keep_grad, $g_ref:ident) => {
         // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
         // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
         // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
+        // 通常の radam_step は atomic 累積 group で次 step 前の zero-out が必須。
     };
-    (mirror, $i:ident, $g_ref:ident, $p_clamped:ident, $mirror:ident) => {
+    (@mirror no_mirror, $i:ident, $p_clamped:ident) => {
+    };
+    (@mirror mirror, $i:ident, $p_clamped:ident, $mirror:ident) => {
         // SAFETY: `mirror` は他の buffer と同要素数で別 alloc (caller 保証)。
         // kernel 冒頭で `i < n` を確認し、各 thread は自分の `i` のみ書く。
         let mirror_ptr = $mirror.as_mut_ptr();
@@ -351,7 +365,7 @@ macro_rules! radam_finish {
     };
 }
 
-// RAdam kernel 4 変種で decay、moment 更新、denom 分岐、clamp のコアを共有する。
+// RAdam kernel の各変種で decay、moment 更新、denom 分岐、clamp のコアを共有する。
 macro_rules! radam_step_body {
     (
         $weights:ident,
@@ -369,7 +383,7 @@ macro_rules! radam_step_body {
         $max_w:ident,
         $n:ident;
         $state:ident $(, $m_scale:ident, $v_scale:ident)?;
-        $finish:ident $(, $mirror:ident)?
+        $grad_mode:ident, $mirror_mode:ident $(, $mirror:ident)?
     ) => {
         let i = thread::index_1d();
         if i.get() >= $n as usize {
@@ -402,7 +416,14 @@ macro_rules! radam_step_body {
                 p
             };
             *w_ref = p_clamped;
-            radam_finish!($finish, i, g_ref, p_clamped $(, $mirror)?);
+            radam_finish!(
+                $grad_mode,
+                $mirror_mode,
+                i,
+                g_ref,
+                p_clamped
+                $(, $mirror)?
+            );
         }
     };
 }
@@ -433,7 +454,7 @@ pub fn radam_step(
     radam_step_body!(
         weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
         f32;
-        reset
+        reset, no_mirror
     );
 }
 
@@ -467,7 +488,7 @@ pub fn radam_step_fp16_mirror(
     radam_step_body!(
         weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
         f32;
-        mirror, mirror
+        keep_grad, mirror, mirror
     );
 }
 
@@ -621,7 +642,7 @@ pub fn radam_step_f16state(
     radam_step_body!(
         weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
         f16, m_scale, v_scale;
-        keep_grad
+        keep_grad, no_mirror
     );
 }
 
@@ -654,7 +675,7 @@ pub fn radam_step_f16state_mirror(
     radam_step_body!(
         weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
         f16, m_scale, v_scale;
-        mirror, mirror
+        keep_grad, mirror, mirror
     );
 }
 
