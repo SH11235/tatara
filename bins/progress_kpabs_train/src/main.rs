@@ -50,10 +50,9 @@ use std::time::Instant;
 use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, kernel, thread};
-use cuda_host::cuda_launch;
 use gpu_runtime::{
     BLOCK_DIM, CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig,
-    grid_dim_1d,
+    cuda_launch, grid_dim_1d,
 };
 use progress_kpabs_train::host::{
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MAX_INDS_PER_POS,

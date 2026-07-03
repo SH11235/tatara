@@ -1,11 +1,15 @@
 use std::io::Write;
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
+#[cfg(feature = "gpu")]
 use gpu_runtime::{CudaStream, DeviceBuffer};
 use nnue_format::ArchKind;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
+#[cfg(feature = "gpu")]
 use crate::arch::{FT_OPT_M_SCALE, FT_OPT_V_SCALE};
+#[cfg(feature = "gpu")]
 use crate::trainer_common::MomentBuf;
 
 // ===========================================================================
@@ -97,16 +101,19 @@ pub(crate) const RAW_CKPT_VERSION: u32 = 6;
 pub(crate) const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
+#[cfg(feature = "gpu")]
 pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer run id,
 /// LR-schedule horizon)`。caller は superbatch+1 から resume し、horizon を
 /// `build_lr_scheduler` に渡す。
+#[cfg(feature = "gpu")]
 pub(crate) type RawCkptResumeState = (usize, Option<String>, Option<usize>);
 
 /// raw checkpoint 1 group 分の device-side 参照。weight name + 要素数 +
 /// `(w, m, v, slow)` device buffer の借用。trainer が format の group 順に並べた
 /// 列を [`save_raw_checkpoint_file`] / [`load_raw_checkpoint_file`] へ渡す。
+#[cfg(feature = "gpu")]
 pub(crate) struct RawCkptGroupSource<'a> {
     pub(crate) name: &'static str,
     pub(crate) len: usize,
@@ -116,6 +123,7 @@ pub(crate) struct RawCkptGroupSource<'a> {
 /// [`RawCkptGroupSource`] の buffer 借用部。`Uniform` は w/m/v/slow 全部
 /// `DeviceBuffer<f32>` の group、`FtMoment` は `m` / `v` が [`MomentBuf`]
 /// (`--fp16-opt-state` で `f16` 格納) の ft_w group。
+#[cfg(feature = "gpu")]
 pub(crate) enum RawCkptGroupBufs<'a> {
     Uniform {
         w: &'a DeviceBuffer<f32>,
@@ -131,6 +139,7 @@ pub(crate) enum RawCkptGroupBufs<'a> {
     },
 }
 
+#[cfg(feature = "gpu")]
 impl RawCkptGroupSource<'_> {
     /// device → host download。`FtMoment` の `m` / `v` は格納精度 (`f32`/`f16`) に
     /// 依らず**真値 `f32`** に戻す — checkpoint format は mode 非依存で、resume 時に
@@ -180,6 +189,7 @@ pub(crate) const fn layerstack_topology(
 /// (`[..., num_buckets, num_buckets]`, 5 dims) を `topo_count` で弁別可能にする。
 /// `--resume` で PSQT 有無を跨ぐ load は dim 数不一致で reject される。PSQT bucket
 /// は LayerStack bucket と必ず一致するため同 `num_buckets` を 2 回書く。
+#[cfg(feature = "gpu")]
 pub(crate) const fn layerstack_topology_with_psqt(
     ft_out: usize,
     l1_out: usize,
@@ -210,6 +220,7 @@ pub(crate) struct RawCkptArch<'a> {
 
 /// raw checkpoint header の counter / lineage 部 (arch identity 以外の可変 field)。
 /// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
+#[cfg(feature = "gpu")]
 pub(crate) struct RawCkptMeta<'a> {
     /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
     /// `lineage.parent_id` に使う)。空文字列は「未記録」。
@@ -515,6 +526,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
 /// `meta.run_id` が空文字列、または [`MAX_RUN_ID_BYTES`] 超過 (warning を出して
 /// 省略) のときは run id を持たない checkpoint になり、resume 時の
 /// `lineage.parent_id` は解決されない。
+#[cfg(feature = "gpu")]
 pub(crate) fn save_raw_checkpoint_file(
     path: &Path,
     stream: &CudaStream,
@@ -605,6 +617,7 @@ pub(crate) fn save_raw_checkpoint_file(
 /// reject する。全 group を読み切ってから返すので、caller は読み途中の失敗で
 /// device 側が中途半端な state になる心配なく upload できる (trailing garbage は
 /// 許容、足りないのは `read_exact` が弾く)。
+#[cfg(feature = "gpu")]
 pub(crate) fn load_raw_checkpoint_file(
     path: &Path,
     expected_arch: &RawCkptArch,
@@ -628,6 +641,7 @@ pub(crate) fn load_raw_checkpoint_file(
 
 /// 1 group 分 (len + w/m/v/slow の f32 × len) を読む。file 記載 `len` と
 /// `expected_len` の不一致 / `u64 → usize` overflow は `InvalidData` で reject。
+#[cfg(feature = "gpu")]
 fn read_raw_ckpt_group<R: std::io::Read>(
     r: &mut R,
     name: &str,

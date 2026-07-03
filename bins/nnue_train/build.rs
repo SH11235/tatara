@@ -46,6 +46,11 @@ fn find_cuda_lib_dir(roots: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
+    if std::env::var_os("CARGO_FEATURE_GPU").is_none() {
+        return;
+    }
+
     let roots = cuda_root_candidates();
     let lib_dir = find_cuda_lib_dir(&roots).unwrap_or_else(|| {
         println!(

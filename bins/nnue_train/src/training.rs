@@ -1,18 +1,33 @@
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
+#[cfg(feature = "gpu")]
 use gpu_runtime::CudaContext;
+#[cfg(feature = "gpu")]
 use nnue_format::LayerStackWeights;
+#[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
+#[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
+#[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{LrSchedulerEnum, WdlScheduler, WdlSchedulerEnum};
+#[cfg(feature = "gpu")]
+use nnue_train::schedule::WdlScheduler;
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
+#[cfg(feature = "gpu")]
 use nnue_train::trainer::{LossKind, TrainingConfig};
+#[cfg(feature = "gpu")]
+use shogi_features::ThreatProfile;
+#[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
+#[cfg(any(feature = "gpu", test))]
+use shogi_features::{FeatureSet, FeatureSetSpec};
 
-use crate::{
-    arch::*, cli::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*,
-};
+#[cfg(any(feature = "gpu", test))]
+use crate::cli::*;
+#[cfg(feature = "gpu")]
+use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
 
 /// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
 /// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
@@ -20,6 +35,7 @@ use crate::{
 /// `--ft-out` / Simple `--l1`)、`threat_profile` は LayerStack のみ Some。
 /// `--ft-fp16` / `--ft-fp16-out` は棋力 trade-off のため remedy には挙げず
 /// (診断用に current 値だけ表示)、メモリ専用の `--fp16-opt-state` を推奨する。
+#[cfg(feature = "gpu")]
 fn gpu_oom_error(
     batch_size: usize,
     ft_fp16: bool,
@@ -57,6 +73,123 @@ fn gpu_oom_error(
     msg.into()
 }
 
+#[cfg(any(feature = "gpu", test))]
+#[derive(Clone, Copy)]
+struct SharedPrecisionFlags {
+    ft_fp16: bool,
+    ft_fp16_out: bool,
+    fp16_opt_state: bool,
+    tf32: bool,
+}
+
+#[cfg(any(feature = "gpu", test))]
+struct SharedCliValidation {
+    feature_set: FeatureSetSpec,
+    precision: SharedPrecisionFlags,
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl SharedCliValidation {
+    fn start_superbatch(
+        &self,
+        cli: &Cli,
+        resumed_superbatch: Option<usize>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let start_superbatch = cli
+            .start_superbatch
+            .unwrap_or_else(|| resumed_superbatch.map_or(1, |sb| sb + 1));
+        if start_superbatch == 0 {
+            return Err("--start-superbatch must be >= 1 (1-indexed)".into());
+        }
+        Ok(start_superbatch)
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn validate_shared_cli(
+    cli: &Cli,
+    ft_fp16_out_raw: bool,
+    tf32_raw: bool,
+) -> Result<SharedCliValidation, Box<dyn std::error::Error>> {
+    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            let names: Vec<&str> = FeatureSet::ALL
+                .iter()
+                .map(|fs| fs.canonical_name())
+                .collect();
+            format!(
+                "--feature-set '{}' is not a known feature set (expected one of: {})",
+                cli.feature_set,
+                names.join(", ")
+            )
+            .into()
+        })?
+        .spec();
+
+    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
+        return Err(format!(
+            "--optimizer '{}' is not implemented (only 'ranger')",
+            cli.optimizer
+        )
+        .into());
+    }
+    // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
+    if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
+        return Err(
+            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
+             FP16 path)"
+                .into(),
+        );
+    }
+    // NaN / 範囲外を kernel に流さない。WDL 値の範囲は [`build_wdl_scheduler`] が検証する。
+    if !(cli.lr.is_finite() && cli.lr > 0.0) {
+        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
+    }
+    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
+        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
+    }
+    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
+        return Err(format!(
+            "--weight-decay must be finite and >= 0 (got {})",
+            cli.weight_decay
+        )
+        .into());
+    }
+    if !cli.batch_size.is_multiple_of(16) {
+        return Err(format!(
+            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
+             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
+            cli.batch_size
+        )
+        .into());
+    }
+    if cli.threads == 0 {
+        return Err("--threads must be >= 1".into());
+    }
+    if cli.init_from.is_some() && cli.resume.is_some() {
+        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
+    }
+    if cli.superbatches == 0 {
+        return Err("--superbatches must be >= 1".into());
+    }
+    if let Some(0) = cli.keep_checkpoints {
+        return Err(
+            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
+        );
+    }
+
+    Ok(SharedCliValidation {
+        feature_set,
+        precision: SharedPrecisionFlags {
+            ft_fp16: cli.ft_fp16 || cli.all_optim,
+            ft_fp16_out: ft_fp16_out_raw || cli.all_optim,
+            fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
+            tf32: tf32_raw || cli.all_optim,
+        },
+    })
+}
+
+#[cfg(feature = "gpu")]
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
     // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
@@ -94,22 +227,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
     }
 
-    // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
-    // dataloader / checkpoint identity が参照する単一の真実源)。
-    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            let names: Vec<&str> = FeatureSet::ALL
-                .iter()
-                .map(|fs| fs.canonical_name())
-                .collect();
-            format!(
-                "--feature-set '{}' is not a known feature set (expected one of: {})",
-                cli.feature_set,
-                names.join(", ")
-            )
-            .into()
-        })?
-        .spec();
+    let shared = validate_shared_cli(cli, layerstack.ft_fp16_out, layerstack.tf32)?;
+    let feature_set = shared.feature_set;
 
     // Threat profile の解決。`off` は base と bit-identical (None)。
     let threat_profile = match layerstack.threat_profile.as_str() {
@@ -171,39 +290,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
-            cli.optimizer
-        )
-        .into());
-    }
-    // --ft-fp16-out は weight FP16 path の上に積む拡張なので --ft-fp16 を要求する。
-    // `--all-optim` は両 flag を含意するため実効値で判定する
-    // ([`ft_fp16_out_missing_ft_fp16`]、`--all-optim --ft-fp16-out` を false-positive
-    // reject しない)。
-    if ft_fp16_out_missing_ft_fp16(layerstack.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
-        return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
-                    FP16 path)"
-                .into(),
-        );
-    }
-    // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss params のみ見る)。
-    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
-    if !(cli.lr.is_finite() && cli.lr > 0.0) {
-        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
-    }
-    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
-        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
-        return Err(format!(
-            "--weight-decay must be finite and >= 0 (got {})",
-            cli.weight_decay
-        )
-        .into());
-    }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -221,19 +307,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` /
-    // `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
-    // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
-    // position の forward / backward が 走らず loss / gradient が corrupt する。`debug_assert!`
-    // は release で消えるので CLI で early reject する。
-    if !cli.batch_size.is_multiple_of(16) {
-        return Err(format!(
-            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
-             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
-            cli.batch_size
-        )
-        .into());
-    }
     // loss kernel の選択: --win-rate-model → loss_wrm、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
         build_wrm_loss(cli)?
@@ -245,20 +318,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             scale: 1.0 / cli.scale,
         }
     };
-    if cli.threads == 0 {
-        return Err("--threads must be >= 1".into());
-    }
-    if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
-    }
-    if cli.superbatches == 0 {
-        return Err("--superbatches must be >= 1".into());
-    }
-    if let Some(0) = cli.keep_checkpoints {
-        return Err(
-            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
-        );
-    }
     // FT 出力次元は backward の gather kernel が grid を `ft_out / 128` で launch する
     // ため 128 の倍数でなければ末尾行の勾配が計算されない。
     if layerstack.ft_out == 0 || !layerstack.ft_out.is_multiple_of(128) {
@@ -347,10 +406,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保。
-    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
-    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
-    let ft_fp16_out = layerstack.ft_fp16_out || cli.all_optim;
-    let tf32 = layerstack.tf32 || cli.all_optim;
+    let SharedPrecisionFlags {
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
+    } = shared.precision;
     if cli.all_optim {
         println!(
             "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
@@ -530,16 +591,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
-    let start_superbatch = match cli.start_superbatch {
-        Some(n) => n,
-        None => match resumed_superbatch {
-            Some(sb) => sb + 1,
-            None => 1,
-        },
-    };
-    if start_superbatch == 0 {
-        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
-    }
+    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     // eval-only は学習しないので train-range 制約を課さない。これを課すと最終
     // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価できない。
     if start_superbatch > cli.superbatches && !cli.eval_only {
@@ -685,11 +737,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
 /// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
 /// crate 側 `nnue_train::dataloader::PSV_RECORD_BYTES` を re-export している。
+#[cfg(feature = "gpu")]
 pub(crate) use nnue_train::dataloader::PSV_RECORD_BYTES;
 
 /// LayerStack network の architecture 記述子 (FT → L1 → L2、progress N-bucket)。
 /// experiment.json `params.architecture` に記録する。FT 出力次元は `--ft-out`、L1
 /// 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は `--num-buckets` で可変。
+#[cfg(feature = "gpu")]
 pub(crate) fn layerstack_architecture(
     ft_out: usize,
     l1_out: usize,
@@ -712,6 +766,7 @@ pub(crate) fn layerstack_architecture(
 /// `resumed_horizon` は v5+ checkpoint から復元した保存済 horizon ([`crate::ckpt`])。
 /// 指定時は `--superbatches` 由来の default より優先され、curve が `--superbatches`
 /// から独立に再現される。優先順位は [`resolve_lr_horizon`] 参照。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_lr_scheduler(
     cli: &Cli,
     resumed_horizon: Option<usize>,
@@ -823,6 +878,7 @@ pub(crate) fn build_lr_scheduler(
 ///
 /// resume 時に保存 horizon が default を上書きする / 明示 flag が保存 horizon を
 /// 上書きする場合は operator 向けに 1 行 note を出す。
+#[cfg(any(feature = "gpu", test))]
 fn resolve_lr_horizon(explicit: Option<usize>, resumed: Option<usize>, default: usize) -> usize {
     match (explicit, resumed) {
         (Some(e), Some(saved)) => {
@@ -846,6 +902,7 @@ fn resolve_lr_horizon(explicit: Option<usize>, resumed: Option<usize>, default: 
 
 /// linear / cosine / exponential 減衰の終端パラメータを検証する。`require_positive`
 /// は exponential 用 (幾何補間 `(final/initial)^lambda` のため `final_lr > 0` を要求)。
+#[cfg(any(feature = "gpu", test))]
 fn validate_decay(
     final_lr: f32,
     final_superbatch: usize,
@@ -869,12 +926,14 @@ fn validate_decay(
 /// に使う。JSON は非有限値を表現できず、混入すると serialise が丸ごと失敗して
 /// 構造化ログが 1 件も書けなくなる。`--scale` は `--win-rate-model` 指定時に
 /// CLI 側の finite 検証を経ないため防御する。
+#[cfg(feature = "gpu")]
 pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
+#[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
     [
         ("--ft-weight-decay", cli.ft_weight_decay),
@@ -889,6 +948,7 @@ pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 
 /// per-group optimizer override flag が一つでも指定されているか。`true` のとき
 /// log と experiment.json に有効 per-group 値を記録する (全 `None` の既定 run では
 /// 記録を省き、大域 `weight_decay` フィールドのみで足りる)。
+#[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
 }
@@ -896,6 +956,7 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
 /// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
 /// layerstack / simple 両 entry で共有するこの helper で前段に行う。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::Error>> {
     if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
         return Err(format!(
@@ -981,6 +1042,7 @@ pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::
 /// `--end-wdl` の同時指定は clap の `conflicts_with` で parse 時に reject される。
 /// すべての値が finite かつ `[0.0, 1.0]` であることを要求する (kernel に NaN /
 /// 範囲外を流さない)。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_wdl_scheduler(
     cli: &Cli,
 ) -> Result<WdlSchedulerEnum, Box<dyn std::error::Error>> {
@@ -1005,6 +1067,7 @@ pub(crate) fn build_wdl_scheduler(
 
 /// `path` の basename を `String` で返す。file_name が取れなければ path 全体の
 /// 表示文字列で代替する。
+#[cfg(feature = "gpu")]
 pub(crate) fn file_basename(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1014,6 +1077,7 @@ pub(crate) fn file_basename(path: &Path) -> String {
 /// tatara の git revision を best-effort で取得する。git が見つからない、
 /// または git repository 外で実行された場合は `None`。working tree に未 commit
 /// の変更があれば `-dirty` を付ける。
+#[cfg(feature = "gpu")]
 pub(crate) fn git_commit() -> Option<String> {
     let rev = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -1042,6 +1106,7 @@ pub(crate) fn git_commit() -> Option<String> {
 /// `--init-from` / `--resume` で重みが上書きされる run では `None` を返す (初期化
 /// 選択が実 weight に効かないので記録しても reader を混乱させるだけ)。override が
 /// あれば差し替えた層名を記す。
+#[cfg(feature = "gpu")]
 pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     if cli.init_from.is_some() || cli.resume.is_some() {
         return None;
@@ -1063,6 +1128,7 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
 }
 
 /// LayerStack の weight 初期化 spec を CLI から組み立てる (既定値 + per-layer override)。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     let mut spec = LayerStackInit::default_uniform();
     if let Some(ov) = cli.init_ft {
@@ -1085,6 +1151,7 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
 
 /// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1f` は L1f を持たない
 /// Simple では error。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn std::error::Error>> {
     let mut spec = SimpleInit::default_uniform();
     if let Some(ov) = cli.init_ft {
@@ -1108,6 +1175,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 /// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
@@ -1255,6 +1323,7 @@ pub(crate) fn build_experiment_logger(
 /// 出しに失敗したときは `0`、`--test-tail-positions` が raw 件数以上の場合は
 /// raw record 数をそのまま返す (`trainer::run` 側で `validate` 経由 reject
 /// される前提の defensive fallback)。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
     let total_records = std::fs::metadata(data)
         .map(|m| m.len() / PSV_RECORD_BYTES)
@@ -1278,6 +1347,7 @@ pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
 /// `tf32` / `ft_fp16` / `ft_fp16_out` / `fp16_opt_state` は `false`)。
 /// 量子化 multiplier (`qa` / `qb`) は活性化と `simple_weights` の固定値から決める。
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger_simple(
     cli: &Cli,
     id: SimpleId,
@@ -1410,6 +1480,7 @@ pub(crate) fn build_experiment_logger_simple(
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
 /// 形式不一致や非整数は `--arch` の不正値として `InvalidInput` で返す。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn parse_simple_preset(
     s: &str,
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
@@ -1456,6 +1527,7 @@ pub(crate) fn parse_simple_preset(
 /// 分岐で呼ばれる。LayerStack 側 (`run_training` 本体) と並ぶ単独 entrypoint で、
 /// trainer 構築・init_from / resume・lr / wdl スケジューラ・superbatch loop は
 /// 同じ `nnue_train::trainer::run` driver を使う。
+#[cfg(feature = "gpu")]
 pub(crate) fn run_simple_training(
     cli: &Cli,
     simple_args: &SimpleArgs,
@@ -1465,52 +1537,8 @@ pub(crate) fn run_simple_training(
         .as_ref()
         .expect("run_simple_training called with --data");
 
-    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            let names: Vec<&str> = FeatureSet::ALL
-                .iter()
-                .map(|fs| fs.canonical_name())
-                .collect();
-            format!(
-                "--feature-set '{}' is not a known feature set (expected one of: {})",
-                cli.feature_set,
-                names.join(", ")
-            )
-            .into()
-        })?
-        .spec();
-
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
-            cli.optimizer
-        )
-        .into());
-    }
-    // `--ft-fp16-out` は FP16 weight mirror 経路の上に積む拡張で、`--ft-fp16` を要求する。
-    // `--all-optim` は両 flag を含意するため実効値で判定する ([`ft_fp16_out_missing_ft_fp16`]、
-    // `--all-optim --ft-fp16-out` の冗長指定を false-positive reject しない)。
-    if ft_fp16_out_missing_ft_fp16(simple_args.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
-        return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
-             FP16 path)"
-                .into(),
-        );
-    }
-    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
-    if !(cli.lr.is_finite() && cli.lr > 0.0) {
-        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
-    }
-    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
-        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
-        return Err(format!(
-            "--weight-decay must be finite and >= 0 (got {})",
-            cli.weight_decay
-        )
-        .into());
-    }
+    let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
+    let feature_set = shared.feature_set;
     if cli.norm_loss {
         return Err(
             "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
@@ -1526,28 +1554,6 @@ pub(crate) fn run_simple_training(
         )
         .into());
     }
-    if !cli.batch_size.is_multiple_of(16) {
-        return Err(format!(
-            "--batch-size must be a multiple of 16 (got {})",
-            cli.batch_size
-        )
-        .into());
-    }
-    if cli.threads == 0 {
-        return Err("--threads must be >= 1".into());
-    }
-    if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive".into());
-    }
-    if cli.superbatches == 0 {
-        return Err("--superbatches must be >= 1".into());
-    }
-    if let Some(0) = cli.keep_checkpoints {
-        return Err(
-            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
-        );
-    }
-
     // 層次元の決定: --arch preset + --l1 / --l2 / --l3 override。
     let (preset_ft_out, preset_l1_out, preset_l2_out) = parse_simple_preset(&simple_args.arch)?;
     let ft_out = simple_args.l1.unwrap_or(preset_ft_out);
@@ -1622,10 +1628,12 @@ pub(crate) fn run_simple_training(
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
     // 設定再現に使う)。
-    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
-    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
-    let ft_fp16_out = simple_args.ft_fp16_out || cli.all_optim;
-    let tf32 = simple_args.tf32 || cli.all_optim;
+    let SharedPrecisionFlags {
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
+    } = shared.precision;
     if cli.all_optim {
         println!(
             "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
@@ -1692,16 +1700,7 @@ pub(crate) fn run_simple_training(
     // `--ft-fp16` 未指定なら no-op。
     trainer.sync_ft_w_h_mirror()?;
 
-    let start_superbatch = match cli.start_superbatch {
-        Some(n) => n,
-        None => match resumed_superbatch {
-            Some(sb) => sb + 1,
-            None => 1,
-        },
-    };
-    if start_superbatch == 0 {
-        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
-    }
+    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     if start_superbatch > cli.superbatches {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train)",
@@ -1774,7 +1773,7 @@ pub(crate) fn run_simple_training(
 }
 
 #[cfg(test)]
-mod tests {
+mod shared_cli_tests {
     use super::*;
     use clap::Parser;
 
@@ -1784,6 +1783,93 @@ mod tests {
         // global init flag を subcommand の前に置く。layerstack は追加必須引数なし。
         argv.push("layerstack");
         Cli::try_parse_from(argv).expect("cli parse")
+    }
+
+    fn shared_cli_error(extra: &[&str], ft_fp16_out: bool) -> String {
+        match validate_shared_cli(&parse(extra), ft_fp16_out, false) {
+            Ok(_) => panic!("shared CLI validation unexpectedly accepted input"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_cli_validation_rejects_invalid_common_values() {
+        assert!(
+            shared_cli_error(&["--feature-set", "unknown"], false)
+                .contains("--feature-set 'unknown' is not a known feature set")
+        );
+        assert!(
+            shared_cli_error(&["--optimizer", "adam"], false)
+                .contains("--optimizer 'adam' is not implemented")
+        );
+        assert!(shared_cli_error(&["--lr", "0"], false).contains("--lr must be finite and > 0"));
+        assert!(
+            shared_cli_error(&["--lr-gamma", "NaN"], false)
+                .contains("--lr-gamma must be finite and > 0")
+        );
+        assert!(
+            shared_cli_error(&["--weight-decay=-1"], false)
+                .contains("--weight-decay must be finite and >= 0")
+        );
+        assert_eq!(
+            shared_cli_error(&["--threads", "0"], false),
+            "--threads must be >= 1"
+        );
+        assert_eq!(
+            shared_cli_error(&["--superbatches", "0"], false),
+            "--superbatches must be >= 1"
+        );
+        assert!(
+            shared_cli_error(&["--keep-checkpoints", "0"], false)
+                .contains("--keep-checkpoints must be >= 1 when set")
+        );
+    }
+
+    #[test]
+    fn shared_cli_validation_pins_unified_errors() {
+        let batch_error = shared_cli_error(&["--batch-size", "17"], false);
+        assert!(batch_error.contains("--batch-size must be a multiple of 16 (got 17)"));
+        assert!(batch_error.contains("tiled dense matmul kernels require b % 16 == 0"));
+
+        let init_resume_error = shared_cli_error(
+            &["--init-from", "base.bin", "--resume", "state.ckpt"],
+            false,
+        );
+        assert!(init_resume_error.contains("--init-from and --resume are mutually exclusive"));
+        assert!(init_resume_error.contains("--init-from injects weights"));
+        assert!(init_resume_error.contains("--resume preserves it"));
+    }
+
+    #[test]
+    fn shared_cli_validation_checks_fp16_dependency_and_expands_all_optim() {
+        assert!(shared_cli_error(&[], true).contains("--ft-fp16-out requires --ft-fp16"));
+
+        let shared =
+            validate_shared_cli(&parse(&["--all-optim"]), false, false).expect("valid shared CLI");
+        assert_eq!(shared.feature_set, FeatureSet::HalfKaHmMerged.spec());
+        assert!(shared.precision.ft_fp16);
+        assert!(shared.precision.ft_fp16_out);
+        assert!(shared.precision.fp16_opt_state);
+        assert!(shared.precision.tf32);
+    }
+
+    #[test]
+    fn shared_cli_validation_resolves_start_superbatch() {
+        let cli = parse(&[]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(shared.start_superbatch(&cli, None).unwrap(), 1);
+        assert_eq!(shared.start_superbatch(&cli, Some(6)).unwrap(), 7);
+
+        let cli = parse(&["--start-superbatch", "3"]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(shared.start_superbatch(&cli, Some(6)).unwrap(), 3);
+
+        let cli = parse(&["--start-superbatch", "0"]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(
+            shared.start_superbatch(&cli, None).unwrap_err().to_string(),
+            "--start-superbatch must be >= 1 (1-indexed)"
+        );
     }
 
     #[test]
@@ -1812,6 +1898,19 @@ mod tests {
         // parse 自体は 0 を通す (型上は非負整数)。0 次元の reject は
         // `run_simple_training` の次元検証が担う。
         assert_eq!(parse_simple_preset("0x2-0-0").unwrap(), (0, 0, 0));
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut argv = vec!["nnue-trainer"];
+        argv.extend_from_slice(extra);
+        argv.push("layerstack");
+        Cli::try_parse_from(argv).expect("cli parse")
     }
 
     #[test]
