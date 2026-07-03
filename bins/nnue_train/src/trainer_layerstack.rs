@@ -1,8 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::Batch;

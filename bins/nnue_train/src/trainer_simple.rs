@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::dataloader::Batch;
 use nnue_train::init::{self, SimpleInit, WeightShape};
