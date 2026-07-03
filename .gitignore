@@ -3,8 +3,11 @@
 **/target
 **/*.rs.bk
 
-# Claude Code runtime state (transient)
-.claude/scheduled_tasks.lock
+# local 作業メモ / セッション設定 (commit せず手元で保管)
+/A
+/res.md
+/tmpmemo
+/.claude/
 
 # 教師データ (大容量)
 /data
