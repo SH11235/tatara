@@ -10,11 +10,36 @@ tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を 
 rustc backend)で build-time に PTX 化する — C / C++ / CUDA C++ を一切介さない。
 
 GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA C++ trainer
-[bullet-shogi](https://github.com/SH11235/bullet-shogi) を上回る throughput を
-出す。RTX 3080 Ti 実測で、LayerStack アーキは bit-identical な既定経路でも
-bullet-shogi 比 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×**。Simple
-アーキ(HalfKP `512x2-8-64`)は既定経路で約 **+20%**、opt-in の FP16/TF32 モード
-(`--all-optim`)で約 **+55%**。
+[bullet-shogi](https://github.com/SH11235/bullet-shogi) を上回る throughput を出す。
+
+**vs bullet-shogi (RTX 3080 Ti 実測)**: LayerStack は bit-identical な既定経路でも
+**+37%**、opt-in の FP16 モードを積むと最大 **~2.1×**。Simple (HalfKP
+`512x2-8-64`) は既定経路で約 **+20%**、`--all-optim`(FP16/TF32) で約 **+55%**。
+
+**実効 throughput** (`--batch-size 65536`, pos/s; fp32 → `--all-optim`(fp16/tf32))。
+`--all-optim` の効果は帯域律速の強い旧世代 GPU ほど、また net が大きいほど大きい:
+
+| arch / 構成 (feature) | RTX 5090 | RTX 3080 Ti |
+|---|---|---|
+| LayerStack `--ft-out 1536` (`halfka-hm-merged`) | 2.45M → 3.13M (+28%) | 0.99M → 1.59M (+61%) |
+| LayerStack `--ft-out 768` (`halfka-hm-merged`) | 4.24M → 5.10M (+20%) | 2.05M → 2.97M (+45%) |
+| Simple `256x2-32-32` (`halfkp`) | 11.29M → 13.37M (+18%) | 7.30M → 10.10M (+38%) |
+
+計測コマンド (教師データ / progress は環境依存 path、`--all-optim` の有無で pos/s を比較):
+
+```sh
+# LayerStack (halfka-hm-merged, progress 必要)
+cargo run --release --bin nnue-train -- \
+  --data /path/to/teacher.psv --progress-coeff /path/to/progress.bin \
+  --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
+  layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
+
+# HalfKP (simple, progress 不要)
+cargo run --release --bin nnue-train -- \
+  --data /path/to/teacher.psv \
+  --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  simple --arch 256x2-32-32
+```
 
 *tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 

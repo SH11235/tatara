@@ -11,13 +11,38 @@ GPU kernels are compiled to PTX at build time by
 rustc backend) — no C / C++ / CUDA C++ anywhere in the pipeline.
 
 Hand-fusing the GPU kernels makes it **very fast** — it out-throughputs its
-upstream CUDA C++ trainer
-[bullet-shogi](https://github.com/SH11235/bullet-shogi). Measured on an RTX 3080
-Ti: for the LayerStack architecture, even the bit-identical default path is
-**+37%** over bullet-shogi, and stacking the opt-in FP16 modes reaches up to
-**~2.1×**. For the Simple architecture (HalfKP `512x2-8-64`), it is around
-**+20%** on the bit-identical default and around **+55%** with the opt-in
-FP16/TF32 modes (`--all-optim`).
+upstream CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi).
+
+**vs bullet-shogi (measured on RTX 3080 Ti)**: for LayerStack, even the
+bit-identical default path is **+37%**, and stacking the opt-in FP16 modes reaches
+up to **~2.1×**. For Simple (HalfKP `512x2-8-64`) it is around **+20%** on the
+default and around **+55%** with `--all-optim` (FP16/TF32).
+
+**Throughput** (`--batch-size 65536`, pos/s; fp32 → `--all-optim` (fp16/tf32)). The
+`--all-optim` gain is larger on older, more bandwidth-bound GPUs and on bigger nets:
+
+| arch / config (feature) | RTX 5090 | RTX 3080 Ti |
+|---|---|---|
+| LayerStack `--ft-out 1536` (`halfka-hm-merged`) | 2.45M → 3.13M (+28%) | 0.99M → 1.59M (+61%) |
+| LayerStack `--ft-out 768` (`halfka-hm-merged`) | 4.24M → 5.10M (+20%) | 2.05M → 2.97M (+45%) |
+| Simple `256x2-32-32` (`halfkp`) | 11.29M → 13.37M (+18%) | 7.30M → 10.10M (+38%) |
+
+Measurement command (teacher-data / progress paths are environment-specific;
+compare pos/s with and without `--all-optim`):
+
+```sh
+# LayerStack (halfka-hm-merged, needs progress)
+cargo run --release --bin nnue-train -- \
+  --data /path/to/teacher.psv --progress-coeff /path/to/progress.bin \
+  --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
+  layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
+
+# HalfKP (simple, no progress needed)
+cargo run --release --bin nnue-train -- \
+  --data /path/to/teacher.psv \
+  --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  simple --arch 256x2-32-32
+```
 
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*
