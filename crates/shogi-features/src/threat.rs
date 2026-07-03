@@ -31,9 +31,13 @@ pub use crate::threat_exclusion::ThreatProfile;
 /// ThreatClass の数 (King 除外、9 family)。
 pub const NUM_THREAT_CLASSES: usize = 9;
 
-/// Threat 特徴量の per-position active 数上限の起点。bullet-shogi の値に合わせる
-/// (将棋は手駒・成駒で利きが多く chess の 128 では足りない)。
-pub const THREAT_MAX_ACTIVE: usize = 320;
+/// Threat 特徴量の per-position active 数の上限。行幅 `base(40) + THREAT_MAX_ACTIVE`
+/// を決める。DLSuisho 803M + aoba 103M 局面の Full profile 実測で total active の
+/// max は 145 (base 40 + threat ≤ 105)、分布は +1.5〜2 特徴ごとに count が半減する
+/// 急峻な指数減衰。128 は実測 max に対し margin 23 を持ち、到達確率は ~1e-13/pos
+/// (100B 局面級でも安全)。万一超過しても dataloader は silent truncation せず
+/// hard-error で停止する (この定数を上げて再ビルドを促す) ため破損は起きない。
+pub const THREAT_MAX_ACTIVE: usize = 128;
 
 /// profile から threat 次元数を返す。`ThreatIndexer::new(profile)` の
 /// `threat_dimensions()` と同値だが pair_base table を組まずに済む const fn で、
