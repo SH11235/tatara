@@ -2513,6 +2513,7 @@ impl GpuTrainer {
                         slice(self.ws.dy_net_output),
                         slice(self.ws.stm_idx_dev),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.bucket_idx_dev),
                         slice(psqt.w_grad),
                         b_u32, max_active as u32, self.num_buckets as u32, ft_in_u
@@ -3148,6 +3149,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * max_active),
                     args: [
                         slice(idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.feat_counts),
                         b_u32, max_active as u32, ft_in as u32
                     ]
@@ -3227,6 +3229,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * max_active),
                     args: [
                         slice(idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.feat_offsets),
                         slice(self.ws.feat_write_ctr),
                         slice(self.ws.feat_positions),
