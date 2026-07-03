@@ -57,6 +57,118 @@ fn gpu_oom_error(
     msg.into()
 }
 
+#[derive(Clone, Copy)]
+struct SharedPrecisionFlags {
+    ft_fp16: bool,
+    ft_fp16_out: bool,
+    fp16_opt_state: bool,
+    tf32: bool,
+}
+
+struct SharedCliValidation {
+    feature_set: FeatureSetSpec,
+    precision: SharedPrecisionFlags,
+}
+
+impl SharedCliValidation {
+    fn start_superbatch(
+        &self,
+        cli: &Cli,
+        resumed_superbatch: Option<usize>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let start_superbatch = cli
+            .start_superbatch
+            .unwrap_or_else(|| resumed_superbatch.map_or(1, |sb| sb + 1));
+        if start_superbatch == 0 {
+            return Err("--start-superbatch must be >= 1 (1-indexed)".into());
+        }
+        Ok(start_superbatch)
+    }
+}
+
+fn validate_shared_cli(
+    cli: &Cli,
+    ft_fp16_out_raw: bool,
+    tf32_raw: bool,
+) -> Result<SharedCliValidation, Box<dyn std::error::Error>> {
+    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            let names: Vec<&str> = FeatureSet::ALL
+                .iter()
+                .map(|fs| fs.canonical_name())
+                .collect();
+            format!(
+                "--feature-set '{}' is not a known feature set (expected one of: {})",
+                cli.feature_set,
+                names.join(", ")
+            )
+            .into()
+        })?
+        .spec();
+
+    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
+        return Err(format!(
+            "--optimizer '{}' is not implemented (only 'ranger')",
+            cli.optimizer
+        )
+        .into());
+    }
+    // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
+    if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
+        return Err(
+            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
+             FP16 path)"
+                .into(),
+        );
+    }
+    // NaN / 範囲外を kernel に流さない。WDL 値の範囲は [`build_wdl_scheduler`] が検証する。
+    if !(cli.lr.is_finite() && cli.lr > 0.0) {
+        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
+    }
+    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
+        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
+    }
+    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
+        return Err(format!(
+            "--weight-decay must be finite and >= 0 (got {})",
+            cli.weight_decay
+        )
+        .into());
+    }
+    if !cli.batch_size.is_multiple_of(16) {
+        return Err(format!(
+            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
+             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
+            cli.batch_size
+        )
+        .into());
+    }
+    if cli.threads == 0 {
+        return Err("--threads must be >= 1".into());
+    }
+    if cli.init_from.is_some() && cli.resume.is_some() {
+        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
+    }
+    if cli.superbatches == 0 {
+        return Err("--superbatches must be >= 1".into());
+    }
+    if let Some(0) = cli.keep_checkpoints {
+        return Err(
+            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
+        );
+    }
+
+    Ok(SharedCliValidation {
+        feature_set,
+        precision: SharedPrecisionFlags {
+            ft_fp16: cli.ft_fp16 || cli.all_optim,
+            ft_fp16_out: ft_fp16_out_raw || cli.all_optim,
+            fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
+            tf32: tf32_raw || cli.all_optim,
+        },
+    })
+}
+
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
     // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
@@ -94,22 +206,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
     }
 
-    // 入力 feature set を CLI から一度だけ決める (以降の buffer 確保 / kernel launch /
-    // dataloader / checkpoint identity が参照する単一の真実源)。
-    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            let names: Vec<&str> = FeatureSet::ALL
-                .iter()
-                .map(|fs| fs.canonical_name())
-                .collect();
-            format!(
-                "--feature-set '{}' is not a known feature set (expected one of: {})",
-                cli.feature_set,
-                names.join(", ")
-            )
-            .into()
-        })?
-        .spec();
+    let shared = validate_shared_cli(cli, layerstack.ft_fp16_out, layerstack.tf32)?;
+    let feature_set = shared.feature_set;
 
     // Threat profile の解決。`off` は base と bit-identical (None)。
     let threat_profile = match layerstack.threat_profile.as_str() {
@@ -171,39 +269,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
-            cli.optimizer
-        )
-        .into());
-    }
-    // --ft-fp16-out は weight FP16 path の上に積む拡張なので --ft-fp16 を要求する。
-    // `--all-optim` は両 flag を含意するため実効値で判定する
-    // ([`ft_fp16_out_missing_ft_fp16`]、`--all-optim --ft-fp16-out` を false-positive
-    // reject しない)。
-    if ft_fp16_out_missing_ft_fp16(layerstack.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
-        return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
-                    FP16 path)"
-                .into(),
-        );
-    }
-    // NaN / 範囲外を kernel に流さない (TrainingConfig::validate は loss params のみ見る)。
-    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
-    if !(cli.lr.is_finite() && cli.lr > 0.0) {
-        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
-    }
-    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
-        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
-        return Err(format!(
-            "--weight-decay must be finite and >= 0 (got {})",
-            cli.weight_decay
-        )
-        .into());
-    }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -221,19 +286,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    // tiled dense matmul kernels (`dense_mm_fwd_bucket_tiled_l1` /
-    // `dense_mm_bwd_input_tiled` / `dense_mm_bwd_weight_*_tiled_*`) は grid 計算が
-    // `b / 16` で partial tile を切り捨てる前提なので、`b % 16 != 0` だと末尾 (b mod 16)
-    // position の forward / backward が 走らず loss / gradient が corrupt する。`debug_assert!`
-    // は release で消えるので CLI で early reject する。
-    if !cli.batch_size.is_multiple_of(16) {
-        return Err(format!(
-            "--batch-size must be a multiple of 16 (got {}); tiled dense matmul kernels \
-             require b % 16 == 0 (block_dim=256 × grid_dim=b/16)",
-            cli.batch_size
-        )
-        .into());
-    }
     // loss kernel の選択: --win-rate-model → loss_wrm、未指定 → loss_wdl。
     let loss = if cli.win_rate_model {
         build_wrm_loss(cli)?
@@ -245,20 +297,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             scale: 1.0 / cli.scale,
         }
     };
-    if cli.threads == 0 {
-        return Err("--threads must be >= 1".into());
-    }
-    if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
-    }
-    if cli.superbatches == 0 {
-        return Err("--superbatches must be >= 1".into());
-    }
-    if let Some(0) = cli.keep_checkpoints {
-        return Err(
-            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
-        );
-    }
     // FT 出力次元は backward の gather kernel が grid を `ft_out / 128` で launch する
     // ため 128 の倍数でなければ末尾行の勾配が計算されない。
     if layerstack.ft_out == 0 || !layerstack.ft_out.is_multiple_of(128) {
@@ -347,10 +385,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保。
-    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
-    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
-    let ft_fp16_out = layerstack.ft_fp16_out || cli.all_optim;
-    let tf32 = layerstack.tf32 || cli.all_optim;
+    let SharedPrecisionFlags {
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
+    } = shared.precision;
     if cli.all_optim {
         println!(
             "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
@@ -530,16 +570,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
-    let start_superbatch = match cli.start_superbatch {
-        Some(n) => n,
-        None => match resumed_superbatch {
-            Some(sb) => sb + 1,
-            None => 1,
-        },
-    };
-    if start_superbatch == 0 {
-        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
-    }
+    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     // eval-only は学習しないので train-range 制約を課さない。これを課すと最終
     // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価できない。
     if start_superbatch > cli.superbatches && !cli.eval_only {
@@ -1465,52 +1496,8 @@ pub(crate) fn run_simple_training(
         .as_ref()
         .expect("run_simple_training called with --data");
 
-    let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            let names: Vec<&str> = FeatureSet::ALL
-                .iter()
-                .map(|fs| fs.canonical_name())
-                .collect();
-            format!(
-                "--feature-set '{}' is not a known feature set (expected one of: {})",
-                cli.feature_set,
-                names.join(", ")
-            )
-            .into()
-        })?
-        .spec();
-
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
-            cli.optimizer
-        )
-        .into());
-    }
-    // `--ft-fp16-out` は FP16 weight mirror 経路の上に積む拡張で、`--ft-fp16` を要求する。
-    // `--all-optim` は両 flag を含意するため実効値で判定する ([`ft_fp16_out_missing_ft_fp16`]、
-    // `--all-optim --ft-fp16-out` の冗長指定を false-positive reject しない)。
-    if ft_fp16_out_missing_ft_fp16(simple_args.ft_fp16_out, cli.ft_fp16, cli.all_optim) {
-        return Err(
-            "--ft-fp16-out requires --ft-fp16 (FT activation FP16 builds on the weight \
-             FP16 path)"
-                .into(),
-        );
-    }
-    // `--wdl` / `--start-wdl` / `--end-wdl` の範囲検証は [`build_wdl_scheduler`] が担う。
-    if !(cli.lr.is_finite() && cli.lr > 0.0) {
-        return Err(format!("--lr must be finite and > 0 (got {})", cli.lr).into());
-    }
-    if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
-        return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
-    }
-    if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
-        return Err(format!(
-            "--weight-decay must be finite and >= 0 (got {})",
-            cli.weight_decay
-        )
-        .into());
-    }
+    let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
+    let feature_set = shared.feature_set;
     if cli.norm_loss {
         return Err(
             "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
@@ -1526,28 +1513,6 @@ pub(crate) fn run_simple_training(
         )
         .into());
     }
-    if !cli.batch_size.is_multiple_of(16) {
-        return Err(format!(
-            "--batch-size must be a multiple of 16 (got {})",
-            cli.batch_size
-        )
-        .into());
-    }
-    if cli.threads == 0 {
-        return Err("--threads must be >= 1".into());
-    }
-    if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive".into());
-    }
-    if cli.superbatches == 0 {
-        return Err("--superbatches must be >= 1".into());
-    }
-    if let Some(0) = cli.keep_checkpoints {
-        return Err(
-            "--keep-checkpoints must be >= 1 when set (0 would delete every raw checkpoint)".into(),
-        );
-    }
-
     // 層次元の決定: --arch preset + --l1 / --l2 / --l3 override。
     let (preset_ft_out, preset_l1_out, preset_l2_out) = parse_simple_preset(&simple_args.arch)?;
     let ft_out = simple_args.l1.unwrap_or(preset_ft_out);
@@ -1622,10 +1587,12 @@ pub(crate) fn run_simple_training(
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
     // 設定再現に使う)。
-    let ft_fp16 = cli.ft_fp16 || cli.all_optim;
-    let fp16_opt_state = cli.fp16_opt_state || cli.all_optim;
-    let ft_fp16_out = simple_args.ft_fp16_out || cli.all_optim;
-    let tf32 = simple_args.tf32 || cli.all_optim;
+    let SharedPrecisionFlags {
+        ft_fp16,
+        ft_fp16_out,
+        fp16_opt_state,
+        tf32,
+    } = shared.precision;
     if cli.all_optim {
         println!(
             "[train] --all-optim → ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out} \
@@ -1692,16 +1659,7 @@ pub(crate) fn run_simple_training(
     // `--ft-fp16` 未指定なら no-op。
     trainer.sync_ft_w_h_mirror()?;
 
-    let start_superbatch = match cli.start_superbatch {
-        Some(n) => n,
-        None => match resumed_superbatch {
-            Some(sb) => sb + 1,
-            None => 1,
-        },
-    };
-    if start_superbatch == 0 {
-        return Err("--start-superbatch must be >= 1 (1-indexed)".into());
-    }
+    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     if start_superbatch > cli.superbatches {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train)",
@@ -1784,6 +1742,92 @@ mod tests {
         // global init flag を subcommand の前に置く。layerstack は追加必須引数なし。
         argv.push("layerstack");
         Cli::try_parse_from(argv).expect("cli parse")
+    }
+
+    fn shared_cli_error(extra: &[&str], ft_fp16_out: bool) -> String {
+        match validate_shared_cli(&parse(extra), ft_fp16_out, false) {
+            Ok(_) => panic!("shared CLI validation unexpectedly accepted input"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_cli_validation_rejects_invalid_common_values() {
+        assert!(
+            shared_cli_error(&["--feature-set", "unknown"], false)
+                .contains("--feature-set 'unknown' is not a known feature set")
+        );
+        assert!(
+            shared_cli_error(&["--optimizer", "adam"], false)
+                .contains("--optimizer 'adam' is not implemented")
+        );
+        assert!(shared_cli_error(&["--lr", "0"], false).contains("--lr must be finite and > 0"));
+        assert!(
+            shared_cli_error(&["--lr-gamma", "NaN"], false)
+                .contains("--lr-gamma must be finite and > 0")
+        );
+        assert!(
+            shared_cli_error(&["--weight-decay=-1"], false)
+                .contains("--weight-decay must be finite and >= 0")
+        );
+        assert_eq!(
+            shared_cli_error(&["--threads", "0"], false),
+            "--threads must be >= 1"
+        );
+        assert_eq!(
+            shared_cli_error(&["--superbatches", "0"], false),
+            "--superbatches must be >= 1"
+        );
+        assert!(
+            shared_cli_error(&["--keep-checkpoints", "0"], false)
+                .contains("--keep-checkpoints must be >= 1 when set")
+        );
+    }
+
+    #[test]
+    fn shared_cli_validation_pins_unified_errors() {
+        let batch_error = shared_cli_error(&["--batch-size", "17"], false);
+        assert!(batch_error.contains("--batch-size must be a multiple of 16 (got 17)"));
+        assert!(batch_error.contains("tiled dense matmul kernels require b % 16 == 0"));
+
+        let init_resume_error = shared_cli_error(
+            &["--init-from", "base.bin", "--resume", "state.ckpt"],
+            false,
+        );
+        assert!(init_resume_error.contains("--init-from and --resume are mutually exclusive"));
+        assert!(init_resume_error.contains("--init-from injects weights"));
+        assert!(init_resume_error.contains("--resume preserves it"));
+    }
+
+    #[test]
+    fn shared_cli_validation_checks_fp16_dependency_and_expands_all_optim() {
+        assert!(shared_cli_error(&[], true).contains("--ft-fp16-out requires --ft-fp16"));
+
+        let shared =
+            validate_shared_cli(&parse(&["--all-optim"]), false, false).expect("valid shared CLI");
+        assert!(shared.precision.ft_fp16);
+        assert!(shared.precision.ft_fp16_out);
+        assert!(shared.precision.fp16_opt_state);
+        assert!(shared.precision.tf32);
+    }
+
+    #[test]
+    fn shared_cli_validation_resolves_start_superbatch() {
+        let cli = parse(&[]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(shared.start_superbatch(&cli, None).unwrap(), 1);
+        assert_eq!(shared.start_superbatch(&cli, Some(6)).unwrap(), 7);
+
+        let cli = parse(&["--start-superbatch", "3"]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(shared.start_superbatch(&cli, Some(6)).unwrap(), 3);
+
+        let cli = parse(&["--start-superbatch", "0"]);
+        let shared = validate_shared_cli(&cli, false, false).expect("valid shared CLI");
+        assert_eq!(
+            shared.start_superbatch(&cli, None).unwrap_err().to_string(),
+            "--start-superbatch must be >= 1 (1-indexed)"
+        );
     }
 
     #[test]
