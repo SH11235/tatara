@@ -1,8 +1,8 @@
 //! PSV file → feature-set sparse batch dataloader (+ prefetch wrapper)。
 //!
 //! trainer の data 供給路。`PackedSfenValue` を [`FeatureSetSpec`] の indexer で
-//! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` / `wdl` /
-//! `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
+//! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `nnz` / `score` /
+//! `wdl` / `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
 //! 本 dataloader から `Batch` を pull する。どの feature set を使うかは生成時に
 //! 渡す `FeatureSetSpec` で決まる (runtime 選択)。
 //!
@@ -13,7 +13,7 @@
 //!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
 //! - sparse index は feature set の最大 active 数 (`FeatureSetSpec::max_active`)
 //!   で固定容量を持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward`
-//!   kernel は `-1` を silent skip する規約
+//!   kernel は position ごとの `nnz` まで走査し、`-1` も防御的に silent skip する規約
 //! - 並列 prefetch は `std::thread::spawn` + `std::sync::mpsc::sync_channel` の
 //!   minimal wrapper として [`PrefetchedLoader`] (single-thread worker) と
 //!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
@@ -60,6 +60,8 @@ pub struct Batch {
     pub max_active: usize,
     pub stm_indices: Vec<i32>,
     pub nstm_indices: Vec<i32>,
+    /// position ごとの実 active feature 数。stm / nstm は対称に emit されるため共通。
+    pub nnz: Vec<i32>,
     pub score: Vec<f32>,
     pub wdl: Vec<f32>,
     pub per_pos_norm: Vec<f32>,
@@ -77,6 +79,7 @@ impl Batch {
             max_active,
             stm_indices: vec![-1; batch_size * max_active],
             nstm_indices: vec![-1; batch_size * max_active],
+            nnz: vec![0; batch_size],
             score: vec![0.0; batch_size],
             wdl: vec![0.0; batch_size],
             per_pos_norm: vec![1.0; batch_size],
@@ -177,6 +180,7 @@ impl Batch {
         if let Some(hist) = active_hist {
             hist[written] += 1;
         }
+        self.nnz[bi] = written as i32;
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);
@@ -1141,11 +1145,15 @@ mod tests {
         for _ in 0..8 {
             let psv = loader.next_psv().unwrap().expect("record");
             let board = psv.decode();
+            let bi = batch.n_positions;
             assert!(
                 batch
                     .push_decoded_counting(&board, Some(&mut hist))
                     .unwrap()
             );
+            let row = &batch.stm_indices[bi * spec.max_active()..(bi + 1) * spec.max_active()];
+            let written = row.iter().take_while(|&&idx| idx >= 0).count();
+            assert_eq!(batch.nnz[bi], written as i32);
             pushed += 1;
         }
         // histogram の総和は push した position 数と一致する。

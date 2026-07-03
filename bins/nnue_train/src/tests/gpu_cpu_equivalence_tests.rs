@@ -3584,18 +3584,68 @@ fn sparse_indices_fixture(batch: usize, nnz: usize, cols: usize, seed: usize) ->
     v
 }
 
+/// position ごとに実長が異なる固定幅 sparse index。先頭 2 row で
+/// `nnz=0` / `nnz=max_active` の境界を作り、各 row の tail は `-1` にする。
+fn sparse_indices_fixture_ragged(
+    batch: usize,
+    max_active: usize,
+    cols: usize,
+    seed: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    let mut indices = vec![-1; batch * max_active];
+    let mut nnz = vec![0; batch];
+    for bi in 0..batch {
+        let row_nnz = match bi {
+            0 => 0,
+            1 => max_active,
+            _ => (bi * 3 + 1) % (max_active + 1),
+        };
+        nnz[bi] = row_nnz as i32;
+        for ni in 0..row_nnz {
+            indices[bi * max_active + ni] = ((bi * 7 + ni * 3 + seed) % cols) as i32;
+        }
+    }
+    (indices, nnz)
+}
+
 #[test]
 fn sparse_ft_forward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // rows は kernel 規約 (1 thread = 4 連続 row) の最小単位 4 の倍数。
-    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let (batch, rows, cols, max_active) = (5_usize, 8_usize, 9_usize, 6_usize);
     let weight = deterministic_floats(rows * cols, 3.0);
-    let indices = sparse_indices_fixture(batch, nnz, cols, 0);
+    let (indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, cols, 0);
     let mut out_cpu = vec![0.0_f32; batch * rows];
-    sparse_ft_forward_cpu(&weight, &indices, &mut out_cpu, batch, rows, cols, nnz);
+    sparse_ft_forward_cpu(
+        &weight,
+        &indices,
+        &nnz,
+        &mut out_cpu,
+        batch,
+        rows,
+        cols,
+        max_active,
+    );
+
+    // tail=-1 の固定幅全 slot 走査は、実長打ち切りと同じ項を同じ順序で加算する。
+    let mut out_full_scan = vec![0.0_f32; batch * rows];
+    sparse_ft_forward_cpu(
+        &weight,
+        &indices,
+        &vec![max_active as i32; batch],
+        &mut out_full_scan,
+        batch,
+        rows,
+        cols,
+        max_active,
+    );
+    assert_eq!(out_cpu, out_full_scan);
+    assert_eq!(nnz[0], 0);
+    assert_eq!(nnz[1], max_active as i32);
 
     let w_dev = DeviceBuffer::from_host(&stream, &weight)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3603,8 +3653,8 @@ fn sparse_ft_forward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         cuda_launch! {
             kernel: sparse_ft_forward, stream: stream, module: module,
             config: cfg_1d(batch * rows / 4),
-            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-                   batch as u32, rows as u32, cols as u32, nnz as u32]
+            args: [slice(w_dev), slice(idx_dev), slice(nnz_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, max_active as u32]
         }
     }?;
     stream.synchronize()?;
@@ -3620,18 +3670,78 @@ fn sparse_ft_forward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn sparse_ft_forward_ignores_valid_indices_past_row_nnz() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, rows, cols, max_active) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let weight = deterministic_floats(rows * cols, 3.25);
+    let (mut indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, cols, 3);
+    let mut expected = vec![0.0_f32; batch * rows];
+    sparse_ft_forward_cpu(
+        &weight,
+        &indices,
+        &nnz,
+        &mut expected,
+        batch,
+        rows,
+        cols,
+        max_active,
+    );
+
+    // nnz 以降を範囲内の index で汚す。kernel が固定幅全体を走査すると結果が変わる。
+    for bi in 0..batch {
+        for ni in nnz[bi] as usize..max_active {
+            indices[bi * max_active + ni] = ((bi + ni + 1) % cols) as i32;
+        }
+    }
+
+    let w_dev = DeviceBuffer::from_host(&stream, &weight)?;
+    let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: sparse_ft_forward, stream: stream, module: module,
+            config: cfg_1d(batch * rows / 4),
+            args: [slice(w_dev), slice(idx_dev), slice(nnz_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, max_active as u32]
+        }
+    }?;
+    stream.synchronize()?;
+    assert_close(
+        "sparse_ft_forward ignores tail",
+        &out_dev.to_host_vec(&stream)?,
+        &expected,
+        0.0,
+    );
+    Ok(())
+}
+
+#[test]
 fn sparse_ft_forward_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let (batch, rows, cols, max_active) = (5_usize, 8_usize, 9_usize, 6_usize);
     let weight = deterministic_floats(rows * cols, 3.5);
     let (weight_h, weight_q) = quantize_f16(&weight);
-    let indices = sparse_indices_fixture(batch, nnz, cols, 1);
+    let (indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, cols, 1);
     // CPU reference は GPU が読むのと同じ f16→f32 値で計算する (f16→f32 は無損失)。
     let mut out_cpu = vec![0.0_f32; batch * rows];
-    sparse_ft_forward_cpu(&weight_q, &indices, &mut out_cpu, batch, rows, cols, nnz);
+    sparse_ft_forward_cpu(
+        &weight_q,
+        &indices,
+        &nnz,
+        &mut out_cpu,
+        batch,
+        rows,
+        cols,
+        max_active,
+    );
 
     let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3639,8 +3749,8 @@ fn sparse_ft_forward_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>
         cuda_launch! {
             kernel: sparse_ft_forward_fp16, stream: stream, module: module,
             config: cfg_1d(batch * rows / 4),
-            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-                   batch as u32, rows as u32, cols as u32, nnz as u32]
+            args: [slice(w_dev), slice(idx_dev), slice(nnz_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, max_active as u32]
         }
     }?;
     stream.synchronize()?;
@@ -3656,18 +3766,28 @@ fn sparse_ft_forward_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>
 #[test]
 fn sparse_ft_forward_fp16_out_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, rows, cols, nnz) = (5_usize, 8_usize, 9_usize, 6_usize);
+    let (batch, rows, cols, max_active) = (5_usize, 8_usize, 9_usize, 6_usize);
     let weight = deterministic_floats(rows * cols, 4.0);
     let (weight_h, weight_q) = quantize_f16(&weight);
-    let indices = sparse_indices_fixture(batch, nnz, cols, 2);
+    let (indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, cols, 2);
     // f32 累算結果は GPU と bit 一致するため、出力の round-to-nearest f16 量子化も
     // 同値になる。CPU 側も f16 量子化して bit-exact 比較する。
     let mut out_cpu = vec![0.0_f32; batch * rows];
-    sparse_ft_forward_cpu(&weight_q, &indices, &mut out_cpu, batch, rows, cols, nnz);
+    sparse_ft_forward_cpu(
+        &weight_q,
+        &indices,
+        &nnz,
+        &mut out_cpu,
+        batch,
+        rows,
+        cols,
+        max_active,
+    );
     let (_, out_cpu_q) = quantize_f16(&out_cpu);
 
     let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let mut out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * rows)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3675,8 +3795,8 @@ fn sparse_ft_forward_fp16_out_matches_cpu() -> Result<(), Box<dyn std::error::Er
         cuda_launch! {
             kernel: sparse_ft_forward_fp16_out, stream: stream, module: module,
             config: cfg_1d(batch * rows / 4),
-            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-                   batch as u32, rows as u32, cols as u32, nnz as u32]
+            args: [slice(w_dev), slice(idx_dev), slice(nnz_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, max_active as u32]
         }
     }?;
     stream.synchronize()?;
@@ -5058,10 +5178,10 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, nnz, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
     let psqt_w = deterministic_floats(ft_in * nb, 33.0);
-    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
-    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    let (stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
+    let (nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
     // 全 9 bucket + `-1` / `>= nb` の invalid bucket (skip) を踏む。
     let bucket_idx = bucket_idx_with_padding(batch, nb);
     let net0 = deterministic_floats(batch, 37.0);
@@ -5071,10 +5191,11 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
         &psqt_w,
         &stm_indices,
         &nstm_indices,
+        &nnz,
         &bucket_idx,
         &mut net_cpu,
         batch,
-        nnz,
+        max_active,
         nb,
         ft_in,
     );
@@ -5082,6 +5203,7 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
     let w_dev = DeviceBuffer::from_host(&stream, &psqt_w)?;
     let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let mut net_dev = DeviceBuffer::from_host(&stream, &net0)?;
     unsafe {
@@ -5090,8 +5212,9 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
         cuda_launch! {
             kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
             config: cfg_1d(batch),
-            args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
-                   slice_mut(net_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+            args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
+                   slice(bidx_dev), slice_mut(net_dev), batch as u32, max_active as u32,
+                   nb as u32, ft_in as u32]
         }
     }?;
     stream.synchronize()?;

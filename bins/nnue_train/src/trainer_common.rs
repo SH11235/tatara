@@ -102,9 +102,10 @@ pub(crate) struct BatchData<'a> {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可
     pub(crate) nstm_indices: &'a [i32],
+    pub(crate) nnz: &'a [i32], // (n_pos)、両 perspective 共通の実 active 数
     pub(crate) bucket_idx: &'a [i32], // (n_pos)、progress-kpabs が emit する 0..num_buckets-1
-    pub(crate) score: &'a [f32],      // (n_pos)、target eval cp の元
-    pub(crate) wdl: &'a [f32],        // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    pub(crate) score: &'a [f32], // (n_pos)、target eval cp の元
+    pub(crate) wdl: &'a [f32], // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
     pub(crate) per_pos_norm: f32, // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)
 }
 
@@ -114,6 +115,7 @@ pub(crate) struct BatchDataOwned {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: Vec<i32>,
     pub(crate) nstm_indices: Vec<i32>,
+    pub(crate) nnz: Vec<i32>,
     pub(crate) bucket_idx: Vec<i32>,
     pub(crate) score: Vec<f32>,
     pub(crate) wdl: Vec<f32>,
@@ -126,6 +128,7 @@ impl BatchDataOwned {
             n_pos: n,
             stm_indices: &self.stm_indices,
             nstm_indices: &self.nstm_indices,
+            nnz: &self.nnz,
             bucket_idx: &self.bucket_idx,
             score: &self.score,
             wdl: &self.wdl,
@@ -166,6 +169,7 @@ impl BatchData<'_> {
             n_pos,
             stm_indices,
             nstm_indices,
+            nnz: vec![max_active as i32; n_pos],
             bucket_idx: vec![0_i32; n_pos],
             score: vec![0.0_f32; n_pos],
             wdl: vec![0.5_f32; n_pos],
@@ -219,6 +223,7 @@ impl BatchData<'_> {
             n_pos,
             stm_indices: &batch.stm_indices[..span],
             nstm_indices: &batch.nstm_indices[..span],
+            nnz: &batch.nnz[..n_pos],
             bucket_idx,
             score: &batch.score[..n_pos],
             wdl: &batch.wdl[..n_pos],
@@ -1040,10 +1045,11 @@ impl Drop for AsyncLossRing {
 /// compute stream に待たせる。
 pub(crate) struct InputUploadRing {
     pub(crate) copy_stream: std::sync::Arc<CudaStream>,
-    // pinned host staging。stm/nstm は `batch * max_active`、bucket/score/wdl は `batch`。
+    // pinned host staging。stm/nstm は `batch * max_active`、nnz/bucket/score/wdl は `batch`。
     // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
+    pinned_nnz: [*mut i32; 2],
     pinned_bucket: Option<[*mut i32; 2]>,
     pinned_score: [*mut f32; 2],
     pinned_wdl: [*mut f32; 2],
@@ -1056,7 +1062,7 @@ pub(crate) struct InputUploadRing {
     step_done: [CudaEvent; 2],
     /// stm/nstm pinned の要素容量 (`batch * max_active`)。
     cap_idx: usize,
-    /// bucket/score/wdl pinned の要素容量 (`batch`)。
+    /// nnz/bucket/score/wdl pinned の要素容量 (`batch`)。
     cap_scalar: usize,
     step: usize,
 }
@@ -1108,6 +1114,7 @@ impl InputUploadRing {
             copy_stream,
             pinned_stm: alloc_pinned_host::<i32>(cap_idx)?,
             pinned_nstm: alloc_pinned_host::<i32>(cap_idx)?,
+            pinned_nnz: alloc_pinned_host::<i32>(cap_scalar)?,
             pinned_bucket,
             pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
             pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
@@ -1119,7 +1126,7 @@ impl InputUploadRing {
         })
     }
 
-    /// `batch` の入力 5 slice を pinned 経由で `dev_*` (caller が swap で active 化した
+    /// `batch` の入力 6 slice を pinned 経由で `dev_*` (caller が swap で active 化した
     /// device buffer) へ copy stream で async H2D し、`compute_stream` に H2D 完了を
     /// 待たせる。
     ///
@@ -1134,6 +1141,8 @@ impl InputUploadRing {
         h_stm: &[i32],
         dev_nstm: &DeviceBuffer<i32>,
         h_nstm: &[i32],
+        dev_nnz: &DeviceBuffer<i32>,
+        h_nnz: &[i32],
         dev_bucket: &DeviceBuffer<i32>,
         h_bucket: &[i32],
         dev_score: &DeviceBuffer<f32>,
@@ -1149,6 +1158,7 @@ impl InputUploadRing {
         );
         assert!(
             h_bucket.len() <= self.cap_scalar
+                && h_nnz.len() <= self.cap_scalar
                 && h_score.len() <= self.cap_scalar
                 && h_wdl.len() <= self.cap_scalar,
             "input batch (scalar) exceeds pinned capacity {}",
@@ -1177,6 +1187,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_bucket.as_ptr(), pinned_bucket[slot], h_bucket.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
@@ -1196,6 +1207,11 @@ impl InputUploadRing {
                 cs,
                 dev_nstm,
                 std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nnz,
+                std::slice::from_raw_parts(self.pinned_nnz[slot], h_nnz.len()),
             )?;
             copy_host_to_device_async_i32(
                 cs,
@@ -1219,7 +1235,8 @@ impl InputUploadRing {
         Ok(())
     }
 
-    /// Simple アーキ用 upload: bucket buffer を持たない 4 buffer 版 (stm/nstm/score/wdl)。
+    /// Simple アーキ用 upload: bucket buffer を持たない 5 buffer 版
+    /// (stm/nstm/nnz/score/wdl)。
     /// 動作セマンティクスは [`upload`](Self::upload) と同じ — caller が active/back を
     /// `mem::swap` 済の `dev_*` に対し pinned 経由 copy stream で先行 H2D し、compute
     /// stream に H2D 完了を待たせる。
@@ -1231,6 +1248,8 @@ impl InputUploadRing {
         h_stm: &[i32],
         dev_nstm: &DeviceBuffer<i32>,
         h_nstm: &[i32],
+        dev_nnz: &DeviceBuffer<i32>,
+        h_nnz: &[i32],
         dev_score: &DeviceBuffer<f32>,
         h_score: &[f32],
         dev_wdl: &DeviceBuffer<f32>,
@@ -1248,7 +1267,9 @@ impl InputUploadRing {
             self.cap_idx
         );
         assert!(
-            h_score.len() <= self.cap_scalar && h_wdl.len() <= self.cap_scalar,
+            h_nnz.len() <= self.cap_scalar
+                && h_score.len() <= self.cap_scalar
+                && h_wdl.len() <= self.cap_scalar,
             "input batch (scalar) exceeds pinned capacity {}",
             self.cap_scalar
         );
@@ -1262,6 +1283,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
         }
@@ -1278,6 +1300,11 @@ impl InputUploadRing {
                 cs,
                 dev_nstm,
                 std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nnz,
+                std::slice::from_raw_parts(self.pinned_nnz[slot], h_nnz.len()),
             )?;
             copy_host_to_device_async_f32(
                 cs,
@@ -1323,6 +1350,7 @@ impl Drop for InputUploadRing {
             .pinned_stm
             .iter()
             .chain(self.pinned_nstm.iter())
+            .chain(self.pinned_nnz.iter())
             .chain(bucket_slots.iter())
         {
             if !slot.is_null() {

@@ -110,6 +110,8 @@ pub(crate) struct SimpleGpuWorkspace {
     stm_idx_dev: DeviceBuffer<i32>,
     /// 同 nstm。
     nstm_idx_dev: DeviceBuffer<i32>,
+    /// position ごとの実 active feature 数。
+    nnz_dev: DeviceBuffer<i32>,
     /// target score (`b`、centipawn)。
     score_dev: DeviceBuffer<f32>,
     /// target wdl (`b`、0.0/0.5/1.0)。
@@ -119,6 +121,7 @@ pub(crate) struct SimpleGpuWorkspace {
     /// 直前 step の compute と並走しても buffer 競合が起きない。
     stm_idx_dev_back: DeviceBuffer<i32>,
     nstm_idx_dev_back: DeviceBuffer<i32>,
+    nnz_dev_back: DeviceBuffer<i32>,
     score_dev_back: DeviceBuffer<f32>,
     wdl_dev_back: DeviceBuffer<f32>,
 }
@@ -177,10 +180,12 @@ impl SimpleGpuWorkspace {
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
         })
@@ -614,6 +619,7 @@ impl SimpleGpuTrainer {
         // h2d_reset を直前 step の compute と並走させる)。
         std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
         std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
         std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
         std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
         self.input_ring.upload_simple(
@@ -622,6 +628,8 @@ impl SimpleGpuTrainer {
             &batch.stm_indices[..b * self.ws.max_active],
             &self.ws.nstm_idx_dev,
             &batch.nstm_indices[..b * self.ws.max_active],
+            &self.ws.nnz_dev,
+            &batch.nnz[..b],
             &self.ws.score_dev,
             &batch.score[..b],
             &self.ws.wdl_dev,
@@ -752,6 +760,7 @@ impl SimpleGpuTrainer {
                 &self.ws.nstm_idx_dev,
                 &batch.nstm_indices[..b * self.ws.max_active],
             )?;
+            copy_host_to_device_async_i32(&self.stream, &self.ws.nnz_dev, &batch.nnz[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
         }
@@ -788,6 +797,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(ft_stm_out_h),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -809,6 +819,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(ft_nstm_out_h),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -830,6 +841,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -846,6 +858,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(ft_w_h),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -863,6 +876,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(self.ft_w),
                         slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]
@@ -879,6 +893,7 @@ impl SimpleGpuTrainer {
                     args: [
                         slice(self.ft_w),
                         slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out),
                         b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
                     ]

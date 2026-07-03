@@ -144,11 +144,21 @@ mod tests {
         let (real, train, real_nnz, train_nnz) = real_and_train_indices();
         let batch = 2;
         let mut out_fold = vec![0.0_f32; batch * FT_OUT];
-        sparse_ft_forward_cpu(&comb, &real, &mut out_fold, batch, FT_OUT, FT_IN, real_nnz);
+        sparse_ft_forward_cpu(
+            &comb,
+            &real,
+            &[real_nnz as i32; 2],
+            &mut out_fold,
+            batch,
+            FT_OUT,
+            FT_IN,
+            real_nnz,
+        );
         let mut out_virtual = vec![0.0_f32; batch * FT_OUT];
         sparse_ft_forward_cpu(
             &w,
             &train,
+            &[train_nnz as i32; 2],
             &mut out_virtual,
             batch,
             FT_OUT,

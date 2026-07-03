@@ -15,7 +15,7 @@
 //!   と `Constant` / `Step` / `LinearDecay` / `CosineDecay` / `Warmup` / `Sequence`
 //!   等の実装)
 //! - `dataloader`: PSV file → HalfKA_hm sparse batch + prefetch
-//!   (`Batch { stm_indices, nstm_indices, score, wdl, per_pos_norm, n_positions }`、
+//!   (`Batch { stm_indices, nstm_indices, nnz, score, wdl, per_pos_norm, n_positions }`、
 //!   `PsvFileLoader` / `PrefetchedLoader` / `BucketedPrefetchedLoader`)
 //! - `optimizer`: `RangerParams` (Ranger optimizer のハイパーパラメータ) と
 //!   `radam_compute_step_size_denom` (GPU `radam_step` kernel に渡す値の host 側
