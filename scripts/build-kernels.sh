@@ -65,10 +65,78 @@ else
   fi
 fi
 
+# libdevice call と LLVM atomic operation が同じ module にある場合、pre-Blackwell
+# 向け legacy NVVM IR は atomic operation を表現できない。modern NVVM IR を一度
+# 生成し、libdevice を link してから LLVM NVPTX backend で実行対象の PTX に落とす。
+# modern IR の target は利用可能な命令を制限するだけで、最終 PTX target は下の
+# llc --mcpu が決める。
+ptx_target="${CUDA_OXIDE_TARGET:-sm_80}"
+target_number="${ptx_target#sm_}"
+target_number="${target_number%%[a-z]*}"
+if [[ "$target_number" =~ ^[0-9]+$ && "$target_number" -ge 100 ]]; then
+  nvvm_target="$ptx_target"
+else
+  nvvm_target="sm_100"
+fi
+
+find_llvm_tool() {
+  local env_name="$1"
+  local tool="$2"
+  local configured="${!env_name:-}"
+  if [[ -n "$configured" ]]; then
+    echo "$configured"
+    return
+  fi
+  command -v "$tool-22" || command -v "$tool-21" || command -v "$tool"
+}
+
+find_libdevice() {
+  local root
+  for root in "${CUDA_TOOLKIT_PATH:-}" "${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda; do
+    if [[ -n "$root" && -f "$root/nvvm/libdevice/libdevice.10.bc" ]]; then
+      echo "$root/nvvm/libdevice/libdevice.10.bc"
+      return
+    fi
+  done
+  local candidate
+  candidate="$(compgen -G '/usr/local/cuda-*/nvvm/libdevice/libdevice.10.bc' | head -1 || true)"
+  [[ -n "$candidate" ]] && echo "$candidate"
+}
+
+llvm_link="$(find_llvm_tool LLVM_LINK_BIN llvm-link)"
+opt_bin="$(find_llvm_tool OPT_BIN opt)"
+llc_bin="$(find_llvm_tool LLC_BIN llc)"
+libdevice="$(find_libdevice)"
+if [[ -z "$llvm_link" || -z "$opt_bin" || -z "$llc_bin" || -z "$libdevice" ]]; then
+  echo "error: PTX 生成に必要な llvm-link / opt / llc / libdevice.10.bc が見つかりません。" >&2
+  exit 1
+fi
+
 # kernel を持つ bin をすべてビルドする。
 for bin in nnue_train progress_kpabs_train; do
-  echo "[build-kernels] cargo-oxide build: bins/$bin"
-  ( cd "bins/$bin" && cargo-oxide build )
+  echo "[build-kernels] cargo-oxide build: bins/$bin (modern NVVM IR: $nvvm_target)"
+  ( cd "bins/$bin" && cargo-oxide build --emit-nvvm-ir --arch "$nvvm_target" )
+
+  ll="$repo_root/$bin.ll"
+  if [[ ! -f "$ll" ]]; then
+    ll="$repo_root/bins/$bin/$bin.ll"
+  fi
+  if [[ ! -f "$ll" ]]; then
+    echo "error: cargo-oxide が $bin.ll を生成しませんでした。" >&2
+    exit 1
+  fi
+
+  artifact_dir="$(dirname "$ll")"
+  linked_bc="$artifact_dir/$bin.linked.bc"
+  opt_bc="$artifact_dir/$bin.opt.bc"
+  ptx="$artifact_dir/$bin.ptx"
+  "$llvm_link" "$ll" "$libdevice" -o "$linked_bc"
+  # internalize が kernel entry を internal 化しても消えないのは、cargo-oxide の
+  # emit する .ll が全 kernel を @llvm.used に載せているため (globaldce の生存根拠)。
+  "$opt_bin" --passes=nvvm-reflect,internalize,globaldce "$linked_bc" -o "$opt_bc"
+  "$llc_bin" --mtriple=nvptx64-nvidia-cuda --mcpu="$ptx_target" -O2 "$opt_bc" -o "$ptx"
+  rm -f "$artifact_dir/$bin.options" "$artifact_dir/$bin.target"
+  echo "[build-kernels] PTX: $ptx ($(sha256sum "$ptx" | awk '{print $1}'))"
 done
 
 echo "[build-kernels] 完了。"

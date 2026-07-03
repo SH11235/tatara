@@ -2439,10 +2439,10 @@ pub fn concat_l1sqr_main_grad(
     let da_val = dout[bi * out_dim + ii];
     let db_val = dout[bi * out_dim + (dim as usize) + ii];
 
-    if let Some(o) = da.get_mut(tid) {
+    if let Some(o) = da.get_mut(thread::index_1d()) {
         *o = da_val;
     }
-    if let Some(o) = db.get_mut(tid) {
+    if let Some(o) = db.get_mut(thread::index_1d()) {
         *o = db_val;
     }
 }
@@ -2471,8 +2471,9 @@ pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) 
     if i.get() >= n as usize {
         return;
     }
+    let j = i.get();
     if let Some(out) = c.get_mut(i) {
-        *out = a[i.get()] + b[i.get()];
+        *out = a[j] + b[j];
     }
 }
 

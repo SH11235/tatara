@@ -84,16 +84,20 @@ fn launch_error_includes_kernel_name() -> Result<(), Box<dyn std::error::Error>>
     let (_ctx, module, stream) = open_module()?;
     let x_dev = DeviceBuffer::from_host(&stream, &[0.0_f32])?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, 1)?;
-    let error = cuda_launch! {
-        kernel: crelu_fwd,
-        stream: stream,
-        module: module,
-        config: LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (2048, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        args: [slice(x_dev), slice_mut(y_dev), 1_u32]
+    let error = unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: crelu_fwd,
+            stream: stream,
+            module: module,
+            config: LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (2048, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [slice(x_dev), slice_mut(y_dev), 1_u32]
+        }
     }
     .unwrap_err();
     assert!(
@@ -174,9 +178,13 @@ fn crelu_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: crelu_fwd, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(x_dev), slice_mut(y_dev), n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: crelu_fwd, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice_mut(y_dev), n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("crelu_fwd", &y_dev.to_host_vec(&stream)?, &y_cpu, 0.0);
@@ -197,9 +205,13 @@ fn crelu_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: crelu_grad, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(x_dev), slice(dy_dev), slice_mut(dx_dev), n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: crelu_grad, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice(dy_dev), slice_mut(dx_dev), n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("crelu_grad", &dx_dev.to_host_vec(&stream)?, &dx_cpu, 0.0);
@@ -220,9 +232,13 @@ fn screlu_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: screlu_fwd, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(x_dev), slice_mut(y_dev), n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: screlu_fwd, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice_mut(y_dev), n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("screlu_fwd", &y_dev.to_host_vec(&stream)?, &y_cpu, 0.0);
@@ -242,9 +258,13 @@ fn abs_pow2_scale_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: abs_pow2_scale_fwd, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(x_dev), slice_mut(y_dev), scale, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: abs_pow2_scale_fwd, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice_mut(y_dev), scale, n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -269,9 +289,13 @@ fn abs_pow2_scale_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: abs_pow2_scale_grad, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(x_dev), slice(dy_dev), slice_mut(dx_dev), scale, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: abs_pow2_scale_grad, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(x_dev), slice(dy_dev), slice_mut(dx_dev), scale, n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -300,9 +324,13 @@ fn elementwise_add_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let a_dev = DeviceBuffer::from_host(&stream, &a)?;
     let b_dev = DeviceBuffer::from_host(&stream, &b)?;
     let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: elementwise_add, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(a_dev), slice(b_dev), slice_mut(c_dev), n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: elementwise_add, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(a_dev), slice(b_dev), slice_mut(c_dev), n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("elementwise_add", &c_dev.to_host_vec(&stream)?, &c_cpu, 0.0);
@@ -322,11 +350,15 @@ fn slice_extract_2d_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let mut main_cpu = vec![0.0_f32; batch * L1_EFFECTIVE];
     slice_extract_2d_cpu(&src, &mut main_cpu, batch, L1_OUT, 0, L1_EFFECTIVE);
     let mut main_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L1_EFFECTIVE)?;
-    cuda_launch! {
-        kernel: slice_extract_2d, stream: stream, module: module,
-        config: cfg_1d(batch * L1_EFFECTIVE),
-        args: [slice(src_dev), slice_mut(main_dev),
-               batch as u32, L1_OUT as u32, 0_u32, L1_EFFECTIVE as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: slice_extract_2d, stream: stream, module: module,
+            config: cfg_1d(batch * L1_EFFECTIVE),
+            args: [slice(src_dev), slice_mut(main_dev),
+                   batch as u32, L1_OUT as u32, 0_u32, L1_EFFECTIVE as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -340,11 +372,15 @@ fn slice_extract_2d_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let mut skip_cpu = vec![0.0_f32; batch * L1_SKIP];
     slice_extract_2d_cpu(&src, &mut skip_cpu, batch, L1_OUT, L1_EFFECTIVE, L1_SKIP);
     let mut skip_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L1_SKIP)?;
-    cuda_launch! {
-        kernel: slice_extract_2d, stream: stream, module: module,
-        config: cfg_1d(batch * L1_SKIP),
-        args: [slice(src_dev), slice_mut(skip_dev),
-               batch as u32, L1_OUT as u32, L1_EFFECTIVE as u32, L1_SKIP as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: slice_extract_2d, stream: stream, module: module,
+            config: cfg_1d(batch * L1_SKIP),
+            args: [slice(src_dev), slice_mut(skip_dev),
+                   batch as u32, L1_OUT as u32, L1_EFFECTIVE as u32, L1_SKIP as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -385,17 +421,25 @@ fn slice_scatter_2d_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let main_dev = DeviceBuffer::from_host(&stream, &dl1_main)?;
     let skip_dev = DeviceBuffer::from_host(&stream, &dl1_skip)?;
     let mut total_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L1_OUT)?;
-    cuda_launch! {
-        kernel: slice_scatter_2d, stream: stream, module: module,
-        config: cfg_1d(batch * L1_EFFECTIVE),
-        args: [slice(main_dev), slice_mut(total_dev),
-               batch as u32, L1_EFFECTIVE as u32, L1_OUT as u32, 0_u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: slice_scatter_2d, stream: stream, module: module,
+            config: cfg_1d(batch * L1_EFFECTIVE),
+            args: [slice(main_dev), slice_mut(total_dev),
+                   batch as u32, L1_EFFECTIVE as u32, L1_OUT as u32, 0_u32]
+        }
     }?;
-    cuda_launch! {
-        kernel: slice_scatter_2d, stream: stream, module: module,
-        config: cfg_1d(batch * L1_SKIP),
-        args: [slice(skip_dev), slice_mut(total_dev),
-               batch as u32, L1_SKIP as u32, L1_OUT as u32, L1_EFFECTIVE as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: slice_scatter_2d, stream: stream, module: module,
+            config: cfg_1d(batch * L1_SKIP),
+            args: [slice(skip_dev), slice_mut(total_dev),
+                   batch as u32, L1_SKIP as u32, L1_OUT as u32, L1_EFFECTIVE as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -423,11 +467,15 @@ fn concat_l1sqr_main_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
     let a_dev = DeviceBuffer::from_host(&stream, &a)?;
     let b_dev = DeviceBuffer::from_host(&stream, &b)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L2_IN)?;
-    cuda_launch! {
-        kernel: concat_l1sqr_main_fwd, stream: stream, module: module,
-        config: cfg_1d(batch * L2_IN),
-        args: [slice(a_dev), slice(b_dev), slice_mut(out_dev),
-               batch as u32, L1_EFFECTIVE as u32, L1_EFFECTIVE as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: concat_l1sqr_main_fwd, stream: stream, module: module,
+            config: cfg_1d(batch * L2_IN),
+            args: [slice(a_dev), slice(b_dev), slice_mut(out_dev),
+                   batch as u32, L1_EFFECTIVE as u32, L1_EFFECTIVE as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("concat_fwd", &out_dev.to_host_vec(&stream)?, &out_cpu, 0.0);
@@ -446,11 +494,15 @@ fn concat_l1sqr_main_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     let dout_dev = DeviceBuffer::from_host(&stream, &dout)?;
     let mut da_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L1_EFFECTIVE)?;
     let mut db_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * L1_EFFECTIVE)?;
-    cuda_launch! {
-        kernel: concat_l1sqr_main_grad, stream: stream, module: module,
-        config: cfg_1d(batch * L1_EFFECTIVE),
-        args: [slice(dout_dev), slice_mut(da_dev), slice_mut(db_dev),
-               batch as u32, L1_EFFECTIVE as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: concat_l1sqr_main_grad, stream: stream, module: module,
+            config: cfg_1d(batch * L1_EFFECTIVE),
+            args: [slice(dout_dev), slice_mut(da_dev), slice_mut(db_dev),
+                   batch as u32, L1_EFFECTIVE as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -491,10 +543,14 @@ fn dense_mm_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_fwd, stream: stream, module: module, config: cfg_1d(batch * out_dim),
-        args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice_mut(y_dev),
-               batch as u32, in_dim as u32, out_dim as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_fwd, stream: stream, module: module, config: cfg_1d(batch * out_dim),
+            args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice_mut(y_dev),
+                   batch as u32, in_dim as u32, out_dim as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close("dense_mm_fwd", &y_dev.to_host_vec(&stream)?, &y_cpu, TOL);
@@ -519,10 +575,14 @@ fn dense_mm_bwd_input_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_bwd_input, stream: stream, module: module, config: cfg_1d(batch * in_dim),
-        args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
-               batch as u32, in_dim as u32, out_dim as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_bwd_input, stream: stream, module: module, config: cfg_1d(batch * in_dim),
+            args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
+                   batch as u32, in_dim as u32, out_dim as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -550,10 +610,14 @@ fn dense_mm_bwd_weight_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let x_dev = DeviceBuffer::from_host(&stream, &x)?;
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, in_dim * out_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_bwd_weight, stream: stream, module: module, config: cfg_1d(in_dim * out_dim),
-        args: [slice(x_dev), slice(dy_dev), slice_mut(dw_dev),
-               batch as u32, in_dim as u32, out_dim as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight, stream: stream, module: module, config: cfg_1d(in_dim * out_dim),
+            args: [slice(x_dev), slice(dy_dev), slice_mut(dw_dev),
+                   batch as u32, in_dim as u32, out_dim as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -595,11 +659,15 @@ fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Erro
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_tiled, stream: stream, module: module,
-            config: config,
-            args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
-                   batch as u32, in_dim as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled, stream: stream, module: module,
+                config: config,
+                args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
+                       batch as u32, in_dim as u32, out_dim as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -637,10 +705,14 @@ fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Err
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_tiled, stream: stream, module: module, config: config,
-            args: [slice(x_dev), slice(dy_dev), slice_mut(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_tiled, stream: stream, module: module, config: config,
+                args: [slice(x_dev), slice(dy_dev), slice_mut(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -667,9 +739,13 @@ fn bias_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim)?;
-    cuda_launch! {
-        kernel: bias_grad, stream: stream, module: module, config: cfg_1d(batch * out_dim),
-        args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: bias_grad, stream: stream, module: module, config: cfg_1d(batch * out_dim),
+            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
+        }
     }?;
     stream.synchronize()?;
     // atomic fetch_add で reduce されるため relative tol (grad_bias と同様)。
@@ -713,10 +789,14 @@ fn simple_bias_grad_dual_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         let blocks = (batch as u32).div_ceil(items);
         let block_dim = ft.min(1024);
         let out_tiles = ft.div_ceil(block_dim);
-        cuda_launch! {
-            kernel: simple_bias_grad_dual, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, items]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: simple_bias_grad_dual, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, items]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -763,10 +843,14 @@ fn simple_bias_grad_dual_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Er
         let blocks = (batch as u32).div_ceil(items);
         let block_dim = ft.min(1024);
         let out_tiles = ft.div_ceil(block_dim);
-        cuda_launch! {
-            kernel: simple_bias_grad_dual_fp16, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, scale, items]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: simple_bias_grad_dual_fp16, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (blocks, out_tiles, 1), block_dim: (block_dim, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(stm_dev), slice(nstm_dev), slice(gb_dev), batch as u32, ft, scale, items]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -882,10 +966,14 @@ fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
         let block = r * out_dim;
-        cuda_launch! {
-            kernel: dense_bias_grad_tiled, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim]
+            }
         }?;
         stream.synchronize()?;
         assert_eq!(
@@ -902,10 +990,14 @@ fn dense_bias_grad_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         bias_grad_cpu(&dy, &mut gb_cpu, batch as usize, out_dim as usize);
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim as usize)?;
-        cuda_launch! {
-            kernel: dense_bias_grad_tiled, stream: stream, module: module,
-            config: cfg_dense_bias_grad(occ, batch, out_dim),
-            args: [slice(dy_dev), slice(gb_dev), batch, out_dim]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: stream, module: module,
+                config: cfg_dense_bias_grad(occ, batch, out_dim),
+                args: [slice(dy_dev), slice(gb_dev), batch, out_dim]
+            }
         }?;
         stream.synchronize()?;
         assert_eq!(
@@ -1011,10 +1103,14 @@ fn bias_grad_shared_l1f_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
 
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, out_dim)?;
-        cuda_launch! {
-            kernel: bias_grad_shared_l1f, stream: stream, module: module,
-            config: cfg_1d(batch * out_dim),
-            args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_grad_shared_l1f, stream: stream, module: module,
+                config: cfg_1d(batch * out_dim),
+                args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1072,10 +1168,14 @@ fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_fwd_bucket, stream: stream, module: module, config: cfg_1d(batch * out_dim),
-        args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev), slice_mut(y_dev),
-               batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_fwd_bucket, stream: stream, module: module, config: cfg_1d(batch * out_dim),
+            args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev), slice_mut(y_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close_rel(
@@ -1124,11 +1224,15 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_fwd_bucket_tiled_l1, stream: stream, module: module,
-            config: config,
-            args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev), slice_mut(y_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket_tiled_l1, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev), slice_mut(y_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1196,44 +1300,68 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         memset_minus_one_i32(&stream, &perm_dev)?;
         memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
 
-        cuda_launch! {
-            kernel: count_buckets, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_scan_aligned, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_bucket_perm, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
-                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * in_dim),
-            args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
-                   padded as u32, in_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * in_dim),
+                args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
+                       padded as u32, in_dim as u32]
+            }
         }?;
         let n_out_tiles = out_dim.div_ceil(16);
-        cuda_launch! {
-            kernel: dense_mm_fwd_bucket_tiled_l1_sorted, stream: stream, module: module,
-            config: LaunchConfig {
-                grid_dim: ((padded / 16) as u32, n_out_tiles as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(bidx_sorted_dev),
-                   slice_mut(y_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket_tiled_l1_sorted, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: ((padded / 16) as u32, n_out_tiles as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(bidx_sorted_dev),
+                       slice_mut(y_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: inverse_permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * out_dim),
-            args: [slice(y_sorted_dev), slice(perm_dev), slice(y_dev),
-                   padded as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: inverse_permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(y_sorted_dev), slice(perm_dev), slice(y_dev),
+                       padded as u32, out_dim as u32]
+            }
         }?;
         stream.synchronize()?;
 
@@ -1295,39 +1423,59 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
         memset_minus_one_i32(&stream, &perm_dev)?;
         memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
 
-        cuda_launch! {
-            kernel: count_buckets, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_scan_aligned, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_bucket_perm, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
-                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * out_dim),
-            args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
-                   padded as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }
         }?;
         // sorted で計算した dx を perm で original order に直接 scatter して dx_dev へ書く。
         // 下の CPU 参照 / 非 tiled kernel との一致で scatter 込みの値が正しいことを確認する。
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter, stream: stream, module: module,
-            config: LaunchConfig {
-                grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev), slice(perm_dev),
-                   slice_mut(dx_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev), slice(perm_dev),
+                       slice_mut(dx_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
 
@@ -1342,11 +1490,15 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
         // sort/inverse-permute は値を変えない gather/scatter)。tiled 化が数値経路を変えないことを
         // CPU tolerance ではなく完全一致で裏付ける。
         let mut dx_nontiled_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
-            config: cfg_1d(batch * in_dim),
-            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_nontiled_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
+                config: cfg_1d(batch * in_dim),
+                args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_nontiled_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_eq!(
@@ -1388,10 +1540,14 @@ fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Err
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_bwd_input_bucket, stream: stream, module: module, config: cfg_1d(batch * in_dim),
-        args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_dev),
-               batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module, config: cfg_1d(batch * in_dim),
+            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close_rel(
@@ -1431,11 +1587,15 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
-    cuda_launch! {
-        kernel: dense_mm_bwd_weight_bucket, stream: stream, module: module,
-        config: cfg_1d(nb * out_dim * in_dim),
-        args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
-               batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: dense_mm_bwd_weight_bucket, stream: stream, module: module,
+            config: cfg_1d(nb * out_dim * in_dim),
+            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
+                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -1489,11 +1649,15 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l2, stream: stream, module: module,
-            config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l2, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1555,11 +1719,15 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l3, stream: stream, module: module,
-            config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l3, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1606,11 +1774,15 @@ fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l1, stream: stream, module: module,
-            config: config,
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l1, stream: stream, module: module,
+                config: config,
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close(
@@ -1673,43 +1845,67 @@ fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Err
         memset_minus_one_i32(&stream, &perm_dev)?;
         memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
 
-        cuda_launch! {
-            kernel: count_buckets, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_scan_aligned, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_bucket_perm, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
-                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * in_dim),
-            args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
-                   padded as u32, in_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * in_dim),
+                args: [slice(x_dev), slice(perm_dev), slice_mut(x_sorted_dev),
+                       padded as u32, in_dim as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * out_dim),
-            args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
-                   padded as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted, stream: stream, module: module,
-            config: LaunchConfig {
-                grid_dim: (((in_dim / 16) * out_dim.div_ceil(16)) as u32, 8, nb as u32),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [slice(x_sorted_dev), slice(dy_sorted_dev), slice(offsets_dev),
-                   slice(dw_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket_tiled_l1_sorted, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: (((in_dim / 16) * out_dim.div_ceil(16)) as u32, 8, nb as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(x_sorted_dev), slice(dy_sorted_dev), slice(offsets_dev),
+                       slice(dw_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1739,10 +1935,14 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim)?;
-    cuda_launch! {
-        kernel: bias_grad_bucket, stream: stream, module: module, config: cfg_1d(batch * out_dim),
-        args: [slice(dy_dev), slice(bidx_dev), slice(gb_dev),
-               batch as u32, out_dim as u32, nb as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: bias_grad_bucket, stream: stream, module: module, config: cfg_1d(batch * out_dim),
+            args: [slice(dy_dev), slice(bidx_dev), slice(gb_dev),
+                   batch as u32, out_dim as u32, nb as u32]
+        }
     }?;
     stream.synchronize()?;
     // atomic fetch_add で reduce されるため relative tol (grad_bias と同様)。
@@ -1796,37 +1996,57 @@ fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error
         memset_minus_one_i32(&stream, &perm_dev)?;
         memset_minus_one_i32(&stream, &bidx_sorted_dev)?;
 
-        cuda_launch! {
-            kernel: count_buckets, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: count_buckets, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(counts_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_scan_aligned, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_scan_aligned, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), (nb + 1) as u32, 16_u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_bucket_perm, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
-                   slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_bucket_perm, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(bidx_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(perm_dev), slice(bidx_sorted_dev), batch as u32, nb as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: permute_rows_f32, stream: stream, module: module,
-            config: cfg_1d(padded * out_dim),
-            args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
-                   padded as u32, out_dim as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: permute_rows_f32, stream: stream, module: module,
+                config: cfg_1d(padded * out_dim),
+                args: [slice(dy_dev), slice(perm_dev), slice_mut(dy_sorted_dev),
+                       padded as u32, out_dim as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: bias_grad_bucket_shared_sorted, stream: stream, module: module,
-            config: LaunchConfig {
-                grid_dim: ((padded / 16) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [slice(dy_sorted_dev), slice(bidx_sorted_dev), slice(gb_dev),
-                   padded as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_grad_bucket_shared_sorted, stream: stream, module: module,
+                config: LaunchConfig {
+                    grid_dim: ((padded / 16) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(dy_sorted_dev), slice(bidx_sorted_dev), slice(gb_dev),
+                       padded as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -1864,10 +2084,14 @@ fn ft_post_perspective_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm)?;
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let mut combined_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
-    cuda_launch! {
-        kernel: ft_post_perspective_fwd, stream: stream, module: module, config: cfg_1d(batch * ft_dim),
-        args: [slice(stm_dev), slice(nstm_dev), slice(bias_dev), slice_mut(combined_dev),
-               batch as u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_fwd, stream: stream, module: module, config: cfg_1d(batch * ft_dim),
+            args: [slice(stm_dev), slice(nstm_dev), slice(bias_dev), slice_mut(combined_dev),
+                   batch as u32, ft_dim as u32, scale]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -1937,15 +2161,23 @@ fn ft_post_perspective_grad_matches_cpu() -> Result<(), Box<dyn std::error::Erro
     let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
     let mut dft_stm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
     let mut dft_nstm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev), slice_mut(dft_stm_dev),
-               slice(grad_bias_dev), batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev), slice_mut(dft_stm_dev),
+                   slice(grad_bias_dev), batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
+        }
     }?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev), slice_mut(dft_nstm_dev),
-               slice(grad_bias_dev), batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev), slice_mut(dft_nstm_dev),
+                   slice(grad_bias_dev), batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -2036,17 +2268,25 @@ fn ft_post_perspective_grad_fused_matches_cpu() -> Result<(), Box<dyn std::error
     let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
     let mut dft_stm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
     let mut dft_nstm_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
-               slice_mut(dft_stm_dev), slice(grad_bias_dev),
-               batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale]
+        }
     }?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
-               slice_mut(dft_nstm_dev), slice(grad_bias_dev),
-               batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused, stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale]
+        }
     }?;
     stream.synchronize()?;
     // dft_*: 和の順序は CPU と同じ (per-thread, no reduction)、tolerance は relative。
@@ -2118,11 +2358,15 @@ fn ft_post_perspective_fwd_fp16_matches_cpu() -> Result<(), Box<dyn std::error::
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_h)?;
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let mut combined_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
-    cuda_launch! {
-        kernel: ft_post_perspective_fwd_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim),
-        args: [slice(stm_dev), slice(nstm_dev), slice(bias_dev), slice_mut(combined_dev),
-               batch as u32, ft_dim as u32, scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_fwd_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(stm_dev), slice(nstm_dev), slice(bias_dev), slice_mut(combined_dev),
+                   batch as u32, ft_dim as u32, scale]
+        }
     }?;
     stream.synchronize()?;
     // 入力 f16 値・f32 演算とも GPU/CPU 一致のため tight tolerance。
@@ -2203,19 +2447,27 @@ fn ft_post_perspective_grad_fused_fp16_matches_cpu() -> Result<(), Box<dyn std::
     // test 入力 dft は O(数十) なので、production の dft_scale (FT_DFT_FP16_BASE_SCALE
     // × batch) では overflow する。loss scaling round-trip 検証用の小さい値を使う。
     let dft_scale = 64.0_f32;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
-               slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+        }
     }?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
-               slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fused_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(da_dev), slice(db_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+        }
     }?;
     stream.synchronize()?;
     // 小 dft_scale 経路では clamp は発火しない (`f16` 有限域 65504 を超えない)。
@@ -2322,19 +2574,27 @@ fn ft_post_perspective_grad_fp16_matches_cpu() -> Result<(), Box<dyn std::error:
     let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     // test 入力は O(数十) なので production の dft_scale は overflow する。小さい値。
     let dft_scale = 64.0_f32;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev),
-               slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(stm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_stm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, 0_u32, ft_dim as u32, scale, dft_scale]
+        }
     }?;
-    cuda_launch! {
-        kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim / 2),
-        args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev),
-               slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_post_perspective_grad_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim / 2),
+            args: [slice(dc_dev), slice(nstm_ft_dev), slice(bias_dev),
+                   slice_mut(dft_nstm_dev), slice(grad_bias_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, half as u32, ft_dim as u32, scale, dft_scale]
+        }
     }?;
     stream.synchronize()?;
     assert_eq!(
@@ -2390,12 +2650,16 @@ fn simple_bias_act_fwd_fp16_in_screlu_matches_cpu() -> Result<(), Box<dyn std::e
     let ft_out_dev = DeviceBuffer::from_host(&stream, &ft_out_h)?;
     let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
     let mut acted_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
-    cuda_launch! {
-        kernel: simple_bias_act_fwd_fp16_in_screlu, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim),
-        args: [slice(ft_out_dev), slice(bias_dev), slice_mut(acted_dev),
-               ft_dim as u32, 0_u32,
-               batch as u32, ft_dim as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: simple_bias_act_fwd_fp16_in_screlu, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice_mut(acted_dev),
+                   ft_dim as u32, 0_u32,
+                   batch as u32, ft_dim as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -2444,13 +2708,17 @@ fn simple_act_grad_to_fp16_screlu_with_scale_matches_cpu() -> Result<(), Box<dyn
     let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     // test 入力 dft は O(数十) なので production の dft_scale は overflow する。小さい値。
     let dft_scale = 64.0_f32;
-    cuda_launch! {
-        kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim),
-        args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
-               ft_dim as u32, 0_u32,
-               slice_mut(dft_out_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: simple_act_grad_to_fp16_screlu_with_scale, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+                   ft_dim as u32, 0_u32,
+                   slice_mut(dft_out_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, dft_scale]
+        }
     }?;
     stream.synchronize()?;
     assert_eq!(
@@ -2493,13 +2761,17 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
     let mut dft_out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
     let clamp_counter_dev = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
     let dft_scale = 1.0e6_f32;
-    cuda_launch! {
-        kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim),
-        args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
-               ft_dim as u32, 0_u32,
-               slice_mut(dft_out_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+                   ft_dim as u32, 0_u32,
+                   slice_mut(dft_out_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, dft_scale]
+        }
     }?;
     stream.synchronize()?;
     let count = clamp_counter_dev.to_host_vec(&stream)?[0];
@@ -2509,13 +2781,17 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
         "clamp counter should equal element count when all cells overflow"
     );
     // 2 回目 launch で counter は cumulative (= 2 × expected) になる (累積 counter)。
-    cuda_launch! {
-        kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
-        config: cfg_1d(batch * ft_dim),
-        args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
-               ft_dim as u32, 0_u32,
-               slice_mut(dft_out_dev), slice(clamp_counter_dev),
-               batch as u32, ft_dim as u32, dft_scale]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: simple_act_grad_to_fp16_crelu_with_scale, stream: stream, module: module,
+            config: cfg_1d(batch * ft_dim),
+            args: [slice(ft_out_dev), slice(bias_dev), slice(dft_acted_dev),
+                   ft_dim as u32, 0_u32,
+                   slice_mut(dft_out_dev), slice(clamp_counter_dev),
+                   batch as u32, ft_dim as u32, dft_scale]
+        }
     }?;
     stream.synchronize()?;
     let count2 = clamp_counter_dev.to_host_vec(&stream)?[0];
@@ -2572,12 +2848,16 @@ fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn 
         let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
-        cuda_launch! {
-            kernel: dense_mm_fwd_bucket, stream: stream, module: module,
-            config: cfg_1d(batch * out_dim),
-            args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev),
-                   slice_mut(y_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket, stream: stream, module: module,
+                config: cfg_1d(batch * out_dim),
+                args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(bidx_dev),
+                       slice_mut(y_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -2621,11 +2901,15 @@ fn dense_mm_bwd_input_bucket_matches_cpu_for_each_num_buckets()
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * in_dim)?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
-            config: cfg_1d(batch * in_dim),
-            args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket, stream: stream, module: module,
+                config: cfg_1d(batch * in_dim),
+                args: [slice(dy_dev), slice(w_dev), slice(bidx_dev), slice_mut(dx_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -2667,11 +2951,15 @@ fn dense_mm_bwd_weight_bucket_matches_cpu_for_each_num_buckets()
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
-        cuda_launch! {
-            kernel: dense_mm_bwd_weight_bucket, stream: stream, module: module,
-            config: cfg_1d(nb * out_dim * in_dim),
-            args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
-                   batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_weight_bucket, stream: stream, module: module,
+                config: cfg_1d(nb * out_dim * in_dim),
+                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice_mut(dw_dev),
+                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close(
@@ -2700,11 +2988,15 @@ fn bias_grad_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
         let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let gb_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim)?;
-        cuda_launch! {
-            kernel: bias_grad_bucket, stream: stream, module: module,
-            config: cfg_1d(batch * out_dim),
-            args: [slice(dy_dev), slice(bidx_dev), slice(gb_dev),
-                   batch as u32, out_dim as u32, nb as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_grad_bucket, stream: stream, module: module,
+                config: cfg_1d(batch * out_dim),
+                args: [slice(dy_dev), slice(bidx_dev), slice(gb_dev),
+                       batch as u32, out_dim as u32, nb as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -2766,14 +3058,18 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
     let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
     let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    cuda_launch! {
-        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-            slice_mut(dl_dev), slice(loss_dev), lambda,
-            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-            2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                slice_mut(dl_dev), slice(loss_dev), lambda,
+                WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+                2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+            ]
+        }
     }?;
     stream.synchronize()?;
     // libdevice exp と std exp の差で grad は ~ulp レベルずれるため relative tolerance。
@@ -2839,21 +3135,29 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
     let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
     let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    cuda_launch! {
-        kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(score_dev), slice(sum_w_dev), w1, w2,
-            WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(score_dev), slice(sum_w_dev), w1, w2,
+                WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
+            ]
+        }
     }?;
-    cuda_launch! {
-        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-            slice_mut(dl_dev), slice(loss_dev), lambda,
-            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-            pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                slice_mut(dl_dev), slice(loss_dev), lambda,
+                WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+            ]
+        }
     }?;
     stream.synchronize()?;
     // exp / powf の libdevice 差が sigmoid → weight → Σw → 正規化と多段で乗るため
@@ -2917,14 +3221,18 @@ fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::E
     let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
     let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
     let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    cuda_launch! {
-        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-            slice_mut(dl_dev), slice(loss_dev), lambda,
-            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-            2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                slice_mut(dl_dev), slice(loss_dev), lambda,
+                WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+                2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+            ]
+        }
     }?;
     stream.synchronize()?;
     assert_close_rel(
@@ -2988,21 +3296,29 @@ fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::
     let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
     let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
     let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    cuda_launch! {
-        kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(score_dev), slice(sum_w_dev), w1, w2,
-            WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: wrm_weight_sum, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(score_dev), slice(sum_w_dev), w1, w2,
+                WRM_TARGET_OFFSET, WRM_TARGET_SCALING, b as u32
+            ]
+        }
     }?;
-    cuda_launch! {
-        kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
-        args: [
-            slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-            slice_mut(dl_dev), slice(loss_dev), lambda,
-            WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-            pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
-        ]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+            args: [
+                slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                slice_mut(dl_dev), slice(loss_dev), lambda,
+                WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+            ]
+        }
     }?;
     stream.synchronize()?;
     assert_close_rel(
@@ -3090,17 +3406,25 @@ fn norm_loss_reduce_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
         // norms_dev は 0 init: reduce が sumsq を atomicAdd、finalize で sqrt。
         let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, lo.n_groups)?;
-        cuda_launch! {
-            kernel: norm_loss_reduce, stream: stream, module: module,
-            config: cfg_norm_loss_reduce(lo.n_groups, lo.group_len),
-            args: [slice(w_dev), slice(norms_dev),
-                   lo.n_groups as u32, lo.group_pitch as u32,
-                   lo.elem_stride as u32, lo.group_len as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: norm_loss_reduce, stream: stream, module: module,
+                config: cfg_norm_loss_reduce(lo.n_groups, lo.group_len),
+                args: [slice(w_dev), slice(norms_dev),
+                       lo.n_groups as u32, lo.group_pitch as u32,
+                       lo.elem_stride as u32, lo.group_len as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: norm_loss_finalize, stream: stream, module: module,
-            config: cfg_1d(lo.n_groups),
-            args: [slice_mut(norms_dev), lo.n_groups as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: norm_loss_finalize, stream: stream, module: module,
+                config: cfg_1d(lo.n_groups),
+                args: [slice_mut(norms_dev), lo.n_groups as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -3148,12 +3472,16 @@ fn norm_loss_apply_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         // GPU: 同じ norm を device に渡して apply のみ実行 (reduce は別 test で検証済)。
         let mut w_dev = DeviceBuffer::from_host(&stream, &w)?;
         let norms_dev = DeviceBuffer::from_host(&stream, &norms)?;
-        cuda_launch! {
-            kernel: norm_loss_apply, stream: stream, module: module,
-            config: cfg_1d(total),
-            args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
-                   lo.n_groups as u32, lo.group_pitch as u32,
-                   lo.elem_stride as u32, lo.group_len as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: norm_loss_apply, stream: stream, module: module,
+                config: cfg_1d(total),
+                args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
+                       lo.n_groups as u32, lo.group_pitch as u32,
+                       lo.elem_stride as u32, lo.group_len as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close_rel(
@@ -3191,22 +3519,34 @@ fn norm_loss_zero_norm_group_matches_cpu() -> Result<(), Box<dyn std::error::Err
 
     let mut w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut norms_dev = DeviceBuffer::<f32>::zeroed(&stream, n_groups)?;
-    cuda_launch! {
-        kernel: norm_loss_reduce, stream: stream, module: module,
-        config: cfg_norm_loss_reduce(n_groups, group_len),
-        args: [slice(w_dev), slice(norms_dev),
-               n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: norm_loss_reduce, stream: stream, module: module,
+            config: cfg_norm_loss_reduce(n_groups, group_len),
+            args: [slice(w_dev), slice(norms_dev),
+                   n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+        }
     }?;
-    cuda_launch! {
-        kernel: norm_loss_finalize, stream: stream, module: module,
-        config: cfg_1d(n_groups),
-        args: [slice_mut(norms_dev), n_groups as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: norm_loss_finalize, stream: stream, module: module,
+            config: cfg_1d(n_groups),
+            args: [slice_mut(norms_dev), n_groups as u32]
+        }
     }?;
-    cuda_launch! {
-        kernel: norm_loss_apply, stream: stream, module: module,
-        config: cfg_1d(n_groups * group_len),
-        args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
-               n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: norm_loss_apply, stream: stream, module: module,
+            config: cfg_1d(n_groups * group_len),
+            args: [slice_mut(w_dev), slice(norms_dev), factor, lr, eps,
+                   n_groups as u32, group_len as u32, 1_u32, group_len as u32]
+        }
     }?;
     stream.synchronize()?;
     let w_gpu = w_dev.to_host_vec(&stream)?;
@@ -3257,11 +3597,15 @@ fn sparse_ft_forward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let w_dev = DeviceBuffer::from_host(&stream, &weight)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
-    cuda_launch! {
-        kernel: sparse_ft_forward, stream: stream, module: module,
-        config: cfg_1d(batch * rows / 4),
-        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-               batch as u32, rows as u32, cols as u32, nnz as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: sparse_ft_forward, stream: stream, module: module,
+            config: cfg_1d(batch * rows / 4),
+            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, nnz as u32]
+        }
     }?;
     stream.synchronize()?;
     // 各出力 cell は weight の純加算を ni 順に積むだけで GPU/CPU の演算列が一致する
@@ -3289,11 +3633,15 @@ fn sparse_ft_forward_fp16_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * rows)?;
-    cuda_launch! {
-        kernel: sparse_ft_forward_fp16, stream: stream, module: module,
-        config: cfg_1d(batch * rows / 4),
-        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-               batch as u32, rows as u32, cols as u32, nnz as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: sparse_ft_forward_fp16, stream: stream, module: module,
+            config: cfg_1d(batch * rows / 4),
+            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, nnz as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -3321,11 +3669,15 @@ fn sparse_ft_forward_fp16_out_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let w_dev = DeviceBuffer::from_host(&stream, &weight_h)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
     let mut out_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * rows)?;
-    cuda_launch! {
-        kernel: sparse_ft_forward_fp16_out, stream: stream, module: module,
-        config: cfg_1d(batch * rows / 4),
-        args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
-               batch as u32, rows as u32, cols as u32, nnz as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: sparse_ft_forward_fp16_out, stream: stream, module: module,
+            config: cfg_1d(batch * rows / 4),
+            args: [slice(w_dev), slice(idx_dev), slice_mut(out_dev),
+                   batch as u32, rows as u32, cols as u32, nnz as u32]
+        }
     }?;
     stream.synchronize()?;
     let out_gpu: Vec<f32> = out_dev
@@ -3349,11 +3701,15 @@ fn sparse_ft_backward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let gout_dev = DeviceBuffer::from_host(&stream, &grad_out)?;
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
     let grad_w_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * cols)?;
-    cuda_launch! {
-        kernel: sparse_ft_backward, stream: stream, module: module,
-        config: cfg_1d(batch * rows),
-        args: [slice(gout_dev), slice(idx_dev), slice(grad_w_dev),
-               batch as u32, rows as u32, cols as u32, nnz as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: sparse_ft_backward, stream: stream, module: module,
+            config: cfg_1d(batch * rows),
+            args: [slice(gout_dev), slice(idx_dev), slice(grad_w_dev),
+                   batch as u32, rows as u32, cols as u32, nnz as u32]
+        }
     }?;
     stream.synchronize()?;
     // atomic scatter の加算順は非決定的なので relative tolerance。
@@ -3402,21 +3758,33 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
-    cuda_launch! {
-        kernel: build_feature_counts, stream: stream, module: module,
-        config: cfg_1d(batch * nnz),
-        args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: build_feature_counts, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+        }
     }?;
-    cuda_launch! {
-        kernel: exclusive_prefix_sum_small, stream: stream, module: module,
-        config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-        args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+            args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+        }
     }?;
-    cuda_launch! {
-        kernel: scatter_positions, stream: stream, module: module,
-        config: cfg_1d(batch * nnz),
-        args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-               batch as u32, nnz as u32, ft_in as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: scatter_positions, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+                   batch as u32, nnz as u32, ft_in as u32]
+        }
     }?;
     stream.synchronize()?;
 
@@ -3453,10 +3821,14 @@ fn exclusive_prefix_sum_small_matches_cpu() -> Result<(), Box<dyn std::error::Er
         }
         let counts_dev = DeviceBuffer::from_host(&stream, &counts)?;
         let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
-        cuda_launch! {
-            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), n as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), n as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_eq!(
@@ -3501,20 +3873,32 @@ fn prefix_sum_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
         let block_sums_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks)?;
         let block_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, num_blocks + 1)?;
-        cuda_launch! {
-            kernel: prefix_sum_block_local, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), slice(block_sums_dev), n as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: prefix_sum_block_local, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), slice(block_sums_dev), n as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(block_sums_dev), slice(block_offsets_dev), num_blocks as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(block_sums_dev), slice(block_offsets_dev), num_blocks as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: prefix_sum_add_block_offset, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(offsets_dev), slice(block_offsets_dev), n as u32, num_blocks as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: prefix_sum_add_block_offset, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (num_blocks as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(offsets_dev), slice(block_offsets_dev), n as u32, num_blocks as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_eq!(
@@ -3589,37 +3973,57 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
         memset_zero(&stream, &write_ctr_dev)?;
         let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
         let dft_dev = DeviceBuffer::from_host(&stream, dft_host)?;
-        cuda_launch! {
-            kernel: build_feature_counts, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: build_feature_counts, stream: stream, module: module,
+                config: cfg_1d(batch * nnz),
+                args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_positions, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-                   batch as u32, nnz as u32, ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_positions, stream: stream, module: module,
+                config: cfg_1d(batch * nnz),
+                args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+                       batch as u32, nnz as u32, ft_in as u32]
+            }
         }?;
         // production (block 128 × grid y = ft_out/128) と同じく ri 軸を blockIdx_y で
         // tile する。ft_out=8 を 4 幅 × 2 tile に割って y 軸も exercise する。
         if iter_idx == 0 {
-            cuda_launch! {
-                kernel: gather_and_sum_per_feature_overwrite, stream: stream, module: module,
-                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                       ft_in as u32, ft_out as u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite, stream: stream, module: module,
+                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                           ft_in as u32, ft_out as u32]
+                }
             }?;
         } else {
-            cuda_launch! {
-                kernel: gather_and_sum_per_feature_add, stream: stream, module: module,
-                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                       ft_in as u32, ft_out as u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_add, stream: stream, module: module,
+                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                           ft_in as u32, ft_out as u32]
+                }
             }?;
         }
     }
@@ -3694,35 +4098,55 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
         memset_zero(&stream, &write_ctr_dev)?;
         let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
         let dft_dev = DeviceBuffer::from_host(&stream, dft_host)?;
-        cuda_launch! {
-            kernel: build_feature_counts, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: build_feature_counts, stream: stream, module: module,
+                config: cfg_1d(batch * nnz),
+                args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: exclusive_prefix_sum_small, stream: stream, module: module,
-            config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
-            args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(counts_dev), slice(offsets_dev), ft_in as u32]
+            }
         }?;
-        cuda_launch! {
-            kernel: scatter_positions, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-                   batch as u32, nnz as u32, ft_in as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: scatter_positions, stream: stream, module: module,
+                config: cfg_1d(batch * nnz),
+                args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
+                       batch as u32, nnz as u32, ft_in as u32]
+            }
         }?;
         if iter_idx == 0 {
-            cuda_launch! {
-                kernel: gather_and_sum_per_feature_overwrite_fp16, stream: stream, module: module,
-                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                       ft_in as u32, ft_out as u32, dft_inv_scale]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite_fp16, stream: stream, module: module,
+                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                           ft_in as u32, ft_out as u32, dft_inv_scale]
+                }
             }?;
         } else {
-            cuda_launch! {
-                kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
-                config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                       ft_in as u32, ft_out as u32, dft_inv_scale]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
+                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                           ft_in as u32, ft_out as u32, dft_inv_scale]
+                }
             }?;
         }
     }
@@ -3752,9 +4176,13 @@ fn cast_f32_to_f16_matches_host_cast() -> Result<(), Box<dyn std::error::Error>>
 
     let src_dev = DeviceBuffer::from_host(&stream, &src)?;
     let mut dst_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: cast_f32_to_f16, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(src_dev), slice_mut(dst_dev), n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: cast_f32_to_f16, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(src_dev), slice_mut(dst_dev), n as u32]
+        }
     }?;
     stream.synchronize()?;
     let got: Vec<f32> = dst_dev
@@ -3802,10 +4230,14 @@ fn ft_fold_virtual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-               ft_out as u32, pi as u32, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
+                   ft_out as u32, pi as u32, n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -3830,10 +4262,14 @@ fn ft_fold_virtual_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-               ft_out as u32, pi as u32, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
+                   ft_out as u32, pi as u32, n as u32]
+        }
     }?;
     stream.synchronize()?;
     let got: Vec<f32> = comb_dev
@@ -3856,10 +4292,14 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     ft_reduce_virtual_grad_cpu(&mut grad_cpu, ft_in, ft_in, ft_out, pi);
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
-    cuda_launch! {
-        kernel: ft_reduce_virtual_grad, stream: stream, module: module,
-        config: cfg_1d(pi * ft_out),
-        args: [slice(grad_dev), ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_reduce_virtual_grad, stream: stream, module: module,
+            config: cfg_1d(pi * ft_out),
+            args: [slice(grad_dev), ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
+        }
     }?;
     stream.synchronize()?;
     let got = grad_dev.to_host_vec(&stream)?;
@@ -3908,10 +4348,14 @@ fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice(w_dev), slice_mut(comb_dev), base_ft_in as u32, ft_in as u32,
-               ft_out as u32, pi as u32, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(w_dev), slice_mut(comb_dev), base_ft_in as u32, ft_in as u32,
+                   ft_out as u32, pi as u32, n as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -3934,10 +4378,14 @@ fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error
     ft_reduce_virtual_grad_cpu(&mut grad_cpu, base_ft_in, ft_in, ft_out, pi);
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
-    cuda_launch! {
-        kernel: ft_reduce_virtual_grad, stream: stream, module: module,
-        config: cfg_1d(pi * ft_out),
-        args: [slice(grad_dev), base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_reduce_virtual_grad, stream: stream, module: module,
+            config: cfg_1d(pi * ft_out),
+            args: [slice(grad_dev), base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32]
+        }
     }?;
     stream.synchronize()?;
     let got = grad_dev.to_host_vec(&stream)?;
@@ -4014,11 +4462,15 @@ fn radam_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let mut m_dev = DeviceBuffer::from_host(&stream, &m)?;
         let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
         let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
-        cuda_launch! {
-            kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                       lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                       W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+            }
         }?;
         stream.synchronize()?;
         assert_close(
@@ -4088,12 +4540,16 @@ fn radam_step_fp16_mirror_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     let mut v_dev = DeviceBuffer::from_host(&stream, &v)?;
     let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
     let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: radam_step_fp16_mirror, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-               slice_mut(mirror_dev),
-               lr, step_size, denom, decay, BETA1, BETA2, EPS,
-               W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: radam_step_fp16_mirror, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                   slice_mut(mirror_dev),
+                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, n as u32]
+        }
     }?;
     stream.synchronize()?;
     let w_gpu = w_dev.to_host_vec(&stream)?;
@@ -4231,12 +4687,16 @@ fn radam_step_f16state_matches_mimic() -> Result<(), Box<dyn std::error::Error>>
             n,
         );
         let mut g_dev = DeviceBuffer::from_host(&stream, g)?;
-        cuda_launch! {
-            kernel: radam_step_f16state, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
-                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step_f16state, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                       lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                       W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                       FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+            }
         }?;
         stream.synchronize()?;
         if step == 1 {
@@ -4313,13 +4773,17 @@ fn radam_step_f16state_mirror_matches_mimic() -> Result<(), Box<dyn std::error::
     let mut v_dev = DeviceBuffer::from_host(&stream, &v_h)?;
     let mut g_dev = DeviceBuffer::from_host(&stream, &grads[0])?;
     let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: radam_step_f16state_mirror, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-               slice_mut(mirror_dev),
-               lr, step_size, denom, decay, BETA1, BETA2, EPS,
-               W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-               FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: radam_step_f16state_mirror, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                   slice_mut(mirror_dev),
+                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, n as u32]
+        }
     }?;
     stream.synchronize()?;
     let w_gpu = w_dev.to_host_vec(&stream)?;
@@ -4360,9 +4824,13 @@ fn ranger_lookahead_lerp_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
 
     let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
     let mut s_dev = DeviceBuffer::from_host(&stream, &slow)?;
-    cuda_launch! {
-        kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
-        args: [slice_mut(w_dev), slice_mut(s_dev), RANGER_ALPHA, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(s_dev), RANGER_ALPHA, n as u32]
+        }
     }?;
     stream.synchronize()?;
     let w_gpu = w_dev.to_host_vec(&stream)?;
@@ -4387,11 +4855,15 @@ fn ranger_lookahead_lerp_fp16_mirror_matches_cpu() -> Result<(), Box<dyn std::er
     let mut w_dev = DeviceBuffer::from_host(&stream, &weights)?;
     let mut s_dev = DeviceBuffer::from_host(&stream, &slow)?;
     let mut mirror_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
-    cuda_launch! {
-        kernel: ranger_lookahead_lerp_fp16_mirror, stream: stream, module: module,
-        config: cfg_1d(n),
-        args: [slice_mut(w_dev), slice_mut(s_dev), slice_mut(mirror_dev),
-               RANGER_ALPHA, n as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ranger_lookahead_lerp_fp16_mirror, stream: stream, module: module,
+            config: cfg_1d(n),
+            args: [slice_mut(w_dev), slice_mut(s_dev), slice_mut(mirror_dev),
+                   RANGER_ALPHA, n as u32]
+        }
     }?;
     stream.synchronize()?;
     let w_gpu = w_dev.to_host_vec(&stream)?;
@@ -4469,16 +4941,24 @@ fn ranger_two_kernel_sequence_matches_ranger_step_cpu() -> Result<(), Box<dyn st
 
         let (step_size, denom) = radam_compute_step_size_denom(step, BETA1, BETA2, N_SMA_THRESHOLD);
         let mut g_dev = DeviceBuffer::from_host(&stream, &grad)?;
-        cuda_launch! {
-            kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-                   lr, step_size, denom, decay, BETA1, BETA2, EPS,
-                   W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                       lr, step_size, denom, decay, BETA1, BETA2, EPS,
+                       W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+            }
         }?;
         if step.is_multiple_of(RANGER_K) {
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
-                args: [slice_mut(w_dev), slice_mut(slow_dev), RANGER_ALPHA, n as u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: stream, module: module, config: cfg_1d(n),
+                    args: [slice_mut(w_dev), slice_mut(slow_dev), RANGER_ALPHA, n as u32]
+                }
             }?;
         }
     }
@@ -4545,10 +5025,14 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
         let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-        cuda_launch! {
-            kernel: loss_wdl, stream: stream, module: module, config: cfg_1d(b),
-            args: [slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                   slice_mut(dl_dev), slice(loss_dev), lambda, scale, b as u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: loss_wdl, stream: stream, module: module, config: cfg_1d(b),
+                args: [slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                       slice_mut(dl_dev), slice(loss_dev), lambda, scale, b as u32]
+            }
         }?;
         stream.synchronize()?;
         // libdevice exp と std exp の差で ~ulp レベルずれるため relative tolerance
@@ -4600,11 +5084,15 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let mut net_dev = DeviceBuffer::from_host(&stream, &net0)?;
-    cuda_launch! {
-        kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
-        config: cfg_1d(batch),
-        args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
-               slice_mut(net_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
+            config: cfg_1d(batch),
+            args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
+                   slice_mut(net_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+        }
     }?;
     stream.synchronize()?;
     assert_close(
@@ -4643,11 +5131,15 @@ fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * nb)?;
-    cuda_launch! {
-        kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
-        config: cfg_1d(batch * nnz),
-        args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
-               slice(grad_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
+            config: cfg_1d(batch * nnz),
+            args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
+                   slice(grad_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+        }
     }?;
     stream.synchronize()?;
     // ±0.5*dnet の atomic scatter は加算順非決定 → relative tolerance。

@@ -29,8 +29,9 @@ pub fn screlu_grad(x: &[f32], dl_dy: &[f32], mut dl_dx: DisjointSlice<f32>, n: u
     } else {
         0.0_f32
     };
+    let j = i.get();
     if let Some(out) = dl_dx.get_mut(i) {
-        *out = dl_dy[i.get()] * dydx;
+        *out = dl_dy[j] * dydx;
     }
 }
 
@@ -360,7 +361,7 @@ macro_rules! radam_finish {
         // kernel 冒頭で `i < n` を確認し、各 thread は自分の `i` のみ書く。
         let mirror_ptr = $mirror.as_mut_ptr();
         unsafe {
-            mirror_ptr.add($i.get()).write($p_clamped as f16);
+            mirror_ptr.add($i).write($p_clamped as f16);
         }
     };
 }
@@ -381,18 +382,31 @@ macro_rules! radam_step_body {
         $eps:ident,
         $min_w:ident,
         $max_w:ident,
-        $n:ident;
+        $n:ident,
+        $i:ident;
         $state:ident $(, $m_scale:ident, $v_scale:ident)?;
         $grad_mode:ident, $mirror_mode:ident $(, $mirror:ident)?
     ) => {
-        let i = thread::index_1d();
-        if i.get() >= $n as usize {
+        if $i.get() >= $n as usize {
             return;
         }
-        let g_opt = $grad.get_mut(i);
-        let m_opt = $m.get_mut(i);
-        let v_opt = $v.get_mut(i);
-        let w_opt = $weights.get_mut(i);
+        let i = $i.get();
+        let (g_opt, m_opt, v_opt, w_opt) =
+            if i < $grad.len() && i < $m.len() && i < $v.len() && i < $weights.len() {
+                // SAFETY: 上の bounds check を通過し、4 buffer は互いに別 allocation。
+                // 1D launch の各 thread は一意な i の cell だけを更新する。
+                let (g, m, v, w) = unsafe {
+                    (
+                        $grad.get_unchecked_mut(i),
+                        $m.get_unchecked_mut(i),
+                        $v.get_unchecked_mut(i),
+                        $weights.get_unchecked_mut(i),
+                    )
+                };
+                (Some(g), Some(m), Some(v), Some(w))
+            } else {
+                (None, None, None, None)
+            };
         if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) =
             (g_opt, m_opt, v_opt, w_opt)
         {
@@ -451,8 +465,9 @@ pub fn radam_step(
     max_w: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f32;
         reset, no_mirror
     );
@@ -485,8 +500,9 @@ pub fn radam_step_fp16_mirror(
     max_w: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f32;
         keep_grad, mirror, mirror
     );
@@ -639,8 +655,9 @@ pub fn radam_step_f16state(
     v_scale: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f16, m_scale, v_scale;
         keep_grad, no_mirror
     );
@@ -672,8 +689,9 @@ pub fn radam_step_f16state_mirror(
     v_scale: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f16, m_scale, v_scale;
         keep_grad, mirror, mirror
     );
@@ -695,8 +713,8 @@ pub fn ranger_lookahead_lerp(
         return;
     }
     let one_minus_alpha = 1.0_f32 - alpha;
-    let w_opt = weights.get_mut(i);
-    let s_opt = slow.get_mut(i);
+    let w_opt = weights.get_mut(thread::index_1d());
+    let s_opt = slow.get_mut(thread::index_1d());
     if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
         let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
         *w_ref = new_w;
@@ -722,8 +740,8 @@ pub fn ranger_lookahead_lerp_fp16_mirror(
         return;
     }
     let one_minus_alpha = 1.0_f32 - alpha;
-    let w_opt = weights.get_mut(i);
-    let s_opt = slow.get_mut(i);
+    let w_opt = weights.get_mut(thread::index_1d());
+    let s_opt = slow.get_mut(thread::index_1d());
     if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
         let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
         *w_ref = new_w;
@@ -772,19 +790,19 @@ macro_rules! sparse_ft_forward_body {
         $batch:ident,
         $rows:ident,
         $cols:ident,
-        $nnz:ident;
+        $nnz:ident,
+        $tid:ident;
         $weight_type:ident,
         $out_type:ident
     ) => {
-        let tid = thread::index_1d();
         let rows_u = $rows as usize;
         let rows_q = rows_u / 4;
         let total = ($batch as usize) * rows_q;
-        if tid.get() >= total {
+        if $tid.get() >= total {
             return;
         }
-        let bi = tid.get() / rows_q;
-        let ri_q = tid.get() % rows_q;
+        let bi = $tid.get() / rows_q;
+        let ri_q = $tid.get() % rows_q;
         let ri_base = ri_q * 4;
 
         // caller は indices.len() == batch * nnz、weight.len() == cols * rows、
@@ -843,7 +861,8 @@ pub fn sparse_ft_forward(
     cols: u32,
     nnz: u32,
 ) {
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f32, f32);
+    let tid = thread::index_1d();
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f32, f32);
 }
 
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
@@ -867,7 +886,8 @@ pub fn sparse_ft_forward_fp16(
     cols: u32,
     nnz: u32,
 ) {
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f16, f32);
+    let tid = thread::index_1d();
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f16, f32);
 }
 
 /// [`sparse_ft_forward_fp16`] の出力も `f16` にした版 (`--ft-fp16-out`)。`weight` を
@@ -889,7 +909,8 @@ pub fn sparse_ft_forward_fp16_out(
     cols: u32,
     nnz: u32,
 ) {
-    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f16, f16);
+    let tid = thread::index_1d();
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz, tid; f16, f16);
 }
 
 /// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。

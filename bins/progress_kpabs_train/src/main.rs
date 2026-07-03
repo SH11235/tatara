@@ -249,10 +249,10 @@ pub fn adam_step(
     // 4 buffer すべて i 番目に対し 1 thread が排他的にアクセスするため atomics 不要。
     // get_mut が None になるのは host 側 invariant 違反 (len < n) のときのみで、
     // forward kernel の defensive pattern と同じく該当 thread は silent skip する。
-    let g_opt = grad.get_mut(i);
-    let m_opt = m.get_mut(i);
-    let v_opt = v.get_mut(i);
-    let w_opt = weights.get_mut(i);
+    let g_opt = grad.get_mut(thread::index_1d());
+    let m_opt = m.get_mut(thread::index_1d());
+    let v_opt = v.get_mut(thread::index_1d());
+    let w_opt = weights.get_mut(thread::index_1d());
     if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) = (g_opt, m_opt, v_opt, w_opt) {
         let g = *g_ref;
         let mi = beta1 * *m_ref + (1.0f32 - beta1) * g;
@@ -490,37 +490,45 @@ impl GpuTrainer {
         };
 
         // Forward: preds[pos] = sigmoid(Σ weights[idx[base+j]])
-        cuda_launch! {
-            kernel: forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(self.indices),
-                slice(self.weights),
-                slice_mut(self.preds),
-                n_pos_u32,
-                max_inds_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_pos,
+                args: [
+                    slice(self.indices),
+                    slice(self.weights),
+                    slice_mut(self.preds),
+                    n_pos_u32,
+                    max_inds_u32
+                ]
+            }
         }?;
 
         // Backward: gscale → grad[idx] (atomic) + loss_acc + hist
-        cuda_launch! {
-            kernel: grad,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(self.indices),
-                slice(self.preds),
-                slice(self.targets),
-                slice(self.per_pos_norm),
-                slice(self.grad),
-                slice(self.loss_acc),
-                slice(self.hist),
-                n_pos_u32,
-                max_inds_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: grad,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_pos,
+                args: [
+                    slice(self.indices),
+                    slice(self.preds),
+                    slice(self.targets),
+                    slice(self.per_pos_norm),
+                    slice(self.grad),
+                    slice(self.loss_acc),
+                    slice(self.hist),
+                    n_pos_u32,
+                    max_inds_u32
+                ]
+            }
         }?;
 
         // Adam step
@@ -538,24 +546,28 @@ impl GpuTrainer {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: adam_step,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_w,
-            args: [
-                slice_mut(self.weights),
-                slice_mut(self.m),
-                slice_mut(self.v),
-                slice_mut(self.grad),
-                lr,
-                beta1,
-                beta2,
-                eps,
-                bc1,
-                bc2,
-                n_w_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: adam_step,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_w,
+                args: [
+                    slice_mut(self.weights),
+                    slice_mut(self.m),
+                    slice_mut(self.v),
+                    slice_mut(self.grad),
+                    lr,
+                    beta1,
+                    beta2,
+                    eps,
+                    bc1,
+                    bc2,
+                    n_w_u32
+                ]
+            }
         }?;
 
         Ok(())
@@ -581,31 +593,39 @@ impl GpuTrainer {
             shared_mem_bytes: 0,
         };
 
-        cuda_launch! {
-            kernel: forward,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(self.indices),
-                slice(self.weights),
-                slice_mut(self.preds),
-                n_pos_u32,
-                max_inds_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: forward,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_pos,
+                args: [
+                    slice(self.indices),
+                    slice(self.weights),
+                    slice_mut(self.preds),
+                    n_pos_u32,
+                    max_inds_u32
+                ]
+            }
         }?;
-        cuda_launch! {
-            kernel: eval,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_pos,
-            args: [
-                slice(self.preds),
-                slice(self.targets),
-                slice(self.loss_acc),
-                slice(self.hist),
-                n_pos_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: eval,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_pos,
+                args: [
+                    slice(self.preds),
+                    slice(self.targets),
+                    slice(self.loss_acc),
+                    slice(self.hist),
+                    n_pos_u32
+                ]
+            }
         }?;
 
         Ok(())
@@ -1064,12 +1084,16 @@ mod gpu_cpu_equivalence_tests {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: forward,
-            stream: stream,
-            module: module,
-            config: cfg,
-            args: [slice(indices_dev), slice(weights_dev), slice_mut(preds_dev), n_pos_u32, max_inds_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: forward,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [slice(indices_dev), slice(weights_dev), slice_mut(preds_dev), n_pos_u32, max_inds_u32]
+            }
         }?;
         stream.synchronize()?;
         let preds_gpu = preds_dev.to_host_vec(&stream)?;
@@ -1128,16 +1152,20 @@ mod gpu_cpu_equivalence_tests {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: grad,
-            stream: stream,
-            module: module,
-            config: cfg,
-            args: [
-                slice(indices_dev), slice(preds_dev), slice(targets_dev),
-                slice(norm_dev), slice(grad_dev), slice(loss_dev), slice(hist_dev),
-                n_pos_u32, max_inds_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: grad,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [
+                    slice(indices_dev), slice(preds_dev), slice(targets_dev),
+                    slice(norm_dev), slice(grad_dev), slice(loss_dev), slice(hist_dev),
+                    n_pos_u32, max_inds_u32
+                ]
+            }
         }?;
         stream.synchronize()?;
         let grad_gpu = grad_dev.to_host_vec(&stream)?;
@@ -1190,12 +1218,16 @@ mod gpu_cpu_equivalence_tests {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: eval,
-            stream: stream,
-            module: module,
-            config: cfg,
-            args: [slice(preds_dev), slice(targets_dev), slice(loss_dev), slice(hist_dev), n_pos_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: eval,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [slice(preds_dev), slice(targets_dev), slice(loss_dev), slice(hist_dev), n_pos_u32]
+            }
         }?;
         stream.synchronize()?;
         let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
@@ -1246,15 +1278,19 @@ mod gpu_cpu_equivalence_tests {
             block_dim: (BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
-        cuda_launch! {
-            kernel: adam_step,
-            stream: stream,
-            module: module,
-            config: cfg,
-            args: [
-                slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
-                lr, beta1, beta2, eps, bc1, bc2, n_u32
-            ]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: adam_step,
+                stream: stream,
+                module: module,
+                config: cfg,
+                args: [
+                    slice_mut(w_dev), slice_mut(m_dev), slice_mut(v_dev), slice_mut(g_dev),
+                    lr, beta1, beta2, eps, bc1, bc2, n_u32
+                ]
+            }
         }?;
         stream.synchronize()?;
         let w_gpu = w_dev.to_host_vec(&stream)?;

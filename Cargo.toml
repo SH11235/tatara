@@ -35,9 +35,9 @@ clap = { version = "4.5", features = ["derive"] }
 # rev を読んで `cargo install --rev` する。channel は rust-toolchain.toml と
 # 必ず一致させる (ずれると link-time fail)。選定理由は
 # docs/decisions/2026-05-09-cuda-oxide-adoption.md、手順は docs/setup.md。
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
