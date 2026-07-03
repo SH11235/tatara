@@ -198,7 +198,9 @@ impl Batch {
 /// が file size を超えても error。range 外まで読み進めず、`remaining_bytes`
 /// が 1 record 分に満たなくなった時点で EOF として `Ok(None)` を返す。
 pub struct PsvFileLoader {
-    reader: BufReader<File>,
+    /// `Take` が raw read 自体を range 長で打ち切るため、BufReader の先読みが
+    /// `end_offset` を越えて file を読むことはない。
+    reader: BufReader<io::Take<File>>,
     eof: bool,
     path: PathBuf,
     /// 残りどれだけ読めるか (byte)。range 末尾に達したら 1 record 分を切らず
@@ -254,7 +256,7 @@ impl PsvFileLoader {
             file.seek(SeekFrom::Start(start))?;
         }
         Ok(Self {
-            reader: BufReader::with_capacity(1024 * 1024, file),
+            reader: BufReader::with_capacity(1024 * 1024, file.take(end - start)),
             eof: false,
             path: path.to_path_buf(),
             remaining_bytes: end - start,
