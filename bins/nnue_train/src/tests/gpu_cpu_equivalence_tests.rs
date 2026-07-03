@@ -20,8 +20,7 @@
 //!
 //! kernel ↔ CPU ref 対応表は `gpu_kernels` 各 module の doc 参照。
 
-use cuda_host::cuda_launch;
-use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
+use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 
 use crate::*;
 use crate::{arch::*, kernel_module::*, trainer_common::*};
@@ -78,6 +77,30 @@ fn open_module() -> Result<CudaCtxModuleStream, Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
     Ok((ctx, module, stream))
+}
+
+#[test]
+fn launch_error_includes_kernel_name() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let x_dev = DeviceBuffer::from_host(&stream, &[0.0_f32])?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, 1)?;
+    let error = cuda_launch! {
+        kernel: crelu_fwd,
+        stream: stream,
+        module: module,
+        config: LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (2048, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        args: [slice(x_dev), slice_mut(y_dev), 1_u32]
+    }
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("crelu_fwd"),
+        "kernel name is missing from error: {error}"
+    );
+    Ok(())
 }
 
 /// 決定論的な「面白い」値列を作る (interior / CReLU 境界 0.0・1.0 / 負 / >1 を踏む)。

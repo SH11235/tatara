@@ -12,9 +12,8 @@
 //! cuda-oxide 側の名前 (`DeviceBuffer`, `CudaStream`) も並行して公開する。
 //!
 //! `KernelLauncher` 相当は **新規 struct を作らず**、cuda-oxide が提供する
-//! `cuda_launch!` macro (本 crate からも再 export) をそのまま使う方針。
-//! cuda-oxide 設計の中心が macro での type-safe launch にあり、これを上から
-//! 薄く wrap してもメリットが出ないため。raw な launch が要る場合は
+//! `cuda_launch!` macro を error context だけ付与する薄い macro で包む方針。
+//! raw な launch が要る場合は
 //! `cuda_core::launch_kernel_on_stream` (unsafe) を直接呼ぶ。
 //!
 //! ## 再 export しないもの
@@ -29,8 +28,30 @@ pub use cuda_core::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError,
     LaunchConfig,
 };
-pub use cuda_host::{LtoirError, cuda_launch};
+pub use cuda_host::LtoirError;
 pub use kernel_loader::{BLOCK_DIM, grid_dim_1d, load_kernel_module_with_fallback};
+
+#[doc(hidden)]
+pub use cuda_host as __cuda_host;
+
+/// CUDA kernel を起動し、失敗時に kernel 名を付与する。
+///
+/// 成功時は cuda-oxide の `cuda_launch!` が返す値をそのまま通す。kernel 名は
+/// compile-time の `stringify!` で得るため、error が発生するまで allocation や
+/// formatting は行わない。
+#[macro_export]
+macro_rules! cuda_launch {
+    (kernel: $kernel:path, $($rest:tt)*) => {
+        $crate::__cuda_host::cuda_launch! {
+            kernel: $kernel,
+            $($rest)*
+        }
+        .map_err(|source| $crate::Error::KernelLaunch {
+            kernel: stringify!($kernel),
+            source,
+        })
+    };
+}
 
 /// `cuda_host::load_kernel_module` の再 export。
 ///
@@ -64,6 +85,13 @@ pub enum Error {
     Cuda(#[from] DriverError),
     #[error(transparent)]
     Ltoir(#[from] LtoirError),
+    /// CUDA kernel launch の失敗。
+    #[error("CUDA kernel launch `{kernel}` failed: {source}")]
+    KernelLaunch {
+        kernel: &'static str,
+        #[source]
+        source: DriverError,
+    },
     /// kernel artifact の探索 / `.ll`→`.ptx` 変換の失敗 (`kernel_loader` 参照)。
     #[error("{0}")]
     KernelArtifact(String),
@@ -85,6 +113,9 @@ pub fn is_out_of_memory(err: &(dyn std::error::Error + 'static)) -> bool {
     }
     if let Some(Error::Cuda(e)) = err.downcast_ref::<Error>() {
         return driver_error_is_out_of_memory(e);
+    }
+    if let Some(Error::KernelLaunch { source, .. }) = err.downcast_ref::<Error>() {
+        return driver_error_is_out_of_memory(source);
     }
     false
 }
