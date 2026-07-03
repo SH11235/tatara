@@ -39,6 +39,8 @@ pub use cuda_host as __cuda_host;
 /// 成功時は cuda-oxide の `cuda_launch!` が返す値をそのまま通す。kernel 名は
 /// compile-time の `stringify!` で得るため、error が発生するまで allocation や
 /// formatting は行わない。
+/// 下層 macro は field 順不同だが、この wrapper の arm は `kernel:` が先頭の launch
+/// のみ受理する。順序を変えた launch は分かりにくい macro error になるため先頭に書く。
 #[macro_export]
 macro_rules! cuda_launch {
     (kernel: $kernel:path, $($rest:tt)*) => {
