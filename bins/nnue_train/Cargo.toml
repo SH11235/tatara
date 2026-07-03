@@ -10,6 +10,16 @@ authors = { workspace = true }
 rust-version = { workspace = true }
 publish = false
 
+[features]
+# `--no-default-features` は CI 用の CPU-testable subset のみを compile し、生成 binary では学習を実行できない。
+default = ["gpu"]
+gpu = [
+    "dep:cuda-core",
+    "dep:cuda-device",
+    "dep:cuda-host",
+    "dep:gpu-runtime",
+]
+
 [lints]
 workspace = true
 
@@ -26,13 +36,13 @@ nnue-format = { workspace = true }
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }
-gpu-runtime = { workspace = true }
+gpu-runtime = { workspace = true, optional = true }
 clap = { workspace = true }
 
 # cuda-oxide device 側 API (`#[kernel]` / DisjointSlice / atomics) + host 側
 # launch (`cuda_launch!` macro)。`cuda-core` は `cuda_launch!` の展開で参照
 # されるため bin の direct dep として明示する必要がある。git rev pin は root
 # Cargo.toml の [workspace.dependencies] に集約。
-cuda-core = { workspace = true }
-cuda-device = { workspace = true }
-cuda-host = { workspace = true }
+cuda-core = { workspace = true, optional = true }
+cuda-device = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }
