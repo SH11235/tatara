@@ -13,6 +13,83 @@ use shogi_features::FeatureSetSpec;
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
+struct StepContext<'a> {
+    lr: f32,
+    wdl_lambda: f32,
+    loss: LossKind,
+    validate: bool,
+    profile_step: bool,
+    prof_t0: &'a mut std::time::Instant,
+    b: usize,
+    b_u32: u32,
+    ft_out: usize,
+    l1_out: usize,
+    l1_effective: usize,
+    l2_in: usize,
+    l2_out: usize,
+    n_out_tiles: usize,
+    padded_b: usize,
+}
+
+pub(crate) struct StepOptions<'a> {
+    lr: f32,
+    wdl_lambda: f32,
+    loss: LossKind,
+    validate: bool,
+    profile_step: bool,
+    prof_t0: &'a mut std::time::Instant,
+}
+
+impl<'a> StepContext<'a> {
+    fn new(
+        trainer: &GpuTrainer,
+        batch: &BatchData,
+        options: StepOptions<'a>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let b = batch.n_pos;
+        if !b.is_multiple_of(16) {
+            return Err(format!(
+                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
+                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
+                b
+            )
+            .into());
+        }
+        // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
+        // 起動時の `GpuWorkspace::new` で確保済)。
+        trainer.ws.check_batch_capacity(b)?;
+        // FT 出力次元 (`--ft-out`)。post-FT buffer の幅と FT kernel の launch arg。
+        let ft_out = trainer.ws.ft_out;
+        // L1 (per-bucket dense) 層の次元 (`--l1` 由来) と派生次元。
+        let l1_out = trainer.ws.l1_out;
+        let l1_effective = trainer.ws.l1_effective();
+        let l2_in = trainer.ws.l2_in();
+        // L2 (per-bucket dense) 層の出力次元 (`--l2` 由来)。L2 / L3 kernel の launch arg。
+        let l2_out = trainer.ws.l2_out;
+        Ok(Self {
+            lr: options.lr,
+            wdl_lambda: options.wdl_lambda,
+            loss: options.loss,
+            validate: options.validate,
+            profile_step: options.profile_step,
+            prof_t0: options.prof_t0,
+            b,
+            b_u32: b as u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
+            // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
+            // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
+            // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
+            n_out_tiles: l1_out.div_ceil(16),
+            padded_b: padded_sort_batch(b, trainer.num_buckets),
+        })
+    }
+}
+
 // ===========================================================================
 // GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progress8kpabs 9 buckets)
 //
@@ -1482,12 +1559,14 @@ impl GpuTrainer {
         let mut prof_t0 = std::time::Instant::now();
         let result = self.step_impl(
             batch,
-            lr,
-            wdl_lambda,
-            loss,
-            false,
-            profile_step,
-            &mut prof_t0,
+            StepOptions {
+                lr,
+                wdl_lambda,
+                loss,
+                validate: false,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
         )?;
         // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
         if profile_step {
@@ -1526,12 +1605,14 @@ impl GpuTrainer {
         // lr は validate モードでは optimizer を呼ばないため未使用 (0.0 を渡す)。
         self.step_impl(
             batch,
-            0.0,
-            wdl_lambda,
-            loss,
-            true,
-            profile_step,
-            &mut prof_t0,
+            StepOptions {
+                lr: 0.0,
+                wdl_lambda,
+                loss,
+                validate: true,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
         )
     }
 
@@ -1559,16 +1640,10 @@ impl GpuTrainer {
     /// (backward / optimizer step は走らず weight は不変、held-out validation 用)。
     /// `validate == false` の通常 training path はこの分岐に入らないため、訓練の
     /// 数値挙動は本フラグ追加前と完全に同一。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_impl(
         &mut self,
         batch: &BatchData,
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-        validate: bool,
-        profile_step: bool,
-        prof_t0: &mut std::time::Instant,
+        options: StepOptions<'_>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
         if b == 0 {
@@ -1583,32 +1658,36 @@ impl GpuTrainer {
         // 契約) ため通常到達しない。
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
-        if !b.is_multiple_of(16) {
-            return Err(format!(
-                "batch.n_pos must be a multiple of 16 (got {}); tiled dense matmul kernels \
-                 require b % 16 == 0 — partial last batch will silently truncate via grid=b/16",
-                b
-            )
-            .into());
+        let mut context = StepContext::new(self, batch, options)?;
+        if let Some(output) = self.forward(batch, &mut context)? {
+            return Ok(output);
         }
-        let b_u32 = b as u32;
-        // FT 出力次元 (`--ft-out`)。post-FT buffer の幅と FT kernel の launch arg。
-        let ft_out = self.ws.ft_out;
-        // L1 (per-bucket dense) 層の次元 (`--l1` 由来) と派生次元。
-        let l1_out = self.ws.l1_out;
-        let l1_effective = self.ws.l1_effective();
-        let l2_in = self.ws.l2_in();
-        // L2 (per-bucket dense) 層の出力次元 (`--l2` 由来)。L2 / L3 kernel の launch arg。
-        let l2_out = self.ws.l2_out;
-        // L1 系 tiled/sorted dense matmul kernel は出力次元を `TILE_OUT = 16` 幅の
-        // out-tile に分割して処理する。`n_out_tiles` は out-tile 数で、kernel の grid
-        // 次元 (forward / weight backward) や内部 loop 回数を決める。`l1_out <= 16` の
-        // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
-        let n_out_tiles = l1_out.div_ceil(16);
+        self.backward(&mut context)?;
+        self.optimizer_step(&mut context)
+    }
 
-        // batch `b` が workspace 容量に収まることを検証する (固定 batch 前提、
-        // 起動時の `GpuWorkspace::new` で確保済)。
-        self.ws.check_batch_capacity(b)?;
+    fn forward(
+        &mut self,
+        batch: &BatchData,
+        context: &mut StepContext<'_>,
+    ) -> Result<Option<StepOutput>, Box<dyn std::error::Error>> {
+        let StepContext {
+            wdl_lambda,
+            loss,
+            validate,
+            profile_step,
+            b,
+            b_u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            n_out_tiles,
+            padded_b: _,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
 
         macro_rules! prof_tick {
             ($label:expr) => {
@@ -2194,7 +2273,46 @@ impl GpuTrainer {
             let mut net_output = self.ws.net_output.to_host_vec(&self.stream)?;
             net_output.truncate(b);
             prof_tick!("validate_io");
-            return Ok(StepOutput { loss, net_output });
+            return Ok(Some(StepOutput { loss, net_output }));
+        }
+
+        Ok(None)
+    }
+
+    fn backward(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            loss: _,
+            profile_step,
+            b,
+            b_u32,
+            ft_out,
+            l1_out,
+            l1_effective,
+            l2_in,
+            l2_out,
+            n_out_tiles,
+            padded_b,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
         }
 
         // ===== BACKWARD =====
@@ -2203,15 +2321,10 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
         let ft_b_n = ft_out;
-        let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
         let l1f_b_n = l1_out;
-        let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
         let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
         // `gather_and_sum_per_feature_overwrite` が実 block の全 (feature, ri) cell
@@ -3009,6 +3122,49 @@ impl GpuTrainer {
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
             prof_tick!("norm_loss");
+        }
+
+        Ok(())
+    }
+
+    fn optimizer_step(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            profile_step,
+            ft_out,
+            l1_out,
+            l2_in,
+            l2_out,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_b_n = ft_out;
+        let l1_w_n = self.num_buckets * l1_out * ft_out;
+        let l1_b_n = self.num_buckets * l1_out;
+        let l1f_w_n = ft_out * l1_out;
+        let l1f_b_n = l1_out;
+        let l2_w_n = self.num_buckets * l2_out * l2_in;
+        let l2_b_n = self.num_buckets * l2_out;
+        let l3_w_n = self.num_buckets * l2_out;
+        let l3_b_n = self.num_buckets;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
         }
 
         // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
