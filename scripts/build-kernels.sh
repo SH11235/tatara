@@ -20,6 +20,26 @@ if ! command -v cargo-oxide >/dev/null 2>&1; then
   exit 1
 fi
 
+# cargo-oxide の codegen backend cache (~/.cargo/cuda-oxide/) は
+# scripts/setup-cuda-oxide.sh だけが pin rev に揃える/揃っているか検証する
+# (詳細は同スクリプトのコメント参照)。ここでは同スクリプトが書いた stamp と
+# Cargo.lock の pin を比べるだけの軽い確認に留め、build 自体では cache を
+# 書き換えない (build のたびに fetch/rebuild すると遅くなるため)。stamp が
+# 無い/ずれているときに実際に device codegen エラーになるとは限らないが、
+# 原因切り分けの入口として fail-fast する。
+if [[ -z "${CUDA_OXIDE_BACKEND:-}" ]]; then
+  full_rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+#[0-9a-f]+' Cargo.lock | sed -E 's/.*#//' || true)"
+  stamp_file="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide/.pin-stamp"
+  expected_stamp="$full_rev|$(rustc --version)"
+  actual_stamp=""
+  [[ -n "$full_rev" && -f "$stamp_file" ]] && actual_stamp="$(cat "$stamp_file")"
+  if [[ -z "$full_rev" || "$actual_stamp" != "$expected_stamp" ]]; then
+    echo "error: cuda-oxide の codegen backend cache が pin rev / toolchain と一致しません。" >&2
+    echo "       bash scripts/setup-cuda-oxide.sh を再実行してから再試行してください。" >&2
+    exit 1
+  fi
+fi
+
 # CUDA_OXIDE_TARGET が既に設定済みならそれを尊重する (local-ci.sh 等の呼び出し
 # 元が export してくる)。未設定のときだけ GPU の compute capability (例: "8.6")
 # を取得し、sub-Ampere (sm < 80) の場合に限り自動設定する。
