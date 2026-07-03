@@ -248,6 +248,10 @@ macro_rules! trainer_backend_impl {
                 wdl_lambda: f32,
                 loss: nnue_train::trainer::LossKind,
             ) -> std::io::Result<f64> {
+                // dataloader が出した batch の feature set が trainer 構築時に選んだ
+                // feature set と一致することを確認する。buffer サイズ / kernel launch
+                // 次元は trainer の feature set 前提で確保済のため、不一致は
+                // out-of-bounds になる。
                 if batch.feature_set != self.$($feature_set).+ {
                     return Err(std::io::Error::other(format!(
                         "batch feature set '{}' does not match trainer feature set '{}'",
@@ -255,7 +259,11 @@ macro_rules! trainer_backend_impl {
                         self.$($feature_set).+.canonical_name(),
                     )));
                 }
-                let data = trainer_backend_impl!(@batch $batch_kind, batch, bucket_idx);
+                let data = $crate::trainer_common::trainer_backend_impl!(
+                    @batch $batch_kind,
+                    batch,
+                    bucket_idx
+                );
                 self.step(&data, lr, wdl_lambda, loss)
                     .map_err(|e| std::io::Error::other(format!($step_error, e)))
             }
@@ -267,6 +275,10 @@ macro_rules! trainer_backend_impl {
                 wdl_lambda: f32,
                 loss: nnue_train::trainer::LossKind,
             ) -> std::io::Result<nnue_train::trainer::ValidationStepOutput> {
+                // dataloader が出した batch の feature set が trainer 構築時に選んだ
+                // feature set と一致することを確認する。buffer サイズ / kernel launch
+                // 次元は trainer の feature set 前提で確保済のため、不一致は
+                // out-of-bounds になる。
                 if batch.feature_set != self.$($feature_set).+ {
                     return Err(std::io::Error::other(format!(
                         "batch feature set '{}' does not match trainer feature set '{}'",
@@ -274,7 +286,11 @@ macro_rules! trainer_backend_impl {
                         self.$($feature_set).+.canonical_name(),
                     )));
                 }
-                let data = trainer_backend_impl!(@batch $batch_kind, batch, bucket_idx);
+                let data = $crate::trainer_common::trainer_backend_impl!(
+                    @batch $batch_kind,
+                    batch,
+                    bucket_idx
+                );
                 let out = self
                     .validate(&data, wdl_lambda, loss)
                     .map_err(|e| std::io::Error::other(format!($validate_error, e)))?;
@@ -313,6 +329,7 @@ macro_rules! trainer_backend_impl {
                 lr_horizon: Option<usize>,
             ) -> std::io::Result<()> {
                 self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
+                    // `io::Error` は downcast して `ErrorKind` を保持したまま返す。
                     .map_err(|e| match e.downcast::<std::io::Error>() {
                         Ok(io_err) => *io_err,
                         Err(other) => std::io::Error::other(format!($resume_error, other)),
@@ -320,6 +337,8 @@ macro_rules! trainer_backend_impl {
             }
 
             fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+                // `to_host_vec` 内部の `stream.synchronize` で十分。cumulative counter は
+                // superbatch 末の報告にだけ使うため、同期 path で問題ない。
                 let host = self
                     .fp16_clamp_counter
                     .to_host_vec(&self.stream)
@@ -331,11 +350,12 @@ macro_rules! trainer_backend_impl {
         }
     };
     (@batch bucketed, $batch:ident, $bucket_idx:ident) => {
-        BatchData::from_batch_ref($batch, $bucket_idx)
+        $crate::trainer_common::BatchData::from_batch_ref($batch, $bucket_idx)
     };
     (@batch bucketless, $batch:ident, $bucket_idx:ident) => {{
+        // bucketless 経路では下流が `bucket_idx` に触れないため、受け取るだけでよい。
         let _ = $bucket_idx;
-        BatchData::from_batch_ref_bucketless($batch)
+        $crate::trainer_common::BatchData::from_batch_ref_bucketless($batch)
     }};
 }
 
