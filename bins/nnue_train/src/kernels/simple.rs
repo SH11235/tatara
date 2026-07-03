@@ -334,7 +334,12 @@ pub fn simple_bias_grad_dual(
     }
     let batch_u = batch as usize;
     let pos_start = thread::blockIdx_x() as usize * items as usize;
-    let pos_end = (pos_start + items as usize).min(batch_u);
+    let end_candidate = pos_start + items as usize;
+    let pos_end = if end_candidate < batch_u {
+        end_candidate
+    } else {
+        batch_u
+    };
     let mut acc = 0.0_f32;
     let mut p = pos_start;
     while p < pos_end {
@@ -372,7 +377,12 @@ pub fn simple_bias_grad_dual_fp16(
     }
     let batch_u = batch as usize;
     let pos_start = thread::blockIdx_x() as usize * items as usize;
-    let pos_end = (pos_start + items as usize).min(batch_u);
+    let end_candidate = pos_start + items as usize;
+    let pos_end = if end_candidate < batch_u {
+        end_candidate
+    } else {
+        batch_u
+    };
     let mut acc = 0.0_f32;
     let mut p = pos_start;
     while p < pos_end {
