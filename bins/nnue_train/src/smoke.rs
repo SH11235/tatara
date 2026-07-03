@@ -288,6 +288,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             PrecisionFlags {
                 ft_fp16: true, // ft_fp16_out requires this
                 ft_fp16_out: true,
+                ft_fp16_dcombined: false,
                 fp16_opt_state: false,
                 tf32: false,
             },

@@ -82,6 +82,37 @@ fn all_optim_meta_flag_parses_for_both_subcommands() {
 }
 
 #[test]
+fn ft_fp16_dcombined_is_layerstack_only_and_not_implied_by_all_optim() {
+    let baseline = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
+    let ArchCommand::LayerStack(baseline) = baseline.arch else {
+        unreachable!()
+    };
+    assert!(!baseline.ft_fp16_dcombined);
+
+    let all_optim = Cli::try_parse_from(["nnue-train", "--all-optim", "layerstack"]).unwrap();
+    let ArchCommand::LayerStack(all_optim_args) = all_optim.arch else {
+        unreachable!()
+    };
+    assert!(all_optim.all_optim);
+    assert!(!all_optim_args.ft_fp16_dcombined);
+
+    let combined = Cli::try_parse_from([
+        "nnue-train",
+        "--all-optim",
+        "layerstack",
+        "--ft-fp16-dcombined",
+    ])
+    .unwrap();
+    assert!(combined.all_optim);
+    let ArchCommand::LayerStack(combined) = combined.arch else {
+        unreachable!()
+    };
+    assert!(combined.ft_fp16_dcombined);
+
+    assert!(Cli::try_parse_from(["nnue-train", "simple", "--ft-fp16-dcombined"]).is_err());
+}
+
+#[test]
 fn ft_fp16_out_requires_ft_fp16_uses_effective_values() {
     // `--ft-fp16-out` が `--ft-fp16` を要求する制約は実効値 (`--all-optim` 含意込み)
     // で判定する。`ft_fp16_out_missing_ft_fp16(ft_fp16_out, ft_fp16, all_optim)` が

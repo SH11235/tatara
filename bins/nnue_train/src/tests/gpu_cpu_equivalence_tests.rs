@@ -613,6 +613,46 @@ fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn dense_mm_bwd_input_tiled_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (batch, in_dim, out_dim) = (32_usize, 48_usize, 17_usize);
+    let dy: Vec<f32> = (0..batch * out_dim)
+        .map(|i| ((i * 17 % 97) as f32 - 48.0) * 1e-4)
+        .collect();
+    let w: Vec<f32> = (0..in_dim * out_dim)
+        .map(|i| ((i * 11 % 89) as f32 - 44.0) * 1e-3)
+        .collect();
+    let mut dx_cpu = vec![0.0_f32; batch * in_dim];
+    dense_mm_bwd_input_cpu(&dy, &w, &mut dx_cpu, batch, in_dim, out_dim);
+
+    let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+    let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let mut dx_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * in_dim)?;
+    let clamp_counter = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
+    let dcombined_scale = 65536.0_f32;
+    cuda_launch! {
+        kernel: dense_mm_bwd_input_tiled_f16, stream: stream, module: module,
+        config: LaunchConfig {
+            grid_dim: (((batch / 16) * (in_dim / 16)) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        args: [slice(dy_dev), slice(w_dev), slice_mut(dx_dev),
+               batch as u32, in_dim as u32, out_dim as u32, dcombined_scale,
+               slice(clamp_counter)]
+    }?;
+    stream.synchronize()?;
+    assert_eq!(clamp_counter.to_host_vec(&stream)?[0], 0);
+    let dx_gpu: Vec<f32> = dx_dev
+        .to_host_vec(&stream)?
+        .into_iter()
+        .map(|x| x as f32 / dcombined_scale)
+        .collect();
+    assert_close_rel("dense_mm_bwd_input_tiled_f16", &dx_gpu, &dx_cpu, 2e-3);
+    Ok(())
+}
+
+#[test]
 fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // tiled kernel は in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0 を要求
     let (_ctx, module, stream) = open_module()?;
@@ -813,6 +853,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 PrecisionFlags {
                     ft_fp16,
                     ft_fp16_out,
+                    ft_fp16_dcombined: false,
                     fp16_opt_state: false,
                     tf32: false,
                 },
@@ -1337,6 +1378,34 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
             &tiled_host,
             &dx_cpu,
             TOL_FMA,
+        );
+        let mut dx_h_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * in_dim)?;
+        let clamp_counter = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
+        let dcombined_scale = 0.25_f32;
+        cuda_launch! {
+            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter_f16,
+            stream: stream, module: module,
+            config: LaunchConfig {
+                grid_dim: ((in_dim / 16) as u32, (padded / 16) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            args: [slice(dy_sorted_dev), slice(w_dev), slice(bidx_sorted_dev), slice(perm_dev),
+                   slice_mut(dx_h_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32,
+                   dcombined_scale, slice(clamp_counter)]
+        }?;
+        stream.synchronize()?;
+        assert_eq!(clamp_counter.to_host_vec(&stream)?[0], 0);
+        let dx_h: Vec<f32> = dx_h_dev
+            .to_host_vec(&stream)?
+            .into_iter()
+            .map(|x| x as f32 / dcombined_scale)
+            .collect();
+        assert_close_rel(
+            &format!("bucket_sort_bwd_input_l1_f16 b={batch} in={in_dim} out={out_dim}"),
+            &dx_h,
+            &dx_cpu,
+            2e-3,
         );
         // 非 tiled `dense_mm_bwd_input_bucket` と GPU 上で bit-exact (同 dy/w・同 o-order の FMA、
         // sort/inverse-permute は値を変えない gather/scatter)。tiled 化が数値経路を変えないことを
@@ -2066,6 +2135,126 @@ fn ft_post_perspective_grad_fused_matches_cpu() -> Result<(), Box<dyn std::error
         "ft_grad_fused grad_bias",
         &grad_bias_dev.to_host_vec(&stream)?,
         &grad_bias_cpu,
+        TOL,
+    );
+    Ok(())
+}
+
+#[test]
+fn ft_post_perspective_grad_fused_f16_dcombined_matches_cpu()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let batch = 3_usize;
+    let ft_dim = DEFAULT_FT_OUT;
+    let scale = FT_POST_SCALE;
+    let dcombined_scale = 64.0_f32;
+    let dcombined_inv_scale = 1.0_f32 / dcombined_scale;
+    let bias: Vec<f32> = (0..ft_dim)
+        .map(|i| -0.5_f32 + (i % 3) as f32 * 0.6)
+        .collect();
+    let d_a: Vec<f32> = (0..batch * ft_dim)
+        .map(|i| (-1.2_f32 + 0.011_f32 * i as f32) * dcombined_scale)
+        .collect();
+    let d_b: Vec<f32> = (0..batch * ft_dim)
+        .map(|i| (-0.8_f32 + 0.007_f32 * i as f32) * dcombined_scale)
+        .collect();
+    let (d_a_h, d_a_q) = quantize_f16(&d_a);
+    let (d_b_h, d_b_q) = quantize_f16(&d_b);
+    let d_combined: Vec<f32> = d_a_q
+        .iter()
+        .zip(d_b_q.iter())
+        .map(|(&a, &b)| a * dcombined_inv_scale + b * dcombined_inv_scale)
+        .collect();
+    let stm_ft: Vec<f32> = (0..batch * ft_dim)
+        .map(|i| -1.0_f32 + 2.0_f32 * ((i * 7) % 13) as f32 / 12.0)
+        .collect();
+    let mut dft_cpu = vec![0.0_f32; batch * ft_dim];
+    let mut grad_bias_cpu = vec![0.0_f32; ft_dim];
+    ft_post_perspective_grad_cpu(
+        &d_combined,
+        &stm_ft,
+        &bias,
+        &mut dft_cpu,
+        &mut grad_bias_cpu,
+        batch,
+        ft_dim,
+        0,
+        ft_dim,
+        scale,
+    );
+
+    let da_dev = DeviceBuffer::from_host(&stream, &d_a_h)?;
+    let db_dev = DeviceBuffer::from_host(&stream, &d_b_h)?;
+    let ft_dev = DeviceBuffer::from_host(&stream, &stm_ft)?;
+    let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
+    let mut dft_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * ft_dim)?;
+    let grad_bias_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
+    cuda_launch! {
+        kernel: ft_post_perspective_grad_fused_f16_dcombined,
+        stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+        args: [slice(da_dev), slice(db_dev), slice(ft_dev), slice(bias_dev),
+               slice_mut(dft_dev), slice(grad_bias_dev), batch as u32, ft_dim as u32,
+               0_u32, ft_dim as u32, scale, dcombined_inv_scale]
+    }?;
+    stream.synchronize()?;
+    assert_close_rel(
+        "ft_grad_fused_f16_dcombined dft",
+        &dft_dev.to_host_vec(&stream)?,
+        &dft_cpu,
+        TOL,
+    );
+    assert_close_rel(
+        "ft_grad_fused_f16_dcombined bias",
+        &grad_bias_dev.to_host_vec(&stream)?,
+        &grad_bias_cpu,
+        TOL,
+    );
+
+    let (stm_ft_h, stm_ft_q) = quantize_f16(&stm_ft);
+    let mut dft_fp16_cpu = vec![0.0_f32; batch * ft_dim];
+    let mut grad_bias_fp16_cpu = vec![0.0_f32; ft_dim];
+    ft_post_perspective_grad_cpu(
+        &d_combined,
+        &stm_ft_q,
+        &bias,
+        &mut dft_fp16_cpu,
+        &mut grad_bias_fp16_cpu,
+        batch,
+        ft_dim,
+        0,
+        ft_dim,
+        scale,
+    );
+    let ft_h_dev = DeviceBuffer::from_host(&stream, &stm_ft_h)?;
+    let mut dft_h_dev = DeviceBuffer::<f16>::zeroed(&stream, batch * ft_dim)?;
+    let grad_bias_h_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_dim)?;
+    let clamp_counter = DeviceBuffer::<u64>::zeroed(&stream, 1)?;
+    let dft_scale = 64.0_f32;
+    cuda_launch! {
+        kernel: ft_post_perspective_grad_fused_fp16_f16_dcombined,
+        stream: stream, module: module, config: cfg_1d(batch * ft_dim / 2),
+        args: [slice(da_dev), slice(db_dev), slice(ft_h_dev), slice(bias_dev),
+               slice_mut(dft_h_dev), slice(grad_bias_h_dev), batch as u32, ft_dim as u32,
+               0_u32, ft_dim as u32, scale, dcombined_inv_scale, dft_scale,
+               slice(clamp_counter)]
+    }?;
+    stream.synchronize()?;
+    assert_eq!(clamp_counter.to_host_vec(&stream)?[0], 0);
+    let dft_fp16_gpu: Vec<f32> = dft_h_dev
+        .to_host_vec(&stream)?
+        .into_iter()
+        .map(|x| x as f32 / dft_scale)
+        .collect();
+    assert_close_rel(
+        "ft_grad_fused_fp16_f16_dcombined dft",
+        &dft_fp16_gpu,
+        &dft_fp16_cpu,
+        2e-3,
+    );
+    assert_close_rel(
+        "ft_grad_fused_fp16_f16_dcombined bias",
+        &grad_bias_h_dev.to_host_vec(&stream)?,
+        &grad_bias_fp16_cpu,
         TOL,
     );
     Ok(())

@@ -469,6 +469,166 @@ pub fn ft_post_perspective_grad_fused_fp16(
     bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
 }
 
+macro_rules! ft_post_dft_write {
+    (f32, $out:ident, $base:ident, $half:ident, $pair:ident, $a:ident, $b:ident) => {
+        let out_ptr = $out.as_mut_ptr();
+        unsafe {
+            out_ptr.add($base + $pair).write($a);
+            out_ptr.add($base + $half + $pair).write($b);
+        }
+    };
+    (
+        f16,
+        $out:ident,
+        $base:ident,
+        $half:ident,
+        $pair:ident,
+        $a:ident,
+        $b:ident,
+        $dft_scale:ident,
+        $clamp_counter:ident
+    ) => {{
+        let da = $a * $dft_scale;
+        let mut local_clamps: u64 = 0;
+        let da_c = clamp_f16_value!(da, local_clamps);
+        let db = $b * $dft_scale;
+        let db_c = clamp_f16_value!(db, local_clamps);
+        let out_ptr = $out.as_mut_ptr();
+        unsafe {
+            out_ptr.add($base + $pair).write(da_c as f16);
+            out_ptr.add($base + $half + $pair).write(db_c as f16);
+        }
+        finish_f16_clamp_count!($clamp_counter, local_clamps);
+    }};
+}
+
+macro_rules! ft_post_activation_read {
+    (f32, $ft_out:ident, $index:expr) => {
+        $ft_out[$index]
+    };
+    (f16, $ft_out:ident, $index:expr) => {
+        $ft_out[$index] as f32
+    };
+}
+
+macro_rules! define_ft_post_perspective_grad_fused_f16_dcombined {
+    (
+        $name:ident,
+        $activation_type:ty,
+        $activation_token:ident,
+        $dft_type:ty,
+        $dft_token:ident
+        $(, $extra:ident : $extra_type:ty)*
+    ) => {
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::manual_clamp)]
+        #[kernel]
+        pub fn $name(
+            d_combined_a: &[f16],
+            d_combined_b: &[f16],
+            ft_out: &[$activation_type],
+            bias: &[f32],
+            mut grad_ft_out: DisjointSlice<$dft_type>,
+            grad_bias: &[f32],
+            batch: u32,
+            ft_dim: u32,
+            d_combined_offset: u32,
+            d_combined_stride: u32,
+            scale: f32,
+            dcombined_inv_scale: f32
+            $(, $extra: $extra_type)*
+        ) {
+            let tid = thread::index_1d();
+            let half = (ft_dim as usize) / 2;
+            let total_pairs = (batch as usize) * half;
+            if tid.get() >= total_pairs {
+                return;
+            }
+            let bi = tid.get() / half;
+            let pair_idx = tid.get() % half;
+
+            let dy_idx =
+                bi * (d_combined_stride as usize) + (d_combined_offset as usize) + pair_idx;
+            let dy = d_combined_a[dy_idx] as f32 * dcombined_inv_scale
+                + d_combined_b[dy_idx] as f32 * dcombined_inv_scale;
+
+            let ft_base = bi * (ft_dim as usize);
+            let xa =
+                ft_post_activation_read!($activation_token, ft_out, ft_base + pair_idx)
+                    + bias[pair_idx];
+            let xb = ft_post_activation_read!(
+                $activation_token,
+                ft_out,
+                ft_base + half + pair_idx
+            ) + bias[half + pair_idx];
+
+            let ya = if xa < 0.0_f32 {
+                0.0_f32
+            } else if xa > 1.0_f32 {
+                1.0_f32
+            } else {
+                xa
+            };
+            let yb = if xb < 0.0_f32 {
+                0.0_f32
+            } else if xb > 1.0_f32 {
+                1.0_f32
+            } else {
+                xb
+            };
+
+            let grad_a_post = dy * yb * scale;
+            let grad_a = if xa > 0.0_f32 && xa < 1.0_f32 {
+                grad_a_post
+            } else {
+                0.0_f32
+            };
+            let grad_b_post = dy * ya * scale;
+            let grad_b = if xb > 0.0_f32 && xb < 1.0_f32 {
+                grad_b_post
+            } else {
+                0.0_f32
+            };
+
+            ft_post_dft_write!(
+                $dft_token,
+                grad_ft_out,
+                ft_base,
+                half,
+                pair_idx,
+                grad_a,
+                grad_b
+                $(, $extra)*
+            );
+
+            let bias_cell_a =
+                unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
+            bias_cell_a.fetch_add(grad_a, AtomicOrdering::Relaxed);
+            let bias_cell_b = unsafe {
+                &*(grad_bias.as_ptr().add(half + pair_idx) as *const DeviceAtomicF32)
+            };
+            bias_cell_b.fetch_add(grad_b, AtomicOrdering::Relaxed);
+        }
+    };
+}
+
+define_ft_post_perspective_grad_fused_f16_dcombined!(
+    ft_post_perspective_grad_fused_f16_dcombined,
+    f32,
+    f32,
+    f32,
+    f32
+);
+define_ft_post_perspective_grad_fused_f16_dcombined!(
+    ft_post_perspective_grad_fused_fp16_f16_dcombined,
+    f16,
+    f16,
+    f16,
+    f16,
+    dft_scale: f32,
+    clamp_counter: &[u64]
+);
+
 /// 非 fused FP16 版 [`ft_post_perspective_grad`]: forward activation `ft_out` を `f16`
 /// で読み、`grad_ft_out` (dft) を loss scaling 付き `f16` で書く。`d_combined` は
 /// 単一 source (`ft_post_perspective_grad` と同じく、`d_combined_offset` で perspective
@@ -644,16 +804,36 @@ pub fn dense_mm_bwd_input(
 /// 非 tiled の [`dense_mm_bwd_input`] は w[ii][o] (out-major) read で warp 内 ii=0..31 が
 /// stride out_dim の uncoalesced になる。本 kernel は W_TILE / DY_TILE を shared に
 /// coalesced load し、各 thread が 1 (bi, ii) cell を out-tile ごと 16 FMA で完成させる。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn dense_mm_bwd_input_tiled(
-    dy: &[f32],
-    w: &[f32],
-    mut dx: DisjointSlice<f32>,
-    batch: u32,
-    in_dim: u32,
-    out_dim: u32,
-) {
+macro_rules! dcombined_write {
+    (f32, $dx:ident, $index:ident, $value:ident) => {
+        unsafe {
+            *$dx.as_mut_ptr().add($index) = $value;
+        }
+    };
+    (f16, $dx:ident, $index:ident, $value:ident, $scale:ident, $clamp_counter:ident) => {{
+        let scaled = $value * $scale;
+        let mut local_clamps: u64 = 0;
+        let clamped = clamp_f16_value!(scaled, local_clamps);
+        unsafe {
+            *$dx.as_mut_ptr().add($index) = clamped as f16;
+        }
+        finish_f16_clamp_count!($clamp_counter, local_clamps);
+    }};
+}
+
+macro_rules! define_dense_mm_bwd_input_tiled {
+    ($name:ident, $out_type:ty, $storage:ident $(, $extra:ident : $extra_type:ty)*) => {
+        #[allow(clippy::too_many_arguments)]
+        #[kernel]
+        pub fn $name(
+            dy: &[f32],
+            w: &[f32],
+            mut dx: DisjointSlice<$out_type>,
+            batch: u32,
+            in_dim: u32,
+            out_dim: u32
+            $(, $extra: $extra_type)*
+        ) {
     // W_TILE[ii_local][o] は row stride 17 で pad する。reduction の FMA read
     // `W_TILE[tid_i * 17 + o]` は tid_i (in-index) が warp 内で変化するため、stride 16 だと
     // 16 lane が 2 bank に集中して 8-way bank conflict になる。stride 17 で 16 bank に散る。
@@ -726,11 +906,20 @@ pub fn dense_mm_bwd_input_tiled(
         // thread::index_1d() (block_lin * 256 + tid_local) と cell_idx は order が異なるため
         // raw pointer 経由で write (各 thread は disjoint cell を担当、host が grid_dim 整合)。
         let cell_idx = global_bi * in_dim_u + global_ii;
-        unsafe {
-            *dx.as_mut_ptr().add(cell_idx) = acc;
-        }
+        dcombined_write!($storage, dx, cell_idx, acc $(, $extra)*);
     }
+        }
+    };
 }
+
+define_dense_mm_bwd_input_tiled!(dense_mm_bwd_input_tiled, f32, f32);
+define_dense_mm_bwd_input_tiled!(
+    dense_mm_bwd_input_tiled_f16,
+    f16,
+    f16,
+    dcombined_scale: f32,
+    clamp_counter: &[u64]
+);
 
 /// Regular dense matrix multiply backward (wrt weight)。`dw[i][o] = sum_b x[b][i] * dy[b][o]`。
 /// 1 thread = 1 (in_index, out_index) weight cell、batch loop 内で sum、atomics 不要 (overwrite)。
@@ -1731,19 +1920,22 @@ pub fn dense_mm_bwd_input_bucket(
 /// buffer には触れない (perm は real row の bijection で全 real row をちょうど 1 回ずつ覆う)。
 ///
 /// 数値同等性: per (b,i) で o=0.. の加算順を保持するため非 tiled 版と bit-exact。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn dense_mm_bwd_input_bucket_tiled_sorted_scatter(
-    dy: &[f32],
-    w: &[f32],
-    bucket_idx: &[i32],
-    perm: &[i32],
-    mut dx: DisjointSlice<f32>,
-    batch: u32,
-    in_dim: u32,
-    out_dim: u32,
-    num_buckets: u32,
-) {
+macro_rules! define_dense_mm_bwd_input_bucket_tiled_sorted_scatter {
+    ($name:ident, $out_type:ty, $storage:ident $(, $extra:ident : $extra_type:ty)*) => {
+        #[allow(clippy::too_many_arguments)]
+        #[kernel]
+        pub fn $name(
+            dy: &[f32],
+            w: &[f32],
+            bucket_idx: &[i32],
+            perm: &[i32],
+            mut dx: DisjointSlice<$out_type>,
+            batch: u32,
+            in_dim: u32,
+            out_dim: u32,
+            num_buckets: u32
+            $(, $extra: $extra_type)*
+        ) {
     static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 b × 16 o
     static mut W_TILE: SharedArray<f32, 256> = SharedArray::UNINIT; // 16 o × 16 i
 
@@ -1821,12 +2013,25 @@ pub fn dense_mm_bwd_input_bucket_tiled_sorted_scatter(
             // kernel 引数 `batch` = padded sorted 長とは別) で global_ii < in_dim なので
             // cell_idx < dx.len()。
             let cell_idx = (dst_row as usize) * in_dim_u + global_ii;
-            unsafe {
-                *dx.as_mut_ptr().add(cell_idx) = acc;
-            }
+            dcombined_write!($storage, dx, cell_idx, acc $(, $extra)*);
         }
     }
+        }
+    };
 }
+
+define_dense_mm_bwd_input_bucket_tiled_sorted_scatter!(
+    dense_mm_bwd_input_bucket_tiled_sorted_scatter,
+    f32,
+    f32
+);
+define_dense_mm_bwd_input_bucket_tiled_sorted_scatter!(
+    dense_mm_bwd_input_bucket_tiled_sorted_scatter_f16,
+    f16,
+    f16,
+    dcombined_scale: f32,
+    clamp_counter: &[u64]
+);
 
 /// Per-bucket dense matmul backward (wrt weight)。
 /// `grad_w[bucket][o][i] = sum_{b: bucket_idx[b]==bucket} x[b][i] * dy[b][o]` (overwrite、atomics 不要)。

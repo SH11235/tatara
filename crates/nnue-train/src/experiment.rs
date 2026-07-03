@@ -208,6 +208,8 @@ pub struct Params {
     pub tf32: bool,
     pub ft_fp16: bool,
     pub ft_fp16_out: bool,
+    #[serde(default)]
+    pub ft_fp16_dcombined: bool,
     pub fp16_opt_state: bool,
     pub threads: usize,
 }
@@ -630,6 +632,7 @@ mod tests {
             tf32: false,
             ft_fp16: true,
             ft_fp16_out: true,
+            ft_fp16_dcombined: false,
             fp16_opt_state: false,
             threads: 16,
         }

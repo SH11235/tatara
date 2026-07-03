@@ -185,16 +185,12 @@ pub(crate) struct GpuTrainer {
     /// kernel が atomic add し、`loss_wrm` の extended 経路が `1/Σw` 正規化に読む。
     /// 二乗誤差経路では未使用 (常に 0)。
     weight_sum_acc: DeviceBuffer<f64>,
-    /// `--ft-fp16-out` 経路で `ft_post_perspective_grad_fused_fp16` /
-    /// `ft_post_perspective_grad_fp16` が `dft_scale * grad` を `±65504` に cap した
+    /// FT backward の FP16 producer が loss-scaled gradient を `±65504` に cap した
     /// 要素数の cumulative atomic counter (len 1)。`--monitor-fp16-clamps` 時に
     /// host が sb 末で D2H read、`[fp16-clamp]` line に出す。
-    /// `--ft-fp16-out` 無しでは対象 kernel が launch されないので常に 0。
     fp16_clamp_counter: DeviceBuffer<u64>,
-    /// `--ft-fp16-out` 経路で dft FP16 書き込みを行った要素数の host-side cumulative
-    /// counter。`[fp16-clamp]` ratio の分母。`fp16_clamp_counter` は dft write の
-    /// 1 element に対し 0 or 1 atomic add するので両者を割って clamp 比率 = (clamps /
-    /// elems) を出す。`--ft-fp16-out` 無しなら 0 のまま。
+    /// FT backward で FP16 書き込みを行った要素数の host-side cumulative counter。
+    /// `[fp16-clamp]` ratio の分母。各 element の clamp 発火は最大 1 回。
     fp16_clamp_elems_written: u64,
     /// step() 末の `loss_acc` 同期読みを async + 1-step lag に置換する pinned host ring。
     /// host が `stream.synchronize` を待たずに次 batch の launch を発行できるようになる。
@@ -211,6 +207,8 @@ pub(crate) struct GpuTrainer {
     /// true なら FT activation (`ft_*_out` forward 出力 / `dft_*_out` backward 勾配) も
     /// FP16 で保持する (`--ft-fp16-out`)。`ft_fp16` が true のときのみ true になりうる。
     ft_fp16_out: bool,
+    /// true なら FT post backward の 2 source を loss-scaled `f16` で保持する。
+    ft_fp16_dcombined: bool,
     /// true なら `ft_w` の Ranger moment (`m` / `v`) を `f16` で保持する
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
@@ -382,6 +380,8 @@ pub(crate) struct GpuWorkspace {
     ft_nstm_out_h: Option<DeviceBuffer<f16>>,  // b × ft_out
     dft_stm_out_h: Option<DeviceBuffer<f16>>,  // b × ft_out
     dft_nstm_out_h: Option<DeviceBuffer<f16>>, // b × ft_out
+    dcombined_from_l1f_h: Option<DeviceBuffer<f16>>, // b × ft_out
+    dcombined_from_l1_h: Option<DeviceBuffer<f16>>, // b × ft_out
 
     // -- inverse-index sparse_ft_backward scratch (sized by feature set) --
     feat_counts: DeviceBuffer<u32>, // ft_in: per-feature histogram (atomic build)
@@ -437,6 +437,7 @@ impl GpuWorkspace {
         l2_out: usize,
         num_buckets: usize,
         ft_fp16_out: bool,
+        ft_fp16_dcombined: bool,
         feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
@@ -498,8 +499,18 @@ impl GpuWorkspace {
             dl1_main_from_sqr: z(batch * l1_effective)?,
             dl1_main: z(batch * l1_effective)?,
             dl1_total: z(batch * l1_out)?,
-            dcombined_from_l1f: z(batch * ft_out)?,
-            dcombined_from_l1: z(batch * ft_out)?,
+            dcombined_from_l1f: z(if ft_fp16_dcombined {
+                ft_out
+            } else {
+                batch * ft_out
+            })?,
+            dcombined_from_l1: z(if ft_fp16_dcombined {
+                ft_out
+            } else {
+                batch * ft_out
+            })?,
+            dcombined_from_l1f_h: alloc_h(ft_fp16_dcombined)?,
+            dcombined_from_l1_h: alloc_h(ft_fp16_dcombined)?,
             dft_stm_out: z(ft_act_f32_n)?,
             dft_nstm_out: z(ft_act_f32_n)?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
@@ -935,6 +946,7 @@ impl GpuTrainer {
                 l2_out,
                 num_buckets,
                 precision.ft_fp16_out,
+                precision.ft_fp16_dcombined,
                 feature_set,
             )?,
             // loss + step
@@ -947,6 +959,7 @@ impl GpuTrainer {
             cublas: CublasHandle::new(&stream, precision.tf32)?,
             ft_fp16: precision.ft_fp16,
             ft_fp16_out: precision.ft_fp16_out,
+            ft_fp16_dcombined: precision.ft_fp16_dcombined,
             fp16_opt_state: precision.fp16_opt_state,
             feature_set,
             optim_groups,
@@ -2624,26 +2637,46 @@ impl GpuTrainer {
         prof_tick!("bwd_L1eff");
 
         // -- Backward 5 reverse: L1f shared dense grad --
+        // FP16 化の loss scaling 係数。dft / dcombined とも loss gradient 由来で 1/batch に
+        // 比例するため、batch 比例 scale で batch 非依存に f16 域へ載せる
+        // ([`FT_DFT_FP16_BASE_SCALE`])。dcombined は producer が `* dft_scale` で書き
+        // ft_post consumer が戻す。dft は ft_post grad kernel が `* dft_scale` で書き
+        // gather kernel が `* dft_inv_scale` で戻す。
+        let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
+        let dft_inv_scale = 1.0_f32 / dft_scale;
+
         // L1f input bwd: in_dim=ft_out, out_dim=l1_out。16×16 tile の kernel (block=256 =
         // 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)。out_dim は reduction 軸で、
         // kernel 内の 16 幅 out-tile loop で消化するため grid には現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_tiled,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.dl1_total),
-                slice(self.l1f_w),
-                slice_mut(self.ws.dcombined_from_l1f),
-                b_u32, ft_out as u32, l1_out as u32
-            ]
-        }?;
+        let l1f_input_cfg = LaunchConfig {
+            grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        if self.ft_fp16_dcombined {
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled_f16,
+                stream: self.stream, module: self.module, config: l1f_input_cfg,
+                args: [
+                    slice(self.ws.dl1_total), slice(self.l1f_w),
+                    slice_mut(self.ws.dcombined_from_l1f_h.as_mut()
+                        .expect("dcombined_from_l1f_h is Some when ft_fp16_dcombined is enabled")),
+                    b_u32, ft_out as u32, l1_out as u32, dft_scale,
+                    slice(self.fp16_clamp_counter)
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled,
+                stream: self.stream, module: self.module, config: l1f_input_cfg,
+                args: [
+                    slice(self.ws.dl1_total), slice(self.l1f_w),
+                    slice_mut(self.ws.dcombined_from_l1f),
+                    b_u32, ft_out as u32, l1_out as u32
+                ]
+            }?;
+        }
         // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
         // combined[batch, ft_out] row-major、dl1_total[batch, l1_out] row-major、reduce 軸は
         // batch。M = l1_out と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
@@ -2728,24 +2761,36 @@ impl GpuTrainer {
         // 1 対 1 で覆うため。padding 行は -1 で上記の write skip 対象)。
         // 16-row tile あたり w[bucket] を 1 回 shared load して L2 trip を削減する。
         // grid = (in-tile = ft_out/16, batch-tile = padded_b/16)。
-        cuda_launch! {
-            kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
-            stream: self.stream,
-            module: self.module,
-            config: LaunchConfig {
-                grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            args: [
-                slice(self.ws.dl1_total_sorted),
-                slice(self.l1_w),
-                slice(self.ws.bucket_idx_sorted_dev),
-                slice(self.ws.bucket_perm_dev),
-                slice_mut(self.ws.dcombined_from_l1),
-                padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-            ]
-        }?;
+        let l1_input_cfg = LaunchConfig {
+            grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        if self.ft_fp16_dcombined {
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter_f16,
+                stream: self.stream, module: self.module, config: l1_input_cfg,
+                args: [
+                    slice(self.ws.dl1_total_sorted), slice(self.l1_w),
+                    slice(self.ws.bucket_idx_sorted_dev), slice(self.ws.bucket_perm_dev),
+                    slice_mut(self.ws.dcombined_from_l1_h.as_mut()
+                        .expect("dcombined_from_l1_h is Some when ft_fp16_dcombined is enabled")),
+                    padded_b as u32, ft_out as u32, l1_out as u32,
+                    self.num_buckets as u32, dft_scale, slice(self.fp16_clamp_counter)
+                ]
+            }?;
+        } else {
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
+                stream: self.stream, module: self.module, config: l1_input_cfg,
+                args: [
+                    slice(self.ws.dl1_total_sorted), slice(self.l1_w),
+                    slice(self.ws.bucket_idx_sorted_dev), slice(self.ws.bucket_perm_dev),
+                    slice_mut(self.ws.dcombined_from_l1),
+                    padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                ]
+            }?;
+        }
         prof_tick!("bwd_L1_inB");
         // L1 bias backward (sorted): 1 block = sorted batch の連続 16 行の per-block
         // shared-mem reduce で global atomic 数を削減する。dl1_total_sorted /
@@ -2769,19 +2814,85 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1");
 
-        // dft (FT activation gradient) FP16 化の loss scaling 係数。dft ∝ 1/batch なので
-        // batch 比例にして batch 非依存に f16 域へ載せる ([`FT_DFT_FP16_BASE_SCALE`])。
-        // grad kernel が `* dft_scale` で書き、gather kernel が `* dft_inv_scale` で戻す。
-        let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
-        let dft_inv_scale = 1.0_f32 / dft_scale;
-
         // -- Backward 3 reverse: ft_post_perspective_grad fused × 2 (stm, nstm) --
         // `dy = dcombined_from_l1 + dcombined_from_l1f` を fused kernel が in-register
         // で計算、合算済 buffer の materialize と read-back の DRAM roundtrip を避ける。
         // `ft_fp16_out` 時は forward activation `ft_*_out` を f16 で読み、dft 出力も f16
         // で書く版 (`ft_post_perspective_grad_fused_fp16`)。`d_combined_*` / `ft_b` /
         // `ft_b_grad` は両 path とも f32。stm: d_combined_offset = 0、nstm: = ft_out/2。
-        if self.ft_fp16_out {
+        if self.ft_fp16_dcombined && self.ft_fp16_out {
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_fp16_f16_dcombined,
+                stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1_h.as_ref().expect(
+                        "dcombined_from_l1_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.dcombined_from_l1f_h.as_ref().expect(
+                        "dcombined_from_l1f_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.ft_stm_out_h.as_ref().expect(
+                        "ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_stm_out_h.as_mut().expect(
+                        "dft_stm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b_grad),
+                    b_u32, ft_out as u32, 0_u32, ft_out as u32, FT_POST_SCALE,
+                    dft_inv_scale, dft_scale, slice(self.fp16_clamp_counter)
+                ]
+            }?;
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_fp16_f16_dcombined,
+                stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1_h.as_ref().expect(
+                        "dcombined_from_l1_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.dcombined_from_l1f_h.as_ref().expect(
+                        "dcombined_from_l1f_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.ft_nstm_out_h.as_ref().expect(
+                        "ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b),
+                    slice_mut(self.ws.dft_nstm_out_h.as_mut().expect(
+                        "dft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                    slice(self.ft_b_grad),
+                    b_u32, ft_out as u32, (ft_out / 2) as u32, ft_out as u32, FT_POST_SCALE,
+                    dft_inv_scale, dft_scale, slice(self.fp16_clamp_counter)
+                ]
+            }?;
+            self.fp16_clamp_elems_written = self
+                .fp16_clamp_elems_written
+                .saturating_add(4_u64 * b as u64 * ft_out as u64);
+        } else if self.ft_fp16_dcombined {
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_f16_dcombined,
+                stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1_h.as_ref().expect(
+                        "dcombined_from_l1_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.dcombined_from_l1f_h.as_ref().expect(
+                        "dcombined_from_l1f_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.ft_stm_out), slice(self.ft_b),
+                    slice_mut(self.ws.dft_stm_out), slice(self.ft_b_grad),
+                    b_u32, ft_out as u32, 0_u32, ft_out as u32, FT_POST_SCALE,
+                    dft_inv_scale
+                ]
+            }?;
+            cuda_launch! {
+                kernel: ft_post_perspective_grad_fused_f16_dcombined,
+                stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 2),
+                args: [
+                    slice(self.ws.dcombined_from_l1_h.as_ref().expect(
+                        "dcombined_from_l1_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.dcombined_from_l1f_h.as_ref().expect(
+                        "dcombined_from_l1f_h is Some when ft_fp16_dcombined is enabled")),
+                    slice(self.ws.ft_nstm_out), slice(self.ft_b),
+                    slice_mut(self.ws.dft_nstm_out), slice(self.ft_b_grad),
+                    b_u32, ft_out as u32, (ft_out / 2) as u32, ft_out as u32, FT_POST_SCALE,
+                    dft_inv_scale
+                ]
+            }?;
+            self.fp16_clamp_elems_written = self
+                .fp16_clamp_elems_written
+                .saturating_add(2_u64 * b as u64 * ft_out as u64);
+        } else if self.ft_fp16_out {
             cuda_launch! {
                 kernel: ft_post_perspective_grad_fused_fp16,
                 stream: self.stream,

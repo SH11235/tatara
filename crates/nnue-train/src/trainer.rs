@@ -1358,6 +1358,7 @@ mod tests {
             tf32: false,
             ft_fp16: false,
             ft_fp16_out: false,
+            ft_fp16_dcombined: false,
             fp16_opt_state: false,
             threads: 1,
         }

@@ -15,6 +15,8 @@ pub(crate) struct PrecisionFlags {
     pub(crate) ft_fp16: bool,
     /// FT activation とその gradient を FP16 で保持する。`ft_fp16` を必要とする。
     pub(crate) ft_fp16_out: bool,
+    /// LayerStack の FT post backward 入力を FP16 で保持する。
+    pub(crate) ft_fp16_dcombined: bool,
     /// FT weight の optimizer moment を scale 付き FP16 で保持する。
     pub(crate) fp16_opt_state: bool,
 }

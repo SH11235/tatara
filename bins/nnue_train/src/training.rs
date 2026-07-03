@@ -418,6 +418,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
              fp16_opt_state={fp16_opt_state} tf32={tf32}"
         );
     }
+    if layerstack.ft_fp16_dcombined {
+        println!("[train] ft_fp16_dcombined=true (independent of --all-optim)");
+    }
     let norm_loss_factor = if cli.norm_loss {
         println!(
             "[train] norm loss active (factor = {})",
@@ -515,6 +518,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             tf32,
             ft_fp16,
             ft_fp16_out,
+            ft_fp16_dcombined: layerstack.ft_fp16_dcombined,
             fp16_opt_state,
         },
         feature_set,
@@ -1296,6 +1300,7 @@ pub(crate) fn build_experiment_logger(
         tf32: layerstack.tf32 || cli.all_optim,
         ft_fp16: cli.ft_fp16 || cli.all_optim,
         ft_fp16_out: layerstack.ft_fp16_out || cli.all_optim,
+        ft_fp16_dcombined: layerstack.ft_fp16_dcombined,
         fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
         threads: cli.threads,
     };
@@ -1450,6 +1455,7 @@ pub(crate) fn build_experiment_logger_simple(
         tf32,
         ft_fp16,
         ft_fp16_out,
+        ft_fp16_dcombined: false,
         fp16_opt_state,
         threads: cli.threads,
     };
@@ -1650,6 +1656,7 @@ pub(crate) fn run_simple_training(
             tf32,
             ft_fp16,
             ft_fp16_out,
+            ft_fp16_dcombined: false,
             fp16_opt_state,
         },
         &init_spec,

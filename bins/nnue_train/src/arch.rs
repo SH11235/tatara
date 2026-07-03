@@ -61,7 +61,7 @@ mod gpu {
     pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;
     pub(crate) const L1_SQR_SCALE: f32 = 127.0 / 128.0;
 
-    /// `--ft-fp16-out` で dft (FT activation gradient) を `f16` 化するときの loss scaling
+    /// FT backward gradient buffer を `f16` 化するときの loss scaling
     /// 基準係数。実際に使う scale は **`FT_DFT_FP16_BASE_SCALE * batch`** (caller が batch を
     /// 掛ける)。
     ///
