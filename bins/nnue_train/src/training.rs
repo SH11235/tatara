@@ -11,15 +11,20 @@ use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
-use nnue_train::schedule::{LrSchedulerEnum, WdlScheduler, WdlSchedulerEnum};
+#[cfg(feature = "gpu")]
+use nnue_train::schedule::WdlScheduler;
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
 #[cfg(feature = "gpu")]
 use nnue_train::trainer::{LossKind, TrainingConfig};
 #[cfg(feature = "gpu")]
 use shogi_features::ThreatProfile;
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+#[cfg(any(feature = "gpu", test))]
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
+#[cfg(any(feature = "gpu", test))]
 use crate::cli::*;
 #[cfg(feature = "gpu")]
 use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
@@ -68,6 +73,7 @@ fn gpu_oom_error(
     msg.into()
 }
 
+#[cfg(any(feature = "gpu", test))]
 #[derive(Clone, Copy)]
 struct SharedPrecisionFlags {
     ft_fp16: bool,
@@ -76,11 +82,13 @@ struct SharedPrecisionFlags {
     tf32: bool,
 }
 
+#[cfg(any(feature = "gpu", test))]
 struct SharedCliValidation {
     feature_set: FeatureSetSpec,
     precision: SharedPrecisionFlags,
 }
 
+#[cfg(any(feature = "gpu", test))]
 impl SharedCliValidation {
     fn start_superbatch(
         &self,
@@ -97,6 +105,7 @@ impl SharedCliValidation {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn validate_shared_cli(
     cli: &Cli,
     ft_fp16_out_raw: bool,
@@ -728,6 +737,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
 /// PSV 教師データ 1 局面のバイト数 (`shogi_format::PackedSfenValue` = `[u8; 40]`)。
 /// crate 側 `nnue_train::dataloader::PSV_RECORD_BYTES` を re-export している。
+#[cfg(feature = "gpu")]
 pub(crate) use nnue_train::dataloader::PSV_RECORD_BYTES;
 
 /// LayerStack network の architecture 記述子 (FT → L1 → L2、progress N-bucket)。
@@ -756,6 +766,7 @@ pub(crate) fn layerstack_architecture(
 /// `resumed_horizon` は v5+ checkpoint から復元した保存済 horizon ([`crate::ckpt`])。
 /// 指定時は `--superbatches` 由来の default より優先され、curve が `--superbatches`
 /// から独立に再現される。優先順位は [`resolve_lr_horizon`] 参照。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_lr_scheduler(
     cli: &Cli,
     resumed_horizon: Option<usize>,
@@ -867,6 +878,7 @@ pub(crate) fn build_lr_scheduler(
 ///
 /// resume 時に保存 horizon が default を上書きする / 明示 flag が保存 horizon を
 /// 上書きする場合は operator 向けに 1 行 note を出す。
+#[cfg(any(feature = "gpu", test))]
 fn resolve_lr_horizon(explicit: Option<usize>, resumed: Option<usize>, default: usize) -> usize {
     match (explicit, resumed) {
         (Some(e), Some(saved)) => {
@@ -890,6 +902,7 @@ fn resolve_lr_horizon(explicit: Option<usize>, resumed: Option<usize>, default: 
 
 /// linear / cosine / exponential 減衰の終端パラメータを検証する。`require_positive`
 /// は exponential 用 (幾何補間 `(final/initial)^lambda` のため `final_lr > 0` を要求)。
+#[cfg(any(feature = "gpu", test))]
 fn validate_decay(
     final_lr: f32,
     final_superbatch: usize,
@@ -1029,6 +1042,7 @@ pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::
 /// `--end-wdl` の同時指定は clap の `conflicts_with` で parse 時に reject される。
 /// すべての値が finite かつ `[0.0, 1.0]` であることを要求する (kernel に NaN /
 /// 範囲外を流さない)。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_wdl_scheduler(
     cli: &Cli,
 ) -> Result<WdlSchedulerEnum, Box<dyn std::error::Error>> {
@@ -1466,7 +1480,7 @@ pub(crate) fn build_experiment_logger_simple(
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
 /// 形式不一致や非整数は `--arch` の不正値として `InvalidInput` で返す。
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn parse_simple_preset(
     s: &str,
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
@@ -1832,6 +1846,7 @@ mod shared_cli_tests {
 
         let shared =
             validate_shared_cli(&parse(&["--all-optim"]), false, false).expect("valid shared CLI");
+        assert_eq!(shared.feature_set, FeatureSet::HalfKaHmMerged.spec());
         assert!(shared.precision.ft_fp16);
         assert!(shared.precision.ft_fp16_out);
         assert!(shared.precision.fp16_opt_state);
@@ -1855,19 +1870,6 @@ mod shared_cli_tests {
             shared.start_superbatch(&cli, None).unwrap_err().to_string(),
             "--start-superbatch must be >= 1 (1-indexed)"
         );
-    }
-}
-
-#[cfg(all(test, feature = "gpu"))]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    fn parse(extra: &[&str]) -> Cli {
-        let mut argv = vec!["nnue-trainer"];
-        argv.extend_from_slice(extra);
-        argv.push("layerstack");
-        Cli::try_parse_from(argv).expect("cli parse")
     }
 
     #[test]
@@ -1896,6 +1898,19 @@ mod tests {
         // parse 自体は 0 を通す (型上は非負整数)。0 次元の reject は
         // `run_simple_training` の次元検証が担う。
         assert_eq!(parse_simple_preset("0x2-0-0").unwrap(), (0, 0, 0));
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut argv = vec!["nnue-trainer"];
+        argv.extend_from_slice(extra);
+        argv.push("layerstack");
+        Cli::try_parse_from(argv).expect("cli parse")
     }
 
     #[test]

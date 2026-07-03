@@ -51,7 +51,9 @@ jobs:
       # `scripts/local-ci.sh` で別途回す)。
       - name: cargo clippy
         if: steps.ws.outputs.empty == 'false'
-        run: cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
+          cargo clippy -p nnue-trainer --no-default-features --all-targets -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'

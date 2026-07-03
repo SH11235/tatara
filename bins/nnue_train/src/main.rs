@@ -1,4 +1,4 @@
-#![feature(f16)]
+#![cfg_attr(feature = "gpu", feature(f16))]
 //! `bins/nnue_train` binary entry point — NNUE trainer。
 //!
 //! 本 file は bin entry point (`fn main`) と module 宣言を持つ。`#[kernel]` device
@@ -18,6 +18,7 @@ use clap::Parser;
 // ===========================================================================
 
 mod arch;
+#[cfg(any(feature = "gpu", test))]
 mod ckpt;
 mod cli;
 #[cfg(feature = "gpu")]

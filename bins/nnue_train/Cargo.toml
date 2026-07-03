@@ -11,6 +11,7 @@ rust-version = { workspace = true }
 publish = false
 
 [features]
+# `--no-default-features` は CI 用の CPU-testable subset のみを compile し、生成 binary では学習を実行できない。
 default = ["gpu"]
 gpu = [
     "dep:cuda-core",

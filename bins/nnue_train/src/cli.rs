@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+#[cfg(any(feature = "gpu", test))]
 use nnue_format::ArchKind;
 
 use crate::arch::*;
@@ -485,6 +486,7 @@ pub(crate) enum LrScheduleArg {
 /// 「`--ft-fp16-out` が raw 指定されていて、`--all-optim` も無く、`--ft-fp16` も raw 指定
 /// されていない」ときのみ。これにより `--all-optim --ft-fp16-out` (冗長指定) を
 /// false-positive reject しない。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn ft_fp16_out_missing_ft_fp16(
     ft_fp16_out_raw: bool,
     ft_fp16_raw: bool,
@@ -505,6 +507,7 @@ pub(crate) enum ArchCommand {
 
 impl ArchCommand {
     /// サブコマンドに対応する [`ArchKind`]。
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) fn kind(&self) -> ArchKind {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
@@ -684,6 +687,7 @@ impl LayerstackArgs {
     /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は
     /// 呼び出し側 (`run_training`) が auto-suppress で解決するため、ここには
     /// 含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) fn ft_factorize_enabled(&self) -> bool {
         !self.no_ft_factorize
     }

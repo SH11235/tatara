@@ -189,6 +189,7 @@ pub(crate) const fn layerstack_topology(
 /// (`[..., num_buckets, num_buckets]`, 5 dims) を `topo_count` で弁別可能にする。
 /// `--resume` で PSQT 有無を跨ぐ load は dim 数不一致で reject される。PSQT bucket
 /// は LayerStack bucket と必ず一致するため同 `num_buckets` を 2 回書く。
+#[cfg(feature = "gpu")]
 pub(crate) const fn layerstack_topology_with_psqt(
     ft_out: usize,
     l1_out: usize,
