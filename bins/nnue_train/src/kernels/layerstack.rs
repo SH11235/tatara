@@ -4,6 +4,7 @@
 //! - atomics は host が呼出前に gradient buffer を 0 初期化する accumulate semantics
 //! - DisjointSlice<f32> は 1 thread = 1 cell の排他書き込み、&[f32] + raw atomic は
 //!   多 thread → 1 cell の atomic accumulate
+//! - perm を使う non-atomic scatter は caller が real row に対する単射性を保証する
 //! - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32, DeviceAtomicU64};
@@ -1424,6 +1425,9 @@ pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets
     } else {
         num_buckets
     };
+    // SAFETY: `counts.len() == num_buckets + 1` (caller 契約) かつ
+    // `bin <= num_buckets`。`u32` と `DeviceAtomicU32` は同 layout で、本 kernel 中の
+    // 書き込みは atomic add のみ。
     unsafe {
         let atom = &*(counts.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
         atom.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1449,6 +1453,8 @@ pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u3
         if rem != 0 {
             acc += align - rem;
         }
+        // SAFETY: `offsets.len() == n` (caller 契約) かつ `i < n`。kernel は thread 0
+        // だけが実行するため、書き込みは他 thread と競合しない。
         unsafe {
             let dst = offsets.as_ptr().add(i) as *mut u32;
             *dst = acc;
@@ -1488,6 +1494,10 @@ pub fn scatter_bucket_perm(
         atom.fetch_add(1, AtomicOrdering::Relaxed)
     };
     let dst = (offsets[bin as usize] + rank) as usize;
+    // SAFETY: `perm.len() == sorted_bucket.len() == padded_batch`、`offsets[bin]` は
+    // bucket の確保範囲先頭、`rank < counts[bin]` なので `dst < padded_batch`
+    // (caller 契約)。atomic increment が bucket 内 rank を一意にするため、各 thread
+    // の書き込み先は重ならない。
     unsafe {
         let perm_dst = perm.as_ptr().add(dst) as *mut i32;
         *perm_dst = tid.get() as i32;
@@ -1541,6 +1551,11 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
         return;
     }
     let dst_idx = (dst_row as usize) * (dim as usize) + col;
+    // SAFETY: `batch` は padding 込みの入力行数で、`output` は実 batch 行 (≤ batch)
+    // しか確保されない。caller 契約: `perm` の real entry は原 batch row index
+    // (< 実 batch 行数) の単射、padding 行は `perm = -1` で上の guard により skip。
+    // よって書き込みは `dst_row < 実 batch 行数` / `col < dim` に収まり、各
+    // (dst_row, col) は thread 間で重ならない。
     unsafe {
         let dst = output.as_ptr().add(dst_idx) as *mut f32;
         *dst = input[tid.get()];
