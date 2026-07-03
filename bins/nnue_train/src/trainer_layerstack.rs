@@ -98,6 +98,7 @@ impl<'a> StepContext<'a> {
 pub(crate) struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
+    device_occupancy: DeviceOccupancy,
 
     // FT (single, shared across perspectives)
     ft_w: DeviceBuffer<f32>,
@@ -738,6 +739,7 @@ impl GpuTrainer {
         );
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
+        let device_occupancy = DeviceOccupancy::query(ctx)?;
 
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
@@ -850,6 +852,7 @@ impl GpuTrainer {
         let mut trainer = Self {
             stream: stream.clone(),
             module,
+            device_occupancy,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
             ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
@@ -2423,7 +2426,7 @@ impl GpuTrainer {
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: (256, 1, 1),
+                grid_dim: (self.device_occupancy.fill_blocks(l3_block), 1, 1),
                 block_dim: (l3_block, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -2490,7 +2493,11 @@ impl GpuTrainer {
             stream: self.stream,
             module: self.module,
             config: LaunchConfig {
-                grid_dim: ((l2_out * l2_in).div_ceil(256) as u32, 256, 1),
+                grid_dim: (
+                    (l2_out * l2_in).div_ceil(256) as u32,
+                    self.device_occupancy.fill_blocks(256),
+                    1,
+                ),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             },

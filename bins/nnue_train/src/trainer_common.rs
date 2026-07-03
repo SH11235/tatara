@@ -375,9 +375,9 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
 /// caller は out_dim がこれを超える層では generic `bias_grad` に fall back する。
 pub(crate) const DENSE_BIAS_GRAD_MAX_OUT: u32 = 256;
 
-/// Grid sizing 用の device occupancy パラメータ。`dense_bias_grad_tiled` の grid 上限を
-/// 実機の SM 数から導出するため、trainer 構築時に 1 度だけ問い合わせて保持する。特定
-/// GPU 固定の grid 上限を避けるためのもの。
+/// Grid sizing 用の device occupancy パラメータ。grid 上限を実機の SM 数から導出する
+/// ため、trainer 構築時に 1 度だけ問い合わせて保持する。特定 GPU 固定の grid 上限を
+/// 避けるためのもの。
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceOccupancy {
     /// SM 数 (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`)。
@@ -418,11 +418,10 @@ impl DeviceOccupancy {
 
     /// `block_dim` thread の block で全 SM を thread 占有上限まで埋める block 数
     /// `sm_count * floor(max_threads_per_sm / block_dim)`。grid をこれ以上に増やしても
-    /// occupancy は頭打ちで、`dense_bias_grad_tiled` では per-cell global atomic contention
-    /// (= gridDim) だけが増える。本 kernel の `block_dim` は常に ~128 以上 (`R * out_dim`、
-    /// `R` は 2 冪、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`) なので thread 占有が SM あたり
-    /// 常駐 block 数のハード上限より先に効き、その上限の別途クランプは要らない。
-    fn fill_blocks(self, block_dim: u32) -> u32 {
+    /// occupancy は頭打ちになる。caller の `block_dim` は常に ~128 以上なので thread
+    /// 占有が SM あたり常駐 block 数のハード上限より先に効き、その上限の別途クランプは
+    /// 要らない。
+    pub(crate) fn fill_blocks(self, block_dim: u32) -> u32 {
         let per_sm = (self.max_threads_per_sm / block_dim.max(1)).max(1);
         self.sm_count.saturating_mul(per_sm).max(1)
     }
