@@ -2000,6 +2000,7 @@ impl SimpleGpuTrainer {
                     config: cfg_1d(b * self.ws.max_active),
                     args: [
                         slice(idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.feat_counts),
                         b_u32, max_active_u32, ft_in_u32
                     ]
@@ -2078,6 +2079,7 @@ impl SimpleGpuTrainer {
                     config: cfg_1d(b * self.ws.max_active),
                     args: [
                         slice(idx_dev),
+                        slice(self.ws.nnz_dev),
                         slice(self.ws.feat_offsets),
                         slice(self.ws.feat_write_ctr),
                         slice(self.ws.feat_positions),

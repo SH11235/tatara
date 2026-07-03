@@ -12,8 +12,10 @@
 //!   本 dataloader は `score` (raw cp) と `wdl` (game result `{0, 0.5, 1}`) を
 //!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
 //! - sparse index は feature set の最大 active 数 (`FeatureSetSpec::max_active`)
-//!   で固定容量を持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward`
-//!   kernel は position ごとの `nnz` まで走査し、`-1` も防御的に silent skip する規約
+//!   で固定容量を持つ。有効 slot は position ごとの `nnz` で決まり、下流 kernel は
+//!   `nnz` までしか走査しない。実長超の slot の内容は未規定 (`Batch` reuse で前 batch
+//!   の残骸が残りうる) — `-1` / 範囲外 index の防御 skip は残すが、正しさは `nnz`
+//!   打ち切りが担保する
 //! - 並列 prefetch は `std::thread::spawn` + `std::sync::mpsc::sync_channel` の
 //!   minimal wrapper として [`PrefetchedLoader`] (single-thread worker) と
 //!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
@@ -41,15 +43,17 @@ pub const PSV_RECORD_BYTES: u64 = 40;
 /// 1 batch 分の feature-set sparse + score/wdl/norm。
 ///
 /// - `stm_indices` / `nstm_indices`: shape `[batch_size, max_active]` を flatten
-///   (row-major、`bi * max_active + j` で参照)。`-1` padding で未使用 slot を
-///   埋める (`sparse_ft_forward` kernel の silent-skip semantics と整合)
+///   (row-major、`bi * max_active + j` で参照)。有効 slot は各行の先頭 `nnz[bi]` 個で、
+///   実長超の slot の内容は未規定 (`reset` は clear せず、下流 kernel は `nnz` 打ち切りで
+///   読まない)。`with_capacity` は初期値として `-1` を入れるが依存してはならない
 /// - `score`: raw cp (`PackedSfenValue::score` の i16 を f32 cast)
 /// - `wdl`: game result を `{0.0, 0.5, 1.0}` に正規化 (Loss → 0.0, Draw → 0.5,
 ///   Win → 1.0)
 /// - `per_pos_norm`: batch averaging 用 weight (default 1.0、trainer 側で
 ///   override 可能)
-/// - `n_positions`: 実際に詰めた数 (`< batch_size` の場合、末尾は uninitialised
-///   ではなく `0` / `-1` で保持される)
+/// - `n_positions`: 実際に詰めた数。下流はどの buffer も `n_positions` (index は
+///   `n_positions * max_active`) までしか読まないため、`[n_positions, batch_size)` の
+///   末尾行の内容は未規定
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub batch_size: usize,
@@ -87,32 +91,26 @@ impl Batch {
         }
     }
 
-    /// 既存 `Batch` を再利用 (alloc 削減)。全 slot を `-1` / `0.0` / `1.0` に
-    /// reset する。`PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の
-    /// ring-buffer return path (消費済み `Batch` を pool channel 経由で worker に
-    /// 返して `reset()` で再利用) の両方で使われる。
+    /// 既存 `Batch` を再利用 (alloc 削減)。`n_positions` を 0 に戻すだけの O(1) 操作。
+    /// `PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の ring-buffer return
+    /// path (消費済み `Batch` を pool channel 経由で worker に返して `reset()` で再利用)
+    /// の両方で使われる。
+    ///
+    /// index / score / wdl / norm buffer は clear しない。次の fill で `push_decoded`
+    /// が position `bi < n_positions` の slot `[0, nnz[bi])` と `score[bi]` / `wdl[bi]` /
+    /// `nnz[bi]` を上書きし、下流はどの buffer も `n_positions` (index は `n_positions *
+    /// max_active`) までしか読まない (`BatchData::from_batch_inner` の slice、kernel の
+    /// `b = n_positions` launch、per-slot kernel の `nnz` early-out)。実長超の slot や
+    /// `[n_positions, batch_size)` の行に前 batch の残骸が残るが、上流にも下流にも
+    /// 観測されない。`per_pos_norm` Vec は下流が scalar `1/n_pos` を再計算するため未使用。
     pub fn reset(&mut self) {
-        for v in &mut self.stm_indices {
-            *v = -1;
-        }
-        for v in &mut self.nstm_indices {
-            *v = -1;
-        }
-        for v in &mut self.score {
-            *v = 0.0;
-        }
-        for v in &mut self.wdl {
-            *v = 0.0;
-        }
-        for v in &mut self.per_pos_norm {
-            *v = 1.0;
-        }
         self.n_positions = 0;
     }
 
     /// 1 position を batch に追加。`Ok(true)` 成功、`Ok(false)` は batch 満杯、
     /// `Err` は active feature 数が `max_active` を超過 (下記参照)。`feature_set`
-    /// の indexer で sparse index を slot に fill (残りは `-1` padding)。
+    /// の indexer が実 active index を行の先頭 `nnz[bi]` slot に書き、`nnz[bi]` を
+    /// 記録する (実長超の slot は書かない — 下流は `nnz` までしか読まない契約)。
     ///
     /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
     /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
@@ -1108,7 +1106,9 @@ mod tests {
         // sample.psv の 100 records しかない → 100 で打ち切り。
         assert_eq!(n, 100);
         assert_eq!(batch.n_positions, 100);
-        // 残り 150-100=50 slot は padding のまま (-1 / 0.0 / 1.0)。
+        // 末尾 50 行は fill が touch しない。fresh batch なので `with_capacity` の初期値
+        // (-1 / 0.0) のまま (`reset` は buffer を clear しないが、初回 fill では
+        // with_capacity 初期化がそのまま残る)。下流はこの領域を読まない。
         for j in 100 * test_spec().max_active()..150 * test_spec().max_active() {
             assert_eq!(batch.stm_indices[j], -1);
         }
@@ -1237,16 +1237,81 @@ mod tests {
         assert!(total > 0, "on では position が集計される");
     }
 
+    /// `reset` は `n_positions` を 0 に戻すだけの O(1) 操作で、index / score buffer を
+    /// clear しない。再 fill 後、`nnz` 打ち切りで読む有効領域は前 batch の残骸に汚染
+    /// されない (下流 kernel の per-slot early-out と同じ不変条件を host 側で検証する)。
     #[test]
-    fn batch_reset_zeros_state() {
-        let mut batch = Batch::with_capacity(4, test_spec());
-        let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        loader.fill_batch(&mut batch).unwrap();
-        assert_eq!(batch.n_positions, 4);
+    fn reset_is_o1_and_refill_ignores_stale_residue() {
+        let spec = test_spec();
+        let max_active = spec.max_active();
+        // batch_size > sample.psv の record 数 (100) にして、`[n_positions, batch_size)`
+        // の残骸 row が必ず存在する状態を作る (実長超 slot の有無に依存しない)。
+        let cap = 150;
+        let mut batch = Batch::with_capacity(cap, spec);
+
+        // 1 回目の fill (100 record で打ち切り)。各 row の有効 index を記録しておく。
+        PsvFileLoader::new(sample_psv_path())
+            .unwrap()
+            .fill_batch(&mut batch)
+            .unwrap();
+        let n_pos = batch.n_positions;
+        assert_eq!(n_pos, 100);
+        let valid_snapshot: Vec<Vec<i32>> = (0..n_pos)
+            .map(|bi| {
+                let base = bi * max_active;
+                batch.stm_indices[base..base + batch.nnz[bi] as usize].to_vec()
+            })
+            .collect();
+
+        // 「前 batch の残骸」を模した範囲内 index を実長超 slot (row 内 tail) と
+        // `[n_pos, cap)` の未使用 row に書き込む (`idx >= 0` 防御 skip を素通りする値)。
+        for bi in 0..n_pos {
+            for ni in batch.nnz[bi] as usize..max_active {
+                batch.stm_indices[bi * max_active + ni] = 7;
+                batch.nstm_indices[bi * max_active + ni] = 7;
+            }
+        }
+        for j in n_pos * max_active..cap * max_active {
+            batch.stm_indices[j] = 7;
+        }
+        batch.score[cap - 1] = 12_345.0;
+
+        // reset は index / score を clear しない (残骸が残ることで O(1) 化を確認)。
         batch.reset();
         assert_eq!(batch.n_positions, 0);
-        assert!(batch.stm_indices.iter().all(|&i| i == -1));
-        assert!(batch.score.iter().all(|&s| s == 0.0));
+        assert_eq!(
+            batch.stm_indices[n_pos * max_active],
+            7,
+            "reset は index buffer を clear しない (残骸 row が残る)"
+        );
+        assert_eq!(
+            batch.score[cap - 1],
+            12_345.0,
+            "reset は score buffer を clear しない"
+        );
+
+        // 2 回目の fill。同一ファイル先頭からなので各 row は同じ局面で埋まる。
+        PsvFileLoader::new(sample_psv_path())
+            .unwrap()
+            .fill_batch(&mut batch)
+            .unwrap();
+        assert_eq!(batch.n_positions, n_pos);
+
+        // 下流が読む領域 (`nnz` 打ち切り / `n_pos` 行) は 1 回目と bit 一致し、
+        // 残骸 (7) を含まない。tail / `[n_pos, cap)` の 7 は下流に観測されない。
+        for (bi, expected) in valid_snapshot.iter().enumerate() {
+            let base = bi * max_active;
+            let n = batch.nnz[bi] as usize;
+            assert_eq!(
+                &batch.stm_indices[base..base + n],
+                expected.as_slice(),
+                "position {bi} の有効 slot は新データのみ (残骸は nnz 打ち切りで除外)"
+            );
+            assert!(
+                batch.stm_indices[base..base + n].iter().all(|&i| i >= 0),
+                "position {bi} の有効 slot に padding/残骸が混入していない"
+            );
+        }
     }
 
     #[test]

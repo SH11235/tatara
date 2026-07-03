@@ -1089,11 +1089,30 @@ pub fn ft_reduce_virtual_grad(
 /// Phase 1 of inverse-index sparse_ft_backward: per-feature 出現回数を histogram。
 /// `counts[f]` に (b, slot) で `indices[b*nnz+slot] == f` の数を atomic accumulate。
 /// host が呼出前に `counts` を 0 reset。
+///
+/// 1 thread = 1 (b, slot)。`nnz_arr[b]` は position b の実 active 数で、`slot >=
+/// nnz_arr[b]` の padding slot は index を DRAM から読む前に捨てる (dataloader が
+/// padding slot を `-1` で埋めない契約に更新されたため、実長超の slot は前 batch の
+/// 残骸を持ちうる。`idx >= 0 && idx < cols` の防御 skip だけでは有効範囲内の残骸を
+/// 除外できないので、実長で必ず打ち切る)。caller は `nnz_arr.len() == batch`、
+/// `0 <= nnz_arr[b] <= nnz` を保証する。
 #[kernel]
-pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u32, cols: u32) {
+pub fn build_feature_counts(
+    indices: &[i32],
+    nnz_arr: &[i32],
+    counts: &[u32],
+    batch: u32,
+    nnz: u32,
+    cols: u32,
+) {
     let tid = thread::index_1d();
     let total = (batch as usize) * (nnz as usize);
     if tid.get() >= total {
+        return;
+    }
+    let b = tid.get() / (nnz as usize);
+    let slot = tid.get() % (nnz as usize);
+    if (slot as i32) >= nnz_arr[b] {
         return;
     }
     let idx = indices[tid.get()];
@@ -1293,9 +1312,16 @@ pub fn prefix_sum_add_block_offset(
 /// Phase 3 of inverse-index: 各 (b, slot) を inverse 順 (feature 別) に配置。
 /// `write_counters[f]` を atomic increment、`positions[offsets[f] + write_counters[f]] = bi`。
 /// host が呼出前に `write_counters` を 0 reset。
+///
+/// 1 thread = 1 (b, slot)。`build_feature_counts` と同じく `slot >= nnz_arr[b]` の
+/// padding slot は index load 前に捨てる (両 kernel が同じ実長で打ち切ることで counts
+/// と positions が整合し、`gather_and_sum_per_feature_*` が読む区間長 = offsets 差分と
+/// 一致する)。caller は `nnz_arr.len() == batch`、`0 <= nnz_arr[b] <= nnz` を保証する。
+#[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn scatter_positions(
     indices: &[i32],
+    nnz_arr: &[i32],
     offsets: &[u32],
     write_counters: &[u32],
     positions: &[u32],
@@ -1308,7 +1334,12 @@ pub fn scatter_positions(
     if tid.get() >= total {
         return;
     }
-    let bi = (tid.get() / (nnz as usize)) as u32;
+    let b = tid.get() / (nnz as usize);
+    let slot = tid.get() % (nnz as usize);
+    if (slot as i32) >= nnz_arr[b] {
+        return;
+    }
+    let bi = b as u32;
     let idx = indices[tid.get()];
     if idx >= 0 && (idx as u32) < cols {
         let cell =

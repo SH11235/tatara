@@ -3848,17 +3848,28 @@ fn sparse_ft_backward_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 /// `scatter_positions`) を単体照合する。counts / offsets は決定論的 (u32 完全一致)。
 /// positions は feature 区間内の並びが atomic write counter の獲得順に依存して
 /// 非決定的なため、区間ごとに sort して多重集合として比較する。
+///
+/// ragged fixture で各 row の実長を変え、`nnz_arr` early-out を exercise する。さらに
+/// 実長超 slot を範囲内のゴミで汚しても counts / offsets / positions が不変であること
+/// (per-slot kernel が `nnz` までしか読まない契約) を確認する。
 #[test]
 fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, nnz, ft_in) = (6_usize, 6_usize, 9_usize);
-    let indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
+    let (batch, max_active, ft_in) = (6_usize, 6_usize, 9_usize);
+    let (mut indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
+    // 実長超 slot を範囲内 index で汚す (kernel が全幅走査すると counts が変わる)。
+    for bi in 0..batch {
+        for ni in nnz[bi] as usize..max_active {
+            indices[bi * max_active + ni] = ((bi + ni + 1) % ft_in) as i32;
+        }
+    }
 
+    // CPU reference は実長 (`nnz[bi]`) までのみ集計する。
     let mut counts_cpu = vec![0_u32; ft_in];
     let mut segments_cpu: Vec<Vec<u32>> = vec![Vec::new(); ft_in];
     for bi in 0..batch {
-        for ni in 0..nnz {
-            let idx = indices[bi * nnz + ni];
+        for ni in 0..nnz[bi] as usize {
+            let idx = indices[bi * max_active + ni];
             if idx >= 0 && (idx as usize) < ft_in {
                 counts_cpu[idx as usize] += 1;
                 segments_cpu[idx as usize].push(bi as u32);
@@ -3869,22 +3880,25 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
     for f in 0..ft_in {
         offsets_cpu[f + 1] = offsets_cpu[f] + counts_cpu[f];
     }
+    let total_valid = offsets_cpu[ft_in] as usize;
     for seg in &mut segments_cpu {
         seg.sort_unstable();
     }
 
     let idx_dev = DeviceBuffer::from_host(&stream, &indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let counts_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
-    let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * max_active)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: build_feature_counts, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+            config: cfg_1d(batch * max_active),
+            args: [slice(idx_dev), slice(nnz_dev), slice(counts_dev),
+                   batch as u32, max_active as u32, ft_in as u32]
         }
     }?;
     unsafe {
@@ -3901,9 +3915,9 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: scatter_positions, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-                   batch as u32, nnz as u32, ft_in as u32]
+            config: cfg_1d(batch * max_active),
+            args: [slice(idx_dev), slice(nnz_dev), slice(offsets_dev), slice(write_ctr_dev),
+                   slice(positions_dev), batch as u32, max_active as u32, ft_in as u32]
         }
     }?;
     stream.synchronize()?;
@@ -3911,7 +3925,7 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
     assert_eq!(
         counts_dev.to_host_vec(&stream)?,
         counts_cpu,
-        "build_feature_counts"
+        "build_feature_counts (実長超のゴミを無視)"
     );
     assert_eq!(
         offsets_dev.to_host_vec(&stream)?,
@@ -3924,6 +3938,12 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
         seg.sort_unstable();
         assert_eq!(seg, segments_cpu[f], "scatter_positions feature {f}");
     }
+    // 有効 index の総数が offsets 末尾と一致する (実長 slot のみ scatter された)。
+    assert_eq!(
+        nnz.iter().map(|&n| n as usize).sum::<usize>(),
+        total_valid,
+        "scatter された position 数 = Σ nnz[bi]"
+    );
     Ok(())
 }
 
@@ -4085,6 +4105,10 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    // 全 row が全幅 nnz を使う fixture なので nnz_arr は一様 (early-out は no-op、
+    // `sparse_ft_backward_cpu` の全幅走査と bit 一致)。
+    let nnz_arr = vec![nnz as i32; batch];
+    let nnz_arr_dev = DeviceBuffer::from_host(&stream, &nnz_arr)?;
     for (iter_idx, (idx_host, dft_host)) in [(&stm_indices, &dft_stm), (&nstm_indices, &dft_nstm)]
         .into_iter()
         .enumerate()
@@ -4099,7 +4123,8 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
             cuda_launch! {
                 kernel: build_feature_counts, stream: stream, module: module,
                 config: cfg_1d(batch * nnz),
-                args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+                args: [slice(idx_dev), slice(nnz_arr_dev), slice(counts_dev),
+                       batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
         unsafe {
@@ -4117,8 +4142,8 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
             cuda_launch! {
                 kernel: scatter_positions, stream: stream, module: module,
                 config: cfg_1d(batch * nnz),
-                args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-                       batch as u32, nnz as u32, ft_in as u32]
+                args: [slice(idx_dev), slice(nnz_arr_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(positions_dev), batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
         // production (block 128 × grid y = ft_out/128) と同じく ri 軸を blockIdx_y で
@@ -4209,6 +4234,9 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    // 全 row が全幅 nnz を使う fixture なので nnz_arr は一様 (early-out は no-op)。
+    let nnz_arr = vec![nnz as i32; batch];
+    let nnz_arr_dev = DeviceBuffer::from_host(&stream, &nnz_arr)?;
     for (iter_idx, (idx_host, dft_host)) in
         [(&stm_indices, &dft_stm_h), (&nstm_indices, &dft_nstm_h)]
             .into_iter()
@@ -4224,7 +4252,8 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
             cuda_launch! {
                 kernel: build_feature_counts, stream: stream, module: module,
                 config: cfg_1d(batch * nnz),
-                args: [slice(idx_dev), slice(counts_dev), batch as u32, nnz as u32, ft_in as u32]
+                args: [slice(idx_dev), slice(nnz_arr_dev), slice(counts_dev),
+                       batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
         unsafe {
@@ -4242,8 +4271,8 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
             cuda_launch! {
                 kernel: scatter_positions, stream: stream, module: module,
                 config: cfg_1d(batch * nnz),
-                args: [slice(idx_dev), slice(offsets_dev), slice(write_ctr_dev), slice(positions_dev),
-                       batch as u32, nnz as u32, ft_in as u32]
+                args: [slice(idx_dev), slice(nnz_arr_dev), slice(offsets_dev), slice(write_ctr_dev),
+                       slice(positions_dev), batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
         if iter_idx == 0 {
@@ -5227,24 +5256,34 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// ragged fixture で `nnz_arr` early-out を exercise し、実長超 slot を範囲内のゴミで
+/// 汚しても勾配が不変 (per-slot kernel が `nnz` までしか読まない) ことを確認する。
 #[test]
 fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, nnz, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
     let dnet = deterministic_floats(batch, 41.0);
-    let stm_indices = sparse_indices_fixture(batch, nnz, ft_in, 0);
-    let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
+    let (mut stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
+    let (mut nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
     let bucket_idx = bucket_idx_with_padding(batch, nb);
+    // 実長超 slot を範囲内 index で汚す (全幅走査すると勾配が変わる)。
+    for bi in 0..batch {
+        for ni in nnz[bi] as usize..max_active {
+            stm_indices[bi * max_active + ni] = ((bi + ni + 1) % ft_in) as i32;
+            nstm_indices[bi * max_active + ni] = ((bi + ni + 2) % ft_in) as i32;
+        }
+    }
 
     let mut grad_cpu = vec![0.0_f32; ft_in * nb];
     psqt_diff_sparse_bwd_cpu(
         &dnet,
         &stm_indices,
         &nstm_indices,
+        &nnz,
         &bucket_idx,
         &mut grad_cpu,
         batch,
-        nnz,
+        max_active,
         nb,
         ft_in,
     );
@@ -5252,6 +5291,7 @@ fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
     let dnet_dev = DeviceBuffer::from_host(&stream, &dnet)?;
     let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
     let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
     let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
     let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * nb)?;
     unsafe {
@@ -5259,15 +5299,16 @@ fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
-            config: cfg_1d(batch * nnz),
-            args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(bidx_dev),
-                   slice(grad_dev), batch as u32, nnz as u32, nb as u32, ft_in as u32]
+            config: cfg_1d(batch * max_active),
+            args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
+                   slice(bidx_dev), slice(grad_dev), batch as u32, max_active as u32,
+                   nb as u32, ft_in as u32]
         }
     }?;
     stream.synchronize()?;
     // ±0.5*dnet の atomic scatter は加算順非決定 → relative tolerance。
     assert_close_rel(
-        "psqt_diff_sparse_bwd",
+        "psqt_diff_sparse_bwd (実長超のゴミを無視)",
         &grad_dev.to_host_vec(&stream)?,
         &grad_cpu,
         TOL,

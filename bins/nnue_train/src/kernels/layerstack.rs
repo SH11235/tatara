@@ -2615,12 +2615,19 @@ pub fn psqt_diff_sparse_fwd_inplace(
 /// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。num_buckets
 /// 上限 9 が小さく contention は限定的 (例: N=9, batch=65536 / nnz=40 / stm+nstm
 /// 両 add で 5.2M atomic-add / 660K cells ≒ 平均 8 thread/cell)。
+///
+/// `nnz_arr[bi]` は position bi の実 active 数で、`ni >= nnz_arr[bi]` の padding slot
+/// は index / bucket / dnet を DRAM から読む前に捨てる (dataloader が padding slot を
+/// `-1` で埋めない契約になったため、実長超の slot は前 batch の残骸を持ちうる。範囲内
+/// 残骸を `idx < ft_in` 防御だけでは除外できないので実長で打ち切る)。caller は
+/// `nnz_arr.len() == batch`、`0 <= nnz_arr[bi] <= nnz` を保証する。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn psqt_diff_sparse_bwd(
     dnet: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     psqt_w_grad: &[f32],
     batch: u32,
@@ -2635,6 +2642,9 @@ pub fn psqt_diff_sparse_bwd(
     }
     let bi = tid.get() / (nnz as usize);
     let ni = tid.get() % (nnz as usize);
+    if (ni as i32) >= nnz_arr[bi] {
+        return;
+    }
     let bucket = bucket_idx[bi];
     if bucket < 0 || (bucket as u32) >= num_buckets {
         return;
