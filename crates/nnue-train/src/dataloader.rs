@@ -130,7 +130,7 @@ impl Batch {
     /// 特徴は合法局面で必ず cap 内だが threat 連結時は `THREAT_MAX_ACTIVE` の
     /// 見積りを edge 数が超え得る。超過を silent skip すると欠落 edge が loss だけ
     /// 見ても気付けないため、利用者に「profile / 実 active 数 / max_active」を含む
-    /// 明示エラーを返して学習を止める (起点 320 不足なら定数を上げて再ビルド)。
+    /// 明示エラーを返して学習を止める (`THREAT_MAX_ACTIVE` 不足なら定数を上げて再ビルド)。
     pub fn push_decoded(&mut self, board: &ShogiBoard) -> io::Result<bool> {
         self.push_decoded_counting(board, None)
     }

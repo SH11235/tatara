@@ -148,11 +148,13 @@ precompute は fallback。**ただし precompute は CPU movegen を消すだけ
 K = THREAT_MAX_ACTIVE) として別途設計する (可変長は dataloader 固定ストライド
 前提を壊すため不採用)。
 
-### 4. max_active は 320 起点 + overflow を hard-error 検出 (silent truncation 禁止)
+### 4. max_active は 128 (実測分布ベース) + overflow を hard-error 検出 (silent truncation 禁止)
 
-`THREAT_MAX_ACTIVE` の起点は **donor bullet-shogi の 320** (40+320=360)。
-chess の 128 は採らない (将棋は手駒・成駒で利きが多い)。Full profile の実 PSV で
-per-position の実 max を計測して確定する。
+`THREAT_MAX_ACTIVE = 128` (行幅 40+128=168)。DLSuisho 803M + aoba 103M 局面の
+Full profile 実測で total active の max は 145 (base 40 + threat ≤ 105)、分布は
++1.5〜2 特徴ごとに count が半減する急峻な指数減衰。128 は実測 max に対し margin 23、
+到達確率 ~1e-13/pos (100B 局面級でも安全)。donor bullet-shogi の 320 は将棋固有の
+実測ではなく過大で、FT gather/scatter と row buffer を無駄に太らせるため採らない。
 
 tatara dataloader は `extract_active_features` の戻り値を捨て max_active 超過を
 silent skip する。threat edge が黙って欠落すると loss だけ見ても気付けないため、
@@ -289,7 +291,7 @@ donor (read-only 参照): bullet-shogi
   bullet-shogi threat module の移植 (ray-walk + index table + profile) が主。
 - 新規実験軸: `full` / `same-class` / `same-class-major-pawn` / `cross-side` を
   rebuild なしで sweep 可能。
-- throughput は active 数増 (320) + ft_in 増 (最大 4×) で必ず落ちる。許容ラインと
+- throughput は active 数増 (最大 40+128) + ft_in 増 (最大 4×) で必ず落ちる。許容ラインと
   本機実行可否は計測で確定。Full は本機で学習不可なら間引き profile に絞る。
 - host 側 unsafe があれば妥当性をコメント。cuda-oxide / nightly 構成には触れない。
 
