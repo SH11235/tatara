@@ -52,7 +52,8 @@ use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, Devi
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_launch;
 use gpu_runtime::{
-    BLOCK_DIM, CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, grid_dim_1d,
+    BLOCK_DIM, CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig,
+    grid_dim_1d,
 };
 use progress_kpabs_train::host::{
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MAX_INDS_PER_POS,
@@ -80,9 +81,9 @@ fn copy_host_to_device_async<T>(
     if bytes == 0 {
         return Ok(());
     }
-    // SAFETY: `dst` is allocated in the stream's context and the length assertion
-    // guarantees that `bytes` stays within it. CUDA stages pageable host memory
-    // before this call returns, so the batch vectors may be reused afterwards.
+    // SAFETY: `dst` は `stream` と同じ context の確保済み device buffer で、直上の
+    // assert により `bytes` は容量内。転送元 slice は H2D 発行後に record する
+    // `GpuTrainer::input_upload_done` の同期まで生存し、書き換えられない。
     unsafe {
         cuda_core::memory::memcpy_htod_async(
             dst.cu_deviceptr(),
@@ -359,6 +360,7 @@ struct GpuTrainer {
     per_pos_norm: DeviceBuffer<f32>,
     preds: DeviceBuffer<f32>,
     input_capacity: usize,
+    input_upload_done: CudaEvent,
 
     /// Adam の `beta^t` 累積値 (`bc1 = 1 - beta1_pow` を kernel に渡す)。
     beta1_pow: f32,
@@ -403,6 +405,7 @@ impl GpuTrainer {
         let targets = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
         let per_pos_norm = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
         let preds = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
+        let input_upload_done = ctx.new_event(None)?;
 
         Ok(Self {
             stream,
@@ -418,6 +421,7 @@ impl GpuTrainer {
             per_pos_norm,
             preds,
             input_capacity,
+            input_upload_done,
             beta1_pow: 1.0,
             beta2_pow: 1.0,
         })
@@ -425,8 +429,8 @@ impl GpuTrainer {
 
     /// `loss_acc` / `hist` を 0 に reset する (epoch 開始時 / log 区間切り替え時)。
     fn zero_loss_hist(&mut self) -> gpu_runtime::Result<()> {
-        // SAFETY: both pointers refer to live buffers in `self.stream`'s context,
-        // and each byte count is the full allocation size reported by the buffer.
+        // SAFETY: 両 pointer は `self.stream` と同じ context の生存中の buffer を指し、
+        // byte count は各 buffer が報告する確保領域全体の大きさ。
         unsafe {
             cuda_core::memory::memset_d8_async(
                 self.loss_acc.cu_deviceptr(),
@@ -474,6 +478,7 @@ impl GpuTrainer {
         copy_host_to_device_async(&self.stream, &self.indices, &batch.indices)?;
         copy_host_to_device_async(&self.stream, &self.targets, &batch.targets)?;
         copy_host_to_device_async(&self.stream, &self.per_pos_norm, &batch.per_pos_norm)?;
+        self.input_upload_done.record(&self.stream)?;
 
         let n_pos_u32 = n_pos as u32;
         let max_inds_u32 = MAX_INDS_PER_POS as u32;
@@ -567,6 +572,7 @@ impl GpuTrainer {
         self.ensure_input_capacity(n_pos)?;
         copy_host_to_device_async(&self.stream, &self.indices, &batch.indices)?;
         copy_host_to_device_async(&self.stream, &self.targets, &batch.targets)?;
+        self.input_upload_done.record(&self.stream)?;
 
         let n_pos_u32 = n_pos as u32;
         let max_inds_u32 = MAX_INDS_PER_POS as u32;
@@ -604,6 +610,11 @@ impl GpuTrainer {
         }?;
 
         Ok(())
+    }
+
+    /// 直前の `step` / `eval_forward` が発行した入力 H2D の完了を host で待つ。
+    fn synchronize_input_upload(&self) -> gpu_runtime::Result<()> {
+        Ok(self.input_upload_done.synchronize()?)
     }
 
     fn read_loss_hist(&self) -> gpu_runtime::Result<(f64, [u64; 8])> {
@@ -727,6 +738,9 @@ fn run_data_pass(
                 samples_total += batch.n_positions;
                 run_batch(trainer, &batch, mode)?;
                 steps += 1;
+                // H2D 完了後だけ転送元 `Batch` storage を再利用する。event は kernel
+                // より前に record 済みなので、GPU compute の完了は待たない。
+                trainer.synchronize_input_upload()?;
                 batch.clear();
 
                 if matches!(mode, PassMode::Train(_))
