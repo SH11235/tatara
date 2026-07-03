@@ -1,13 +1,11 @@
-use std::io::Write;
 use std::path::Path;
 
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
-use nnue_train::dataloader::Batch;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
-use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
+use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSetSpec;
 
 use crate::*;
@@ -3456,108 +3454,16 @@ impl GpuTrainer {
 // TrainerBackend impl — `nnue-train::trainer::run` から 1 batch ずつ呼ばれる
 // ===========================================================================
 
-impl TrainerBackend for GpuTrainer {
-    fn train_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<f64> {
-        // dataloader が出した batch の feature set が trainer 構築時に選んだ feature set
-        // と一致することを確認する (buffer サイズ / kernel launch 次元が前者を前提に
-        // 確保済のため、不一致は out-of-bounds になる)。
-        if batch.feature_set != self.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.feature_set.canonical_name()
-            )));
-        }
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
-        self.step(&data, lr, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("GpuTrainer::step failed: {e}")))
-    }
-
-    fn validate_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<ValidationStepOutput> {
-        // train_step と同じく batch の feature set が trainer の feature set と
-        // 一致することを確認する (GPU buffer / kernel 次元の前提)。
-        if batch.feature_set != self.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.feature_set.canonical_name()
-            )));
-        }
-        let data = BatchData::from_batch_ref(batch, bucket_idx);
-        let out = self
-            .validate(&data, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("GpuTrainer::validate failed: {e}")))?;
-        Ok(ValidationStepOutput {
-            sum_sq_err: out.loss,
-            net_output: out.net_output,
-        })
-    }
-
-    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
-        self.loss_ring.flush_pending_loss().map_err(|e| {
-            std::io::Error::other(format!(
-                "GpuTrainer::loss_ring.flush_pending_loss failed: {e}"
-            ))
-        })
-    }
-
-    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
-        let weights = self.to_layerstack_weights().map_err(|e| {
-            std::io::Error::other(format!("GpuTrainer::to_layerstack_weights failed: {e}"))
-        })?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-        weights.save_quantised(&mut writer)?;
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn save_resume_checkpoint(
-        &mut self,
-        path: &Path,
-        superbatch: usize,
-        run_id: &str,
-        lr_horizon: Option<usize>,
-    ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
-            .map_err(|e| {
-                // 既に io::Error なら kind を保つ、それ以外は other で包む。
-                match e.downcast::<std::io::Error>() {
-                    Ok(io_err) => *io_err,
-                    Err(other) => std::io::Error::other(format!(
-                        "GpuTrainer::save_raw_checkpoint failed: {other}"
-                    )),
-                }
-            })
-    }
-
-    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
-        // `to_host_vec` 内部で `stream.synchronize` する (`AsyncLossRing` と違って
-        // pinned host ring を介さない 1-shot D2H で十分、cumulative counter の sb 末
-        // 報告は同期 path で OK)。
-        let host = self
-            .fp16_clamp_counter
-            .to_host_vec(&self.stream)
-            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
-        Ok((host[0], self.fp16_clamp_elems_written))
-    }
+trainer_backend_impl! {
+    trainer: GpuTrainer,
+    feature_set: feature_set,
+    batch: bucketed,
+    weights: to_layerstack_weights,
+    step_error: "GpuTrainer::step failed: {}",
+    validate_error: "GpuTrainer::validate failed: {}",
+    flush_error: "GpuTrainer::loss_ring.flush_pending_loss failed: {}",
+    weights_error: "GpuTrainer::to_layerstack_weights failed: {}",
+    resume_error: "GpuTrainer::save_raw_checkpoint failed: {}",
 }
 
 #[cfg(test)]

@@ -227,6 +227,120 @@ impl BatchData<'_> {
     }
 }
 
+macro_rules! trainer_backend_impl {
+    (
+        trainer: $trainer:ty,
+        feature_set: $($feature_set:ident).+,
+        batch: $batch_kind:ident,
+        weights: $weights:ident,
+        step_error: $step_error:literal,
+        validate_error: $validate_error:literal,
+        flush_error: $flush_error:literal,
+        weights_error: $weights_error:literal,
+        resume_error: $resume_error:literal $(,)?
+    ) => {
+        impl nnue_train::trainer::TrainerBackend for $trainer {
+            fn train_step(
+                &mut self,
+                batch: &nnue_train::dataloader::Batch,
+                bucket_idx: &[i32],
+                lr: f32,
+                wdl_lambda: f32,
+                loss: nnue_train::trainer::LossKind,
+            ) -> std::io::Result<f64> {
+                if batch.feature_set != self.$($feature_set).+ {
+                    return Err(std::io::Error::other(format!(
+                        "batch feature set '{}' does not match trainer feature set '{}'",
+                        batch.feature_set.canonical_name(),
+                        self.$($feature_set).+.canonical_name(),
+                    )));
+                }
+                let data = trainer_backend_impl!(@batch $batch_kind, batch, bucket_idx);
+                self.step(&data, lr, wdl_lambda, loss)
+                    .map_err(|e| std::io::Error::other(format!($step_error, e)))
+            }
+
+            fn validate_step(
+                &mut self,
+                batch: &nnue_train::dataloader::Batch,
+                bucket_idx: &[i32],
+                wdl_lambda: f32,
+                loss: nnue_train::trainer::LossKind,
+            ) -> std::io::Result<nnue_train::trainer::ValidationStepOutput> {
+                if batch.feature_set != self.$($feature_set).+ {
+                    return Err(std::io::Error::other(format!(
+                        "batch feature set '{}' does not match trainer feature set '{}'",
+                        batch.feature_set.canonical_name(),
+                        self.$($feature_set).+.canonical_name(),
+                    )));
+                }
+                let data = trainer_backend_impl!(@batch $batch_kind, batch, bucket_idx);
+                let out = self
+                    .validate(&data, wdl_lambda, loss)
+                    .map_err(|e| std::io::Error::other(format!($validate_error, e)))?;
+                Ok(nnue_train::trainer::ValidationStepOutput {
+                    sum_sq_err: out.loss,
+                    net_output: out.net_output,
+                })
+            }
+
+            fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+                self.loss_ring
+                    .flush_pending_loss()
+                    .map_err(|e| std::io::Error::other(format!($flush_error, e)))
+            }
+
+            fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+                let weights = self
+                    .$weights()
+                    .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+                weights.save_quantised(&mut writer)?;
+                std::io::Write::flush(&mut writer)?;
+                Ok(())
+            }
+
+            fn save_resume_checkpoint(
+                &mut self,
+                path: &std::path::Path,
+                superbatch: usize,
+                run_id: &str,
+                lr_horizon: Option<usize>,
+            ) -> std::io::Result<()> {
+                self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
+                    .map_err(|e| match e.downcast::<std::io::Error>() {
+                        Ok(io_err) => *io_err,
+                        Err(other) => std::io::Error::other(format!($resume_error, other)),
+                    })
+            }
+
+            fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+                let host = self
+                    .fp16_clamp_counter
+                    .to_host_vec(&self.stream)
+                    .map_err(|e| {
+                        std::io::Error::other(format!("clamp counter D2H failed: {e}"))
+                    })?;
+                Ok((host[0], self.fp16_clamp_elems_written))
+            }
+        }
+    };
+    (@batch bucketed, $batch:ident, $bucket_idx:ident) => {
+        BatchData::from_batch_ref($batch, $bucket_idx)
+    };
+    (@batch bucketless, $batch:ident, $bucket_idx:ident) => {{
+        let _ = $bucket_idx;
+        BatchData::from_batch_ref_bucketless($batch)
+    }};
+}
+
+pub(crate) use trainer_backend_impl;
+
 /// `LaunchConfig` builder for 1D launch with `BLOCK_DIM` per block.
 pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
     LaunchConfig {
