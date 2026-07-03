@@ -2,10 +2,9 @@ use std::path::Path;
 
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
-use nnue_train::dataloader::Batch;
 use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
-use nnue_train::trainer::{LossKind, TrainerBackend, ValidationStepOutput};
+use nnue_train::trainer::LossKind;
 
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
@@ -2447,103 +2446,14 @@ impl SimpleGpuTrainer {
     }
 }
 
-impl TrainerBackend for SimpleGpuTrainer {
-    fn train_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        lr: f32,
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<f64> {
-        if batch.feature_set != self.id.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.id.feature_set.canonical_name(),
-            )));
-        }
-        // Simple は bucket を持たないため `bucket_idx` を kernel に渡さない (caller の
-        // `TrainerBackend` 契約上は受け取るが、`from_batch_ref_bucketless` で空 slice 化
-        // して下流 backend が `bucket_idx` に触れない経路を強制する)。
-        let _ = bucket_idx;
-        let data = BatchData::from_batch_ref_bucketless(batch);
-        self.step(&data, lr, wdl_lambda, loss)
-            .map_err(|e| std::io::Error::other(format!("SimpleGpuTrainer::step failed: {e}")))
-    }
-
-    fn validate_step(
-        &mut self,
-        batch: &Batch,
-        bucket_idx: &[i32],
-        wdl_lambda: f32,
-        loss: LossKind,
-    ) -> std::io::Result<ValidationStepOutput> {
-        if batch.feature_set != self.id.feature_set {
-            return Err(std::io::Error::other(format!(
-                "batch feature set '{}' does not match trainer feature set '{}'",
-                batch.feature_set.canonical_name(),
-                self.id.feature_set.canonical_name(),
-            )));
-        }
-        let _ = bucket_idx;
-        let data = BatchData::from_batch_ref_bucketless(batch);
-        let out = self.validate(&data, wdl_lambda, loss).map_err(|e| {
-            std::io::Error::other(format!("SimpleGpuTrainer::validate failed: {e}"))
-        })?;
-        Ok(ValidationStepOutput {
-            sum_sq_err: out.loss,
-            net_output: out.net_output,
-        })
-    }
-
-    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
-        self.loss_ring.flush_pending_loss().map_err(|e| {
-            std::io::Error::other(format!(
-                "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {e}"
-            ))
-        })
-    }
-
-    fn save_checkpoint(&mut self, path: &Path) -> std::io::Result<()> {
-        let weights = self.to_simple_weights().map_err(|e| {
-            std::io::Error::other(format!("SimpleGpuTrainer::to_simple_weights failed: {e}"))
-        })?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-        weights.save_quantised(&mut writer)?;
-        use std::io::Write;
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn save_resume_checkpoint(
-        &mut self,
-        path: &Path,
-        superbatch: usize,
-        run_id: &str,
-        lr_horizon: Option<usize>,
-    ) -> std::io::Result<()> {
-        self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
-            .map_err(|e| match e.downcast::<std::io::Error>() {
-                Ok(io_err) => *io_err,
-                Err(other) => std::io::Error::other(format!(
-                    "SimpleGpuTrainer::save_raw_checkpoint failed: {other}"
-                )),
-            })
-    }
-
-    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
-        // `to_host_vec` 内部で `stream.synchronize` する。cumulative counter の sb 末
-        // 報告は同期 path で十分。
-        let host = self
-            .fp16_clamp_counter
-            .to_host_vec(&self.stream)
-            .map_err(|e| std::io::Error::other(format!("clamp counter D2H failed: {e}")))?;
-        Ok((host[0], self.fp16_clamp_elems_written))
-    }
+trainer_backend_impl! {
+    trainer: SimpleGpuTrainer,
+    feature_set: id.feature_set,
+    batch: bucketless,
+    weights: to_simple_weights,
+    step_error: "SimpleGpuTrainer::step failed: {}",
+    validate_error: "SimpleGpuTrainer::validate failed: {}",
+    flush_error: "SimpleGpuTrainer::loss_ring.flush_pending_loss failed: {}",
+    weights_error: "SimpleGpuTrainer::to_simple_weights failed: {}",
+    resume_error: "SimpleGpuTrainer::save_raw_checkpoint failed: {}",
 }
