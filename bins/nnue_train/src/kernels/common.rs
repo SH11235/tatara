@@ -1062,6 +1062,8 @@ pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u3
     }
     let idx = indices[tid.get()];
     if idx >= 0 && (idx as u32) < cols {
+        // SAFETY: `counts.len() == cols` (caller 契約) かつ `idx < cols`。`u32` と
+        // `DeviceAtomicU32` は同 layout で、本 kernel 中の書き込みは atomic add のみ。
         let cell = unsafe { &*(counts.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
         cell.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -1131,6 +1133,8 @@ pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
     thread::sync_threads();
 
     // Phase 3: per-thread output exclusive scan of chunk
+    // SAFETY: `offsets.len() == n + 1` (caller 契約)。各 thread の `[start, end)` は
+    // 互いに重ならず、末尾 `offsets[n]` は最後の thread だけが書く。
     let out_ptr = offsets.as_ptr() as *mut u32;
     let mut acc = chunk_offset;
     let mut j = start;
@@ -1275,6 +1279,9 @@ pub fn scatter_positions(
             unsafe { &*(write_counters.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
         let pos = cell.fetch_add(1, AtomicOrdering::Relaxed);
         let abs_pos = offsets[idx as usize] + pos;
+        // SAFETY: `positions.len() == batch * nnz`、`offsets` は `counts` の prefix sum、
+        // `write_counters[idx] < counts[idx]` なので `abs_pos` は範囲内。atomic increment
+        // が同じ feature 内の rank を一意にするため、各 thread の書き込み先は重ならない。
         unsafe {
             let p = positions.as_ptr().add(abs_pos as usize) as *mut u32;
             p.write(bi);

@@ -254,7 +254,7 @@ impl PsvFileLoader {
             file.seek(SeekFrom::Start(start))?;
         }
         Ok(Self {
-            reader: BufReader::new(file),
+            reader: BufReader::with_capacity(1024 * 1024, file),
             eof: false,
             path: path.to_path_buf(),
             remaining_bytes: end - start,
