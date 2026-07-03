@@ -735,18 +735,103 @@ pub fn ranger_lookahead_lerp_fp16_mirror(
     }
 }
 
+macro_rules! sparse_ft_weight_read {
+    (f32, $weight_ptr:ident, $index:expr) => {
+        unsafe { $weight_ptr.add($index).read() }
+    };
+    (f16, $weight_ptr:ident, $index:expr) => {
+        unsafe { $weight_ptr.add($index).read() } as f32
+    };
+}
+
+macro_rules! sparse_ft_out_write {
+    (f32, $out_ptr:ident, $out_base:ident, $s0:ident, $s1:ident, $s2:ident, $s3:ident) => {
+        unsafe {
+            $out_ptr.add($out_base).write($s0);
+            $out_ptr.add($out_base + 1).write($s1);
+            $out_ptr.add($out_base + 2).write($s2);
+            $out_ptr.add($out_base + 3).write($s3);
+        }
+    };
+    (f16, $out_ptr:ident, $out_base:ident, $s0:ident, $s1:ident, $s2:ident, $s3:ident) => {
+        unsafe {
+            $out_ptr.add($out_base).write($s0 as f16);
+            $out_ptr.add($out_base + 1).write($s1 as f16);
+            $out_ptr.add($out_base + 2).write($s2 as f16);
+            $out_ptr.add($out_base + 3).write($s3 as f16);
+        }
+    };
+}
+
+// sparse FT forward の各変種で index 解決、4-row 累算、出力のコアを共有する。
+macro_rules! sparse_ft_forward_body {
+    (
+        $weight:ident,
+        $indices:ident,
+        $out:ident,
+        $batch:ident,
+        $rows:ident,
+        $cols:ident,
+        $nnz:ident;
+        $weight_type:ident,
+        $out_type:ident
+    ) => {
+        let tid = thread::index_1d();
+        let rows_u = $rows as usize;
+        let rows_q = rows_u / 4;
+        let total = ($batch as usize) * rows_q;
+        if tid.get() >= total {
+            return;
+        }
+        let bi = tid.get() / rows_q;
+        let ri_q = tid.get() % rows_q;
+        let ri_base = ri_q * 4;
+
+        // caller は indices.len() == batch * nnz、weight.len() == cols * rows、
+        // out.len() == batch * rows、rows % 4 == 0 を保証する。idx の範囲検査は
+        // padding と異常入力を除外する。idx*rows は 4 の倍数 (rows は 128 の倍数)、
+        // ri_base も 4 の倍数なので、4 連続 row は最低 8-byte 境界に整列する。
+        let indices_ptr = $indices.as_ptr();
+        let weight_ptr = $weight.as_ptr();
+        let mut s0: f32 = 0.0;
+        let mut s1: f32 = 0.0;
+        let mut s2: f32 = 0.0;
+        let mut s3: f32 = 0.0;
+        let base = bi * ($nnz as usize);
+        let mut ni: u32 = 0;
+        while ni < $nnz {
+            let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
+            if idx >= 0 && (idx as u32) < $cols {
+                let off = (idx as usize) * rows_u + ri_base;
+                // f32 path は LLVM/NVPTX が pointer の 4-byte alignment しか推論せず
+                // vector load 化しない。align(16) の struct cast も SROA 後に alignment
+                // を保持せず scalar load + local-mem spill になる。scalar load のままでも
+                // warp の 32 thread × 4 row が同じ feature の 128 連続 row を読み、
+                // coalescing を維持する。
+                let w0 = sparse_ft_weight_read!($weight_type, weight_ptr, off);
+                let w1 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 1);
+                let w2 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 2);
+                let w3 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 3);
+                s0 += w0;
+                s1 += w1;
+                s2 += w2;
+                s3 += w3;
+            }
+            ni += 1;
+        }
+        let out_ptr = $out.as_mut_ptr();
+        let out_base = bi * rows_u + ri_base;
+        sparse_ft_out_write!($out_type, out_ptr, out_base, s0, s1, s2, s3);
+    };
+}
+
 /// Sparse feature transform forward (HalfKA_hm 用)。
 ///
-/// 1 thread = 4 連続 row (output cells)、column-major weight (`weight[idx * rows + ri]`)、
-/// atomics 不要 (各 thread は別 4 output cell に書く)。`-1` padding と `idx >= cols`
-/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する (`rows` は FT 出力
-/// 次元で `--ft-out` 検証により 128 の倍数)、grid は `cfg_1d(batch * rows / 4)`。
-///
-/// inner loop は 4 連続 scalar weight read + 4 scalar partial-sum 更新形 (LLVM/NVPTX
-/// backend は `f32` pointer の 4-byte alignment 推論止まりで `ld.global.v4.f32` へ
-/// 集約しない、`#[repr(C, align(16))]` struct cast 経由でも SROA が align を保持せず
-/// scalar load + local-mem spill になる)。warp coalesce は 32 thread × 4 row = 128
-/// 連続 row が同 idx の cache line をまたいで読まれる pattern で維持される。
+/// 1 thread = 4 連続 row (output cells)、column-major weight
+/// (`weight[idx * rows + ri]`)、atomics 不要 (各 thread は別 4 output cell に書く)。
+/// `-1` padding と `idx >= cols` の異常入力は silent skip。caller は `rows % 4 == 0`
+/// を保証する (`rows` は FT 出力次元で `--ft-out` 検証により 128 の倍数)、grid は
+/// `cfg_1d(batch * rows / 4)`。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward(
@@ -758,51 +843,7 @@ pub fn sparse_ft_forward(
     cols: u32,
     nnz: u32,
 ) {
-    let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // raw pointer 版。unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1`
-    // padding 含めて確保)、weight.len() == cols * rows (FT 重み、arch 固定、rows %
-    // 4 == 0)、`if idx >= 0 && (idx as u32) < cols` のロジックチェックは値検査として保持。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() };
-            let w1 = unsafe { weight_ptr.add(off + 1).read() };
-            let w2 = unsafe { weight_ptr.add(off + 2).read() };
-            let w3 = unsafe { weight_ptr.add(off + 3).read() };
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0);
-        out_ptr.add(out_base + 1).write(s1);
-        out_ptr.add(out_base + 2).write(s2);
-        out_ptr.add(out_base + 3).write(s3);
-    }
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f32, f32);
 }
 
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
@@ -826,52 +867,7 @@ pub fn sparse_ft_forward_fp16(
     cols: u32,
     nnz: u32,
 ) {
-    let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // raw pointer 版。unsafe 妥当性は [`sparse_ft_forward`] と同一 (indices.len() ==
-    // batch * nnz、weight.len() == cols * rows、out.len() == batch * rows、
-    // rows % 4 == 0)。weight のみ要素型が `f16` で、4 連続 row の read は 8 byte
-    // 境界に整列する (idx*rows は 4 の倍数 [rows は 128 の倍数]、ri_base は 4 の倍数)。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
-            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
-            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
-            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0);
-        out_ptr.add(out_base + 1).write(s1);
-        out_ptr.add(out_base + 2).write(s2);
-        out_ptr.add(out_base + 3).write(s3);
-    }
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f16, f32);
 }
 
 /// [`sparse_ft_forward_fp16`] の出力も `f16` にした版 (`--ft-fp16-out`)。`weight` を
@@ -880,8 +876,8 @@ pub fn sparse_ft_forward_fp16(
 ///
 /// `out` (`ft_*_out`、b × ft_out) を `f16` にすると書き出し DRAM traffic が半減し、
 /// 後続の [`ft_post_perspective_fwd_fp16`] / [`ft_post_perspective_grad_fused_fp16`]
-/// の read も半精度になる。`ft_*_out` は CReLU 前の FT accumulator で値域は ~O(1〜数十)、
-/// f16 の有限域に収まる (loss scaling 不要、underflow する dft とは異なる)。
+/// の read も半精度になる。`ft_*_out` は CReLU 前の FT accumulator で値域は
+/// ~O(1〜数十)、f16 の有限域に収まる (loss scaling 不要、underflow する dft とは異なる)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward_fp16_out(
@@ -893,51 +889,7 @@ pub fn sparse_ft_forward_fp16_out(
     cols: u32,
     nnz: u32,
 ) {
-    let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // unsafe 妥当性は [`sparse_ft_forward_fp16`] と同一。`weight` / `out` とも `f16` で、
-    // 4 連続 row の read / write は 8 byte 境界に整列する (idx*rows は 4 の倍数
-    // [rows は 128 の倍数]、ri_base は 4 の倍数)。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
-            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
-            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
-            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0 as f16);
-        out_ptr.add(out_base + 1).write(s1 as f16);
-        out_ptr.add(out_base + 2).write(s2 as f16);
-        out_ptr.add(out_base + 3).write(s3 as f16);
-    }
+    sparse_ft_forward_body!(weight, indices, out, batch, rows, cols, nnz; f16, f16);
 }
 
 /// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。
