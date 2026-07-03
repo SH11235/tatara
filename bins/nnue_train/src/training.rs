@@ -1,18 +1,28 @@
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
+#[cfg(feature = "gpu")]
 use gpu_runtime::CudaContext;
+#[cfg(feature = "gpu")]
 use nnue_format::LayerStackWeights;
+#[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
+#[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
+#[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
 use nnue_train::schedule::{LrSchedulerEnum, WdlScheduler, WdlSchedulerEnum};
+#[cfg(feature = "gpu")]
 use nnue_train::trainer::{LossKind, TrainingConfig};
+#[cfg(feature = "gpu")]
+use shogi_features::ThreatProfile;
+#[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::{FeatureSet, FeatureSetSpec, ThreatProfile};
+use shogi_features::{FeatureSet, FeatureSetSpec};
 
-use crate::{
-    arch::*, cli::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*,
-};
+use crate::cli::*;
+#[cfg(feature = "gpu")]
+use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
 
 /// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
 /// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
@@ -20,6 +30,7 @@ use crate::{
 /// `--ft-out` / Simple `--l1`)、`threat_profile` は LayerStack のみ Some。
 /// `--ft-fp16` / `--ft-fp16-out` は棋力 trade-off のため remedy には挙げず
 /// (診断用に current 値だけ表示)、メモリ専用の `--fp16-opt-state` を推奨する。
+#[cfg(feature = "gpu")]
 fn gpu_oom_error(
     batch_size: usize,
     ft_fp16: bool,
@@ -169,6 +180,7 @@ fn validate_shared_cli(
     })
 }
 
+#[cfg(feature = "gpu")]
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
     // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
@@ -721,6 +733,7 @@ pub(crate) use nnue_train::dataloader::PSV_RECORD_BYTES;
 /// LayerStack network の architecture 記述子 (FT → L1 → L2、progress N-bucket)。
 /// experiment.json `params.architecture` に記録する。FT 出力次元は `--ft-out`、L1
 /// 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は `--num-buckets` で可変。
+#[cfg(feature = "gpu")]
 pub(crate) fn layerstack_architecture(
     ft_out: usize,
     l1_out: usize,
@@ -900,12 +913,14 @@ fn validate_decay(
 /// に使う。JSON は非有限値を表現できず、混入すると serialise が丸ごと失敗して
 /// 構造化ログが 1 件も書けなくなる。`--scale` は `--win-rate-model` 指定時に
 /// CLI 側の finite 検証を経ないため防御する。
+#[cfg(feature = "gpu")]
 pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
+#[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
     [
         ("--ft-weight-decay", cli.ft_weight_decay),
@@ -920,6 +935,7 @@ pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 
 /// per-group optimizer override flag が一つでも指定されているか。`true` のとき
 /// log と experiment.json に有効 per-group 値を記録する (全 `None` の既定 run では
 /// 記録を省き、大域 `weight_decay` フィールドのみで足りる)。
+#[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
 }
@@ -927,6 +943,7 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
 /// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
 /// layerstack / simple 両 entry で共有するこの helper で前段に行う。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::Error>> {
     if !(cli.wrm_in_scaling.is_finite() && cli.wrm_in_scaling > 0.0) {
         return Err(format!(
@@ -1036,6 +1053,7 @@ pub(crate) fn build_wdl_scheduler(
 
 /// `path` の basename を `String` で返す。file_name が取れなければ path 全体の
 /// 表示文字列で代替する。
+#[cfg(feature = "gpu")]
 pub(crate) fn file_basename(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1045,6 +1063,7 @@ pub(crate) fn file_basename(path: &Path) -> String {
 /// tatara の git revision を best-effort で取得する。git が見つからない、
 /// または git repository 外で実行された場合は `None`。working tree に未 commit
 /// の変更があれば `-dirty` を付ける。
+#[cfg(feature = "gpu")]
 pub(crate) fn git_commit() -> Option<String> {
     let rev = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -1073,6 +1092,7 @@ pub(crate) fn git_commit() -> Option<String> {
 /// `--init-from` / `--resume` で重みが上書きされる run では `None` を返す (初期化
 /// 選択が実 weight に効かないので記録しても reader を混乱させるだけ)。override が
 /// あれば差し替えた層名を記す。
+#[cfg(feature = "gpu")]
 pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     if cli.init_from.is_some() || cli.resume.is_some() {
         return None;
@@ -1094,6 +1114,7 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
 }
 
 /// LayerStack の weight 初期化 spec を CLI から組み立てる (既定値 + per-layer override)。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     let mut spec = LayerStackInit::default_uniform();
     if let Some(ov) = cli.init_ft {
@@ -1116,6 +1137,7 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
 
 /// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1f` は L1f を持たない
 /// Simple では error。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn std::error::Error>> {
     let mut spec = SimpleInit::default_uniform();
     if let Some(ov) = cli.init_ft {
@@ -1139,6 +1161,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 /// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
@@ -1286,6 +1309,7 @@ pub(crate) fn build_experiment_logger(
 /// 出しに失敗したときは `0`、`--test-tail-positions` が raw 件数以上の場合は
 /// raw record 数をそのまま返す (`trainer::run` 側で `validate` 経由 reject
 /// される前提の defensive fallback)。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
     let total_records = std::fs::metadata(data)
         .map(|m| m.len() / PSV_RECORD_BYTES)
@@ -1309,6 +1333,7 @@ pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
 /// `tf32` / `ft_fp16` / `ft_fp16_out` / `fp16_opt_state` は `false`)。
 /// 量子化 multiplier (`qa` / `qb`) は活性化と `simple_weights` の固定値から決める。
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger_simple(
     cli: &Cli,
     id: SimpleId,
@@ -1441,6 +1466,7 @@ pub(crate) fn build_experiment_logger_simple(
 ///
 /// 例: `"256x2-32-32"` → `(256, 32, 32)`、`"1024x2-128-64"` → `(1024, 128, 64)`。
 /// 形式不一致や非整数は `--arch` の不正値として `InvalidInput` で返す。
+#[cfg(feature = "gpu")]
 pub(crate) fn parse_simple_preset(
     s: &str,
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
@@ -1487,6 +1513,7 @@ pub(crate) fn parse_simple_preset(
 /// 分岐で呼ばれる。LayerStack 側 (`run_training` 本体) と並ぶ単独 entrypoint で、
 /// trainer 構築・init_from / resume・lr / wdl スケジューラ・superbatch loop は
 /// 同じ `nnue_train::trainer::run` driver を使う。
+#[cfg(feature = "gpu")]
 pub(crate) fn run_simple_training(
     cli: &Cli,
     simple_args: &SimpleArgs,
@@ -1732,7 +1759,7 @@ pub(crate) fn run_simple_training(
 }
 
 #[cfg(test)]
-mod tests {
+mod shared_cli_tests {
     use super::*;
     use clap::Parser;
 
@@ -1828,6 +1855,19 @@ mod tests {
             shared.start_superbatch(&cli, None).unwrap_err().to_string(),
             "--start-superbatch must be >= 1 (1-indexed)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut argv = vec!["nnue-trainer"];
+        argv.extend_from_slice(extra);
+        argv.push("layerstack");
+        Cli::try_parse_from(argv).expect("cli parse")
     }
 
     #[test]

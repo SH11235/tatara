@@ -5,6 +5,7 @@
 //! 関数は [`kernels`] module、host 側コード (kernel loader / checkpoint format /
 //! trainer / CLI / smoke test) と GPU↔CPU 同等性テストは各 sibling module に置く。
 
+#[cfg(feature = "gpu")]
 use clap::Parser;
 
 // ===========================================================================
@@ -19,26 +20,38 @@ use clap::Parser;
 mod arch;
 mod ckpt;
 mod cli;
+#[cfg(feature = "gpu")]
 mod kernel_module;
+#[cfg(feature = "gpu")]
 mod kernels;
+#[cfg(feature = "gpu")]
 mod smoke;
+#[cfg(feature = "gpu")]
 mod threat_ablate;
+#[cfg(feature = "gpu")]
 mod trainer_common;
+#[cfg(feature = "gpu")]
 mod trainer_layerstack;
+#[cfg(feature = "gpu")]
 mod trainer_simple;
 mod training;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "gpu")]
 use cli::Cli;
+#[cfg(feature = "gpu")]
 use smoke::smoke_test;
+#[cfg(feature = "gpu")]
 use training::run_training;
 // `cuda_launch!` 呼出側 (trainer / smoke / tests) は `use crate::*;` で `#[kernel]`
 // marker 型 (`__<name>_CudaKernel`) を解決する。`kernels` module の marker を crate
 // root から見えるよう re-export する。
+#[cfg(feature = "gpu")]
 pub(crate) use kernels::*;
 
+#[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     // 診断 flag (--eval-only / --threat-ablate / --threat-norm-dump) は学習データを
@@ -61,4 +74,10 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(1)
         }
     }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn main() -> std::process::ExitCode {
+    eprintln!("nnue-train requires the default `gpu` feature");
+    std::process::ExitCode::from(1)
 }

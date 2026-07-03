@@ -55,4 +55,6 @@ jobs:
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
-        run: cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer
+        run: |
+          cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer
+          cargo test -p nnue-trainer --no-default-features

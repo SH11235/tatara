@@ -5,9 +5,9 @@
 
 #[cfg(test)]
 mod cli_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 mod ft_factorize_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 mod gpu_cpu_equivalence_tests;
 #[cfg(test)]
 mod raw_ckpt_format_tests;
