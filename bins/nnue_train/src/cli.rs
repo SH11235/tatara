@@ -428,6 +428,21 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) monitor_fp16_clamps: bool,
 
+    /// Log a histogram of the real active-feature count per position (the value
+    /// returned by the feature extractor before `-1` padding) at the end of every
+    /// superbatch. Used to check how much of the `max_active` sparse capacity is
+    /// actually used and whether any feature set (e.g. with threats appended)
+    /// pushes counts toward the cap.
+    ///
+    /// Each superbatch prints a one-line summary over the cumulative histogram
+    /// (`[active-hist] sb=... positions=... mean=... p50=... p90=... p99=...
+    /// max=...`); at the end of training the full non-zero histogram is dumped
+    /// once (`[active-hist] count[<active>]=<n>`). Off by default: when unset the
+    /// dataloader allocates no histogram and runs no counting code on the hot
+    /// path. Works for any feature set (threats on or off).
+    #[arg(long, global = true)]
+    pub(crate) monitor_active_features: bool,
+
     /// Override the feature-transformer (L0) weight initialiser. Applies to a
     /// fresh run; ignored when `--init-from` / `--resume` loads weights. The
     /// default weight init is `[-0.01, 0.01]` uniform.

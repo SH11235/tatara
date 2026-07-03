@@ -628,6 +628,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         compute_bucket: true,
         num_buckets: layerstack.num_buckets,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
+        monitor_active_features: cli.monitor_active_features,
     };
 
     // forward 用 FT weight (`--ft-fp16` の mirror / factorizer の comb) を学習
@@ -1733,6 +1734,7 @@ pub(crate) fn run_simple_training(
         // 通すための placeholder。
         num_buckets: 1,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
+        monitor_active_features: cli.monitor_active_features,
     };
 
     let mut experiment = build_experiment_logger_simple(

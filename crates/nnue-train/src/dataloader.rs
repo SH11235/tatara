@@ -131,6 +131,23 @@ impl Batch {
     /// 見ても気付けないため、利用者に「profile / 実 active 数 / max_active」を含む
     /// 明示エラーを返して学習を止める (起点 320 不足なら定数を上げて再ビルド)。
     pub fn push_decoded(&mut self, board: &ShogiBoard) -> io::Result<bool> {
+        self.push_decoded_counting(board, None)
+    }
+
+    /// [`Batch::push_decoded`] と同一だが、成功 push 時に実 active feature 数
+    /// `written` を `active_hist` (長さ `max_active + 1` の呼び出し側 histogram)
+    /// の bin `written` に 1 加算する。`--monitor-active-features` の計装点。
+    ///
+    /// `active_hist` が `None` のときは histogram を一切触らない (計装 off 時の
+    /// ホットパス no-op)。`Some` のときの `active_hist` は `feature_set.max_active()
+    /// + 1` 以上の長さでなければならない (overflow は下の hard-error で弾かれるため
+    /// `written <= max_active` が index の不変条件)。batch 満杯 (`Ok(false)`) や
+    /// overflow (`Err`) では加算しない。
+    pub fn push_decoded_counting(
+        &mut self,
+        board: &ShogiBoard,
+        active_hist: Option<&mut [u64]>,
+    ) -> io::Result<bool> {
         if self.n_positions >= self.batch_size {
             return Ok(false);
         }
@@ -155,6 +172,10 @@ impl Batch {
                     spec.canonical_name(),
                 ),
             ));
+        }
+        // overflow 済み後なので `written <= max_active`、bin index は必ず範囲内。
+        if let Some(hist) = active_hist {
+            hist[written] += 1;
         }
 
         // score / wdl / norm
@@ -554,6 +575,12 @@ pub struct BucketedPrefetchedLoader {
     pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
     /// worker が reader から受けた io::Error を main に伝えるための slot。
     err_slot: Arc<Mutex<Option<io::Error>>>,
+    /// `--monitor-active-features` 時のみ `Some`。全 worker が共有する実 active
+    /// feature 数の histogram (長さ `feature_set.max_active() + 1`、bin `k` =
+    /// 実 active 数がちょうど `k` だった position 数の累積)。worker は自身の
+    /// batch-local histogram を batch 単位でここに flush する (1 position ごとの
+    /// lock を避ける)。`None` なら計装なし。
+    active_hist: Option<Arc<Mutex<Vec<u64>>>>,
     /// worker thread handle (`Drop` で join する)。
     handles: Vec<thread::JoinHandle<()>>,
 }
@@ -576,6 +603,10 @@ impl BucketedPrefetchedLoader {
     /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
     /// ようにするのが主用途。`train_end_offset` は [`PSV_RECORD_BYTES`] の倍数で
     /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
+    /// `monitor_active` が `true` のとき、各 position の実 active feature 数を
+    /// histogram (`feature_set.max_active() + 1` bins) に集計し [`Self::active_histogram_snapshot`]
+    /// で参照できるようにする (`--monitor-active-features`)。`false` では histogram
+    /// を確保せず worker のホットパスに計装コードを一切通さない。
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         path: &Path,
@@ -587,6 +618,7 @@ impl BucketedPrefetchedLoader {
         compute_bucket: bool,
         num_buckets: usize,
         train_end_offset: u64,
+        monitor_active: bool,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
@@ -607,6 +639,14 @@ impl BucketedPrefetchedLoader {
             score_drop_abs,
         )?));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+        let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
+            Some(Arc::new(Mutex::new(vec![
+                0u64;
+                feature_set.max_active() + 1
+            ])))
+        } else {
+            None
+        };
 
         let (result_tx, result_rx) = mpsc::sync_channel::<BatchSlot>(prefetch_depth);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
@@ -627,9 +667,16 @@ impl BucketedPrefetchedLoader {
             let err_slot = Arc::clone(&err_slot);
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
+            let active_hist = active_hist.clone();
             let handle = thread::spawn(move || {
                 // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
                 let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
+                // batch-local な active-feature histogram (計装 on のときだけ確保)。
+                // batch 末に共有 `active_hist` へ一括加算 → 1 position ごとの lock を
+                // 避ける。
+                let mut local_hist: Option<Vec<u64>> = active_hist
+                    .as_ref()
+                    .map(|_| vec![0u64; feature_set.max_active() + 1]);
                 loop {
                     // 空の batch slot を pool から借りる。
                     let (mut batch, mut buckets) = {
@@ -677,7 +724,7 @@ impl BucketedPrefetchedLoader {
                     let mut overflow: Option<io::Error> = None;
                     for psv in &scratch {
                         let board = psv.decode();
-                        match batch.push_decoded(&board) {
+                        match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
                                     pushed,
@@ -707,6 +754,20 @@ impl BucketedPrefetchedLoader {
                     debug_assert_eq!(batch.n_positions, batch_size);
                     debug_assert!(!compute_bucket || buckets.len() == batch_size);
 
+                    // batch-local histogram を共有 accumulator に flush して 0 に戻す
+                    // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
+                    // `Some` / `None`。
+                    if let (Some(shared), Some(local)) = (active_hist.as_ref(), local_hist.as_mut())
+                    {
+                        let mut g = shared.lock().expect("active_hist mutex poisoned");
+                        for (dst, src) in g.iter_mut().zip(local.iter()) {
+                            *dst += *src;
+                        }
+                        for v in local.iter_mut() {
+                            *v = 0;
+                        }
+                    }
+
                     // main へ。受信側が落ちていたら (loader drop) 終了。
                     if result_tx.send((batch, buckets)).is_err() {
                         break;
@@ -723,8 +784,20 @@ impl BucketedPrefetchedLoader {
             result_rx: Some(result_rx),
             pool_tx: Some(pool_tx),
             err_slot,
+            active_hist,
             handles,
         })
+    }
+
+    /// `--monitor-active-features` の histogram の現時点 snapshot を返す
+    /// (`spawn` で `monitor_active = false` なら `None`)。返す `Vec<u64>` は
+    /// 長さ `feature_set.max_active() + 1` で、bin `k` = 実 active 数がちょうど
+    /// `k` だった position 数の累積 (全 worker 合算)。lock 中に clone するので
+    /// 呼び出しは superbatch 末など低頻度に留めること。
+    pub fn active_histogram_snapshot(&self) -> Option<Vec<u64>> {
+        self.active_hist
+            .as_ref()
+            .map(|h| h.lock().expect("active_hist mutex poisoned").clone())
     }
 
     /// 次の `(Batch, per-position bucket)` を取得。返り値:
@@ -1058,6 +1131,105 @@ mod tests {
     }
 
     #[test]
+    fn push_decoded_counting_aggregates_active_counts() {
+        let spec = test_spec();
+        let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
+        let mut batch = Batch::with_capacity(8, spec);
+        let mut hist = vec![0u64; spec.max_active() + 1];
+
+        let mut pushed = 0u64;
+        for _ in 0..8 {
+            let psv = loader.next_psv().unwrap().expect("record");
+            let board = psv.decode();
+            assert!(
+                batch
+                    .push_decoded_counting(&board, Some(&mut hist))
+                    .unwrap()
+            );
+            pushed += 1;
+        }
+        // histogram の総和は push した position 数と一致する。
+        assert_eq!(hist.iter().sum::<u64>(), pushed);
+        // すべての実 active 数は `max_active` の bin 域に収まる (padding index には
+        // 入らない): non-zero の最大 bin が max_active 以下であることで確認。
+        let max_bin = hist.iter().rposition(|&c| c > 0).expect("some active");
+        assert!(max_bin <= spec.max_active());
+
+        // batch 満杯後の push (`Ok(false)`) は histogram を増やさない。
+        let extra = loader.next_psv().unwrap().expect("record").decode();
+        assert!(
+            !batch
+                .push_decoded_counting(&extra, Some(&mut hist))
+                .unwrap()
+        );
+        assert_eq!(
+            hist.iter().sum::<u64>(),
+            pushed,
+            "batch 満杯時の push は histogram に加算しない"
+        );
+    }
+
+    #[test]
+    fn bucketed_loader_active_histogram_gated_by_flag() {
+        let progress = ShogiProgressKPAbs;
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
+
+        // 計装 off: snapshot は None (histogram を確保しない = 集計しない)。
+        let mut off = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .unwrap();
+        let (batch, buckets) = off.next_batch().unwrap().expect("a batch");
+        off.recycle((batch, buckets));
+        assert!(
+            off.active_histogram_snapshot().is_none(),
+            "flag off では histogram を確保・集計しない"
+        );
+        drop(off);
+
+        // 計装 on: snapshot は Some、長さ = max_active + 1、総和は消費した
+        // position 数以上 (worker が先読みで余分に埋め得るため厳密一致は保証
+        // しない)。全 active 数は max_active bin 域に収まる。
+        let mut on = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            true,
+        )
+        .unwrap();
+        let mut consumed = 0u64;
+        for _ in 0..5 {
+            let (batch, buckets) = on.next_batch().unwrap().expect("a batch");
+            consumed += batch.n_positions as u64;
+            on.recycle((batch, buckets));
+        }
+        let hist = on.active_histogram_snapshot().expect("histogram present");
+        assert_eq!(hist.len(), test_spec().max_active() + 1);
+        let total: u64 = hist.iter().sum();
+        assert!(
+            total >= consumed,
+            "histogram total {total} は消費 position 数 {consumed} 以上"
+        );
+        assert!(total > 0, "on では position が集計される");
+    }
+
+    #[test]
     fn batch_reset_zeros_state() {
         let mut batch = Batch::with_capacity(4, test_spec());
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
@@ -1112,6 +1284,7 @@ mod tests {
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
@@ -1158,9 +1331,19 @@ mod tests {
         let progress = ShogiProgressKPAbs;
         let path = sample_psv_path();
         let end = full_range_end(&path);
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&path, 8, None, 0, progress, test_spec(), true, 9, end)
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            0,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
@@ -1188,6 +1371,7 @@ mod tests {
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
@@ -1208,6 +1392,7 @@ mod tests {
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         let _ = drop_loader.next_batch();
@@ -1231,6 +1416,7 @@ mod tests {
             true,
             9,
             2800,
+            false,
         )
         .unwrap();
         for _ in 0..30 {
@@ -1265,9 +1451,19 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true, 9, 0)
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &tmp,
+            8,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            0,
+            false,
+        )
+        .unwrap();
         let err = loader
             .next_batch()
             .expect_err("empty file → barren error, not None and not hang");

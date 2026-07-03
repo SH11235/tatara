@@ -434,6 +434,14 @@ pub struct TrainingConfig {
     /// 側 atomic 計数は常時有効だが host 報告のみ gate)。`--ft-fp16-out` 無しの
     /// run では FP16 clamp kernel 自体が launch されないため total は常に 0。
     pub monitor_fp16_clamps: bool,
+    /// `true` のとき dataloader worker が各 position の実 active feature 数
+    /// (`Batch::push_decoded_counting` の `written`) を histogram に集計し、各
+    /// superbatch 末に `[active-hist] sb=N positions=T mean=M p50=.. p90=.. p99=..
+    /// max=..` line を、run 終了時に non-zero bin の full dump (`[active-hist]
+    /// count[k]=n`) を stderr に出す (`--monitor-active-features`)。stats は累積
+    /// histogram に対して計算する。`false` では histogram を確保せず worker の
+    /// ホットパスに計装コードを通さない (feature-set 非依存、threat off でも動く)。
+    pub monitor_active_features: bool,
 }
 
 impl TrainingConfig {
@@ -501,6 +509,67 @@ impl TrainingConfig {
             ));
         }
         Ok(())
+    }
+}
+
+// =============================================================================
+// ActiveHistStats — 実 active feature 数 histogram の要約統計
+// =============================================================================
+
+/// 実 active feature 数 histogram (`bin[k]` = active 数 `k` の position 数) から
+/// 計算した分布要約 (`--monitor-active-features` の superbatch 末 line 用)。
+struct ActiveHistStats {
+    /// histogram に入っている総 position 数 (= bin の総和)。
+    positions: u64,
+    /// active 数の算術平均。
+    mean: f64,
+    /// 50 / 90 / 99 percentile (nearest-rank: 累積が `ceil(p * N)` に達する最小
+    /// bin index)。
+    p50: usize,
+    p90: usize,
+    p99: usize,
+    /// non-zero だった最大 bin index (= 観測された最大 active 数)。
+    max: usize,
+}
+
+impl ActiveHistStats {
+    /// `histogram` (index = active 数、値 = 出現 position 数) から統計を計算する。
+    /// 総和が 0 (= 1 position も入っていない) なら `None`。
+    fn from_histogram(histogram: &[u64]) -> Option<Self> {
+        let positions: u64 = histogram.iter().sum();
+        if positions == 0 {
+            return None;
+        }
+        let weighted: u128 = histogram
+            .iter()
+            .enumerate()
+            .map(|(active, &count)| active as u128 * count as u128)
+            .sum();
+        let mean = weighted as f64 / positions as f64;
+
+        // nearest-rank percentile: 累積 count が threshold 以上になる最小 bin。
+        let percentile = |p: f64| -> usize {
+            let threshold = (p * positions as f64).ceil() as u64;
+            let mut cumulative = 0u64;
+            for (active, &count) in histogram.iter().enumerate() {
+                cumulative += count;
+                if cumulative >= threshold {
+                    return active;
+                }
+            }
+            histogram.len().saturating_sub(1)
+        };
+
+        let max = histogram.iter().rposition(|&count| count > 0).unwrap_or(0);
+
+        Some(Self {
+            positions,
+            mean,
+            p50: percentile(0.50),
+            p90: percentile(0.90),
+            p99: percentile(0.99),
+            max,
+        })
     }
 }
 
@@ -583,6 +652,7 @@ where
         cfg.compute_bucket,
         cfg.num_buckets,
         train_end_offset,
+        cfg.monitor_active_features,
     )?;
 
     println!(
@@ -836,6 +906,19 @@ where
             );
         }
 
+        if cfg.monitor_active_features
+            && let Some(hist) = loader.active_histogram_snapshot()
+            && let Some(stats) = ActiveHistStats::from_histogram(&hist)
+        {
+            // 累積 histogram に対する分布統計 (実 active feature 数)。overflow は
+            // `push_decoded_counting` 側の hard-error で弾かれるため histogram には
+            // 現れない。
+            eprintln!(
+                "[active-hist] sb={} positions={} mean={:.1} p50={} p90={} p99={} max={}",
+                sb, stats.positions, stats.mean, stats.p50, stats.p90, stats.p99, stats.max,
+            );
+        }
+
         let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
@@ -882,6 +965,18 @@ where
     // 当該 batch の H2D は完了済、loader に返しても安全。
     if let Some(prev) = prev_pending.take() {
         loader.recycle(prev);
+    }
+
+    // 学習終了時に 1 回だけ full histogram を dump (non-zero bin のみ)。累積なので
+    // run 全体の実 active feature 数分布になる。
+    if cfg.monitor_active_features
+        && let Some(hist) = loader.active_histogram_snapshot()
+    {
+        for (active, count) in hist.iter().enumerate() {
+            if *count > 0 {
+                eprintln!("[active-hist] count[{active}]={count}");
+            }
+        }
     }
 
     println!(
@@ -1147,6 +1242,7 @@ mod tests {
             compute_bucket: true,
             num_buckets: 9,
             monitor_fp16_clamps: false,
+            monitor_active_features: false,
         }
     }
 

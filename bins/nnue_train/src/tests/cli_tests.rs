@@ -144,6 +144,21 @@ fn monitor_fp16_clamps_flag_defaults_off_and_parses_global() {
 }
 
 #[test]
+fn monitor_active_features_flag_defaults_off_and_parses_global() {
+    // default は false (新規 opt-in flag、実 active feature 数 histogram の log を gate)。
+    let cli =
+        Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand should parse");
+    assert!(!cli.monitor_active_features);
+    // 指定すれば true、`global = true` なので subcommand 前後どちらでも accept。
+    let cli_pre = Cli::try_parse_from(["nnue-train", "--monitor-active-features", "simple"])
+        .expect("--monitor-active-features before subcommand");
+    assert!(cli_pre.monitor_active_features);
+    let cli_post = Cli::try_parse_from(["nnue-train", "layerstack", "--monitor-active-features"])
+        .expect("--monitor-active-features after subcommand");
+    assert!(cli_post.monitor_active_features);
+}
+
+#[test]
 fn simple_accepts_tf32_flag() {
     // `--tf32` は LayerStack / Simple 両 subcommand で受理される (両方 cuBLAS handle
     // に同 flag を渡す opt-in)。default OFF / 渡せば ON で TF32 TC 有効化。
