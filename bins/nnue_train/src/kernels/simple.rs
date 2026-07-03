@@ -96,23 +96,11 @@ pub fn simple_act_grad_to_fp16_crelu_with_scale(
     };
     let s = g * dft_scale;
     let mut local_clamps: u64 = 0;
-    let s_c = if s > 65504.0_f32 {
-        local_clamps = 1;
-        65504.0_f32
-    } else if s < -65504.0_f32 {
-        local_clamps = 1;
-        -65504.0_f32
-    } else {
-        s
-    };
+    let s_c = clamp_f16_value!(s, local_clamps);
     if let Some(o) = dft_out.get_mut(tid) {
         *o = s_c as f16;
     }
-    if local_clamps > 0 {
-        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 }
 
 /// Simple FP16 FT activation forward (SCReLU): f16 FT 出力 + f32 bias → f32 acted。
@@ -201,23 +189,11 @@ pub fn simple_act_grad_to_fp16_screlu_with_scale(
     let g = dft * dydx;
     let s = g * dft_scale;
     let mut local_clamps: u64 = 0;
-    let s_c = if s > 65504.0_f32 {
-        local_clamps = 1;
-        65504.0_f32
-    } else if s < -65504.0_f32 {
-        local_clamps = 1;
-        -65504.0_f32
-    } else {
-        s
-    };
+    let s_c = clamp_f16_value!(s, local_clamps);
     if let Some(o) = dft_out.get_mut(tid) {
         *o = s_c as f16;
     }
-    if local_clamps > 0 {
-        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 }
 
 /// Simple FP16 FT bias gradient: f16 dft + inv_scale → f32 grad_bias atomic add。

@@ -451,41 +451,15 @@ pub fn ft_post_perspective_grad_fused_fp16(
     // atomic counter で、host (`--monitor-fp16-clamps`) が sb 末に D2H read する。
     let da = grad_a * dft_scale;
     let mut local_clamps: u64 = 0;
-    let da_c = if da > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if da < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        da
-    };
+    let da_c = clamp_f16_value!(da, local_clamps);
     let db = grad_b * dft_scale;
-    let db_c = if db > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if db < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        db
-    };
+    let db_c = clamp_f16_value!(db, local_clamps);
     let out_ptr = grad_ft_out.as_mut_ptr();
     unsafe {
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
-    if local_clamps > 0 {
-        // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64`
-        // (align 8) と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。
-        // 同 cell を更新するのは本 kernel および同 file の `ft_post_perspective_
-        // grad_fp16`、`bins/nnue_train/src/kernels/simple.rs` の `simple_act_grad_
-        // to_fp16_{crelu,screlu}_with_scale` の計 4 kernel 関数で、いずれも
-        // `DeviceAtomicU64::fetch_add` 経由でのみ書く (non-atomic 経路無し)。
-        // cumulative counter なので host も memset reset を出さない。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 
     // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
     let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
@@ -573,25 +547,9 @@ pub fn ft_post_perspective_grad_fp16(
     // `clamp_counter` は cap が当たった要素数の cumulative atomic counter。
     let da = grad_a * dft_scale;
     let mut local_clamps: u64 = 0;
-    let da_c = if da > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if da < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        da
-    };
+    let da_c = clamp_f16_value!(da, local_clamps);
     let db = grad_b * dft_scale;
-    let db_c = if db > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if db < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        db
-    };
+    let db_c = clamp_f16_value!(db, local_clamps);
     // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の
     // 偶数性で pair_idx ∈ [0, half) → {pair_idx, half + pair_idx} ⊂ [0, ft_dim)、tid 範囲
     // チェックで bi < batch。同一 (bi, ii) cell を書く thread は他に無い (pair_idx 単射)。
@@ -600,11 +558,7 @@ pub fn ft_post_perspective_grad_fp16(
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
-    if local_clamps > 0 {
-        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 
     // grad_bias は f32 accumulate を維持 (scale 無しの grad_a / grad_b を atomic add)。
     // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
