@@ -216,6 +216,12 @@ pub(crate) struct GpuTrainer {
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
+    /// true なら L1 forward (per-bucket dense) と L1f input backward を手書き tiled
+    /// kernel ではなく `self.cublas` の TF32 Sgemm で計算する (`--tf32`)。false では
+    /// 手書き kernel の純 FP32 path と bit-identical。`self.cublas` の math mode も同
+    /// flag で `CUBLAS_TF32_TENSOR_OP_MATH` / `CUBLAS_DEFAULT_MATH` に決まる
+    /// ([`CublasHandle::new`]) ため、cuBLAS 経路選択と math mode は常に一致する。
+    tf32: bool,
     /// 入力 feature set spec。FT 入力次元 (`ft_in`) / active feature 数
     /// (`max_active`) / artifact identity の単一の真実源。起動時に
     /// `--feature-set` から一度だけ決まり、以降不変。
@@ -955,6 +961,7 @@ impl GpuTrainer {
             ft_fp16: precision.ft_fp16,
             ft_fp16_out: precision.ft_fp16_out,
             fp16_opt_state: precision.fp16_opt_state,
+            tf32: precision.tf32,
             feature_set,
             optim_groups,
             norm_loss_factor,
@@ -2033,30 +2040,77 @@ impl GpuTrainer {
             }
         }?;
 
-        // c) sorted fwd_L1 → l1_bucket_sorted。grid = (padded_b/16 batch-tile, n_out_tiles
-        // out-tile)、各 block uniform-bucket 保証。
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
-                stream: self.stream,
-                module: self.module,
-                config: LaunchConfig {
-                    grid_dim: ((padded_b / 16) as u32, n_out_tiles as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.combined_sorted),
-                    slice(self.l1_w),
-                    slice(self.l1_b),
-                    slice(self.ws.bucket_idx_sorted_dev),
-                    slice_mut(self.ws.l1_bucket_sorted),
-                    padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-                ]
+        // c) sorted fwd_L1 → l1_bucket_sorted。`self.tf32` で per-bucket cuBLAS Sgemm と
+        // 手書き tiled kernel を分岐する。手書き kernel は bias を fuse するが、cuBLAS は
+        // matmul のみなので step e) で bias を別 pass する。
+        if self.tf32 {
+            // 各 bucket の sorted 開始行は device の `exclusive_scan_aligned` と同じ手順を
+            // host で再現する (batch.bucket_idx は original order の 0..num_buckets 値)。
+            // GPU 同期を挟まないため device offsets の readback は行わない。bucket g の real
+            // row `[row0, row0 + count_g)` は 16-align 済で combined_sorted 上に連続する。
+            let nb = self.num_buckets;
+            let mut counts = [0_u32; MAX_SUPPORTED_NUM_BUCKETS];
+            for &bk in batch.bucket_idx.iter() {
+                if bk >= 0 && (bk as usize) < nb {
+                    counts[bk as usize] += 1;
+                }
             }
-        }?;
+            let combined_base = self.ws.combined_sorted.cu_deviceptr() as *const f32;
+            let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
+            let out_base = self.ws.l1_bucket_sorted.cu_deviceptr() as *mut f32;
+            let mut acc: u32 = 0;
+            for (g, &m) in counts.iter().enumerate().take(nb) {
+                let rem = acc % 16;
+                if rem != 0 {
+                    acc += 16 - rem;
+                }
+                let row0 = acc as usize;
+                acc += m;
+                if m == 0 {
+                    continue;
+                }
+                // C[m, l1_out] = combined_sorted[row0.., ft_out] @ l1_w[g][l1_out, ft_out]^T
+                // (reduce 軸 ft_out)。w[g] は `[l1_out, ft_out]` row-major で offset
+                // `g * l1_out * ft_out`。beta=0 overwrite。
+                // SAFETY: 全 pointer は cudaMalloc 由来の base + element offset で、offset は
+                // real row / weight slab の範囲内 (row0 + m <= padded_b、g < num_buckets)。
+                // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行。
+                unsafe {
+                    self.cublas.sgemm_x_yt_rowmajor(
+                        m as i32,      // rows in bucket g
+                        l1_out as i32, // n = out_dim
+                        ft_out as i32, // k = in_dim (reduce)
+                        combined_base.add(row0 * ft_out),
+                        l1w_base.add(g * l1_out * ft_out),
+                        out_base.add(row0 * l1_out),
+                    )?;
+                }
+            }
+        } else {
+            // grid = (padded_b/16 batch-tile, n_out_tiles out-tile)、各 block uniform-bucket 保証。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: ((padded_b / 16) as u32, n_out_tiles as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.combined_sorted),
+                        slice(self.l1_w),
+                        slice(self.l1_b),
+                        slice(self.ws.bucket_idx_sorted_dev),
+                        slice_mut(self.ws.l1_bucket_sorted),
+                        padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+        }
 
         // d) l1_bucket_sorted を perm で inverse-scatter → l1_bucket (original order)。
         // padding 行 (perm=-1) は inverse permute kernel が skip。
@@ -2075,6 +2129,28 @@ impl GpuTrainer {
                 ]
             }
         }?;
+
+        // e) tf32 経路のみ: original order の l1_bucket に per-bucket bias を足す
+        // (手書き kernel は fuse 済なので non-tf32 経路では不要)。bucket_idx_dev は
+        // original order の bucket、l1_b は `[num_buckets, l1_out]` row-major。
+        if self.tf32 {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_add_per_bucket_row,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.l1_b),
+                        slice(self.ws.bucket_idx_dev),
+                        slice_mut(self.ws.l1_bucket),
+                        b_u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+        }
 
         prof_tick!("fwd_L1");
 
@@ -2842,30 +2918,51 @@ impl GpuTrainer {
         prof_tick!("bwd_L1eff");
 
         // -- Backward 5 reverse: L1f shared dense grad --
-        // L1f input bwd: in_dim=ft_out, out_dim=l1_out。16×16 tile の kernel (block=256 =
-        // 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)。out_dim は reduction 軸で、
-        // kernel 内の 16 幅 out-tile loop で消化するため grid には現れない。
+        // L1f input bwd: `dcombined[b][i] = sum_o dl1_total[b][o] * l1f_w[i][o]`
+        // (in_dim=ft_out, out_dim=l1_out)。`self.tf32` で cuBLAS Sgemm (X @ Y^T、beta=0
+        // overwrite) と手書き tiled kernel を分岐する。手書き kernel は 16×16 tile
+        // (block=256 = 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)、out_dim は
+        // reduction 軸で kernel 内 16 幅 out-tile loop で消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: dense_mm_bwd_input_tiled,
-                stream: self.stream,
-                module: self.module,
-                config: LaunchConfig {
-                    grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.dl1_total),
-                    slice(self.l1f_w),
-                    slice_mut(self.ws.dcombined_from_l1f),
-                    b_u32, ft_out as u32, l1_out as u32
-                ]
+        if self.tf32 {
+            // C[b, ft_out] = dl1_total[b, l1_out] @ l1f_w[ft_out, l1_out]^T (reduce 軸 l1_out)。
+            // SAFETY: dl1_total / l1f_w / dcombined_from_l1f は cudaMalloc 由来、長さは arch
+            // 上 invariant (`dl1_total.len() == b*l1_out`、`l1f_w.len() == ft_out*l1_out`、
+            // `dcombined_from_l1f.len() == b*ft_out`)、`self.cublas` は `self.stream` に bind
+            // 済で同 stream 内 in-order 実行。beta=0 overwrite は手書き kernel の write
+            // semantics (`*dx = acc`) と一致。
+            unsafe {
+                self.cublas.sgemm_x_yt_rowmajor(
+                    b_u32 as i32,  // m = batch
+                    ft_out as i32, // n = in_dim
+                    l1_out as i32, // k = out_dim (reduce)
+                    self.ws.dl1_total.cu_deviceptr() as *const f32,
+                    self.l1f_w.cu_deviceptr() as *const f32,
+                    self.ws.dcombined_from_l1f.cu_deviceptr() as *mut f32,
+                )?;
             }
-        }?;
+        } else {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_input_tiled,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.dl1_total),
+                        slice(self.l1f_w),
+                        slice_mut(self.ws.dcombined_from_l1f),
+                        b_u32, ft_out as u32, l1_out as u32
+                    ]
+                }
+            }?;
+        }
         // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
         // combined[batch, ft_out] row-major、dl1_total[batch, l1_out] row-major、reduce 軸は
         // batch。M = l1_out と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の

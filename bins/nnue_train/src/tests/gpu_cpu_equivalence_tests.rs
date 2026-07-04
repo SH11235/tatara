@@ -680,6 +680,64 @@ fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// `CublasHandle::sgemm_x_yt_rowmajor` (row-major `C[m,n] = X[m,k] @ Y[n,k]^T`) が
+/// `dense_mm_bwd_input_cpu` と一致する。この helper は tf32 経路の L1f input backward
+/// (m=batch, n=ft_out, k=l1_out で reduce 軸 k=16 が細い) と per-bucket L1 forward
+/// (n=l1_out=16 が細い、k=ft_out) の双方を計算するため、両 shape regime を張る。
+/// FP32 handle (`CUBLAS_DEFAULT_MATH`) は cuBLAS の K 分割による FMA 順序差のみなので
+/// tight、TF32 handle (`CUBLAS_TF32_TENSOR_OP_MATH`) は入力の仮数 10-bit cast 分だけ
+/// 緩める。入力を正値に寄せて桁落ちを避け、TF32 の相対 tolerance を安定させる。
+#[test]
+fn cublas_sgemm_x_yt_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, _module, stream) = open_module()?;
+    // (m = batch, n = in_dim, k = out_dim/reduce)
+    for &(m, n, k) in &[
+        (64_usize, 128_usize, 16_usize), // L1f input-bwd regime: k=16 が細い
+        (128, 256, 16),
+        (64, 16, 128), // per-bucket L1-fwd regime: n=16 が細い
+        (128, 16, 512),
+        (48, 64, 32),
+    ] {
+        let x: Vec<f32> = deterministic_floats(m * k, 0.3)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let y: Vec<f32> = deterministic_floats(n * k, 0.7)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let mut c_cpu = vec![0.0_f32; m * n];
+        dense_mm_bwd_input_cpu(&x, &y, &mut c_cpu, m, n, k);
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let y_dev = DeviceBuffer::from_host(&stream, &y)?;
+        for &(enable_tf32, tol) in &[(false, 1e-4_f32), (true, 5e-3_f32)] {
+            let handle = CublasHandle::new(&stream, enable_tf32)?;
+            let c_dev = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
+            // SAFETY: device buffer 長は仕様分 (x=m*k, y=n*k, c=m*n)、handle は stream に
+            // bind 済で同 stream 内 in-order 実行、beta=0 overwrite。
+            unsafe {
+                handle.sgemm_x_yt_rowmajor(
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    x_dev.cu_deviceptr() as *const f32,
+                    y_dev.cu_deviceptr() as *const f32,
+                    c_dev.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("sgemm_x_yt tf32={enable_tf32} m={m} n={n} k={k}"),
+                &c_dev.to_host_vec(&stream)?,
+                &c_cpu,
+                tol,
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // tiled kernel は in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0 を要求
