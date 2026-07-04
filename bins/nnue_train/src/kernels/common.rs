@@ -349,10 +349,11 @@ macro_rules! radam_finish {
         *$g_ref = 0.0_f32;
     };
     (@grad keep_grad, $g_ref:ident) => {
-        // ft_w_grad は毎 step backward (overwrite-gather、factorizer 有効時は仮想行を
-        // `ft_reduce_virtual_grad`) が全 cell を書き直すため、ここで grad を 0 に戻さない
-        // (戻しても次 read 前に上書きされ DRAM 書き込みを浪費するだけ)。
-        // 通常の radam_step は atomic 累積 group で次 step 前の zero-out が必須。
+        // ft_w_grad は毎 step backward 冒頭の memset_zero が 0 起点を与え、gather (add
+        // 累積、factorizer 有効時は仮想行を `ft_reduce_virtual_grad` が上書き) が積む
+        // ため、ここで grad を 0 に戻さない (戻しても次 read 前に 0 化され DRAM 書き込み
+        // を浪費するだけ)。通常の radam_step は atomic 累積 group で次 step 前の
+        // zero-out が必須。
     };
     (@mirror no_mirror, $i:ident, $p_clamped:ident) => {
     };
@@ -1309,6 +1310,62 @@ pub fn prefix_sum_add_block_offset(
     }
 }
 
+/// Compaction phase of inverse-index (prefix sum の直後): `counts` から active
+/// feature (出現数 > 0) の indicator を作る。1 thread = 1 feature、
+/// `indicator[f] = (counts[f] > 0) as u32`。この indicator を [`prefix_sum_block_local`]
+/// → [`exclusive_prefix_sum_small`] → [`prefix_sum_add_block_offset`] の 3 段 scan に
+/// 流すと `active_offsets[f]` = feature f より前の active 数、`active_offsets[n_features]`
+/// = active 総数 (n_active) になる。`gather_and_sum_per_feature_*` の grid-stride が
+/// count=0 feature の block を launch しないようにするための前処理。
+///
+/// host: `cfg_1d(n_features)` (1 thread/feature)。caller は `indicator.len() ==
+/// n_features` を保証する。
+#[kernel]
+pub fn build_active_indicator(counts: &[u32], indicator: &[u32], n_features: u32) {
+    let tid = thread::index_1d();
+    if tid.get() >= n_features as usize {
+        return;
+    }
+    let v: u32 = if counts[tid.get()] > 0 { 1 } else { 0 };
+    // SAFETY: `indicator.len() == n_features` (caller 契約) かつ `tid < n_features`。
+    // 各 thread の書き込み先は disjoint な単一 cell で、non-atomic write で衝突しない。
+    let out_ptr = indicator.as_ptr() as *mut u32;
+    unsafe {
+        out_ptr.add(tid.get()).write(v);
+    }
+}
+
+/// Compaction phase (indicator の prefix sum 後): active feature の id を密に詰める。
+/// 1 thread = 1 feature、`if indicator[f] != 0 { active_ids[active_offsets[f]] = f }`。
+/// exclusive prefix sum が active feature ごとに一意な書き先 slot (`< n_active`) を
+/// 与えるので atomic 不要。
+///
+/// host: `cfg_1d(n_features)`。`active_ids` は最大 `n_features` 要素 (全 feature
+/// active のとき)。caller は `active_offsets` が `indicator` の exclusive prefix sum
+/// (`n_features + 1` 要素) であることを保証する。
+#[kernel]
+pub fn compact_active_features(
+    indicator: &[u32],
+    active_offsets: &[u32],
+    active_ids: &[u32],
+    n_features: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= n_features as usize {
+        return;
+    }
+    if indicator[tid.get()] != 0 {
+        let slot = active_offsets[tid.get()] as usize;
+        // SAFETY: active 数 = `active_offsets[n_features]` <= `n_features` <=
+        // `active_ids.len()`。exclusive prefix sum が active feature ごとに異なる
+        // `slot` (< n_active) を与えるため書き込み先は重ならない。
+        let out_ptr = active_ids.as_ptr() as *mut u32;
+        unsafe {
+            out_ptr.add(slot).write(tid.get() as u32);
+        }
+    }
+}
+
 /// Phase 3 of inverse-index: 各 (b, slot) を inverse 順 (feature 別) に配置。
 /// `write_counters[f]` を atomic increment、`positions[offsets[f] + write_counters[f]] = bi`。
 /// host が呼出前に `write_counters` を 0 reset。
@@ -1375,13 +1432,6 @@ macro_rules! gather_grad_scale {
 }
 
 macro_rules! gather_grad_flush {
-    (overwrite, $grad_w:ident, $index:expr, $value:expr) => {{
-        // 範囲外 (n_f=0、off_start == off_end) でも sum=0 を書き、host の事前 0-reset を不要にする。
-        let out_ptr = $grad_w.as_ptr() as *mut f32;
-        unsafe {
-            out_ptr.add($index).write($value);
-        }
-    }};
     (add, $grad_w:ident, $index:expr, $sum:ident, $value:expr) => {
         if $sum != 0.0_f32 {
             // DeviceAtomicF32 は f32 と同じ layout / alignment で、同じ cell を
@@ -1394,22 +1444,6 @@ macro_rules! gather_grad_flush {
 
 macro_rules! gather_grad_finish {
     (
-        overwrite,
-        $scale:ident,
-        $grad_w:ident,
-        $index:expr,
-        $sum:ident
-        $(, $dft_inv_scale:ident)?
-    ) => {
-        gather_grad_flush!(
-            overwrite,
-            $grad_w,
-            $index,
-            gather_grad_scale!($scale, $sum $(, $dft_inv_scale)?)
-        );
-    };
-    (
-        add,
         $scale:ident,
         $grad_w:ident,
         $index:expr,
@@ -1426,103 +1460,104 @@ macro_rules! gather_grad_finish {
     };
 }
 
-// gather kernel の各変種で index 解決、4-way unroll、累算のコアを共有する。
+// gather kernel の各変種で active feature の grid-stride、index 解決、4-way unroll、
+// 累算のコアを共有する。`grad_w` への書き出しは常に atomic add で、caller が phase D
+// 前に `grad_w` を 0 で memset する契約 (stm / nstm の 2 回の add が同 buffer に重なる)。
 macro_rules! gather_and_sum_per_feature_body {
     (
         $grad_out:ident,
         $positions:ident,
         $offsets:ident,
         $grad_w:ident,
+        $active_ids:ident,
+        $active_offsets:ident,
         $n_features:ident,
         $ft_out:ident;
         $grad_type:ident,
-        $scale:ident,
-        $flush:ident
+        $scale:ident
         $(, $dft_inv_scale:ident)?
     ) => {
-        let feature = thread::blockIdx_x() as usize;
         let ri_block = thread::blockIdx_y() as usize;
         let tid_local = thread::threadIdx_x() as usize;
         let block_dim = thread::blockDim_x() as usize;
         let ri = ri_block * block_dim + tid_local;
         let ft_out_u = $ft_out as usize;
-        if ri >= ft_out_u || feature >= ($n_features as usize) {
+        if ri >= ft_out_u {
             return;
         }
-
-        let off_start = $offsets[feature] as usize;
-        let off_end = $offsets[feature + 1] as usize;
+        // active feature 数 = indicator の exclusive prefix sum 末尾。compaction が
+        // `active_ids[0..n_active]` に count>0 の feature id を密に詰めている。
+        let n_active = $active_offsets[$n_features as usize] as usize;
 
         // caller は positions の容量、offsets が示す有効範囲、grad_out / grad_w の
         // arch 固定長を保証する。launch config と上の検査により ri < ft_out_u。
         let grad_out_ptr = $grad_out.as_ptr();
         let positions_ptr = $positions.as_ptr();
-        // 1-load-1-fadd では in-flight load が 1 個に限られ Long Scoreboard stall 中に
-        // warp scheduler が idle になるため、4-way unroll で load 待ちを分散する。
-        // 加算順は kernel の数値挙動の一部。
-        let mut sum0 = 0.0_f32;
-        let mut sum1 = 0.0_f32;
-        let mut sum2 = 0.0_f32;
-        let mut sum3 = 0.0_f32;
-        let mut i = off_start;
-        let unroll_end = if off_end >= off_start + 3 {
-            off_end - 3
-        } else {
-            off_start
-        };
-        while i < unroll_end {
-            let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
-            let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
-            let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
-            let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
-            sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi0 * ft_out_u + ri);
-            sum1 += gather_grad_read!($grad_type, grad_out_ptr, bi1 * ft_out_u + ri);
-            sum2 += gather_grad_read!($grad_type, grad_out_ptr, bi2 * ft_out_u + ri);
-            sum3 += gather_grad_read!($grad_type, grad_out_ptr, bi3 * ft_out_u + ri);
-            i += 4;
-        }
-        while i < off_end {
-            let bi = unsafe { positions_ptr.add(i).read() } as usize;
-            sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi * ft_out_u + ri);
-            i += 1;
-        }
-        let sum = (sum0 + sum1) + (sum2 + sum3);
+        let active_ids_ptr = $active_ids.as_ptr();
+        // grid-stride: `blockIdx_x` を active_ids の index として grid 全体で n_active を
+        // 覆う。count=0 feature は active_ids に無いので空振り block を launch しない。
+        let grid_x = thread::gridDim_x() as usize;
+        let mut a = thread::blockIdx_x() as usize;
+        while a < n_active {
+            let feature = unsafe { active_ids_ptr.add(a).read() } as usize;
+            let off_start = $offsets[feature] as usize;
+            let off_end = $offsets[feature + 1] as usize;
 
-        gather_grad_finish!(
-            $flush,
-            $scale,
-            $grad_w,
-            feature * ft_out_u + ri,
-            sum
-            $(, $dft_inv_scale)?
-        );
+            // 1-load-1-fadd では in-flight load が 1 個に限られ Long Scoreboard stall 中に
+            // warp scheduler が idle になるため、4-way unroll で load 待ちを分散する。
+            // 加算順は kernel の数値挙動の一部。
+            let mut sum0 = 0.0_f32;
+            let mut sum1 = 0.0_f32;
+            let mut sum2 = 0.0_f32;
+            let mut sum3 = 0.0_f32;
+            let mut i = off_start;
+            let unroll_end = if off_end >= off_start + 3 {
+                off_end - 3
+            } else {
+                off_start
+            };
+            while i < unroll_end {
+                let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+                let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+                let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+                let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+                sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi0 * ft_out_u + ri);
+                sum1 += gather_grad_read!($grad_type, grad_out_ptr, bi1 * ft_out_u + ri);
+                sum2 += gather_grad_read!($grad_type, grad_out_ptr, bi2 * ft_out_u + ri);
+                sum3 += gather_grad_read!($grad_type, grad_out_ptr, bi3 * ft_out_u + ri);
+                i += 4;
+            }
+            while i < off_end {
+                let bi = unsafe { positions_ptr.add(i).read() } as usize;
+                sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi * ft_out_u + ri);
+                i += 1;
+            }
+            let sum = (sum0 + sum1) + (sum2 + sum3);
+
+            gather_grad_finish!(
+                $scale,
+                $grad_w,
+                feature * ft_out_u + ri,
+                sum
+                $(, $dft_inv_scale)?
+            );
+
+            a += grid_x;
+        }
     };
 }
 
-/// Phase 4 of inverse-index: 各 feature について grad_out の対応 row を sum し、
-/// `grad_w[feature][ri]` に書き出し (overwrite 版)。
+/// Phase 4 of inverse-index: active feature (出現数 > 0) について grad_out の対応 row を
+/// sum し、`grad_w[feature][ri]` へ atomic add する。
 ///
-/// block 構成: blockIdx_x = feature_id (`cols`)、blockIdx_y = ri tile (`ft_out / blockDim`)。
-/// block_dim threads (各 1 ri cell、cell 境界は block 内で disjoint なため atomic 不要)。
-/// launch grid の全 `(feature, ri)` cell を必ず書く (`off_start == off_end` の feature でも
-/// sum=0 を書く) ため、caller は grad_w を事前 0-reset しなくてよい。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn gather_and_sum_per_feature_overwrite(
-    grad_out: &[f32],
-    positions: &[u32],
-    offsets: &[u32],
-    grad_w: &[f32],
-    n_features: u32,
-    ft_out: u32,
-) {
-    gather_and_sum_per_feature_body!(
-        grad_out, positions, offsets, grad_w, n_features, ft_out;
-        f32, noscale, overwrite
-    );
-}
-
-/// Phase 4 (add 版): nstm 第 2 回呼び出し用。stm の overwrite 結果に atomic 加算。
+/// block 構成: `blockIdx_x` = active_ids index (grid-stride、grid.x は occupancy 由来の
+/// 固定値)、`blockIdx_y` = ri tile (`ft_out / blockDim`)、`blockDim` threads (各 1 ri
+/// cell)。count=0 feature は compaction phase (`build_active_indicator` /
+/// `compact_active_features`) が active_ids から除外するので launch されない。
+///
+/// caller は phase D の前に `grad_w` を 0 で memset する契約 (stm / nstm の 2 回 add が
+/// 同 buffer に重なり、factorizer の `ft_reduce_virtual_grad` も 0 起点の実 block を
+/// 前提とする)。`active_offsets[n_features]` が active 総数 (n_active)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn gather_and_sum_per_feature_add(
@@ -1530,17 +1565,19 @@ pub fn gather_and_sum_per_feature_add(
     positions: &[u32],
     offsets: &[u32],
     grad_w: &[f32],
+    active_ids: &[u32],
+    active_offsets: &[u32],
     n_features: u32,
     ft_out: u32,
 ) {
     gather_and_sum_per_feature_body!(
-        grad_out, positions, offsets, grad_w, n_features, ft_out;
-        f32, noscale, add
+        grad_out, positions, offsets, grad_w, active_ids, active_offsets, n_features, ft_out;
+        f32, noscale
     );
 }
 
-/// [`gather_and_sum_per_feature_overwrite`] の FP16 入力版。`grad_out` (dft) を `f16`
-/// で読み、各値を `f32` に変換してから累算する。累算と `grad_w` への書き出しは `f32`。
+/// [`gather_and_sum_per_feature_add`] の FP16 入力版。`grad_out` (dft) を `f16` で読み、
+/// 各値を `f32` に変換してから累算する。累算と `grad_w` への書き出しは `f32`。
 ///
 /// `grad_out` は b × ft_out で、本 kernel は 1 feature の出現位置すべてに対して全 ri
 /// 行を gather-read するため step 中で最も read DRAM traffic が大きい。`ft_post_
@@ -1552,38 +1589,20 @@ pub fn gather_and_sum_per_feature_add(
 /// `dft_inv_scale` (= 1 / dft_scale) を掛けて元の scale に戻す。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
-pub fn gather_and_sum_per_feature_overwrite_fp16(
-    grad_out: &[f16],
-    positions: &[u32],
-    offsets: &[u32],
-    grad_w: &[f32],
-    n_features: u32,
-    ft_out: u32,
-    dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
-) {
-    gather_and_sum_per_feature_body!(
-        grad_out, positions, offsets, grad_w, n_features, ft_out;
-        f16, scale, overwrite, dft_inv_scale
-    );
-}
-
-/// [`gather_and_sum_per_feature_add`] の FP16 入力版。`grad_out` (dft) を `f16` で読み、
-/// `dft_inv_scale` で loss scaling を打ち消す以外は `gather_and_sum_per_feature_add` と
-/// 同一 (nstm 第 2 回呼び出しで stm の overwrite 結果へ atomic 加算)。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
 pub fn gather_and_sum_per_feature_add_fp16(
     grad_out: &[f16],
     positions: &[u32],
     offsets: &[u32],
     grad_w: &[f32],
+    active_ids: &[u32],
+    active_offsets: &[u32],
     n_features: u32,
     ft_out: u32,
     dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
 ) {
     gather_and_sum_per_feature_body!(
-        grad_out, positions, offsets, grad_w, n_features, ft_out;
-        f16, scale, add, dft_inv_scale
+        grad_out, positions, offsets, grad_w, active_ids, active_offsets, n_features, ft_out;
+        f16, scale, dft_inv_scale
     );
 }
 

@@ -3947,6 +3947,67 @@ fn inverse_index_phase_kernels_match_cpu() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// compaction (`build_active_indicator` → prefix sum → `compact_active_features`) が
+/// count>0 の feature を密に詰め、`active_offsets[n]` = n_active、`active_ids[0..n_active]`
+/// = 昇順 active id を出すことを空 batch / 全 active / 疎の 3 ケースで確認する。
+#[test]
+fn compaction_kernels_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let cases: &[Vec<u32>] = &[
+        vec![0, 0, 0, 0, 0],          // 空 batch: active 0
+        vec![3, 1, 7, 2, 5],          // 全 active
+        vec![0, 4, 0, 0, 9, 0, 2, 0], // 疎
+    ];
+    for counts in cases {
+        let n = counts.len();
+        let expected_ids: Vec<u32> = (0..n as u32).filter(|&f| counts[f as usize] > 0).collect();
+        let n_active = expected_ids.len() as u32;
+
+        let counts_dev = DeviceBuffer::from_host(&stream, counts)?;
+        let indicator_dev = DeviceBuffer::<u32>::zeroed(&stream, n)?;
+        let active_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, n + 1)?;
+        let active_ids_dev = DeviceBuffer::<u32>::zeroed(&stream, n)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: build_active_indicator, stream: stream, module: module,
+                config: cfg_1d(n),
+                args: [slice(counts_dev), slice(indicator_dev), n as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(indicator_dev), slice(active_offsets_dev), n as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: compact_active_features, stream: stream, module: module,
+                config: cfg_1d(n),
+                args: [slice(indicator_dev), slice(active_offsets_dev), slice(active_ids_dev), n as u32]
+            }
+        }?;
+        stream.synchronize()?;
+
+        let offsets = active_offsets_dev.to_host_vec(&stream)?;
+        assert_eq!(offsets[n], n_active, "n_active (counts={counts:?})");
+        let ids = active_ids_dev.to_host_vec(&stream)?;
+        assert_eq!(
+            &ids[..n_active as usize],
+            expected_ids.as_slice(),
+            "active_ids (counts={counts:?})"
+        );
+    }
+    Ok(())
+}
+
 /// `exclusive_prefix_sum_small` の per-thread chunk 直列和経路 (n > 1024、本番
 /// ft_in ≈ 73K 相当) と、余剰 thread が出る n < 1024 の両方を照合する。
 #[test]
@@ -4050,11 +4111,11 @@ fn prefix_sum_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// inverse-index pipeline (count → prefix sum → scatter → gather) の合成が素朴
-/// atomic scatter reference `sparse_ft_backward_cpu` と一致することを確認する。
-/// trainer と同じく stm を overwrite 版・nstm を add 版で 2 周し ft_w_grad に合算
-/// する。phase D の 4-way unroll partial sum で加算順が CPU と異なるため relative
-/// tolerance。
+/// inverse-index pipeline (count → prefix sum → compaction → scatter → gather) の
+/// 合成が素朴 atomic scatter reference `sparse_ft_backward_cpu` と一致することを
+/// 確認する。trainer と同じく grad_w を 0 化してから stm / nstm を add で 2 周し
+/// 合算する。phase D の 4-way unroll partial sum で加算順が CPU と異なるため relative
+/// tolerance。gather は grid.x を n_active より小さく取り grid-stride も exercise する。
 #[test]
 fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -4064,8 +4125,8 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
     let nstm_indices = sparse_indices_fixture(batch, nnz, ft_in, 4);
     // fixture 前提の guard: feature 0 の区間は 4-way unroll 本体 (4 個) を通過した後
     // 端数 tail に継続する出現数 (> 4 かつ非 4 倍数)、feature ft_in-1 の区間は空
-    // (overwrite kernel の sum=0 書き切り経路)。fixture を変えてこの前提が崩れたら
-    // ここで気付く。
+    // (compaction が active_ids から除外 → grad_w は memset の 0 のまま残る経路)。
+    // fixture を変えてこの前提が崩れたらここで気付く。
     for idx in [&stm_indices, &nstm_indices] {
         let count0 = idx.iter().filter(|&&i| i == 0).count();
         assert!(
@@ -4105,14 +4166,16 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    let active_indicator_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let active_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
+    let active_ids_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     // 全 row が全幅 nnz を使う fixture なので nnz_arr は一様 (early-out は no-op、
     // `sparse_ft_backward_cpu` の全幅走査と bit 一致)。
     let nnz_arr = vec![nnz as i32; batch];
     let nnz_arr_dev = DeviceBuffer::from_host(&stream, &nnz_arr)?;
-    for (iter_idx, (idx_host, dft_host)) in [(&stm_indices, &dft_stm), (&nstm_indices, &dft_nstm)]
-        .into_iter()
-        .enumerate()
-    {
+    // 新契約: stm / nstm とも add で 0 起点に重ねるため、loop 前に grad_w を 0 化する。
+    memset_zero(&stream, &grad_w_dev)?;
+    for (idx_host, dft_host) in [(&stm_indices, &dft_stm), (&nstm_indices, &dft_nstm)] {
         memset_zero(&stream, &counts_dev)?;
         memset_zero(&stream, &write_ctr_dev)?;
         let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
@@ -4146,31 +4209,48 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
                        slice(positions_dev), batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
-        // production (block 128 × grid y = ft_out/128) と同じく ri 軸を blockIdx_y で
-        // tile する。ft_out=8 を 4 幅 × 2 tile に割って y 軸も exercise する。
-        if iter_idx == 0 {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_overwrite, stream: stream, module: module,
-                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                           ft_in as u32, ft_out as u32]
-                }
-            }?;
-        } else {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_add, stream: stream, module: module,
-                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                           ft_in as u32, ft_out as u32]
-                }
-            }?;
-        }
+        // B': compaction (indicator → active_offsets → active_ids)。ft_in=9 は小さいので
+        // active_offsets は単一 block scan (`exclusive_prefix_sum_small`) で作る。
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: build_active_indicator, stream: stream, module: module,
+                config: cfg_1d(ft_in),
+                args: [slice(counts_dev), slice(active_indicator_dev), ft_in as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(active_indicator_dev), slice(active_offsets_dev), ft_in as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: compact_active_features, stream: stream, module: module,
+                config: cfg_1d(ft_in),
+                args: [slice(active_indicator_dev), slice(active_offsets_dev), slice(active_ids_dev), ft_in as u32]
+            }
+        }?;
+        // D: stm / nstm とも add で grid-stride。grid.x=2 を n_active (最大 8) より小さく
+        // 取り、grid-stride の複数周回を強制する。ri 軸は blockIdx_y で 2 tile (ft_out=8 を
+        // 幅 4 × 2) に割って y 軸も exercise する。
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_add, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (2, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       slice(active_ids_dev), slice(active_offsets_dev), ft_in as u32, ft_out as u32]
+            }
+        }?;
     }
     stream.synchronize()?;
     assert_close_rel(
@@ -4182,8 +4262,8 @@ fn inverse_index_pipeline_matches_sparse_ft_backward_cpu() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// inverse-index pipeline の FP16 dft 版 (`gather_and_sum_per_feature_{overwrite,add}
-/// _fp16`)。dft は loss scaling 済の値を f16 量子化して渡し、gather 側の
+/// inverse-index pipeline の FP16 dft 版 (`gather_and_sum_per_feature_add_fp16`)。
+/// dft は loss scaling 済の値を f16 量子化して渡し、gather 側の
 /// `dft_inv_scale` が scale を打ち消す round-trip を検証する。CPU reference は
 /// GPU が読む f16→f32 値で合算し、最後に inv_scale を掛ける。
 #[test]
@@ -4234,14 +4314,15 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
     let offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
     let write_ctr_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     let positions_dev = DeviceBuffer::<u32>::zeroed(&stream, batch * nnz)?;
+    let active_indicator_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
+    let active_offsets_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in + 1)?;
+    let active_ids_dev = DeviceBuffer::<u32>::zeroed(&stream, ft_in)?;
     // 全 row が全幅 nnz を使う fixture なので nnz_arr は一様 (early-out は no-op)。
     let nnz_arr = vec![nnz as i32; batch];
     let nnz_arr_dev = DeviceBuffer::from_host(&stream, &nnz_arr)?;
-    for (iter_idx, (idx_host, dft_host)) in
-        [(&stm_indices, &dft_stm_h), (&nstm_indices, &dft_nstm_h)]
-            .into_iter()
-            .enumerate()
-    {
+    // 新契約: stm / nstm とも add で 0 起点に重ねるため、loop 前に grad_w を 0 化する。
+    memset_zero(&stream, &grad_w_dev)?;
+    for (idx_host, dft_host) in [(&stm_indices, &dft_stm_h), (&nstm_indices, &dft_nstm_h)] {
         memset_zero(&stream, &counts_dev)?;
         memset_zero(&stream, &write_ctr_dev)?;
         let idx_dev = DeviceBuffer::from_host(&stream, idx_host)?;
@@ -4275,29 +4356,45 @@ fn inverse_index_pipeline_fp16_matches_cpu() -> Result<(), Box<dyn std::error::E
                        slice(positions_dev), batch as u32, nnz as u32, ft_in as u32]
             }
         }?;
-        if iter_idx == 0 {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_overwrite_fp16, stream: stream, module: module,
-                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                           ft_in as u32, ft_out as u32, dft_inv_scale]
-                }
-            }?;
-        } else {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
-                    config: LaunchConfig { grid_dim: (ft_in as u32, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
-                    args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
-                           ft_in as u32, ft_out as u32, dft_inv_scale]
-                }
-            }?;
-        }
+        // B': compaction (indicator → active_offsets → active_ids)。
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: build_active_indicator, stream: stream, module: module,
+                config: cfg_1d(ft_in),
+                args: [slice(counts_dev), slice(active_indicator_dev), ft_in as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: exclusive_prefix_sum_small, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(active_indicator_dev), slice(active_offsets_dev), ft_in as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: compact_active_features, stream: stream, module: module,
+                config: cfg_1d(ft_in),
+                args: [slice(active_indicator_dev), slice(active_offsets_dev), slice(active_ids_dev), ft_in as u32]
+            }
+        }?;
+        // D: stm / nstm とも add_fp16 で grid-stride (grid.x=2 < n_active で複数周回)。
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
+                config: LaunchConfig { grid_dim: (2, 2, 1), block_dim: (4, 1, 1), shared_mem_bytes: 0 },
+                args: [slice(dft_dev), slice(positions_dev), slice(offsets_dev), slice(grad_w_dev),
+                       slice(active_ids_dev), slice(active_offsets_dev), ft_in as u32, ft_out as u32, dft_inv_scale]
+            }
+        }?;
     }
     stream.synchronize()?;
     // GPU は iter ごとに inv_scale を掛けてから加算、CPU は合算後に 1 回掛けるため

@@ -102,6 +102,12 @@ pub(crate) struct SimpleGpuWorkspace {
     feat_write_ctr: DeviceBuffer<u32>,
     /// 各 feature 出現位置の sorted ストレージ (`batch * max_active`、`scatter_positions` が書く)。
     feat_positions: DeviceBuffer<u32>,
+    /// active feature (`feat_counts[f] > 0`) の indicator (`ft_in`、`build_active_indicator` が書く)。
+    active_indicator: DeviceBuffer<u32>,
+    /// `active_indicator` の exclusive prefix sum (`ft_in + 1`、末尾 = n_active)。
+    active_offsets: DeviceBuffer<u32>,
+    /// count>0 の feature id を密に詰めた列 (`ft_in`、`compact_active_features` が書く)。
+    active_ids: DeviceBuffer<u32>,
 
     // -- 入力 buffer (active / back ペア。`InputUploadRing` の double-buffer 規約) --
     /// stm sparse index (`b × max_active`、無効 slot は -1)。active 側 = 現 step が forward
@@ -178,6 +184,9 @@ impl SimpleGpuWorkspace {
             feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
+            active_indicator: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
+            active_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
+            active_ids: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
@@ -1395,9 +1404,10 @@ impl SimpleGpuTrainer {
         let l2_n_u32 = l2_n as u32;
 
         // bias grad kernel (`dense_bias_grad_tiled` / `simple_bias_grad_dual`) は atomic add で
-        // 累積するため host で 0 初期化必須。`ft_w_grad` は後段の
-        // `gather_and_sum_per_feature_overwrite` (本関数末尾の inverse-index pipeline、
-        // iter 0 = stm) が全 `(feature, ri)` cell を書き切るため reset 不要。
+        // 累積するため host で 0 初期化必須。`ft_w_grad` も後段の inverse-index pipeline
+        // phase D が stm / nstm の 2 回 add を重ねる 0 起点として reset する (active feature
+        // のみ gather する構成で、非 active の実 cell は 0 のまま残す必要がある)。
+        memset_zero(&self.stream, &self.ft_w_grad)?;
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
         memset_zero(&self.stream, &self.l2_b_grad)?;
@@ -1972,14 +1982,19 @@ impl SimpleGpuTrainer {
 
         // FT weight grad — **inverse-index pipeline** で per-feature gather に変換する経路。
         // 各 perspective につき (A) `build_feature_counts` で histogram、(B) multi-block
-        // exclusive prefix sum で offset、(C) `scatter_positions` で sorted position 列を
-        // 構築し、(D) `gather_and_sum_per_feature_overwrite` (1 回目 = stm) /
-        // `gather_and_sum_per_feature_add` (2 回目 = nstm) が `(feature, ri)` cell ごとに
-        // sum を書く。FP16 path は同 pipeline で `_fp16` 変種に dft_inv_scale を渡す。
-        // stm の overwrite が `ft_w_grad` の全 `(feature, ri)` cell を unconditionally 書き切るため、
-        // 本関数冒頭の memset_zero 群に `ft_w_grad` は含めない (LayerStack の同 pipeline と同規約)。
+        // exclusive prefix sum で offset、(B') compaction で count>0 の feature id を密に詰め、
+        // (C) `scatter_positions` で sorted position 列を構築し、(D)
+        // `gather_and_sum_per_feature_add` (stm / nstm とも add) が active feature の
+        // `(feature, ri)` cell へ sum を atomic add する。stm / nstm は本関数冒頭の memset で
+        // 0 化された `ft_w_grad` に 2 回重ねる。FP16 path は同 pipeline で `_fp16` 変種に
+        // dft_inv_scale を渡す。phase D の grid.x は occupancy 由来の固定値で active_ids を
+        // grid-stride 走査する (count=0 block の空振り launch を回避)。
         let gather_config = LaunchConfig {
-            grid_dim: (ft_in_u32, self.id.ft_out.div_ceil(128) as u32, 1),
+            grid_dim: (
+                self.dense_bias_grad_occ.fill_blocks(128),
+                self.id.ft_out.div_ceil(128) as u32,
+                1,
+            ),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -2068,6 +2083,96 @@ impl SimpleGpuTrainer {
                     ]
                 }
             }?;
+            // B': compaction。count>0 の feature id を密に詰め、phase D の grid-stride が
+            // count=0 block を launch しないようにする。indicator を作り、phase B と同じ 3 段
+            // prefix-sum で active_offsets を得て (末尾 = n_active)、compact で active_ids に
+            // 詰める。block scratch (feat_block_sums / feat_block_offsets) は phase B 完了後で
+            // 再利用可 (feat_offsets は保持され C / D が読む)。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: build_active_indicator,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(self.ws.ft_in),
+                    args: [
+                        slice(self.ws.feat_counts),
+                        slice(self.ws.active_indicator),
+                        ft_in_u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: prefix_sum_block_local,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (prefix_blocks, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.active_indicator),
+                        slice(self.ws.active_offsets),
+                        slice(self.ws.feat_block_sums),
+                        ft_in_u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: exclusive_prefix_sum_small,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.feat_block_sums),
+                        slice(self.ws.feat_block_offsets),
+                        prefix_blocks
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: prefix_sum_add_block_offset,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (prefix_blocks, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.active_offsets),
+                        slice(self.ws.feat_block_offsets),
+                        ft_in_u32,
+                        prefix_blocks
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: compact_active_features,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(self.ws.ft_in),
+                    args: [
+                        slice(self.ws.active_indicator),
+                        slice(self.ws.active_offsets),
+                        slice(self.ws.active_ids),
+                        ft_in_u32
+                    ]
+                }
+            }?;
             // C: 各 (b, ni) sparse index について feat_positions の per-feature slot に
             // batch position `b` を書き込む (`feat_write_ctr[feature]++` で位置決定)。
             unsafe {
@@ -2087,98 +2192,62 @@ impl SimpleGpuTrainer {
                     ]
                 }
             }?;
-            // D: 各 (feature, ri) cell について feat_positions[feat_offsets[f]..feat_offsets[f+1]]
-            // を順 read して accumulate。iter 0 = stm は overwrite (全 cell 書き切り)、iter 1 =
-            // nstm は atomic add で stm 結果に重ねる。FP16 path は `dft_inv_scale` で loss scaling
-            // を打ち消しながら read。
+            // D: active feature ごとに feat_positions[feat_offsets[f]..feat_offsets[f+1]] を
+            // 順 read して sum し、`ft_w_grad[feature][ri]` へ atomic add する。stm / nstm とも
+            // add で、本関数冒頭の memset が与えた 0 起点に 2 回重ねる。FP16 path は
+            // `dft_inv_scale` で loss scaling を打ち消しながら read。
             if self.ft_fp16_out {
-                let dft_stm_out_h = self
-                    .ws
-                    .dft_stm_out_h
-                    .as_ref()
-                    .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-                let dft_nstm_out_h = self
-                    .ws
-                    .dft_nstm_out_h
-                    .as_ref()
-                    .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
                 let dft_h = if iter_idx == 0 {
-                    dft_stm_out_h
+                    self.ws
+                        .dft_stm_out_h
+                        .as_ref()
+                        .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")
                 } else {
-                    dft_nstm_out_h
+                    self.ws
+                        .dft_nstm_out_h
+                        .as_ref()
+                        .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled")
                 };
-                if iter_idx == 0 {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: gather_and_sum_per_feature_overwrite_fp16,
-                            stream: self.stream, module: self.module, config: gather_config,
-                            args: [
-                                slice(dft_h),
-                                slice(self.ws.feat_positions),
-                                slice(self.ws.feat_offsets),
-                                slice(self.ft_w_grad),
-                                ft_in_u32, ft_out_u32, dft_inv_scale_fp16
-                            ]
-                        }
-                    }?;
-                } else {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: gather_and_sum_per_feature_add_fp16,
-                            stream: self.stream, module: self.module, config: gather_config,
-                            args: [
-                                slice(dft_h),
-                                slice(self.ws.feat_positions),
-                                slice(self.ws.feat_offsets),
-                                slice(self.ft_w_grad),
-                                ft_in_u32, ft_out_u32, dft_inv_scale_fp16
-                            ]
-                        }
-                    }?;
-                }
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add_fp16,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft_h),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            slice(self.ws.active_ids),
+                            slice(self.ws.active_offsets),
+                            ft_in_u32, ft_out_u32, dft_inv_scale_fp16
+                        ]
+                    }
+                }?;
             } else {
                 let dft = if iter_idx == 0 {
                     &self.ws.dft_stm_out
                 } else {
                     &self.ws.dft_nstm_out
                 };
-                if iter_idx == 0 {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: gather_and_sum_per_feature_overwrite,
-                            stream: self.stream, module: self.module, config: gather_config,
-                            args: [
-                                slice(dft),
-                                slice(self.ws.feat_positions),
-                                slice(self.ws.feat_offsets),
-                                slice(self.ft_w_grad),
-                                ft_in_u32, ft_out_u32
-                            ]
-                        }
-                    }?;
-                } else {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: gather_and_sum_per_feature_add,
-                            stream: self.stream, module: self.module, config: gather_config,
-                            args: [
-                                slice(dft),
-                                slice(self.ws.feat_positions),
-                                slice(self.ws.feat_offsets),
-                                slice(self.ft_w_grad),
-                                ft_in_u32, ft_out_u32
-                            ]
-                        }
-                    }?;
-                }
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: gather_and_sum_per_feature_add,
+                        stream: self.stream, module: self.module, config: gather_config,
+                        args: [
+                            slice(dft),
+                            slice(self.ws.feat_positions),
+                            slice(self.ws.feat_offsets),
+                            slice(self.ft_w_grad),
+                            slice(self.ws.active_ids),
+                            slice(self.ws.active_offsets),
+                            ft_in_u32, ft_out_u32
+                        ]
+                    }
+                }?;
             }
         }
         tick("bwd_ft_bw", &self.stream, &mut prof_t0)?;
