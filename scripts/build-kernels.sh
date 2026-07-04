@@ -27,7 +27,15 @@ fi
 # 書き換えない (build のたびに fetch/rebuild すると遅くなるため)。stamp が
 # 無い/ずれているときに実際に device codegen エラーになるとは限らないが、
 # 原因切り分けの入口として fail-fast する。
-if [[ -z "${CUDA_OXIDE_BACKEND:-}" ]]; then
+# CUDA_OXIDE_BACKEND は実在ファイルを指すときだけ override として有効。cargo-oxide は
+# 不在パスを無視して cache に fallback するため、不在パスを override 扱いすると
+# この stamp 確認を skip したまま unpinned cache でビルドしてしまう (setup-cuda-oxide.sh
+# の同名ガードと揃える)。不在なら通常どおり stamp を確認する。
+oxide_backend_override=""
+if [[ -n "${CUDA_OXIDE_BACKEND:-}" && -e "$CUDA_OXIDE_BACKEND" ]]; then
+  oxide_backend_override="$CUDA_OXIDE_BACKEND"
+fi
+if [[ -z "$oxide_backend_override" ]]; then
   full_rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+#[0-9a-f]+' Cargo.lock | sed -E 's/.*#//' || true)"
   stamp_file="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide/.pin-stamp"
   expected_stamp="$full_rev|$(rustc --version)"

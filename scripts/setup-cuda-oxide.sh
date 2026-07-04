@@ -124,11 +124,26 @@ fi
 # ときだけ cache 全体を破棄して pin rev で再取得する。`doctor` が cache 不在を
 # `cargo oxide setup` が提供する backend build 経路を使い、独自の build
 # コマンドは持たない。
+# CUDA_OXIDE_BACKEND は実在ファイルを指すときだけ backend override として有効。
+# cargo-oxide の resolver は不在パスを指す値には警告を出して cache / auto-fetch
+# に fallback するため、そのまま override 扱いすると下の pin 検証を skip した上で
+# cargo-oxide が unpinned cache を黙って使い、この script が防ぎたい version skew を
+# 見逃す。不在パス (typo / 別マシン由来の stale な shell var) は override 無効と
+# みなし、pin 検証を通常どおり走らせる。
+oxide_backend_override=""
 if [[ -n "${CUDA_OXIDE_BACKEND:-}" ]]; then
-  echo "WARN: CUDA_OXIDE_BACKEND=$CUDA_OXIDE_BACKEND が設定されています。"
-  echo "      この env var は下記の pin 検証より優先されるため、以降の"
-  echo "      backend cache 検証は skip されます。"
-  echo
+  if [[ -e "$CUDA_OXIDE_BACKEND" ]]; then
+    oxide_backend_override="$CUDA_OXIDE_BACKEND"
+    echo "WARN: CUDA_OXIDE_BACKEND=$CUDA_OXIDE_BACKEND が設定されています。"
+    echo "      この env var は下記の pin 検証より優先されるため、以降の"
+    echo "      backend cache 検証は skip されます。"
+    echo
+  else
+    echo "WARN: CUDA_OXIDE_BACKEND=$CUDA_OXIDE_BACKEND が存在しません。cargo-oxide は"
+    echo "      不在パスを無視して cache / auto-fetch に fallback するため、この値は"
+    echo "      override として扱わず backend cache の pin 検証を通常どおり実行します。"
+    echo
+  fi
 fi
 
 backend_cache_dir="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide"
@@ -137,7 +152,7 @@ backend_so="$backend_cache_dir/librustc_codegen_cuda.so"
 stamp_file="$backend_cache_dir/.pin-stamp"
 expected_stamp="$full_rev|$(rustc --version)"
 
-if [[ -z "${CUDA_OXIDE_BACKEND:-}" ]]; then
+if [[ -z "$oxide_backend_override" ]]; then
   current_stamp=""
   [[ -f "$stamp_file" ]] && current_stamp="$(cat "$stamp_file")"
   current_source_rev=""
@@ -164,7 +179,7 @@ fi
 
 # install した pin rev の source から backend を build する。`doctor` は診断専用で
 # backend を build しないため、cache が無い場合は明示的に `setup` を実行する。
-if [[ -z "${CUDA_OXIDE_BACKEND:-}" && ! -f "$backend_so" && -x "$oxide" ]]; then
+if [[ -z "$oxide_backend_override" && ! -f "$backend_so" && -x "$oxide" ]]; then
   echo "cuda-oxide codegen backend を build します:"
   "$oxide" setup
   echo
