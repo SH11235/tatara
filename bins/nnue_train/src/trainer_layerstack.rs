@@ -452,6 +452,7 @@ impl GpuWorkspace {
         l2_out: usize,
         num_buckets: usize,
         ft_fp16_out: bool,
+        tf32: bool,
         feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
@@ -549,7 +550,13 @@ impl GpuWorkspace {
             combined_sorted: z(padded_sort_batch(batch, num_buckets) * ft_out)?,
             l1_bucket_sorted: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
             dl1_total_sorted: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
-            dcombined_from_l1_sorted: z(padded_sort_batch(batch, num_buckets) * ft_out)?,
+            // tf32 の per-bucket L1 input-bwd 経路のみが使う (bs65536/ft1536 で ~400MB)。
+            // tf32 off では参照されないため 0-byte で確保し dead allocation を避ける。
+            dcombined_from_l1_sorted: if tf32 {
+                z(padded_sort_batch(batch, num_buckets) * ft_out)?
+            } else {
+                z(0)?
+            },
             dl2_out_sorted: z(padded_sort_batch(batch, num_buckets) * l2_out)?,
         })
     }
@@ -955,6 +962,7 @@ impl GpuTrainer {
                 l2_out,
                 num_buckets,
                 precision.ft_fp16_out,
+                precision.tf32,
                 feature_set,
             )?,
             // loss + step
