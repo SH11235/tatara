@@ -738,6 +738,117 @@ fn cublas_sgemm_x_yt_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// `CublasHandle::sgemm_xt_y_rowmajor` (row-major `C[m,n] = X^T @ Y`、X[k,m]/Y[k,n]/C[m,n]) が
+/// `dense_mm_bwd_weight_cpu` (`dw[i][o] = Σ_b x[b][i] * dy[b][o]`) と一致する。tf32 経路の
+/// L1 weight backward (m=l1_out, n=ft_out, k=bucket の row 数) と L1f weight backward
+/// (m=ft_out, n=l1_out, k=batch) がこの helper を使う。tolerance 方針は
+/// [`cublas_sgemm_x_yt_rowmajor_matches_cpu`] と同一。
+#[test]
+fn cublas_sgemm_xt_y_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, _module, stream) = open_module()?;
+    // (m = in_dim, n = out_dim, k = batch/reduce)
+    for &(m, n, k) in &[
+        (16_usize, 128_usize, 256_usize), // L1 wgrad regime: m=l1_out=16
+        (128, 16, 256),                   // L1f wgrad regime: n=l1_out=16
+        (64, 96, 512),
+        (32, 48, 128),
+    ] {
+        let x: Vec<f32> = deterministic_floats(k * m, 0.3)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let y: Vec<f32> = deterministic_floats(k * n, 0.7)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let mut c_cpu = vec![0.0_f32; m * n];
+        dense_mm_bwd_weight_cpu(&x, &y, &mut c_cpu, k, m, n);
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+        let y_dev = DeviceBuffer::from_host(&stream, &y)?;
+        for &(enable_tf32, tol) in &[(false, 1e-4_f32), (true, 5e-3_f32)] {
+            let handle = CublasHandle::new(&stream, enable_tf32)?;
+            let c_dev = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
+            // SAFETY: device buffer 長は仕様分 (x=k*m, y=k*n, c=m*n)、handle は stream に
+            // bind 済で同 stream 内 in-order 実行、beta=0 overwrite。
+            unsafe {
+                handle.sgemm_xt_y_rowmajor(
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    x_dev.cu_deviceptr() as *const f32,
+                    y_dev.cu_deviceptr() as *const f32,
+                    c_dev.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("sgemm_xt_y tf32={enable_tf32} m={m} n={n} k={k}"),
+                &c_dev.to_host_vec(&stream)?,
+                &c_cpu,
+                tol,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `CublasHandle::sgemm_fwd_rowmajor` (row-major `C[m,n] = A @ B`、A[m,k]/B[k,n]/C[m,n]) が
+/// `dense_mm_fwd_cpu` (bias 0、`y[b][o] = Σ_k x[b][k] * w[k][o]`) と一致する。tf32 経路の
+/// L1 input backward (m=bucket の row 数, n=ft_out, k=l1_out) と L1f forward (m=batch,
+/// n=l1_out, k=ft_out) がこの helper を使う。tolerance 方針は
+/// [`cublas_sgemm_x_yt_rowmajor_matches_cpu`] と同一。
+#[test]
+fn cublas_sgemm_fwd_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, _module, stream) = open_module()?;
+    // (m = batch, n = out_dim, k = in_dim/reduce)
+    for &(m, n, k) in &[
+        (64_usize, 128_usize, 16_usize), // L1 input-bwd regime: k=l1_out=16
+        (128, 16, 256),                  // L1f forward regime: n=l1_out=16
+        (64, 96, 48),
+        (32, 64, 32),
+    ] {
+        let a: Vec<f32> = deterministic_floats(m * k, 0.3)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let bmat: Vec<f32> = deterministic_floats(k * n, 0.7)
+            .iter()
+            .map(|v| v.abs() + 0.1)
+            .collect();
+        let zero_bias = vec![0.0_f32; n];
+        let mut c_cpu = vec![0.0_f32; m * n];
+        dense_mm_fwd_cpu(&a, &bmat, &zero_bias, &mut c_cpu, m, k, n);
+
+        let a_dev = DeviceBuffer::from_host(&stream, &a)?;
+        let b_dev = DeviceBuffer::from_host(&stream, &bmat)?;
+        for &(enable_tf32, tol) in &[(false, 1e-4_f32), (true, 5e-3_f32)] {
+            let handle = CublasHandle::new(&stream, enable_tf32)?;
+            let c_dev = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
+            // SAFETY: device buffer 長は仕様分 (a=m*k, b=k*n, c=m*n)、handle は stream に
+            // bind 済で同 stream 内 in-order 実行、beta=0 overwrite。
+            unsafe {
+                handle.sgemm_fwd_rowmajor(
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    a_dev.cu_deviceptr() as *const f32,
+                    b_dev.cu_deviceptr() as *const f32,
+                    c_dev.cu_deviceptr() as *mut f32,
+                )?;
+            }
+            stream.synchronize()?;
+            assert_close_rel(
+                &format!("sgemm_fwd tf32={enable_tf32} m={m} n={n} k={k}"),
+                &c_dev.to_host_vec(&stream)?,
+                &c_cpu,
+                tol,
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn dense_mm_bwd_weight_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // tiled kernel は in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0 を要求
