@@ -2463,6 +2463,37 @@ pub fn bias_add_per_row(bias: &[f32], mut out: DisjointSlice<f32>, batch: u32, n
     }
 }
 
+/// Per-bucket broadcast bias add — `out[bi, oi] += bias[bucket_idx[bi]][oi]`。per-bucket
+/// dense を cuBLAS Sgemm (matmul のみ) で計算した後、original row order の出力に
+/// bucket ごとの bias を足す post-pass。`bias` は `[num_buckets, out_dim]` row-major。
+/// `bucket_idx[bi]` が range 外 (< 0 / >= num_buckets) の row は skip する
+/// (caller は real row の bucket_idx が `[0, num_buckets)` に収まることを保証する)。
+#[kernel]
+pub fn bias_add_per_bucket_row(
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut out: DisjointSlice<f32>,
+    batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let buc = bucket_idx[bi];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        return;
+    }
+    let bias_val = bias[(buc as usize) * (out_dim as usize) + oi];
+    if let Some(o) = out.get_mut(tid) {
+        *o += bias_val;
+    }
+}
+
 /// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
 /// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
 #[kernel]
