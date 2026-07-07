@@ -10,6 +10,7 @@ members = [
     "bins/progress_kpabs_train",
     "bins/nnue_train",
     "bins/progress_bucket_survey",
+    "bins/threat_symmetric_survey",
 ]
 
 [workspace.package]

@@ -680,10 +680,13 @@ pub(crate) struct LayerstackArgs {
     pub(crate) no_ft_factorize: bool,
 
     /// Threat sparse feature profile. One of: off (default), full, same-class,
-    /// same-class-major-pawn, step-attacker, cross-side. When not `off`, threat edge features
-    /// (one piece attacking another) are concatenated after the base feature
-    /// transformer inputs, growing the FT input dimension and the active-feature
-    /// count. `off` is bit-identical to the base feature set.
+    /// same-class-major-pawn, step-attacker, full-symdedup, cross-side. When not
+    /// `off`, threat edge features (one piece attacking another) are concatenated
+    /// after the base feature transformer inputs, growing the FT input dimension
+    /// and the active-feature count. `off` is bit-identical to the base feature
+    /// set. `full-symdedup` shares `full`'s input dimension but drops each
+    /// symmetric-redundant edge (one side of a mutually-implied attack pair),
+    /// lowering the active-feature count without changing the index space.
     ///
     /// Threat coexists with the FT factorizer (the fold/reduce/coalesce paths
     /// stay within the base rows and never touch the threat block); it is still

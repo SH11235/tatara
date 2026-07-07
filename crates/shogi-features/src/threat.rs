@@ -27,6 +27,7 @@ use shogi_format::types::{Color, PieceType, Square};
 
 use crate::halfka_hm::is_hm_mirror;
 pub use crate::threat_exclusion::ThreatProfile;
+use crate::threat_symmetric::{RawThreatEdge, is_canonical_dead};
 
 /// ThreatClass の数 (King 除外、9 family)。
 pub const NUM_THREAT_CLASSES: usize = 9;
@@ -49,6 +50,8 @@ pub const fn threat_dimensions_of(profile: ThreatProfile) -> usize {
         ThreatProfile::SameClass => 192_640,
         ThreatProfile::SameClassMajorPawn => 173_568,
         ThreatProfile::StepAttacker => 33_408,
+        // FullSymDedup は emit の対称重複除去のみで index 空間は Full と同一。
+        ThreatProfile::FullSymDedup => 216_720,
         ThreatProfile::CrossSide => 96_320,
     }
 }
@@ -545,6 +548,20 @@ impl AttackOrderTable {
 static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
 static ATTACK_ORDER_TABLE: LazyLock<AttackOrderTable> = LazyLock::new(AttackOrderTable::new);
 
+/// 空盤面で `class`/`color` の駒が `from` から `to` を攻撃するか (raw 座標)。
+/// index 算出用 [`AttackOrderTable`] の逆引き (O(1)、alloc なし) で、対称重複除去
+/// 分類器 ([`crate::threat_symmetric`]) の necessarily-mutual 判定に使う。
+#[inline]
+pub(crate) fn empty_board_attacks(
+    class: ThreatClass,
+    color: Color,
+    from: Square,
+    to: Square,
+) -> bool {
+    let pattern = attack_pattern_id(class, color);
+    ATTACK_ORDER_TABLE.get(pattern, from, to) != AttackOrderTable::INVALID
+}
+
 static SHARED_FULL: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::Full));
 static SHARED_SAME_CLASS: LazyLock<ThreatIndexer> =
@@ -553,6 +570,8 @@ static SHARED_SAME_CLASS_MAJOR_PAWN: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::SameClassMajorPawn));
 static SHARED_STEP_ATTACKER: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::StepAttacker));
+static SHARED_FULL_SYM_DEDUP: LazyLock<ThreatIndexer> =
+    LazyLock::new(|| ThreatIndexer::new(ThreatProfile::FullSymDedup));
 static SHARED_CROSS_SIDE: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::CrossSide));
 
@@ -639,6 +658,7 @@ impl ThreatIndexer {
             ThreatProfile::SameClass => &SHARED_SAME_CLASS,
             ThreatProfile::SameClassMajorPawn => &SHARED_SAME_CLASS_MAJOR_PAWN,
             ThreatProfile::StepAttacker => &SHARED_STEP_ATTACKER,
+            ThreatProfile::FullSymDedup => &SHARED_FULL_SYM_DEDUP,
             ThreatProfile::CrossSide => &SHARED_CROSS_SIDE,
         }
     }
@@ -706,6 +726,18 @@ impl ThreatIndexer {
                     else {
                         return; // King / None
                     };
+                    if self.profile.drops_canonical_dead()
+                        && is_canonical_dead(&RawThreatEdge {
+                            attacker_class,
+                            attacker_color,
+                            from_sq,
+                            attacked_class,
+                            target_color: target.color,
+                            to_sq,
+                        })
+                    {
+                        return;
+                    }
                     let attacked_side = usize::from(target.color != friend);
                     let to_n = normalize_sq(to_sq, perspective, hm);
 
@@ -790,14 +822,19 @@ impl ThreatIndexer {
                     else {
                         return; // King / None
                     };
-                    let edge = ThreatEdge {
-                        attacker_color,
+                    let edge = RawThreatEdge {
                         attacker_class,
-                        target_color: target.color,
-                        attacked_class,
+                        attacker_color,
                         from_sq,
+                        attacked_class,
+                        target_color: target.color,
                         to_sq,
                     };
+                    // canonical-dead drop は raw 座標判定で perspective 非依存なので、
+                    // 両視点を同時に落とし both-or-neither を保つ (下の debug_assert)。
+                    if self.profile.drops_canonical_dead() && is_canonical_dead(&edge) {
+                        return;
+                    }
                     let stm_idx = self.edge_index(stm, stm_hm, &edge);
                     let nstm_idx = self.edge_index(nstm, nstm_hm, &edge);
                     // 除外判定 (`is_excluded`) は side / class 関係に依り perspective
@@ -819,7 +856,7 @@ impl ThreatIndexer {
 
     /// 1 edge を 1 視点から見た threat index を計算する。除外 pair は None。
     #[inline]
-    fn edge_index(&self, perspective: Color, hm: bool, edge: &ThreatEdge) -> Option<usize> {
+    fn edge_index(&self, perspective: Color, hm: bool, edge: &RawThreatEdge) -> Option<usize> {
         let friend = perspective;
         let attacker_side = usize::from(edge.attacker_color != friend);
         let attacked_side = usize::from(edge.target_color != friend);
@@ -841,18 +878,6 @@ impl ThreatIndexer {
             &self.pair_base,
         )
     }
-}
-
-/// 1 つの threat edge (attacker → target) の perspective 非依存な生データ。
-/// 両視点の index 計算で共有する (`edge_index` が perspective ごとに side /
-/// oriented_color / 正規化マスを導出する)。
-struct ThreatEdge {
-    attacker_color: Color,
-    attacker_class: ThreatClass,
-    target_color: Color,
-    attacked_class: ThreatClass,
-    from_sq: Square,
-    to_sq: Square,
 }
 
 #[cfg(test)]
@@ -912,6 +937,10 @@ mod tests {
             33_408
         );
         assert_eq!(
+            ThreatIndexer::new(ThreatProfile::FullSymDedup).threat_dimensions(),
+            216_720
+        );
+        assert_eq!(
             ThreatIndexer::new(ThreatProfile::CrossSide).threat_dimensions(),
             96_320
         );
@@ -924,6 +953,7 @@ mod tests {
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
             ThreatProfile::StepAttacker,
+            ThreatProfile::FullSymDedup,
             ThreatProfile::CrossSide,
         ] {
             assert_eq!(
@@ -1050,10 +1080,63 @@ mod tests {
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
             ThreatProfile::StepAttacker,
+            ThreatProfile::FullSymDedup,
             ThreatProfile::CrossSide,
         ] {
             assert_indices_in_range(profile, &startpos_board());
             assert_indices_in_range(profile, &mirrored_king_board());
+        }
+    }
+
+    /// FullSymDedup は Full の active index の真部分集合を emit し、落とした差分は
+    /// ちょうど canonical-dead edge 数に一致する (both-or-neither は pair emit の
+    /// debug_assert が担保、ここでは片視点の active 集合で検証)。
+    #[test]
+    fn full_symdedup_drops_exactly_canonical_dead() {
+        use crate::threat_symmetric::{
+            RawThreatEdge, for_each_active_threat_edge, is_canonical_dead,
+        };
+
+        let full = ThreatIndexer::new(ThreatProfile::Full);
+        let dedup = ThreatIndexer::new(ThreatProfile::FullSymDedup);
+        for board in [startpos_board(), mirrored_king_board()] {
+            for perspective in [Color::Black, Color::White] {
+                let full_set = full.active_threat_indices(&board, perspective);
+                let dedup_set = dedup.active_threat_indices(&board, perspective);
+                assert!(
+                    dedup_set.len() <= full_set.len(),
+                    "dedup must not add features"
+                );
+                // 落とした数 = この局面の canonical-dead edge 数。
+                let mut dead = 0usize;
+                for_each_active_threat_edge(&board, |e: &RawThreatEdge| {
+                    if is_canonical_dead(e) {
+                        dead += 1;
+                    }
+                });
+                assert_eq!(
+                    full_set.len() - dedup_set.len(),
+                    dead,
+                    "dropped feature count must equal canonical-dead edge count"
+                );
+            }
+        }
+    }
+
+    /// FullSymDedup の pair emit は both-or-neither を保つ (dead は raw 判定で両視点
+    /// 同時 drop なので `for_each_active_threat_index_pair` の debug_assert が発火
+    /// しない)。debug build で panic しなければ pass。
+    #[test]
+    fn full_symdedup_pair_emit_both_or_neither() {
+        let dedup = ThreatIndexer::new(ThreatProfile::FullSymDedup);
+        for board in [startpos_board(), mirrored_king_board()] {
+            let mut count = 0usize;
+            dedup.for_each_active_threat_index_pair(&board, Color::Black, Color::White, |_, _| {
+                count += 1;
+            });
+            // pair emit 数は片視点の active 数と一致する。
+            let per_perspective = dedup.active_threat_indices(&board, Color::Black).len();
+            assert_eq!(count, per_perspective);
         }
     }
 
@@ -1105,6 +1188,35 @@ mod tests {
         assert_eq!(
             white, expected,
             "White perspective canonical mismatch (symmetric pos)"
+        );
+    }
+
+    /// FullSymDedup の startpos active index (両視点一致、対称局面)。canonical
+    /// startpos (full) から canonical-dead 2 edge (11047 / 122160) を落とした 32 値。
+    /// rshogi engine の同 profile 実装と index 集合が一致することの cross-repo
+    /// アンカー (同一の期待値を両 repo の golden test に持たせる)。
+    #[test]
+    fn canonical_startpos_symdedup_indices() {
+        let board = startpos_board();
+        let indexer = ThreatIndexer::new(ThreatProfile::FullSymDedup);
+
+        #[rustfmt::skip]
+        let expected: Vec<usize> = vec![
+            1330, 1618, 7147, 7148, 7231, 7232, 11213, 16475, 16578, 23268,
+            23270, 24087, 25717, 37487, 40080, 43974, 112573, 112861, 116503,
+            116504, 116587, 116588, 122650, 128533, 128636, 138321, 138323,
+            139136, 140770, 158280, 160871, 164753,
+        ];
+
+        let mut black = indexer.active_threat_indices(&board, Color::Black);
+        black.sort_unstable();
+        assert_eq!(black, expected, "Black symdedup startpos mismatch");
+
+        let mut white = indexer.active_threat_indices(&board, Color::White);
+        white.sort_unstable();
+        assert_eq!(
+            white, expected,
+            "White symdedup startpos mismatch (symmetric pos)"
         );
     }
 }
