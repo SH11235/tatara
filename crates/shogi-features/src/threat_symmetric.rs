@@ -17,7 +17,7 @@
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Square};
 
-use crate::threat::{Occupied, ThreatClass, attacks_empty_board, for_each_attack};
+use crate::threat::{Occupied, ThreatClass, empty_board_attacks, for_each_attack};
 
 /// 1 つの active threat edge を raw (視点非依存) 座標・色で表す。
 ///
@@ -39,18 +39,6 @@ pub struct RawThreatEdge {
     pub to_sq: Square,
 }
 
-/// 空盤面上で `class`/`color` の駒が `from` から `target` を攻撃するか。
-#[inline]
-fn empty_board_attack_reaches(
-    class: ThreatClass,
-    color: Color,
-    from: Square,
-    target: Square,
-) -> bool {
-    let (squares, count) = attacks_empty_board(class, color, from);
-    squares[..count].contains(&target.0)
-}
-
 /// この edge の逆向き edge (`target → attacker`) が、この edge が active な全局面で
 /// 必ず active か。
 ///
@@ -62,7 +50,7 @@ fn empty_board_attack_reaches(
 /// 色で利き向きが変わるため、逆向き ray の向きは target 自身の色で決める。攻め手
 /// 側の class / 色 / マスは判定に不要 (逆向きの到達可否のみで決まる)。
 pub fn is_necessarily_mutual(edge: &RawThreatEdge) -> bool {
-    empty_board_attack_reaches(
+    empty_board_attacks(
         edge.attacked_class,
         edge.target_color,
         edge.to_sq,
