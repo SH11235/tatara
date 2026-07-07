@@ -263,7 +263,11 @@ const ALL_CLASSES: [ThreatClass; NUM_THREAT_CLASSES] = [
 /// 空盤面なので slider は盤端まで伸び、遮蔽は無い。これは index table 用の
 /// 事前計算であって実盤面の利きではない (実盤面は [`for_each_attack`] が
 /// [`Occupied`] で遮蔽する)。
-fn attacks_empty_board(class: ThreatClass, color: Color, from: Square) -> ([u8; 36], usize) {
+pub(crate) fn attacks_empty_board(
+    class: ThreatClass,
+    color: Color,
+    from: Square,
+) -> ([u8; 36], usize) {
     let mut targets = [0u8; 36];
     let mut count = 0;
     let mut push = |sq: Square| {
