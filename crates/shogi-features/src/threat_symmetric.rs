@@ -60,25 +60,18 @@ pub fn is_necessarily_mutual(edge: &RawThreatEdge) -> bool {
 
 /// この edge が necessarily-mutual pair の「落とす側」(canonical dead) か。
 ///
-/// mutual pair の両 edge から常にちょうど片方だけを dead にするため、視点非依存な
-/// raw データだけで tie-break する (両 trainer 視点で判定が一致する必要がある):
+/// tie-break は **perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な
+/// 量**でなければならない (trainer は両視点 + HM 正規化後の index を突き合わせる)。
+/// `ThreatClass` discriminant の大小は駒種の順序でミラー・回転・視点反転いずれにも
+/// 不変なので、class が違う pair は大きい class を attacker とする側を残し、小さい側
+/// (`ac < dc`) を dead にする。
 ///
-/// - class が違う: `ThreatClass` discriminant が大きい側を attacker とする edge を
-///   残し、小さい側 (`ac < dc`) を dead にする。
-/// - class が同じ: raw マス番号が大きい側を attacker とする edge を残し、小さい側
-///   (`from_sq < to_sq`) を dead にする。攻め手と被攻め手は別マスなので同値になる
-///   ことはなく、pair のちょうど片方だけが dead になる。
+/// 同 class pair は class では区別できず raw マス番号でしか順序付けできないが、raw
+/// file 順は HM ミラーで反転する。ミラー等価な 2 局面で「残す側」が逆転し、正規化
+/// index 空間で HM 等価性 (同一 index 集合) と dead 保証 (dead の相方が必ず active)
+/// が壊れるため、同 class 相互 pair は dedup せず両側を emit する。
 pub fn is_canonical_dead(edge: &RawThreatEdge) -> bool {
-    if !is_necessarily_mutual(edge) {
-        return false;
-    }
-    let ac = edge.attacker_class as u8;
-    let dc = edge.attacked_class as u8;
-    if ac != dc {
-        ac < dc
-    } else {
-        edge.from_sq.0 < edge.to_sq.0
-    }
+    is_necessarily_mutual(edge) && (edge.attacker_class as u8) < (edge.attacked_class as u8)
 }
 
 /// 1 局面の active directed threat edge を raw 表現で 1 つずつ `f` へ渡す。
@@ -192,14 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn same_slider_pair_is_mutual_and_one_dead() {
-        // 飛↔飛 同士 (同筋)。必ず相互、canonical で from<to 側が dead。
+    fn same_class_pair_is_mutual_but_never_dead() {
+        // 飛↔飛 同士 (同筋)。必ず相互だが同 class なので dedup しない (HM ミラーで
+        // raw file 順が反転し「残す側」が正規化空間で一意に定まらないため両側 emit)。
         let mut board = bare_board();
         let lo = put(&mut board, 4, 4, Color::Black, PieceType::Rook);
         let hi = put(&mut board, 4, 6, Color::White, PieceType::Rook);
-        // 実装内の from<to は raw マス番号。file*9+rank なので同筋 file=4 で
-        // rank が小さい方が番号小。ここでは (4,4)=40, (4,6)=42。
-        assert!(lo.0 < hi.0);
         let edge_lo_hi = RawThreatEdge {
             attacker_class: ThreatClass::Rook,
             attacker_color: Color::Black,
@@ -208,8 +199,18 @@ mod tests {
             target_color: Color::White,
             to_sq: hi,
         };
+        let edge_hi_lo = RawThreatEdge {
+            attacker_class: ThreatClass::Rook,
+            attacker_color: Color::White,
+            from_sq: hi,
+            attacked_class: ThreatClass::Rook,
+            target_color: Color::Black,
+            to_sq: lo,
+        };
         assert!(is_necessarily_mutual(&edge_lo_hi));
-        assert!(is_canonical_dead(&edge_lo_hi));
+        assert!(is_necessarily_mutual(&edge_hi_lo));
+        assert!(!is_canonical_dead(&edge_lo_hi));
+        assert!(!is_canonical_dead(&edge_hi_lo));
         assert_dead_implies_reverse_active(&board);
         assert_exactly_one_dead_per_pair(&board);
     }
@@ -279,8 +280,8 @@ mod tests {
     }
 
     #[test]
-    fn opposing_pawns_mutual() {
-        // 対面する対色の歩は相互。canonical は from<to 側が dead。
+    fn opposing_pawns_mutual_but_not_dead() {
+        // 対面する対色の歩は相互だが同 class なので dedup しない (両側 emit)。
         let mut board = bare_board();
         put(&mut board, 4, 5, Color::Black, PieceType::Pawn);
         put(&mut board, 4, 4, Color::White, PieceType::Pawn);
@@ -292,10 +293,7 @@ mod tests {
                 dead_count += 1;
             }
         });
-        assert_eq!(
-            dead_count, 1,
-            "opposing pawn pair should yield one dead edge"
-        );
+        assert_eq!(dead_count, 0, "same-class pair must not be deduped");
     }
 
     #[test]

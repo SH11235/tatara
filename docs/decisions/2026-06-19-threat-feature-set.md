@@ -134,12 +134,17 @@ threat_index =
   空間のまま、逆向き edge (`target → attacker`) がこの edge の active な全局面で
   必ず active な「canonical-dead」edge を emit で落とす。判定は占有非依存の静的分類器
   (`threat_symmetric`): 逆向き駒が空盤面で相手マスに届くか (= 逆向き edge が保証共
-  active か) を index 算出用 attack-order table の逆引き O(1) で問い、mutual pair の
-  片側を視点非依存 canonical 規則 (class 大 / raw マス番号大を attacker に残す) で
-  dead 化する。dead edge は raw 座標判定で両視点同時に落ちるため both-or-neither と
-  index 空間は保たれる。狙いは active edge の対称冗長を捨てて engine の per-edge gather /
-  列挙後 drop コストを削ること (情報は捨てない: dead edge の逆向きは必ず active)。
-  active edge 削減率は PSV 実測で ~8.6% (歩→大駒・銀→金・成駒間で高い)。専用再学習は
+  active か) を index 算出用 attack-order table の逆引き O(1) で問う。tie-break は
+  perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な量である必要がある
+  (正規化後の index を両視点で突き合わせるため): **class が違う mutual pair のみ**、
+  大きい `ThreatClass` を attacker とする側を残し小さい側を dead 化する (class 順は
+  ミラー・回転・視点反転に不変)。同 class 相互 pair は raw マス番号でしか順序付け
+  できず raw file 順が HM ミラーで反転する — ミラー等価な 2 局面で残す側が逆転し
+  正規化 index 空間の HM 等価性・dead 保証が壊れるため dedup せず両側を emit する。
+  dead edge は class 判定で両視点同時に落ちるため both-or-neither と index 空間は
+  保たれる。狙いは active edge の対称冗長を捨てて engine の per-edge gather / 列挙後
+  drop コストを削ること (情報は捨てない: dead edge の逆向きは必ず active)。cross-class
+  のみのため削減率は全 pair 版より低い (実測は survey ログ / PR 本文)。専用再学習は
   せず次回再学習に opt-in で同梱する位置づけ。golden は donor に無いため tatara ↔
   rshogi 間で index 一致を直接検証する。
 
