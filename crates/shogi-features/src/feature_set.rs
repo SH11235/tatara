@@ -1150,8 +1150,8 @@ mod tests {
     #[test]
     fn arch_feature_name_uses_pascal_case() {
         // arch_str に embed される keyword は PascalCase 表記で固定する。
-        // 推論側 (rshogi) parser は両綴りを受理するが、emit 側は単一の
-        // canonical 形を残す。
+        // net を load する側の parser は両綴りを受理し得るが、emit 側は
+        // 単一の canonical 形を残す。
         let expected = [
             (FeatureSet::HalfKp, "HalfKP"),
             (FeatureSet::HalfKaSplit, "HalfKaSplit"),

@@ -15,16 +15,17 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 6):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 7):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (6)             (4 bytes)
+//   version      u32 (7)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
 //   ft_out       u64                 (FT 出力次元、`--ft-out`)
 //   max_active   u64                 (学習側の 1 perspective あたり active feature 数)
 //   ft_factorize u8                  (v6+、FT factorizer 有効 flag)
+//   feature_hash u32                 (v7+、feature mapping identity)
 //   run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
 //   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
@@ -45,7 +46,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=6 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=7 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -88,13 +89,17 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   accepts that value too, because the tensor payload is identical either
 ///   way.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
+/// - `7`: a `u32` feature hash follows the FT-factorizer flag in the
+///   feature-set header. It distinguishes feature mappings that share the
+///   same canonical feature-set name and dimensions.
+///
+/// `load_raw_checkpoint` accepts versions 1..=7. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 6 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 7 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
-/// versions 1..=5.
-pub(crate) const RAW_CKPT_VERSION: u32 = 6;
+/// versions 1..=5; the feature hash is absent for versions 1..=6.
+pub(crate) const RAW_CKPT_VERSION: u32 = 7;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -271,6 +276,8 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(&(arch.feature_set.max_active() as u64).to_le_bytes())?;
     // FT factorizer flag (v6+)。
     w.write_all(&[arch.feature_set.ft_factorize() as u8])?;
+    // feature mapping hash (v7+)。
+    w.write_all(&arch.feature_set.feature_hash().to_le_bytes())?;
     // producer run id (v3+)。
     w.write_all(&(run_id.len() as u32).to_le_bytes())?;
     w.write_all(run_id.as_bytes())?;
@@ -291,11 +298,12 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=6 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=7 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
 /// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
+/// version 7 は feature-set header に feature hash を持つ。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -348,6 +356,12 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         } else {
             false
         };
+        let ckpt_feature_hash = if version >= 7 {
+            read_exact_or_invalid(r, &mut buf4, "feature hash")?;
+            Some(u32::from_le_bytes(buf4))
+        } else {
+            None
+        };
 
         let want = expected.feature_set;
         if fs_name != want_name {
@@ -364,6 +378,15 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                  requested {} (cannot resume across --ft-factorize on/off)",
                 want.ft_factorize()
             )));
+        }
+        if let Some(ckpt_feature_hash) = ckpt_feature_hash {
+            let want_feature_hash = want.feature_hash();
+            if ckpt_feature_hash != want_feature_hash {
+                return Err(invalid_data(format!(
+                    "raw checkpoint feature hash mismatch: got {ckpt_feature_hash:#010x}, \
+                     want {want_feature_hash:#010x} (E4 config / threat profile mismatch)"
+                )));
+            }
         }
         if ckpt_ft_in != want.train_ft_in() as u64 {
             return Err(invalid_data(format!(

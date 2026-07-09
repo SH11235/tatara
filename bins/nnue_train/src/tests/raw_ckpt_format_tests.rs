@@ -1,7 +1,7 @@
 //! raw checkpoint format helper tests (GPU 不要)。
 
 use nnue_format::ArchKind;
-use shogi_features::FeatureSet;
+use shogi_features::{E4Config, FeatureSet};
 
 use crate::{arch::*, ckpt::*};
 
@@ -53,10 +53,10 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=4 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=6 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 6);
+    assert_eq!(RAW_CKPT_VERSION, 7);
 }
 
 #[test]
@@ -156,6 +156,22 @@ fn layerstack_arch_factorized() -> RawCkptArch<'static> {
     }
 }
 
+fn layerstack_arch_e4(config: E4Config) -> RawCkptArch<'static> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged.spec().with_e4_config(config),
+        arch_kind: ArchKind::LayerStack,
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+fn remove_v7_feature_hash(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    buf[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let max_active_off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8;
+    let feature_hash_off = max_active_off + 8 + 1;
+    buf.drain(feature_hash_off..feature_hash_off + 4);
+}
+
 #[test]
 fn raw_ckpt_header_ft_factorize_round_trips() {
     let arch = layerstack_arch_factorized();
@@ -163,6 +179,37 @@ fn raw_ckpt_header_ft_factorize_round_trips() {
     write_raw_ckpt_header(&mut buf, &arch, "run-1", 2, 20, None, 10).unwrap();
     let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+}
+
+#[test]
+fn raw_ckpt_header_rejects_e4_config_hash_mismatch() {
+    let fixed = layerstack_arch_e4(E4Config::E4_2X2_KINGFIXED);
+    let bucketed = layerstack_arch_e4(E4Config::E4_2X2_KINGBUCKETED);
+    assert_eq!(
+        fixed.feature_set.canonical_name(),
+        bucketed.feature_set.canonical_name()
+    );
+    assert_eq!(
+        fixed.feature_set.train_ft_in(),
+        bucketed.feature_set.train_ft_in()
+    );
+    assert_eq!(
+        fixed.feature_set.max_active(),
+        bucketed.feature_set.max_active()
+    );
+    assert_ne!(
+        fixed.feature_set.feature_hash(),
+        bucketed.feature_set.feature_hash()
+    );
+
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &fixed, "e4-fixed", 5, 50, None, 10).unwrap();
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &bucketed)
+        .expect_err("E4 config mismatch must be rejected");
+    assert!(
+        err.to_string().contains("feature hash mismatch"),
+        "error should mention feature hash mismatch: {err}"
+    );
 }
 
 #[test]
@@ -174,6 +221,7 @@ fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     let arch = layerstack_arch_factorized();
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &arch, "run-legacy", 3, 30, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf, &arch);
     let base = arch.feature_set.max_active() as u64;
     // max_active field の offset = magic(4) + version(4) + name_len(4) +
     // name + ft_in(8) + ft_out(8)。書き換え前に base 値が居ることを確認して
@@ -192,6 +240,7 @@ fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     let off_arch = layerstack_arch();
     let mut buf_off = Vec::new();
     write_raw_ckpt_header(&mut buf_off, &off_arch, "", 1, 0, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf_off, &off_arch);
     buf_off[off..off + 8].copy_from_slice(&(2 * base).to_le_bytes());
     let err = read_raw_ckpt_header(&mut Cursor::new(&buf_off), &off_arch)
         .expect_err("non-factorize header with 2x max_active must be rejected");
