@@ -4544,7 +4544,7 @@ fn ft_factorize_layout(
     pi: usize,
     nb: usize,
     mode: u32,
-) -> FtFactorizeLayout {
+) -> FtFactorizeLayout<'static> {
     FtFactorizeLayout {
         base_ft_in,
         ft_in,
@@ -4552,11 +4552,22 @@ fn ft_factorize_layout(
         piece_inputs: pi,
         nb,
         mode,
+        threat_pair_starts: &[],
     }
 }
 
 fn ft_factorize_pack(nb: usize, mode: u32) -> u32 {
     (nb as u32) | (mode << 16)
+}
+
+fn ft_factorize_bounds(base_ft_in: usize, ft_in: usize) -> u64 {
+    (base_ft_in as u64) | ((ft_in as u64) << 32)
+}
+
+fn no_threat_pair_starts(
+    stream: &CudaStream,
+) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+    DeviceBuffer::from_host(stream, &[0_u32]).map_err(Into::into)
 }
 
 /// fold (f32 出力) が CPU reference と完全一致する (thread ごと 1 加算で
@@ -4576,14 +4587,16 @@ fn ft_fold_virtual_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let threat_starts_dev = no_threat_pair_starts(&stream)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-                   ft_out as u32, pi as u32, ft_factorize_pack(1, FT_FACTORIZE_BASE)]
+            args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
         }
     }?;
     stream.synchronize()?;
@@ -4612,14 +4625,16 @@ fn ft_fold_virtual_f16_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_, expected) = quantize_f16(&comb_cpu);
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let threat_starts_dev = no_threat_pair_starts(&stream)?;
     let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-                   ft_out as u32, pi as u32, ft_factorize_pack(1, FT_FACTORIZE_BASE)]
+            args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
         }
     }?;
     stream.synchronize()?;
@@ -4646,13 +4661,16 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     );
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
+    let threat_starts_dev = no_threat_pair_starts(&stream)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_reduce_virtual_grad, stream: stream, module: module,
             config: cfg_1d(pi * ft_out),
-            args: [slice(grad_dev), ft_in as u32, ft_in as u32,  ft_out as u32, pi as u32, 1_u32, FT_FACTORIZE_BASE]
+            args: [slice(grad_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
         }
     }?;
     stream.synchronize()?;
@@ -4705,14 +4723,16 @@ fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error
     }
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let threat_starts_dev = no_threat_pair_starts(&stream)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-            args: [slice(w_dev), slice_mut(comb_dev), base_ft_in as u32, ft_in as u32,
-                   ft_out as u32, pi as u32, ft_factorize_pack(1, FT_FACTORIZE_BASE)]
+            args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(base_ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
         }
     }?;
     stream.synchronize()?;
@@ -4739,13 +4759,16 @@ fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error
     );
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
+    let threat_starts_dev = no_threat_pair_starts(&stream)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_reduce_virtual_grad, stream: stream, module: module,
             config: cfg_1d(pi * ft_out),
-            args: [slice(grad_dev), base_ft_in as u32, ft_in as u32,  ft_out as u32, pi as u32, 1_u32, FT_FACTORIZE_BASE]
+            args: [slice(grad_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(base_ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
         }
     }?;
     stream.synchronize()?;
@@ -4798,14 +4821,16 @@ fn ft_fold_virtual_effect_bucket_matches_cpu() -> Result<(), Box<dyn std::error:
         );
 
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let threat_starts_dev = no_threat_pair_starts(&stream)?;
         let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
                 kernel: ft_fold_virtual, stream: stream, module: module, config: cfg_1d(n),
-                args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-                       ft_out as u32, pi as u32, ft_factorize_pack(nb, mode)]
+                args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                       ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                       ft_factorize_pack(nb, mode)]
             }
         }?;
         stream.synchronize()?;
@@ -4838,14 +4863,16 @@ fn ft_fold_virtual_f16_effect_bucket_matches_cpu() -> Result<(), Box<dyn std::er
         let (_, expected) = quantize_f16(&comb_cpu);
 
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+        let threat_starts_dev = no_threat_pair_starts(&stream)?;
         let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
                 kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
-                args: [slice(w_dev), slice_mut(comb_dev), ft_in as u32, ft_in as u32,
-                       ft_out as u32, pi as u32, ft_factorize_pack(nb, mode)]
+                args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                       ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                       ft_factorize_pack(nb, mode)]
             }
         }?;
         stream.synchronize()?;
@@ -4880,14 +4907,16 @@ fn ft_reduce_virtual_grad_effect_bucket_matches_cpu() -> Result<(), Box<dyn std:
         );
 
         let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
+        let threat_starts_dev = no_threat_pair_starts(&stream)?;
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
                 kernel: ft_reduce_virtual_grad, stream: stream, module: module,
                 config: cfg_1d(virtual_rows * ft_out),
-                args: [slice(grad_dev), ft_in as u32, ft_in as u32,
-                       ft_out as u32, pi as u32, nb as u32, mode]
+                args: [slice(grad_dev), slice(threat_starts_dev),
+                       ft_factorize_bounds(ft_in, ft_in), ft_out as u32, pi as u32,
+                       ft_factorize_pack(nb, mode)]
             }
         }?;
         stream.synchronize()?;

@@ -397,15 +397,15 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
 /// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
-/// 学習時の FT weight は `[base real | threat real | piece-input 仮想行]` の
-/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。piece-input 仮想行は
-/// 玉位置に依らない駒価値を持つ。base factorizer は駒ごとに 1 仮想行を base の
-/// king-bucket 数 (HalfKA_hm 系では 45) で共有する。effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
-/// `PoolEffectBuckets` では駒ごとに 1 仮想行を全バケットで共有し、
-/// `PerEffectBucket` では (駒, バケット) ごとに仮想行を持つ。export では実行に
-/// 仮想行を畳み込んで固定し、仮想行を捨てる。threat real 行
-/// (`[base_ft_in, ft_in())`) は仮想行を持たないので **そのまま残す** (silent に
-/// 切り落とさない)。戻り値は base 折り込み済み + threat 不可触の `ft_in() × ft_out`。
+/// 学習時の FT weight は
+/// `[base real | threat real | virtual piece-input rows | virtual threat-pair rows]` の
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。base factorizer は
+/// 駒ごとに 1 仮想行を base の king-bucket 数 (HalfKA_hm 系では 45) で共有する。
+/// effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
+/// `PoolEffectBuckets` では駒ごとに 1 仮想行を全バケットで共有し、`PerEffectBucket`
+/// では (駒, バケット) ごとに仮想行を持つ。virtual threat-pair rows は同じ threat
+/// pair に属する threat 実行へ共有される。export では実行に仮想行を畳み込んで固定し、
+/// 仮想行を捨てる。戻り値は base + threat 折り込み済みの `ft_in() × ft_out`。
 /// 量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の値に掛けること
 /// (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
 ///
@@ -428,10 +428,12 @@ pub fn coalesce_ft_factorized(
         train_ft_in * ft_out,
         "ft_w length must be train_ft_in * ft_out"
     );
-    // piece-input 仮想行は base+threat 実行の後ろ。export は実行部 (base + threat) を
-    // まず複製し、base 実行に対応する仮想行を加算する。
+    // virtual piece-input rows は base+threat 実行の後ろ。export は実行部 (base + threat)
+    // をまず複製し、base/effect-bucket 実行に対応する仮想行を加算する。
     let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
+    let base_virtual_rows =
+        feature_set.ft_factorize_virtual_rows() - feature_set.threat_factorize_pair_count();
     let fold_ft_in = if feature_set.effect_bucket_config().is_some() {
         ft_in
     } else {
@@ -452,6 +454,19 @@ pub fn coalesce_ft_factorized(
         let src = virtual_base + vrow * ft_out;
         for o in 0..ft_out {
             out[dst + o] += ft_w_train[src + o];
+        }
+    }
+    let threat_pair_starts = feature_set.threat_factorize_pair_starts();
+    let threat_virtual_base = ft_in + base_virtual_rows;
+    for pair in 0..threat_pair_starts.len().saturating_sub(1) {
+        let start = base_ft_in + threat_pair_starts[pair];
+        let end = base_ft_in + threat_pair_starts[pair + 1];
+        let src = (threat_virtual_base + pair) * ft_out;
+        for feat in start..end {
+            let dst = feat * ft_out;
+            for o in 0..ft_out {
+                out[dst + o] += ft_w_train[src + o];
+            }
         }
     }
     out
@@ -1438,10 +1453,10 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_keeps_threat_rows_and_folds_only_base() {
+    fn coalesce_folds_base_and_threat_pair_virtual_rows() {
         use shogi_features::{FeatureSet, ThreatProfile};
         // factorizer × threat 同居: export 形状 = ft_in() (base+threat)、base 行は
-        // piece 仮想行を畳み込み、threat 行は仮想行を持たないので素通しする。
+        // virtual piece-input rows、threat 行は virtual threat-pair rows を畳み込む。
         let spec = FeatureSet::HalfKaHmMerged
             .spec()
             .with_threat_profile(ThreatProfile::CrossSide)
@@ -1449,8 +1464,10 @@ mod tests {
         let base_ft_in = spec.base_ft_in();
         let ft_in = spec.ft_in(); // base + threat
         let pi = spec.piece_inputs();
+        let pair_starts = spec.threat_factorize_pair_starts();
+        let pair_count = pair_starts.len() - 1;
         let ft_out = 2usize;
-        assert_eq!(spec.train_ft_in(), ft_in + pi);
+        assert_eq!(spec.train_ft_in(), ft_in + pi + pair_count);
 
         let mut w = vec![0.0f32; spec.train_ft_in() * ft_out];
         // base 実行 / threat 実行 / 仮想行を distinctive 値で埋める。
@@ -1464,6 +1481,11 @@ mod tests {
                 w[(ft_in + p) * ft_out + o] = 10_000.0 + p as f32 + o as f32 * 0.25;
             }
         }
+        for pair in 0..pair_count {
+            for o in 0..ft_out {
+                w[(ft_in + pi + pair) * ft_out + o] = 20_000.0 + pair as f32 + o as f32 * 0.125;
+            }
+        }
         let out = coalesce_ft_factorized(&spec, ft_out, &w);
         // export 形状は base + threat (仮想行を落とす)。
         assert_eq!(out.len(), ft_in * ft_out);
@@ -1475,10 +1497,13 @@ mod tests {
                 assert_eq!(out[feat * ft_out + o], want, "base feat={feat} o={o}");
             }
         }
-        // threat 行は素通し。
+        // threat 行は同じ pair の仮想行を加算する。
         for feat in [base_ft_in, base_ft_in + 1, ft_in - 1] {
+            let rel = feat - base_ft_in;
+            let pair = pair_starts.partition_point(|&start| start <= rel) - 1;
             for o in 0..ft_out {
-                let want = feat as f32 + o as f32 * 0.5;
+                let want =
+                    (feat as f32 + o as f32 * 0.5) + (20_000.0 + pair as f32 + o as f32 * 0.125);
                 assert_eq!(out[feat * ft_out + o], want, "threat feat={feat} o={o}");
             }
         }
@@ -1489,7 +1514,7 @@ mod tests {
         use shogi_features::{FeatureSet, ThreatProfile};
         // boundary 網羅: 全 base featureset × 全 profile で同居 coalesce が
         // (a) export 形状 = ft_in()*ft_out、(b) base 行 = 実行 + 同 p 仮想行、
-        // (c) threat 行 = 実行のまま、を満たす。`base_ft_in % piece_inputs == 0` も確認。
+        // (c) threat 行 = 実行 + pair 仮想行、を満たす。`base_ft_in % piece_inputs == 0` も確認。
         let ft_out = 2usize;
         for fs in FeatureSet::ALL {
             for profile in [
@@ -1504,6 +1529,8 @@ mod tests {
                 let base_ft_in = spec.base_ft_in();
                 let ft_in = spec.ft_in();
                 let pi = spec.piece_inputs();
+                let pair_starts = spec.threat_factorize_pair_starts();
+                let pair_count = pair_starts.len() - 1;
                 assert_eq!(
                     base_ft_in % pi,
                     0,
@@ -1521,6 +1548,11 @@ mod tests {
                 for p in 0..pi {
                     for o in 0..ft_out {
                         w[(ft_in + p) * ft_out + o] = 1000.0 + (p % 13) as f32;
+                    }
+                }
+                for pair in 0..pair_count {
+                    for o in 0..ft_out {
+                        w[(ft_in + pi + pair) * ft_out + o] = 2000.0 + (pair % 17) as f32;
                     }
                 }
                 let out = coalesce_ft_factorized(&spec, ft_out, &w);
@@ -1546,12 +1578,15 @@ mod tests {
                     }
                 }
                 for &feat in &[base_ft_in, ft_in - 1] {
+                    let rel = feat - base_ft_in;
+                    let pair = pair_starts.partition_point(|&start| start <= rel) - 1;
                     for o in 0..ft_out {
-                        let want = (feat % 97) as f32 + o as f32 * 0.5;
+                        let want =
+                            ((feat % 97) as f32 + o as f32 * 0.5) + (2000.0 + (pair % 17) as f32);
                         assert_eq!(
                             out[feat * ft_out + o],
                             want,
-                            "{} {profile} threat feat={feat}",
+                            "{} {profile} threat feat={feat} pair={pair}",
                             fs.canonical_name()
                         );
                     }

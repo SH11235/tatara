@@ -117,6 +117,40 @@ fn ft_fold_virtual_cpu_matches_export_coalesce() {
             piece_inputs: spec.piece_inputs(),
             nb: 1,
             mode: FT_FACTORIZE_BASE,
+            threat_pair_starts: &[],
+        },
+    );
+    let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
+    assert_eq!(comb, coalesced);
+}
+
+#[test]
+fn threat_ft_fold_virtual_cpu_matches_export_coalesce() {
+    use shogi_features::ThreatProfile;
+
+    let spec = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide)
+        .with_ft_factorize();
+    let ft_out = 4;
+    let train_n = spec.train_ft_in() * ft_out;
+    let w: Vec<f32> = (0..train_n)
+        .map(|i| ((i * 41 % 223) as f32 - 111.0) * 0.005)
+        .collect();
+    let pair_starts = spec.threat_factorize_pair_starts();
+
+    let mut comb = vec![0.0_f32; spec.ft_in() * ft_out];
+    gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
+        &w,
+        &mut comb,
+        FtFactorizeLayout {
+            base_ft_in: spec.base_ft_in(),
+            ft_in: spec.ft_in(),
+            ft_out,
+            piece_inputs: spec.piece_inputs(),
+            nb: 1,
+            mode: FT_FACTORIZE_BASE,
+            threat_pair_starts: &pair_starts,
         },
     );
     let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
@@ -156,41 +190,12 @@ fn effect_bucket_ft_fold_virtual_cpu_matches_export_coalesce() {
                 piece_inputs: spec.piece_inputs(),
                 nb: spec.effect_bucket_config().unwrap().nb,
                 mode: kernel_mode,
+                threat_pair_starts: &[],
             },
         );
         let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
         assert_eq!(comb, coalesced, "{mode:?}");
     }
-}
-
-#[test]
-fn threat_ft_fold_virtual_cpu_keeps_threat_rows_and_matches_export_coalesce() {
-    use shogi_features::ThreatProfile;
-    let spec = FeatureSet::HalfKaHmMerged
-        .spec()
-        .with_threat_profile(ThreatProfile::CrossSide)
-        .with_ft_factorize();
-    let ft_out = 4;
-    let train_n = spec.train_ft_in() * ft_out;
-    let w: Vec<f32> = (0..train_n)
-        .map(|i| ((i * 41 % 223) as f32 - 111.0) * 0.005)
-        .collect();
-
-    let mut comb = vec![0.0_f32; spec.ft_in() * ft_out];
-    gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
-        &w,
-        &mut comb,
-        FtFactorizeLayout {
-            base_ft_in: spec.base_ft_in(),
-            ft_in: spec.ft_in(),
-            ft_out,
-            piece_inputs: spec.piece_inputs(),
-            nb: 1,
-            mode: FT_FACTORIZE_BASE,
-        },
-    );
-    let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
-    assert_eq!(comb, coalesced);
 }
 
 #[test]

@@ -7,7 +7,9 @@ use nnue_format::layerstack_weights::{
     DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, LEGACY_NNUE_VERSION_BUCKETS9,
     NNUE_VERSION, QA, QB,
 };
-use shogi_features::{EffectBucketConfig, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs};
+use shogi_features::{
+    EffectBucketConfig, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs, ThreatProfile,
+};
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
 
@@ -63,9 +65,16 @@ fn load_layerstack(
 ) -> Result<(LayerStackWeights, FeatureSetSpec), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let meta = read_arch_meta(&bytes)?;
-    let spec = FeatureSet::HalfKaHmMerged
-        .spec()
-        .with_effect_bucket_config(meta.effect_bucket_config);
+    let mut spec = FeatureSet::HalfKaHmMerged.spec();
+    if let Some(effect_bucket_config) = meta.effect_bucket_config {
+        spec = spec.with_effect_bucket_config(effect_bucket_config);
+    }
+    if let Some(threat_profile) = meta.threat_profile {
+        if meta.effect_bucket_config.is_some() {
+            return Err("arch string contains both EffectBucket and Threat tokens".into());
+        }
+        spec = spec.with_threat_profile(threat_profile);
+    }
     let mut cursor = Cursor::new(&bytes);
     let weights = LayerStackWeights::load_quantised(
         &mut cursor,
@@ -79,7 +88,8 @@ fn load_layerstack(
 }
 
 struct ArchMeta {
-    effect_bucket_config: EffectBucketConfig,
+    effect_bucket_config: Option<EffectBucketConfig>,
+    threat_profile: Option<ThreatProfile>,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -116,6 +126,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
         effect_bucket_config: parse_effect_bucket_config(arch)?,
+        threat_profile: parse_threat_profile(arch)?,
         ft_out: parse_between(arch, "->", "x2]")?,
         l1_out: affine_outs.last().copied().unwrap_or(DEFAULT_L1_OUT),
         l2_out: affine_outs.get(1).copied().unwrap_or(DEFAULT_L2_OUT),
@@ -129,18 +140,41 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
 
 fn parse_effect_bucket_config(
     arch: &str,
-) -> Result<EffectBucketConfig, Box<dyn std::error::Error>> {
+) -> Result<Option<EffectBucketConfig>, Box<dyn std::error::Error>> {
     if arch.contains("EffectBucket=2x2fixed") {
-        Ok(EffectBucketConfig::KINGFIXED_2X2)
+        Ok(Some(EffectBucketConfig::KINGFIXED_2X2))
     } else if arch.contains("EffectBucket=2x2bucketed") {
-        Ok(EffectBucketConfig::KINGBUCKETED_2X2)
+        Ok(Some(EffectBucketConfig::KINGBUCKETED_2X2))
     } else if arch.contains("EffectBucket=3x3fixed") {
-        Ok(EffectBucketConfig::KINGFIXED_3X3)
+        Ok(Some(EffectBucketConfig::KINGFIXED_3X3))
     } else if arch.contains("EffectBucket=3x3bucketed") {
-        Ok(EffectBucketConfig::KINGBUCKETED_3X3)
+        Ok(Some(EffectBucketConfig::KINGBUCKETED_3X3))
     } else {
-        Err(format!("unsupported or missing effect bucket token in arch string: {arch}").into())
+        Ok(None)
     }
+}
+
+fn parse_threat_profile(arch: &str) -> Result<Option<ThreatProfile>, Box<dyn std::error::Error>> {
+    let Some(dims) = parse_token_usize(arch, "Threat=")? else {
+        return Ok(None);
+    };
+    let profile = match parse_token_usize(arch, "ThreatProfile=")? {
+        None | Some(0) => ThreatProfile::Full,
+        Some(1) => ThreatProfile::SameClass,
+        Some(2) => ThreatProfile::SameClassMajorPawn,
+        Some(3) => ThreatProfile::StepAttacker,
+        Some(4) => ThreatProfile::FullSymDedup,
+        Some(10) => ThreatProfile::CrossSide,
+        Some(id) => return Err(format!("unsupported ThreatProfile id {id}").into()),
+    };
+    let expected = shogi_features::threat_dimensions_of(profile);
+    if dims != expected {
+        return Err(format!(
+            "Threat dims/profile mismatch in arch string: dims={dims}, profile={profile}, expected={expected}"
+        )
+        .into());
+    }
+    Ok(Some(profile))
 }
 
 fn parse_affine_outs(arch: &str) -> Vec<usize> {
@@ -173,6 +207,17 @@ fn parse_between(
         .ok_or_else(|| format!("missing `{end_pat}` in arch string"))?
         + start;
     Ok(s[start..end].parse()?)
+}
+
+fn parse_token_usize(s: &str, token: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    let Some(start) = s.find(token).map(|pos| pos + token.len()) else {
+        return Ok(None);
+    };
+    let end = s[start..]
+        .find(',')
+        .map(|pos| start + pos)
+        .unwrap_or(s.len());
+    Ok(Some(s[start..end].parse()?))
 }
 
 fn forward_one_raw(

@@ -7,11 +7,12 @@
 //!
 //! ## アルゴリズム
 //!
-//! FT factorizer は学習時のみ玉位置に依らない駒価値を表す piece-input 仮想行を
+//! FT factorizer は学習時のみ virtual piece-input rows と virtual threat-pair rows を
 //! FT weight の後ろに持つ。base feature は駒ごとに 1 仮想行を base の
 //! king-bucket 数 (HalfKA_hm 系では 45) で共有する。effect bucket は各駒特徴を
 //! NB 個の被攻撃×被防御バケットに分割するため、mode が piece-input 仮想行を
-//! effect bucket でも pool するかを決める。この対応を
+//! effect bucket でも pool するかを決める。threat feature は pair prefix table で
+//! 同じ pair に属する行を 1 つの virtual threat-pair row へ対応させる。この対応を
 //! sparse path に流す代わりに dense kernel 2 本で配線する:
 //!
 //! - **fold** (forward): base feature には対応する仮想行を畳む。effect bucket の
@@ -19,17 +20,18 @@
 //!   駒ごとに 1 仮想行を全バケットで共有する。PerEffectBucket は
 //!   `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB` を使い、
 //!   (駒, バケット) ごとに仮想行を持つ。threat real 行
-//!   (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w` で素通し。線形性に
-//!   より base 実行の `Σ_active (w_real + w_virt) = Σ_active comb`、threat は
-//!   そのまま。
+//!   (`[base_ft_in, ft_in)`) は同じ pair の仮想行を畳み込む。線形性に
+//!   より実行部の `Σ_active (w_real + w_virt) = Σ_active comb` と等価。
 //! - **reduce** (backward): 各仮想行の勾配を、同じ仮想行へ対応する **base**
 //!   実特徴の勾配和で埋める。仮想特徴の出現列は対応する base 実特徴の出現列の
 //!   合併なので、仮想 index を sparse backward に流す直接 gather と数学的に等価
-//!   (f32 加算順のみ異なる)。threat real 行の勾配は仮想行に寄与せず不可触。
+//!   (f32 加算順のみ異なる)。threat pair 仮想行は同じ pair に属する threat 実行の
+//!   勾配和で埋める。
 //!
 //! weight / grad は column-major (`buf[feature * ft_out + ri]`)。`base_ft_in` は
 //! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が piece-input 仮想行
-//! の手前。train 形状は `(ft_in + piece_inputs) × ft_out`、
+//! の手前。train 形状は
+//! `(ft_in + base_virtual_rows + threat_pair_starts.len() - 1) × ft_out`、
 //! `base_ft_in % piece_inputs == 0` が前提。threat 無効時は `base_ft_in == ft_in`。
 
 pub const FT_FACTORIZE_BASE: u32 = 0;
@@ -37,13 +39,14 @@ pub const FT_FACTORIZE_POOL_EFFECT_BUCKETS: u32 = 1;
 pub const FT_FACTORIZE_PER_EFFECT_BUCKET: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
-pub struct FtFactorizeLayout {
+pub struct FtFactorizeLayout<'a> {
     pub base_ft_in: usize,
     pub ft_in: usize,
     pub ft_out: usize,
     pub piece_inputs: usize,
     pub nb: usize,
     pub mode: u32,
+    pub threat_pair_starts: &'a [usize],
 }
 
 pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
@@ -64,35 +67,46 @@ fn virtual_row(feature: usize, piece_inputs: usize, nb: usize, mode: u32) -> usi
 }
 
 /// Reference CPU 実装 (fold)。`comb` (export 形状 `ft_in * ft_out` = base + threat)
-/// を全要素 overwrite する。base セル `[0, base_ft_in)` は仮想行を加算、threat 行
-/// `[base_ft_in, ft_in)` は素通し。
+/// を全要素 overwrite する。base セル `[0, base_ft_in)` は virtual piece-input rows
+/// を加算、threat 行 `[base_ft_in, ft_in)` は virtual threat-pair rows を加算する。
 ///
 /// 入力前提:
-/// - `w.len() == (ft_in + piece_inputs) * ft_out` (train 形状)
+/// - `w.len() == (ft_in + base_virtual_rows + threat_pair_starts.len() - 1) * ft_out`
+///   (train 形状)
 /// - `comb.len() == ft_in * ft_out` (export 形状)
 /// - `base_ft_in <= ft_in` かつ `base_ft_in % piece_inputs == 0`
-pub fn ft_fold_virtual_cpu(w: &[f32], comb: &mut [f32], layout: FtFactorizeLayout) {
+pub fn ft_fold_virtual_cpu(w: &[f32], comb: &mut [f32], layout: FtFactorizeLayout<'_>) {
+    let base_vrows = base_virtual_rows(layout.piece_inputs, layout.nb, layout.mode);
+    let threat_virtual_base = layout.ft_in + base_vrows;
     for feature in 0..layout.ft_in {
         for ri in 0..layout.ft_out {
             let real = w[feature * layout.ft_out + ri];
             comb[feature * layout.ft_out + ri] = if feature < layout.base_ft_in {
                 let vrow = virtual_row(feature, layout.piece_inputs, layout.nb, layout.mode);
                 real + w[(layout.ft_in + vrow) * layout.ft_out + ri]
+            } else if layout.threat_pair_starts.len() >= 2 {
+                let rel = feature - layout.base_ft_in;
+                let pair = layout
+                    .threat_pair_starts
+                    .partition_point(|&start| start <= rel)
+                    - 1;
+                real + w[(threat_virtual_base + pair) * layout.ft_out + ri]
             } else {
-                real // threat real 行: 仮想行を持たない
+                real
             };
         }
     }
 }
 
-/// Reference CPU 実装 (reduce)。`grad` の仮想 block (`ft_in..ft_in+piece_inputs`
-/// 行) を **base** 実 block の対応行の和で overwrite する。base / threat
-/// 実 block は読みのみ (threat 行は仮想行に寄与しない)。
+/// Reference CPU 実装 (reduce)。`grad` の仮想 block (`ft_in..`) を overwrite する。
+/// virtual piece-input rows は **base** 実行部の対応行の和、virtual threat-pair rows は
+/// 同じ pair に属する threat 実行の和で埋める。base / threat 実行部は読みのみ。
 ///
 /// 入力前提:
-/// - `grad.len() == (ft_in + piece_inputs) * ft_out` (train 形状)
+/// - `grad.len() == (ft_in + base_virtual_rows + threat_pair_starts.len() - 1) * ft_out`
+///   (train 形状)
 /// - `base_ft_in <= ft_in` かつ `base_ft_in % piece_inputs == 0`
-pub fn ft_reduce_virtual_grad_cpu(grad: &mut [f32], layout: FtFactorizeLayout) {
+pub fn ft_reduce_virtual_grad_cpu(grad: &mut [f32], layout: FtFactorizeLayout<'_>) {
     let base_vrows = base_virtual_rows(layout.piece_inputs, layout.nb, layout.mode);
     for vrow in 0..base_vrows {
         for ri in 0..layout.ft_out {
@@ -103,6 +117,18 @@ pub fn ft_reduce_virtual_grad_cpu(grad: &mut [f32], layout: FtFactorizeLayout) {
                 }
             }
             grad[(layout.ft_in + vrow) * layout.ft_out + ri] = sum;
+        }
+    }
+    let threat_virtual_base = layout.ft_in + base_vrows;
+    for pair in 0..layout.threat_pair_starts.len().saturating_sub(1) {
+        let start = layout.base_ft_in + layout.threat_pair_starts[pair];
+        let end = layout.base_ft_in + layout.threat_pair_starts[pair + 1];
+        for ri in 0..layout.ft_out {
+            let mut sum = 0.0_f32;
+            for feature in start..end {
+                sum += grad[feature * layout.ft_out + ri];
+            }
+            grad[(threat_virtual_base + pair) * layout.ft_out + ri] = sum;
         }
     }
 }
@@ -119,7 +145,7 @@ mod tests {
     const PI: usize = 2;
     const TRAIN_ROWS: usize = FT_IN + PI;
 
-    fn base_layout() -> FtFactorizeLayout {
+    fn base_layout() -> FtFactorizeLayout<'static> {
         FtFactorizeLayout {
             base_ft_in: FT_IN,
             ft_in: FT_IN,
@@ -127,6 +153,7 @@ mod tests {
             piece_inputs: PI,
             nb: 1,
             mode: FT_FACTORIZE_BASE,
+            threat_pair_starts: &[],
         }
     }
 
@@ -293,7 +320,7 @@ mod tests {
     const FT: usize = B + THREAT; // 10 (= 仮想行の手前)
     const COEXIST_ROWS: usize = FT + PI; // train 形状 12
 
-    fn coexist_layout() -> FtFactorizeLayout {
+    fn coexist_layout() -> FtFactorizeLayout<'static> {
         FtFactorizeLayout {
             base_ft_in: B,
             ft_in: FT,
@@ -301,6 +328,7 @@ mod tests {
             piece_inputs: PI,
             nb: 1,
             mode: FT_FACTORIZE_BASE,
+            threat_pair_starts: &[],
         }
     }
 
@@ -404,6 +432,77 @@ mod tests {
     }
 
     #[test]
+    fn threat_pair_fold_adds_variable_width_pair_virtual_rows() {
+        const STARTS: [usize; 4] = [0, 1, 3, THREAT];
+        const ROWS: usize = FT + PI + 3;
+        let mut w = vec![0.0_f32; ROWS * FT_OUT];
+        for feature in 0..FT {
+            for ri in 0..FT_OUT {
+                w[feature * FT_OUT + ri] = feature as f32 + ri as f32 * 0.25;
+            }
+        }
+        for p in 0..PI {
+            for ri in 0..FT_OUT {
+                w[(FT + p) * FT_OUT + ri] = 100.0 + p as f32 + ri as f32 * 0.5;
+            }
+        }
+        for pair in 0..3 {
+            for ri in 0..FT_OUT {
+                w[(FT + PI + pair) * FT_OUT + ri] = 1000.0 + pair as f32 * 10.0 + ri as f32 * 0.75;
+            }
+        }
+
+        let mut comb = vec![0.0_f32; FT * FT_OUT];
+        ft_fold_virtual_cpu(
+            &w,
+            &mut comb,
+            FtFactorizeLayout {
+                threat_pair_starts: &STARTS,
+                ..coexist_layout()
+            },
+        );
+
+        for pair in 0..3 {
+            for rel in STARTS[pair]..STARTS[pair + 1] {
+                let feature = B + rel;
+                for ri in 0..FT_OUT {
+                    assert_eq!(
+                        comb[feature * FT_OUT + ri],
+                        w[feature * FT_OUT + ri] + w[(FT + PI + pair) * FT_OUT + ri]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn threat_pair_reduce_sums_variable_width_pairs() {
+        const STARTS: [usize; 4] = [0, 1, 3, THREAT];
+        const ROWS: usize = FT + PI + 3;
+        let mut grad: Vec<f32> = (0..ROWS * FT_OUT)
+            .map(|i| (i as f32 + 1.0) * 0.125)
+            .collect();
+        let real_snapshot = grad[..FT * FT_OUT].to_vec();
+        ft_reduce_virtual_grad_cpu(
+            &mut grad,
+            FtFactorizeLayout {
+                threat_pair_starts: &STARTS,
+                ..coexist_layout()
+            },
+        );
+
+        assert_eq!(&grad[..FT * FT_OUT], &real_snapshot[..]);
+        for pair in 0..3 {
+            for ri in 0..FT_OUT {
+                let want: f32 = (STARTS[pair]..STARTS[pair + 1])
+                    .map(|rel| real_snapshot[(B + rel) * FT_OUT + ri])
+                    .sum();
+                assert_eq!(grad[(FT + PI + pair) * FT_OUT + ri], want);
+            }
+        }
+    }
+
+    #[test]
     fn effect_bucket_fold_maps_virtual_rows_by_mode() {
         const KB: usize = 3;
         const NB: usize = 4;
@@ -434,6 +533,7 @@ mod tests {
                 piece_inputs: PI,
                 nb: NB,
                 mode: FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+                threat_pair_starts: &[],
             },
         );
         let mut bucketed = vec![0.0_f32; EFFECT_BUCKET_FT * FT_OUT];
@@ -447,6 +547,7 @@ mod tests {
                 piece_inputs: PI,
                 nb: NB,
                 mode: FT_FACTORIZE_PER_EFFECT_BUCKET,
+                threat_pair_starts: &[],
             },
         );
 
@@ -485,6 +586,7 @@ mod tests {
                 piece_inputs: PI,
                 nb: NB,
                 mode: FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+                threat_pair_starts: &[],
             },
         );
         for p in 0..PI {
@@ -512,6 +614,7 @@ mod tests {
                 piece_inputs: PI,
                 nb: NB,
                 mode: FT_FACTORIZE_PER_EFFECT_BUCKET,
+                threat_pair_starts: &[],
             },
         );
         for p in 0..PI {

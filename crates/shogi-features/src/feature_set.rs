@@ -272,7 +272,8 @@ pub struct FeatureSetSpec {
     feature_hash: u32,
     arch_feature_name: &'static str,
     /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴が共有する
-    /// piece-input 仮想行 を FT weight の後ろに持ち、export 時に実行へ畳み込む。
+    /// virtual piece-input rows と virtual threat-pair rows を FT weight の後ろに持ち、
+    /// export 時に実行へ畳み込む。
     /// 仮想行の forward 寄与と勾配は trainer が dense kernel
     /// (実行との畳み込み / 同じ仮想行に対応する実行勾配の縮約) で配線するため、特徴
     /// emit と active 数 (`max_active`) は factorizer 非依存のまま。次元で
@@ -284,8 +285,8 @@ pub struct FeatureSetSpec {
     /// bit-identical。`Some(profile)` のとき base の `ft_in` 直後に
     /// `threat_dims(profile)` 行を連結し、`max_active` / `feature_hash` も
     /// 変える (factorizer の次元不変 modifier とは別カテゴリ = base 次元の拡張)。
-    /// factorizer とは併用可 (fold/reduce/coalesce が base row 限定で threat 行を
-    /// 跨がない)。PSQT との併用のみ CLI が hard-error にする。
+    /// factorizer とは併用可 (fold/reduce/coalesce が threat pair ごとの仮想行を
+    /// 追加で配線する)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
     /// effect bucket で base index 全体を書き換える config。`None` で base と
     /// bit-identical。threat とは同時に使わない。
@@ -402,7 +403,7 @@ impl FeatureSetSpec {
     /// `ft_factorize` とは違い base 次元を拡張する: `ft_in` / `max_active` /
     /// `feature_hash` がすべて変わる。base offset (`base_ft_in`) は不変で、
     /// threat index の emit はその直後に連結される。`ft_factorize` とは併用可
-    /// (fold/reduce/coalesce が base row 限定で threat 行を跨がない)。PSQT との
+    /// (fold/reduce/coalesce が threat pair ごとの仮想行を追加で配線する)。PSQT との
     /// 併用のみ呼び出し側 (CLI) が hard-error にする (base 限定 PSQT が未検証のため)。
     pub fn with_threat_profile(self, profile: ThreatProfile) -> Self {
         if self.effect_bucket_config.is_some() {
@@ -446,7 +447,7 @@ impl FeatureSetSpec {
         if !self.ft_factorize {
             return 0;
         }
-        match (self.ft_factorize_mode, self.effect_bucket_config) {
+        let base_rows = match (self.ft_factorize_mode, self.effect_bucket_config) {
             (FtFactorizeMode::Base, _) | (FtFactorizeMode::PoolEffectBuckets, _) => {
                 self.piece_inputs
             }
@@ -454,11 +455,44 @@ impl FeatureSetSpec {
             (FtFactorizeMode::PerEffectBucket, None) => {
                 panic!("effect bucket per-effect-bucket factorizer needs effect bucket config")
             }
+        };
+        base_rows + self.threat_factorize_pair_count()
+    }
+
+    /// Threat profile に残る pair 数。virtual threat-pair rows の行数に使う。
+    pub const fn threat_factorize_pair_count(&self) -> usize {
+        match self.threat_profile {
+            Some(ThreatProfile::Full) | Some(ThreatProfile::FullSymDedup) => 324,
+            Some(ThreatProfile::SameClass) => 288,
+            Some(ThreatProfile::SameClassMajorPawn) => 272,
+            Some(ThreatProfile::StepAttacker) => 144,
+            Some(ThreatProfile::CrossSide) => 144,
+            None => 0,
         }
     }
 
-    /// 学習時の FT weight 行数。factorizer 有効時は mode ごとのpiece-input 仮想行 が
-    /// 実行の後ろに連結される。無効時は `ft_in` と同値。sparse index の
+    /// Threat within-pair factorizer 用の pair prefix table。
+    ///
+    /// 返り値は threat block 内 offset の prefix table で、pair ordinal `p` の範囲は
+    /// `[starts[p], starts[p + 1])`。factorizer 無効または threat 無効なら空。
+    pub fn threat_factorize_pair_starts(&self) -> Vec<usize> {
+        let Some(profile) = self.threat_profile else {
+            return Vec::new();
+        };
+        if !self.ft_factorize {
+            return Vec::new();
+        }
+        let mut starts = Vec::with_capacity(self.threat_factorize_pair_count() + 1);
+        starts.push(0);
+        crate::threat::for_each_threat_pair_range(profile, |_, _, _, _, base, width| {
+            debug_assert_eq!(starts.last().copied(), Some(base));
+            starts.push(base + width);
+        });
+        starts
+    }
+
+    /// 学習時の FT weight 行数。factorizer 有効時は mode ごとの virtual piece-input rows
+    /// と virtual threat-pair rows が実行の後ろに連結される。無効時は `ft_in` と同値。sparse index の
     /// 範囲と active 数は factorizer に依らず base (`ft_in` / `max_active`) の
     /// まま — 仮想行は trainer の dense kernel 経由でのみ読み書きされる。
     pub const fn train_ft_in(&self) -> usize {
@@ -1234,6 +1268,39 @@ mod tests {
                 assert_eq!(spec.max_active(), base.max_active() + THREAT_MAX_ACTIVE);
                 // threat-only は factorizer 無効なので train_ft_in == ft_in。
                 assert_eq!(spec.train_ft_in(), spec.ft_in());
+            }
+        }
+    }
+
+    #[test]
+    fn threat_factorized_pair_prefix_matches_profile_dimensions() {
+        for fs in FeatureSet::ALL {
+            for profile in ALL_PROFILES {
+                let spec = fs.spec().with_threat_profile(profile).with_ft_factorize();
+                let starts = spec.threat_factorize_pair_starts();
+                assert_eq!(
+                    starts.len(),
+                    spec.threat_factorize_pair_count() + 1,
+                    "{} {profile} pair prefix length",
+                    fs.canonical_name()
+                );
+                assert_eq!(
+                    starts.last().copied(),
+                    Some(spec.threat_dims()),
+                    "{} {profile} pair prefix terminal dim",
+                    fs.canonical_name()
+                );
+                assert!(
+                    starts.windows(2).all(|w| w[0] < w[1]),
+                    "{} {profile} pair prefix must be strictly increasing",
+                    fs.canonical_name()
+                );
+                assert_eq!(
+                    spec.train_ft_in(),
+                    spec.ft_in() + spec.piece_inputs() + spec.threat_factorize_pair_count(),
+                    "{} {profile} train_ft_in",
+                    fs.canonical_name()
+                );
             }
         }
     }
