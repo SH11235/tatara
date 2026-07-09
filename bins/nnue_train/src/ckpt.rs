@@ -387,6 +387,11 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                      want {want_feature_hash:#010x} (effect bucket config / threat profile mismatch)"
                 )));
             }
+        } else if want.effect_bucket_config().is_some() {
+            return Err(invalid_data(
+                "raw checkpoint for this EffectBucket spec requires a checkpoint with feature hash"
+                    .to_string(),
+            ));
         }
         if ckpt_ft_in != want.train_ft_in() as u64 {
             return Err(invalid_data(format!(
@@ -414,6 +419,11 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 want.max_active()
             )));
         }
+    } else if expected.feature_set.effect_bucket_config().is_some() {
+        return Err(invalid_data(
+            "raw checkpoint for this EffectBucket spec requires a checkpoint with feature hash"
+                .to_string(),
+        ));
     } else if want_name != FeatureSet::HalfKaHmMerged.spec().canonical_name() {
         return Err(invalid_data(format!(
             "raw checkpoint version 1 is always 'halfka-hm-merged', \

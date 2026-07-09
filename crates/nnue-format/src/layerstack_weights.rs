@@ -284,7 +284,7 @@ impl EffectBucketArch {
         let axes = match self.nb {
             4 => "2x2",
             9 => "3x3",
-            _ => "unsupported",
+            _ => panic!("unsupported EffectBucket bucket count: {}", self.nb),
         };
         format!("{axes}{king}")
     }
@@ -398,9 +398,9 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
 /// 学習時の FT weight は `[base real | threat real | piece-input 仮想行]` の
-/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。piece-input 仮想行 は
-/// 玉位置に依らない駒価値を持つ。base factorizer は駒ごとに 1 仮想行を45玉
-/// バケットで共有する。effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。piece-input 仮想行は
+/// 玉位置に依らない駒価値を持つ。base factorizer は駒ごとに 1 仮想行を base の
+/// king-bucket 数 (HalfKA_hm 系では 45) で共有する。effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
 /// `PoolEffectBuckets` では駒ごとに 1 仮想行を全バケットで共有し、
 /// `PerEffectBucket` では (駒, バケット) ごとに仮想行を持つ。export では実行に
 /// 仮想行を畳み込んで固定し、仮想行を捨てる。threat real 行
@@ -428,7 +428,7 @@ pub fn coalesce_ft_factorized(
         train_ft_in * ft_out,
         "ft_w length must be train_ft_in * ft_out"
     );
-    // piece-input 仮想行 は base+threat 実行の後ろ。export は実行部 (base + threat) を
+    // piece-input 仮想行は base+threat 実行の後ろ。export は実行部 (base + threat) を
     // まず複製し、base 実行に対応する仮想行を加算する。
     let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
@@ -2453,6 +2453,27 @@ mod tests {
         );
         assert!(s.contains("EffectBucket=2x2fixed,"), "{s}");
         assert!(s.find("EffectBucket=2x2fixed,").unwrap() < s.find("Network=").unwrap());
+    }
+
+    #[test]
+    fn effect_bucket_arch_rejects_unsupported_bucket_count() {
+        let err = std::panic::catch_unwind(|| {
+            let _ = EffectBucketArch {
+                nb: 5,
+                king_bucketed: false,
+            }
+            .token_value();
+        })
+        .expect_err("unsupported EffectBucket bucket count must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("unsupported EffectBucket bucket count: 5"),
+            "panic message should mention the unsupported bucket count: {msg}"
+        );
     }
 
     #[test]

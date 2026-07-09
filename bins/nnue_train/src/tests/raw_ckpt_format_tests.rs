@@ -215,6 +215,22 @@ fn raw_ckpt_header_rejects_effect_bucket_config_hash_mismatch() {
 }
 
 #[test]
+fn raw_ckpt_header_rejects_hashless_effect_bucket_checkpoint() {
+    let arch = layerstack_arch_effect_bucket(EffectBucketConfig::KINGFIXED_2X2);
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "hashless-effect-bucket", 5, 50, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf, &arch);
+
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch)
+        .expect_err("hashless effect bucket checkpoint must be rejected");
+    assert!(
+        err.to_string()
+            .contains("requires a checkpoint with feature hash"),
+        "error should mention feature hash requirement: {err}"
+    );
+}
+
+#[test]
 fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     // v6 の factorized file には max_active = 2×base の個体が存在する (仮想
     // 特徴を sparse index 列に流す実装が書いたもの、RAW_CKPT_VERSION doc 参照)。

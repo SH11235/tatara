@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::{
-    DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, QA, QB,
+    DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, LEGACY_NNUE_VERSION_BUCKETS9,
+    NNUE_VERSION, QA, QB,
 };
 use shogi_features::{EffectBucketConfig, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs};
 use shogi_format::ShogiBoard;
@@ -15,6 +16,7 @@ const STARTPOS_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNS
 
 #[derive(Parser)]
 struct Args {
+    /// Quantised EffectBucket LayerStack net (arch token `EffectBucket=`).
     #[arg(long)]
     nnue_file: PathBuf,
 
@@ -88,18 +90,29 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     if bytes.len() < 16 {
         return Err("NNUE file is too short".into());
     }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().expect("slice has 4 bytes"));
+    if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
+        return Err(format!("unsupported NNUE version: {version:#x}").into());
+    }
     let arch_len = u32::from_le_bytes(bytes[8..12].try_into().expect("slice has 4 bytes")) as usize;
     let arch_start = 12;
     let arch_end = arch_start + arch_len;
-    if arch_end + 4 > bytes.len() {
+    if arch_end > bytes.len() {
         return Err("NNUE arch string extends past end of file".into());
     }
     let arch = std::str::from_utf8(&bytes[arch_start..arch_end])?;
-    let num_buckets = u32::from_le_bytes(
-        bytes[arch_end..arch_end + 4]
-            .try_into()
-            .expect("slice has 4 bytes"),
-    ) as usize;
+    let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
+        DEFAULT_NUM_BUCKETS
+    } else {
+        if arch_end + 4 > bytes.len() {
+            return Err("NNUE num_buckets field extends past end of file".into());
+        }
+        u32::from_le_bytes(
+            bytes[arch_end..arch_end + 4]
+                .try_into()
+                .expect("slice has 4 bytes"),
+        ) as usize
+    };
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
         effect_bucket_config: parse_effect_bucket_config(arch)?,

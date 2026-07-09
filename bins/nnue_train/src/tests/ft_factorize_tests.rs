@@ -6,7 +6,7 @@
 //! のみ CPU で検証する。
 
 use gpu_kernels::sparse::ft_factorize::{
-    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_ATTACK_BUCKET, FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
     FtFactorizeLayout,
 };
 use gpu_runtime::CudaContext;
@@ -128,11 +128,11 @@ fn effect_bucket_ft_fold_virtual_cpu_matches_export_coalesce() {
     for (mode, kernel_mode) in [
         (
             FtFactorizeMode::PoolEffectBuckets,
-            FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+            FT_FACTORIZE_POOL_EFFECT_BUCKETS,
         ),
         (
             FtFactorizeMode::PerEffectBucket,
-            FT_FACTORIZE_PER_ATTACK_BUCKET,
+            FT_FACTORIZE_PER_EFFECT_BUCKET,
         ),
     ] {
         let spec = FeatureSet::HalfKaHmMerged

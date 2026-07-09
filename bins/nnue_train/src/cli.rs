@@ -648,7 +648,7 @@ pub(crate) struct LayerstackArgs {
     /// FT factorizer (training-time virtual features). **Default ON.** Pass
     /// `--no-ft-factorize` to disable.
     ///
-    /// The FT weight table gains a virtual piece-input rows for piece values independent
+    /// The FT weight table gains virtual piece-input rows for piece values independent
     /// of the king position. Each virtual row accumulates the gradients of
     /// every real row sharing its piece-input ordinal, so rarely visited king-square
     /// cells inherit a sensible shared prior instead of staying near their

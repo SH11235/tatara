@@ -7,10 +7,11 @@
 //!
 //! ## アルゴリズム
 //!
-//! FT factorizer は学習時のみ玉位置に依らない駒価値を表すpiece-input 仮想行 を
-//! FT weight の後ろに持つ。base feature は駒ごとに 1 仮想行を45玉バケットで
-//! 共有する。effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割するため、
-//! mode がpiece-input 仮想行 を被攻撃バケットでも pool するかを決める。この対応を
+//! FT factorizer は学習時のみ玉位置に依らない駒価値を表す piece-input 仮想行を
+//! FT weight の後ろに持つ。base feature は駒ごとに 1 仮想行を base の
+//! king-bucket 数 (HalfKA_hm 系では 45) で共有する。effect bucket は各駒特徴を
+//! NB 個の被攻撃×被防御バケットに分割するため、mode が piece-input 仮想行を
+//! effect bucket でも pool するかを決める。この対応を
 //! sparse path に流す代わりに dense kernel 2 本で配線する:
 //!
 //! - **fold** (forward): base feature には対応する仮想行を畳む。effect bucket の
@@ -27,13 +28,13 @@
 //!   (f32 加算順のみ異なる)。threat real 行の勾配は仮想行に寄与せず不可触。
 //!
 //! weight / grad は column-major (`buf[feature * ft_out + ri]`)。`base_ft_in` は
-//! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) がpiece-input 仮想行
+//! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が piece-input 仮想行
 //! の手前。train 形状は `(ft_in + piece_inputs) × ft_out`、
 //! `base_ft_in % piece_inputs == 0` が前提。threat 無効時は `base_ft_in == ft_in`。
 
 pub const FT_FACTORIZE_BASE: u32 = 0;
-pub const FT_FACTORIZE_POOL_ATTACK_BUCKETS: u32 = 1;
-pub const FT_FACTORIZE_PER_ATTACK_BUCKET: u32 = 2;
+pub const FT_FACTORIZE_POOL_EFFECT_BUCKETS: u32 = 1;
+pub const FT_FACTORIZE_PER_EFFECT_BUCKET: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FtFactorizeLayout {
@@ -47,8 +48,8 @@ pub struct FtFactorizeLayout {
 
 pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
     match mode {
-        FT_FACTORIZE_PER_ATTACK_BUCKET => piece_inputs * nb,
-        FT_FACTORIZE_BASE | FT_FACTORIZE_POOL_ATTACK_BUCKETS => piece_inputs,
+        FT_FACTORIZE_PER_EFFECT_BUCKET => piece_inputs * nb,
+        FT_FACTORIZE_BASE | FT_FACTORIZE_POOL_EFFECT_BUCKETS => piece_inputs,
         _ => panic!("unknown FT factorizer mode"),
     }
 }
@@ -56,8 +57,8 @@ pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
 fn virtual_row(feature: usize, piece_inputs: usize, nb: usize, mode: u32) -> usize {
     match mode {
         FT_FACTORIZE_BASE => feature % piece_inputs,
-        FT_FACTORIZE_POOL_ATTACK_BUCKETS => (feature / nb) % piece_inputs,
-        FT_FACTORIZE_PER_ATTACK_BUCKET => ((feature / nb) % piece_inputs) * nb + feature % nb,
+        FT_FACTORIZE_POOL_EFFECT_BUCKETS => (feature / nb) % piece_inputs,
+        FT_FACTORIZE_PER_EFFECT_BUCKET => ((feature / nb) % piece_inputs) * nb + feature % nb,
         _ => panic!("unknown FT factorizer mode"),
     }
 }
@@ -285,7 +286,7 @@ mod tests {
 
     // ---- threat 同居 (base_ft_in < ft_in) ----
     // base 実行 `[0, B)` の後ろに threat real 行 `[B, FT)`、その後ろに
-    // piece-input 仮想行 `[FT, FT+PI)` が並ぶ layout で fold/reduce が range-aware に
+    // piece-input 仮想行の `[FT, FT+PI)` が並ぶ layout で fold/reduce が range-aware に
     // 動くことを確認する。
     const B: usize = 6; // base (kb=3 × pi=2)
     const THREAT: usize = 4; // threat real 行
@@ -432,7 +433,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+                mode: FT_FACTORIZE_POOL_EFFECT_BUCKETS,
             },
         );
         let mut bucketed = vec![0.0_f32; EFFECT_BUCKET_FT * FT_OUT];
@@ -445,7 +446,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_PER_ATTACK_BUCKET,
+                mode: FT_FACTORIZE_PER_EFFECT_BUCKET,
             },
         );
 
@@ -483,7 +484,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+                mode: FT_FACTORIZE_POOL_EFFECT_BUCKETS,
             },
         );
         for p in 0..PI {
@@ -510,7 +511,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_PER_ATTACK_BUCKET,
+                mode: FT_FACTORIZE_PER_EFFECT_BUCKET,
             },
         );
         for p in 0..PI {

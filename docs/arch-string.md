@@ -33,6 +33,15 @@ bucket 数を自己記述する):
 Features=<...>,PSQT=<N>,Network=<...>,fv_scale=<N>
 ```
 
+EffectBucket feature set では、Features と Network の間に `EffectBucket=<config>,`
+トークンが挿入される。`<config>` は `2x2fixed` / `2x2bucketed` /
+`3x3fixed` / `3x3bucketed` のいずれかで、bucket 数と玉 feature の bucket 化有無を
+表す:
+
+```
+Features=<...>,EffectBucket=2x2fixed,Network=<...>,fv_scale=<N>
+```
+
 ### Features トークン
 
 特徴変換器 (FT) の入出力を表す:
@@ -98,7 +107,8 @@ Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Cl
 
 LayerStack の arch string は dense 層チェーンの要約で、L1f skip 接続や
 pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 有効時の
-`PSQT=<N>` トークンにのみ現れる)。LayerStack の完全なアーキ記述は
+`PSQT=<N>` トークンにのみ現れる)。EffectBucket feature set の config は
+`EffectBucket=<config>` トークンに現れる。LayerStack の完全なアーキ記述は
 `crates/nnue-format/src/layerstack_weights.rs` の module doc を参照。
 
 ## Simple の例

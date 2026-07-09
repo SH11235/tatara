@@ -1,5 +1,8 @@
 use std::path::Path;
 
+use gpu_kernels::sparse::ft_factorize::{
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+};
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
@@ -13,9 +16,9 @@ use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
 fn ft_factorize_kernel_mode(feature_set: &FeatureSetSpec) -> u32 {
     match feature_set.ft_factorize_mode() {
-        FtFactorizeMode::Base => 0,
-        FtFactorizeMode::PoolEffectBuckets => 1,
-        FtFactorizeMode::PerEffectBucket => 2,
+        FtFactorizeMode::Base => FT_FACTORIZE_BASE,
+        FtFactorizeMode::PoolEffectBuckets => FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+        FtFactorizeMode::PerEffectBucket => FT_FACTORIZE_PER_EFFECT_BUCKET,
     }
 }
 
@@ -1538,6 +1541,13 @@ impl GpuTrainer {
             0,
             "base_ft_in must be a multiple of piece_inputs for the factorizer"
         );
+        if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
+            assert_eq!(
+                base_ft_in % (pi * nb),
+                0,
+                "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
+            );
+        }
         let n = ft_in_total * self.ws.ft_out;
         if self.ft_fp16 {
             let mut comb = self
@@ -1596,7 +1606,7 @@ impl GpuTrainer {
                     config: cfg_1d(psqt_n),
                     args: [slice(psqt.w), slice_mut(comb),
                            base_ft_in as u32, base_ft_in as u32, self.num_buckets as u32,
-                           pi as u32, ft_factorize_kernel_pack(1, 0)]
+                           pi as u32, ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)]
                 }
             }?;
         }
@@ -3583,6 +3593,18 @@ impl GpuTrainer {
                 .effect_bucket_config()
                 .map_or(1, |cfg| cfg.nb);
             let mode = ft_factorize_kernel_mode(&self.feature_set);
+            assert_eq!(
+                base_ft_in % pi,
+                0,
+                "base_ft_in must be a multiple of piece_inputs for the factorizer"
+            );
+            if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
+                assert_eq!(
+                    base_ft_in % (pi * nb),
+                    0,
+                    "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
+                );
+            }
             let virtual_rows = self.feature_set.ft_factorize_virtual_rows();
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
