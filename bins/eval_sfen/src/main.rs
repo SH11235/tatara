@@ -6,7 +6,7 @@ use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::{
     DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, QA, QB,
 };
-use shogi_features::{E4Config, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs};
+use shogi_features::{EffectBucketConfig, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs};
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
 
@@ -63,7 +63,7 @@ fn load_layerstack(
     let meta = read_arch_meta(&bytes)?;
     let spec = FeatureSet::HalfKaHmMerged
         .spec()
-        .with_e4_config(meta.e4_config);
+        .with_effect_bucket_config(meta.effect_bucket_config);
     let mut cursor = Cursor::new(&bytes);
     let weights = LayerStackWeights::load_quantised(
         &mut cursor,
@@ -77,7 +77,7 @@ fn load_layerstack(
 }
 
 struct ArchMeta {
-    e4_config: E4Config,
+    effect_bucket_config: EffectBucketConfig,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -102,7 +102,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     ) as usize;
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
-        e4_config: parse_e4_config(arch)?,
+        effect_bucket_config: parse_effect_bucket_config(arch)?,
         ft_out: parse_between(arch, "->", "x2]")?,
         l1_out: affine_outs.last().copied().unwrap_or(DEFAULT_L1_OUT),
         l2_out: affine_outs.get(1).copied().unwrap_or(DEFAULT_L2_OUT),
@@ -114,17 +114,19 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     })
 }
 
-fn parse_e4_config(arch: &str) -> Result<E4Config, Box<dyn std::error::Error>> {
-    if arch.contains("E4=4xfixed") {
-        Ok(E4Config::E4_2X2_KINGFIXED)
-    } else if arch.contains("E4=4xbucketed") {
-        Ok(E4Config::E4_2X2_KINGBUCKETED)
-    } else if arch.contains("E4=9xfixed") {
-        Ok(E4Config::KPE9_KINGFIXED)
-    } else if arch.contains("E4=9xbucketed") {
-        Ok(E4Config::KPE9_KINGBUCKETED)
+fn parse_effect_bucket_config(
+    arch: &str,
+) -> Result<EffectBucketConfig, Box<dyn std::error::Error>> {
+    if arch.contains("EffectBucket=2x2fixed") {
+        Ok(EffectBucketConfig::KINGFIXED_2X2)
+    } else if arch.contains("EffectBucket=2x2bucketed") {
+        Ok(EffectBucketConfig::KINGBUCKETED_2X2)
+    } else if arch.contains("EffectBucket=3x3fixed") {
+        Ok(EffectBucketConfig::KINGFIXED_3X3)
+    } else if arch.contains("EffectBucket=3x3bucketed") {
+        Ok(EffectBucketConfig::KINGBUCKETED_3X3)
     } else {
-        Err(format!("unsupported or missing E4 token in arch string: {arch}").into())
+        Err(format!("unsupported or missing effect bucket token in arch string: {arch}").into())
     }
 }
 

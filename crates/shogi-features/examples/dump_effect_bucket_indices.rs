@@ -2,7 +2,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Write};
 
-use shogi_features::{E4Config, collect_e4_features_board};
+use shogi_features::{EffectBucketConfig, collect_effect_bucket_features_board};
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
 
@@ -14,11 +14,23 @@ const SFENS: [&str; 5] = [
     "lnsgkgsnl/1r5b1/ppppppppp/9/4P4/9/PPPP1PPPP/1B5R1/LNSGKGSNL b - 1",
 ];
 
-const CONFIGS: [(&str, E4Config); 4] = [
-    ("e4_2x2_kingfixed", E4Config::E4_2X2_KINGFIXED),
-    ("e4_2x2_kingbucketed", E4Config::E4_2X2_KINGBUCKETED),
-    ("kpe9_kingfixed", E4Config::KPE9_KINGFIXED),
-    ("kpe9_kingbucketed", E4Config::KPE9_KINGBUCKETED),
+const CONFIGS: [(&str, EffectBucketConfig); 4] = [
+    (
+        "effect_bucket_2x2_kingfixed",
+        EffectBucketConfig::KINGFIXED_2X2,
+    ),
+    (
+        "effect_bucket_2x2_kingbucketed",
+        EffectBucketConfig::KINGBUCKETED_2X2,
+    ),
+    (
+        "effect_bucket_3x3_kingfixed",
+        EffectBucketConfig::KINGFIXED_3X3,
+    ),
+    (
+        "effect_bucket_3x3_kingbucketed",
+        EffectBucketConfig::KINGBUCKETED_3X3,
+    ),
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let board = parse_sfen(sfen)?;
         for perspective in [Color::Black, Color::White] {
             for &(config_name, config) in &CONFIGS {
-                let mut indices = collect_e4_features_board(&board, config, perspective);
+                let mut indices = collect_effect_bucket_features_board(&board, config, perspective);
                 indices.sort_unstable();
                 write!(
                     out,

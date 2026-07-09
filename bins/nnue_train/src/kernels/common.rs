@@ -946,12 +946,12 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     }
 }
 
-/// FT factorizer の forward 用畳み込み: base 実行の各要素へ対応する仮想 P-plane
+/// FT factorizer の forward 用畳み込み: base 実行の各要素へ対応するpiece-input 仮想行
 /// 行を加算し、forward が読む畳み込み済み weight `comb` (export 形状
 /// `ft_in × ft_out` = base + threat) を作る。`w` は train 形状
 /// (`(ft_in + piece_inputs) × ft_out`、column-major で `w[feature * ft_out + ri]`)。
 /// 線形性により base 実行は `Σ_active (w_real + w_virt) = Σ_active comb`。
-/// `base_ft_in` が仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane
+/// `base_ft_in` が仮想行を持つ base 実行の行数、`ft_in` (= base + threat) がpiece-input 仮想行
 /// の手前。threat real 行 (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w`
 /// で素通しする。threat 無効時は `base_ft_in == ft_in` で全セルが畳まれ threat
 /// 連結前と bit-identical。1 thread = 1 出力要素。仮想要素 offset は恒等式
@@ -964,7 +964,7 @@ pub fn ft_fold_virtual(
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
-    e4_factorize: u32,
+    effect_bucket_factorize: u32,
 ) {
     let i = thread::index_1d();
     let n = ft_in * ft_out;
@@ -975,8 +975,8 @@ pub fn ft_fold_virtual(
     // `comb.len() == n`、`base_ft_in <= ft_in` を保証。
     let ft_out_u = ft_out as usize;
     let pi_u = piece_inputs as usize;
-    let nb = e4_factorize & 0xffff;
-    let mode = e4_factorize >> 16;
+    let nb = effect_bucket_factorize & 0xffff;
+    let mode = effect_bucket_factorize >> 16;
     let nb_u = nb as usize;
     let feature = i.get() / ft_out_u;
     let v = if feature < base_ft_in as usize {
@@ -1016,7 +1016,7 @@ pub fn ft_fold_virtual_f16(
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
-    e4_factorize: u32,
+    effect_bucket_factorize: u32,
 ) {
     let i = thread::index_1d();
     let n = ft_in * ft_out;
@@ -1028,8 +1028,8 @@ pub fn ft_fold_virtual_f16(
     // base_ft_in`) は仮想行を持たないので素通し。
     let ft_out_u = ft_out as usize;
     let pi_u = piece_inputs as usize;
-    let nb = e4_factorize & 0xffff;
-    let mode = e4_factorize >> 16;
+    let nb = effect_bucket_factorize & 0xffff;
+    let mode = effect_bucket_factorize >> 16;
     let nb_u = nb as usize;
     let feature = i.get() / ft_out_u;
     let v = if feature < base_ft_in as usize {
@@ -1055,13 +1055,13 @@ pub fn ft_fold_virtual_f16(
     }
 }
 
-/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece plane を持つ
+/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece-input ordinal を持つ
 /// **base** 実行の勾配和で埋める (`grad[(ft_in + p) * ft_out + ri] =
 /// Σ_{kb < base_ft_in/pi} grad[(kb * piece_inputs + p) * ft_out + ri]`)。各仮想
 /// 特徴の出現列が「同 p を持つ base 実特徴の出現列の合併」である (base 実特徴 1 つ
 /// につき仮想特徴ちょうど 1 つが対応) ことから、仮想 index を sparse backward に
 /// 流す直接 gather と数学的に等価 (f32 加算順のみ異なる)。`base_ft_in` が縮約対象
-/// の base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane の手前。threat
+/// の base 実行の行数、`ft_in` (= base + threat) がpiece-input 仮想行 の手前。threat
 /// real 行は仮想行に寄与しない。threat 無効時は `base_ft_in == ft_in` で threat
 /// 連結前と bit-identical。実 block の gather (`gather_and_sum_per_feature_*`) が stm / nstm
 /// 両方完了した後に launch する。1 thread = 1 仮想要素、仮想 block は overwrite。

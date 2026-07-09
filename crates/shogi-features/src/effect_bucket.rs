@@ -1,7 +1,7 @@
-//! HalfKa-E4 active index emission.
+//! effect bucket active index emission.
 //!
-//! HalfKa-E4 extends the base HalfKA_hm merged index with a per-piece attack
-//! bucket: `e4_index = base_index * NB + bucket`.
+//! effect bucket extends the base HalfKA_hm merged index with a per-piece attack
+//! bucket: `effect_bucket_index = base_index * NB + bucket`.
 
 use shogi_format::types::{Color, HAND_PIECE_TYPES, PieceType, Square};
 use shogi_format::{BonaPiece, ShogiBoard};
@@ -11,38 +11,38 @@ use crate::halfka_hm::{
     pack_bonapiece,
 };
 
-/// E4 bucket configuration.
+/// effect bucket configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct E4Config {
+pub struct EffectBucketConfig {
     /// Number of buckets. Supported values are 4 and 9.
     pub nb: usize,
-    /// Whether king features receive attack buckets.
+    /// Whether king features receive effect buckets.
     pub king_bucketed: bool,
 }
 
-impl E4Config {
+impl EffectBucketConfig {
     /// 2x2 attack bucket, kings fixed to bucket 0.
-    pub const E4_2X2_KINGFIXED: Self = Self {
+    pub const KINGFIXED_2X2: Self = Self {
         nb: 4,
         king_bucketed: false,
     };
     /// 2x2 attack bucket, kings bucketed.
-    pub const E4_2X2_KINGBUCKETED: Self = Self {
+    pub const KINGBUCKETED_2X2: Self = Self {
         nb: 4,
         king_bucketed: true,
     };
     /// 3x3 attack bucket, kings fixed to bucket 0.
-    pub const KPE9_KINGFIXED: Self = Self {
+    pub const KINGFIXED_3X3: Self = Self {
         nb: 9,
         king_bucketed: false,
     };
     /// 3x3 attack bucket, kings bucketed.
-    pub const KPE9_KINGBUCKETED: Self = Self {
+    pub const KINGBUCKETED_3X3: Self = Self {
         nb: 9,
         king_bucketed: true,
     };
 
-    /// E4 input dimension.
+    /// effect bucket input dimension.
     pub const fn dimensions(self) -> usize {
         45 * PIECE_INPUTS * self.nb
     }
@@ -50,11 +50,11 @@ impl E4Config {
 
 /// Per-color attacker counts for all board squares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct E4AttackCounts {
+pub struct EffectBucketAttackCounts {
     counts: [[u8; Square::NONE.0 as usize]; 2],
 }
 
-impl E4AttackCounts {
+impl EffectBucketAttackCounts {
     /// Returns the number of pieces of `color` attacking `sq`.
     #[inline]
     pub fn get(self, color: Color, sq: Square) -> u8 {
@@ -65,7 +65,7 @@ impl E4AttackCounts {
 const PACKED_HAND_END: usize = 90;
 const PACKED_BOARD_END: usize = 1548;
 
-/// Returns whether a packed BonaPiece receives an E4 bucket.
+/// Returns whether a packed BonaPiece receives an effect bucket.
 #[inline]
 pub fn packed_is_bucketed(packed_bp: usize, king_bucketed: bool) -> bool {
     if packed_bp < PACKED_HAND_END {
@@ -77,19 +77,19 @@ pub fn packed_is_bucketed(packed_bp: usize, king_bucketed: bool) -> bool {
     }
 }
 
-/// Quantizes attacked/defended counts into an E4 bucket.
+/// Quantizes attacked/defended counts into an effect bucket.
 #[inline]
-pub fn e4_bucket(attacked: u8, defended: u8, nb: usize) -> usize {
+pub fn effect_bucket(attacked: u8, defended: u8, nb: usize) -> usize {
     match nb {
         4 => defended.min(1) as usize * 2 + attacked.min(1) as usize,
         9 => defended.min(2) as usize * 3 + attacked.min(2) as usize,
-        _ => unreachable!("unsupported E4 bucket count: {nb}"),
+        _ => unreachable!("unsupported effect bucket count: {nb}"),
     }
 }
 
-/// Combines a base HalfKA_hm index and an E4 bucket.
+/// Combines a base HalfKA_hm index and an effect bucket.
 #[inline]
-pub fn e4_index(base_index: usize, bucket: usize, nb: usize) -> usize {
+pub fn effect_bucket_index(base_index: usize, bucket: usize, nb: usize) -> usize {
     base_index * nb + bucket
 }
 
@@ -97,7 +97,7 @@ pub fn e4_index(base_index: usize, bucket: usize, nb: usize) -> usize {
 ///
 /// Counts include king attacks, ignore pins, exclude the piece's own square, and
 /// stop sliders at the first occupied square while still counting that square.
-pub fn e4_attacker_counts(board: &ShogiBoard) -> E4AttackCounts {
+pub fn effect_bucket_attacker_counts(board: &ShogiBoard) -> EffectBucketAttackCounts {
     let occ = Occupied::from_board(board);
     let mut counts = [[0u8; Square::NONE.0 as usize]; 2];
 
@@ -113,16 +113,16 @@ pub fn e4_attacker_counts(board: &ShogiBoard) -> E4AttackCounts {
         });
     }
 
-    E4AttackCounts { counts }
+    EffectBucketAttackCounts { counts }
 }
 
-/// Emits E4 active indices for one physical perspective.
+/// Emits effect bucket active indices for one physical perspective.
 ///
 /// `perspective` is independent from side-to-move; pass `Color::Black` for the
 /// black view and `Color::White` for the white view.
-pub fn map_e4_features_board<F: FnMut(usize)>(
+pub fn map_effect_bucket_features_board<F: FnMut(usize)>(
     board: &ShogiBoard,
-    config: E4Config,
+    config: EffectBucketConfig,
     perspective: Color,
     mut f: F,
 ) {
@@ -132,19 +132,19 @@ pub fn map_e4_features_board<F: FnMut(usize)>(
         return;
     }
 
-    let ctx = E4PerspectiveCtx {
+    let ctx = EffectBucketPerspectiveCtx {
         king_bucket: king_bucket(king_sq, perspective),
         hm_mirror: is_hm_mirror(king_sq, perspective),
     };
-    let counts = e4_attacker_counts(board);
+    let counts = effect_bucket_attacker_counts(board);
 
     board.for_each_board_piece(|piece, sq| {
         let bp = BonaPiece::from_piece_square(piece, sq, perspective);
-        emit_e4_index(&ctx, &counts, config, bp, Some((piece.color, sq)), &mut f);
+        emit_effect_bucket_index(&ctx, &counts, config, bp, Some((piece.color, sq)), &mut f);
     });
 
     let friend_king = king_bonapiece(perspective_sq_index(king_sq, perspective), true);
-    emit_e4_index(
+    emit_effect_bucket_index(
         &ctx,
         &counts,
         config,
@@ -154,7 +154,7 @@ pub fn map_e4_features_board<F: FnMut(usize)>(
     );
 
     let enemy_king = king_bonapiece(perspective_sq_index(enemy_king_sq, perspective), false);
-    emit_e4_index(
+    emit_effect_bucket_index(
         &ctx,
         &counts,
         config,
@@ -168,25 +168,25 @@ pub fn map_e4_features_board<F: FnMut(usize)>(
             for i in 1..=board.hand(owner).count(pt) {
                 let bp = BonaPiece::from_hand_piece(perspective, owner, pt, i);
                 if bp != BonaPiece::ZERO {
-                    emit_e4_index(&ctx, &counts, config, bp, None, &mut f);
+                    emit_effect_bucket_index(&ctx, &counts, config, bp, None, &mut f);
                 }
             }
         }
     }
 }
 
-/// Collects E4 active indices for one perspective.
-pub fn collect_e4_features_board(
+/// Collects effect bucket active indices for one perspective.
+pub fn collect_effect_bucket_features_board(
     board: &ShogiBoard,
-    config: E4Config,
+    config: EffectBucketConfig,
     perspective: Color,
 ) -> Vec<usize> {
     let mut out = Vec::with_capacity(MAX_ACTIVE_FEATURES);
-    map_e4_features_board(board, config, perspective, |idx| out.push(idx));
+    map_effect_bucket_features_board(board, config, perspective, |idx| out.push(idx));
     out
 }
 
-struct E4PerspectiveCtx {
+struct EffectBucketPerspectiveCtx {
     king_bucket: usize,
     hm_mirror: bool,
 }
@@ -199,10 +199,10 @@ fn perspective_sq_index(sq: Square, perspective: Color) -> usize {
     }
 }
 
-fn emit_e4_index<F: FnMut(usize)>(
-    ctx: &E4PerspectiveCtx,
-    counts: &E4AttackCounts,
-    config: E4Config,
+fn emit_effect_bucket_index<F: FnMut(usize)>(
+    ctx: &EffectBucketPerspectiveCtx,
+    counts: &EffectBucketAttackCounts,
+    config: EffectBucketConfig,
     bp: BonaPiece,
     board_piece: Option<(Color, Square)>,
     f: &mut F,
@@ -210,8 +210,9 @@ fn emit_e4_index<F: FnMut(usize)>(
     let packed = pack_bonapiece(bp, ctx.hm_mirror);
     let base = halfka_index(ctx.king_bucket, packed);
     let bucket = if packed_is_bucketed(packed, config.king_bucketed) {
-        let (color, sq) = board_piece.expect("bucketed E4 feature must have a board square");
-        e4_bucket(
+        let (color, sq) =
+            board_piece.expect("bucketed effect bucket feature must have a board square");
+        effect_bucket(
             counts.get(color.opponent(), sq),
             counts.get(color, sq),
             config.nb,
@@ -219,7 +220,7 @@ fn emit_e4_index<F: FnMut(usize)>(
     } else {
         0
     };
-    f(e4_index(base, bucket, config.nb));
+    f(effect_bucket_index(base, bucket, config.nb));
 }
 
 struct Occupied {
@@ -382,8 +383,8 @@ mod tests {
 
     #[test]
     fn dimensions_match_config() {
-        assert_eq!(E4Config::E4_2X2_KINGFIXED.dimensions(), 73_305 * 4);
-        assert_eq!(E4Config::KPE9_KINGFIXED.dimensions(), 73_305 * 9);
+        assert_eq!(EffectBucketConfig::KINGFIXED_2X2.dimensions(), 73_305 * 4);
+        assert_eq!(EffectBucketConfig::KINGFIXED_3X3.dimensions(), 73_305 * 9);
     }
 
     #[test]
@@ -398,17 +399,17 @@ mod tests {
 
     #[test]
     fn bucket_quantization() {
-        assert_eq!(e4_bucket(0, 0, 4), 0);
-        assert_eq!(e4_bucket(1, 0, 4), 1);
-        assert_eq!(e4_bucket(0, 1, 4), 2);
-        assert_eq!(e4_bucket(4, 3, 4), 3);
-        assert_eq!(e4_bucket(2, 0, 9), 2);
-        assert_eq!(e4_bucket(0, 2, 9), 6);
-        assert_eq!(e4_bucket(4, 3, 9), 8);
+        assert_eq!(effect_bucket(0, 0, 4), 0);
+        assert_eq!(effect_bucket(1, 0, 4), 1);
+        assert_eq!(effect_bucket(0, 1, 4), 2);
+        assert_eq!(effect_bucket(4, 3, 4), 3);
+        assert_eq!(effect_bucket(2, 0, 9), 2);
+        assert_eq!(effect_bucket(0, 2, 9), 6);
+        assert_eq!(effect_bucket(4, 3, 9), 8);
     }
 
     #[test]
-    fn e4_active_divides_back_to_base_set() {
+    fn effect_bucket_active_divides_back_to_base_set() {
         let mut board = board_with_kings(
             Square::new(4, 8),
             Square::new(4, 0),
@@ -422,10 +423,10 @@ mod tests {
         board.black_hand.add(PieceType::Gold, 1);
 
         for config in [
-            E4Config::E4_2X2_KINGFIXED,
-            E4Config::E4_2X2_KINGBUCKETED,
-            E4Config::KPE9_KINGFIXED,
-            E4Config::KPE9_KINGBUCKETED,
+            EffectBucketConfig::KINGFIXED_2X2,
+            EffectBucketConfig::KINGBUCKETED_2X2,
+            EffectBucketConfig::KINGFIXED_3X3,
+            EffectBucketConfig::KINGBUCKETED_3X3,
         ] {
             for perspective in [Color::Black, Color::White] {
                 board.side_to_move = perspective;
@@ -435,9 +436,11 @@ mod tests {
                     .map_features_board(&board, |stm, _| base.push(stm));
                 base.sort_unstable();
 
-                let mut e4 = collect_e4_features_board(&board, config, perspective);
-                e4.sort_unstable();
-                let mut recovered: Vec<_> = e4.iter().map(|idx| idx / config.nb).collect();
+                let mut effect_bucket =
+                    collect_effect_bucket_features_board(&board, config, perspective);
+                effect_bucket.sort_unstable();
+                let mut recovered: Vec<_> =
+                    effect_bucket.iter().map(|idx| idx / config.nb).collect();
                 recovered.sort_unstable();
                 assert_eq!(recovered, base);
             }
@@ -451,12 +454,15 @@ mod tests {
             Square::new(4, 0),
             &[(Color::Black, PieceType::Gold, Square::new(4, 7))],
         );
-        let counts = e4_attacker_counts(&board);
+        let counts = effect_bucket_attacker_counts(&board);
         let gold_sq = Square::new(4, 7);
         assert_eq!(counts.get(Color::Black, gold_sq), 1);
 
-        let mut indices =
-            collect_e4_features_board(&board, E4Config::E4_2X2_KINGFIXED, Color::Black);
+        let mut indices = collect_effect_bucket_features_board(
+            &board,
+            EffectBucketConfig::KINGFIXED_2X2,
+            Color::Black,
+        );
         indices.sort_unstable();
         assert!(
             indices.iter().any(|idx| idx % 4 == 2 || idx % 4 == 3),

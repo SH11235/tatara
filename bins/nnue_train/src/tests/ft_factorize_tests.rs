@@ -13,7 +13,7 @@ use gpu_runtime::CudaContext;
 use nnue_train::dataloader::Batch;
 use nnue_train::init::LayerStackInit;
 use nnue_train::trainer::LossKind;
-use shogi_features::{E4Config, FeatureSet, FtFactorizeMode};
+use shogi_features::{EffectBucketConfig, FeatureSet, FtFactorizeMode};
 
 use crate::arch::*;
 use crate::trainer_common::{BatchData, PrecisionFlags};
@@ -124,20 +124,20 @@ fn ft_fold_virtual_cpu_matches_export_coalesce() {
 }
 
 #[test]
-fn e4_ft_fold_virtual_cpu_matches_export_coalesce() {
+fn effect_bucket_ft_fold_virtual_cpu_matches_export_coalesce() {
     for (mode, kernel_mode) in [
         (
-            FtFactorizeMode::PoolAttackBuckets,
+            FtFactorizeMode::PoolEffectBuckets,
             FT_FACTORIZE_POOL_ATTACK_BUCKETS,
         ),
         (
-            FtFactorizeMode::PerAttackBucket,
+            FtFactorizeMode::PerEffectBucket,
             FT_FACTORIZE_PER_ATTACK_BUCKET,
         ),
     ] {
         let spec = FeatureSet::HalfKaHmMerged
             .spec()
-            .with_e4_config(E4Config::E4_2X2_KINGFIXED)
+            .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
             .with_ft_factorize_mode(mode);
         let ft_out = 4;
         let train_n = spec.train_ft_in() * ft_out;
@@ -154,7 +154,7 @@ fn e4_ft_fold_virtual_cpu_matches_export_coalesce() {
                 ft_in: spec.ft_in(),
                 ft_out,
                 piece_inputs: spec.piece_inputs(),
-                nb: spec.e4_config().unwrap().nb,
+                nb: spec.effect_bucket_config().unwrap().nb,
                 mode: kernel_mode,
             },
         );
@@ -246,12 +246,12 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
 }
 
 #[test]
-fn e4_ft_factorize_first_step_matches_off_and_virtual_rows_learn()
+fn effect_bucket_ft_factorize_first_step_matches_off_and_virtual_rows_learn()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged
         .spec()
-        .with_e4_config(E4Config::E4_2X2_KINGFIXED);
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
     let fact = base.with_ft_factorize();
     let batch = BatchData::smoke_dummy(B, base);
     let (loss_off, w_off) = {
@@ -268,14 +268,14 @@ fn e4_ft_factorize_first_step_matches_off_and_virtual_rows_learn()
     let tol = loss_off.abs() * 1e-6 + 1e-12;
     assert!(
         (loss_on - loss_off).abs() <= tol,
-        "E4 step-1 loss must match: on={loss_on:e} off={loss_off:e}"
+        "effect bucket step-1 loss must match: on={loss_on:e} off={loss_off:e}"
     );
     assert_eq!(w_on.feature_set, base);
     assert_eq!(w_on.ft_w.len(), w_off.ft_w.len());
     assert!(w_on.ft_w != w_off.ft_w);
 
     let pi = base.piece_inputs();
-    let nb = base.e4_config().unwrap().nb;
+    let nb = base.effect_bucket_config().unwrap().nb;
     for p in 0..8 {
         let feat0 = p * nb;
         let feat1 = (pi + p) * nb;
@@ -283,7 +283,7 @@ fn e4_ft_factorize_first_step_matches_off_and_virtual_rows_learn()
         let d1 = w_on.ft_w[feat1 * FT_OUT_TEST] - w_off.ft_w[feat1 * FT_OUT_TEST];
         assert!(
             (d0 - d1).abs() <= d0.abs().max(d1.abs()) * 1e-5 + 1e-7,
-            "E4 残差が同じ piece plane で一致する: p={p} d0={d0:e} d1={d1:e}"
+            "effect bucket 残差が同じ piece-input ordinal で一致する: p={p} d0={d0:e} d1={d1:e}"
         );
     }
     Ok(())
@@ -393,7 +393,7 @@ fn ft_factorize_threat_coexist_first_step_matches_threat_only()
 }
 
 /// PSQT 有効の trainer を作る (psqt_init は base 形状)。factorize 有効 spec を
-/// 渡すと PSQT block も仮想 P 行を持ち、`psqt_init` の base 行を実 block に置いて
+/// 渡すと PSQT block もpiece-input 仮想行を持ち、`psqt_init` の base 行を実 block に置いて
 /// 仮想 block は zero append される。
 fn make_trainer_psqt_init(
     ctx: &std::sync::Arc<CudaContext>,

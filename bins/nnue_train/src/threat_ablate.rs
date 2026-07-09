@@ -1,7 +1,7 @@
 //! threat FT 重みの部分集合 0 化 (ablation 寄与診断) と pair-class 別ノルム分解。
 //!
 //! `--init-from` で量子化 threat net を load した直後の [`LayerStackWeights::ft_w`]
-//! (layout `[base real | threat real | (virtual P)]`) に対し、threat real row
+//! (layout `[base real | threat real | (virtual piece-input rows)]`) に対し、threat real row
 //! `[base_ft_in, base_ft_in + threat_dims)` のうち述語一致 pair の row を 0 にする。
 //! `--eval-only` と組み合わせ「どの pair-class 部分集合が held-out test_loss に
 //! どれだけ寄与するか」を、再学習なしで測る診断経路。

@@ -648,9 +648,9 @@ pub(crate) struct LayerstackArgs {
     /// FT factorizer (training-time virtual features). **Default ON.** Pass
     /// `--no-ft-factorize` to disable.
     ///
-    /// The FT weight table gains a virtual P-plane for piece values independent
+    /// The FT weight table gains a virtual piece-input rows for piece values independent
     /// of the king position. Each virtual row accumulates the gradients of
-    /// every real row sharing its piece plane, so rarely visited king-square
+    /// every real row sharing its piece-input ordinal, so rarely visited king-square
     /// cells inherit a sensible shared prior instead of staying near their
     /// initial values. The virtual rows are folded into the real rows when the
     /// quantised `.bin` is saved, so
@@ -679,11 +679,11 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
 
-    /// E4 FT factorizer sharing mode. `pool-buckets` shares one virtual row
-    /// for each piece across attack buckets; `per-bucket` keeps attack buckets
+    /// effect bucket FT factorizer sharing mode. `pool-buckets` shares one virtual row
+    /// for each piece across effect buckets; `per-bucket` keeps effect buckets
     /// separate.
-    #[arg(long = "ft-factorize-e4-share", value_enum, default_value_t = E4FactorizeShare::PoolBuckets)]
-    pub(crate) ft_factorize_e4_share: E4FactorizeShare,
+    #[arg(long = "ft-factorize-effect-bucket-share", value_enum, default_value_t = EffectBucketFactorizeShare::PoolBuckets)]
+    pub(crate) ft_factorize_effect_bucket_share: EffectBucketFactorizeShare,
 
     /// Threat sparse feature profile. One of: off (default), full, same-class,
     /// same-class-major-pawn, step-attacker, full-symdedup, cross-side. When not
@@ -704,13 +704,13 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
 
-    /// HalfKa-E4 bucket feature config. One of: off (default),
-    /// 2x2-kingfixed, 2x2-kingbucketed, kpe9-kingfixed,
-    /// kpe9-kingbucketed. E4 rewrites every base feature row as
+    /// effect bucket feature config. One of: off (default),
+    /// 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed,
+    /// 3x3-kingbucketed. effect bucket rewrites every base feature row as
     /// `base_index * NB + bucket`, so it is mutually exclusive with
     /// `--threat-profile` and `--psqt`.
-    #[arg(long = "e4-config", default_value = "off")]
-    pub(crate) e4_config: String,
+    #[arg(long = "effect-bucket", default_value = "off")]
+    pub(crate) effect_bucket_config: String,
 }
 
 impl LayerstackArgs {
@@ -735,7 +735,7 @@ pub(crate) enum PsqtInit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum E4FactorizeShare {
+pub(crate) enum EffectBucketFactorizeShare {
     PoolBuckets,
     PerBucket,
 }

@@ -200,7 +200,7 @@ row layout は 3 ケースで定義する (相互に矛盾しないこと):
 - **threat-only** (factorizer OFF): `ft_in = base_ft_in + threat_dims`、
   layout `[base real | threat real]`。
 - **factorizer-only** (threat OFF): `train_ft_in = ft_in + base_piece_inputs`、
-  layout `[base real | base virtual(P)]` (現行どおり仮想 P plane が末尾)。
+  layout `[base real | base virtual(P)]` (現行どおりpiece-input 仮想行 が末尾)。
 - **両方 ON** (将来。現状は CLI 相互排他で禁止): `train_ft_in() = ft_in() +
   base_piece_inputs` の自然な append 順に従うと layout は
   `[base real | threat real | base virtual(P)]` になる。この順では

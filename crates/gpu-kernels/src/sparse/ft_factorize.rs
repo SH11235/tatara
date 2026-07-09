@@ -7,15 +7,15 @@
 //!
 //! ## アルゴリズム
 //!
-//! FT factorizer は学習時のみ玉位置に依らない駒価値を表す仮想 P-plane を
+//! FT factorizer は学習時のみ玉位置に依らない駒価値を表すpiece-input 仮想行 を
 //! FT weight の後ろに持つ。base feature は駒ごとに 1 仮想行を45玉バケットで
-//! 共有する。E4 は各駒特徴を NB 個の被攻撃×被防御バケットに分割するため、
-//! mode が仮想 P-plane を被攻撃バケットでも pool するかを決める。この対応を
+//! 共有する。effect bucket は各駒特徴を NB 個の被攻撃×被防御バケットに分割するため、
+//! mode がpiece-input 仮想行 を被攻撃バケットでも pool するかを決める。この対応を
 //! sparse path に流す代わりに dense kernel 2 本で配線する:
 //!
-//! - **fold** (forward): base feature には対応する仮想行を畳む。E4 の
-//!   PoolAttackBuckets は `virtual_row = (feat/NB)%piece_inputs` を使い、
-//!   駒ごとに 1 仮想行を全バケットで共有する。PerAttackBucket は
+//! - **fold** (forward): base feature には対応する仮想行を畳む。effect bucket の
+//!   PoolEffectBuckets は `virtual_row = (feat/NB)%piece_inputs` を使い、
+//!   駒ごとに 1 仮想行を全バケットで共有する。PerEffectBucket は
 //!   `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB` を使い、
 //!   (駒, バケット) ごとに仮想行を持つ。threat real 行
 //!   (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w` で素通し。線形性に
@@ -27,7 +27,7 @@
 //!   (f32 加算順のみ異なる)。threat real 行の勾配は仮想行に寄与せず不可触。
 //!
 //! weight / grad は column-major (`buf[feature * ft_out + ri]`)。`base_ft_in` は
-//! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane
+//! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) がpiece-input 仮想行
 //! の手前。train 形状は `(ft_in + piece_inputs) × ft_out`、
 //! `base_ft_in % piece_inputs == 0` が前提。threat 無効時は `base_ft_in == ft_in`。
 
@@ -285,7 +285,7 @@ mod tests {
 
     // ---- threat 同居 (base_ft_in < ft_in) ----
     // base 実行 `[0, B)` の後ろに threat real 行 `[B, FT)`、その後ろに
-    // 仮想 P plane `[FT, FT+PI)` が並ぶ layout で fold/reduce が range-aware に
+    // piece-input 仮想行 `[FT, FT+PI)` が並ぶ layout で fold/reduce が range-aware に
     // 動くことを確認する。
     const B: usize = 6; // base (kb=3 × pi=2)
     const THREAT: usize = 4; // threat real 行
@@ -403,12 +403,12 @@ mod tests {
     }
 
     #[test]
-    fn e4_fold_maps_virtual_rows_by_mode() {
+    fn effect_bucket_fold_maps_virtual_rows_by_mode() {
         const KB: usize = 3;
         const NB: usize = 4;
-        const E4_FT: usize = KB * PI * NB;
-        let mut w = vec![0.0_f32; (E4_FT + PI * NB) * FT_OUT];
-        for feature in 0..E4_FT {
+        const EFFECT_BUCKET_FT: usize = KB * PI * NB;
+        let mut w = vec![0.0_f32; (EFFECT_BUCKET_FT + PI * NB) * FT_OUT];
+        for feature in 0..EFFECT_BUCKET_FT {
             for ri in 0..FT_OUT {
                 w[feature * FT_OUT + ri] = feature as f32 + ri as f32 * 0.25;
             }
@@ -416,32 +416,32 @@ mod tests {
         for p in 0..PI {
             for bucket in 0..NB {
                 for ri in 0..FT_OUT {
-                    w[(E4_FT + p * NB + bucket) * FT_OUT + ri] =
+                    w[(EFFECT_BUCKET_FT + p * NB + bucket) * FT_OUT + ri] =
                         1000.0 + (p * 10 + bucket) as f32 + ri as f32 * 0.5;
                 }
             }
         }
 
-        let mut attack = vec![0.0_f32; E4_FT * FT_OUT];
+        let mut attack = vec![0.0_f32; EFFECT_BUCKET_FT * FT_OUT];
         ft_fold_virtual_cpu(
-            &w[..(E4_FT + PI) * FT_OUT],
+            &w[..(EFFECT_BUCKET_FT + PI) * FT_OUT],
             &mut attack,
             FtFactorizeLayout {
-                base_ft_in: E4_FT,
-                ft_in: E4_FT,
+                base_ft_in: EFFECT_BUCKET_FT,
+                ft_in: EFFECT_BUCKET_FT,
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
                 mode: FT_FACTORIZE_POOL_ATTACK_BUCKETS,
             },
         );
-        let mut bucketed = vec![0.0_f32; E4_FT * FT_OUT];
+        let mut bucketed = vec![0.0_f32; EFFECT_BUCKET_FT * FT_OUT];
         ft_fold_virtual_cpu(
             &w,
             &mut bucketed,
             FtFactorizeLayout {
-                base_ft_in: E4_FT,
-                ft_in: E4_FT,
+                base_ft_in: EFFECT_BUCKET_FT,
+                ft_in: EFFECT_BUCKET_FT,
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
@@ -449,36 +449,37 @@ mod tests {
             },
         );
 
-        for feature in 0..E4_FT {
+        for feature in 0..EFFECT_BUCKET_FT {
             let p = (feature / NB) % PI;
             let bucket = feature % NB;
             for ri in 0..FT_OUT {
                 assert_eq!(
                     attack[feature * FT_OUT + ri],
-                    w[feature * FT_OUT + ri] + w[(E4_FT + p) * FT_OUT + ri]
+                    w[feature * FT_OUT + ri] + w[(EFFECT_BUCKET_FT + p) * FT_OUT + ri]
                 );
                 assert_eq!(
                     bucketed[feature * FT_OUT + ri],
-                    w[feature * FT_OUT + ri] + w[(E4_FT + p * NB + bucket) * FT_OUT + ri]
+                    w[feature * FT_OUT + ri]
+                        + w[(EFFECT_BUCKET_FT + p * NB + bucket) * FT_OUT + ri]
                 );
             }
         }
     }
 
     #[test]
-    fn e4_reduce_sums_expected_axes() {
+    fn effect_bucket_reduce_sums_expected_axes() {
         const KB: usize = 3;
         const NB: usize = 4;
-        const E4_FT: usize = KB * PI * NB;
-        let mut attack_grad: Vec<f32> = (0..(E4_FT + PI) * FT_OUT)
+        const EFFECT_BUCKET_FT: usize = KB * PI * NB;
+        let mut attack_grad: Vec<f32> = (0..(EFFECT_BUCKET_FT + PI) * FT_OUT)
             .map(|i| (i as f32 + 1.0) * 0.01)
             .collect();
-        let attack_snapshot = attack_grad[..E4_FT * FT_OUT].to_vec();
+        let attack_snapshot = attack_grad[..EFFECT_BUCKET_FT * FT_OUT].to_vec();
         ft_reduce_virtual_grad_cpu(
             &mut attack_grad,
             FtFactorizeLayout {
-                base_ft_in: E4_FT,
-                ft_in: E4_FT,
+                base_ft_in: EFFECT_BUCKET_FT,
+                ft_in: EFFECT_BUCKET_FT,
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
@@ -493,19 +494,19 @@ mod tests {
                         want += attack_snapshot[((kb * PI + p) * NB + bucket) * FT_OUT + ri];
                     }
                 }
-                assert_eq!(attack_grad[(E4_FT + p) * FT_OUT + ri], want);
+                assert_eq!(attack_grad[(EFFECT_BUCKET_FT + p) * FT_OUT + ri], want);
             }
         }
 
-        let mut bucket_grad: Vec<f32> = (0..(E4_FT + PI * NB) * FT_OUT)
+        let mut bucket_grad: Vec<f32> = (0..(EFFECT_BUCKET_FT + PI * NB) * FT_OUT)
             .map(|i| (i as f32 + 1.0) * 0.02)
             .collect();
-        let bucket_snapshot = bucket_grad[..E4_FT * FT_OUT].to_vec();
+        let bucket_snapshot = bucket_grad[..EFFECT_BUCKET_FT * FT_OUT].to_vec();
         ft_reduce_virtual_grad_cpu(
             &mut bucket_grad,
             FtFactorizeLayout {
-                base_ft_in: E4_FT,
-                ft_in: E4_FT,
+                base_ft_in: EFFECT_BUCKET_FT,
+                ft_in: EFFECT_BUCKET_FT,
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
@@ -518,7 +519,10 @@ mod tests {
                     let want: f32 = (0..KB)
                         .map(|kb| bucket_snapshot[((kb * PI + p) * NB + bucket) * FT_OUT + ri])
                         .sum();
-                    assert_eq!(bucket_grad[(E4_FT + p * NB + bucket) * FT_OUT + ri], want);
+                    assert_eq!(
+                        bucket_grad[(EFFECT_BUCKET_FT + p * NB + bucket) * FT_OUT + ri],
+                        want
+                    );
                 }
             }
         }

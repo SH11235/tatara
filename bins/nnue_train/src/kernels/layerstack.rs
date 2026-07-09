@@ -2573,7 +2573,7 @@ pub fn slice_scatter_2d(
 //
 // 形式:
 //   psqt_w shape   = (rows, NUM_BUCKETS) row-major (`psqt_w[feat * NB + bucket]`、
-//                    rows は base `ft_in`、factorizer 有効時は仮想 P 行込みの
+//                    rows は base `ft_in`、factorizer 有効時はpiece-input 仮想行込みの
 //                    `train_ft_in`。本 kernel は `feat < ft_in` の実 block のみ touch)
 //   forward 出力   = net_output[b] += 0.5 * (Σ_f∈stm_active psqt_w[f,bk]
 //                                            − Σ_f∈nstm_active psqt_w[f,bk])

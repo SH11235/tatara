@@ -23,7 +23,7 @@ Stockfish の HalfKA → HalfKAv2 に当たる「玉 plane を 2 枚持つか 1 
 
 HalfKA / HalfKAv2 / HalfKAv2_hm の **いずれも両玉の位置を active feature として
 emit する**。HalfKA → HalfKAv2 の差は「玉を 1 つ捨てる」ことではなく、玉用の
-piece plane を 2 枚持つか 1 枚に畳むかという次元上の違いである。
+piece-input ordinal を 2 枚持つか 1 枚に畳むかという次元上の違いである。
 
 ## Decision
 

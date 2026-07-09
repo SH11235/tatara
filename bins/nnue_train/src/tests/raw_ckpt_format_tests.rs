@@ -1,7 +1,7 @@
 //! raw checkpoint format helper tests (GPU 不要)。
 
 use nnue_format::ArchKind;
-use shogi_features::{E4Config, FeatureSet};
+use shogi_features::{EffectBucketConfig, FeatureSet};
 
 use crate::{arch::*, ckpt::*};
 
@@ -156,9 +156,11 @@ fn layerstack_arch_factorized() -> RawCkptArch<'static> {
     }
 }
 
-fn layerstack_arch_e4(config: E4Config) -> RawCkptArch<'static> {
+fn layerstack_arch_effect_bucket(config: EffectBucketConfig) -> RawCkptArch<'static> {
     RawCkptArch {
-        feature_set: FeatureSet::HalfKaHmMerged.spec().with_e4_config(config),
+        feature_set: FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_effect_bucket_config(config),
         arch_kind: ArchKind::LayerStack,
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
@@ -182,9 +184,9 @@ fn raw_ckpt_header_ft_factorize_round_trips() {
 }
 
 #[test]
-fn raw_ckpt_header_rejects_e4_config_hash_mismatch() {
-    let fixed = layerstack_arch_e4(E4Config::E4_2X2_KINGFIXED);
-    let bucketed = layerstack_arch_e4(E4Config::E4_2X2_KINGBUCKETED);
+fn raw_ckpt_header_rejects_effect_bucket_config_hash_mismatch() {
+    let fixed = layerstack_arch_effect_bucket(EffectBucketConfig::KINGFIXED_2X2);
+    let bucketed = layerstack_arch_effect_bucket(EffectBucketConfig::KINGBUCKETED_2X2);
     assert_eq!(
         fixed.feature_set.canonical_name(),
         bucketed.feature_set.canonical_name()
@@ -203,9 +205,9 @@ fn raw_ckpt_header_rejects_e4_config_hash_mismatch() {
     );
 
     let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &fixed, "e4-fixed", 5, 50, None, 10).unwrap();
+    write_raw_ckpt_header(&mut buf, &fixed, "effect_bucket-fixed", 5, 50, None, 10).unwrap();
     let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &bucketed)
-        .expect_err("E4 config mismatch must be rejected");
+        .expect_err("effect bucket config mismatch must be rejected");
     assert!(
         err.to_string().contains("feature hash mismatch"),
         "error should mention feature hash mismatch: {err}"

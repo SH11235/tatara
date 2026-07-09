@@ -4672,7 +4672,7 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
 }
 
 /// threat 同居 fixture: base 実行 (35 行) の後ろに threat
-/// real 行 (12)、その後ろに仮想 P plane (pi=5)。base_ft_in=35 < ft_in=47。
+/// real 行 (12)、その後ろにpiece-input 仮想行 (pi=5)。base_ft_in=35 < ft_in=47。
 fn ft_factorize_coexist_fixture() -> (usize, usize, usize, usize, Vec<f32>) {
     let base_ft_in = 35;
     let threat = 12;
@@ -4765,7 +4765,7 @@ fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn ft_factorize_e4_fixture(mode: u32) -> (usize, usize, usize, usize, Vec<f32>) {
+fn ft_factorize_effect_bucket_fixture(mode: u32) -> (usize, usize, usize, usize, Vec<f32>) {
     let kb = 7;
     let pi = 5;
     let nb = 4;
@@ -4787,7 +4787,7 @@ fn ft_fold_virtual_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         FT_FACTORIZE_POOL_ATTACK_BUCKETS,
         FT_FACTORIZE_PER_ATTACK_BUCKET,
     ] {
-        let (ft_in, ft_out, pi, nb, w) = ft_factorize_e4_fixture(mode);
+        let (ft_in, ft_out, pi, nb, w) = ft_factorize_effect_bucket_fixture(mode);
         let n = ft_in * ft_out;
 
         let mut comb_cpu = vec![0.0_f32; n];
@@ -4810,7 +4810,7 @@ fn ft_fold_virtual_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         }?;
         stream.synchronize()?;
         assert_close(
-            "ft_fold_virtual e4",
+            "ft_fold_virtual effect_bucket",
             &comb_dev.to_host_vec(&stream)?,
             &comb_cpu,
             0.0,
@@ -4826,7 +4826,7 @@ fn ft_fold_virtual_f16_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>
         FT_FACTORIZE_POOL_ATTACK_BUCKETS,
         FT_FACTORIZE_PER_ATTACK_BUCKET,
     ] {
-        let (ft_in, ft_out, pi, nb, w) = ft_factorize_e4_fixture(mode);
+        let (ft_in, ft_out, pi, nb, w) = ft_factorize_effect_bucket_fixture(mode);
         let n = ft_in * ft_out;
 
         let mut comb_cpu = vec![0.0_f32; n];
@@ -4854,7 +4854,7 @@ fn ft_fold_virtual_f16_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>
             .iter()
             .map(|&x| x as f32)
             .collect();
-        assert_close("ft_fold_virtual_f16 e4", &got, &expected, 0.0);
+        assert_close("ft_fold_virtual_f16 effect_bucket", &got, &expected, 0.0);
     }
     Ok(())
 }
@@ -4866,7 +4866,7 @@ fn ft_reduce_virtual_grad_e4_matches_cpu() -> Result<(), Box<dyn std::error::Err
         FT_FACTORIZE_POOL_ATTACK_BUCKETS,
         FT_FACTORIZE_PER_ATTACK_BUCKET,
     ] {
-        let (ft_in, ft_out, pi, nb, grad_init) = ft_factorize_e4_fixture(mode);
+        let (ft_in, ft_out, pi, nb, grad_init) = ft_factorize_effect_bucket_fixture(mode);
         let virtual_rows = if mode == FT_FACTORIZE_PER_ATTACK_BUCKET {
             pi * nb
         } else {
@@ -4895,10 +4895,10 @@ fn ft_reduce_virtual_grad_e4_matches_cpu() -> Result<(), Box<dyn std::error::Err
         assert_eq!(
             &got[..ft_in * ft_out],
             &grad_init[..ft_in * ft_out],
-            "E4 実 block は read-only"
+            "effect bucket 実 block は read-only"
         );
         assert_close_rel(
-            "ft_reduce_virtual_grad e4 virtual block",
+            "ft_reduce_virtual_grad effect_bucket virtual block",
             &got[ft_in * ft_out..],
             &grad_cpu[ft_in * ft_out..],
             TOL,

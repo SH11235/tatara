@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use shogi_features::E4Config;
+use shogi_features::EffectBucketConfig;
 use shogi_features::feature_set::{FeatureSet, FeatureSetSpec};
 use shogi_features::halfka_hm::ShogiHalfKA_hm;
 use shogi_format::bona_piece::{E_KING, F_KING, FE_OLD_END};
@@ -95,7 +95,10 @@ fn mirror_board(board: &ShogiBoard) -> ShogiBoard {
     mirrored
 }
 
-fn collect_e4_sorted(spec: &FeatureSetSpec, board: &ShogiBoard) -> (Vec<usize>, Vec<usize>) {
+fn collect_effect_bucket_sorted(
+    spec: &FeatureSetSpec,
+    board: &ShogiBoard,
+) -> (Vec<usize>, Vec<usize>) {
     let mut stm = vec![0i32; spec.max_active()];
     let mut nstm = vec![0i32; spec.max_active()];
     let n = spec.extract_active_features(board, &mut stm, &mut nstm);
@@ -565,7 +568,7 @@ fn direct_cells_are_not_invariant_under_file_mirror() {
 }
 
 #[test]
-fn e4_canonical_golden_halfka_hm_merged_2x2_kingfixed() {
+fn effect_bucket_canonical_golden_halfka_hm_merged_2x2_kingfixed() {
     let pieces: &[(Color, PieceType, Square)] = &[
         (Color::Black, PieceType::Gold, Square::new(3, 7)),
         (Color::Black, PieceType::Silver, Square::new(4, 7)),
@@ -582,8 +585,8 @@ fn e4_canonical_golden_halfka_hm_merged_2x2_kingfixed() {
     let board = build_board(Color::Black, Square::new(4, 8), Square::new(4, 0), pieces);
     let spec = FeatureSet::HalfKaHmMerged
         .spec()
-        .with_e4_config(E4Config::E4_2X2_KINGFIXED);
-    let (stm, nstm) = collect_e4_sorted(&spec, &board);
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+    let (stm, nstm) = collect_effect_bucket_sorted(&spec, &board);
 
     assert_eq!(
         stm,
@@ -601,28 +604,31 @@ fn e4_canonical_golden_halfka_hm_merged_2x2_kingfixed() {
     );
 }
 
-/// 学習経路 (`extract_active_features` = `map_e4_features_board_both`) が cross-repo
-/// golden で検証済みの単視点 dumper (`collect_e4_features_board`) と各視点で index 集合
+/// 学習経路 (`extract_active_features` = `map_effect_bucket_features_board_both`) が cross-repo
+/// golden で検証済みの単視点 dumper (`collect_effect_bucket_features_board`) と各視点で index 集合
 /// bit 一致する不変条件。両者は別実装なので実局面で突き合わせないと契約が silent に割れる。
 #[test]
-fn e4_training_path_matches_golden_dumper_on_real_psv() {
+fn effect_bucket_training_path_matches_golden_dumper_on_real_psv() {
     let configs = [
-        E4Config::E4_2X2_KINGFIXED,
-        E4Config::E4_2X2_KINGBUCKETED,
-        E4Config::KPE9_KINGFIXED,
-        E4Config::KPE9_KINGBUCKETED,
+        EffectBucketConfig::KINGFIXED_2X2,
+        EffectBucketConfig::KINGBUCKETED_2X2,
+        EffectBucketConfig::KINGFIXED_3X3,
+        EffectBucketConfig::KINGBUCKETED_3X3,
     ];
     let records = sample_psv_records();
     let mut checked = 0usize;
     for cfg in configs {
-        let spec = FeatureSet::HalfKaHmMerged.spec().with_e4_config(cfg);
+        let spec = FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_effect_bucket_config(cfg);
         for (i, psv) in records.iter().enumerate() {
             let board = psv.decode();
             let stm = board.side_to_move;
-            let (train_stm, train_nstm) = collect_e4_sorted(&spec, &board);
-            let mut gold_stm = shogi_features::collect_e4_features_board(&board, cfg, stm);
+            let (train_stm, train_nstm) = collect_effect_bucket_sorted(&spec, &board);
+            let mut gold_stm =
+                shogi_features::collect_effect_bucket_features_board(&board, cfg, stm);
             let mut gold_nstm =
-                shogi_features::collect_e4_features_board(&board, cfg, stm.opponent());
+                shogi_features::collect_effect_bucket_features_board(&board, cfg, stm.opponent());
             gold_stm.sort_unstable();
             gold_nstm.sort_unstable();
             assert_eq!(
@@ -640,6 +646,6 @@ fn e4_training_path_matches_golden_dumper_on_real_psv() {
     }
     assert!(
         checked > 0,
-        "sample.psv に active E4 feature を持つ record が無い"
+        "sample.psv に active effect bucket feature を持つ record が無い"
     );
 }

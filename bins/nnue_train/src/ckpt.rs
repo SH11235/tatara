@@ -384,7 +384,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             if ckpt_feature_hash != want_feature_hash {
                 return Err(invalid_data(format!(
                     "raw checkpoint feature hash mismatch: got {ckpt_feature_hash:#010x}, \
-                     want {want_feature_hash:#010x} (E4 config / threat profile mismatch)"
+                     want {want_feature_hash:#010x} (effect bucket config / threat profile mismatch)"
                 )));
             }
         }
