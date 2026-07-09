@@ -8,6 +8,7 @@
 //!   logistic regression による `0..=1` progress / N-bucket 割当 (caller が N を指定)。
 
 pub mod feature_set;
+pub mod halfka_e4;
 pub mod halfka_hm;
 pub mod progress_kpabs;
 pub mod psqt_material;
@@ -16,6 +17,10 @@ pub mod threat;
 pub mod threat_exclusion;
 
 pub use feature_set::{FeatureSet, FeatureSetSpec};
+pub use halfka_e4::{
+    E4AttackCounts, E4Config, collect_e4_features_board, e4_attacker_counts, e4_bucket, e4_index,
+    map_e4_features_board, packed_is_bucketed,
+};
 pub use halfka_hm::{
     FEATURE_HASH_HM_V2, HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, NUM_KING_BUCKETS, PIECE_INPUTS,
     SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, SHOGI_HALFKA_HM_NUM_FEATURES, ShogiHalfKA_hm,
