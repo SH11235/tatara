@@ -4570,6 +4570,14 @@ fn no_threat_pair_starts(
     DeviceBuffer::from_host(stream, &[0_u32]).map_err(Into::into)
 }
 
+fn threat_pair_starts_dev(
+    stream: &CudaStream,
+    starts: &[usize],
+) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+    let starts_u32: Vec<u32> = starts.iter().map(|&x| x as u32).collect();
+    DeviceBuffer::from_host(stream, &starts_u32).map_err(Into::into)
+}
+
 /// fold (f32 出力) が CPU reference と完全一致する (thread ごと 1 加算で
 /// 加算順差が無い)。
 #[test]
@@ -4689,20 +4697,23 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// threat 同居 fixture: base 実行 (35 行) の後ろに threat
-/// real 行 (12)、その後ろに piece-input 仮想行 (pi=5)。base_ft_in=35 < ft_in=47。
+/// threat 同居 fixture: base 実行 (35 行) の後ろに threat real 行 (12)、その後ろに
+/// piece-input 仮想行 (pi=5) と threat-pair 仮想行 (3)。pair 幅は 2/3/7。
 fn ft_factorize_coexist_fixture() -> (usize, usize, usize, usize, Vec<f32>) {
     let base_ft_in = 35;
     let threat = 12;
     let ft_in = base_ft_in + threat;
     let ft_out = 8;
     let pi = 5;
-    let w = deterministic_floats((ft_in + pi) * ft_out, 3.0);
+    let threat_pairs = 3;
+    let w = deterministic_floats((ft_in + pi + threat_pairs) * ft_out, 3.0);
     (base_ft_in, ft_in, ft_out, pi, w)
 }
 
-/// 同居 fold: base セルは仮想行を畳み、threat 行は素通し。GPU が range-aware CPU
-/// reference と完全一致する (1 加算/cell で加算順差なし)。
+const COEXIST_THREAT_PAIR_STARTS: [usize; 4] = [0, 2, 5, 12];
+
+/// 同居 fold: base セルは piece-input 仮想行を畳み、threat セルは pair 仮想行を畳む。
+/// GPU が range-aware CPU reference と完全一致する (1 加算/cell で加算順差なし)。
 #[test]
 fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -4713,17 +4724,35 @@ fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error
     ft_fold_virtual_cpu(
         &w,
         &mut comb_cpu,
-        ft_factorize_layout(base_ft_in, ft_in, ft_out, pi, 1, FT_FACTORIZE_BASE),
+        FtFactorizeLayout {
+            threat_pair_starts: &COEXIST_THREAT_PAIR_STARTS,
+            ..ft_factorize_layout(base_ft_in, ft_in, ft_out, pi, 1, FT_FACTORIZE_BASE)
+        },
     );
-    // threat 行 (`[base_ft_in, ft_in)`) は素通しのはず (reference の裏取り)。
-    for feat in base_ft_in..ft_in {
+    for pair in 0..COEXIST_THREAT_PAIR_STARTS.len() - 1 {
+        let vrow = ft_in + pi + pair;
+        for rel in COEXIST_THREAT_PAIR_STARTS[pair]..COEXIST_THREAT_PAIR_STARTS[pair + 1] {
+            let feat = base_ft_in + rel;
+            for ri in 0..ft_out {
+                assert_eq!(
+                    comb_cpu[feat * ft_out + ri],
+                    w[feat * ft_out + ri] + w[vrow * ft_out + ri]
+                );
+            }
+        }
+    }
+    for feat in 0..base_ft_in {
+        let p = feat % pi;
         for ri in 0..ft_out {
-            assert_eq!(comb_cpu[feat * ft_out + ri], w[feat * ft_out + ri]);
+            assert_eq!(
+                comb_cpu[feat * ft_out + ri],
+                w[feat * ft_out + ri] + w[(ft_in + p) * ft_out + ri]
+            );
         }
     }
 
     let w_dev = DeviceBuffer::from_host(&stream, &w)?;
-    let threat_starts_dev = no_threat_pair_starts(&stream)?;
+    let threat_starts_dev = threat_pair_starts_dev(&stream, &COEXIST_THREAT_PAIR_STARTS)?;
     let mut comb_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -4745,8 +4774,49 @@ fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// 同居 reduce: 仮想行は **base** 実行のみの和。base + threat 実 block は
-/// read-only、threat 行は仮想行に寄与しない。
+/// 同居 fold f16 出力版も threat pair table 付き CPU reference と一致する。
+#[test]
+fn ft_fold_virtual_f16_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let (base_ft_in, ft_in, ft_out, pi, w) = ft_factorize_coexist_fixture();
+    let n = ft_in * ft_out;
+
+    let mut comb_cpu = vec![0.0_f32; n];
+    ft_fold_virtual_cpu(
+        &w,
+        &mut comb_cpu,
+        FtFactorizeLayout {
+            threat_pair_starts: &COEXIST_THREAT_PAIR_STARTS,
+            ..ft_factorize_layout(base_ft_in, ft_in, ft_out, pi, 1, FT_FACTORIZE_BASE)
+        },
+    );
+    let (_, expected) = quantize_f16(&comb_cpu);
+
+    let w_dev = DeviceBuffer::from_host(&stream, &w)?;
+    let threat_starts_dev = threat_pair_starts_dev(&stream, &COEXIST_THREAT_PAIR_STARTS)?;
+    let mut comb_dev = DeviceBuffer::<f16>::zeroed(&stream, n)?;
+    unsafe {
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        cuda_launch! {
+            kernel: ft_fold_virtual_f16, stream: stream, module: module, config: cfg_1d(n),
+            args: [slice(w_dev), slice_mut(comb_dev), slice(threat_starts_dev),
+                   ft_factorize_bounds(base_ft_in, ft_in), ft_out as u32, pi as u32,
+                   ft_factorize_pack(1, FT_FACTORIZE_BASE)]
+        }
+    }?;
+    stream.synchronize()?;
+    let got: Vec<f32> = comb_dev
+        .to_host_vec(&stream)?
+        .iter()
+        .map(|&x| x as f32)
+        .collect();
+    assert_close("ft_fold_virtual_f16 coexist", &got, &expected, 0.0);
+    Ok(())
+}
+
+/// 同居 reduce: piece-input 仮想行は base 実行の和、threat-pair 仮想行は同じ
+/// pair に属する threat 実行の和。base + threat 実 block は read-only。
 #[test]
 fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
@@ -4755,17 +4825,21 @@ fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error
     let mut grad_cpu = grad_init.clone();
     ft_reduce_virtual_grad_cpu(
         &mut grad_cpu,
-        ft_factorize_layout(base_ft_in, ft_in, ft_out, pi, 1, FT_FACTORIZE_BASE),
+        FtFactorizeLayout {
+            threat_pair_starts: &COEXIST_THREAT_PAIR_STARTS,
+            ..ft_factorize_layout(base_ft_in, ft_in, ft_out, pi, 1, FT_FACTORIZE_BASE)
+        },
     );
 
     let grad_dev = DeviceBuffer::from_host(&stream, &grad_init)?;
-    let threat_starts_dev = no_threat_pair_starts(&stream)?;
+    let threat_starts_dev = threat_pair_starts_dev(&stream, &COEXIST_THREAT_PAIR_STARTS)?;
+    let virtual_rows = pi + COEXIST_THREAT_PAIR_STARTS.len() - 1;
     unsafe {
         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
         // stream の完了を待つ同期点まで生存する device allocation。
         cuda_launch! {
             kernel: ft_reduce_virtual_grad, stream: stream, module: module,
-            config: cfg_1d(pi * ft_out),
+            config: cfg_1d(virtual_rows * ft_out),
             args: [slice(grad_dev), slice(threat_starts_dev),
                    ft_factorize_bounds(base_ft_in, ft_in), ft_out as u32, pi as u32,
                    ft_factorize_pack(1, FT_FACTORIZE_BASE)]

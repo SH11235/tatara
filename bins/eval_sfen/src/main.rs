@@ -18,7 +18,7 @@ const STARTPOS_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNS
 
 #[derive(Parser)]
 struct Args {
-    /// Quantised EffectBucket LayerStack net (arch token `EffectBucket=`).
+    /// Quantised LayerStack net (supports base / Threat= / EffectBucket= arch tokens).
     #[arg(long)]
     nnue_file: PathBuf,
 
@@ -141,16 +141,15 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
 fn parse_effect_bucket_config(
     arch: &str,
 ) -> Result<Option<EffectBucketConfig>, Box<dyn std::error::Error>> {
-    if arch.contains("EffectBucket=2x2fixed") {
-        Ok(Some(EffectBucketConfig::KINGFIXED_2X2))
-    } else if arch.contains("EffectBucket=2x2bucketed") {
-        Ok(Some(EffectBucketConfig::KINGBUCKETED_2X2))
-    } else if arch.contains("EffectBucket=3x3fixed") {
-        Ok(Some(EffectBucketConfig::KINGFIXED_3X3))
-    } else if arch.contains("EffectBucket=3x3bucketed") {
-        Ok(Some(EffectBucketConfig::KINGBUCKETED_3X3))
-    } else {
-        Ok(None)
+    let Some(value) = parse_token_str(arch, "EffectBucket=") else {
+        return Ok(None);
+    };
+    match value {
+        "2x2fixed" => Ok(Some(EffectBucketConfig::KINGFIXED_2X2)),
+        "2x2bucketed" => Ok(Some(EffectBucketConfig::KINGBUCKETED_2X2)),
+        "3x3fixed" => Ok(Some(EffectBucketConfig::KINGFIXED_3X3)),
+        "3x3bucketed" => Ok(Some(EffectBucketConfig::KINGBUCKETED_3X3)),
+        _ => Err(format!("unsupported EffectBucket value `{value}`").into()),
     }
 }
 
@@ -210,14 +209,16 @@ fn parse_between(
 }
 
 fn parse_token_usize(s: &str, token: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-    let Some(start) = s.find(token).map(|pos| pos + token.len()) else {
-        return Ok(None);
-    };
+    Ok(parse_token_str(s, token).map(str::parse).transpose()?)
+}
+
+fn parse_token_str<'a>(s: &'a str, token: &str) -> Option<&'a str> {
+    let start = s.find(token).map(|pos| pos + token.len())?;
     let end = s[start..]
         .find(',')
         .map(|pos| start + pos)
         .unwrap_or(s.len());
-    Ok(Some(s[start..end].parse()?))
+    Some(s[start..end].split(']').next().unwrap_or(&s[start..end]))
 }
 
 fn forward_one_raw(

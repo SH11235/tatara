@@ -142,6 +142,7 @@ pub(crate) struct GpuTrainer {
     /// 代わりに読む。それ以外の構成では `None` (FP32 forward は `ft_w` を直接読む)。
     ft_w_fold32: Option<DeviceBuffer<f32>>,
     threat_pair_starts: DeviceBuffer<u32>,
+    empty_threat_pair_starts: DeviceBuffer<u32>,
     ft_b: DeviceBuffer<f32>,
     ft_b_m: DeviceBuffer<f32>,
     ft_b_v: DeviceBuffer<f32>,
@@ -849,6 +850,11 @@ impl GpuTrainer {
         );
         let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l2_out), &init_spec.l3_b);
 
+        assert!(
+            psqt_init.is_none() || feature_set.threat_profile().is_none(),
+            "GpuTrainer does not support PSQT with threat features"
+        );
+
         // PSQT shortcut の初期 weight (有効時のみ確保)。入力 `psqt_init` は base 形状
         // (`base_ft_in * num_buckets`) を caller が validation 済 (CLI / `run_training`)。
         // factorizer 有効時は FT weight と同じく実 block を base 形状で受けて仮想 block
@@ -930,6 +936,7 @@ impl GpuTrainer {
                 None
             },
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
+            empty_threat_pair_starts: DeviceBuffer::from_host(&stream, &[0_u32])?,
             ft_b: DeviceBuffer::from_host(&stream, &ft_b_init)?,
             ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
             ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
@@ -1531,7 +1538,8 @@ impl GpuTrainer {
         assert!(self.feature_set.ft_factorize());
         // `base_ft_in` = 仮想行を持つ base 実行の行数 (fold 対象)。
         // `ft_in_total` = base + threat (= comb サイズ / piece-input 仮想行 の手前)。
-        // threat 無効時は両者一致。FT comb は base+threat 全行 (threat 行は素通し)。
+        // threat 無効時は両者一致。FT comb は base 行に piece-input 仮想行を畳み、
+        // threat 行に pair 仮想行を畳む。
         let ft_in_total = self.feature_set.ft_in();
         let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {
             ft_in_total
@@ -1603,8 +1611,8 @@ impl GpuTrainer {
         }
         // PSQT shortcut も factorizer 有効時は同じpiece-input 仮想行を持つ。FT と同じ
         // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
-        // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat と CLI
-        // 排他なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
+        // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat と排他
+        // なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
         if let Some(psqt) = self.psqt.as_mut() {
             let mut comb = psqt
                 .w_fold
@@ -1620,7 +1628,7 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(psqt_n),
-                    args: [slice(psqt.w), slice_mut(comb), slice(self.threat_pair_starts),
+                    args: [slice(psqt.w), slice_mut(comb), slice(self.empty_threat_pair_starts),
                            psqt_bounds, self.num_buckets as u32,
                            pi as u32, ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)]
                 }
@@ -2687,7 +2695,7 @@ impl GpuTrainer {
             // 同じ `ft_reduce_virtual_grad` を「列 = num_buckets」で再利用、overwrite)。
             if self.feature_set.ft_factorize() {
                 let pi = self.feature_set.piece_inputs();
-                // PSQT は threat と CLI 排他なので psqt_w に threat 行は無く、縮約
+                // PSQT は threat と排他なので psqt_w に threat 行は無く、縮約
                 // 範囲 = 仮想 offset = base_ft_in (= ft_in_u と一致)。
                 let base_ft_in = self.feature_set.base_ft_in() as u32;
                 let ft_bounds = ft_factorize_ft_bounds(base_ft_in as usize, base_ft_in as usize);
@@ -2700,7 +2708,7 @@ impl GpuTrainer {
                         config: cfg_1d(pi * self.num_buckets),
                         args: [
                             slice(psqt.w_grad),
-                            slice(self.threat_pair_starts),
+                            slice(self.empty_threat_pair_starts),
                             ft_bounds, self.num_buckets as u32, pi as u32,
                             ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)
                         ]
@@ -3595,10 +3603,9 @@ impl GpuTrainer {
                 prof_tick!("phD_nstm");
             }
         }
-        // factorizer: 仮想行の勾配 = 同 piece-input ordinal を持つ **base** 実行の勾配和。
-        // stm / nstm 両方の gather が実 block を確定させた後に 1 launch で仮想 block を
-        // 埋める (仮想 index を sparse pipeline に流す方式と数学的に等価、kernel doc
-        // 参照)。threat real 行は仮想行に寄与しないので縮約範囲は base_ft_in のみ。
+        // factorizer: piece-input 仮想行は base 実行の勾配和、threat-pair 仮想行は
+        // 同じ pair に属する threat 実行の勾配和で埋める。stm / nstm 両方の gather が
+        // 実 block を確定させた後に 1 launch で仮想 block を埋める。
         if self.feature_set.ft_factorize() {
             let pi = self.feature_set.piece_inputs();
             let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {

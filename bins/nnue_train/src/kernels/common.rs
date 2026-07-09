@@ -1143,7 +1143,7 @@ pub fn ft_reduce_virtual_grad(
     };
 
     // raw pointer 版 (PTX の bounds check 除去)。unsafe 妥当性: caller が
-    // `grad.len() == (ft_in + piece_inputs) * ft_out`、`base_ft_in <= ft_in`、
+    // `grad.len() == train_ft_in * ft_out`、`base_ft_in <= ft_in`、
     // `base_ft_in % piece_inputs == 0` を保証し、読みは base 実 block
     // (`feature < base_ft_in`)、書きは thread ごとに disjoint な仮想 cell
     // (`ft_in + p` 行) に閉じる。

@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_leaves_threat_rows_untouched() {
+    fn fold_without_threat_pair_table_leaves_threat_rows_untouched() {
         let w = coexist_weights();
         let mut comb = vec![0.0_f32; FT * FT_OUT];
         ft_fold_virtual_cpu(&w, &mut comb, coexist_layout());
@@ -351,7 +351,7 @@ mod tests {
                 assert_eq!(comb[feature * FT_OUT + ri], want, "base {feature} ri {ri}");
             }
         }
-        // threat 行は素通し (仮想行を加算しない)。
+        // pair table が無い場合、threat 行は素通し (仮想行を加算しない)。
         for feature in B..FT {
             for ri in 0..FT_OUT {
                 assert_eq!(
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn reduce_uses_only_base_king_buckets_and_leaves_threat_grad() {
+    fn reduce_without_threat_pair_table_uses_only_base_rows() {
         let mut grad: Vec<f32> = (0..COEXIST_ROWS * FT_OUT)
             .map(|i| (i as f32 + 1.0) * 0.3)
             .collect();
@@ -376,7 +376,7 @@ mod tests {
             &real_snapshot[..],
             "実 block は reduce で不変"
         );
-        // 仮想行は **base 実行のみ** の和 (threat 行は寄与しない)。
+        // pair table が無い場合、仮想行は base 実行のみの和。
         for p in 0..PI {
             for ri in 0..FT_OUT {
                 let want: f32 = (0..B / PI)
@@ -388,8 +388,8 @@ mod tests {
     }
 
     #[test]
-    fn fold_separation_threat_only_nonzero() {
-        // base + 仮想 = 0、threat ≠ 0 → fold 後 threat row == 元 threat row。
+    fn fold_without_threat_pair_table_keeps_threat_only_rows() {
+        // pair table が無い場合、base + 仮想 = 0、threat != 0 なら fold 後 threat row == 元 threat row。
         let mut w = vec![0.0_f32; COEXIST_ROWS * FT_OUT];
         for feature in B..FT {
             for ri in 0..FT_OUT {
@@ -411,8 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn reduce_separation_threat_grad_gives_zero_virtual() {
-        // base grad = 0・threat grad ≠ 0 → 仮想行 grad = 0 (threat は寄与しない)。
+    fn reduce_without_threat_pair_table_ignores_threat_grad() {
+        // pair table が無い場合、base grad = 0・threat grad != 0 なら仮想行 grad = 0。
         let mut grad = vec![0.0_f32; COEXIST_ROWS * FT_OUT];
         for feature in B..FT {
             for ri in 0..FT_OUT {
