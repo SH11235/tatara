@@ -16,7 +16,7 @@ mod simd;
 pub mod threat;
 pub mod threat_exclusion;
 
-pub use feature_set::{FeatureSet, FeatureSetSpec};
+pub use feature_set::{FeatureSet, FeatureSetSpec, FtFactorizeMode};
 pub use halfka_e4::{
     E4AttackCounts, E4Config, collect_e4_features_board, e4_attacker_counts, e4_bucket, e4_index,
     map_e4_features_board, packed_is_bucketed,

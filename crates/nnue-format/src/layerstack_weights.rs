@@ -69,7 +69,7 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::{E4Config, FeatureSetSpec};
+use shogi_features::{E4Config, FeatureSetSpec, FtFactorizeMode};
 
 // =============================================================================
 // constants (LayerStack architecture)
@@ -412,6 +412,7 @@ pub fn coalesce_ft_factorized(
     let base_ft_in = feature_set.base_ft_in();
     let ft_in = feature_set.ft_in(); // base + threat (= 仮想行の手前まで)
     let piece_inputs = feature_set.piece_inputs();
+    let nb = feature_set.e4_config().map_or(1, |cfg| cfg.nb);
     let train_ft_in = feature_set.train_ft_in();
     assert_eq!(
         ft_w_train.len(),
@@ -422,10 +423,24 @@ pub fn coalesce_ft_factorized(
     // まず複製し、base king-bucket セルにのみ仮想行を加算する。
     let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
-    for feat in 0..base_ft_in {
-        let p = feat % piece_inputs;
+    let fold_ft_in = if feature_set.e4_config().is_some() {
+        ft_in
+    } else {
+        base_ft_in
+    };
+    for feat in 0..fold_ft_in {
+        let p = match feature_set.ft_factorize_mode() {
+            FtFactorizeMode::Base => feat % piece_inputs,
+            FtFactorizeMode::E4KingAttack | FtFactorizeMode::E4KingBucket => {
+                (feat / nb) % piece_inputs
+            }
+        };
+        let vrow = match feature_set.ft_factorize_mode() {
+            FtFactorizeMode::E4KingBucket => p * nb + feat % nb,
+            FtFactorizeMode::Base | FtFactorizeMode::E4KingAttack => p,
+        };
         let dst = feat * ft_out;
-        let src = virtual_base + p * ft_out;
+        let src = virtual_base + vrow * ft_out;
         for o in 0..ft_out {
             out[dst + o] += ft_w_train[src + o];
         }
@@ -1411,7 +1426,7 @@ mod tests {
     fn coalesce_keeps_threat_rows_and_folds_only_base() {
         use shogi_features::{FeatureSet, ThreatProfile};
         // factorizer × threat 同居: export 形状 = ft_in() (base+threat)、base 行は
-        // 仮想行を畳み込み、threat 行は不可触で残る。最小 profile (cross-side) を使う。
+        // piece 仮想行を畳み込み、threat 行は仮想行を持たないので素通しする。
         let spec = FeatureSet::HalfKaHmMerged
             .spec()
             .with_threat_profile(ThreatProfile::CrossSide)
@@ -1445,14 +1460,11 @@ mod tests {
                 assert_eq!(out[feat * ft_out + o], want, "base feat={feat} o={o}");
             }
         }
-        // threat 行は不可触 (元の値のまま、仮想行を加算しない)。
+        // threat 行は素通し。
         for feat in [base_ft_in, base_ft_in + 1, ft_in - 1] {
             for o in 0..ft_out {
-                assert_eq!(
-                    out[feat * ft_out + o],
-                    feat as f32 + o as f32 * 0.5,
-                    "threat feat={feat} o={o} は不可触のはず"
-                );
+                let want = feat as f32 + o as f32 * 0.5;
+                assert_eq!(out[feat * ft_out + o], want, "threat feat={feat} o={o}");
             }
         }
     }
@@ -1462,7 +1474,7 @@ mod tests {
         use shogi_features::{FeatureSet, ThreatProfile};
         // boundary 網羅: 全 base featureset × 全 profile で同居 coalesce が
         // (a) export 形状 = ft_in()*ft_out、(b) base 行 = 実行 + 同 p 仮想行、
-        // (c) threat 行不可触、を満たす。`base_ft_in % piece_inputs == 0` も確認。
+        // (c) threat 行 = 実行のまま、を満たす。`base_ft_in % piece_inputs == 0` も確認。
         let ft_out = 2usize;
         for fs in FeatureSet::ALL {
             for profile in [
@@ -1519,10 +1531,11 @@ mod tests {
                 }
                 for &feat in &[base_ft_in, ft_in - 1] {
                     for o in 0..ft_out {
+                        let want = (feat % 97) as f32 + o as f32 * 0.5;
                         assert_eq!(
                             out[feat * ft_out + o],
-                            (feat % 97) as f32 + o as f32 * 0.5,
-                            "{} {profile} threat feat={feat} 不可触",
+                            want,
+                            "{} {profile} threat feat={feat}",
                             fs.canonical_name()
                         );
                     }

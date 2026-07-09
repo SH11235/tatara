@@ -964,18 +964,34 @@ pub fn ft_fold_virtual(
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
-    n: u32,
+    e4_factorize: u32,
 ) {
     let i = thread::index_1d();
+    let n = ft_in * ft_out;
     if i.get() >= n as usize {
         return;
     }
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
     // `comb.len() == n`、`base_ft_in <= ft_in` を保証。
-    let feature = i.get() / (ft_out as usize);
+    let ft_out_u = ft_out as usize;
+    let pi_u = piece_inputs as usize;
+    let nb = e4_factorize & 0xffff;
+    let mode = e4_factorize >> 16;
+    let nb_u = nb as usize;
+    let feature = i.get() / ft_out_u;
     let v = if feature < base_ft_in as usize {
-        let virt_block = (piece_inputs as usize) * (ft_out as usize);
-        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        let ri = i.get() - feature * ft_out_u;
+        let p = if mode == 0 {
+            feature % pi_u
+        } else {
+            (feature / nb_u) % pi_u
+        };
+        let vrow = if mode == 2 {
+            p * nb_u + feature % nb_u
+        } else {
+            p
+        };
+        let virt = ((ft_in as usize) + vrow) * ft_out_u + ri;
         w[i.get()] + w[virt]
     } else {
         w[i.get()] // threat real 行: 仮想行を持たない
@@ -1000,19 +1016,35 @@ pub fn ft_fold_virtual_f16(
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
-    n: u32,
+    e4_factorize: u32,
 ) {
     let i = thread::index_1d();
+    let n = ft_in * ft_out;
     if i.get() >= n as usize {
         return;
     }
     // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
     // `comb.len() == n`、`base_ft_in <= ft_in` を保証。threat 行 (`feature >=
     // base_ft_in`) は仮想行を持たないので素通し。
-    let feature = i.get() / (ft_out as usize);
+    let ft_out_u = ft_out as usize;
+    let pi_u = piece_inputs as usize;
+    let nb = e4_factorize & 0xffff;
+    let mode = e4_factorize >> 16;
+    let nb_u = nb as usize;
+    let feature = i.get() / ft_out_u;
     let v = if feature < base_ft_in as usize {
-        let virt_block = (piece_inputs as usize) * (ft_out as usize);
-        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        let ri = i.get() - feature * ft_out_u;
+        let p = if mode == 0 {
+            feature % pi_u
+        } else {
+            (feature / nb_u) % pi_u
+        };
+        let vrow = if mode == 2 {
+            p * nb_u + feature % nb_u
+        } else {
+            p
+        };
+        let virt = ((ft_in as usize) + vrow) * ft_out_u + ri;
         w[i.get()] + w[virt]
     } else {
         w[i.get()]
@@ -1040,16 +1072,26 @@ pub fn ft_reduce_virtual_grad(
     ft_in: u32,
     ft_out: u32,
     piece_inputs: u32,
+    nb: u32,
+    mode: u32,
 ) {
     let i = thread::index_1d();
     let ft_out_u = ft_out as usize;
     let pi_u = piece_inputs as usize;
-    if i.get() >= pi_u * ft_out_u {
+    let nb_u = nb as usize;
+    let base_vrows = if mode == 2 { pi_u * nb_u } else { pi_u };
+    if i.get() >= base_vrows * ft_out_u {
         return;
     }
-    let p = i.get() / ft_out_u;
-    let ri = i.get() - p * ft_out_u;
-    let n_kb = (base_ft_in as usize) / pi_u;
+    let vrow = i.get() / ft_out_u;
+    let ri = i.get() - vrow * ft_out_u;
+    let p = if mode == 2 { vrow / nb_u } else { vrow };
+    let bucket = if mode == 2 { vrow - p * nb_u } else { 0 };
+    let n_kb = if mode == 0 {
+        (base_ft_in as usize) / pi_u
+    } else {
+        (base_ft_in as usize) / (pi_u * nb_u)
+    };
 
     // raw pointer 版 (PTX の bounds check 除去)。unsafe 妥当性: caller が
     // `grad.len() == (ft_in + piece_inputs) * ft_out`、`base_ft_in <= ft_in`、
@@ -1060,8 +1102,33 @@ pub fn ft_reduce_virtual_grad(
     // in-flight load を確保する (`gather_and_sum_per_feature_*` と同じ理由)。
     // 加算順は kb 逐次和と異なるが f32 非結合則の丸め差のみ。
     let grad_ptr = grad.as_ptr();
-    let row_stride = pi_u * ft_out_u;
-    let base = p * ft_out_u + ri;
+    if mode == 1 {
+        let mut sum = 0.0_f32;
+        let kb_stride = pi_u * nb_u * ft_out_u;
+        for kb in 0..n_kb {
+            let kb_base = kb * kb_stride + p * nb_u * ft_out_u + ri;
+            for b in 0..nb_u {
+                sum += unsafe { grad_ptr.add(kb_base + b * ft_out_u).read() };
+            }
+        }
+        let out_ptr = grad_ptr as *mut f32;
+        unsafe {
+            out_ptr
+                .add((ft_in as usize + vrow) * ft_out_u + ri)
+                .write(sum);
+        }
+        return;
+    }
+    let row_stride = if mode == 0 {
+        pi_u * ft_out_u
+    } else {
+        pi_u * nb_u * ft_out_u
+    };
+    let base = if mode == 0 {
+        p * ft_out_u + ri
+    } else {
+        (p * nb_u + bucket) * ft_out_u + ri
+    };
     let mut sum0 = 0.0_f32;
     let mut sum1 = 0.0_f32;
     let mut sum2 = 0.0_f32;
@@ -1082,7 +1149,9 @@ pub fn ft_reduce_virtual_grad(
     let sum = (sum0 + sum1) + (sum2 + sum3);
     let out_ptr = grad_ptr as *mut f32;
     unsafe {
-        out_ptr.add((ft_in as usize + p) * ft_out_u + ri).write(sum);
+        out_ptr
+            .add((ft_in as usize + vrow) * ft_out_u + ri)
+            .write(sum);
     }
 }
 

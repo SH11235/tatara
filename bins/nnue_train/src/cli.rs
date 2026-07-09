@@ -679,6 +679,11 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
 
+    /// E4 FT factorizer sharing mode. `king-attack` uses one virtual row per
+    /// piece plane; `king-bucket` keeps attack buckets separate.
+    #[arg(long = "ft-factorize-e4-share", value_enum, default_value_t = E4FactorizeShare::KingAttack)]
+    pub(crate) ft_factorize_e4_share: E4FactorizeShare,
+
     /// Threat sparse feature profile. One of: off (default), full, same-class,
     /// same-class-major-pawn, step-attacker, cross-side. When not `off`, threat edge features
     /// (one piece attacking another) are concatenated after the base feature
@@ -699,7 +704,7 @@ pub(crate) struct LayerstackArgs {
     /// 2x2-kingfixed, 2x2-kingbucketed, kpe9-kingfixed,
     /// kpe9-kingbucketed. E4 rewrites every base feature row as
     /// `base_index * NB + bucket`, so it is mutually exclusive with
-    /// `--threat-profile`, `--psqt`, and the FT factorizer.
+    /// `--threat-profile` and `--psqt`.
     #[arg(long = "e4-config", default_value = "off")]
     pub(crate) e4_config: String,
 }
@@ -723,6 +728,12 @@ pub(crate) enum PsqtInit {
     Zeroed,
     /// Pre-load PSQT with centipawn piece values / out_scaling (Material prior).
     Material,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum E4FactorizeShare {
+    KingAttack,
+    KingBucket,
 }
 
 /// Simple 4 層アーキ固有の引数。

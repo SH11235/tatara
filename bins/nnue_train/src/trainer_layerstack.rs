@@ -6,10 +6,22 @@ use nnue_format::LayerStackWeights;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::LossKind;
-use shogi_features::FeatureSetSpec;
+use shogi_features::{FeatureSetSpec, FtFactorizeMode};
 
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
+
+fn ft_factorize_kernel_mode(feature_set: &FeatureSetSpec) -> u32 {
+    match feature_set.ft_factorize_mode() {
+        FtFactorizeMode::Base => 0,
+        FtFactorizeMode::E4KingAttack => 1,
+        FtFactorizeMode::E4KingBucket => 2,
+    }
+}
+
+fn ft_factorize_kernel_pack(nb: usize, mode: u32) -> u32 {
+    (nb as u32) | (mode << 16)
+}
 
 struct StepContext<'a> {
     lr: f32,
@@ -1156,9 +1168,12 @@ impl GpuTrainer {
             // 戻すと threat が silent に drop され次元不整合になる)。
             feature_set: if self.feature_set.ft_factorize() {
                 let base = self.feature_set.feature_set().spec();
-                match self.feature_set.threat_profile() {
-                    Some(profile) => base.with_threat_profile(profile),
-                    None => base,
+                if let Some(profile) = self.feature_set.threat_profile() {
+                    base.with_threat_profile(profile)
+                } else if let Some(config) = self.feature_set.e4_config() {
+                    base.with_e4_config(config)
+                } else {
+                    base
                 }
             } else {
                 self.feature_set
@@ -1478,9 +1493,16 @@ impl GpuTrainer {
         // `base_ft_in` = 仮想行を持つ base king-bucket セル数 (fold 対象)。
         // `ft_in_total` = base + threat (= comb サイズ / 仮想 P plane の手前)。
         // threat 無効時は両者一致。FT comb は base+threat 全行 (threat 行は素通し)。
-        let base_ft_in = self.feature_set.base_ft_in();
         let ft_in_total = self.feature_set.ft_in();
+        let base_ft_in = if self.feature_set.e4_config().is_some() {
+            ft_in_total
+        } else {
+            self.feature_set.base_ft_in()
+        };
         let pi = self.feature_set.piece_inputs();
+        let nb = self.feature_set.e4_config().map_or(1, |cfg| cfg.nb);
+        let mode = ft_factorize_kernel_mode(&self.feature_set);
+        let fold_mode = ft_factorize_kernel_pack(nb, mode);
         // fold/reduce kernel は base 実行を king-bucket (`p = feat % pi`) で仮想行へ
         // 対応付ける。base 行が piece plane で割り切れない feature set は仮想行の
         // 対応が崩れるので release でも弾く (全 feature set で成立する不変条件)。
@@ -1503,8 +1525,9 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                           ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
+                    args: [slice(self.ft_w), slice_mut(comb),
+                           base_ft_in as u32, ft_in_total as u32, self.ws.ft_out as u32,
+                           pi as u32, fold_mode]
                 }
             }?;
         } else {
@@ -1520,8 +1543,9 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                           ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
+                    args: [slice(self.ft_w), slice_mut(comb),
+                           base_ft_in as u32, ft_in_total as u32, self.ws.ft_out as u32,
+                           pi as u32, fold_mode]
                 }
             }?;
         }
@@ -1543,8 +1567,9 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(psqt_n),
-                    args: [slice(psqt.w), slice_mut(comb), base_ft_in as u32,
-                           base_ft_in as u32, self.num_buckets as u32, pi as u32, psqt_n as u32]
+                    args: [slice(psqt.w), slice_mut(comb),
+                           base_ft_in as u32, base_ft_in as u32, self.num_buckets as u32,
+                           pi as u32, ft_factorize_kernel_pack(1, 0)]
                 }
             }?;
         }
@@ -2537,7 +2562,8 @@ impl GpuTrainer {
                         config: cfg_1d(pi * self.num_buckets),
                         args: [
                             slice(psqt.w_grad),
-                            base_ft_in, base_ft_in, self.num_buckets as u32, pi as u32
+                            base_ft_in, base_ft_in, self.num_buckets as u32, pi as u32,
+                            1_u32, 0_u32
                         ]
                     }
                 }?;
@@ -3335,17 +3361,25 @@ impl GpuTrainer {
         // 参照)。threat real 行は仮想行に寄与しないので縮約範囲は base_ft_in のみ。
         if self.feature_set.ft_factorize() {
             let pi = self.feature_set.piece_inputs();
-            let base_ft_in = self.feature_set.base_ft_in();
+            let base_ft_in = if self.feature_set.e4_config().is_some() {
+                ft_in
+            } else {
+                self.feature_set.base_ft_in()
+            };
+            let nb = self.feature_set.e4_config().map_or(1, |cfg| cfg.nb);
+            let mode = ft_factorize_kernel_mode(&self.feature_set);
+            let virtual_rows = self.feature_set.ft_factorize_virtual_rows();
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
                 cuda_launch! {
                     kernel: ft_reduce_virtual_grad,
                     stream: self.stream, module: self.module,
-                    config: cfg_1d(pi * ft_out),
+                    config: cfg_1d(virtual_rows * ft_out),
                     args: [
                         slice(self.ft_w_grad),
-                        base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32
+                        base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32,
+                        nb as u32, mode
                     ]
                 }
             }?;

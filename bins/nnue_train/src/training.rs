@@ -20,7 +20,7 @@ use nnue_train::trainer::{LossKind, TrainingConfig};
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
-use shogi_features::{E4Config, ThreatProfile};
+use shogi_features::{E4Config, FtFactorizeMode, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
@@ -297,17 +297,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 .into(),
         );
     }
-    if e4_config.is_some() && layerstack.ft_factorize_enabled() {
-        return Err(
-            "--e4-config is mutually exclusive with the FT factorizer; use --no-ft-factorize"
-                .into(),
-        );
-    }
-
     // spec の modifier 適用 (確定はこの 1 箇所)。threat と factorizer は独立に
     // 連結でき、両 ON の FT layout は `[base real | threat real | virtual P]`。
-    // E4 は base row 全体を bucket 数倍に展開する feature-set なので、threat /
-    // factorizer と同時に使わない。factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
+    // E4 は base row 全体を bucket 数倍に展開し、factorizer は共有 mode に応じた
+    // 仮想 P plane を後ろへ連結する。factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
     // factorizer と排他で auto-suppress する (量子化 .bin は仮想行を持たないため
     // 初期化元にできない)。threat profile は init-from でも保持する (threat row は
     // .bin に書かれており初期化できる)。
@@ -334,7 +327,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             );
             feature_set
         } else {
-            feature_set.with_ft_factorize()
+            let mode = if feature_set.e4_config().is_some() {
+                match layerstack.ft_factorize_e4_share {
+                    E4FactorizeShare::KingAttack => FtFactorizeMode::E4KingAttack,
+                    E4FactorizeShare::KingBucket => FtFactorizeMode::E4KingBucket,
+                }
+            } else {
+                FtFactorizeMode::Base
+            };
+            feature_set.with_ft_factorize_mode(mode)
         }
     } else {
         feature_set

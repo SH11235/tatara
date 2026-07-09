@@ -115,6 +115,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKP,
                 arch_feature_name: "HalfKP",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
                 e4_config: None,
             },
@@ -128,6 +129,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_SPLIT,
                 arch_feature_name: "HalfKaSplit",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
                 e4_config: None,
             },
@@ -141,6 +143,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_MERGED,
                 arch_feature_name: "HalfKaMerged",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
                 e4_config: None,
             },
@@ -154,6 +157,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_SPLIT,
                 arch_feature_name: "HalfKaHmSplit",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
                 e4_config: None,
             },
@@ -167,6 +171,7 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_MERGED,
                 arch_feature_name: "HalfKaHmMerged",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
                 e4_config: None,
             },
@@ -265,15 +270,15 @@ pub struct FeatureSetSpec {
     max_active: usize,
     feature_hash: u32,
     arch_feature_name: &'static str,
-    /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴
-    /// `kb * piece_inputs + p` ごとに king-bucket 非依存の仮想 P plane
-    /// (`piece_inputs` 行) を FT weight の後ろに持ち、export 時に実行へ
-    /// 畳み込む。仮想行の forward 寄与と勾配は trainer が dense kernel
+    /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴が共有する
+    /// 仮想 P plane を FT weight の後ろに持ち、export 時に実行へ畳み込む。
+    /// 仮想行の forward 寄与と勾配は trainer が dense kernel
     /// (実行との畳み込み / king-bucket 方向の縮約) で配線するため、特徴
     /// emit と active 数 (`max_active`) は factorizer 非依存のまま。次元で
     /// 変わるのは weight 行数 (`train_ft_in`) だけ。export 後の artifact
     /// (次元 / hash / arch 名) も base と同一。
     ft_factorize: bool,
+    ft_factorize_mode: FtFactorizeMode,
     /// Threat sparse 特徴を base に連結する profile。`None` で base と
     /// bit-identical。`Some(profile)` のとき base の `ft_in` 直後に
     /// `threat_dims(profile)` 行を連結し、`max_active` / `feature_hash` も
@@ -282,8 +287,19 @@ pub struct FeatureSetSpec {
     /// 跨がない)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
     /// E4 bucket で base index 全体を書き換える config。`None` で base と
-    /// bit-identical。threat / factorizer とは同時に使わない。
+    /// bit-identical。threat とは同時に使わない。
     e4_config: Option<E4Config>,
+}
+
+/// FT factorizer の仮想行と実特徴の対応。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FtFactorizeMode {
+    /// Base feature index `kb * piece_inputs + p` は `virtual[p]` を参照する。
+    Base,
+    /// E4 index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p]` を参照する。
+    E4KingAttack,
+    /// E4 index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p, bucket]` を参照する。
+    E4KingBucket,
 }
 
 impl FeatureSetSpec {
@@ -355,11 +371,27 @@ impl FeatureSetSpec {
     /// 同一形であることを型レベルで表す。学習側の weight buffer / checkpoint
     /// だけが `train_ft_in` を参照する。
     pub const fn with_ft_factorize(self) -> Self {
-        if self.e4_config.is_some() {
-            panic!("E4 feature sets cannot use FT factorizer");
+        let mode = match self.e4_config {
+            Some(_) => FtFactorizeMode::E4KingAttack,
+            None => FtFactorizeMode::Base,
+        };
+        self.with_ft_factorize_mode(mode)
+    }
+
+    /// FT factorizer を指定 mode で有効にした spec を返す。
+    pub const fn with_ft_factorize_mode(self, mode: FtFactorizeMode) -> Self {
+        match (self.e4_config, mode) {
+            (Some(_), FtFactorizeMode::Base) => {
+                panic!("E4 feature sets need an E4 factorizer mode")
+            }
+            (None, FtFactorizeMode::E4KingAttack | FtFactorizeMode::E4KingBucket) => {
+                panic!("E4 factorizer modes require an E4 feature set")
+            }
+            _ => {}
         }
         FeatureSetSpec {
             ft_factorize: true,
+            ft_factorize_mode: mode,
             ..self
         }
     }
@@ -386,11 +418,14 @@ impl FeatureSetSpec {
         if self.threat_profile.is_some() {
             panic!("E4 feature sets cannot use threat profiles");
         }
-        if self.ft_factorize {
-            panic!("E4 feature sets cannot use FT factorizer");
-        }
+        let ft_factorize_mode = if self.ft_factorize {
+            FtFactorizeMode::E4KingAttack
+        } else {
+            self.ft_factorize_mode
+        };
         FeatureSetSpec {
             e4_config: Some(config),
+            ft_factorize_mode,
             ..self
         }
     }
@@ -400,15 +435,32 @@ impl FeatureSetSpec {
         self.ft_factorize
     }
 
-    /// 学習時の FT weight 行数。factorizer 有効時は仮想 P plane (`piece_inputs`
-    /// 行) が base の後ろに連結される。無効時は `ft_in` と同値。sparse index の
+    /// FT factorizer の共有 mode。
+    pub const fn ft_factorize_mode(&self) -> FtFactorizeMode {
+        self.ft_factorize_mode
+    }
+
+    /// FT factorizer の仮想行数。
+    pub const fn ft_factorize_virtual_rows(&self) -> usize {
+        if !self.ft_factorize {
+            return 0;
+        }
+        match (self.ft_factorize_mode, self.e4_config) {
+            (FtFactorizeMode::Base, _) | (FtFactorizeMode::E4KingAttack, _) => self.piece_inputs,
+            (FtFactorizeMode::E4KingBucket, Some(cfg)) => self.piece_inputs * cfg.nb,
+            (FtFactorizeMode::E4KingBucket, None) => {
+                panic!("E4 king-bucket factorizer needs E4 config")
+            }
+        }
+    }
+
+    /// 学習時の FT weight 行数。factorizer 有効時は mode ごとの仮想 P plane が
+    /// 実行の後ろに連結される。無効時は `ft_in` と同値。sparse index の
     /// 範囲と active 数は factorizer に依らず base (`ft_in` / `max_active`) の
     /// まま — 仮想行は trainer の dense kernel 経由でのみ読み書きされる。
     pub const fn train_ft_in(&self) -> usize {
-        if self.e4_config.is_some() {
-            self.ft_in()
-        } else if self.ft_factorize {
-            self.ft_in() + self.piece_inputs
+        if self.ft_factorize {
+            self.ft_in() + self.ft_factorize_virtual_rows()
         } else {
             self.ft_in()
         }
@@ -1292,6 +1344,14 @@ mod tests {
                 assert_eq!(spec.ft_in(), base.base_ft_in() * cfg.nb);
                 assert_eq!(spec.max_active(), base.max_active());
                 assert_eq!(spec.train_ft_in(), spec.ft_in());
+                let fact = spec.with_ft_factorize();
+                assert_eq!(fact.ft_factorize_mode(), FtFactorizeMode::E4KingAttack);
+                assert_eq!(fact.train_ft_in(), spec.ft_in() + spec.piece_inputs());
+                let fact_bucket = spec.with_ft_factorize_mode(FtFactorizeMode::E4KingBucket);
+                assert_eq!(
+                    fact_bucket.train_ft_in(),
+                    spec.ft_in() + spec.piece_inputs() * cfg.nb
+                );
             }
         }
     }
@@ -1324,12 +1384,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "E4 feature sets cannot use FT factorizer")]
-    fn with_e4_config_rejects_factorize() {
-        FeatureSet::HalfKaHmMerged
+    fn with_e4_config_keeps_factorize_enabled() {
+        let spec = FeatureSet::HalfKaHmMerged
             .spec()
             .with_ft_factorize()
             .with_e4_config(E4Config::E4_2X2_KINGFIXED);
+        assert!(spec.ft_factorize());
+        assert_eq!(spec.ft_factorize_mode(), FtFactorizeMode::E4KingAttack);
     }
 
     #[test]

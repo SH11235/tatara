@@ -29,6 +29,37 @@
 //! の手前。train 形状は `(ft_in + piece_inputs) × ft_out`、
 //! `base_ft_in % piece_inputs == 0` が前提。threat 無効時は `base_ft_in == ft_in`。
 
+pub const FT_FACTORIZE_BASE: u32 = 0;
+pub const FT_FACTORIZE_E4_KING_ATTACK: u32 = 1;
+pub const FT_FACTORIZE_E4_KING_BUCKET: u32 = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub struct FtFactorizeLayout {
+    pub base_ft_in: usize,
+    pub ft_in: usize,
+    pub ft_out: usize,
+    pub piece_inputs: usize,
+    pub nb: usize,
+    pub mode: u32,
+}
+
+pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
+    match mode {
+        FT_FACTORIZE_E4_KING_BUCKET => piece_inputs * nb,
+        FT_FACTORIZE_BASE | FT_FACTORIZE_E4_KING_ATTACK => piece_inputs,
+        _ => panic!("unknown FT factorizer mode"),
+    }
+}
+
+fn virtual_row(feature: usize, piece_inputs: usize, nb: usize, mode: u32) -> usize {
+    match mode {
+        FT_FACTORIZE_BASE => feature % piece_inputs,
+        FT_FACTORIZE_E4_KING_ATTACK => (feature / nb) % piece_inputs,
+        FT_FACTORIZE_E4_KING_BUCKET => ((feature / nb) % piece_inputs) * nb + feature % nb,
+        _ => panic!("unknown FT factorizer mode"),
+    }
+}
+
 /// Reference CPU 実装 (fold)。`comb` (export 形状 `ft_in * ft_out` = base + threat)
 /// を全要素 overwrite する。base セル `[0, base_ft_in)` は仮想行を加算、threat 行
 /// `[base_ft_in, ft_in)` は素通し。
@@ -37,20 +68,13 @@
 /// - `w.len() == (ft_in + piece_inputs) * ft_out` (train 形状)
 /// - `comb.len() == ft_in * ft_out` (export 形状)
 /// - `base_ft_in <= ft_in` かつ `base_ft_in % piece_inputs == 0`
-pub fn ft_fold_virtual_cpu(
-    w: &[f32],
-    comb: &mut [f32],
-    base_ft_in: usize,
-    ft_in: usize,
-    ft_out: usize,
-    piece_inputs: usize,
-) {
-    for feature in 0..ft_in {
-        for ri in 0..ft_out {
-            let real = w[feature * ft_out + ri];
-            comb[feature * ft_out + ri] = if feature < base_ft_in {
-                let p = feature % piece_inputs;
-                real + w[(ft_in + p) * ft_out + ri]
+pub fn ft_fold_virtual_cpu(w: &[f32], comb: &mut [f32], layout: FtFactorizeLayout) {
+    for feature in 0..layout.ft_in {
+        for ri in 0..layout.ft_out {
+            let real = w[feature * layout.ft_out + ri];
+            comb[feature * layout.ft_out + ri] = if feature < layout.base_ft_in {
+                let vrow = virtual_row(feature, layout.piece_inputs, layout.nb, layout.mode);
+                real + w[(layout.ft_in + vrow) * layout.ft_out + ri]
             } else {
                 real // threat real 行: 仮想行を持たない
             };
@@ -65,21 +89,17 @@ pub fn ft_fold_virtual_cpu(
 /// 入力前提:
 /// - `grad.len() == (ft_in + piece_inputs) * ft_out` (train 形状)
 /// - `base_ft_in <= ft_in` かつ `base_ft_in % piece_inputs == 0`
-pub fn ft_reduce_virtual_grad_cpu(
-    grad: &mut [f32],
-    base_ft_in: usize,
-    ft_in: usize,
-    ft_out: usize,
-    piece_inputs: usize,
-) {
-    let n_kb = base_ft_in / piece_inputs;
-    for p in 0..piece_inputs {
-        for ri in 0..ft_out {
+pub fn ft_reduce_virtual_grad_cpu(grad: &mut [f32], layout: FtFactorizeLayout) {
+    let base_vrows = base_virtual_rows(layout.piece_inputs, layout.nb, layout.mode);
+    for vrow in 0..base_vrows {
+        for ri in 0..layout.ft_out {
             let mut sum = 0.0_f32;
-            for kb in 0..n_kb {
-                sum += grad[(kb * piece_inputs + p) * ft_out + ri];
+            for feature in 0..layout.base_ft_in {
+                if virtual_row(feature, layout.piece_inputs, layout.nb, layout.mode) == vrow {
+                    sum += grad[feature * layout.ft_out + ri];
+                }
             }
-            grad[(ft_in + p) * ft_out + ri] = sum;
+            grad[(layout.ft_in + vrow) * layout.ft_out + ri] = sum;
         }
     }
 }
@@ -95,6 +115,17 @@ mod tests {
     const FT_OUT: usize = 4;
     const PI: usize = 2;
     const TRAIN_ROWS: usize = FT_IN + PI;
+
+    fn base_layout() -> FtFactorizeLayout {
+        FtFactorizeLayout {
+            base_ft_in: FT_IN,
+            ft_in: FT_IN,
+            ft_out: FT_OUT,
+            piece_inputs: PI,
+            nb: 1,
+            mode: FT_FACTORIZE_BASE,
+        }
+    }
 
     fn train_weights() -> Vec<f32> {
         (0..TRAIN_ROWS * FT_OUT)
@@ -139,7 +170,7 @@ mod tests {
     fn fold_forward_matches_virtual_index_forward() {
         let w = train_weights();
         let mut comb = vec![0.0_f32; FT_IN * FT_OUT];
-        ft_fold_virtual_cpu(&w, &mut comb, FT_IN, FT_IN, FT_OUT, PI);
+        ft_fold_virtual_cpu(&w, &mut comb, base_layout());
 
         let (real, train, real_nnz, train_nnz) = real_and_train_indices();
         let batch = 2;
@@ -188,7 +219,7 @@ mod tests {
             FT_IN,
             real_nnz,
         );
-        ft_reduce_virtual_grad_cpu(&mut grad_new, FT_IN, FT_IN, FT_OUT, PI);
+        ft_reduce_virtual_grad_cpu(&mut grad_new, base_layout());
 
         let mut grad_virtual = vec![0.0_f32; TRAIN_ROWS * FT_OUT];
         sparse_ft_backward_cpu(
@@ -219,7 +250,7 @@ mod tests {
     fn fold_adds_matching_virtual_row() {
         let w = train_weights();
         let mut comb = vec![0.0_f32; FT_IN * FT_OUT];
-        ft_fold_virtual_cpu(&w, &mut comb, FT_IN, FT_IN, FT_OUT, PI);
+        ft_fold_virtual_cpu(&w, &mut comb, base_layout());
         for feature in 0..FT_IN {
             let p = feature % PI;
             for ri in 0..FT_OUT {
@@ -238,7 +269,7 @@ mod tests {
     fn reduce_sums_over_king_buckets() {
         let mut grad: Vec<f32> = (0..TRAIN_ROWS * FT_OUT).map(|i| i as f32).collect();
         let real_snapshot = grad[..FT_IN * FT_OUT].to_vec();
-        ft_reduce_virtual_grad_cpu(&mut grad, FT_IN, FT_IN, FT_OUT, PI);
+        ft_reduce_virtual_grad_cpu(&mut grad, base_layout());
         assert_eq!(&grad[..FT_IN * FT_OUT], &real_snapshot[..]);
         for p in 0..PI {
             for ri in 0..FT_OUT {
@@ -259,6 +290,17 @@ mod tests {
     const FT: usize = B + THREAT; // 10 (= 仮想行の手前)
     const COEXIST_ROWS: usize = FT + PI; // train 形状 12
 
+    fn coexist_layout() -> FtFactorizeLayout {
+        FtFactorizeLayout {
+            base_ft_in: B,
+            ft_in: FT,
+            ft_out: FT_OUT,
+            piece_inputs: PI,
+            nb: 1,
+            mode: FT_FACTORIZE_BASE,
+        }
+    }
+
     fn coexist_weights() -> Vec<f32> {
         (0..COEXIST_ROWS * FT_OUT)
             .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.011)
@@ -269,7 +311,7 @@ mod tests {
     fn fold_leaves_threat_rows_untouched() {
         let w = coexist_weights();
         let mut comb = vec![0.0_f32; FT * FT_OUT];
-        ft_fold_virtual_cpu(&w, &mut comb, B, FT, FT_OUT, PI);
+        ft_fold_virtual_cpu(&w, &mut comb, coexist_layout());
         // base セルは実行 + 同 p 仮想行。
         for feature in 0..B {
             let p = feature % PI;
@@ -296,7 +338,7 @@ mod tests {
             .map(|i| (i as f32 + 1.0) * 0.3)
             .collect();
         let real_snapshot = grad[..FT * FT_OUT].to_vec();
-        ft_reduce_virtual_grad_cpu(&mut grad, B, FT, FT_OUT, PI);
+        ft_reduce_virtual_grad_cpu(&mut grad, coexist_layout());
         // base + threat 実 block は読みのみ (不変)。
         assert_eq!(
             &grad[..FT * FT_OUT],
@@ -324,7 +366,7 @@ mod tests {
             }
         }
         let mut comb = vec![0.0_f32; FT * FT_OUT];
-        ft_fold_virtual_cpu(&w, &mut comb, B, FT, FT_OUT, PI);
+        ft_fold_virtual_cpu(&w, &mut comb, coexist_layout());
         for feature in 0..B {
             for ri in 0..FT_OUT {
                 assert_eq!(comb[feature * FT_OUT + ri], 0.0, "base は 0 のまま");
@@ -346,7 +388,7 @@ mod tests {
                 grad[feature * FT_OUT + ri] = ((feature * ri) as f32 + 1.0) * 0.5;
             }
         }
-        ft_reduce_virtual_grad_cpu(&mut grad, B, FT, FT_OUT, PI);
+        ft_reduce_virtual_grad_cpu(&mut grad, coexist_layout());
         for p in 0..PI {
             for ri in 0..FT_OUT {
                 assert_eq!(
@@ -354,6 +396,128 @@ mod tests {
                     0.0,
                     "virtual p {p} ri {ri} は 0"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn e4_fold_maps_virtual_rows_by_mode() {
+        const KB: usize = 3;
+        const NB: usize = 4;
+        const E4_FT: usize = KB * PI * NB;
+        let mut w = vec![0.0_f32; (E4_FT + PI * NB) * FT_OUT];
+        for feature in 0..E4_FT {
+            for ri in 0..FT_OUT {
+                w[feature * FT_OUT + ri] = feature as f32 + ri as f32 * 0.25;
+            }
+        }
+        for p in 0..PI {
+            for bucket in 0..NB {
+                for ri in 0..FT_OUT {
+                    w[(E4_FT + p * NB + bucket) * FT_OUT + ri] =
+                        1000.0 + (p * 10 + bucket) as f32 + ri as f32 * 0.5;
+                }
+            }
+        }
+
+        let mut attack = vec![0.0_f32; E4_FT * FT_OUT];
+        ft_fold_virtual_cpu(
+            &w[..(E4_FT + PI) * FT_OUT],
+            &mut attack,
+            FtFactorizeLayout {
+                base_ft_in: E4_FT,
+                ft_in: E4_FT,
+                ft_out: FT_OUT,
+                piece_inputs: PI,
+                nb: NB,
+                mode: FT_FACTORIZE_E4_KING_ATTACK,
+            },
+        );
+        let mut bucketed = vec![0.0_f32; E4_FT * FT_OUT];
+        ft_fold_virtual_cpu(
+            &w,
+            &mut bucketed,
+            FtFactorizeLayout {
+                base_ft_in: E4_FT,
+                ft_in: E4_FT,
+                ft_out: FT_OUT,
+                piece_inputs: PI,
+                nb: NB,
+                mode: FT_FACTORIZE_E4_KING_BUCKET,
+            },
+        );
+
+        for feature in 0..E4_FT {
+            let p = (feature / NB) % PI;
+            let bucket = feature % NB;
+            for ri in 0..FT_OUT {
+                assert_eq!(
+                    attack[feature * FT_OUT + ri],
+                    w[feature * FT_OUT + ri] + w[(E4_FT + p) * FT_OUT + ri]
+                );
+                assert_eq!(
+                    bucketed[feature * FT_OUT + ri],
+                    w[feature * FT_OUT + ri] + w[(E4_FT + p * NB + bucket) * FT_OUT + ri]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e4_reduce_sums_expected_axes() {
+        const KB: usize = 3;
+        const NB: usize = 4;
+        const E4_FT: usize = KB * PI * NB;
+        let mut attack_grad: Vec<f32> = (0..(E4_FT + PI) * FT_OUT)
+            .map(|i| (i as f32 + 1.0) * 0.01)
+            .collect();
+        let attack_snapshot = attack_grad[..E4_FT * FT_OUT].to_vec();
+        ft_reduce_virtual_grad_cpu(
+            &mut attack_grad,
+            FtFactorizeLayout {
+                base_ft_in: E4_FT,
+                ft_in: E4_FT,
+                ft_out: FT_OUT,
+                piece_inputs: PI,
+                nb: NB,
+                mode: FT_FACTORIZE_E4_KING_ATTACK,
+            },
+        );
+        for p in 0..PI {
+            for ri in 0..FT_OUT {
+                let mut want = 0.0_f32;
+                for kb in 0..KB {
+                    for bucket in 0..NB {
+                        want += attack_snapshot[((kb * PI + p) * NB + bucket) * FT_OUT + ri];
+                    }
+                }
+                assert_eq!(attack_grad[(E4_FT + p) * FT_OUT + ri], want);
+            }
+        }
+
+        let mut bucket_grad: Vec<f32> = (0..(E4_FT + PI * NB) * FT_OUT)
+            .map(|i| (i as f32 + 1.0) * 0.02)
+            .collect();
+        let bucket_snapshot = bucket_grad[..E4_FT * FT_OUT].to_vec();
+        ft_reduce_virtual_grad_cpu(
+            &mut bucket_grad,
+            FtFactorizeLayout {
+                base_ft_in: E4_FT,
+                ft_in: E4_FT,
+                ft_out: FT_OUT,
+                piece_inputs: PI,
+                nb: NB,
+                mode: FT_FACTORIZE_E4_KING_BUCKET,
+            },
+        );
+        for p in 0..PI {
+            for bucket in 0..NB {
+                for ri in 0..FT_OUT {
+                    let want: f32 = (0..KB)
+                        .map(|kb| bucket_snapshot[((kb * PI + p) * NB + bucket) * FT_OUT + ri])
+                        .sum();
+                    assert_eq!(bucket_grad[(E4_FT + p * NB + bucket) * FT_OUT + ri], want);
+                }
             }
         }
     }
