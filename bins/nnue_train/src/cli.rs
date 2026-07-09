@@ -648,12 +648,12 @@ pub(crate) struct LayerstackArgs {
     /// FT factorizer (training-time virtual features). **Default ON.** Pass
     /// `--no-ft-factorize` to disable.
     ///
-    /// The FT weight table gains a king-bucket-independent virtual row per
-    /// piece plane. Each virtual row accumulates the gradients of every real
-    /// row sharing its piece plane (~king-bucket-count times more data per
-    /// row), so rarely visited king-square cells inherit a sensible shared
-    /// prior instead of staying near their initial values. The virtual rows
-    /// are folded into the real rows when the quantised `.bin` is saved, so
+    /// The FT weight table gains a virtual P-plane for piece values independent
+    /// of the king position. Each virtual row accumulates the gradients of
+    /// every real row sharing its piece plane, so rarely visited king-square
+    /// cells inherit a sensible shared prior instead of staying near their
+    /// initial values. The virtual rows are folded into the real rows when the
+    /// quantised `.bin` is saved, so
     /// the exported net is identical in shape to a non-factorized net and
     /// inference engines need no changes.
     ///
@@ -679,9 +679,10 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
 
-    /// E4 FT factorizer sharing mode. `king-attack` uses one virtual row per
-    /// piece plane; `king-bucket` keeps attack buckets separate.
-    #[arg(long = "ft-factorize-e4-share", value_enum, default_value_t = E4FactorizeShare::KingAttack)]
+    /// E4 FT factorizer sharing mode. `pool-buckets` shares one virtual row
+    /// for each piece across attack buckets; `per-bucket` keeps attack buckets
+    /// separate.
+    #[arg(long = "ft-factorize-e4-share", value_enum, default_value_t = E4FactorizeShare::PoolBuckets)]
     pub(crate) ft_factorize_e4_share: E4FactorizeShare,
 
     /// Threat sparse feature profile. One of: off (default), full, same-class,
@@ -732,8 +733,8 @@ pub(crate) enum PsqtInit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum E4FactorizeShare {
-    KingAttack,
-    KingBucket,
+    PoolBuckets,
+    PerBucket,
 }
 
 /// Simple 4 層アーキ固有の引数。

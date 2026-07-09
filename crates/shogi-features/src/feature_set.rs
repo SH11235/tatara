@@ -273,7 +273,7 @@ pub struct FeatureSetSpec {
     /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴が共有する
     /// 仮想 P plane を FT weight の後ろに持ち、export 時に実行へ畳み込む。
     /// 仮想行の forward 寄与と勾配は trainer が dense kernel
-    /// (実行との畳み込み / king-bucket 方向の縮約) で配線するため、特徴
+    /// (実行との畳み込み / 同じ仮想行に対応する実行勾配の縮約) で配線するため、特徴
     /// emit と active 数 (`max_active`) は factorizer 非依存のまま。次元で
     /// 変わるのは weight 行数 (`train_ft_in`) だけ。export 後の artifact
     /// (次元 / hash / arch 名) も base と同一。
@@ -297,9 +297,9 @@ pub enum FtFactorizeMode {
     /// Base feature index `kb * piece_inputs + p` は `virtual[p]` を参照する。
     Base,
     /// E4 index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p]` を参照する。
-    E4KingAttack,
+    PoolAttackBuckets,
     /// E4 index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p, bucket]` を参照する。
-    E4KingBucket,
+    PerAttackBucket,
 }
 
 impl FeatureSetSpec {
@@ -372,7 +372,7 @@ impl FeatureSetSpec {
     /// だけが `train_ft_in` を参照する。
     pub const fn with_ft_factorize(self) -> Self {
         let mode = match self.e4_config {
-            Some(_) => FtFactorizeMode::E4KingAttack,
+            Some(_) => FtFactorizeMode::PoolAttackBuckets,
             None => FtFactorizeMode::Base,
         };
         self.with_ft_factorize_mode(mode)
@@ -384,7 +384,7 @@ impl FeatureSetSpec {
             (Some(_), FtFactorizeMode::Base) => {
                 panic!("E4 feature sets need an E4 factorizer mode")
             }
-            (None, FtFactorizeMode::E4KingAttack | FtFactorizeMode::E4KingBucket) => {
+            (None, FtFactorizeMode::PoolAttackBuckets | FtFactorizeMode::PerAttackBucket) => {
                 panic!("E4 factorizer modes require an E4 feature set")
             }
             _ => {}
@@ -419,7 +419,7 @@ impl FeatureSetSpec {
             panic!("E4 feature sets cannot use threat profiles");
         }
         let ft_factorize_mode = if self.ft_factorize {
-            FtFactorizeMode::E4KingAttack
+            FtFactorizeMode::PoolAttackBuckets
         } else {
             self.ft_factorize_mode
         };
@@ -446,10 +446,12 @@ impl FeatureSetSpec {
             return 0;
         }
         match (self.ft_factorize_mode, self.e4_config) {
-            (FtFactorizeMode::Base, _) | (FtFactorizeMode::E4KingAttack, _) => self.piece_inputs,
-            (FtFactorizeMode::E4KingBucket, Some(cfg)) => self.piece_inputs * cfg.nb,
-            (FtFactorizeMode::E4KingBucket, None) => {
-                panic!("E4 king-bucket factorizer needs E4 config")
+            (FtFactorizeMode::Base, _) | (FtFactorizeMode::PoolAttackBuckets, _) => {
+                self.piece_inputs
+            }
+            (FtFactorizeMode::PerAttackBucket, Some(cfg)) => self.piece_inputs * cfg.nb,
+            (FtFactorizeMode::PerAttackBucket, None) => {
+                panic!("E4 per-attack-bucket factorizer needs E4 config")
             }
         }
     }
@@ -1345,9 +1347,9 @@ mod tests {
                 assert_eq!(spec.max_active(), base.max_active());
                 assert_eq!(spec.train_ft_in(), spec.ft_in());
                 let fact = spec.with_ft_factorize();
-                assert_eq!(fact.ft_factorize_mode(), FtFactorizeMode::E4KingAttack);
+                assert_eq!(fact.ft_factorize_mode(), FtFactorizeMode::PoolAttackBuckets);
                 assert_eq!(fact.train_ft_in(), spec.ft_in() + spec.piece_inputs());
-                let fact_bucket = spec.with_ft_factorize_mode(FtFactorizeMode::E4KingBucket);
+                let fact_bucket = spec.with_ft_factorize_mode(FtFactorizeMode::PerAttackBucket);
                 assert_eq!(
                     fact_bucket.train_ft_in(),
                     spec.ft_in() + spec.piece_inputs() * cfg.nb
@@ -1390,7 +1392,7 @@ mod tests {
             .with_ft_factorize()
             .with_e4_config(E4Config::E4_2X2_KINGFIXED);
         assert!(spec.ft_factorize());
-        assert_eq!(spec.ft_factorize_mode(), FtFactorizeMode::E4KingAttack);
+        assert_eq!(spec.ft_factorize_mode(), FtFactorizeMode::PoolAttackBuckets);
     }
 
     #[test]

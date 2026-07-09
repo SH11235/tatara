@@ -390,15 +390,17 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
 /// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
-/// 学習時の FT weight は `[base real | threat real | 仮想 P plane]` の
-/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。仮想 P plane
-/// (`piece_inputs` 行) は **base 実行 (king-bucket セル `kb * piece_inputs + p`)
-/// のみ** に対応する king-bucket 非依存の prior。export では base 実行に
-/// `W_real[(kb, p)] += W_virtual[p]` で仮想行を畳み込んで固定し、仮想行を捨てる。
-/// threat real 行 (`[base_ft_in, ft_in())`) は仮想行を持たないので **そのまま
-/// 残す** (silent に切り落とさない)。戻り値は base 折り込み済み + threat 不可触の
-/// `ft_in() × ft_out`。量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の
-/// 値に掛けること (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
+/// 学習時の FT weight は `[base real | threat real | 仮想 P-plane]` の
+/// `train_ft_in × ft_out` (row-major、`ft_w[feat * ft_out + out]`)。仮想 P-plane は
+/// 玉位置に依らない駒価値を持つ。base factorizer は駒ごとに 1 仮想行を45玉
+/// バケットで共有する。E4 は各駒特徴を NB 個の被攻撃×被防御バケットに分割し、
+/// `PoolAttackBuckets` では駒ごとに 1 仮想行を全バケットで共有し、
+/// `PerAttackBucket` では (駒, バケット) ごとに仮想行を持つ。export では実行に
+/// 仮想行を畳み込んで固定し、仮想行を捨てる。threat real 行
+/// (`[base_ft_in, ft_in())`) は仮想行を持たないので **そのまま残す** (silent に
+/// 切り落とさない)。戻り値は base 折り込み済み + threat 不可触の `ft_in() × ft_out`。
+/// 量子化と飽和検査 (`warn_if_i16_saturates`) は畳み込み後の値に掛けること
+/// (caller は本関数の戻り値で `LayerStackWeights::ft_w` を構築)。
 ///
 /// factorizer 無効の spec では入力をそのまま返す。
 pub fn coalesce_ft_factorized(
@@ -419,8 +421,8 @@ pub fn coalesce_ft_factorized(
         train_ft_in * ft_out,
         "ft_w length must be train_ft_in * ft_out"
     );
-    // 仮想 P plane は base+threat 実行の後ろ。export は実行部 (base + threat) を
-    // まず複製し、base king-bucket セルにのみ仮想行を加算する。
+    // 仮想 P-plane は base+threat 実行の後ろ。export は実行部 (base + threat) を
+    // まず複製し、base 実行に対応する仮想行を加算する。
     let virtual_base = ft_in * ft_out;
     let mut out = ft_w_train[..virtual_base].to_vec();
     let fold_ft_in = if feature_set.e4_config().is_some() {
@@ -431,13 +433,13 @@ pub fn coalesce_ft_factorized(
     for feat in 0..fold_ft_in {
         let p = match feature_set.ft_factorize_mode() {
             FtFactorizeMode::Base => feat % piece_inputs,
-            FtFactorizeMode::E4KingAttack | FtFactorizeMode::E4KingBucket => {
+            FtFactorizeMode::PoolAttackBuckets | FtFactorizeMode::PerAttackBucket => {
                 (feat / nb) % piece_inputs
             }
         };
         let vrow = match feature_set.ft_factorize_mode() {
-            FtFactorizeMode::E4KingBucket => p * nb + feat % nb,
-            FtFactorizeMode::Base | FtFactorizeMode::E4KingAttack => p,
+            FtFactorizeMode::PerAttackBucket => p * nb + feat % nb,
+            FtFactorizeMode::Base | FtFactorizeMode::PoolAttackBuckets => p,
         };
         let dst = feat * ft_out;
         let src = virtual_base + vrow * ft_out;

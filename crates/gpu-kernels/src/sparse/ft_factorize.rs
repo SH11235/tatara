@@ -7,31 +7,33 @@
 //!
 //! ## アルゴリズム
 //!
-//! FT factorizer は学習時のみ仮想 P plane (`piece_inputs` 行) を FT weight の
-//! 後ろに持つ。実特徴 index は全 feature set で `kb * piece_inputs + p` の形
-//! なので、実特徴 1 つに対応する仮想特徴は piece plane `p = idx % piece_inputs`
-//! で一意に決まる。この対応を sparse path に流す代わりに dense kernel 2 本で
-//! 配線する:
+//! FT factorizer は学習時のみ玉位置に依らない駒価値を表す仮想 P-plane を
+//! FT weight の後ろに持つ。base feature は駒ごとに 1 仮想行を45玉バケットで
+//! 共有する。E4 は各駒特徴を NB 個の被攻撃×被防御バケットに分割するため、
+//! mode が仮想 P-plane を被攻撃バケットでも pool するかを決める。この対応を
+//! sparse path に流す代わりに dense kernel 2 本で配線する:
 //!
-//! - **fold** (forward): base king-bucket セル `kb·pi + p` には
-//!   `comb = w[同] + w[(ft_in + p)·ft_out + ri]` を畳む。threat real 行
+//! - **fold** (forward): base feature には対応する仮想行を畳む。E4 の
+//!   PoolAttackBuckets は `virtual_row = (feat/NB)%piece_inputs` を使い、
+//!   駒ごとに 1 仮想行を全バケットで共有する。PerAttackBucket は
+//!   `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB` を使い、
+//!   (駒, バケット) ごとに仮想行を持つ。threat real 行
 //!   (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w` で素通し。線形性に
 //!   より base 実行の `Σ_active (w_real + w_virt) = Σ_active comb`、threat は
 //!   そのまま。
-//! - **reduce** (backward): `grad[(ft_in + p)·ft_out + ri] =
-//!   Σ_{kb < base_ft_in/pi} grad[(kb·pi + p)·ft_out + ri]`。各仮想特徴の出現列は
-//!   同 p を持つ **base** 実特徴の出現列の合併 (base 実 1 つにつき仮想 1 つ) なので
-//!   仮想 index を sparse backward に流す直接 gather と数学的に等価 (f32 加算順
-//!   のみ異なる)。threat real 行の勾配は仮想行に寄与せず不可触。
+//! - **reduce** (backward): 各仮想行の勾配を、同じ仮想行へ対応する **base**
+//!   実特徴の勾配和で埋める。仮想特徴の出現列は対応する base 実特徴の出現列の
+//!   合併なので、仮想 index を sparse backward に流す直接 gather と数学的に等価
+//!   (f32 加算順のみ異なる)。threat real 行の勾配は仮想行に寄与せず不可触。
 //!
 //! weight / grad は column-major (`buf[feature * ft_out + ri]`)。`base_ft_in` は
-//! 仮想行を持つ base king-bucket セル数、`ft_in` (= base + threat) が仮想 P plane
+//! 仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane
 //! の手前。train 形状は `(ft_in + piece_inputs) × ft_out`、
 //! `base_ft_in % piece_inputs == 0` が前提。threat 無効時は `base_ft_in == ft_in`。
 
 pub const FT_FACTORIZE_BASE: u32 = 0;
-pub const FT_FACTORIZE_E4_KING_ATTACK: u32 = 1;
-pub const FT_FACTORIZE_E4_KING_BUCKET: u32 = 2;
+pub const FT_FACTORIZE_POOL_ATTACK_BUCKETS: u32 = 1;
+pub const FT_FACTORIZE_PER_ATTACK_BUCKET: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FtFactorizeLayout {
@@ -45,8 +47,8 @@ pub struct FtFactorizeLayout {
 
 pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
     match mode {
-        FT_FACTORIZE_E4_KING_BUCKET => piece_inputs * nb,
-        FT_FACTORIZE_BASE | FT_FACTORIZE_E4_KING_ATTACK => piece_inputs,
+        FT_FACTORIZE_PER_ATTACK_BUCKET => piece_inputs * nb,
+        FT_FACTORIZE_BASE | FT_FACTORIZE_POOL_ATTACK_BUCKETS => piece_inputs,
         _ => panic!("unknown FT factorizer mode"),
     }
 }
@@ -54,8 +56,8 @@ pub fn base_virtual_rows(piece_inputs: usize, nb: usize, mode: u32) -> usize {
 fn virtual_row(feature: usize, piece_inputs: usize, nb: usize, mode: u32) -> usize {
     match mode {
         FT_FACTORIZE_BASE => feature % piece_inputs,
-        FT_FACTORIZE_E4_KING_ATTACK => (feature / nb) % piece_inputs,
-        FT_FACTORIZE_E4_KING_BUCKET => ((feature / nb) % piece_inputs) * nb + feature % nb,
+        FT_FACTORIZE_POOL_ATTACK_BUCKETS => (feature / nb) % piece_inputs,
+        FT_FACTORIZE_PER_ATTACK_BUCKET => ((feature / nb) % piece_inputs) * nb + feature % nb,
         _ => panic!("unknown FT factorizer mode"),
     }
 }
@@ -83,7 +85,7 @@ pub fn ft_fold_virtual_cpu(w: &[f32], comb: &mut [f32], layout: FtFactorizeLayou
 }
 
 /// Reference CPU 実装 (reduce)。`grad` の仮想 block (`ft_in..ft_in+piece_inputs`
-/// 行) を **base** 実 block の king-bucket 方向和で overwrite する。base / threat
+/// 行) を **base** 実 block の対応行の和で overwrite する。base / threat
 /// 実 block は読みのみ (threat 行は仮想行に寄与しない)。
 ///
 /// 入力前提:
@@ -282,7 +284,7 @@ mod tests {
     }
 
     // ---- threat 同居 (base_ft_in < ft_in) ----
-    // base king-bucket セル `[0, B)` の後ろに threat real 行 `[B, FT)`、その後ろに
+    // base 実行 `[0, B)` の後ろに threat real 行 `[B, FT)`、その後ろに
     // 仮想 P plane `[FT, FT+PI)` が並ぶ layout で fold/reduce が range-aware に
     // 動くことを確認する。
     const B: usize = 6; // base (kb=3 × pi=2)
@@ -345,7 +347,7 @@ mod tests {
             &real_snapshot[..],
             "実 block は reduce で不変"
         );
-        // 仮想行は **base king-bucket のみ** の和 (threat 行は寄与しない)。
+        // 仮想行は **base 実行のみ** の和 (threat 行は寄与しない)。
         for p in 0..PI {
             for ri in 0..FT_OUT {
                 let want: f32 = (0..B / PI)
@@ -430,7 +432,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_E4_KING_ATTACK,
+                mode: FT_FACTORIZE_POOL_ATTACK_BUCKETS,
             },
         );
         let mut bucketed = vec![0.0_f32; E4_FT * FT_OUT];
@@ -443,7 +445,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_E4_KING_BUCKET,
+                mode: FT_FACTORIZE_PER_ATTACK_BUCKET,
             },
         );
 
@@ -480,7 +482,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_E4_KING_ATTACK,
+                mode: FT_FACTORIZE_POOL_ATTACK_BUCKETS,
             },
         );
         for p in 0..PI {
@@ -507,7 +509,7 @@ mod tests {
                 ft_out: FT_OUT,
                 piece_inputs: PI,
                 nb: NB,
-                mode: FT_FACTORIZE_E4_KING_BUCKET,
+                mode: FT_FACTORIZE_PER_ATTACK_BUCKET,
             },
         );
         for p in 0..PI {

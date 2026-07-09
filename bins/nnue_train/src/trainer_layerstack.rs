@@ -14,8 +14,8 @@ use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 fn ft_factorize_kernel_mode(feature_set: &FeatureSetSpec) -> u32 {
     match feature_set.ft_factorize_mode() {
         FtFactorizeMode::Base => 0,
-        FtFactorizeMode::E4KingAttack => 1,
-        FtFactorizeMode::E4KingBucket => 2,
+        FtFactorizeMode::PoolAttackBuckets => 1,
+        FtFactorizeMode::PerAttackBucket => 2,
     }
 }
 
@@ -260,7 +260,7 @@ pub(crate) struct GpuTrainer {
 /// (`w[feat * num_buckets + bucket]`)。factorizer 無効時は `train_ft_in == ft_in`。
 /// `m` / `v` は f32 固定 (PSQT weight 自体が小さく FP16 化の利得が小さいため)。
 /// factorizer 有効時は FT と同じ仮想 P 行を持ち、forward は畳み込み済み comb
-/// (`w_fold`) を、backward は実 grad の king-bucket 方向縮約で仮想 grad を埋める。
+/// (`w_fold`) を、backward は同じ仮想行に対応する実 grad の縮約で仮想 grad を埋める。
 pub(crate) struct PsqtState {
     pub(crate) w: DeviceBuffer<f32>,
     pub(crate) w_m: DeviceBuffer<f32>,
@@ -762,7 +762,7 @@ impl GpuTrainer {
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
         // ここでの `base_ft_in` は実 FT row 数 = `ft_in()` (threat 連結時は
         // base + threat)。FT weight init と buffer 確保の「実行部の行数」であり、
-        // **factorizer の仮想境界ではない**。fold/reduce が虚行を base king-bucket
+        // **factorizer の仮想境界ではない**。fold/reduce が虚行を base 実行
         // セルへ畳む境界は launch 側で別途 `feature_set.base_ft_in()` を使う
         // (threat 行を跨がないため両者は別物)。
         let base_ft_in = feature_set.ft_in();
@@ -1490,7 +1490,7 @@ impl GpuTrainer {
         // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
         // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
         assert!(self.feature_set.ft_factorize());
-        // `base_ft_in` = 仮想行を持つ base king-bucket セル数 (fold 対象)。
+        // `base_ft_in` = 仮想行を持つ base 実行の行数 (fold 対象)。
         // `ft_in_total` = base + threat (= comb サイズ / 仮想 P plane の手前)。
         // threat 無効時は両者一致。FT comb は base+threat 全行 (threat 行は素通し)。
         let ft_in_total = self.feature_set.ft_in();
@@ -1503,8 +1503,10 @@ impl GpuTrainer {
         let nb = self.feature_set.e4_config().map_or(1, |cfg| cfg.nb);
         let mode = ft_factorize_kernel_mode(&self.feature_set);
         let fold_mode = ft_factorize_kernel_pack(nb, mode);
-        // fold/reduce kernel は base 実行を king-bucket (`p = feat % pi`) で仮想行へ
-        // 対応付ける。base 行が piece plane で割り切れない feature set は仮想行の
+        // fold/reduce kernel は base 実行を仮想 P-plane へ対応付ける。E4 では
+        // PoolAttackBuckets が `virtual_row = (feat/NB)%piece_inputs`、
+        // PerAttackBucket が `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB`
+        // を使う。base 行が piece plane で割り切れない feature set は仮想行の
         // 対応が崩れるので release でも弾く (全 feature set で成立する不変条件)。
         assert_eq!(
             base_ft_in % pi,

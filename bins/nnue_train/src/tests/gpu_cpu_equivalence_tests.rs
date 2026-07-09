@@ -46,8 +46,8 @@ use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_st
 use gpu_kernels::pointwise::ranger_step::{ranger_lookahead_lerp_cpu, ranger_step_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
 use gpu_kernels::sparse::ft_factorize::{
-    FT_FACTORIZE_BASE, FT_FACTORIZE_E4_KING_ATTACK, FT_FACTORIZE_E4_KING_BUCKET, FtFactorizeLayout,
-    ft_fold_virtual_cpu, ft_reduce_virtual_grad_cpu,
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_ATTACK_BUCKET, FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+    FtFactorizeLayout, ft_fold_virtual_cpu, ft_reduce_virtual_grad_cpu,
 };
 use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
 use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
@@ -4502,7 +4502,7 @@ fn ft_reduce_virtual_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// threat 同居 fixture: base king-bucket セル (kb=7 × pi=5 = 35) の後ろに threat
+/// threat 同居 fixture: base 実行 (35 行) の後ろに threat
 /// real 行 (12)、その後ろに仮想 P plane (pi=5)。base_ft_in=35 < ft_in=47。
 fn ft_factorize_coexist_fixture() -> (usize, usize, usize, usize, Vec<f32>) {
     let base_ft_in = 35;
@@ -4556,7 +4556,7 @@ fn ft_fold_virtual_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// 同居 reduce: 仮想行は **base** king-bucket のみの和。base + threat 実 block は
+/// 同居 reduce: 仮想行は **base** 実行のみの和。base + threat 実 block は
 /// read-only、threat 行は仮想行に寄与しない。
 #[test]
 fn ft_reduce_virtual_grad_coexist_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -4602,7 +4602,7 @@ fn ft_factorize_e4_fixture(mode: u32) -> (usize, usize, usize, usize, Vec<f32>) 
     let nb = 4;
     let ft_in = kb * pi * nb;
     let ft_out = 8;
-    let virtual_rows = if mode == FT_FACTORIZE_E4_KING_BUCKET {
+    let virtual_rows = if mode == FT_FACTORIZE_PER_ATTACK_BUCKET {
         pi * nb
     } else {
         pi
@@ -4614,7 +4614,10 @@ fn ft_factorize_e4_fixture(mode: u32) -> (usize, usize, usize, usize, Vec<f32>) 
 #[test]
 fn ft_fold_virtual_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for mode in [FT_FACTORIZE_E4_KING_ATTACK, FT_FACTORIZE_E4_KING_BUCKET] {
+    for mode in [
+        FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+        FT_FACTORIZE_PER_ATTACK_BUCKET,
+    ] {
         let (ft_in, ft_out, pi, nb, w) = ft_factorize_e4_fixture(mode);
         let n = ft_in * ft_out;
 
@@ -4650,7 +4653,10 @@ fn ft_fold_virtual_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn ft_fold_virtual_f16_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for mode in [FT_FACTORIZE_E4_KING_ATTACK, FT_FACTORIZE_E4_KING_BUCKET] {
+    for mode in [
+        FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+        FT_FACTORIZE_PER_ATTACK_BUCKET,
+    ] {
         let (ft_in, ft_out, pi, nb, w) = ft_factorize_e4_fixture(mode);
         let n = ft_in * ft_out;
 
@@ -4687,9 +4693,12 @@ fn ft_fold_virtual_f16_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>
 #[test]
 fn ft_reduce_virtual_grad_e4_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for mode in [FT_FACTORIZE_E4_KING_ATTACK, FT_FACTORIZE_E4_KING_BUCKET] {
+    for mode in [
+        FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+        FT_FACTORIZE_PER_ATTACK_BUCKET,
+    ] {
         let (ft_in, ft_out, pi, nb, grad_init) = ft_factorize_e4_fixture(mode);
-        let virtual_rows = if mode == FT_FACTORIZE_E4_KING_BUCKET {
+        let virtual_rows = if mode == FT_FACTORIZE_PER_ATTACK_BUCKET {
             pi * nb
         } else {
             pi

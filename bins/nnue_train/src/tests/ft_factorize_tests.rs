@@ -6,7 +6,8 @@
 //! のみ CPU で検証する。
 
 use gpu_kernels::sparse::ft_factorize::{
-    FT_FACTORIZE_BASE, FT_FACTORIZE_E4_KING_ATTACK, FT_FACTORIZE_E4_KING_BUCKET, FtFactorizeLayout,
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_ATTACK_BUCKET, FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+    FtFactorizeLayout,
 };
 use gpu_runtime::CudaContext;
 use nnue_train::dataloader::Batch;
@@ -125,8 +126,14 @@ fn ft_fold_virtual_cpu_matches_export_coalesce() {
 #[test]
 fn e4_ft_fold_virtual_cpu_matches_export_coalesce() {
     for (mode, kernel_mode) in [
-        (FtFactorizeMode::E4KingAttack, FT_FACTORIZE_E4_KING_ATTACK),
-        (FtFactorizeMode::E4KingBucket, FT_FACTORIZE_E4_KING_BUCKET),
+        (
+            FtFactorizeMode::PoolAttackBuckets,
+            FT_FACTORIZE_POOL_ATTACK_BUCKETS,
+        ),
+        (
+            FtFactorizeMode::PerAttackBucket,
+            FT_FACTORIZE_PER_ATTACK_BUCKET,
+        ),
     ] {
         let spec = FeatureSet::HalfKaHmMerged
             .spec()

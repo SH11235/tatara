@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::{
-    DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, QA, QB,
+    DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, QA, QB,
 };
 use shogi_features::{E4Config, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs};
 use shogi_format::ShogiBoard;
@@ -21,7 +21,8 @@ struct Args {
     #[arg(long)]
     progress_coeff: PathBuf,
 
-    #[arg(long, default_value_t = 16)]
+    /// Quantised LayerStack output scale used to convert raw NNUE output to centipawns.
+    #[arg(long, default_value_t = FV_SCALE)]
     fv_scale: i32,
 
     #[arg(long)]

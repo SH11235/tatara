@@ -329,8 +329,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         } else {
             let mode = if feature_set.e4_config().is_some() {
                 match layerstack.ft_factorize_e4_share {
-                    E4FactorizeShare::KingAttack => FtFactorizeMode::E4KingAttack,
-                    E4FactorizeShare::KingBucket => FtFactorizeMode::E4KingBucket,
+                    E4FactorizeShare::PoolBuckets => FtFactorizeMode::PoolAttackBuckets,
+                    E4FactorizeShare::PerBucket => FtFactorizeMode::PerAttackBucket,
                 }
             } else {
                 FtFactorizeMode::Base

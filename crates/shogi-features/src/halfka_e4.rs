@@ -3,7 +3,6 @@
 //! HalfKa-E4 extends the base HalfKA_hm merged index with a per-piece attack
 //! bucket: `e4_index = base_index * NB + bucket`.
 
-use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
 use shogi_format::types::{Color, HAND_PIECE_TYPES, PieceType, Square};
 use shogi_format::{BonaPiece, ShogiBoard};
 
@@ -355,21 +354,6 @@ fn for_each_attack_with_king<F: FnMut(Square)>(
         }
         PieceType::None => {}
     }
-}
-
-#[allow(dead_code)]
-fn decode_board_square_fb(bp: BonaPiece) -> Option<Square> {
-    let v = bp.value() as usize;
-    if (FE_HAND_END..FE_OLD_END).contains(&v) {
-        return Some(Square(((v - FE_HAND_END) % Square::NONE.0 as usize) as u8));
-    }
-    if (F_KING as usize..F_KING as usize + Square::NONE.0 as usize).contains(&v) {
-        return Some(Square((v - F_KING as usize) as u8));
-    }
-    if (E_KING as usize..E_KING as usize + Square::NONE.0 as usize).contains(&v) {
-        return Some(Square((v - E_KING as usize) as u8));
-    }
-    None
 }
 
 #[cfg(test)]

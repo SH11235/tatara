@@ -946,12 +946,12 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     }
 }
 
-/// FT factorizer の forward 用畳み込み: base king-bucket セルの各要素へ同じ piece
-/// plane の仮想行を加算し、forward が読む畳み込み済み weight `comb` (export 形状
+/// FT factorizer の forward 用畳み込み: base 実行の各要素へ対応する仮想 P-plane
+/// 行を加算し、forward が読む畳み込み済み weight `comb` (export 形状
 /// `ft_in × ft_out` = base + threat) を作る。`w` は train 形状
 /// (`(ft_in + piece_inputs) × ft_out`、column-major で `w[feature * ft_out + ri]`)。
 /// 線形性により base 実行は `Σ_active (w_real + w_virt) = Σ_active comb`。
-/// `base_ft_in` が仮想行を持つ base セル数、`ft_in` (= base + threat) が仮想 P plane
+/// `base_ft_in` が仮想行を持つ base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane
 /// の手前。threat real 行 (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w`
 /// で素通しする。threat 無効時は `base_ft_in == ft_in` で全セルが畳まれ threat
 /// 連結前と bit-identical。1 thread = 1 出力要素。仮想要素 offset は恒等式
@@ -1061,7 +1061,7 @@ pub fn ft_fold_virtual_f16(
 /// 特徴の出現列が「同 p を持つ base 実特徴の出現列の合併」である (base 実特徴 1 つ
 /// につき仮想特徴ちょうど 1 つが対応) ことから、仮想 index を sparse backward に
 /// 流す直接 gather と数学的に等価 (f32 加算順のみ異なる)。`base_ft_in` が縮約対象
-/// の king-bucket セル数、`ft_in` (= base + threat) が仮想 P plane の手前。threat
+/// の base 実行の行数、`ft_in` (= base + threat) が仮想 P-plane の手前。threat
 /// real 行は仮想行に寄与しない。threat 無効時は `base_ft_in == ft_in` で threat
 /// 連結前と bit-identical。実 block の gather (`gather_and_sum_per_feature_*`) が stm / nstm
 /// 両方完了した後に launch する。1 thread = 1 仮想要素、仮想 block は overwrite。
