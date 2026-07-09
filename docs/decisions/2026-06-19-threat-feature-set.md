@@ -115,6 +115,9 @@ threat_index =
   - `same-class-major-pawn` (id 2): `ac == dc || (ac >= 5 && dc == 0)` → 173,568 dims
   - `step-attacker` (id 3): `ac == 1 || ac >= 5` (occupancy 依存 slider = 香角飛馬竜 を
     attacker から全除外、単発利き駒 歩桂銀金 のみ attacker に残す) → 33,408 dims
+  - `full-symdedup` (id 4): pair 除外なし (index 空間 = `full`、216,720 dims)。
+    間引きは `is_excluded` ではなく emit 時の対称重複除去で、逆向き edge が全局面で
+    共 active な canonical-dead edge のみ active から落とす (dims 不変)
   - `cross-side` (id 10): `as == ds || ac == dc` → 96,320 dims
 - normalize (perspective swap → HM mirror、from/to に同一適用) も donor に合わせる。
   STM / NSTM 両視点で別 index を出す。
@@ -127,6 +130,23 @@ threat_index =
   (engine 対応は follow-up)。eval 寄与の根拠は
   attacker-class 別 ablation 診断 (slider attacker は per-dim eval 効率が最低、step 駒は
   最高密)。golden は donor に無いため tatara ↔ rshogi 間で index 一致を直接検証する。
+- `full-symdedup` (id 4) も donor に無い engine-native profile。`full` と同じ index
+  空間のまま、逆向き edge (`target → attacker`) がこの edge の active な全局面で
+  必ず active な「canonical-dead」edge を emit で落とす。判定は占有非依存の静的分類器
+  (`threat_symmetric`): 逆向き駒が空盤面で相手マスに届くか (= 逆向き edge が保証共
+  active か) を index 算出用 attack-order table の逆引き O(1) で問う。tie-break は
+  perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な量である必要がある
+  (正規化後の index を両視点で突き合わせるため): **class が違う mutual pair のみ**、
+  大きい `ThreatClass` を attacker とする側を残し小さい側を dead 化する (class 順は
+  ミラー・回転・視点反転に不変)。同 class 相互 pair は raw マス番号でしか順序付け
+  できず raw file 順が HM ミラーで反転する — ミラー等価な 2 局面で残す側が逆転し
+  正規化 index 空間の HM 等価性・dead 保証が壊れるため dedup せず両側を emit する。
+  dead edge は class 判定で両視点同時に落ちるため both-or-neither と index 空間は
+  保たれる。狙いは active edge の対称冗長を捨てて engine の per-edge gather / 列挙後
+  drop コストを削ること (情報は捨てない: dead edge の逆向きは必ず active)。cross-class
+  のみのため削減率は全 pair 版より低い (実測は survey ログ / PR 本文)。専用再学習は
+  せず次回再学習に opt-in で同梱する位置づけ。golden は donor に無いため tatara ↔
+  rshogi 間で index 一致を直接検証する。
 
 ### 3. on-the-fly 移植 = PoC、forward+backward+GPU メモリを計測して方式確定
 

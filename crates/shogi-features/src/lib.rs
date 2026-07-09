@@ -15,6 +15,7 @@ pub mod psqt_material;
 mod simd;
 pub mod threat;
 pub mod threat_exclusion;
+pub mod threat_symmetric;
 
 pub use feature_set::{FeatureSet, FeatureSetSpec, FtFactorizeMode};
 pub use halfka_e4::{
@@ -29,3 +30,6 @@ pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};
 pub use threat::{THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, threat_dimensions_of};
 pub use threat_exclusion::ThreatProfile;
+pub use threat_symmetric::{
+    RawThreatEdge, for_each_active_threat_edge, is_canonical_dead, is_necessarily_mutual,
+};

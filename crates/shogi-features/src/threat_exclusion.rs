@@ -6,8 +6,12 @@
 //! 詰めて除外される (該当 edge は active feature として出力されない)。
 //!
 //! id と除外規則 (id 0-10) は bullet-shogi 正準ベクタに揃える。`step-attacker`
-//! (id 3) は donor に無い engine-native profile で、占有依存 slider を attacker から
-//! 外して利き列挙コストを削る狙い (tatara ↔ rshogi 間で id/規則を直接一致させる):
+//! (id 3) と `full-symdedup` (id 4) は donor に無い engine-native profile
+//! (tatara ↔ rshogi 間で id/規則を直接一致させる)。`step-attacker` は占有依存
+//! slider を attacker から外して利き列挙コストを削る狙い。`full-symdedup` は
+//! pair 除外ではなく emit 時の対称重複除去で、index 空間は `full` と同一 (dims
+//! 不変)、逆向き edge が全局面で共 active な canonical-dead edge のみ active から
+//! 落とす ([`crate::threat_symmetric`] の分類器で判定):
 //!
 //! | id | CLI 値 | 除外規則 |
 //! |----|--------|---------|
@@ -15,6 +19,7 @@
 //! | 1  | `same-class`            | `ac == dc` |
 //! | 2  | `same-class-major-pawn` | `ac == dc \|\| (ac >= 5 && dc == 0)` |
 //! | 3  | `step-attacker`         | `ac == 1 \|\| ac >= 5` (slider attacker 全除外) |
+//! | 4  | `full-symdedup`         | pair 除外なし + canonical-dead edge を emit で drop |
 //! | 10 | `cross-side`            | `as == ds \|\| ac == dc` |
 
 /// Threat pair 除外 profile。
@@ -29,6 +34,9 @@ pub enum ThreatProfile {
     /// 占有依存 slider (香・角・飛・馬・竜) を attacker から除外し、単発利き駒
     /// (歩・桂・銀・GoldLike) のみ attacker に残す。
     StepAttacker,
+    /// pair 除外はせず (index 空間は `Full` と同一)、逆向き edge が全局面で共
+    /// active な canonical-dead edge を emit 時に落とす対称重複除去。
+    FullSymDedup,
     /// 同 side (味方→味方 / 敵→敵) と同種 class を除外し、cross-side 異種のみ残す。
     CrossSide,
 }
@@ -41,6 +49,7 @@ impl ThreatProfile {
             "same-class" => Some(Self::SameClass),
             "same-class-major-pawn" => Some(Self::SameClassMajorPawn),
             "step-attacker" => Some(Self::StepAttacker),
+            "full-symdedup" => Some(Self::FullSymDedup),
             "cross-side" => Some(Self::CrossSide),
             _ => None,
         }
@@ -53,8 +62,17 @@ impl ThreatProfile {
             Self::SameClass => 1,
             Self::SameClassMajorPawn => 2,
             Self::StepAttacker => 3,
+            Self::FullSymDedup => 4,
             Self::CrossSide => 10,
         }
+    }
+
+    /// canonical-dead edge を emit で落とす profile か。`Full` と同じ index 空間の
+    /// まま、逆向き edge が全局面で共 active な edge のみ active から間引く
+    /// ([`crate::threat_symmetric::is_canonical_dead`] で判定)。他 profile は false。
+    #[inline]
+    pub fn drops_canonical_dead(self) -> bool {
+        matches!(self, Self::FullSymDedup)
     }
 
     /// pair を除外すべきか判定する。
@@ -69,7 +87,9 @@ impl ThreatProfile {
     #[inline]
     pub fn is_excluded(self, as_: usize, ac: usize, ds: usize, dc: usize) -> bool {
         match self {
-            Self::Full => false,
+            // FullSymDedup は pair 除外をしない (index 空間 = Full)。active edge の
+            // 間引きは emit 側の canonical-dead drop が担う (drops_canonical_dead)。
+            Self::Full | Self::FullSymDedup => false,
             Self::SameClass => ac == dc,
             Self::SameClassMajorPawn => ac == dc || (ac >= 5 && dc == 0),
             Self::StepAttacker => ac == 1 || ac >= 5,
@@ -79,7 +99,7 @@ impl ThreatProfile {
 
     /// 利用可能な profile 名の一覧 (ヘルプ表示用)。
     pub fn available() -> &'static str {
-        "full, same-class, same-class-major-pawn, step-attacker, cross-side"
+        "full, same-class, same-class-major-pawn, step-attacker, full-symdedup, cross-side"
     }
 }
 
@@ -90,6 +110,7 @@ impl std::fmt::Display for ThreatProfile {
             Self::SameClass => "same-class",
             Self::SameClassMajorPawn => "same-class-major-pawn",
             Self::StepAttacker => "step-attacker",
+            Self::FullSymDedup => "full-symdedup",
             Self::CrossSide => "cross-side",
         };
         f.write_str(name)
@@ -107,6 +128,7 @@ mod tests {
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
             ThreatProfile::StepAttacker,
+            ThreatProfile::FullSymDedup,
             ThreatProfile::CrossSide,
         ] {
             assert_eq!(ThreatProfile::from_cli(&p.to_string()), Some(p));
@@ -120,7 +142,35 @@ mod tests {
         assert_eq!(ThreatProfile::SameClass.profile_id(), 1);
         assert_eq!(ThreatProfile::SameClassMajorPawn.profile_id(), 2);
         assert_eq!(ThreatProfile::StepAttacker.profile_id(), 3);
+        assert_eq!(ThreatProfile::FullSymDedup.profile_id(), 4);
         assert_eq!(ThreatProfile::CrossSide.profile_id(), 10);
+    }
+
+    #[test]
+    fn full_symdedup_excludes_no_pair_but_drops_dead() {
+        // index 空間は Full と同一 (pair 除外なし)。active 間引きは emit 側の担当。
+        for as_ in 0..2 {
+            for ac in 0..9 {
+                for ds in 0..2 {
+                    for dc in 0..9 {
+                        assert!(!ThreatProfile::FullSymDedup.is_excluded(as_, ac, ds, dc));
+                    }
+                }
+            }
+        }
+        assert!(ThreatProfile::FullSymDedup.drops_canonical_dead());
+        for p in [
+            ThreatProfile::Full,
+            ThreatProfile::SameClass,
+            ThreatProfile::SameClassMajorPawn,
+            ThreatProfile::StepAttacker,
+            ThreatProfile::CrossSide,
+        ] {
+            assert!(
+                !p.drops_canonical_dead(),
+                "{p} must not drop canonical-dead"
+            );
+        }
     }
 
     #[test]

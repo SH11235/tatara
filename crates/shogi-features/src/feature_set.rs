@@ -233,6 +233,7 @@ const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
         ThreatProfile::SameClass => fnv1a32("threat-same-class"),
         ThreatProfile::SameClassMajorPawn => fnv1a32("threat-same-class-major-pawn"),
         ThreatProfile::StepAttacker => fnv1a32("threat-step-attacker"),
+        ThreatProfile::FullSymDedup => fnv1a32("threat-full-symdedup"),
         ThreatProfile::CrossSide => fnv1a32("threat-cross-side"),
     }
 }
@@ -1165,11 +1166,12 @@ mod tests {
 
     // ---- Threat 連結 ----
 
-    const ALL_PROFILES: [ThreatProfile; 5] = [
+    const ALL_PROFILES: [ThreatProfile; 6] = [
         ThreatProfile::Full,
         ThreatProfile::SameClass,
         ThreatProfile::SameClassMajorPawn,
         ThreatProfile::StepAttacker,
+        ThreatProfile::FullSymDedup,
         ThreatProfile::CrossSide,
     ];
 
@@ -1198,6 +1200,8 @@ mod tests {
             (ThreatProfile::SameClass, 192_640),
             (ThreatProfile::SameClassMajorPawn, 173_568),
             (ThreatProfile::StepAttacker, 33_408),
+            // FullSymDedup は index 空間が Full と同一 (dims 216_720)。
+            (ThreatProfile::FullSymDedup, 216_720),
             (ThreatProfile::CrossSide, 96_320),
         ];
         for fs in FeatureSet::ALL {
@@ -1217,8 +1221,9 @@ mod tests {
 
     #[test]
     fn threat_profile_hashes_keep_all_specs_distinct() {
-        // 全 base(5) × {off + 5 profile} = 30 通りの合成 feature_hash が pairwise
-        // distinct (profile compaction で row の意味が変わるため load 時に弾ける)。
+        // 全 base(5) × {off + 6 profile} = 35 通りの合成 feature_hash が pairwise
+        // distinct (profile compaction / dedup で row の意味が変わるため load 時に
+        // 弾ける。FullSymDedup は dims が Full と同一なので特に hash で判別する)。
         let mut seen = Vec::new();
         for fs in FeatureSet::ALL {
             let base = fs.spec();
@@ -1238,7 +1243,7 @@ mod tests {
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (30 通り)");
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (35 通り)");
     }
 
     #[test]
