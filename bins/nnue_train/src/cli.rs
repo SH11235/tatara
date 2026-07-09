@@ -694,6 +694,14 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
+
+    /// HalfKa-E4 bucket feature config. One of: off (default),
+    /// 2x2-kingfixed, 2x2-kingbucketed, kpe9-kingfixed,
+    /// kpe9-kingbucketed. E4 rewrites every base feature row as
+    /// `base_index * NB + bucket`, so it is mutually exclusive with
+    /// `--threat-profile`, `--psqt`, and the FT factorizer.
+    #[arg(long = "e4-config", default_value = "off")]
+    pub(crate) e4_config: String,
 }
 
 impl LayerstackArgs {

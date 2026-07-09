@@ -69,7 +69,7 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::FeatureSetSpec;
+use shogi_features::{E4Config, FeatureSetSpec};
 
 // =============================================================================
 // constants (LayerStack architecture)
@@ -264,6 +264,25 @@ pub struct ThreatArch {
     pub profile_id: u32,
 }
 
+/// arch_str / stream に書く E4 identity。`nb` は bucket 数、`king_bucketed`
+/// は玉 feature も bucket 化するかを表す。
+#[derive(Clone, Copy, Debug)]
+pub struct E4Arch {
+    pub nb: usize,
+    pub king_bucketed: bool,
+}
+
+impl E4Arch {
+    fn token_value(self) -> String {
+        let king = if self.king_bucketed {
+            "bucketed"
+        } else {
+            "fixed"
+        };
+        format!("{}x{king}", self.nb)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_arch_str(
     feature_name: &str,
@@ -275,6 +294,7 @@ pub fn build_arch_str(
     fv_scale: i32,
     psqt_buckets: Option<usize>,
     threat: Option<ThreatArch>,
+    e4: Option<E4Arch>,
 ) -> String {
     let psqt_part = match psqt_buckets {
         Some(n) => format!("PSQT={n},"),
@@ -294,8 +314,12 @@ pub fn build_arch_str(
         Some(t) => format!("Threat={},", t.dims),
         None => String::new(),
     };
+    let e4_part = match e4 {
+        Some(e) => format!("E4={},", e.token_value()),
+        None => String::new(),
+    };
     format!(
-        "{},{}{}\
+        "{},{}{}{}\
          Network=AffineTransform[1<-{}](\
          ClippedReLU[{}](\
          AffineTransform[{}<-{}](\
@@ -306,6 +330,7 @@ pub fn build_arch_str(
         features_token(feature_name, input_size, ft_out),
         psqt_part,
         threat_part,
+        e4_part,
         l2_out,     // Output input
         l2_out,     // L2 output / L3 input
         l2_out,     // L2 output
@@ -540,6 +565,10 @@ impl LayerStackWeights {
             dims: self.feature_set.threat_dims(),
             profile_id: p.profile_id(),
         });
+        let e4_arch = self.feature_set.e4_config().map(|c| E4Arch {
+            nb: c.nb,
+            king_bucketed: c.king_bucketed,
+        });
         let arch_str = build_arch_str(
             self.feature_set.arch_feature_name(),
             self.feature_set.ft_in(),
@@ -550,6 +579,7 @@ impl LayerStackWeights {
             FV_SCALE,
             psqt_buckets,
             threat_arch,
+            e4_arch,
         );
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
@@ -580,11 +610,6 @@ impl LayerStackWeights {
         write_leb128_tensor_i16(writer, &ft_b_i16)?;
 
         // ---- FT weights LEB128 (i16, scale=QA) ----
-        // base 部分 = base_ft_in * ft_out のみを FT block に書く。threat 連結時の
-        // threat row は PSQT block の後ろの **Threat block** に分けて書く (engine が
-        // base FT block を threat 非対応のまま byte-identical に読めるように)。本
-        // trainer の ft_w は (ft_in, ft_out) row-major で base row が先頭に並ぶ。
-        let base_ft_w_n = self.feature_set.base_ft_in() * ft_out;
         if self.ft_w.len() != self.feature_set.ft_in() * ft_out {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -596,6 +621,13 @@ impl LayerStackWeights {
                 ),
             ));
         }
+        // threat は base FT block と raw i8 threat block に分ける。E4 は追加 block
+        // を持たず、拡張済み row 全体を通常の i16 FT block に書く。
+        let base_ft_w_n = if self.feature_set.threat_profile().is_some() {
+            self.feature_set.base_ft_in() * ft_out
+        } else {
+            self.feature_set.ft_in() * ft_out
+        };
         let ft_w_base = &self.ft_w[..base_ft_w_n];
         warn_if_i16_saturates("ft_w", ft_w_base, qa_f);
         let ft_w_i16: Vec<i16> = ft_w_base
@@ -887,6 +919,12 @@ impl LayerStackWeights {
                     format!("arch_str has multiple ThreatProfile= tokens: `{arch_str}`"),
                 )
             })?;
+        let file_e4 = parse_single_arch_token(&arch_str, "E4=").map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("arch_str has multiple E4= tokens: `{arch_str}`"),
+            )
+        })?;
         let expected_threat = expected
             .threat_profile()
             .map(|p| (expected.threat_dims(), p.profile_id()));
@@ -933,6 +971,36 @@ impl LayerStackWeights {
                     ));
                 }
             }
+        }
+        let expected_e4 = expected.e4_config().map(e4_arch_token_value);
+        match (expected_e4.as_deref(), file_e4) {
+            (Some(expected_token), Some(file_token)) if expected_token == file_token => {}
+            (Some(expected_token), Some(file_token)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "E4 config mismatch: file E4={file_token}, expected E4={expected_token} \
+                         (arch_str = `{arch_str}`)"
+                    ),
+                ));
+            }
+            (Some(expected_token), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "E4 requested but not present in arch_str (expected E4={expected_token}): `{arch_str}`"
+                    ),
+                ));
+            }
+            (None, Some(file_token)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "`.bin` has E4={file_token} but the requested feature set has no E4 config: `{arch_str}`"
+                    ),
+                ));
+            }
+            (None, None) => {}
         }
         let psqt_token = format!("PSQT={file_num_buckets},");
         let file_has_psqt = arch_str.contains(&psqt_token);
@@ -1015,9 +1083,13 @@ impl LayerStackWeights {
         let qa_f = QA as f32;
         let ft_b: Vec<f32> = ft_b_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
-        // FT weights (LEB128 i16, base_ft_in * ft_out 個)。threat row は PSQT block
-        // の後ろの Threat block で読む (save 側と対称)。
-        let base_ft_w_n = expected.base_ft_in() * ft_out;
+        // FT weights (LEB128 i16)。threat row は PSQT block の後ろの Threat block
+        // で読む。E4 は拡張済み row 全体をこの block に持つ。
+        let base_ft_w_n = if expected.threat_profile().is_some() {
+            expected.base_ft_in() * ft_out
+        } else {
+            expected.ft_in() * ft_out
+        };
         let ft_w_i16 = read_leb128_tensor_i16(reader, Some(base_ft_w_n))?;
         let mut ft_w: Vec<f32> = ft_w_i16.iter().map(|&v| v as f32 / qa_f).collect();
 
@@ -1219,6 +1291,14 @@ fn parse_single_arch_token<'a>(arch_str: &'a str, prefix: &str) -> Result<Option
         }
     }
     Ok(found)
+}
+
+fn e4_arch_token_value(config: E4Config) -> String {
+    E4Arch {
+        nb: config.nb,
+        king_bucketed: config.king_bucketed,
+    }
+    .token_value()
 }
 
 /// `round(scale·v)` が i16 範囲 `[-32768, 32767]` を超える要素数を数える。`scale`
@@ -1565,6 +1645,10 @@ mod tests {
             .with_threat_profile(profile)
     }
 
+    fn e4_spec(config: E4Config) -> FeatureSetSpec {
+        FeatureSet::HalfKaHmMerged.spec().with_e4_config(config)
+    }
+
     #[test]
     fn parse_single_arch_token_is_strict() {
         // 正常: comma 区切りの 1 token を厳密一致で拾う。
@@ -1805,6 +1889,68 @@ mod tests {
             buf.len() > 4 + threat_i8_n,
             "stream too short for i8 threat block"
         );
+    }
+
+    #[test]
+    fn e4_save_load_roundtrip_preserves_expanded_ft_rows() {
+        let spec = e4_spec(E4Config::E4_2X2_KINGFIXED);
+        let ft_out = 128;
+        let mut original = LayerStackWeights::zeroed(
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        assert_eq!(original.ft_w.len(), spec.ft_in() * ft_out);
+        let last = original.ft_w.len() - 1;
+        original.ft_w[0] = 1.0;
+        original.ft_w[last] = -5.0 / 127.0;
+
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+        let arch = String::from_utf8_lossy(&buf);
+        assert!(arch.contains("E4=4xfixed,"), "{arch}");
+        assert!(!arch.contains("Threat="), "{arch}");
+
+        let loaded = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            spec,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap();
+        assert_eq!(loaded.ft_w.len(), original.ft_w.len());
+        assert!((loaded.ft_w[0] - 1.0).abs() < 1e-6);
+        assert!((loaded.ft_w[last] - (-5.0 / 127.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn e4_load_rejects_config_mismatch() {
+        let ft_out = 128;
+        let saved = e4_spec(E4Config::E4_2X2_KINGFIXED);
+        let original = LayerStackWeights::zeroed(
+            saved,
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf).unwrap();
+
+        let err = LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(&buf),
+            e4_spec(E4Config::E4_2X2_KINGBUCKETED),
+            ft_out,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -2171,6 +2317,7 @@ mod tests {
             FV_SCALE,
             None,
             None,
+            None,
         );
         assert!(s.contains("HalfKaHmMerged"));
         assert!(s.contains("73305->1536x2"));
@@ -2197,6 +2344,7 @@ mod tests {
             32,
             28,
             Some(9),
+            None,
             None,
         );
         assert!(s.contains("PSQT=9,"));
@@ -2226,6 +2374,7 @@ mod tests {
                 dims: 96_320,
                 profile_id: 10,
             }),
+            None,
         );
         assert!(with_id.contains("Threat=96320,"), "{with_id}");
         assert!(with_id.contains("ThreatProfile=10,"), "{with_id}");
@@ -2245,12 +2394,34 @@ mod tests {
                 dims: 216_720,
                 profile_id: 0,
             }),
+            None,
         );
         assert!(id_zero.contains("Threat=216720,"), "{id_zero}");
         assert!(
             !id_zero.contains("ThreatProfile="),
             "id 0 は ThreatProfile token を省く: {id_zero}"
         );
+    }
+
+    #[test]
+    fn build_arch_str_e4_token_uses_bucket_count_and_king_mode() {
+        let s = build_arch_str(
+            "HalfKaHmMerged",
+            293_220,
+            1536,
+            16,
+            30,
+            32,
+            28,
+            None,
+            None,
+            Some(E4Arch {
+                nb: 4,
+                king_bucketed: false,
+            }),
+        );
+        assert!(s.contains("E4=4xfixed,"), "{s}");
+        assert!(s.find("E4=4xfixed,").unwrap() < s.find("Network=").unwrap());
     }
 
     #[test]

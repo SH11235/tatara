@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use shogi_features::E4Config;
 use shogi_features::feature_set::{FeatureSet, FeatureSetSpec};
 use shogi_features::halfka_hm::ShogiHalfKA_hm;
 use shogi_format::bona_piece::{E_KING, F_KING, FE_OLD_END};
@@ -92,6 +93,17 @@ fn mirror_board(board: &ShogiBoard) -> ShogiBoard {
         }
     }
     mirrored
+}
+
+fn collect_e4_sorted(spec: &FeatureSetSpec, board: &ShogiBoard) -> (Vec<usize>, Vec<usize>) {
+    let mut stm = vec![0i32; spec.max_active()];
+    let mut nstm = vec![0i32; spec.max_active()];
+    let n = spec.extract_active_features(board, &mut stm, &mut nstm);
+    let mut stm: Vec<usize> = stm[..n].iter().map(|&x| x as usize).collect();
+    let mut nstm: Vec<usize> = nstm[..n].iter().map(|&x| x as usize).collect();
+    stm.sort_unstable();
+    nstm.sort_unstable();
+    (stm, nstm)
 }
 
 // =============================================================================
@@ -550,4 +562,84 @@ fn direct_cells_are_not_invariant_under_file_mirror() {
             spec.canonical_name(),
         );
     }
+}
+
+#[test]
+fn e4_canonical_golden_halfka_hm_merged_2x2_kingfixed() {
+    let pieces: &[(Color, PieceType, Square)] = &[
+        (Color::Black, PieceType::Gold, Square::new(3, 7)),
+        (Color::Black, PieceType::Silver, Square::new(4, 7)),
+        (Color::Black, PieceType::Horse, Square::new(6, 6)),
+        (Color::Black, PieceType::Pawn, Square::new(2, 5)),
+        (Color::Black, PieceType::Pawn, Square::new(4, 5)),
+        (Color::White, PieceType::Gold, Square::new(4, 1)),
+        (Color::White, PieceType::Silver, Square::new(5, 1)),
+        (Color::White, PieceType::Dragon, Square::new(2, 2)),
+        (Color::White, PieceType::Pawn, Square::new(4, 3)),
+        (Color::White, PieceType::Lance, Square::new(0, 4)),
+        (Color::Black, PieceType::Pawn, Square::new(0, 6)),
+    ];
+    let board = build_board(Color::Black, Square::new(4, 8), Square::new(4, 0), pieces);
+    let spec = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_e4_config(E4Config::E4_2X2_KINGFIXED);
+    let (stm, nstm) = collect_e4_sorted(&spec, &board);
+
+    assert_eq!(
+        stm,
+        vec![
+            287_089, 287_157, 287_228, 287_544, 288_052, 289_182, 289_518, 289_794, 290_130,
+            291_192, 292_653, 293_040, 293_072,
+        ]
+    );
+    assert_eq!(
+        nstm,
+        vec![
+            287_228, 287_544, 287_617, 287_685, 288_016, 289_146, 289_482, 289_830, 290_166,
+            291_356, 292_489, 293_040, 293_072,
+        ]
+    );
+}
+
+/// 学習経路 (`extract_active_features` = `map_e4_features_board_both`) が cross-repo
+/// golden で検証済みの単視点 dumper (`collect_e4_features_board`) と各視点で index 集合
+/// bit 一致する不変条件。両者は別実装なので実局面で突き合わせないと契約が silent に割れる。
+#[test]
+fn e4_training_path_matches_golden_dumper_on_real_psv() {
+    let configs = [
+        E4Config::E4_2X2_KINGFIXED,
+        E4Config::E4_2X2_KINGBUCKETED,
+        E4Config::KPE9_KINGFIXED,
+        E4Config::KPE9_KINGBUCKETED,
+    ];
+    let records = sample_psv_records();
+    let mut checked = 0usize;
+    for cfg in configs {
+        let spec = FeatureSet::HalfKaHmMerged.spec().with_e4_config(cfg);
+        for (i, psv) in records.iter().enumerate() {
+            let board = psv.decode();
+            let stm = board.side_to_move;
+            let (train_stm, train_nstm) = collect_e4_sorted(&spec, &board);
+            let mut gold_stm = shogi_features::collect_e4_features_board(&board, cfg, stm);
+            let mut gold_nstm =
+                shogi_features::collect_e4_features_board(&board, cfg, stm.opponent());
+            gold_stm.sort_unstable();
+            gold_nstm.sort_unstable();
+            assert_eq!(
+                train_stm, gold_stm,
+                "cfg {cfg:?} record {i}: stm 視点が golden dumper と不一致"
+            );
+            assert_eq!(
+                train_nstm, gold_nstm,
+                "cfg {cfg:?} record {i}: nstm 視点が golden dumper と不一致"
+            );
+            if !train_stm.is_empty() {
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "sample.psv に active E4 feature を持つ record が無い"
+    );
 }

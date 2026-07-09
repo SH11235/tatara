@@ -20,6 +20,7 @@ use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
 use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
+use crate::halfka_e4::{E4AttackCounts, E4Config};
 use crate::threat::{THREAT_MAX_ACTIVE, ThreatIndexer};
 use crate::threat_exclusion::ThreatProfile;
 
@@ -115,6 +116,7 @@ impl FeatureSet {
                 arch_feature_name: "HalfKP",
                 ft_factorize: false,
                 threat_profile: None,
+                e4_config: None,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
                 feature_set: self,
@@ -127,6 +129,7 @@ impl FeatureSet {
                 arch_feature_name: "HalfKaSplit",
                 ft_factorize: false,
                 threat_profile: None,
+                e4_config: None,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
                 feature_set: self,
@@ -139,6 +142,7 @@ impl FeatureSet {
                 arch_feature_name: "HalfKaMerged",
                 ft_factorize: false,
                 threat_profile: None,
+                e4_config: None,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
                 feature_set: self,
@@ -151,6 +155,7 @@ impl FeatureSet {
                 arch_feature_name: "HalfKaHmSplit",
                 ft_factorize: false,
                 threat_profile: None,
+                e4_config: None,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
                 feature_set: self,
@@ -163,6 +168,7 @@ impl FeatureSet {
                 arch_feature_name: "HalfKaHmMerged",
                 ft_factorize: false,
                 threat_profile: None,
+                e4_config: None,
             },
         }
     }
@@ -226,6 +232,19 @@ const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
     }
 }
 
+/// E4 config ごとの feature hash 定数。`feature_hash() = base ^ この値` で
+/// 合成する。config は row の意味を変えるため load 時に hash / arch token の
+/// 両方で取り違えを弾く。
+const fn e4_config_hash(config: E4Config) -> u32 {
+    match (config.nb, config.king_bucketed) {
+        (4, false) => fnv1a32("e4-4-kingfixed"),
+        (4, true) => fnv1a32("e4-4-kingbucketed"),
+        (9, false) => fnv1a32("e4-9-kingfixed"),
+        (9, true) => fnv1a32("e4-9-kingbucketed"),
+        _ => panic!("unsupported E4 config"),
+    }
+}
+
 // =============================================================================
 // FeatureSetSpec — feature 軸の単一の真実源
 // =============================================================================
@@ -262,6 +281,9 @@ pub struct FeatureSetSpec {
     /// factorizer とは併用可 (fold/reduce/coalesce が base row 限定で threat 行を
     /// 跨がない)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
+    /// E4 bucket で base index 全体を書き換える config。`None` で base と
+    /// bit-identical。threat / factorizer とは同時に使わない。
+    e4_config: Option<E4Config>,
 }
 
 impl FeatureSetSpec {
@@ -291,6 +313,11 @@ impl FeatureSetSpec {
         self.threat_profile
     }
 
+    /// E4 bucket config (無効時 `None`)。
+    pub const fn e4_config(&self) -> Option<E4Config> {
+        self.e4_config
+    }
+
     /// 連結 threat 次元数 (threat 無効時 0)。
     pub const fn threat_dims(&self) -> usize {
         match self.threat_profile {
@@ -299,18 +326,25 @@ impl FeatureSetSpec {
         }
     }
 
-    /// 総入力次元 `ft_in`。base (`base_ft_in`) に threat 連結分を加える。
-    /// threat 無効時は base と同値。
+    /// 総入力次元 `ft_in`。E4 は base index を bucket 数倍に展開し、threat は
+    /// base の直後に sparse row を連結する。
     pub const fn ft_in(&self) -> usize {
-        self.base_ft_in() + self.threat_dims()
+        match self.e4_config {
+            Some(cfg) => {
+                debug_assert!(self.threat_profile.is_none());
+                self.base_ft_in() * cfg.nb
+            }
+            None => self.base_ft_in() + self.threat_dims(),
+        }
     }
 
     /// 1 局面で同時に active になる最大特徴数。threat 有効時は両視点の threat
     /// edge 上限 (`THREAT_MAX_ACTIVE`) を base に加える。
     pub const fn max_active(&self) -> usize {
-        match self.threat_profile {
-            Some(_) => self.max_active + THREAT_MAX_ACTIVE,
-            None => self.max_active,
+        match (self.e4_config, self.threat_profile) {
+            (Some(_), _) => self.max_active,
+            (None, Some(_)) => self.max_active + THREAT_MAX_ACTIVE,
+            (None, None) => self.max_active,
         }
     }
 
@@ -321,6 +355,9 @@ impl FeatureSetSpec {
     /// 同一形であることを型レベルで表す。学習側の weight buffer / checkpoint
     /// だけが `train_ft_in` を参照する。
     pub const fn with_ft_factorize(self) -> Self {
+        if self.e4_config.is_some() {
+            panic!("E4 feature sets cannot use FT factorizer");
+        }
         FeatureSetSpec {
             ft_factorize: true,
             ..self
@@ -335,8 +372,25 @@ impl FeatureSetSpec {
     /// (fold/reduce/coalesce が base row 限定で threat 行を跨がない)。PSQT との
     /// 併用のみ呼び出し側 (CLI) が hard-error にする (base 限定 PSQT が未検証のため)。
     pub fn with_threat_profile(self, profile: ThreatProfile) -> Self {
+        if self.e4_config.is_some() {
+            panic!("E4 feature sets cannot use threat profiles");
+        }
         FeatureSetSpec {
             threat_profile: Some(profile),
+            ..self
+        }
+    }
+
+    /// E4 bucket feature set を有効にした spec を返す。
+    pub fn with_e4_config(self, config: E4Config) -> Self {
+        if self.threat_profile.is_some() {
+            panic!("E4 feature sets cannot use threat profiles");
+        }
+        if self.ft_factorize {
+            panic!("E4 feature sets cannot use FT factorizer");
+        }
+        FeatureSetSpec {
+            e4_config: Some(config),
             ..self
         }
     }
@@ -351,7 +405,9 @@ impl FeatureSetSpec {
     /// 範囲と active 数は factorizer に依らず base (`ft_in` / `max_active`) の
     /// まま — 仮想行は trainer の dense kernel 経由でのみ読み書きされる。
     pub const fn train_ft_in(&self) -> usize {
-        if self.ft_factorize {
+        if self.e4_config.is_some() {
+            self.ft_in()
+        } else if self.ft_factorize {
             self.ft_in() + self.piece_inputs
         } else {
             self.ft_in()
@@ -363,9 +419,10 @@ impl FeatureSetSpec {
     /// と bit-identical)。全 base × 全 profile の合成 hash が pairwise distinct で
     /// あることは test (`threat_profile_hashes_keep_all_specs_distinct`) で固定。
     pub const fn feature_hash(&self) -> u32 {
-        match self.threat_profile {
-            Some(p) => self.feature_hash ^ threat_profile_hash(p),
-            None => self.feature_hash,
+        match (self.e4_config, self.threat_profile) {
+            (Some(cfg), _) => self.feature_hash ^ e4_config_hash(cfg),
+            (None, Some(p)) => self.feature_hash ^ threat_profile_hash(p),
+            (None, None) => self.feature_hash,
         }
     }
 
@@ -410,6 +467,11 @@ impl FeatureSetSpec {
     /// emit は FT factorizer に依存しない (仮想行は trainer の dense kernel が
     /// 配線するため sparse index 列には現れない)。
     pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, mut f: F) {
+        if let Some(config) = self.e4_config {
+            self.map_e4_features_board_both(board, config, f);
+            return;
+        }
+
         let stm = board.side_to_move;
         let nstm = stm.opponent();
 
@@ -508,6 +570,19 @@ impl FeatureSetSpec {
         nstm_out: &mut [i32],
     ) -> usize {
         debug_assert_eq!(stm_out.len(), nstm_out.len());
+
+        if let Some(config) = self.e4_config {
+            let cap = stm_out.len();
+            let mut count = 0usize;
+            self.map_e4_features_board_both(board, config, |stm, nstm| {
+                if count < cap {
+                    stm_out[count] = stm as i32;
+                    nstm_out[count] = nstm as i32;
+                }
+                count += 1;
+            });
+            return count;
+        }
 
         let stm = board.side_to_move;
         let nstm = stm.opponent();
@@ -678,6 +753,107 @@ impl FeatureSetSpec {
     /// 1 視点の context と BonaPiece から特徴インデックスを計算する。
     fn index(&self, ctx: &PerspectiveCtx, bp: BonaPiece) -> usize {
         ctx.king_bucket * self.piece_inputs + self.pack_bonapiece(bp, ctx.mirror_files)
+    }
+
+    fn e4_index(
+        &self,
+        ctx: &PerspectiveCtx,
+        counts: &E4AttackCounts,
+        config: E4Config,
+        bp: BonaPiece,
+        board_piece: Option<(Color, Square)>,
+    ) -> usize {
+        let packed = self.pack_bonapiece(bp, ctx.mirror_files);
+        let base = ctx.king_bucket * self.piece_inputs + packed;
+        let bucket = if crate::halfka_e4::packed_is_bucketed(packed, config.king_bucketed) {
+            let (color, sq) = board_piece.expect("bucketed E4 feature must have a board square");
+            crate::halfka_e4::e4_bucket(
+                counts.get(color.opponent(), sq),
+                counts.get(color, sq),
+                config.nb,
+            )
+        } else {
+            0
+        };
+        crate::halfka_e4::e4_index(base, bucket, config.nb)
+    }
+
+    fn map_e4_features_board_both<F: FnMut(usize, usize)>(
+        &self,
+        board: &ShogiBoard,
+        config: E4Config,
+        mut f: F,
+    ) {
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
+
+        let stm_king = board.king_square(stm);
+        let nstm_king = board.king_square(nstm);
+        if !stm_king.is_valid() || !nstm_king.is_valid() {
+            return;
+        }
+
+        let stm_ctx = self.perspective_ctx(stm_king, stm);
+        let nstm_ctx = self.perspective_ctx(nstm_king, nstm);
+        let counts = crate::halfka_e4::e4_attacker_counts(board);
+
+        board.for_each_board_piece(|piece, sq| {
+            let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+            let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+            f(
+                self.e4_index(&stm_ctx, &counts, config, stm_bp, Some((piece.color, sq))),
+                self.e4_index(&nstm_ctx, &counts, config, nstm_bp, Some((piece.color, sq))),
+            );
+        });
+
+        if self.emits_king_feature() {
+            let stm_friend = king_bonapiece(stm_king, stm, true);
+            let nstm_friend = king_bonapiece(nstm_king, nstm, true);
+            f(
+                self.e4_index(&stm_ctx, &counts, config, stm_friend, Some((stm, stm_king))),
+                self.e4_index(
+                    &nstm_ctx,
+                    &counts,
+                    config,
+                    nstm_friend,
+                    Some((nstm, nstm_king)),
+                ),
+            );
+
+            let stm_enemy = king_bonapiece(nstm_king, stm, false);
+            let nstm_enemy = king_bonapiece(stm_king, nstm, false);
+            f(
+                self.e4_index(
+                    &stm_ctx,
+                    &counts,
+                    config,
+                    stm_enemy,
+                    Some((nstm, nstm_king)),
+                ),
+                self.e4_index(
+                    &nstm_ctx,
+                    &counts,
+                    config,
+                    nstm_enemy,
+                    Some((stm, stm_king)),
+                ),
+            );
+        }
+
+        for owner in [Color::Black, Color::White] {
+            for &pt in &HAND_PIECE_TYPES {
+                for i in 1..=board.hand(owner).count(pt) {
+                    let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                    if stm_bp != BonaPiece::ZERO {
+                        let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                        f(
+                            self.e4_index(&stm_ctx, &counts, config, stm_bp, None),
+                            self.e4_index(&nstm_ctx, &counts, config, nstm_bp, None),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// BonaPiece を piece plane 内のインデックスへ写す。
@@ -943,6 +1119,13 @@ mod tests {
         ThreatProfile::CrossSide,
     ];
 
+    const ALL_E4_CONFIGS: [E4Config; 4] = [
+        E4Config::E4_2X2_KINGFIXED,
+        E4Config::E4_2X2_KINGBUCKETED,
+        E4Config::KPE9_KINGFIXED,
+        E4Config::KPE9_KINGBUCKETED,
+    ];
+
     #[test]
     fn threat_off_is_bit_identical_to_base() {
         // `with_threat_profile` を呼ばない spec は base と全 getter 一致。
@@ -1096,6 +1279,106 @@ mod tests {
         let total = spec.extract_active_features(&board, &mut s2, &mut n2);
         assert_eq!(total, true_total, "戻り値が cap で truncate されている");
         assert!(total > small_cap, "overflow (cap 越え) を検出できる戻り値");
+    }
+
+    #[test]
+    fn e4_getters_multiply_base_dims() {
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            for cfg in ALL_E4_CONFIGS {
+                let spec = base.with_e4_config(cfg);
+                assert_eq!(spec.e4_config(), Some(cfg));
+                assert_eq!(spec.base_ft_in(), base.base_ft_in());
+                assert_eq!(spec.ft_in(), base.base_ft_in() * cfg.nb);
+                assert_eq!(spec.max_active(), base.max_active());
+                assert_eq!(spec.train_ft_in(), spec.ft_in());
+            }
+        }
+    }
+
+    #[test]
+    fn e4_config_hashes_keep_all_specs_distinct() {
+        let mut seen = Vec::new();
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            seen.push(base.feature_hash());
+            for cfg in ALL_E4_CONFIGS {
+                let h = base.with_e4_config(cfg).feature_hash();
+                assert_ne!(h, base.feature_hash(), "{}", base.canonical_name());
+                seen.push(h);
+            }
+        }
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (25 通り)");
+    }
+
+    #[test]
+    #[should_panic(expected = "E4 feature sets cannot use threat profiles")]
+    fn with_e4_config_rejects_threat() {
+        FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide)
+            .with_e4_config(E4Config::E4_2X2_KINGFIXED);
+    }
+
+    #[test]
+    #[should_panic(expected = "E4 feature sets cannot use FT factorizer")]
+    fn with_e4_config_rejects_factorize() {
+        FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_ft_factorize()
+            .with_e4_config(E4Config::E4_2X2_KINGFIXED);
+    }
+
+    #[test]
+    fn e4_emit_matches_closure_and_uses_e4_range() {
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (size_of test で 40 byte 確認済、align 1)、`bytes.len() % 40 == 0` を
+        // 直前で assert。`bytes` の所有 lifetime 内に閉じる slice。
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+
+        let cfg = E4Config::E4_2X2_KINGFIXED;
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            let spec = base.with_e4_config(cfg);
+            for (i, psv) in records.iter().take(20).enumerate() {
+                let board = psv.decode();
+                let mut base_pairs = Vec::new();
+                base.map_features_board(&board, |s, n| base_pairs.push((s, n)));
+                let mut e4_pairs = Vec::new();
+                spec.map_features_board(&board, |s, n| e4_pairs.push((s, n)));
+                assert_eq!(
+                    e4_pairs.len(),
+                    base_pairs.len(),
+                    "{} record {i}",
+                    fs.canonical_name()
+                );
+                for (&(e4_s, e4_n), &(base_s, base_n)) in e4_pairs.iter().zip(&base_pairs) {
+                    assert_eq!(e4_s / cfg.nb, base_s, "{} record {i}", fs.canonical_name());
+                    assert_eq!(e4_n / cfg.nb, base_n, "{} record {i}", fs.canonical_name());
+                    assert!(e4_s < spec.ft_in() && e4_n < spec.ft_in());
+                }
+
+                let mut stm_buf = vec![0i32; spec.max_active()];
+                let mut nstm_buf = vec![0i32; spec.max_active()];
+                let cnt = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
+                let direct: Vec<(usize, usize)> = (0..cnt)
+                    .map(|k| (stm_buf[k] as usize, nstm_buf[k] as usize))
+                    .collect();
+                assert_eq!(direct, e4_pairs, "{} record {i}", fs.canonical_name());
+            }
+        }
     }
 
     fn startpos_for_overflow() -> ShogiBoard {
