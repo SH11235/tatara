@@ -707,8 +707,21 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
         // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
+        // cfg.validate() 丸ごとは呼べない: eval-only では resume 由来の
+        // start_superbatch が --superbatches を超えていても正当なため。
         if cfg.test_positions == 0 {
             return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
+        }
+        // score_clamp_abs も同様に cfg.validate() と等価の範囲チェックを掛ける
+        // (範囲外は HeldoutSet 内の `as i16` で wrap し検証 target を無言で壊す)。
+        if let Some(c) = cfg.score_clamp_abs
+            && !(1..=i32::from(i16::MAX)).contains(&c)
+        {
+            return Err(format!(
+                "--score-clamp-abs must be in [1, {}] (got {c}); PSV score is i16",
+                i16::MAX
+            )
+            .into());
         }
         let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
