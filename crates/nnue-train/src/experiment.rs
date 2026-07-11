@@ -182,6 +182,9 @@ pub struct Params {
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
+    /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_clamp_abs: Option<i32>,
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
@@ -622,6 +625,7 @@ mod tests {
             wrm_weight_boost_w1: Some(0.0),
             wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
+            score_clamp_abs: None,
             init_from: None,
             init_preset: None,
             test_data: None,

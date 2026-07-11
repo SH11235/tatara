@@ -189,6 +189,13 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
 
+    /// Saturate the teacher score of surviving positions to `[-N, N]` (applied
+    /// after the `--score-drop-abs` filter, so e.g. mate stamps are still
+    /// dropped, not clamped). Useful to normalise teacher files whose encode
+    /// variants clip at different ceilings. Must be in `[1, 32767]`.
+    #[arg(long, global = true)]
+    pub(crate) score_clamp_abs: Option<i32>,
+
     /// Inject weights from a quantised NNUE binary before training starts
     /// (pretrained start). The optimizer state (Ranger m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and

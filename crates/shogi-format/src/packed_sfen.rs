@@ -294,6 +294,11 @@ impl PackedSfenValue {
         i16::from_le_bytes([self.data[32], self.data[33]])
     }
 
+    /// 評価値を上書きする（手番側視点、wire 形式 bytes 32-33、little-endian）
+    pub fn set_score(&mut self, score: i16) {
+        self.data[32..34].copy_from_slice(&score.to_le_bytes());
+    }
+
     /// 指し手を取得
     pub fn move16(&self) -> u16 {
         u16::from_le_bytes([self.data[34], self.data[35]])
@@ -683,6 +688,17 @@ mod tests {
         assert_eq!(psv.score(), 0x1234);
         assert_eq!(psv.game_ply(), 0x0056);
         assert_eq!(psv.game_result(), -1);
+    }
+
+    #[test]
+    fn test_packed_sfen_value_set_score_roundtrip() {
+        let mut psv = PackedSfenValue::default();
+        psv.data[36] = 0x56; // game_ply — set_score が隣接 field を壊さないことの確認用
+        for s in [0i16, 1, -1, 4144, -4144, i16::MAX, i16::MIN] {
+            psv.set_score(s);
+            assert_eq!(psv.score(), s);
+        }
+        assert_eq!(psv.game_ply(), 0x0056);
     }
 
     #[test]

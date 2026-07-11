@@ -63,13 +63,16 @@ impl HeldoutSet {
     /// `test_positions` を `batch_size` 単位に切り上げた数の満タン batch を作る。
     /// PSV を逐次読みし EOF で打ち切る (学習 loader のような epoch wrap はしない —
     /// 検証集合に同一局面が重複しないため)。`score_drop_abs` 指定時は学習と同じく
-    /// `|score| >= t` の局面を除外する。
+    /// `|score| >= t` の局面を除外し、`score_clamp_abs` 指定時は生き残った局面の
+    /// score を `[-c, c]` に飽和させる。
     ///
     /// test file が満タン batch 1 個分にも満たない場合は error を返す。
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i32>,
         test_positions: usize,
         progress: &ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
@@ -82,6 +85,7 @@ impl HeldoutSet {
             file_size,
             batch_size,
             score_drop_abs,
+            score_clamp_abs,
             test_positions,
             progress,
             feature_set,
@@ -102,6 +106,7 @@ impl HeldoutSet {
         end_offset: u64,
         batch_size: usize,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i32>,
         test_positions: usize,
         progress: &ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
@@ -117,7 +122,7 @@ impl HeldoutSet {
         let mut cur_buckets: Vec<i32> = Vec::with_capacity(batch_size);
 
         while batches.len() < n_batches {
-            let Some(psv) = loader.next_psv()? else {
+            let Some(mut psv) = loader.next_psv()? else {
                 break; // EOF — epoch wrap しない
             };
             // 学習側 `PsvEpochReader` と同じ score-drop 近似 (i64 cast で
@@ -126,6 +131,17 @@ impl HeldoutSet {
                 && i64::from(psv.score()).abs() >= i64::from(t)
             {
                 continue;
+            }
+            // 学習側 `PsvEpochReader` と同じく drop 判定の後に score を飽和させる
+            // (詰み stamp が clamp されて drop をすり抜けるのを防ぐ順序)。
+            if let Some(c) = score_clamp_abs {
+                let c = c as i16;
+                let s = psv.score();
+                if s > c {
+                    psv.set_score(c);
+                } else if s < -c {
+                    psv.set_score(-c);
+                }
             }
             let board = psv.decode();
             let pushed = cur.push_decoded(&board)?;
@@ -290,8 +306,17 @@ mod tests {
         // sample.psv は 100 records。batch_size 16 / test_positions 40 →
         // 切り上げ 3 batch (48 pos) を要求するが、100 records あるので wrap せず 3 batch。
         let progress = ShogiProgressKPAbs;
-        let set = HeldoutSet::load(&sample_psv_path(), 16, None, 40, &progress, test_spec(), 9)
-            .expect("load held-out set");
+        let set = HeldoutSet::load(
+            &sample_psv_path(),
+            16,
+            None,
+            None,
+            40,
+            &progress,
+            test_spec(),
+            9,
+        )
+        .expect("load held-out set");
         assert_eq!(set.n_batches(), 3);
         assert_eq!(set.n_positions(), 48);
     }
@@ -305,6 +330,7 @@ mod tests {
             &sample_psv_path(),
             16,
             None,
+            None,
             100_000,
             &progress,
             test_spec(),
@@ -313,6 +339,33 @@ mod tests {
         .expect("load held-out set");
         assert_eq!(set.n_batches(), 6);
         assert_eq!(set.n_positions(), 96);
+    }
+
+    #[test]
+    fn heldout_set_score_clamp_saturates_batch_scores() {
+        // sample.psv (実教師局面 = |score| > 10 を含む) を clamp 10 で読むと、
+        // 全 batch の score が [-10, 10] に収まる。
+        let progress = ShogiProgressKPAbs;
+        let set = HeldoutSet::load(
+            &sample_psv_path(),
+            16,
+            None,
+            Some(10),
+            96,
+            &progress,
+            test_spec(),
+            9,
+        )
+        .expect("load held-out set");
+        for (batch, _) in &set.batches {
+            for bi in 0..batch.n_positions {
+                assert!(
+                    batch.score[bi].abs() <= 10.0,
+                    "score {} exceeds clamp",
+                    batch.score[bi]
+                );
+            }
+        }
     }
 
     #[test]
@@ -327,6 +380,7 @@ mod tests {
             2800,
             4000,
             16,
+            None,
             None,
             30,
             &progress,
@@ -348,6 +402,7 @@ mod tests {
             4000,
             16,
             None,
+            None,
             16,
             &progress,
             test_spec(),
@@ -367,6 +422,7 @@ mod tests {
         let err = HeldoutSet::load(
             &sample_psv_path(),
             200,
+            None,
             None,
             200,
             &progress,

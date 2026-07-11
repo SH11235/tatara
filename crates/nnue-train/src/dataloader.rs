@@ -449,6 +449,7 @@ struct PsvEpochReader {
     end_offset: u64,
     loader: PsvFileLoader,
     score_drop_abs: Option<i32>,
+    score_clamp_abs: Option<i32>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
     pushed_this_epoch: u64,
     /// 1 epoch 丸ごと 0 push だった連続回数。
@@ -464,6 +465,7 @@ impl PsvEpochReader {
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i32>,
     ) -> io::Result<Self> {
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         Ok(Self {
@@ -472,6 +474,7 @@ impl PsvEpochReader {
             end_offset,
             loader,
             score_drop_abs,
+            score_clamp_abs,
             pushed_this_epoch: 0,
             barren_passes: 0,
         })
@@ -482,13 +485,27 @@ impl PsvEpochReader {
     fn next(&mut self) -> io::Result<PackedSfenValue> {
         loop {
             match self.loader.next_psv()? {
-                Some(psv) => {
+                Some(mut psv) => {
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
                     if let Some(t) = self.score_drop_abs
                         && i64::from(psv.score()).abs() >= i64::from(t)
                     {
                         continue;
+                    }
+                    // `--score-clamp-abs c` 指定時: 生き残った position の score を
+                    // `[-c, c]` に飽和させる。drop 判定の後に適用する (先に clamp
+                    // すると `|score| >= drop` の詰み stamp が clamp されて drop を
+                    // すり抜ける)。c は TrainingConfig::validate が [1, i16::MAX]
+                    // を保証する。
+                    if let Some(c) = self.score_clamp_abs {
+                        let c = c as i16;
+                        let s = psv.score();
+                        if s > c {
+                            psv.set_score(c);
+                        } else if s < -c {
+                            psv.set_score(-c);
+                        }
                     }
                     self.pushed_this_epoch += 1;
                     return Ok(psv);
@@ -591,6 +608,8 @@ impl BucketedPrefetchedLoader {
     /// `path` の PSV を `num_workers` 本の worker で読み込む。各 batch は
     /// `batch_size` 件の有効 position を持つ (epoch wrap するので末尾 partial は
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
+    /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
+    /// `[-c, c]` に飽和させる (`--score-clamp-abs`)。
     /// `progress` は output bucket を計算する [`ShogiProgressKPAbs`] (ZST; 重みは
     /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
     /// 未ロードなら全 bucket 4)。`feature_set` は sparse index 化に使う feature
@@ -614,6 +633,7 @@ impl BucketedPrefetchedLoader {
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i32>,
         num_workers: usize,
         progress: ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
@@ -639,6 +659,7 @@ impl BucketedPrefetchedLoader {
             0,
             train_end_offset,
             score_drop_abs,
+            score_clamp_abs,
         )?));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
@@ -1188,6 +1209,7 @@ mod tests {
             &path,
             8,
             None,
+            None,
             1,
             progress,
             test_spec(),
@@ -1211,6 +1233,7 @@ mod tests {
         let mut on = BucketedPrefetchedLoader::spawn(
             &path,
             8,
+            None,
             None,
             1,
             progress,
@@ -1351,6 +1374,7 @@ mod tests {
             &path,
             16,
             None,
+            None,
             num_workers,
             progress,
             test_spec(),
@@ -1408,6 +1432,7 @@ mod tests {
             &path,
             8,
             None,
+            None,
             0,
             progress,
             test_spec(),
@@ -1438,6 +1463,7 @@ mod tests {
             &path,
             8,
             Some(32000),
+            None,
             2,
             progress,
             test_spec(),
@@ -1459,6 +1485,7 @@ mod tests {
             &path,
             100,
             Some(1),
+            None,
             1,
             progress,
             test_spec(),
@@ -1482,6 +1509,7 @@ mod tests {
         let mut loader = BucketedPrefetchedLoader::spawn(
             &path,
             8,
+            None,
             None,
             1,
             progress,
@@ -1508,12 +1536,38 @@ mod tests {
         // 末尾 30 records (offset 2800..4000) の範囲を epoch reader で読む。
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
-        let mut reader = PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None).unwrap();
+        let mut reader =
+            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None).unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
                 .unwrap_or_else(|e| panic!("wrap should keep returning records (i={i}): {e}"));
         }
+    }
+
+    #[test]
+    fn psv_epoch_reader_clamps_after_drop() {
+        // score だけ既知の synthetic PSV (盤面 bytes は reader レベルでは decode
+        // されないので zero 埋めで良い)。drop 32000 → 詰み stamp ±32000 は clamp
+        // されずに drop され、生き残りは ±100 に飽和されることを確認する。
+        let scores: [i16; 7] = [0, 50, -50, 200, -200, 32000, -32000];
+        let mut bytes = Vec::with_capacity(scores.len() * 40);
+        for s in scores {
+            let mut rec = [0u8; 40];
+            rec[32..34].copy_from_slice(&s.to_le_bytes());
+            bytes.extend_from_slice(&rec);
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "nnue-train-clamp-after-drop-{}.psv",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &bytes).expect("write synthetic psv");
+
+        let mut reader =
+            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100)).unwrap();
+        let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(got, vec![0, 50, -50, 100, -100]);
     }
 
     #[test]
@@ -1527,6 +1581,7 @@ mod tests {
         let mut loader = BucketedPrefetchedLoader::spawn(
             &tmp,
             8,
+            None,
             None,
             1,
             progress,
