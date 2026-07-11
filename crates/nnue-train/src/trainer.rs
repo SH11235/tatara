@@ -401,8 +401,9 @@ pub struct TrainingConfig {
     pub score_drop_abs: Option<i32>,
     /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
     /// させる (`--score-clamp-abs`)。教師の encode 変種 (clip 上限の違い等) を
-    /// 単一の上限へ正規化する用途。
-    pub score_clamp_abs: Option<i32>,
+    /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
+    /// 消費側の縮小 cast (wrap) を型で不可能にするため。
+    pub score_clamp_abs: Option<i16>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
@@ -484,11 +485,19 @@ impl TrainingConfig {
             )));
         }
         if let Some(c) = self.score_clamp_abs
-            && !(1..=i32::from(i16::MAX)).contains(&c)
+            && c < 1
         {
             return Err(io::Error::other(format!(
-                "score_clamp_abs must be in [1, {}] (got {c}); PSV score is i16",
-                i16::MAX
+                "score_clamp_abs must be >= 1 (got {c}); a non-positive bound would saturate \
+                 every score to it"
+            )));
+        }
+        if let (Some(t), Some(c)) = (self.score_drop_abs, self.score_clamp_abs)
+            && i64::from(c) >= i64::from(t)
+        {
+            return Err(io::Error::other(format!(
+                "score_clamp_abs ({c}) must be < score_drop_abs ({t}); every position surviving \
+                 the drop filter already has |score| < {t}, so the clamp would never fire"
             )));
         }
         if self.test_data.is_some() && self.test_positions == 0 {
@@ -2224,7 +2233,6 @@ mod tests {
         assert!(
             TrainingConfig {
                 score_drop_abs: Some(0),
-                score_clamp_abs: None,
                 ..base_cfg()
             }
             .validate()
@@ -2233,7 +2241,6 @@ mod tests {
         assert!(
             TrainingConfig {
                 score_drop_abs: Some(-1),
-                score_clamp_abs: None,
                 ..base_cfg()
             }
             .validate()
@@ -2242,14 +2249,13 @@ mod tests {
         assert!(
             TrainingConfig {
                 score_drop_abs: Some(32000),
-                score_clamp_abs: None,
                 ..base_cfg()
             }
             .validate()
             .is_ok()
         );
-        // score-clamp-abs は [1, i16::MAX]。0 / 負値 / i16 範囲外を reject。
-        for bad in [0, -1, i32::from(i16::MAX) + 1] {
+        // score-clamp-abs は >= 1 (上限 i16::MAX は型で保証)。
+        for bad in [0, -1] {
             assert!(
                 TrainingConfig {
                     score_clamp_abs: Some(bad),
@@ -2262,6 +2268,26 @@ mod tests {
         }
         assert!(
             TrainingConfig {
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // clamp >= drop は「drop 生存者に clamp が一度も発火しない」silent no-op
+        // 構成なので reject。clamp < drop は OK。
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(3000),
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(32000),
                 score_clamp_abs: Some(4144),
                 ..base_cfg()
             }

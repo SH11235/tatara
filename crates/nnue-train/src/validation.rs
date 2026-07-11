@@ -72,7 +72,7 @@ impl HeldoutSet {
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
         test_positions: usize,
         progress: &ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
@@ -106,7 +106,7 @@ impl HeldoutSet {
         end_offset: u64,
         batch_size: usize,
         score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
         test_positions: usize,
         progress: &ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
@@ -135,13 +135,7 @@ impl HeldoutSet {
             // 学習側 `PsvEpochReader` と同じく drop 判定の後に score を飽和させる
             // (詰み stamp が clamp されて drop をすり抜けるのを防ぐ順序)。
             if let Some(c) = score_clamp_abs {
-                let c = c as i16;
-                let s = psv.score();
-                if s > c {
-                    psv.set_score(c);
-                } else if s < -c {
-                    psv.set_score(-c);
-                }
+                psv.set_score(psv.score().clamp(-c, c));
             }
             let board = psv.decode();
             let pushed = cur.push_decoded(&board)?;

@@ -709,19 +709,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
         // cfg.validate() 丸ごとは呼べない: eval-only では resume 由来の
         // start_superbatch が --superbatches を超えていても正当なため。
+        // score_clamp_abs は CLI parser (i16 + range 1..) が値域を保証する。
         if cfg.test_positions == 0 {
             return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
-        }
-        // score_clamp_abs も同様に cfg.validate() と等価の範囲チェックを掛ける
-        // (範囲外は HeldoutSet 内の `as i16` で wrap し検証 target を無言で壊す)。
-        if let Some(c) = cfg.score_clamp_abs
-            && !(1..=i32::from(i16::MAX)).contains(&c)
-        {
-            return Err(format!(
-                "--score-clamp-abs must be in [1, {}] (got {c}); PSV score is i16",
-                i16::MAX
-            )
-            .into());
         }
         let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
@@ -1365,7 +1355,7 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        score_clamp_abs: cli.score_clamp_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1524,7 +1514,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        score_clamp_abs: cli.score_clamp_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),

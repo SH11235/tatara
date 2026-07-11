@@ -449,7 +449,7 @@ struct PsvEpochReader {
     end_offset: u64,
     loader: PsvFileLoader,
     score_drop_abs: Option<i32>,
-    score_clamp_abs: Option<i32>,
+    score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
     pushed_this_epoch: u64,
     /// 1 epoch 丸ごと 0 push だった連続回数。
@@ -465,7 +465,7 @@ impl PsvEpochReader {
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
     ) -> io::Result<Self> {
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         Ok(Self {
@@ -496,16 +496,10 @@ impl PsvEpochReader {
                     // `--score-clamp-abs c` 指定時: 生き残った position の score を
                     // `[-c, c]` に飽和させる。drop 判定の後に適用する (先に clamp
                     // すると `|score| >= drop` の詰み stamp が clamp されて drop を
-                    // すり抜ける)。c は TrainingConfig::validate が [1, i16::MAX]
-                    // を保証する。
+                    // すり抜ける)。c >= 1 は TrainingConfig::validate が保証する
+                    // ため `-c` は overflow しない。
                     if let Some(c) = self.score_clamp_abs {
-                        let c = c as i16;
-                        let s = psv.score();
-                        if s > c {
-                            psv.set_score(c);
-                        } else if s < -c {
-                            psv.set_score(-c);
-                        }
+                        psv.set_score(psv.score().clamp(-c, c));
                     }
                     self.pushed_this_epoch += 1;
                     return Ok(psv);
@@ -633,7 +627,7 @@ impl BucketedPrefetchedLoader {
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
         num_workers: usize,
         progress: ShogiProgressKPAbs,
         feature_set: FeatureSetSpec,
