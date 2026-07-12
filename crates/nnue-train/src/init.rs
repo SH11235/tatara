@@ -10,7 +10,7 @@
 //!
 //! 値生成は xorshift ベースの決定論的 RNG で、同一 seed なら常に同一列を返す
 //! (smoke / 数値同等性テストの再現性を保つため)。`Dist::Uniform` + `Scale::Abs`
-//! は既定の `±0.01` 一様初期化と bit-identical な列を返すよう実装してあり、unit
+//! は `±0.01` 一様初期化と bit-identical な列を返すよう実装してあり、unit
 //! test (`uniform_abs_is_bit_identical_to_reference_xorshift`) が保証する。
 
 /// 重みをサンプリングする確率分布。
@@ -224,6 +224,9 @@ const DEFAULT_SIMPLE_SEEDS: [u64; 8] = [
 
 const DEFAULT_HALF_WIDTH: f32 = 0.01;
 
+/// FT weight の既定 fan-in スケーリング gain。半値幅は `sqrt(gain / fan_in)`。
+const DEFAULT_FAN_IN_GAIN: f32 = 1.0;
+
 /// LayerStack (FT → L1(+L1f) → L2 → L3、bucket 付き) の全 weight group の初期化指定。
 #[derive(Debug, Clone, Copy)]
 pub struct LayerStackInit {
@@ -240,10 +243,15 @@ pub struct LayerStackInit {
 }
 
 impl LayerStackInit {
-    /// 既定初期化: weight は `[-0.01, 0.01]` 一様 (固定 seed)、bias は全て 0。
+    /// 既定初期化: FT weight は半値幅 `sqrt(1 / fan_in)` の一様分布、それ以外の weight は
+    /// `[-0.01, 0.01]` 一様 (いずれも固定 seed)、bias は全て 0。
+    ///
+    /// FT だけ fan-in スケーリングなのは、FT の fan_in が他層と桁違いに大きく (halfka-hm-merged
+    /// で 73,305)、固定半値幅では初期活性が CReLU の上限に張り付いて学習初期の勾配が失われる
+    /// ため。L1/L2/L3 は fan_in が小さく、固定半値幅でも飽和しない。
     pub fn default_uniform() -> Self {
         Self {
-            ft_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[0]),
+            ft_w: LayerInit::uniform_fan_in(DEFAULT_FAN_IN_GAIN, false, DEFAULT_LS_SEEDS[0]),
             ft_b: LayerInit::zeroed(),
             l1_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[1]),
             l1_b: LayerInit::zeroed(),
@@ -351,7 +359,7 @@ impl LayerInitOverride {
 /// - `normal:` も同じ scale 部を取る
 ///
 /// 例: `uniform:fanin` (半値幅 `sqrt(1/fan_in)`)、`normal:fanin:2:32`
-/// (He-normal 風、`std=sqrt(2/32)=0.25`)、`uniform:abs:0.01` (既定初期化と等価)。
+/// (He-normal 風、`std=sqrt(2/32)=0.25`)、`uniform:abs:0.01`。
 pub fn parse_layer_init_spec(spec: &str) -> Result<LayerInitOverride, String> {
     let parts: Vec<&str> = spec.split(':').collect();
     let bad = |msg: &str| {
@@ -542,6 +550,28 @@ mod tests {
         assert_eq!(p.ft_b.dist, Dist::Zeroed);
         assert_eq!(p.l1_b.dist, Dist::Zeroed);
         assert_eq!(p.l3_b.dist, Dist::Zeroed);
+    }
+
+    #[test]
+    fn default_layerstack_ft_is_fan_in_and_others_are_abs() {
+        let p = LayerStackInit::default_uniform();
+        assert_eq!(p.ft_w.dist, Dist::Uniform);
+        assert_eq!(
+            p.ft_w.scale,
+            Scale::FanIn {
+                gain: 1.0,
+                effective: None
+            }
+        );
+        assert_eq!(p.l1_w.scale, Scale::Abs(0.01));
+        assert_eq!(p.l2_w.scale, Scale::Abs(0.01));
+        assert_eq!(p.l3_w.scale, Scale::Abs(0.01));
+        assert_eq!(p.l1f_w.scale, Scale::Abs(0.01));
+    }
+
+    #[test]
+    fn default_simple_ft_stays_abs() {
+        let p = SimpleInit::default_uniform();
         assert_eq!(p.ft_w.scale, Scale::Abs(0.01));
     }
 

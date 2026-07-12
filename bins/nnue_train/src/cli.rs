@@ -452,15 +452,16 @@ pub(crate) struct Cli {
     pub(crate) monitor_active_features: bool,
 
     /// Override the feature-transformer (L0) weight initialiser. Applies to a
-    /// fresh run; ignored when `--init-from` / `--resume` loads weights. The
-    /// default weight init is `[-0.01, 0.01]` uniform.
+    /// fresh run; ignored when `--init-from` / `--resume` loads weights. The FT
+    /// default is `uniform:fanin` (half-width `sqrt(1 / fan_in)`); the other
+    /// layers default to `[-0.01, 0.01]` uniform.
     ///
     /// Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
     /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
     /// `sqrt(gain / effective_or_fan_in)` (half-width for uniform, std for
     /// normal). Examples: `uniform:fanin`, `normal:fanin:2:32`
-    /// (`sqrt(2/32) = 0.25`), `uniform:abs:0.01` (the default). Applies to the
-    /// weight only; the bias keeps the default.
+    /// (`sqrt(2/32) = 0.25`), `uniform:abs:0.01`. Applies to the weight only;
+    /// the bias keeps the default.
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
     pub(crate) init_ft: Option<nnue_train::init::LayerInitOverride>,
 
