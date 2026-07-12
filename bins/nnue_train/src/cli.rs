@@ -452,9 +452,12 @@ pub(crate) struct Cli {
     pub(crate) monitor_active_features: bool,
 
     /// Override the feature-transformer (L0) weight initialiser. Applies to a
-    /// fresh run; ignored when `--init-from` / `--resume` loads weights. The FT
-    /// default is `uniform:fanin` (half-width `sqrt(1 / fan_in)`); the other
-    /// layers default to `[-0.01, 0.01]` uniform.
+    /// fresh run; ignored when `--init-from` / `--resume` loads weights.
+    ///
+    /// Defaults differ per architecture: `layerstack` initialises the FT with
+    /// `uniform:fanin` (half-width `sqrt(1 / fan_in)`), while `simple` uses
+    /// `[-0.01, 0.01]` uniform. Every other weight defaults to `[-0.01, 0.01]`
+    /// uniform in both architectures.
     ///
     /// Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
     /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
