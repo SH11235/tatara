@@ -2,6 +2,8 @@
 
 # tatara
 
+![tatara — forging shogi NNUE in Rust](docs/tatara-hero.jpg)
+
 **A fast Rust trainer for shogi NNUE evaluation networks.**
 
 tatara trains shogi NNUE (Efficiently Updatable Neural Network) evaluation

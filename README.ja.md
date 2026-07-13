@@ -2,6 +2,8 @@
 
 # tatara
 
+![tatara — Rust で鍛える将棋 NNUE](docs/tatara-hero.jpg)
+
 **将棋 NNUE 評価関数を高速に学習する Rust 製トレーナー。**
 
 tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を GPU で
