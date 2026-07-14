@@ -54,9 +54,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use shogi_features::FeatureSetSpec;
+#[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
+use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
 use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
 
@@ -421,7 +422,7 @@ pub struct TrainingConfig {
     /// `[file_size - n * PSV_RECORD_BYTES, file_size)` を読む。`test_data` と
     /// 同時指定は `validate()` で error。
     pub test_tail_positions: Option<u64>,
-    /// dataloader worker で `ShogiProgressKPAbs::bucket_board` を計算して per-position
+    /// dataloader worker で選択された bucket mode を計算して per-position
     /// bucket を `Batch` と共に返すか。LayerStack (bucket-aware) は `true`、Simple
     /// (bucket-less) は `false` で worker CPU 仕事を ~1 board 推論分削減できる。
     /// `false` のとき backend に渡る `bucket_idx` は空 slice になるので backend は
@@ -429,7 +430,7 @@ pub struct TrainingConfig {
     /// を使わない契約)。
     pub compute_bucket: bool,
     /// LayerStack の output bucket 数 (`--num-buckets`)。dataloader worker が
-    /// `progress.bucket_board(board, num_buckets)` で `0..num_buckets-1` を emit
+    /// bucket mode が `0..num_buckets-1` を emit
     /// するために必要。`compute_bucket = false` の Simple 経路では bucket 計算
     /// 自体が skip されるため値は参照されない (任意の `>= 1` で可)。
     pub num_buckets: usize,
@@ -525,8 +526,7 @@ impl TrainingConfig {
         }
         if self.num_buckets == 0 {
             return Err(io::Error::other(
-                "num_buckets must be >= 1 (`progress.bucket_board` requires at \
-                 least one bucket; LayerStack uses `--num-buckets` in [2, 9])",
+                "num_buckets must be >= 1 (LayerStack uses `--num-buckets` in [2, 9])",
             ));
         }
         Ok(())
@@ -602,8 +602,8 @@ impl ActiveHistStats {
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
 /// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
-/// - `progress`: progress8kpabs 重み (`--progress-coeff` 未指定なら zero-weight default → 全 bucket 4)。
-///   重みは process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること
+/// - `bucket_mode`: dataloader と held-out validation に共通の bucket 算出方式。
+///   progress8kpabs の重みは process-global なので呼び出し前に load 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
 /// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
 /// - `experiment`: `Some` のとき、run 開始時・superbatch ごと・正常終了時に
@@ -614,10 +614,10 @@ impl ActiveHistStats {
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
 /// worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる点に注意
 /// (training では問題ない)。
-pub fn run<B, L, W>(
+pub fn run<B, L, W, M>(
     backend: &mut B,
     data_path: &Path,
-    progress: &ShogiProgressKPAbs,
+    bucket_mode: &M,
     lr_scheduler: &L,
     wdl_scheduler: &W,
     cfg: &TrainingConfig,
@@ -627,6 +627,7 @@ where
     B: TrainerBackend,
     L: LrScheduler,
     W: WdlScheduler,
+    M: Copy + Into<BucketMode>,
 {
     cfg.validate()?;
 
@@ -669,7 +670,7 @@ where
         cfg.score_drop_abs,
         cfg.score_clamp_abs,
         cfg.threads,
-        *progress,
+        (*bucket_mode).into(),
         cfg.feature_set,
         cfg.compute_bucket,
         cfg.num_buckets,
@@ -704,7 +705,7 @@ where
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
                 cfg.test_positions,
-                progress,
+                bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?;
@@ -726,7 +727,7 @@ where
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
                 cfg.test_positions,
-                progress,
+                bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?;
