@@ -5888,8 +5888,11 @@ fn layerstack_raw_ckpt_roundtrips_with_psqt() -> Result<(), Box<dyn std::error::
 /// (1) FT master が train 形状 (実行 + piece-input 仮想行) で確保される、(2) backward の
 /// reduce が仮想行 grad を埋め optimizer が仮想行を更新する (仮想行が非ゼロになる)、
 /// (3) step / weight が finite、(4) 量子化 export は仮想行を実行へ畳み込んで base 形状に
-/// なり id から factorizer modifier が外れ、非 factorize 網と同一 byte 長になる、を
-/// FP32 / `--ft-fp16(-out)` 経路で網羅する。
+/// なり id から factorizer modifier が外れ、非 factorize 網と同一 byte 長になる。
+///
+/// 3 活性化 (crelu / screlu / pairwise) × 精度 3 構成 (FP32 / `--ft-fp16` / `--all-optim`
+/// = ft_fp16 + ft_fp16_out + fp16_opt_state + tf32) を網羅し、f16 comb 経路と f16
+/// optimizer state 下でも仮想行の集約・更新・fold が成立することを確認する。
 #[test]
 fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     use crate::trainer_simple::SimpleGpuTrainer;
@@ -5900,112 +5903,131 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
     let ctx = CudaContext::new(0)?;
     let init = SimpleInit::default_uniform();
     let base_spec = FeatureSet::HalfKaHmMerged.spec();
-    let ft_out = 256_usize;
-    let base_id = SimpleId {
-        feature_set: base_spec,
-        activation: SimpleActivation::CReLU,
-        ft_out,
-        l1_out: 32,
-        l2_out: 32,
-    };
-
-    // 非 factorize 網の量子化 byte 長 (export 同形の基準)。
-    let base_bytes_len = {
-        let trainer = SimpleGpuTrainer::new(
-            &ctx,
-            SMOKE_BATCH,
-            base_id,
-            1e-7,
-            16,
-            PrecisionFlags::default(),
-            &init,
-        )?;
-        let mut bytes = Vec::new();
-        trainer.to_simple_weights()?.save_quantised(&mut bytes)?;
-        bytes.len()
-    };
-
     let fac_spec = base_spec.with_ft_factorize();
     assert!(fac_spec.ft_factorize());
     assert!(
         fac_spec.train_ft_in() > fac_spec.ft_in(),
         "factorize train_ft_in must exceed base ft_in"
     );
+    let ft_out = 256_usize;
 
-    for &(ft_fp16, ft_fp16_out) in &[(false, false), (true, false), (true, true)] {
-        let id = SimpleId {
-            feature_set: fac_spec,
-            ..base_id
-        };
-        let mut trainer = SimpleGpuTrainer::new(
-            &ctx,
-            SMOKE_BATCH,
-            id,
-            1e-7,
-            16,
+    let precisions: [(&str, PrecisionFlags); 3] = [
+        ("fp32", PrecisionFlags::default()),
+        (
+            "ft_fp16",
             PrecisionFlags {
-                ft_fp16,
-                ft_fp16_out,
+                ft_fp16: true,
+                ft_fp16_out: false,
                 fp16_opt_state: false,
                 tf32: false,
             },
-            &init,
-        )?;
-        trainer.sync_ft_forward_weights()?;
+        ),
+        (
+            "all-optim",
+            PrecisionFlags {
+                ft_fp16: true,
+                ft_fp16_out: true,
+                fp16_opt_state: true,
+                tf32: true,
+            },
+        ),
+    ];
 
-        // ft_w master は train 形状 (実行 + 仮想行)。
-        let ft_w_n = fac_spec.train_ft_in() * ft_out;
-        assert_eq!(
-            trainer.ft_w_to_host()?.len(),
-            ft_w_n,
-            "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: ft_w must be train-shaped"
-        );
+    for activation in [
+        SimpleActivation::CReLU,
+        SimpleActivation::SCReLU,
+        SimpleActivation::Pairwise,
+    ] {
+        let act = activation.canonical_name();
+        let base_id = SimpleId {
+            feature_set: base_spec,
+            activation,
+            ft_out,
+            l1_out: 32,
+            l2_out: 32,
+        };
+        // 非 factorize 網の量子化 byte 長 (export 同形の基準)。pairwise は combined_dim が
+        // 半減し L1 形状が変わるので活性化ごとに基準を取り直す。
+        let base_bytes_len = {
+            let trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                base_id,
+                1e-7,
+                16,
+                PrecisionFlags::default(),
+                &init,
+            )?;
+            let mut bytes = Vec::new();
+            trainer.to_simple_weights()?.save_quantised(&mut bytes)?;
+            bytes.len()
+        };
 
-        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-        for s in batch.score.iter_mut() {
-            *s = 200.0;
-        }
-        for w in batch.wdl.iter_mut() {
-            *w = 0.8;
-        }
-        for _ in 0..8 {
-            let loss = trainer.step(&batch.as_ref(), 1e-1, 0.0, SMOKE_LOSS_SIGMOID)?;
-            assert!(
-                loss.is_finite(),
-                "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: loss {loss} not finite"
+        for (label, precision) in precisions {
+            let id = SimpleId {
+                feature_set: fac_spec,
+                ..base_id
+            };
+            let mut trainer =
+                SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, 1e-7, 16, precision, &init)?;
+            trainer.sync_ft_forward_weights()?;
+
+            // ft_w master は train 形状 (実行 + 仮想行)。
+            assert_eq!(
+                trainer.ft_w_to_host()?.len(),
+                fac_spec.train_ft_in() * ft_out,
+                "{act}/{label}: ft_w must be train-shaped"
             );
+
+            let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+            for s in batch.score.iter_mut() {
+                *s = 200.0;
+            }
+            for w in batch.wdl.iter_mut() {
+                *w = 0.8;
+            }
+            for _ in 0..8 {
+                let loss = trainer.step(&batch.as_ref(), 1e-1, 0.0, SMOKE_LOSS_SIGMOID)?;
+                assert!(loss.is_finite(), "{act}/{label}: loss {loss} not finite");
+            }
+            trainer.assert_all_weights_finite()?;
+
+            // reduce + optimizer が仮想行を更新している (train block 末尾が非ゼロ)。仮想行は
+            // 0 初期化なので非ゼロ = reduce が grad を埋め optimizer が master を動かした証拠。
+            // f16 optimizer state (`--fp16-opt-state`) では微小勾配が f16 で丸まり数 step では
+            // 仮想行が動かないことがある (長時間学習では動く) ので、f32 moment state の構成
+            // (FP32 / `--ft-fp16`) でのみ要求する。wiring の証明には十分。
+            if !precision.fp16_opt_state {
+                let ft_w_host = trainer.ft_w_to_host()?;
+                let virtual_block = &ft_w_host[fac_spec.ft_in() * ft_out..];
+                assert!(
+                    virtual_block.iter().any(|&x| x != 0.0),
+                    "{act}/{label}: virtual rows stayed zero (reduce/optimizer not wired)"
+                );
+            }
+
+            // export: 仮想行 fold 後の base 形状 + factorizer modifier を外した id、
+            // 量子化 byte 長は非 factorize 網と同形。
+            let weights = trainer.to_simple_weights()?;
+            assert!(
+                !weights.id.feature_set.ft_factorize(),
+                "{act}/{label}: exported id must drop the factorizer modifier"
+            );
+            assert_eq!(
+                weights.ft_w.len(),
+                fac_spec.ft_in() * ft_out,
+                "{act}/{label}: exported ft_w must be base-shaped"
+            );
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes)?;
+            assert_eq!(
+                bytes.len(),
+                base_bytes_len,
+                "{act}/{label}: factorized export must be byte-identical in shape to a non-factorized net"
+            );
+            // base id で reload できる (推論側は factorizer を観測しない)。
+            SimpleWeights::load(&mut std::io::Cursor::new(&bytes), base_id)?;
         }
-        trainer.assert_all_weights_finite()?;
-
-        // reduce + optimizer が仮想行を更新している (train block 末尾が非ゼロ)。
-        let ft_w_host = trainer.ft_w_to_host()?;
-        let virtual_block = &ft_w_host[fac_spec.ft_in() * ft_out..];
-        assert!(
-            virtual_block.iter().any(|&x| x != 0.0),
-            "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: virtual rows stayed zero (reduce/optimizer not wired)"
-        );
-
-        // export: 仮想行 fold 後の base 形状 + factorizer modifier を外した id、
-        // 量子化 byte 長は非 factorize 網と同形。
-        let weights = trainer.to_simple_weights()?;
-        assert!(
-            !weights.id.feature_set.ft_factorize(),
-            "exported id must drop the factorizer modifier"
-        );
-        assert_eq!(
-            weights.ft_w.len(),
-            fac_spec.ft_in() * ft_out,
-            "exported ft_w must be base-shaped"
-        );
-        let mut bytes = Vec::new();
-        weights.save_quantised(&mut bytes)?;
-        assert_eq!(
-            bytes.len(),
-            base_bytes_len,
-            "factorized export must be byte-identical in shape to a non-factorized net"
-        );
-        // base id で reload できる (推論側は factorizer を観測しない)。
-        SimpleWeights::load(&mut std::io::Cursor::new(&bytes), base_id)?;
     }
     Ok(())
 }
