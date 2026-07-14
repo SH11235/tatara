@@ -51,6 +51,7 @@ use gpu_kernels::sparse::ft_factorize::{
 };
 use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
 use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
+use nnue_train::optimizer::OptimizerKind;
 
 /// forward / gradient の f32 tolerance。atomic reduce (`fetch_add`) で加算順序が
 /// GPU↔CPU で異なる出力向け (`assert_close_rel`)。順序差は和の項数に比例し得るため
@@ -1064,6 +1065,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 &ctx,
                 SMOKE_BATCH,
                 id,
+                OptimizerKind::Ranger,
                 1e-7,
                 None,
                 16,
@@ -5806,6 +5808,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             nnue_train::dataloader::BucketMode::Progress8KpAbs,
             PrecisionFlags::default(),
             feature_set,
+            OptimizerKind::Ranger,
             OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
             None,
             psqt_init.as_deref(),
@@ -5955,6 +5958,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 &ctx,
                 SMOKE_BATCH,
                 base_id,
+                OptimizerKind::Ranger,
                 1e-7,
                 None,
                 16,
@@ -5971,8 +5975,17 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 feature_set: fac_spec,
                 ..base_id
             };
-            let mut trainer =
-                SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, 1e-7, None, 16, precision, &init)?;
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                OptimizerKind::Ranger,
+                1e-7,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
             trainer.sync_ft_forward_weights()?;
 
             // ft_w master は train 形状 (実行 + 仮想行)。
@@ -6063,6 +6076,7 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
             &ctx,
             SMOKE_BATCH,
             id,
+            OptimizerKind::Ranger,
             1e-7,
             None,
             16,
@@ -6124,6 +6138,7 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         0.0,
         Some(factor),
         16,
@@ -6160,6 +6175,7 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         0.0,
         Some(0.0),
         16,
@@ -6173,5 +6189,418 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         before,
         "factor=0 norm-loss must be a no-op"
     );
+    Ok(())
+}
+
+/// Simple トレーナ実体を 3 種の optimizer で 6 step 駆動し、weight decay 経由で
+/// per-step scalar (`step_size`) が種別どおり GPU kernel に届くことを確認する。
+/// grad=0 (fresh trainer) では m/v が 0 のままなので更新量は decoupled decay
+/// `w *= 1 - decay * lr * step_size_t` のみになり、CPU で厳密に再現できる。
+/// step_size_t は ranger (beta1=0.99) / radam (beta1=0.9) / adamw (定数 1) で
+/// 全て異なるため、種別の取り違え・lookahead gate の誤発火はここで検出される。
+/// ranger は step 6 で lookahead lerp が 1 回入り、slow (= 初期 weight、Simple の
+/// `slow_param ← param` 初期化規約) と補間される。
+///
+/// precision variant (`--ft-fp16` / `--fp16-opt-state`) もループし、
+/// `radam_step_fp16_mirror` / `radam_step_f16state_mirror` の launch が同じ
+/// per-step scalar を受けることを確認する (weight master は f32 のまま、moment の
+/// `f16` 格納も 0 のままなので期待軌跡は variant 間で共通)。
+#[test]
+fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let lr = 0.1_f32;
+    let decay = 0.01_f32;
+    let steps = RANGER_K;
+    assert_eq!(steps, 6, "expected exactly one lookahead lerp for ranger");
+
+    let precisions = [
+        ("f32", PrecisionFlags::default()),
+        (
+            "ft_fp16",
+            PrecisionFlags {
+                ft_fp16: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+        (
+            "fp16_opt_state",
+            PrecisionFlags {
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+        (
+            "ft_fp16+fp16_opt_state",
+            PrecisionFlags {
+                ft_fp16: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+    ];
+
+    for (label, precision) in precisions {
+        for kind in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+        ] {
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                kind,
+                decay,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
+            let w0 = trainer.ft_w_to_host()?;
+            for _ in 0..steps {
+                trainer.run_optimizer_step(lr)?;
+            }
+            let got = trainer.ft_w_to_host()?;
+
+            // CPU 参照: kernel と同じ f32 演算順序で decay 係数を 1 step ずつ適用する。
+            let mut factor = 1.0_f32;
+            for step in 1..=steps {
+                let (step_size, _denom) = kind.step_size_denom(step, BETA2, N_SMA_THRESHOLD);
+                factor *= 1.0_f32 - decay * (lr * step_size);
+            }
+            for (i, (&g, &w)) in got.iter().zip(&w0).enumerate() {
+                let mut expected = w * factor;
+                if kind.uses_lookahead() {
+                    expected = RANGER_ALPHA * expected + (1.0_f32 - RANGER_ALPHA) * w;
+                }
+                assert!(
+                    (g - expected).abs() <= expected.abs() * 1e-5 + 1e-7,
+                    "{label}/{kind:?} ft_w[{i}]: got {g} exp {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Simple トレーナ実体を lr=0 で 1 step 駆動し、`beta1` が種別どおり kernel に
+/// 届くことを 1st moment で確認する。weight 不変 + 決定的 init により grad `g` は
+/// 種別間で (丸め順序を除き) 同一なので `m = (1 - beta1) * g` に閉じ、
+/// `m_ranger * (1 - 0.9) ≈ m_radam * (1 - 0.99)` (elementwise) と
+/// `m_radam ≈ m_adamw` が成り立つ。
+///
+/// FT の m を precision 4 variant で観測することで、`ft_w` の radam_step
+/// 4 kernel variant (`radam_step` / `radam_step_fp16_mirror` /
+/// `radam_step_f16state` / `radam_step_f16state_mirror`) 全ての beta1 配線を
+/// runtime 検証する。`l1_w` (常に f32 `radam_step`) は f32 iteration でのみ確認。
+/// FT grad は sparse backward の atomic 累積で丸め順序が run 間で変わり得るため、
+/// 種別間比較も許容誤差付き (f16 格納 variant はさらに量子化誤差を上乗せ)。
+#[test]
+fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    // smoke_dummy の score=0 / wdl=0.5 は sigmoid loss の最小点に近く勾配が
+    // 消えるので、score を動かして学習信号 (非ゼロ grad) を作る。
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
+
+    let precisions = [
+        ("f32", PrecisionFlags::default(), 1e-4_f32),
+        (
+            "ft_fp16",
+            PrecisionFlags {
+                ft_fp16: true,
+                ..PrecisionFlags::default()
+            },
+            1e-4,
+        ),
+        (
+            "fp16_opt_state",
+            PrecisionFlags {
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            1e-2,
+        ),
+        (
+            "ft_fp16+fp16_opt_state",
+            PrecisionFlags {
+                ft_fp16: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            1e-2,
+        ),
+    ];
+
+    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1();
+    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1();
+
+    for (label, precision, tol) in precisions {
+        let mut ft_moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
+        let mut l1_moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
+        for kind in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+        ] {
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                kind,
+                0.0,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
+            let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(loss.is_finite(), "{label}/{kind:?}: loss must be finite");
+            ft_moments.push((kind, trainer.ft_w_m_to_host()?));
+            l1_moments.push((kind, trainer.l1_w_m_to_host()?));
+        }
+
+        let check = |moments: &[(OptimizerKind, Vec<f32>)], tensor: &str| {
+            let m_of = |k: OptimizerKind| -> &Vec<f32> {
+                &moments.iter().find(|(kind, _)| *kind == k).unwrap().1
+            };
+            let m_ranger = m_of(OptimizerKind::Ranger);
+            let m_radam = m_of(OptimizerKind::RAdam);
+            let m_adamw = m_of(OptimizerKind::AdamW);
+            let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+            assert!(
+                max_abs > 0.0,
+                "{label}: {tensor} grads must be non-trivial for the m check"
+            );
+            for (i, (&ma, &md)) in m_adamw.iter().zip(m_radam).enumerate() {
+                assert!(
+                    (ma - md).abs() <= max_abs * tol,
+                    "{label} {tensor} m[{i}]: adamw {ma} vs radam {md} (both beta1=0.9)"
+                );
+            }
+            for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+                assert!(
+                    (mr * c_radam - md * c_ranger).abs() <= max_abs * c_radam * tol,
+                    "{label} {tensor} m[{i}]: ranger {mr} vs radam {md} violate the \
+                     (1 - beta1) ratio"
+                );
+            }
+        };
+        check(&ft_moments, "ft_w");
+        if label == "f32" {
+            check(&l1_moments, "l1_w");
+        }
+    }
+    Ok(())
+}
+
+/// Simple トレーナ実体を lr>0 の 1 step で駆動し、`denom` が種別どおり kernel に
+/// 届くことを weight 更新式で確認する。step 1 では radam (rectified schedule) は
+/// n_sma が閾値未満で `denom=0` → `w -= rate * m`、adamw は `denom=1` →
+/// `w -= lr * m / (sqrt(v) + eps)`。observed m から `g = m / (1 - beta1)`、
+/// `v = (1 - beta2) * g^2` を復元して両式の期待値を組み立てる (decay=0)。
+/// denom の取り違えは分母 `sqrt(v)` の有無で数百倍規模の差になり検出される。
+#[test]
+fn simple_denom_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
+    let lr = 1e-3_f32;
+
+    for kind in [OptimizerKind::RAdam, OptimizerKind::AdamW] {
+        let mut trainer = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id,
+            kind,
+            0.0,
+            None,
+            16,
+            PrecisionFlags::default(),
+            &init,
+        )?;
+        let w0 = trainer.l1_w_to_host()?;
+        let loss = trainer.step(&batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+        assert!(loss.is_finite(), "{kind:?}: loss must be finite");
+        let w1 = trainer.l1_w_to_host()?;
+        let m = trainer.l1_w_m_to_host()?;
+
+        let (step_size, denom) = kind.step_size_denom(1, BETA2, N_SMA_THRESHOLD);
+        let rate = lr * step_size;
+        let max_abs_w = w0.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+        let mut updated = 0usize;
+        for i in 0..w0.len() {
+            let mut val = m[i];
+            if denom != 0 {
+                let g = m[i] / (1.0_f32 - kind.beta1());
+                let v = (1.0_f32 - BETA2) * g * g;
+                val /= v.sqrt() + EPS;
+            }
+            let expected = w0[i] - rate * val;
+            assert!(
+                (w1[i] - expected).abs() <= max_abs_w * 1e-4 + 1e-7,
+                "{kind:?} l1_w[{i}]: got {} exp {expected} (denom={denom})",
+                w1[i]
+            );
+            if w1[i] != w0[i] {
+                updated += 1;
+            }
+        }
+        assert!(
+            updated > 0,
+            "{kind:?}: the step must move some l1_w weights"
+        );
+    }
+    Ok(())
+}
+
+/// LayerStack トレーナ実体を lr=0 で RANGER_K step 駆動し、(1) lookahead lerp が
+/// ranger でだけ発火すること、(2) `beta1` が種別どおり kernel に届くことを確認する。
+///
+/// lr=0 では radam_step の decay 項も更新項も 0 なので weight は不変のまま
+/// m/v だけが実 batch の grad で更新される:
+/// - weight: step 6 の lerp (LayerStack の slow は 0 初期化) だけが現れる。
+///   ranger → `w = alpha * w0` (= 0.5 倍)、radam / adamw → w0 と値一致。
+/// - 1st moment: weight 不変 + 決定的 init により全 step / 全種別で grad `g` が
+///   同一なので、EMA は `m = (1 - beta1^6) * g` に閉じる。よって
+///   `m_ranger * (1 - 0.9^6) == m_radam * (1 - 0.99^6)` (elementwise)、
+///   `m_radam == m_adamw` (beta1 が同じ 0.9、m 更新は denom に依らない)。
+///   beta1 の取り違え (例: 全種別 0.99) はこの比で検出される。
+#[test]
+fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+    use nnue_train::init::LayerStackInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let feature_set = FeatureSet::HalfKp.spec();
+    // smoke_dummy の score=0 / wdl=0.5 は sigmoid loss の最小点に近く勾配が
+    // 消えるので、score を動かして学習信号 (非ゼロ grad) を作る。
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
+
+    let mut moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
+    for kind in [
+        OptimizerKind::Ranger,
+        OptimizerKind::RAdam,
+        OptimizerKind::AdamW,
+    ] {
+        // ft_out はフル次元 (1536) だと並列実行中の他 GPU テストと合わせて OOM に
+        // なり得るため、checkpoint roundtrip テストと同じ縮小次元にする。
+        let mut trainer = GpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            128,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+            nnue_train::dataloader::BucketMode::Progress8KpAbs,
+            PrecisionFlags::default(),
+            feature_set,
+            kind,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            None,
+            &LayerStackInit::default_uniform(),
+        )?;
+        let w0 = trainer.to_layerstack_weights()?;
+        for _ in 0..RANGER_K {
+            let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(loss.is_finite(), "{kind:?}: loss must be finite");
+        }
+        let w = trainer.to_layerstack_weights()?;
+
+        if kind.uses_lookahead() {
+            for (i, (&g, &e)) in w.l1_w.iter().zip(&w0.l1_w).enumerate() {
+                let expected = RANGER_ALPHA * e;
+                assert!(
+                    (g - expected).abs() <= 1e-7,
+                    "ranger l1_w[{i}]: got {g} exp {expected} (single lerp toward slow=0)"
+                );
+            }
+        } else {
+            assert_eq!(
+                w.l1_w, w0.l1_w,
+                "{kind:?}: lr=0 run must keep weights unchanged (no lookahead lerp)"
+            );
+        }
+        moments.push((kind, trainer.l3_b_m_to_host()?));
+    }
+
+    let m_of =
+        |k: OptimizerKind| -> &Vec<f32> { &moments.iter().find(|(kind, _)| *kind == k).unwrap().1 };
+    let m_ranger = m_of(OptimizerKind::Ranger);
+    let m_radam = m_of(OptimizerKind::RAdam);
+    let m_adamw = m_of(OptimizerKind::AdamW);
+    let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+    assert!(
+        max_abs > 0.0,
+        "l3_b grads must be non-trivial for the m check"
+    );
+    // bias grad は atomic 累積で run 間の丸め順序が変わり得るため、bit 一致では
+    // なく許容誤差で比較する (beta1 取り違えは 10 倍差なので検出力は十分)。
+    for (i, (&ma, &md)) in m_adamw.iter().zip(m_radam).enumerate() {
+        assert!(
+            (ma - md).abs() <= max_abs * 1e-5,
+            "l3_b m[{i}]: adamw {ma} vs radam {md} (both beta1=0.9)"
+        );
+    }
+    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1().powi(RANGER_K as i32);
+    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1().powi(RANGER_K as i32);
+    for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+        let lhs = mr * c_radam;
+        let rhs = md * c_ranger;
+        assert!(
+            (lhs - rhs).abs() <= max_abs * c_radam * 1e-5,
+            "l3_b m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1^6) ratio"
+        );
+    }
     Ok(())
 }

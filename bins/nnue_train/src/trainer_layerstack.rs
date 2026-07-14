@@ -6,7 +6,7 @@ use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::BucketMode;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
-use nnue_train::optimizer::radam_compute_step_size_denom;
+use nnue_train::optimizer::OptimizerKind;
 use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSetSpec;
 
@@ -110,7 +110,7 @@ pub(crate) struct GpuTrainer {
 
     // FT (single, shared across perspectives)
     ft_w: DeviceBuffer<f32>,
-    /// Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    /// 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
     ft_w_m: MomentBuf,
     ft_w_v: MomentBuf,
     ft_w_slow: DeviceBuffer<f32>,
@@ -181,7 +181,7 @@ pub(crate) struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    /// PSQT shortcut の weight + Ranger optimizer state。`--psqt` 有効時のみ `Some`、
+    /// PSQT shortcut の weight + optimizer state。`--psqt` 有効時のみ `Some`、
     /// 既定 `None` で従来 path と bit-identical (forward / backward / optimizer の
     /// PSQT 関連 launch は全て skip される)。
     psqt: Option<PsqtState>,
@@ -222,7 +222,7 @@ pub(crate) struct GpuTrainer {
     /// true なら FT activation (`ft_*_out` forward 出力 / `dft_*_out` backward 勾配) も
     /// FP16 で保持する (`--ft-fp16-out`)。`ft_fp16` が true のときのみ true になりうる。
     ft_fp16_out: bool,
-    /// true なら `ft_w` の Ranger moment (`m` / `v`) を `f16` で保持する
+    /// true なら `ft_w` の optimizer moment (`m` / `v`) を `f16` で保持する
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
@@ -236,7 +236,7 @@ pub(crate) struct GpuTrainer {
     /// (`max_active`) / artifact identity の単一の真実源。起動時に
     /// `--feature-set` から一度だけ決まり、以降不変。
     feature_set: FeatureSetSpec,
-    /// Ranger optimizer の param-group (FT / dense / bias) ごとの weight_decay と
+    /// optimizer の param-group (FT / dense / bias) ごとの weight_decay と
     /// lr 倍率。各 `radam_step` launch に group の `decay` 引数と
     /// `scheduled_lr × lr_mult` の lr を渡す。CLI から起動時に決まり、以降不変。
     /// per-group flag 未指定の group は大域 `--weight-decay` と lr_mult=1.0 に
@@ -257,10 +257,11 @@ pub(crate) struct GpuTrainer {
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
     bucket_mode: BucketMode,
+    optimizer: OptimizerKind,
     step_count: u64,
 }
 
-/// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
+/// PSQT shortcut の weight + optimizer state を集約した sub-struct。
 /// `Option<PsqtState>` で gated。`w` shape は `(train_ft_in, num_buckets)` row-major
 /// (`w[feat * num_buckets + bucket]`)。factorizer 無効時は `train_ft_in == ft_in`。
 /// `m` / `v` は f32 固定 (PSQT weight 自体が小さく FP16 化の利得が小さいため)。
@@ -279,7 +280,7 @@ pub(crate) struct PsqtState {
 }
 
 impl PsqtState {
-    /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。Ranger state
+    /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。optimizer state
     /// は `m`/`v` = 0、`slow` = 0、`grad` = 0。`fold_len` が `Some(base_ft_in *
     /// num_buckets)` のとき forward 用 comb (`w_fold`) を確保する (factorizer 有効時)。
     fn new(
@@ -727,7 +728,7 @@ fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGro
 }
 
 impl GpuTrainer {
-    /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
+    /// CUDA context を作成し、kernel module を load、10 weight groups + optimizer state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
     ///
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
@@ -753,6 +754,7 @@ impl GpuTrainer {
         bucket_mode: BucketMode,
         precision: PrecisionFlags,
         feature_set: FeatureSetSpec,
+        optimizer: OptimizerKind,
         optim_groups: OptimGroupConfig,
         norm_loss_factor: Option<f32>,
         psqt_init: Option<&[f32]>,
@@ -891,7 +893,7 @@ impl GpuTrainer {
             threat_pair_starts_host.push(0);
         }
 
-        // Ranger Lookahead の slow weight は **0 初期化**。初回 lerp (`step % k == 0`)
+        // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
             stream: stream.clone(),
@@ -1005,6 +1007,7 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             bucket_mode,
+            optimizer,
             step_count: 0,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -1018,7 +1021,7 @@ impl GpuTrainer {
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
     ///
     /// Optimizer state reset:
-    /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
+    /// - `m`, `v`: 0 (fresh start、1st/2nd moment)
     /// - `slow`: **loaded weights と同値** (warm-start anchor。from-scratch path
     ///   (`GpuTrainer::new`) は `slow = 0` だが、`--init-from` は量子化済 NNUE の
     ///   continue-training/fine-tuning で optimizer state を持たない。`slow = 0`
@@ -1031,10 +1034,10 @@ impl GpuTrainer {
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
     /// 注: `step_count = 0` 状態で `step()` を呼ぶと `self.step_count += 1` → 1 に
-    /// なってから `radam_compute_step_size_denom(1, BETA1, BETA2, N_SMA_THRESHOLD)`
-    /// を呼ぶ。`radam_compute_step_size_denom` は step >= 1 で安全動作 (step=0 では
-    /// `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` になる)。本実装は
-    /// step=0 で呼ばないため OK。
+    /// なってから `OptimizerKind::step_size_denom(1, ..)` を呼ぶ。rectified
+    /// schedule (`radam_compute_step_size_denom`) は step >= 1 で安全動作
+    /// (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` になる)。
+    /// 本実装は step=0 で呼ばないため OK。
     pub(crate) fn load_layerstack_weights(
         &mut self,
         w: &LayerStackWeights,
@@ -1168,6 +1171,13 @@ impl GpuTrainer {
         }
         self.step_count = 0;
         Ok(())
+    }
+
+    /// `l3_b` の 1st moment を host へ download する (optimizer 配線検証テスト用。
+    /// 出力 bias は loss 勾配が直接届き、smoke バッチでも underflow しない)。
+    #[cfg(test)]
+    pub(crate) fn l3_b_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l3_b_m.to_host_vec(&self.stream).map_err(Into::into)
     }
 
     /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
@@ -1316,9 +1326,9 @@ impl GpuTrainer {
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_layerstack_weights` → `save_quantised`)
     /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
-    /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
-    /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
-    /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
+    /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}`
+    /// (1st/2nd moment + lookahead slow weight、`grad` は resume に不要なので含めない) +
+    /// `step_count` (optimizer step counter) + 完了 `superbatch` 番号を書き出す。
     ///
     /// file layout と atomic 書き出しは [`save_raw_checkpoint_file`] が担い、本 method
     /// は arch identity と group 列 ([`Self::raw_ckpt_group_sources`]、PSQT 無し 10 /
@@ -1581,7 +1591,7 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// 1 batch 分の forward → loss kernel → backward → Ranger step を実行。
+    /// 1 batch 分の forward → loss kernel → backward → optimizer step を実行。
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
     ///
     /// 実体は [`GpuTrainer::step_impl`]。本 method は `NNUE_TRAIN_STEP_PROFILE`
@@ -3687,10 +3697,15 @@ impl GpuTrainer {
             };
         }
 
-        // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
+        // ===== OPTIMIZER STEP =====
+        // 3 種 (ranger / radam / adamw) とも element 更新は同じ radam_step kernel。
+        // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
+        // 有無だけで表現する ([`OptimizerKind`])。
         self.step_count += 1;
         let (step_size, denom) =
-            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+            self.optimizer
+                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let beta1 = self.optimizer.beta1();
         // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
         // `&mut self.*` を保持するので、loop 内で `self.optim_groups` を参照すると
         // borrow が衝突する。先に局所へ退避して resolve に使う。
@@ -3723,7 +3738,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                         }
                     }?;
@@ -3736,7 +3751,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                         }
                     }?;
@@ -3753,7 +3768,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                         }
                     }?;
                 } else {
@@ -3764,7 +3779,7 @@ impl GpuTrainer {
                             kernel: radam_step,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, BETA1, BETA2,
+                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, BETA2,
                                    EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                         }
                     }?;
@@ -3930,16 +3945,16 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module, config: cfg_1d(g.n),
                     args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
                            slice_mut(*g.grad), lr_g, step_size, denom, wd,
-                           BETA1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
+                           beta1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
                 }
             }?;
         }
 
-        // Lookahead lerp every K steps。lerp は radam の後に FT weight を再度書き換える
-        // ので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新 variant を使い、
-        // forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer 有効時は
-        // radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
-        if self.step_count.is_multiple_of(RANGER_K) {
+        // Lookahead lerp every K steps (ranger のみ)。lerp は radam の後に FT weight を
+        // 再度書き換えるので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新
+        // variant を使い、forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer
+        // 有効時は radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
+        if self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K) {
             if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は

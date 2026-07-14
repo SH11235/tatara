@@ -2,6 +2,7 @@ use gpu_runtime::CudaContext;
 use nnue_format::LayerStackWeights;
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{LayerStackInit, SimpleInit};
+use nnue_train::optimizer::OptimizerKind;
 use shogi_features::FeatureSet;
 
 use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*};
@@ -32,6 +33,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -74,6 +76,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id_screlu,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -144,6 +147,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -173,6 +177,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -209,6 +214,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id_pairwise,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -250,6 +256,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id_pairwise,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
         smoke_fv_scale,
@@ -289,6 +296,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             &ctx,
             SMOKE_BATCH,
             id_fp16,
+            OptimizerKind::Ranger,
             smoke_weight_decay,
             None,
             smoke_fv_scale,
@@ -357,6 +365,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         nnue_train::dataloader::BucketMode::Progress8KpAbs,
         PrecisionFlags::default(),
         feature_set,
+        OptimizerKind::Ranger,
         // smoke は per-group override 無し (全 group weight_decay=0 / lr_mult=1.0)。
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
