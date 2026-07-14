@@ -25,6 +25,10 @@ struct Args {
     /// YaneuraOu nn.bin
     #[arg(long)]
     output: PathBuf,
+    /// Assert that the input was trained with `--bucket-mode kingrank9`.
+    /// Quantised `.bin` files do not record their bucket routing mode.
+    #[arg(long)]
+    assume_kingrank9: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
+    require_kingrank9_assertion(args.assume_kingrank9)?;
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
@@ -49,6 +54,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = BufWriter::new(output);
     write_yo(&mut writer, &weights)?;
     writer.flush()?;
+    Ok(())
+}
+
+fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
+    if !assume_kingrank9 {
+        return invalid_input(
+            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9",
+        );
+    }
     Ok(())
 }
 
@@ -312,5 +326,13 @@ mod tests {
         let error = reject_trailing_data(&mut &b"x"[..]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         reject_trailing_data(&mut &b""[..]).unwrap();
+    }
+
+    #[test]
+    fn kingrank9_requires_an_explicit_assertion() {
+        let error = require_kingrank9_assertion(false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--assume-kingrank9"));
+        require_kingrank9_assertion(true).unwrap();
     }
 }
