@@ -87,6 +87,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.ja.md) 参照) |
 | `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
 | `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp / --wrm-nnue2score` で収束する。`layerstack` では任意 (未指定なら plain sigmoid-MSE)。`simple` トレーナは必須で、さらに `--scale = --wrm-nnue2score` が必要 (`--scale` が export の `fv_scale` を決めるため)。上の例は両方を 290 とし、`FV_SCALE=28` になる。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
+| `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99) / `radam` (lookahead なしの rectified Adam, beta1=0.9) / `adamw` (bias correction なしの Adam, beta1=0.9) から選ぶ。raw `.ckpt` からの `--resume` 時は元 run と同じ値を渡す |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
@@ -116,7 +117,7 @@ validation を有効化する。勾配更新に一切使わない局面を毎 su
 
 ## 学習中断・再開
 
-raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在の
+raw `.ckpt` は **weight + optimizer state (m / v / slow / step) + 現在の
 superbatch 番号** を全部保存する。電源断や GPU エラーで止まっても完全に再開
 できる。学習時と同じ option + アーキ サブコマンドに `--resume` を足す:
 

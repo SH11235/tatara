@@ -17,7 +17,8 @@
 //! - `dataloader`: PSV file → HalfKA_hm sparse batch + prefetch
 //!   (`Batch { stm_indices, nstm_indices, nnz, score, wdl, per_pos_norm, n_positions }`、
 //!   `PsvFileLoader` / `PrefetchedLoader` / `BucketedPrefetchedLoader`)
-//! - `optimizer`: `RangerParams` (Ranger optimizer のハイパーパラメータ) と
+//! - `optimizer`: `OptimizerKind` (ranger / radam / adamw の選択と per-step
+//!   scalar の解決)、`RangerParams` (ハイパーパラメータ)、
 //!   `radam_compute_step_size_denom` (GPU `radam_step` kernel に渡す値の host 側
 //!   事前計算 helper)
 //! - `trainer`: superbatch training loop driver (`TrainerBackend` trait +

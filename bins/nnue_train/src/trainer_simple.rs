@@ -3,7 +3,7 @@ use std::path::Path;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{self, SimpleInit, WeightShape};
-use nnue_train::optimizer::radam_compute_step_size_denom;
+use nnue_train::optimizer::OptimizerKind;
 use nnue_train::trainer::LossKind;
 
 use crate::ft_factorize_host::{self, FoldComb};
@@ -355,9 +355,11 @@ pub(crate) struct SimpleGpuTrainer {
     input_ring: InputUploadRing,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
-    /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
+    /// optimizer step counter。ranger では `RANGER_K` の倍数で lookahead lerp する。
     step_count: u64,
-    /// Ranger optimizer の weight decay 係数 (`radam_step` 引数)。
+    /// optimizer 種別 (per-step scalar / beta1 / lookahead 有無を決める)。
+    optimizer: OptimizerKind,
+    /// weight decay 係数 (`radam_step` 引数)。
     weight_decay: f32,
     /// oblique manifold norm-loss 正則化の係数 (`--norm-loss` opt-in、無効時 `None`)。
     /// `Some(f)` の間 radam step の直前に各 weight group を
@@ -388,6 +390,7 @@ impl SimpleGpuTrainer {
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
+        optimizer: OptimizerKind,
         weight_decay: f32,
         norm_loss_factor: Option<f32>,
         fv_scale: i32,
@@ -573,6 +576,7 @@ impl SimpleGpuTrainer {
             dense_bias_grad_occ,
             id,
             step_count: 0,
+            optimizer,
             weight_decay,
             norm_loss_factor,
             norm_scratch,
@@ -2311,13 +2315,18 @@ impl SimpleGpuTrainer {
         Ok(())
     }
 
-    /// Ranger optimizer step (RAdam + Lookahead) を 8 weight group に走らせる。
-    /// `RANGER_K` の倍数 step では lookahead lerp を続けて走らせ slow weight と
-    /// master weight を補間する。`run_backward_kernels` の直後に呼ぶ。
+    /// optimizer step を 8 weight group に走らせる。3 種 (ranger / radam / adamw)
+    /// とも element 更新は同じ radam_step kernel で、per-step scalar
+    /// (`step_size`, `denom`) と `beta1`、lookahead lerp の有無だけが異なる
+    /// ([`OptimizerKind`])。ranger では `RANGER_K` の倍数 step で lookahead lerp を
+    /// 続けて走らせ slow weight と master weight を補間する。
+    /// `run_backward_kernels` の直後に呼ぶ。
     pub(crate) fn run_optimizer_step(&mut self, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.step_count += 1;
         let (step_size, denom) =
-            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+            self.optimizer
+                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let beta1 = self.optimizer.beta1();
 
         let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
@@ -2412,7 +2421,7 @@ impl SimpleGpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                                   self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                         }
                     }?;
@@ -2425,7 +2434,7 @@ impl SimpleGpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), lr, step_size, denom,
-                                   self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                         }
                     }?;
@@ -2442,7 +2451,7 @@ impl SimpleGpuTrainer {
                             config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                                   self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                         }
                     }?;
                 } else {
@@ -2454,7 +2463,7 @@ impl SimpleGpuTrainer {
                             config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
-                                   BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                                   beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                         }
                     }?;
                 }
@@ -2471,7 +2480,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
                 args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
                        slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
+                       beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
             }
         }?;
         unsafe {
@@ -2481,7 +2490,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
                 args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
                        slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
             }
         }?;
         unsafe {
@@ -2491,7 +2500,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
                 args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
                        slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
             }
         }?;
         unsafe {
@@ -2501,7 +2510,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
                 args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
                        slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
             }
         }?;
         unsafe {
@@ -2511,7 +2520,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
                 args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
                        slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
             }
         }?;
         unsafe {
@@ -2521,7 +2530,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
                 args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
                        slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
             }
         }?;
         unsafe {
@@ -2531,11 +2540,11 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
                 args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
                        slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay,
-                       BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
+                       beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
             }
         }?;
 
-        if self.step_count.is_multiple_of(RANGER_K) {
+        if self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K) {
             // ft_w lookahead lerp: lerp は radam の後に ft_w を再度書き換えるので、
             // `ft_fp16` 時は mirror 同時更新版で `ft_w_h` を lerp 後の最終値に同期する。
             // factorizer 有効時は mirror variant を使わず (comb は base 形状で train 形状の

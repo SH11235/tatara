@@ -306,7 +306,12 @@ pub(crate) struct Cli {
     /// Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 0.5, global = true)]
     pub(crate) loss_weight_boost_w2: f32,
-    /// Optimizer name (only "ranger" is implemented).
+    /// Optimizer: "ranger" (RAdam + lookahead, beta1=0.99), "radam" (rectified
+    /// Adam without lookahead, beta1=0.9), or "adamw" (Adam without bias
+    /// correction, decoupled weight decay, beta1=0.9). All three share
+    /// beta2=0.999 and the per-layer weight clamp. When resuming from a raw
+    /// checkpoint, pass the same optimizer as the original run (the checkpoint
+    /// stores moment buffers but not the optimizer name).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
     /// Weight decay coefficient for the Ranger optimizer (AdamW-style decoupled

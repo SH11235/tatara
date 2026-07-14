@@ -13,6 +13,8 @@ use nnue_train::dataloader::BucketMode;
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::optimizer::OptimizerKind;
 #[cfg(feature = "gpu")]
 use nnue_train::schedule::WdlScheduler;
 #[cfg(any(feature = "gpu", test))]
@@ -105,6 +107,7 @@ struct SharedPrecisionFlags {
 struct SharedCliValidation {
     feature_set: FeatureSetSpec,
     precision: SharedPrecisionFlags,
+    optimizer: OptimizerKind,
 }
 
 #[cfg(feature = "gpu")]
@@ -203,13 +206,12 @@ fn validate_shared_cli(
         })?
         .spec();
 
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
+    let optimizer = OptimizerKind::parse(&cli.optimizer).ok_or_else(|| {
+        format!(
+            "--optimizer '{}' is not a known optimizer (expected one of: ranger, radam, adamw)",
             cli.optimizer
         )
-        .into());
-    }
+    })?;
     // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
     if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
         return Err(
@@ -257,6 +259,7 @@ fn validate_shared_cli(
 
     Ok(SharedCliValidation {
         feature_set,
+        optimizer,
         precision: SharedPrecisionFlags {
             ft_fp16: cli.ft_fp16 || cli.all_optim,
             ft_fp16_out: ft_fp16_out_raw || cli.all_optim,
@@ -479,6 +482,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
+    println!("[train] optimizer: {}", shared.optimizer.name());
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保。
     let SharedPrecisionFlags {
@@ -594,6 +598,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             fp16_opt_state,
         },
         feature_set,
+        shared.optimizer,
         optim_groups,
         norm_loss_factor,
         psqt_init_vec.as_deref(),
@@ -1397,7 +1402,7 @@ pub(crate) fn build_experiment_logger(
         l1: layerstack.l1,
         l2: layerstack.l2,
         num_buckets: Some(layerstack.num_buckets),
-        optimizer: cli.optimizer.clone(),
+        optimizer: cli.optimizer.to_ascii_lowercase(),
         bucket_mode: Some(layerstack.bucket_mode.clone()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
@@ -1559,7 +1564,7 @@ pub(crate) fn build_experiment_logger_simple(
         l1: id.l1_out,
         l2: id.l2_out,
         num_buckets: None,
-        optimizer: cli.optimizer.clone(),
+        optimizer: cli.optimizer.to_ascii_lowercase(),
         bucket_mode: None,
         activation: Some(id.activation.canonical_name().to_string()),
         progress_coeff: None,
@@ -1793,6 +1798,7 @@ pub(crate) fn run_simple_training(
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
+    println!("[train] optimizer: {}", shared.optimizer.name());
     // 推論側 evaluation scale。FT 活性化出力は活性化に依らず 127-scale のため
     // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
     // は前段で有限・正値を保証済。
@@ -1826,6 +1832,7 @@ pub(crate) fn run_simple_training(
         &ctx,
         cli.batch_size,
         id,
+        shared.optimizer,
         cli.weight_decay,
         norm_loss_factor,
         fv_scale,
@@ -1986,7 +1993,7 @@ mod shared_cli_tests {
         );
         assert!(
             shared_cli_error(&["--optimizer", "adam"], false)
-                .contains("--optimizer 'adam' is not implemented")
+                .contains("--optimizer 'adam' is not a known optimizer")
         );
         assert!(shared_cli_error(&["--lr", "0"], false).contains("--lr must be finite and > 0"));
         assert!(
@@ -2009,6 +2016,20 @@ mod shared_cli_tests {
             shared_cli_error(&["--keep-checkpoints", "0"], false)
                 .contains("--keep-checkpoints must be >= 1 when set")
         );
+    }
+
+    #[test]
+    fn shared_cli_validation_resolves_optimizer_kind() {
+        for (arg, expected) in [
+            ("ranger", OptimizerKind::Ranger),
+            ("radam", OptimizerKind::RAdam),
+            ("adamw", OptimizerKind::AdamW),
+            ("AdamW", OptimizerKind::AdamW),
+        ] {
+            let shared = validate_shared_cli(&parse(&["--optimizer", arg]), false, false)
+                .expect("valid shared CLI");
+            assert_eq!(shared.optimizer, expected, "--optimizer {arg}");
+        }
     }
 
     #[test]

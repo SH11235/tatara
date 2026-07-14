@@ -6,7 +6,7 @@ use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::BucketMode;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
-use nnue_train::optimizer::radam_compute_step_size_denom;
+use nnue_train::optimizer::OptimizerKind;
 use nnue_train::trainer::LossKind;
 use shogi_features::FeatureSetSpec;
 
@@ -257,6 +257,7 @@ pub(crate) struct GpuTrainer {
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
     bucket_mode: BucketMode,
+    optimizer: OptimizerKind,
     step_count: u64,
 }
 
@@ -753,6 +754,7 @@ impl GpuTrainer {
         bucket_mode: BucketMode,
         precision: PrecisionFlags,
         feature_set: FeatureSetSpec,
+        optimizer: OptimizerKind,
         optim_groups: OptimGroupConfig,
         norm_loss_factor: Option<f32>,
         psqt_init: Option<&[f32]>,
@@ -1005,6 +1007,7 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             bucket_mode,
+            optimizer,
             step_count: 0,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -1031,10 +1034,10 @@ impl GpuTrainer {
     /// - `step_count`: 0 (1-indexed、次 step は 1)
     ///
     /// 注: `step_count = 0` 状態で `step()` を呼ぶと `self.step_count += 1` → 1 に
-    /// なってから `radam_compute_step_size_denom(1, BETA1, BETA2, N_SMA_THRESHOLD)`
-    /// を呼ぶ。`radam_compute_step_size_denom` は step >= 1 で安全動作 (step=0 では
-    /// `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` になる)。本実装は
-    /// step=0 で呼ばないため OK。
+    /// なってから `OptimizerKind::step_size_denom(1, ..)` を呼ぶ。rectified
+    /// schedule (`radam_compute_step_size_denom`) は step >= 1 で安全動作
+    /// (step=0 では `beta^0 = 1` → `bc1 = 0` で `step_size = 1/0 = inf` になる)。
+    /// 本実装は step=0 で呼ばないため OK。
     pub(crate) fn load_layerstack_weights(
         &mut self,
         w: &LayerStackWeights,
@@ -3687,10 +3690,15 @@ impl GpuTrainer {
             };
         }
 
-        // ===== OPTIMIZER STEP (Ranger = RAdam + Lookahead) =====
+        // ===== OPTIMIZER STEP =====
+        // 3 種 (ranger / radam / adamw) とも element 更新は同じ radam_step kernel。
+        // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
+        // 有無だけで表現する ([`OptimizerKind`])。
         self.step_count += 1;
         let (step_size, denom) =
-            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+            self.optimizer
+                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let beta1 = self.optimizer.beta1();
         // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
         // `&mut self.*` を保持するので、loop 内で `self.optim_groups` を参照すると
         // borrow が衝突する。先に局所へ退避して resolve に使う。
@@ -3723,7 +3731,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                         }
                     }?;
@@ -3736,7 +3744,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                         }
                     }?;
@@ -3753,7 +3761,7 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                         }
                     }?;
                 } else {
@@ -3764,7 +3772,7 @@ impl GpuTrainer {
                             kernel: radam_step,
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, BETA1, BETA2,
+                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, BETA2,
                                    EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                         }
                     }?;
@@ -3930,16 +3938,16 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module, config: cfg_1d(g.n),
                     args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
                            slice_mut(*g.grad), lr_g, step_size, denom, wd,
-                           BETA1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
+                           beta1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
                 }
             }?;
         }
 
-        // Lookahead lerp every K steps。lerp は radam の後に FT weight を再度書き換える
-        // ので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新 variant を使い、
-        // forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer 有効時は
-        // radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
-        if self.step_count.is_multiple_of(RANGER_K) {
+        // Lookahead lerp every K steps (ranger のみ)。lerp は radam の後に FT weight を
+        // 再度書き換えるので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新
+        // variant を使い、forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer
+        // 有効時は radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
+        if self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K) {
             if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は

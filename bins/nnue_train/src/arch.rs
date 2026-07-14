@@ -108,6 +108,9 @@ mod gpu {
     // を single source of truth として参照する。
     pub(crate) const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
         nnue_train::optimizer::RangerParams::DEFAULT;
+    /// ranger の beta1。本番経路は `OptimizerKind::beta1()` が種別ごとに解決する
+    /// ため、この const は ranger 既定値で kernel を叩く同等性テスト専用。
+    #[cfg(test)]
     pub(crate) const BETA1: f32 = RANGER_DEFAULTS.beta1;
     pub(crate) const BETA2: f32 = RANGER_DEFAULTS.beta2;
     pub(crate) const EPS: f32 = RANGER_DEFAULTS.eps;

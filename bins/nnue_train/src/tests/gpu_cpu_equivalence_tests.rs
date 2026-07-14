@@ -51,6 +51,7 @@ use gpu_kernels::sparse::ft_factorize::{
 };
 use gpu_kernels::sparse::sparse_ft_backward::sparse_ft_backward_cpu;
 use gpu_kernels::sparse::sparse_ft_forward::sparse_ft_forward_cpu;
+use nnue_train::optimizer::OptimizerKind;
 
 /// forward / gradient の f32 tolerance。atomic reduce (`fetch_add`) で加算順序が
 /// GPU↔CPU で異なる出力向け (`assert_close_rel`)。順序差は和の項数に比例し得るため
@@ -1064,6 +1065,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 &ctx,
                 SMOKE_BATCH,
                 id,
+                OptimizerKind::Ranger,
                 1e-7,
                 None,
                 16,
@@ -5806,6 +5808,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             nnue_train::dataloader::BucketMode::Progress8KpAbs,
             PrecisionFlags::default(),
             feature_set,
+            OptimizerKind::Ranger,
             OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
             None,
             psqt_init.as_deref(),
@@ -5955,6 +5958,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 &ctx,
                 SMOKE_BATCH,
                 base_id,
+                OptimizerKind::Ranger,
                 1e-7,
                 None,
                 16,
@@ -5971,8 +5975,17 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 feature_set: fac_spec,
                 ..base_id
             };
-            let mut trainer =
-                SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, 1e-7, None, 16, precision, &init)?;
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                OptimizerKind::Ranger,
+                1e-7,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
             trainer.sync_ft_forward_weights()?;
 
             // ft_w master は train 形状 (実行 + 仮想行)。
@@ -6063,6 +6076,7 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
             &ctx,
             SMOKE_BATCH,
             id,
+            OptimizerKind::Ranger,
             1e-7,
             None,
             16,
@@ -6124,6 +6138,7 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         0.0,
         Some(factor),
         16,
@@ -6160,6 +6175,7 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         0.0,
         Some(0.0),
         16,
