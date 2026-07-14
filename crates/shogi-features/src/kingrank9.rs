@@ -73,21 +73,21 @@ mod tests {
     #[test]
     fn oracle_fixtures_match_yaneuraou_kingrank9() {
         let fixtures = [
-            // 先手玉 5i: kF=6、後手玉 5a を反転: kE=2。
+            // 先手玉 5i (rank=8) → kF=6、後手玉 5a を反転 (rank=8) → kE=2。
             (
                 "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
                 8,
             ),
-            // 後手玉 5b を反転: kF=6、先手玉 5h: kE=2。
+            // 後手玉 5b を反転 (rank=7) → kF=6、先手玉 5h (rank=7) → kE=2。
             (
                 "lnsg1gsnl/1r2k2b1/ppppppppp/9/9/9/PPPPPPPPP/1B2K2R1/LNSG1GSNL w - 1",
                 8,
             ),
-            // 先手玉 5c: kF=0、後手玉 5g を反転して 5c: kE=0。
+            // 先手玉 5c (rank=2) → kF=0、後手玉 5g を反転 (rank=2) → kE=0。
             ("9/9/4K4/9/9/9/4k4/9/9 b - 1", 0),
-            // 先手玉 5d: kF=3、後手玉 5e を反転して 5e: kE=1。
+            // 先手玉 5d (rank=3) → kF=3、後手玉 5e を反転 (rank=4) → kE=1。
             ("9/9/9/4K4/4k4/9/9/9/9 b - 1", 4),
-            // 後手玉 5a を反転: kF=6、先手玉 5i: kE=2。
+            // 後手玉 5a を反転 (rank=8) → kF=6、先手玉 5i (rank=8) → kE=2。
             (
                 "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1",
                 8,
