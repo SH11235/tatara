@@ -485,9 +485,63 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
     pub(crate) init_l3: Option<nnue_train::init::LayerInitOverride>,
 
+    /// FT factorizer (training-time virtual features). **Default ON.** Pass
+    /// `--no-ft-factorize` to disable. Supported by both the `layerstack` and
+    /// `simple` trainers.
+    ///
+    /// The FT weight table gains virtual piece-input rows for piece values independent
+    /// of the king position. Each virtual row accumulates the gradients of
+    /// every real row sharing its piece-input ordinal, so rarely visited king-square
+    /// cells inherit a sensible shared prior instead of staying near their
+    /// initial values. The virtual rows are folded into the real rows when the
+    /// quantised `.bin` is saved, so
+    /// the exported net is identical in shape to a non-factorized net and
+    /// inference engines need no changes.
+    ///
+    /// The sparse input stream is unchanged (the active-feature count stays
+    /// the base value); virtual rows are wired through two dense kernels per
+    /// optimizer step (a forward weight fold and a backward gradient
+    /// reduction), costing a single-digit percentage of training throughput
+    /// and zero inference cost.
+    ///
+    /// This flag is accepted for explicitness/back-compat but is redundant
+    /// with the default. `--psqt` (layerstack) and `--init-from` automatically
+    /// disable the factorizer (logged at startup): the separate PSQT shortcut
+    /// block has no virtual-row fold yet, and a quantised `.bin` has no virtual
+    /// rows to initialise from. Resume across the resulting on/off is rejected
+    /// (checkpoint dimensions differ).
+    #[arg(
+        long = "ft-factorize",
+        global = true,
+        overrides_with = "no_ft_factorize"
+    )]
+    pub(crate) ft_factorize: bool,
+
+    /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
+    /// Use this to train the non-factorized network. (The factorizer coexists
+    /// with `--threat-profile`; `--psqt` and `--init-from` auto-disable it.)
+    #[arg(
+        long = "no-ft-factorize",
+        global = true,
+        overrides_with = "ft_factorize"
+    )]
+    pub(crate) no_ft_factorize: bool,
+
     /// Subcommand selecting the NNUE architecture to train (`layerstack` / `simple`).
     #[command(subcommand)]
     pub(crate) arch: ArchCommand,
+}
+
+impl Cli {
+    /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
+    /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
+    /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は呼び出し側
+    /// (`run_training` / `run_simple_training`) が auto-suppress で解決するため、
+    /// ここには含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn ft_factorize_enabled(&self) -> bool {
+        !self.no_ft_factorize
+    }
 }
 
 /// `--lr-schedule` の選択肢。lib 側 schedule 型への runtime selection。
@@ -657,40 +711,6 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
     pub(crate) psqt_init: PsqtInit,
 
-    /// FT factorizer (training-time virtual features). **Default ON.** Pass
-    /// `--no-ft-factorize` to disable.
-    ///
-    /// The FT weight table gains virtual piece-input rows for piece values independent
-    /// of the king position. Each virtual row accumulates the gradients of
-    /// every real row sharing its piece-input ordinal, so rarely visited king-square
-    /// cells inherit a sensible shared prior instead of staying near their
-    /// initial values. The virtual rows are folded into the real rows when the
-    /// quantised `.bin` is saved, so
-    /// the exported net is identical in shape to a non-factorized net and
-    /// inference engines need no changes.
-    ///
-    /// The sparse input stream is unchanged (the active-feature count stays
-    /// the base value); virtual rows are wired through two dense kernels per
-    /// optimizer step (a forward weight fold and a backward gradient
-    /// reduction), costing a single-digit percentage of training throughput
-    /// and zero inference cost.
-    ///
-    /// This flag is accepted for explicitness/back-compat but is redundant
-    /// with the default. `--psqt` and `--init-from` automatically disable the
-    /// factorizer (logged at startup): the separate PSQT shortcut block has no
-    /// virtual-row fold yet, and a quantised `.bin` has no virtual rows to
-    /// initialise from. Resume across the resulting on/off is rejected
-    /// (checkpoint dimensions differ).
-    #[arg(long = "ft-factorize", overrides_with = "no_ft_factorize")]
-    pub(crate) ft_factorize: bool,
-
-    /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
-    /// Use this to train the non-factorized network. (The factorizer now
-    /// coexists with `--threat-profile`; `--psqt` and `--init-from` auto-disable
-    /// it.)
-    #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
-    pub(crate) no_ft_factorize: bool,
-
     /// effect bucket FT factorizer sharing mode. `pool-buckets` shares one virtual row
     /// for each piece across effect buckets; `per-bucket` keeps effect buckets
     /// separate.
@@ -723,18 +743,6 @@ pub(crate) struct LayerstackArgs {
     /// `--threat-profile` and `--psqt`.
     #[arg(long = "effect-bucket", default_value = "off")]
     pub(crate) effect_bucket_config: String,
-}
-
-impl LayerstackArgs {
-    /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
-    /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
-    /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は
-    /// 呼び出し側 (`run_training`) が auto-suppress で解決するため、ここには
-    /// 含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
-    #[cfg(any(feature = "gpu", test))]
-    pub(crate) fn ft_factorize_enabled(&self) -> bool {
-        !self.no_ft_factorize
-    }
 }
 
 /// PSQT shortcut の初期化方式。

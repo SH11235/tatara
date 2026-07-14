@@ -5883,3 +5883,186 @@ fn layerstack_raw_ckpt_roundtrips_without_psqt() -> Result<(), Box<dyn std::erro
 fn layerstack_raw_ckpt_roundtrips_with_psqt() -> Result<(), Box<dyn std::error::Error>> {
     layerstack_raw_ckpt_roundtrip(true)
 }
+
+/// Simple トレーナ + FT factorizer の end-to-end 配線を確認する。factorizer 有効時に
+/// (1) FT master が train 形状 (実行 + piece-input 仮想行) で確保される、(2) backward の
+/// reduce が仮想行 grad を埋め optimizer が仮想行を更新する (仮想行が非ゼロになる)、
+/// (3) step / weight が finite、(4) 量子化 export は仮想行を実行へ畳み込んで base 形状に
+/// なり id から factorizer modifier が外れ、非 factorize 網と同一 byte 長になる、を
+/// FP32 / `--ft-fp16(-out)` 経路で網羅する。
+#[test]
+fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let base_spec = FeatureSet::HalfKaHmMerged.spec();
+    let ft_out = 256_usize;
+    let base_id = SimpleId {
+        feature_set: base_spec,
+        activation: SimpleActivation::CReLU,
+        ft_out,
+        l1_out: 32,
+        l2_out: 32,
+    };
+
+    // 非 factorize 網の量子化 byte 長 (export 同形の基準)。
+    let base_bytes_len = {
+        let trainer = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            base_id,
+            1e-7,
+            16,
+            PrecisionFlags::default(),
+            &init,
+        )?;
+        let mut bytes = Vec::new();
+        trainer.to_simple_weights()?.save_quantised(&mut bytes)?;
+        bytes.len()
+    };
+
+    let fac_spec = base_spec.with_ft_factorize();
+    assert!(fac_spec.ft_factorize());
+    assert!(
+        fac_spec.train_ft_in() > fac_spec.ft_in(),
+        "factorize train_ft_in must exceed base ft_in"
+    );
+
+    for &(ft_fp16, ft_fp16_out) in &[(false, false), (true, false), (true, true)] {
+        let id = SimpleId {
+            feature_set: fac_spec,
+            ..base_id
+        };
+        let mut trainer = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id,
+            1e-7,
+            16,
+            PrecisionFlags {
+                ft_fp16,
+                ft_fp16_out,
+                fp16_opt_state: false,
+                tf32: false,
+            },
+            &init,
+        )?;
+        trainer.sync_ft_forward_weights()?;
+
+        // ft_w master は train 形状 (実行 + 仮想行)。
+        let ft_w_n = fac_spec.train_ft_in() * ft_out;
+        assert_eq!(
+            trainer.ft_w_to_host()?.len(),
+            ft_w_n,
+            "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: ft_w must be train-shaped"
+        );
+
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+        for s in batch.score.iter_mut() {
+            *s = 200.0;
+        }
+        for w in batch.wdl.iter_mut() {
+            *w = 0.8;
+        }
+        for _ in 0..8 {
+            let loss = trainer.step(&batch.as_ref(), 1e-1, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(
+                loss.is_finite(),
+                "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: loss {loss} not finite"
+            );
+        }
+        trainer.assert_all_weights_finite()?;
+
+        // reduce + optimizer が仮想行を更新している (train block 末尾が非ゼロ)。
+        let ft_w_host = trainer.ft_w_to_host()?;
+        let virtual_block = &ft_w_host[fac_spec.ft_in() * ft_out..];
+        assert!(
+            virtual_block.iter().any(|&x| x != 0.0),
+            "ft_fp16={ft_fp16} ft_fp16_out={ft_fp16_out}: virtual rows stayed zero (reduce/optimizer not wired)"
+        );
+
+        // export: 仮想行 fold 後の base 形状 + factorizer modifier を外した id、
+        // 量子化 byte 長は非 factorize 網と同形。
+        let weights = trainer.to_simple_weights()?;
+        assert!(
+            !weights.id.feature_set.ft_factorize(),
+            "exported id must drop the factorizer modifier"
+        );
+        assert_eq!(
+            weights.ft_w.len(),
+            fac_spec.ft_in() * ft_out,
+            "exported ft_w must be base-shaped"
+        );
+        let mut bytes = Vec::new();
+        weights.save_quantised(&mut bytes)?;
+        assert_eq!(
+            bytes.len(),
+            base_bytes_len,
+            "factorized export must be byte-identical in shape to a non-factorized net"
+        );
+        // base id で reload できる (推論側は factorizer を観測しない)。
+        SimpleWeights::load(&mut std::io::Cursor::new(&bytes), base_id)?;
+    }
+    Ok(())
+}
+
+/// raw checkpoint の resume は factorizer の on/off 不一致を reject する (header の
+/// ft_factorize flag / train_ft_in が異なるため)。Simple でも [`ckpt`] の照合が効くことを
+/// 両方向で確認する。
+#[test]
+fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let base_id = SimpleId {
+        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let fac_id = SimpleId {
+        feature_set: base_id.feature_set.with_ft_factorize(),
+        ..base_id
+    };
+    let mk = |id: SimpleId| -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
+        SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id,
+            1e-7,
+            16,
+            PrecisionFlags::default(),
+            &init,
+        )
+    };
+
+    let dir = std::env::temp_dir();
+    let fac_path = dir.join(format!("simple-fac-{}.ckpt", std::process::id()));
+    let base_path = dir.join(format!("simple-base-{}.ckpt", std::process::id()));
+    mk(fac_id)?.save_raw_checkpoint(&fac_path, 1, "t", None)?;
+    mk(base_id)?.save_raw_checkpoint(&base_path, 1, "t", None)?;
+
+    // factorize checkpoint を非 factorize trainer に load → reject。
+    assert!(
+        mk(base_id)?.load_raw_checkpoint(&fac_path).is_err(),
+        "loading a factorized checkpoint into a non-factorized trainer must be rejected"
+    );
+    // 非 factorize checkpoint を factorize trainer に load → reject。
+    assert!(
+        mk(fac_id)?.load_raw_checkpoint(&base_path).is_err(),
+        "loading a non-factorized checkpoint into a factorized trainer must be rejected"
+    );
+
+    let _ = std::fs::remove_file(&fac_path);
+    let _ = std::fs::remove_file(&base_path);
+    Ok(())
+}

@@ -1,34 +1,17 @@
 use std::path::Path;
 
-use gpu_kernels::sparse::ft_factorize::{
-    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
-};
+use gpu_kernels::sparse::ft_factorize::FT_FACTORIZE_BASE;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::LossKind;
-use shogi_features::{FeatureSetSpec, FtFactorizeMode};
+use shogi_features::FeatureSetSpec;
 
+use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
-
-fn ft_factorize_kernel_mode(feature_set: &FeatureSetSpec) -> u32 {
-    match feature_set.ft_factorize_mode() {
-        FtFactorizeMode::Base => FT_FACTORIZE_BASE,
-        FtFactorizeMode::PoolEffectBuckets => FT_FACTORIZE_POOL_EFFECT_BUCKETS,
-        FtFactorizeMode::PerEffectBucket => FT_FACTORIZE_PER_EFFECT_BUCKET,
-    }
-}
-
-fn ft_factorize_kernel_pack(nb: usize, mode: u32) -> u32 {
-    (nb as u32) | (mode << 16)
-}
-
-fn ft_factorize_ft_bounds(base_ft_in: usize, ft_in: usize) -> u64 {
-    (base_ft_in as u64) | ((ft_in as u64) << 32)
-}
 
 struct StepContext<'a> {
     lr: f32,
@@ -1536,89 +1519,43 @@ impl GpuTrainer {
         // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
         // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
         assert!(self.feature_set.ft_factorize());
-        // `base_ft_in` = 仮想行を持つ base 実行の行数 (fold 対象)。
-        // `ft_in_total` = base + threat (= comb サイズ / piece-input 仮想行 の手前)。
-        // threat 無効時は両者一致。FT comb は base 行に piece-input 仮想行を畳み、
-        // threat 行に pair 仮想行を畳む。
-        let ft_in_total = self.feature_set.ft_in();
-        let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {
-            ft_in_total
+        // FT comb の再生成は LayerStack / Simple 共通の [`ft_factorize_host::launch_ft_fold`]
+        // に委ねる (base 行に piece-input 仮想行、threat 行に pair 仮想行を畳み base 形状の
+        // comb を上書き)。`--ft-fp16` 系列は f16 comb、既定 FP32 経路は f32 comb。
+        let comb = if self.ft_fp16 {
+            FoldComb::F16(
+                self.ft_w_h
+                    .as_mut()
+                    .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled"),
+            )
         } else {
-            self.feature_set.base_ft_in()
+            FoldComb::F32(
+                self.ft_w_fold32
+                    .as_mut()
+                    .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16"),
+            )
         };
-        let pi = self.feature_set.piece_inputs();
-        let nb = self
-            .feature_set
-            .effect_bucket_config()
-            .map_or(1, |cfg| cfg.nb);
-        let mode = ft_factorize_kernel_mode(&self.feature_set);
-        let fold_mode = ft_factorize_kernel_pack(nb, mode);
-        let ft_bounds = ft_factorize_ft_bounds(base_ft_in, ft_in_total);
-        // fold/reduce kernel は base 実行をpiece-input 仮想行 へ対応付ける。effect bucket では
-        // PoolEffectBuckets が `virtual_row = (feat/NB)%piece_inputs`、
-        // PerEffectBucket が `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB`
-        // を使う。base 行が piece-input ordinal で割り切れない feature set は仮想行の
-        // 対応が崩れるので release でも弾く (全 feature set で成立する不変条件)。
-        assert_eq!(
-            base_ft_in % pi,
-            0,
-            "base_ft_in must be a multiple of piece_inputs for the factorizer"
-        );
-        if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
-            assert_eq!(
-                base_ft_in % (pi * nb),
-                0,
-                "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
-            );
-        }
-        let n = ft_in_total * self.ws.ft_out;
-        if self.ft_fp16 {
-            let mut comb = self
-                .ft_w_h
-                .as_mut()
-                .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled");
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: ft_fold_virtual_f16,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), slice(self.threat_pair_starts),
-                           ft_bounds, self.ws.ft_out as u32,
-                           pi as u32, fold_mode]
-                }
-            }?;
-        } else {
-            let mut comb = self
-                .ft_w_fold32
-                .as_mut()
-                .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16");
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: ft_fold_virtual,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), slice(self.threat_pair_starts),
-                           ft_bounds, self.ws.ft_out as u32,
-                           pi as u32, fold_mode]
-                }
-            }?;
-        }
+        ft_factorize_host::launch_ft_fold(
+            &self.stream,
+            &self.module,
+            &self.feature_set,
+            self.ws.ft_out,
+            &self.ft_w,
+            comb,
+            &self.threat_pair_starts,
+        )?;
         // PSQT shortcut も factorizer 有効時は同じpiece-input 仮想行を持つ。FT と同じ
         // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
-        // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat と排他
-        // なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
+        // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat / effect
+        // bucket と排他なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
         if let Some(psqt) = self.psqt.as_mut() {
+            let base_ft_in = self.feature_set.base_ft_in();
+            let pi = self.feature_set.piece_inputs();
             let mut comb = psqt
                 .w_fold
                 .as_mut()
                 .expect("psqt.w_fold is Some when ft_factorize and psqt are enabled");
-            let psqt_bounds = ft_factorize_ft_bounds(base_ft_in, base_ft_in);
+            let psqt_bounds = ft_factorize_host::ft_bounds(base_ft_in, base_ft_in);
             let psqt_n = base_ft_in * self.num_buckets;
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -1630,7 +1567,7 @@ impl GpuTrainer {
                     config: cfg_1d(psqt_n),
                     args: [slice(psqt.w), slice_mut(comb), slice(self.empty_threat_pair_starts),
                            psqt_bounds, self.num_buckets as u32,
-                           pi as u32, ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)]
+                           pi as u32, ft_factorize_host::kernel_pack(1, FT_FACTORIZE_BASE)]
                 }
             }?;
         }
@@ -2697,8 +2634,8 @@ impl GpuTrainer {
                 let pi = self.feature_set.piece_inputs();
                 // PSQT は threat と排他なので psqt_w に threat 行は無く、縮約
                 // 範囲 = 仮想 offset = base_ft_in (= ft_in_u と一致)。
-                let base_ft_in = self.feature_set.base_ft_in() as u32;
-                let ft_bounds = ft_factorize_ft_bounds(base_ft_in as usize, base_ft_in as usize);
+                let base_ft_in = self.feature_set.base_ft_in();
+                let ft_bounds = ft_factorize_host::ft_bounds(base_ft_in, base_ft_in);
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。
@@ -2710,7 +2647,7 @@ impl GpuTrainer {
                             slice(psqt.w_grad),
                             slice(self.empty_threat_pair_starts),
                             ft_bounds, self.num_buckets as u32, pi as u32,
-                            ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)
+                            ft_factorize_host::kernel_pack(1, FT_FACTORIZE_BASE)
                         ]
                     }
                 }?;
@@ -3607,47 +3544,14 @@ impl GpuTrainer {
         // 同じ pair に属する threat 実行の勾配和で埋める。stm / nstm 両方の gather が
         // 実 block を確定させた後に 1 launch で仮想 block を埋める。
         if self.feature_set.ft_factorize() {
-            let pi = self.feature_set.piece_inputs();
-            let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {
-                ft_in
-            } else {
-                self.feature_set.base_ft_in()
-            };
-            let nb = self
-                .feature_set
-                .effect_bucket_config()
-                .map_or(1, |cfg| cfg.nb);
-            let mode = ft_factorize_kernel_mode(&self.feature_set);
-            assert_eq!(
-                base_ft_in % pi,
-                0,
-                "base_ft_in must be a multiple of piece_inputs for the factorizer"
-            );
-            if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
-                assert_eq!(
-                    base_ft_in % (pi * nb),
-                    0,
-                    "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
-                );
-            }
-            let virtual_rows = self.feature_set.ft_factorize_virtual_rows();
-            let ft_bounds = ft_factorize_ft_bounds(base_ft_in, ft_in);
-            let fold_mode = ft_factorize_kernel_pack(nb, mode);
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: ft_reduce_virtual_grad,
-                    stream: self.stream, module: self.module,
-                    config: cfg_1d(virtual_rows * ft_out),
-                    args: [
-                        slice(self.ft_w_grad),
-                        slice(self.threat_pair_starts),
-                        ft_bounds, ft_out as u32, pi as u32,
-                        fold_mode
-                    ]
-                }
-            }?;
+            ft_factorize_host::launch_ft_reduce(
+                &self.stream,
+                &self.module,
+                &self.feature_set,
+                ft_out,
+                &self.ft_w_grad,
+                &self.threat_pair_starts,
+            )?;
         }
         prof_tick!("bwd_ftbwd");
 

@@ -22,6 +22,8 @@ mod arch;
 mod ckpt;
 mod cli;
 #[cfg(feature = "gpu")]
+mod ft_factorize_host;
+#[cfg(feature = "gpu")]
 mod kernel_module;
 #[cfg(feature = "gpu")]
 mod kernels;

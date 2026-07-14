@@ -269,7 +269,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     // `--ft-fp16-out` 経路 (FT activation を FP16 で保持) を 3 活性化すべてで確認する。
     // f16 FT-out kernel が活性化別に正しく分岐し、loss scaling 込みの backward が
     // finite に走って loss を下げることを見る。`ft_fp16` を要求するので両 flag ON、
-    // `ft_w_h` mirror は `sync_ft_w_h_mirror` で初期同期する (`run_simple_training` と同じ)。
+    // `ft_w_h` mirror は `sync_ft_forward_weights` で初期同期する (`run_simple_training` と同じ)。
     for act in [
         SimpleActivation::CReLU,
         SimpleActivation::SCReLU,
@@ -293,7 +293,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             },
             &SimpleInit::default_uniform(),
         )?;
-        trainer_fp16.sync_ft_w_h_mirror()?;
+        trainer_fp16.sync_ft_forward_weights()?;
         let fwd = trainer_fp16.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
         if !fwd.is_finite() {
             return Err(format!("--ft-fp16-out {act:?} forward loss = {fwd} is not finite").into());

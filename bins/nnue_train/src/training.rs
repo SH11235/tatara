@@ -323,7 +323,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             unreachable!("effect bucket and threat are rejected before spec construction")
         }
     };
-    let feature_set = if layerstack.ft_factorize_enabled() {
+    let feature_set = if cli.ft_factorize_enabled() {
         if cli.init_from.is_some() {
             println!(
                 "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \
@@ -1470,7 +1470,7 @@ pub(crate) fn build_experiment_logger_simple(
         architecture,
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
-        ft_factorize: None,
+        ft_factorize: id.feature_set.ft_factorize().then_some(true),
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,
@@ -1660,6 +1660,26 @@ pub(crate) fn run_simple_training(
             .into()
         },
     )?;
+    // FT factorizer は default ON で `--no-ft-factorize` が opt-out。Simple の feature set は
+    // threat / effect bucket を持たないので mode は Base 固定 (piece-input 仮想行のみ)。仮想行を
+    // 持つ .bin は無いため `--init-from` とは排他で auto-suppress する。量子化 .bin は仮想行を
+    // 実行へ畳み込んで shape が非 factorize と同形になるので推論側の変更は不要。
+    let feature_set = if cli.ft_factorize_enabled() {
+        if cli.init_from.is_some() {
+            println!(
+                "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \
+                 virtual factorizer rows)"
+            );
+            feature_set
+        } else {
+            println!(
+                "[train] ft-factorizer ON (virtual piece-input rows folded into the exported .bin)"
+            );
+            feature_set.with_ft_factorize_mode(FtFactorizeMode::Base)
+        }
+    } else {
+        feature_set
+    };
     let id = SimpleId {
         feature_set,
         activation,
@@ -1770,10 +1790,11 @@ pub(crate) fn run_simple_training(
         (None, None, None)
     };
 
-    // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
-    // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
-    // `--ft-fp16` 未指定なら no-op。
-    trainer.sync_ft_w_h_mirror()?;
+    // forward が読む FT weight (factorizer の comb / `--ft-fp16` mirror) を学習開始時の
+    // `ft_w` (init / --init-from / --resume いずれか) から一度同期する。以降は factorizer
+    // の comb は step 末の fold、`--ft-fp16` mirror は optimizer が維持する。factorizer 無効
+    // かつ `--ft-fp16` 未指定なら no-op。
+    trainer.sync_ft_forward_weights()?;
 
     let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     if start_superbatch > cli.superbatches {

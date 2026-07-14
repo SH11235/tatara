@@ -6,6 +6,7 @@ use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::LossKind;
 
+use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
@@ -236,10 +237,22 @@ pub(crate) struct SimpleGpuTrainer {
     /// `ranger_lookahead_lerp_fp16_mirror` で `ft_w` 更新と同時に `ft_w_h` を書く。
     /// FP32 master `ft_w` / 量子化 checkpoint byte layout は不変。
     ft_fp16: bool,
-    /// `ft_w` の FP16 mirror。`ft_fp16` が `true` のときだけ `Some`。`sparse_ft_forward_fp16`
-    /// の weight 入力で、`radam_step_fp16_mirror` が optimizer step ごとに同期する。
-    /// 学習開始時の初期同期は [`sync_ft_w_h_mirror`](Self::sync_ft_w_h_mirror) で。
+    /// `ft_fp16` が `true` のときだけ `Some`。factorizer 無効時は `ft_w` (train 形状
+    /// = base) の FP16 mirror で、`sparse_ft_forward_fp16` の weight 入力・
+    /// `radam_step_fp16_mirror` が optimizer step ごとに同期する。factorizer 有効時は
+    /// 仮想行を実行へ畳み込んだ base 形状の f16 comb で、毎 step 末の
+    /// [`ft_factorize_host::launch_ft_fold`] が master (`ft_w`、train 形状) から再生成
+    /// する (optimizer は master のみ更新)。初期同期は
+    /// [`sync_ft_forward_weights`](Self::sync_ft_forward_weights)。
     ft_w_h: Option<DeviceBuffer<f16>>,
+    /// factorizer 有効かつ `ft_fp16` 無効のときの forward 用畳み込み weight (comb、
+    /// base 形状 `ft_in * ft_out` の f32)。`ft_w_h` の f16 comb と同役で、FP32 forward が
+    /// `ft_w` (train 形状 master) の代わりにこれを読む。毎 step 末の fold が再生成する。
+    ft_w_fold32: Option<DeviceBuffer<f32>>,
+    /// fold/reduce kernel に渡す threat within-pair prefix table (Simple の base feature
+    /// set は threat 行を持たないので実質 sentinel `[0]`、factorizer の virtual 対応を
+    /// piece-input 行に限定する)。factorizer 無効でも 1 要素確保する。
+    threat_pair_starts: DeviceBuffer<u32>,
     /// `--ft-fp16-out` opt-in flag。`true` の間 forward は `sparse_ft_forward_fp16_out`
     /// (FP16 weight + FP16 出力) で `ft_*_out` を f16 化し、FT post は活性化別の f16
     /// 入力 kernel (CReLU/SCReLU は `simple_bias_act_fwd_fp16_in_*`、Pairwise は
@@ -411,10 +424,21 @@ impl SimpleGpuTrainer {
             "pairwise requires even ft_out for the half-split"
         );
 
+        // FT weight の行数。factorizer 有効時は base 実行 (`ft_in`) の後ろに piece-input
+        // 仮想行が連結される (`train_ft_in`)。sparse index の範囲と active 数は factorizer
+        // 非依存で base のまま — 仮想行は fold/reduce dense kernel でのみ読み書きされる。
+        let ft_factorize = id.feature_set.ft_factorize();
+        let train_ft_in = id.feature_set.train_ft_in();
+
         // weight / bias の初期値を `init_spec` から生成する。Simple は bucket / 共有
         // 因子層を持たないので全 group `flat`。fan_in は各層の入力次元 (FT=ft_in、
         // L1=combined_dim()、L2=l1_out、L3=l2_out)、bias は対応 weight と同じ fan_in。
-        let ft_w_h = init::sample(WeightShape::flat(ft_in * ft_out, ft_in), &init_spec.ft_w);
+        // FT weight は実 block を base 形状・base fan_in で sample し、factorizer の仮想
+        // block は zero を append する (train 形状で一括 sample すると仮想行に noise が
+        // 入り step-0 forward が OFF 構成とずれ、fan_in と RNG 消費数も変わって実 row の
+        // 乱数列が OFF と不一致になる)。
+        let mut ft_w_init = init::sample(WeightShape::flat(ft_in * ft_out, ft_in), &init_spec.ft_w);
+        ft_w_init.resize(train_ft_in * ft_out, 0.0);
         let ft_b_h = init::sample(WeightShape::flat(ft_out, ft_in), &init_spec.ft_b);
         let l1_in = id.combined_dim();
         let l1_w_h = init::sample(WeightShape::flat(l1_in * l1_out, l1_in), &init_spec.l1_w);
@@ -428,7 +452,7 @@ impl SimpleGpuTrainer {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&stream, n).map_err(Into::into)
         };
-        let ft_w_n = ft_in * ft_out;
+        let ft_w_n = train_ft_in * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = id.combined_dim() * l1_out;
         let l1_b_n = l1_out;
@@ -438,7 +462,7 @@ impl SimpleGpuTrainer {
         let l3_b_n = 1;
         // Lookahead slow weight は学習開始時 weights と同値で初期化する
         // (Ranger の初期 `slow_param ← param` 規約)。
-        let ft_w = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_w = DeviceBuffer::from_host(&stream, &ft_w_init)?;
         let ft_b = DeviceBuffer::from_host(&stream, &ft_b_h)?;
         let l1_w = DeviceBuffer::from_host(&stream, &l1_w_h)?;
         let l1_b = DeviceBuffer::from_host(&stream, &l1_b_h)?;
@@ -446,7 +470,7 @@ impl SimpleGpuTrainer {
         let l2_b = DeviceBuffer::from_host(&stream, &l2_b_h)?;
         let l3_w = DeviceBuffer::from_host(&stream, &l3_w_h)?;
         let l3_b = DeviceBuffer::from_host(&stream, &l3_b_h)?;
-        let ft_w_slow = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_w_slow = DeviceBuffer::from_host(&stream, &ft_w_init)?;
         let ft_b_slow = DeviceBuffer::from_host(&stream, &ft_b_h)?;
         let l1_w_slow = DeviceBuffer::from_host(&stream, &l1_w_h)?;
         let l1_b_slow = DeviceBuffer::from_host(&stream, &l1_b_h)?;
@@ -454,6 +478,15 @@ impl SimpleGpuTrainer {
         let l2_b_slow = DeviceBuffer::from_host(&stream, &l2_b_h)?;
         let l3_w_slow = DeviceBuffer::from_host(&stream, &l3_w_h)?;
         let l3_b_slow = DeviceBuffer::from_host(&stream, &l3_b_h)?;
+        let mut threat_pair_starts_host: Vec<u32> = id
+            .feature_set
+            .threat_factorize_pair_starts()
+            .into_iter()
+            .map(|x| x as u32)
+            .collect();
+        if threat_pair_starts_host.is_empty() {
+            threat_pair_starts_host.push(0);
+        }
         Ok(Self {
             ft_w,
             ft_b,
@@ -502,11 +535,21 @@ impl SimpleGpuTrainer {
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
+            // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb (base 形状)、
+            // 無効時の `ft_w_h` は master の cast mirror (train 形状 = base と同値)。いずれも
+            // `sync_ft_forward_weights` が初期同期する。
             ft_w_h: if precision.ft_fp16 {
-                Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
+                let n = if ft_factorize { ft_in * ft_out } else { ft_w_n };
+                Some(DeviceBuffer::<f16>::zeroed(&stream, n)?)
             } else {
                 None
             },
+            ft_w_fold32: if ft_factorize && !precision.ft_fp16 {
+                Some(DeviceBuffer::<f32>::zeroed(&stream, ft_in * ft_out)?)
+            } else {
+                None
+            },
+            threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
             stream,
             module,
             dense_bias_grad_occ,
@@ -521,12 +564,18 @@ impl SimpleGpuTrainer {
         })
     }
 
-    /// 学習開始時の `ft_w_h` 初期同期。`ft_w_h` は `new` で zeroed 確保、optimizer
-    /// (`radam_step_fp16_mirror` / `ranger_lookahead_lerp_fp16_mirror`) が以後 step ごと
-    /// に維持するが、最初の forward の前に一度 `ft_w` (FP32 master) から cast しないと
-    /// mirror が全 0 で forward が trivial になる。`--init-from` / `--resume` で `ft_w`
-    /// を読み込んだ後にも呼ぶ。`ft_fp16` が無効 (`ft_w_h` が `None`) なら no-op。
-    pub(crate) fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// forward が読む FT weight buffer (`ft_w_h` mirror / factorizer の comb) を現在の
+    /// `ft_w` (FP32 master) から再生成する。
+    ///
+    /// 構築直後の初期同期と、master を後から上書きする経路 (`--init-from` / `--resume`
+    /// の load 後) の再同期が役目。学習中は factorizer 無効 + `--ft-fp16` の mirror を
+    /// optimizer (`radam_step_fp16_mirror`) が step ごとに書き、factorizer 有効時の comb は
+    /// 毎 step 末の [`launch_ft_fold`](Self::launch_ft_fold) が維持する。どちらにも該当
+    /// しない構成 (FP32 + factorizer 無効) は forward が master を直接読むため no-op。
+    pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.id.feature_set.ft_factorize() {
+            return self.launch_ft_fold();
+        }
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
             let ft_w_n = self.ws.ft_in * self.id.ft_out;
             unsafe {
@@ -542,6 +591,46 @@ impl SimpleGpuTrainer {
             }?;
         }
         Ok(())
+    }
+
+    /// factorizer の forward 用畳み込み weight (comb = 実行 + 仮想行 broadcast、base 形状)
+    /// を `ft_w` (train 形状の FP32 master) から再生成する。`--ft-fp16` 系列では f16 comb
+    /// (`ft_w_h`)、FP32 では f32 comb (`ft_w_fold32`)。optimizer が master を書き換えた後、
+    /// 次の forward が読む前に毎 step 1 回呼ぶ。caller が factorizer 有効を保証する
+    /// (constructor が「factorize ⇒ comb buffer がちょうど 1 つ」を確立済み)。
+    fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // 非 factorize で誤呼び出しされると ft_fp16 構成では train 形状 mirror へ base 想定
+        // の fold が走り OOB read になるため、release でも入口で止める。
+        assert!(self.id.feature_set.ft_factorize());
+        let comb = if self.ft_fp16 {
+            FoldComb::F16(
+                self.ft_w_h
+                    .as_mut()
+                    .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled"),
+            )
+        } else {
+            FoldComb::F32(
+                self.ft_w_fold32
+                    .as_mut()
+                    .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16"),
+            )
+        };
+        ft_factorize_host::launch_ft_fold(
+            &self.stream,
+            &self.module,
+            &self.id.feature_set,
+            self.id.ft_out,
+            &self.ft_w,
+            comb,
+            &self.threat_pair_starts,
+        )
+    }
+
+    /// FT weight master (`ft_w`、factorizer 有効時は train 形状) を host に download する。
+    /// factorizer の仮想行が更新されているかを test で観測するための accessor。
+    #[cfg(test)]
+    pub(crate) fn ft_w_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.ft_w.to_host_vec(&self.stream).map_err(Into::into)
     }
 
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
@@ -865,6 +954,9 @@ impl SimpleGpuTrainer {
                 }
             }?;
         } else {
+            // factorizer 有効時は畳み込み済み comb (`ft_w_fold32`、base 形状) を読む
+            // (sparse path を base 次元に保つ)。無効時は master を直接読む。
+            let ft_w_fwd = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -874,7 +966,7 @@ impl SimpleGpuTrainer {
                     module: self.module,
                     config: cfg_1d(b * self.id.ft_out / 4),
                     args: [
-                        slice(self.ft_w),
+                        slice(ft_w_fwd),
                         slice(self.ws.stm_idx_dev),
                         slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_stm_out),
@@ -891,7 +983,7 @@ impl SimpleGpuTrainer {
                     module: self.module,
                     config: cfg_1d(b * self.id.ft_out / 4),
                     args: [
-                        slice(self.ft_w),
+                        slice(ft_w_fwd),
                         slice(self.ws.nstm_idx_dev),
                         slice(self.ws.nnz_dev),
                         slice_mut(self.ws.ft_nstm_out),
@@ -2181,6 +2273,19 @@ impl SimpleGpuTrainer {
                 }
             }
         }
+        // factorizer: piece-input 仮想行の grad を対応 base 実行の grad 和で埋める。
+        // 上の gather は実 block (`[0, ft_in)`) のみ書くので、仮想 block は reduce が
+        // overwrite で書き切る。optimizer は train 形状 master の全行を更新する。
+        if self.id.feature_set.ft_factorize() {
+            ft_factorize_host::launch_ft_reduce(
+                &self.stream,
+                &self.module,
+                &self.id.feature_set,
+                self.id.ft_out,
+                &self.ft_w_grad,
+                &self.threat_pair_starts,
+            )?;
+        }
         tick("bwd_ft_bw", &self.stream, &mut prof_t0)?;
 
         Ok(())
@@ -2194,11 +2299,13 @@ impl SimpleGpuTrainer {
         let (step_size, denom) =
             radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
 
-        let ft_in = self.ws.ft_in;
         let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
         let l2_out = self.id.l2_out;
-        let ft_w_n = (ft_in * ft_out) as u32;
+        // factorizer 有効時は FT master が train 形状 (実行 + piece-input 仮想行)。仮想行も
+        // radam で更新し、forward comb は step 末の fold が master から再生成する。
+        let ft_factorize = self.id.feature_set.ft_factorize();
+        let ft_w_n = (self.id.feature_set.train_ft_in() * ft_out) as u32;
         let ft_b_n = ft_out as u32;
         let l1_w_n = (self.id.combined_dim() * l1_out) as u32;
         let l1_b_n = l1_out as u32;
@@ -2216,7 +2323,7 @@ impl SimpleGpuTrainer {
         match (&mut self.ft_w_m, &mut self.ft_w_v) {
             (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                     unsafe {
                         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                         // stream の完了を待つ同期点まで生存する device allocation。
@@ -2246,7 +2353,7 @@ impl SimpleGpuTrainer {
             }
             (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                     unsafe {
                         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                         // stream の完了を待つ同期点まで生存する device allocation。
@@ -2351,7 +2458,9 @@ impl SimpleGpuTrainer {
         if self.step_count.is_multiple_of(RANGER_K) {
             // ft_w lookahead lerp: lerp は radam の後に ft_w を再度書き換えるので、
             // `ft_fp16` 時は mirror 同時更新版で `ft_w_h` を lerp 後の最終値に同期する。
-            if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
+            // factorizer 有効時は mirror variant を使わず (comb は base 形状で train 形状の
+            // lerp からは書けない)、master のみ lerp し step 末の fold が comb を再生成する。
+            if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。
@@ -2437,6 +2546,11 @@ impl SimpleGpuTrainer {
                 }
             }?;
         }
+        // factorizer: master (`ft_w`) の本 step の全更新 (radam / lookahead) が確定した後、
+        // 次 step の forward が読む comb を再生成する。
+        if ft_factorize {
+            self.launch_ft_fold()?;
+        }
         Ok(())
     }
 
@@ -2457,6 +2571,23 @@ impl SimpleGpuTrainer {
         let l1_in = id.combined_dim();
 
         let ft_w = self.ft_w.to_host_vec(&self.stream)?;
+        // factorizer 有効時は piece-input 仮想行を実行へ畳み込み base 形状で返す
+        // (量子化・飽和検査は畳み込み後の値に掛かる)。export id は factorizer modifier を
+        // 外した base spec にする (量子化 .bin は仮想行を持たず shape は非 factorize と同形)。
+        let (export_id, ft_w) = if self.id.feature_set.ft_factorize() {
+            let folded = nnue_format::layerstack_weights::coalesce_ft_factorized(
+                &self.id.feature_set,
+                self.id.ft_out,
+                &ft_w,
+            );
+            let base_id = SimpleId {
+                feature_set: self.id.feature_set.feature_set().spec(),
+                ..self.id
+            };
+            (base_id, folded)
+        } else {
+            (id, ft_w)
+        };
         let ft_b = self.ft_b.to_host_vec(&self.stream)?;
         let l1_w_in_major = self.l1_w.to_host_vec(&self.stream)?;
         let l1_b = self.l1_b.to_host_vec(&self.stream)?;
@@ -2479,7 +2610,7 @@ impl SimpleGpuTrainer {
         }
 
         Ok(SimpleWeights {
-            id,
+            id: export_id,
             fv_scale: self.fv_scale,
             ft_w,
             ft_b,
@@ -2564,8 +2695,10 @@ impl SimpleGpuTrainer {
 
         // m / v / grad を 0 リセット、step_count を 0 に戻す (Ranger を最初から)。
         // ft_w の m / v は [`MomentBuf`] で `--fp16-opt-state` 精度を保つため `zeroed`
-        // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。
-        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。長さは `ft_w` と同じ
+        // train 形状 (factorizer 有効時は仮想行込み。`--init-from` では factorizer が
+        // auto-suppress されるので通常 base と一致する)。
+        let ft_w_n = self.id.feature_set.train_ft_in() * self.id.ft_out;
         self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         for buf in [
@@ -2724,7 +2857,10 @@ impl SimpleGpuTrainer {
                 }
             };
         }
-        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        // ft_w は train 形状 (factorizer 有効時は piece-input 仮想行込み)。header にも
+        // train_ft_in と ft_factorize flag が書かれ、resume 時の on/off 不一致は
+        // [`load_raw_checkpoint_file`] が reject する。
+        let ft_w_n = self.id.feature_set.train_ft_in() * self.id.ft_out;
         let ft_b_n = self.id.ft_out;
         let l1_w_n = self.id.combined_dim() * self.id.l1_out;
         let l1_b_n = self.id.l1_out;

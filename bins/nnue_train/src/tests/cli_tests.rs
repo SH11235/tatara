@@ -13,28 +13,30 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
-fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
-    let mut full = vec!["nnue-train", "layerstack"];
+/// `--ft-factorize` / `--no-ft-factorize` は global flag。任意 subcommand の後ろに
+/// 付けても global 引数として parse される (層は `simple` でも `layerstack` でも同じ)。
+fn cli_with_factorize(argv: &[&str]) -> Cli {
+    let mut full = vec!["nnue-train", "simple"];
     full.extend_from_slice(argv);
-    match Cli::try_parse_from(full)
-        .expect("layerstack should parse")
-        .arch
-    {
-        ArchCommand::LayerStack(args) => args,
-        other => panic!("unexpected arch: {other:?}"),
-    }
+    Cli::try_parse_from(full).expect("cli should parse")
 }
 
 #[test]
 fn ft_factorize_defaults_on_and_no_flag_disables() {
     // default は ON (flag 無し)。`--ft-factorize` は back-compat の明示 ON。
-    assert!(layerstack_args(&[]).ft_factorize_enabled());
-    assert!(layerstack_args(&["--ft-factorize"]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&[]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&["--ft-factorize"]).ft_factorize_enabled());
     // `--no-ft-factorize` で OFF。
-    assert!(!layerstack_args(&["--no-ft-factorize"]).ft_factorize_enabled());
+    assert!(!cli_with_factorize(&["--no-ft-factorize"]).ft_factorize_enabled());
     // overrides_with: command-line 後勝ち。
-    assert!(!layerstack_args(&["--ft-factorize", "--no-ft-factorize"]).ft_factorize_enabled());
-    assert!(layerstack_args(&["--no-ft-factorize", "--ft-factorize"]).ft_factorize_enabled());
+    assert!(!cli_with_factorize(&["--ft-factorize", "--no-ft-factorize"]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&["--no-ft-factorize", "--ft-factorize"]).ft_factorize_enabled());
+    // layerstack subcommand の後ろに置いても global flag として parse される (back-compat)。
+    assert!(
+        !Cli::try_parse_from(["nnue-train", "layerstack", "--no-ft-factorize"])
+            .expect("layerstack --no-ft-factorize should parse")
+            .ft_factorize_enabled()
+    );
     // `--psqt` と併用しても clap では衝突しない (実効 OFF は run_training の
     // auto-suppress が解決する)。
     assert!(
