@@ -32,8 +32,17 @@ target/release/nnue-train \
   --feature-set halfkp \
   --superbatches <N> \
   --threads <N> \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
+
+`simple` トレーナは `--win-rate-model` が必須。int8 の出力層は plain sigmoid loss
+が収束する centipawn スケールの出力を表現できないため、plain sigmoid 経路は起動時に
+reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退化させる設定で、
+`--scale` と各 `--wrm-*-scaling` / `--wrm-nnue2score` は同じ値に揃える (simple は
+書き出す `fv_scale` を `--scale` から算出するため)。
 
 `simple` は既定で `--arch 256x2-32-32` / `--activation crelu`。`--superbatches`
 の決め方と、追加で指定できる option は下記「主な option」を参照。
@@ -69,7 +78,7 @@ target/release/nnue-train \
 | `--batch-size` | 16384 | 勾配更新 1 回あたりの局面数。GPU throughput と学習特性 (勾配のばらつき・更新回数) の両方に効く学習ハイパーパラメータ |
 | `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.ja.md) 参照) |
 | `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。量子化推論向けの net を学習するなら追加する (未指定なら plain sigmoid-MSE)。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
+| `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。`layerstack` では任意 (未指定なら plain sigmoid-MSE) だが、`simple` トレーナは必須 — int8 出力層が plain sigmoid loss の収束する centipawn スケール出力を表現できないため。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
@@ -107,6 +116,9 @@ target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --feature-set halfkp --superbatches <N> --keep-checkpoints 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   --resume checkpoints/<run-name>/<run-name>-<sb>.ckpt \
   simple
 ```
@@ -155,6 +167,9 @@ target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 \
   --save-rate 1 --threads 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
 

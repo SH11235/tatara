@@ -36,8 +36,18 @@ target/release/nnue-train \
   --feature-set halfkp \
   --superbatches <N> \
   --threads <N> \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
+
+The `simple` trainer requires `--win-rate-model`: its int8 output layer cannot
+represent the centipawn-scale output that the plain sigmoid loss converges to,
+so the plain-sigmoid path is rejected up front. The `--wrm-*` values above
+degenerate the WRM to a plain sigmoid; keep `--scale` and every
+`--wrm-*-scaling` / `--wrm-nnue2score` on the same value, because the simple
+trainer derives the exported `fv_scale` from `--scale`.
 
 `simple` defaults to `--arch 256x2-32-32` / `--activation crelu`. For how to
 choose `--superbatches` and the additional options you can pass, see "Key
@@ -76,7 +86,7 @@ change for real training are:
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
 | `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~1.8 GB (default LayerStack arch) ≈ 36 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE). See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
+| `--win-rate-model` | OFF (layerstack) / required (simple) | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). On `layerstack` it is optional (without it, plain sigmoid-MSE); the `simple` trainer requires it, because its int8 output layer cannot represent the centipawn-scale output that the plain sigmoid loss converges to. See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
@@ -120,6 +130,9 @@ target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --feature-set halfkp --superbatches <N> --keep-checkpoints 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   --resume checkpoints/<run-name>/<run-name>-<sb>.ckpt \
   simple
 ```
@@ -171,6 +184,9 @@ target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 \
   --save-rate 1 --threads 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
 

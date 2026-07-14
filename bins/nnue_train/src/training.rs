@@ -1057,12 +1057,15 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
 pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
         return Err(
-            "the simple trainer requires --win-rate-model: the plain sigmoid (loss_wdl) \
+            "the simple trainer requires --win-rate-model: the plain sigmoid loss \
              path converges to net_output ≈ cp, which the int8 dense weight clamp (±127/QB) \
              cannot represent, so the exported output layer saturates and the evaluation breaks \
              (the sign-based test accuracy will not surface this). To recover a plain sigmoid, \
-             degenerate the WRM to identity with --wrm-in-offset 0 --wrm-target-offset 0 \
-             --wrm-in-scaling <scale> --wrm-target-scaling <scale> --wrm-nnue2score <scale>."
+             degenerate the WRM to identity with --scale <scale> --wrm-in-offset 0 \
+             --wrm-target-offset 0 --wrm-in-scaling <scale> --wrm-target-scaling <scale> \
+             --wrm-nnue2score <scale> (use the same <scale> everywhere; the simple trainer \
+             derives fv_scale from --scale even under the WRM, so omitting it silently shifts \
+             the evaluation scale)."
                 .into(),
         );
     }

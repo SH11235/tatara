@@ -39,12 +39,21 @@ cargo run --release --bin nnue-train -- \
   --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
   layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
 
-# HalfKP (simple, no progress needed)
+# HalfKP (simple, no progress needed; the simple trainer requires --win-rate-model)
 cargo run --release --bin nnue-train -- \
   --data /path/to/teacher.psv \
   --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple --arch 256x2-32-32
 ```
+
+The simple trainer only supports the win-rate-model loss (its int8 output
+layer cannot represent the centipawn-scale output that the plain sigmoid loss
+converges to). The `--wrm-*` values above degenerate the WRM to a plain
+sigmoid; use the same scale for `--scale` and every `--wrm-*-scaling` /
+`--wrm-nnue2score`, since `--scale` also sets the exported `fv_scale`.
 
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*

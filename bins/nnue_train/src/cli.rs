@@ -175,9 +175,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, conflicts_with = "wdl")]
     pub(crate) end_wdl: Option<f32>,
 
-    /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). Not used
-    /// when `--win-rate-model` is set (WRM loss uses the `--wrm-*` scaling
-    /// instead).
+    /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
+    /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
+    /// loss uses the `--wrm-*` scaling instead). The simple trainer always uses
+    /// it to derive the exported `fv_scale`, so it stays in effect even under
+    /// the WRM there.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 

@@ -36,12 +36,20 @@ cargo run --release --bin nnue-train -- \
   --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
   layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
 
-# HalfKP (simple, progress 不要)
+# HalfKP (simple, progress 不要; simple トレーナは --win-rate-model 必須)
 cargo run --release --bin nnue-train -- \
   --data /path/to/teacher.psv \
   --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple --arch 256x2-32-32
 ```
+
+simple トレーナは win-rate-model loss のみ対応 (int8 出力層が plain sigmoid loss の
+収束する centipawn スケール出力を表現できない)。上記の `--wrm-*` は WRM を plain
+sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` / `--wrm-nnue2score`
+は同じ値に揃える (`--scale` が書き出す `fv_scale` も決めるため)。
 
 *tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 

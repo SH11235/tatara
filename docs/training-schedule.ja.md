@@ -63,6 +63,9 @@ target = lambda * (対局結果) + (1 - lambda) * (教師 score)
 blend は素の sigmoid-MSE loss でも win-rate-model loss（`--win-rate-model`）でも
 同一で、両者で違うのは式の教師 score 側だけ。`lambda` の範囲は `[0.0, 1.0]`。
 
+以下の `... simple` はフルコマンドの省略形で、simple トレーナでは常に必須の
+`--win-rate-model` フラグ群を含む（[quickstart](training-quickstart.ja.md#例-1-halfkp-nnue-を学習-simple-アーキ) を参照）。
+
 ### 一定 lambda（`--wdl`）
 
 `--wdl <value>` は `lambda` を学習全体で固定する。default は `0.0`（教師 score

@@ -68,6 +68,10 @@ purely on the game outcome. The blend is identical for the plain sigmoid-MSE
 loss and the win-rate-model loss (`--win-rate-model`); only the teacher-score
 side of the formula differs between them. `lambda` is in `[0.0, 1.0]`.
 
+The `... simple` invocations below abbreviate a full command; on the simple
+trainer that always includes the required `--win-rate-model` flags (see
+[the quickstart](training-quickstart.md#example-1-training-a-halfkp-nnue-simple-architecture)).
+
 ### Constant lambda (`--wdl`)
 
 `--wdl <value>` holds `lambda` fixed for the whole run. The default is `0.0`
