@@ -136,6 +136,8 @@ For building the kernels and running the smoke test, see
 - [Arch string](docs/arch-string.md) — how the architecture-description string
   embedded in the quantised `.bin` header is assembled and checked at load time
   (Japanese only)
+- [Converting a LayerStack net for YaneuraOu](docs/net-to-yaneuraou.md) —
+  `net_to_yo` usage, supported architecture, and binary layout (Japanese only)
 
 ## Using the trained net
 
@@ -144,7 +146,8 @@ The quantised `.bin` that tatara produces is designed to be loaded by the
 SCReLU / Pairwise activations are specific to this project, so other shogi
 engines such as YaneuraOu cannot necessarily load it as-is; depending on the
 architecture, some nets need additional inference code before they can be
-loaded. Pre-trained reference nets are attached to the
+loaded. The supported 1536-16-32 LayerStack architecture can be converted with
+[`net_to_yo`](docs/net-to-yaneuraou.md). Pre-trained reference nets are attached to the
 [GitHub Releases](https://github.com/SH11235/tatara/releases). To train your
 own net, see the [setup guide](docs/setup.md).
 

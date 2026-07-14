@@ -12,6 +12,7 @@ members = [
     "bins/progress_bucket_survey",
     "bins/eval_sfen",
     "bins/net_header_rewrite",
+    "bins/net_to_yo",
     "bins/threat_symmetric_survey",
 ]
 

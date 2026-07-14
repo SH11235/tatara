@@ -122,6 +122,8 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
   が何を担うか
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
   記述文字列の組み立てと load 時照合 (日本語のみ)
+- [YaneuraOu 用 LayerStack net 変換](docs/net-to-yaneuraou.md) —
+  `net_to_yo` の使い方、対応アーキ、binary layout
 
 ## 学習した net の使い方
 
@@ -129,6 +131,8 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 エンジンでロードする前提の format。`.bin` header と SCReLU / Pairwise 活性化は
 本プロジェクト固有なので、YaneuraOu など他の将棋エンジンでそのまま読めるとは
 限らず、アーキテクチャによっては推論部の追加実装をしないとロードできない。
+対応する 1536-16-32 LayerStack は
+[`net_to_yo`](docs/net-to-yaneuraou.md) で変換できる。
 学習済みの参考 net は
 [GitHub Releases](https://github.com/SH11235/tatara/releases) に添付している。
 自分で net を学習する場合の環境構築は [docs/setup.ja.md](docs/setup.ja.md) を参照。
