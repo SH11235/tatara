@@ -1047,6 +1047,28 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// simple トレーナは `--win-rate-model` (WRM) を必須とする。非 WRM の loss_wdl は
+/// net_output ≈ cp (±数千) に収束するが、simple の quantised export は dense weight を
+/// int8 clamp (±127/QB ≈ ±1.98) で書くため、出力層がその大きな出力スケールを構成
+/// できず clamp 端へ飽和し、量子化ネットの評価値が破綻する。WRM 経路は
+/// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
+/// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if !cli.win_rate_model {
+        return Err(
+            "the simple trainer requires --win-rate-model: the plain sigmoid (loss_wdl) \
+             path converges to net_output ≈ cp, which the int8 dense weight clamp (±127/QB) \
+             cannot represent, so the exported output layer saturates and the evaluation breaks \
+             (the sign-based test accuracy will not surface this). To recover a plain sigmoid, \
+             degenerate the WRM to identity with --wrm-in-offset 0 --wrm-target-offset 0 \
+             --wrm-in-scaling <scale> --wrm-target-scaling <scale> --wrm-nnue2score <scale>."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
 /// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
 /// layerstack / simple 両 entry で共有するこの helper で前段に行う。
@@ -1633,6 +1655,7 @@ pub(crate) fn run_simple_training(
     // 等では `--data` 不在でも本 driver に dispatch するため、後段の `data.expect` より前で
     // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
     reject_simple_unsupported_flags(cli)?;
+    require_simple_win_rate_model(cli)?;
     let data = cli
         .data
         .as_ref()
@@ -1712,13 +1735,9 @@ pub(crate) fn run_simple_training(
     if !(cli.scale.is_finite() && cli.scale > 0.0) {
         return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
     }
-    let loss = if cli.win_rate_model {
-        build_wrm_loss(cli)?
-    } else {
-        LossKind::Sigmoid {
-            scale: 1.0 / cli.scale,
-        }
-    };
+    // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
+    // ため、simple の loss は WRM に限られる。
+    let loss = build_wrm_loss(cli)?;
 
     // `--init-l1f` は Simple では受け付けないため CUDA 初期化より前に解決して
     // 早期 reject する (CUDA context 作成のコストを払わせない)。
