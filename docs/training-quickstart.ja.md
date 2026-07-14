@@ -86,7 +86,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--batch-size` | 16384 | 勾配更新 1 回あたりの局面数。GPU throughput と学習特性 (勾配のばらつき・更新回数) の両方に効く学習ハイパーパラメータ |
 | `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.ja.md) 参照) |
 | `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
-| `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。`layerstack` では任意 (未指定なら plain sigmoid-MSE) だが、`simple` トレーナは必須 — int8 出力層が plain sigmoid loss の収束する centipawn スケール出力を表現できないため。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
+| `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp / --wrm-nnue2score` で収束する。`layerstack` では任意 (未指定なら plain sigmoid-MSE)。`simple` トレーナは必須で、さらに `--scale = --wrm-nnue2score` が必要 (`--scale` が export の `fv_scale` を決めるため)。上の例は両方を 290 とし、`FV_SCALE=28` になる。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |

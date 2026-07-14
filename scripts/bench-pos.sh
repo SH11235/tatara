@@ -74,7 +74,9 @@ case "$ARCH" in
     arch_args=(layerstack --progress-coeff "$PROG" --bucket-mode progress8kpabs)
     ;;
   simple)
-    arch_args=(simple --arch "$SIMPLE_ARCH" --activation "$SIMPLE_ACTIVATION")
+    # benchmark は既存の WRM 既定値 (`--wrm-nnue2score 600`) を使う。Simple の
+    # export scale も同じ単位に揃え、起動時の loss / 量子化整合 guard を満たす。
+    arch_args=(simple --arch "$SIMPLE_ARCH" --activation "$SIMPLE_ACTIVATION" --scale 600)
     ;;
   *)
     echo "error: ARCH='$ARCH' は未対応 (layerstack または simple)" >&2

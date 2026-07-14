@@ -403,9 +403,9 @@ impl SimpleWeights {
         // ---- dense layers (bias i32 scale 127*QB, weight i8 scale QB) ----
         let bias_scale = (FT_OUTPUT_QA * QB) as f64;
         let weight_scale = QB as f64;
-        // dense weight は int8 clamp (±127/QB) で書かれる。loss と出力スケールの不整合で
-        // weight が clamp 域を超えて育つと、特に出力層 (l3) が clamp 端へ飽和して評価値が
-        // 破綻するため、層別に飽和率を警告する (i16 FT 飽和警告と対の export 側 guard)。
+        // dense weight は学習中に ±127/QB へ clamp される。loss と出力スケールの不整合で
+        // 特に出力層 (l3) が clamp 端へ張り付くと評価値が破綻するため、層別に飽和率を
+        // 警告する (i16 FT 飽和警告と対の export 側 guard)。
         warn_if_i8_saturates("l1_w", &self.l1_w, weight_scale);
         warn_if_i8_saturates("l2_w", &self.l2_w, weight_scale);
         warn_if_i8_saturates("l3_w (output)", &self.l3_w, weight_scale);
@@ -592,33 +592,33 @@ fn warn_if_i16_saturates(name: &str, values: &[f32], scale: f64) {
     }
 }
 
-/// `round(scale·v)` が i8 範囲 `[-128, 127]` を超える要素数を数える。`scale` は dense
-/// weight の量子化スケール QB。値域に収まれば 0。`write_i8_weight` の clamp が情報を
-/// 落とす要素を export 前に把握するための pure helper。
-fn count_i8_saturations(values: &[f32], scale: f64) -> usize {
+/// `round(scale·v)` が学習時の対称 i8 clamp 端 `±127` に達した要素数を数える。
+/// `scale` は dense weight の量子化スケール QB。Simple trainer は dense weight を
+/// `±127/QB` に clamp するため、loss と出力 scale が不整合な run では範囲外へは出ず、
+/// clamp 端に張り付く。export の表現域 `[-128, 127]` の外だけを数えるとその状態を
+/// 見逃すので、`|round(scale·v)| >= 127` を飽和として扱う。
+fn count_i8_clamp_saturations(values: &[f32], scale: f64) -> usize {
     values
         .iter()
         .filter(|&&v| {
             let q = (scale * v as f64).round();
-            q < i8::MIN as f64 || q > i8::MAX as f64
+            q <= -(i8::MAX as f64) || q >= i8::MAX as f64
         })
         .count()
 }
 
-/// dense 層の i8 weight 量子化で飽和が起きていれば層名付きで警告する。件数 0 なら
-/// 無出力。飽和 (`round(scale·w)` が `[-128, 127]` の外) は `write_i8_weight` が int8
-/// 範囲に clamp するため即座の破綻にはならないが、weight が int8 表現域を超えて育った
-/// 状態を示す。出力層で飽和率が高いと、学習が要求する出力スケールを int8 dense が構成
-/// できず、量子化ネットの評価値が破綻する (loss と dense clamp のスケール不整合の兆候)。
+/// dense 層の weight が学習時の i8 clamp 端 `±127/QB` に達していれば層名付きで警告する。
+/// 件数 0 なら無出力。出力層で張り付き率が高いと、学習が要求する出力スケールを i8 dense
+/// が構成できず、量子化ネットの評価値が破綻する (loss と dense clamp の不整合の兆候)。
 fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
-    let n = count_i8_saturations(values, scale);
+    let n = count_i8_clamp_saturations(values, scale);
     if n > 0 {
         let pct = 100.0 * n as f64 / values.len() as f64;
         eprintln!(
-            "[nnue-format] warning: {name} has {n}/{} ({pct:.1}%) elements whose round(scale·w) \
-             falls outside the int8 range [-128, 127] and is clamped on export. A large \
-             saturating fraction in the output layer means the trained weights cannot form the \
-             requested evaluation scale (loss / dense clamp scale mismatch).",
+            "[nnue-format] warning: {name} has {n}/{} ({pct:.1}%) elements at or beyond the \
+             symmetric int8 training clamp (|round(scale·w)| >= 127). A large saturating \
+             fraction in the output layer means the trained weights cannot form the requested \
+             evaluation scale (loss / dense clamp scale mismatch).",
             values.len()
         );
     }
@@ -722,24 +722,27 @@ mod tests {
     }
 
     #[test]
-    fn count_i8_saturations_flags_only_clamped_dense_weights() {
+    fn count_i8_clamp_saturations_flags_boundary_pinned_dense_weights() {
         // dense weight scale = QB = 64。clamp 境界は |w| ≈ 127/64 ≈ 1.98
-        // (負側は 128/64 = 2.0)。正常な dense weight (±1.98 以内) は 0 件、
-        // loss_wdl × dense clamp 不整合で育った大きな weight のみ飽和。
+        // 正常な dense weight は 0 件、loss / dense clamp 不整合で境界へ張り付いた
+        // weight は export 範囲内の ±127 でも飽和として数える。
         let qb = QB as f64;
-        assert_eq!(count_i8_saturations(&[0.0, 1.98, -1.98, 0.5], qb), 0);
-        assert_eq!(count_i8_saturations(&[10.0, -10.0, 1.0], qb), 2);
-        assert_eq!(count_i8_saturations(&[], qb), 0);
+        assert_eq!(count_i8_clamp_saturations(&[0.0, 1.97, -1.97, 0.5], qb), 0);
+        assert_eq!(
+            count_i8_clamp_saturations(&[127.0 / 64.0, -127.0 / 64.0, 1.0], qb),
+            2
+        );
+        assert_eq!(count_i8_clamp_saturations(&[], qb), 0);
     }
 
     #[test]
-    fn count_i8_saturations_boundary_exact() {
-        // scale=1.0 で w を量子化値そのものに使う。127 / -128 は範囲内 (0 件)、
-        // 128 / -129 は飽和。round 後判定: 127.4→127 (範囲内)、127.5→128 (飽和)。
-        assert_eq!(count_i8_saturations(&[127.0, -128.0], 1.0), 0);
-        assert_eq!(count_i8_saturations(&[128.0, -129.0], 1.0), 2);
-        assert_eq!(count_i8_saturations(&[127.4], 1.0), 0);
-        assert_eq!(count_i8_saturations(&[127.5], 1.0), 1);
+    fn count_i8_clamp_saturations_boundary_exact() {
+        // scale=1.0 で w を量子化値そのものに使う。±126 は未飽和、±127 は学習 clamp
+        // 端なので飽和。round 後判定も固定する: 126.4→126、126.5→127。
+        assert_eq!(count_i8_clamp_saturations(&[126.0, -126.0], 1.0), 0);
+        assert_eq!(count_i8_clamp_saturations(&[127.0, -127.0], 1.0), 2);
+        assert_eq!(count_i8_clamp_saturations(&[126.4], 1.0), 0);
+        assert_eq!(count_i8_clamp_saturations(&[126.5], 1.0), 1);
     }
 
     #[test]
