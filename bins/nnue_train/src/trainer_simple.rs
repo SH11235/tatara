@@ -2838,6 +2838,7 @@ impl SimpleGpuTrainer {
             &RawCkptArch {
                 feature_set: self.id.feature_set,
                 arch_kind: ArchKind::Simple,
+                bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
             },
@@ -2878,6 +2879,7 @@ impl SimpleGpuTrainer {
             &RawCkptArch {
                 feature_set: self.id.feature_set,
                 arch_kind: ArchKind::Simple,
+                bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
             },

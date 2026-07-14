@@ -7,6 +7,8 @@ use gpu_runtime::CudaContext;
 use nnue_format::LayerStackWeights;
 #[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::dataloader::BucketMode;
 #[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
@@ -22,12 +24,16 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
 use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
-use shogi_features::{FeatureSet, FeatureSetSpec};
+use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS};
 
 #[cfg(any(feature = "gpu", test))]
 use crate::cli::*;
 #[cfg(feature = "gpu")]
-use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
+use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
+
+#[cfg(any(feature = "gpu", test))]
+// kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
+const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
 #[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Default)]
@@ -120,6 +126,43 @@ fn parse_effect_bucket_config(
         }
     };
     Ok(config)
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_bucket_mode(
+    args: &LayerstackArgs,
+) -> Result<BucketMode, Box<dyn std::error::Error>> {
+    match args.bucket_mode.as_str() {
+        "progress8kpabs" => {
+            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
+                return Err(format!(
+                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progress8kpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    args.num_buckets
+                )
+                .into());
+            }
+            Ok(BucketMode::Progress8KpAbs)
+        }
+        "kingrank9" => {
+            if args.num_buckets != KINGRANK9_NUM_BUCKETS {
+                return Err(format!(
+                    "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
+                    args.num_buckets,
+                )
+                .into());
+            }
+            if args.progress_coeff.is_some() {
+                return Err(
+                    "--progress-coeff is not used with --bucket-mode kingrank9; remove it".into(),
+                );
+            }
+            Ok(BucketMode::KingRank9)
+        }
+        other => Err(format!(
+            "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
+        )
+        .into()),
+    }
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -332,14 +375,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         feature_set
     };
 
-    // --- 未実装オプション値の reject ---
-    if layerstack.bucket_mode != "progress8kpabs" {
-        return Err(format!(
-            "--bucket-mode '{}' is not implemented (only 'progress8kpabs')",
-            layerstack.bucket_mode
-        )
-        .into());
-    }
+    let bucket_mode = validate_bucket_mode(layerstack)?;
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -399,36 +435,25 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    // bucket 数の下限 2 は progress binning が意味を持つ最小値。上限 9 は L2 / L3
-    // per-bucket weight backward kernel の固定 9-register accumulator 容量
-    // (`MAX_SUPPORTED_NUM_BUCKETS`)。larger N would need the per-bucket weight
-    // backward kernels' register fan-out to be generalised.
-    if !(2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&layerstack.num_buckets) {
-        return Err(format!(
-            "--num-buckets must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}] (got {}); larger N \
-             requires the per-bucket weight backward kernels to be generalised",
-            layerstack.num_buckets
-        )
-        .into());
-    }
-
     std::fs::create_dir_all(&cli.output)?;
 
-    // progress8kpabs weights (process-global; 未指定なら zero → 全 bucket 4)
-    let progress = match &layerstack.progress_coeff {
-        Some(p) => {
-            println!("[train] loading progress8kpabs coeff: {}", p.display());
-            ShogiProgressKPAbs::load_from_bin(p).map_err(|e| -> Box<dyn std::error::Error> {
-                format!("failed to load --progress-coeff {}: {e}", p.display()).into()
-            })?
-        }
-        None => {
-            eprintln!(
+    // progress8kpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
+    // 直接求めるため file I/O も progress model 初期化も行わない。
+    if matches!(bucket_mode, BucketMode::Progress8KpAbs) {
+        match &layerstack.progress_coeff {
+            Some(p) => {
+                println!("[train] loading progress8kpabs coeff: {}", p.display());
+                ShogiProgressKPAbs::load_from_bin(p).map_err(
+                    |e| -> Box<dyn std::error::Error> {
+                        format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+                    },
+                )?;
+            }
+            None => eprintln!(
                 "[train] note: --progress-coeff not given; all positions map to bucket 4 (sigmoid(0) = 0.5)"
-            );
-            ShogiProgressKPAbs
+            ),
         }
-    };
+    }
 
     // norm-dump は load した threat FT 重みの host 側 L2 分解だけで GPU を要さない。
     // CUDA context / GpuTrainer の構築前に load → dump → return し、GPU 非搭載の
@@ -561,6 +586,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.l1,
         layerstack.l2,
         layerstack.num_buckets,
+        bucket_mode,
         PrecisionFlags {
             tf32,
             ft_fp16,
@@ -708,7 +734,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
                 cfg.test_positions,
-                &progress,
+                &bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?,
@@ -734,7 +760,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     cfg.score_drop_abs,
                     cfg.score_clamp_abs,
                     cfg.test_positions,
-                    &progress,
+                    &bucket_mode,
                     cfg.feature_set,
                     cfg.num_buckets,
                 )?
@@ -773,7 +799,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let result = nnue_train::trainer::run(
         &mut trainer,
         data,
-        &progress,
+        &bucket_mode,
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,

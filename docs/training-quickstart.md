@@ -21,7 +21,7 @@ examples:
 | File | Format | Purpose | Approx. size |
 |---|---|---|---:|
 | Training data PSV | `PackedSfenValue` × N (fixed 40 bytes / position) | Passed via `--data` | Hundreds of GB |
-| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff`. For LayerStack's 9-bucket assignment (not needed for simple) | 1.0 MB |
+| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progress8kpabs` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
 | (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
 
 ## Example 1: Training a HalfKP NNUE (simple architecture)
@@ -45,10 +45,13 @@ options" below.
 
 ## Example 2: Training a LayerStack NNUE
 
-The `layerstack` architecture uses the 9 game-progress buckets, so prepare the
-bucket coefficients `progress.bin` first — train it with `progress-kpabs-train`
-and check the bucket split with `progress-bucket-survey`, as described in
-[Game-progress buckets: preparing `progress.bin`](progress-bin.md).
+The `layerstack` architecture supports two bucket modes. The default
+`progress8kpabs` mode uses 2–9 game-progress buckets; prepare `progress.bin`
+with `progress-kpabs-train` and inspect it with `progress-bucket-survey`, as
+described in [Game-progress buckets: preparing `progress.bin`](progress-bin.md).
+`kingrank9` matches YaneuraOu KingRank9: it normalises both king ranks to the
+side-to-move perspective and selects one of a fixed 3x3 grid of 9 buckets. It
+does not use `progress.bin`.
 
 ### Training
 
@@ -59,6 +62,12 @@ target/release/nnue-train \
   --superbatches <N> \
   --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
+```
+
+For KingRank9, replace the final line with:
+
+```bash
+  layerstack --bucket-mode kingrank9 --num-buckets 9
 ```
 
 `layerstack` defaults to `--feature-set halfka-hm-merged` / 9 buckets. The FT
@@ -82,7 +91,8 @@ change for real training are:
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack output bucket count, an integer in `[2, 9]`. Each position is routed to `min(N-1, floor(progress * N))`. Lower values trade per-bucket specialisation for more samples per bucket; the default 9 keeps the binning identical to existing distributed nets |
+| `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
+| `--num-buckets` (`layerstack`) | 9 | In `progress8kpabs` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9 |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 and the like can be left at their defaults; pass them only when you want to

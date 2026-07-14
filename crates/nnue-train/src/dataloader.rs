@@ -27,14 +27,49 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
 use shogi_format::{PackedSfenValue, ShogiBoard};
 
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
 /// 40-byte struct). Used everywhere we compute byte offsets, validate range
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
+
+/// LayerStack の position bucket 算出方式。
+#[derive(Clone, Copy, Debug, Default)]
+pub enum BucketMode {
+    /// KP-absolute progress 推定値を `num_buckets` 等分する。
+    #[default]
+    Progress8KpAbs,
+    /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
+    KingRank9,
+}
+
+impl BucketMode {
+    /// checkpoint / experiment metadata に記録する canonical 名。
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Progress8KpAbs => "progress8kpabs",
+            Self::KingRank9 => "kingrank9",
+        }
+    }
+
+    /// decode 済み局面の bucket index を返す。
+    #[inline]
+    pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+        match self {
+            Self::Progress8KpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
+            Self::KingRank9 => kingrank9_bucket_board(board),
+        }
+    }
+}
+
+impl From<ShogiProgressKPAbs> for BucketMode {
+    fn from(_: ShogiProgressKPAbs) -> Self {
+        Self::Progress8KpAbs
+    }
+}
 
 // =============================================================================
 // Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
@@ -112,7 +147,7 @@ impl Batch {
     /// の indexer が実 active index を行の先頭 `nnz[bi]` slot に書き、`nnz[bi]` を
     /// 記録する (実長超の slot は書かない — 下流は `nnz` までしか読まない契約)。
     ///
-    /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
+    /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 position bucket も
     /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
     /// 1 回だけ呼んで `ShogiBoard` を使い回すこと (decode-once 経路)。
     pub fn push(&mut self, pos: &PackedSfenValue) -> io::Result<bool> {
@@ -122,8 +157,8 @@ impl Batch {
     /// [`Batch::push`] の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
     /// prefetch worker が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ
-    /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と progress8kpabs
-    /// bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で使い回すための
+    /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と bucket 計算の両方で
+    /// 使い回すための
     /// 入口 (decode-once)。`push(&pos)` は `push_decoded(&pos.decode())` と等価。
     ///
     /// active feature 数が `max_active` を超えると `Err(io::Error)` を返す。base
@@ -436,7 +471,7 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 /// reader。`--score-drop-abs` の近似 skip (`|score| >= t` を捨てる) と空 file の
 /// 無限ループ防止 (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない**
 /// (decode-once 経路: bucket は呼び出し側 prefetch worker が `decode()` した
-/// `ShogiBoard` から `ShogiProgressKPAbs::bucket_board` で求める)。
+/// `ShogiBoard` から選択された [`BucketMode`] で求める)。
 ///
 /// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
@@ -546,20 +581,19 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 type BatchSlot = (Batch, Vec<i32>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
-/// 「PSV パース + feature sparse 抽出 + progress8kpabs bucket 計算」を
+/// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
 /// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
 /// prefetch loader。
 ///
 /// ## 設計
 ///
 /// - **decode-once**: worker は `psv.decode()` した `ShogiBoard` を
-///   `Batch::push_decoded` (feature 抽出) と `ShogiProgressKPAbs::bucket_board`
-///   (output bucket) の両方に渡す。`pos.decode()` は 1 局面 1 回。
+///   `Batch::push_decoded` (feature 抽出) と [`BucketMode::bucket_board`] の両方に
+///   渡す。`pos.decode()` は 1 局面 1 回。
 /// - **並列パース**: worker は短い critical section (共有 `Mutex<PsvEpochReader>`
 ///   を lock して `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は
 ///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`FeatureSetSpec` は
-///   `Copy` の値型、`ShogiProgressKPAbs` は ZST + process-global `OnceLock`
-///   (read-only) なので thread 間共有して問題ない。
+///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
 ///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
@@ -604,12 +638,11 @@ impl BucketedPrefetchedLoader {
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
     /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
     /// `[-c, c]` に飽和させる (`--score-clamp-abs`)。
-    /// `progress` は output bucket を計算する [`ShogiProgressKPAbs`] (ZST; 重みは
-    /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
-    /// 未ロードなら全 bucket 4)。`feature_set` は sparse index 化に使う feature
-    /// set spec で、全 worker が共有する (`Copy`、read-only)。
-    /// `num_buckets` は worker が `progress.bucket_board(board, num_buckets)` を
-    /// 呼ぶときの bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
+    /// `bucket_mode` は output bucket の算出方式。`Progress8KpAbs` の重みは
+    /// process-global なので呼び出し前に `ShogiProgressKPAbs::load_from_bin` 済で
+    /// あること、未ロードなら全 bucket 4。`KingRank9` は外部重みを参照しない。
+    /// `feature_set` は sparse index 化に使う feature set spec で、全 worker が共有する。
+    /// `num_buckets` は progress mode の bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
     /// 計算自体が skip されるが、worker 側 assertion (`num_buckets >= 1`) は常に
     /// 評価する。
     /// `train_end_offset` は training stream の上限 byte offset (`[0, train_end_offset)`
@@ -629,7 +662,7 @@ impl BucketedPrefetchedLoader {
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
         num_workers: usize,
-        progress: ShogiProgressKPAbs,
+        bucket_mode: impl Into<BucketMode>,
         feature_set: FeatureSetSpec,
         compute_bucket: bool,
         num_buckets: usize,
@@ -641,6 +674,7 @@ impl BucketedPrefetchedLoader {
             "BucketedPrefetchedLoader requires num_buckets >= 1"
         );
         assert!(batch_size >= 1, "batch_size must be >= 1");
+        let bucket_mode = bucket_mode.into();
         let num_workers = num_workers.max(1);
         let prefetch_depth = prefetch_depth_for(num_workers);
         // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
@@ -734,9 +768,8 @@ impl BucketedPrefetchedLoader {
                     }
 
                     // decode-once: ShogiBoard を feature 抽出 + (compute_bucket=true
-                    // のとき) progress bucket の両方に使う。`compute_bucket=false`
-                    // (Simple アーキ) では `progress.bucket_board` の per-position 推論
-                    // (~30-40 KP-abs weight load + exp + clamp) を skip し worker CPU を
+                    // のとき) position bucket の両方に使う。`compute_bucket=false`
+                    // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
                     let mut overflow: Option<io::Error> = None;
                     for psv in &scratch {
@@ -758,7 +791,7 @@ impl BucketedPrefetchedLoader {
                             }
                         }
                         if compute_bucket {
-                            buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
+                            buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
                         }
                     }
                     if let Some(e) = overflow {
@@ -1405,6 +1438,45 @@ mod tests {
             loader.recycle((batch, buckets));
         }
         drop(loader); // worker は channel close で抜ける (hang しない)。
+    }
+
+    #[test]
+    fn bucketed_loader_dispatches_kingrank9_without_progress_weights() {
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
+        let mut expected_reader = PsvFileLoader::new(&path).expect("open sample PSV");
+        let mut expected = Vec::new();
+        for _ in 0..16 {
+            let board = expected_reader
+                .next_psv()
+                .expect("read sample PSV")
+                .expect("sample record")
+                .decode();
+            expected.push(i32::from(kingrank9_bucket_board(&board)));
+        }
+
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &path,
+            16,
+            None,
+            None,
+            1,
+            BucketMode::KingRank9,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .expect("spawn KingRank9 loader");
+        let (batch, buckets) = loader
+            .next_batch()
+            .expect("load batch")
+            .expect("full batch");
+        assert_eq!(batch.n_positions, 16);
+        assert_eq!(buckets, expected);
+        assert!(buckets.iter().all(|&bucket| (0..9).contains(&bucket)));
+        loader.recycle((batch, buckets));
     }
 
     #[test]

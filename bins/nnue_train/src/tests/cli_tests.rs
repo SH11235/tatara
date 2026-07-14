@@ -4,7 +4,9 @@ use clap::Parser;
 use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;
-use crate::training::{per_group_optim_flags, reject_simple_unsupported_flags};
+use crate::training::{
+    per_group_optim_flags, reject_simple_unsupported_flags, validate_bucket_mode,
+};
 
 use clap::CommandFactory;
 
@@ -126,6 +128,45 @@ fn ft_factorize_defaults_on_and_no_flag_disables() {
 fn layerstack_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::LayerStack);
+}
+
+fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
+    let mut full = vec!["nnue-train", "layerstack"];
+    full.extend_from_slice(argv);
+    match Cli::try_parse_from(full)
+        .expect("layerstack CLI should parse")
+        .arch
+    {
+        ArchCommand::LayerStack(args) => args,
+        ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
+    }
+}
+
+#[test]
+fn kingrank9_bucket_mode_validation() {
+    let valid = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "9"]);
+    assert!(validate_bucket_mode(&valid).is_ok());
+
+    let wrong_count = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "8"]);
+    let err = validate_bucket_mode(&wrong_count).unwrap_err().to_string();
+    assert!(err.contains("must be 9"), "{err}");
+
+    let progress_coeff = layerstack_args(&[
+        "--bucket-mode",
+        "kingrank9",
+        "--progress-coeff",
+        "progress.bin",
+    ]);
+    let err = validate_bucket_mode(&progress_coeff)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not used"), "{err}");
+
+    let unknown = layerstack_args(&["--bucket-mode", "unknown"]);
+    let err = validate_bucket_mode(&unknown).unwrap_err().to_string();
+    assert!(err.contains("unknown"), "{err}");
+    assert!(err.contains("progress8kpabs"), "{err}");
+    assert!(err.contains("kingrank9"), "{err}");
 }
 
 #[test]

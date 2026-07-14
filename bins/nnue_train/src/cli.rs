@@ -581,7 +581,7 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress-kpabs N-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2; bucket count by --num-buckets).
+    /// Bucketed LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
@@ -603,12 +603,14 @@ impl ArchCommand {
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
     /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
-    /// king squares x 1548 KP-abs piece inputs). When omitted, every position
-    /// falls in bucket 4 (zero weights → `sigmoid(0) = 0.5`).
+    /// king squares x 1548 KP-abs piece inputs). When omitted in progress8kpabs
+    /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
+    /// 0.5`). Do not specify this option in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// Bucket mode (only "progress8kpabs" is implemented).
+    /// Bucket assignment: `progress8kpabs` uses the KP-absolute progress model;
+    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets.
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
 
@@ -636,9 +638,9 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
 
-    /// LayerStack output bucket count. Each position is routed to bucket
-    /// `min(N-1, floor(p * N))` where `p` is the progress estimate. Specify a
-    /// value in `[2, 9]`; the upper bound is the fixed 9-register accumulator
+    /// LayerStack output bucket count. In progress8kpabs mode, each position is
+    /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
+    /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
     /// in the per-bucket weight backward kernels. The default 9 keeps the
     /// binning and weight-buffer shape identical to the standard layout and
     /// resume-compatible with existing checkpoints. The historical 8-bucket
