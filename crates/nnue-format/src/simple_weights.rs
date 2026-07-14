@@ -606,20 +606,19 @@ fn count_i8_saturations(values: &[f32], scale: f64) -> usize {
 }
 
 /// dense 層の i8 weight 量子化で飽和が起きていれば層名付きで警告する。件数 0 なら
-/// 無出力。飽和は `write_i8_weight` が int8 範囲に clamp するため即座の破綻には
-/// ならないが、dense weight が clamp 域 (±127/QB) を超えて育った状態を示す。出力層で
-/// 飽和率が高いと、学習が要求する出力スケールを int8 dense が構成できず、量子化ネット
-/// の評価値が破綻する (loss と dense clamp のスケール不整合の兆候)。
+/// 無出力。飽和 (`round(scale·w)` が `[-128, 127]` の外) は `write_i8_weight` が int8
+/// 範囲に clamp するため即座の破綻にはならないが、weight が int8 表現域を超えて育った
+/// 状態を示す。出力層で飽和率が高いと、学習が要求する出力スケールを int8 dense が構成
+/// できず、量子化ネットの評価値が破綻する (loss と dense clamp のスケール不整合の兆候)。
 fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
     let n = count_i8_saturations(values, scale);
     if n > 0 {
-        let bound = i8::MAX as f64 / scale;
         let pct = 100.0 * n as f64 / values.len() as f64;
         eprintln!(
-            "[nnue-format] warning: {name} has {n}/{} ({pct:.1}%) elements saturating i8 \
-             quantisation (|w| > {bound:.4}); values are clamped to the int8 range on export. \
-             A large saturating fraction in the output layer means the trained weights cannot \
-             form the requested evaluation scale (loss / dense clamp scale mismatch).",
+            "[nnue-format] warning: {name} has {n}/{} ({pct:.1}%) elements whose round(scale·w) \
+             falls outside the int8 range [-128, 127] and is clamped on export. A large \
+             saturating fraction in the output layer means the trained weights cannot form the \
+             requested evaluation scale (loss / dense clamp scale mismatch).",
             values.len()
         );
     }
