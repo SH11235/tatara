@@ -110,7 +110,7 @@ pub(crate) struct GpuTrainer {
 
     // FT (single, shared across perspectives)
     ft_w: DeviceBuffer<f32>,
-    /// Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    /// 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
     ft_w_m: MomentBuf,
     ft_w_v: MomentBuf,
     ft_w_slow: DeviceBuffer<f32>,
@@ -181,7 +181,7 @@ pub(crate) struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    /// PSQT shortcut の weight + Ranger optimizer state。`--psqt` 有効時のみ `Some`、
+    /// PSQT shortcut の weight + optimizer state。`--psqt` 有効時のみ `Some`、
     /// 既定 `None` で従来 path と bit-identical (forward / backward / optimizer の
     /// PSQT 関連 launch は全て skip される)。
     psqt: Option<PsqtState>,
@@ -222,7 +222,7 @@ pub(crate) struct GpuTrainer {
     /// true なら FT activation (`ft_*_out` forward 出力 / `dft_*_out` backward 勾配) も
     /// FP16 で保持する (`--ft-fp16-out`)。`ft_fp16` が true のときのみ true になりうる。
     ft_fp16_out: bool,
-    /// true なら `ft_w` の Ranger moment (`m` / `v`) を `f16` で保持する
+    /// true なら `ft_w` の optimizer moment (`m` / `v`) を `f16` で保持する
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
@@ -236,7 +236,7 @@ pub(crate) struct GpuTrainer {
     /// (`max_active`) / artifact identity の単一の真実源。起動時に
     /// `--feature-set` から一度だけ決まり、以降不変。
     feature_set: FeatureSetSpec,
-    /// Ranger optimizer の param-group (FT / dense / bias) ごとの weight_decay と
+    /// optimizer の param-group (FT / dense / bias) ごとの weight_decay と
     /// lr 倍率。各 `radam_step` launch に group の `decay` 引数と
     /// `scheduled_lr × lr_mult` の lr を渡す。CLI から起動時に決まり、以降不変。
     /// per-group flag 未指定の group は大域 `--weight-decay` と lr_mult=1.0 に
@@ -261,7 +261,7 @@ pub(crate) struct GpuTrainer {
     step_count: u64,
 }
 
-/// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
+/// PSQT shortcut の weight + optimizer state を集約した sub-struct。
 /// `Option<PsqtState>` で gated。`w` shape は `(train_ft_in, num_buckets)` row-major
 /// (`w[feat * num_buckets + bucket]`)。factorizer 無効時は `train_ft_in == ft_in`。
 /// `m` / `v` は f32 固定 (PSQT weight 自体が小さく FP16 化の利得が小さいため)。
@@ -280,7 +280,7 @@ pub(crate) struct PsqtState {
 }
 
 impl PsqtState {
-    /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。Ranger state
+    /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。optimizer state
     /// は `m`/`v` = 0、`slow` = 0、`grad` = 0。`fold_len` が `Some(base_ft_in *
     /// num_buckets)` のとき forward 用 comb (`w_fold`) を確保する (factorizer 有効時)。
     fn new(
@@ -728,7 +728,7 @@ fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGro
 }
 
 impl GpuTrainer {
-    /// CUDA context を作成し、kernel module を load、10 weight groups + Ranger state +
+    /// CUDA context を作成し、kernel module を load、10 weight groups + optimizer state +
     /// 中間 activation workspace (`batch_size` 分) を確保。
     ///
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
@@ -893,7 +893,7 @@ impl GpuTrainer {
             threat_pair_starts_host.push(0);
         }
 
-        // Ranger Lookahead の slow weight は **0 初期化**。初回 lerp (`step % k == 0`)
+        // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
             stream: stream.clone(),
@@ -1021,7 +1021,7 @@ impl GpuTrainer {
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
     ///
     /// Optimizer state reset:
-    /// - `m`, `v`: 0 (fresh start、Ranger 1st/2nd moment)
+    /// - `m`, `v`: 0 (fresh start、1st/2nd moment)
     /// - `slow`: **loaded weights と同値** (warm-start anchor。from-scratch path
     ///   (`GpuTrainer::new`) は `slow = 0` だが、`--init-from` は量子化済 NNUE の
     ///   continue-training/fine-tuning で optimizer state を持たない。`slow = 0`
@@ -1319,9 +1319,9 @@ impl GpuTrainer {
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_layerstack_weights` → `save_quantised`)
     /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
-    /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}` (Ranger の
-    /// 1st/2nd moment + Lookahead slow weight、`grad` は resume に不要なので含めない) +
-    /// `step_count` (Ranger lookahead step counter) + 完了 `superbatch` 番号を書き出す。
+    /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}`
+    /// (1st/2nd moment + lookahead slow weight、`grad` は resume に不要なので含めない) +
+    /// `step_count` (optimizer step counter) + 完了 `superbatch` 番号を書き出す。
     ///
     /// file layout と atomic 書き出しは [`save_raw_checkpoint_file`] が担い、本 method
     /// は arch identity と group 列 ([`Self::raw_ckpt_group_sources`]、PSQT 無し 10 /

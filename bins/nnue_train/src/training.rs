@@ -246,7 +246,7 @@ fn validate_shared_cli(
         return Err("--threads must be >= 1".into());
     }
     if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
+        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the optimizer state; --resume preserves it)".into());
     }
     if cli.superbatches == 0 {
         return Err("--superbatches must be >= 1".into());

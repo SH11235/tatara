@@ -200,7 +200,7 @@ pub(crate) struct Cli {
     pub(crate) score_clamp_abs: Option<i16>,
 
     /// Inject weights from a quantised NNUE binary before training starts
-    /// (pretrained start). The optimizer state (Ranger m/v/slow/step) is
+    /// (pretrained start). The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and
     /// `--resume` are mutually exclusive).
     #[arg(long, global = true)]
@@ -224,7 +224,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) threat_norm_dump: bool,
 
-    /// Resume training by restoring weights + Ranger optimizer state
+    /// Resume training by restoring weights + optimizer state
     /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
     /// resume. Mutually exclusive with `--init-from` (which injects weights only
     /// and resets the optimizer). When `--start-superbatch` is omitted, resumes
@@ -314,7 +314,7 @@ pub(crate) struct Cli {
     /// stores moment buffers but not the optimizer name).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
-    /// Weight decay coefficient for the Ranger optimizer (AdamW-style decoupled
+    /// Weight decay coefficient for the optimizer (AdamW-style decoupled
     /// weight decay). The default 0.0 means no decay. A non-zero value slightly
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
@@ -358,7 +358,7 @@ pub(crate) struct Cli {
     pub(crate) bias_lr_mult: Option<f32>,
     /// Enable norm loss (per-weight-group L2-norm regularisation, Georgiou et
     /// al. 2021). With the default `false`, the optimizer step is bit-identical
-    /// to the baseline. When enabled, each step (just before the Ranger update)
+    /// to the baseline. When enabled, each step (just before the optimizer update)
     /// every targeted weight group is nudged so its L2 norm relaxes toward 1
     /// (the oblique manifold): the 2D layer weights per output neuron (FT /
     /// L1f / L1 / L2 / L3), the PSQT shortcut weights per output bucket (when

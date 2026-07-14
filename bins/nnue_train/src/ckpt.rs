@@ -35,7 +35,7 @@ use crate::trainer_common::MomentBuf;
 //   topo_count   u64                 (topology 次元の個数)
 //   topology     u64 [topo_count]     (arch 固有の層次元列)
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
-//   step_count   u64  (Ranger lookahead step counter)
+//   step_count   u64  (optimizer step counter)
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
 //   num_groups   u64
 //   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
@@ -52,7 +52,7 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
-/// weight group raw f32 + Ranger optimizer state + step + superbatch を 1 file に
+/// weight group raw f32 + optimizer state + step + superbatch を 1 file に
 /// まとめた self-contained format。
 pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 
@@ -242,7 +242,7 @@ pub(crate) struct RawCkptMeta<'a> {
     pub(crate) run_id: &'a str,
     /// この checkpoint が表す完了 superbatch 番号 (resume はこの +1 から)。
     pub(crate) superbatch: usize,
-    /// Ranger lookahead step counter。
+    /// optimizer step counter (ranger では lookahead lerp の周期判定にも使う)。
     pub(crate) step_count: u64,
     /// LR-schedule horizon (horizon を持たない schedule では `None`)。
     pub(crate) lr_horizon: Option<usize>,
@@ -253,7 +253,7 @@ pub(crate) struct RawCkptMeta<'a> {
 pub(crate) struct RawCkptHeader {
     /// この checkpoint が表す完了 superbatch 番号。
     pub(crate) superbatch: usize,
-    /// Ranger lookahead step counter。
+    /// optimizer step counter (ranger では lookahead lerp の周期判定にも使う)。
     pub(crate) step_count: u64,
     /// format 記載の weight group 数 (caller が arch 期待値と照合する)。
     pub(crate) num_groups: u64,

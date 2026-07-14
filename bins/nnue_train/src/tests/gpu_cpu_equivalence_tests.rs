@@ -6191,3 +6191,138 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
     );
     Ok(())
 }
+
+/// Simple トレーナ実体を 3 種の optimizer で 6 step 駆動し、weight decay 経由で
+/// per-step scalar (`step_size`) が種別どおり GPU kernel に届くことを確認する。
+/// grad=0 (fresh trainer) では m/v が 0 のままなので更新量は decoupled decay
+/// `w *= 1 - decay * lr * step_size_t` のみになり、CPU で厳密に再現できる。
+/// step_size_t は ranger (beta1=0.99) / radam (beta1=0.9) / adamw (定数 1) で
+/// 全て異なるため、種別の取り違え・lookahead gate の誤発火はここで検出される。
+/// ranger は step 6 で lookahead lerp が 1 回入り、slow (= 初期 weight、Simple の
+/// `slow_param ← param` 初期化規約) と補間される。
+#[test]
+fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let lr = 0.1_f32;
+    let decay = 0.01_f32;
+    let steps = RANGER_K;
+    assert_eq!(steps, 6, "expected exactly one lookahead lerp for ranger");
+
+    for kind in [
+        OptimizerKind::Ranger,
+        OptimizerKind::RAdam,
+        OptimizerKind::AdamW,
+    ] {
+        let mut trainer = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id,
+            kind,
+            decay,
+            None,
+            16,
+            PrecisionFlags::default(),
+            &init,
+        )?;
+        let w0 = trainer.ft_w_to_host()?;
+        for _ in 0..steps {
+            trainer.run_optimizer_step(lr)?;
+        }
+        let got = trainer.ft_w_to_host()?;
+
+        // CPU 参照: kernel と同じ f32 演算順序で decay 係数を 1 step ずつ適用する。
+        let mut factor = 1.0_f32;
+        for step in 1..=steps {
+            let (step_size, _denom) = kind.step_size_denom(step, BETA2, N_SMA_THRESHOLD);
+            factor *= 1.0_f32 - decay * (lr * step_size);
+        }
+        for (i, (&g, &w)) in got.iter().zip(&w0).enumerate() {
+            let mut expected = w * factor;
+            if kind.uses_lookahead() {
+                expected = RANGER_ALPHA * expected + (1.0_f32 - RANGER_ALPHA) * w;
+            }
+            assert!(
+                (g - expected).abs() <= expected.abs() * 1e-5 + 1e-7,
+                "{kind:?} ft_w[{i}]: got {g} exp {expected}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// LayerStack トレーナ実体を lr=0 で RANGER_K step 駆動し、lookahead lerp が
+/// ranger でだけ発火することを確認する。lr=0 では radam_step の decay 項も更新項も
+/// 0 なので weight は不変のまま m/v だけが実 batch の grad で更新され、step 6 の
+/// lerp (LayerStack の slow は 0 初期化) だけが weight に現れる:
+/// ranger → `w = alpha * w0` (= 0.5 倍)、radam / adamw → w0 と bit 一致。
+#[test]
+fn layerstack_lookahead_fires_only_for_ranger() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+    use nnue_train::init::LayerStackInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let feature_set = FeatureSet::HalfKaHmMerged.spec();
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+
+    for kind in [
+        OptimizerKind::Ranger,
+        OptimizerKind::RAdam,
+        OptimizerKind::AdamW,
+    ] {
+        // ft_out はフル次元 (1536) だと並列実行中の他 GPU テストと合わせて OOM に
+        // なり得るため、checkpoint roundtrip テストと同じ縮小次元にする。
+        let mut trainer = GpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            128,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+            nnue_train::dataloader::BucketMode::Progress8KpAbs,
+            PrecisionFlags::default(),
+            feature_set,
+            kind,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            None,
+            &LayerStackInit::default_uniform(),
+        )?;
+        let w0 = trainer.to_layerstack_weights()?;
+        for _ in 0..RANGER_K {
+            let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(loss.is_finite(), "{kind:?}: loss must be finite");
+        }
+        let w = trainer.to_layerstack_weights()?;
+
+        if kind.uses_lookahead() {
+            for (i, (&g, &e)) in w.l1_w.iter().zip(&w0.l1_w).enumerate() {
+                let expected = RANGER_ALPHA * e;
+                assert!(
+                    (g - expected).abs() <= 1e-7,
+                    "ranger l1_w[{i}]: got {g} exp {expected} (single lerp toward slow=0)"
+                );
+            }
+        } else {
+            assert_eq!(
+                w.l1_w, w0.l1_w,
+                "{kind:?}: lr=0 run must keep weights bit-identical (no lookahead lerp)"
+            );
+        }
+    }
+    Ok(())
+}

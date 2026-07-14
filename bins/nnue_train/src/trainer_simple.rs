@@ -212,7 +212,7 @@ impl SimpleGpuWorkspace {
 }
 
 /// Simple 4 層アーキ用 GPU トレーナ。LayerStack 用 `GpuTrainer` と並ぶもう一方の
-/// アーキの host driver。1 batch の forward → loss → backward → Ranger optimizer step
+/// アーキの host driver。1 batch の forward → loss → backward → optimizer step
 /// を 8 weight group ({ft, l1, l2, l3} × {w, b}) について実行する。
 ///
 /// `--ft-fp16` / `--ft-fp16-out` / `--fp16-opt-state` / `--tf32` の risky 精度系 flag は
@@ -298,8 +298,8 @@ pub(crate) struct SimpleGpuTrainer {
     l3_w_grad: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    // -- Ranger optimizer state (RAdam 1st/2nd moment + Lookahead slow weight、各 weight と同 shape) --
-    /// FT Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    // -- optimizer state (Adam 系 1st/2nd moment + lookahead slow weight、各 weight と同 shape) --
+    /// FT の 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
     /// 他 7 group の moment buffer は小さく `f16` 化の意味が無いので `f32` のまま。
     ft_w_m: MomentBuf,
     ft_w_v: MomentBuf,
@@ -698,7 +698,7 @@ impl SimpleGpuTrainer {
         Ok(loss_host[0])
     }
 
-    /// 1 batch の forward → backward → Ranger optimizer step を走らせ、loss kernel が
+    /// 1 batch の forward → backward → optimizer step を走らせ、loss kernel が
     /// 累積した Σerr² を返す。`bucket_idx` は受け取らない (Simple アーキは bucket 無し)。
     ///
     /// 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
@@ -2344,7 +2344,7 @@ impl SimpleGpuTrainer {
         let l3_b_n = 1_u32;
 
         // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
-        // radam step の **前** に適用する (Ranger update の直前、LayerStack と同じ順序)。
+        // radam step の **前** に適用する (optimizer update の直前、LayerStack と同じ順序)。
         // forward 用 FT weight (`ft_w_h` mirror / factorizer の comb) は後続の radam
         // (mirror 同時更新) または step 末の fold が master から再同期するので、ここで触る
         // 必要はない。各テンソルで reduce (per-group L2 norm) → finalize (sqrt) →
@@ -2713,7 +2713,7 @@ impl SimpleGpuTrainer {
     }
 
     /// `SimpleWeights` を device 上に upload して現在の重み・lookahead slow を置き換える。
-    /// `m` / `v` / `grad` は 0 リセット、`step_count` を 0 に戻す (Ranger を最初から
+    /// `m` / `v` / `grad` は 0 リセット、`step_count` を 0 に戻す (optimizer を最初から
     /// やり直すのと等価)。`load_simple_weights` 後の slow weight は upload した weight
     /// と同値 (lookahead が `w == slow` 状態から始まる、`new` と同じ規約)。
     ///
@@ -2782,7 +2782,7 @@ impl SimpleGpuTrainer {
         self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
         self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
 
-        // m / v / grad を 0 リセット、step_count を 0 に戻す (Ranger を最初から)。
+        // m / v / grad を 0 リセット、step_count を 0 に戻す (optimizer を最初から)。
         // ft_w の m / v は [`MomentBuf`] で `--fp16-opt-state` 精度を保つため `zeroed`
         // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。長さは `ft_w` と同じ
         // train 形状 (factorizer 有効時は仮想行込み。`--init-from` では factorizer が
