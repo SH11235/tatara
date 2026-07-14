@@ -4,8 +4,17 @@ use clap::Parser;
 use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;
+use crate::training::{per_group_optim_flags, reject_simple_unsupported_flags};
 
 use clap::CommandFactory;
+
+/// `nnue-train <global flags...> simple` を parse して `Cli` を返す helper。
+fn simple_cli(argv: &[&str]) -> Cli {
+    let mut full = vec!["nnue-train"];
+    full.extend_from_slice(argv);
+    full.push("simple");
+    Cli::try_parse_from(full).expect("simple cli should parse")
+}
 
 #[test]
 fn cli_definition_is_valid() {
@@ -19,6 +28,74 @@ fn cli_with_factorize(argv: &[&str]) -> Cli {
     let mut full = vec!["nnue-train", "simple"];
     full.extend_from_slice(argv);
     Cli::try_parse_from(full).expect("cli should parse")
+}
+
+/// simple が reject すべき layerstack 専用 per-group optimizer フラグの期待セット。
+/// production テーブル ([`per_group_optim_flags`]) から独立に固定し、テーブル側の
+/// 追加・脱落を検出する。
+const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
+    "--ft-weight-decay",
+    "--dense-weight-decay",
+    "--bias-weight-decay",
+    "--ft-lr-mult",
+    "--dense-lr-mult",
+    "--bias-lr-mult",
+];
+
+#[test]
+fn simple_rejects_layerstack_only_global_flags() {
+    // eval / threat 系は layerstack の eval・threat 経路専用 → simple では reject。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--eval-only"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
+    // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
+    for name in SIMPLE_REJECTED_PER_GROUP {
+        assert!(
+            reject_simple_unsupported_flags(&simple_cli(&[name, "0.1"])).is_err(),
+            "{name} must be rejected on the simple subcommand"
+        );
+    }
+    // production テーブルが期待リストと完全一致することも固定する (テーブルからの
+    // 脱落・順序変更・追加を検出)。
+    let table: Vec<&str> = per_group_optim_flags(&simple_cli(&[]))
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        table, SIMPLE_REJECTED_PER_GROUP,
+        "per_group_optim_flags table drifted from the rejected set"
+    );
+}
+
+#[test]
+fn simple_accepts_consumed_global_flags() {
+    // 既定 simple run は reject されない。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&[])).is_ok());
+    // --norm-loss / precision 系は simple が消費するので reject されない。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--norm-loss"])).is_ok());
+    assert!(
+        reject_simple_unsupported_flags(&simple_cli(&[
+            "--norm-loss",
+            "--norm-loss-factor",
+            "1e-4"
+        ]))
+        .is_ok()
+    );
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--ft-fp16", "--all-optim"])).is_ok());
+}
+
+/// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
+/// する。reject が `data.expect` より前に走らないと clean error が panic に化けるため、
+/// 実経路 (`run_training` → `run_simple_training`) で clean な `Err` になることを固定する。
+#[cfg(feature = "gpu")]
+#[test]
+fn simple_eval_only_without_data_errors_cleanly() {
+    let cli = Cli::try_parse_from(["nnue-train", "--eval-only", "simple"])
+        .expect("--eval-only simple should parse");
+    assert!(
+        crate::training::run_training(&cli).is_err(),
+        "--eval-only on simple without --data must return a clean Err, not panic"
+    );
 }
 
 #[test]
