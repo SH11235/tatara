@@ -1434,6 +1434,7 @@ pub(crate) fn build_experiment_logger(
         lineage,
         params,
         data_info,
+        nnue_format::layerstack_weights::FV_SCALE,
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1481,6 +1482,9 @@ pub(crate) fn build_experiment_logger_simple(
     fp16_opt_state: bool,
     tf32: bool,
     lr_schedule: String,
+    // export される `.bin` の実効値。`--init-from` で入力 `.bin` の値に上書きされるため、
+    // CLI の `--scale` から再計算せず trainer の値を渡す。
+    fv_scale: i32,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     let net_id_compact = format!(
@@ -1592,6 +1596,7 @@ pub(crate) fn build_experiment_logger_simple(
         lineage,
         params,
         data_info,
+        fv_scale,
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1899,6 +1904,7 @@ pub(crate) fn run_simple_training(
         fp16_opt_state,
         tf32,
         lr_scheduler.to_string(),
+        trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
@@ -2083,6 +2089,59 @@ mod tests {
             init_summary_for_log(&cli).as_deref(),
             Some("overrides: ft,l2")
         );
+    }
+
+    /// `results.fv_scale` は builder に渡された実効値 (trainer が export に使う値) を
+    /// 記録する。CLI の `--scale` から再計算すると `--init-from` で入力 `.bin` の値を
+    /// 引き継いだ場合に export と食い違うため、素通しであることを固定する。
+    #[test]
+    fn simple_logger_records_effective_fv_scale_not_cli_scale() {
+        let dir = std::env::temp_dir().join(format!("tatara-fv-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let data = dir.join("teacher.psv");
+        std::fs::write(&data, [0u8; PSV_RECORD_BYTES as usize]).expect("write teacher");
+
+        let out = dir.join("out");
+        let mut argv = vec!["nnue-trainer"];
+        let out_str = out.to_str().expect("utf8 path");
+        argv.extend_from_slice(&["--scale", "600", "--output", out_str]);
+        argv.push("simple");
+        let cli = Cli::try_parse_from(argv).expect("cli parse");
+
+        // CLI 由来値と実効値を意図的にずらす (`--init-from` で入力 `.bin` の値を
+        // 引き継いだ状況に相当)。
+        let cli_derived = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+        let effective = cli_derived + 14;
+        assert_ne!(cli_derived, effective);
+
+        let logger = build_experiment_logger_simple(
+            &cli,
+            SimpleId {
+                feature_set: FeatureSet::HalfKp.spec(),
+                activation: SimpleActivation::CReLU,
+                ft_out: 256,
+                l1_out: 32,
+                l2_out: 32,
+            },
+            0,
+            None,
+            None,
+            &data,
+            false,
+            false,
+            false,
+            false,
+            "step".to_string(),
+            effective,
+        );
+        logger.write().expect("write experiment.json");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(logger.path()).expect("read json"))
+                .expect("parse json");
+        assert_eq!(json["results"]["fv_scale"], serde_json::json!(effective));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

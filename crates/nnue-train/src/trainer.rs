@@ -1520,6 +1520,7 @@ mod tests {
             None,
             params,
             data,
+            nnue_format::layerstack_weights::FV_SCALE,
         );
         let mut logger = ExperimentLogger::new(json_path.clone(), doc);
 
@@ -1627,6 +1628,7 @@ mod tests {
                 total_positions: 0,
                 dataset_passes: 0.0,
             },
+            nnue_format::layerstack_weights::FV_SCALE,
         );
         let mut logger = ExperimentLogger::new(json_path.clone(), doc);
 

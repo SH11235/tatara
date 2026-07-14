@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-# `experiment::FV_SCALE` (本体依存を避けて持ち直した定数) が
-# `nnue_format::layerstack_weights::FV_SCALE` と同値であることをテストで担保する。
+# `ExperimentDoc::new` が呼び出し側の `fv_scale` を素通しで記録することを、実 export 値
+# (`nnue_format::{layerstack_weights::FV_SCALE, simple_weights::simple_fv_scale}`) を
+# 使ったテストで担保する。
 nnue-format = { workspace = true }

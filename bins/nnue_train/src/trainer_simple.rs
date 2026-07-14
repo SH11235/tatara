@@ -2812,6 +2812,13 @@ impl SimpleGpuTrainer {
         Ok(())
     }
 
+    /// export される `.bin` の arch 文字列に書かれる実効 `fv_scale`。`--init-from` で
+    /// weights を読むと入力 `.bin` の値で上書きされるため、CLI の `--scale` から再計算
+    /// せずこの値を使う (experiment.json が `.bin` と食い違うのを防ぐ)。
+    pub(crate) fn fv_scale(&self) -> i32 {
+        self.fv_scale
+    }
+
     /// resume 用 raw f32 checkpoint を `path` に atomic に書き出す (LayerStack の
     /// [`GpuTrainer::save_raw_checkpoint`] と同 format / 同方針)。
     ///

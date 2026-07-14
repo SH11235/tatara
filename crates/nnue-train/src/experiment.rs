@@ -38,10 +38,8 @@ use serde::Serialize;
 /// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// LayerStack の量子化 `fv_scale` (`nnue_format::layerstack_weights::FV_SCALE` と
-/// 同値)。`results.fv_scale` に記録する。`nnue-train` crate は `nnue-format` に
-/// 本体依存しないため定数を持ち直す (同値性は dev-dependency 経由のテストで固定)。
-const FV_SCALE: i32 = 28;
+// `results.fv_scale` はアーキごとに異なる (LayerStack は形式固定、simple は学習
+// `--scale` から導出) ため、呼び出し側が実際に export する値を渡す。
 
 // =============================================================================
 // serialise 対象の本体
@@ -308,6 +306,10 @@ impl ExperimentDoc {
     /// run 開始時点の `ExperimentDoc` を組み立てる (`status = "running"`、
     /// `history` 空、`results` は 0 埋め)。`date` / `last_updated_at` は
     /// `start_epoch_secs` から導出する。
+    ///
+    /// `fv_scale` は **実際に export される NNUE の値**を渡すこと。experiment.json は
+    /// 公開の実験トラッカーに投入され、利用者はこの値をエンジンの `FV_SCALE` に設定する
+    /// ため、`.bin` の arch string と食い違うと誤った評価スケールで対局させることになる。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -318,6 +320,7 @@ impl ExperimentDoc {
         lineage: Option<Lineage>,
         params: Params,
         data: DataInfo,
+        fv_scale: i32,
     ) -> Self {
         let date = format_utc_iso(start_epoch_secs);
         Self {
@@ -335,7 +338,7 @@ impl ExperimentDoc {
             data,
             results: Results {
                 training_time_seconds: 0,
-                fv_scale: FV_SCALE,
+                fv_scale,
                 best_loss: None,
                 best_loss_superbatch: None,
                 best_test_loss: None,
@@ -571,11 +574,30 @@ fn civil_from_epoch(epoch_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
-    /// 持ち直した定数 (定義箇所の doc 参照) が `nnue-format` 側と乖離すると
-    /// experiment.json が誤った `fv_scale` を記録するため、同値性を固定する。
+    /// `results.fv_scale` は呼び出し側が渡した値をそのまま記録する。固定値に戻すと
+    /// simple (scale から導出) で `.bin` と食い違うため、素通しであることを守る。
     #[test]
-    fn fv_scale_matches_nnue_format() {
-        assert_eq!(FV_SCALE, nnue_format::layerstack_weights::FV_SCALE);
+    fn fv_scale_is_taken_from_caller() {
+        let doc = sample_doc();
+        assert_eq!(
+            doc.results.fv_scale,
+            nnue_format::layerstack_weights::FV_SCALE
+        );
+
+        let simple_fv_scale = nnue_format::simple_weights::simple_fv_scale(600.0);
+        assert_ne!(simple_fv_scale, nnue_format::layerstack_weights::FV_SCALE);
+        let doc = ExperimentDoc::new(
+            "exp".to_string(),
+            "exp".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train".to_string(),
+            None,
+            sample_params(),
+            sample_data(),
+            simple_fv_scale,
+        );
+        assert_eq!(doc.results.fv_scale, simple_fv_scale);
     }
 
     fn sample_params() -> Params {
@@ -658,6 +680,7 @@ mod tests {
             None,
             sample_params(),
             sample_data(),
+            nnue_format::layerstack_weights::FV_SCALE,
         )
     }
 
@@ -801,6 +824,7 @@ mod tests {
             None,
             params,
             sample_data(),
+            nnue_format::layerstack_weights::FV_SCALE,
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert!(v.get("commit").is_none());
@@ -827,6 +851,7 @@ mod tests {
             None,
             params,
             sample_data(),
+            nnue_format::layerstack_weights::FV_SCALE,
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert_eq!(v["params"]["start_wdl"], 0.0);
