@@ -15,10 +15,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 7):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 8):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (7)             (4 bytes)
+//   version      u32 (8)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -30,6 +30,8 @@ use crate::trainer_common::MomentBuf;
 //   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
 //   arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、例 "layerstack")
+//   bucket_mode_len u32              (v8+、bucket mode 名の長さ、bucket 無しは 0)
+//   bucket_mode  UTF-8 [bucket_mode_len] (例 "progress8kpabs" / "kingrank9")
 //   topo_count   u64                 (topology 次元の個数)
 //   topology     u64 [topo_count]     (arch 固有の層次元列)
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
@@ -46,7 +48,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=7 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=8 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -93,13 +95,19 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   feature-set header. It distinguishes feature mappings that share the
 ///   same canonical feature-set name and dimensions.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=7. Version 1 is interpreted as
+/// - `8`: a bucket-mode name (length-prefixed UTF-8, empty when the architecture
+///   has no bucket concept) follows the arch-kind name. Cross-bucket-mode resumes
+///   are rejected. For v<=7 layerstack checkpoints the mode is absent and is
+///   interpreted as "progress8kpabs" (the only mode that existed when they were
+///   written).
+///
+/// `load_raw_checkpoint` accepts versions 1..=8. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 7 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 8 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6.
-pub(crate) const RAW_CKPT_VERSION: u32 = 7;
+pub(crate) const RAW_CKPT_VERSION: u32 = 8;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -217,6 +225,8 @@ pub(crate) struct RawCkptArch<'a> {
     pub(crate) feature_set: FeatureSetSpec,
     /// network アーキ種別。
     pub(crate) arch_kind: ArchKind,
+    /// LayerStack の bucket 算出方式。bucket 概念を持たないアーキでは `None`。
+    pub(crate) bucket_mode: Option<&'a str>,
     /// FT 出力次元 (feature set header の `ft_out` 欄に書く値)。
     pub(crate) ft_out: u64,
     /// arch 固有の層次元列 (v4 topology header)。
@@ -285,6 +295,10 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     let arch_name = arch.arch_kind.canonical_name();
     w.write_all(&(arch_name.len() as u32).to_le_bytes())?;
     w.write_all(arch_name.as_bytes())?;
+    // bucket mode (v8+)。bucket 概念を持たないアーキは空文字列。
+    let bucket_mode = arch.bucket_mode.unwrap_or("");
+    w.write_all(&(bucket_mode.len() as u32).to_le_bytes())?;
+    w.write_all(bucket_mode.as_bytes())?;
     w.write_all(&(arch.topology.len() as u64).to_le_bytes())?;
     for &dim in arch.topology {
         w.write_all(&dim.to_le_bytes())?;
@@ -298,12 +312,13 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=7 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=8 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
 /// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
-/// version 7 は feature-set header に feature hash を持つ。
+/// version 7 は feature-set header に feature hash、version 8 は arch kind の直後に
+/// bucket mode 名を持つ。version 7 以前の LayerStack は `progress8kpabs` と解釈する。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -482,6 +497,37 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.arch_kind.canonical_name()
             )));
         }
+        let ckpt_bucket_mode = if version >= 8 {
+            read_exact_or_invalid(r, &mut buf4, "bucket mode name length")?;
+            let bucket_mode_len = u32::from_le_bytes(buf4) as usize;
+            if bucket_mode_len > 256 {
+                return Err(invalid_data(format!(
+                    "raw checkpoint bucket mode name length {bucket_mode_len} is implausible (max 256)"
+                )));
+            }
+            let mut bucket_mode_bytes = vec![0u8; bucket_mode_len];
+            read_exact_or_invalid(r, &mut bucket_mode_bytes, "bucket mode name")?;
+            let bucket_mode = String::from_utf8(bucket_mode_bytes).map_err(|_| {
+                invalid_data("raw checkpoint bucket mode name is not valid UTF-8".to_string())
+            })?;
+            (!bucket_mode.is_empty()).then_some(bucket_mode)
+        } else if ckpt_arch == ArchKind::LayerStack {
+            Some("progress8kpabs".to_string())
+        } else {
+            None
+        };
+        if ckpt_bucket_mode.as_deref() != expected.bucket_mode {
+            if let (Some(got), Some(want)) = (ckpt_bucket_mode.as_deref(), expected.bucket_mode) {
+                return Err(invalid_data(format!(
+                    "checkpoint bucket mode '{got}' does not match --bucket-mode '{want}'"
+                )));
+            }
+            return Err(invalid_data(format!(
+                "raw checkpoint bucket mode {:?} does not match architecture '{}'",
+                ckpt_bucket_mode.as_deref().unwrap_or(""),
+                expected.arch_kind.canonical_name()
+            )));
+        }
         read_exact_or_invalid(r, &mut buf8, "topology dim count")?;
         let topo_count = u64::from_le_bytes(buf8);
         if topo_count != expected.topology.len() as u64 {
@@ -505,6 +551,11 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             "raw checkpoint version {version} predates the arch-kind header and is \
              always 'layerstack', requested '{}' (cannot resume across architectures)",
             expected.arch_kind.canonical_name()
+        )));
+    } else if expected.bucket_mode != Some("progress8kpabs") {
+        return Err(invalid_data(format!(
+            "checkpoint bucket mode 'progress8kpabs' does not match --bucket-mode '{}'",
+            expected.bucket_mode.unwrap_or("")
         )));
     }
 

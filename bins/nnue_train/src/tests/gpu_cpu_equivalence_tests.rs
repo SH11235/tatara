@@ -5803,6 +5803,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
+            nnue_train::dataloader::BucketMode::Progress8KpAbs,
             PrecisionFlags::default(),
             feature_set,
             OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),

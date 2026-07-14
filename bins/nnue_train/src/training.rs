@@ -586,6 +586,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.l1,
         layerstack.l2,
         layerstack.num_buckets,
+        bucket_mode,
         PrecisionFlags {
             tf32,
             ft_fp16,

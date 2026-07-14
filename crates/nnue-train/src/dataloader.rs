@@ -47,6 +47,14 @@ pub enum BucketMode {
 }
 
 impl BucketMode {
+    /// checkpoint / experiment metadata に記録する canonical 名。
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Progress8KpAbs => "progress8kpabs",
+            Self::KingRank9 => "kingrank9",
+        }
+    }
+
     /// decode 済み局面の bucket index を返す。
     #[inline]
     pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
