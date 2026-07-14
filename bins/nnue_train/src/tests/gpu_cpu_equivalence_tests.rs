@@ -1065,6 +1065,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                 SMOKE_BATCH,
                 id,
                 1e-7,
+                None,
                 16,
                 PrecisionFlags {
                     ft_fp16,
@@ -5954,6 +5955,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 SMOKE_BATCH,
                 base_id,
                 1e-7,
+                None,
                 16,
                 PrecisionFlags::default(),
                 &init,
@@ -5969,7 +5971,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 ..base_id
             };
             let mut trainer =
-                SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, 1e-7, 16, precision, &init)?;
+                SimpleGpuTrainer::new(&ctx, SMOKE_BATCH, id, 1e-7, None, 16, precision, &init)?;
             trainer.sync_ft_forward_weights()?;
 
             // ft_w master は train 形状 (実行 + 仮想行)。
@@ -6061,6 +6063,7 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
             SMOKE_BATCH,
             id,
             1e-7,
+            None,
             16,
             PrecisionFlags::default(),
             &init,
@@ -6086,5 +6089,88 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
 
     let _ = std::fs::remove_file(&fac_path);
     let _ = std::fs::remove_file(&base_path);
+    Ok(())
+}
+
+/// Simple トレーナの norm-loss が期待式どおり FT weight group を 1 へ緩めることを確認する。
+/// weight_decay=0 かつ grad=0 (fresh trainer) で run_optimizer_step を 1 回呼ぶと radam は
+/// no-op (更新量 ∝ grad=0、wd 項も 0) なので、ft_w への効果は norm-loss のみ。factorizer
+/// 有効 (train 形状) にして FT group が train_ft_in 行 (piece-input 仮想行込み) をまたぐこと
+/// もあわせて確認する。CPU 参照は norm_loss_compute_norms_cpu + norm_loss_apply_cpu。
+#[test]
+fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let fac_spec = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
+    let ft_out = 256_usize;
+    let id = SimpleId {
+        feature_set: fac_spec,
+        activation: SimpleActivation::CReLU,
+        ft_out,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let train_ft_in = fac_spec.train_ft_in();
+    let lr = 0.1_f32;
+    let factor = 0.05_f32;
+
+    let mut trainer = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id,
+        0.0,
+        Some(factor),
+        16,
+        PrecisionFlags::default(),
+        &init,
+    )?;
+    // CPU 参照: FT group は per-output-neuron (ft_out groups, pitch=1, stride=ft_out,
+    // len=train_ft_in)。仮想行 (0 初期化) も同じ group に含まれる。
+    let mut expected = trainer.ft_w_to_host()?;
+    let mut norms = vec![0.0_f32; ft_out];
+    norm_loss_compute_norms_cpu(&expected, &mut norms, ft_out, 1, ft_out, train_ft_in);
+    norm_loss_apply_cpu(
+        &mut expected,
+        &norms,
+        factor,
+        lr,
+        EPS,
+        ft_out,
+        1,
+        ft_out,
+        train_ft_in,
+    );
+
+    trainer.run_optimizer_step(lr)?;
+    assert_close_rel(
+        "simple norm-loss ft_w",
+        &trainer.ft_w_to_host()?,
+        &expected,
+        TOL,
+    );
+
+    // factor=0 は no-op (norm-loss apply が ×1.0、radam も grad=0/wd=0 で no-op)。
+    let mut trainer0 = SimpleGpuTrainer::new(
+        &ctx,
+        SMOKE_BATCH,
+        id,
+        0.0,
+        Some(0.0),
+        16,
+        PrecisionFlags::default(),
+        &init,
+    )?;
+    let before = trainer0.ft_w_to_host()?;
+    trainer0.run_optimizer_step(lr)?;
+    assert_eq!(
+        trainer0.ft_w_to_host()?,
+        before,
+        "factor=0 norm-loss must be a no-op"
+    );
     Ok(())
 }

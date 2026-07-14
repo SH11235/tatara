@@ -359,6 +359,13 @@ pub(crate) struct SimpleGpuTrainer {
     step_count: u64,
     /// Ranger optimizer の weight decay 係数 (`radam_step` 引数)。
     weight_decay: f32,
+    /// oblique manifold norm-loss 正則化の係数 (`--norm-loss` opt-in、無効時 `None`)。
+    /// `Some(f)` の間 radam step の直前に各 weight group を
+    /// `w *= 1 - lr * 2 * f * (1 - 1 / (||w_group||_2 + eps))` で 1 へ緩める。
+    norm_loss_factor: Option<f32>,
+    /// norm-loss の per-group L2 norm 作業領域。長さは対象テンソル中の最大 group 数
+    /// (`norm_loss_factor` が `None` のときは 1 の dummy)。
+    norm_scratch: DeviceBuffer<f32>,
     /// 推論時の評価値スケール (`round(QA * QB / 学習 scale)`)。量子化 checkpoint
     /// 出力の arch 文字列に書く (`SimpleWeights::fv_scale`)。
     fv_scale: i32,
@@ -376,11 +383,13 @@ impl Drop for SimpleGpuTrainer {
 
 impl SimpleGpuTrainer {
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
         weight_decay: f32,
+        norm_loss_factor: Option<f32>,
         fv_scale: i32,
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
@@ -487,6 +496,15 @@ impl SimpleGpuTrainer {
         if threat_pair_starts_host.is_empty() {
             threat_pair_starts_host.push(0);
         }
+        // norm-loss reduce の per-group norm scratch。長さは対象テンソル中の最大 group 数
+        // (dense weight は per-output-neuron: FT=ft_out / L1=l1_out / L2=l2_out / L3=1、
+        // bias は per-tensor=1)。無効時は 1 の dummy。
+        let norm_scratch_len = if norm_loss_factor.is_some() {
+            ft_out.max(l1_out).max(l2_out).max(1)
+        } else {
+            1
+        };
+        let norm_scratch = DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?;
         Ok(Self {
             ft_w,
             ft_b,
@@ -556,6 +574,8 @@ impl SimpleGpuTrainer {
             id,
             step_count: 0,
             weight_decay,
+            norm_loss_factor,
+            norm_scratch,
             fv_scale,
             cublas,
             ft_fp16: precision.ft_fp16,
@@ -2313,6 +2333,66 @@ impl SimpleGpuTrainer {
         let l2_b_n = l2_out as u32;
         let l3_w_n = l2_out as u32;
         let l3_b_n = 1_u32;
+
+        // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
+        // radam step の **前** に適用する (Ranger update の直前、LayerStack と同じ順序)。
+        // forward 用 FT weight (`ft_w_h` mirror / factorizer の comb) は後続の radam
+        // (mirror 同時更新) または step 末の fold が master から再同期するので、ここで触る
+        // 必要はない。各テンソルで reduce (per-group L2 norm) → finalize (sqrt) →
+        // apply (`w *= 1 - lr*2*factor*(1 - 1/(norm+eps))`) の 3 launch。group の
+        // (n_groups, group_pitch, elem_stride, group_len) は weight レイアウトで決まる:
+        // dense weight は per-output-neuron ([in, out] strided column: pitch=1 / stride=out、
+        // L3 は out=1 で 1 group)、bias は per-tensor scalar (n_groups=1)。
+        if let Some(nl_factor) = self.norm_loss_factor {
+            // FT の norm group 行数は train 値 — factorizer の piece-input 仮想行も同じ
+            // 正則化 group に含める (LayerStack と同じ扱い)。
+            let ft_w_rows = self.id.feature_set.train_ft_in();
+            let combined_dim = self.id.combined_dim();
+            macro_rules! norm_loss_group {
+                ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
+                    memset_zero(&self.stream, &self.norm_scratch)?;
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: norm_loss_reduce,
+                            stream: self.stream, module: self.module,
+                            config: cfg_norm_loss_reduce($ng, $len),
+                            args: [slice($w), slice(self.norm_scratch),
+                                   ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                        }
+                    }?;
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: norm_loss_finalize,
+                            stream: self.stream, module: self.module,
+                            config: cfg_1d($ng),
+                            args: [slice_mut(self.norm_scratch), ($ng) as u32]
+                        }
+                    }?;
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: norm_loss_apply,
+                            stream: self.stream, module: self.module,
+                            config: cfg_1d(($ng) * ($len)),
+                            args: [slice_mut($w), slice(self.norm_scratch),
+                                   nl_factor, lr, EPS,
+                                   ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                        }
+                    }?;
+                }};
+            }
+            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+            norm_loss_group!(self.l1_w, l1_out, 1, l1_out, combined_dim);
+            norm_loss_group!(self.l2_w, l2_out, 1, l2_out, l1_out);
+            norm_loss_group!(self.l3_w, 1, 1, 1, l2_out);
+            norm_loss_group!(self.ft_b, 1, 0, 1, ft_out);
+            norm_loss_group!(self.l1_b, 1, 0, 1, l1_out);
+            norm_loss_group!(self.l2_b, 1, 0, 1, l2_out);
+            norm_loss_group!(self.l3_b, 1, 0, 1, 1);
+        }
 
         // ft_w optimizer: 2 つの opt-in flag で 4 通りに分岐する (LayerStack と同じパターン)。
         //  - `--ft-fp16`: FP16 mirror (`ft_w_h`) 同時更新版 (`*_mirror`) を使い、forward 用

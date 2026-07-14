@@ -1499,8 +1499,8 @@ pub(crate) fn build_experiment_logger_simple(
         ft_lr_mult: None,
         dense_lr_mult: None,
         bias_lr_mult: None,
-        // simple subcommand は norm loss 非対応 (`run_simple_training` で reject 済)。
-        norm_loss_factor: None,
+        // `--norm-loss` 有効時のみ factor を記録する (無効時 None)。
+        norm_loss_factor: cli.norm_loss.then_some(cli.norm_loss_factor),
         qa: id.activation.qa(),
         qb: nnue_format::simple_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
@@ -1614,11 +1614,12 @@ pub(crate) fn run_simple_training(
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
-    if cli.norm_loss {
-        return Err(
-            "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
-                .into(),
-        );
+    if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
+        return Err(format!(
+            "--norm-loss-factor must be finite and >= 0 (got {})",
+            cli.norm_loss_factor
+        )
+        .into());
     }
     // per-group flag は global 定義なので parse は通るが、simple trainer は単一
     // weight_decay 経路のみ。silent no-op (指定 hyperparameter が効かないまま走る)
@@ -1719,6 +1720,15 @@ pub(crate) fn run_simple_training(
     // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
     // は前段で有限・正値を保証済。
     let fv_scale = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+    let norm_loss_factor = if cli.norm_loss {
+        println!(
+            "[train] norm loss active (factor = {})",
+            cli.norm_loss_factor
+        );
+        Some(cli.norm_loss_factor)
+    } else {
+        None
+    };
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
@@ -1740,6 +1750,7 @@ pub(crate) fn run_simple_training(
         cli.batch_size,
         id,
         cli.weight_decay,
+        norm_loss_factor,
         fv_scale,
         PrecisionFlags {
             tf32,
