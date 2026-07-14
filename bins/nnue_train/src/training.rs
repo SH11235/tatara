@@ -1057,7 +1057,7 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 ///     simple は単一 `weight_decay` 経路のみ。
 ///
 /// 他の layerstack 専用 flag の enforce は別所が担う: `--optimizer` は
-/// [`validate_shared_cli`] が `ranger` 以外を reject、`--init-l1f` は
+/// [`validate_shared_cli`] が未知の optimizer 名を reject、`--init-l1f` は
 /// [`build_simple_init_spec`] が reject (simple に L1f 層は無い)。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {

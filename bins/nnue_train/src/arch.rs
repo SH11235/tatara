@@ -84,7 +84,7 @@ mod gpu {
     /// batch=65536 のとき実 scale は `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
     pub(crate) const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 1st moment (`m`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 1st moment (`m`) を `f16` 格納するときの
     /// scale。`m` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `m` は batch 正規化された勾配の EMA で、実測 (1000 step 時点の `ft_w` checkpoint)
@@ -94,7 +94,7 @@ mod gpu {
     /// (学習初期の勾配増大に ~24× の余裕)。scale は power-of-2 で scale 自体は無誤差。
     pub(crate) const FT_OPT_M_SCALE: f32 = (1_u32 << 28) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 2nd moment (`v`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 2nd moment (`v`) を `f16` 格納するときの
     /// scale。`v` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `v` は勾配二乗の EMA で `m` よりさらに小さく、実測で中央値 ~2e-15・最大 ~2e-9。

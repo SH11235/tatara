@@ -6200,6 +6200,11 @@ fn simple_norm_loss_step_matches_cpu() -> Result<(), Box<dyn std::error::Error>>
 /// 全て異なるため、種別の取り違え・lookahead gate の誤発火はここで検出される。
 /// ranger は step 6 で lookahead lerp が 1 回入り、slow (= 初期 weight、Simple の
 /// `slow_param ← param` 初期化規約) と補間される。
+///
+/// precision variant (`--ft-fp16` / `--fp16-opt-state`) もループし、
+/// `radam_step_fp16_mirror` / `radam_step_f16state_mirror` の launch が同じ
+/// per-step scalar を受けることを確認する (weight master は f32 のまま、moment の
+/// `f16` 格納も 0 のままなので期待軌跡は variant 間で共通)。
 #[test]
 fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -6211,7 +6216,7 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
     let ctx = CudaContext::new(0)?;
     let init = SimpleInit::default_uniform();
     let id = SimpleId {
-        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        feature_set: FeatureSet::HalfKp.spec(),
         activation: SimpleActivation::CReLU,
         ft_out: 256,
         l1_out: 32,
@@ -6222,6 +6227,98 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
     let steps = RANGER_K;
     assert_eq!(steps, 6, "expected exactly one lookahead lerp for ranger");
 
+    let precisions = [
+        ("f32", PrecisionFlags::default()),
+        (
+            "ft_fp16",
+            PrecisionFlags {
+                ft_fp16: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+        (
+            "ft_fp16+fp16_opt_state",
+            PrecisionFlags {
+                ft_fp16: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+    ];
+
+    for (label, precision) in precisions {
+        for kind in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+        ] {
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                kind,
+                decay,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
+            let w0 = trainer.ft_w_to_host()?;
+            for _ in 0..steps {
+                trainer.run_optimizer_step(lr)?;
+            }
+            let got = trainer.ft_w_to_host()?;
+
+            // CPU 参照: kernel と同じ f32 演算順序で decay 係数を 1 step ずつ適用する。
+            let mut factor = 1.0_f32;
+            for step in 1..=steps {
+                let (step_size, _denom) = kind.step_size_denom(step, BETA2, N_SMA_THRESHOLD);
+                factor *= 1.0_f32 - decay * (lr * step_size);
+            }
+            for (i, (&g, &w)) in got.iter().zip(&w0).enumerate() {
+                let mut expected = w * factor;
+                if kind.uses_lookahead() {
+                    expected = RANGER_ALPHA * expected + (1.0_f32 - RANGER_ALPHA) * w;
+                }
+                assert!(
+                    (g - expected).abs() <= expected.abs() * 1e-5 + 1e-7,
+                    "{label}/{kind:?} ft_w[{i}]: got {g} exp {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Simple トレーナ実体を lr=0 で 1 step 駆動し、`beta1` が種別どおり kernel に
+/// 届くことを 1st moment で確認する。weight 不変 + 決定的 init により grad `g` は
+/// 種別間で同一なので `m = (1 - beta1) * g` に閉じ、
+/// `m_ranger * (1 - 0.9) == m_radam * (1 - 0.99)` (elementwise) と
+/// `m_radam == m_adamw` が成り立つ。
+#[test]
+fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    // smoke_dummy の score=0 / wdl=0.5 は sigmoid loss の最小点に近く勾配が
+    // 消えるので、score を動かして学習信号 (非ゼロ grad) を作る。
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
+
+    let mut moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
     for kind in [
         OptimizerKind::Ranger,
         OptimizerKind::RAdam,
@@ -6232,53 +6329,71 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
             SMOKE_BATCH,
             id,
             kind,
-            decay,
+            0.0,
             None,
             16,
             PrecisionFlags::default(),
             &init,
         )?;
-        let w0 = trainer.ft_w_to_host()?;
-        for _ in 0..steps {
-            trainer.run_optimizer_step(lr)?;
-        }
-        let got = trainer.ft_w_to_host()?;
+        let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+        assert!(loss.is_finite(), "{kind:?}: loss must be finite");
+        moments.push((kind, trainer.l1_w_m_to_host()?));
+    }
 
-        // CPU 参照: kernel と同じ f32 演算順序で decay 係数を 1 step ずつ適用する。
-        let mut factor = 1.0_f32;
-        for step in 1..=steps {
-            let (step_size, _denom) = kind.step_size_denom(step, BETA2, N_SMA_THRESHOLD);
-            factor *= 1.0_f32 - decay * (lr * step_size);
-        }
-        for (i, (&g, &w)) in got.iter().zip(&w0).enumerate() {
-            let mut expected = w * factor;
-            if kind.uses_lookahead() {
-                expected = RANGER_ALPHA * expected + (1.0_f32 - RANGER_ALPHA) * w;
-            }
-            assert!(
-                (g - expected).abs() <= expected.abs() * 1e-5 + 1e-7,
-                "{kind:?} ft_w[{i}]: got {g} exp {expected}"
-            );
-        }
+    let m_of =
+        |k: OptimizerKind| -> &Vec<f32> { &moments.iter().find(|(kind, _)| *kind == k).unwrap().1 };
+    let m_ranger = m_of(OptimizerKind::Ranger);
+    let m_radam = m_of(OptimizerKind::RAdam);
+    let m_adamw = m_of(OptimizerKind::AdamW);
+    let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+    assert!(
+        max_abs > 0.0,
+        "l1_w grads must be non-trivial for the m check"
+    );
+    assert_eq!(
+        m_radam, m_adamw,
+        "radam / adamw share beta1=0.9 → identical m"
+    );
+    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1();
+    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1();
+    for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+        assert!(
+            (mr * c_radam - md * c_ranger).abs() <= max_abs * c_radam * 1e-5,
+            "l1_w m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1) ratio"
+        );
     }
     Ok(())
 }
 
-/// LayerStack トレーナ実体を lr=0 で RANGER_K step 駆動し、lookahead lerp が
-/// ranger でだけ発火することを確認する。lr=0 では radam_step の decay 項も更新項も
-/// 0 なので weight は不変のまま m/v だけが実 batch の grad で更新され、step 6 の
-/// lerp (LayerStack の slow は 0 初期化) だけが weight に現れる:
-/// ranger → `w = alpha * w0` (= 0.5 倍)、radam / adamw → w0 と bit 一致。
+/// LayerStack トレーナ実体を lr=0 で RANGER_K step 駆動し、(1) lookahead lerp が
+/// ranger でだけ発火すること、(2) `beta1` が種別どおり kernel に届くことを確認する。
+///
+/// lr=0 では radam_step の decay 項も更新項も 0 なので weight は不変のまま
+/// m/v だけが実 batch の grad で更新される:
+/// - weight: step 6 の lerp (LayerStack の slow は 0 初期化) だけが現れる。
+///   ranger → `w = alpha * w0` (= 0.5 倍)、radam / adamw → w0 と値一致。
+/// - 1st moment: weight 不変 + 決定的 init により全 step / 全種別で grad `g` が
+///   同一なので、EMA は `m = (1 - beta1^6) * g` に閉じる。よって
+///   `m_ranger * (1 - 0.9^6) == m_radam * (1 - 0.99^6)` (elementwise)、
+///   `m_radam == m_adamw` (beta1 が同じ 0.9、m 更新は denom に依らない)。
+///   beta1 の取り違え (例: 全種別 0.99) はこの比で検出される。
 #[test]
-fn layerstack_lookahead_fires_only_for_ranger() -> Result<(), Box<dyn std::error::Error>> {
+fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn std::error::Error>>
+{
     use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
     use nnue_train::init::LayerStackInit;
     use shogi_features::FeatureSet;
 
     let ctx = CudaContext::new(0)?;
-    let feature_set = FeatureSet::HalfKaHmMerged.spec();
-    let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    let feature_set = FeatureSet::HalfKp.spec();
+    // smoke_dummy の score=0 / wdl=0.5 は sigmoid loss の最小点に近く勾配が
+    // 消えるので、score を動かして学習信号 (非ゼロ grad) を作る。
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
 
+    let mut moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
     for kind in [
         OptimizerKind::Ranger,
         OptimizerKind::RAdam,
@@ -6320,9 +6435,35 @@ fn layerstack_lookahead_fires_only_for_ranger() -> Result<(), Box<dyn std::error
         } else {
             assert_eq!(
                 w.l1_w, w0.l1_w,
-                "{kind:?}: lr=0 run must keep weights bit-identical (no lookahead lerp)"
+                "{kind:?}: lr=0 run must keep weights unchanged (no lookahead lerp)"
             );
         }
+        moments.push((kind, trainer.l3_b_m_to_host()?));
+    }
+
+    let m_of =
+        |k: OptimizerKind| -> &Vec<f32> { &moments.iter().find(|(kind, _)| *kind == k).unwrap().1 };
+    let m_ranger = m_of(OptimizerKind::Ranger);
+    let m_radam = m_of(OptimizerKind::RAdam);
+    let m_adamw = m_of(OptimizerKind::AdamW);
+    let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+    assert!(
+        max_abs > 0.0,
+        "l3_b grads must be non-trivial for the m check"
+    );
+    assert_eq!(
+        m_radam, m_adamw,
+        "radam / adamw share beta1=0.9 → identical m"
+    );
+    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1().powi(RANGER_K as i32);
+    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1().powi(RANGER_K as i32);
+    for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+        let lhs = mr * c_radam;
+        let rhs = md * c_ranger;
+        assert!(
+            (lhs - rhs).abs() <= max_abs * c_radam * 1e-5,
+            "l3_b m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1^6) ratio"
+        );
     }
     Ok(())
 }

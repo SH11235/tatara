@@ -1174,6 +1174,13 @@ impl GpuTrainer {
     }
 
     /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
+    /// `l3_b` の 1st moment を host へ download する (optimizer 配線検証テスト用。
+    /// 出力 bias は loss 勾配が直接届き、smoke バッチでも underflow しない)。
+    #[cfg(test)]
+    pub(crate) fn l3_b_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l3_b_m.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
     pub(crate) fn to_layerstack_weights(
         &self,
     ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
@@ -1584,7 +1591,7 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// 1 batch 分の forward → loss kernel → backward → Ranger step を実行。
+    /// 1 batch 分の forward → loss kernel → backward → optimizer step を実行。
     /// 戻り値: batch 全体の loss (f64、loss_acc から読み出し)。
     ///
     /// 実体は [`GpuTrainer::step_impl`]。本 method は `NNUE_TRAIN_STEP_PROFILE`

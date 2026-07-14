@@ -657,6 +657,12 @@ impl SimpleGpuTrainer {
         self.ft_w.to_host_vec(&self.stream).map_err(Into::into)
     }
 
+    /// `l1_w` の 1st moment を host へ download する (optimizer 配線検証テスト用)。
+    #[cfg(test)]
+    pub(crate) fn l1_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l1_w_m.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
     pub(crate) fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
         let groups: [(&DeviceBuffer<f32>, &str); 8] = [
