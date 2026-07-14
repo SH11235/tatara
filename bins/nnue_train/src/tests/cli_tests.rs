@@ -37,11 +37,11 @@ fn ft_factorize_defaults_on_and_no_flag_disables() {
             .expect("layerstack --no-ft-factorize should parse")
             .ft_factorize_enabled()
     );
-    // `--psqt` と併用しても clap では衝突しない (実効 OFF は run_training の
-    // auto-suppress が解決する)。
+    // `--psqt` と factorizer は併用可 (PSQT 行も同じ fold を通る)。clap で衝突せず
+    // parse できることだけ確認する (auto-suppress するのは `--init-from` のみ)。
     assert!(
         Cli::try_parse_from(["nnue-train", "layerstack", "--psqt"]).is_ok(),
-        "--psqt alone parses (factorizer auto-suppressed at run time)"
+        "--psqt coexists with the factorizer"
     );
 }
 

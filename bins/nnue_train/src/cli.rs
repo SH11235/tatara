@@ -505,11 +505,13 @@ pub(crate) struct Cli {
     /// and zero inference cost.
     ///
     /// This flag is accepted for explicitness/back-compat but is redundant
-    /// with the default. `--psqt` (layerstack) and `--init-from` automatically
-    /// disable the factorizer (logged at startup): the separate PSQT shortcut
-    /// block has no virtual-row fold yet, and a quantised `.bin` has no virtual
-    /// rows to initialise from. Resume across the resulting on/off is rejected
-    /// (checkpoint dimensions differ).
+    /// with the default. It is auto-disabled (logged at startup) only by
+    /// `--init-from` (a quantised `.bin` has no virtual rows to initialise
+    /// from); resume across the resulting on/off is rejected (checkpoint
+    /// dimensions differ). On the layerstack trainer it coexists with `--psqt`
+    /// (the PSQT shortcut rows share the same fold), `--threat-profile`, and
+    /// `--effect-bucket`; the `simple` trainer has no such modifiers, so it
+    /// always shares one virtual row per piece input.
     #[arg(
         long = "ft-factorize",
         global = true,
@@ -518,8 +520,8 @@ pub(crate) struct Cli {
     pub(crate) ft_factorize: bool,
 
     /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
-    /// Use this to train the non-factorized network. (The factorizer coexists
-    /// with `--threat-profile`; `--psqt` and `--init-from` auto-disable it.)
+    /// Use this to train the non-factorized network. Only `--init-from`
+    /// auto-disables it otherwise.
     #[arg(
         long = "no-ft-factorize",
         global = true,
@@ -535,7 +537,7 @@ pub(crate) struct Cli {
 impl Cli {
     /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
     /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
-    /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は呼び出し側
+    /// command-line 上で後勝ちする。`--init-from` との排他は呼び出し側
     /// (`run_training` / `run_simple_training`) が auto-suppress で解決するため、
     /// ここには含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
     #[cfg(any(feature = "gpu", test))]
