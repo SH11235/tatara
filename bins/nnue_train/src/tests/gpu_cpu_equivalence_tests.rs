@@ -6584,10 +6584,14 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
         max_abs > 0.0,
         "l3_b grads must be non-trivial for the m check"
     );
-    assert_eq!(
-        m_radam, m_adamw,
-        "radam / adamw share beta1=0.9 → identical m"
-    );
+    // bias grad は atomic 累積で run 間の丸め順序が変わり得るため、bit 一致では
+    // なく許容誤差で比較する (beta1 取り違えは 10 倍差なので検出力は十分)。
+    for (i, (&ma, &md)) in m_adamw.iter().zip(m_radam).enumerate() {
+        assert!(
+            (ma - md).abs() <= max_abs * 1e-5,
+            "l3_b m[{i}]: adamw {ma} vs radam {md} (both beta1=0.9)"
+        );
+    }
     let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1().powi(RANGER_K as i32);
     let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1().powi(RANGER_K as i32);
     for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
