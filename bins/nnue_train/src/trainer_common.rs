@@ -19,7 +19,7 @@ pub(crate) struct PrecisionFlags {
     pub(crate) fp16_opt_state: bool,
 }
 
-/// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
+/// `ft_w` の optimizer moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
 /// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
 /// optimizer phase の DRAM traffic を占めるため `f16` 化の効果がある一方、他 9 group
 /// の moment は小さく `f16` 化の意味が無いので `f32` (`DeviceBuffer<f32>`) のまま。

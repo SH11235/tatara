@@ -657,10 +657,23 @@ impl SimpleGpuTrainer {
         self.ft_w.to_host_vec(&self.stream).map_err(Into::into)
     }
 
+    /// `l1_w` を host へ download する (optimizer 配線検証テスト用)。
+    #[cfg(test)]
+    pub(crate) fn l1_w_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l1_w.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
     /// `l1_w` の 1st moment を host へ download する (optimizer 配線検証テスト用)。
     #[cfg(test)]
     pub(crate) fn l1_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.l1_w_m.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    /// `ft_w` の 1st moment を真値 `f32` で host へ download する (optimizer 配線
+    /// 検証テスト用)。`--fp16-opt-state` の `f16` 格納は scale を割り戻す。
+    #[cfg(test)]
+    pub(crate) fn ft_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)
     }
 
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。

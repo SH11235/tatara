@@ -1173,7 +1173,6 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
     /// `l3_b` の 1st moment を host へ download する (optimizer 配線検証テスト用。
     /// 出力 bias は loss 勾配が直接届き、smoke バッチでも underflow しない)。
     #[cfg(test)]
@@ -1181,6 +1180,7 @@ impl GpuTrainer {
         self.l3_b_m.to_host_vec(&self.stream).map_err(Into::into)
     }
 
+    /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
     pub(crate) fn to_layerstack_weights(
         &self,
     ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {

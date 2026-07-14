@@ -19,7 +19,7 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + Ranger state (resume 用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + optimizer state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
@@ -264,7 +264,7 @@ pub struct ValidationStepOutput {
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
 /// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
-    /// 1 batch 分 (forward → loss kernel → backward → Ranger step) を実行し、
+    /// 1 batch 分 (forward → loss kernel → backward → optimizer step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
     ///
@@ -322,7 +322,7 @@ pub trait TrainerBackend {
     /// resume 用 **raw f32 checkpoint** を `path` に書き出す。
     ///
     /// 量子化 `.bin` ([`TrainerBackend::save_checkpoint`]) と違い、全 weight
-    /// group の raw f32 値に加えて optimizer state (Ranger の `m` / `v` / `slow`)
+    /// group の raw f32 値に加えて optimizer state (`m` / `v` / `slow`)
     /// と step counter、および現在の `superbatch` 番号を保存する。これを
     /// `--resume` で読み戻すと optimizer state ごと学習を再開できる
     /// (`--init-from` の weight だけ注入する経路と違い、optimizer 状態も
@@ -951,7 +951,7 @@ where
             backend.save_checkpoint(&path)?;
             println!("[train] checkpoint saved: {}", path.display());
 
-            // resume 用 raw checkpoint: weight raw f32 + Ranger state + step + sb。
+            // resume 用 raw checkpoint: weight raw f32 + optimizer state + step + sb。
             // 実験ログがあれば run id を渡し `*.ckpt` に埋め込む (resume 時に
             // その run が lineage の親として参照される)。
             let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));

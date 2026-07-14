@@ -6237,6 +6237,13 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
             },
         ),
         (
+            "fp16_opt_state",
+            PrecisionFlags {
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+        (
             "ft_fp16+fp16_opt_state",
             PrecisionFlags {
                 ft_fp16: true,
@@ -6292,9 +6299,16 @@ fn simple_optimizer_kinds_drive_expected_decay_trajectory() -> Result<(), Box<dy
 
 /// Simple トレーナ実体を lr=0 で 1 step 駆動し、`beta1` が種別どおり kernel に
 /// 届くことを 1st moment で確認する。weight 不変 + 決定的 init により grad `g` は
-/// 種別間で同一なので `m = (1 - beta1) * g` に閉じ、
-/// `m_ranger * (1 - 0.9) == m_radam * (1 - 0.99)` (elementwise) と
-/// `m_radam == m_adamw` が成り立つ。
+/// 種別間で (丸め順序を除き) 同一なので `m = (1 - beta1) * g` に閉じ、
+/// `m_ranger * (1 - 0.9) ≈ m_radam * (1 - 0.99)` (elementwise) と
+/// `m_radam ≈ m_adamw` が成り立つ。
+///
+/// FT の m を precision 4 variant で観測することで、`ft_w` の radam_step
+/// 4 kernel variant (`radam_step` / `radam_step_fp16_mirror` /
+/// `radam_step_f16state` / `radam_step_f16state_mirror`) 全ての beta1 配線を
+/// runtime 検証する。`l1_w` (常に f32 `radam_step`) は f32 iteration でのみ確認。
+/// FT grad は sparse backward の atomic 累積で丸め順序が run 間で変わり得るため、
+/// 種別間比較も許容誤差付き (f16 格納 variant はさらに量子化誤差を上乗せ)。
 #[test]
 fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error>> {
     use crate::trainer_simple::SimpleGpuTrainer;
@@ -6318,12 +6332,126 @@ fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error
         *s = 200.0;
     }
 
-    let mut moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
-    for kind in [
-        OptimizerKind::Ranger,
-        OptimizerKind::RAdam,
-        OptimizerKind::AdamW,
-    ] {
+    let precisions = [
+        ("f32", PrecisionFlags::default(), 1e-4_f32),
+        (
+            "ft_fp16",
+            PrecisionFlags {
+                ft_fp16: true,
+                ..PrecisionFlags::default()
+            },
+            1e-4,
+        ),
+        (
+            "fp16_opt_state",
+            PrecisionFlags {
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            1e-2,
+        ),
+        (
+            "ft_fp16+fp16_opt_state",
+            PrecisionFlags {
+                ft_fp16: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            1e-2,
+        ),
+    ];
+
+    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1();
+    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1();
+
+    for (label, precision, tol) in precisions {
+        let mut ft_moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
+        let mut l1_moments: Vec<(OptimizerKind, Vec<f32>)> = Vec::new();
+        for kind in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+        ] {
+            let mut trainer = SimpleGpuTrainer::new(
+                &ctx,
+                SMOKE_BATCH,
+                id,
+                kind,
+                0.0,
+                None,
+                16,
+                precision,
+                &init,
+            )?;
+            let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+            assert!(loss.is_finite(), "{label}/{kind:?}: loss must be finite");
+            ft_moments.push((kind, trainer.ft_w_m_to_host()?));
+            l1_moments.push((kind, trainer.l1_w_m_to_host()?));
+        }
+
+        let check = |moments: &[(OptimizerKind, Vec<f32>)], tensor: &str| {
+            let m_of = |k: OptimizerKind| -> &Vec<f32> {
+                &moments.iter().find(|(kind, _)| *kind == k).unwrap().1
+            };
+            let m_ranger = m_of(OptimizerKind::Ranger);
+            let m_radam = m_of(OptimizerKind::RAdam);
+            let m_adamw = m_of(OptimizerKind::AdamW);
+            let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+            assert!(
+                max_abs > 0.0,
+                "{label}: {tensor} grads must be non-trivial for the m check"
+            );
+            for (i, (&ma, &md)) in m_adamw.iter().zip(m_radam).enumerate() {
+                assert!(
+                    (ma - md).abs() <= max_abs * tol,
+                    "{label} {tensor} m[{i}]: adamw {ma} vs radam {md} (both beta1=0.9)"
+                );
+            }
+            for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+                assert!(
+                    (mr * c_radam - md * c_ranger).abs() <= max_abs * c_radam * tol,
+                    "{label} {tensor} m[{i}]: ranger {mr} vs radam {md} violate the \
+                     (1 - beta1) ratio"
+                );
+            }
+        };
+        check(&ft_moments, "ft_w");
+        if label == "f32" {
+            check(&l1_moments, "l1_w");
+        }
+    }
+    Ok(())
+}
+
+/// Simple トレーナ実体を lr>0 の 1 step で駆動し、`denom` が種別どおり kernel に
+/// 届くことを weight 更新式で確認する。step 1 では radam (rectified schedule) は
+/// n_sma が閾値未満で `denom=0` → `w -= rate * m`、adamw は `denom=1` →
+/// `w -= lr * m / (sqrt(v) + eps)`。observed m から `g = m / (1 - beta1)`、
+/// `v = (1 - beta2) * g^2` を復元して両式の期待値を組み立てる (decay=0)。
+/// denom の取り違えは分母 `sqrt(v)` の有無で数百倍規模の差になり検出される。
+#[test]
+fn simple_denom_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let init = SimpleInit::default_uniform();
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    for s in batch.score.iter_mut() {
+        *s = 200.0;
+    }
+    let lr = 1e-3_f32;
+
+    for kind in [OptimizerKind::RAdam, OptimizerKind::AdamW] {
         let mut trainer = SimpleGpuTrainer::new(
             &ctx,
             SMOKE_BATCH,
@@ -6335,31 +6463,36 @@ fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error
             PrecisionFlags::default(),
             &init,
         )?;
-        let loss = trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+        let w0 = trainer.l1_w_to_host()?;
+        let loss = trainer.step(&batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
         assert!(loss.is_finite(), "{kind:?}: loss must be finite");
-        moments.push((kind, trainer.l1_w_m_to_host()?));
-    }
+        let w1 = trainer.l1_w_to_host()?;
+        let m = trainer.l1_w_m_to_host()?;
 
-    let m_of =
-        |k: OptimizerKind| -> &Vec<f32> { &moments.iter().find(|(kind, _)| *kind == k).unwrap().1 };
-    let m_ranger = m_of(OptimizerKind::Ranger);
-    let m_radam = m_of(OptimizerKind::RAdam);
-    let m_adamw = m_of(OptimizerKind::AdamW);
-    let max_abs = m_radam.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
-    assert!(
-        max_abs > 0.0,
-        "l1_w grads must be non-trivial for the m check"
-    );
-    assert_eq!(
-        m_radam, m_adamw,
-        "radam / adamw share beta1=0.9 → identical m"
-    );
-    let c_ranger = 1.0_f32 - OptimizerKind::Ranger.beta1();
-    let c_radam = 1.0_f32 - OptimizerKind::RAdam.beta1();
-    for (i, (&mr, &md)) in m_ranger.iter().zip(m_radam).enumerate() {
+        let (step_size, denom) = kind.step_size_denom(1, BETA2, N_SMA_THRESHOLD);
+        let rate = lr * step_size;
+        let max_abs_w = w0.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+        let mut updated = 0usize;
+        for i in 0..w0.len() {
+            let mut val = m[i];
+            if denom != 0 {
+                let g = m[i] / (1.0_f32 - kind.beta1());
+                let v = (1.0_f32 - BETA2) * g * g;
+                val /= v.sqrt() + EPS;
+            }
+            let expected = w0[i] - rate * val;
+            assert!(
+                (w1[i] - expected).abs() <= max_abs_w * 1e-4 + 1e-7,
+                "{kind:?} l1_w[{i}]: got {} exp {expected} (denom={denom})",
+                w1[i]
+            );
+            if w1[i] != w0[i] {
+                updated += 1;
+            }
+        }
         assert!(
-            (mr * c_radam - md * c_ranger).abs() <= max_abs * c_radam * 1e-5,
-            "l1_w m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1) ratio"
+            updated > 0,
+            "{kind:?}: the step must move some l1_w weights"
         );
     }
     Ok(())
