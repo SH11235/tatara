@@ -8,7 +8,8 @@ use nnue_format::layerstack_weights::{
     NNUE_VERSION, QA, QB,
 };
 use shogi_features::{
-    EffectBucketConfig, FeatureSet, FeatureSetSpec, ShogiProgressKPAbs, ThreatProfile,
+    EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
+    ThreatProfile, kingrank9_bucket_board,
 };
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
@@ -22,8 +23,13 @@ struct Args {
     #[arg(long)]
     nnue_file: PathBuf,
 
+    /// Bucket assignment used when the net was trained: progress8kpabs or kingrank9.
+    #[arg(long, default_value = "progress8kpabs")]
+    bucket_mode: String,
+
+    /// progress8kpabs coefficient file. Required in progress8kpabs mode and unused in kingrank9 mode.
     #[arg(long)]
-    progress_coeff: PathBuf,
+    progress_coeff: Option<PathBuf>,
 
     /// Quantised LayerStack output scale used to convert raw NNUE output to centipawns.
     #[arg(long, default_value_t = FV_SCALE)]
@@ -38,9 +44,40 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let progress = ShogiProgressKPAbs::load_from_bin(&args.progress_coeff)
-        .map_err(|e| format!("failed to load progress coeff: {e}"))?;
     let (weights, spec) = load_layerstack(&args.nnue_file)?;
+    let progress = match args.bucket_mode.as_str() {
+        "progress8kpabs" => {
+            let path = args
+                .progress_coeff
+                .as_deref()
+                .ok_or("--progress-coeff is required with --bucket-mode progress8kpabs")?;
+            Some(
+                ShogiProgressKPAbs::load_from_bin(path)
+                    .map_err(|e| format!("failed to load progress coeff: {e}"))?,
+            )
+        }
+        "kingrank9" => {
+            if weights.num_buckets != KINGRANK9_NUM_BUCKETS {
+                return Err(format!(
+                    "--bucket-mode kingrank9 requires a 9-bucket net (file has {})",
+                    weights.num_buckets
+                )
+                .into());
+            }
+            if args.progress_coeff.is_some() {
+                return Err(
+                    "--progress-coeff is not used with --bucket-mode kingrank9; remove it".into(),
+                );
+            }
+            None
+        }
+        other => {
+            return Err(format!(
+                "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
+            )
+            .into());
+        }
+    };
     let positions = if args.sfen.is_empty() {
         vec!["startpos".to_string()]
     } else {
@@ -49,7 +86,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for pos in positions {
         let board = parse_position(&pos)?;
-        let bucket = progress.bucket_board(&board, weights.num_buckets) as usize;
+        let bucket = progress.map_or_else(
+            || kingrank9_bucket_board(&board),
+            |progress| progress.bucket_board(&board, weights.num_buckets),
+        ) as usize;
         let raw = forward_one_raw(&weights, spec, &board, bucket)?;
         let cp = raw / args.fv_scale;
         if args.debug {

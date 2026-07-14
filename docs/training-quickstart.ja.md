@@ -18,7 +18,7 @@
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
 | 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
-| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。LayerStack の 9 bucket 振り分け用 (simple では不要) | 1.0 MB |
+| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progress8kpabs` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)
@@ -49,10 +49,12 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数
-`progress.bin` を用意する——`progress-kpabs-train` で学習し、`progress-bucket-survey`
-で bucket 分布を確認する。手順は
+`layerstack` アーキには 2 つの bucket mode がある。既定の `progress8kpabs` は
+局面進行度を 2–9 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
+学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
+`kingrank9` は YaneuraOu KingRank9 と同じく、双方の玉段を手番側視点へ正規化して
+3x3 の固定 9 bucket に分ける。この mode では `progress.bin` は使わない。
 
 ### 学習
 
@@ -63,6 +65,12 @@ target/release/nnue-train \
   --superbatches <N> \
   --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
+```
+
+KingRank9 を使う場合は末尾を次のように置き換える:
+
+```bash
+  layerstack --bucket-mode kingrank9 --num-buckets 9
 ```
 
 `layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
@@ -84,7 +92,8 @@ target/release/nnue-train \
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack の output bucket 数、`[2, 9]` の整数。各局面は `min(N-1, floor(progress * N))` で routing される。低い N は bucket 1 個あたりのサンプル数が増える代わりに局面別特殊化が緩む。既定 9 は既存配布 net と同じ binning |
+| `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` は KP-absolute 進行度で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
+| `--num-buckets` (`layerstack`) | 9 | `progress8kpabs` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。

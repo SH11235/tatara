@@ -4,6 +4,7 @@ use gpu_kernels::sparse::ft_factorize::FT_FACTORIZE_BASE;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
+use nnue_train::dataloader::BucketMode;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::LossKind;
@@ -255,6 +256,7 @@ pub(crate) struct GpuTrainer {
     /// の bucket 軸長と、kernel launch args の `num_buckets` を駆動する。
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
+    bucket_mode: BucketMode,
     step_count: u64,
 }
 
@@ -748,6 +750,7 @@ impl GpuTrainer {
         l1_out: usize,
         l2_out: usize,
         num_buckets: usize,
+        bucket_mode: BucketMode,
         precision: PrecisionFlags,
         feature_set: FeatureSetSpec,
         optim_groups: OptimGroupConfig,
@@ -1001,6 +1004,7 @@ impl GpuTrainer {
             norm_loss_factor,
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
+            bucket_mode,
             step_count: 0,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -1340,6 +1344,7 @@ impl GpuTrainer {
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
+                bucket_mode: Some(self.bucket_mode.canonical_name()),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -1360,7 +1365,8 @@ impl GpuTrainer {
     /// `None`。LR-schedule horizon は version 5+ かつ horizon を持つ schedule で
     /// 保存されていれば `Some` (caller が `--superbatches` より優先して curve に使う)。
     ///
-    /// magic 不一致、`version > 5`、arch kind / topology が LayerStack と不一致、group 数
+    /// magic 不一致、未対応 version、arch kind / bucket mode / topology が LayerStack と
+    /// 不一致、group 数
     /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
     /// (32-bit / 破損 file) は `InvalidData` で reject。
     ///
@@ -1387,6 +1393,7 @@ impl GpuTrainer {
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
+                bucket_mode: Some(self.bucket_mode.canonical_name()),
                 ft_out: ft_out as u64,
                 topology,
             },

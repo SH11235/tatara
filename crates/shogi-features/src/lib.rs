@@ -10,6 +10,7 @@
 pub mod effect_bucket;
 pub mod feature_set;
 pub mod halfka_hm;
+pub mod kingrank9;
 pub mod progress_kpabs;
 pub mod psqt_material;
 mod simd;
@@ -27,6 +28,7 @@ pub use halfka_hm::{
     FEATURE_HASH_HM_V2, HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, NUM_KING_BUCKETS, PIECE_INPUTS,
     SHOGI_HALFKA_HM_NUM_ACTIVE_INDICES, SHOGI_HALFKA_HM_NUM_FEATURES, ShogiHalfKA_hm,
 };
+pub use kingrank9::{KINGRANK9_NUM_BUCKETS, kingrank9_bucket_board};
 pub use progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 pub use psqt_material::{material_cp, psqt_material_values};
 pub use threat::{THREAT_MAX_ACTIVE, ThreatClass, ThreatIndexer, threat_dimensions_of};

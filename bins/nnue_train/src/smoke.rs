@@ -354,6 +354,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
+        nnue_train::dataloader::BucketMode::Progress8KpAbs,
         PrecisionFlags::default(),
         feature_set,
         // smoke は per-group override 無し (全 group weight_decay=0 / lr_mult=1.0)。

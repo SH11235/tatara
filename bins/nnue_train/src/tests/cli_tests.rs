@@ -6,6 +6,7 @@ use nnue_format::{ArchKind, SimpleActivation};
 use crate::cli::*;
 use crate::training::{
     per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
+    validate_bucket_mode,
 };
 
 use clap::CommandFactory;
@@ -90,11 +91,20 @@ fn simple_accepts_consumed_global_flags() {
 fn simple_rejects_loss_wdl_requires_win_rate_model() {
     // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
     assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
-    // WRM 併用時は accept (identity 退化の設定でも受理される)。
-    assert!(require_simple_win_rate_model(&simple_cli(&["--win-rate-model"])).is_ok());
+    // WRM の出力 scale と export の scale が不一致なら reject。
+    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
+    // 一致する WRM は accept (identity 退化の設定でも受理される)。
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
+    );
     assert!(
         require_simple_win_rate_model(&simple_cli(&[
             "--win-rate-model",
+            "--scale",
+            "600",
             "--wrm-in-offset",
             "0",
             "--wrm-target-offset",
@@ -152,6 +162,45 @@ fn ft_factorize_defaults_on_and_no_flag_disables() {
 fn layerstack_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::LayerStack);
+}
+
+fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
+    let mut full = vec!["nnue-train", "layerstack"];
+    full.extend_from_slice(argv);
+    match Cli::try_parse_from(full)
+        .expect("layerstack CLI should parse")
+        .arch
+    {
+        ArchCommand::LayerStack(args) => args,
+        ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
+    }
+}
+
+#[test]
+fn kingrank9_bucket_mode_validation() {
+    let valid = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "9"]);
+    assert!(validate_bucket_mode(&valid).is_ok());
+
+    let wrong_count = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "8"]);
+    let err = validate_bucket_mode(&wrong_count).unwrap_err().to_string();
+    assert!(err.contains("must be 9"), "{err}");
+
+    let progress_coeff = layerstack_args(&[
+        "--bucket-mode",
+        "kingrank9",
+        "--progress-coeff",
+        "progress.bin",
+    ]);
+    let err = validate_bucket_mode(&progress_coeff)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not used"), "{err}");
+
+    let unknown = layerstack_args(&["--bucket-mode", "unknown"]);
+    let err = validate_bucket_mode(&unknown).unwrap_err().to_string();
+    assert!(err.contains("unknown"), "{err}");
+    assert!(err.contains("progress8kpabs"), "{err}");
+    assert!(err.contains("kingrank9"), "{err}");
 }
 
 #[test]

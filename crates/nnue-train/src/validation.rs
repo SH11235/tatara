@@ -23,9 +23,10 @@ use std::io;
 use std::path::Path;
 
 use shogi_features::FeatureSetSpec;
+#[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, PsvFileLoader};
+use crate::dataloader::{Batch, BucketMode, PsvFileLoader};
 use crate::trainer::{LossKind, TrainerBackend};
 
 /// held-out validation 1 回分の集計結果。
@@ -50,7 +51,7 @@ pub struct ValidationReport {
 #[derive(Debug)]
 pub struct HeldoutSet {
     /// `(Batch, per-position bucket)`。`bucket` は学習側 dataloader と同じく
-    /// progress8kpabs で計算する (LayerStack 用; bucket 非依存アーキでは無視される)。
+    /// 学習側 dataloader と同じ [`BucketMode`] で計算する。
     batches: Vec<(Batch, Vec<i32>)>,
     /// 検証 position 総数 (`batches.len() * batch_size`)。
     n_positions: u64,
@@ -74,7 +75,7 @@ impl HeldoutSet {
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
         test_positions: usize,
-        progress: &ShogiProgressKPAbs,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
@@ -87,7 +88,7 @@ impl HeldoutSet {
             score_drop_abs,
             score_clamp_abs,
             test_positions,
-            progress,
+            bucket_mode,
             feature_set,
             num_buckets,
         )
@@ -108,12 +109,13 @@ impl HeldoutSet {
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
         test_positions: usize,
-        progress: &ShogiProgressKPAbs,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
+        let bucket_mode = (*bucket_mode).into();
         let n_batches = test_positions.div_ceil(batch_size).max(1);
 
         let mut loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
@@ -140,7 +142,7 @@ impl HeldoutSet {
             let board = psv.decode();
             let pushed = cur.push_decoded(&board)?;
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
-            cur_buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
+            cur_buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
             if cur.n_positions == batch_size {
                 let full =
                     std::mem::replace(&mut cur, Batch::with_capacity(batch_size, feature_set));
@@ -277,6 +279,34 @@ mod tests {
         // 引き分け 1 件を除く 4 件が分母、うち一致は idx 0 と idx 4 の 2 件。
         assert_eq!(counted, 4);
         assert_eq!(correct, 2);
+    }
+
+    #[test]
+    fn heldout_set_dispatches_kingrank9_without_progress_weights() {
+        let path = sample_psv_path();
+        let set = HeldoutSet::load(
+            &path,
+            8,
+            None,
+            None,
+            8,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+        )
+        .expect("load KingRank9 held-out set");
+
+        let mut reader = PsvFileLoader::new(&path).expect("open sample PSV");
+        let mut expected = Vec::new();
+        for _ in 0..8 {
+            let board = reader
+                .next_psv()
+                .expect("read sample PSV")
+                .expect("sample record")
+                .decode();
+            expected.push(i32::from(shogi_features::kingrank9_bucket_board(&board)));
+        }
+        assert_eq!(set.batches[0].1, expected);
     }
 
     #[test]
