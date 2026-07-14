@@ -46,7 +46,9 @@ pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 /// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
 /// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
 /// restructure (register fan-out → `blockIdx.z` grid axis).
-/// kernel の容量仕様だが、CLI validation が非 GPU build でも参照するため gpu module の外に置く。
+/// kernel の容量仕様だが、CLI validation (test 含む) が非 GPU build でも参照するため
+/// gpu module の外に置く。参照元と同じ cfg で非 GPU の bin 単体 build では消える。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
 
 #[cfg(feature = "gpu")]
