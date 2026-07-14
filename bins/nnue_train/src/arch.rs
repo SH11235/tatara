@@ -41,6 +41,14 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
+/// Maximum supported bucket count without changing the per-bucket weight
+/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
+/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
+/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
+/// restructure (register fan-out → `blockIdx.z` grid axis).
+/// kernel の容量仕様だが、CLI validation が非 GPU build でも参照するため gpu module の外に置く。
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use nnue_train::trainer::LossKind;
@@ -49,13 +57,6 @@ mod gpu {
     /// `l1_effective = l1_out - L1_SKIP` main dims plus this single skip dim, which
     /// is added straight onto the network output.
     pub(crate) const L1_SKIP: usize = 1;
-
-    /// Maximum supported bucket count without changing the per-bucket weight
-    /// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
-    /// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-    /// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
-    /// restructure (register fan-out → `blockIdx.z` grid axis).
-    pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
 
     // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
     pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;
