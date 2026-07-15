@@ -1,8 +1,14 @@
-# YaneuraOu 用 LayerStack net 変換
+# tatara ↔ YaneuraOu LayerStack net 変換
 
-`net_to_yo` は tatara の 9 bucket LayerStack `.bin` を YaneuraOu の SFNN 評価
-ファイルへ変換する。feature set と FT 出力 / 隠れ層の次元は入力 `.bin` の
-`arch_str` から自動検出するため、追加の指定は要らない。
+9 bucket LayerStack net を tatara と YaneuraOu SFNN の間で相互変換する 2 つのツール:
+`net_to_yo` (tatara → YaneuraOu) と `net_from_yo` (YaneuraOu → tatara)。どちらも
+feature set と FT 出力 / 隠れ層の次元を入力の `arch_str` から自動検出するため、
+追加の指定は要らない。対応 feature set / 次元とファイル形式は両ツール共通で、以下の
+各節にまとめる。
+
+## `net_to_yo` — tatara → YaneuraOu
+
+tatara の 9 bucket LayerStack `.bin` を YaneuraOu の SFNN 評価ファイルへ変換する。
 
 ```bash
 cargo run --release -p net-to-yo -- \
@@ -10,6 +16,30 @@ cargo run --release -p net-to-yo -- \
   --output /path/to/eval/nn.bin \
   --assume-kingrank9
 ```
+
+## `net_from_yo` — YaneuraOu → tatara
+
+`net_to_yo` の逆変換。YaneuraOu 形式で export された SFNN 評価ファイルを tatara の
+quantised LayerStack `.bin` へ変換する。他の学習器が YaneuraOu 形式で出力した SFNN net
+を tatara / rshogi でロードして評価・対局するのに使う。
+
+```bash
+cargo run --release -p net-from-yo -- \
+  --input /path/to/eval/nn.bin \
+  --output /path/to/tatara.bin \
+  --assume-kingrank9
+```
+
+feature set と次元は入力の `arch_str` (`ModelType=SFNNWithoutPsqt;Features=<name>…`)
+から検出し、既定の `SFNN-1536-V2` と生成名の両綴りを受理する。`SFNNWithoutPsqt` で
+ない (PSQT 付き)・未知 `Features`・`LayerStack` が 9 でない入力は reject する。YaneuraOu
+SFNN ファイルは bucket routing 規則を自己記述しないため、`--assume-kingrank9` で
+KingRank9 を明示する。FT block の先頭が `_` 始まり (`_COMPRESSED_LEB128`) の入力も
+受理する (先頭の `_` を 1 byte 読み飛ばし、共通の `COMPRESSED_LEB128` magic から読む)。
+dense weight の 32 境界 padding 列は復元時に除去する。`net_to_yo` と同一の量子化・
+レイアウト規則を用いるため、現行 format の `.bin` については
+`tatara → net_to_yo → net_from_yo` の round-trip が元と byte 一致する (legacy version
+header の `.bin` は `net_from_yo` が現行 header で書き直すため一致しない)。
 
 ## 対応する feature set と次元
 
