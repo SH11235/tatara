@@ -484,6 +484,7 @@ dependencies = [
  "gpu-runtime",
  "nnue-format",
  "nnue-train",
+ "serde_json",
  "shogi-features",
  "shogi-format",
 ]
