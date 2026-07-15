@@ -248,14 +248,19 @@ fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
 
 /// Network 構造名から L1/L2 出力次元を復元する。既定 `SFNN-1536`(-V2) は
 /// `HalfKA_hm2`/1536 専用で 16/32、それ以外は生成器同形の
-/// `SFNN_<gen_key>_<ft>_<h1>_<h2>_k3k3` から `l1_out = h1 + 1`, `l2_out = h2` を取る。
+/// `SFNN_<GEN_KEY>_<ft>_<h1>_<h2>_K3K3` から `l1_out = h1 + 1`, `l2_out = h2` を取る。
+/// `nnue_arch_gen.py` は生成名を大文字化する (`arch.upper()`) ため、実 YaneuraOu net
+/// の構造名は大文字だが、大小どちらの綴りも受理する。
 /// `feature`/`ft_out` は Features トークンとの整合を照合するために受け取る。
 fn parse_network_dims(
     network: &str,
     feature: &YoFeature,
     ft_out: usize,
 ) -> io::Result<(usize, usize)> {
-    if network == "SFNN-1536" || network == "SFNN-1536-V2" {
+    // 生成名の casing は環境差があるため大文字に正規化して照合する
+    // (数字・アンダースコアは大文字化の影響を受けない)。
+    let net_upper = network.to_ascii_uppercase();
+    if net_upper == "SFNN-1536" || net_upper == "SFNN-1536-V2" {
         if feature.feature_set != FeatureSet::HalfKaHmMerged || ft_out != 1536 {
             return invalid_data(format!(
                 "Network `{network}` is HalfKA_hm2/1536 only, but Features declares {}(ft_out={ft_out})",
@@ -264,16 +269,16 @@ fn parse_network_dims(
         }
         return Ok((16, 32));
     }
-    let body = network
+    let body = net_upper
         .strip_prefix("SFNN_")
-        .and_then(|s| s.strip_suffix("_k3k3"))
+        .and_then(|s| s.strip_suffix("_K3K3"))
         .ok_or_else(|| {
             invalid_data_err(format!(
                 "unsupported Network structure `{network}` (expected SFNN-1536 or SFNN_<key>_<ft>_<h1>_<h2>_k3k3)"
             ))
         })?;
     let parts: Vec<&str> = body.split('_').collect();
-    if parts.len() != 4 || parts[0] != feature.gen_key {
+    if parts.len() != 4 || parts[0] != feature.gen_key.to_ascii_uppercase() {
         return invalid_data(format!(
             "Network structure `{network}` does not match feature `{}`",
             feature.gen_key
@@ -455,6 +460,7 @@ mod tests {
         {
             "SFNN-1536".to_string()
         } else {
+            // 実 YaneuraOu (`nnue_arch_gen.py` の `arch.upper()`) と同じ大文字構造名。
             format!(
                 "SFNN_{}_{}_{}_{}_k3k3",
                 f.gen_key,
@@ -462,6 +468,7 @@ mod tests {
                 l1_out - 1,
                 l2_out
             )
+            .to_ascii_uppercase()
         };
         format!(
             "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{ft_out}x2],Network={network}{{LayerStack=9}}",
@@ -495,6 +502,19 @@ mod tests {
         .unwrap();
         assert_eq!(v2.feature_set, FeatureSet::HalfKaHmMerged);
         assert_eq!((v2.ft_out, v2.l1_out, v2.l2_out), (1536, 16, 32));
+    }
+
+    #[test]
+    fn parse_yo_arch_accepts_generated_name_in_either_case() {
+        // 実 YaneuraOu (`nnue_arch_gen.py` の `arch.upper()`) は大文字、旧 net_to_yo
+        // 出力は小文字。どちらの綴りも同じ次元に解決する。
+        let upper = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_HALFKAHM2_512_15_32_K3K3{LayerStack=9}";
+        let lower = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_halfkahm2_512_15_32_k3k3{LayerStack=9}";
+        for arch in [upper, lower] {
+            let a = parse_yo_arch(arch).expect("parses");
+            assert_eq!(a.feature_set, FeatureSet::HalfKaHmMerged);
+            assert_eq!((a.ft_out, a.l1_out, a.l2_out), (512, 16, 32));
+        }
     }
 
     #[test]

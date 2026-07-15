@@ -262,8 +262,9 @@ fn reject_trailing_data<R: Read>(reader: &mut R) -> io::Result<()> {
 
 /// YaneuraOu `GetArchitectureString()` と同形の arch 文字列を生成する。既定次元
 /// (halfkahm2 / 1536 / l1=16 / l2=32) は `sfnn-1536.h` の構造名 `SFNN-1536`、
-/// それ以外は `nnue_arch_gen.py` が返す `SFNN_<gen_key>_<ft>_<h1>_<h2>_k3k3` 形の
-/// 名前に揃える (`h1 = l1_out - 1`, `h2 = l2_out`)。
+/// それ以外は `nnue_arch_gen.py` が返す構造名に揃える。生成器はアーキ名を大文字化
+/// する (`arch.upper()`) ため `SFNN_<GEN_KEY>_<ft>_<h1>_<h2>_K3K3` と大文字で出力する
+/// (`h1 = l1_out - 1`, `h2 = l2_out`)。
 fn yo_arch_string(arch: &DetectedArch) -> String {
     let feature = yo_feature(arch.feature_set);
     let input_size = arch.feature_set.spec().ft_in();
@@ -280,6 +281,7 @@ fn yo_arch_string(arch: &DetectedArch) -> String {
             "SFNN_{}_{}_{}_{}_k3k3",
             feature.gen_key, arch.ft_out, h1, h2
         )
+        .to_ascii_uppercase()
     };
     format!(
         "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={YO_LAYER_STACKS}}}",
@@ -508,11 +510,11 @@ mod tests {
     fn arch_string_uses_generated_network_name_off_baseline() {
         assert_eq!(
             yo_arch_string(&detected(FeatureSet::HalfKaHmMerged, 512, 16, 32)),
-            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_halfkahm2_512_15_32_k3k3{LayerStack=9}"
+            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_HALFKAHM2_512_15_32_K3K3{LayerStack=9}"
         );
         assert_eq!(
             yo_arch_string(&detected(FeatureSet::HalfKp, 1536, 16, 32)),
-            "ModelType=SFNNWithoutPsqt;Features=HalfKP(Friend)[125388->1536x2],Network=SFNN_halfkp_1536_15_32_k3k3{LayerStack=9}"
+            "ModelType=SFNNWithoutPsqt;Features=HalfKP(Friend)[125388->1536x2],Network=SFNN_HALFKP_1536_15_32_K3K3{LayerStack=9}"
         );
     }
 
