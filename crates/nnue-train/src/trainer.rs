@@ -317,7 +317,12 @@ pub trait TrainerBackend {
 
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
-    fn save_checkpoint(&mut self, path: &Path, fv_scale: Option<i32>) -> io::Result<()>;
+    fn save_checkpoint(
+        &mut self,
+        path: &Path,
+        fv_scale: Option<i32>,
+        output_format: OutputFormat,
+    ) -> io::Result<()>;
 
     /// resume 用 **raw f32 checkpoint** を `path` に書き出す。
     ///
@@ -365,6 +370,16 @@ pub trait TrainerBackend {
 // TrainingConfig
 // =============================================================================
 
+/// 推論用 checkpoint の出力形式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// tatara LayerStack / Simple quantised binary。
+    #[default]
+    Tatara,
+    /// YaneuraOu SFNNWithoutPsqt evaluation file。
+    Yaneuraou,
+}
+
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
@@ -392,6 +407,8 @@ pub struct TrainingConfig {
     pub save_rate: usize,
     /// LayerStack arch string に書く `fv_scale`。`None` は token を省略する。
     pub fv_scale: Option<i32>,
+    /// 推論用 checkpoint の serialization format。
+    pub output_format: OutputFormat,
     /// `Some(n)` のとき、新しい raw checkpoint (`{net_id}-{sb}.ckpt`) を書いた
     /// 後、直近 `n` 個より古い raw checkpoint を削除する (`--keep-checkpoints`)。
     /// `None` は全 raw checkpoint を保持。raw state は ~1.8GB/個 なので
@@ -950,7 +967,7 @@ where
         let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
-            backend.save_checkpoint(&path, cfg.fv_scale)?;
+            backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
             println!("[train] checkpoint saved: {}", path.display());
 
             // resume 用 raw checkpoint: weight raw f32 + optimizer state + step + sb。
@@ -1227,7 +1244,12 @@ mod tests {
             })
         }
 
-        fn save_checkpoint(&mut self, path: &Path, _fv_scale: Option<i32>) -> io::Result<()> {
+        fn save_checkpoint(
+            &mut self,
+            path: &Path,
+            _fv_scale: Option<i32>,
+            _output_format: OutputFormat,
+        ) -> io::Result<()> {
             self.saves.push(path.to_path_buf());
             Ok(())
         }
@@ -1261,6 +1283,7 @@ mod tests {
             batch_size: 8,
             save_rate: 2,
             fv_scale: Some(nnue_format::layerstack_weights::FV_SCALE),
+            output_format: OutputFormat::Tatara,
             keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,

@@ -10,6 +10,7 @@ pub(crate) trait SaveQuantisedExport {
         &self,
         writer: &mut W,
         fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
     ) -> std::io::Result<()>;
 }
 
@@ -18,8 +19,14 @@ impl SaveQuantisedExport for nnue_format::LayerStackWeights {
         &self,
         writer: &mut W,
         fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
     ) -> std::io::Result<()> {
-        self.save_quantised(writer, fv_scale)
+        match output_format {
+            nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer, fv_scale),
+            nnue_train::trainer::OutputFormat::Yaneuraou => {
+                nnue_format::save_yaneuraou(writer, self)
+            }
+        }
     }
 }
 
@@ -28,8 +35,15 @@ impl SaveQuantisedExport for nnue_format::SimpleWeights {
         &self,
         writer: &mut W,
         _fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
     ) -> std::io::Result<()> {
-        self.save_quantised(writer)
+        match output_format {
+            nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer),
+            nnue_train::trainer::OutputFormat::Yaneuraou => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--output-format yaneuraou is supported only for the LayerStack architecture",
+            )),
+        }
     }
 }
 
@@ -343,6 +357,7 @@ macro_rules! trainer_backend_impl {
                 &mut self,
                 path: &std::path::Path,
                 fv_scale: Option<i32>,
+                output_format: nnue_train::trainer::OutputFormat,
             ) -> std::io::Result<()> {
                 let weights = self
                     .$weights()
@@ -353,7 +368,7 @@ macro_rules! trainer_backend_impl {
                     std::fs::create_dir_all(parent)?;
                 }
                 let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                weights.save_quantised_export(&mut writer, fv_scale)?;
+                weights.save_quantised_export(&mut writer, fv_scale, output_format)?;
                 std::io::Write::flush(&mut writer)?;
                 Ok(())
             }

@@ -187,6 +187,21 @@ pub(crate) fn validate_bucket_mode(
 }
 
 #[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_output_format(
+    output_format: OutputFormatArg,
+    bucket_mode: BucketMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
+    {
+        return Err(
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress8kpabs routing is not representable in YaneuraOu SFNN"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "gpu", test))]
 impl SharedCliValidation {
     fn start_superbatch(
         &self,
@@ -329,6 +344,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )?),
     };
     let effect_bucket_config = parse_effect_bucket_config(&layerstack.effect_bucket_config)?;
+    if cli.output_format == OutputFormatArg::Yaneuraou
+        && (layerstack.psqt || threat_profile.is_some() || effect_bucket_config.is_some())
+    {
+        return Err(
+            "--output-format yaneuraou supports plain LayerStack only; PSQT, threat-profile, and effect-bucket models are not representable in YaneuraOu SFNN"
+                .into(),
+        );
+    }
     if threat_profile.is_some() && effect_bucket_config.is_some() {
         return Err("--effect-bucket is mutually exclusive with --threat-profile".into());
     }
@@ -397,6 +420,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
+    validate_output_format(cli.output_format, bucket_mode)?;
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -722,6 +746,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
         fv_scale,
+        output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
@@ -1082,6 +1107,11 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 /// [`build_simple_init_spec`] が reject (simple に L1f 層は無い)。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.output_format == OutputFormatArg::Yaneuraou {
+        return Err(
+            "--output-format yaneuraou is supported only with the layerstack subcommand".into(),
+        );
+    }
     if cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump {
         return Err(
             "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
@@ -1939,6 +1969,7 @@ pub(crate) fn run_simple_training(
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
         fv_scale: Some(trainer.fv_scale()),
+        output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,

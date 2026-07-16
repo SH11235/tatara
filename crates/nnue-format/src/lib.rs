@@ -14,15 +14,18 @@
 //! - `layerstack_weights`: LayerStack quantised binary
 //!   (HalfKA_hm + 9-bucket LayerStack) の save / load
 //! - `simple_weights`: Simple 4 層 (bucket 無し) quantised binary の save / load
+//! - `yaneuraou`: YaneuraOu SFNNWithoutPsqt evaluation file の save
 
 pub mod arch_kind;
 pub mod halfka_psqt;
 pub mod header;
 pub mod layerstack_weights;
 pub mod simple_weights;
+pub mod yaneuraou;
 
 pub use arch_kind::ArchKind;
 pub use halfka_psqt::{FT_OUT_DIM, HalfKAPsqtNet, L1_OUT_DIM, NUM_FEATURES, QuantTarget};
 pub use header::{DEFAULT_FV_SCALE, DEFAULT_QA, DEFAULT_QB, HEADER_BYTES, NET_ID_LEN, NnueHeader};
 pub use layerstack_weights::LayerStackWeights;
 pub use simple_weights::{SimpleActivation, SimpleId, SimpleWeights};
+pub use yaneuraou::{YANEURAOU_LAYER_STACKS, save_yaneuraou};

@@ -64,6 +64,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
 
+    /// Inference checkpoint format. `yaneuraou` is available only for a
+    /// LayerStack trained with `--bucket-mode kingrank9` and writes an SFNN
+    /// evaluation file directly.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Tatara, global = true)]
+    pub(crate) output_format: OutputFormatArg,
+
     /// Network id (used in checkpoint file names).
     #[arg(long, default_value = "rshogi", global = true)]
     pub(crate) net_id: String,
@@ -575,6 +581,22 @@ pub(crate) enum LrScheduleArg {
     Exponential,
     #[value(name = "one-cycle")]
     OneCycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum OutputFormatArg {
+    #[default]
+    Tatara,
+    Yaneuraou,
+}
+
+impl From<OutputFormatArg> for nnue_train::trainer::OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Tatara => Self::Tatara,
+            OutputFormatArg::Yaneuraou => Self::Yaneuraou,
+        }
+    }
 }
 
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)

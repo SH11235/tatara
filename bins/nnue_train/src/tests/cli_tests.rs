@@ -6,7 +6,7 @@ use nnue_format::{ArchKind, SimpleActivation};
 use crate::cli::*;
 use crate::training::{
     per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
-    validate_bucket_mode,
+    validate_bucket_mode, validate_output_format,
 };
 
 use clap::CommandFactory;
@@ -162,6 +162,30 @@ fn ft_factorize_defaults_on_and_no_flag_disables() {
 fn layerstack_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::LayerStack);
+    assert_eq!(cli.output_format, OutputFormatArg::Tatara);
+}
+
+#[test]
+fn yaneuraou_output_format_parses_and_simple_rejects_it() {
+    let cli = Cli::try_parse_from(["nnue-train", "--output-format", "yaneuraou", "layerstack"])
+        .expect("YaneuraOu LayerStack output should parse");
+    assert_eq!(cli.output_format, OutputFormatArg::Yaneuraou);
+
+    let simple = simple_cli(&["--output-format", "yaneuraou"]);
+    let error = reject_simple_unsupported_flags(&simple).unwrap_err();
+    assert!(error.to_string().contains("only with the layerstack"));
+
+    validate_output_format(
+        OutputFormatArg::Yaneuraou,
+        nnue_train::dataloader::BucketMode::KingRank9,
+    )
+    .expect("KingRank9 should support YaneuraOu output");
+    let error = validate_output_format(
+        OutputFormatArg::Yaneuraou,
+        nnue_train::dataloader::BucketMode::Progress8KpAbs,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("--bucket-mode kingrank9"));
 }
 
 fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
