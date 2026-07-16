@@ -3,79 +3,18 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use nnue_format::LayerStackWeights;
-use nnue_format::layerstack_weights::{
-    LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION, QA, QB, write_leb128_tensor_i16,
-};
+use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
+use nnue_format::{LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou};
 use shogi_features::FeatureSet;
-
-/// YaneuraOu SFNNwoPSQT ビルドが評価ファイルに要求する 4 つのハッシュ。
-/// SFNNwoPSQT では feature set / 次元に依らず固定定数で、YaneuraOu 側は
-/// `evaluate_nnue.cpp` で version 以外の不一致を warning 扱いにするが、ここでは
-/// 正しい定数を書き出して生成済み YaneuraOu ビルドと byte 一致させる。
-const YO_VERSION: u32 = 0x7af3_2f16;
-const YO_TOP_HASH: u32 = 0x3c20_3b32;
-const YO_FT_HASH: u32 = 0x5f13_4ab8;
-const YO_NETWORK_HASH: u32 = 0x6333_718a;
 
 /// LayerStack バケット数。YaneuraOu SFNN は KingRank9 (3x3) 固定で、変換対象も
 /// これに揃える。
-const YO_LAYER_STACKS: usize = 9;
+const YO_LAYER_STACKS: usize = YANEURAOU_LAYER_STACKS;
 
 /// 変換対象の SFNN 次元上限。実在アーキは十分収まり、壊れた arch 文字列 (0 次元 /
 /// 巨大値) が overflow や過大 allocation を起こす前に弾くための健全性ガード。
 const MAX_FT_OUT: usize = 8192;
 const MAX_HIDDEN_DIM: usize = 4096;
-
-/// tatara feature set と YaneuraOu SFNN feature の対応。
-///
-/// - `yo_name`: YaneuraOu `GetName()` (`Features=<yo_name>(Friend)[...]` に入る)
-/// - `gen_key`: `nnue_arch_gen.py` の feature キーワード
-///   (非既定次元の `Network=SFNN_<gen_key>_<ft>_<h1>_<h2>_k3k3` に入る)
-///
-/// tatara と YaneuraOu の feature index は同一 Apery-BonaPiece 規約で恒等一致する
-/// ため、重みは並べ替えなしでそのまま移送できる (`DISTINGUISH_GOLDS` 無効の
-/// YaneuraOu ビルドが前提)。
-struct YoFeature {
-    feature_set: FeatureSet,
-    yo_name: &'static str,
-    gen_key: &'static str,
-}
-
-const YO_FEATURES: [YoFeature; 5] = [
-    YoFeature {
-        feature_set: FeatureSet::HalfKp,
-        yo_name: "HalfKP",
-        gen_key: "halfkp",
-    },
-    YoFeature {
-        feature_set: FeatureSet::HalfKaSplit,
-        yo_name: "HalfKA1",
-        gen_key: "halfka1",
-    },
-    YoFeature {
-        feature_set: FeatureSet::HalfKaMerged,
-        yo_name: "HalfKA2",
-        gen_key: "halfka2",
-    },
-    YoFeature {
-        feature_set: FeatureSet::HalfKaHmSplit,
-        yo_name: "HalfKA_hm1",
-        gen_key: "halfkahm1",
-    },
-    YoFeature {
-        feature_set: FeatureSet::HalfKaHmMerged,
-        yo_name: "HalfKA_hm2",
-        gen_key: "halfkahm2",
-    },
-];
-
-fn yo_feature(feature_set: FeatureSet) -> &'static YoFeature {
-    YO_FEATURES
-        .iter()
-        .find(|f| f.feature_set == feature_set)
-        .expect("every FeatureSet variant has a YaneuraOu mapping")
-}
 
 /// tatara `.bin` header から読み取った変換対象アーキ。
 #[derive(Debug)]
@@ -125,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    write_yo(&mut writer, &arch, &weights)?;
+    save_yaneuraou(&mut writer, &weights)?;
     writer.flush()?;
     Ok(())
 }
@@ -260,136 +199,6 @@ fn reject_trailing_data<R: Read>(reader: &mut R) -> io::Result<()> {
     Ok(())
 }
 
-/// YaneuraOu `GetArchitectureString()` と同形の arch 文字列を生成する。既定次元
-/// (halfkahm2 / 1536 / l1=16 / l2=32) は `sfnn-1536.h` の構造名 `SFNN-1536`、
-/// それ以外は `nnue_arch_gen.py` が返す構造名に揃える。生成器はアーキ名を大文字化
-/// する (`arch.upper()`) ため `SFNN_<GEN_KEY>_<ft>_<h1>_<h2>_K3K3` と大文字で出力する
-/// (`h1 = l1_out - 1`, `h2 = l2_out`)。
-fn yo_arch_string(arch: &DetectedArch) -> String {
-    let feature = yo_feature(arch.feature_set);
-    let input_size = arch.feature_set.spec().ft_in();
-    let h1 = arch.l1_out - 1;
-    let h2 = arch.l2_out;
-    let network = if arch.feature_set == FeatureSet::HalfKaHmMerged
-        && arch.ft_out == 1536
-        && arch.l1_out == 16
-        && arch.l2_out == 32
-    {
-        "SFNN-1536".to_string()
-    } else {
-        format!(
-            "SFNN_{}_{}_{}_{}_k3k3",
-            feature.gen_key, arch.ft_out, h1, h2
-        )
-        .to_ascii_uppercase()
-    };
-    format!(
-        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={YO_LAYER_STACKS}}}",
-        feature.yo_name, arch.ft_out
-    )
-}
-
-fn write_yo<W: Write>(
-    writer: &mut W,
-    arch: &DetectedArch,
-    weights: &LayerStackWeights,
-) -> io::Result<()> {
-    validate_weights(arch, weights)?;
-
-    let ft_out = arch.ft_out;
-    let l1_out = arch.l1_out;
-    let l2_out = arch.l2_out;
-    let l2_in = (l1_out - 1) * 2;
-
-    write_u32(writer, YO_VERSION)?;
-    write_u32(writer, YO_TOP_HASH)?;
-    let arch_string = yo_arch_string(arch);
-    write_u32(
-        writer,
-        u32::try_from(arch_string.len()).expect("arch string length fits in u32"),
-    )?;
-    writer.write_all(arch_string.as_bytes())?;
-
-    write_u32(writer, YO_FT_HASH)?;
-    let ft_biases = quantize_i16(&weights.ft_b, QA as f64);
-    write_leb128_tensor_i16(writer, &ft_biases)?;
-    let ft_weights = quantize_i16(&weights.ft_w, QA as f64);
-    write_leb128_tensor_i16(writer, &ft_weights)?;
-
-    for bucket in 0..YO_LAYER_STACKS {
-        write_u32(writer, YO_NETWORK_HASH)?;
-
-        // l1f (factorizer 共有項) は save 時に l1 へ merge 済みで load 側は常に 0 を
-        // 返す。加算は未 merge の入力が来ても正しい防御であって通常経路では no-op。
-        let l1_biases = (0..l1_out)
-            .map(|output| weights.l1_b[bucket * l1_out + output] + weights.l1f_b[output]);
-        let l1_weights = (0..l1_out).flat_map(|output| {
-            (0..ft_out).map(move |input| {
-                weights.l1_w[bucket * l1_out * ft_out + output * ft_out + input]
-                    + weights.l1f_w[input * l1_out + output]
-            })
-        });
-        write_affine(writer, l1_biases, l1_weights, ft_out, l1_out)?;
-
-        let l2_biases = (0..l2_out).map(|output| weights.l2_b[bucket * l2_out + output]);
-        let l2_weights = (0..l2_out).flat_map(|output| {
-            (0..l2_in)
-                .map(move |input| weights.l2_w[bucket * l2_out * l2_in + output * l2_in + input])
-        });
-        write_affine(writer, l2_biases, l2_weights, l2_in, l2_out)?;
-
-        let l3_biases = std::iter::once(weights.l3_b[bucket]);
-        let l3_weights = (0..l2_out).map(|input| weights.l3_w[bucket * l2_out + input]);
-        write_affine(writer, l3_biases, l3_weights, l2_out, 1)?;
-    }
-    Ok(())
-}
-
-fn validate_weights(arch: &DetectedArch, weights: &LayerStackWeights) -> io::Result<()> {
-    let expected_feature_set = arch.feature_set.spec();
-    if weights.feature_set != expected_feature_set {
-        return invalid_input(format!(
-            "feature set mismatch: detected {}, but weights carry a different spec",
-            arch.feature_set.canonical_name()
-        ));
-    }
-    if weights.psqt_w.is_some() {
-        return invalid_input("PSQT models are not supported");
-    }
-    let ft_out = arch.ft_out;
-    let l1_out = arch.l1_out;
-    let l2_out = arch.l2_out;
-    let l2_in = (l1_out - 1) * 2;
-    let lengths = [
-        ("ft_b", weights.ft_b.len(), ft_out),
-        (
-            "ft_w",
-            weights.ft_w.len(),
-            expected_feature_set.ft_in() * ft_out,
-        ),
-        ("l1_b", weights.l1_b.len(), YO_LAYER_STACKS * l1_out),
-        (
-            "l1_w",
-            weights.l1_w.len(),
-            YO_LAYER_STACKS * l1_out * ft_out,
-        ),
-        ("l1f_b", weights.l1f_b.len(), l1_out),
-        ("l1f_w", weights.l1f_w.len(), ft_out * l1_out),
-        ("l2_b", weights.l2_b.len(), YO_LAYER_STACKS * l2_out),
-        ("l2_w", weights.l2_w.len(), YO_LAYER_STACKS * l2_out * l2_in),
-        ("l3_b", weights.l3_b.len(), YO_LAYER_STACKS),
-        ("l3_w", weights.l3_w.len(), YO_LAYER_STACKS * l2_out),
-    ];
-    for (name, actual, expected) in lengths {
-        if actual != expected {
-            return invalid_input(format!(
-                "{name} length mismatch: expected {expected}, got {actual}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn invalid_input<T>(message: impl Into<String>) -> io::Result<T> {
     Err(invalid_input_err(message.into()))
 }
@@ -398,76 +207,10 @@ fn invalid_input_err(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn write_affine<W, B, V>(
-    writer: &mut W,
-    biases: B,
-    weights: V,
-    input_dimensions: usize,
-    output_dimensions: usize,
-) -> io::Result<()>
-where
-    W: Write,
-    B: IntoIterator<Item = f32>,
-    V: IntoIterator<Item = f32>,
-{
-    for bias in biases {
-        writer.write_all(&quantize_i32(bias, (QA * QB) as f64).to_le_bytes())?;
-    }
-
-    let padded_input = input_dimensions.div_ceil(32) * 32;
-    let mut weights = weights.into_iter();
-    for _ in 0..output_dimensions {
-        for input in 0..padded_input {
-            let value = if input < input_dimensions {
-                weights.next().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "affine weight iterator is short",
-                    )
-                })?
-            } else {
-                0.0
-            };
-            writer.write_all(&[quantize_i8(value, QB as f64) as u8])?;
-        }
-    }
-    if weights.next().is_some() {
-        return invalid_input("affine weight iterator has extra values");
-    }
-    Ok(())
-}
-
-fn quantize_i16(values: &[f32], scale: f64) -> Vec<i16> {
-    values
-        .iter()
-        .map(|&value| {
-            (value as f64 * scale)
-                .round()
-                .clamp(i16::MIN as f64, i16::MAX as f64) as i16
-        })
-        .collect()
-}
-
-fn quantize_i32(value: f32, scale: f64) -> i32 {
-    (value as f64 * scale)
-        .round()
-        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
-}
-
-fn quantize_i8(value: f32, scale: f64) -> i8 {
-    (value as f64 * scale)
-        .round()
-        .clamp(i8::MIN as f64, i8::MAX as f64) as i8
-}
-
 fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
     let mut bytes = [0_u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
-}
-
-fn write_u32<W: Write>(writer: &mut W, value: u32) -> io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
 }
 
 #[cfg(test)]
@@ -486,45 +229,6 @@ mod tests {
             ft_out,
             l1_out,
             l2_out,
-        }
-    }
-
-    #[test]
-    fn header_uses_fixed_sfnnwopsqt_constants() {
-        assert_eq!(YO_VERSION, 0x7af3_2f16);
-        assert_eq!(YO_TOP_HASH, 0x3c20_3b32);
-        assert_eq!(YO_FT_HASH, 0x5f13_4ab8);
-        assert_eq!(YO_NETWORK_HASH, 0x6333_718a);
-    }
-
-    #[test]
-    fn arch_string_matches_yaneuraou_for_baseline() {
-        let arch = detected(FeatureSet::HalfKaHmMerged, 1536, 16, 32);
-        assert_eq!(
-            yo_arch_string(&arch),
-            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->1536x2],Network=SFNN-1536{LayerStack=9}"
-        );
-    }
-
-    #[test]
-    fn arch_string_uses_generated_network_name_off_baseline() {
-        assert_eq!(
-            yo_arch_string(&detected(FeatureSet::HalfKaHmMerged, 512, 16, 32)),
-            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_HALFKAHM2_512_15_32_K3K3{LayerStack=9}"
-        );
-        assert_eq!(
-            yo_arch_string(&detected(FeatureSet::HalfKp, 1536, 16, 32)),
-            "ModelType=SFNNWithoutPsqt;Features=HalfKP(Friend)[125388->1536x2],Network=SFNN_HALFKP_1536_15_32_K3K3{LayerStack=9}"
-        );
-    }
-
-    #[test]
-    fn every_feature_set_maps_to_a_yaneuraou_feature() {
-        for fs in FeatureSet::ALL {
-            let feature = yo_feature(fs);
-            assert_eq!(feature.feature_set, fs);
-            assert!(!feature.yo_name.is_empty());
-            assert!(!feature.gen_key.is_empty());
         }
     }
 
@@ -680,39 +384,6 @@ mod tests {
     }
 
     #[test]
-    fn affine_file_weights_are_canonical_row_major_with_zero_padding() {
-        let mut output = Vec::new();
-        write_affine(
-            &mut output,
-            [1.0, -1.0],
-            [
-                1.0 / 64.0,
-                2.0 / 64.0,
-                3.0 / 64.0,
-                -1.0 / 64.0,
-                -2.0 / 64.0,
-                -3.0 / 64.0,
-            ],
-            3,
-            2,
-        )
-        .unwrap();
-
-        assert_eq!(
-            i32::from_le_bytes(output[0..4].try_into().unwrap()),
-            QA * QB
-        );
-        assert_eq!(
-            i32::from_le_bytes(output[4..8].try_into().unwrap()),
-            -(QA * QB)
-        );
-        assert_eq!(&output[8..11], &[1, 2, 3]);
-        assert!(output[11..40].iter().all(|&byte| byte == 0));
-        assert_eq!(&output[40..43], &[255, 254, 253]);
-        assert!(output[43..72].iter().all(|&byte| byte == 0));
-    }
-
-    #[test]
     fn trailing_input_is_rejected() {
         let error = reject_trailing_data(&mut &b"x"[..]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -765,7 +436,7 @@ mod tests {
         reject_trailing_data(&mut load_reader).expect("no trailing data");
 
         let mut out = Vec::new();
-        write_yo(&mut out, &arch, &weights).expect("write_yo");
+        save_yaneuraou(&mut out, &weights).expect("save_yaneuraou");
         out
     }
 
@@ -774,32 +445,62 @@ mod tests {
         // 検証対象は header と affine のパディング済み次元追随なので、FT 出力は
         // 小さめ (128 の倍数) にして全 feature set を高速に網羅する。
         let configs = [
-            (FeatureSet::HalfKaHmMerged, 256_usize, 16_usize, 32_usize),
-            (FeatureSet::HalfKp, 128, 16, 32),
-            (FeatureSet::HalfKaSplit, 128, 8, 16),
-            (FeatureSet::HalfKaMerged, 128, 16, 32),
-            (FeatureSet::HalfKaHmSplit, 256, 7, 16),
+            (
+                FeatureSet::HalfKaHmMerged,
+                256_usize,
+                16_usize,
+                32_usize,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->256x2],Network=SFNN_HALFKAHM2_256_15_32_K3K3{LayerStack=9}",
+            ),
+            (
+                FeatureSet::HalfKp,
+                128,
+                16,
+                32,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKP(Friend)[125388->128x2],Network=SFNN_HALFKP_128_15_32_K3K3{LayerStack=9}",
+            ),
+            (
+                FeatureSet::HalfKaSplit,
+                128,
+                8,
+                16,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA1(Friend)[138510->128x2],Network=SFNN_HALFKA1_128_7_16_K3K3{LayerStack=9}",
+            ),
+            (
+                FeatureSet::HalfKaMerged,
+                128,
+                16,
+                32,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)[131949->128x2],Network=SFNN_HALFKA2_128_15_32_K3K3{LayerStack=9}",
+            ),
+            (
+                FeatureSet::HalfKaHmSplit,
+                256,
+                7,
+                16,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm1(Friend)[76950->256x2],Network=SFNN_HALFKAHM1_256_6_16_K3K3{LayerStack=9}",
+            ),
         ];
-        for (fs, ft_out, l1_out, l2_out) in configs {
+        for (fs, ft_out, l1_out, l2_out, expected_arch) in configs {
             let expect = detected(fs, ft_out, l1_out, l2_out);
             let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out);
             let out = convert(&bytes, &expect);
 
             assert_eq!(
                 u32::from_le_bytes(out[0..4].try_into().unwrap()),
-                YO_VERSION
+                0x7af3_2f16
             );
             assert_eq!(
                 u32::from_le_bytes(out[4..8].try_into().unwrap()),
-                YO_TOP_HASH
+                0x3c20_3b32
             );
             let arch_len = u32::from_le_bytes(out[8..12].try_into().unwrap()) as usize;
             let arch_str = std::str::from_utf8(&out[12..12 + arch_len]).unwrap();
-            assert_eq!(arch_str, yo_arch_string(&expect));
+            assert_eq!(arch_str, expected_arch);
             let ft_hash_at = 12 + arch_len;
             assert_eq!(
                 u32::from_le_bytes(out[ft_hash_at..ft_hash_at + 4].try_into().unwrap()),
-                YO_FT_HASH
+                0x5f13_4ab8
             );
         }
     }

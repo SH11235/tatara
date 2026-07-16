@@ -17,6 +17,26 @@ cargo run --release -p net-to-yo -- \
   --assume-kingrank9
 ```
 
+## `nnue-train` から直接出力
+
+LayerStack を KingRank9 で学習する場合は、推論用 checkpoint を最初から YaneuraOu
+SFNN 形式で出力できる。この出力は、同じ weights を tatara `.bin` に export してから
+`net_to_yo` で変換した出力と byte 一致する。
+
+```bash
+cargo run --release -p nnue-trainer -- \
+  --data /path/to/training.psv \
+  --output /path/to/checkpoints \
+  --output-format yaneuraou \
+  layerstack \
+  --bucket-mode kingrank9
+```
+
+`--output-format` の既定値は `tatara`。`yaneuraou` は plain LayerStack と KingRank9 の
+組合せだけを受理し、`progress8kpabs`、Simple、PSQT、Threat、EffectBucket は明示的に
+エラーにする。学習 config から bucket routing mode を判定できるため、この経路では
+`--assume-kingrank9` は不要。
+
 ## `net_from_yo` — YaneuraOu → tatara
 
 `net_to_yo` の逆変換。YaneuraOu 形式で export された SFNN 評価ファイルを tatara の
@@ -99,6 +119,10 @@ plain sigmoid-MSE 学習では `round(QA×QB / --scale)` を書き、既定の `
 なら 28 になる。WRM 学習では、評価値の換算係数が loss だけから一意に決まらないため
 `fv_scale` token を省略する。値の確定後は `net-fv-scale` で tatara `.bin` の arch
 string に直接書き込める。
+
+`nnue-train --output-format yaneuraou` でも YaneuraOu SFNN ファイル内に `fv_scale` は
+保存されないため、`--fv-scale` の有無は出力 byte に影響しない。評価時は YaneuraOu の
+`FV_SCALE` option を目的の値に設定する。
 
 ```bash
 cargo run --release -p net-fv-scale -- \
