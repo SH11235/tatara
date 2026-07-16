@@ -409,7 +409,7 @@ pub struct TrainingConfig {
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
     pub threads: usize,
-    /// `Some` のとき held-out validation 用 PSV file。各 superbatch 末に
+    /// `Some` のとき held-out validation 用 PSV / HCPE file。各 superbatch 末に
     /// forward-only 検証を走らせ test_loss / test_accuracy を report する。
     pub test_data: Option<PathBuf>,
     /// held-out validation 1 回あたりの検証局面数 (`batch_size` 単位に切り上げて
@@ -509,7 +509,7 @@ impl TrainingConfig {
         if self.test_data.is_some() && self.test_tail_positions.is_some() {
             return Err(io::Error::other(
                 "test_data and test_tail_positions are mutually exclusive \
-                 (pick one held-out source: external PSV file or training-data tail)",
+                 (pick one held-out source: external PSV/HCPE file or training-data tail)",
             ));
         }
         if let Some(n) = self.test_tail_positions {

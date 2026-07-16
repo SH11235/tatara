@@ -15,7 +15,7 @@ console), and `experiment.json` records the same numbers as `test_loss` /
 | Flag | Role | Type |
 |---|---|---|
 | `--test-tail-positions <N>` | Held-out **source**: the last N positions of `--data` itself | source A |
-| `--test-data <PATH>` | Held-out **source**: a separate PSV file | source B |
+| `--test-data <PATH>` | Held-out **source**: a separate PSV or HCPE file | source B |
 | `--test-positions <K>` | How many positions are **evaluated** per superbatch from the chosen source | evaluation size, shared |
 
 `--test-tail-positions` and `--test-data` are alternative held-out sources and
@@ -35,7 +35,9 @@ multiple).
   sync. The only cost is that training loses N positions from its pool — for
   `N << total positions` (e.g. 1e6 reserved out of 1e9 trained) this is well
   under 0.1% and not noticeable.
-- **`--test-data <path>`**: a separate PSV file used only for validation. Use
+- **`--test-data <path>`**: a separate PSV or HCPE file used only for validation. The
+  `.hcpe` extension selects the 38-byte Apery / dlshogi format; other extensions
+  use the existing 40-byte PSV reader. Use
   it when you have a held-out set that is meaningfully independent of `--data`
   (different generator, different time period, etc.) and you want that
   independence preserved. For ergonomic reasons alone there is no benefit to

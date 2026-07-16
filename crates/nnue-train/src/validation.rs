@@ -1,4 +1,4 @@
-//! held-out validation — 学習に使わない別 PSV データで loss / accuracy を測る。
+//! held-out validation — 学習に使わない別 PSV / HCPE データで loss / accuracy を測る。
 //!
 //! training loss は学習が今まさにフィットしているデータ上の値でバイアスがある。
 //! held-out (勾配更新に一度も使わない) データ上の loss / accuracy は汎化性能の
@@ -6,7 +6,7 @@
 //!
 //! ## 構成
 //!
-//! - [`HeldoutSet`] は起動時に test PSV の先頭から固定の検証 batch 集合を作る
+//! - [`HeldoutSet`] は test data の先頭から固定の検証 batch 集合を作る
 //!   (毎 superbatch 同じ集合で測ることで loss/accuracy の軌跡が低分散になる)。
 //! - 各 superbatch 末に [`HeldoutSet::evaluate`] が backend の
 //!   [`TrainerBackend::validate_step`] (forward + loss のみ) を全 batch に回し、
@@ -26,7 +26,7 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketMode, PsvFileLoader};
+use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvFileLoader};
 use crate::trainer::{LossKind, TrainerBackend};
 
 /// held-out validation 1 回分の集計結果。
@@ -58,7 +58,7 @@ pub struct HeldoutSet {
 }
 
 impl HeldoutSet {
-    /// test PSV file の **先頭から** 固定の検証集合を読み込む
+    /// test PSV / HCPE file の **先頭から** 固定の検証集合を読み込む
     /// ([`HeldoutSet::load_from_range`] の `[0, file_size)` 特化)。
     ///
     /// `test_positions` を `batch_size` 単位に切り上げた数の満タン batch を作る。
@@ -79,6 +79,25 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
+        if path.extension().is_some_and(|ext| {
+            ext.to_str()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
+        }) {
+            let loader = HcpeFileLoader::new(path)?;
+            return Self::load_boards(
+                loader,
+                |loader| loader.next_board(),
+                path,
+                batch_size,
+                score_drop_abs,
+                score_clamp_abs,
+                test_positions,
+                bucket_mode,
+                feature_set,
+                num_buckets,
+            );
+        }
+
         let file_size = std::fs::metadata(path)?.len();
         Self::load_from_range(
             path,
@@ -113,33 +132,58 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
+        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        Self::load_boards(
+            loader,
+            |loader| Ok(loader.next_psv()?.map(|psv| psv.decode())),
+            path,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            test_positions,
+            bucket_mode,
+            feature_set,
+            num_buckets,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_boards<L>(
+        mut loader: L,
+        mut next_board: impl FnMut(&mut L) -> io::Result<Option<shogi_format::ShogiBoard>>,
+        path: &Path,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        test_positions: usize,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
+        feature_set: FeatureSetSpec,
+        num_buckets: usize,
+    ) -> io::Result<Self> {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let bucket_mode = (*bucket_mode).into();
         let n_batches = test_positions.div_ceil(batch_size).max(1);
-
-        let mut loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         let mut batches: Vec<(Batch, Vec<i32>)> = Vec::with_capacity(n_batches);
         let mut cur = Batch::with_capacity(batch_size, feature_set);
         let mut cur_buckets: Vec<i32> = Vec::with_capacity(batch_size);
 
         while batches.len() < n_batches {
-            let Some(mut psv) = loader.next_psv()? else {
+            let Some(mut board) = next_board(&mut loader)? else {
                 break; // EOF — epoch wrap しない
             };
             // 学習側 `PsvEpochReader` と同じ score-drop 近似 (i64 cast で
             // `i16::MIN` の abs overflow を避ける)。
             if let Some(t) = score_drop_abs
-                && i64::from(psv.score()).abs() >= i64::from(t)
+                && i64::from(board.score).abs() >= i64::from(t)
             {
                 continue;
             }
             // 学習側 `PsvEpochReader` と同じく drop 判定の後に score を飽和させる
             // (詰み stamp が clamp されて drop をすり抜けるのを防ぐ順序)。
             if let Some(c) = score_clamp_abs {
-                psv.set_score(psv.score().clamp(-c, c));
+                board.score = board.score.clamp(-c, c);
             }
-            let board = psv.decode();
             let pushed = cur.push_decoded(&board)?;
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
             cur_buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
@@ -153,8 +197,8 @@ impl HeldoutSet {
 
         if batches.is_empty() {
             return Err(io::Error::other(format!(
-                "test data file {} range [{start_offset}, {end_offset}) has fewer than batch_size \
-                 ({batch_size}) usable positions; held-out validation needs at least one full batch",
+                "test data file {} has fewer than batch_size ({batch_size}) usable positions; \
+                 held-out validation needs at least one full batch",
                 path.display()
             )));
         }
@@ -257,6 +301,27 @@ mod tests {
             .parent()
             .expect("crates/nnue-train has a parent dir")
             .join("shogi-format/tests/data/sample.psv")
+    }
+
+    #[test]
+    #[ignore = "requires an external HCPE file"]
+    fn heldout_set_loads_external_hcpe() {
+        let path = std::env::var_os("TATARA_HCPE_CROSSCHECK")
+            .map(PathBuf::from)
+            .expect("set TATARA_HCPE_CROSSCHECK");
+        let set = HeldoutSet::load(
+            &path,
+            16,
+            None,
+            None,
+            128,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+        )
+        .expect("load HCPE held-out data");
+        assert_eq!(set.n_batches(), 8);
+        assert_eq!(set.n_positions(), 128);
     }
 
     /// 任意の `wdl` ベクタで `n_positions` 件の `Batch` を作る (sign_agreement テスト用)。

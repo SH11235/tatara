@@ -153,6 +153,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
 | **L1f** | LayerStack アーキの bucket 非依存 (全 bucket 共有) L1 dense 層。出力は per-bucket L1 の出力に加算される |
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
+| **HCPE** | HuffmanCodedPosAndEval — Apery / dlshogi の 38-byte 局面・score・指し手・対局結果 format |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
 | **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
 | **PSQT** | Piece-Square Table — 駒種×マスごとの線形評価テーブル。LayerStack の `--psqt` で per-bucket PSQT 出力を network 出力に加算し、dense 経路は非マテリアル構造の学習に専念できる |

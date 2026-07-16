@@ -23,7 +23,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) data: Option<PathBuf>,
 
-    /// PSV file for held-out validation. Pass positions that are never used for
+    /// PSV or HCPE file for held-out validation. Pass positions that are never used for
     /// a gradient update, separate from the training `--data`. When set, a
     /// forward-only validation pass runs at the end of each superbatch and
     /// reports test_loss (mean held-out loss) and test_accuracy (agreement

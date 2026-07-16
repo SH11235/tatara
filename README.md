@@ -169,6 +169,7 @@ own net, see the [setup guide](docs/setup.md).
 | **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
 | **L1f** | The bucket-independent (shared across all buckets) L1 dense layer of the LayerStack architecture; its output is added to the per-bucket L1 output |
 | **PSV** | PackedSfenValue — a training-data format from bullet-shogi (one position + score + WDL) |
+| **HCPE** | HuffmanCodedPosAndEval — the 38-byte Apery / dlshogi position, score, move, and game-result format |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
 | **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
