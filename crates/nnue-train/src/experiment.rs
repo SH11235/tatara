@@ -38,8 +38,8 @@ use serde::Serialize;
 /// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
 pub const SCHEMA_VERSION: u32 = 2;
 
-// `results.fv_scale` はアーキごとに異なる (LayerStack は形式固定、simple は学習
-// `--scale` から導出) ため、呼び出し側が実際に export する値を渡す。
+// `results.fv_scale` はアーキと loss により異なるため、呼び出し側が実際に export
+// する値を渡す。LayerStack の arch string で省略する場合は JSON でも省略する。
 
 // =============================================================================
 // serialise 対象の本体
@@ -234,7 +234,7 @@ pub struct DataInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct Results {
     pub training_time_seconds: u64,
-    pub fv_scale: i32,
+    pub fv_scale: Option<i32>,
     /// 最小 loss と、それを記録した superbatch。1 点も記録されていなければ省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_loss: Option<f64>,
@@ -320,7 +320,7 @@ impl ExperimentDoc {
         lineage: Option<Lineage>,
         params: Params,
         data: DataInfo,
-        fv_scale: i32,
+        fv_scale: Option<i32>,
     ) -> Self {
         let date = format_utc_iso(start_epoch_secs);
         Self {
@@ -581,7 +581,7 @@ mod tests {
         let doc = sample_doc();
         assert_eq!(
             doc.results.fv_scale,
-            nnue_format::layerstack_weights::FV_SCALE
+            Some(nnue_format::layerstack_weights::FV_SCALE)
         );
 
         let simple_fv_scale = nnue_format::simple_weights::simple_fv_scale(600.0);
@@ -595,9 +595,15 @@ mod tests {
             None,
             sample_params(),
             sample_data(),
-            simple_fv_scale,
+            Some(simple_fv_scale),
         );
-        assert_eq!(doc.results.fv_scale, simple_fv_scale);
+        assert_eq!(doc.results.fv_scale, Some(simple_fv_scale));
+
+        let mut doc = sample_doc();
+        doc.results.fv_scale = None;
+        let results = serde_json::to_value(&doc.results).expect("serialise results");
+        assert!(results.get("fv_scale").is_some());
+        assert!(results["fv_scale"].is_null());
     }
 
     fn sample_params() -> Params {
@@ -680,7 +686,7 @@ mod tests {
             None,
             sample_params(),
             sample_data(),
-            nnue_format::layerstack_weights::FV_SCALE,
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         )
     }
 
@@ -824,7 +830,7 @@ mod tests {
             None,
             params,
             sample_data(),
-            nnue_format::layerstack_weights::FV_SCALE,
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert!(v.get("commit").is_none());
@@ -851,7 +857,7 @@ mod tests {
             None,
             params,
             sample_data(),
-            nnue_format::layerstack_weights::FV_SCALE,
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let v = serde_json::to_value(&doc).expect("serialise");
         assert_eq!(v["params"]["start_wdl"], 0.0);

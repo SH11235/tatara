@@ -549,7 +549,7 @@ mod tests {
                 l1_out,
                 l2_in,
                 l2_out,
-                28,
+                Some(28),
                 None,
                 None,
                 None,
@@ -589,7 +589,18 @@ mod tests {
             ),
         ];
         for (token, psqt, threat, effect) in cases {
-            let arch_str = build_arch_str(name, 73305, 1536, 16, 30, 32, 28, psqt, threat, effect);
+            let arch_str = build_arch_str(
+                name,
+                73305,
+                1536,
+                16,
+                30,
+                32,
+                Some(28),
+                psqt,
+                threat,
+                effect,
+            );
             let error = parse_arch_str(&arch_str).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(
@@ -608,7 +619,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             None,
             None,
@@ -649,7 +660,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             None,
             None,
@@ -727,7 +738,7 @@ mod tests {
             LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, YO_LAYER_STACKS);
         let mut bytes = Vec::new();
         weights
-            .save_quantised(&mut bytes)
+            .save_quantised(&mut bytes, Some(nnue_format::layerstack_weights::FV_SCALE))
             .expect("save synthetic .bin");
         bytes
     }

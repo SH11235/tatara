@@ -101,8 +101,7 @@ pub const QA: i32 = 127;
 pub const QB: i32 = 64;
 pub const FV_SCALE: i32 = 28;
 
-/// `(127.0 / 290.0) * 28 == 12.262...` の denominator。
-/// 推論エンジン側は arch_str から `fv_scale=28` を読み、本 SCALE と組み合わせる。
+/// plain sigmoid-MSE の既定 score scale。
 pub const SCALE: u32 = 290;
 
 /// pad to multiple of 32 (SIMD alignment)。
@@ -242,7 +241,7 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
 ///  SqrClippedReLU[<l2_in>](
 ///  AffineTransform[<l1_out>-<ft_out_x2>](
 ///  InputSlice[<ft_out_x2>(0:<ft_out_x2>)]))))),
-///  fv_scale=<fv_scale>`
+///  [,fv_scale=<fv_scale>]`
 ///
 /// (実際は 1 行連結、ここでは可読性のため改行)
 ///
@@ -298,7 +297,7 @@ pub fn build_arch_str(
     l1_out: usize,
     l2_in: usize,
     l2_out: usize,
-    fv_scale: i32,
+    fv_scale: Option<i32>,
     psqt_buckets: Option<usize>,
     threat: Option<ThreatArch>,
     effect_bucket: Option<EffectBucketArch>,
@@ -325,6 +324,7 @@ pub fn build_arch_str(
         Some(e) => format!("EffectBucket={},", e.token_value()),
         None => String::new(),
     };
+    let fv_scale_part = fv_scale.map_or_else(String::new, |n| format!(",fv_scale={n}"));
     format!(
         "{},{}{}{}\
          Network=AffineTransform[1<-{}](\
@@ -332,8 +332,7 @@ pub fn build_arch_str(
          AffineTransform[{}<-{}](\
          SqrClippedReLU[{}](\
          AffineTransform[{}<-{}](\
-         InputSlice[{}(0:{})]))))),\
-         fv_scale={}",
+         InputSlice[{}(0:{})]))))){}",
         features_token(feature_name, input_size, ft_out),
         psqt_part,
         threat_part,
@@ -347,7 +346,7 @@ pub fn build_arch_str(
         ft_out * 2, // L1 input (dual perspective)
         ft_out * 2,
         ft_out * 2,
-        fv_scale,
+        fv_scale_part,
     )
 }
 
@@ -564,8 +563,13 @@ impl LayerStackWeights {
 
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
     /// `NetworkLayerStacks::read` で parse できる byte layout (`num_buckets` を
-    /// header から読む対応が rshogi 側で要る)。
-    pub fn save_quantised<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    /// header から読む対応が rshogi 側で要る)。`fv_scale = None` のときは arch
+    /// string から `fv_scale` token を省略する。
+    pub fn save_quantised<W: Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+    ) -> io::Result<()> {
         // ---- header ---- (arch 文字列・hash は feature set + 層次元から導出)
         // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1f bias buffer の長さ
         // (どちらも 1 perspective / 1 dim あたり 1 要素)。L2 出力次元は L2 bias buffer の
@@ -618,7 +622,7 @@ impl LayerStackWeights {
             l1_out,
             l2_in,
             l2_out,
-            FV_SCALE,
+            fv_scale,
             psqt_buckets,
             threat_arch,
             effect_bucket_arch,
@@ -1678,7 +1682,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let mut cursor = std::io::Cursor::new(&buf);
         let loaded = LayerStackWeights::load_quantised(
             &mut cursor,
@@ -1771,7 +1775,7 @@ mod tests {
         original.ft_w[base_ft_w_n + 1] = 5.0 / 127.0; // threat: 5/127
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // arch_str は rshogi 契約: `Threat=<dims>` + cross-side (id 10≠0) は
         // `ThreatProfile=10` も付く。token は dims 値で、profile 名は使わない。
@@ -1821,7 +1825,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
         let err = LayerStackWeights::load_quantised(
@@ -1852,7 +1856,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
         let err = LayerStackWeights::load_quantised(
@@ -1888,7 +1892,7 @@ mod tests {
         original.ft_w[base_ft_w_n] = 1.0; // threat row 端値 (127/127)
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let arch = String::from_utf8_lossy(&buf);
         assert!(
             arch.contains(&format!("Threat={},", spec.threat_dims())),
@@ -1933,7 +1937,7 @@ mod tests {
         original.ft_w[base_ft_w_n + 1] = -5.0 / 127.0; // → i8 -5
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // threat block は末尾 (LayerStacks の前) ではなく、save 順では PSQT(無)→
         // Threat(u32 id + i8...)→LayerStacks。threat block の長さは 4 (u32) +
@@ -1974,7 +1978,7 @@ mod tests {
         original.ft_w[last] = -5.0 / 127.0;
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let arch = String::from_utf8_lossy(&buf);
         assert!(arch.contains("EffectBucket=2x2fixed,"), "{arch}");
         assert!(!arch.contains("Threat="), "{arch}");
@@ -2005,7 +2009,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         let err = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
@@ -2034,7 +2038,7 @@ mod tests {
         assert_eq!(original.ft_b.len(), ft_out);
         assert_eq!(original.ft_w.len(), test_spec().ft_in() * ft_out);
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2086,7 +2090,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
         );
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2135,7 +2139,7 @@ mod tests {
         assert_eq!(original.l2_w.len(), DEFAULT_NUM_BUCKETS * l2_out * l2_in);
         assert_eq!(original.l3_w.len(), DEFAULT_NUM_BUCKETS * l2_out);
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2176,7 +2180,7 @@ mod tests {
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
         )
-        .save_quantised(&mut buf)
+        .save_quantised(&mut buf, Some(FV_SCALE))
         .unwrap();
 
         let ok = LayerStackWeights::load_quantised(
@@ -2314,7 +2318,7 @@ mod tests {
         )
         .unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
-        weights.save_quantised(&mut writer).unwrap();
+        weights.save_quantised(&mut writer, Some(FV_SCALE)).unwrap();
         drop(writer);
 
         let in_size = in_bytes.len() as i64;
@@ -2380,7 +2384,7 @@ mod tests {
             DEFAULT_L1_OUT,
             (DEFAULT_L1_OUT - 1) * 2,
             DEFAULT_L2_OUT,
-            FV_SCALE,
+            Some(FV_SCALE),
             None,
             None,
             None,
@@ -2399,6 +2403,47 @@ mod tests {
     }
 
     #[test]
+    fn arch_str_omits_fv_scale_when_absent() {
+        let s = build_arch_str(
+            "HalfKaHmMerged",
+            test_spec().ft_in(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            (DEFAULT_L1_OUT - 1) * 2,
+            DEFAULT_L2_OUT,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!s.contains("fv_scale"), "{s}");
+        assert!(s.ends_with(")))))"), "{s}");
+    }
+
+    #[test]
+    fn quantised_net_without_fv_scale_loads() {
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        );
+        let mut buf = Vec::new();
+        original.save_quantised(&mut buf, None).unwrap();
+
+        LayerStackWeights::load_quantised(
+            &mut std::io::Cursor::new(buf),
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+        )
+        .expect("fv_scale を省略した arch string も load できる");
+    }
+
+    #[test]
     fn build_arch_str_with_psqt_inserts_token() {
         // psqt_buckets = Some(9) で `PSQT=9,` token が Features と Network の間に入る。
         let s = build_arch_str(
@@ -2408,7 +2453,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             Some(9),
             None,
             None,
@@ -2434,7 +2479,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             Some(ThreatArch {
                 dims: 96_320,
@@ -2454,7 +2499,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             Some(ThreatArch {
                 dims: 216_720,
@@ -2478,7 +2523,7 @@ mod tests {
             16,
             30,
             32,
-            28,
+            Some(28),
             None,
             None,
             Some(EffectBucketArch {
@@ -2526,7 +2571,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        original.save_quantised(&mut buf).unwrap();
+        original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2561,7 +2606,7 @@ mod tests {
         psqt[(test_spec().ft_in() - 1) * DEFAULT_NUM_BUCKETS + 5] = 7.0 * lsb;
 
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let loaded = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2596,7 +2641,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let err = LayerStackWeights::load_quantised(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2620,7 +2665,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         let err = LayerStackWeights::load_quantised_with_psqt(
             &mut std::io::Cursor::new(&buf),
             test_spec(),
@@ -2669,7 +2714,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
 
         // bucket 3 の bias cell (i32 LE) を非ゼロに書き換える。
         // raw i32 = 16256 → dequant = 16256 / 8128 = 2.0 (整然と確認できる値)。
@@ -2722,7 +2767,7 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut buf = Vec::new();
-        net.save_quantised(&mut buf).unwrap();
+        net.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
         // bias 領域 9 個の i32 LE が全て 0 であることを直接確認する (zero-branch を
         // どの bucket でも通る前提の test)。
         let bias_start = psqt_bias_start(buf.len(), test_spec().ft_in());
@@ -2765,8 +2810,8 @@ mod tests {
         );
         let mut buf_w = Vec::new();
         let mut buf_wo = Vec::new();
-        with.save_quantised(&mut buf_w).unwrap();
-        without.save_quantised(&mut buf_wo).unwrap();
+        with.save_quantised(&mut buf_w, Some(FV_SCALE)).unwrap();
+        without.save_quantised(&mut buf_wo, Some(FV_SCALE)).unwrap();
         let arch_token_len = "PSQT=9,".len();
         let psqt_bytes = (DEFAULT_NUM_BUCKETS + ft_in * DEFAULT_NUM_BUCKETS) * 4;
         assert_eq!(

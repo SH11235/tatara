@@ -308,7 +308,7 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
 
     let w = t_on.to_layerstack_weights()?;
     let mut buf = Vec::new();
-    w.save_quantised(&mut buf)?;
+    w.save_quantised(&mut buf, Some(nnue_format::layerstack_weights::FV_SCALE))?;
     let loaded = nnue_format::LayerStackWeights::load_quantised(
         &mut std::io::Cursor::new(&buf),
         base,

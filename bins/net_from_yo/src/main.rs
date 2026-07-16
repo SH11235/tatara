@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    weights.save_quantised(&mut writer)?;
+    weights.save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
     writer.flush()?;
     Ok(())
 }
@@ -659,9 +659,12 @@ mod tests {
             // 変換器の native 出力 (tatara .bin) が byte 一致することも確認する:
             // 元 weights と往復後 weights の save_quantised は同一バイト列になる。
             let mut direct = Vec::new();
-            w.save_quantised(&mut direct).unwrap();
+            w.save_quantised(&mut direct, Some(nnue_format::layerstack_weights::FV_SCALE))
+                .unwrap();
             let mut via = Vec::new();
-            parsed.save_quantised(&mut via).unwrap();
+            parsed
+                .save_quantised(&mut via, Some(nnue_format::layerstack_weights::FV_SCALE))
+                .unwrap();
             assert_eq!(direct, via, "{fs:?} save_quantised byte-identity");
         }
     }

@@ -6,6 +6,16 @@ use nnue_format::ArchKind;
 
 use crate::arch::*;
 
+fn parse_positive_i32(value: &str) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| "fv_scale must be an integer greater than zero".to_string())?;
+    if parsed <= 0 {
+        return Err("fv_scale must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
 // ===========================================================================
 // CLI (clap)
 // ===========================================================================
@@ -609,6 +619,13 @@ impl ArchCommand {
 /// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
+    /// Evaluation scale written to the LayerStack architecture string. When
+    /// omitted, sigmoid loss derives it from `--scale`; WRM loss leaves the
+    /// token out so the consuming engine can supply it through its FV_SCALE
+    /// option.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
+    pub(crate) fv_scale: Option<i32>,
+
     /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
     /// king squares x 1548 KP-abs piece inputs). When omitted in progress8kpabs
     /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
