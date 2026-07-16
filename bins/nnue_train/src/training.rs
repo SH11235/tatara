@@ -19,8 +19,10 @@ use nnue_train::optimizer::OptimizerKind;
 use nnue_train::schedule::WdlScheduler;
 #[cfg(any(feature = "gpu", test))]
 use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::trainer::LossKind;
 #[cfg(feature = "gpu")]
-use nnue_train::trainer::{LossKind, TrainingConfig};
+use nnue_train::trainer::TrainingConfig;
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
@@ -36,6 +38,22 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 #[cfg(any(feature = "gpu", test))]
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn layerstack_export_fv_scale(
+    override_value: Option<i32>,
+    loss: LossKind,
+    score_scale: f32,
+) -> Option<i32> {
+    override_value.or_else(|| match loss {
+        LossKind::Sigmoid { .. } => Some(
+            ((nnue_format::layerstack_weights::QA * nnue_format::layerstack_weights::QB) as f32
+                / score_scale)
+                .round() as i32,
+        ),
+        LossKind::Wrm { .. } => None,
+    })
+}
 
 #[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Default)]
@@ -407,6 +425,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             scale: 1.0 / cli.scale,
         }
     };
+    let fv_scale = layerstack_export_fv_scale(layerstack.fv_scale, loss, cli.scale);
     // FT 出力次元は backward の gather kernel が grid を `ft_out / 128` で launch する
     // ため 128 の倍数でなければ末尾行の勾配が計算されない。
     if layerstack.ft_out == 0 || !layerstack.ft_out.is_multiple_of(128) {
@@ -702,6 +721,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
+        fv_scale,
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
@@ -798,6 +818,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         resume_parent_id,
         data,
         lr_scheduler.to_string(),
+        fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
@@ -1347,6 +1368,7 @@ pub(crate) fn build_experiment_logger(
     resume_parent_id: Option<String>,
     data: &Path,
     lr_schedule: String,
+    fv_scale: Option<i32>,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
@@ -1476,7 +1498,7 @@ pub(crate) fn build_experiment_logger(
         lineage,
         params,
         data_info,
-        nnue_format::layerstack_weights::FV_SCALE,
+        fv_scale,
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1638,7 +1660,7 @@ pub(crate) fn build_experiment_logger_simple(
         lineage,
         params,
         data_info,
-        fv_scale,
+        Some(fv_scale),
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1916,6 +1938,7 @@ pub(crate) fn run_simple_training(
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
+        fv_scale: Some(trainer.fv_scale()),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
@@ -1974,6 +1997,44 @@ pub(crate) fn run_simple_training(
 #[cfg(test)]
 mod shared_cli_tests {
     use super::*;
+
+    #[test]
+    fn layerstack_fv_scale_follows_loss_and_override() {
+        let wrm = LossKind::Wrm {
+            nnue2score: 600.0,
+            in_scaling: 340.0,
+            in_offset: 270.0,
+            target_offset: 270.0,
+            target_scaling: 380.0,
+            pow_exp: 2.0,
+            qp_asymmetry: 0.0,
+            weight_boost_w1: 0.0,
+            weight_boost_w2: 0.5,
+        };
+        assert_eq!(
+            layerstack_export_fv_scale(None, LossKind::Sigmoid { scale: 1.0 / 290.0 }, 290.0,),
+            Some(28)
+        );
+        assert_eq!(layerstack_export_fv_scale(None, wrm, 290.0), None);
+        assert_eq!(layerstack_export_fv_scale(Some(41), wrm, 290.0), Some(41));
+
+        let cli = Cli::try_parse_from(["nnue-trainer", "layerstack", "--fv-scale", "37"])
+            .expect("cli parse");
+        let ArchCommand::LayerStack(args) = cli.arch else {
+            unreachable!()
+        };
+        assert_eq!(args.fv_scale, Some(37));
+
+        for invalid in ["0", "-1"] {
+            let error = Cli::try_parse_from(["nnue-trainer", "layerstack", "--fv-scale", invalid])
+                .expect_err("non-positive fv_scale must be rejected")
+                .to_string();
+            assert!(
+                error.contains("fv_scale must be greater than zero"),
+                "{error}"
+            );
+        }
+    }
     use clap::Parser;
 
     fn parse(extra: &[&str]) -> Cli {

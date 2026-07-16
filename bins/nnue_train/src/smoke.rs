@@ -432,7 +432,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         println!("[smoke] saving trained weights to {out_path_str} ...");
         let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
-        saved_weights.save_quantised(&mut writer)?;
+        saved_weights
+            .save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
         drop(writer);
         let out_size = std::fs::metadata(&out_path)?.len();
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");
@@ -475,7 +476,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         let out_path_str = out_path.display();
         let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
-        saved_weights.save_quantised(&mut writer)?;
+        saved_weights
+            .save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
         drop(writer);
         let out_size = std::fs::metadata(&out_path)?.len();
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");

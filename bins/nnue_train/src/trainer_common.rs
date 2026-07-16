@@ -5,6 +5,34 @@ use shogi_features::FeatureSetSpec;
 
 use crate::kernel_module::*;
 
+pub(crate) trait SaveQuantisedExport {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+    ) -> std::io::Result<()>;
+}
+
+impl SaveQuantisedExport for nnue_format::LayerStackWeights {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+    ) -> std::io::Result<()> {
+        self.save_quantised(writer, fv_scale)
+    }
+}
+
+impl SaveQuantisedExport for nnue_format::SimpleWeights {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        _fv_scale: Option<i32>,
+    ) -> std::io::Result<()> {
+        self.save_quantised(writer)
+    }
+}
+
 /// GPU trainer の数値精度と optimizer state の形式を選択する。既定値はすべて無効。
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PrecisionFlags {
@@ -311,7 +339,11 @@ macro_rules! trainer_backend_impl {
                     .map_err(|e| std::io::Error::other(format!($flush_error, e)))
             }
 
-            fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+            fn save_checkpoint(
+                &mut self,
+                path: &std::path::Path,
+                fv_scale: Option<i32>,
+            ) -> std::io::Result<()> {
                 let weights = self
                     .$weights()
                     .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
@@ -321,7 +353,7 @@ macro_rules! trainer_backend_impl {
                     std::fs::create_dir_all(parent)?;
                 }
                 let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                weights.save_quantised(&mut writer)?;
+                weights.save_quantised_export(&mut writer, fv_scale)?;
                 std::io::Write::flush(&mut writer)?;
                 Ok(())
             }

@@ -165,7 +165,11 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         );
         let mut new_bytes = Vec::new();
-        net.save_quantised(&mut new_bytes).unwrap();
+        net.save_quantised(
+            &mut new_bytes,
+            Some(nnue_format::layerstack_weights::FV_SCALE),
+        )
+        .unwrap();
 
         let old_bytes = synthesize_old_header(&new_bytes, &TOKEN_REWRITES[0]);
         let old_payload = payload_after_feature_hash(&old_bytes);
