@@ -445,6 +445,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-fv-scale"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "nnue-format",
+ "shogi-features",
+]
+
+[[package]]
 name = "net-header-rewrite"
 version = "0.1.0"
 dependencies = [
