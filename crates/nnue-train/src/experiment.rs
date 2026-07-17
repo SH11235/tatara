@@ -191,7 +191,7 @@ pub struct Params {
     /// 互換のため従来どおり `init_preset`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_preset: Option<String>,
-    /// held-out validation 用 PSV ファイルの basename (`--test-data`)。未指定なら省略。
+    /// held-out validation 用ファイルの basename (`--test-data`)。未指定なら省略。
     /// `--test-tail-positions` 経路では同 file (= training PSV) の末尾を holdout
     /// にするためここではなく `test_tail_positions` 側に N が入る。
     #[serde(skip_serializing_if = "Option::is_none")]

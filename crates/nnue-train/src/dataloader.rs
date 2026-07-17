@@ -29,12 +29,49 @@ use std::thread;
 
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
-use shogi_format::{PackedSfenValue, ShogiBoard};
+use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
 /// 40-byte struct). Used everywhere we compute byte offsets, validate range
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
+
+/// Sequential reader for 38-byte Apery / dlshogi HCPE records.
+pub struct HcpeFileLoader {
+    reader: BufReader<File>,
+    remaining_records: u64,
+}
+
+impl HcpeFileLoader {
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len();
+        let record_bytes = HCPE_RECORD_BYTES as u64;
+        if !file_size.is_multiple_of(record_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "HCPE file size {file_size} is not a multiple of {HCPE_RECORD_BYTES} bytes for {}",
+                    path.as_ref().display()
+                ),
+            ));
+        }
+        Ok(Self {
+            reader: BufReader::with_capacity(1024 * 1024, file),
+            remaining_records: file_size / record_bytes,
+        })
+    }
+
+    pub fn next_board(&mut self) -> io::Result<Option<ShogiBoard>> {
+        if self.remaining_records == 0 {
+            return Ok(None);
+        }
+        let mut record = HuffmanCodedPosAndEval::default();
+        self.reader.read_exact(record.as_bytes_mut())?;
+        self.remaining_records -= 1;
+        record.decode().map(Some)
+    }
+}
 
 /// LayerStack の position bucket 算出方式。
 #[derive(Clone, Copy, Debug, Default)]
@@ -949,6 +986,57 @@ mod tests {
             .parent()
             .unwrap()
             .join("shogi-format/tests/data/sample.psv")
+    }
+
+    #[test]
+    #[ignore = "requires matching external HCPE and PSV files"]
+    fn hcpe_matches_psv_crosscheck() {
+        let hcpe_path = std::env::var_os("TATARA_HCPE_CROSSCHECK")
+            .map(PathBuf::from)
+            .expect("set TATARA_HCPE_CROSSCHECK");
+        let psv_path = std::env::var_os("TATARA_PSV_CROSSCHECK")
+            .map(PathBuf::from)
+            .expect("set TATARA_PSV_CROSSCHECK");
+        let mut hcpe = HcpeFileLoader::new(hcpe_path).expect("open HCPE");
+        let mut psv = PsvFileLoader::new(psv_path).expect("open PSV");
+        let mut positions = 0_u64;
+
+        loop {
+            let hcpe_board = hcpe.next_board().expect("decode HCPE");
+            let psv_board = psv.next_psv().expect("decode PSV").map(|p| p.decode());
+            match (hcpe_board, psv_board) {
+                (Some(h), Some(p)) => {
+                    assert_eq!(h.board, p.board, "board mismatch at record {positions}");
+                    assert_eq!(
+                        h.black_hand.counts, p.black_hand.counts,
+                        "black hand mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.white_hand.counts, p.white_hand.counts,
+                        "white hand mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.side_to_move, p.side_to_move,
+                        "side-to-move mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.black_king_sq, p.black_king_sq,
+                        "black king mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.white_king_sq, p.white_king_sq,
+                        "white king mismatch at record {positions}"
+                    );
+                    assert_eq!(h.score, p.score, "score mismatch at record {positions}");
+                    assert_eq!(h.result, p.result, "result mismatch at record {positions}");
+                    positions += 1;
+                }
+                (None, None) => break,
+                _ => panic!("record count mismatch after {positions} positions"),
+            }
+        }
+        assert!(positions > 0, "cross-check files are empty");
+        eprintln!("cross-checked {positions} HCPE/PSV positions");
     }
 
     #[test]
