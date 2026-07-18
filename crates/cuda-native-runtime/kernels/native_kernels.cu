@@ -1,6 +1,13 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+// LayerStack bucket 数の上限。per-bucket accumulator を register array で持つ kernel が
+// この値で配列を確保する。各アクセスは `min(num_buckets, kMaxSupportedNumBuckets)` で
+// clamp するので範囲外 index (UB) にはならないが、host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS`
+// がこの値を超えると上位 bucket の勾配が黙って落ちる。両定数の一致を
+// `native_bucket_capacity_matches_host` test で固定する。
+constexpr unsigned int kMaxSupportedNumBuckets = 9;
+
 extern "C" __global__ void native_vec_add(
     const float* lhs,
     const float* rhs,
@@ -2154,7 +2161,7 @@ extern "C" __global__ void psqt_diff_sparse_fwd_inplace(
     }
     float stm_sum = 0.0F;
     float nstm_sum = 0.0F;
-    const unsigned int base = row * max_active;
+    const unsigned long long base = static_cast<unsigned long long>(row) * max_active;
     for (int active = 0; active < nonzero_counts[row]; ++active) {
         const int stm = stm_indices[base + static_cast<unsigned int>(active)];
         const int nstm = nstm_indices[base + static_cast<unsigned int>(active)];
@@ -2567,16 +2574,17 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l2(
     const unsigned int rows_per_split = (batch + gridDim.y - 1U) / gridDim.y;
     const unsigned int first_row = blockIdx.y * rows_per_split;
     const unsigned int last_row = min(first_row + rows_per_split, batch);
-    float accumulators[9] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    float accumulators[kMaxSupportedNumBuckets] = {};
+    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
     for (unsigned int row = first_row; row < last_row; ++row) {
         const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
             accumulators[bucket] +=
                 input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
                 output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
         }
     }
-    for (unsigned int bucket = 0; bucket < num_buckets; ++bucket) {
+    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
         atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * cells_per_bucket + cell,
                   accumulators[bucket]);
     }
@@ -2601,22 +2609,26 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l3(
     const unsigned int lanes_per_column = blockDim.x / input_dimension;
     const unsigned int stride = gridDim.x * lanes_per_column;
     unsigned int row = blockIdx.x * lanes_per_column + lane;
-    float accumulators[9] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    float accumulators[kMaxSupportedNumBuckets] = {};
+    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
     while (row < batch) {
         const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
             accumulators[bucket] +=
                 input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
                 output_gradient[static_cast<unsigned long long>(row) * output_dimension];
         }
         row += stride;
     }
-    for (unsigned int bucket = 0; bucket < num_buckets; ++bucket) {
+    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
         atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * input_dimension + input_index,
                   accumulators[bucket]);
     }
 }
 
+// 各 (row, output) 要素を1 thread が担当し bias_gradient[output] へ直接 global atomicAdd
+// する。shared-memory 縮約は行わない。結果は縮約実装と fp32 の加算順の範囲で一致し、
+// native⇔cuda-oxide の数値 parity test が許容誤差内で固定する。
 extern "C" __global__ void bias_grad_shared_l1f(
     const float* output_gradient,
     unsigned long long,
@@ -2633,6 +2645,10 @@ extern "C" __global__ void bias_grad_shared_l1f(
     }
 }
 
+// 1 thread = 1 output 列。`output_index = threadIdx.x` と `output_index >= output_dimension`
+// の early return により、`blockDim.x >= output_dimension` を満たさないと
+// `[blockDim.x, output_dimension)` の列が処理されず脱落する。caller は block を
+// `output_dimension` 以上で launch する契約 (host 側 launch 前に assert)。
 extern "C" __global__ void bias_grad_bucket_shared_sorted(
     const float* output_gradient,
     unsigned long long,

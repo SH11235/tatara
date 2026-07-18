@@ -20,6 +20,10 @@ cargo test -p nnue-trainer --features native-cuda --release \
     native_inventory_parser -- --nocapture
 cargo test -p nnue-trainer --features native-cuda --release \
     every_production_cuda_launch_is_exported -- --nocapture
+cargo test -p nnue-trainer --features native-cuda --release \
+    cuda_launch_stays_within_known_production_roots -- --nocapture
+cargo test -p nnue-trainer --features native-cuda --release \
+    native_bucket_capacity_matches_host -- --nocapture
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
 cargo test -p nnue-trainer --features native-cuda --release \
