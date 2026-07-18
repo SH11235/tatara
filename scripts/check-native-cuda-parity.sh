@@ -23,6 +23,9 @@ cargo test -p nnue-trainer --no-default-features --features native-cuda-host --r
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
 
+echo "== portable host CLI smoke =="
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+
 extract_fingerprint() {
     sed -n 's/^.*\[native-host-parity\] //p' "$1" | tail -n 1
 }

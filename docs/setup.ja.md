@@ -81,7 +81,11 @@ cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
 cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
 cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
 ```
+
+最後のコマンドは教師データを使わず、nativeの対応範囲に限定したGPU smokeを実行する。
+末尾に`[smoke/simple] PASSED`が出れば成功。
 
 現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU、hidden dimension各256以下、
 FP32 (TF32無効)、factorizer OFF、default WRM、Ranger。LayerStack、SCReLU / Pairwise、

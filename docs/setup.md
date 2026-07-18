@@ -85,7 +85,11 @@ cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
 cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
 cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
 ```
+
+The last command runs a GPU smoke test without training data, restricted to the
+native backend's supported scope. It succeeds with a final `[smoke/simple] PASSED` line.
 
 The current scope is Simple (including HalfKaHmMerged), CReLU, hidden dimensions
 up to 256, FP32 with TF32 disabled, factorizer off, default WRM, and Ranger.

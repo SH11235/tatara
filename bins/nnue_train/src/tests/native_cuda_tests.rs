@@ -6,12 +6,23 @@ use shogi_features::FeatureSet;
 #[cfg(feature = "native-cuda")]
 use crate::kernel_module::with_test_native_backend;
 use crate::{
-    arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
+    arch::{SMOKE_BATCH, SMOKE_LOSS_SIGMOID, SMOKE_LOSS_WRM},
     trainer_common::{BatchData, DENSE_BIAS_GRAD_MAX_OUT, PrecisionFlags},
     trainer_simple::{
         SimpleGpuTrainer, validate_native_simple_configuration, validate_native_simple_loss,
     },
 };
+
+fn with_native_backend<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "native-cuda")]
+    {
+        with_test_native_backend(true, operation)
+    }
+    #[cfg(feature = "native-cuda-host")]
+    {
+        operation()
+    }
+}
 
 fn standard_id() -> SimpleId {
     SimpleId {
@@ -155,6 +166,28 @@ fn native_simple_loss_guard_rejects_non_default_paths() {
         nnue_train::trainer::LossKind::Sigmoid { .. } => unreachable!(),
     };
     assert!(validate_native_simple_loss(extended).is_err());
+}
+
+#[test]
+fn native_simple_forward_rejects_unsupported_loss_before_device_launch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let id = standard_id();
+    let mut trainer = create_trainer(&context, id, true, SMOKE_BATCH)?;
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+
+    let error = with_native_backend(|| {
+        trainer
+            .forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)
+            .unwrap_err()
+    });
+    assert!(error.to_string().contains("only the default WRM loss"));
+
+    // A device trap would poison this context. A successful supported forward proves that the
+    // unsupported loss was rejected on the host before any loss kernel launch.
+    let loss = with_native_backend(|| trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM))?;
+    assert!(loss.is_finite());
+    Ok(())
 }
 
 #[test]
