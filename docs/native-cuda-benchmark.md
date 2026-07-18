@@ -4,7 +4,7 @@
 C++ backend. The benchmark contract, timing, run ordering, statistics, environment capture, and
 JSON output are implemented in Rust and are shared by Linux/WSL and native Windows.
 
-This is different from `scripts/bench-pos.sh`: that script measures an end-to-end training job
+This is different from `nnue-train bench-pos`: that runner measures an end-to-end training job
 with real data, while `native-bench` measures trainer/GPU throughput using a deterministic
 in-memory batch and excludes trainer construction and batch generation.
 
@@ -28,7 +28,7 @@ order also alternates, so a systematic first-run advantage does not belong to on
 
 LayerStack does not read `progress.bin`: the in-memory benchmark batch assigns deterministic
 round-robin bucket indices (`row % 9`). This isolates trainer/GPU throughput. Use
-`scripts/bench-pos.sh` when progress calculation and real-data loading should be included.
+`nnue-train bench-pos` when progress calculation and real-data loading should be included.
 
 ## Commands
 

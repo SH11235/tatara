@@ -25,6 +25,8 @@ use clap::Parser;
 
 mod arch;
 #[cfg(any(feature = "gpu", test))]
+mod bench_pos;
+#[cfg(any(feature = "gpu", test))]
 mod ckpt;
 mod cli;
 #[cfg(feature = "gpu")]
@@ -70,7 +72,9 @@ fn main() -> std::process::ExitCode {
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
     // smoke test に落ちて何もせず成功扱いになる。
     #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-    let result = if let cli::ArchCommand::NativeBench(args) = &cli.arch {
+    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+        bench_pos::run(args)
+    } else if let cli::ArchCommand::NativeBench(args) = &cli.arch {
         native_bench::run(args, cli.batch_size)
     } else if cli.data.is_some()
         || cli.eval_only
@@ -82,7 +86,9 @@ fn main() -> std::process::ExitCode {
         smoke_test(cli.arch.kind())
     };
     #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
-    let result = if cli.data.is_some()
+    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+        bench_pos::run(args)
+    } else if cli.data.is_some()
         || cli.eval_only
         || cli.threat_ablate.is_some()
         || cli.threat_norm_dump

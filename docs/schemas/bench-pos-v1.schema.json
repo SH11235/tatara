@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SH11235/tatara/docs/schemas/bench-pos-v1.schema.json",
+  "title": "tatara end-to-end training benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "timestamp_unix_ms", "profile", "parameters", "inputs", "environment", "cases", "summaries"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "timestamp_unix_ms": { "type": "integer", "minimum": 0 },
+    "profile": { "type": "string", "minLength": 1 },
+    "parameters": { "$ref": "#/$defs/parameters" },
+    "inputs": { "$ref": "#/$defs/inputs" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/summary" }
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runs", "superbatches", "warmup_superbatches", "batches_per_superbatch", "batch_size", "threads", "learning_rate", "score_drop_abs", "lock_gpu_clock"],
+      "properties": {
+        "runs": { "type": "integer", "minimum": 1 },
+        "superbatches": { "type": "integer", "minimum": 1 },
+        "warmup_superbatches": { "type": "integer", "minimum": 0 },
+        "batches_per_superbatch": { "type": "integer", "minimum": 1 },
+        "batch_size": { "type": "integer", "minimum": 1 },
+        "threads": { "type": "integer", "minimum": 1 },
+        "learning_rate": { "type": "number", "exclusiveMinimum": 0 },
+        "score_drop_abs": { "type": "integer", "minimum": 1 },
+        "lock_gpu_clock": { "type": "boolean" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data_id", "data_file_name", "data_bytes", "progress_id", "progress_file_name", "progress_bytes"],
+      "properties": {
+        "data_id": { "type": "string", "minLength": 1 },
+        "data_file_name": { "$ref": "#/$defs/nullableString" },
+        "data_bytes": { "type": "integer", "minimum": 1 },
+        "progress_id": { "$ref": "#/$defs/nullableString" },
+        "progress_file_name": { "$ref": "#/$defs/nullableString" },
+        "progress_bytes": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "os", "architecture", "gpu", "driver", "cuda_toolkit", "rustc", "git_commit", "dirty", "cargo_features", "command_line"],
+      "properties": {
+        "platform": { "type": "string", "minLength": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "gpu": { "$ref": "#/$defs/nullableString" },
+        "driver": { "$ref": "#/$defs/nullableString" },
+        "cuda_toolkit": { "$ref": "#/$defs/nullableString" },
+        "rustc": { "$ref": "#/$defs/nullableString" },
+        "git_commit": { "$ref": "#/$defs/nullableString" },
+        "dirty": { "type": ["boolean", "null"] },
+        "cargo_features": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "command_line": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "superbatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["superbatch", "pos_per_sec"],
+      "properties": {
+        "superbatch": { "type": "integer", "minimum": 1 },
+        "pos_per_sec": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run", "order_in_run", "elapsed_ms", "superbatches", "measured_mean_pos_per_sec", "log_file"],
+      "properties": {
+        "run": { "type": "integer", "minimum": 1 },
+        "order_in_run": { "type": "integer", "minimum": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "superbatches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/superbatch" } },
+        "measured_mean_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "log_file": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "architecture", "feature_set", "training_arguments", "runs"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "architecture": { "enum": ["layerstack", "simple"] },
+        "feature_set": { "type": "string", "minLength": 1 },
+        "training_arguments": { "type": "array", "items": { "type": "string" } },
+        "runs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/run" } }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "runs", "mean_pos_per_sec", "median_pos_per_sec", "sample_sd_pos_per_sec", "min_pos_per_sec", "max_pos_per_sec", "coefficient_of_variation_percent"],
+      "properties": {
+        "case_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "runs": { "type": "array", "minItems": 1, "items": { "type": "number", "exclusiveMinimum": 0 } },
+        "mean_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "median_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "sample_sd_pos_per_sec": { "type": "number", "minimum": 0 },
+        "min_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "max_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "coefficient_of_variation_percent": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

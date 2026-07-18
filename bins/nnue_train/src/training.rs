@@ -309,6 +309,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let layerstack = match &cli.arch {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
+        ArchCommand::BenchPos(_) => {
+            return Err("bench-pos must be dispatched before run_training".into());
+        }
         #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         ArchCommand::NativeBench(_) => {
             return Err("native-bench must be dispatched before training".into());

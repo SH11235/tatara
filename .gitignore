@@ -44,7 +44,8 @@
 # local issue (GitHub Issue を立てない課題の spec、1 file = 1 issue)
 /docs/issue/
 
-# bench-pos.sh の machine 依存設定 (テンプレート: scripts/bench-pos.env.example)
+# end-to-end benchmark の machine 固有設定
+/bench-pos.local.toml
 /scripts/bench-pos.env
 
 # OS / editor

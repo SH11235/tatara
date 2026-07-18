@@ -1,5 +1,7 @@
 //! CLI 構成テスト (clap、GPU 不要)。
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use nnue_format::{ArchKind, SimpleActivation};
 
@@ -166,6 +168,26 @@ fn layerstack_subcommand_parses() {
 }
 
 #[test]
+fn bench_pos_subcommand_uses_tracked_and_local_defaults() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "bench-pos",
+        "--case",
+        "layerstack-fp32",
+        "--case",
+        "simple-halfkp-fp32",
+    ])
+    .expect("bench-pos subcommand should parse");
+    let ArchCommand::BenchPos(args) = cli.arch else {
+        panic!("expected bench-pos subcommand");
+    };
+    assert_eq!(args.profile, PathBuf::from("bench-pos.toml"));
+    assert_eq!(args.local_config, PathBuf::from("bench-pos.local.toml"));
+    assert_eq!(args.cases, ["layerstack-fp32", "simple-halfkp-fp32"]);
+    assert!(!args.allow_dirty);
+}
+
+#[test]
 #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 fn native_bench_subcommand_has_fixed_v1_defaults() {
     let cli = Cli::try_parse_from(["nnue-train", "native-bench"])
@@ -217,6 +239,7 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
     {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
+        ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
         #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
@@ -367,6 +390,7 @@ fn simple_accepts_tf32_flag() {
     match cli.arch {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+        ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
         #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
@@ -635,6 +659,7 @@ fn simple_activation_arg_parses_and_maps() {
         let act = match cli.arch {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+            ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
             #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
             ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };
