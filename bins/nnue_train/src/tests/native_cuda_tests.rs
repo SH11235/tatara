@@ -52,10 +52,56 @@ fn standard_id() -> SimpleId {
 }
 
 fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
+    // 属性の bracket stream が `cfg` と `test` の両 identifier を含むか。`cfg(test)` /
+    // `cfg(all(test, ...))` にマッチし、`cfg(feature = "test")` (test は string literal で
+    // identifier ではない) にはマッチしない。
+    fn attribute_gates_on_test(stream: proc_macro2::TokenStream) -> bool {
+        fn idents(stream: proc_macro2::TokenStream, found: &mut (bool, bool)) {
+            for token in stream {
+                match token {
+                    proc_macro2::TokenTree::Ident(ident) if ident == "cfg" => found.0 = true,
+                    proc_macro2::TokenTree::Ident(ident) if ident == "test" => found.1 = true,
+                    proc_macro2::TokenTree::Group(group) => idents(group.stream(), found),
+                    _ => {}
+                }
+            }
+        }
+        let mut found = (false, false);
+        idents(stream, &mut found);
+        found.0 && found.1
+    }
+
     fn visit(stream: proc_macro2::TokenStream, symbols: &mut std::collections::BTreeSet<String>) {
         let mut tokens = stream.into_iter().peekable();
+        // `#[cfg(test)]` を見たら次に来る item 本体 (brace group) か `;` までを production
+        // launch 走査から除外する。inline test module 内の launch を数えないため。
+        let mut skip_next_item_body = false;
         while let Some(token) = tokens.next() {
+            if skip_next_item_body {
+                match token {
+                    proc_macro2::TokenTree::Group(group)
+                        if group.delimiter() == proc_macro2::Delimiter::Brace =>
+                    {
+                        skip_next_item_body = false;
+                    }
+                    proc_macro2::TokenTree::Punct(punct) if punct.as_char() == ';' => {
+                        skip_next_item_body = false;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match token {
+                proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                    if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek() {
+                        if group.delimiter() == proc_macro2::Delimiter::Bracket
+                            && attribute_gates_on_test(group.stream())
+                        {
+                            skip_next_item_body = true;
+                            tokens.next();
+                        }
+                    }
+                }
                 proc_macro2::TokenTree::Ident(ident) if ident == "cuda_launch" => {
                     let is_macro = matches!(
                         tokens.peek(),
@@ -131,12 +177,22 @@ fn production_cuda_launch_symbols() -> std::collections::BTreeSet<String> {
     symbols
 }
 
-fn assert_native_exports(required: &std::collections::BTreeSet<String>) {
+/// `native_kernels.cu` の行頭に `extern "C" __global__ void <name>(` がある export だけを
+/// 集める。行頭アンカーなので `//` / `/*` で始まるコメント行の宣言にはマッチしない
+/// (コメント化された kernel を「存在する」と誤判定して穴を素通りさせないため)。
+fn native_source_exports() -> std::collections::BTreeSet<String> {
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
-    let missing: Vec<_> = required
-        .iter()
-        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
-        .collect();
+    let prefix = "extern \"C\" __global__ void ";
+    native
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .filter_map(|declaration| declaration.split_once('(').map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+fn assert_native_exports(required: &std::collections::BTreeSet<String>) {
+    let exported = native_source_exports();
+    let missing: Vec<_> = required.difference(&exported).collect();
     assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
 }
 
@@ -219,6 +275,82 @@ fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
     assert_eq!(required.len(), 77, "production kernel inventory changed");
     assert_native_exports(&required);
+}
+
+/// `production_cuda_launch_symbols` は nnue_train crate の `src` だけを走査する。native path
+/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 77 本の
+/// inventory tripwire も発火しなくなる。workspace 全体を走査し、`cuda_launch!` を含む
+/// production source が既知の許可 path 配下だけにあることを固定する。
+#[test]
+fn cuda_launch_stays_within_known_production_roots() {
+    // native trainer が launch する crate。ここ以外に `cuda_launch!` が現れたら、native
+    // export 検査 (`every_production_cuda_launch_is_exported`) の走査外になっていないか確認する。
+    const NATIVE_LAUNCH_ROOT: &str = "bins/nnue_train/src";
+    // `cuda_launch!` を含むが native path ではない既知の場所。gpu-runtime は macro 定義と
+    // example、progress_kpabs_train は cuda-oxide 固定 backend。
+    const NON_NATIVE_LAUNCH_ROOTS: [&str; 2] =
+        ["crates/gpu-runtime", "bins/progress_kpabs_train/src"];
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root is two levels above the crate manifest")
+        .to_owned();
+
+    fn visit(path: &std::path::Path, offenders: &mut Vec<String>, root: &std::path::Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|name| name.to_str());
+                if !matches!(name, Some("target") | Some("tests") | Some(".git")) {
+                    visit(&path, offenders, root);
+                }
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                if !source.contains("cuda_launch!") {
+                    continue;
+                }
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                let known = relative.starts_with(NATIVE_LAUNCH_ROOT)
+                    || NON_NATIVE_LAUNCH_ROOTS
+                        .iter()
+                        .any(|allowed| relative.starts_with(allowed));
+                if !known {
+                    offenders.push(relative);
+                }
+            }
+        }
+    }
+
+    let mut offenders = Vec::new();
+    visit(&workspace_root, &mut offenders, &workspace_root);
+    assert!(
+        offenders.is_empty(),
+        "cuda_launch! appears outside known roots (update production inventory scan): {offenders:?}"
+    );
+}
+
+/// `native_kernels.cu` の per-bucket accumulator 容量 (`kMaxSupportedNumBuckets`) が host 側の
+/// `MAX_SUPPORTED_NUM_BUCKETS` と一致することを固定する。ズレると register array の範囲外
+/// index (UB) になる。
+#[test]
+fn native_bucket_capacity_matches_host() {
+    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
+    let marker = "constexpr unsigned int kMaxSupportedNumBuckets = ";
+    let value = native
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(marker))
+        .and_then(|rest| rest.split(';').next())
+        .map(str::trim)
+        .expect("native_kernels.cu must define kMaxSupportedNumBuckets")
+        .parse::<usize>()
+        .expect("kMaxSupportedNumBuckets must be an integer");
+    assert_eq!(
+        value,
+        crate::arch::MAX_SUPPORTED_NUM_BUCKETS,
+        "native kMaxSupportedNumBuckets must match host MAX_SUPPORTED_NUM_BUCKETS"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -682,6 +814,114 @@ fn assert_layerstack_native_matches_cuda_oxide_with_batch(
     } else {
         assert_checkpoint_state_close("LayerStack", &oxide_state, &native_state);
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn all_threat_and_effect_profiles_layerstack_native_match_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    let base = FeatureSet::HalfKp.spec();
+    let threats = [
+        ThreatProfile::Full,
+        ThreatProfile::SameClass,
+        ThreatProfile::SameClassMajorPawn,
+        ThreatProfile::StepAttacker,
+        ThreatProfile::FullSymDedup,
+        ThreatProfile::CrossSide,
+    ];
+    let effects = [
+        EffectBucketConfig::KINGFIXED_2X2,
+        EffectBucketConfig::KINGBUCKETED_2X2,
+        EffectBucketConfig::KINGFIXED_3X3,
+        EffectBucketConfig::KINGBUCKETED_3X3,
+    ];
+    let mut feature_sets = Vec::new();
+    for profile in threats {
+        feature_sets.push(("threat", base.with_threat_profile(profile)));
+    }
+    for effect in effects {
+        feature_sets.push(("effect", base.with_effect_bucket_config(effect)));
+    }
+    for (name, feature_set) in feature_sets {
+        eprintln!(
+            "[native-parity] LayerStack {name}: {}",
+            feature_set.arch_feature_name()
+        );
+        let options = LayerStackTestOptions {
+            feature_set,
+            l1_out: 2,
+            l2_out: 2,
+            ..LayerStackTestOptions::standard()
+        };
+        assert_layerstack_native_matches_cuda_oxide(options, SMOKE_LOSS_WRM, 1)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn production_ft_width_layerstack_native_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    // 既定の parity 構成は ft_out=128 のみで、`ft_out / 16` tile/grid や大 stride でだけ出る
+    // 差を取り逃す。production 既定幅 (1536) で 1 ケース比較する。
+    assert_layerstack_native_matches_cuda_oxide(
+        LayerStackTestOptions {
+            ft_out: 1536,
+            ..LayerStackTestOptions::standard()
+        },
+        SMOKE_LOSS_WRM,
+        1,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    // TF32 L1 経路は有効 bucket segment のみ cuBLAS で上書きする。ある行の bucket が
+    // 有効→invalid に変わると、その行の sorted 出力は更新されず前 step 値が残り得る。
+    // 手書き kernel / cuda-oxide は同じ行を 0 で埋めるので、native TF32 もそれに一致する
+    // ことを 2-step で確認する。
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions {
+        precision: PrecisionFlags {
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+        ..LayerStackTestOptions::standard()
+    };
+    let mut oxide = create_layerstack_trainer_with_options(&context, false, options)?;
+    let mut native = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    // Step 1: 全行 valid bucket。
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+
+    // Step 2: 一部の行を invalid bucket (>= num_buckets) にして、有効→invalid 遷移を作る。
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = if row % 4 == 0 {
+            options.num_buckets as i32
+        } else {
+            (row % options.num_buckets) as i32
+        };
+    }
+    let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+
+    let oxide_state = oxide.raw_checkpoint_state_to_host()?;
+    let native_state = native.raw_checkpoint_state_to_host()?;
+    assert_checkpoint_state_close(
+        "LayerStack tf32 invalid bucket",
+        &oxide_state,
+        &native_state,
+    );
     Ok(())
 }
 

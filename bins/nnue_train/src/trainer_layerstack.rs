@@ -2122,6 +2122,10 @@ impl GpuTrainer {
         // 手書き tiled kernel を分岐する。手書き kernel は bias を fuse するが、cuBLAS は
         // matmul のみなので step e) で bias を別 pass する。
         if self.tf32 {
+            // cuBLAS 経路は有効 bucket segment のみ上書きするため、invalid bucket や segment 外の
+            // sorted 行には前 step の値が残る。手書き kernel 経路は同じ行を 0 で埋めるので、
+            // inverse-scatter (d) 後の l1_bucket を両経路で一致させるため出力を 0 初期化する。
+            memset_zero(&self.stream, &self.ws.l1_bucket_sorted)?;
             // bucket g の real row `[row0, row0 + count)` は 16-align 済で combined_sorted 上に
             // 連続する (segment は host で device と同一手順に算出、GPU 同期なし)。
             let segs = bucket_segments;
@@ -2850,6 +2854,12 @@ impl GpuTrainer {
                 ]
             }
         }?;
+        // bias_grad_bucket_shared_sorted は 1 thread = 1 output 列で block_dim.x 未満の
+        // output 列しか処理しない。block_dim.x (256) >= output_dimension を保証する。
+        debug_assert!(
+            l2_out <= 256,
+            "bias_grad_bucket_shared_sorted requires block_dim.x >= output_dimension"
+        );
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -3233,6 +3243,11 @@ impl GpuTrainer {
         // L1 bias backward (sorted): 1 block = sorted batch の連続 16 行の per-block
         // shared-mem reduce で global atomic 数を削減する。dl1_total_sorted /
         // bucket_idx_sorted_dev は同 step 内で構築済 (fwd_L1 + 直前 permute)。
+        // 1 thread = 1 output 列なので block_dim.x (256) >= output_dimension を保証する。
+        debug_assert!(
+            l1_out <= 256,
+            "bias_grad_bucket_shared_sorted requires block_dim.x >= output_dimension"
+        );
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
