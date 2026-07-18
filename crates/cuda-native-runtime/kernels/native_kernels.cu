@@ -179,7 +179,8 @@ extern "C" __global__ void sparse_ft_forward(
     for (int active = 0; active < count; ++active) {
         const int column = indices[index_base + static_cast<unsigned int>(active)];
         if (column >= 0 && static_cast<unsigned int>(column) < columns) {
-            const unsigned int weight_base = static_cast<unsigned int>(column) * rows + row;
+            const unsigned long long weight_base =
+                static_cast<unsigned long long>(column) * rows + row;
 #pragma unroll
             for (unsigned int lane = 0; lane < 4; ++lane) {
                 sums[lane] += weight[weight_base + lane];
@@ -1147,7 +1148,9 @@ __device__ __forceinline__ void native_radam_step_fp16(
         float stored_momentum = momentum * momentum_scale;
         stored_momentum = stored_momentum > 65504.0F
             ? 65504.0F : (stored_momentum < -65504.0F ? -65504.0F : stored_momentum);
-        const float stored_velocity = min(velocity * velocity_scale, 65504.0F);
+        float stored_velocity = velocity * velocity_scale;
+        // Comparison-based clamping preserves NaN like the cuda-oxide if-else lowering.
+        stored_velocity = stored_velocity > 65504.0F ? 65504.0F : stored_velocity;
         momentum_half[i] = __float2half_rn(stored_momentum);
         velocity_half[i] = __float2half_rn(stored_velocity);
     } else {

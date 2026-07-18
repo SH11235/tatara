@@ -373,6 +373,9 @@ pub(crate) struct SimpleGpuTrainer {
     fv_scale: i32,
 }
 
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) type SimpleRawCheckpointState = (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
+
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
         // device buffer 解放前に compute / copy 両 stream の in-flight 操作を排出する
@@ -399,10 +402,9 @@ impl SimpleGpuTrainer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
-        debug_assert!(
-            !precision.ft_fp16_out || precision.ft_fp16,
-            "ft_fp16_out requires ft_fp16"
-        );
+        if precision.ft_fp16_out && !precision.ft_fp16 {
+            return Err("--ft-fp16-out requires --ft-fp16".into());
+        }
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
@@ -674,6 +676,20 @@ impl SimpleGpuTrainer {
     #[cfg(test)]
     pub(crate) fn ft_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)
+    }
+
+    /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
+    /// download する。resume の無中断学習 oracle との比較に使う。
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn raw_checkpoint_state_to_host(
+        &self,
+    ) -> Result<SimpleRawCheckpointState, Box<dyn std::error::Error>> {
+        let groups = self
+            .raw_ckpt_group_sources()
+            .iter()
+            .map(|source| Ok((source.name, source.to_host(&self.stream)?)))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok((self.step_count, groups))
     }
 
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。

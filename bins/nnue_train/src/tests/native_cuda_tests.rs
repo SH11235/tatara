@@ -9,11 +9,17 @@ use shogi_features::FeatureSet;
 
 #[cfg(feature = "native-cuda")]
 use crate::kernel_module::with_test_native_backend;
+#[cfg(feature = "native-cuda")]
+use crate::trainer_simple::SimpleRawCheckpointState;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
     trainer_common::{BatchData, PrecisionFlags},
     trainer_simple::SimpleGpuTrainer,
 };
+
+// NVCC の FMA による mul-add ごとの丸め差を許容するため、CUDA C++ と cuda-oxide は
+// bit 一致ではなくこの相対 tolerance で比較する。
+const NATIVE_PARITY_TOLERANCE: f64 = 2.0e-6;
 
 fn standard_id() -> SimpleId {
     SimpleId {
@@ -27,20 +33,25 @@ fn standard_id() -> SimpleId {
 
 #[test]
 fn every_simple_native_kernel_is_exported() {
-    let driver = include_str!("../trainer_simple.rs");
+    let launch_sources = [
+        include_str!("../trainer_simple.rs"),
+        include_str!("../ft_factorize_host.rs"),
+    ];
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
     let mut required = std::collections::BTreeSet::new();
-    for line in driver.lines() {
-        let Some((_, suffix)) = line.split_once("kernel:") else {
-            continue;
-        };
-        let symbol = suffix
-            .trim_start()
-            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-            .next()
-            .unwrap_or_default();
-        if !symbol.is_empty() {
-            required.insert(symbol);
+    for source in launch_sources {
+        for line in source.lines() {
+            let Some((_, suffix)) = line.split_once("kernel:") else {
+                continue;
+            };
+            let symbol = suffix
+                .trim_start()
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .next()
+                .unwrap_or_default();
+            if !symbol.is_empty() {
+                required.insert(symbol);
+            }
         }
     }
     let missing: Vec<_> = required
@@ -48,7 +59,7 @@ fn every_simple_native_kernel_is_exported() {
         .copied()
         .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
         .collect();
-    assert_eq!(required.len(), 46, "Simple kernel inventory changed");
+    assert_eq!(required.len(), 49, "Simple kernel inventory changed");
     assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
 }
 
@@ -693,7 +704,7 @@ fn assert_trainers_close(
 
     let loss_difference = (oxide_loss - native_loss).abs();
     assert!(
-        loss_difference <= 2.0e-6 * (1.0 + oxide_loss.abs()),
+        loss_difference <= NATIVE_PARITY_TOLERANCE * (1.0 + oxide_loss.abs()),
         "loss differs: oxide={oxide_loss}, native={native_loss}, diff={loss_difference}"
     );
     for (name, oxide_group, native_group) in [
@@ -713,8 +724,9 @@ fn assert_trainers_close(
 
 /// raw checkpoint が backend 非依存であることを、optimizer state と Ranger の
 /// `step_count` まで含めて固定する。片方の backend で 5 step 進めて保存し、同じ
-/// checkpoint を cuda-oxide / CUDA C++ の両方で読み、6 step 目 (lookahead 発火点)
-/// を進めた結果を比較する。保存元も両 backend を試すため、双方向の resume を覆う。
+/// checkpoint を cuda-oxide / CUDA C++ の両方で読んだ直後の全 state を bit 比較する。
+/// 続く 6 step 目 (lookahead 発火点) の結果も無中断の 6 step 状態と比較する。保存元も
+/// 両 backend を試すため、双方向の resume を覆う。
 #[test]
 #[cfg(feature = "native-cuda")]
 fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
@@ -756,7 +768,12 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
             for _ in 0..5 {
                 let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             }
+            let checkpoint_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(checkpoint_state.0, 5, "checkpoint source step count");
             source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let oracle_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(oracle_state.0, 6, "uninterrupted oracle step count");
             drop(source);
 
             let mut oxide = create_trainer_with_options(
@@ -777,13 +794,25 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
                 None,
                 precision,
             )?;
-            for trainer in [&mut oxide, &mut native] {
+            for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
                 let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
                 assert_eq!(producer.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
+                let loaded_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_bit_identical(
+                    &format!("{source_name} to {backend_name} load"),
+                    &checkpoint_state,
+                    &loaded_state,
+                );
                 trainer.sync_ft_forward_weights()?;
                 let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                let resumed_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_close(
+                    &format!("{source_name} to {backend_name}"),
+                    &oracle_state,
+                    &resumed_state,
+                );
             }
             let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
             let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
@@ -796,13 +825,84 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
 }
 
 #[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_bit_identical(
+    path: &str,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+) {
+    assert_eq!(actual.0, expected.0, "{path}: step count differs");
+    assert_eq!(
+        actual.1.len(),
+        expected.1.len(),
+        "{path}: group count differs"
+    );
+    for ((expected_name, expected_group), (actual_name, actual_group)) in
+        expected.1.iter().zip(&actual.1)
+    {
+        assert_eq!(actual_name, expected_name, "{path}: group name differs");
+        for (state_name, expected_values, actual_values) in [
+            ("weight", &expected_group.0, &actual_group.0),
+            ("first moment", &expected_group.1, &actual_group.1),
+            ("second moment", &expected_group.2, &actual_group.2),
+            ("slow weight", &expected_group.3, &actual_group.3),
+        ] {
+            assert_eq!(
+                expected_values.len(),
+                actual_values.len(),
+                "{path} {expected_name} {state_name}: length differs"
+            );
+            for (index, (&expected, &actual)) in
+                expected_values.iter().zip(actual_values).enumerate()
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{path} {expected_name} {state_name}[{index}]: expected={expected:?}, actual={actual:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_close(
+    path: &str,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+) {
+    assert_eq!(actual.0, expected.0, "{path}: step count differs");
+    assert_eq!(
+        actual.1.len(),
+        expected.1.len(),
+        "{path}: group count differs"
+    );
+    for ((expected_name, expected_group), (actual_name, actual_group)) in
+        expected.1.iter().zip(&actual.1)
+    {
+        assert_eq!(actual_name, expected_name, "{path}: group name differs");
+        for (state_name, expected_values, actual_values) in [
+            ("weight", &expected_group.0, &actual_group.0),
+            ("first moment", &expected_group.1, &actual_group.1),
+            ("second moment", &expected_group.2, &actual_group.2),
+            ("slow weight", &expected_group.3, &actual_group.3),
+        ] {
+            assert_weight_group_close(
+                &format!("{path} {expected_name} {state_name}"),
+                expected_values,
+                actual_values,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
 fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
     assert_eq!(expected.len(), actual.len());
     let mut maximum_difference = 0.0_f32;
     let mut maximum_bound = 0.0_f32;
     for (&expected, &actual) in expected.iter().zip(actual) {
         let difference = (expected - actual).abs();
-        let bound = 2.0e-6 * (1.0 + expected.abs());
+        let bound = NATIVE_PARITY_TOLERANCE as f32 * (1.0 + expected.abs());
         maximum_difference = maximum_difference.max(difference);
         maximum_bound = maximum_bound.max(bound);
         assert!(

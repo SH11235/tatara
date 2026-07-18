@@ -9,8 +9,9 @@ fn arg<T>(value: &mut T) -> *mut c_void {
 }
 
 /// NVCCがsource上のexportをfatbinから落としていないことをCUDA Driver APIで検証する。
-/// nnue-trainer側のtestが「Simpleの全launch symbol ⊆ source export」を確認し、本testが
-/// 「全source export ⊆ 実artifact」を確認するため、両方でSimpleのsymbol coverageが閉じる。
+/// nnue-trainer側のtestがfactorizer helperを含む「Simpleの全launch symbol ⊆ source
+/// export」を確認し、本testが「全source export ⊆ 実artifact」を確認するため、両方で
+/// Simpleのsymbol coverageが閉じる。
 #[test]
 fn every_source_export_resolves_from_embedded_fatbin() {
     let context = Context::new(0).unwrap();
