@@ -15,6 +15,7 @@ use std::sync::Arc;
 use gpu_runtime::{CudaModule, CudaStream, DeviceBuffer, cuda_launch};
 use shogi_features::{FeatureSetSpec, FtFactorizeMode};
 
+#[cfg(feature = "cuda-oxide")]
 use crate::kernels::*;
 use crate::trainer_common::cfg_1d;
 

@@ -3,9 +3,10 @@ use nnue_format::{SimpleActivation, SimpleId};
 use nnue_train::{init::SimpleInit, optimizer::OptimizerKind, trainer::TrainerBackend};
 use shogi_features::FeatureSet;
 
+#[cfg(feature = "native-cuda")]
+use crate::kernel_module::with_test_native_backend;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
-    kernel_module::with_test_native_backend,
     trainer_common::{BatchData, PrecisionFlags},
     trainer_simple::SimpleGpuTrainer,
 };
@@ -26,7 +27,8 @@ fn create_trainer(
     native: bool,
     batch_size: usize,
 ) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
-    with_test_native_backend(native, || {
+    #[cfg(feature = "native-cuda")]
+    let result = with_test_native_backend(native, || {
         SimpleGpuTrainer::new(
             context,
             batch_size,
@@ -38,7 +40,26 @@ fn create_trainer(
             PrecisionFlags::default(),
             &SimpleInit::default_uniform(),
         )
-    })
+    });
+    #[cfg(feature = "native-cuda-host")]
+    let result = {
+        assert!(
+            native,
+            "native-host build cannot create a cuda-oxide trainer"
+        );
+        SimpleGpuTrainer::new(
+            context,
+            batch_size,
+            id,
+            OptimizerKind::Ranger,
+            0.0,
+            None,
+            16,
+            PrecisionFlags::default(),
+            &SimpleInit::default_uniform(),
+        )
+    };
+    result
 }
 
 #[test]
@@ -54,10 +75,31 @@ fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn s
     let loss = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
     assert!(loss.is_finite(), "native Simple loss is not finite: {loss}");
     trainer.assert_all_weights_finite()?;
+    let weights = trainer.to_simple_weights()?;
+    let mut fingerprint = 0xcbf29ce484222325_u64;
+    for value in weights
+        .ft_w
+        .iter()
+        .chain(&weights.ft_b)
+        .chain(&weights.l1_w)
+        .chain(&weights.l1_b)
+        .chain(&weights.l2_w)
+        .chain(&weights.l2_b)
+        .chain(&weights.l3_w)
+        .chain(&weights.l3_b)
+    {
+        fingerprint ^= u64::from(value.to_bits());
+        fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    }
+    eprintln!(
+        "[native-host-parity] loss_bits={:016x}, weight_fingerprint={fingerprint:016x}",
+        loss.to_bits()
+    );
     Ok(())
 }
 
 #[test]
+#[cfg(feature = "native-cuda")]
 fn standard_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
@@ -110,6 +152,7 @@ fn standard_simple_native_matches_cuda_oxide_after_one_step()
     Ok(())
 }
 
+#[cfg(feature = "native-cuda")]
 fn benchmark_backend(
     context: &std::sync::Arc<CudaContext>,
     id: SimpleId,
@@ -132,6 +175,7 @@ fn benchmark_backend(
 }
 
 #[test]
+#[cfg(feature = "native-cuda")]
 #[ignore = "manual WSL performance comparison"]
 fn benchmark_standard_simple_native_against_cuda_oxide() -> Result<(), Box<dyn std::error::Error>> {
     let parse = |name: &str, default: usize| {

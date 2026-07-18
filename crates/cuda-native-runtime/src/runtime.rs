@@ -17,6 +17,8 @@ const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
 unsafe extern "C" {
     fn cuInit(flags: u32) -> CuResult;
     fn cuDeviceGet(device: *mut CuDevice, ordinal: i32) -> CuResult;
+    fn cuDeviceGetAttribute(value: *mut i32, attribute: i32, device: CuDevice) -> CuResult;
+    fn cuDeviceGetName(name: *mut i8, len: i32, device: CuDevice) -> CuResult;
     fn cuDevicePrimaryCtxRetain(context: *mut CuContext, device: CuDevice) -> CuResult;
     fn cuDevicePrimaryCtxRelease_v2(device: CuDevice) -> CuResult;
     fn cuCtxSetCurrent(context: CuContext) -> CuResult;
@@ -83,6 +85,32 @@ pub struct NativeCudaError {
 
 pub type Result<T> = std::result::Result<T, NativeCudaError>;
 
+/// Allocates page-locked host memory that may be used by any CUDA context.
+///
+/// # Safety
+///
+/// The returned pointer must be released exactly once with [`free_pinned_host`].
+pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut c_void> {
+    assert!(
+        bytes > 0,
+        "zero-length pinned allocations are not supported"
+    );
+    let mut raw = ptr::null_mut();
+    // SAFETY: raw points to writable output storage and bytes is non-zero.
+    unsafe { check(cuMemHostAlloc(&mut raw, bytes, CU_MEMHOSTALLOC_PORTABLE))? };
+    Ok(raw)
+}
+
+/// Releases memory returned by [`alloc_pinned_host`].
+///
+/// # Safety
+///
+/// `raw` must be a live allocation returned by [`alloc_pinned_host`] with no in-flight transfer.
+pub unsafe fn free_pinned_host(raw: *mut c_void) -> Result<()> {
+    // SAFETY: caller owns the allocation and guarantees all transfers completed.
+    unsafe { check(cuMemFreeHost(raw)) }
+}
+
 fn check(code: CuResult) -> Result<()> {
     if code == CUDA_SUCCESS {
         return Ok(());
@@ -148,6 +176,37 @@ impl Context {
         unsafe { check(cuCtxSetCurrent(self.inner.raw)) }
     }
 
+    pub fn device_attribute(&self, attribute: i32) -> Result<i32> {
+        self.set_current()?;
+        let mut value = 0;
+        // SAFETY: value points to writable local storage and device is retained by self.
+        unsafe {
+            check(cuDeviceGetAttribute(
+                &mut value,
+                attribute,
+                self.inner.device,
+            ))?
+        };
+        Ok(value)
+    }
+
+    pub fn device_name(&self) -> Result<String> {
+        self.set_current()?;
+        let mut name = [0_i8; 256];
+        // SAFETY: name is writable for the advertised length and device is retained by self.
+        unsafe {
+            check(cuDeviceGetName(
+                name.as_mut_ptr(),
+                name.len() as i32,
+                self.inner.device,
+            ))?
+        };
+        // SAFETY: CUDA guarantees a NUL-terminated device name within the supplied buffer.
+        Ok(unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         self.set_current()?;
         // SAFETY: a current retained CUDA context exists.
@@ -205,7 +264,17 @@ pub struct Stream {
     context: Arc<ContextInner>,
 }
 
+// SAFETY: CUDA stream handles may be submitted from any thread after selecting their context;
+// every operation in this wrapper selects the retained context before using the handle.
+unsafe impl Send for Stream {}
+// SAFETY: CUDA serializes work submitted to one stream, and wrapper methods expose no host alias.
+unsafe impl Sync for Stream {}
+
 impl Stream {
+    pub fn raw_handle(&self) -> *mut c_void {
+        self.raw
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         set_current(&self.context)?;
         // SAFETY: raw is a live stream owned by self.
@@ -469,6 +538,66 @@ impl<T: Copy> DeviceBuffer<T> {
 
     pub fn device_ptr(&self) -> u64 {
         self.raw
+    }
+
+    /// Copies at most the allocation length from host memory without synchronizing.
+    ///
+    /// # Safety
+    ///
+    /// `values` must remain alive and immutable until the operation completes on `stream`.
+    pub unsafe fn copy_from_async(&self, values: &[T], stream: &Stream) -> Result<()> {
+        assert!(
+            values.len() <= self.len,
+            "host slice exceeds device allocation"
+        );
+        ensure_same_context(&self.context, &stream.context);
+        set_current(&self.context)?;
+        // SAFETY: the capacity assertion bounds the copy and caller owns the source lifetime.
+        unsafe {
+            check(cuMemcpyHtoDAsync_v2(
+                self.raw,
+                values.as_ptr().cast(),
+                std::mem::size_of_val(values),
+                stream.raw,
+            ))
+        }
+    }
+
+    /// Copies at most the allocation length into host memory without synchronizing.
+    ///
+    /// # Safety
+    ///
+    /// `values` must remain alive and inaccessible until the operation completes on `stream`.
+    pub unsafe fn copy_to_async(&self, values: &mut [T], stream: &Stream) -> Result<()> {
+        assert!(
+            values.len() <= self.len,
+            "host slice exceeds device allocation"
+        );
+        ensure_same_context(&self.context, &stream.context);
+        set_current(&self.context)?;
+        // SAFETY: the capacity assertion bounds the copy and caller owns destination access.
+        unsafe {
+            check(cuMemcpyDtoHAsync_v2(
+                values.as_mut_ptr().cast(),
+                self.raw,
+                std::mem::size_of_val(values),
+                stream.raw,
+            ))
+        }
+    }
+
+    pub fn fill_byte_async(&self, value: u8, stream: &Stream) -> Result<()> {
+        ensure_same_context(&self.context, &stream.context);
+        set_current(&self.context)?;
+        // SAFETY: the allocation is live and the exact byte extent is used.
+        unsafe {
+            check(cuMemsetD8Async(
+                self.raw,
+                value,
+                self.len * size_of::<T>(),
+                stream.raw,
+            ))
+        }
     }
 
     pub fn len(&self) -> usize {

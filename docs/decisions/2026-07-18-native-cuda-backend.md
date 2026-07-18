@@ -44,3 +44,20 @@ Driver APIのportable runtimeを独立して整備し、kernel coverageの完成
   NVIDIA固有intrinsicやlibraryによる最適化はparity確立後に個別計測する。
 - native backendが全kernelを実装するまでは、対応architectureとprecision optionを明示して
   unsupported構成を起動前に拒否する。
+
+## Backend feature構成
+
+- 既定buildは`cuda-oxide` featureを使い、従来のdevice/host実装を維持する。
+- `native-cuda`はcuda-oxide hostからCUDA C++ fat binaryを起動する比較用構成である。
+- `native-cuda-host`はCUDA C++ fat binaryとportable Driver API host runtimeだけを使う。
+  Windowsへ持ち込む対象はこの構成であり、次のようにcuda-oxide依存を無効化してbuildする。
+
+```bash
+cargo build -p nnue-trainer \
+  --no-default-features --features native-cuda-host --release
+```
+
+`native-cuda-host`で現在対応するのは、HalfKaHmMergedを含む標準Simple、CReLU、FP32、
+factorizer無効、default WRM、Rangerの組合せである。LayerStack、SCReLU、Pairwise、FP16、
+factorizer、norm loss、拡張lossは起動時に拒否する。cuBLASはCUDA ToolkitのC APIを直接呼び、
+stream handleだけを共通runtimeから受け取るためcuda-oxideの型には依存しない。

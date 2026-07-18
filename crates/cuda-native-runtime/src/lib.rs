@@ -6,6 +6,7 @@ mod runtime;
 #[cfg(feature = "native-cuda")]
 pub use runtime::{
     Context, DeviceBuffer, Event, Function, Module, NativeCudaError, PinnedBuffer, Result, Stream,
+    alloc_pinned_host, free_pinned_host,
 };
 
 #[cfg(feature = "native-cuda")]

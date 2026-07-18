@@ -12,16 +12,26 @@ publish = false
 
 [features]
 # `--no-default-features` は CI 用の CPU-testable subset のみを compile し、生成 binary では学習を実行できない。
-default = ["gpu"]
-gpu = [
+default = ["gpu", "cuda-oxide"]
+gpu = ["dep:gpu-runtime"]
+cuda-oxide = [
+    "gpu",
     "dep:cuda-core",
     "dep:cuda-device",
     "dep:cuda-host",
-    "dep:gpu-runtime",
+    "gpu-runtime/cuda-oxide",
 ]
 # WSL/Linux validation path for CUDA C++ device kernels. The existing host pipeline remains the
 # oracle until the portable Driver API runtime reaches full trainer coverage.
-native-cuda = ["gpu", "dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
+native-cuda = ["cuda-oxide", "dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
+# CUDA C++ kernels + portable Driver API host runtime. Build with --no-default-features so the
+# cuda-oxide crates are absent; this is the configuration intended to expand to native Windows.
+native-cuda-host = [
+    "gpu",
+    "dep:cuda-native-runtime",
+    "cuda-native-runtime/native-cuda",
+    "gpu-runtime/native-cuda",
+]
 
 [lints]
 workspace = true

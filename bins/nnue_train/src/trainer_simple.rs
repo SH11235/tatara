@@ -397,7 +397,7 @@ impl SimpleGpuTrainer {
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(feature = "native-cuda")]
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         if native_backend_requested() {
             if id.activation != SimpleActivation::CReLU {
                 return Err("native CUDA currently supports only Simple CReLU".into());
@@ -861,7 +861,7 @@ impl SimpleGpuTrainer {
         loss: LossKind,
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(feature = "native-cuda")]
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         if native_backend_requested()
             && (!matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended())
         {

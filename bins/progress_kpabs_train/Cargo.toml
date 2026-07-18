@@ -19,7 +19,7 @@ path = "src/main.rs"
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }
-gpu-runtime = { workspace = true }
+gpu-runtime = { workspace = true, features = ["cuda-oxide"] }
 clap = { workspace = true }
 
 # cuda-oxide deps: device 側 API (#[kernel] / DisjointSlice / atomics) と host 側

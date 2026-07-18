@@ -760,7 +760,7 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(feature = "native-cuda")]
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         if native_backend_requested() {
             return Err("native CUDA currently supports only the Simple architecture".into());
         }

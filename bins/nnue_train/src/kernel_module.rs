@@ -21,13 +21,19 @@ pub(crate) fn with_test_native_backend<T>(native: bool, operation: impl FnOnce()
     operation()
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 pub(crate) fn native_backend_requested() -> bool {
-    #[cfg(test)]
-    if let Some(native) = TEST_NATIVE_BACKEND.get() {
-        return native;
+    #[cfg(feature = "native-cuda-host")]
+    return true;
+
+    #[cfg(feature = "native-cuda")]
+    {
+        #[cfg(test)]
+        if let Some(native) = TEST_NATIVE_BACKEND.get() {
+            return native;
+        }
+        std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native"))
     }
-    std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native"))
 }
 
 /// `gpu_runtime::load_kernel_module_with_fallback` の本 bin 向け wrapper。
@@ -37,7 +43,7 @@ pub(crate) fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
 ) -> gpu_runtime::Result<std::sync::Arc<CudaModule>> {
-    #[cfg(not(feature = "native-cuda"))]
+    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
     if std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native")) {
         return Err(gpu_runtime::Error::KernelArtifact(
             "native CUDA was requested, but nnue-train was built without --features native-cuda"
@@ -45,16 +51,27 @@ pub(crate) fn load_kernel_module_with_fallback(
         ));
     }
 
-    #[cfg(feature = "native-cuda")]
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
     if native_backend_requested() {
+        #[cfg(feature = "native-cuda-host")]
+        return ctx.load_module_from_image(cuda_native_runtime::NATIVE_KERNEL_FATBIN);
+        #[cfg(feature = "native-cuda")]
         return ctx
             .load_module_from_image(cuda_native_runtime::NATIVE_KERNEL_FATBIN)
             .map_err(Into::into);
     }
 
-    gpu_runtime::load_kernel_module_with_fallback(
-        ctx,
-        name,
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-    )
+    #[cfg(feature = "cuda-oxide")]
+    {
+        gpu_runtime::load_kernel_module_with_fallback(
+            ctx,
+            name,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+    }
+
+    #[cfg(not(feature = "cuda-oxide"))]
+    Err(gpu_runtime::Error::KernelArtifact(format!(
+        "native CUDA module `{name}` was not selected"
+    )))
 }

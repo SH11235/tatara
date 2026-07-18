@@ -16,8 +16,19 @@ fn main() {
         return;
     }
 
-    if cfg!(target_os = "linux") && Path::new("/usr/lib/wsl/lib").exists() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets CARGO_CFG_TARGET_OS");
+    if target_os == "linux" && Path::new("/usr/lib/wsl/lib").exists() {
         println!("cargo:rustc-link-search=native=/usr/lib/wsl/lib");
+    }
+    if target_os == "windows"
+        && let Some(root) = ["CUDA_TOOLKIT_PATH", "CUDA_HOME", "CUDA_PATH"]
+            .iter()
+            .find_map(env::var_os)
+    {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            PathBuf::from(root).join("lib").join("x64").display()
+        );
     }
 
     let nvcc = find_nvcc();

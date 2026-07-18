@@ -334,6 +334,7 @@ version = "0.5.0"
 dependencies = [
  "cuda-core",
  "cuda-host",
+ "cuda-native-runtime",
  "thiserror",
 ]
 
