@@ -84,6 +84,160 @@ fn zero_length_device_buffer_is_a_noop_allocation() {
 }
 
 #[test]
+fn zero_length_pinned_buffer_is_a_noop_allocation() {
+    let context = Context::new(0).unwrap();
+    let mut buffer = PinnedBuffer::<f32>::new(&context, 0).unwrap();
+    assert!(buffer.is_empty());
+    assert!(buffer.as_slice().is_empty());
+    assert!(buffer.as_mut_slice().is_empty());
+    assert!(
+        PinnedBuffer::<f32>::from_slice(&context, &[])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn layerstack_fp16_fused_gradient_preserves_nan() {
+    let context = Context::new(0).unwrap();
+    let stream = context.create_stream().unwrap();
+    let module = context.load_module(NATIVE_KERNEL_FATBIN).unwrap();
+    let function = module
+        .function(c"ft_post_perspective_grad_fused_fp16")
+        .unwrap();
+
+    let gradient_a = DeviceBuffer::from_slice(&context, &[1.0_f32]).unwrap();
+    let gradient_b = DeviceBuffer::from_slice(&context, &[0.0_f32]).unwrap();
+    let ft_output = DeviceBuffer::from_slice(&context, &[0x7e00_u16, 0x3800]).unwrap();
+    let bias = DeviceBuffer::from_slice(&context, &[0.0_f32, 0.0]).unwrap();
+    let ft_gradient = DeviceBuffer::<u16>::zeroed(&context, 2).unwrap();
+    let bias_gradient = DeviceBuffer::<f32>::zeroed(&context, 2).unwrap();
+    let clamp_counter = DeviceBuffer::<u64>::zeroed(&context, 1).unwrap();
+
+    let mut gradient_a_ptr = gradient_a.device_ptr();
+    let mut gradient_a_len = gradient_a.len() as u64;
+    let mut gradient_b_ptr = gradient_b.device_ptr();
+    let mut gradient_b_len = gradient_b.len() as u64;
+    let mut ft_output_ptr = ft_output.device_ptr();
+    let mut ft_output_len = ft_output.len() as u64;
+    let mut bias_ptr = bias.device_ptr();
+    let mut bias_len = bias.len() as u64;
+    let mut ft_gradient_ptr = ft_gradient.device_ptr();
+    let mut ft_gradient_len = ft_gradient.len() as u64;
+    let mut bias_gradient_ptr = bias_gradient.device_ptr();
+    let mut bias_gradient_len = bias_gradient.len() as u64;
+    let mut clamp_counter_ptr = clamp_counter.device_ptr();
+    let mut clamp_counter_len = clamp_counter.len() as u64;
+    let mut batch = 1_u32;
+    let mut ft_dimension = 2_u32;
+    let mut combined_offset = 0_u32;
+    let mut combined_stride = 1_u32;
+    let mut scale = 1.0_f32;
+    let mut gradient_scale = 1.0_f32;
+    let mut args = [
+        arg(&mut gradient_a_ptr),
+        arg(&mut gradient_a_len),
+        arg(&mut gradient_b_ptr),
+        arg(&mut gradient_b_len),
+        arg(&mut ft_output_ptr),
+        arg(&mut ft_output_len),
+        arg(&mut bias_ptr),
+        arg(&mut bias_len),
+        arg(&mut ft_gradient_ptr),
+        arg(&mut ft_gradient_len),
+        arg(&mut bias_gradient_ptr),
+        arg(&mut bias_gradient_len),
+        arg(&mut clamp_counter_ptr),
+        arg(&mut clamp_counter_len),
+        arg(&mut batch),
+        arg(&mut ft_dimension),
+        arg(&mut combined_offset),
+        arg(&mut combined_stride),
+        arg(&mut scale),
+        arg(&mut gradient_scale),
+    ];
+    // SAFETY: arguments match the kernel ABI and each buffer covers the one launched pair.
+    unsafe {
+        function
+            .launch(&stream, (1, 1, 1), (1, 1, 1), 0, &mut args)
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let mut actual_ft_gradient = [0_u16; 2];
+    let mut actual_bias_gradient = [0.0_f32; 2];
+    let mut actual_clamps = [0_u64; 1];
+    ft_gradient.copy_to(&mut actual_ft_gradient).unwrap();
+    bias_gradient.copy_to(&mut actual_bias_gradient).unwrap();
+    clamp_counter.copy_to(&mut actual_clamps).unwrap();
+    assert_eq!(actual_ft_gradient[0], 0);
+    assert_eq!(actual_ft_gradient[1] & 0x7c00, 0x7c00);
+    assert_ne!(actual_ft_gradient[1] & 0x03ff, 0);
+    assert_eq!(actual_bias_gradient[0], 0.0);
+    assert!(actual_bias_gradient[1].is_nan());
+    assert_eq!(actual_clamps[0], 0, "NaN is not a finite-value clamp");
+}
+
+#[test]
+fn layerstack_sorted_scatter_zeroes_invalid_bucket_rows() {
+    let context = Context::new(0).unwrap();
+    let stream = context.create_stream().unwrap();
+    let module = context.load_module(NATIVE_KERNEL_FATBIN).unwrap();
+    let function = module
+        .function(c"dense_mm_bwd_input_bucket_tiled_sorted_scatter")
+        .unwrap();
+
+    let output_gradient = DeviceBuffer::from_slice(&context, &[1.0_f32; 16]).unwrap();
+    let weights = DeviceBuffer::from_slice(&context, &[1.0_f32; 32]).unwrap();
+    let bucket_idx = DeviceBuffer::from_slice(&context, &[-1_i32; 16]).unwrap();
+    let permutation_values: Vec<i32> = (0..16).collect();
+    let permutation = DeviceBuffer::from_slice(&context, &permutation_values).unwrap();
+    let input_gradient = DeviceBuffer::from_slice(&context, &[7.0_f32; 256]).unwrap();
+
+    let mut output_gradient_ptr = output_gradient.device_ptr();
+    let mut output_gradient_len = output_gradient.len() as u64;
+    let mut weights_ptr = weights.device_ptr();
+    let mut weights_len = weights.len() as u64;
+    let mut bucket_idx_ptr = bucket_idx.device_ptr();
+    let mut bucket_idx_len = bucket_idx.len() as u64;
+    let mut permutation_ptr = permutation.device_ptr();
+    let mut permutation_len = permutation.len() as u64;
+    let mut input_gradient_ptr = input_gradient.device_ptr();
+    let mut input_gradient_len = input_gradient.len() as u64;
+    let mut batch = 16_u32;
+    let mut input_dimension = 16_u32;
+    let mut output_dimension = 1_u32;
+    let mut num_buckets = 2_u32;
+    let mut args = [
+        arg(&mut output_gradient_ptr),
+        arg(&mut output_gradient_len),
+        arg(&mut weights_ptr),
+        arg(&mut weights_len),
+        arg(&mut bucket_idx_ptr),
+        arg(&mut bucket_idx_len),
+        arg(&mut permutation_ptr),
+        arg(&mut permutation_len),
+        arg(&mut input_gradient_ptr),
+        arg(&mut input_gradient_len),
+        arg(&mut batch),
+        arg(&mut input_dimension),
+        arg(&mut output_dimension),
+        arg(&mut num_buckets),
+    ];
+    // SAFETY: arguments match the kernel ABI and the 16x16 launch covers the allocations exactly.
+    unsafe {
+        function
+            .launch(&stream, (1, 1, 1), (256, 1, 1), 0, &mut args)
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let mut actual = [0.0_f32; 256];
+    input_gradient.copy_to(&mut actual).unwrap();
+    assert_eq!(actual, [0.0_f32; 256]);
+}
+
+#[test]
 fn pinned_async_copies_can_be_ordered_across_streams() {
     let context = Context::new(0).unwrap();
     let upload_stream = context.create_stream().unwrap();

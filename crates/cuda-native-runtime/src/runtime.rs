@@ -692,7 +692,14 @@ pub struct PinnedBuffer<T: Copy> {
 
 impl<T: Copy + Default> PinnedBuffer<T> {
     pub fn new(context: &Context, len: usize) -> Result<Self> {
-        assert!(len > 0, "zero-length pinned allocations are not supported");
+        if len == 0 {
+            return Ok(Self {
+                raw: ptr::NonNull::<T>::dangling().as_ptr().cast(),
+                len: 0,
+                context: Arc::clone(&context.inner),
+                marker: PhantomData,
+            });
+        }
         context.set_current()?;
         let bytes = len
             .checked_mul(size_of::<T>())
@@ -742,6 +749,9 @@ impl<T: Copy> PinnedBuffer<T> {
 
 impl<T: Copy> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
         // SAFETY: the retained context stays alive and raw was allocated once by cuMemHostAlloc.
         unsafe {
             let _ = cuCtxSetCurrent(self.context.raw);

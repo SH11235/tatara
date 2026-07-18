@@ -2246,8 +2246,8 @@ extern "C" __global__ void ft_post_perspective_grad_fused(
     const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
     const float xa = ft_output[base + column] + bias[column];
     const float xb = ft_output[base + half + column] + bias[half + column];
-    const float ya = fminf(fmaxf(xa, 0.0F), 1.0F);
-    const float yb = fminf(fmaxf(xb, 0.0F), 1.0F);
+    const float ya = native_clamp_unit(xa);
+    const float yb = native_clamp_unit(xb);
     const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
     const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
     ft_gradient[base + column] = grad_a;
@@ -2293,22 +2293,16 @@ extern "C" __global__ void ft_post_perspective_grad_fused_fp16(
     const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
     const float xa = __half2float(ft_output[base + column]) + bias[column];
     const float xb = __half2float(ft_output[base + half + column]) + bias[half + column];
-    const float ya = fminf(fmaxf(xa, 0.0F), 1.0F);
-    const float yb = fminf(fmaxf(xb, 0.0F), 1.0F);
+    const float ya = native_clamp_unit(xa);
+    const float yb = native_clamp_unit(xb);
     const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
     const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
     const float scaled_a = grad_a * gradient_scale;
     const float scaled_b = grad_b * gradient_scale;
-    const float clamped_a = fminf(fmaxf(scaled_a, -65504.0F), 65504.0F);
-    const float clamped_b = fminf(fmaxf(scaled_b, -65504.0F), 65504.0F);
+    const float clamped_a = native_clamp_half(scaled_a, clamp_counter);
+    const float clamped_b = native_clamp_half(scaled_b, clamp_counter);
     ft_gradient[base + column] = __float2half_rn(clamped_a);
     ft_gradient[base + half + column] = __float2half_rn(clamped_b);
-    const unsigned long long clamps =
-        static_cast<unsigned long long>(scaled_a != clamped_a) +
-        static_cast<unsigned long long>(scaled_b != clamped_b);
-    if (clamps != 0) {
-        atomicAdd(clamp_counter, clamps);
-    }
     atomicAdd(bias_gradient + column, grad_a);
     atomicAdd(bias_gradient + half + column, grad_b);
 }
@@ -2487,6 +2481,8 @@ extern "C" __global__ void dense_mm_bwd_input_bucket_tiled_sorted_scatter(
     }
     const int bucket = bucket_idx[blockIdx.y * 16U];
     if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        input_gradient[static_cast<unsigned long long>(destination_row) * input_dimension + input_index] =
+            0.0F;
         return;
     }
     float accumulator = 0.0F;
