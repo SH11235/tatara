@@ -1325,8 +1325,6 @@ impl GpuTrainer {
         groups
     }
 
-    /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
-    /// download する。backend 間の無中断学習比較に使う。
     /// 直近 forward の sorted-order per-bucket L1 出力 (`padded × l1_out`) と、対応する sorted
     /// bucket index (padding 行は `-1`) を host へ download する。TF32 経路は有効 bucket segment
     /// だけを cuBLAS で上書きするため、padding 行の 0 初期化が無いと prior step の残差が残る。
@@ -3076,9 +3074,10 @@ impl GpuTrainer {
             )?;
         }
         // L1f bias backward。cuda-oxide 版は 256 要素固定 shared array + 先頭 out_dim thread の
-        // 初期化 / flush、native CUDA C++ 版は 1 thread = 1 要素の直接 global atomicAdd で、
-        // どちらも block_dim.x (256) >= out_dim (= l1_out) を前提にする (cuda-oxide は shared
-        // array 容量、native は列 index の上限)。起動時 CLI も l1_out <= 256 を保証する。
+        // 初期化 / flush で block_dim.x (256) >= out_dim (= l1_out) を前提にする。native CUDA C++
+        // 版は batch * out_dim を 1D launch し `i % out_dim` へ直接 global atomicAdd するため
+        // block 幅には依存しない。共有 launch site なので厳しい方 (cuda-oxide の shared array 容量)
+        // に合わせて l1_out <= 256 を検査する。起動時 CLI も l1_out <= 256 を保証する。
         debug_assert!(
             l1_out <= 256,
             "bias_grad_shared_l1f requires block_dim.x >= output_dimension"
