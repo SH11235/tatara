@@ -672,6 +672,17 @@ fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
     }
     let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, loss)?;
     let native_loss = native.forward(&batch.as_ref(), 0.0, loss)?;
+    assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_trainers_close(
+    id: SimpleId,
+    oxide_loss: f64,
+    native_loss: f64,
+    oxide: &SimpleGpuTrainer,
+    native: &SimpleGpuTrainer,
+) -> Result<(), Box<dyn std::error::Error>> {
     if id.feature_set.ft_factorize() {
         let oxide_master = oxide.ft_w_to_host()?;
         let native_master = native.ft_w_to_host()?;
@@ -696,6 +707,90 @@ fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
         ("l3_b", &oxide_weights.l3_b, &native_weights.l3_b),
     ] {
         assert_weight_group_close(name, oxide_group, native_group);
+    }
+    Ok(())
+}
+
+/// raw checkpoint が backend 非依存であることを、optimizer state と Ranger の
+/// `step_count` まで含めて固定する。片方の backend で 5 step 進めて保存し、同じ
+/// checkpoint を cuda-oxide / CUDA C++ の両方で読み、6 step 目 (lookahead 発火点)
+/// を進めた結果を比較する。保存元も両 backend を試すため、双方向の resume を覆う。
+#[test]
+#[cfg(feature = "native-cuda")]
+fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
+        activation: SimpleActivation::Pairwise,
+        ft_out: 8,
+        l1_out: 8,
+        l2_out: 8,
+    };
+    let precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    for source_is_native in [false, true] {
+        let source_name = if source_is_native { "native" } else { "oxide" };
+        let path = std::env::temp_dir().join(format!(
+            "tatara-simple-native-resume-{source_name}-{}.ckpt",
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut source = create_trainer_with_options(
+                &context,
+                id,
+                source_is_native,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            for _ in 0..5 {
+                let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            }
+            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            drop(source);
+
+            let mut oxide = create_trainer_with_options(
+                &context,
+                id,
+                false,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            let mut native = create_trainer_with_options(
+                &context,
+                id,
+                true,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            for trainer in [&mut oxide, &mut native] {
+                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
+                assert_eq!(superbatch, 17);
+                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(horizon, Some(42));
+                trainer.sync_ft_forward_weights()?;
+                let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            }
+            let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+            let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+            assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
+        })();
+        let _ = std::fs::remove_file(&path);
+        result?;
     }
     Ok(())
 }

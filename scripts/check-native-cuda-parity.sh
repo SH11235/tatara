@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 
 hybrid_log=$(mktemp /tmp/tatara-native-hybrid.XXXXXX)
 portable_log=$(mktemp /tmp/tatara-native-portable.XXXXXX)
-trap 'rm -f -- "$hybrid_log" "$portable_log"' EXIT
+portable_cli_dir=$(mktemp -d /tmp/tatara-native-cli.XXXXXX)
+trap 'rm -f -- "$hybrid_log" "$portable_log"; rm -r -- "$portable_cli_dir"' EXIT
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
 cargo test -p nnue-trainer --features native-cuda --release \
@@ -29,6 +30,20 @@ cargo test -p nnue-trainer --no-default-features --features native-cuda-host --r
 
 echo "== portable host CLI smoke =="
 cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+
+echo "== portable host full Simple CLI training =="
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple \
+    --data crates/shogi-format/tests/data/sample.psv \
+    --output "$portable_cli_dir" --net-id native-simple-cli \
+    --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise \
+    --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 \
+    --win-rate-model --scale 600 --wrm-nnue2score 600 \
+    --loss-pow-exp 2.5 --loss-qp-asymmetry 0.2 \
+    --loss-weight-boost-w1 1.5 --loss-weight-boost-w2 0.75 \
+    --optimizer adamw --weight-decay 0.0001 \
+    --norm-loss --norm-loss-factor 0.0001 --all-optim
+test -s "$portable_cli_dir/native-simple-cli-1.bin"
+test -s "$portable_cli_dir/native-simple-cli-1.ckpt"
 
 extract_fingerprint() {
     sed -n 's/^.*\[native-host-parity\] //p' "$1" | tail -n 1
