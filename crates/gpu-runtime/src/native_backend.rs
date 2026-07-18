@@ -1,4 +1,8 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    sync::{Arc, Mutex},
+};
 
 use cuda_native_runtime as native;
 
@@ -47,11 +51,6 @@ impl CudaContext {
         Ok(self.inner.synchronize()?)
     }
 
-    pub fn default_stream(self: &Arc<Self>) -> Arc<CudaStream> {
-        self.new_stream()
-            .expect("failed to create native CUDA compute stream")
-    }
-
     pub fn new_stream(self: &Arc<Self>) -> Result<Arc<CudaStream>> {
         Ok(Arc::new(CudaStream {
             inner: self.inner.create_stream()?,
@@ -92,6 +91,7 @@ impl CudaContext {
         Ok(Arc::new(CudaModule {
             inner: self.inner.load_module(image)?,
             context: Arc::clone(self),
+            functions: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -139,6 +139,7 @@ pub struct CudaModule {
     inner: native::Module,
     #[allow(dead_code)]
     context: Arc<CudaContext>,
+    functions: Mutex<HashMap<&'static str, native::Function>>,
 }
 
 impl CudaModule {
@@ -152,9 +153,22 @@ impl CudaModule {
         config: LaunchConfig,
         args: &mut KernelArgs,
     ) -> Result<()> {
-        let name = std::ffi::CString::new(kernel)
-            .map_err(|_| Error::KernelArtifact(format!("invalid CUDA kernel name `{kernel}`")))?;
-        let function = self.inner.function(&name)?;
+        let function = {
+            let mut functions = self
+                .functions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(function) = functions.get(kernel) {
+                function.clone()
+            } else {
+                let name = std::ffi::CString::new(kernel).map_err(|_| {
+                    Error::KernelArtifact(format!("invalid CUDA kernel name `{kernel}`"))
+                })?;
+                let function = self.inner.function(&name)?;
+                functions.insert(kernel, function.clone());
+                function
+            }
+        };
         // SAFETY: caller guarantees the encoded ABI and device allocation bounds.
         unsafe {
             function.launch(

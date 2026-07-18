@@ -11,6 +11,7 @@ type CuEvent = *mut c_void;
 
 const CUDA_SUCCESS: CuResult = 0;
 const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
+const CU_STREAM_NON_BLOCKING: u32 = 1;
 
 #[cfg_attr(target_os = "windows", link(name = "cuda"))]
 #[cfg_attr(not(target_os = "windows"), link(name = "cuda"))]
@@ -21,6 +22,7 @@ unsafe extern "C" {
     fn cuDeviceGetName(name: *mut i8, len: i32, device: CuDevice) -> CuResult;
     fn cuDevicePrimaryCtxRetain(context: *mut CuContext, device: CuDevice) -> CuResult;
     fn cuDevicePrimaryCtxRelease_v2(device: CuDevice) -> CuResult;
+    fn cuCtxGetCurrent(context: *mut CuContext) -> CuResult;
     fn cuCtxSetCurrent(context: CuContext) -> CuResult;
     fn cuCtxSynchronize() -> CuResult;
     fn cuStreamCreate(stream: *mut CuStream, flags: u32) -> CuResult;
@@ -164,7 +166,12 @@ impl Context {
             check(cuInit(0))?;
             check(cuDeviceGet(&mut device, ordinal))?;
             check(cuDevicePrimaryCtxRetain(&mut raw, device))?;
-            check(cuCtxSetCurrent(raw))?;
+            let set_current = cuCtxSetCurrent(raw);
+            if set_current != CUDA_SUCCESS {
+                // Retain succeeded, so balance it before propagating the context-bind error.
+                let _ = cuDevicePrimaryCtxRelease_v2(device);
+                check(set_current)?;
+            }
         }
         Ok(Self {
             inner: Arc::new(ContextInner { device, raw }),
@@ -217,7 +224,7 @@ impl Context {
         self.set_current()?;
         let mut raw = ptr::null_mut();
         // SAFETY: raw points to local output storage and the current context is valid.
-        unsafe { check(cuStreamCreate(&mut raw, 0))? };
+        unsafe { check(cuStreamCreate(&mut raw, CU_STREAM_NON_BLOCKING))? };
         Ok(Stream {
             raw,
             context: Arc::clone(&self.inner),
@@ -251,9 +258,14 @@ impl Context {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        // SAFETY: raw remains retained until this last shared owner is dropped.
+        // SAFETY: raw remains retained until this last shared owner is dropped. If this context is
+        // current on the dropping thread, clear it before releasing the final primary-context
+        // retain so the thread does not keep a dangling current-context handle.
         unsafe {
-            let _ = cuCtxSetCurrent(self.raw);
+            let mut current = ptr::null_mut();
+            if cuCtxGetCurrent(&mut current) == CUDA_SUCCESS && current == self.raw {
+                let _ = cuCtxSetCurrent(ptr::null_mut());
+            }
             let _ = cuDevicePrimaryCtxRelease_v2(self.device);
         }
     }
@@ -370,6 +382,21 @@ pub struct Function {
     raw: CuFunction,
     module: Arc<ModuleInner>,
 }
+
+impl Clone for Function {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw,
+            module: Arc::clone(&self.module),
+        }
+    }
+}
+
+// SAFETY: CUfunction is an immutable module-owned handle and the retained module/context outlives
+// every clone. Launch selects the correct context for the calling thread before using the handle.
+unsafe impl Send for Function {}
+// SAFETY: CUDA permits concurrent launches of one function handle on streams in its context.
+unsafe impl Sync for Function {}
 
 impl Function {
     /// # Safety

@@ -87,10 +87,11 @@ cargo test -p cuda-native-runtime --features native-cuda --release -- --nocaptur
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
 ```
 
-The current scope is standard Simple (including HalfKaHmMerged), CReLU, FP32,
-factorizer off, default WRM, and Ranger. LayerStack, SCReLU / Pairwise, FT
-factorizer, FP16 options/state, norm loss, and non-default extended losses are
-unsupported and rejected at startup.
+The current scope is Simple (including HalfKaHmMerged), CReLU, hidden dimensions
+up to 256, FP32 with TF32 disabled, factorizer off, default WRM, and Ranger.
+LayerStack, SCReLU / Pairwise, hidden dimensions above 256, RAdam / AdamW,
+TF32 / FP16 options or state, FT factorizer, norm loss, and non-default extended
+losses are unsupported and rejected at startup.
 
 ## Preparing Windows (WSL2)
 

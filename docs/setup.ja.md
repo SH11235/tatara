@@ -83,8 +83,9 @@ cargo test -p cuda-native-runtime --features native-cuda --release -- --nocaptur
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
 ```
 
-現在の対応範囲は標準 Simple (HalfKaHmMerged を含む)、CReLU、FP32、factorizer OFF、
-default WRM、Ranger。LayerStack、SCReLU / Pairwise、FT factorizer、FP16 option/state、
+現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU、hidden dimension各256以下、
+FP32 (TF32無効)、factorizer OFF、default WRM、Ranger。LayerStack、SCReLU / Pairwise、
+hidden dimension 257以上、RAdam / AdamW、TF32 / FP16 option/state、FT factorizer、
 norm loss、既定以外の拡張 loss は未対応で、起動時に拒否する。
 
 ## Windows (WSL2) の準備

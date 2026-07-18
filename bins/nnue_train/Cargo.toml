@@ -21,11 +21,11 @@ cuda-oxide = [
     "dep:cuda-host",
     "gpu-runtime/cuda-oxide",
 ]
-# WSL/Linux validation path for CUDA C++ device kernels. The existing host pipeline remains the
-# oracle until the portable Driver API runtime reaches full trainer coverage.
+# CUDA C++ device kernels launched through the cuda-oxide host runtime, used as the comparison
+# oracle for the portable host runtime.
 native-cuda = ["cuda-oxide", "dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
-# CUDA C++ kernels + portable Driver API host runtime. Build with --no-default-features so the
-# cuda-oxide crates are absent; this is the configuration intended to expand to native Windows.
+# CUDA C++ kernels + portable Driver API host runtime for Linux/WSL and native Windows. Build with
+# --no-default-features so the cuda-oxide crates are absent.
 native-cuda-host = [
     "gpu",
     "dep:cuda-native-runtime",

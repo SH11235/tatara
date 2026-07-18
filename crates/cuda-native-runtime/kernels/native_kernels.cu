@@ -149,8 +149,8 @@ extern "C" __global__ void native_sparse_ft_forward(
 }
 
 // Trainer ABI wrappers. cuda-oxide marshals every Rust slice as a device pointer followed by a
-// u64 length. Keeping that packet layout lets the mature host pipeline launch CUDA C++ kernels
-// during WSL parity work without changing its allocation, stream, or cuBLAS code.
+// u64 length. Both host backends use this packet layout so one fat binary can be checked against
+// the cuda-oxide reference without changing allocation, stream, or cuBLAS semantics.
 extern "C" __global__ void sparse_ft_forward(
     const float* weight,
     unsigned long long,
@@ -220,11 +220,17 @@ extern "C" __global__ void loss_wrm(
     unsigned int n
 ) {
     __shared__ double partial[256];
+    if (extended != 0) {
+        // Extended WRM is rejected by the host before launch. Trap defensively so adding only its
+        // prerequisite kernels cannot turn this wrapper into a silent stale-gradient path.
+        asm volatile("trap;");
+        return;
+    }
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int tid = threadIdx.x;
     double contribution = 0.0;
 
-    if (i < n && extended == 0) {
+    if (i < n) {
         const float s = score[i];
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));

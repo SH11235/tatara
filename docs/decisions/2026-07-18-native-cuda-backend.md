@@ -40,6 +40,8 @@ Driver APIのportable runtimeを独立して整備し、kernel coverageの完成
 - Windows native trainerをcuda-oxideのWindows対応から独立して実装できる。
 - Linux/WSL上で同一GPUを使い、compiler/backendだけを変えた数値・性能比較ができる。
 - CUDA C++とRustの二言語を保守し、kernel ABIの一致をtestで固定する必要がある。
+- backend parityの契約は各演算の許容誤差内での数値一致であり、異なるGPU世代を跨ぐ
+  bit一致ではない。同一GPU上のhost runtime比較では追加の強い回帰検査としてbit fingerprintも使う。
 - CUDA C++化だけでは高速化を保証しない。既存throughputを維持することを移植時の基準とし、
   NVIDIA固有intrinsicやlibraryによる最適化はparity確立後に個別計測する。
 - native backendが全kernelを実装するまでは、対応architectureとprecision optionを明示して
@@ -57,7 +59,8 @@ cargo build -p nnue-trainer \
   --no-default-features --features native-cuda-host --release
 ```
 
-`native-cuda-host`で現在対応するのは、HalfKaHmMergedを含む標準Simple、CReLU、FP32、
-factorizer無効、default WRM、Rangerの組合せである。LayerStack、SCReLU、Pairwise、FP16、
-factorizer、norm loss、拡張lossは起動時に拒否する。cuBLASはCUDA ToolkitのC APIを直接呼び、
-stream handleだけを共通runtimeから受け取るためcuda-oxideの型には依存しない。
+`native-cuda-host`で現在対応するのは、HalfKaHmMergedを含むSimple、CReLU、hidden dimension
+各256以下、FP32（TF32無効）、factorizer無効、default WRM、Rangerの組合せである。
+LayerStack、SCReLU、Pairwise、hidden dimension 257以上、RAdam/AdamW、TF32/FP16、factorizer、
+norm loss、拡張lossは起動時に拒否する。cuBLASはCUDA ToolkitのC APIを直接呼び、stream
+handleだけを共通runtimeから受け取るためcuda-oxideの型には依存しない。

@@ -7,8 +7,10 @@ use shogi_features::FeatureSet;
 use crate::kernel_module::with_test_native_backend;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
-    trainer_common::{BatchData, PrecisionFlags},
-    trainer_simple::SimpleGpuTrainer,
+    trainer_common::{BatchData, DENSE_BIAS_GRAD_MAX_OUT, PrecisionFlags},
+    trainer_simple::{
+        SimpleGpuTrainer, validate_native_simple_configuration, validate_native_simple_loss,
+    },
 };
 
 fn standard_id() -> SimpleId {
@@ -60,6 +62,99 @@ fn create_trainer(
         )
     };
     result
+}
+
+#[test]
+fn native_simple_hidden_dimension_guard_accepts_256_and_rejects_257() {
+    let mut id = standard_id();
+    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
+    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
+    assert!(
+        validate_native_simple_configuration(
+            id,
+            OptimizerKind::Ranger,
+            None,
+            PrecisionFlags::default(),
+        )
+        .is_ok()
+    );
+
+    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
+    let l1_error = validate_native_simple_configuration(
+        id,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+    )
+    .unwrap_err();
+    assert!(l1_error.contains("hidden dimensions <= 256"));
+
+    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
+    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
+    let l2_error = validate_native_simple_configuration(
+        id,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+    )
+    .unwrap_err();
+    assert!(l2_error.contains("hidden dimensions <= 256"));
+}
+
+#[test]
+fn native_simple_guard_rejects_unvalidated_optimizer_and_tf32_modes() {
+    for optimizer in [OptimizerKind::RAdam, OptimizerKind::AdamW] {
+        let error = validate_native_simple_configuration(
+            standard_id(),
+            optimizer,
+            None,
+            PrecisionFlags::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("only the Ranger optimizer"));
+    }
+
+    let precision = PrecisionFlags {
+        tf32: true,
+        ..PrecisionFlags::default()
+    };
+    let error =
+        validate_native_simple_configuration(standard_id(), OptimizerKind::Ranger, None, precision)
+            .unwrap_err();
+    assert!(error.contains("TF32 to be disabled"));
+}
+
+#[test]
+fn native_simple_loss_guard_rejects_non_default_paths() {
+    assert!(validate_native_simple_loss(SMOKE_LOSS_WRM).is_ok());
+    assert!(
+        validate_native_simple_loss(nnue_train::trainer::LossKind::Sigmoid { scale: 1.0 / 600.0 })
+            .unwrap_err()
+            .contains("only the default WRM loss")
+    );
+    let extended = match SMOKE_LOSS_WRM {
+        nnue_train::trainer::LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            weight_boost_w2,
+            ..
+        } => nnue_train::trainer::LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.0,
+            weight_boost_w1: 0.0,
+            weight_boost_w2,
+        },
+        nnue_train::trainer::LossKind::Sigmoid { .. } => unreachable!(),
+    };
+    assert!(validate_native_simple_loss(extended).is_err());
 }
 
 #[test]

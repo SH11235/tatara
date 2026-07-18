@@ -25,6 +25,10 @@ cargo fmt --all -- --check
 echo "== cargo clippy --workspace --all-targets -- -D warnings =="
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "== native CUDA feature compile coverage =="
+cargo check -p nnue-trainer --features native-cuda
+cargo check -p nnue-trainer --no-default-features --features native-cuda-host
+
 # kernel source を編集したあと `cargo-oxide build` を忘れると、kernel loader の
 # 鮮度チェックが `.ptx` vs `.ll` の mtime しか見ないため、test も本番 run も古い
 # kernel のまま silent に走る。test の前に必ず再生成して artifact を source と
@@ -33,6 +37,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 数十秒掛かる。
 echo "== bash scripts/build-kernels.sh (kernel artifacts) =="
 bash scripts/build-kernels.sh
+
+echo "== bash scripts/check-native-cuda-parity.sh =="
+bash scripts/check-native-cuda-parity.sh
 
 echo "== cargo test --workspace --release =="
 cargo test --workspace --release

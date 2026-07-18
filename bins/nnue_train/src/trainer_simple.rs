@@ -383,6 +383,53 @@ impl Drop for SimpleGpuTrainer {
     }
 }
 
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+pub(crate) fn validate_native_simple_configuration(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+) -> Result<(), String> {
+    if id.activation != SimpleActivation::CReLU {
+        return Err("native CUDA currently supports only Simple CReLU".into());
+    }
+    if id.feature_set.ft_factorize() {
+        return Err("native CUDA does not yet support FT factorization".into());
+    }
+    if id.l1_out > DENSE_BIAS_GRAD_MAX_OUT as usize || id.l2_out > DENSE_BIAS_GRAD_MAX_OUT as usize
+    {
+        return Err(format!(
+            "native CUDA requires Simple hidden dimensions <= {DENSE_BIAS_GRAD_MAX_OUT} \
+             (got l1_out={}, l2_out={})",
+            id.l1_out, id.l2_out
+        ));
+    }
+    if optimizer != OptimizerKind::Ranger {
+        return Err(format!(
+            "native CUDA currently supports only the Ranger optimizer (got {})",
+            optimizer.name()
+        ));
+    }
+    if precision.tf32 {
+        return Err("native CUDA parity configuration requires TF32 to be disabled".into());
+    }
+    if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
+        return Err("native CUDA does not yet support FP16 training options".into());
+    }
+    if norm_loss_factor.is_some() {
+        return Err("native CUDA does not yet support norm loss".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+pub(crate) fn validate_native_simple_loss(loss: LossKind) -> Result<(), &'static str> {
+    if !matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended() {
+        return Err("native CUDA currently supports only the default WRM loss");
+    }
+    Ok(())
+}
+
 impl SimpleGpuTrainer {
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     #[allow(clippy::too_many_arguments)]
@@ -399,18 +446,7 @@ impl SimpleGpuTrainer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
         if native_backend_requested() {
-            if id.activation != SimpleActivation::CReLU {
-                return Err("native CUDA currently supports only Simple CReLU".into());
-            }
-            if id.feature_set.ft_factorize() {
-                return Err("native CUDA does not yet support FT factorization".into());
-            }
-            if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
-                return Err("native CUDA does not yet support FP16 training options".into());
-            }
-            if norm_loss_factor.is_some() {
-                return Err("native CUDA does not yet support norm loss".into());
-            }
+            validate_native_simple_configuration(id, optimizer, norm_loss_factor, precision)?;
         }
 
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
@@ -419,7 +455,7 @@ impl SimpleGpuTrainer {
             !precision.ft_fp16_out || precision.ft_fp16,
             "ft_fp16_out requires ft_fp16"
         );
-        let stream = ctx.default_stream();
+        let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
         let cublas = CublasHandle::new(&stream, precision.tf32)?;
@@ -862,10 +898,8 @@ impl SimpleGpuTrainer {
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested()
-            && (!matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended())
-        {
-            return Err("native CUDA currently supports only the default WRM loss".into());
+        if native_backend_requested() {
+            validate_native_simple_loss(loss)?;
         }
 
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {

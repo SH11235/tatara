@@ -176,6 +176,18 @@ pub enum Error {
 /// `Result<T, gpu_runtime::Error>` の alias。
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Creates the trainer's compute stream while preserving backend-specific ordering semantics.
+/// cuda-oxide uses its context default stream; the native backend returns a fallible non-blocking
+/// stream so allocation failures propagate through trainer construction instead of panicking.
+pub fn create_compute_stream(
+    ctx: &std::sync::Arc<CudaContext>,
+) -> Result<std::sync::Arc<CudaStream>> {
+    #[cfg(feature = "cuda-oxide")]
+    return Ok(ctx.default_stream());
+    #[cfg(feature = "native-cuda")]
+    ctx.new_stream()
+}
+
 /// `err` が CUDA out-of-memory (`CUDA_ERROR_OUT_OF_MEMORY`) を表すか判定する。
 ///
 /// `DeviceBuffer` 確保失敗は `DriverError` として伝播する。本 crate の

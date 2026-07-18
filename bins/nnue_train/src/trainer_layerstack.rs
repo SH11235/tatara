@@ -775,7 +775,7 @@ impl GpuTrainer {
             !precision.ft_fp16_out || precision.ft_fp16,
             "ft_fp16_out requires ft_fp16"
         );
-        let stream = ctx.default_stream();
+        let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
 
