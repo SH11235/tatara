@@ -23,6 +23,10 @@ cargo test -p nnue-trainer --no-default-features --features native-cuda-host --r
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
 
+echo "== portable host Simple configuration matrix =="
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+    complete_simple_native_configuration_matrix_runs_one_step -- --nocapture --test-threads=1
+
 echo "== portable host CLI smoke =="
 cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
 

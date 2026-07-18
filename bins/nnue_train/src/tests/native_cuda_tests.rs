@@ -150,6 +150,146 @@ fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn complete_simple_native_configuration_matrix_runs_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let all_fp16 = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let extended_wrm = match SMOKE_LOSS_WRM {
+        LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            ..
+        } => LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.2,
+            weight_boost_w1: 1.5,
+            weight_boost_w2: 0.75,
+        },
+        LossKind::Sigmoid { .. } => unreachable!(),
+    };
+
+    for (activation, optimizer, norm_loss, loss) in [
+        (
+            SimpleActivation::CReLU,
+            OptimizerKind::Ranger,
+            None,
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            SimpleActivation::SCReLU,
+            OptimizerKind::RAdam,
+            None,
+            LossKind::Sigmoid { scale: 1.0 / 600.0 },
+        ),
+        (
+            SimpleActivation::Pairwise,
+            OptimizerKind::AdamW,
+            Some(0.25),
+            extended_wrm,
+        ),
+    ] {
+        let mut id = standard_id();
+        id.activation = activation;
+        assert_native_configuration_runs(&context, id, optimizer, norm_loss, all_fp16, loss)?;
+    }
+
+    assert_native_configuration_runs(
+        &context,
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags {
+            ft_fp16: true,
+            ..PrecisionFlags::default()
+        },
+        SMOKE_LOSS_WRM,
+    )?;
+
+    let mut factorized = standard_id();
+    factorized.feature_set = factorized.feature_set.with_ft_factorize();
+    assert_native_configuration_runs(
+        &context,
+        factorized,
+        OptimizerKind::Ranger,
+        None,
+        all_fp16,
+        SMOKE_LOSS_WRM,
+    )?;
+
+    let mut wide = standard_id();
+    wide.l1_out = 257;
+    wide.l2_out = 257;
+    assert_native_configuration_runs(
+        &context,
+        wide,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags {
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+        SMOKE_LOSS_WRM,
+    )?;
+
+    for feature_set in FeatureSet::ALL {
+        let mut id = standard_id();
+        id.feature_set = feature_set.spec();
+        id.ft_out = 32;
+        id.l1_out = 16;
+        id.l2_out = 16;
+        assert_native_configuration_runs(
+            &context,
+            id,
+            OptimizerKind::Ranger,
+            None,
+            PrecisionFlags::default(),
+            SMOKE_LOSS_WRM,
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_native_configuration_runs(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+    loss: LossKind,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut trainer = create_trainer_with_options(
+        context,
+        id,
+        true,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+    let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    let forward_loss = trainer.forward(&batch.as_ref(), 0.0, loss)?;
+    assert!(forward_loss.is_finite());
+    trainer.assert_all_weights_finite()?;
+    Ok(())
+}
+
+#[test]
 #[cfg(feature = "native-cuda")]
 fn standard_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
