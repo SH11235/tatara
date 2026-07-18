@@ -106,6 +106,19 @@ Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckp
 
 正常終了し、両 file が空でないことを確認する。
 
+同一のmemory上fixtureでOS間throughputを比較する場合は次を実行する:
+
+```powershell
+$env:TATARA_NATIVE_BENCH_BATCH = '16384'
+$env:TATARA_NATIVE_BENCH_STEPS = '100'
+$env:TATARA_NATIVE_BENCH_RUNS = '3'
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release `
+  benchmark_factorized_fp16_simple_native_portable -- --ignored --nocapture --test-threads=1
+```
+
+出力される`[native-bench-portable-fp16]`を同じ3環境変数で実行したWSLの値と比較する。
+これはdummy batch上のtrainer kernel測定で、PSV decodeとdisk I/Oは含まない。
+
 現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU / SCReLU / Pairwise、
 任意のhidden dimension、FP32 / FP16 option/state (TF32 ON / OFF)、factorizer ON / OFF、
 Sigmoid / WRM (拡張設定を含む)、norm loss、Ranger / RAdam / AdamW。Simpleが起動し得る

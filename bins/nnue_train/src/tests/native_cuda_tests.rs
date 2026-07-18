@@ -815,7 +815,7 @@ fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
     );
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 fn benchmark_backend(
     context: &std::sync::Arc<CudaContext>,
     id: SimpleId,
@@ -937,6 +937,46 @@ fn benchmark_factorized_fp16_simple_native_against_cuda_oxide()
     eprintln!(
         "[native-bench-fp16] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
         native / oxide
+    );
+    Ok(())
+}
+
+/// cuda-oxideをcompileできないnative Windowsでも、WSLと同じdummy batch・precisionで
+/// CUDA C++ backend単体のthroughputを測る。backend間比較は上のhybrid test、OS間の
+/// portability確認は本testと役割を分ける。
+#[test]
+#[ignore = "manual portable native performance comparison"]
+fn benchmark_factorized_fp16_simple_native_portable() -> Result<(), Box<dyn std::error::Error>> {
+    let parse = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let batch_size = parse("TATARA_NATIVE_BENCH_BATCH", 16_384);
+    let steps = parse("TATARA_NATIVE_BENCH_STEPS", 20);
+    let runs = parse("TATARA_NATIVE_BENCH_RUNS", 3).max(1);
+    let context = CudaContext::new(0)?;
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    let precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let mut owned = BatchData::smoke_dummy(batch_size, id.feature_set);
+    owned.score.fill(200.0);
+    owned.wdl.fill(0.8);
+    let batch = owned.as_ref();
+
+    let mut total = 0.0;
+    for _ in 0..runs {
+        total += benchmark_backend(&context, id, &batch, true, steps, precision)?;
+    }
+    let native = total / runs as f64;
+    eprintln!(
+        "[native-bench-portable-fp16] batch={batch_size}, steps={steps}, runs={runs}, native={native:.0} pos/s"
     );
     Ok(())
 }

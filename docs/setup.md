@@ -110,6 +110,20 @@ Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckp
 
 The run must finish normally and both files must be non-empty.
 
+For an OS-to-OS throughput comparison with the same in-memory fixture, run:
+
+```powershell
+$env:TATARA_NATIVE_BENCH_BATCH = '16384'
+$env:TATARA_NATIVE_BENCH_STEPS = '100'
+$env:TATARA_NATIVE_BENCH_RUNS = '3'
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release `
+  benchmark_factorized_fp16_simple_native_portable -- --ignored --nocapture --test-threads=1
+```
+
+Compare the reported `[native-bench-portable-fp16]` value with a WSL run using
+the same three environment variables. This measures the trainer kernels on a
+dummy batch; it does not include PSV decoding or disk I/O.
+
 The current scope is Simple (including HalfKaHmMerged), CReLU / SCReLU / Pairwise,
 arbitrary hidden dimensions, FP32 and FP16 options or state with TF32 on or off,
 factorizer on or off, Sigmoid or WRM (including extended settings), norm loss,
