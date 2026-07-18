@@ -121,7 +121,11 @@ fn create_trainer_with_options(
             &SimpleInit::default_uniform(),
         )
     };
-    result
+    let mut trainer = result?;
+    // Production synchronizes the FP16 mirror / factorizer comb before the first batch.
+    // Keep parity and configuration tests on that same initialized forward path.
+    trainer.sync_ft_forward_weights()?;
+    Ok(trainer)
 }
 
 #[test]
