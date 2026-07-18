@@ -2884,7 +2884,8 @@ impl SimpleGpuTrainer {
     /// resume 用 raw f32 checkpoint を `path` に atomic に書き出す (LayerStack の
     /// [`GpuTrainer::save_raw_checkpoint`] と同 format / 同方針)。
     ///
-    /// file layout と atomic 書き出しは [`save_raw_checkpoint_file`] が担い、本 method
+    /// file layout (実効 beta1 を含む) と atomic 書き出しは
+    /// [`save_raw_checkpoint_file`] が担い、本 method
     /// は arch identity (`topology = [ft_out, l1_out, l2_out]`) と group 列
     /// ([`Self::raw_ckpt_group_sources`]、8 group) を組んで渡すだけ。L1/L2 weight は
     /// device-native `[in, out]` 並びそのまま書く (resume 互換性は device 上の layout
@@ -2910,6 +2911,7 @@ impl SimpleGpuTrainer {
                 bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
+                optimizer_beta1: self.optimizer_beta1,
             },
             &RawCkptMeta {
                 run_id,
@@ -2925,7 +2927,7 @@ impl SimpleGpuTrainer {
     /// producer run id, LR-schedule horizon)` で、caller は通常 `superbatch + 1`
     /// から resume する。horizon は version 5+ で保存されていれば `Some`。
     ///
-    /// header (`arch_kind=Simple`, `topology=[ft_out, l1_out, l2_out]`, feature set)
+    /// header (`arch_kind=Simple`, `topology=[ft_out, l1_out, l2_out]`, feature set, beta1)
     /// と group 本体の読み出し・照合は [`load_raw_checkpoint_file`] が担当する。
     /// 本 method は 8 group 各 `(w, m, v, slow)` を device へ upload し直し、
     /// `step_count` を復元する。`grad` は触らない (step ごとに memset される)。
@@ -2951,6 +2953,7 @@ impl SimpleGpuTrainer {
                 bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
+                optimizer_beta1: self.optimizer_beta1,
             },
             &expected_groups,
         )?;

@@ -53,10 +53,10 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=7 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=8 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 8);
+    assert_eq!(RAW_CKPT_VERSION, 9);
 }
 
 #[test]
@@ -136,6 +136,7 @@ const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(
     DEFAULT_L2_OUT,
     DEFAULT_NUM_BUCKETS,
 );
+const TEST_OPTIMIZER_BETA1: f32 = 0.99;
 
 fn layerstack_arch() -> RawCkptArch<'static> {
     layerstack_arch_with_mode("progress8kpabs")
@@ -148,6 +149,7 @@ fn layerstack_arch_with_mode(bucket_mode: &'static str) -> RawCkptArch<'static> 
         bucket_mode: Some(bucket_mode),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     }
 }
 
@@ -162,6 +164,7 @@ fn simple_arch() -> RawCkptArch<'static> {
             DEFAULT_L1_OUT as u64,
             DEFAULT_L2_OUT as u64,
         ],
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     }
 }
 
@@ -173,6 +176,7 @@ fn layerstack_arch_factorized() -> RawCkptArch<'static> {
         bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     }
 }
 
@@ -185,6 +189,7 @@ fn layerstack_arch_effect_bucket(config: EffectBucketConfig) -> RawCkptArch<'sta
         bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     }
 }
 
@@ -196,7 +201,15 @@ fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
     off + 4 + arch_name_len
 }
 
+fn downgrade_v9_to_v8(buf: &mut Vec<u8>) {
+    // Header-only fixture の末尾は beta1 f32 + num_groups u64。
+    let beta1_off = buf.len() - 12;
+    buf.drain(beta1_off..beta1_off + 4);
+    buf[4..8].copy_from_slice(&8u32.to_le_bytes());
+}
+
 fn downgrade_v8_to_v7(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    downgrade_v9_to_v8(buf);
     let off = bucket_mode_field_offset(buf, arch);
     let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     buf.drain(off..off + 4 + len);
@@ -220,6 +233,7 @@ fn raw_ckpt_v8_bucket_modes_round_trip() {
     ] {
         let mut buf = Vec::new();
         write_raw_ckpt_header(&mut buf, &arch, "bucket-mode-roundtrip", 2, 20, None, 10).unwrap();
+        downgrade_v9_to_v8(&mut buf);
         let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
         assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
     }
@@ -242,6 +256,7 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
             10,
         )
         .unwrap();
+        downgrade_v9_to_v8(&mut buf);
         let err = read_raw_ckpt_header(
             &mut Cursor::new(&buf),
             &layerstack_arch_with_mode(requested),
@@ -254,6 +269,45 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
             )
         );
     }
+}
+
+#[test]
+fn raw_ckpt_v9_optimizer_beta1_round_trips_and_rejects_mismatch() {
+    let written = layerstack_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &written, "beta1-run", 2, 20, None, 10).unwrap();
+
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &written).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+
+    let requested = RawCkptArch {
+        optimizer_beta1: 0.975,
+        ..written
+    };
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &requested)
+        .expect_err("resume with a different optimizer beta1 must be rejected");
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(err.to_string().contains("optimizer beta1 mismatch"));
+    assert!(err.to_string().contains("checkpoint 0.99"));
+    assert!(err.to_string().contains("requested 0.975"));
+}
+
+#[test]
+fn raw_ckpt_v8_without_optimizer_beta1_keeps_legacy_resume_compatibility() {
+    let written = layerstack_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &written, "legacy-beta1", 2, 20, None, 10).unwrap();
+    downgrade_v9_to_v8(&mut buf);
+
+    let requested = RawCkptArch {
+        optimizer_beta1: 0.975,
+        ..written
+    };
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &requested).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
 }
 
 #[test]
@@ -408,6 +462,7 @@ fn layerstack_arch_threat_factorized() -> RawCkptArch<'static> {
         bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     }
 }
 
@@ -537,6 +592,7 @@ fn raw_ckpt_header_rejects_wrong_arch_kind() {
         bucket_mode: None,
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     };
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &written, "", 1, 0, None, 10).unwrap();
@@ -555,6 +611,7 @@ fn raw_ckpt_header_rejects_wrong_topology() {
         bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &wrong_topo,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     };
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &written, "", 1, 0, None, 10).unwrap();
@@ -576,6 +633,7 @@ fn raw_ckpt_header_rejects_legacy_non_layerstack_request() {
         bucket_mode: None,
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &simple_topo,
+        optimizer_beta1: TEST_OPTIMIZER_BETA1,
     };
     let err = read_raw_ckpt_header(&mut Cursor::new(&v3), &simple_arch)
         .expect_err("legacy checkpoint cannot be read as a non-layerstack arch");

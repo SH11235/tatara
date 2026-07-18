@@ -534,7 +534,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
-    println!("[train] optimizer: {}", shared.optimizer.name());
+    println!(
+        "[train] optimizer: {} | beta1={}",
+        shared.optimizer.name(),
+        shared.optimizer_beta1
+    );
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保。
     let SharedPrecisionFlags {
@@ -675,11 +679,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         }
     })?;
     trainer.set_optimizer_beta1(shared.optimizer_beta1)?;
-    println!(
-        "[train] optimizer: {} | beta1={}",
-        shared.optimizer.name(),
-        shared.optimizer_beta1
-    );
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
@@ -851,6 +850,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let mut experiment = build_experiment_logger(
         cli,
+        shared.optimizer_beta1,
         layerstack,
         feature_set,
         start_superbatch,
@@ -1406,6 +1406,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 #[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
+    optimizer_beta1: f32,
     layerstack: &LayerstackArgs,
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
@@ -1470,6 +1471,7 @@ pub(crate) fn build_experiment_logger(
         l2: layerstack.l2,
         num_buckets: Some(layerstack.num_buckets),
         optimizer: cli.optimizer.to_ascii_lowercase(),
+        optimizer_beta1,
         bucket_mode: Some(layerstack.bucket_mode.clone()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
@@ -1581,6 +1583,7 @@ pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
 #[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger_simple(
     cli: &Cli,
+    optimizer_beta1: f32,
     id: SimpleId,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
@@ -1636,6 +1639,7 @@ pub(crate) fn build_experiment_logger_simple(
         l2: id.l2_out,
         num_buckets: None,
         optimizer: cli.optimizer.to_ascii_lowercase(),
+        optimizer_beta1,
         bucket_mode: None,
         activation: Some(id.activation.canonical_name().to_string()),
         progress_coeff: None,
@@ -1870,7 +1874,11 @@ pub(crate) fn run_simple_training(
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
-    println!("[train] optimizer: {}", shared.optimizer.name());
+    println!(
+        "[train] optimizer: {} | beta1={}",
+        shared.optimizer.name(),
+        shared.optimizer_beta1
+    );
     // 推論側 evaluation scale。FT 活性化出力は活性化に依らず 127-scale のため
     // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
     // は前段で有限・正値を保証済。
@@ -1932,11 +1940,6 @@ pub(crate) fn run_simple_training(
         }
     })?;
     trainer.set_optimizer_beta1(shared.optimizer_beta1)?;
-    println!(
-        "[train] optimizer: {} | beta1={}",
-        shared.optimizer.name(),
-        shared.optimizer_beta1
-    );
 
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
         Option<usize>,
@@ -2010,6 +2013,7 @@ pub(crate) fn run_simple_training(
 
     let mut experiment = build_experiment_logger_simple(
         cli,
+        shared.optimizer_beta1,
         id,
         start_superbatch,
         resumed_superbatch,
@@ -2154,7 +2158,18 @@ mod shared_cli_tests {
         let overridden = validate_shared_cli(&parse(&["--optimizer-beta1", "0.975"]), false, false)
             .expect("valid beta1 override");
         assert_eq!(overridden.optimizer_beta1, 0.975);
-        assert!(shared_cli_error(&["--optimizer-beta1", "1"], false).contains("0 < beta1 < 1"));
+        for invalid in ["0", "1", "1.1", "NaN", "inf"] {
+            assert!(
+                shared_cli_error(&["--optimizer-beta1", invalid], false).contains("0 < beta1 < 1"),
+                "--optimizer-beta1 {invalid} must be rejected"
+            );
+        }
+        for invalid in ["--optimizer-beta1=-0.1", "--optimizer-beta1=-inf"] {
+            assert!(
+                shared_cli_error(&[invalid], false).contains("0 < beta1 < 1"),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2290,6 +2305,7 @@ mod tests {
 
         let logger = build_experiment_logger_simple(
             &cli,
+            0.975,
             SimpleId {
                 feature_set: FeatureSet::HalfKp.spec(),
                 activation: SimpleActivation::CReLU,
@@ -2314,6 +2330,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(logger.path()).expect("read json"))
                 .expect("parse json");
         assert_eq!(json["results"]["fv_scale"], serde_json::json!(effective));
+        assert_eq!(json["params"]["optimizer_beta1"], serde_json::json!(0.975));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1463,6 +1463,7 @@ mod tests {
             l2: 32,
             num_buckets: Some(9),
             optimizer: "ranger".to_string(),
+            optimizer_beta1: 0.99,
             bucket_mode: Some("progress8kpabs".to_string()),
             activation: None,
             progress_coeff: None,

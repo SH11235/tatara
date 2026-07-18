@@ -1358,7 +1358,7 @@ impl GpuTrainer {
     /// は推論用 final artifact として別 method で保存される。本 method はそれとは別の
     /// `*.ckpt` file に、全 weight group の **raw f32** `{w, m, v, slow}`
     /// (1st/2nd moment + lookahead slow weight、`grad` は resume に不要なので含めない) +
-    /// `step_count` (optimizer step counter) + 完了 `superbatch` 番号を書き出す。
+    /// `step_count` (optimizer step counter) + 実効 beta1 + 完了 `superbatch` 番号を書き出す。
     ///
     /// file layout と atomic 書き出しは [`save_raw_checkpoint_file`] が担い、本 method
     /// は arch identity と group 列 ([`Self::raw_ckpt_group_sources`]、PSQT 無し 10 /
@@ -1387,6 +1387,7 @@ impl GpuTrainer {
                 bucket_mode: Some(self.bucket_mode.canonical_name()),
                 ft_out: ft_out as u64,
                 topology,
+                optimizer_beta1: self.optimizer_beta1,
             },
             &RawCkptMeta {
                 run_id,
@@ -1405,8 +1406,8 @@ impl GpuTrainer {
     /// `None`。LR-schedule horizon は version 5+ かつ horizon を持つ schedule で
     /// 保存されていれば `Some` (caller が `--superbatches` より優先して curve に使う)。
     ///
-    /// magic 不一致、未対応 version、arch kind / bucket mode / topology が LayerStack と
-    /// 不一致、group 数
+    /// magic 不一致、未対応 version、arch kind / bucket mode / topology / beta1 が
+    /// LayerStack の現在設定と不一致、group 数
     /// や各 group の len が LayerStack arch と不一致、または `u64 → usize` overflow
     /// (32-bit / 破損 file) は `InvalidData` で reject。
     ///
@@ -1436,6 +1437,7 @@ impl GpuTrainer {
                 bucket_mode: Some(self.bucket_mode.canonical_name()),
                 ft_out: ft_out as u64,
                 topology,
+                optimizer_beta1: self.optimizer_beta1,
             },
             &expected_groups,
         )?;

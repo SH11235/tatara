@@ -97,6 +97,7 @@ change for real training are:
 | `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~1.8 GB (default LayerStack arch) ≈ 36 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
 | `--win-rate-model` | OFF (layerstack) / required (simple) | WRM (win-rate-model) loss. Converges to `net_output ≈ cp / --wrm-nnue2score`. On `layerstack` it is optional (without it, plain sigmoid-MSE). The `simple` trainer requires it and also requires `--scale = --wrm-nnue2score`, because `--scale` determines the exported `fv_scale`; the example above uses 290 for both, producing `FV_SCALE=28`. See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99), `radam` (rectified Adam without lookahead, beta1=0.9), or `adamw` (Adam without bias correction, beta1=0.9). When resuming from a raw `.ckpt`, pass the same value as the original run |
+| `--optimizer-beta1` | optimizer default | Override first-moment decay for optimizer ablations. Accepted range is `0 < beta1 < 1`. Raw checkpoints record the effective value and reject a resume that requests a different value |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
@@ -132,9 +133,9 @@ flags, how to pick the held-out source, and how to read the metrics.
 ## Interrupting and resuming training
 
 A raw `.ckpt` saves everything: **weights + optimizer state
-(m / v / slow / step) + the current superbatch number**. Even if it stops on a
-power loss or a GPU error, you can fully resume. Add `--resume` to the same
-options + architecture subcommand used for training:
+(m / v / slow / step) + effective beta1 + the current superbatch number**.
+Even if it stops on a power loss or a GPU error, you can fully resume. Add
+`--resume` to the same options + architecture subcommand used for training:
 
 ```bash
 target/release/nnue-train \
@@ -150,7 +151,10 @@ target/release/nnue-train \
 
 With `--resume` (and `--start-superbatch` omitted), it resumes from the
 checkpoint's sb + 1; specifying `--start-superbatch N` explicitly lets you redo
-past superbatches.
+past superbatches. Pass the same `--optimizer-beta1` value used by the source
+run; a checkpoint that records a different value is rejected before its tensor
+payload is loaded. Legacy checkpoints without beta1 metadata retain the value
+resolved from the resume command.
 
 For LR schedules with a horizon, the checkpoint records the resolved horizon so
 the curve is reproduced on resume independently of `--superbatches`; see

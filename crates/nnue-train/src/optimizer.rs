@@ -270,4 +270,24 @@ mod tests {
             assert_eq!(ranger.1, radam.1);
         }
     }
+
+    #[test]
+    fn explicit_beta1_controls_rectified_schedule_without_changing_adamw_semantics() {
+        let beta1 = 0.975_f32;
+        for step in [1_u64, 10, 1000] {
+            let expected = radam_compute_step_size_denom(step, beta1, 0.999, 5.0);
+            assert_eq!(
+                OptimizerKind::Ranger.step_size_denom_with_beta1(step, beta1, 0.999, 5.0),
+                expected
+            );
+            assert_eq!(
+                OptimizerKind::RAdam.step_size_denom_with_beta1(step, beta1, 0.999, 5.0),
+                expected
+            );
+            assert_eq!(
+                OptimizerKind::AdamW.step_size_denom_with_beta1(step, beta1, 0.999, 5.0),
+                (1.0, 1)
+            );
+        }
+    }
 }

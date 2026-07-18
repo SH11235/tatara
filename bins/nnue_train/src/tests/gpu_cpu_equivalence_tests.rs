@@ -5817,6 +5817,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
     };
 
     let mut saver = new_trainer()?;
+    saver.set_optimizer_beta1(0.975)?;
     // Ranger lookahead の lerp (`step % k == 0`) を 1 回踏ませて slow weight も
     // 非零にする (k = RANGER_K)。
     let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
@@ -5832,7 +5833,14 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
     ));
     saver.save_raw_checkpoint(&path, 3, "roundtrip-test", Some(42))?;
 
+    let mut mismatched = new_trainer()?;
+    let err = mismatched
+        .load_raw_checkpoint(&path)
+        .expect_err("checkpoint beta1 mismatch must reject before resume");
+    assert!(err.to_string().contains("optimizer beta1 mismatch"));
+
     let mut loader = new_trainer()?;
+    loader.set_optimizer_beta1(0.975)?;
     let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
     assert_eq!(superbatch, 3);
     assert_eq!(producer.as_deref(), Some("roundtrip-test"));
@@ -6423,6 +6431,62 @@ fn simple_beta1_follows_optimizer_kind() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+#[test]
+fn simple_optimizer_beta1_override_reaches_moment_kernel() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::trainer_simple::SimpleGpuTrainer;
+    use nnue_format::{SimpleActivation, SimpleId};
+    use nnue_train::init::SimpleInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKp.spec(),
+        activation: SimpleActivation::CReLU,
+        ft_out: 256,
+        l1_out: 32,
+        l2_out: 32,
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch.score.fill(200.0);
+    let init = SimpleInit::default_uniform();
+
+    let run = |beta1: Option<f32>| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let mut trainer = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id,
+            OptimizerKind::Ranger,
+            0.0,
+            None,
+            16,
+            PrecisionFlags::default(),
+            &init,
+        )?;
+        if let Some(beta1) = beta1 {
+            trainer.set_optimizer_beta1(beta1)?;
+        }
+        trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+        trainer.l1_w_m_to_host()
+    };
+
+    let default = run(None)?;
+    let overridden = run(Some(0.975))?;
+    let max_abs = overridden
+        .iter()
+        .fold(0.0_f32, |max, &value| max.max(value.abs()));
+    assert!(max_abs > 0.0, "override test requires non-zero moments");
+    for (i, (&default_m, &override_m)) in default.iter().zip(&overridden).enumerate() {
+        let lhs = default_m * (1.0_f32 - 0.975);
+        let rhs = override_m * (1.0_f32 - OptimizerKind::Ranger.beta1());
+        assert!(
+            (lhs - rhs).abs() <= max_abs * 1e-6,
+            "l1_w m[{i}]: default {default_m}, override {override_m}"
+        );
+    }
+    Ok(())
+}
+
 /// Simple トレーナ実体を lr>0 の 1 step で駆動し、`denom` が種別どおり kernel に
 /// 届くことを weight 更新式で確認する。step 1 では radam (rectified schedule) は
 /// n_sma が閾値未満で `denom=0` → `w -= rate * m`、adamw は `denom=1` →
@@ -6600,6 +6664,60 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
         assert!(
             (lhs - rhs).abs() <= max_abs * c_radam * 1e-5,
             "l3_b m[{i}]: ranger {mr} vs radam {md} violate the (1 - beta1^6) ratio"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn layerstack_optimizer_beta1_override_reaches_moment_kernel()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
+    use nnue_train::init::LayerStackInit;
+    use shogi_features::FeatureSet;
+
+    let ctx = CudaContext::new(0)?;
+    let feature_set = FeatureSet::HalfKp.spec();
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    batch.score.fill(200.0);
+    let init = LayerStackInit::default_uniform();
+
+    let run = |beta1: Option<f32>| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let mut trainer = GpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            128,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            DEFAULT_NUM_BUCKETS,
+            nnue_train::dataloader::BucketMode::Progress8KpAbs,
+            PrecisionFlags::default(),
+            feature_set,
+            OptimizerKind::Ranger,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            None,
+            &init,
+        )?;
+        if let Some(beta1) = beta1 {
+            trainer.set_optimizer_beta1(beta1)?;
+        }
+        trainer.step(&batch.as_ref(), 0.0, 0.0, SMOKE_LOSS_SIGMOID)?;
+        trainer.l3_b_m_to_host()
+    };
+
+    let default = run(None)?;
+    let overridden = run(Some(0.975))?;
+    let max_abs = overridden
+        .iter()
+        .fold(0.0_f32, |max, &value| max.max(value.abs()));
+    assert!(max_abs > 0.0, "override test requires non-zero moments");
+    for (i, (&default_m, &override_m)) in default.iter().zip(&overridden).enumerate() {
+        let lhs = default_m * (1.0_f32 - 0.975);
+        let rhs = override_m * (1.0_f32 - OptimizerKind::Ranger.beta1());
+        assert!(
+            (lhs - rhs).abs() <= max_abs * 1e-5,
+            "l3_b m[{i}]: default {default_m}, override {override_m}"
         );
     }
     Ok(())

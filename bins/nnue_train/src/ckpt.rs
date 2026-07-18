@@ -15,7 +15,7 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 8):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 9):
 //
 //   magic        b"RNRC"             (4 bytes)
 //   version      u32 (8)             (4 bytes)
@@ -37,6 +37,7 @@ use crate::trainer_common::MomentBuf;
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
 //   step_count   u64  (optimizer step counter)
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
+//   optimizer_beta1 f32 (v9+、optimizer first-moment decay)
 //   num_groups   u64
 //   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
 //   固有 — 各 trainer の `raw_ckpt_group_sources` を参照):
@@ -48,7 +49,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=8 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=9 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -101,13 +102,19 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   interpreted as "progress8kpabs" (the only mode that existed when they were
 ///   written).
 ///
-/// `load_raw_checkpoint` accepts versions 1..=8. Version 1 is interpreted as
+/// - `9`: the effective optimizer beta1 is stored as an `f32` after the LR
+///   horizon. Resume rejects a different beta1 before loading tensor payloads,
+///   because existing first-moment state and RAdam bias correction depend on
+///   the same value.
+///
+/// `load_raw_checkpoint` accepts versions 1..=9. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 8 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 9 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
-/// versions 1..=5; the feature hash is absent for versions 1..=6.
-pub(crate) const RAW_CKPT_VERSION: u32 = 8;
+/// versions 1..=5; the feature hash is absent for versions 1..=6; optimizer
+/// beta1 is absent for versions 1..=8, which retain the caller-supplied value.
+pub(crate) const RAW_CKPT_VERSION: u32 = 9;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -231,6 +238,8 @@ pub(crate) struct RawCkptArch<'a> {
     pub(crate) ft_out: u64,
     /// arch 固有の層次元列 (v4 topology header)。
     pub(crate) topology: &'a [u64],
+    /// resume 前後で一致が必要な実効 optimizer beta1。
+    pub(crate) optimizer_beta1: f32,
 }
 
 /// raw checkpoint header の counter / lineage 部 (arch identity 以外の可変 field)。
@@ -307,18 +316,21 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(&step_count.to_le_bytes())?;
     // LR-schedule horizon (v5+)。0 = horizon 無し (step / constant / drop)。
     w.write_all(&(lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
+    // optimizer beta1 (v9+)。resume 時に既存 moment state との整合を検証する。
+    w.write_all(&arch.optimizer_beta1.to_le_bytes())?;
     w.write_all(&num_groups.to_le_bytes())?;
     Ok(())
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=8 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=9 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
 /// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
 /// version 7 は feature-set header に feature hash、version 8 は arch kind の直後に
-/// bucket mode 名を持つ。version 7 以前の LayerStack は `progress8kpabs` と解釈する。
+/// bucket mode 名、version 9 は LR horizon の直後に実効 optimizer beta1 を持つ。
+/// version 7 以前の LayerStack は `progress8kpabs` と解釈する。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -585,6 +597,18 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     } else {
         None
     };
+
+    if version >= 9 {
+        read_exact_or_invalid(r, &mut buf4, "optimizer beta1")?;
+        let checkpoint_beta1 = f32::from_le_bytes(buf4);
+        if checkpoint_beta1.to_bits() != expected.optimizer_beta1.to_bits() {
+            return Err(invalid_data(format!(
+                "raw checkpoint optimizer beta1 mismatch: checkpoint {checkpoint_beta1}, \
+                 requested {} (resume requires the same --optimizer-beta1)",
+                expected.optimizer_beta1
+            )));
+        }
+    }
 
     read_exact_or_invalid(r, &mut buf8, "num_groups")?;
     let num_groups = u64::from_le_bytes(buf8);

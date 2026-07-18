@@ -98,6 +98,8 @@ pub struct Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_buckets: Option<usize>,
     pub optimizer: String,
+    /// 選択した optimizer と CLI override から解決した実効 first-moment decay。
+    pub optimizer_beta1: f32,
     /// bucket mode の canonical 名 (`progress8kpabs` 等)。bucket 無しアーキでは未指定。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket_mode: Option<String>,
@@ -617,6 +619,7 @@ mod tests {
             l2: 32,
             num_buckets: Some(9),
             optimizer: "ranger".to_string(),
+            optimizer_beta1: 0.99,
             bucket_mode: Some("progress8kpabs".to_string()),
             activation: None,
             progress_coeff: Some("progress.bin".to_string()),
@@ -799,6 +802,7 @@ mod tests {
         assert_eq!(v["history"][0]["test_accuracy"], 0.8);
         assert_eq!(v["generator"]["name"], "tatara");
         assert_eq!(v["params"]["lr"], 0.000875);
+        assert_eq!(v["params"]["optimizer_beta1"], 0.99);
         assert_eq!(v["history"][0]["superbatch"], 1);
         assert_eq!(v["checkpoints"][0], "rshogi-20.bin");
         assert_eq!(v["results"]["interrupted"], false);

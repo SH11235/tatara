@@ -332,7 +332,8 @@ pub(crate) struct Cli {
     pub(crate) optimizer: String,
     /// Override the optimizer first-moment decay. When omitted, the selected
     /// optimizer keeps its historical default (ranger=0.99, radam/adamw=0.9).
-    /// This value affects training dynamics and must be repeated on resume.
+    /// This value affects training dynamics. A resume checkpoint that records
+    /// a different beta1 is rejected.
     #[arg(long, global = true)]
     pub(crate) optimizer_beta1: Option<f32>,
     /// Weight decay coefficient for the optimizer (AdamW-style decoupled
