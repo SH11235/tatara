@@ -45,10 +45,15 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke/simple] CUDA context created, loading kernel module...");
     if native_scope {
-        println!("[smoke/simple] native scope: CReLU, FP32, Ranger, default WRM");
+        println!("[smoke/simple] native scope: CReLU, FP32, FT factorizer, Ranger, default WRM");
     }
+    let feature_set = if native_scope {
+        FeatureSet::HalfKaHmMerged.spec().with_ft_factorize()
+    } else {
+        FeatureSet::HalfKaHmMerged.spec()
+    };
     let id = SimpleId {
-        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        feature_set,
         activation: SimpleActivation::CReLU,
         ft_out: 256,
         l1_out: 32,
@@ -214,6 +219,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
+    trainer_r.sync_ft_forward_weights()?;
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
     }
@@ -234,7 +240,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     if native_scope {
         println!(
-            "[smoke/simple] PASSED — native CReLU/default-WRM forward + gradient + \
+            "[smoke/simple] PASSED — native factorized CReLU/default-WRM forward + gradient + \
              quantised round-trip + raw round-trip OK"
         );
         return Ok(());

@@ -40,17 +40,37 @@ fn create_trainer(
     native: bool,
     batch_size: usize,
 ) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
+    create_trainer_with_options(
+        context,
+        id,
+        native,
+        batch_size,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+    )
+}
+
+fn create_trainer_with_options(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    native: bool,
+    batch_size: usize,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
     #[cfg(feature = "native-cuda")]
     let result = with_test_native_backend(native, || {
         SimpleGpuTrainer::new(
             context,
             batch_size,
             id,
-            OptimizerKind::Ranger,
+            optimizer,
             0.0,
-            None,
+            norm_loss_factor,
             16,
-            PrecisionFlags::default(),
+            precision,
             &SimpleInit::default_uniform(),
         )
     });
@@ -64,11 +84,11 @@ fn create_trainer(
             context,
             batch_size,
             id,
-            OptimizerKind::Ranger,
+            optimizer,
             0.0,
-            None,
+            norm_loss_factor,
             16,
-            PrecisionFlags::default(),
+            precision,
             &SimpleInit::default_uniform(),
         )
     };
@@ -80,59 +100,41 @@ fn native_simple_hidden_dimension_guard_accepts_256_and_rejects_257() {
     let mut id = standard_id();
     id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
     id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    assert!(
-        validate_native_simple_configuration(
-            id,
-            OptimizerKind::Ranger,
-            None,
-            PrecisionFlags::default(),
-        )
-        .is_ok()
-    );
+    assert!(validate_native_simple_configuration(id, None, PrecisionFlags::default(),).is_ok());
 
     id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l1_error = validate_native_simple_configuration(
-        id,
-        OptimizerKind::Ranger,
-        None,
-        PrecisionFlags::default(),
-    )
-    .unwrap_err();
+    let l1_error =
+        validate_native_simple_configuration(id, None, PrecisionFlags::default()).unwrap_err();
     assert!(l1_error.contains("hidden dimensions <= 256"));
 
     id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
     id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l2_error = validate_native_simple_configuration(
-        id,
-        OptimizerKind::Ranger,
-        None,
-        PrecisionFlags::default(),
-    )
-    .unwrap_err();
+    let l2_error =
+        validate_native_simple_configuration(id, None, PrecisionFlags::default()).unwrap_err();
     assert!(l2_error.contains("hidden dimensions <= 256"));
 }
 
 #[test]
-fn native_simple_guard_rejects_unvalidated_optimizer_and_tf32_modes() {
-    for optimizer in [OptimizerKind::RAdam, OptimizerKind::AdamW] {
-        let error = validate_native_simple_configuration(
-            standard_id(),
-            optimizer,
-            None,
-            PrecisionFlags::default(),
-        )
-        .unwrap_err();
-        assert!(error.contains("only the Ranger optimizer"));
-    }
+fn native_simple_configuration_accepts_ft_factorizer() {
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    assert!(validate_native_simple_configuration(id, None, PrecisionFlags::default(),).is_ok());
+}
 
-    let precision = PrecisionFlags {
-        tf32: true,
-        ..PrecisionFlags::default()
-    };
-    let error =
-        validate_native_simple_configuration(standard_id(), OptimizerKind::Ranger, None, precision)
-            .unwrap_err();
-    assert!(error.contains("TF32 to be disabled"));
+#[test]
+fn native_simple_configuration_accepts_all_simple_activations() {
+    for activation in [
+        SimpleActivation::CReLU,
+        SimpleActivation::SCReLU,
+        SimpleActivation::Pairwise,
+    ] {
+        let mut id = standard_id();
+        id.activation = activation;
+        assert!(
+            validate_native_simple_configuration(id, None, PrecisionFlags::default(),).is_ok(),
+            "{activation:?}"
+        );
+    }
 }
 
 #[test]
@@ -230,10 +232,94 @@ fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn s
 #[cfg(feature = "native-cuda")]
 fn standard_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step(standard_id())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn factorized_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn screlu_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut id = standard_id();
+    id.activation = SimpleActivation::SCReLU;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn pairwise_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.activation = SimpleActivation::Pairwise;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn radam_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::RAdam,
+        PrecisionFlags::default(),
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn adamw_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::AdamW,
+        PrecisionFlags::default(),
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn tf32_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step(
+    id: SimpleId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        id,
+        OptimizerKind::Ranger,
+        PrecisionFlags::default(),
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step_with_options(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    precision: PrecisionFlags,
+) -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
-    let id = standard_id();
-    let mut oxide = create_trainer(&context, id, false, SMOKE_BATCH)?;
-    let mut native = create_trainer(&context, id, true, SMOKE_BATCH)?;
+    let mut oxide =
+        create_trainer_with_options(&context, id, false, SMOKE_BATCH, optimizer, None, precision)?;
+    let mut native =
+        create_trainer_with_options(&context, id, true, SMOKE_BATCH, optimizer, None, precision)?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
@@ -242,6 +328,11 @@ fn standard_simple_native_matches_cuda_oxide_after_one_step()
     let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
     let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    if id.feature_set.ft_factorize() {
+        let oxide_master = oxide.ft_w_to_host()?;
+        let native_master = native.ft_w_to_host()?;
+        assert_weight_group_close("ft_w_master", &oxide_master, &native_master);
+    }
     let oxide_weights = oxide.to_simple_weights()?;
     let native_weights = native.to_simple_weights()?;
 
@@ -260,24 +351,29 @@ fn standard_simple_native_matches_cuda_oxide_after_one_step()
         ("l3_w", &oxide_weights.l3_w, &native_weights.l3_w),
         ("l3_b", &oxide_weights.l3_b, &native_weights.l3_b),
     ] {
-        assert_eq!(oxide_group.len(), native_group.len());
-        let mut maximum_difference = 0.0_f32;
-        let mut maximum_bound = 0.0_f32;
-        for (&expected, &actual) in oxide_group.iter().zip(native_group) {
-            let difference = (expected - actual).abs();
-            let bound = 2.0e-6 * (1.0 + expected.abs());
-            maximum_difference = maximum_difference.max(difference);
-            maximum_bound = maximum_bound.max(bound);
-            assert!(
-                difference <= bound,
-                "{name} differs: oxide={expected}, native={actual}, diff={difference}, bound={bound}"
-            );
-        }
-        eprintln!(
-            "[native-parity] {name}: max_abs_diff={maximum_difference:.3e}, max_bound={maximum_bound:.3e}"
-        );
+        assert_weight_group_close(name, oxide_group, native_group);
     }
     Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
+    assert_eq!(expected.len(), actual.len());
+    let mut maximum_difference = 0.0_f32;
+    let mut maximum_bound = 0.0_f32;
+    for (&expected, &actual) in expected.iter().zip(actual) {
+        let difference = (expected - actual).abs();
+        let bound = 2.0e-6 * (1.0 + expected.abs());
+        maximum_difference = maximum_difference.max(difference);
+        maximum_bound = maximum_bound.max(bound);
+        assert!(
+            difference <= bound,
+            "{name} differs: expected={expected}, actual={actual}, diff={difference}, bound={bound}"
+        );
+    }
+    eprintln!(
+        "[native-parity] {name}: max_abs_diff={maximum_difference:.3e}, max_bound={maximum_bound:.3e}"
+    );
 }
 
 #[cfg(feature = "native-cuda")]
