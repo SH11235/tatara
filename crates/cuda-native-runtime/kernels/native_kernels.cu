@@ -2,9 +2,10 @@
 #include <cuda_fp16.h>
 
 // LayerStack bucket 数の上限。per-bucket accumulator を register array で持つ kernel が
-// この値で配列を確保する。host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS` と一致していないと
-// `num_buckets > kMaxSupportedNumBuckets` で register array の範囲外 index になるため、
-// 両定数の一致を `native_bucket_capacity_matches_host` test で固定する。
+// この値で配列を確保する。各アクセスは `min(num_buckets, kMaxSupportedNumBuckets)` で
+// clamp するので範囲外 index (UB) にはならないが、host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS`
+// がこの値を超えると上位 bucket の勾配が黙って落ちる。両定数の一致を
+// `native_bucket_capacity_matches_host` test で固定する。
 constexpr unsigned int kMaxSupportedNumBuckets = 9;
 
 extern "C" __global__ void native_vec_add(

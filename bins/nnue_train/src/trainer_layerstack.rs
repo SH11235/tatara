@@ -1327,6 +1327,20 @@ impl GpuTrainer {
 
     /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
     /// download する。backend 間の無中断学習比較に使う。
+    /// 直近 forward の sorted-order per-bucket L1 出力 (`padded × l1_out`) と、対応する sorted
+    /// bucket index (padding 行は `-1`) を host へ download する。TF32 経路は有効 bucket segment
+    /// だけを cuBLAS で上書きするため、padding 行の 0 初期化が無いと prior step の残差が残る。
+    /// その 0 初期化を直接固定する test に使う。
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn l1_bucket_sorted_and_index_to_host_for_test(
+        &self,
+    ) -> Result<(Vec<f32>, Vec<i32>), Box<dyn std::error::Error>> {
+        Ok((
+            self.ws.l1_bucket_sorted.to_host_vec(&self.stream)?,
+            self.ws.bucket_idx_sorted_dev.to_host_vec(&self.stream)?,
+        ))
+    }
+
     #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
     pub(crate) fn raw_checkpoint_state_to_host(
         &self,
@@ -3061,8 +3075,14 @@ impl GpuTrainer {
                 self.l1f_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        // L1f bias backward: block-level shared-mem reduce で global atomic を削減する。
-        // out_dim (= l1_out) は PARTIAL 固定容量 (256) 以内を起動時 CLI が保証する。
+        // L1f bias backward。cuda-oxide 版は 256 要素固定 shared array + 先頭 out_dim thread の
+        // 初期化 / flush、native CUDA C++ 版は 1 thread = 1 要素の直接 global atomicAdd で、
+        // どちらも block_dim.x (256) >= out_dim (= l1_out) を前提にする (cuda-oxide は shared
+        // array 容量、native は列 index の上限)。起動時 CLI も l1_out <= 256 を保証する。
+        debug_assert!(
+            l1_out <= 256,
+            "bias_grad_shared_l1f requires block_dim.x >= output_dimension"
+        );
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。

@@ -52,23 +52,111 @@ fn standard_id() -> SimpleId {
 }
 
 fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
-    // 属性の bracket stream が `cfg` と `test` の両 identifier を含むか。`cfg(test)` /
-    // `cfg(all(test, ...))` にマッチし、`cfg(feature = "test")` (test は string literal で
-    // identifier ではない) にはマッチしない。
-    fn attribute_gates_on_test(stream: proc_macro2::TokenStream) -> bool {
-        fn idents(stream: proc_macro2::TokenStream, found: &mut (bool, bool)) {
-            for token in stream {
-                match token {
-                    proc_macro2::TokenTree::Ident(ident) if ident == "cfg" => found.0 = true,
-                    proc_macro2::TokenTree::Ident(ident) if ident == "test" => found.1 = true,
-                    proc_macro2::TokenTree::Group(group) => idents(group.stream(), found),
-                    _ => {}
+    // attribute (`#[...]` の bracket stream) が item を **非 test build で必ず除去する** か。
+    // `#[test]` (bare) と `#[cfg(test)]` / `#[cfg(all(test, ...))]` / `#[cfg(any(test))]` は
+    // test 専用なので除外する。一方 `#[cfg(not(test))]` (production 専用) や
+    // `#[cfg(any(test, feature = "x"))]` (feature 有効な production でも compile) は production
+    // launch を含み得るので **除外しない**。誤って production を除外すると native export 検査の
+    // 走査から実 launch が漏れる (穴が素通り) ため、判定を誤らない側に倒す。
+    #[derive(Clone, Copy, PartialEq)]
+    enum Tri {
+        True,
+        False,
+        Unknown,
+    }
+
+    fn attribute_marks_test_only(stream: proc_macro2::TokenStream) -> bool {
+        let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+        // bare `#[test]`。
+        if let [proc_macro2::TokenTree::Ident(ident)] = tokens.as_slice() {
+            return ident == "test";
+        }
+        // `#[cfg(<predicate>)]` の predicate を test=false で 3 値評価し、False なら test 専用。
+        for window in tokens.windows(2) {
+            if let [
+                proc_macro2::TokenTree::Ident(ident),
+                proc_macro2::TokenTree::Group(group),
+            ] = window
+            {
+                if ident == "cfg" && group.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                    return eval_predicate_group(group.stream()) == Tri::False;
                 }
             }
         }
-        let mut found = (false, false);
-        idents(stream, &mut found);
-        found.0 && found.1
+        false
+    }
+
+    // group の中身を top-level `,` で分割し、各 predicate を評価する。
+    fn split_predicates(stream: proc_macro2::TokenStream) -> Vec<Vec<proc_macro2::TokenTree>> {
+        let mut parts = vec![Vec::new()];
+        for token in stream {
+            match &token {
+                proc_macro2::TokenTree::Punct(punct) if punct.as_char() == ',' => {
+                    parts.push(Vec::new());
+                }
+                _ => parts.last_mut().unwrap().push(token),
+            }
+        }
+        parts.into_iter().filter(|part| !part.is_empty()).collect()
+    }
+
+    // `test` は false、`not` / `all` / `any` を再帰評価、その他 (feature = "x" 等) は Unknown。
+    fn eval_predicate(tokens: &[proc_macro2::TokenTree]) -> Tri {
+        match tokens {
+            [proc_macro2::TokenTree::Ident(ident)] => {
+                if ident == "test" {
+                    Tri::False
+                } else {
+                    Tri::Unknown
+                }
+            }
+            [
+                proc_macro2::TokenTree::Ident(ident),
+                proc_macro2::TokenTree::Group(group),
+            ] if group.delimiter() == proc_macro2::Delimiter::Parenthesis => {
+                let inner = split_predicates(group.stream());
+                if ident == "not" {
+                    match inner.as_slice() {
+                        [only] => match eval_predicate(only) {
+                            Tri::True => Tri::False,
+                            Tri::False => Tri::True,
+                            Tri::Unknown => Tri::Unknown,
+                        },
+                        _ => Tri::Unknown,
+                    }
+                } else if ident == "all" {
+                    let mut result = Tri::True;
+                    for predicate in &inner {
+                        match eval_predicate(predicate) {
+                            Tri::False => return Tri::False,
+                            Tri::Unknown => result = Tri::Unknown,
+                            Tri::True => {}
+                        }
+                    }
+                    result
+                } else if ident == "any" {
+                    let mut result = Tri::False;
+                    for predicate in &inner {
+                        match eval_predicate(predicate) {
+                            Tri::True => return Tri::True,
+                            Tri::Unknown => result = Tri::Unknown,
+                            Tri::False => {}
+                        }
+                    }
+                    result
+                } else {
+                    Tri::Unknown
+                }
+            }
+            _ => Tri::Unknown,
+        }
+    }
+
+    fn eval_predicate_group(stream: proc_macro2::TokenStream) -> Tri {
+        match split_predicates(stream).as_slice() {
+            [only] => eval_predicate(only),
+            _ => Tri::Unknown,
+        }
     }
 
     fn visit(stream: proc_macro2::TokenStream, symbols: &mut std::collections::BTreeSet<String>) {
@@ -95,7 +183,7 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
                 proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
                     if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek() {
                         if group.delimiter() == proc_macro2::Delimiter::Bracket
-                            && attribute_gates_on_test(group.stream())
+                            && attribute_marks_test_only(group.stream())
                         {
                             skip_next_item_body = true;
                             tokens.next();
@@ -153,6 +241,34 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
     symbols
 }
 
+/// source が `cuda_launch!` を実際に **invoke** しているか (macro ident + `!`)。tokenize して
+/// 判定するので、コメント / string literal 中の文字列は誤検出しない。tokenize できない source
+/// は raw 部分列一致に fallback する (誤検出側に倒し、実 launch を見逃さない)。
+fn source_invokes_cuda_launch(source: &str) -> bool {
+    fn scan(stream: proc_macro2::TokenStream) -> bool {
+        let mut tokens = stream.into_iter().peekable();
+        while let Some(token) = tokens.next() {
+            match &token {
+                proc_macro2::TokenTree::Ident(ident) if ident == "cuda_launch" => {
+                    if matches!(
+                        tokens.peek(),
+                        Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == '!'
+                    ) {
+                        return true;
+                    }
+                }
+                proc_macro2::TokenTree::Group(group) if scan(group.stream()) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+    match source.parse::<proc_macro2::TokenStream>() {
+        Ok(stream) => scan(stream),
+        Err(_) => source.contains("cuda_launch!"),
+    }
+}
+
 fn production_cuda_launch_symbols() -> std::collections::BTreeSet<String> {
     fn visit(path: &std::path::Path, symbols: &mut std::collections::BTreeSet<String>) {
         for entry in std::fs::read_dir(path).unwrap() {
@@ -177,15 +293,90 @@ fn production_cuda_launch_symbols() -> std::collections::BTreeSet<String> {
     symbols
 }
 
+/// `//` 行コメントと `/* ... */` ブロックコメントを空白へ潰す (改行と string literal は保持)。
+/// ブロックコメントは複数行に跨るので、行頭アンカーだけではコメント化された宣言を弾けない。
+fn strip_cuda_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        Line,
+        Block,
+        Str,
+    }
+    let mut state = State::Code;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match state {
+            State::Code => {
+                if b == b'/' && next == Some(b'/') {
+                    state = State::Line;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else if b == b'/' && next == Some(b'*') {
+                    state = State::Block;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else {
+                    if b == b'"' {
+                        state = State::Str;
+                    }
+                    out.push(b as char);
+                    i += 1;
+                }
+            }
+            State::Str => {
+                out.push(b as char);
+                if b == b'\\' {
+                    if let Some(escaped) = next {
+                        out.push(escaped as char);
+                        i += 2;
+                        continue;
+                    }
+                } else if b == b'"' {
+                    state = State::Code;
+                }
+                i += 1;
+            }
+            State::Line => {
+                if b == b'\n' {
+                    state = State::Code;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            State::Block => {
+                if b == b'*' && next == Some(b'/') {
+                    state = State::Code;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else {
+                    out.push(if b == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `native_kernels.cu` の行頭に `extern "C" __global__ void <name>(` がある export だけを
-/// 集める。行頭アンカーなので `//` / `/*` で始まるコメント行の宣言にはマッチしない
-/// (コメント化された kernel を「存在する」と誤判定して穴を素通りさせないため)。
+/// 集める。コメントを潰してから行頭マッチするので、`//` / `/* ... */` (複数行含む) で
+/// コメント化された宣言は「存在する」と誤判定されない (穴を素通りさせないため)。
 fn native_source_exports() -> std::collections::BTreeSet<String> {
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
     let prefix = "extern \"C\" __global__ void ";
-    native
+    strip_cuda_comments(native)
         .lines()
-        .filter_map(|line| line.strip_prefix(prefix))
+        .filter_map(|line| line.strip_prefix(prefix).map(str::to_owned))
         .filter_map(|declaration| declaration.split_once('(').map(|(name, _)| name.to_owned()))
         .collect()
 }
@@ -240,6 +431,36 @@ fn native_inventory_parser_ignores_comments_and_string_delimiters() {
 #[should_panic(expected = "cuda_launch! must contain `kernel: <identifier>`")]
 fn native_inventory_parser_rejects_unrecognized_launches() {
     let _ = cuda_launch_symbols("cuda_launch! { stream: stream, args: [] }");
+}
+
+#[test]
+fn native_inventory_parser_excludes_only_test_only_launches() {
+    let source = r#"
+        #[cfg(test)]
+        mod tests {
+            fn t() { cuda_launch! { kernel: cfg_test_excluded, stream: s } }
+        }
+        #[cfg(all(test, feature = "x"))]
+        fn all_test() { cuda_launch! { kernel: all_test_excluded, stream: s } }
+        #[test]
+        fn bare_test() { cuda_launch! { kernel: bare_test_excluded, stream: s } }
+
+        #[cfg(not(test))]
+        fn prod_only() { cuda_launch! { kernel: not_test_kept, stream: s } }
+        #[cfg(any(test, feature = "x"))]
+        fn maybe_prod() { cuda_launch! { kernel: any_test_feature_kept, stream: s } }
+        fn always() { cuda_launch! { kernel: ungated_kept, stream: s } }
+    "#;
+    assert_eq!(
+        cuda_launch_symbols(source),
+        [
+            "any_test_feature_kept".to_owned(),
+            "not_test_kept".to_owned(),
+            "ungated_kept".to_owned(),
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 #[test]
@@ -307,7 +528,8 @@ fn cuda_launch_stays_within_known_production_roots() {
                 }
             } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                if !source.contains("cuda_launch!") {
+                // token 走査でコメント / string literal 中の `cuda_launch!` を誤検出しない。
+                if !source_invokes_cuda_launch(&source) {
                     continue;
                 }
                 let relative = path.strip_prefix(root).unwrap_or(&path);
@@ -332,8 +554,8 @@ fn cuda_launch_stays_within_known_production_roots() {
 }
 
 /// `native_kernels.cu` の per-bucket accumulator 容量 (`kMaxSupportedNumBuckets`) が host 側の
-/// `MAX_SUPPORTED_NUM_BUCKETS` と一致することを固定する。ズレると register array の範囲外
-/// index (UB) になる。
+/// `MAX_SUPPORTED_NUM_BUCKETS` と一致することを固定する。host が上回ると kernel が
+/// `min(num_buckets, kMaxSupportedNumBuckets)` で clamp し、上位 bucket の勾配が黙って落ちる。
 #[test]
 fn native_bucket_capacity_matches_host() {
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
@@ -914,6 +1136,33 @@ fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
     }
     let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+
+    // native/oxide は同じ host trainer を共有し kernel module だけ切り替わるので、上の
+    // checkpoint 比較は両経路共有の 0 初期化 (trainer_layerstack.rs の TF32 分岐) が消えても
+    // 両者一致で通ってしまう。修正を守るには「sorted L1 出力の padding 行が prior step の残差を
+    // 持たず 0」を backend 非依存に固定する。step 1 で real row だった sorted 位置が step 2 で
+    // padding になると、0 初期化が無ければ step 1 の値が残る。
+    let (l1_bucket_sorted, bucket_idx_sorted) =
+        native.l1_bucket_sorted_and_index_to_host_for_test()?;
+    let l1_out = l1_bucket_sorted.len() / bucket_idx_sorted.len();
+    let mut padding_rows = 0usize;
+    for (sorted_row, &bucket) in bucket_idx_sorted.iter().enumerate() {
+        if bucket >= 0 {
+            continue;
+        }
+        padding_rows += 1;
+        let row = &l1_bucket_sorted[sorted_row * l1_out..(sorted_row + 1) * l1_out];
+        for (column, &value) in row.iter().enumerate() {
+            assert_eq!(
+                value, 0.0,
+                "padding sorted row {sorted_row} col {column} carried a stale L1 output",
+            );
+        }
+    }
+    assert!(
+        padding_rows > 0,
+        "expected invalid buckets to create padding sorted rows",
+    );
 
     let oxide_state = oxide.raw_checkpoint_state_to_host()?;
     let native_state = native.raw_checkpoint_state_to_host()?;
