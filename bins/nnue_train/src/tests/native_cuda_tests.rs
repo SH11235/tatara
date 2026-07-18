@@ -22,6 +22,24 @@ use crate::{
 // NVCC の FMA による mul-add ごとの丸め差を許容するため、CUDA C++ と cuda-oxide は
 // bit 一致ではなくこの相対 tolerance で比較する。
 const NATIVE_PARITY_TOLERANCE: f64 = 2.0e-6;
+const NATIVE_WEIGHT_ABS_TOLERANCE: f32 = 2.0e-9;
+const NATIVE_FIRST_MOMENT_ABS_TOLERANCE: f32 = 2.0e-10;
+const NATIVE_SECOND_MOMENT_ABS_TOLERANCE: f32 = 8.0e-12;
+
+#[cfg(feature = "native-cuda")]
+#[derive(Clone, Copy)]
+struct StateTolerances {
+    weight: f32,
+    first_moment: f32,
+    second_moment: f32,
+}
+
+#[cfg(feature = "native-cuda")]
+const LARGE_BATCH_STATE_TOLERANCES: StateTolerances = StateTolerances {
+    weight: 5.0e-8,
+    first_moment: 5.0e-7,
+    second_moment: 1.0e-8,
+};
 
 fn standard_id() -> SimpleId {
     SimpleId {
@@ -33,36 +51,150 @@ fn standard_id() -> SimpleId {
     }
 }
 
+fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
+    let mut symbols = std::collections::BTreeSet::new();
+    let mut cursor = 0;
+    while let Some(relative_macro) = source[cursor..].find("cuda_launch!") {
+        let after_macro = cursor + relative_macro + "cuda_launch!".len();
+        let whitespace = source[after_macro..]
+            .len()
+            .saturating_sub(source[after_macro..].trim_start().len());
+        let opening = after_macro + whitespace;
+        let Some(opening_delimiter) = source[opening..].chars().next() else {
+            break;
+        };
+        if !matches!(opening_delimiter, '{' | '(' | '[') {
+            cursor = after_macro;
+            continue;
+        }
+
+        let mut delimiters = Vec::new();
+        let mut closing = None;
+        for (relative, character) in source[opening..].char_indices() {
+            match character {
+                '{' | '(' | '[' => delimiters.push(character),
+                '}' | ')' | ']' => {
+                    let expected = match character {
+                        '}' => '{',
+                        ')' => '(',
+                        ']' => '[',
+                        _ => unreachable!(),
+                    };
+                    if delimiters.pop() != Some(expected) {
+                        break;
+                    }
+                    if delimiters.is_empty() {
+                        closing = Some(opening + relative + character.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(closing) = closing else {
+            cursor = after_macro;
+            continue;
+        };
+        let body = &source[opening..closing];
+        let mut body_cursor = 0;
+        while let Some(relative_kernel) = body[body_cursor..].find("kernel") {
+            let kernel_start = body_cursor + relative_kernel;
+            let before_is_identifier = body[..kernel_start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            let mut value_start = kernel_start + "kernel".len();
+            let after_is_identifier = body[value_start..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            if before_is_identifier || after_is_identifier {
+                body_cursor = value_start;
+                continue;
+            }
+            value_start += body[value_start..]
+                .len()
+                .saturating_sub(body[value_start..].trim_start().len());
+            if !body[value_start..].starts_with(':') {
+                body_cursor = value_start;
+                continue;
+            }
+            value_start += 1;
+            value_start += body[value_start..]
+                .len()
+                .saturating_sub(body[value_start..].trim_start().len());
+            let symbol_len = body[value_start..]
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if symbol_len != 0 {
+                symbols.insert(body[value_start..value_start + symbol_len].to_owned());
+            }
+            body_cursor = value_start + symbol_len;
+        }
+        cursor = closing;
+    }
+    symbols
+}
+
+fn production_cuda_launch_symbols() -> std::collections::BTreeSet<String> {
+    fn visit(path: &std::path::Path, symbols: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some("tests") {
+                    visit(&path, symbols);
+                }
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                symbols.extend(cuda_launch_symbols(&source));
+            }
+        }
+    }
+
+    let mut symbols = std::collections::BTreeSet::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut symbols,
+    );
+    symbols
+}
+
+fn assert_native_exports(required: &std::collections::BTreeSet<String>) {
+    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
+        .collect();
+    assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+}
+
+#[test]
+fn native_inventory_parser_accepts_inline_and_multiline_launches() {
+    let source = "cuda_launch! { kernel: inline, stream: s }\n\
+                  cuda_launch!(\n  kernel : multiline,\n  stream: s\n);";
+    assert_eq!(
+        cuda_launch_symbols(source),
+        ["inline".to_owned(), "multiline".to_owned()]
+            .into_iter()
+            .collect()
+    );
+}
+
 #[test]
 fn every_simple_native_kernel_is_exported() {
     let launch_sources = [
         include_str!("../trainer_simple.rs"),
         include_str!("../ft_factorize_host.rs"),
     ];
-    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
     let mut required = std::collections::BTreeSet::new();
     for source in launch_sources {
-        for line in source.lines() {
-            let Some((_, suffix)) = line.split_once("kernel:") else {
-                continue;
-            };
-            let symbol = suffix
-                .trim_start()
-                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-                .next()
-                .unwrap_or_default();
-            if !symbol.is_empty() {
-                required.insert(symbol);
-            }
-        }
+        required.extend(cuda_launch_symbols(source));
     }
-    let missing: Vec<_> = required
-        .iter()
-        .copied()
-        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
-        .collect();
     assert_eq!(required.len(), 49, "Simple kernel inventory changed");
-    assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+    assert_native_exports(&required);
 }
 
 #[test]
@@ -71,30 +203,19 @@ fn every_layerstack_native_kernel_is_exported() {
         include_str!("../trainer_layerstack.rs"),
         include_str!("../ft_factorize_host.rs"),
     ];
-    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
     let mut required = std::collections::BTreeSet::new();
     for source in launch_sources {
-        for line in source.lines() {
-            let Some(suffix) = line.trim_start().strip_prefix("kernel:") else {
-                continue;
-            };
-            let symbol = suffix
-                .trim_start()
-                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-                .next()
-                .unwrap_or_default();
-            if !symbol.is_empty() {
-                required.insert(symbol);
-            }
-        }
+        required.extend(cuda_launch_symbols(source));
     }
-    let missing: Vec<_> = required
-        .iter()
-        .copied()
-        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
-        .collect();
     assert_eq!(required.len(), 61, "LayerStack kernel inventory changed");
-    assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+    assert_native_exports(&required);
+}
+
+#[test]
+fn every_production_cuda_launch_is_exported() {
+    let required = production_cuda_launch_symbols();
+    assert_eq!(required.len(), 77, "production kernel inventory changed");
+    assert_native_exports(&required);
 }
 
 #[derive(Clone, Copy)]
@@ -231,6 +352,21 @@ fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
         LayerStackTestOptions::standard(),
         SMOKE_LOSS_WRM,
         1,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn large_batch_multistep_layerstack_native_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_layerstack_native_matches_cuda_oxide_with_batch(
+        LayerStackTestOptions {
+            num_buckets: 9,
+            ..LayerStackTestOptions::standard()
+        },
+        SMOKE_LOSS_WRM,
+        3,
+        16_384,
     )
 }
 
@@ -479,10 +615,20 @@ fn assert_layerstack_native_matches_cuda_oxide(
     loss: LossKind,
     steps: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    assert_layerstack_native_matches_cuda_oxide_with_batch(options, loss, steps, SMOKE_BATCH)
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_layerstack_native_matches_cuda_oxide_with_batch(
+    options: LayerStackTestOptions,
+    loss: LossKind,
+    steps: usize,
+    batch_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
-    let mut oxide = create_layerstack_trainer_with_options(&context, false, options)?;
-    let mut native = create_layerstack_trainer_with_options(&context, true, options)?;
-    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    let mut oxide = create_layerstack_trainer_with_batch(&context, false, options, batch_size)?;
+    let mut native = create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
+    let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
     for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
         *bucket = (row % options.num_buckets) as i32;
     }
@@ -502,7 +648,16 @@ fn assert_layerstack_native_matches_cuda_oxide(
     );
     let oxide_state = oxide.raw_checkpoint_state_to_host()?;
     let native_state = native.raw_checkpoint_state_to_host()?;
-    assert_checkpoint_state_close("LayerStack", &oxide_state, &native_state);
+    if batch_size > SMOKE_BATCH {
+        assert_checkpoint_state_close_with_tolerances(
+            "LayerStack large batch",
+            &oxide_state,
+            &native_state,
+            LARGE_BATCH_STATE_TOLERANCES,
+        );
+    } else {
+        assert_checkpoint_state_close("LayerStack", &oxide_state, &native_state);
+    }
     Ok(())
 }
 
@@ -565,8 +720,9 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
                 trainer.sync_ft_forward_weights()?;
                 let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
                 let resumed_state = trainer.raw_checkpoint_state_to_host()?;
-                assert_checkpoint_state_close(
+                assert_checkpoint_state_delta_close(
                     &format!("LayerStack {source_name} to {backend_name}"),
+                    &checkpoint_state,
                     &oracle_state,
                     &resumed_state,
                 );
@@ -1328,8 +1484,9 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
                 trainer.sync_ft_forward_weights()?;
                 let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
                 let resumed_state = trainer.raw_checkpoint_state_to_host()?;
-                assert_checkpoint_state_close(
+                assert_checkpoint_state_delta_close(
                     &format!("{source_name} to {backend_name}"),
+                    &checkpoint_state,
                     &oracle_state,
                     &resumed_state,
                 );
@@ -1390,6 +1547,25 @@ fn assert_checkpoint_state_close(
     expected: &SimpleRawCheckpointState,
     actual: &SimpleRawCheckpointState,
 ) {
+    assert_checkpoint_state_close_with_tolerances(
+        path,
+        expected,
+        actual,
+        StateTolerances {
+            weight: NATIVE_WEIGHT_ABS_TOLERANCE,
+            first_moment: NATIVE_FIRST_MOMENT_ABS_TOLERANCE,
+            second_moment: NATIVE_SECOND_MOMENT_ABS_TOLERANCE,
+        },
+    );
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_close_with_tolerances(
+    path: &str,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+    tolerances: StateTolerances,
+) {
     assert_eq!(actual.0, expected.0, "{path}: step count differs");
     assert_eq!(
         actual.1.len(),
@@ -1406,23 +1582,127 @@ fn assert_checkpoint_state_close(
             ("second moment", &expected_group.2, &actual_group.2),
             ("slow weight", &expected_group.3, &actual_group.3),
         ] {
-            assert_weight_group_close(
+            assert_weight_group_close_with_abs(
                 &format!("{path} {expected_name} {state_name}"),
                 expected_values,
                 actual_values,
+                state_abs_tolerance(state_name, tolerances),
             );
         }
     }
 }
 
 #[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_delta_close(
+    path: &str,
+    baseline: &SimpleRawCheckpointState,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+) {
+    assert_eq!(actual.0, expected.0, "{path}: step count differs");
+    assert_eq!(baseline.1.len(), expected.1.len());
+    assert_eq!(actual.1.len(), expected.1.len());
+    for (
+        ((baseline_name, baseline_group), (expected_name, expected_group)),
+        (actual_name, actual_group),
+    ) in baseline.1.iter().zip(&expected.1).zip(&actual.1)
+    {
+        assert_eq!(
+            baseline_name, expected_name,
+            "{path}: baseline group differs"
+        );
+        assert_eq!(actual_name, expected_name, "{path}: actual group differs");
+        for (state_name, baseline_values, expected_values, actual_values) in [
+            (
+                "weight",
+                &baseline_group.0,
+                &expected_group.0,
+                &actual_group.0,
+            ),
+            (
+                "first moment",
+                &baseline_group.1,
+                &expected_group.1,
+                &actual_group.1,
+            ),
+            (
+                "second moment",
+                &baseline_group.2,
+                &expected_group.2,
+                &actual_group.2,
+            ),
+            (
+                "slow weight",
+                &baseline_group.3,
+                &expected_group.3,
+                &actual_group.3,
+            ),
+        ] {
+            assert_eq!(baseline_values.len(), expected_values.len());
+            assert_eq!(actual_values.len(), expected_values.len());
+            let absolute_tolerance = state_abs_tolerance(
+                state_name,
+                StateTolerances {
+                    weight: NATIVE_WEIGHT_ABS_TOLERANCE,
+                    first_moment: NATIVE_FIRST_MOMENT_ABS_TOLERANCE,
+                    second_moment: NATIVE_SECOND_MOMENT_ABS_TOLERANCE,
+                },
+            );
+            let mut maximum_expected_delta = 0.0_f32;
+            let mut maximum_delta_difference = 0.0_f32;
+            for (index, ((&baseline, &expected), &actual)) in baseline_values
+                .iter()
+                .zip(expected_values)
+                .zip(actual_values)
+                .enumerate()
+            {
+                let expected_delta = expected - baseline;
+                let actual_delta = actual - baseline;
+                let difference = (expected_delta - actual_delta).abs();
+                let bound =
+                    absolute_tolerance + NATIVE_PARITY_TOLERANCE as f32 * expected_delta.abs();
+                maximum_expected_delta = maximum_expected_delta.max(expected_delta.abs());
+                maximum_delta_difference = maximum_delta_difference.max(difference);
+                assert!(
+                    difference <= bound,
+                    "{path} {expected_name} {state_name}[{index}] delta differs: baseline={baseline}, expected={expected}, actual={actual}, expected_delta={expected_delta}, actual_delta={actual_delta}, diff={difference}, bound={bound}"
+                );
+            }
+            eprintln!(
+                "[native-parity] {path} {expected_name} {state_name} delta: max_expected={maximum_expected_delta:.3e}, max_diff={maximum_delta_difference:.3e}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+fn state_abs_tolerance(state_name: &str, tolerances: StateTolerances) -> f32 {
+    match state_name {
+        "first moment" => tolerances.first_moment,
+        "second moment" => tolerances.second_moment,
+        "weight" | "slow weight" => tolerances.weight,
+        _ => panic!("unknown checkpoint state: {state_name}"),
+    }
+}
+
+#[cfg(feature = "native-cuda")]
 fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
+    assert_weight_group_close_with_abs(name, expected, actual, NATIVE_WEIGHT_ABS_TOLERANCE);
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_weight_group_close_with_abs(
+    name: &str,
+    expected: &[f32],
+    actual: &[f32],
+    absolute_tolerance: f32,
+) {
     assert_eq!(expected.len(), actual.len());
     let mut maximum_difference = 0.0_f32;
     let mut maximum_bound = 0.0_f32;
     for (&expected, &actual) in expected.iter().zip(actual) {
         let difference = (expected - actual).abs();
-        let bound = NATIVE_PARITY_TOLERANCE as f32 * (1.0 + expected.abs());
+        let bound = absolute_tolerance + NATIVE_PARITY_TOLERANCE as f32 * expected.abs();
         maximum_difference = maximum_difference.max(difference);
         maximum_bound = maximum_bound.max(bound);
         assert!(
@@ -1510,6 +1790,22 @@ fn benchmark_layerstack_backend(
     Ok(batch.n_pos as f64 * steps as f64 / start.elapsed().as_secs_f64())
 }
 
+#[cfg(feature = "native-cuda")]
+fn benchmark_mean_and_sample_sd(values: &[f64]) -> (f64, f64) {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let sample_sd = if values.len() > 1 {
+        (values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (values.len() - 1) as f64)
+            .sqrt()
+    } else {
+        0.0
+    };
+    (mean, sample_sd)
+}
+
 #[test]
 #[cfg(feature = "native-cuda")]
 #[ignore = "manual WSL performance comparison"]
@@ -1537,21 +1833,42 @@ fn benchmark_layerstack_native_against_cuda_oxide() -> Result<(), Box<dyn std::e
     owned.wdl.fill(0.8);
     let batch = owned.as_ref();
 
-    let mut oxide_total = 0.0;
-    let mut native_total = 0.0;
+    let mut oxide_runs = Vec::with_capacity(runs);
+    let mut native_runs = Vec::with_capacity(runs);
     for run in 0..runs {
-        if run.is_multiple_of(2) {
-            oxide_total += benchmark_layerstack_backend(&context, options, &batch, false, steps)?;
-            native_total += benchmark_layerstack_backend(&context, options, &batch, true, steps)?;
+        let (oxide, native) = if run.is_multiple_of(2) {
+            (
+                benchmark_layerstack_backend(&context, options, &batch, false, steps)?,
+                benchmark_layerstack_backend(&context, options, &batch, true, steps)?,
+            )
         } else {
-            native_total += benchmark_layerstack_backend(&context, options, &batch, true, steps)?;
-            oxide_total += benchmark_layerstack_backend(&context, options, &batch, false, steps)?;
-        }
+            let native = benchmark_layerstack_backend(&context, options, &batch, true, steps)?;
+            let oxide = benchmark_layerstack_backend(&context, options, &batch, false, steps)?;
+            (oxide, native)
+        };
+        eprintln!(
+            "[native-bench-layerstack-run] run={}, first={}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, delta={:.3}%",
+            run + 1,
+            if run.is_multiple_of(2) {
+                "cuda-oxide"
+            } else {
+                "native"
+            },
+            (native / oxide - 1.0) * 100.0,
+        );
+        oxide_runs.push(oxide);
+        native_runs.push(native);
     }
-    let oxide = oxide_total / runs as f64;
-    let native = native_total / runs as f64;
+    let paired_deltas: Vec<_> = oxide_runs
+        .iter()
+        .zip(&native_runs)
+        .map(|(oxide, native)| (native / oxide - 1.0) * 100.0)
+        .collect();
+    let (oxide, oxide_sd) = benchmark_mean_and_sample_sd(&oxide_runs);
+    let (native, native_sd) = benchmark_mean_and_sample_sd(&native_runs);
+    let (paired_delta, paired_delta_sd) = benchmark_mean_and_sample_sd(&paired_deltas);
     eprintln!(
-        "[native-bench-layerstack] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
+        "[native-bench-layerstack] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0}±{oxide_sd:.0} pos/s, native={native:.0}±{native_sd:.0} pos/s, paired_delta={paired_delta:.3}±{paired_delta_sd:.3}%, ratio={:.3}",
         native / oxide
     );
     Ok(())

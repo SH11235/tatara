@@ -11,6 +11,16 @@ portable_cli_dir=$(mktemp -d /tmp/tatara-native-cli.XXXXXX)
 portable_layerstack_cli_dir=$(mktemp -d /tmp/tatara-native-layerstack-cli.XXXXXX)
 trap 'rm -f -- "$hybrid_log" "$portable_log"; rm -r -- "$portable_cli_dir" "$portable_layerstack_cli_dir"' EXIT
 
+echo "== native CUDA artifact and edge-case tests =="
+cargo test -p cuda-native-runtime --features native-cuda --release -- \
+    --nocapture --test-threads=1
+
+echo "== native CUDA production launch inventory =="
+cargo test -p nnue-trainer --features native-cuda --release \
+    native_inventory_parser_accepts_inline_and_multiline_launches -- --nocapture
+cargo test -p nnue-trainer --features native-cuda --release \
+    every_production_cuda_launch_is_exported -- --nocapture
+
 echo "== native CUDA C++ kernels vs cuda-oxide =="
 cargo test -p nnue-trainer --features native-cuda --release \
     simple_native_ -- --nocapture --test-threads=1
