@@ -13,7 +13,7 @@ tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
 | OS | 位置づけ | 手順 |
 |---|---|---|
 | Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | WSL2 は既定 backend。`feat/cuda-cpp-backend` では CUDA C++ backend により native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
+| Windows | WSL2 は既定 backend。CUDA C++ backend により native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
 | macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
 
 cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
@@ -28,8 +28,8 @@ macOS でも可能だが、`cargo build` を workspace 全体に掛けると cud
 
 ## Windows native (実験的)
 
-`feat/cuda-cpp-backend` branch の `native-cuda-host` feature は cuda-oxide を使わず、
-NVCC で build した CUDA C++ kernel を portable Rust CUDA Driver API runtime から
+`native-cuda-host` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
+kernel を portable Rust CUDA Driver API runtime から
 起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
 Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
 1 step を確認済み。現時点では実験 backend であり、既定 backend は引き続き
@@ -87,10 +87,42 @@ cargo run -p nnue-trainer --no-default-features --features native-cuda-host --re
 最後のコマンドは教師データを使わず、nativeの対応範囲に限定したGPU smokeを実行する。
 末尾に`[smoke/simple] PASSED`が出れば成功。
 
-現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU、hidden dimension各256以下、
-FP32 (TF32無効)、factorizer OFF、default WRM、Ranger。LayerStack、SCReLU / Pairwise、
-hidden dimension 257以上、RAdam / AdamW、TF32 / FP16 option/state、FT factorizer、
-norm loss、既定以外の拡張 loss は未対応で、起動時に拒否する。
+production CLI、dataloader、拡張 WRM、factorizer、全 FP16 経路、TF32、AdamW、
+norm loss、2 種の checkpoint format を短い 1 run でまとめて確認する:
+
+```powershell
+$smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+  --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
+  --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
+  --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
+  --win-rate-model --scale 600 --wrm-nnue2score 600 `
+  --loss-pow-exp 2.5 --loss-qp-asymmetry 0.2 `
+  --loss-weight-boost-w1 1.5 --loss-weight-boost-w2 0.75 `
+  --optimizer adamw --weight-decay 0.0001 `
+  --norm-loss --norm-loss-factor 0.0001 --all-optim
+Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckpt"
+```
+
+正常終了し、両 file が空でないことを確認する。
+
+同一のmemory上fixtureでOS間throughputを比較する場合は次を実行する:
+
+```powershell
+$env:TATARA_NATIVE_BENCH_BATCH = '16384'
+$env:TATARA_NATIVE_BENCH_STEPS = '100'
+$env:TATARA_NATIVE_BENCH_RUNS = '3'
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release `
+  benchmark_factorized_fp16_simple_native_portable -- --ignored --nocapture --test-threads=1
+```
+
+出力される`[native-bench-portable-fp16]`を同じ3環境変数で実行したWSLの値と比較する。
+これはdummy batch上のtrainer kernel測定で、PSV decodeとdisk I/Oは含まない。
+
+現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU / SCReLU / Pairwise、
+任意のhidden dimension、FP32 / FP16 option/state (TF32 ON / OFF)、factorizer ON / OFF、
+Sigmoid / WRM (拡張設定を含む)、norm loss、Ranger / RAdam / AdamW。Simpleが起動し得る
+全kernelを収録する。LayerStackは未対応で、起動時に拒否する。
 
 ## Windows (WSL2) の準備
 

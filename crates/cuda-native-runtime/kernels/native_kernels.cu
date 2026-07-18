@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 extern "C" __global__ void native_vec_add(
     const float* lhs,
@@ -178,7 +179,8 @@ extern "C" __global__ void sparse_ft_forward(
     for (int active = 0; active < count; ++active) {
         const int column = indices[index_base + static_cast<unsigned int>(active)];
         if (column >= 0 && static_cast<unsigned int>(column) < columns) {
-            const unsigned int weight_base = static_cast<unsigned int>(column) * rows + row;
+            const unsigned long long weight_base =
+                static_cast<unsigned long long>(column) * rows + row;
 #pragma unroll
             for (unsigned int lane = 0; lane < 4; ++lane) {
                 sums[lane] += weight[weight_base + lane];
@@ -190,6 +192,210 @@ extern "C" __global__ void sparse_ft_forward(
     for (unsigned int lane = 0; lane < 4; ++lane) {
         output[output_base + lane] = sums[lane];
     }
+}
+
+extern "C" __global__ void ft_fold_virtual(
+    const float* weights,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
+    const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long n = static_cast<unsigned long long>(ft_in) * ft_out;
+    if (i >= n) {
+        return;
+    }
+
+    const unsigned int nb = effect_bucket_factorize & 0xffffU;
+    const unsigned int mode = effect_bucket_factorize >> 16;
+    const unsigned long long feature = i / ft_out;
+    const unsigned int column = static_cast<unsigned int>(i - feature * ft_out);
+    float value = weights[i];
+    if (feature < base_ft_in) {
+        const unsigned long long piece = mode == 0
+            ? feature % piece_inputs
+            : (feature / nb) % piece_inputs;
+        const unsigned long long virtual_row = mode == 2
+            ? piece * nb + feature % nb
+            : piece;
+        const unsigned long long virtual_index =
+            (static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column;
+        value += weights[virtual_index];
+    } else if (threat_pair_starts_len >= 2) {
+        const unsigned long long relative = feature - base_ft_in;
+        unsigned long long low = 0;
+        unsigned long long high = threat_pair_starts_len - 1;
+        while (low + 1 < high) {
+            const unsigned long long middle = (low + high) / 2;
+            if (threat_pair_starts[middle] <= relative) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        const unsigned long long base_virtual_rows = mode == 2
+            ? static_cast<unsigned long long>(piece_inputs) * nb
+            : piece_inputs;
+        const unsigned long long virtual_index =
+            (static_cast<unsigned long long>(ft_in) + base_virtual_rows + low) * ft_out + column;
+        value += weights[virtual_index];
+    }
+    combined[i] = value;
+}
+
+extern "C" __global__ void ft_fold_virtual_f16(
+    const float* weights,
+    unsigned long long,
+    __half* combined,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
+    const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long n = static_cast<unsigned long long>(ft_in) * ft_out;
+    if (i >= n) {
+        return;
+    }
+
+    const unsigned int nb = effect_bucket_factorize & 0xffffU;
+    const unsigned int mode = effect_bucket_factorize >> 16;
+    const unsigned long long feature = i / ft_out;
+    const unsigned int column = static_cast<unsigned int>(i - feature * ft_out);
+    float value = weights[i];
+    if (feature < base_ft_in) {
+        const unsigned long long piece = mode == 0
+            ? feature % piece_inputs
+            : (feature / nb) % piece_inputs;
+        const unsigned long long virtual_row = mode == 2
+            ? piece * nb + feature % nb
+            : piece;
+        const unsigned long long virtual_index =
+            (static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column;
+        value += weights[virtual_index];
+    } else if (threat_pair_starts_len >= 2) {
+        const unsigned long long relative = feature - base_ft_in;
+        unsigned long long low = 0;
+        unsigned long long high = threat_pair_starts_len - 1;
+        while (low + 1 < high) {
+            const unsigned long long middle = (low + high) / 2;
+            if (threat_pair_starts[middle] <= relative) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        const unsigned long long base_virtual_rows = mode == 2
+            ? static_cast<unsigned long long>(piece_inputs) * nb
+            : piece_inputs;
+        const unsigned long long virtual_index =
+            (static_cast<unsigned long long>(ft_in) + base_virtual_rows + low) * ft_out + column;
+        value += weights[virtual_index];
+    }
+    combined[i] = __float2half_rn(value);
+}
+
+extern "C" __global__ void ft_reduce_virtual_grad(
+    float* gradient,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
+    const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
+    const unsigned int nb = effect_bucket_factorize & 0xffffU;
+    const unsigned int mode = effect_bucket_factorize >> 16;
+    const unsigned int base_virtual_rows = mode == 2 ? piece_inputs * nb : piece_inputs;
+    const unsigned long long threat_virtual_rows = threat_pair_starts_len == 0
+        ? 0
+        : threat_pair_starts_len - 1;
+    const unsigned long long virtual_rows = base_virtual_rows + threat_virtual_rows;
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= virtual_rows * ft_out) {
+        return;
+    }
+
+    const unsigned long long virtual_row = i / ft_out;
+    const unsigned int column = static_cast<unsigned int>(i - virtual_row * ft_out);
+    float sum = 0.0F;
+    if (virtual_row >= base_virtual_rows) {
+        const unsigned long long pair = virtual_row - base_virtual_rows;
+        const unsigned long long start =
+            static_cast<unsigned long long>(base_ft_in) + threat_pair_starts[pair];
+        const unsigned long long end =
+            static_cast<unsigned long long>(base_ft_in) + threat_pair_starts[pair + 1];
+        for (unsigned long long feature = start; feature < end; ++feature) {
+            sum += gradient[feature * ft_out + column];
+        }
+        gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
+        return;
+    }
+
+    const unsigned int piece = mode == 2 ? virtual_row / nb : virtual_row;
+    const unsigned int bucket = mode == 2 ? virtual_row - piece * nb : 0;
+    const unsigned int king_buckets = mode == 0
+        ? base_ft_in / piece_inputs
+        : base_ft_in / (piece_inputs * nb);
+    if (mode == 1) {
+        const unsigned long long king_stride =
+            static_cast<unsigned long long>(piece_inputs) * nb * ft_out;
+        for (unsigned int king_bucket = 0; king_bucket < king_buckets; ++king_bucket) {
+            const unsigned long long base =
+                static_cast<unsigned long long>(king_bucket) * king_stride
+                + static_cast<unsigned long long>(piece) * nb * ft_out + column;
+            for (unsigned int effect_bucket = 0; effect_bucket < nb; ++effect_bucket) {
+                sum += gradient[base + static_cast<unsigned long long>(effect_bucket) * ft_out];
+            }
+        }
+        gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
+        return;
+    }
+
+    const unsigned long long row_stride = mode == 0
+        ? static_cast<unsigned long long>(piece_inputs) * ft_out
+        : static_cast<unsigned long long>(piece_inputs) * nb * ft_out;
+    const unsigned long long base = mode == 0
+        ? static_cast<unsigned long long>(piece) * ft_out + column
+        : (static_cast<unsigned long long>(piece) * nb + bucket) * ft_out + column;
+    float sum0 = 0.0F;
+    float sum1 = 0.0F;
+    float sum2 = 0.0F;
+    float sum3 = 0.0F;
+    unsigned int king_bucket = 0;
+    const unsigned int unroll_end = king_buckets > 3 ? king_buckets - 3 : 0;
+    while (king_bucket < unroll_end) {
+        sum0 += gradient[base + static_cast<unsigned long long>(king_bucket) * row_stride];
+        sum1 += gradient[base + static_cast<unsigned long long>(king_bucket + 1) * row_stride];
+        sum2 += gradient[base + static_cast<unsigned long long>(king_bucket + 2) * row_stride];
+        sum3 += gradient[base + static_cast<unsigned long long>(king_bucket + 3) * row_stride];
+        king_bucket += 4;
+    }
+    while (king_bucket < king_buckets) {
+        sum0 += gradient[base + static_cast<unsigned long long>(king_bucket) * row_stride];
+        ++king_bucket;
+    }
+    sum = (sum0 + sum1) + (sum2 + sum3);
+    gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
 }
 
 extern "C" __global__ void loss_wrm(
@@ -210,22 +416,16 @@ extern "C" __global__ void loss_wrm(
     float input_offset,
     float target_offset,
     float target_scaling,
-    float,
-    float,
-    float,
-    float,
-    const double*,
+    float pow_exp,
+    float qp_asymmetry,
+    float weight_boost_w1,
+    float weight_boost_w2,
+    const double* weight_sum_accumulator,
     unsigned long long,
     unsigned int extended,
     unsigned int n
 ) {
     __shared__ double partial[256];
-    if (extended != 0) {
-        // Extended WRM is rejected by the host before launch. Trap defensively so adding only its
-        // prerequisite kernels cannot turn this wrapper into a silent stale-gradient path.
-        asm volatile("trap;");
-        return;
-    }
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int tid = threadIdx.x;
     double contribution = 0.0;
@@ -241,11 +441,31 @@ extern "C" __global__ void loss_wrm(
         const float qm = 1.0F / (1.0F + expf(-((-score_net - input_offset) / input_scaling)));
         const float prediction = 0.5F * (1.0F + q - qm);
         const float error = prediction - target;
-        output_gradient[i] = error
-            * (nnue2score / input_scaling)
-            * (q * (1.0F - q) + qm * (1.0F - qm))
-            * per_pos_norm;
-        contribution = static_cast<double>(error) * static_cast<double>(error);
+        if (extended == 0) {
+            output_gradient[i] = error
+                * (nnue2score / input_scaling)
+                * (q * (1.0F - q) + qm * (1.0F - qm))
+                * per_pos_norm;
+            contribution = static_cast<double>(error) * static_cast<double>(error);
+        } else {
+            const float weight_base = (target_wrm - 0.5F) * (target_wrm - 0.5F)
+                * target_wrm * (1.0F - target_wrm);
+            const float weight = 1.0F
+                + (powf(2.0F, weight_boost_w1) - 1.0F) * powf(weight_base, weight_boost_w2);
+            const float asymmetry = prediction > target ? 1.0F + qp_asymmetry : 1.0F;
+            const float absolute_error = fabsf(error);
+            const float absolute_power = powf(absolute_error, pow_exp - 1.0F);
+            const float signed_power = error < 0.0F ? -absolute_power : absolute_power;
+            const float inverse_weight_sum = static_cast<float>(1.0 / weight_sum_accumulator[0]);
+            const float prediction_gradient = 0.5F * (nnue2score / input_scaling)
+                * (q * (1.0F - q) + qm * (1.0F - qm));
+            output_gradient[i] = (weight * inverse_weight_sum)
+                * (asymmetry * pow_exp * signed_power) * prediction_gradient;
+            contribution = static_cast<double>(
+                asymmetry * powf(absolute_error, pow_exp) * weight
+                * static_cast<float>(n) * inverse_weight_sum
+            );
+        }
     }
 
     partial[tid] = contribution;
@@ -258,6 +478,806 @@ extern "C" __global__ void loss_wrm(
     }
     if (tid == 0) {
         atomicAdd(loss_accumulator, partial[0]);
+    }
+}
+
+extern "C" __global__ void loss_wdl(
+    const float* output,
+    unsigned long long,
+    const float* score,
+    unsigned long long,
+    const float* wdl,
+    unsigned long long,
+    float per_pos_norm,
+    float* output_gradient,
+    unsigned long long,
+    double* loss_accumulator,
+    unsigned long long,
+    float lambda,
+    float scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float prediction = 1.0F / (1.0F + expf(-(output[i] * scale)));
+    const float score_target = 1.0F / (1.0F + expf(-(score[i] * scale)));
+    const float target = lambda * wdl[i] + (1.0F - lambda) * score_target;
+    const float error = prediction - target;
+    output_gradient[i] = 2.0F * error * prediction * (1.0F - prediction)
+        * scale * per_pos_norm;
+    atomicAdd(loss_accumulator, static_cast<double>(error) * static_cast<double>(error));
+}
+
+extern "C" __global__ void wrm_weight_sum(
+    const float* score,
+    unsigned long long,
+    double* weight_sum_accumulator,
+    unsigned long long,
+    float weight_boost_w1,
+    float weight_boost_w2,
+    float target_offset,
+    float target_scaling,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float s = score[i];
+    const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
+    const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
+    const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
+    const float weight_base = (target_wrm - 0.5F) * (target_wrm - 0.5F)
+        * target_wrm * (1.0F - target_wrm);
+    const float weight = 1.0F
+        + (powf(2.0F, weight_boost_w1) - 1.0F) * powf(weight_base, weight_boost_w2);
+    atomicAdd(weight_sum_accumulator, static_cast<double>(weight));
+}
+
+extern "C" __global__ void norm_loss_reduce(
+    const float* weight,
+    unsigned long long,
+    float* norms,
+    unsigned long long,
+    unsigned int n_groups,
+    unsigned int group_pitch,
+    unsigned int element_stride,
+    unsigned int group_length
+) {
+    const unsigned int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= n_groups) {
+        return;
+    }
+    const unsigned long long base = static_cast<unsigned long long>(group) * group_pitch;
+    float sum_squared = 0.0F;
+    for (unsigned int position = blockIdx.y; position < group_length; position += gridDim.y) {
+        const float value = weight[base + static_cast<unsigned long long>(position) * element_stride];
+        sum_squared += value * value;
+    }
+    if (sum_squared != 0.0F) {
+        atomicAdd(norms + group, sum_squared);
+    }
+}
+
+extern "C" __global__ void bias_grad(
+    const float* output_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int output_dimension
+) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * output_dimension;
+    if (index < count) {
+        atomicAdd(bias_gradient + index % output_dimension, output_gradient[index]);
+    }
+}
+
+extern "C" __global__ void norm_loss_finalize(
+    float* norms,
+    unsigned long long,
+    unsigned int n_groups
+) {
+    const unsigned int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group < n_groups) {
+        norms[group] = sqrtf(norms[group]);
+    }
+}
+
+extern "C" __global__ void norm_loss_apply(
+    float* weight,
+    unsigned long long,
+    const float* norms,
+    unsigned long long,
+    float factor,
+    float learning_rate,
+    float epsilon,
+    unsigned int n_groups,
+    unsigned int group_pitch,
+    unsigned int element_stride,
+    unsigned int group_length
+) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(n_groups) * group_length;
+    if (index >= count) {
+        return;
+    }
+    unsigned int group;
+    unsigned int position;
+    if (group_pitch == 1) {
+        group = static_cast<unsigned int>(index % n_groups);
+        position = static_cast<unsigned int>(index / n_groups);
+    } else {
+        group = static_cast<unsigned int>(index / group_length);
+        position = static_cast<unsigned int>(index % group_length);
+    }
+    const unsigned long long offset = static_cast<unsigned long long>(group) * group_pitch
+        + static_cast<unsigned long long>(position) * element_stride;
+    const float correction = 2.0F * factor * (1.0F - 1.0F / (norms[group] + epsilon));
+    weight[offset] *= 1.0F - learning_rate * correction;
+}
+
+__device__ __forceinline__ float native_clamp_unit(float value) {
+    return value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+}
+
+__device__ __forceinline__ float native_clamp_half(float value, unsigned long long* clamps) {
+    if (value > 65504.0F) {
+        atomicAdd(clamps, 1ULL);
+        return 65504.0F;
+    }
+    if (value < -65504.0F) {
+        atomicAdd(clamps, 1ULL);
+        return -65504.0F;
+    }
+    return value;
+}
+
+extern "C" __global__ void cast_f32_to_f16(
+    const float* source,
+    unsigned long long,
+    __half* destination,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        destination[i] = __float2half_rn(source[i]);
+    }
+}
+
+template <typename Output>
+__device__ __forceinline__ void native_sparse_ft_forward_fp16(
+    const __half* weight,
+    const int* indices,
+    const int* nonzero_counts,
+    Output* output,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    const unsigned int rows_quarter = rows / 4;
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * rows_quarter;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index = index / rows_quarter;
+    const unsigned int row = (index % rows_quarter) * 4;
+    float sums[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    const unsigned int index_base = batch_index * max_active;
+    const int row_nonzero_count = nonzero_counts[batch_index];
+    for (int active = 0; active < row_nonzero_count; ++active) {
+        const int column = indices[index_base + static_cast<unsigned int>(active)];
+        if (column >= 0 && static_cast<unsigned int>(column) < columns) {
+            const unsigned long long weight_base =
+                static_cast<unsigned long long>(column) * rows + row;
+#pragma unroll
+            for (unsigned int lane = 0; lane < 4; ++lane) {
+                sums[lane] += __half2float(weight[weight_base + lane]);
+            }
+        }
+    }
+    const unsigned long long output_base =
+        static_cast<unsigned long long>(batch_index) * rows + row;
+#pragma unroll
+    for (unsigned int lane = 0; lane < 4; ++lane) {
+        output[output_base + lane] = sums[lane];
+    }
+}
+
+template <>
+__device__ __forceinline__ void native_sparse_ft_forward_fp16<__half>(
+    const __half* weight,
+    const int* indices,
+    const int* nonzero_counts,
+    __half* output,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    const unsigned int rows_quarter = rows / 4;
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * rows_quarter;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index = index / rows_quarter;
+    const unsigned int row = (index % rows_quarter) * 4;
+    float sums[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    const unsigned int index_base = batch_index * max_active;
+    const int row_nonzero_count = nonzero_counts[batch_index];
+    for (int active = 0; active < row_nonzero_count; ++active) {
+        const int column = indices[index_base + static_cast<unsigned int>(active)];
+        if (column >= 0 && static_cast<unsigned int>(column) < columns) {
+            const unsigned long long weight_base =
+                static_cast<unsigned long long>(column) * rows + row;
+#pragma unroll
+            for (unsigned int lane = 0; lane < 4; ++lane) {
+                sums[lane] += __half2float(weight[weight_base + lane]);
+            }
+        }
+    }
+    const unsigned long long output_base =
+        static_cast<unsigned long long>(batch_index) * rows + row;
+#pragma unroll
+    for (unsigned int lane = 0; lane < 4; ++lane) {
+        output[output_base + lane] = __float2half_rn(sums[lane]);
+    }
+}
+
+extern "C" __global__ void sparse_ft_forward_fp16(
+    const __half* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    native_sparse_ft_forward_fp16(
+        weight, indices, nonzero_counts, output, batch, rows, columns, max_active
+    );
+}
+
+extern "C" __global__ void sparse_ft_forward_fp16_out(
+    const __half* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    __half* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    native_sparse_ft_forward_fp16(
+        weight, indices, nonzero_counts, output, batch, rows, columns, max_active
+    );
+}
+
+template <bool Squared>
+__device__ __forceinline__ void native_simple_bias_act_fwd_fp16(
+    const __half* ft_output,
+    const float* bias,
+    float* combined,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    unsigned int batch,
+    unsigned int ft_dimension
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * ft_dimension;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int row = index % ft_dimension;
+    const unsigned int batch_index = index / ft_dimension;
+    const float activated = native_clamp_unit(__half2float(ft_output[index]) + bias[row]);
+    combined[static_cast<unsigned long long>(batch_index) * combined_stride
+        + column_offset + row] = Squared ? activated * activated : activated;
+}
+
+extern "C" __global__ void simple_bias_act_fwd_fp16_in_crelu(
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    unsigned int batch,
+    unsigned int ft_dimension
+) {
+    native_simple_bias_act_fwd_fp16<false>(
+        ft_output, bias, combined, combined_stride, column_offset, batch, ft_dimension
+    );
+}
+
+extern "C" __global__ void simple_bias_act_fwd_fp16_in_screlu(
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    unsigned int batch,
+    unsigned int ft_dimension
+) {
+    native_simple_bias_act_fwd_fp16<true>(
+        ft_output, bias, combined, combined_stride, column_offset, batch, ft_dimension
+    );
+}
+
+extern "C" __global__ void ft_post_perspective_fwd_fp16(
+    const __half* stm_output,
+    unsigned long long,
+    const __half* nstm_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float scale
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * ft_dimension;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index = index / ft_dimension;
+    const unsigned int row = index % ft_dimension;
+    const unsigned int half = ft_dimension / 2;
+    const __half* source = row < half ? stm_output : nstm_output;
+    const unsigned int pair = row < half ? row : row - half;
+    const unsigned long long base = static_cast<unsigned long long>(batch_index) * ft_dimension;
+    const float first = native_clamp_unit(__half2float(source[base + pair]) + bias[pair]);
+    const float second = native_clamp_unit(
+        __half2float(source[base + half + pair]) + bias[half + pair]
+    );
+    combined[index] = first * second * scale;
+}
+
+template <bool Squared>
+__device__ __forceinline__ void native_simple_act_grad_to_fp16(
+    const __half* ft_output,
+    const float* bias,
+    const float* combined_gradient,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    __half* ft_gradient,
+    unsigned long long* clamp_counter,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float gradient_scale
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * ft_dimension;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int row = index % ft_dimension;
+    const unsigned int batch_index = index / ft_dimension;
+    const float x = __half2float(ft_output[index]) + bias[row];
+    const float activated = native_clamp_unit(x);
+    const float derivative = Squared
+        ? (activated > 0.0F && activated < 1.0F ? 2.0F * activated : 0.0F)
+        : (x > 0.0F && x < 1.0F ? 1.0F : 0.0F);
+    const float upstream = combined_gradient[
+        static_cast<unsigned long long>(batch_index) * combined_stride + column_offset + row
+    ];
+    const float scaled = upstream * derivative * gradient_scale;
+    ft_gradient[index] = __float2half_rn(native_clamp_half(scaled, clamp_counter));
+}
+
+extern "C" __global__ void simple_act_grad_to_fp16_crelu_with_scale(
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const float* combined_gradient,
+    unsigned long long,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    __half* ft_gradient,
+    unsigned long long,
+    unsigned long long* clamp_counter,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float gradient_scale
+) {
+    native_simple_act_grad_to_fp16<false>(
+        ft_output, bias, combined_gradient, combined_stride, column_offset, ft_gradient,
+        clamp_counter, batch, ft_dimension, gradient_scale
+    );
+}
+
+extern "C" __global__ void simple_act_grad_to_fp16_screlu_with_scale(
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const float* combined_gradient,
+    unsigned long long,
+    unsigned int combined_stride,
+    unsigned int column_offset,
+    __half* ft_gradient,
+    unsigned long long,
+    unsigned long long* clamp_counter,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float gradient_scale
+) {
+    native_simple_act_grad_to_fp16<true>(
+        ft_output, bias, combined_gradient, combined_stride, column_offset, ft_gradient,
+        clamp_counter, batch, ft_dimension, gradient_scale
+    );
+}
+
+extern "C" __global__ void ft_post_perspective_grad_fp16(
+    const float* combined_gradient,
+    unsigned long long,
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    __half* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned long long* clamp_counter,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale,
+    float gradient_scale
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half = ft_dimension / 2;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * half;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index = index / half;
+    const unsigned int pair = index % half;
+    const float upstream = combined_gradient[
+        static_cast<unsigned long long>(batch_index) * combined_stride + combined_offset + pair
+    ];
+    const unsigned long long base = static_cast<unsigned long long>(batch_index) * ft_dimension;
+    const float x_first = __half2float(ft_output[base + pair]) + bias[pair];
+    const float x_second = __half2float(ft_output[base + half + pair]) + bias[half + pair];
+    const float first = native_clamp_unit(x_first);
+    const float second = native_clamp_unit(x_second);
+    const float first_gradient = x_first > 0.0F && x_first < 1.0F
+        ? upstream * second * scale : 0.0F;
+    const float second_gradient = x_second > 0.0F && x_second < 1.0F
+        ? upstream * first * scale : 0.0F;
+    ft_gradient[base + pair] = __float2half_rn(native_clamp_half(
+        first_gradient * gradient_scale, clamp_counter
+    ));
+    ft_gradient[base + half + pair] = __float2half_rn(native_clamp_half(
+        second_gradient * gradient_scale, clamp_counter
+    ));
+    atomicAdd(bias_gradient + pair, first_gradient);
+    atomicAdd(bias_gradient + half + pair, second_gradient);
+}
+
+extern "C" __global__ void simple_bias_grad_dual_fp16(
+    const __half* stm_gradient,
+    unsigned long long,
+    const __half* nstm_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float inverse_gradient_scale,
+    unsigned int items
+) {
+    const unsigned int output = blockIdx.y * blockDim.x + threadIdx.x;
+    if (output >= ft_dimension) {
+        return;
+    }
+    const unsigned int start = blockIdx.x * items;
+    const unsigned int end = min(start + items, batch);
+    float sum = 0.0F;
+    for (unsigned int position = start; position < end; ++position) {
+        const unsigned long long index =
+            static_cast<unsigned long long>(position) * ft_dimension + output;
+        sum += __half2float(stm_gradient[index]) * inverse_gradient_scale
+            + __half2float(nstm_gradient[index]) * inverse_gradient_scale;
+    }
+    atomicAdd(bias_gradient + output, sum);
+}
+
+template <bool Add>
+__device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
+    const __half* output_gradient,
+    const unsigned int* positions,
+    const unsigned int* offsets,
+    float* weight_gradient,
+    unsigned int n_features,
+    unsigned int ft_output,
+    float inverse_gradient_scale
+) {
+    const unsigned int feature = blockIdx.x;
+    const unsigned int row = blockIdx.y * blockDim.x + threadIdx.x;
+    if (feature >= n_features || row >= ft_output) {
+        return;
+    }
+    const unsigned int start = offsets[feature];
+    const unsigned int end = offsets[feature + 1];
+    float sum0 = 0.0F;
+    float sum1 = 0.0F;
+    float sum2 = 0.0F;
+    float sum3 = 0.0F;
+    unsigned int i = start;
+    const unsigned int unroll_end = end >= start + 3 ? end - 3 : start;
+    while (i < unroll_end) {
+        sum0 += __half2float(output_gradient[
+            static_cast<unsigned long long>(positions[i]) * ft_output + row
+        ]);
+        sum1 += __half2float(output_gradient[
+            static_cast<unsigned long long>(positions[i + 1]) * ft_output + row
+        ]);
+        sum2 += __half2float(output_gradient[
+            static_cast<unsigned long long>(positions[i + 2]) * ft_output + row
+        ]);
+        sum3 += __half2float(output_gradient[
+            static_cast<unsigned long long>(positions[i + 3]) * ft_output + row
+        ]);
+        i += 4;
+    }
+    while (i < end) {
+        sum0 += __half2float(output_gradient[
+            static_cast<unsigned long long>(positions[i]) * ft_output + row
+        ]);
+        ++i;
+    }
+    const float sum = (sum0 + sum1) + (sum2 + sum3);
+    const unsigned long long output_index =
+        static_cast<unsigned long long>(feature) * ft_output + row;
+    const float scaled = sum * inverse_gradient_scale;
+    if (Add) {
+        if (sum != 0.0F) {
+            atomicAdd(weight_gradient + output_index, scaled);
+        }
+    } else {
+        weight_gradient[output_index] = scaled;
+    }
+}
+
+extern "C" __global__ void gather_and_sum_per_feature_overwrite_fp16(
+    const __half* output_gradient,
+    unsigned long long,
+    const unsigned int* positions,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int n_features,
+    unsigned int ft_output,
+    float inverse_gradient_scale
+) {
+    native_gather_and_sum_per_feature_fp16<false>(
+        output_gradient, positions, offsets, weight_gradient, n_features, ft_output,
+        inverse_gradient_scale
+    );
+}
+
+extern "C" __global__ void gather_and_sum_per_feature_add_fp16(
+    const __half* output_gradient,
+    unsigned long long,
+    const unsigned int* positions,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int n_features,
+    unsigned int ft_output,
+    float inverse_gradient_scale
+) {
+    native_gather_and_sum_per_feature_fp16<true>(
+        output_gradient, positions, offsets, weight_gradient, n_features, ft_output,
+        inverse_gradient_scale
+    );
+}
+
+template <bool HalfState, bool Mirror>
+__device__ __forceinline__ void native_radam_step_fp16(
+    float* weights,
+    void* momentum_storage,
+    void* velocity_storage,
+    float* gradient,
+    __half* mirror,
+    float learning_rate,
+    float step_size,
+    int use_variance_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    float momentum_scale,
+    float velocity_scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float g = gradient[i];
+    const float rate = learning_rate * step_size;
+    float p = weights[i] * (1.0F - decay * rate);
+    float momentum;
+    float velocity;
+    if (HalfState) {
+        __half* momentum_half = static_cast<__half*>(momentum_storage);
+        __half* velocity_half = static_cast<__half*>(velocity_storage);
+        const float previous_momentum = __half2float(momentum_half[i]) / momentum_scale;
+        const float previous_velocity = __half2float(velocity_half[i]) / velocity_scale;
+        momentum = beta1 * previous_momentum + (1.0F - beta1) * g;
+        velocity = beta2 * previous_velocity + (1.0F - beta2) * g * g;
+        float stored_momentum = momentum * momentum_scale;
+        stored_momentum = stored_momentum > 65504.0F
+            ? 65504.0F : (stored_momentum < -65504.0F ? -65504.0F : stored_momentum);
+        float stored_velocity = velocity * velocity_scale;
+        // Comparison-based clamping preserves NaN like the cuda-oxide if-else lowering.
+        stored_velocity = stored_velocity > 65504.0F ? 65504.0F : stored_velocity;
+        momentum_half[i] = __float2half_rn(stored_momentum);
+        velocity_half[i] = __float2half_rn(stored_velocity);
+    } else {
+        float* momentum_float = static_cast<float*>(momentum_storage);
+        float* velocity_float = static_cast<float*>(velocity_storage);
+        momentum = beta1 * momentum_float[i] + (1.0F - beta1) * g;
+        velocity = beta2 * velocity_float[i] + (1.0F - beta2) * g * g;
+        momentum_float[i] = momentum;
+        velocity_float[i] = velocity;
+    }
+    float value = momentum;
+    if (use_variance_denom != 0) {
+        value /= sqrtf(velocity) + epsilon;
+    }
+    p -= rate * value;
+    p = p < min_weight ? min_weight : (p > max_weight ? max_weight : p);
+    weights[i] = p;
+    if (Mirror) {
+        mirror[i] = __float2half_rn(p);
+    }
+}
+
+extern "C" __global__ void radam_step_fp16_mirror(
+    float* weights,
+    unsigned long long,
+    float* momentum,
+    unsigned long long,
+    float* velocity,
+    unsigned long long,
+    float* gradient,
+    unsigned long long,
+    __half* mirror,
+    unsigned long long,
+    float learning_rate,
+    float step_size,
+    int use_variance_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    unsigned int n
+) {
+    native_radam_step_fp16<false, true>(
+        weights, momentum, velocity, gradient, mirror, learning_rate, step_size,
+        use_variance_denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+        1.0F, 1.0F, n
+    );
+}
+
+extern "C" __global__ void radam_step_f16state(
+    float* weights,
+    unsigned long long,
+    __half* momentum,
+    unsigned long long,
+    __half* velocity,
+    unsigned long long,
+    float* gradient,
+    unsigned long long,
+    float learning_rate,
+    float step_size,
+    int use_variance_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    float momentum_scale,
+    float velocity_scale,
+    unsigned int n
+) {
+    native_radam_step_fp16<true, false>(
+        weights, momentum, velocity, gradient, nullptr, learning_rate, step_size,
+        use_variance_denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+        momentum_scale, velocity_scale, n
+    );
+}
+
+extern "C" __global__ void radam_step_f16state_mirror(
+    float* weights,
+    unsigned long long,
+    __half* momentum,
+    unsigned long long,
+    __half* velocity,
+    unsigned long long,
+    float* gradient,
+    unsigned long long,
+    __half* mirror,
+    unsigned long long,
+    float learning_rate,
+    float step_size,
+    int use_variance_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    float momentum_scale,
+    float velocity_scale,
+    unsigned int n
+) {
+    native_radam_step_fp16<true, true>(
+        weights, momentum, velocity, gradient, mirror, learning_rate, step_size,
+        use_variance_denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+        momentum_scale, velocity_scale, n
+    );
+}
+
+extern "C" __global__ void ranger_lookahead_lerp_fp16_mirror(
+    float* weights,
+    unsigned long long,
+    float* slow_weights,
+    unsigned long long,
+    __half* mirror,
+    unsigned long long,
+    float alpha,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float value = alpha * weights[i] + (1.0F - alpha) * slow_weights[i];
+        weights[i] = value;
+        slow_weights[i] = value;
+        mirror[i] = __float2half_rn(value);
     }
 }
 
@@ -329,6 +1349,39 @@ extern "C" __global__ void crelu_grad(
     }
 }
 
+extern "C" __global__ void screlu_fwd(
+    const float* input,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float x = input[i];
+        const float clipped = x < 0.0F ? 0.0F : (x > 1.0F ? 1.0F : x);
+        output[i] = clipped * clipped;
+    }
+}
+
+extern "C" __global__ void screlu_grad(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float x = input[i];
+        const float clipped = x < 0.0F ? 0.0F : (x > 1.0F ? 1.0F : x);
+        const float derivative = clipped > 0.0F && clipped < 1.0F ? 2.0F * clipped : 0.0F;
+        input_gradient[i] = output_gradient[i] * derivative;
+    }
+}
+
 extern "C" __global__ void bias_add_per_row(
     const float* bias,
     unsigned long long,
@@ -366,6 +1419,29 @@ extern "C" __global__ void simple_ft_post_fused_crelu(
         value <= 0.0F ? 0.0F : (value >= 1.0F ? 1.0F : value);
 }
 
+extern "C" __global__ void simple_ft_post_fused_screlu(
+    float* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    unsigned int destination_offset
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * ft_columns) {
+        return;
+    }
+    const unsigned int row = i / ft_columns;
+    const unsigned int column = i % ft_columns;
+    const float value = ft_output[i] + bias[column];
+    ft_output[i] = value;
+    const float clipped = value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+    combined[row * (2 * ft_columns) + destination_offset + column] = clipped * clipped;
+}
+
 extern "C" __global__ void simple_bwd_ft_act_crelu_fused(
     const float* combined_gradient,
     unsigned long long,
@@ -387,6 +1463,103 @@ extern "C" __global__ void simple_bwd_ft_act_crelu_fused(
     ft_gradient[i] = x > 0.0F && x < 1.0F
         ? combined_gradient[row * (2 * ft_columns) + source_offset + column]
         : 0.0F;
+}
+
+extern "C" __global__ void simple_bwd_ft_act_screlu_fused(
+    const float* combined_gradient,
+    unsigned long long,
+    const float* ft_pre_activation,
+    unsigned long long,
+    float* ft_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    unsigned int source_offset
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * ft_columns) {
+        return;
+    }
+    const unsigned int row = i / ft_columns;
+    const unsigned int column = i % ft_columns;
+    const float x = ft_pre_activation[i];
+    const float clipped = x < 0.0F ? 0.0F : (x > 1.0F ? 1.0F : x);
+    const float derivative = clipped > 0.0F && clipped < 1.0F ? 2.0F * clipped : 0.0F;
+    ft_gradient[i] =
+        combined_gradient[row * (2 * ft_columns) + source_offset + column] * derivative;
+}
+
+extern "C" __global__ void ft_post_perspective_fwd(
+    const float* stm_ft_output,
+    unsigned long long,
+    const float* nstm_ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    float scale
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * ft_columns) {
+        return;
+    }
+    const unsigned int row = i / ft_columns;
+    const unsigned int column = i % ft_columns;
+    const unsigned int half = ft_columns / 2;
+    const unsigned int pair = column < half ? column : column - half;
+    const float* ft_output = column < half ? stm_ft_output : nstm_ft_output;
+    const unsigned int base = row * ft_columns;
+    const float xa = ft_output[base + pair] + bias[pair];
+    const float xb = ft_output[base + half + pair] + bias[half + pair];
+    const float ya = xa < 0.0F ? 0.0F : (xa > 1.0F ? 1.0F : xa);
+    const float yb = xb < 0.0F ? 0.0F : (xb > 1.0F ? 1.0F : xb);
+    combined[i] = ya * yb * scale;
+}
+
+extern "C" __global__ void ft_post_perspective_grad(
+    const float* combined_gradient,
+    unsigned long long,
+    const float* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half = ft_columns / 2;
+    if (i >= batch * half) {
+        return;
+    }
+    const unsigned int row = i / half;
+    const unsigned int pair = i % half;
+    const float output_gradient =
+        combined_gradient[row * combined_stride + combined_offset + pair];
+    const unsigned int base = row * ft_columns;
+    const float xa = ft_output[base + pair] + bias[pair];
+    const float xb = ft_output[base + half + pair] + bias[half + pair];
+    const float ya = xa < 0.0F ? 0.0F : (xa > 1.0F ? 1.0F : xa);
+    const float yb = xb < 0.0F ? 0.0F : (xb > 1.0F ? 1.0F : xb);
+    const float gradient_a = xa > 0.0F && xa < 1.0F
+        ? output_gradient * yb * scale
+        : 0.0F;
+    const float gradient_b = xb > 0.0F && xb < 1.0F
+        ? output_gradient * ya * scale
+        : 0.0F;
+    ft_gradient[base + pair] = gradient_a;
+    ft_gradient[base + half + pair] = gradient_b;
+    atomicAdd(bias_gradient + pair, gradient_a);
+    atomicAdd(bias_gradient + half + pair, gradient_b);
 }
 
 extern "C" __global__ void simple_bias_grad_dual(

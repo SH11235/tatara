@@ -1,28 +1,25 @@
 use gpu_runtime::CudaContext;
 use nnue_format::{SimpleActivation, SimpleId};
-use nnue_train::{init::SimpleInit, optimizer::OptimizerKind, trainer::TrainerBackend};
+use nnue_train::{
+    init::SimpleInit,
+    optimizer::OptimizerKind,
+    trainer::{LossKind, TrainerBackend},
+};
 use shogi_features::FeatureSet;
 
 #[cfg(feature = "native-cuda")]
 use crate::kernel_module::with_test_native_backend;
+#[cfg(feature = "native-cuda")]
+use crate::trainer_simple::SimpleRawCheckpointState;
 use crate::{
-    arch::{SMOKE_BATCH, SMOKE_LOSS_SIGMOID, SMOKE_LOSS_WRM},
-    trainer_common::{BatchData, DENSE_BIAS_GRAD_MAX_OUT, PrecisionFlags},
-    trainer_simple::{
-        SimpleGpuTrainer, validate_native_simple_configuration, validate_native_simple_loss,
-    },
+    arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
+    trainer_common::{BatchData, PrecisionFlags},
+    trainer_simple::SimpleGpuTrainer,
 };
 
-fn with_native_backend<T>(operation: impl FnOnce() -> T) -> T {
-    #[cfg(feature = "native-cuda")]
-    {
-        with_test_native_backend(true, operation)
-    }
-    #[cfg(feature = "native-cuda-host")]
-    {
-        operation()
-    }
-}
+// NVCC の FMA による mul-add ごとの丸め差を許容するため、CUDA C++ と cuda-oxide は
+// bit 一致ではなくこの相対 tolerance で比較する。
+const NATIVE_PARITY_TOLERANCE: f64 = 2.0e-6;
 
 fn standard_id() -> SimpleId {
     SimpleId {
@@ -34,11 +31,63 @@ fn standard_id() -> SimpleId {
     }
 }
 
+#[test]
+fn every_simple_native_kernel_is_exported() {
+    let launch_sources = [
+        include_str!("../trainer_simple.rs"),
+        include_str!("../ft_factorize_host.rs"),
+    ];
+    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
+    let mut required = std::collections::BTreeSet::new();
+    for source in launch_sources {
+        for line in source.lines() {
+            let Some((_, suffix)) = line.split_once("kernel:") else {
+                continue;
+            };
+            let symbol = suffix
+                .trim_start()
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .next()
+                .unwrap_or_default();
+            if !symbol.is_empty() {
+                required.insert(symbol);
+            }
+        }
+    }
+    let missing: Vec<_> = required
+        .iter()
+        .copied()
+        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
+        .collect();
+    assert_eq!(required.len(), 49, "Simple kernel inventory changed");
+    assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+}
+
 fn create_trainer(
     context: &std::sync::Arc<CudaContext>,
     id: SimpleId,
     native: bool,
     batch_size: usize,
+) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
+    create_trainer_with_options(
+        context,
+        id,
+        native,
+        batch_size,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+    )
+}
+
+fn create_trainer_with_options(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    native: bool,
+    batch_size: usize,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
 ) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
     #[cfg(feature = "native-cuda")]
     let result = with_test_native_backend(native, || {
@@ -46,11 +95,11 @@ fn create_trainer(
             context,
             batch_size,
             id,
-            OptimizerKind::Ranger,
+            optimizer,
             0.0,
-            None,
+            norm_loss_factor,
             16,
-            PrecisionFlags::default(),
+            precision,
             &SimpleInit::default_uniform(),
         )
     });
@@ -64,130 +113,15 @@ fn create_trainer(
             context,
             batch_size,
             id,
-            OptimizerKind::Ranger,
+            optimizer,
             0.0,
-            None,
+            norm_loss_factor,
             16,
-            PrecisionFlags::default(),
+            precision,
             &SimpleInit::default_uniform(),
         )
     };
     result
-}
-
-#[test]
-fn native_simple_hidden_dimension_guard_accepts_256_and_rejects_257() {
-    let mut id = standard_id();
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    assert!(
-        validate_native_simple_configuration(
-            id,
-            OptimizerKind::Ranger,
-            None,
-            PrecisionFlags::default(),
-        )
-        .is_ok()
-    );
-
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l1_error = validate_native_simple_configuration(
-        id,
-        OptimizerKind::Ranger,
-        None,
-        PrecisionFlags::default(),
-    )
-    .unwrap_err();
-    assert!(l1_error.contains("hidden dimensions <= 256"));
-
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l2_error = validate_native_simple_configuration(
-        id,
-        OptimizerKind::Ranger,
-        None,
-        PrecisionFlags::default(),
-    )
-    .unwrap_err();
-    assert!(l2_error.contains("hidden dimensions <= 256"));
-}
-
-#[test]
-fn native_simple_guard_rejects_unvalidated_optimizer_and_tf32_modes() {
-    for optimizer in [OptimizerKind::RAdam, OptimizerKind::AdamW] {
-        let error = validate_native_simple_configuration(
-            standard_id(),
-            optimizer,
-            None,
-            PrecisionFlags::default(),
-        )
-        .unwrap_err();
-        assert!(error.contains("only the Ranger optimizer"));
-    }
-
-    let precision = PrecisionFlags {
-        tf32: true,
-        ..PrecisionFlags::default()
-    };
-    let error =
-        validate_native_simple_configuration(standard_id(), OptimizerKind::Ranger, None, precision)
-            .unwrap_err();
-    assert!(error.contains("TF32 to be disabled"));
-}
-
-#[test]
-fn native_simple_loss_guard_rejects_non_default_paths() {
-    assert!(validate_native_simple_loss(SMOKE_LOSS_WRM).is_ok());
-    assert!(
-        validate_native_simple_loss(nnue_train::trainer::LossKind::Sigmoid { scale: 1.0 / 600.0 })
-            .unwrap_err()
-            .contains("only the default WRM loss")
-    );
-    let extended = match SMOKE_LOSS_WRM {
-        nnue_train::trainer::LossKind::Wrm {
-            nnue2score,
-            in_scaling,
-            in_offset,
-            target_offset,
-            target_scaling,
-            weight_boost_w2,
-            ..
-        } => nnue_train::trainer::LossKind::Wrm {
-            nnue2score,
-            in_scaling,
-            in_offset,
-            target_offset,
-            target_scaling,
-            pow_exp: 2.5,
-            qp_asymmetry: 0.0,
-            weight_boost_w1: 0.0,
-            weight_boost_w2,
-        },
-        nnue_train::trainer::LossKind::Sigmoid { .. } => unreachable!(),
-    };
-    assert!(validate_native_simple_loss(extended).is_err());
-}
-
-#[test]
-fn native_simple_forward_rejects_unsupported_loss_before_device_launch()
--> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
-    let id = standard_id();
-    let mut trainer = create_trainer(&context, id, true, SMOKE_BATCH)?;
-    let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-
-    let error = with_native_backend(|| {
-        trainer
-            .forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)
-            .unwrap_err()
-    });
-    assert!(error.to_string().contains("only the default WRM loss"));
-
-    // A device trap would poison this context. A successful supported forward proves that the
-    // unsupported loss was rejected on the host before any loss kernel launch.
-    let loss = with_native_backend(|| trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM))?;
-    assert!(loss.is_finite());
-    Ok(())
 }
 
 #[test]
@@ -227,27 +161,550 @@ fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn complete_simple_native_configuration_matrix_runs_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let all_fp16 = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let extended_wrm = match SMOKE_LOSS_WRM {
+        LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            ..
+        } => LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.2,
+            weight_boost_w1: 1.5,
+            weight_boost_w2: 0.75,
+        },
+        LossKind::Sigmoid { .. } => unreachable!(),
+    };
+
+    for (activation, optimizer, norm_loss, loss) in [
+        (
+            SimpleActivation::CReLU,
+            OptimizerKind::Ranger,
+            None,
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            SimpleActivation::SCReLU,
+            OptimizerKind::RAdam,
+            None,
+            LossKind::Sigmoid { scale: 1.0 / 600.0 },
+        ),
+        (
+            SimpleActivation::Pairwise,
+            OptimizerKind::AdamW,
+            Some(0.25),
+            extended_wrm,
+        ),
+    ] {
+        let mut id = standard_id();
+        id.activation = activation;
+        assert_native_configuration_runs(&context, id, optimizer, norm_loss, all_fp16, loss)?;
+    }
+
+    assert_native_configuration_runs(
+        &context,
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags {
+            ft_fp16: true,
+            ..PrecisionFlags::default()
+        },
+        SMOKE_LOSS_WRM,
+    )?;
+
+    let mut factorized = standard_id();
+    factorized.feature_set = factorized.feature_set.with_ft_factorize();
+    assert_native_configuration_runs(
+        &context,
+        factorized,
+        OptimizerKind::Ranger,
+        None,
+        all_fp16,
+        SMOKE_LOSS_WRM,
+    )?;
+
+    let mut wide = standard_id();
+    wide.l1_out = 257;
+    wide.l2_out = 257;
+    assert_native_configuration_runs(
+        &context,
+        wide,
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags {
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+        SMOKE_LOSS_WRM,
+    )?;
+
+    for feature_set in FeatureSet::ALL {
+        let mut id = standard_id();
+        id.feature_set = feature_set.spec();
+        id.ft_out = 32;
+        id.l1_out = 16;
+        id.l2_out = 16;
+        assert_native_configuration_runs(
+            &context,
+            id,
+            OptimizerKind::Ranger,
+            None,
+            PrecisionFlags::default(),
+            SMOKE_LOSS_WRM,
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_native_configuration_runs(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+    loss: LossKind,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut trainer = create_trainer_with_options(
+        context,
+        id,
+        true,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+    let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    let forward_loss = trainer.forward(&batch.as_ref(), 0.0, loss)?;
+    assert!(forward_loss.is_finite());
+    trainer.assert_all_weights_finite()?;
+    Ok(())
+}
+
+#[test]
 #[cfg(feature = "native-cuda")]
 fn standard_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step(standard_id())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn factorized_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn screlu_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut id = standard_id();
+    id.activation = SimpleActivation::SCReLU;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn pairwise_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.activation = SimpleActivation::Pairwise;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn wide_hidden_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.l1_out = 257;
+    id.l2_out = 257;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn radam_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::RAdam,
+        PrecisionFlags::default(),
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn adamw_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::AdamW,
+        PrecisionFlags::default(),
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn tf32_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn ft_fp16_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn ft_fp16_out_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn ft_fp16_out_screlu_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.activation = SimpleActivation::SCReLU;
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        id,
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn ft_fp16_out_pairwise_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.activation = SimpleActivation::Pairwise;
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        id,
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn fp16_optimizer_state_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn all_fp16_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn factorized_all_fp16_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        id,
+        OptimizerKind::Ranger,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn all_fp16_adamw_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        standard_id(),
+        OptimizerKind::AdamW,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn all_fp16_ranger_lookahead_simple_native_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_with_training_options_and_steps(
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+        SMOKE_LOSS_WRM,
+        6,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn all_feature_sets_simple_native_match_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    for feature_set in FeatureSet::ALL {
+        let mut id = standard_id();
+        id.feature_set = feature_set.spec();
+        id.ft_out = 32;
+        id.l1_out = 16;
+        id.l2_out = 16;
+        assert_native_matches_cuda_oxide_after_one_step(id)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn norm_loss_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        Some(0.25),
+        PrecisionFlags::default(),
+        SMOKE_LOSS_WRM,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn sigmoid_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+        LossKind::Sigmoid { scale: 1.0 / 600.0 },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn extended_wrm_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let extended = match SMOKE_LOSS_WRM {
+        LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            ..
+        } => LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.2,
+            weight_boost_w1: 1.5,
+            weight_boost_w2: 0.75,
+        },
+        LossKind::Sigmoid { .. } => unreachable!(),
+    };
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+        extended,
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step(
+    id: SimpleId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_options(
+        id,
+        OptimizerKind::Ranger,
+        PrecisionFlags::default(),
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step_with_options(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    precision: PrecisionFlags,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        id,
+        optimizer,
+        None,
+        precision,
+        SMOKE_LOSS_WRM,
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+    loss: LossKind,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_with_training_options_and_steps(
+        id,
+        optimizer,
+        norm_loss_factor,
+        precision,
+        loss,
+        1,
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+    loss: LossKind,
+    steps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
-    let id = standard_id();
-    let mut oxide = create_trainer(&context, id, false, SMOKE_BATCH)?;
-    let mut native = create_trainer(&context, id, true, SMOKE_BATCH)?;
+    let mut oxide = create_trainer_with_options(
+        &context,
+        id,
+        false,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
+    let mut native = create_trainer_with_options(
+        &context,
+        id,
+        true,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
 
-    let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-    let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-    let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
-    let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    for _ in 0..steps {
+        let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+        let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    }
+    let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, loss)?;
+    let native_loss = native.forward(&batch.as_ref(), 0.0, loss)?;
+    assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_trainers_close(
+    id: SimpleId,
+    oxide_loss: f64,
+    native_loss: f64,
+    oxide: &SimpleGpuTrainer,
+    native: &SimpleGpuTrainer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if id.feature_set.ft_factorize() {
+        let oxide_master = oxide.ft_w_to_host()?;
+        let native_master = native.ft_w_to_host()?;
+        assert_weight_group_close("ft_w_master", &oxide_master, &native_master);
+    }
     let oxide_weights = oxide.to_simple_weights()?;
     let native_weights = native.to_simple_weights()?;
 
     let loss_difference = (oxide_loss - native_loss).abs();
     assert!(
-        loss_difference <= 2.0e-6 * (1.0 + oxide_loss.abs()),
+        loss_difference <= NATIVE_PARITY_TOLERANCE * (1.0 + oxide_loss.abs()),
         "loss differs: oxide={oxide_loss}, native={native_loss}, diff={loss_difference}"
     );
     for (name, oxide_group, native_group) in [
@@ -260,35 +717,222 @@ fn standard_simple_native_matches_cuda_oxide_after_one_step()
         ("l3_w", &oxide_weights.l3_w, &native_weights.l3_w),
         ("l3_b", &oxide_weights.l3_b, &native_weights.l3_b),
     ] {
-        assert_eq!(oxide_group.len(), native_group.len());
-        let mut maximum_difference = 0.0_f32;
-        let mut maximum_bound = 0.0_f32;
-        for (&expected, &actual) in oxide_group.iter().zip(native_group) {
-            let difference = (expected - actual).abs();
-            let bound = 2.0e-6 * (1.0 + expected.abs());
-            maximum_difference = maximum_difference.max(difference);
-            maximum_bound = maximum_bound.max(bound);
-            assert!(
-                difference <= bound,
-                "{name} differs: oxide={expected}, native={actual}, diff={difference}, bound={bound}"
-            );
-        }
-        eprintln!(
-            "[native-parity] {name}: max_abs_diff={maximum_difference:.3e}, max_bound={maximum_bound:.3e}"
-        );
+        assert_weight_group_close(name, oxide_group, native_group);
+    }
+    Ok(())
+}
+
+/// raw checkpoint が backend 非依存であることを、optimizer state と Ranger の
+/// `step_count` まで含めて固定する。片方の backend で 5 step 進めて保存し、同じ
+/// checkpoint を cuda-oxide / CUDA C++ の両方で読んだ直後の全 state を bit 比較する。
+/// 続く 6 step 目 (lookahead 発火点) の結果も無中断の 6 step 状態と比較する。保存元も
+/// 両 backend を試すため、双方向の resume を覆う。
+#[test]
+#[cfg(feature = "native-cuda")]
+fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let id = SimpleId {
+        feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
+        activation: SimpleActivation::Pairwise,
+        ft_out: 8,
+        l1_out: 8,
+        l2_out: 8,
+    };
+    let precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    for source_is_native in [false, true] {
+        let source_name = if source_is_native { "native" } else { "oxide" };
+        let path = std::env::temp_dir().join(format!(
+            "tatara-simple-native-resume-{source_name}-{}.ckpt",
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut source = create_trainer_with_options(
+                &context,
+                id,
+                source_is_native,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            for _ in 0..5 {
+                let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            }
+            let checkpoint_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(checkpoint_state.0, 5, "checkpoint source step count");
+            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let oracle_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(oracle_state.0, 6, "uninterrupted oracle step count");
+            drop(source);
+
+            let mut oxide = create_trainer_with_options(
+                &context,
+                id,
+                false,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            let mut native = create_trainer_with_options(
+                &context,
+                id,
+                true,
+                SMOKE_BATCH,
+                OptimizerKind::Ranger,
+                None,
+                precision,
+            )?;
+            for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
+                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
+                assert_eq!(superbatch, 17);
+                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(horizon, Some(42));
+                let loaded_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_bit_identical(
+                    &format!("{source_name} to {backend_name} load"),
+                    &checkpoint_state,
+                    &loaded_state,
+                );
+                trainer.sync_ft_forward_weights()?;
+                let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                let resumed_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_close(
+                    &format!("{source_name} to {backend_name}"),
+                    &oracle_state,
+                    &resumed_state,
+                );
+            }
+            let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+            let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+            assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
+        })();
+        let _ = std::fs::remove_file(&path);
+        result?;
     }
     Ok(())
 }
 
 #[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_bit_identical(
+    path: &str,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+) {
+    assert_eq!(actual.0, expected.0, "{path}: step count differs");
+    assert_eq!(
+        actual.1.len(),
+        expected.1.len(),
+        "{path}: group count differs"
+    );
+    for ((expected_name, expected_group), (actual_name, actual_group)) in
+        expected.1.iter().zip(&actual.1)
+    {
+        assert_eq!(actual_name, expected_name, "{path}: group name differs");
+        for (state_name, expected_values, actual_values) in [
+            ("weight", &expected_group.0, &actual_group.0),
+            ("first moment", &expected_group.1, &actual_group.1),
+            ("second moment", &expected_group.2, &actual_group.2),
+            ("slow weight", &expected_group.3, &actual_group.3),
+        ] {
+            assert_eq!(
+                expected_values.len(),
+                actual_values.len(),
+                "{path} {expected_name} {state_name}: length differs"
+            );
+            for (index, (&expected, &actual)) in
+                expected_values.iter().zip(actual_values).enumerate()
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{path} {expected_name} {state_name}[{index}]: expected={expected:?}, actual={actual:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_checkpoint_state_close(
+    path: &str,
+    expected: &SimpleRawCheckpointState,
+    actual: &SimpleRawCheckpointState,
+) {
+    assert_eq!(actual.0, expected.0, "{path}: step count differs");
+    assert_eq!(
+        actual.1.len(),
+        expected.1.len(),
+        "{path}: group count differs"
+    );
+    for ((expected_name, expected_group), (actual_name, actual_group)) in
+        expected.1.iter().zip(&actual.1)
+    {
+        assert_eq!(actual_name, expected_name, "{path}: group name differs");
+        for (state_name, expected_values, actual_values) in [
+            ("weight", &expected_group.0, &actual_group.0),
+            ("first moment", &expected_group.1, &actual_group.1),
+            ("second moment", &expected_group.2, &actual_group.2),
+            ("slow weight", &expected_group.3, &actual_group.3),
+        ] {
+            assert_weight_group_close(
+                &format!("{path} {expected_name} {state_name}"),
+                expected_values,
+                actual_values,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
+    assert_eq!(expected.len(), actual.len());
+    let mut maximum_difference = 0.0_f32;
+    let mut maximum_bound = 0.0_f32;
+    for (&expected, &actual) in expected.iter().zip(actual) {
+        let difference = (expected - actual).abs();
+        let bound = NATIVE_PARITY_TOLERANCE as f32 * (1.0 + expected.abs());
+        maximum_difference = maximum_difference.max(difference);
+        maximum_bound = maximum_bound.max(bound);
+        assert!(
+            difference <= bound,
+            "{name} differs: expected={expected}, actual={actual}, diff={difference}, bound={bound}"
+        );
+    }
+    eprintln!(
+        "[native-parity] {name}: max_abs_diff={maximum_difference:.3e}, max_bound={maximum_bound:.3e}"
+    );
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 fn benchmark_backend(
     context: &std::sync::Arc<CudaContext>,
     id: SimpleId,
     batch: &BatchData,
     native: bool,
     steps: usize,
+    precision: PrecisionFlags,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let mut trainer = create_trainer(context, id, native, batch.n_pos)?;
+    let mut trainer = create_trainer_with_options(
+        context,
+        id,
+        native,
+        batch.n_pos,
+        OptimizerKind::Ranger,
+        None,
+        precision,
+    )?;
     for _ in 0..3 {
         let _ = trainer.step(batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     }
@@ -300,6 +944,29 @@ fn benchmark_backend(
     let _ = TrainerBackend::flush_pending_loss(&mut trainer)?;
     let elapsed = start.elapsed().as_secs_f64();
     Ok(batch.n_pos as f64 * steps as f64 / elapsed)
+}
+
+#[cfg(feature = "native-cuda")]
+fn benchmark_backends_alternating(
+    context: &std::sync::Arc<CudaContext>,
+    id: SimpleId,
+    batch: &BatchData,
+    steps: usize,
+    precision: PrecisionFlags,
+    runs: usize,
+) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+    let mut oxide_total = 0.0;
+    let mut native_total = 0.0;
+    for run in 0..runs {
+        if run.is_multiple_of(2) {
+            oxide_total += benchmark_backend(context, id, batch, false, steps, precision)?;
+            native_total += benchmark_backend(context, id, batch, true, steps, precision)?;
+        } else {
+            native_total += benchmark_backend(context, id, batch, true, steps, precision)?;
+            oxide_total += benchmark_backend(context, id, batch, false, steps, precision)?;
+        }
+    }
+    Ok((oxide_total / runs as f64, native_total / runs as f64))
 }
 
 #[test]
@@ -314,6 +981,7 @@ fn benchmark_standard_simple_native_against_cuda_oxide() -> Result<(), Box<dyn s
     };
     let batch_size = parse("TATARA_NATIVE_BENCH_BATCH", 16_384);
     let steps = parse("TATARA_NATIVE_BENCH_STEPS", 20);
+    let runs = parse("TATARA_NATIVE_BENCH_RUNS", 3).max(1);
     let context = CudaContext::new(0)?;
     let id = standard_id();
     let mut owned = BatchData::smoke_dummy(batch_size, id.feature_set);
@@ -321,11 +989,94 @@ fn benchmark_standard_simple_native_against_cuda_oxide() -> Result<(), Box<dyn s
     owned.wdl.fill(0.8);
     let batch = owned.as_ref();
 
-    let oxide = benchmark_backend(&context, id, &batch, false, steps)?;
-    let native = benchmark_backend(&context, id, &batch, true, steps)?;
+    let (oxide, native) = benchmark_backends_alternating(
+        &context,
+        id,
+        &batch,
+        steps,
+        PrecisionFlags::default(),
+        runs,
+    )?;
     eprintln!(
-        "[native-bench] batch={batch_size}, steps={steps}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
+        "[native-bench] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
         native / oxide
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+#[ignore = "manual WSL performance comparison"]
+fn benchmark_factorized_fp16_simple_native_against_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    let parse = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let batch_size = parse("TATARA_NATIVE_BENCH_BATCH", 16_384);
+    let steps = parse("TATARA_NATIVE_BENCH_STEPS", 20);
+    let runs = parse("TATARA_NATIVE_BENCH_RUNS", 3).max(1);
+    let context = CudaContext::new(0)?;
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    let precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let mut owned = BatchData::smoke_dummy(batch_size, id.feature_set);
+    owned.score.fill(200.0);
+    owned.wdl.fill(0.8);
+    let batch = owned.as_ref();
+
+    let (oxide, native) =
+        benchmark_backends_alternating(&context, id, &batch, steps, precision, runs)?;
+    eprintln!(
+        "[native-bench-fp16] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
+        native / oxide
+    );
+    Ok(())
+}
+
+/// cuda-oxideをcompileできないnative Windowsでも、WSLと同じdummy batch・precisionで
+/// CUDA C++ backend単体のthroughputを測る。backend間比較は上のhybrid test、OS間の
+/// portability確認は本testと役割を分ける。
+#[test]
+#[ignore = "manual portable native performance comparison"]
+fn benchmark_factorized_fp16_simple_native_portable() -> Result<(), Box<dyn std::error::Error>> {
+    let parse = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let batch_size = parse("TATARA_NATIVE_BENCH_BATCH", 16_384);
+    let steps = parse("TATARA_NATIVE_BENCH_STEPS", 20);
+    let runs = parse("TATARA_NATIVE_BENCH_RUNS", 3).max(1);
+    let context = CudaContext::new(0)?;
+    let mut id = standard_id();
+    id.feature_set = id.feature_set.with_ft_factorize();
+    let precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
+    let mut owned = BatchData::smoke_dummy(batch_size, id.feature_set);
+    owned.score.fill(200.0);
+    owned.wdl.fill(0.8);
+    let batch = owned.as_ref();
+
+    let mut total = 0.0;
+    for _ in 0..runs {
+        total += benchmark_backend(&context, id, &batch, true, steps, precision)?;
+    }
+    let native = total / runs as f64;
+    eprintln!(
+        "[native-bench-portable-fp16] batch={batch_size}, steps={steps}, runs={runs}, native={native:.0} pos/s"
     );
     Ok(())
 }

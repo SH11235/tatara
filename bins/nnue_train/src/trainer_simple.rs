@@ -373,6 +373,9 @@ pub(crate) struct SimpleGpuTrainer {
     fv_scale: i32,
 }
 
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) type SimpleRawCheckpointState = (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
+
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
         // device buffer 解放前に compute / copy 両 stream の in-flight 操作を排出する
@@ -381,53 +384,6 @@ impl Drop for SimpleGpuTrainer {
         let _ = self.stream.synchronize();
         let _ = self.input_ring.copy_stream.synchronize();
     }
-}
-
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-pub(crate) fn validate_native_simple_configuration(
-    id: SimpleId,
-    optimizer: OptimizerKind,
-    norm_loss_factor: Option<f32>,
-    precision: PrecisionFlags,
-) -> Result<(), String> {
-    if id.activation != SimpleActivation::CReLU {
-        return Err("native CUDA currently supports only Simple CReLU".into());
-    }
-    if id.feature_set.ft_factorize() {
-        return Err("native CUDA does not yet support FT factorization".into());
-    }
-    if id.l1_out > DENSE_BIAS_GRAD_MAX_OUT as usize || id.l2_out > DENSE_BIAS_GRAD_MAX_OUT as usize
-    {
-        return Err(format!(
-            "native CUDA requires Simple hidden dimensions <= {DENSE_BIAS_GRAD_MAX_OUT} \
-             (got l1_out={}, l2_out={})",
-            id.l1_out, id.l2_out
-        ));
-    }
-    if optimizer != OptimizerKind::Ranger {
-        return Err(format!(
-            "native CUDA currently supports only the Ranger optimizer (got {})",
-            optimizer.name()
-        ));
-    }
-    if precision.tf32 {
-        return Err("native CUDA parity configuration requires TF32 to be disabled".into());
-    }
-    if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
-        return Err("native CUDA does not yet support FP16 training options".into());
-    }
-    if norm_loss_factor.is_some() {
-        return Err("native CUDA does not yet support norm loss".into());
-    }
-    Ok(())
-}
-
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-pub(crate) fn validate_native_simple_loss(loss: LossKind) -> Result<(), &'static str> {
-    if !matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended() {
-        return Err("native CUDA currently supports only the default WRM loss");
-    }
-    Ok(())
 }
 
 impl SimpleGpuTrainer {
@@ -444,17 +400,11 @@ impl SimpleGpuTrainer {
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested() {
-            validate_native_simple_configuration(id, optimizer, norm_loss_factor, precision)?;
-        }
-
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
-        debug_assert!(
-            !precision.ft_fp16_out || precision.ft_fp16,
-            "ft_fp16_out requires ft_fp16"
-        );
+        if precision.ft_fp16_out && !precision.ft_fp16 {
+            return Err("--ft-fp16-out requires --ft-fp16".into());
+        }
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
@@ -728,6 +678,20 @@ impl SimpleGpuTrainer {
         self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)
     }
 
+    /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
+    /// download する。resume の無中断学習 oracle との比較に使う。
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn raw_checkpoint_state_to_host(
+        &self,
+    ) -> Result<SimpleRawCheckpointState, Box<dyn std::error::Error>> {
+        let groups = self
+            .raw_ckpt_group_sources()
+            .iter()
+            .map(|source| Ok((source.name, source.to_host(&self.stream)?)))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok((self.step_count, groups))
+    }
+
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
     pub(crate) fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
         let groups: [(&DeviceBuffer<f32>, &str); 8] = [
@@ -897,11 +861,6 @@ impl SimpleGpuTrainer {
         loss: LossKind,
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested() {
-            validate_native_simple_loss(loss)?;
-        }
-
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
             Some(std::time::Instant::now())

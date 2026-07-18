@@ -40,6 +40,8 @@ fn main() {
     let codegen = format!("arch=compute_{compute},code=compute_{compute}");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"))
         .join("tatara_native.fatbin");
+    // Keep NVCC's default fmad=true for native throughput. CUDA C++ and cuda-oxide parity allows
+    // the resulting mul-add rounding differences with a 2e-6 tolerance instead of bit equality.
     let status = Command::new(&nvcc)
         .args([
             "--fatbin",

@@ -8,6 +8,36 @@ fn arg<T>(value: &mut T) -> *mut c_void {
     ptr::from_mut(value).cast()
 }
 
+/// NVCCがsource上のexportをfatbinから落としていないことをCUDA Driver APIで検証する。
+/// nnue-trainer側のtestがfactorizer helperを含む「Simpleの全launch symbol ⊆ source
+/// export」を確認し、本testが「全source export ⊆ 実artifact」を確認するため、両方で
+/// Simpleのsymbol coverageが閉じる。
+#[test]
+fn every_source_export_resolves_from_embedded_fatbin() {
+    let context = Context::new(0).unwrap();
+    let module = context.load_module(NATIVE_KERNEL_FATBIN).unwrap();
+    let source = include_str!("../kernels/native_kernels.cu");
+    let prefix = "extern \"C\" __global__ void ";
+    let mut resolved = 0;
+
+    for line in source.lines() {
+        let Some(declaration) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let name = declaration
+            .split_once('(')
+            .map(|(name, _)| name)
+            .expect("CUDA export declaration must contain '('");
+        let name = std::ffi::CString::new(name).expect("CUDA export name must not contain NUL");
+        module.function(&name).unwrap_or_else(|error| {
+            panic!("fatbin is missing {}: {error}", name.to_string_lossy())
+        });
+        resolved += 1;
+    }
+
+    assert_eq!(resolved, 53, "CUDA source export inventory changed");
+}
+
 #[test]
 fn vector_add_runs_from_embedded_fatbin() {
     let context = Context::new(0).unwrap();

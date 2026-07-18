@@ -7,11 +7,12 @@ cd "$(dirname "$0")/.."
 
 hybrid_log=$(mktemp /tmp/tatara-native-hybrid.XXXXXX)
 portable_log=$(mktemp /tmp/tatara-native-portable.XXXXXX)
-trap 'rm -f -- "$hybrid_log" "$portable_log"' EXIT
+portable_cli_dir=$(mktemp -d /tmp/tatara-native-cli.XXXXXX)
+trap 'rm -f -- "$hybrid_log" "$portable_log"; rm -r -- "$portable_cli_dir"' EXIT
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
 cargo test -p nnue-trainer --features native-cuda --release \
-    standard_simple_native_matches_cuda_oxide_after_one_step -- --nocapture --test-threads=1
+    simple_native_ -- --nocapture --test-threads=1
 
 echo "== cuda-oxide host fingerprint =="
 cargo test -p nnue-trainer --features native-cuda --release \
@@ -23,8 +24,36 @@ cargo test -p nnue-trainer --no-default-features --features native-cuda-host --r
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
 
+echo "== portable host Simple configuration matrix =="
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+    complete_simple_native_configuration_matrix_runs_one_step -- --nocapture --test-threads=1
+
 echo "== portable host CLI smoke =="
 cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+
+echo "== portable host full Simple CLI training =="
+portable_cli_args=(
+    --data crates/shogi-format/tests/data/sample.psv
+    --output "$portable_cli_dir"
+    --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise
+    --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1
+    --win-rate-model --scale 600 --wrm-nnue2score 600
+    --loss-pow-exp 2.5 --loss-qp-asymmetry 0.2
+    --loss-weight-boost-w1 1.5 --loss-weight-boost-w2 0.75
+    --optimizer adamw --weight-decay 0.0001
+    --norm-loss --norm-loss-factor 0.0001 --all-optim
+)
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple \
+    "${portable_cli_args[@]}" --net-id native-simple-cli --superbatches 1
+test -s "$portable_cli_dir/native-simple-cli-1.bin"
+test -s "$portable_cli_dir/native-simple-cli-1.ckpt"
+
+echo "== portable host Simple CLI resume =="
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple \
+    "${portable_cli_args[@]}" --net-id native-simple-cli-resume --superbatches 2 \
+    --resume "$portable_cli_dir/native-simple-cli-1.ckpt"
+test -s "$portable_cli_dir/native-simple-cli-resume-2.bin"
+test -s "$portable_cli_dir/native-simple-cli-resume-2.ckpt"
 
 extract_fingerprint() {
     sed -n 's/^.*\[native-host-parity\] //p' "$1" | tail -n 1

@@ -14,7 +14,7 @@ end).
 | OS | Status | Steps |
 |---|---|---|
 | Linux | First-class support (verified on Ubuntu 22.04 / 24.04) | Follow the steps in this file directly |
-| Windows | WSL2 is the default backend. The CUDA C++ backend on `feat/cuda-cpp-backend` also supports native Windows experimentally | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
+| Windows | WSL2 is the default backend. The CUDA C++ backend also supports native Windows experimentally | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
 | macOS | GPU builds unsupported | Work on a remote Linux machine with an NVIDIA GPU (see below) |
 
 cuda-oxide and this repo's GPU crates require an **NVIDIA GPU + the CUDA
@@ -29,8 +29,8 @@ whole workspace fails on the cuda-oxide-dependent build.
 
 ## Native Windows (experimental)
 
-The `native-cuda-host` feature on `feat/cuda-cpp-backend` does not use
-cuda-oxide. It launches NVCC-built CUDA C++ kernels through a portable Rust
+The `native-cuda-host` feature does not use cuda-oxide. It launches NVCC-built
+CUDA C++ kernels through a portable Rust
 CUDA Driver API runtime. The build, GPU smoke tests, and one native trainer step
 have been verified on Windows 11 with an RTX 5090, driver 596.36, CUDA Toolkit
 12.9.86, Visual Studio 2022 (MSVC 19.44), and Rust nightly-2026-04-03. This is
@@ -91,11 +91,44 @@ cargo run -p nnue-trainer --no-default-features --features native-cuda-host --re
 The last command runs a GPU smoke test without training data, restricted to the
 native backend's supported scope. It succeeds with a final `[smoke/simple] PASSED` line.
 
-The current scope is Simple (including HalfKaHmMerged), CReLU, hidden dimensions
-up to 256, FP32 with TF32 disabled, factorizer off, default WRM, and Ranger.
-LayerStack, SCReLU / Pairwise, hidden dimensions above 256, RAdam / AdamW,
-TF32 / FP16 options or state, FT factorizer, norm loss, and non-default extended
-losses are unsupported and rejected at startup.
+To exercise the production CLI, dataloader, extended WRM, factorizer, all FP16
+paths, TF32, AdamW, norm loss, and both checkpoint formats in one short run:
+
+```powershell
+$smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
+cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+  --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
+  --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
+  --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
+  --win-rate-model --scale 600 --wrm-nnue2score 600 `
+  --loss-pow-exp 2.5 --loss-qp-asymmetry 0.2 `
+  --loss-weight-boost-w1 1.5 --loss-weight-boost-w2 0.75 `
+  --optimizer adamw --weight-decay 0.0001 `
+  --norm-loss --norm-loss-factor 0.0001 --all-optim
+Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckpt"
+```
+
+The run must finish normally and both files must be non-empty.
+
+For an OS-to-OS throughput comparison with the same in-memory fixture, run:
+
+```powershell
+$env:TATARA_NATIVE_BENCH_BATCH = '16384'
+$env:TATARA_NATIVE_BENCH_STEPS = '100'
+$env:TATARA_NATIVE_BENCH_RUNS = '3'
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release `
+  benchmark_factorized_fp16_simple_native_portable -- --ignored --nocapture --test-threads=1
+```
+
+Compare the reported `[native-bench-portable-fp16]` value with a WSL run using
+the same three environment variables. This measures the trainer kernels on a
+dummy batch; it does not include PSV decoding or disk I/O.
+
+The current scope is Simple (including HalfKaHmMerged), CReLU / SCReLU / Pairwise,
+arbitrary hidden dimensions, FP32 and FP16 options or state with TF32 on or off,
+factorizer on or off, Sigmoid or WRM (including extended settings), norm loss,
+and Ranger / RAdam / AdamW. It contains every kernel that Simple can launch.
+LayerStack is unsupported and rejected at startup.
 
 ## Preparing Windows (WSL2)
 
