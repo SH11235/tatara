@@ -85,6 +85,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
+    trainer.sync_ft_forward_weights()?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
         + id.combined_dim() * id.l1_out
@@ -182,7 +183,9 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let weights = trainer.to_simple_weights()?;
     let mut quantised_bytes = Vec::new();
     weights.save_quantised(&mut quantised_bytes)?;
-    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&quantised_bytes), id)?;
+    // Factorized training exports folded base-shape weights, so preserve the exported ID when
+    // loading them instead of reattaching the trainer's virtual-row factorizer modifier.
+    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&quantised_bytes), weights.id)?;
     if reloaded.fv_scale != smoke_fv_scale {
         return Err(format!(
             "SimpleWeights round-trip: fv_scale mismatch (got {}, want {smoke_fv_scale})",
@@ -193,7 +196,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let mut trainer_q = SimpleGpuTrainer::new(
         &ctx,
         SMOKE_BATCH,
-        id,
+        reloaded.id,
         OptimizerKind::Ranger,
         smoke_weight_decay,
         None,
@@ -202,6 +205,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
+    trainer_q.sync_ft_forward_weights()?;
     let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     println!(
         "[smoke/simple] quantised round-trip: trained loss {final_loss:.6e} \
