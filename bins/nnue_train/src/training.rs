@@ -126,6 +126,7 @@ struct SharedCliValidation {
     feature_set: FeatureSetSpec,
     precision: SharedPrecisionFlags,
     optimizer: OptimizerKind,
+    optimizer_beta1: f32,
 }
 
 #[cfg(feature = "gpu")]
@@ -245,6 +246,13 @@ fn validate_shared_cli(
             cli.optimizer
         )
     })?;
+    let optimizer_beta1 = cli.optimizer_beta1.unwrap_or_else(|| optimizer.beta1());
+    if !(optimizer_beta1.is_finite() && optimizer_beta1 > 0.0 && optimizer_beta1 < 1.0) {
+        return Err(format!(
+            "--optimizer-beta1 must be finite and satisfy 0 < beta1 < 1 (got {optimizer_beta1})"
+        )
+        .into());
+    }
     // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
     if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
         return Err(
@@ -293,6 +301,7 @@ fn validate_shared_cli(
     Ok(SharedCliValidation {
         feature_set,
         optimizer,
+        optimizer_beta1,
         precision: SharedPrecisionFlags {
             ft_fp16: cli.ft_fp16 || cli.all_optim,
             ft_fp16_out: ft_fp16_out_raw || cli.all_optim,
@@ -665,6 +674,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             e
         }
     })?;
+    trainer.set_optimizer_beta1(shared.optimizer_beta1)?;
+    println!(
+        "[train] optimizer: {} | beta1={}",
+        shared.optimizer.name(),
+        shared.optimizer_beta1
+    );
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
@@ -1916,6 +1931,12 @@ pub(crate) fn run_simple_training(
             e
         }
     })?;
+    trainer.set_optimizer_beta1(shared.optimizer_beta1)?;
+    println!(
+        "[train] optimizer: {} | beta1={}",
+        shared.optimizer.name(),
+        shared.optimizer_beta1
+    );
 
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
         Option<usize>,
@@ -2127,7 +2148,13 @@ mod shared_cli_tests {
             let shared = validate_shared_cli(&parse(&["--optimizer", arg]), false, false)
                 .expect("valid shared CLI");
             assert_eq!(shared.optimizer, expected, "--optimizer {arg}");
+            assert_eq!(shared.optimizer_beta1, expected.beta1());
         }
+
+        let overridden = validate_shared_cli(&parse(&["--optimizer-beta1", "0.975"]), false, false)
+            .expect("valid beta1 override");
+        assert_eq!(overridden.optimizer_beta1, 0.975);
+        assert!(shared_cli_error(&["--optimizer-beta1", "1"], false).contains("0 < beta1 < 1"));
     }
 
     #[test]

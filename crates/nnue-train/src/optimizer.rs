@@ -78,9 +78,22 @@ impl OptimizerKind {
     /// bias correction を行わないため step によらず `(1.0, 1)` で、kernel の
     /// 更新式は `p -= lr * m / (sqrt(v) + eps)` に退化する。
     pub fn step_size_denom(self, step: u64, beta2: f32, n_sma_threshold: f32) -> (f32, i32) {
+        self.step_size_denom_with_beta1(step, self.beta1(), beta2, n_sma_threshold)
+    }
+
+    /// [`Self::step_size_denom`] with an explicit beta1 override. This keeps
+    /// optimizer-kind semantics (rectification and lookahead selection) while
+    /// allowing controlled beta1 ablations.
+    pub fn step_size_denom_with_beta1(
+        self,
+        step: u64,
+        beta1: f32,
+        beta2: f32,
+        n_sma_threshold: f32,
+    ) -> (f32, i32) {
         match self {
             Self::Ranger | Self::RAdam => {
-                radam_compute_step_size_denom(step, self.beta1(), beta2, n_sma_threshold)
+                radam_compute_step_size_denom(step, beta1, beta2, n_sma_threshold)
             }
             Self::AdamW => (1.0, 1),
         }

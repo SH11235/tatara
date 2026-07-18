@@ -330,6 +330,11 @@ pub(crate) struct Cli {
     /// stores moment buffers but not the optimizer name).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
+    /// Override the optimizer first-moment decay. When omitted, the selected
+    /// optimizer keeps its historical default (ranger=0.99, radam/adamw=0.9).
+    /// This value affects training dynamics and must be repeated on resume.
+    #[arg(long, global = true)]
+    pub(crate) optimizer_beta1: Option<f32>,
     /// Weight decay coefficient for the optimizer (AdamW-style decoupled
     /// weight decay). The default 0.0 means no decay. A non-zero value slightly
     /// decays the weights of every weight group toward 0 on each step.

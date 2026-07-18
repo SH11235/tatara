@@ -262,6 +262,7 @@ pub(crate) struct GpuTrainer {
     num_buckets: usize,
     bucket_mode: BucketMode,
     optimizer: OptimizerKind,
+    optimizer_beta1: f32,
     step_count: u64,
 }
 
@@ -1011,6 +1012,7 @@ impl GpuTrainer {
             num_buckets,
             bucket_mode,
             optimizer,
+            optimizer_beta1: optimizer.beta1(),
             step_count: 0,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -1019,6 +1021,17 @@ impl GpuTrainer {
         // --resume) は load 後に caller が再同期する。
         trainer.sync_ft_forward_weights()?;
         Ok(trainer)
+    }
+
+    pub(crate) fn set_optimizer_beta1(
+        &mut self,
+        beta1: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !(beta1.is_finite() && beta1 > 0.0 && beta1 < 1.0) {
+            return Err(format!("optimizer beta1 must satisfy 0 < beta1 < 1 (got {beta1})").into());
+        }
+        self.optimizer_beta1 = beta1;
+        Ok(())
     }
 
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
@@ -3719,10 +3732,13 @@ impl GpuTrainer {
         // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
         // 有無だけで表現する ([`OptimizerKind`])。
         self.step_count += 1;
-        let (step_size, denom) =
-            self.optimizer
-                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
-        let beta1 = self.optimizer.beta1();
+        let beta1 = self.optimizer_beta1;
+        let (step_size, denom) = self.optimizer.step_size_denom_with_beta1(
+            self.step_count,
+            beta1,
+            BETA2,
+            N_SMA_THRESHOLD,
+        );
         // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
         // `&mut self.*` を保持するので、loop 内で `self.optim_groups` を参照すると
         // borrow が衝突する。先に局所へ退避して resolve に使う。

@@ -359,6 +359,9 @@ pub(crate) struct SimpleGpuTrainer {
     step_count: u64,
     /// optimizer 種別 (per-step scalar / beta1 / lookahead 有無を決める)。
     optimizer: OptimizerKind,
+    /// optimizer first-moment decay. Defaults to the optimizer-kind value and
+    /// may be overridden by `--optimizer-beta1` before training starts.
+    optimizer_beta1: f32,
     /// weight decay 係数 (`radam_step` 引数)。
     weight_decay: f32,
     /// oblique manifold norm-loss 正則化の係数 (`--norm-loss` opt-in、無効時 `None`)。
@@ -579,6 +582,7 @@ impl SimpleGpuTrainer {
             id,
             step_count: 0,
             optimizer,
+            optimizer_beta1: optimizer.beta1(),
             weight_decay,
             norm_loss_factor,
             norm_scratch,
@@ -588,6 +592,17 @@ impl SimpleGpuTrainer {
             ft_fp16_out: precision.ft_fp16_out,
             fp16_opt_state: precision.fp16_opt_state,
         })
+    }
+
+    pub(crate) fn set_optimizer_beta1(
+        &mut self,
+        beta1: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !(beta1.is_finite() && beta1 > 0.0 && beta1 < 1.0) {
+            return Err(format!("optimizer beta1 must satisfy 0 < beta1 < 1 (got {beta1})").into());
+        }
+        self.optimizer_beta1 = beta1;
+        Ok(())
     }
 
     /// forward が読む FT weight buffer (`ft_w_h` mirror / factorizer の comb) を現在の
@@ -2358,10 +2373,13 @@ impl SimpleGpuTrainer {
     /// `run_backward_kernels` の直後に呼ぶ。
     pub(crate) fn run_optimizer_step(&mut self, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.step_count += 1;
-        let (step_size, denom) =
-            self.optimizer
-                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
-        let beta1 = self.optimizer.beta1();
+        let beta1 = self.optimizer_beta1;
+        let (step_size, denom) = self.optimizer.step_size_denom_with_beta1(
+            self.step_count,
+            beta1,
+            BETA2,
+            N_SMA_THRESHOLD,
+        );
 
         let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
