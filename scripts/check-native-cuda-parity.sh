@@ -11,7 +11,7 @@ trap 'rm -f -- "$hybrid_log" "$portable_log"' EXIT
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
 cargo test -p nnue-trainer --features native-cuda --release \
-    simple_native_matches_cuda_oxide_after_one_step -- --nocapture --test-threads=1
+    simple_native_ -- --nocapture --test-threads=1
 
 echo "== cuda-oxide host fingerprint =="
 cargo test -p nnue-trainer --features native-cuda --release \

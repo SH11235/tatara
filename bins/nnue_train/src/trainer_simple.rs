@@ -383,18 +383,6 @@ impl Drop for SimpleGpuTrainer {
     }
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-pub(crate) fn validate_native_simple_configuration(
-    _id: SimpleId,
-    _norm_loss_factor: Option<f32>,
-    precision: PrecisionFlags,
-) -> Result<(), String> {
-    if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
-        return Err("native CUDA does not yet support FP16 training options".into());
-    }
-    Ok(())
-}
-
 impl SimpleGpuTrainer {
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     #[allow(clippy::too_many_arguments)]
@@ -409,11 +397,6 @@ impl SimpleGpuTrainer {
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested() {
-            validate_native_simple_configuration(id, norm_loss_factor, precision)?;
-        }
-
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
         debug_assert!(

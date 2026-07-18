@@ -60,7 +60,8 @@ cargo build -p nnue-trainer \
 ```
 
 `native-cuda-host`で現在対応するのは、HalfKaHmMergedを含むSimple、CReLU / SCReLU /
-Pairwise、任意のhidden dimension、FP32（TF32有効または無効）、factorizer有効または
-無効、Sigmoid / WRM（拡張設定を含む）、norm loss、Ranger / RAdam / AdamWの組合せである。
-LayerStackとFP16は起動時に拒否する。cuBLASはCUDA ToolkitのC APIを直接呼び、stream
+Pairwise、任意のhidden dimension、FP32 / FP16 option/state（TF32有効または無効）、
+factorizer有効または無効、Sigmoid / WRM（拡張設定を含む）、norm loss、Ranger / RAdam /
+AdamWの組合せであり、Simpleが起動し得る全kernelを収録する。LayerStackは起動時に拒否する。
+cuBLASはCUDA ToolkitのC APIを直接呼び、stream
 handleだけを共通runtimeから受け取るためcuda-oxideの型には依存しない。

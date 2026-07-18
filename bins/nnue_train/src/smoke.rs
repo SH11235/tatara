@@ -19,9 +19,9 @@ fn native_simple_smoke_scope() -> bool {
 }
 
 /// Simple アーキ用 smoke test。preset `256x2-32-32` (HalfKaHmMerged + CReLU) で
-/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む。native backendでは対応契約どおり
-/// CReLU / FP32 / Ranger / default WRMだけを検査し、未実装経路は起動しない。
-/// cuda-oxide backendでは全経路を検査する:
+/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む。native backendではfactorizerと
+/// FP16 weight/output/optimizer stateを同時に有効化し、portable host pathも含めて検査する。
+/// cuda-oxide backendでは追加の活性化/loss経路も検査する:
 /// 1. forward sanity — CReLU + SCReLU 両活性化 + sigmoid / WRM 両 loss kernel を
 ///    1 step ずつ launch して loss が finite であること。
 /// 2. step が gradient を正しく配線していることを 10 step の loss 推移で確認する
@@ -45,7 +45,10 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     println!("[smoke/simple] CUDA context created, loading kernel module...");
     if native_scope {
-        println!("[smoke/simple] native scope: CReLU, FP32, FT factorizer, Ranger, default WRM");
+        println!(
+            "[smoke/simple] native scope: CReLU, FT factorizer, FP16 weight/output/state, \
+             Ranger, default WRM"
+        );
     }
     let feature_set = if native_scope {
         FeatureSet::HalfKaHmMerged.spec().with_ft_factorize()
@@ -61,6 +64,16 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     };
     let smoke_fv_scale = 16_i32;
     let smoke_weight_decay = 1e-7_f32;
+    let smoke_precision = if native_scope {
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        }
+    } else {
+        PrecisionFlags::default()
+    };
     let mut trainer = SimpleGpuTrainer::new(
         &ctx,
         SMOKE_BATCH,
@@ -69,7 +82,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_weight_decay,
         None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
     let params = id.ft_in() * id.ft_out
@@ -185,7 +198,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_weight_decay,
         None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
@@ -215,7 +228,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_weight_decay,
         None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
@@ -240,8 +253,8 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     if native_scope {
         println!(
-            "[smoke/simple] PASSED — native factorized CReLU/default-WRM forward + gradient + \
-             quantised round-trip + raw round-trip OK"
+            "[smoke/simple] PASSED — native factorized FP16 CReLU/default-WRM forward + \
+             gradient + quantised round-trip + raw round-trip OK"
         );
         return Ok(());
     }
