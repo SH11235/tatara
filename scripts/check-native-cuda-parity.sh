@@ -17,7 +17,7 @@ cargo test -p cuda-native-runtime --features native-cuda --release -- \
 
 echo "== native CUDA production launch inventory =="
 cargo test -p nnue-trainer --features native-cuda --release \
-    native_inventory_parser_accepts_inline_and_multiline_launches -- --nocapture
+    native_inventory_parser -- --nocapture
 cargo test -p nnue-trainer --features native-cuda --release \
     every_production_cuda_launch_is_exported -- --nocapture
 

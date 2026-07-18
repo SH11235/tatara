@@ -52,89 +52,58 @@ fn standard_id() -> SimpleId {
 }
 
 fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
-    let mut symbols = std::collections::BTreeSet::new();
-    let mut cursor = 0;
-    while let Some(relative_macro) = source[cursor..].find("cuda_launch!") {
-        let after_macro = cursor + relative_macro + "cuda_launch!".len();
-        let whitespace = source[after_macro..]
-            .len()
-            .saturating_sub(source[after_macro..].trim_start().len());
-        let opening = after_macro + whitespace;
-        let Some(opening_delimiter) = source[opening..].chars().next() else {
-            break;
-        };
-        if !matches!(opening_delimiter, '{' | '(' | '[') {
-            cursor = after_macro;
-            continue;
-        }
-
-        let mut delimiters = Vec::new();
-        let mut closing = None;
-        for (relative, character) in source[opening..].char_indices() {
-            match character {
-                '{' | '(' | '[' => delimiters.push(character),
-                '}' | ')' | ']' => {
-                    let expected = match character {
-                        '}' => '{',
-                        ')' => '(',
-                        ']' => '[',
-                        _ => unreachable!(),
+    fn visit(stream: proc_macro2::TokenStream, symbols: &mut std::collections::BTreeSet<String>) {
+        let mut tokens = stream.into_iter().peekable();
+        while let Some(token) = tokens.next() {
+            match token {
+                proc_macro2::TokenTree::Ident(ident) if ident == "cuda_launch" => {
+                    let is_macro = matches!(
+                        tokens.peek(),
+                        Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == '!'
+                    );
+                    if !is_macro {
+                        continue;
+                    }
+                    tokens.next();
+                    let Some(proc_macro2::TokenTree::Group(body)) = tokens.next() else {
+                        panic!("cuda_launch! must be followed by a delimited macro body");
                     };
-                    if delimiters.pop() != Some(expected) {
+                    let mut body_tokens = body.stream().into_iter().peekable();
+                    let mut kernel_symbol = None;
+                    while let Some(body_token) = body_tokens.next() {
+                        let proc_macro2::TokenTree::Ident(field) = body_token else {
+                            continue;
+                        };
+                        if field != "kernel" {
+                            continue;
+                        }
+                        let has_colon = matches!(
+                            body_tokens.next(),
+                            Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == ':'
+                        );
+                        if !has_colon {
+                            continue;
+                        }
+                        if let Some(proc_macro2::TokenTree::Ident(symbol)) = body_tokens.next() {
+                            kernel_symbol = Some(symbol.to_string());
+                        }
                         break;
                     }
-                    if delimiters.is_empty() {
-                        closing = Some(opening + relative + character.len_utf8());
-                        break;
-                    }
+                    symbols.insert(
+                        kernel_symbol.expect("cuda_launch! must contain `kernel: <identifier>`"),
+                    );
                 }
+                proc_macro2::TokenTree::Group(group) => visit(group.stream(), symbols),
                 _ => {}
             }
         }
-        let Some(closing) = closing else {
-            cursor = after_macro;
-            continue;
-        };
-        let body = &source[opening..closing];
-        let mut body_cursor = 0;
-        while let Some(relative_kernel) = body[body_cursor..].find("kernel") {
-            let kernel_start = body_cursor + relative_kernel;
-            let before_is_identifier = body[..kernel_start]
-                .chars()
-                .next_back()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
-            let mut value_start = kernel_start + "kernel".len();
-            let after_is_identifier = body[value_start..]
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
-            if before_is_identifier || after_is_identifier {
-                body_cursor = value_start;
-                continue;
-            }
-            value_start += body[value_start..]
-                .len()
-                .saturating_sub(body[value_start..].trim_start().len());
-            if !body[value_start..].starts_with(':') {
-                body_cursor = value_start;
-                continue;
-            }
-            value_start += 1;
-            value_start += body[value_start..]
-                .len()
-                .saturating_sub(body[value_start..].trim_start().len());
-            let symbol_len = body[value_start..]
-                .chars()
-                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
-                .map(char::len_utf8)
-                .sum::<usize>();
-            if symbol_len != 0 {
-                symbols.insert(body[value_start..value_start + symbol_len].to_owned());
-            }
-            body_cursor = value_start + symbol_len;
-        }
-        cursor = closing;
     }
+
+    let mut symbols = std::collections::BTreeSet::new();
+    visit(
+        source.parse().expect("Rust source must tokenize"),
+        &mut symbols,
+    );
     symbols
 }
 
@@ -181,6 +150,40 @@ fn native_inventory_parser_accepts_inline_and_multiline_launches() {
             .into_iter()
             .collect()
     );
+}
+
+#[test]
+fn native_inventory_parser_ignores_comments_and_string_delimiters() {
+    let source = r#"
+        fn launch() {
+            let _ignored = "cuda_launch! { kernel: string_fake, args: [\"]\"] }";
+            // cuda_launch! { kernel: line_comment_fake }
+            /* cuda_launch![kernel: block_comment_fake] */
+            cuda_launch! /* comment with } ] ) */ {
+                kernel: comment_separated,
+                args: ["}", "]", ")"],
+            };
+            cuda_launch![
+                kernel: bracket_delimited,
+                args: [call("}"), nested({ 1 })],
+            ];
+        }
+    "#;
+    assert_eq!(
+        cuda_launch_symbols(source),
+        [
+            "bracket_delimited".to_owned(),
+            "comment_separated".to_owned()
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+#[should_panic(expected = "cuda_launch! must contain `kernel: <identifier>`")]
+fn native_inventory_parser_rejects_unrecognized_launches() {
+    let _ = cuda_launch_symbols("cuda_launch! { stream: stream, args: [] }");
 }
 
 #[test]
@@ -362,6 +365,27 @@ fn large_batch_multistep_layerstack_native_matches_cuda_oxide()
     assert_layerstack_native_matches_cuda_oxide_with_batch(
         LayerStackTestOptions {
             num_buckets: 9,
+            ..LayerStackTestOptions::standard()
+        },
+        SMOKE_LOSS_WRM,
+        3,
+        16_384,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn large_batch_multistep_all_optim_layerstack_native_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_layerstack_native_matches_cuda_oxide_with_batch(
+        LayerStackTestOptions {
+            num_buckets: 9,
+            precision: PrecisionFlags {
+                tf32: true,
+                ft_fp16: true,
+                ft_fp16_out: true,
+                fp16_opt_state: true,
+            },
             ..LayerStackTestOptions::standard()
         },
         SMOKE_LOSS_WRM,

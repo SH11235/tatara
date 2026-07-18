@@ -512,6 +512,7 @@ dependencies = [
  "gpu-runtime",
  "nnue-format",
  "nnue-train",
+ "proc-macro2",
  "serde_json",
  "shogi-features",
  "shogi-format",

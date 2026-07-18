@@ -64,3 +64,6 @@ cuda-host = { workspace = true, optional = true }
 [dev-dependencies]
 # builder が experiment.json に記録した `results.fv_scale` を読み出して検証する。
 serde_json = "1"
+# production CUDA launch inventoryをRust token単位で走査し、コメントや文字列内の
+# delimiterをmacro構文と誤認しないようにする。
+proc-macro2 = "1"
