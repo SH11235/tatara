@@ -10,9 +10,19 @@ rust-version = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+default = ["cuda-oxide"]
+cuda-oxide = ["dep:cuda-core", "dep:cuda-host"]
+native-cuda = ["dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
+
 # cuda-oxide host API。git rev pin と選定理由は root Cargo.toml の
 # [workspace.dependencies] に集約。
 [dependencies]
-cuda-core = { workspace = true }
-cuda-host = { workspace = true }
+cuda-core = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }
+cuda-native-runtime = { workspace = true, optional = true }
 thiserror = "2"
+
+[[example]]
+name = "vecadd_demo"
+required-features = ["cuda-oxide"]

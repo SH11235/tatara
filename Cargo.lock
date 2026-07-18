@@ -262,6 +262,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-native-runtime"
+version = "0.5.0"
+dependencies = [
+ "gpu-kernels",
+ "thiserror",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -326,6 +334,7 @@ version = "0.5.0"
 dependencies = [
  "cuda-core",
  "cuda-host",
+ "cuda-native-runtime",
  "thiserror",
 ]
 
@@ -498,6 +507,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "cuda-native-runtime",
  "gpu-kernels",
  "gpu-runtime",
  "nnue-format",

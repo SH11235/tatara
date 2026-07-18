@@ -7,8 +7,21 @@ use shogi_features::FeatureSet;
 
 use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*};
 
+fn native_simple_smoke_scope() -> bool {
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    {
+        crate::kernel_module::native_backend_requested()
+    }
+    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
+    {
+        false
+    }
+}
+
 /// Simple アーキ用 smoke test。preset `256x2-32-32` (HalfKaHmMerged + CReLU) で
-/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む:
+/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む。native backendでは対応契約どおり
+/// CReLU / FP32 / Ranger / default WRMだけを検査し、未実装経路は起動しない。
+/// cuda-oxide backendでは全経路を検査する:
 /// 1. forward sanity — CReLU + SCReLU 両活性化 + sigmoid / WRM 両 loss kernel を
 ///    1 step ずつ launch して loss が finite であること。
 /// 2. step が gradient を正しく配線していることを 10 step の loss 推移で確認する
@@ -18,8 +31,22 @@ use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*
 /// 4. `save_raw_checkpoint` → 新 trainer での `load_raw_checkpoint` 後の forward が
 ///    元と完全一致 (raw f32 round-trip の exact preservation)。
 pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let native_scope = native_simple_smoke_scope();
+    let primary_loss = if native_scope {
+        SMOKE_LOSS_WRM
+    } else {
+        SMOKE_LOSS_SIGMOID
+    };
+    let primary_loss_name = if native_scope {
+        "default WRM"
+    } else {
+        "sigmoid-MSE"
+    };
     let ctx = CudaContext::new(0)?;
     println!("[smoke/simple] CUDA context created, loading kernel module...");
+    if native_scope {
+        println!("[smoke/simple] native scope: CReLU, FP32, Ranger, default WRM");
+    }
     let id = SimpleId {
         feature_set: FeatureSet::HalfKaHmMerged.spec(),
         activation: SimpleActivation::CReLU,
@@ -61,38 +88,40 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
 
     let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-    let loss = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] forward 1 (sigmoid-MSE, crelu): loss = {loss:.6e}");
+    let loss = trainer.forward(&batch.as_ref(), 0.0, primary_loss)?;
+    println!("[smoke/simple] forward 1 ({primary_loss_name}, crelu): loss = {loss:.6e}");
     if !loss.is_finite() {
         return Err(format!("forward 1 loss = {loss} is not finite").into());
     }
     trainer.assert_all_weights_finite()?;
 
-    let id_screlu = SimpleId {
-        activation: SimpleActivation::SCReLU,
-        ..id
-    };
-    let mut trainer_screlu = SimpleGpuTrainer::new(
-        &ctx,
-        SMOKE_BATCH,
-        id_screlu,
-        OptimizerKind::Ranger,
-        smoke_weight_decay,
-        None,
-        smoke_fv_scale,
-        PrecisionFlags::default(),
-        &SimpleInit::default_uniform(),
-    )?;
-    let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
-    if !loss_screlu.is_finite() {
-        return Err(format!("forward 2 loss = {loss_screlu} is not finite").into());
-    }
+    if !native_scope {
+        let id_screlu = SimpleId {
+            activation: SimpleActivation::SCReLU,
+            ..id
+        };
+        let mut trainer_screlu = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id_screlu,
+            OptimizerKind::Ranger,
+            smoke_weight_decay,
+            None,
+            smoke_fv_scale,
+            PrecisionFlags::default(),
+            &SimpleInit::default_uniform(),
+        )?;
+        let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+        println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
+        if !loss_screlu.is_finite() {
+            return Err(format!("forward 2 loss = {loss_screlu} is not finite").into());
+        }
 
-    let loss_wrm_val = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
-    println!("[smoke/simple] forward 3 (win-rate-model, crelu): loss = {loss_wrm_val:.6e}");
-    if !loss_wrm_val.is_finite() {
-        return Err(format!("forward 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+        let loss_wrm_val = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+        println!("[smoke/simple] forward 3 (win-rate-model, crelu): loss = {loss_wrm_val:.6e}");
+        if !loss_wrm_val.is_finite() {
+            return Err(format!("forward 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+        }
     }
     println!("[smoke/simple] forward sanity OK ✓");
 
@@ -107,16 +136,16 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     for w in training_batch.wdl.iter_mut() {
         *w = 0.8;
     }
-    let lr = 1e-1_f32;
-    let initial_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let lr = if native_scope { 1e-3_f32 } else { 1e-1_f32 };
+    let initial_loss = trainer.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     for step_idx in 0..10 {
-        let step_loss = trainer.step(&training_batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+        let step_loss = trainer.step(&training_batch.as_ref(), lr, 0.0, primary_loss)?;
         if !step_loss.is_finite() {
             return Err(format!("step {step_idx} loss = {step_loss} is not finite").into());
         }
     }
     trainer.assert_all_weights_finite()?;
-    let final_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let final_loss = trainer.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     println!("[smoke/simple] 10-step training: loss {initial_loss:.6e} -> {final_loss:.6e}");
     // NaN は `>=` でも `<` でも false になるので、`is_finite` で別途弾く。
     if !final_loss.is_finite() || final_loss >= initial_loss {
@@ -155,7 +184,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
-    let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     println!(
         "[smoke/simple] quantised round-trip: trained loss {final_loss:.6e} \
          -> reloaded loss {loss_q:.6e} ({} bytes)",
@@ -188,7 +217,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
     }
-    let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     let _ = std::fs::remove_file(&raw_path);
     let loss_r_rel = ((loss_r - final_loss).abs() / final_loss.abs().max(1e-12)) as f32;
     println!(
@@ -201,6 +230,14 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
              (raw f32 should be bit-identical; group ordering / topology / step_count likely broken)"
         )
         .into());
+    }
+
+    if native_scope {
+        println!(
+            "[smoke/simple] PASSED — native CReLU/default-WRM forward + gradient + \
+             quantised round-trip + raw round-trip OK"
+        );
+        return Ok(());
     }
 
     // Pairwise 活性化: forward sanity + 10-step gradient + 量子化 round-trip。

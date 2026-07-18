@@ -1,4 +1,10 @@
 #![cfg_attr(feature = "gpu", feature(f16))]
+// Native launch argument encoding borrows writable buffers immutably; the same source needs `mut`
+// for cuda-oxide's typed macro, so those bindings appear unused only in the native-host build.
+#![cfg_attr(
+    feature = "native-cuda-host",
+    allow(dead_code, unused_imports, unused_mut)
+)]
 //! `bins/nnue_train` binary entry point — NNUE trainer。
 //!
 //! 本 file は bin entry point (`fn main`) と module 宣言を持つ。`#[kernel]` device
@@ -25,7 +31,7 @@ mod cli;
 mod ft_factorize_host;
 #[cfg(feature = "gpu")]
 mod kernel_module;
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda-oxide")]
 mod kernels;
 #[cfg(feature = "gpu")]
 mod smoke;
@@ -51,7 +57,7 @@ use training::run_training;
 // `cuda_launch!` 呼出側 (trainer / smoke / tests) は `use crate::*;` で `#[kernel]`
 // marker 型 (`__<name>_CudaKernel`) を解決する。`kernels` module の marker を crate
 // root から見えるよう re-export する。
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda-oxide")]
 pub(crate) use kernels::*;
 
 #[cfg(feature = "gpu")]

@@ -35,10 +35,19 @@ fn cuda_root_candidates() -> Vec<PathBuf> {
     roots
 }
 
-fn find_cuda_lib_dir(roots: &[PathBuf]) -> Option<PathBuf> {
+fn find_cuda_lib_dir(roots: &[PathBuf], target_os: &str) -> Option<PathBuf> {
     for root in roots {
-        let lib = root.join("lib64");
-        if lib.join("libcublas.so").exists() || lib.join("libcublas.so.12").exists() {
+        let lib = if target_os == "windows" {
+            root.join("lib").join("x64")
+        } else {
+            root.join("lib64")
+        };
+        let found = if target_os == "windows" {
+            lib.join("cublas.lib").exists()
+        } else {
+            lib.join("libcublas.so").exists() || lib.join("libcublas.so.12").exists()
+        };
+        if found {
             return Some(lib);
         }
     }
@@ -51,13 +60,26 @@ fn main() {
         return;
     }
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets CARGO_CFG_TARGET_OS");
     let roots = cuda_root_candidates();
-    let lib_dir = find_cuda_lib_dir(&roots).unwrap_or_else(|| {
+    let lib_dir = find_cuda_lib_dir(&roots, &target_os).unwrap_or_else(|| {
+        let fallback = if target_os == "windows" {
+            std::env::var_os("CUDA_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+                })
+                .join("lib")
+                .join("x64")
+        } else {
+            PathBuf::from("/usr/local/cuda/lib64")
+        };
         println!(
-            "cargo:warning=build.rs: libcublas.so not found in CUDA_TOOLKIT_PATH / CUDA_HOME / \
-             CUDA_PATH / /usr/local/cuda*; falling back to /usr/local/cuda/lib64 (link may fail)."
+            "cargo:warning=build.rs: cuBLAS import library not found in CUDA_TOOLKIT_PATH / \
+             CUDA_HOME / CUDA_PATH / defaults; falling back to {} (link may fail).",
+            fallback.display()
         );
-        PathBuf::from("/usr/local/cuda/lib64")
+        fallback
     });
     println!(
         "cargo:rustc-link-search=native={}",

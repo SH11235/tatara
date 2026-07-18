@@ -1,4 +1,3 @@
-use cuda_core::IntoResult as _;
 use gpu_runtime::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, LaunchConfig};
 use nnue_train::dataloader::Batch;
 use shogi_features::FeatureSetSpec;
@@ -442,30 +441,11 @@ impl DeviceOccupancy {
     /// `ctx` の device から SM 数 / SM あたり thread 上限を問い合わせる。driver attribute
     /// 照会で kernel launch には非依存 (`CudaContext::compute_capability` と同経路)。
     pub(crate) fn query(ctx: &CudaContext) -> Result<Self, Box<dyn std::error::Error>> {
-        ctx.bind_to_thread()?;
-        let dev = ctx.cu_device();
-        let mut sm = std::mem::MaybeUninit::<i32>::uninit();
-        let mut threads = std::mem::MaybeUninit::<i32>::uninit();
-        // SAFETY: 出力先は MaybeUninit の有効ポインタ、属性 enum は driver の有効な ID、
-        // `dev` は `ctx` 由来の有効な CUdevice。`result()?` 成功時のみ assume_init する。
-        unsafe {
-            cuda_core::sys::cuDeviceGetAttribute(
-                sm.as_mut_ptr(),
-                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                dev,
-            )
-            .result()?;
-            cuda_core::sys::cuDeviceGetAttribute(
-                threads.as_mut_ptr(),
-                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
-                dev,
-            )
-            .result()?;
-            Ok(Self {
-                sm_count: sm.assume_init().max(1) as u32,
-                max_threads_per_sm: threads.assume_init().max(1) as u32,
-            })
-        }
+        let (sm, threads) = gpu_runtime::device_occupancy_attributes(ctx)?;
+        Ok(Self {
+            sm_count: sm.max(1) as u32,
+            max_threads_per_sm: threads.max(1) as u32,
+        })
     }
 
     /// `block_dim` thread の block で全 SM を thread 占有上限まで埋める block 数
@@ -531,7 +511,7 @@ pub(crate) fn cfg_norm_loss_reduce(n_groups: usize, group_len: usize) -> LaunchC
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
 /// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
 /// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
-pub(crate) fn memset_zero<T>(
+pub(crate) fn memset_zero<T: Copy>(
     stream: &CudaStream,
     buf: &DeviceBuffer<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -541,9 +521,7 @@ pub(crate) fn memset_zero<T>(
         // 有効 device ptr、`stream` は同 context (`buf` も `stream` も `GpuTrainer` が
         // 同 context から作る)。`cuMemsetD8Async` は overlap を要求しない。0 fill は
         // f32/f64 ともに数値 0.0 を表すバイトパターン (全 0) なので型に依らず正しい。
-        unsafe {
-            cuda_core::memory::memset_d8_async(buf.cu_deviceptr(), 0, bytes, stream.cu_stream())?;
-        }
+        gpu_runtime::memset_d8_async(buf, 0, stream)?;
     }
     Ok(())
 }
@@ -560,14 +538,7 @@ pub(crate) fn memset_minus_one_i32(
         // SAFETY: [`memset_zero`] と同じ前提 — `buf.cu_deviceptr()` は本
         // `DeviceBuffer` が確保した `bytes` byte の有効 device ptr、`stream` は
         // 同 context。0xFF fill が i32 の -1 になる根拠は関数 doc を参照。
-        unsafe {
-            cuda_core::memory::memset_d8_async(
-                buf.cu_deviceptr(),
-                0xFF,
-                bytes,
-                stream.cu_stream(),
-            )?;
-        }
+        gpu_runtime::memset_d8_async(buf, 0xFF, stream)?;
     }
     Ok(())
 }
@@ -605,14 +576,7 @@ pub(crate) fn copy_host_to_device_async_i32(
     // event で slot 再利用を gate し、pageable 経路 (`BatchData` の slice) は
     // 「pageable src は staging へ copy してから return する」という CUDA Driver
     // API の同期挙動 (API synchronization behavior) に依る。
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
+    unsafe { gpu_runtime::memcpy_htod_async(buf, src, stream)? };
     Ok(())
 }
 
@@ -633,14 +597,7 @@ pub(crate) fn copy_host_to_device_async_f32(
     }
     // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
     // 同 context + `src` 生存は caller 保証)。
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
+    unsafe { gpu_runtime::memcpy_htod_async(buf, src, stream)? };
     Ok(())
 }
 
@@ -689,7 +646,7 @@ unsafe extern "C" {
     fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
     fn cublasSetStream_v2(
         handle: cublasHandle_t,
-        stream_id: cuda_core::sys::CUstream,
+        stream_id: *mut std::os::raw::c_void,
     ) -> cublasStatus_t;
     fn cublasSetMathMode(handle: cublasHandle_t, mode: cublasMath_t) -> cublasStatus_t;
     fn cublasSgemm_v2(
@@ -743,8 +700,7 @@ impl CublasHandle {
             return Err(format!("cublasCreate_v2 failed: status={status}").into());
         }
         // SAFETY: handle is valid (above), stream.cu_stream() returns the wrapped CUstream。
-        let status =
-            unsafe { cublasSetStream_v2(handle, stream.cu_stream() as cuda_core::sys::CUstream) };
+        let status = unsafe { cublasSetStream_v2(handle, stream.cu_stream().cast()) };
         if status != CUBLAS_STATUS_SUCCESS {
             // SAFETY: handle is valid (cleanup before erroring).
             unsafe {
@@ -967,16 +923,9 @@ impl AsyncLossRing {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut pinned = [std::ptr::null_mut::<f64>(); 2];
         for slot in pinned.iter_mut() {
-            let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
-            // SAFETY: cuMemHostAlloc は page-locked host memory を 8 byte 確保、
-            // failure 時は CUresult != SUCCESS を返す (.result()? で check)。
+            // SAFETY: allocation ownership transfers to this ring and Drop releases it after sync.
+            let p = unsafe { gpu_runtime::alloc_pinned_host(std::mem::size_of::<f64>())? };
             unsafe {
-                cuda_core::sys::cuMemHostAlloc(
-                    &mut p as *mut _,
-                    std::mem::size_of::<f64>(),
-                    cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
-                )
-                .result()?;
                 // 初期値 0 (warmup で読まれないが defensive)
                 std::ptr::write(p as *mut f64, 0.0);
             }
@@ -1004,11 +953,10 @@ impl AsyncLossRing {
         // loss_acc has len == 1 (= 8 bytes), stream 上 in-order なので async D2H は
         // 直前の memset/atomic 完了後に実行される。
         unsafe {
-            cuda_core::memory::memcpy_dtoh_async(
-                self.pinned[cur],
-                loss_acc.cu_deviceptr(),
-                std::mem::size_of::<f64>(),
-                stream.cu_stream(),
+            gpu_runtime::memcpy_dtoh_async(
+                std::slice::from_raw_parts_mut(self.pinned[cur], 1),
+                loss_acc,
+                stream,
             )?;
         }
         self.events[cur].record(stream)?;
@@ -1067,7 +1015,7 @@ impl Drop for AsyncLossRing {
                 // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放する。
                 // 上の event sync で in-flight D2H が完了済。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1404,7 +1352,7 @@ impl Drop for InputUploadRing {
                 // SAFETY: cuMemHostAlloc で確保した pointer を cuMemFreeHost で解放。
                 // 上の copy stream sync で in-flight H2D は完了済。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1412,7 +1360,7 @@ impl Drop for InputUploadRing {
             if !slot.is_null() {
                 // SAFETY: 同上。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1423,17 +1371,8 @@ impl Drop for InputUploadRing {
 pub(crate) fn alloc_pinned_host<T>(n: usize) -> Result<[*mut T; 2], Box<dyn std::error::Error>> {
     let mut out = [std::ptr::null_mut::<T>(); 2];
     for slot in out.iter_mut() {
-        let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
-        // SAFETY: cuMemHostAlloc は page-locked host memory を `n * size_of::<T>()` byte
-        // 確保、失敗時は CUresult != SUCCESS を返す (.result()? で check)。
-        unsafe {
-            cuda_core::sys::cuMemHostAlloc(
-                &mut p as *mut _,
-                n * std::mem::size_of::<T>(),
-                cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
-            )
-            .result()?;
-        }
+        // SAFETY: allocation ownership transfers to the returned slot array.
+        let p = unsafe { gpu_runtime::alloc_pinned_host(n * std::mem::size_of::<T>())? };
         *slot = p as *mut T;
     }
     Ok(out)

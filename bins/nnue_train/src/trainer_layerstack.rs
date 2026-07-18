@@ -760,6 +760,11 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        if native_backend_requested() {
+            return Err("native CUDA currently supports only the Simple architecture".into());
+        }
+
         assert!(
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
@@ -770,7 +775,7 @@ impl GpuTrainer {
             !precision.ft_fp16_out || precision.ft_fp16,
             "ft_fp16_out requires ft_fp16"
         );
-        let stream = ctx.default_stream();
+        let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
 
