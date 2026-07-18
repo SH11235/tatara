@@ -625,6 +625,9 @@ pub(crate) enum ArchCommand {
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
     Simple(SimpleArgs),
+    /// Run reproducible end-to-end training benchmarks from TOML configuration.
+    #[command(name = "bench-pos")]
+    BenchPos(BenchPosArgs),
     /// Run the fixed native CUDA throughput benchmark and write a JSON report.
     #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
     #[command(name = "native-bench")]
@@ -638,12 +641,38 @@ impl ArchCommand {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
             ArchCommand::Simple(_) => ArchKind::Simple,
+            ArchCommand::BenchPos(_) => {
+                unreachable!("bench-pos does not select a training architecture")
+            }
             #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
             ArchCommand::NativeBench(_) => {
                 unreachable!("native-bench does not select a training architecture")
             }
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BenchPosArgs {
+    /// Tracked benchmark profile containing measurement parameters and cases.
+    #[arg(long, default_value = "bench-pos.toml")]
+    pub(crate) profile: PathBuf,
+
+    /// Gitignored machine-local paths and hardware settings.
+    #[arg(long, default_value = "bench-pos.local.toml")]
+    pub(crate) local_config: PathBuf,
+
+    /// Run only the named case. Repeat this option to select multiple cases.
+    #[arg(long = "case", value_name = "ID")]
+    pub(crate) cases: Vec<String>,
+
+    /// Directory receiving JSON reports and per-run logs.
+    #[arg(long, default_value = "target/benchmark-results/bench-pos")]
+    pub(crate) output_dir: PathBuf,
+
+    /// Permit benchmarking an uncommitted working tree (recorded in JSON).
+    #[arg(long)]
+    pub(crate) allow_dirty: bool,
 }
 
 #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]

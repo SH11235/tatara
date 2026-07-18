@@ -1,0 +1,8 @@
+schema_version = 1
+data = "/path/to/teacher.psv"
+data_id = "teacher-dataset-v1"
+progress_coeff = "/path/to/progress.bin"
+progress_id = "progress-coefficients-v1"
+threads = 16
+lock_gpu_clock = false
+# work_dir = "target/benchmark-work/bench-pos"

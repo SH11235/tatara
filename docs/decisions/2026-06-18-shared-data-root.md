@@ -43,8 +43,8 @@ tracked file の参照規則:
 - 自 repo 内ファイル → repo-relative
 - 外部 repo → `/path/to/...` placeholder
 - 個人ツール → `~/...`
-- machine 固有の具体パスは gitignored の local config（例: `scripts/bench-pos.env` の
-  `DATA=` / `PROG=`）だけに書く。
+- machine 固有の具体パスはgitignoredのlocal config（例: `bench-pos.local.toml`の
+  `data` / `progress_coeff`）だけに書く。
 
 `$SHOGI_DATA` は各 host の shell rc で定義する（デフォルト例: `$HOME/shogi-data`。大容量
 ストレージを別マウントに持つ host はその配下）。具体パスは各 host の shell rc /

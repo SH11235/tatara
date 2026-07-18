@@ -1,0 +1,37 @@
+schema_version = 1
+profile = "standard-v1"
+runs = 2
+superbatches = 5
+warmup_superbatches = 1
+batches_per_superbatch = 200
+batch_size = 65536
+learning_rate = 0.000875
+score_drop_abs = 32000
+
+[[cases]]
+id = "layerstack-fp32"
+architecture = "layerstack"
+feature_set = "halfka-hm-merged"
+global_args = ["--ft-factorize"]
+architecture_args = ["--bucket-mode", "progress8kpabs"]
+
+[[cases]]
+id = "layerstack-all-optim"
+architecture = "layerstack"
+feature_set = "halfka-hm-merged"
+global_args = ["--ft-factorize", "--all-optim"]
+architecture_args = ["--bucket-mode", "progress8kpabs"]
+
+[[cases]]
+id = "simple-halfkp-fp32"
+architecture = "simple"
+feature_set = "halfkp"
+global_args = ["--ft-factorize"]
+architecture_args = ["--arch", "256x2-32-32", "--activation", "crelu", "--scale", "600"]
+
+[[cases]]
+id = "simple-halfkp-all-optim"
+architecture = "simple"
+feature_set = "halfkp"
+global_args = ["--ft-factorize", "--all-optim"]
+architecture_args = ["--arch", "256x2-32-32", "--activation", "crelu", "--scale", "600"]
