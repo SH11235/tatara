@@ -92,9 +92,9 @@ The last command runs a GPU smoke test without training data, restricted to the
 native backend's supported scope. It succeeds with a final `[smoke/simple] PASSED` line.
 
 The current scope is Simple (including HalfKaHmMerged), CReLU / SCReLU / Pairwise,
-hidden dimensions up to 256, FP32 with TF32 on or off, factorizer on or off,
-default WRM, and Ranger / RAdam / AdamW. LayerStack, hidden dimensions above 256,
-FP16 options or state, norm loss, and non-default extended losses are unsupported
+arbitrary hidden dimensions, FP32 with TF32 on or off, factorizer on or off,
+Sigmoid or WRM (including extended settings), norm loss, and Ranger / RAdam / AdamW.
+LayerStack and FP16 options or state are unsupported
 and rejected at startup.
 
 ## Preparing Windows (WSL2)

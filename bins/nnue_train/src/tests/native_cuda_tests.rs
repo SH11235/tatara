@@ -1,28 +1,19 @@
 use gpu_runtime::CudaContext;
 use nnue_format::{SimpleActivation, SimpleId};
-use nnue_train::{init::SimpleInit, optimizer::OptimizerKind, trainer::TrainerBackend};
+use nnue_train::{
+    init::SimpleInit,
+    optimizer::OptimizerKind,
+    trainer::{LossKind, TrainerBackend},
+};
 use shogi_features::FeatureSet;
 
 #[cfg(feature = "native-cuda")]
 use crate::kernel_module::with_test_native_backend;
 use crate::{
-    arch::{SMOKE_BATCH, SMOKE_LOSS_SIGMOID, SMOKE_LOSS_WRM},
-    trainer_common::{BatchData, DENSE_BIAS_GRAD_MAX_OUT, PrecisionFlags},
-    trainer_simple::{
-        SimpleGpuTrainer, validate_native_simple_configuration, validate_native_simple_loss,
-    },
+    arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
+    trainer_common::{BatchData, PrecisionFlags},
+    trainer_simple::{SimpleGpuTrainer, validate_native_simple_configuration},
 };
-
-fn with_native_backend<T>(operation: impl FnOnce() -> T) -> T {
-    #[cfg(feature = "native-cuda")]
-    {
-        with_test_native_backend(true, operation)
-    }
-    #[cfg(feature = "native-cuda-host")]
-    {
-        operation()
-    }
-}
 
 fn standard_id() -> SimpleId {
     SimpleId {
@@ -96,25 +87,6 @@ fn create_trainer_with_options(
 }
 
 #[test]
-fn native_simple_hidden_dimension_guard_accepts_256_and_rejects_257() {
-    let mut id = standard_id();
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    assert!(validate_native_simple_configuration(id, None, PrecisionFlags::default(),).is_ok());
-
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l1_error =
-        validate_native_simple_configuration(id, None, PrecisionFlags::default()).unwrap_err();
-    assert!(l1_error.contains("hidden dimensions <= 256"));
-
-    id.l1_out = DENSE_BIAS_GRAD_MAX_OUT as usize;
-    id.l2_out = DENSE_BIAS_GRAD_MAX_OUT as usize + 1;
-    let l2_error =
-        validate_native_simple_configuration(id, None, PrecisionFlags::default()).unwrap_err();
-    assert!(l2_error.contains("hidden dimensions <= 256"));
-}
-
-#[test]
 fn native_simple_configuration_accepts_ft_factorizer() {
     let mut id = standard_id();
     id.feature_set = id.feature_set.with_ft_factorize();
@@ -135,61 +107,6 @@ fn native_simple_configuration_accepts_all_simple_activations() {
             "{activation:?}"
         );
     }
-}
-
-#[test]
-fn native_simple_loss_guard_rejects_non_default_paths() {
-    assert!(validate_native_simple_loss(SMOKE_LOSS_WRM).is_ok());
-    assert!(
-        validate_native_simple_loss(nnue_train::trainer::LossKind::Sigmoid { scale: 1.0 / 600.0 })
-            .unwrap_err()
-            .contains("only the default WRM loss")
-    );
-    let extended = match SMOKE_LOSS_WRM {
-        nnue_train::trainer::LossKind::Wrm {
-            nnue2score,
-            in_scaling,
-            in_offset,
-            target_offset,
-            target_scaling,
-            weight_boost_w2,
-            ..
-        } => nnue_train::trainer::LossKind::Wrm {
-            nnue2score,
-            in_scaling,
-            in_offset,
-            target_offset,
-            target_scaling,
-            pow_exp: 2.5,
-            qp_asymmetry: 0.0,
-            weight_boost_w1: 0.0,
-            weight_boost_w2,
-        },
-        nnue_train::trainer::LossKind::Sigmoid { .. } => unreachable!(),
-    };
-    assert!(validate_native_simple_loss(extended).is_err());
-}
-
-#[test]
-fn native_simple_forward_rejects_unsupported_loss_before_device_launch()
--> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
-    let id = standard_id();
-    let mut trainer = create_trainer(&context, id, true, SMOKE_BATCH)?;
-    let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-
-    let error = with_native_backend(|| {
-        trainer
-            .forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)
-            .unwrap_err()
-    });
-    assert!(error.to_string().contains("only the default WRM loss"));
-
-    // A device trap would poison this context. A successful supported forward proves that the
-    // unsupported loss was rejected on the host before any loss kernel launch.
-    let loss = with_native_backend(|| trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM))?;
-    assert!(loss.is_finite());
-    Ok(())
 }
 
 #[test]
@@ -264,6 +181,16 @@ fn pairwise_simple_native_matches_cuda_oxide_after_one_step()
 
 #[test]
 #[cfg(feature = "native-cuda")]
+fn wide_hidden_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut id = standard_id();
+    id.l1_out = 257;
+    id.l2_out = 257;
+    assert_native_matches_cuda_oxide_after_one_step(id)
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
 fn radam_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
 {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -298,6 +225,66 @@ fn tf32_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn 
     )
 }
 
+#[test]
+#[cfg(feature = "native-cuda")]
+fn norm_loss_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        Some(0.25),
+        PrecisionFlags::default(),
+        SMOKE_LOSS_WRM,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn sigmoid_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+        LossKind::Sigmoid { scale: 1.0 / 600.0 },
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn extended_wrm_simple_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let extended = match SMOKE_LOSS_WRM {
+        LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            ..
+        } => LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.2,
+            weight_boost_w1: 1.5,
+            weight_boost_w2: 0.75,
+        },
+        LossKind::Sigmoid { .. } => unreachable!(),
+    };
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        standard_id(),
+        OptimizerKind::Ranger,
+        None,
+        PrecisionFlags::default(),
+        extended,
+    )
+}
+
 #[cfg(feature = "native-cuda")]
 fn assert_native_matches_cuda_oxide_after_one_step(
     id: SimpleId,
@@ -315,19 +302,50 @@ fn assert_native_matches_cuda_oxide_after_one_step_with_options(
     optimizer: OptimizerKind,
     precision: PrecisionFlags,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+        id,
+        optimizer,
+        None,
+        precision,
+        SMOKE_LOSS_WRM,
+    )
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_native_matches_cuda_oxide_after_one_step_with_training_options(
+    id: SimpleId,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    precision: PrecisionFlags,
+    loss: LossKind,
+) -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
-    let mut oxide =
-        create_trainer_with_options(&context, id, false, SMOKE_BATCH, optimizer, None, precision)?;
-    let mut native =
-        create_trainer_with_options(&context, id, true, SMOKE_BATCH, optimizer, None, precision)?;
+    let mut oxide = create_trainer_with_options(
+        &context,
+        id,
+        false,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
+    let mut native = create_trainer_with_options(
+        &context,
+        id,
+        true,
+        SMOKE_BATCH,
+        optimizer,
+        norm_loss_factor,
+        precision,
+    )?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
 
-    let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-    let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-    let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
-    let native_loss = native.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, loss)?;
+    let native_loss = native.forward(&batch.as_ref(), 0.0, loss)?;
     if id.feature_set.ft_factorize() {
         let oxide_master = oxide.ft_w_to_host()?;
         let native_master = native.ft_w_to_host()?;

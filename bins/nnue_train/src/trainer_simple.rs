@@ -385,31 +385,12 @@ impl Drop for SimpleGpuTrainer {
 
 #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 pub(crate) fn validate_native_simple_configuration(
-    id: SimpleId,
-    norm_loss_factor: Option<f32>,
+    _id: SimpleId,
+    _norm_loss_factor: Option<f32>,
     precision: PrecisionFlags,
 ) -> Result<(), String> {
-    if id.l1_out > DENSE_BIAS_GRAD_MAX_OUT as usize || id.l2_out > DENSE_BIAS_GRAD_MAX_OUT as usize
-    {
-        return Err(format!(
-            "native CUDA requires Simple hidden dimensions <= {DENSE_BIAS_GRAD_MAX_OUT} \
-             (got l1_out={}, l2_out={})",
-            id.l1_out, id.l2_out
-        ));
-    }
     if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
         return Err("native CUDA does not yet support FP16 training options".into());
-    }
-    if norm_loss_factor.is_some() {
-        return Err("native CUDA does not yet support norm loss".into());
-    }
-    Ok(())
-}
-
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-pub(crate) fn validate_native_simple_loss(loss: LossKind) -> Result<(), &'static str> {
-    if !matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended() {
-        return Err("native CUDA currently supports only the default WRM loss");
     }
     Ok(())
 }
@@ -881,11 +862,6 @@ impl SimpleGpuTrainer {
         loss: LossKind,
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested() {
-            validate_native_simple_loss(loss)?;
-        }
-
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
             Some(std::time::Instant::now())

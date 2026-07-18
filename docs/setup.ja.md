@@ -88,9 +88,9 @@ cargo run -p nnue-trainer --no-default-features --features native-cuda-host --re
 末尾に`[smoke/simple] PASSED`が出れば成功。
 
 現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU / SCReLU / Pairwise、
-hidden dimension各256以下、FP32 (TF32 ON / OFF)、factorizer ON / OFF、default WRM、
-Ranger / RAdam / AdamW。LayerStack、hidden dimension 257以上、FP16 option/state、
-norm loss、既定以外の拡張 loss は未対応で、起動時に拒否する。
+任意のhidden dimension、FP32 (TF32 ON / OFF)、factorizer ON / OFF、Sigmoid / WRM
+(拡張設定を含む)、norm loss、Ranger / RAdam / AdamW。LayerStackとFP16 option/stateは
+未対応で、起動時に拒否する。
 
 ## Windows (WSL2) の準備
 

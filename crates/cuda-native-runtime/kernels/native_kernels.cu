@@ -415,22 +415,16 @@ extern "C" __global__ void loss_wrm(
     float input_offset,
     float target_offset,
     float target_scaling,
-    float,
-    float,
-    float,
-    float,
-    const double*,
+    float pow_exp,
+    float qp_asymmetry,
+    float weight_boost_w1,
+    float weight_boost_w2,
+    const double* weight_sum_accumulator,
     unsigned long long,
     unsigned int extended,
     unsigned int n
 ) {
     __shared__ double partial[256];
-    if (extended != 0) {
-        // Extended WRM is rejected by the host before launch. Trap defensively so adding only its
-        // prerequisite kernels cannot turn this wrapper into a silent stale-gradient path.
-        asm volatile("trap;");
-        return;
-    }
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int tid = threadIdx.x;
     double contribution = 0.0;
@@ -446,11 +440,31 @@ extern "C" __global__ void loss_wrm(
         const float qm = 1.0F / (1.0F + expf(-((-score_net - input_offset) / input_scaling)));
         const float prediction = 0.5F * (1.0F + q - qm);
         const float error = prediction - target;
-        output_gradient[i] = error
-            * (nnue2score / input_scaling)
-            * (q * (1.0F - q) + qm * (1.0F - qm))
-            * per_pos_norm;
-        contribution = static_cast<double>(error) * static_cast<double>(error);
+        if (extended == 0) {
+            output_gradient[i] = error
+                * (nnue2score / input_scaling)
+                * (q * (1.0F - q) + qm * (1.0F - qm))
+                * per_pos_norm;
+            contribution = static_cast<double>(error) * static_cast<double>(error);
+        } else {
+            const float weight_base = (target_wrm - 0.5F) * (target_wrm - 0.5F)
+                * target_wrm * (1.0F - target_wrm);
+            const float weight = 1.0F
+                + (powf(2.0F, weight_boost_w1) - 1.0F) * powf(weight_base, weight_boost_w2);
+            const float asymmetry = prediction > target ? 1.0F + qp_asymmetry : 1.0F;
+            const float absolute_error = fabsf(error);
+            const float absolute_power = powf(absolute_error, pow_exp - 1.0F);
+            const float signed_power = error < 0.0F ? -absolute_power : absolute_power;
+            const float inverse_weight_sum = static_cast<float>(1.0 / weight_sum_accumulator[0]);
+            const float prediction_gradient = 0.5F * (nnue2score / input_scaling)
+                * (q * (1.0F - q) + qm * (1.0F - qm));
+            output_gradient[i] = (weight * inverse_weight_sum)
+                * (asymmetry * pow_exp * signed_power) * prediction_gradient;
+            contribution = static_cast<double>(
+                asymmetry * powf(absolute_error, pow_exp) * weight
+                * static_cast<float>(n) * inverse_weight_sum
+            );
+        }
     }
 
     partial[tid] = contribution;
@@ -464,6 +478,147 @@ extern "C" __global__ void loss_wrm(
     if (tid == 0) {
         atomicAdd(loss_accumulator, partial[0]);
     }
+}
+
+extern "C" __global__ void loss_wdl(
+    const float* output,
+    unsigned long long,
+    const float* score,
+    unsigned long long,
+    const float* wdl,
+    unsigned long long,
+    float per_pos_norm,
+    float* output_gradient,
+    unsigned long long,
+    double* loss_accumulator,
+    unsigned long long,
+    float lambda,
+    float scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float prediction = 1.0F / (1.0F + expf(-(output[i] * scale)));
+    const float score_target = 1.0F / (1.0F + expf(-(score[i] * scale)));
+    const float target = lambda * wdl[i] + (1.0F - lambda) * score_target;
+    const float error = prediction - target;
+    output_gradient[i] = 2.0F * error * prediction * (1.0F - prediction)
+        * scale * per_pos_norm;
+    atomicAdd(loss_accumulator, static_cast<double>(error) * static_cast<double>(error));
+}
+
+extern "C" __global__ void wrm_weight_sum(
+    const float* score,
+    unsigned long long,
+    double* weight_sum_accumulator,
+    unsigned long long,
+    float weight_boost_w1,
+    float weight_boost_w2,
+    float target_offset,
+    float target_scaling,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float s = score[i];
+    const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
+    const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
+    const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
+    const float weight_base = (target_wrm - 0.5F) * (target_wrm - 0.5F)
+        * target_wrm * (1.0F - target_wrm);
+    const float weight = 1.0F
+        + (powf(2.0F, weight_boost_w1) - 1.0F) * powf(weight_base, weight_boost_w2);
+    atomicAdd(weight_sum_accumulator, static_cast<double>(weight));
+}
+
+extern "C" __global__ void norm_loss_reduce(
+    const float* weight,
+    unsigned long long,
+    float* norms,
+    unsigned long long,
+    unsigned int n_groups,
+    unsigned int group_pitch,
+    unsigned int element_stride,
+    unsigned int group_length
+) {
+    const unsigned int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= n_groups) {
+        return;
+    }
+    const unsigned long long base = static_cast<unsigned long long>(group) * group_pitch;
+    float sum_squared = 0.0F;
+    for (unsigned int position = blockIdx.y; position < group_length; position += gridDim.y) {
+        const float value = weight[base + static_cast<unsigned long long>(position) * element_stride];
+        sum_squared += value * value;
+    }
+    if (sum_squared != 0.0F) {
+        atomicAdd(norms + group, sum_squared);
+    }
+}
+
+extern "C" __global__ void bias_grad(
+    const float* output_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int output_dimension
+) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * output_dimension;
+    if (index < count) {
+        atomicAdd(bias_gradient + index % output_dimension, output_gradient[index]);
+    }
+}
+
+extern "C" __global__ void norm_loss_finalize(
+    float* norms,
+    unsigned long long,
+    unsigned int n_groups
+) {
+    const unsigned int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group < n_groups) {
+        norms[group] = sqrtf(norms[group]);
+    }
+}
+
+extern "C" __global__ void norm_loss_apply(
+    float* weight,
+    unsigned long long,
+    const float* norms,
+    unsigned long long,
+    float factor,
+    float learning_rate,
+    float epsilon,
+    unsigned int n_groups,
+    unsigned int group_pitch,
+    unsigned int element_stride,
+    unsigned int group_length
+) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(n_groups) * group_length;
+    if (index >= count) {
+        return;
+    }
+    unsigned int group;
+    unsigned int position;
+    if (group_pitch == 1) {
+        group = static_cast<unsigned int>(index % n_groups);
+        position = static_cast<unsigned int>(index / n_groups);
+    } else {
+        group = static_cast<unsigned int>(index / group_length);
+        position = static_cast<unsigned int>(index % group_length);
+    }
+    const unsigned long long offset = static_cast<unsigned long long>(group) * group_pitch
+        + static_cast<unsigned long long>(position) * element_stride;
+    const float correction = 2.0F * factor * (1.0F - 1.0F / (norms[group] + epsilon));
+    weight[offset] *= 1.0F - learning_rate * correction;
 }
 
 extern "C" __global__ void radam_step(
