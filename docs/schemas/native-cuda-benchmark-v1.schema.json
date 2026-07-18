@@ -94,7 +94,7 @@
       "required": ["architecture", "fixture_id", "precision", "precision_flags", "backend", "run", "order_in_run", "positions", "elapsed_ns", "pos_per_sec"],
       "properties": {
         "architecture": { "$ref": "#/$defs/architecture" },
-        "fixture_id": { "enum": ["layerstack-v1", "simple-v1"] },
+        "fixture_id": { "enum": ["layerstack-halfka-hm-merged-factorized-v1", "simple-halfkp-factorized-v1"] },
         "precision": { "$ref": "#/$defs/precision" },
         "precision_flags": { "$ref": "#/$defs/precisionFlags" },
         "backend": { "$ref": "#/$defs/backend" },
@@ -111,7 +111,7 @@
       "required": ["architecture", "fixture_id", "precision", "backend", "runs", "mean_pos_per_sec", "median_pos_per_sec", "sample_sd_pos_per_sec", "min_pos_per_sec", "max_pos_per_sec"],
       "properties": {
         "architecture": { "$ref": "#/$defs/architecture" },
-        "fixture_id": { "enum": ["layerstack-v1", "simple-v1"] },
+        "fixture_id": { "enum": ["layerstack-halfka-hm-merged-factorized-v1", "simple-halfkp-factorized-v1"] },
         "precision": { "$ref": "#/$defs/precision" },
         "backend": { "$ref": "#/$defs/backend" },
         "runs": { "type": "array", "minItems": 1, "items": { "type": "number", "exclusiveMinimum": 0 } },

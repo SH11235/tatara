@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "timestamp_unix_ms": 1784400000000,
+  "profile": "v1",
+  "mode": "compare",
+  "parameters": {
+    "batch_size": 16384,
+    "warmup_steps": 3,
+    "steps": 100,
+    "runs": 3,
+    "device": 0,
+    "customized": false
+  },
+  "environment": {
+    "platform": "windows",
+    "os": "windows",
+    "architecture": "x86_64",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "driver": "596.36",
+    "cuda_toolkit": "CUDA 12.9",
+    "rustc": "rustc fixture",
+    "git_commit": "0123456789abcdef",
+    "dirty": false,
+    "cargo_features": ["native-cuda"],
+    "command_line": ["nnue-train", "native-bench"]
+  },
+  "measurements": [
+    {
+      "architecture": "simple",
+      "fixture_id": "simple-halfkp-factorized-v1",
+      "precision": "fp32",
+      "precision_flags": {
+        "tf32": false,
+        "ft_fp16": false,
+        "ft_fp16_out": false,
+        "fp16_opt_state": false
+      },
+      "backend": "native-cuda",
+      "run": 1,
+      "order_in_run": 1,
+      "positions": 1638400,
+      "elapsed_ns": 100000000,
+      "pos_per_sec": 16384000.0
+    }
+  ],
+  "summaries": [
+    {
+      "architecture": "simple",
+      "fixture_id": "simple-halfkp-factorized-v1",
+      "precision": "fp32",
+      "backend": "native-cuda",
+      "runs": [16384000.0],
+      "mean_pos_per_sec": 16384000.0,
+      "median_pos_per_sec": 16384000.0,
+      "sample_sd_pos_per_sec": 0.0,
+      "min_pos_per_sec": 16384000.0,
+      "max_pos_per_sec": 16384000.0
+    }
+  ],
+  "backend_comparisons": [
+    {
+      "architecture": "simple",
+      "precision": "fp32",
+      "paired_deltas_percent": [1.0],
+      "mean_paired_delta_percent": 1.0,
+      "sample_sd_paired_delta_percent": 0.0,
+      "native_over_oxide_ratio": 1.01
+    }
+  ],
+  "precision_speedups": [
+    {
+      "architecture": "simple",
+      "backend": "native-cuda",
+      "all_optim_over_fp32_ratio": 1.25
+    }
+  ]
+}

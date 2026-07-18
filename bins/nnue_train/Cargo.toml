@@ -64,6 +64,8 @@ cuda-device = { workspace = true, optional = true }
 cuda-host = { workspace = true, optional = true }
 
 [dev-dependencies]
+# benchmark reportとversioned JSON Schemaのdriftを実serializer出力で検出する。
+jsonschema = { version = "0.48", default-features = false }
 # production CUDA launch inventoryをRust token単位で走査し、コメントや文字列内の
 # delimiterをmacro構文と誤認しないようにする。
 proc-macro2 = "1"

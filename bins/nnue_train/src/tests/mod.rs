@@ -9,6 +9,8 @@ mod cli_tests;
 mod ft_factorize_tests;
 #[cfg(all(test, feature = "cuda-oxide"))]
 mod gpu_cpu_equivalence_tests;
+#[cfg(test)]
+mod native_bench_schema_tests;
 #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
 mod native_cuda_tests;
 #[cfg(test)]

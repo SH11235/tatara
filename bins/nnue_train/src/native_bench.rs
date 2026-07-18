@@ -60,8 +60,8 @@ impl Architecture {
 
     fn fixture_id(self) -> &'static str {
         match self {
-            Self::Layerstack => "layerstack-v1",
-            Self::Simple => "simple-v1",
+            Self::Layerstack => "layerstack-halfka-hm-merged-factorized-v1",
+            Self::Simple => "simple-halfkp-factorized-v1",
         }
     }
 }
@@ -445,9 +445,8 @@ fn benchmark_architecture(
 
 fn fixture_feature_set(architecture: Architecture) -> shogi_features::FeatureSetSpec {
     match architecture {
-        Architecture::Layerstack | Architecture::Simple => {
-            FeatureSet::HalfKaHmMerged.spec().with_ft_factorize()
-        }
+        Architecture::Layerstack => FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
+        Architecture::Simple => FeatureSet::HalfKp.spec().with_ft_factorize(),
     }
 }
 
@@ -938,5 +937,85 @@ mod tests {
         assert!(precisions[1].flags.ft_fp16);
         assert!(precisions[1].flags.ft_fp16_out);
         assert!(precisions[1].flags.fp16_opt_state);
+    }
+
+    #[test]
+    fn serialized_v1_report_conforms_to_versioned_json_schema() {
+        let measurement = Measurement {
+            architecture: "simple",
+            fixture_id: Architecture::Simple.fixture_id(),
+            precision: "fp32",
+            precision_flags: PrecisionFlags::default().into(),
+            backend: Backend::NativeCuda,
+            run: 1,
+            order_in_run: 1,
+            positions: 16_384,
+            elapsed_ns: 1_000_000,
+            pos_per_sec: 16_384_000.0,
+        };
+        let report = BenchmarkReport {
+            schema_version: SCHEMA_VERSION,
+            timestamp_unix_ms: 1_784_400_000_000,
+            profile: PROFILE_NAME,
+            mode: "compare",
+            parameters: BenchmarkParameters {
+                batch_size: DEFAULT_BATCH_SIZE,
+                warmup_steps: DEFAULT_WARMUP_STEPS,
+                steps: DEFAULT_STEPS,
+                runs: DEFAULT_RUNS,
+                device: 0,
+                customized: false,
+            },
+            environment: EnvironmentReport {
+                platform: "wsl",
+                os: "linux",
+                architecture: "x86_64",
+                gpu: Some("NVIDIA GeForce RTX 5090".into()),
+                driver: Some("596.36".into()),
+                cuda_toolkit: Some("CUDA 12.9".into()),
+                rustc: Some("rustc test".into()),
+                git_commit: Some("0123456789abcdef".into()),
+                dirty: Some(false),
+                cargo_features: vec!["native-cuda"],
+                command_line: vec!["nnue-train".into(), "native-bench".into()],
+            },
+            measurements: vec![measurement],
+            summaries: vec![Summary {
+                architecture: "simple",
+                fixture_id: Architecture::Simple.fixture_id(),
+                precision: "fp32",
+                backend: Backend::NativeCuda,
+                runs: vec![16_384_000.0],
+                mean_pos_per_sec: 16_384_000.0,
+                median_pos_per_sec: 16_384_000.0,
+                sample_sd_pos_per_sec: 0.0,
+                min_pos_per_sec: 16_384_000.0,
+                max_pos_per_sec: 16_384_000.0,
+            }],
+            backend_comparisons: vec![BackendComparison {
+                architecture: "simple",
+                precision: "fp32",
+                paired_deltas_percent: vec![1.0],
+                mean_paired_delta_percent: 1.0,
+                sample_sd_paired_delta_percent: 0.0,
+                native_over_oxide_ratio: 1.01,
+            }],
+            precision_speedups: vec![PrecisionSpeedup {
+                architecture: "simple",
+                backend: Backend::NativeCuda,
+                all_optim_over_fp32_ratio: 1.25,
+            }],
+        };
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/schemas/native-cuda-benchmark-v1.schema.json"
+        ))
+        .expect("benchmark schema must be valid JSON");
+        let instance = serde_json::to_value(report).expect("benchmark report must serialize");
+        let validator = jsonschema::validator_for(&schema).expect("benchmark schema must compile");
+        let errors = validator
+            .iter_errors(&instance)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "schema validation failed: {errors:#?}");
     }
 }

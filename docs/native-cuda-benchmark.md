@@ -15,8 +15,8 @@ Changing a fixture default requires a new profile version.
 
 | Architecture | Fixture |
 |---|---|
-| LayerStack | factorized HalfKaHmMerged, FT 1536, L1 16, L2 32, 9 Progress8KpAbs buckets |
-| Simple | factorized HalfKaHmMerged, CReLU, FT 256, L1 32, L2 32 |
+| LayerStack | `layerstack-halfka-hm-merged-factorized-v1`: factorized HalfKaHmMerged, FT 1536, L1 16, L2 32, 9-bucket Progress8KpAbs trainer shape |
+| Simple | `simple-halfkp-factorized-v1`: factorized HalfKP, CReLU, FT 256, L1 32, L2 32 |
 
 Each architecture is measured with both precision configurations by default:
 
@@ -25,6 +25,10 @@ Each architecture is measured with both precision configurations by default:
 
 The precision order alternates between runs. In `compare` mode the cuda-oxide/CUDA C++ backend
 order also alternates, so a systematic first-run advantage does not belong to one backend.
+
+LayerStack does not read `progress.bin`: the in-memory benchmark batch assigns deterministic
+round-robin bucket indices (`row % 9`). This isolates trainer/GPU throughput. Use
+`scripts/bench-pos.sh` when progress calculation and real-data loading should be included.
 
 ## Commands
 
@@ -65,6 +69,10 @@ contain every run, mean/median/sample standard deviation/min/max, paired backend
 all-optim/FP32 speedups, expanded precision flags, commit and dirty state, platform (Windows,
 WSL, or Linux), GPU, driver, CUDA
 toolkit, rustc, Cargo features, and the full command line.
+
+Normal CPU-only CI compiles the versioned schema and validates the checked-in representative
+fixture. Native-feature tests additionally serialize the real Rust report types and validate that
+document against the same schema.
 
 The runner rejects a dirty working tree by default. `--allow-dirty` is useful while developing,
 and the report still records `dirty: true`. Raw reports remain under the gitignored `target/`
