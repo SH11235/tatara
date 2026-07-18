@@ -23,11 +23,17 @@ echo "== cuda-oxide host fingerprint =="
 cargo test -p nnue-trainer --features native-cuda --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$hybrid_log"
+cargo test -p nnue-trainer --features native-cuda --release \
+    standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
+    2>&1 | tee -a "$hybrid_log"
 
 echo "== portable host fingerprint =="
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
+cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+    standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
+    2>&1 | tee -a "$portable_log"
 
 echo "== portable host Simple configuration matrix =="
 cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
@@ -103,6 +109,10 @@ extract_fingerprint() {
     sed -n 's/^.*\[native-host-parity\] //p' "$1" | tail -n 1
 }
 
+extract_layerstack_fingerprint() {
+    sed -n 's/^.*\[native-layerstack-host-parity\] //p' "$1" | tail -n 1
+}
+
 hybrid_fingerprint=$(extract_fingerprint "$hybrid_log")
 portable_fingerprint=$(extract_fingerprint "$portable_log")
 if [[ -z "$hybrid_fingerprint" || -z "$portable_fingerprint" ]]; then
@@ -117,3 +127,18 @@ if [[ "$hybrid_fingerprint" != "$portable_fingerprint" ]]; then
 fi
 
 echo "native host parity matched: $portable_fingerprint"
+
+hybrid_layerstack_fingerprint=$(extract_layerstack_fingerprint "$hybrid_log")
+portable_layerstack_fingerprint=$(extract_layerstack_fingerprint "$portable_log")
+if [[ -z "$hybrid_layerstack_fingerprint" || -z "$portable_layerstack_fingerprint" ]]; then
+    echo "LayerStack native parity fingerprint was not emitted" >&2
+    exit 1
+fi
+if [[ "$hybrid_layerstack_fingerprint" != "$portable_layerstack_fingerprint" ]]; then
+    echo "LayerStack native host parity mismatch" >&2
+    echo "  cuda-oxide host: $hybrid_layerstack_fingerprint" >&2
+    echo "  portable host:   $portable_layerstack_fingerprint" >&2
+    exit 1
+fi
+
+echo "LayerStack native host parity matched: $portable_layerstack_fingerprint"

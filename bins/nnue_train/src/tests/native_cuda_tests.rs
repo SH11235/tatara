@@ -199,6 +199,27 @@ fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std
         "native LayerStack loss is not finite: {loss}"
     );
     trainer.assert_all_weights_finite()?;
+    let state = trainer.raw_checkpoint_state_to_host()?;
+    let mut fingerprint = 0xcbf29ce484222325_u64;
+    fingerprint ^= state.0;
+    fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    for (_, group) in &state.1 {
+        for value in group
+            .0
+            .iter()
+            .chain(&group.1)
+            .chain(&group.2)
+            .chain(&group.3)
+        {
+            let quantized = (f64::from(*value) * 1.0e6).round() as i64;
+            fingerprint ^= quantized as u64;
+            fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+        }
+    }
+    eprintln!(
+        "[native-layerstack-host-parity] loss_bits={:016x}, state_fingerprint_1e6={fingerprint:016x}",
+        loss.to_bits()
+    );
     Ok(())
 }
 

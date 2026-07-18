@@ -45,7 +45,7 @@ pub(crate) struct StepOptions<'a> {
     prof_t0: &'a mut std::time::Instant,
 }
 
-#[cfg(all(test, feature = "native-cuda"))]
+#[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
 pub(crate) type LayerStackRawCheckpointState =
     (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
@@ -1327,7 +1327,7 @@ impl GpuTrainer {
 
     /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
     /// download する。backend 間の無中断学習比較に使う。
-    #[cfg(all(test, feature = "native-cuda"))]
+    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
     pub(crate) fn raw_checkpoint_state_to_host(
         &self,
     ) -> Result<LayerStackRawCheckpointState, Box<dyn std::error::Error>> {
