@@ -397,6 +397,22 @@ impl SimpleGpuTrainer {
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "native-cuda")]
+        if native_backend_requested() {
+            if id.activation != SimpleActivation::CReLU {
+                return Err("native CUDA currently supports only Simple CReLU".into());
+            }
+            if id.feature_set.ft_factorize() {
+                return Err("native CUDA does not yet support FT factorization".into());
+            }
+            if precision.ft_fp16 || precision.ft_fp16_out || precision.fp16_opt_state {
+                return Err("native CUDA does not yet support FP16 training options".into());
+            }
+            if norm_loss_factor.is_some() {
+                return Err("native CUDA does not yet support norm loss".into());
+            }
+        }
+
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
         debug_assert!(
@@ -845,6 +861,13 @@ impl SimpleGpuTrainer {
         loss: LossKind,
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "native-cuda")]
+        if native_backend_requested()
+            && (!matches!(loss, LossKind::Wrm { .. }) || loss.wrm_extended())
+        {
+            return Err("native CUDA currently supports only the default WRM loss".into());
+        }
+
         let mut prof_t0 = if std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some() {
             self.stream.synchronize()?;
             Some(std::time::Instant::now())

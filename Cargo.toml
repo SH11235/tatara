@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/shogi-format",
     "crates/shogi-features",
+    "crates/cuda-native-runtime",
     "crates/gpu-kernels",
     "crates/gpu-runtime",
     "crates/nnue-format",
@@ -30,6 +31,7 @@ shogi-format = { path = "crates/shogi-format" }
 shogi-features = { path = "crates/shogi-features" }
 gpu-kernels = { path = "crates/gpu-kernels" }
 gpu-runtime = { path = "crates/gpu-runtime" }
+cuda-native-runtime = { path = "crates/cuda-native-runtime" }
 nnue-format = { path = "crates/nnue-format" }
 nnue-train = { path = "crates/nnue-train" }
 clap = { version = "4.5", features = ["derive"] }

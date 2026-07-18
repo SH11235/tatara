@@ -760,6 +760,11 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "native-cuda")]
+        if native_backend_requested() {
+            return Err("native CUDA currently supports only the Simple architecture".into());
+        }
+
         assert!(
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"

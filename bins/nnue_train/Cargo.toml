@@ -19,6 +19,9 @@ gpu = [
     "dep:cuda-host",
     "dep:gpu-runtime",
 ]
+# WSL/Linux validation path for CUDA C++ device kernels. The existing host pipeline remains the
+# oracle until the portable Driver API runtime reaches full trainer coverage.
+native-cuda = ["gpu", "dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
 
 [lints]
 workspace = true
@@ -37,6 +40,7 @@ shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }
 gpu-runtime = { workspace = true, optional = true }
+cuda-native-runtime = { workspace = true, optional = true }
 clap = { workspace = true }
 
 # cuda-oxide device 側 API (`#[kernel]` / DisjointSlice / atomics) + host 側
