@@ -6,15 +6,22 @@
 
 **将棋 NNUE 評価関数を高速に学習する Rust 製トレーナー。**
 
-tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を GPU で
-学習するツール。host から device まで **Rust 一言語**で書かれ、GPU kernel は
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide)(NVIDIA Labs の Rust → PTX
-rustc backend)で build-time に PTX 化する — C / C++ / CUDA C++ を一切介さない。
+tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を NVIDIA
+GPU で学習するツール。trainer、data pipeline、CUDA Driver API runtime は
+Rust で書かれ、native GPU backend は hand-fuse した CUDA C++ kernel を NVCC で
+fat binary に compile して実行ファイルへ埋め込む。
 
-GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA C++ trainer
-[bullet-shogi](https://github.com/SH11235/bullet-shogi) を上回る throughput を出す。
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide) の Rust → PTX backend も Cargo の
+既定 feature および native backend の数値・性能 reference として保守している。
+`native-cuda-host` build は cuda-oxide を使わず、NVCC で build した kernel と
+portable Rust host runtime だけを使う。`native-cuda` feature は数値 parity と
+benchmark 比較のため両方の device backend を build する。
 
-**vs bullet-shogi (RTX 3080 Ti 実測)**: LayerStack は bit-identical な既定経路でも
+GPU kernel を hand-fuse することで **極めて高速** — 実測した cuda-oxide backend は
+上流の CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi)
+を上回る throughput を出し、native backend も同じ fused training 設計を使う。
+
+**cuda-oxide vs bullet-shogi (RTX 3080 Ti 実測)**: LayerStack は bit-identical な既定経路でも
 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×**。Simple (HalfKP
 `512x2-8-64`) は既定経路で約 **+20%**、`--all-optim`(FP16/TF32) で約 **+55%**。
 
@@ -53,7 +60,7 @@ sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` /
 
 *tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 
-> **NVIDIA only** — cuda-oxide が PTX 生成専用なため ROCm / AMD は対象外。
+> **NVIDIA only** — どちらの GPU backend も NVIDIA CUDA を対象とし、ROCm / AMD は対象外。
 > AMD GPU で類似の NNUE 学習を行いたい場合は CUDA / HIP 両 backend を持つ
 > 上流の [bullet-shogi](https://github.com/SH11235/bullet-shogi) を参照。
 
@@ -94,17 +101,15 @@ sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` /
 
 ### 環境要件
 
-- **OS** — Linux 一級サポート、Windows は WSL2 経由、macOS は GPU ビルド非対応
-- **NVIDIA GPU** (Ampere 以降 / sm_80+ を公式サポート、Turing / sm_75 も
-  `CUDA_OXIDE_TARGET=sm_75` 環境変数で単純な kernel は動作)
+- **OS** — Linux 一級サポート、Windows は WSL2 経由に加え
+  `native-cuda-host` で native Windows を実験的にサポート、macOS は GPU ビルド非対応
+- **NVIDIA GPU** (backend 別の対応表は `docs/setup.ja.md` 参照)
 - **CUDA Toolkit 12.x** (12.9 で動作確認)
-- **LLVM 21+** (`llc-21` が floor、`llc-22` が atomics syncscope の完全性に
-  必要なので推奨)
-- **Rust nightly** (`rust-toolchain.toml` で cuda-oxide upstream の channel
-  に追従、rustc internal ABI に依存するため channel を勝手に変えない)
+- `native-cuda-host` は **NVCC**、既定の cuda-oxide backend は **LLVM 21+** と
+  `cargo-oxide`
+- **Rust nightly** (`rust-toolchain.toml` で固定)
 
-GPU kernel をビルドする `cargo-oxide` のセットアップは
-`bash scripts/setup-cuda-oxide.sh`。詳細なインストール手順・OS 別の案内・
+native CUDA C++ の build command、cuda-oxide のセットアップ、OS 別の詳細手順、
 サポート GPU マトリクスは [docs/setup.ja.md](docs/setup.ja.md) を参照。
 
 ### ビルドと学習
@@ -114,7 +119,7 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 
 ## ドキュメント
 
-- [Setup guide](docs/setup.ja.md) — OS 別の案内、CUDA / LLVM / `cargo-oxide` の
+- [Setup guide](docs/setup.ja.md) — OS 別の案内、native CUDA / cuda-oxide の build
   セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.ja.md) — アーキ別の学習例 + 主要
   CLI option + resume / checkpoint 運用

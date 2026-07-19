@@ -7,15 +7,23 @@
 **A fast Rust trainer for shogi NNUE evaluation networks.**
 
 tatara trains shogi NNUE (Efficiently Updatable Neural Network) evaluation
-networks on the GPU. It is written in **Rust end to end**, from host to device:
-GPU kernels are compiled to PTX at build time by
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide) (NVIDIA Labs' Rust → PTX
-rustc backend) — no C / C++ / CUDA C++ anywhere in the pipeline.
+networks on NVIDIA GPUs. The trainer, data pipeline, and CUDA Driver API runtime
+are written in Rust, while the native GPU backend compiles hand-fused CUDA C++
+kernels with NVCC into an embedded fat binary.
 
-Hand-fusing the GPU kernels makes it **very fast** — it out-throughputs its
-upstream CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi).
+The [cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend is
+also maintained as the default Cargo feature and as a numerical and performance
+reference for the native backend. A `native-cuda-host` build uses only the
+NVCC-built kernels and portable Rust host runtime, without cuda-oxide. The
+`native-cuda` feature builds both device backends for parity and benchmark
+comparisons.
 
-**vs bullet-shogi (measured on RTX 3080 Ti)**: for LayerStack, even the
+Hand-fusing the GPU kernels makes it **very fast** — the measured cuda-oxide
+backend out-throughputs its upstream CUDA C++ trainer
+[bullet-shogi](https://github.com/SH11235/bullet-shogi), while the native backend
+keeps the same fused training design.
+
+**cuda-oxide vs bullet-shogi (measured on RTX 3080 Ti)**: for LayerStack, even the
 bit-identical default path is **+37%**, and stacking the opt-in FP16 modes reaches
 up to **~2.1×**. For Simple (HalfKP `512x2-8-64`) it is around **+20%** on the
 default and around **+55%** with `--all-optim` (FP16/TF32).
@@ -58,7 +66,7 @@ sigmoid; use the same scale for `--scale` and every `--wrm-*-scaling` /
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*
 
-> **NVIDIA only** — because cuda-oxide only generates PTX, ROCm / AMD is out of
+> **NVIDIA only** — both GPU backends target NVIDIA CUDA; ROCm / AMD is out of
 > scope. To train comparable shogi NNUE nets on an AMD GPU, see the upstream
 > [bullet-shogi](https://github.com/SH11235/bullet-shogi), which has both CUDA
 > and HIP backends.
@@ -103,21 +111,17 @@ from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000)
 
 ### Requirements
 
-- **OS** — Linux is first-class; Windows is supported via WSL2; macOS cannot
-  build the GPU crates
-- **NVIDIA GPU** (Ampere and later / sm_80+ is officially supported; Turing /
-  sm_75 also runs simple kernels with the `CUDA_OXIDE_TARGET=sm_75` environment
-  variable)
+- **OS** — Linux is first-class; Windows is supported via WSL2, with experimental
+  native Windows support through `native-cuda-host`; macOS cannot build the GPU
+  crates
+- **NVIDIA GPU** (see the backend-specific support matrix in `docs/setup.md`)
 - **CUDA Toolkit 12.x** (verified with 12.9)
-- **LLVM 21+** (`llc-21` is the floor; `llc-22` is recommended because it is
-  needed for fully correct atomics syncscope)
-- **Rust nightly** (`rust-toolchain.toml` tracks the cuda-oxide upstream
-  channel; do not change the channel yourself, since it depends on the rustc
-  internal ABI)
+- **NVCC** for `native-cuda-host`; **LLVM 21+** and `cargo-oxide` for the default
+  cuda-oxide backend
+- **Rust nightly** (pinned in `rust-toolchain.toml`)
 
-To set up `cargo-oxide`, which builds the GPU kernels, run
-`bash scripts/setup-cuda-oxide.sh`. For detailed installation steps, per-OS
-guidance, and the supported-GPU matrix, see [docs/setup.md](docs/setup.md).
+For the native CUDA C++ build command, cuda-oxide setup, detailed per-OS
+instructions, and the supported-GPU matrix, see [docs/setup.md](docs/setup.md).
 
 ### Build and train
 
@@ -127,7 +131,7 @@ For building the kernels and running the smoke test, see
 
 ## Documentation
 
-- [Setup guide](docs/setup.md) — per-OS guidance, CUDA / LLVM / `cargo-oxide`
+- [Setup guide](docs/setup.md) — per-OS guidance, native CUDA / cuda-oxide build
   setup, supported-GPU matrix, CUDA toolkit root resolution
 - [Training quickstart](docs/training-quickstart.md) — per-architecture training
   examples + key CLI options + resume / checkpoint workflow
