@@ -73,6 +73,12 @@ Also confirm that `CUDA_PATH\lib\x64\cuda.lib` and `cublas.lib` exist. Setting
 causes the trainer to fail at startup with `STATUS_DLL_NOT_FOUND (0xc0000135)`
 when it loads the cuBLAS DLL.
 
+The CUDA C++ kernel source contains UTF-8 comments. On Windows, the repository
+build script automatically passes `/utf-8` to NVCC's MSVC host compiler. When
+building an older commit or compiling the source directly, warning C4819
+followed by `identifier ... is undefined` means MSVC interpreted the source as
+the CP932 code page. Set `$env:CL = '/utf-8'` in Developer PowerShell and retry.
+
 ### Build and smoke tests
 
 Disable default features and select only `native-cuda-host`:

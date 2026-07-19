@@ -69,6 +69,12 @@ cargo -V
 `CUDA_PATH` だけを設定して `PATH` に `CUDA_PATH\bin` を加えないと、build は通っても
 trainer 起動時に cuBLAS DLL を解決できず `STATUS_DLL_NOT_FOUND (0xc0000135)` になる。
 
+CUDA C++ kernel source は UTF-8 のコメントを含む。repository の build script は Windows
+で NVCC の host compiler（MSVC）へ `/utf-8` を自動で渡す。古い commit や source を
+NVCC で直接 compile するときに warning C4819 と、直後の定数について
+`identifier ... is undefined` が同時に出る場合は、MSVC が source を CP932 として
+誤解釈している。Developer PowerShell で `$env:CL = '/utf-8'` を設定して再実行する。
+
 ### build と smoke test
 
 既定 feature を無効化し、必ず `native-cuda-host` だけを指定する:
