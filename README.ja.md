@@ -15,7 +15,10 @@ fat binary に compile して実行ファイルへ埋め込む。
 既定 feature および native backend の数値・性能 reference として保守している。
 `native-cuda-host` build は cuda-oxide を使わず、NVCC で build した kernel と
 portable Rust host runtime だけを使う。`native-cuda` feature は数値 parity と
-benchmark 比較のため両方の device backend を build する。
+benchmark 比較のため両方の device backend を有効化するが、build されるのは
+NVCC fat binary のみ — cuda-oxide 側の PTX は事前に
+`bash scripts/build-kernels.sh` で生成しておく
+([docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md) 参照)。
 
 GPU kernel を hand-fuse することで **極めて高速** — 実測した cuda-oxide backend は
 上流の CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi)

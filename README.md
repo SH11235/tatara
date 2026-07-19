@@ -15,8 +15,10 @@ The [cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend is
 also maintained as the default Cargo feature and as a numerical and performance
 reference for the native backend. A `native-cuda-host` build uses only the
 NVCC-built kernels and portable Rust host runtime, without cuda-oxide. The
-`native-cuda` feature builds both device backends for parity and benchmark
-comparisons.
+`native-cuda` feature enables parity and benchmark comparisons across both
+device backends; it builds the NVCC fat binary only, so generate the cuda-oxide
+PTX first with `bash scripts/build-kernels.sh` (see
+[docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md)).
 
 Hand-fusing the GPU kernels makes it **very fast** — the measured cuda-oxide
 backend out-throughputs its upstream CUDA C++ trainer
