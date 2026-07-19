@@ -61,6 +61,11 @@ the JSON report then records `parameters.customized: true`.
 Run the command from a Visual Studio Developer PowerShell on Windows if the C++ build tools are
 not already in `PATH`. The CUDA toolkit containing `nvcc` must also be installed.
 
+If warning C4819 is followed by `identifier ... is undefined` on Windows, NVCC's host compiler
+has interpreted the UTF-8 kernel source using the default code page. The current build script
+passes `/utf-8` to MSVC automatically. For an older commit, set `$env:CL = '/utf-8'` in Developer
+PowerShell before running the same benchmark command.
+
 ## Results
 
 Reports are written to `target/benchmark-results/native-cuda/` by default and conform to

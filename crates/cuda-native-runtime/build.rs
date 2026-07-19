@@ -42,16 +42,22 @@ fn main() {
         .join("tatara_native.fatbin");
     // Keep NVCC's default fmad=true for native throughput. CUDA C++ and cuda-oxide parity allows
     // the resulting mul-add rounding differences with a 2e-6 tolerance instead of bit equality.
-    let status = Command::new(&nvcc)
-        .args([
-            "--fatbin",
-            "--std=c++17",
-            "-O3",
-            "--generate-code",
-            &codegen,
-            "kernels/native_kernels.cu",
-            "-o",
-        ])
+    let mut command = Command::new(&nvcc);
+    command.args([
+        "--fatbin",
+        "--std=c++17",
+        "-O3",
+        "--generate-code",
+        &codegen,
+    ]);
+    if target_os == "windows" {
+        // native_kernels.cu は UTF-8 の日本語コメントを含む。MSVC の既定 code page が
+        // CP932 の環境では、コメント中の byte 列を誤解釈して後続の定義までコメント扱いに
+        // することがあるため、NVCC の host compiler に source encoding を明示する。
+        command.args(["-Xcompiler", "/utf-8"]);
+    }
+    let status = command
+        .args(["kernels/native_kernels.cu", "-o"])
         .arg(&output)
         .status()
         .unwrap_or_else(|e| panic!("failed to execute {}: {e}", nvcc.display()));

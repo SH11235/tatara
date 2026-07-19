@@ -61,6 +61,11 @@ cargo run -p nnue-trainer --release --features native-cuda -- \
 WindowsでC++ build toolが`PATH`にない場合はVisual Studio Developer PowerShellから
 実行する。`nvcc`を含むCUDA toolkitも必要。
 
+Windowsでwarning C4819に続いて`identifier ... is undefined`が出る場合は、NVCCの
+host compilerがUTF-8のkernel sourceを既定code pageとして誤解釈している。現行の
+build scriptはMSVCへ`/utf-8`を自動で渡す。古いcommitを測る場合はDeveloper
+PowerShellで`$env:CL = '/utf-8'`を設定してから同じbenchmark commandを実行する。
+
 ## 結果
 
 既定の出力先は`target/benchmark-results/native-cuda/`で、
