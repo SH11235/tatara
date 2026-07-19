@@ -50,7 +50,9 @@ fn main() {
         "--generate-code",
         &codegen,
     ]);
-    if target_os == "windows" {
+    if env::consts::OS == "windows" {
+        // build script と NVCC は host 上で動くため、host compiler の引数は target OS
+        // ではなく host OS で分岐する。
         // native_kernels.cu は UTF-8 の日本語コメントを含む。MSVC の既定 code page が
         // CP932 の環境では、コメント中の byte 列を誤解釈して後続の定義までコメント扱いに
         // することがあるため、NVCC の host compiler に source encoding を明示する。
