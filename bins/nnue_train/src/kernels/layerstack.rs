@@ -764,6 +764,56 @@ pub fn dense_mm_bwd_weight(
     }
 }
 
+/// Per-bucket dense parameter と全 bucket 共通 parameter を forward 用 buffer へ畳み込む。
+///
+/// `folded[bucket][i] = bucketed[bucket][i] + shared[i]`。weight / bias のどちらにも
+/// 同じ layout で使い、`group_len` は 1 bucket 分の要素数。
+#[kernel]
+pub fn stack_factorizer_fold(
+    bucketed: &[f32],
+    shared: &[f32],
+    mut folded: DisjointSlice<f32>,
+    num_buckets: u32,
+    group_len: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (num_buckets as usize) * (group_len as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let index = tid.get();
+    let shared_index = index % (group_len as usize);
+    if let Some(out) = folded.get_mut(tid) {
+        *out = bucketed[index] + shared[shared_index];
+    }
+}
+
+/// Per-bucket dense parameter の勾配を全 bucket 共通 parameter の勾配へ縮約する。
+///
+/// `shared_grad[i] = Σ_bucket bucketed_grad[bucket][i]`。各出力 cell は単一 thread が
+/// 上書きするため atomic と事前の zero fill は不要。
+#[kernel]
+pub fn stack_factorizer_reduce_grad(
+    bucketed_grad: &[f32],
+    mut shared_grad: DisjointSlice<f32>,
+    num_buckets: u32,
+    group_len: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= group_len as usize {
+        return;
+    }
+    let mut sum = 0.0_f32;
+    let mut bucket = 0_u32;
+    while bucket < num_buckets {
+        sum += bucketed_grad[(bucket as usize) * (group_len as usize) + tid.get()];
+        bucket += 1;
+    }
+    if let Some(out) = shared_grad.get_mut(tid) {
+        *out = sum;
+    }
+}
+
 /// Tiled shared-memory variant of [`dense_mm_bwd_weight`]. L1f 用 (`in_dim=ft_out`,
 /// `out_dim=16` 固定) を想定した固定タイル形状 (TILE_K=16, TILE_IN=16,
 /// TILE_OUT=16, block=256 threads)。`in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0`

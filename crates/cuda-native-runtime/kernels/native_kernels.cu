@@ -2090,6 +2090,44 @@ extern "C" __global__ void elementwise_add(
     }
 }
 
+extern "C" __global__ void stack_factorizer_fold(
+    const float* bucketed,
+    unsigned long long,
+    const float* shared,
+    unsigned long long,
+    float* folded,
+    unsigned long long,
+    unsigned int num_buckets,
+    unsigned int group_len
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total =
+        static_cast<unsigned long long>(num_buckets) * group_len;
+    if (i < total) {
+        folded[i] = bucketed[i] + shared[i % group_len];
+    }
+}
+
+extern "C" __global__ void stack_factorizer_reduce_grad(
+    const float* bucketed_gradient,
+    unsigned long long,
+    float* shared_gradient,
+    unsigned long long,
+    unsigned int num_buckets,
+    unsigned int group_len
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= group_len) {
+        return;
+    }
+    float sum = 0.0F;
+    for (unsigned int bucket = 0; bucket < num_buckets; ++bucket) {
+        sum += bucketed_gradient[static_cast<unsigned long long>(bucket) * group_len + i];
+    }
+    shared_gradient[i] = sum;
+}
+
 extern "C" __global__ void slice_extract_2d(
     const float* source,
     unsigned long long,

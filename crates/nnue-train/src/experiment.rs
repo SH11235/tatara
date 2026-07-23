@@ -90,6 +90,10 @@ pub struct Params {
     /// 無効の run では省略 (factorizer 以前の run の JSON と同形)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_factorize: Option<bool>,
+    /// LayerStack L2/L3 shared factorizer. L1 shared factorization is part of
+    /// the base LayerStack architecture and is therefore not represented here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_factorize_all: Option<bool>,
     /// FT 出力次元 (per-perspective)。入力次元ではない点に注意。
     pub l0: usize,
     pub l1: usize,
@@ -612,6 +616,7 @@ mod tests {
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
             ft_factorize: None,
+            stack_factorize_all: None,
             l0: 1536,
             l1: 16,
             l2: 32,

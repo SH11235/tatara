@@ -49,6 +49,26 @@ pub(crate) struct StepOptions<'a> {
 pub(crate) type LayerStackRawCheckpointState =
     (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
+struct SharedStackLayer {
+    w: DeviceBuffer<f32>,
+    w_m: DeviceBuffer<f32>,
+    w_v: DeviceBuffer<f32>,
+    w_slow: DeviceBuffer<f32>,
+    w_grad: DeviceBuffer<f32>,
+    b: DeviceBuffer<f32>,
+    b_m: DeviceBuffer<f32>,
+    b_v: DeviceBuffer<f32>,
+    b_slow: DeviceBuffer<f32>,
+    b_grad: DeviceBuffer<f32>,
+    folded_w: DeviceBuffer<f32>,
+    folded_b: DeviceBuffer<f32>,
+}
+
+struct SharedStackFactorizer {
+    l2: SharedStackLayer,
+    l3: SharedStackLayer,
+}
+
 impl<'a> StepContext<'a> {
     fn new(
         trainer: &GpuTrainer,
@@ -184,6 +204,10 @@ pub(crate) struct GpuTrainer {
     l3_b_v: DeviceBuffer<f32>,
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
+
+    /// Optional L2/L3 shared terms. L1 is always factorized through `l1f_*`;
+    /// enabling this state extends the same decomposition to every dense layer.
+    stack_factorizer: Option<SharedStackFactorizer>,
 
     /// PSQT shortcut の weight + optimizer state。`--psqt` 有効時のみ `Some`、
     /// 既定 `None` で従来 path と bit-identical (forward / backward / optimizer の
@@ -977,6 +1001,7 @@ impl GpuTrainer {
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            stack_factorizer: None,
             psqt,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は小さい固定 batch を渡す)。
@@ -1019,6 +1044,85 @@ impl GpuTrainer {
         // --resume) は load 後に caller が再同期する。
         trainer.sync_ft_forward_weights()?;
         Ok(trainer)
+    }
+
+    /// Extend the existing shared L1 factorizer to L2 and L3.
+    ///
+    /// Shared terms start at zero, so enabling this keeps the initial forward
+    /// pass identical to the non-factorized control.
+    pub(crate) fn enable_stack_factorizer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.stack_factorizer.is_some() {
+            return Ok(());
+        }
+        let z = |n| DeviceBuffer::<f32>::zeroed(&self.stream, n);
+        let layer = |w_n: usize,
+                     b_n: usize,
+                     bucket_w_n: usize,
+                     bucket_b_n: usize|
+         -> Result<SharedStackLayer, Box<dyn std::error::Error>> {
+            Ok(SharedStackLayer {
+                w: z(w_n)?,
+                w_m: z(w_n)?,
+                w_v: z(w_n)?,
+                w_slow: z(w_n)?,
+                w_grad: z(w_n)?,
+                b: z(b_n)?,
+                b_m: z(b_n)?,
+                b_v: z(b_n)?,
+                b_slow: z(b_n)?,
+                b_grad: z(b_n)?,
+                folded_w: z(bucket_w_n)?,
+                folded_b: z(bucket_b_n)?,
+            })
+        };
+        let l2_w_n = self.ws.l2_out * self.ws.l2_in();
+        let l2_b_n = self.ws.l2_out;
+        let l3_w_n = self.ws.l2_out;
+        self.stack_factorizer = Some(SharedStackFactorizer {
+            l2: layer(
+                l2_w_n,
+                l2_b_n,
+                self.num_buckets * l2_w_n,
+                self.num_buckets * l2_b_n,
+            )?,
+            l3: layer(l3_w_n, 1, self.num_buckets * l3_w_n, self.num_buckets)?,
+        });
+        self.sync_stack_forward_weights()
+    }
+
+    fn sync_stack_forward_weights(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(f) = self.stack_factorizer.as_ref() else {
+            return Ok(());
+        };
+        let fold = |bucketed: &DeviceBuffer<f32>,
+                    shared: &DeviceBuffer<f32>,
+                    folded: &DeviceBuffer<f32>,
+                    group_len: usize|
+         -> Result<(), Box<dyn std::error::Error>> {
+            unsafe {
+                cuda_launch! {
+                    kernel: stack_factorizer_fold,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(self.num_buckets * group_len),
+                    args: [
+                        slice(bucketed), slice(shared), slice(folded),
+                        self.num_buckets as u32, group_len as u32
+                    ]
+                }
+            }?;
+            Ok(())
+        };
+        fold(
+            &self.l2_w,
+            &f.l2.w,
+            &f.l2.folded_w,
+            self.ws.l2_out * self.ws.l2_in(),
+        )?;
+        fold(&self.l2_b, &f.l2.b, &f.l2.folded_b, self.ws.l2_out)?;
+        fold(&self.l3_w, &f.l3.w, &f.l3.folded_w, self.ws.l2_out)?;
+        fold(&self.l3_b, &f.l3.b, &f.l3.folded_b, 1)?;
+        Ok(())
     }
 
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
@@ -1173,6 +1277,7 @@ impl GpuTrainer {
             (None, None) => {}
         }
         self.step_count = 0;
+        self.sync_stack_forward_weights()?;
         Ok(())
     }
 
@@ -1244,10 +1349,22 @@ impl GpuTrainer {
             l1_b: self.l1_b.to_host_vec(&self.stream)?,
             l1f_w: self.l1f_w.to_host_vec(&self.stream)?,
             l1f_b: self.l1f_b.to_host_vec(&self.stream)?,
-            l2_w: self.l2_w.to_host_vec(&self.stream)?,
-            l2_b: self.l2_b.to_host_vec(&self.stream)?,
-            l3_w: self.l3_w.to_host_vec(&self.stream)?,
-            l3_b: self.l3_b.to_host_vec(&self.stream)?,
+            l2_w: match self.stack_factorizer.as_ref() {
+                Some(f) => f.l2.folded_w.to_host_vec(&self.stream)?,
+                None => self.l2_w.to_host_vec(&self.stream)?,
+            },
+            l2_b: match self.stack_factorizer.as_ref() {
+                Some(f) => f.l2.folded_b.to_host_vec(&self.stream)?,
+                None => self.l2_b.to_host_vec(&self.stream)?,
+            },
+            l3_w: match self.stack_factorizer.as_ref() {
+                Some(f) => f.l3.folded_w.to_host_vec(&self.stream)?,
+                None => self.l3_w.to_host_vec(&self.stream)?,
+            },
+            l3_b: match self.stack_factorizer.as_ref() {
+                Some(f) => f.l3.folded_b.to_host_vec(&self.stream)?,
+                None => self.l3_b.to_host_vec(&self.stream)?,
+            },
             psqt_w,
         })
     }
@@ -1310,6 +1427,28 @@ impl GpuTrainer {
             uniform!("l3_w", l3_w_n, l3_w, l3_w_m, l3_w_v, l3_w_slow),
             uniform!("l3_b", l3_b_n, l3_b, l3_b_m, l3_b_v, l3_b_slow),
         ];
+        if let Some(f) = self.stack_factorizer.as_ref() {
+            macro_rules! shared {
+                ($name:literal, $len:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {
+                    RawCkptGroupSource {
+                        name: $name,
+                        len: $len,
+                        bufs: RawCkptGroupBufs::Uniform {
+                            w: &f.$layer.$w,
+                            m: &f.$layer.$m,
+                            v: &f.$layer.$v,
+                            slow: &f.$layer.$slow,
+                        },
+                    }
+                };
+            }
+            groups.extend([
+                shared!("l2f_w", l2_out * l2_in, l2, w, w_m, w_v, w_slow),
+                shared!("l2f_b", l2_out, l2, b, b_m, b_v, b_slow),
+                shared!("l3f_w", l2_out, l3, w, w_m, w_v, w_slow),
+                shared!("l3f_b", 1, l3, b, b_m, b_v, b_slow),
+            ]);
+        }
         if let Some(psqt) = self.psqt.as_ref() {
             groups.push(RawCkptGroupSource {
                 name: "psqt_w",
@@ -1469,9 +1608,27 @@ impl GpuTrainer {
         up!(8, l3_w, l3_w_m, l3_w_v, l3_w_slow);
         up!(9, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
+        let psqt_idx = if let Some(f) = self.stack_factorizer.as_mut() {
+            macro_rules! up_shared {
+                ($idx:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
+                    let (w, m, v, s) = &loaded[$idx];
+                    f.$layer.$w = DeviceBuffer::from_host(&self.stream, w)?;
+                    f.$layer.$m = DeviceBuffer::from_host(&self.stream, m)?;
+                    f.$layer.$v = DeviceBuffer::from_host(&self.stream, v)?;
+                    f.$layer.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                }};
+            }
+            up_shared!(10, l2, w, w_m, w_v, w_slow);
+            up_shared!(11, l2, b, b_m, b_v, b_slow);
+            up_shared!(12, l3, w, w_m, w_v, w_slow);
+            up_shared!(13, l3, b, b_m, b_v, b_slow);
+            14
+        } else {
+            10
+        };
         // PSQT (任意): 末尾 group (save 側と対称)。
         if let Some(psqt) = self.psqt.as_mut() {
-            let (w_host, m_host, v_host, slow_host) = &loaded[10];
+            let (w_host, m_host, v_host, slow_host) = &loaded[psqt_idx];
             psqt.w = DeviceBuffer::from_host(&self.stream, w_host)?;
             psqt.w_m = DeviceBuffer::from_host(&self.stream, m_host)?;
             psqt.w_v = DeviceBuffer::from_host(&self.stream, v_host)?;
@@ -1479,6 +1636,7 @@ impl GpuTrainer {
         }
 
         self.step_count = header.step_count;
+        self.sync_stack_forward_weights()?;
         Ok((header.superbatch, header.producer_run_id, header.lr_horizon))
     }
 
@@ -2376,6 +2534,12 @@ impl GpuTrainer {
         prof_tick!("fwd_L1tail");
 
         // -- Forward step 11: L2 per-bucket dense → l2_dense_out (B × l2_out) --
+        let (l2_forward_w, l2_forward_b) = self
+            .stack_factorizer
+            .as_ref()
+            .map_or((&self.l2_w, &self.l2_b), |f| {
+                (&f.l2.folded_w, &f.l2.folded_b)
+            });
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -2386,8 +2550,8 @@ impl GpuTrainer {
                 config: cfg_1d(b * l2_out),
                 args: [
                     slice(self.ws.l2_input),
-                    slice(self.l2_w),
-                    slice(self.l2_b),
+                    slice(l2_forward_w),
+                    slice(l2_forward_b),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.l2_dense_out),
                     b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
@@ -2415,6 +2579,12 @@ impl GpuTrainer {
         prof_tick!("fwd_L2");
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
+        let (l3_forward_w, l3_forward_b) = self
+            .stack_factorizer
+            .as_ref()
+            .map_or((&self.l3_w, &self.l3_b), |f| {
+                (&f.l3.folded_w, &f.l3.folded_b)
+            });
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -2425,8 +2595,8 @@ impl GpuTrainer {
                 config: cfg_1d(b),
                 args: [
                     slice(self.ws.l2_acted),
-                    slice(self.l3_w),
-                    slice(self.l3_b),
+                    slice(l3_forward_w),
+                    slice(l3_forward_b),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.l3_out),
                     b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
@@ -2709,6 +2879,10 @@ impl GpuTrainer {
         // (elementwise_add 逆: dl3_out = dy, dl1_skip = dy、両者同じ buffer を直接渡せばよい)
 
         // -- Backward 13 reverse: L3 per-bucket dense grad --
+        let l3_backward_w = self
+            .stack_factorizer
+            .as_ref()
+            .map_or(&self.l3_w, |f| &f.l3.folded_w);
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -2719,7 +2893,7 @@ impl GpuTrainer {
                 config: cfg_1d(b * l2_out),
                 args: [
                     slice(self.ws.dy_net_output),
-                    slice(self.l3_w),
+                    slice(l3_backward_w),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.dl2_acted),
                     b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
@@ -2778,6 +2952,31 @@ impl GpuTrainer {
             }
         }?;
 
+        if let Some(f) = self.stack_factorizer.as_ref() {
+            unsafe {
+                cuda_launch! {
+                    kernel: stack_factorizer_reduce_grad,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_out),
+                    args: [
+                        slice(self.l3_w_grad), slice(f.l3.w_grad),
+                        self.num_buckets as u32, l2_out as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                cuda_launch! {
+                    kernel: stack_factorizer_reduce_grad,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(1),
+                    args: [
+                        slice(self.l3_b_grad), slice(f.l3.b_grad),
+                        self.num_buckets as u32, 1_u32
+                    ]
+                }
+            }?;
+        }
+
         prof_tick!("bwd_L3");
 
         // -- Backward 12 reverse: crelu_grad on l2_dense_out --
@@ -2799,6 +2998,10 @@ impl GpuTrainer {
         }?;
 
         // -- Backward 11 reverse: L2 per-bucket dense grad --
+        let l2_backward_w = self
+            .stack_factorizer
+            .as_ref()
+            .map_or(&self.l2_w, |f| &f.l2.folded_w);
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -2809,7 +3012,7 @@ impl GpuTrainer {
                 config: cfg_1d(b * l2_in),
                 args: [
                     slice(self.ws.dl2_out),
-                    slice(self.l2_w),
+                    slice(l2_backward_w),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.dl2_input),
                     b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
@@ -2892,6 +3095,32 @@ impl GpuTrainer {
                 ]
             }
         }?;
+
+        if let Some(f) = self.stack_factorizer.as_ref() {
+            let l2_group_len = l2_out * l2_in;
+            unsafe {
+                cuda_launch! {
+                    kernel: stack_factorizer_reduce_grad,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_group_len),
+                    args: [
+                        slice(self.l2_w_grad), slice(f.l2.w_grad),
+                        self.num_buckets as u32, l2_group_len as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                cuda_launch! {
+                    kernel: stack_factorizer_reduce_grad,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_out),
+                    args: [
+                        slice(self.l2_b_grad), slice(f.l2.b_grad),
+                        self.num_buckets as u32, l2_out as u32
+                    ]
+                }
+            }?;
+        }
 
         prof_tick!("bwd_L2");
 
@@ -3688,6 +3917,12 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
             norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
+            if let Some(f) = self.stack_factorizer.as_mut() {
+                norm_loss_group!(f.l2.w, l2_out, l2_in, 1, l2_in);
+                norm_loss_group!(f.l3.w, 1, l2_out, 1, l2_out);
+                norm_loss_group!(f.l2.b, 1, 0, 1, l2_out);
+                norm_loss_group!(f.l3.b, 1, 0, 1, 1);
+            }
             // PSQT shortcut weight (任意): psqt_w[feat*num_buckets + bucket] を
             // bucket 列ごと (= per-output-neuron) に正規化する (pitch=1 /
             // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —
@@ -4000,6 +4235,75 @@ impl GpuTrainer {
                 }
             }?;
         }
+        if let Some(f) = self.stack_factorizer.as_mut() {
+            let (dense_wd, dense_lr) = optim_groups.effective(OptimGroupKind::Dense, lr);
+            let (bias_wd, bias_lr) = optim_groups.effective(OptimGroupKind::Bias, lr);
+            macro_rules! update_shared {
+                ($layer:ident, $field:ident, $m:ident, $v:ident, $grad:ident, $n:expr,
+                 $lr:expr, $wd:expr, $min:expr, $max:expr) => {{
+                    let layer = &mut f.$layer;
+                    unsafe {
+                        cuda_launch! {
+                            kernel: radam_step,
+                            stream: self.stream, module: self.module, config: cfg_1d($n),
+                            args: [
+                                slice_mut(layer.$field), slice_mut(layer.$m), slice_mut(layer.$v),
+                                slice_mut(layer.$grad), $lr, step_size, denom, $wd,
+                                beta1, BETA2, EPS, $min, $max, ($n) as u32
+                            ]
+                        }
+                    }?;
+                }};
+            }
+            update_shared!(
+                l2,
+                w,
+                w_m,
+                w_v,
+                w_grad,
+                l2_out * l2_in,
+                dense_lr,
+                dense_wd,
+                W_CLAMP_QUANT_MIN,
+                W_CLAMP_QUANT_MAX
+            );
+            update_shared!(
+                l2,
+                b,
+                b_m,
+                b_v,
+                b_grad,
+                l2_out,
+                bias_lr,
+                bias_wd,
+                W_CLAMP_QUANT_MIN,
+                W_CLAMP_QUANT_MAX
+            );
+            update_shared!(
+                l3,
+                w,
+                w_m,
+                w_v,
+                w_grad,
+                l2_out,
+                dense_lr,
+                dense_wd,
+                W_CLAMP_QUANT_MIN,
+                W_CLAMP_QUANT_MAX
+            );
+            update_shared!(
+                l3,
+                b,
+                b_m,
+                b_v,
+                b_grad,
+                1,
+                bias_lr,
+                bias_wd,
+                W_CLAMP_NONE_MIN,
+                W_CLAMP_NONE_MAX
+            );
+        }
 
         // Lookahead lerp every K steps (ranger のみ)。lerp は radam の後に FT weight を
         // 再度書き換えるので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新
@@ -4040,12 +4344,34 @@ impl GpuTrainer {
                     }
                 }?;
             }
+            if let Some(f) = self.stack_factorizer.as_mut() {
+                macro_rules! lerp_shared {
+                    ($layer:ident, $weight:ident, $slow:ident, $n:expr) => {{
+                        let layer = &mut f.$layer;
+                        unsafe {
+                            cuda_launch! {
+                                kernel: ranger_lookahead_lerp,
+                                stream: self.stream, module: self.module, config: cfg_1d($n),
+                                args: [
+                                    slice_mut(layer.$weight), slice_mut(layer.$slow),
+                                    RANGER_ALPHA, ($n) as u32
+                                ]
+                            }
+                        }?;
+                    }};
+                }
+                lerp_shared!(l2, w, w_slow, l2_out * l2_in);
+                lerp_shared!(l2, b, b_slow, l2_out);
+                lerp_shared!(l3, w, w_slow, l2_out);
+                lerp_shared!(l3, b, b_slow, 1);
+            }
         }
         // factorizer: master (`ft_w`) の本 step の全更新 (norm loss / radam /
         // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
         if ft_factorize {
             self.launch_ft_fold()?;
         }
+        self.sync_stack_forward_weights()?;
         prof_tick!("optimizer");
 
         // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の

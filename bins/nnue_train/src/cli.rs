@@ -814,6 +814,12 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
     pub(crate) num_buckets: usize,
 
+    /// Extend the always-on shared L1 factorizer to L2 and L3. The shared
+    /// terms are initialized to zero and folded into each bucket on export, so
+    /// the resulting .bin remains compatible with existing LayerStack engines.
+    #[arg(long)]
+    pub(crate) stack_factorize_all: bool,
+
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the
     /// FP32 Sgemm inputs to 10-bit-mantissa TF32 and running TC mma → FP32

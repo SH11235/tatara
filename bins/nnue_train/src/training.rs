@@ -672,6 +672,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             e
         }
     })?;
+    if layerstack.stack_factorize_all {
+        trainer.enable_stack_factorizer()?;
+    }
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
@@ -1457,6 +1460,7 @@ pub(crate) fn build_experiment_logger(
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
         ft_factorize: feature_set.ft_factorize().then_some(true),
+        stack_factorize_all: layerstack.stack_factorize_all.then_some(true),
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
@@ -1623,6 +1627,7 @@ pub(crate) fn build_experiment_logger_simple(
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
         ft_factorize: id.feature_set.ft_factorize().then_some(true),
+        stack_factorize_all: None,
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,
