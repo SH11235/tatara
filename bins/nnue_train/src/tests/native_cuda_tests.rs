@@ -77,10 +77,10 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
                 proc_macro2::TokenTree::Ident(ident),
                 proc_macro2::TokenTree::Group(group),
             ] = window
+                && ident == "cfg"
+                && group.delimiter() == proc_macro2::Delimiter::Parenthesis
             {
-                if ident == "cfg" && group.delimiter() == proc_macro2::Delimiter::Parenthesis {
-                    return eval_predicate_group(group.stream()) == Tri::False;
-                }
+                return eval_predicate_group(group.stream()) == Tri::False;
             }
         }
         false
@@ -181,13 +181,12 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
             }
             match token {
                 proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
-                    if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek() {
-                        if group.delimiter() == proc_macro2::Delimiter::Bracket
-                            && attribute_marks_test_only(group.stream())
-                        {
-                            skip_next_item_body = true;
-                            tokens.next();
-                        }
+                    if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek()
+                        && group.delimiter() == proc_macro2::Delimiter::Bracket
+                        && attribute_marks_test_only(group.stream())
+                    {
+                        skip_next_item_body = true;
+                        tokens.next();
                     }
                 }
                 proc_macro2::TokenTree::Ident(ident) if ident == "cuda_launch" => {
@@ -487,19 +486,19 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 61, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 63, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 77, "production kernel inventory changed");
+    assert_eq!(required.len(), 79, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
 /// `production_cuda_launch_symbols` は nnue_train crate の `src` だけを走査する。native path
-/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 77 本の
+/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 79 本の
 /// inventory tripwire も発火しなくなる。workspace 全体を走査し、`cuda_launch!` を含む
 /// production source が既知の許可 path 配下だけにあることを固定する。
 #[test]
