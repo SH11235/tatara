@@ -105,7 +105,7 @@ Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Cl
 | `ClippedReLU[32]` | 32 要素の clipped ReLU |
 | `AffineTransform[1<-32]` | 出力層、32 → 1 |
 
-LayerStack の arch string は dense 層チェーンの要約で、L1f skip 接続や
+LayerStack の arch string は dense 層チェーンの要約で、L1 shared skip 接続や
 pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 有効時の
 `PSQT=<N>` トークンにのみ現れる)。EffectBucket feature set の config は
 `EffectBucket=<config>` トークンに現れる。LayerStack の完全なアーキ記述は

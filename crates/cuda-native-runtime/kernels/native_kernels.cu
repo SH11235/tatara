@@ -2090,7 +2090,7 @@ extern "C" __global__ void elementwise_add(
     }
 }
 
-extern "C" __global__ void stack_factorizer_fold(
+extern "C" __global__ void stack_shared_delta_fold(
     const float* bucketed,
     unsigned long long,
     const float* shared,
@@ -2109,7 +2109,7 @@ extern "C" __global__ void stack_factorizer_fold(
     }
 }
 
-extern "C" __global__ void stack_factorizer_reduce_grad(
+extern "C" __global__ void stack_shared_delta_reduce_grad(
     const float* bucketed_gradient,
     unsigned long long,
     float* shared_gradient,
@@ -2667,7 +2667,7 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l3(
 // 各 (row, output) 要素を1 thread が担当し bias_gradient[output] へ直接 global atomicAdd
 // する。shared-memory 縮約は行わない。結果は縮約実装と fp32 の加算順の範囲で一致し、
 // native⇔cuda-oxide の数値 parity test が許容誤差内で固定する。
-extern "C" __global__ void bias_grad_shared_l1f(
+extern "C" __global__ void bias_grad_l1_shared(
     const float* output_gradient,
     unsigned long long,
     float* bias_gradient,

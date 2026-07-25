@@ -9,8 +9,8 @@
 //!   依存、ft_out は `--ft-out`)
 //! - per-perspective post: bias add → CReLU → pairwise_mul (ft_out → ft_out/2) → ×127/128
 //! - combined = stm.concat(nstm) = ft_out
-//! - L1 (per-bucket delta + shared l1f factorized): `num_buckets` × l1_out + (ft_out, l1_out)
-//! - l1_total = L1.select(bucket) + L1f、main (l1_out - 1) + skip (1) に slice
+//! - L1 (per-bucket term + L1 shared term): `num_buckets` × l1_out + (ft_out, l1_out)
+//! - l1_total = L1.select(bucket) + L1 shared、main (l1_out - 1) + skip (1) に slice
 //! - L2 (per-bucket): `num_buckets` × l2_out with input l2_in = (l1_out - 1) * 2
 //! - L3 (per-bucket output): `num_buckets` × 1
 //! - PSQT shortcut (任意): `(ft_in, num_buckets)` の per-feature × per-bucket スカラー。
@@ -30,13 +30,13 @@
 //!    feat 内 bucket 連番)。scale は `QA * QB = 8128` (bias は 0 固定)。
 //! 7. layerstacks: `num_buckets` × {fc_hash (4 LE u32), L1 (bias + weight), L2 (同), L3 (同)}
 //!
-//! ## save 時の L1 / L1f coalesce
+//! ## save 時の L1 / L1 shared coalesce
 //!
-//! per-bucket l1 と shared l1f を **save 時に merge** して per-bucket の単一
+//! per-bucket L1 と L1 shared term を **save 時に merge** して per-bucket の単一
 //! weight として書き出す:
 //!
-//! - `l1_bias_merged[bucket][out] = l1_b[bucket][out] + l1f_b[out]` (bias broadcast)
-//! - `l1_weight_merged[bucket][out][in] = l1_w[bucket][out][in] + l1f_w[in][out]` (in/out 軸入替注意)
+//! - `l1_bias_merged[bucket][out] = l1_b[bucket][out] + l1_shared_bias[out]` (bias broadcast)
+//! - `l1_weight_merged[bucket][out][in] = l1_w[bucket][out][in] + l1_shared_weight[in][out]` (in/out 軸入替注意)
 //!
 //! 推論エンジン rshogi は `Factorizer` を含む arch を reject する (coalesced only を要求)
 //! ため、save 時に必ず merge する不変条件。
@@ -483,8 +483,8 @@ pub fn coalesce_ft_factorized(
 /// - `ft_b`: `(ft_out)` (stm/nstm 共有)
 /// - `l1_w`: `(num_buckets, l1_out, ft_out)` row-major、`l1_w[buc * l1_out * ft_out + out * ft_out + in]`
 /// - `l1_b`: `(num_buckets, l1_out)` row-major
-/// - `l1f_w`: `(ft_out, l1_out)` row-major、`l1f_w[in * l1_out + out]`
-/// - `l1f_b`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
+/// - `l1_shared_weight`: `(ft_out, l1_out)` row-major、`l1_shared_weight[in * l1_out + out]`
+/// - `l1_shared_bias`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
 /// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
 /// - `l2_b`: `(num_buckets, l2_out)`
 /// - `l3_w`: `(num_buckets, l2_out)` (out_dim=1 なので out 軸省略)
@@ -502,8 +502,8 @@ pub struct LayerStackWeights {
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
     pub l1_b: Vec<f32>,
-    pub l1f_w: Vec<f32>,
-    pub l1f_b: Vec<f32>,
+    pub l1_shared_weight: Vec<f32>,
+    pub l1_shared_bias: Vec<f32>,
     pub l2_w: Vec<f32>,
     pub l2_b: Vec<f32>,
     pub l3_w: Vec<f32>,
@@ -537,8 +537,8 @@ impl LayerStackWeights {
             ft_b: vec![0.0; ft_out],
             l1_w: vec![0.0; num_buckets * l1_out * ft_out],
             l1_b: vec![0.0; num_buckets * l1_out],
-            l1f_w: vec![0.0; ft_out * l1_out],
-            l1f_b: vec![0.0; l1_out],
+            l1_shared_weight: vec![0.0; ft_out * l1_out],
+            l1_shared_bias: vec![0.0; l1_out],
             l2_w: vec![0.0; num_buckets * l2_out * l2_in],
             l2_b: vec![0.0; num_buckets * l2_out],
             l3_w: vec![0.0; num_buckets * l2_out],
@@ -571,7 +571,7 @@ impl LayerStackWeights {
         fv_scale: Option<i32>,
     ) -> io::Result<()> {
         // ---- header ---- (arch 文字列・hash は feature set + 層次元から導出)
-        // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1f bias buffer の長さ
+        // FT 出力次元は FT bias buffer の長さ、L1 出力次元は L1 shared bias buffer の長さ
         // (どちらも 1 perspective / 1 dim あたり 1 要素)。L2 出力次元は L2 bias buffer の
         // 長さを bucket 数で割った値 (`l2_b` は `(num_buckets, l2_out)`)。L2 入力次元は
         // L1 出力から導出。
@@ -591,7 +591,7 @@ impl LayerStackWeights {
             )
         })?;
         let ft_out = self.ft_b.len();
-        let l1_out = self.l1f_b.len();
+        let l1_out = self.l1_shared_bias.len();
         let l2_out = self.l2_b.len() / num_buckets;
         let l2_in = (l1_out - 1) * 2;
         let feature_hash = self.feature_set.feature_hash();
@@ -750,20 +750,20 @@ impl LayerStackWeights {
             // --- L1 (merged delta + shared) ---
             // Biases: l1_out i32 scale = QA*QB = 8128
             for out in 0..l1_out {
-                let merged = self.l1_b[buc * l1_out + out] + self.l1f_b[out];
+                let merged = self.l1_b[buc * l1_out + out] + self.l1_shared_bias[out];
                 let val = (l1_bias_scale * merged as f64).round() as i32;
                 writer.write_all(&val.to_le_bytes())?;
             }
             // Weights: l1_out × pad32(ft_out) i8 scale = QB
             // For each (buc, out, in) in [0, l1_out) × [0, pad32(ft_out))
-            // - in < ft_out: merged = l1_w[buc][out][in] + l1f_w[in][out]
+            // - in < ft_out: merged = l1_w[buc][out][in] + l1_shared_weight[in][out]
             // - else: padding 0
             let l1_padded_in = pad32(ft_out);
             for out in 0..l1_out {
                 for in_idx in 0..l1_padded_in {
                     let q: i8 = if in_idx < ft_out {
                         let buc_w = self.l1_w[buc * l1_out * ft_out + out * ft_out + in_idx];
-                        let shared_w = self.l1f_w[in_idx * l1_out + out];
+                        let shared_w = self.l1_shared_weight[in_idx * l1_out + out];
                         let merged = buc_w + shared_w;
                         clamp_i8((qb_f * merged as f64).round())
                     } else {
@@ -815,17 +815,16 @@ impl LayerStackWeights {
 
     /// LayerStack quantised.bin を parse し `LayerStackWeights` を返す。
     ///
-    /// 注: save 時に per-bucket l1 と shared l1f は merge されて書き出されるため、
-    /// load 時には分離不能。本実装は **l1_w に merged 値をそのまま入れ、l1f_w /
-    /// l1f_b は 0 にする** 方針 (forward 計算は等価)。
+    /// 注: save 時に per-bucket L1 と L1 shared term は merge されて書き出されるため、
+    /// load 時には分離不能。本実装は **l1_w に merged 値をそのまま入れ、l1_shared_weight /
+    /// l1_shared_bias は 0 にする** 方針 (forward 計算は等価)。
     ///
-    /// **継続学習時の注意**: forward は等価でも、l1f が「shared factorized 部」と
-    /// しての意味は失われる (全て l1_w に畳まれた状態)。per-bucket l1 と shared
-    /// l1f を別々に学習し続ける場合と勾配の流れ方が変わるため、本 method で得た
-    /// `LayerStackWeights` から continue-training すると factorize を保ったまま
-    /// 学習した場合の軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save し、
-    /// 出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは l1f を
-    /// 再び factorize し直す前提なら問題ない。
+    /// **継続学習時の注意**: forward は等価でも、L1 shared term としての分解は失われる
+    /// (全て `l1_w` に畳まれた状態)。per-bucket L1 と L1 shared term を別々に学習し続ける
+    /// 場合と勾配の流れ方が変わるため、本 method で得た `LayerStackWeights` から
+    /// continue-training した軌跡とは厳密一致しない。「pretrained 注入 → 1 step → save
+    /// し、出力 `.bin` が参照と byte 単位で一致するか」を確認する用途、あるいは shared
+    /// term を再び分離する前提なら問題ない。
     /// `expected` は要求 feature set、`ft_out` は要求 FT 出力次元 (`--ft-out`)、
     /// `l1_out` は要求 L1 出力次元 (`--l1`)、`l2_out` は要求 L2 出力次元 (`--l2`)、
     /// `num_buckets` は要求 bucket 数 (`--num-buckets`)。file の arch 文字列・hash・
@@ -1239,7 +1238,7 @@ impl LayerStackWeights {
                 l1_b[buc * l1_out + out] = v as f32 / l1_bias_scale;
             }
             // L1 weights (i8 × l1_out × l1_padded_in)、保存値は merged
-            // → l1_w に直接書き込み、l1f_w は 0 のまま (forward 等価)
+            // → l1_w に直接書き込み、l1_shared_weight は 0 のまま (forward 等価)
             for out in 0..l1_out {
                 for in_idx in 0..l1_padded_in {
                     let mut buf1 = [0u8; 1];
@@ -1291,8 +1290,8 @@ impl LayerStackWeights {
             ft_b,
             l1_w,
             l1_b,
-            l1f_w: vec![0.0; ft_out * l1_out], // save 時に l1_w に merge 済 → load 側は 0
-            l1f_b: vec![0.0; l1_out],
+            l1_shared_weight: vec![0.0; ft_out * l1_out], // save 時に l1_w に merge 済 → load 側は 0
+            l1_shared_bias: vec![0.0; l1_out],
             l2_w,
             l2_b,
             l3_w,
@@ -2080,7 +2079,7 @@ mod tests {
             DEFAULT_L2_OUT,
             DEFAULT_NUM_BUCKETS,
         );
-        assert_eq!(original.l1f_b.len(), l1_out);
+        assert_eq!(original.l1_shared_bias.len(), l1_out);
         assert_eq!(
             original.l1_w.len(),
             DEFAULT_NUM_BUCKETS * l1_out * DEFAULT_FT_OUT

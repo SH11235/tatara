@@ -672,8 +672,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             e
         }
     })?;
-    if layerstack.stack_factorize_all {
-        trainer.enable_stack_factorizer()?;
+    if layerstack.stack_shared_delta {
+        trainer.enable_stack_shared_delta()?;
     }
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
@@ -1113,8 +1113,8 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 ///     simple は単一 `weight_decay` 経路のみ。
 ///
 /// 他の layerstack 専用 flag の enforce は別所が担う: `--optimizer` は
-/// [`validate_shared_cli`] が未知の optimizer 名を reject、`--init-l1f` は
-/// [`build_simple_init_spec`] が reject (simple に L1f 層は無い)。
+/// [`validate_shared_cli`] が未知の optimizer 名を reject、`--init-l1-shared` は
+/// [`build_simple_init_spec`] が reject (simple に L1 shared term は無い)。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.output_format == OutputFormatArg::Yaneuraou {
@@ -1337,7 +1337,7 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     let overridden: Vec<&str> = [
         ("ft", cli.init_ft.is_some()),
         ("l1", cli.init_l1.is_some()),
-        ("l1f", cli.init_l1f.is_some()),
+        ("l1_shared_weight", cli.init_l1_shared.is_some()),
         ("l2", cli.init_l2.is_some()),
         ("l3", cli.init_l3.is_some()),
     ]
@@ -1360,8 +1360,8 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     if let Some(ov) = cli.init_l1 {
         spec.apply_weight_override(WeightLayer::L1, ov);
     }
-    if let Some(ov) = cli.init_l1f {
-        spec.apply_weight_override(WeightLayer::L1f, ov);
+    if let Some(ov) = cli.init_l1_shared {
+        spec.apply_weight_override(WeightLayer::L1Shared, ov);
     }
     if let Some(ov) = cli.init_l2 {
         spec.apply_weight_override(WeightLayer::L2, ov);
@@ -1372,7 +1372,7 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     spec
 }
 
-/// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1f` は L1f を持たない
+/// Simple の weight 初期化 spec を CLI から組み立てる。`--init-l1-shared` は L1 shared term を持たない
 /// Simple では error。
 #[cfg(feature = "gpu")]
 pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn std::error::Error>> {
@@ -1383,8 +1383,8 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
     if let Some(ov) = cli.init_l1 {
         spec.apply_weight_override(WeightLayer::L1, ov)?;
     }
-    if let Some(ov) = cli.init_l1f {
-        spec.apply_weight_override(WeightLayer::L1f, ov)?;
+    if let Some(ov) = cli.init_l1_shared {
+        spec.apply_weight_override(WeightLayer::L1Shared, ov)?;
     }
     if let Some(ov) = cli.init_l2 {
         spec.apply_weight_override(WeightLayer::L2, ov)?;
@@ -1460,7 +1460,7 @@ pub(crate) fn build_experiment_logger(
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
         ft_factorize: feature_set.ft_factorize().then_some(true),
-        stack_factorize_all: layerstack.stack_factorize_all.then_some(true),
+        stack_shared_delta: layerstack.stack_shared_delta.then_some(true),
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
@@ -1627,7 +1627,7 @@ pub(crate) fn build_experiment_logger_simple(
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
         ft_factorize: id.feature_set.ft_factorize().then_some(true),
-        stack_factorize_all: None,
+        stack_shared_delta: None,
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,
@@ -1854,7 +1854,7 @@ pub(crate) fn run_simple_training(
     // ため、simple の loss は WRM に限られる。
     let loss = build_wrm_loss(cli)?;
 
-    // `--init-l1f` は Simple では受け付けないため CUDA 初期化より前に解決して
+    // `--init-l1-shared` は Simple では受け付けないため CUDA 初期化より前に解決して
     // 早期 reject する (CUDA context 作成のコストを払わせない)。
     let init_spec = build_simple_init_spec(cli)?;
 

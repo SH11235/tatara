@@ -49,7 +49,7 @@ pub(crate) struct StepOptions<'a> {
 pub(crate) type LayerStackRawCheckpointState =
     (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
-struct SharedStackLayer {
+struct SharedDenseLayerState {
     w: DeviceBuffer<f32>,
     w_m: DeviceBuffer<f32>,
     w_v: DeviceBuffer<f32>,
@@ -64,9 +64,9 @@ struct SharedStackLayer {
     folded_b: DeviceBuffer<f32>,
 }
 
-struct SharedStackFactorizer {
-    l2: SharedStackLayer,
-    l3: SharedStackLayer,
+struct StackSharedDelta {
+    l2: SharedDenseLayerState,
+    l3: SharedDenseLayerState,
 }
 
 impl<'a> StepContext<'a> {
@@ -169,17 +169,17 @@ pub(crate) struct GpuTrainer {
     l1_b_slow: DeviceBuffer<f32>,
     l1_b_grad: DeviceBuffer<f32>,
 
-    // L1f shared factorized
-    l1f_w: DeviceBuffer<f32>,
-    l1f_w_m: DeviceBuffer<f32>,
-    l1f_w_v: DeviceBuffer<f32>,
-    l1f_w_slow: DeviceBuffer<f32>,
-    l1f_w_grad: DeviceBuffer<f32>,
-    l1f_b: DeviceBuffer<f32>,
-    l1f_b_m: DeviceBuffer<f32>,
-    l1f_b_v: DeviceBuffer<f32>,
-    l1f_b_slow: DeviceBuffer<f32>,
-    l1f_b_grad: DeviceBuffer<f32>,
+    // L1 shared term
+    l1_shared_weight: DeviceBuffer<f32>,
+    l1_shared_weight_m: DeviceBuffer<f32>,
+    l1_shared_weight_v: DeviceBuffer<f32>,
+    l1_shared_weight_slow: DeviceBuffer<f32>,
+    l1_shared_weight_grad: DeviceBuffer<f32>,
+    l1_shared_bias: DeviceBuffer<f32>,
+    l1_shared_bias_m: DeviceBuffer<f32>,
+    l1_shared_bias_v: DeviceBuffer<f32>,
+    l1_shared_bias_slow: DeviceBuffer<f32>,
+    l1_shared_bias_grad: DeviceBuffer<f32>,
 
     // L2 per-bucket
     l2_w: DeviceBuffer<f32>,
@@ -205,9 +205,10 @@ pub(crate) struct GpuTrainer {
     l3_b_slow: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    /// Optional L2/L3 shared terms. L1 is always factorized through `l1f_*`;
-    /// enabling this state extends the same decomposition to every dense layer.
-    stack_factorizer: Option<SharedStackFactorizer>,
+    /// Optional L2/L3 shared terms. L1 always has `l1_shared_weight` and
+    /// `l1_shared_bias`; enabling this state applies the same shared-delta
+    /// parameterization to every dense layer.
+    stack_shared_delta: Option<StackSharedDelta>,
 
     /// PSQT shortcut の weight + optimizer state。`--psqt` 有効時のみ `Some`、
     /// 既定 `None` で従来 path と bit-identical (forward / backward / optimizer の
@@ -240,7 +241,7 @@ pub(crate) struct GpuTrainer {
     loss_ring: AsyncLossRing,
     /// step 先頭の入力 H2D を専用 copy stream で直前 step の compute と overlap させる ring。
     input_ring: InputUploadRing,
-    /// L1f weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
+    /// L1 shared weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
     cublas: CublasHandle,
@@ -254,7 +255,7 @@ pub(crate) struct GpuTrainer {
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
-    /// true なら L1 forward (per-bucket dense) と L1f input backward を手書き tiled
+    /// true なら L1 forward (per-bucket dense) と L1 shared input backward を手書き tiled
     /// kernel ではなく `self.cublas` の TF32 Sgemm で計算する (`--tf32`)。false では
     /// 手書き kernel の純 FP32 path と bit-identical。`self.cublas` の math mode も同
     /// flag で `CUBLAS_TF32_TENSOR_OP_MATH` / `CUBLAS_DEFAULT_MATH` に決まる
@@ -394,7 +395,7 @@ pub(crate) struct GpuWorkspace {
     ft_nstm_out: DeviceBuffer<f32>,   // b × ft_out
     combined: DeviceBuffer<f32>,      // b × ft_out (post-FT、pairwise 後 2 perspective 連結)
     l1_bucket: DeviceBuffer<f32>,     // b × l1_out
-    l1f_out: DeviceBuffer<f32>,       // b × l1_out
+    l1_shared_out: DeviceBuffer<f32>, // b × l1_out
     l1_total: DeviceBuffer<f32>,      // b × l1_out
     l1_main: DeviceBuffer<f32>,       // b × l1_effective
     l1_skip: DeviceBuffer<f32>,       // b × L1_SKIP
@@ -408,19 +409,19 @@ pub(crate) struct GpuWorkspace {
     dy_net_output: DeviceBuffer<f32>, // b (loss kernel が書き込む dnet)
 
     // -- backward activation-grads --
-    dl2_acted: DeviceBuffer<f32>,            // b × l2_out
-    dl2_out: DeviceBuffer<f32>,              // b × l2_out
-    dl2_input: DeviceBuffer<f32>,            // b × l2_in
-    dl2_pre: DeviceBuffer<f32>,              // b × l2_in
-    dl1_sqr: DeviceBuffer<f32>,              // b × l1_effective
-    dl1_main_from_concat: DeviceBuffer<f32>, // b × l1_effective
-    dl1_main_from_sqr: DeviceBuffer<f32>,    // b × l1_effective
-    dl1_main: DeviceBuffer<f32>,             // b × l1_effective
-    dl1_total: DeviceBuffer<f32>,            // b × l1_out (毎 step memset、slice_scatter 契約)
-    dcombined_from_l1f: DeviceBuffer<f32>,   // b × ft_out
-    dcombined_from_l1: DeviceBuffer<f32>,    // b × ft_out
-    dft_stm_out: DeviceBuffer<f32>,          // b × ft_out
-    dft_nstm_out: DeviceBuffer<f32>,         // b × ft_out
+    dl2_acted: DeviceBuffer<f32>,                // b × l2_out
+    dl2_out: DeviceBuffer<f32>,                  // b × l2_out
+    dl2_input: DeviceBuffer<f32>,                // b × l2_in
+    dl2_pre: DeviceBuffer<f32>,                  // b × l2_in
+    dl1_sqr: DeviceBuffer<f32>,                  // b × l1_effective
+    dl1_main_from_concat: DeviceBuffer<f32>,     // b × l1_effective
+    dl1_main_from_sqr: DeviceBuffer<f32>,        // b × l1_effective
+    dl1_main: DeviceBuffer<f32>,                 // b × l1_effective
+    dl1_total: DeviceBuffer<f32>,                // b × l1_out (毎 step memset、slice_scatter 契約)
+    dcombined_from_l1_shared: DeviceBuffer<f32>, // b × ft_out
+    dcombined_from_l1: DeviceBuffer<f32>,        // b × ft_out
+    dft_stm_out: DeviceBuffer<f32>,              // b × ft_out
+    dft_nstm_out: DeviceBuffer<f32>,             // b × ft_out
 
     // FT activation の FP16 版。`ft_fp16_out` (`--ft-fp16-out`) が true のときだけ
     // b × ft_out で確保され、`ft_*_out` / `dft_*_out` (f32) の代わりに使われる
@@ -528,7 +529,7 @@ impl GpuWorkspace {
             dft_nstm_out_h: alloc_h(ft_fp16_out)?,
             combined: z(batch * ft_out)?,
             l1_bucket: z(batch * l1_out)?,
-            l1f_out: z(batch * l1_out)?,
+            l1_shared_out: z(batch * l1_out)?,
             l1_total: z(batch * l1_out)?,
             l1_main: z(batch * l1_effective)?,
             l1_skip: z(batch * L1_SKIP)?,
@@ -549,7 +550,7 @@ impl GpuWorkspace {
             dl1_main_from_sqr: z(batch * l1_effective)?,
             dl1_main: z(batch * l1_effective)?,
             dl1_total: z(batch * l1_out)?,
-            dcombined_from_l1f: z(batch * ft_out)?,
+            dcombined_from_l1_shared: z(batch * ft_out)?,
             dcombined_from_l1: z(batch * ft_out)?,
             dft_stm_out: z(ft_act_f32_n)?,
             dft_nstm_out: z(ft_act_f32_n)?,
@@ -634,8 +635,8 @@ impl GpuWorkspace {
 
 /// optimizer の param-group。全学習対象テンソルを規模と役割でこの 3 分類に静的に
 /// 割り当て、group ごとに weight_decay と lr 倍率を変える。`ft` は入力側 weight
-/// (`ft_w` / `psqt_w`)、`dense` は hidden dense weight (`l1_w` / `l1f_w` / `l2_w`
-/// / `l3_w`)、`bias` は全層の bias (`ft_b` / `l1_b` / `l1f_b` / `l2_b` / `l3_b`)。
+/// (`ft_w` / `psqt_w`)、`dense` は hidden dense weight (`l1_w` / `l1_shared_weight` / `l2_w`
+/// / `l3_w`)、`bias` は全層の bias (`ft_b` / `l1_b` / `l1_shared_bias` / `l2_b` / `l3_b`)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OptimGroupKind {
     Ft,
@@ -734,7 +735,7 @@ struct UniformOptimGroup<'a> {
 /// `uniform_optim_group_layout_matches_handwritten_order` test が照合する。
 /// `kind` は radam の weight_decay / lr を resolve する param-group: dense weight は
 /// `Dense`、全 bias は `Bias`、PSQT shortcut weight は入力側 weight なので `Ft`。
-/// dense weight (L1/L1f/L2/L3 weight + L1/L1f/L2 bias) は i8@QB 量子化由来の対称 clamp、
+/// dense weight (L1/L1 shared/L2/L3 weight + L1/L1 shared/L2 bias) は i8@QB 量子化由来の対称 clamp、
 /// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
 fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGroupKind, f32, f32)> {
     use OptimGroupKind::{Bias, Dense, Ft};
@@ -742,8 +743,13 @@ fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGro
         ("ft_b", Bias, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
         ("l1_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l1_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1f_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1f_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        (
+            "l1_shared_weight",
+            Dense,
+            W_CLAMP_QUANT_MIN,
+            W_CLAMP_QUANT_MAX,
+        ),
+        ("l1_shared_bias", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l3_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
@@ -817,15 +823,15 @@ impl GpuTrainer {
         let ft_b_n = ft_out;
         let l1_w_n = num_buckets * l1_out * ft_out;
         let l1_b_n = num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
-        let l1f_b_n = l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
         let l2_w_n = num_buckets * l2_out * l2_in;
         let l2_b_n = num_buckets * l2_out;
         let l3_w_n = num_buckets * l2_out;
         let l3_b_n = num_buckets;
 
         // weight / bias の初期値を `init_spec` から生成する。fan_in は各層の入力次元
-        // (FT=ft_in、L1/L1f=ft_out、L2=l2_in、L3=l2_out)、bias は対応 weight と同じ
+        // (FT=ft_in、L1/L1 shared=ft_out、L2=l2_in、L3=l2_out)、bias は対応 weight と同じ
         // fan_in を使う (`Scale::FanIn` の override 時に bias も同じ半値幅にするため)。
         // bucket 付き層 (l1/l2/l3) は bucket-major layout なので `bucketed` で渡し、
         // `per_bucket_repeat` が立つと block_len = n/num_buckets 分を 1 回生成して
@@ -849,8 +855,14 @@ impl GpuTrainer {
             WeightShape::bucketed(l1_b_n, num_buckets, ft_out),
             &init_spec.l1_b,
         );
-        let l1f_w_init = init::sample(WeightShape::flat(l1f_w_n, ft_out), &init_spec.l1f_w);
-        let l1f_b_init = init::sample(WeightShape::flat(l1f_b_n, ft_out), &init_spec.l1f_b);
+        let l1_shared_weight_init = init::sample(
+            WeightShape::flat(l1_shared_weight_n, ft_out),
+            &init_spec.l1_shared_weight,
+        );
+        let l1_shared_bias_init = init::sample(
+            WeightShape::flat(l1_shared_bias_n, ft_out),
+            &init_spec.l1_shared_bias,
+        );
         let l2_w_init = init::sample(
             WeightShape::bucketed(l2_w_n, num_buckets, l2_in),
             &init_spec.l2_w,
@@ -898,7 +910,7 @@ impl GpuTrainer {
         // norm loss reduce pass の per-group norm scratch。長さは対象テンソル中の
         // 最大 group 数 (= 1 launch あたりの最大 n_groups)。対象とその group 数は
         // optimizer step の norm loss 配線と一致させる:
-        //   FT weight   ft_out        L1f weight l1_out
+        //   FT weight   ft_out        L1 shared weight l1_out
         //   L1 weight   buckets*l1_out L2 weight  buckets*l2_out
         //   L3 weight   buckets        bias 各    1
         let norm_scratch_len = if norm_loss_factor.is_some() {
@@ -968,17 +980,17 @@ impl GpuTrainer {
             l1_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
             l1_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
             l1_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
-            // L1f
-            l1f_w: DeviceBuffer::from_host(&stream, &l1f_w_init)?,
-            l1f_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_w_n)?,
-            l1f_b: DeviceBuffer::from_host(&stream, &l1f_b_init)?,
-            l1f_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
-            l1f_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
-            l1f_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
-            l1f_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l1f_b_n)?,
+            // L1 shared
+            l1_shared_weight: DeviceBuffer::from_host(&stream, &l1_shared_weight_init)?,
+            l1_shared_weight_m: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
+            l1_shared_weight_v: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
+            l1_shared_weight_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
+            l1_shared_weight_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
+            l1_shared_bias: DeviceBuffer::from_host(&stream, &l1_shared_bias_init)?,
+            l1_shared_bias_m: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
+            l1_shared_bias_v: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
+            l1_shared_bias_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
+            l1_shared_bias_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
             // L2
             l2_w: DeviceBuffer::from_host(&stream, &l2_w_init)?,
             l2_w_m: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
@@ -1001,7 +1013,7 @@ impl GpuTrainer {
             l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
             l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
-            stack_factorizer: None,
+            stack_shared_delta: None,
             psqt,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
             // `len_batch == 0` (未確保) を作らない — smoke は小さい固定 batch を渡す)。
@@ -1046,12 +1058,12 @@ impl GpuTrainer {
         Ok(trainer)
     }
 
-    /// Extend the existing shared L1 factorizer to L2 and L3.
+    /// Apply the existing L1 shared-delta parameterization to L2 and L3.
     ///
     /// Shared terms start at zero, so enabling this keeps the initial forward
-    /// pass identical to the non-factorized control.
-    pub(crate) fn enable_stack_factorizer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.stack_factorizer.is_some() {
+    /// pass identical to the control.
+    pub(crate) fn enable_stack_shared_delta(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.stack_shared_delta.is_some() {
             return Ok(());
         }
         let z = |n| DeviceBuffer::<f32>::zeroed(&self.stream, n);
@@ -1059,8 +1071,8 @@ impl GpuTrainer {
                      b_n: usize,
                      bucket_w_n: usize,
                      bucket_b_n: usize|
-         -> Result<SharedStackLayer, Box<dyn std::error::Error>> {
-            Ok(SharedStackLayer {
+         -> Result<SharedDenseLayerState, Box<dyn std::error::Error>> {
+            Ok(SharedDenseLayerState {
                 w: z(w_n)?,
                 w_m: z(w_n)?,
                 w_v: z(w_n)?,
@@ -1078,7 +1090,7 @@ impl GpuTrainer {
         let l2_w_n = self.ws.l2_out * self.ws.l2_in();
         let l2_b_n = self.ws.l2_out;
         let l3_w_n = self.ws.l2_out;
-        self.stack_factorizer = Some(SharedStackFactorizer {
+        self.stack_shared_delta = Some(StackSharedDelta {
             l2: layer(
                 l2_w_n,
                 l2_b_n,
@@ -1091,7 +1103,7 @@ impl GpuTrainer {
     }
 
     fn sync_stack_forward_weights(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(f) = self.stack_factorizer.as_ref() else {
+        let Some(f) = self.stack_shared_delta.as_ref() else {
             return Ok(());
         };
         let fold = |bucketed: &DeviceBuffer<f32>,
@@ -1101,7 +1113,7 @@ impl GpuTrainer {
          -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
                 cuda_launch! {
-                    kernel: stack_factorizer_fold,
+                    kernel: stack_shared_delta_fold,
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(self.num_buckets * group_len),
@@ -1176,8 +1188,8 @@ impl GpuTrainer {
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
         self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
-        self.l1f_w = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
-        self.l1f_b = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
+        self.l1_shared_weight = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
+        self.l1_shared_bias = DeviceBuffer::from_host(&self.stream, &w.l1_shared_bias)?;
         self.l2_w = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
         self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
         self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
@@ -1198,8 +1210,8 @@ impl GpuTrainer {
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
-        let l1f_b_n = l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
         let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
         let l3_w_n = self.num_buckets * l2_out;
@@ -1220,14 +1232,14 @@ impl GpuTrainer {
         self.l1_b_v = zeros_f32(l1_b_n)?;
         self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
         self.l1_b_grad = zeros_f32(l1_b_n)?;
-        self.l1f_w_m = zeros_f32(l1f_w_n)?;
-        self.l1f_w_v = zeros_f32(l1f_w_n)?;
-        self.l1f_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_w)?;
-        self.l1f_w_grad = zeros_f32(l1f_w_n)?;
-        self.l1f_b_m = zeros_f32(l1f_b_n)?;
-        self.l1f_b_v = zeros_f32(l1f_b_n)?;
-        self.l1f_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1f_b)?;
-        self.l1f_b_grad = zeros_f32(l1f_b_n)?;
+        self.l1_shared_weight_m = zeros_f32(l1_shared_weight_n)?;
+        self.l1_shared_weight_v = zeros_f32(l1_shared_weight_n)?;
+        self.l1_shared_weight_slow = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
+        self.l1_shared_weight_grad = zeros_f32(l1_shared_weight_n)?;
+        self.l1_shared_bias_m = zeros_f32(l1_shared_bias_n)?;
+        self.l1_shared_bias_v = zeros_f32(l1_shared_bias_n)?;
+        self.l1_shared_bias_slow = DeviceBuffer::from_host(&self.stream, &w.l1_shared_bias)?;
+        self.l1_shared_bias_grad = zeros_f32(l1_shared_bias_n)?;
         self.l2_w_m = zeros_f32(l2_w_n)?;
         self.l2_w_v = zeros_f32(l2_w_n)?;
         self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
@@ -1347,21 +1359,21 @@ impl GpuTrainer {
             ft_b: self.ft_b.to_host_vec(&self.stream)?,
             l1_w: self.l1_w.to_host_vec(&self.stream)?,
             l1_b: self.l1_b.to_host_vec(&self.stream)?,
-            l1f_w: self.l1f_w.to_host_vec(&self.stream)?,
-            l1f_b: self.l1f_b.to_host_vec(&self.stream)?,
-            l2_w: match self.stack_factorizer.as_ref() {
+            l1_shared_weight: self.l1_shared_weight.to_host_vec(&self.stream)?,
+            l1_shared_bias: self.l1_shared_bias.to_host_vec(&self.stream)?,
+            l2_w: match self.stack_shared_delta.as_ref() {
                 Some(f) => f.l2.folded_w.to_host_vec(&self.stream)?,
                 None => self.l2_w.to_host_vec(&self.stream)?,
             },
-            l2_b: match self.stack_factorizer.as_ref() {
+            l2_b: match self.stack_shared_delta.as_ref() {
                 Some(f) => f.l2.folded_b.to_host_vec(&self.stream)?,
                 None => self.l2_b.to_host_vec(&self.stream)?,
             },
-            l3_w: match self.stack_factorizer.as_ref() {
+            l3_w: match self.stack_shared_delta.as_ref() {
                 Some(f) => f.l3.folded_w.to_host_vec(&self.stream)?,
                 None => self.l3_w.to_host_vec(&self.stream)?,
             },
-            l3_b: match self.stack_factorizer.as_ref() {
+            l3_b: match self.stack_shared_delta.as_ref() {
                 Some(f) => f.l3.folded_b.to_host_vec(&self.stream)?,
                 None => self.l3_b.to_host_vec(&self.stream)?,
             },
@@ -1370,7 +1382,7 @@ impl GpuTrainer {
     }
 
     /// raw checkpoint format の全 weight group を format の group 順 (= ft_w, ft_b,
-    /// l1_w, l1_b, l1f_w, l1f_b, l2_w, l2_b, l3_w, l3_b, PSQT 有効時は末尾に psqt_w)
+    /// l1_w, l1_b, l1_shared_weight, l1_shared_bias, l2_w, l2_b, l3_w, l3_b, PSQT 有効時は末尾に psqt_w)
     /// で返す (save / load / roundtrip 比較で iterate する immutable view)。`grad` は
     /// resume に不要なので含めない。
     ///
@@ -1400,8 +1412,8 @@ impl GpuTrainer {
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
-        let l1f_b_n = l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
         let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
         let l3_w_n = self.num_buckets * l2_out;
@@ -1420,14 +1432,28 @@ impl GpuTrainer {
             uniform!("ft_b", ft_b_n, ft_b, ft_b_m, ft_b_v, ft_b_slow),
             uniform!("l1_w", l1_w_n, l1_w, l1_w_m, l1_w_v, l1_w_slow),
             uniform!("l1_b", l1_b_n, l1_b, l1_b_m, l1_b_v, l1_b_slow),
-            uniform!("l1f_w", l1f_w_n, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow),
-            uniform!("l1f_b", l1f_b_n, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow),
+            uniform!(
+                "l1_shared_weight",
+                l1_shared_weight_n,
+                l1_shared_weight,
+                l1_shared_weight_m,
+                l1_shared_weight_v,
+                l1_shared_weight_slow
+            ),
+            uniform!(
+                "l1_shared_bias",
+                l1_shared_bias_n,
+                l1_shared_bias,
+                l1_shared_bias_m,
+                l1_shared_bias_v,
+                l1_shared_bias_slow
+            ),
             uniform!("l2_w", l2_w_n, l2_w, l2_w_m, l2_w_v, l2_w_slow),
             uniform!("l2_b", l2_b_n, l2_b, l2_b_m, l2_b_v, l2_b_slow),
             uniform!("l3_w", l3_w_n, l3_w, l3_w_m, l3_w_v, l3_w_slow),
             uniform!("l3_b", l3_b_n, l3_b, l3_b_m, l3_b_v, l3_b_slow),
         ];
-        if let Some(f) = self.stack_factorizer.as_ref() {
+        if let Some(f) = self.stack_shared_delta.as_ref() {
             macro_rules! shared {
                 ($name:literal, $len:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {
                     RawCkptGroupSource {
@@ -1443,10 +1469,10 @@ impl GpuTrainer {
                 };
             }
             groups.extend([
-                shared!("l2f_w", l2_out * l2_in, l2, w, w_m, w_v, w_slow),
-                shared!("l2f_b", l2_out, l2, b, b_m, b_v, b_slow),
-                shared!("l3f_w", l2_out, l3, w, w_m, w_v, w_slow),
-                shared!("l3f_b", 1, l3, b, b_m, b_v, b_slow),
+                shared!("l2_shared_weight", l2_out * l2_in, l2, w, w_m, w_v, w_slow),
+                shared!("l2_shared_bias", l2_out, l2, b, b_m, b_v, b_slow),
+                shared!("l3_shared_weight", l2_out, l3, w, w_m, w_v, w_slow),
+                shared!("l3_shared_bias", 1, l3, b, b_m, b_v, b_slow),
             ]);
         }
         if let Some(psqt) = self.psqt.as_ref() {
@@ -1601,14 +1627,26 @@ impl GpuTrainer {
         up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
         up!(2, l1_w, l1_w_m, l1_w_v, l1_w_slow);
         up!(3, l1_b, l1_b_m, l1_b_v, l1_b_slow);
-        up!(4, l1f_w, l1f_w_m, l1f_w_v, l1f_w_slow);
-        up!(5, l1f_b, l1f_b_m, l1f_b_v, l1f_b_slow);
+        up!(
+            4,
+            l1_shared_weight,
+            l1_shared_weight_m,
+            l1_shared_weight_v,
+            l1_shared_weight_slow
+        );
+        up!(
+            5,
+            l1_shared_bias,
+            l1_shared_bias_m,
+            l1_shared_bias_v,
+            l1_shared_bias_slow
+        );
         up!(6, l2_w, l2_w_m, l2_w_v, l2_w_slow);
         up!(7, l2_b, l2_b_m, l2_b_v, l2_b_slow);
         up!(8, l3_w, l3_w_m, l3_w_v, l3_w_slow);
         up!(9, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
-        let psqt_idx = if let Some(f) = self.stack_factorizer.as_mut() {
+        let psqt_idx = if let Some(f) = self.stack_shared_delta.as_mut() {
             macro_rules! up_shared {
                 ($idx:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                     let (w, m, v, s) = &loaded[$idx];
@@ -1647,8 +1685,8 @@ impl GpuTrainer {
             (&self.ft_b, "ft_b"),
             (&self.l1_w, "l1_w"),
             (&self.l1_b, "l1_b"),
-            (&self.l1f_w, "l1f_w"),
-            (&self.l1f_b, "l1f_b"),
+            (&self.l1_shared_weight, "l1_shared_weight"),
+            (&self.l1_shared_bias, "l1_shared_bias"),
             (&self.l2_w, "l2_w"),
             (&self.l2_b, "l2_b"),
             (&self.l3_w, "l3_w"),
@@ -1899,7 +1937,7 @@ impl GpuTrainer {
     /// (`self.ws.*`) を使い回す — forward の各 activation は読まれる前に kernel が
     /// 全 cell を上書きするので memset 不要。Backward path (~16 step): forward 逆順、`*_grad`
     /// buffer は本 method 冒頭で `memset_async(0)` で reset してから kernel が書き込む
-    /// (per-bucket weight grad は sorted + split-K kernel の atomicAdd、FT / L1f / bias の
+    /// (per-bucket weight grad は sorted + split-K kernel の atomicAdd、FT / L1 shared / bias の
     /// grad も atomic accumulate なので reset 必須。`dl1_total` も `slice_scatter_2d` の
     /// host 契約を守るため reset)。`loss_acc` も同様に毎 step memset。
     /// 入力 H2D buffer (`stm_idx_dev` 等) は workspace 上の pre-allocated buffer に
@@ -2392,12 +2430,12 @@ impl GpuTrainer {
 
         prof_tick!("fwd_L1");
 
-        // -- Forward step 5: L1f shared dense → l1f_out (B × l1_out) --
+        // -- Forward step 5: L1 shared dense → l1_shared_out (B × l1_out) --
         // cuBLAS Sgemm (TF32 TC) で matmul、`bias_add_per_row` kernel で bias を別 pass。
-        // shape: combined[B, ft_out] @ l1f_w[ft_out, l1_out] → l1f_out[B, l1_out]。
+        // shape: combined[B, ft_out] @ l1_shared_weight[ft_out, l1_out] → l1_shared_out[B, l1_out]。
         //
-        // SAFETY: combined / l1f_w / l1f_out は cudaMalloc 由来、長さは arch 上 invariant
-        // (combined.len() == B*ft_out、l1f_w.len() == ft_out*l1_out、l1f_out.len() == B*l1_out)、
+        // SAFETY: combined / l1_shared_weight / l1_shared_out は cudaMalloc 由来、長さは arch 上 invariant
+        // (combined.len() == B*ft_out、l1_shared_weight.len() == ft_out*l1_out、l1_shared_out.len() == B*l1_out)、
         // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行 (先行 kernel
         // 完了後に Sgemm が走り、結果は後続 bias_add_per_row が観測)。
         unsafe {
@@ -2406,8 +2444,8 @@ impl GpuTrainer {
                 l1_out as i32, // n = out_dim
                 ft_out as i32, // k = in_dim
                 self.ws.combined.cu_deviceptr() as *const f32,
-                self.l1f_w.cu_deviceptr() as *const f32,
-                self.ws.l1f_out.cu_deviceptr() as *mut f32,
+                self.l1_shared_weight.cu_deviceptr() as *const f32,
+                self.ws.l1_shared_out.cu_deviceptr() as *mut f32,
             )?;
         }
         unsafe {
@@ -2419,16 +2457,16 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(b * l1_out),
                 args: [
-                    slice(self.l1f_b),
-                    slice_mut(self.ws.l1f_out),
+                    slice(self.l1_shared_bias),
+                    slice_mut(self.ws.l1_shared_out),
                     b_u32, l1_out as u32
                 ]
             }
         }?;
 
-        prof_tick!("fwd_L1f");
+        prof_tick!("fwd_l1_shared");
 
-        // -- Forward step 6: l1_total = l1_bucket + l1f_out (B × l1_out) --
+        // -- Forward step 6: l1_total = l1_bucket + l1_shared_out (B × l1_out) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -2439,7 +2477,7 @@ impl GpuTrainer {
                 config: cfg_1d(b * l1_out),
                 args: [
                     slice(self.ws.l1_bucket),
-                    slice(self.ws.l1f_out),
+                    slice(self.ws.l1_shared_out),
                     slice_mut(self.ws.l1_total),
                     (b * l1_out) as u32
                 ]
@@ -2535,7 +2573,7 @@ impl GpuTrainer {
 
         // -- Forward step 11: L2 per-bucket dense → l2_dense_out (B × l2_out) --
         let (l2_forward_w, l2_forward_b) = self
-            .stack_factorizer
+            .stack_shared_delta
             .as_ref()
             .map_or((&self.l2_w, &self.l2_b), |f| {
                 (&f.l2.folded_w, &f.l2.folded_b)
@@ -2580,7 +2618,7 @@ impl GpuTrainer {
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
         let (l3_forward_w, l3_forward_b) = self
-            .stack_factorizer
+            .stack_shared_delta
             .as_ref()
             .map_or((&self.l3_w, &self.l3_b), |f| {
                 (&f.l3.folded_w, &f.l3.folded_b)
@@ -2797,7 +2835,7 @@ impl GpuTrainer {
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
         let ft_b_n = ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_b_n = l1_out;
+        let l1_shared_bias_n = l1_out;
         let l2_b_n = self.num_buckets * l2_out;
         let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
@@ -2808,8 +2846,8 @@ impl GpuTrainer {
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
-        memset_zero(&self.stream, &self.l1f_w_grad)?;
-        memset_zero(&self.stream, &self.l1f_b_grad)?;
+        memset_zero(&self.stream, &self.l1_shared_weight_grad)?;
+        memset_zero(&self.stream, &self.l1_shared_bias_grad)?;
         memset_zero(&self.stream, &self.l2_w_grad)?;
         memset_zero(&self.stream, &self.l2_b_grad)?;
         memset_zero(&self.stream, &self.l3_w_grad)?;
@@ -2880,7 +2918,7 @@ impl GpuTrainer {
 
         // -- Backward 13 reverse: L3 per-bucket dense grad --
         let l3_backward_w = self
-            .stack_factorizer
+            .stack_shared_delta
             .as_ref()
             .map_or(&self.l3_w, |f| &f.l3.folded_w);
         unsafe {
@@ -2952,10 +2990,10 @@ impl GpuTrainer {
             }
         }?;
 
-        if let Some(f) = self.stack_factorizer.as_ref() {
+        if let Some(f) = self.stack_shared_delta.as_ref() {
             unsafe {
                 cuda_launch! {
-                    kernel: stack_factorizer_reduce_grad,
+                    kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_out),
                     args: [
@@ -2966,7 +3004,7 @@ impl GpuTrainer {
             }?;
             unsafe {
                 cuda_launch! {
-                    kernel: stack_factorizer_reduce_grad,
+                    kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(1),
                     args: [
@@ -2999,7 +3037,7 @@ impl GpuTrainer {
 
         // -- Backward 11 reverse: L2 per-bucket dense grad --
         let l2_backward_w = self
-            .stack_factorizer
+            .stack_shared_delta
             .as_ref()
             .map_or(&self.l2_w, |f| &f.l2.folded_w);
         unsafe {
@@ -3096,11 +3134,11 @@ impl GpuTrainer {
             }
         }?;
 
-        if let Some(f) = self.stack_factorizer.as_ref() {
+        if let Some(f) = self.stack_shared_delta.as_ref() {
             let l2_group_len = l2_out * l2_in;
             unsafe {
                 cuda_launch! {
-                    kernel: stack_factorizer_reduce_grad,
+                    kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_group_len),
                     args: [
@@ -3111,7 +3149,7 @@ impl GpuTrainer {
             }?;
             unsafe {
                 cuda_launch! {
-                    kernel: stack_factorizer_reduce_grad,
+                    kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_out),
                     args: [
@@ -3230,24 +3268,24 @@ impl GpuTrainer {
             }
         }?;
 
-        // -- Backward 6 reverse: dl1_total を l1_bucket と l1f_out 両方の grad に流す --
-        // (elementwise_add 逆: dl1_bucket = dl1_total, dl1f = dl1_total)
+        // -- Backward 6 reverse: dl1_total を l1_bucket と l1_shared_out 両方の grad に流す --
+        // (elementwise_add 逆: dl1_bucket = dl1_total, dl1_shared = dl1_total)
         // 直接 dl1_total を両 dense_mm_bwd に渡す
 
         prof_tick!("bwd_L1eff");
 
-        // -- Backward 5 reverse: L1f shared dense grad --
-        // L1f input bwd: `dcombined[b][i] = sum_o dl1_total[b][o] * l1f_w[i][o]`
+        // -- Backward 5 reverse: L1 shared dense grad --
+        // L1 shared input bwd: `dcombined[b][i] = sum_o dl1_total[b][o] * l1_shared_weight[i][o]`
         // (in_dim=ft_out, out_dim=l1_out)。`self.tf32` で cuBLAS Sgemm (X @ Y^T、beta=0
         // overwrite) と手書き tiled kernel を分岐する。手書き kernel は 16×16 tile
         // (block=256 = 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)、out_dim は
         // reduction 軸で kernel 内 16 幅 out-tile loop で消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
         if self.tf32 {
-            // C[b, ft_out] = dl1_total[b, l1_out] @ l1f_w[ft_out, l1_out]^T (reduce 軸 l1_out)。
-            // SAFETY: dl1_total / l1f_w / dcombined_from_l1f は cudaMalloc 由来、長さは arch
-            // 上 invariant (`dl1_total.len() == b*l1_out`、`l1f_w.len() == ft_out*l1_out`、
-            // `dcombined_from_l1f.len() == b*ft_out`)、`self.cublas` は `self.stream` に bind
+            // C[b, ft_out] = dl1_total[b, l1_out] @ l1_shared_weight[ft_out, l1_out]^T (reduce 軸 l1_out)。
+            // SAFETY: dl1_total / l1_shared_weight / dcombined_from_l1_shared は cudaMalloc 由来、長さは arch
+            // 上 invariant (`dl1_total.len() == b*l1_out`、`l1_shared_weight.len() == ft_out*l1_out`、
+            // `dcombined_from_l1_shared.len() == b*ft_out`)、`self.cublas` は `self.stream` に bind
             // 済で同 stream 内 in-order 実行。beta=0 overwrite は手書き kernel の write
             // semantics (`*dx = acc`) と一致。
             unsafe {
@@ -3256,8 +3294,8 @@ impl GpuTrainer {
                     ft_out as i32, // n = in_dim
                     l1_out as i32, // k = out_dim (reduce)
                     self.ws.dl1_total.cu_deviceptr() as *const f32,
-                    self.l1f_w.cu_deviceptr() as *const f32,
-                    self.ws.dcombined_from_l1f.cu_deviceptr() as *mut f32,
+                    self.l1_shared_weight.cu_deviceptr() as *const f32,
+                    self.ws.dcombined_from_l1_shared.cu_deviceptr() as *mut f32,
                 )?;
             }
         } else {
@@ -3275,21 +3313,21 @@ impl GpuTrainer {
                     },
                     args: [
                         slice(self.ws.dl1_total),
-                        slice(self.l1f_w),
-                        slice_mut(self.ws.dcombined_from_l1f),
+                        slice(self.l1_shared_weight),
+                        slice_mut(self.ws.dcombined_from_l1_shared),
                         b_u32, ft_out as u32, l1_out as u32
                     ]
                 }
             }?;
         }
-        // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
+        // L1 shared weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
         // combined[batch, ft_out] row-major、dl1_total[batch, l1_out] row-major、reduce 軸は
         // batch。M = l1_out と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
         // split-K + tensor pipeline 最適化が効きやすい (cuBLAS は任意の n を受けるので分岐不要)。
         //
-        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc 由来、長さは arch 上
+        // SAFETY: combined / dl1_total / l1_shared_weight_grad は cudaMalloc 由来、長さは arch 上
         // invariant (`combined.len() == b*ft_out`、`dl1_total.len() == b*l1_out`、
-        // `l1f_w_grad.len() == ft_out*l1_out`)、`self.cublas` は `self.stream` に bind 済で
+        // `l1_shared_weight_grad.len() == ft_out*l1_out`)、`self.cublas` は `self.stream` に bind 済で
         // 同 stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、結果は後続 kernel
         // が観測する)。
         unsafe {
@@ -3299,35 +3337,35 @@ impl GpuTrainer {
                 b_u32 as i32,  // k = batch
                 self.ws.combined.cu_deviceptr() as *const f32,
                 self.ws.dl1_total.cu_deviceptr() as *const f32,
-                self.l1f_w_grad.cu_deviceptr() as *mut f32,
+                self.l1_shared_weight_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        // L1f bias backward。cuda-oxide 版は 256 要素固定 shared array + 先頭 out_dim thread の
+        // L1 shared bias backward。cuda-oxide 版は 256 要素固定 shared array + 先頭 out_dim thread の
         // 初期化 / flush で block_dim.x (256) >= out_dim (= l1_out) を前提にする。native CUDA C++
         // 版は batch * out_dim を 1D launch し `i % out_dim` へ直接 global atomicAdd するため
         // block 幅には依存しない。共有 launch site なので厳しい方 (cuda-oxide の shared array 容量)
         // に合わせて l1_out <= 256 を検査する。起動時 CLI も l1_out <= 256 を保証する。
         debug_assert!(
             l1_out <= 256,
-            "bias_grad_shared_l1f requires block_dim.x >= output_dimension"
+            "bias_grad_l1_shared requires block_dim.x >= output_dimension"
         );
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: bias_grad_shared_l1f,
+                kernel: bias_grad_l1_shared,
                 stream: self.stream,
                 module: self.module,
                 config: cfg_1d(b * l1_out),
                 args: [
                     slice(self.ws.dl1_total),
-                    slice(self.l1f_b_grad),
+                    slice(self.l1_shared_bias_grad),
                     b_u32, l1_out as u32
                 ]
             }
         }?;
 
-        prof_tick!("bwd_L1f");
+        prof_tick!("bwd_l1_shared");
 
         // -- Backward 4 reverse: L1 per-bucket dense grad (weight → input、sorted layout)。
         //    dl1_total を bucket_perm_dev で gather → dl1_total_sorted (weight/input/bias 共通)。
@@ -3526,7 +3564,7 @@ impl GpuTrainer {
         let dft_inv_scale = 1.0_f32 / dft_scale;
 
         // -- Backward 3 reverse: ft_post_perspective_grad fused × 2 (stm, nstm) --
-        // `dy = dcombined_from_l1 + dcombined_from_l1f` を fused kernel が in-register
+        // `dy = dcombined_from_l1 + dcombined_from_l1_shared` を fused kernel が in-register
         // で計算、合算済 buffer の materialize と read-back の DRAM roundtrip を避ける。
         // `ft_fp16_out` 時は forward activation `ft_*_out` を f16 で読み、dft 出力も f16
         // で書く版 (`ft_post_perspective_grad_fused_fp16`)。`d_combined_*` / `ft_b` /
@@ -3542,7 +3580,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * ft_out / 2),
                     args: [
                         slice(self.ws.dcombined_from_l1),
-                        slice(self.ws.dcombined_from_l1f),
+                        slice(self.ws.dcombined_from_l1_shared),
                         slice(self.ws.ft_stm_out_h.as_ref()
                             .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
                         slice(self.ft_b),
@@ -3565,7 +3603,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * ft_out / 2),
                     args: [
                         slice(self.ws.dcombined_from_l1),
-                        slice(self.ws.dcombined_from_l1f),
+                        slice(self.ws.dcombined_from_l1_shared),
                         slice(self.ws.ft_nstm_out_h.as_ref()
                             .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
                         slice(self.ft_b),
@@ -3594,7 +3632,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * ft_out / 2),
                     args: [
                         slice(self.ws.dcombined_from_l1),
-                        slice(self.ws.dcombined_from_l1f),
+                        slice(self.ws.dcombined_from_l1_shared),
                         slice(self.ws.ft_stm_out),
                         slice(self.ft_b),
                         slice_mut(self.ws.dft_stm_out),
@@ -3613,7 +3651,7 @@ impl GpuTrainer {
                     config: cfg_1d(b * ft_out / 2),
                     args: [
                         slice(self.ws.dcombined_from_l1),
-                        slice(self.ws.dcombined_from_l1f),
+                        slice(self.ws.dcombined_from_l1_shared),
                         slice(self.ws.ft_nstm_out),
                         slice(self.ft_b),
                         slice_mut(self.ws.dft_nstm_out),
@@ -3907,17 +3945,17 @@ impl GpuTrainer {
                     }?;
                 }};
             }
-            // dense weight: per-output-neuron。FT / L1f は [in, out] strided column
+            // dense weight: per-output-neuron。FT / L1 shared は [in, out] strided column
             // (pitch=1, stride=out)、L1 / L2 / L3 は [bucket*out, in] contiguous row
             // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
             // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
             // prior と整合する方向の intended 仕様、ADR 参照)。
             norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
-            norm_loss_group!(self.l1f_w, l1_out, 1, l1_out, ft_out);
+            norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
             norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
-            if let Some(f) = self.stack_factorizer.as_mut() {
+            if let Some(f) = self.stack_shared_delta.as_mut() {
                 norm_loss_group!(f.l2.w, l2_out, l2_in, 1, l2_in);
                 norm_loss_group!(f.l3.w, 1, l2_out, 1, l2_out);
                 norm_loss_group!(f.l2.b, 1, 0, 1, l2_out);
@@ -3934,7 +3972,7 @@ impl GpuTrainer {
             // bias: per-tensor scalar (テンソル全体で 1 norm、bucket 軸も畳む)。
             norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
             norm_loss_group!(self.l1_b, 1, 0, 1, l1_b_n);
-            norm_loss_group!(self.l1f_b, 1, 0, 1, l1f_b_n);
+            norm_loss_group!(self.l1_shared_bias, 1, 0, 1, l1_shared_bias_n);
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
             prof_tick!("norm_loss");
@@ -3961,8 +3999,8 @@ impl GpuTrainer {
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
-        let l1f_w_n = ft_out * l1_out;
-        let l1f_b_n = l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
         let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
         let l3_w_n = self.num_buckets * l2_out;
@@ -4120,26 +4158,26 @@ impl GpuTrainer {
                 clamp_max: W_CLAMP_QUANT_MAX,
             },
             UniformOptimGroup {
-                label: "l1f_w",
+                label: "l1_shared_weight",
                 kind: OptimGroupKind::Dense,
-                weight: &mut self.l1f_w,
-                m: &mut self.l1f_w_m,
-                v: &mut self.l1f_w_v,
-                grad: &mut self.l1f_w_grad,
-                slow: &mut self.l1f_w_slow,
-                n: l1f_w_n,
+                weight: &mut self.l1_shared_weight,
+                m: &mut self.l1_shared_weight_m,
+                v: &mut self.l1_shared_weight_v,
+                grad: &mut self.l1_shared_weight_grad,
+                slow: &mut self.l1_shared_weight_slow,
+                n: l1_shared_weight_n,
                 clamp_min: W_CLAMP_QUANT_MIN,
                 clamp_max: W_CLAMP_QUANT_MAX,
             },
             UniformOptimGroup {
-                label: "l1f_b",
+                label: "l1_shared_bias",
                 kind: OptimGroupKind::Bias,
-                weight: &mut self.l1f_b,
-                m: &mut self.l1f_b_m,
-                v: &mut self.l1f_b_v,
-                grad: &mut self.l1f_b_grad,
-                slow: &mut self.l1f_b_slow,
-                n: l1f_b_n,
+                weight: &mut self.l1_shared_bias,
+                m: &mut self.l1_shared_bias_m,
+                v: &mut self.l1_shared_bias_v,
+                grad: &mut self.l1_shared_bias_grad,
+                slow: &mut self.l1_shared_bias_slow,
+                n: l1_shared_bias_n,
                 clamp_min: W_CLAMP_QUANT_MIN,
                 clamp_max: W_CLAMP_QUANT_MAX,
             },
@@ -4235,7 +4273,7 @@ impl GpuTrainer {
                 }
             }?;
         }
-        if let Some(f) = self.stack_factorizer.as_mut() {
+        if let Some(f) = self.stack_shared_delta.as_mut() {
             let (dense_wd, dense_lr) = optim_groups.effective(OptimGroupKind::Dense, lr);
             let (bias_wd, bias_lr) = optim_groups.effective(OptimGroupKind::Bias, lr);
             macro_rules! update_shared {
@@ -4344,7 +4382,7 @@ impl GpuTrainer {
                     }
                 }?;
             }
-            if let Some(f) = self.stack_factorizer.as_mut() {
+            if let Some(f) = self.stack_shared_delta.as_mut() {
                 macro_rules! lerp_shared {
                     ($layer:ident, $weight:ident, $slow:ident, $n:expr) => {{
                         let layer = &mut f.$layer;
@@ -4429,8 +4467,8 @@ mod tests {
             ("ft_b", Bias, none.0, none.1),
             ("l1_w", Dense, q.0, q.1),
             ("l1_b", Bias, q.0, q.1),
-            ("l1f_w", Dense, q.0, q.1),
-            ("l1f_b", Bias, q.0, q.1),
+            ("l1_shared_weight", Dense, q.0, q.1),
+            ("l1_shared_bias", Bias, q.0, q.1),
             ("l2_w", Dense, q.0, q.1),
             ("l2_b", Bias, q.0, q.1),
             ("l3_w", Dense, q.0, q.1),

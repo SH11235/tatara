@@ -1458,7 +1458,7 @@ mod tests {
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
             ft_factorize: None,
-            stack_factorize_all: None,
+            stack_shared_delta: None,
             l0: 1536,
             l1: 16,
             l2: 32,

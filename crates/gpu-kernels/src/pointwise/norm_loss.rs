@@ -36,7 +36,7 @@
 //!   bucket 軸も row に畳んだ `[bucket*out, in]`): `group_pitch = group_len`,
 //!   `elem_stride = 1`。1 行 = 1 出力ニューロンの入力次元ベクトル。
 //! - **strided column** `[group_len, n_groups]` row-major (FT weight
-//!   `[ft_in, ft_out]`、shared L1f weight `[ft_out, l1_out]`): `group_pitch = 1`,
+//!   `[ft_in, ft_out]`、L1 shared weight `[ft_out, l1_out]`): `group_pitch = 1`,
 //!   `elem_stride = n_groups`。1 列 = 1 出力ニューロンの入力次元ベクトル
 //!   (列方向 stride `n_groups`)。
 //! - **per-tensor scalar** (bias、1D テンソル全体で 1 norm): `n_groups = 1`,
@@ -155,7 +155,7 @@ mod tests {
     }
 
     /// strided column layout `[group_len, n_groups]`: 列ごとの L2 norm。
-    /// FT weight `[ft_in, ft_out]` や L1f weight `[ft_out, l1_out]` の per-output
+    /// FT weight `[ft_in, ft_out]` や L1 shared weight `[ft_out, l1_out]` の per-output
     /// norm に対応する (列 = 出力ニューロン、stride = n_groups)。
     #[test]
     fn norms_strided_columns() {

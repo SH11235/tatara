@@ -83,14 +83,14 @@ pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> 
     for bucket in 0..YANEURAOU_LAYER_STACKS {
         write_u32(writer, YO_NETWORK_HASH)?;
 
-        // factorizer 共有項は通常 export 前に L1 へ fold 済み。未 fold の weights を
+        // L1 shared term は通常 export 前に L1 へ fold 済み。未 fold の weights を
         // caller が渡した場合にも同じ推論 weight になるよう加算する。
         let l1_biases = (0..l1_out)
-            .map(|output| weights.l1_b[bucket * l1_out + output] + weights.l1f_b[output]);
+            .map(|output| weights.l1_b[bucket * l1_out + output] + weights.l1_shared_bias[output]);
         let l1_weights = (0..l1_out).flat_map(|output| {
             (0..ft_out).map(move |input| {
                 weights.l1_w[bucket * l1_out * ft_out + output * ft_out + input]
-                    + weights.l1f_w[input * l1_out + output]
+                    + weights.l1_shared_weight[input * l1_out + output]
             })
         });
         write_affine(writer, l1_biases, l1_weights, ft_out, l1_out)?;
@@ -127,7 +127,7 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
         .find(|feature_set| feature_set.spec() == weights.feature_set)
         .ok_or_else(|| invalid_input_err("feature set is not representable in YaneuraOu SFNN"))?;
     let ft_out = weights.ft_b.len();
-    let l1_out = weights.l1f_b.len();
+    let l1_out = weights.l1_shared_bias.len();
     let num_buckets = weights.num_buckets;
     if num_buckets != YANEURAOU_LAYER_STACKS {
         return invalid_input(format!(
@@ -207,8 +207,12 @@ fn validate_weights(arch: &Architecture, weights: &LayerStackWeights) -> io::Res
             weights.l1_w.len(),
             YANEURAOU_LAYER_STACKS * arch.l1_out * arch.ft_out,
         ),
-        ("l1f_b", weights.l1f_b.len(), arch.l1_out),
-        ("l1f_w", weights.l1f_w.len(), arch.ft_out * arch.l1_out),
+        ("l1_shared_bias", weights.l1_shared_bias.len(), arch.l1_out),
+        (
+            "l1_shared_weight",
+            weights.l1_shared_weight.len(),
+            arch.ft_out * arch.l1_out,
+        ),
         (
             "l2_b",
             weights.l2_b.len(),
@@ -390,8 +394,8 @@ mod tests {
         weights.ft_w[17] = -0.5;
         weights.l1_b[2] = 0.75;
         weights.l1_w[31] = -0.25;
-        weights.l1f_b[1] = 0.25;
-        weights.l1f_w[7] = -0.5;
+        weights.l1_shared_bias[1] = 0.25;
+        weights.l1_shared_weight[7] = -0.5;
         weights.l2_b[4] = 0.5;
         weights.l2_w[9] = -0.75;
         weights.l3_b[3] = 0.125;

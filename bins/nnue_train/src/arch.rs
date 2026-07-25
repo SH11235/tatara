@@ -132,8 +132,8 @@ mod gpu {
     // kernel launch ごとに対象テンソルの値を渡す。QB=64 は LayerStack と Simple 両
     // format で共通 (`nnue_format::{layerstack_weights,simple_weights}`)。
 
-    /// i8 dense weight (L1 / L1f / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
-    /// 据える L1 / L1f / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
+    /// i8 dense weight (L1 / L1 shared / L2 / L3 weight) と、挙動 neutral 維持のため同じ範囲に
+    /// 据える L1 / L1 shared / L2 bias に渡す対称 clamp ±i8::MAX/QB (= ±127/64)。i8 量子化
     /// `round(w·QB)` の正側端点 (127) に対応する。
     pub(crate) const W_CLAMP_QUANT_MIN: f32 =
         -(i8::MAX as f32) / nnue_format::layerstack_weights::QB as f32;

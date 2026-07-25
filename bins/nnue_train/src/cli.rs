@@ -339,13 +339,13 @@ pub(crate) struct Cli {
     /// input weights, plus the PSQT shortcut weights when --psqt is set). When
     /// unset, this group uses the global --weight-decay. The optimizer splits
     /// all trainable parameters into three param groups — FT (input-side
-    /// weights), dense (the L1/L1f/L2/L3 hidden-layer weights), and bias (every
+    /// weights), dense (the L1/L1 shared/L2/L3 hidden-layer weights), and bias (every
     /// layer's bias) — each with its own weight decay and learning-rate
     /// multiplier. Leaving all six per-group flags unset is bit-identical to
     /// the single --weight-decay path.
     #[arg(long, global = true)]
     pub(crate) ft_weight_decay: Option<f32>,
-    /// Weight decay override for the dense param group (the L1/L1f/L2/L3
+    /// Weight decay override for the dense param group (the L1/L1 shared/L2/L3
     /// hidden-layer weights). Unset falls back to the global --weight-decay.
     #[arg(long, global = true)]
     pub(crate) dense_weight_decay: Option<f32>,
@@ -377,7 +377,7 @@ pub(crate) struct Cli {
     /// to the baseline. When enabled, each step (just before the optimizer update)
     /// every targeted weight group is nudged so its L2 norm relaxes toward 1
     /// (the oblique manifold): the 2D layer weights per output neuron (FT /
-    /// L1f / L1 / L2 / L3), the PSQT shortcut weights per output bucket (when
+    /// L1 shared / L1 / L2 / L3), the PSQT shortcut weights per output bucket (when
     /// --psqt is enabled), and 1D biases by their whole-tensor norm. Strength
     /// is set by --norm-loss-factor. An opt-in regularizer whose playing-strength
     /// effect must be confirmed by SPRT.
@@ -495,10 +495,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
     pub(crate) init_l1: Option<nnue_train::init::LayerInitOverride>,
 
-    /// Override the shared factorised L1f weight initialiser (layerstack only).
+    /// Override the L1 shared weight initialiser (layerstack only).
     /// Same grammar as `--init-ft`.
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
-    pub(crate) init_l1f: Option<nnue_train::init::LayerInitOverride>,
+    pub(crate) init_l1_shared: Option<nnue_train::init::LayerInitOverride>,
 
     /// Override the L2 weight initialiser. Same grammar as `--init-ft`.
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
@@ -814,11 +814,11 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
     pub(crate) num_buckets: usize,
 
-    /// Extend the always-on shared L1 factorizer to L2 and L3. The shared
-    /// terms are initialized to zero and folded into each bucket on export, so
+    /// Apply the existing L1 shared-delta parameterization to L2 and L3. The
+    /// shared terms are initialized to zero and folded into each bucket on export, so
     /// the resulting .bin remains compatible with existing LayerStack engines.
     #[arg(long)]
-    pub(crate) stack_factorize_all: bool,
+    pub(crate) stack_shared_delta: bool,
 
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the
@@ -827,8 +827,8 @@ pub(crate) struct LayerstackArgs {
     /// same as FP32). With the default `false`, it runs `CUBLAS_DEFAULT_MATH` (a
     /// pure FP32 path, no Tensor Cores).
     ///
-    /// Dropping 13 mantissa bits affects the numerics of the `fwd_L1f` /
-    /// `bwd_L1f` Sgemm, so it is conservatively default OFF for quality.
+    /// Dropping 13 mantissa bits affects the numerics of the `fwd_l1_shared` /
+    /// `bwd_l1_shared` Sgemm, so it is conservatively default OFF for quality.
     #[arg(long)]
     pub(crate) tf32: bool,
 

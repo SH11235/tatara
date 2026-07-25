@@ -40,11 +40,11 @@ kernel は `lr` と `decay` (weight_decay) を **per-launch の scalar 引数**�
 | group | 含むテンソル | 役割 |
 |---|---|---|
 | **ft** | `ft_w`, `psqt_w` | feature-indexed な入力側 weight (大規模) |
-| **dense** | `l1_w`, `l1f_w`, `l2_w`, `l3_w` | hidden dense layer weight |
-| **bias** | `ft_b`, `l1_b`, `l1f_b`, `l2_b`, `l3_b` | 全層の bias |
+| **dense** | `l1_w`, `l1_shared_weight`, `l2_w`, `l3_w` | hidden dense layer weight |
+| **bias** | `ft_b`, `l1_b`, `l1_shared_bias`, `l2_b`, `l3_b` | 全層の bias |
 
 `psqt_w` は shape `(ft_in, num_buckets)` の feature-indexed な shortcut weight で
-性質が `ft_w` に近いため **ft group** に置く。per-layer の細粒度 (l1/l1f/l2/l3 を
+性質が `ft_w` に近いため **ft group** に置く。per-layer の細粒度 (l1/l1_shared/l2/l3 を
 個別) は flag 数と探索空間が膨らみ SPRT で寄与を切り分けにくいため採らない
 (§Alternatives)。
 
@@ -129,7 +129,7 @@ per-group lr_mult を norm loss の pull にまで波及させると「optimizer
 
 ## Alternatives considered
 
-- **per-layer の細粒度 (ft/l1/l1f/l2/l3 + bias を個別)**: 柔軟だが flag が 10+ に
+- **per-layer の細粒度 (ft/l1/l1_shared/l2/l3 + bias を個別)**: 柔軟だが flag が 10+ に
   増え、SPRT で各 knob の寄与を切り分けるのが現実的でない。3 分類で必要な調整力は
   得られる。却下。
 - **FT vs rest の 2 分類**: 最小実装だが bias を独立させられず、定石の bias wd=0 を

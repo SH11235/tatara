@@ -85,7 +85,7 @@ fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
     let rmse = (sum_sq_diff / n as f64).sqrt();
     let norm_a = sum_a_sq.sqrt();
     let norm_b = sum_b_sq.sqrt();
-    // 全ゼロ tensor (LayerStack では l1f_w / l1f_b は load 後 0) は cosine 未定義。
+    // 全ゼロ tensor (LayerStack では l1_shared_weight / l1_shared_bias は load 後 0) は cosine 未定義。
     // 両方ゼロなら一致とみなし 1.0、片方だけゼロなら 0.0 を出す。
     let cos_sim = if norm_a > 0.0 && norm_b > 0.0 {
         sum_ab / (norm_a * norm_b)
@@ -116,14 +116,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("a = {}", args[1]);
     println!("b = {}", args[2]);
     // 各行は自己記述的 (key=value)。tensor ごとに 1 行。
-    // LayerStack の全 weight tensor。l1f_w / l1f_b は shared factorized 層で、
+    // LayerStack の全 weight tensor。l1_shared_weight / l1_shared_bias は L1 shared term で、
     // load_quantised 後は 0 (l1_w 側に畳み込まれている)。
     print_stats("ft_w", &a.ft_w, &b.ft_w)?;
     print_stats("ft_b", &a.ft_b, &b.ft_b)?;
     print_stats("l1_w", &a.l1_w, &b.l1_w)?;
     print_stats("l1_b", &a.l1_b, &b.l1_b)?;
-    print_stats("l1f_w", &a.l1f_w, &b.l1f_w)?;
-    print_stats("l1f_b", &a.l1f_b, &b.l1f_b)?;
+    print_stats("l1_shared_weight", &a.l1_shared_weight, &b.l1_shared_weight)?;
+    print_stats("l1_shared_bias", &a.l1_shared_bias, &b.l1_shared_bias)?;
     print_stats("l2_w", &a.l2_w, &b.l2_w)?;
     print_stats("l2_b", &a.l2_b, &b.l2_b)?;
     print_stats("l3_w", &a.l3_w, &b.l3_w)?;

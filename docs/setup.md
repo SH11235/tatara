@@ -186,7 +186,7 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 
 ## Resolving the CUDA toolkit root
 
-`bins/nnue_train` dynamically links against **libcublas** (it runs the L1f
+`bins/nnue_train` dynamically links against **libcublas** (it runs the L1 shared
 weight backward with `cublasSgemm_v2`). Both build.rs and the runtime look for
 the CUDA toolkit root in the following order of precedence:
 

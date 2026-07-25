@@ -637,7 +637,7 @@ pub fn dense_mm_bwd_input(
     }
 }
 
-/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1f 用 (`in_dim=ft_out`)、
+/// Tiled shared-memory variant of [`dense_mm_bwd_input`]. L1 shared 用 (`in_dim=ft_out`)、
 /// `batch % 16 == 0`、`in_dim % 16 == 0` を host が保証。`out_dim` は reduction 軸で、
 /// 16 幅の out-tile に分割して loop で消化するため任意の値に対応する (`out_dim` が 16 の
 /// 倍数でなければ末尾 out-tile は 0 padding)。
@@ -769,7 +769,7 @@ pub fn dense_mm_bwd_weight(
 /// `folded[bucket][i] = bucketed[bucket][i] + shared[i]`。weight / bias のどちらにも
 /// 同じ layout で使い、`group_len` は 1 bucket 分の要素数。
 #[kernel]
-pub fn stack_factorizer_fold(
+pub fn stack_shared_delta_fold(
     bucketed: &[f32],
     shared: &[f32],
     mut folded: DisjointSlice<f32>,
@@ -793,7 +793,7 @@ pub fn stack_factorizer_fold(
 /// `shared_grad[i] = Σ_bucket bucketed_grad[bucket][i]`。各出力 cell は単一 thread が
 /// 上書きするため atomic と事前の zero fill は不要。
 #[kernel]
-pub fn stack_factorizer_reduce_grad(
+pub fn stack_shared_delta_reduce_grad(
     bucketed_grad: &[f32],
     mut shared_grad: DisjointSlice<f32>,
     num_buckets: u32,
@@ -814,7 +814,7 @@ pub fn stack_factorizer_reduce_grad(
     }
 }
 
-/// Tiled shared-memory variant of [`dense_mm_bwd_weight`]. L1f 用 (`in_dim=ft_out`,
+/// Tiled shared-memory variant of [`dense_mm_bwd_weight`]. L1 shared 用 (`in_dim=ft_out`,
 /// `out_dim=16` 固定) を想定した固定タイル形状 (TILE_K=16, TILE_IN=16,
 /// TILE_OUT=16, block=256 threads)。`in_dim % 16 == 0 && out_dim == 16 && batch % 16 == 0`
 /// が host 契約。非該当形状では結果未定義 (host 側で sizes チェックの上で本 kernel を選ぶ)。
@@ -1226,14 +1226,14 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1_sorted(
     }
 }
 
-/// Bias gradient (block-level shared-mem reduction) — L1f 用。`out_dim` は `--l1` 依存で、
+/// Bias gradient (block-level shared-mem reduction) — L1 shared 用。`out_dim` は `--l1` 依存で、
 /// host が `<= 256` を保証する (`PARTIAL` の固定容量)。
 ///
 /// 各 block (256 threads) が shared-mem の out_dim-cell accumulator に集約してから
 /// 1 block × out_dim atomic add で global に flush する。全 thread が直接 global の
 /// out_dim cells へ atomic add する [`bias_grad`] の contention を避ける。
 #[kernel]
-pub fn bias_grad_shared_l1f(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
+pub fn bias_grad_l1_shared(dy: &[f32], grad_bias: &[f32], batch: u32, out_dim: u32) {
     use core::ptr::addr_of_mut;
     // out_dim (= l1_out) は host が <= 256 を保証。PARTIAL は固定上限で確保し先頭
     // out_dim cell のみ使う (1 KB、occupancy への影響は無視できる)。
@@ -2544,7 +2544,7 @@ pub fn bias_add_per_bucket_row(
     }
 }
 
-/// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
+/// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1_shared, l3+l1_skip) と
 /// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
 #[kernel]
 pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) {

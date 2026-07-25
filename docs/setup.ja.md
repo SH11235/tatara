@@ -180,7 +180,7 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 
 ## CUDA toolkit root の解決
 
-`bins/nnue_train` は **libcublas** に dynamic link する (L1f weight backward を
+`bins/nnue_train` は **libcublas** に dynamic link する (L1 shared weight backward を
 `cublasSgemm_v2` で実行するため)。build.rs / runtime ともに以下の優先順で CUDA
 toolkit root を探す:
 

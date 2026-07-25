@@ -168,6 +168,26 @@ fn layerstack_subcommand_parses() {
 }
 
 #[test]
+fn shared_delta_and_l1_shared_names_parse() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--init-l1-shared",
+        "zero",
+        "layerstack",
+        "--stack-shared-delta",
+    ])
+    .expect("renamed shared-delta arguments should parse");
+    assert!(cli.init_l1_shared.is_some());
+    let ArchCommand::LayerStack(args) = cli.arch else {
+        panic!("expected layerstack subcommand");
+    };
+    assert!(args.stack_shared_delta);
+
+    assert!(Cli::try_parse_from(["nnue-train", "--init-l1f", "zero", "layerstack",]).is_err());
+    assert!(Cli::try_parse_from(["nnue-train", "layerstack", "--stack-factorize-all"]).is_err());
+}
+
+#[test]
 fn bench_pos_subcommand_uses_tracked_and_local_defaults() {
     let cli = Cli::try_parse_from([
         "nnue-train",
