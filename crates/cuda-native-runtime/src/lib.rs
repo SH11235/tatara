@@ -1,5 +1,10 @@
 #![cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 
+// 実体は build script が `include!` して使う。lib からは呼ばないため、test を走らせる
+// ためだけに compile する。
+#[cfg(test)]
+mod compute_cap;
+
 #[cfg(feature = "native-cuda")]
 mod runtime;
 

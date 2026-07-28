@@ -175,11 +175,18 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 | Item | Requirement | Notes |
 |---|---|---|
 | OS | Linux / WSL2; native Windows for the experimental backend | See "Supported OSes" |
-| CUDA Toolkit | 12.x (verified with 12.9) | nvcc, libNVVM, nvJitLink, **libcublas** |
+| CUDA Toolkit | NVCC supporting compute_75 or later (12.9 verified) | nvcc, libNVVM, nvJitLink, **libcublas** |
 | LLVM | **21+ (floor), 22 recommended** | apt.llvm.org provides LLVM 20/21/22 for both jammy / noble. If `llc-22` is on PATH, cuda-oxide prefers it |
 | Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | Needed by `cuda-bindings`' bindgen (even on LLVM 22, one of clang-21/22 is required) |
 | Rust | nightly-2026-04-03 (cuda-oxide pinned) | Pinned by `rust-toolchain.toml` |
-| GPU | **Official: Ampere+ (sm_80+)**. Turing (sm_75) also works with `CUDA_OXIDE_TARGET=sm_75` | RTX 30/40/50, A100, H100, B200, etc. |
+| GPU | **Official: Ampere+ (sm_80+)**. Native CUDA also supports Turing (sm_75); cuda-oxide requires `CUDA_OXIDE_TARGET=sm_75` there | The embedded PTX architecture is bounded by the architectures reported by the installed NVCC |
+
+For the default native backend, the build selects the lowest compute capability
+reported by `nvidia-smi`, so its PTX can be JIT-compiled for every visible GPU.
+If the GPUs are newer than the installed toolkit, the target is clamped to the
+highest virtual architecture reported by `nvcc --list-gpu-arch`; the CUDA driver
+then JIT-compiles that PTX for the newer GPU. Set `TATARA_CUDA_COMPUTE` only to
+override this selection explicitly.
 
 ## Resolving the CUDA toolkit root
 
@@ -399,12 +406,12 @@ prebuilt `.ptx`, so even users who do not modify the kernels need
 |---|---|---|---|---|
 | Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | Untested (LLVM IR compatibility also unverified) |
 | Volta | sm_70 | V100, Titan V | ✗ | May work (untested) |
-| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✗ | ✅ Verified |
+| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✅ | ✅ Verified |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
 | Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ Verified (primary) | n/a |
 | Ada | sm_89 | RTX 40xx | ✅ | n/a |
 | Hopper | sm_90 | H100, H200 | ✅ | n/a |
-| Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ | n/a |
+| Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ when supported by the installed NVCC, otherwise PTX is compiled for its supported maximum | n/a |
 
 The cuda-oxide rev is pinned in this repository's `Cargo.toml`
 (`[workspace.dependencies]`), and `scripts/setup-cuda-oxide.sh` keeps

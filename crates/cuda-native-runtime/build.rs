@@ -4,6 +4,10 @@ use std::{
     process::Command,
 };
 
+// build script は lib を dependency にできないため、parse ロジックを source 共有する。
+// cargo は build script の test を実行しないので、test は lib 側の module で走る。
+include!("src/compute_cap.rs");
+
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -32,17 +36,39 @@ fn main() {
     }
 
     let nvcc = find_nvcc();
-    let (compute, source) = match env::var("TATARA_CUDA_COMPUTE") {
-        Ok(compute) => (compute, "TATARA_CUDA_COMPUTE"),
-        Err(_) => detect_compute_capability()
-            .map(|compute| (compute, "nvidia-smi"))
-            .unwrap_or_else(|| ("75".into(), "fallback")),
+    let compute = match env::var("TATARA_CUDA_COMPUTE") {
+        Ok(compute) => compute,
+        Err(_) => match detect_compute_capability() {
+            Some(detected) => match max_nvcc_compute_capability(&nvcc) {
+                Some(maximum) if detected > maximum => {
+                    println!(
+                        "cargo:warning=detected CUDA compute capability {detected}, but NVCC \
+                         supports at most {maximum}; compiling PTX for {maximum}"
+                    );
+                    maximum.to_string()
+                }
+                Some(_) => detected.to_string(),
+                None => {
+                    println!(
+                        "cargo:warning=NVCC GPU architecture detection failed; compiling PTX \
+                         for fallback compute capability 75"
+                    );
+                    "75".into()
+                }
+            },
+            None => {
+                println!(
+                    "cargo:warning=CUDA compute capability detection failed; compiling PTX for \
+                     fallback compute capability 75"
+                );
+                "75".into()
+            }
+        },
     };
     assert!(
         !compute.is_empty() && compute.bytes().all(|byte| byte.is_ascii_digit()),
         "TATARA_CUDA_COMPUTE must be a numeric compute capability such as 75 or 120"
     );
-    println!("cargo:warning=CUDA compute capability: {compute} ({source})");
     let codegen = format!("arch=compute_{compute},code=compute_{compute}");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"))
         .join("tatara_native.fatbin");
@@ -72,7 +98,7 @@ fn main() {
     assert!(status.success(), "NVCC failed with status {status}");
 }
 
-fn detect_compute_capability() -> Option<String> {
+fn detect_compute_capability() -> Option<u32> {
     let mut candidates = vec![PathBuf::from("nvidia-smi")];
     if cfg!(target_os = "linux") {
         candidates.push(PathBuf::from("/usr/lib/wsl/lib/nvidia-smi"));
@@ -88,20 +114,24 @@ fn detect_compute_capability() -> Option<String> {
         if !output.status.success() {
             continue;
         }
-        let first = String::from_utf8(output.stdout).ok()?;
-        let value = first.lines().next()?.trim();
-        let (major, minor) = value.split_once('.')?;
-        if !major.is_empty()
-            && !minor.is_empty()
-            && major.bytes().all(|byte| byte.is_ascii_digit())
-            && minor.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            // nvidia-smi output is not tracked by Cargo, so replacing the GPU alone does not
-            // rerun this build script; set TATARA_CUDA_COMPUTE to force a tracked rebuild.
-            return Some(format!("{major}{minor}"));
+        let Ok(stdout) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        if let Some(minimum) = minimum_compute_capability(&stdout) {
+            // Cargo does not track nvidia-smi output. After replacing a GPU or moving target/
+            // to another machine, rebuild explicitly with cargo clean -p cuda-native-runtime.
+            return Some(minimum);
         }
     }
     None
+}
+
+fn max_nvcc_compute_capability(nvcc: &Path) -> Option<u32> {
+    let output = Command::new(nvcc).arg("--list-gpu-arch").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    max_listed_compute_capability(&String::from_utf8(output.stdout).ok()?)
 }
 
 fn find_nvcc() -> PathBuf {

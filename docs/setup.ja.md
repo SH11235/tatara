@@ -169,11 +169,17 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 | 項目 | 要件 | 備考 |
 |---|---|---|
 | OS | Linux / WSL2、実験 backend は native Windows | 「対応 OS」参照 |
-| CUDA Toolkit | 12.x (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
+| CUDA Toolkit | compute_75 以降に対応する NVCC (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
 | LLVM | **21+ (floor)、22 推奨** | apt.llvm.org が jammy / noble の両方に LLVM 20/21/22 を提供。`llc-22` が PATH にあれば cuda-oxide が優先する |
 | Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
 | Rust | nightly-2026-04-03 (cuda-oxide pinned) | `rust-toolchain.toml` で固定 |
-| GPU | **公式: Ampere+ (sm_80+)**。Turing (sm_75) も `CUDA_OXIDE_TARGET=sm_75` で動作 | RTX 30/40/50, A100, H100, B200 等 |
+| GPU | **公式: Ampere+ (sm_80+)**。native CUDA は Turing (sm_75) にも対応し、cuda-oxide では `CUDA_OXIDE_TARGET=sm_75` が必要 | 埋め込む PTX architecture は install 済み nvcc が報告する範囲が上限 |
+
+既定の native backend は `nvidia-smi` が報告する最小の compute capability を選び、
+すべての可視 GPU で JIT 可能な PTX を生成する。GPU が install 済み toolkit より
+新しい場合は `nvcc --list-gpu-arch` が報告する最大の virtual architecture へ丸め、
+CUDA driver が新しい GPU 向けにその PTX を JIT compile する。
+`TATARA_CUDA_COMPUTE` はこの選択を明示的に上書きする場合だけ設定する。
 
 ## CUDA toolkit root の解決
 
@@ -384,12 +390,12 @@ kernel を改変しないユーザーも初回は `cargo-oxide build` が必要�
 |---|---|---|---|---|
 | Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | 未検証 (LLVM IR 互換性も要確認) |
 | Volta | sm_70 | V100, Titan V | ✗ | 動く可能性 (未検証) |
-| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✗ | ✅ 確認済み |
+| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✅ | ✅ 確認済み |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
 | Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ 確認済み (primary) | n/a |
 | Ada | sm_89 | RTX 40xx | ✅ | n/a |
 | Hopper | sm_90 | H100, H200 | ✅ | n/a |
-| Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ | n/a |
+| Blackwell | sm_100/120 | B100, B200, RTX 50xx | install 済み nvcc が対応。未対応なら nvcc の対応上限向け PTX を生成 | n/a |
 
 cuda-oxide の rev は本リポジトリの `Cargo.toml` (`[workspace.dependencies]`) に
 pin し、`scripts/setup-cuda-oxide.sh` が `cargo-oxide` を同 rev に揃える。LLVM は
