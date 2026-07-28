@@ -1,4 +1,4 @@
-//! cuBLAS の dynamic link 設定。`dense_mm_bwd_weight_tiled` (L1f weight bwd) を
+//! cuBLAS の dynamic link 設定。`dense_mm_bwd_weight_tiled` (L1 shared weight bwd) を
 //! `cublasSgemm_v2` で置換するため。
 //!
 //! CUDA toolkit root 解決順 (gpu-runtime `kernel_loader` の `find_libdevice_bc`

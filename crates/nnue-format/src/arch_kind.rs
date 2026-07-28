@@ -9,7 +9,7 @@
 /// NNUE network のアーキテクチャ種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArchKind {
-    /// progress8kpabs 9-bucket LayerStack (FT → bucket 化 L1/L2/L3 + L1f skip)。
+    /// progress8kpabs 9-bucket LayerStack (FT → bucket 化 L1/L2/L3 + L1 shared skip)。
     LayerStack,
     /// bucket 無しの 4 層 dense アーキ (FT → L1 → L2 → L3)。
     Simple,

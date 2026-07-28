@@ -514,12 +514,12 @@ pub fn radam_step_fp16_mirror(
 /// element offset は `g*group_pitch + pos*elem_stride` (`pos < group_len`)。各 thread は
 /// 担当 pos チャンク (`blockIdx_y` 始点、`gridDim_y` stride) の Σ w² を計算し `norms[g]`
 /// へ atomicAdd する。呼び出し側は launch 前に `norms` を 0 fill し、後段
-/// [`norm_loss_finalize`] が sqrt して L2 norm にする。strided column (FT/L1f,
+/// [`norm_loss_finalize`] が sqrt して L2 norm にする。strided column (FT/L1 shared,
 /// `group_pitch=1`) では同一 pos の隣接 g が連続アドレスなので x 軸 thread で coalesce する。
 ///
 /// `(group_pitch, elem_stride, group_len, n_groups)` の 3 レイアウト統一表現は
 /// [`norm_loss_finalize`] / [`norm_loss_apply`] と共通: contiguous row (dense weight
-/// `[n_groups, group_len]`、`pitch=group_len, stride=1`)、strided column (FT/L1f weight
+/// `[n_groups, group_len]`、`pitch=group_len, stride=1`)、strided column (FT/L1 shared weight
 /// `[group_len, n_groups]`、`pitch=1, stride=n_groups`)、per-tensor scalar (bias、
 /// `n_groups=1, pitch=0, stride=1`)。
 #[kernel]
@@ -577,7 +577,7 @@ pub fn norm_loss_finalize(mut norms: DisjointSlice<f32>, n_groups: u32) {
 /// Norm loss 補正の適用 (apply pass)。1 thread = 1 weight element。
 ///
 /// thread `t` を、stride==1 の連続軸が最内になるよう `(g, pos)` へ分解して coalesce する:
-/// strided column (FT/L1f、`group_pitch==1`) は `g` 最内 (`g=t%n_groups, pos=t/n_groups`)
+/// strided column (FT/L1 shared、`group_pitch==1`) は `g` 最内 (`g=t%n_groups, pos=t/n_groups`)
 /// で連続 thread が連続 g (同 pos) を触り、contiguous row / scalar は `pos` 最内
 /// (`g=t/group_len, pos=t%group_len`)。どちらも offset は `g*group_pitch + pos*elem_stride`
 /// で、weight に `*= 1 - lr*2*factor*(1 - 1/(norms[g]+eps))` を掛ける。各要素が受ける補正は
@@ -602,7 +602,7 @@ pub fn norm_loss_apply(
         return;
     }
     // 連続 thread が連続メモリを触るよう、stride==1 の軸を最内にする。strided column
-    // (group_pitch==1, FT/L1f) は g を、それ以外 (contiguous row / scalar) は pos を最内に。
+    // (group_pitch==1, FT/L1 shared) は g を、それ以外 (contiguous row / scalar) は pos を最内に。
     let (g, pos) = if group_pitch == 1 {
         (t % ng, t / ng)
     } else {

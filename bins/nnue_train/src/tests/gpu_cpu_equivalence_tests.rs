@@ -525,9 +525,9 @@ fn concat_l1sqr_main_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>
 }
 
 // -- dense_mm (regular) fwd / bwd_input / bwd_weight / bias_grad ---------
-// L1f 実 shape: in_dim=ft_out は重いので、ここは小さい shape で
+// L1 shared 実 shape: in_dim=ft_out は重いので、ここは小さい shape で
 // layout 規約 (in-major weight、row-major x/y) を確認 (実 shape は equivalence で
-// 担保不要、layout が一致すれば良い)。1 つは L1f 実 shape の縮小版も入れる。
+// 担保不要、layout が一致すれば良い)。1 つは L1 shared 実 shape の縮小版も入れる。
 
 #[test]
 fn dense_mm_fwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -685,7 +685,7 @@ fn dense_mm_bwd_input_tiled_matches_cpu() -> Result<(), Box<dyn std::error::Erro
 }
 
 /// `CublasHandle::sgemm_x_yt_rowmajor` (row-major `C[m,n] = X[m,k] @ Y[n,k]^T`) が
-/// `dense_mm_bwd_input_cpu` と一致する。この helper は tf32 経路の L1f input backward
+/// `dense_mm_bwd_input_cpu` と一致する。この helper は tf32 経路の L1 shared input backward
 /// (m=batch, n=ft_out, k=l1_out で reduce 軸 k=16 が細い) と per-bucket L1 forward
 /// (n=l1_out=16 が細い、k=ft_out) の双方を計算するため、両 shape regime を張る。
 /// FP32 handle (`CUBLAS_DEFAULT_MATH`) は cuBLAS の K 分割による FMA 順序差のみなので
@@ -696,7 +696,7 @@ fn cublas_sgemm_x_yt_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let (_ctx, _module, stream) = open_module()?;
     // (m = batch, n = in_dim, k = out_dim/reduce)
     for &(m, n, k) in &[
-        (64_usize, 128_usize, 16_usize), // L1f input-bwd regime: k=16 が細い
+        (64_usize, 128_usize, 16_usize), // L1 shared input-bwd regime: k=16 が細い
         (128, 256, 16),
         (64, 16, 128), // per-bucket L1-fwd regime: n=16 が細い
         (128, 16, 512),
@@ -744,7 +744,7 @@ fn cublas_sgemm_x_yt_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Er
 
 /// `CublasHandle::sgemm_xt_y_rowmajor` (row-major `C[m,n] = X^T @ Y`、X[k,m]/Y[k,n]/C[m,n]) が
 /// `dense_mm_bwd_weight_cpu` (`dw[i][o] = Σ_b x[b][i] * dy[b][o]`) と一致する。tf32 経路の
-/// L1 weight backward (m=l1_out, n=ft_out, k=bucket の row 数) と L1f weight backward
+/// L1 weight backward (m=l1_out, n=ft_out, k=bucket の row 数) と L1 shared weight backward
 /// (m=ft_out, n=l1_out, k=batch) がこの helper を使う。tolerance 方針は
 /// [`cublas_sgemm_x_yt_rowmajor_matches_cpu`] と同一。
 #[test]
@@ -753,7 +753,7 @@ fn cublas_sgemm_xt_y_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Er
     // (m = in_dim, n = out_dim, k = batch/reduce)
     for &(m, n, k) in &[
         (16_usize, 128_usize, 256_usize), // L1 wgrad regime: m=l1_out=16
-        (128, 16, 256),                   // L1f wgrad regime: n=l1_out=16
+        (128, 16, 256),                   // L1 shared wgrad regime: n=l1_out=16
         (64, 96, 512),
         (32, 48, 128),
     ] {
@@ -799,7 +799,7 @@ fn cublas_sgemm_xt_y_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Er
 
 /// `CublasHandle::sgemm_fwd_rowmajor` (row-major `C[m,n] = A @ B`、A[m,k]/B[k,n]/C[m,n]) が
 /// `dense_mm_fwd_cpu` (bias 0、`y[b][o] = Σ_k x[b][k] * w[k][o]`) と一致する。tf32 経路の
-/// L1 input backward (m=bucket の row 数, n=ft_out, k=l1_out) と L1f forward (m=batch,
+/// L1 input backward (m=bucket の row 数, n=ft_out, k=l1_out) と L1 shared forward (m=batch,
 /// n=l1_out, k=ft_out) がこの helper を使う。tolerance 方針は
 /// [`cublas_sgemm_x_yt_rowmajor_matches_cpu`] と同一。
 #[test]
@@ -808,7 +808,7 @@ fn cublas_sgemm_fwd_rowmajor_matches_cpu() -> Result<(), Box<dyn std::error::Err
     // (m = batch, n = out_dim, k = in_dim/reduce)
     for &(m, n, k) in &[
         (64_usize, 128_usize, 16_usize), // L1 input-bwd regime: k=l1_out=16
-        (128, 16, 256),                  // L1f forward regime: n=l1_out=16
+        (128, 16, 256),                  // L1 shared forward regime: n=l1_out=16
         (64, 96, 48),
         (32, 64, 32),
     ] {
@@ -1256,11 +1256,11 @@ fn cfg_dense_bias_grad_invariants() {
     );
 }
 
-/// `bias_grad_shared_l1f` (block-shared reduce 版) が `bias_grad_cpu` と reduction
+/// `bias_grad_l1_shared` (block-shared reduce 版) が `bias_grad_cpu` と reduction
 /// tolerance 内で一致することを確認。out_dim (= l1_out) を 16 / 16 倍数 / 非倍数 /
 /// 上限 256 で網羅する。
 #[test]
-fn bias_grad_shared_l1f_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+fn bias_grad_l1_shared_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     for &(batch, out_dim) in &[
         (5_usize, 16_usize),
@@ -1282,14 +1282,14 @@ fn bias_grad_shared_l1f_matches_cpu() -> Result<(), Box<dyn std::error::Error>> 
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: bias_grad_shared_l1f, stream: stream, module: module,
+                kernel: bias_grad_l1_shared, stream: stream, module: module,
                 config: cfg_1d(batch * out_dim),
                 args: [slice(dy_dev), slice(gb_dev), batch as u32, out_dim as u32]
             }
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("bias_grad_shared_l1f b={batch} out={out_dim}"),
+            &format!("bias_grad_l1_shared b={batch} out={out_dim}"),
             &gb_dev.to_host_vec(&stream)?,
             &gb_cpu,
             TOL,
@@ -3534,7 +3534,7 @@ fn norm_loss_layouts() -> Vec<NormLossLayout> {
             elem_stride: 1,
             group_len: 8,
         },
-        // strided column [group_len, n_groups]: FT / L1f weight 相当。
+        // strided column [group_len, n_groups]: FT / L1 shared weight 相当。
         NormLossLayout {
             label: "column",
             n_groups: 6,

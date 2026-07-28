@@ -77,10 +77,10 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
                 proc_macro2::TokenTree::Ident(ident),
                 proc_macro2::TokenTree::Group(group),
             ] = window
+                && ident == "cfg"
+                && group.delimiter() == proc_macro2::Delimiter::Parenthesis
             {
-                if ident == "cfg" && group.delimiter() == proc_macro2::Delimiter::Parenthesis {
-                    return eval_predicate_group(group.stream()) == Tri::False;
-                }
+                return eval_predicate_group(group.stream()) == Tri::False;
             }
         }
         false
@@ -181,13 +181,12 @@ fn cuda_launch_symbols(source: &str) -> std::collections::BTreeSet<String> {
             }
             match token {
                 proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
-                    if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek() {
-                        if group.delimiter() == proc_macro2::Delimiter::Bracket
-                            && attribute_marks_test_only(group.stream())
-                        {
-                            skip_next_item_body = true;
-                            tokens.next();
-                        }
+                    if let Some(proc_macro2::TokenTree::Group(group)) = tokens.peek()
+                        && group.delimiter() == proc_macro2::Delimiter::Bracket
+                        && attribute_marks_test_only(group.stream())
+                    {
+                        skip_next_item_body = true;
+                        tokens.next();
                     }
                 }
                 proc_macro2::TokenTree::Ident(ident) if ident == "cuda_launch" => {
@@ -487,19 +486,19 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 61, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 63, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 77, "production kernel inventory changed");
+    assert_eq!(required.len(), 79, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
 /// `production_cuda_launch_symbols` は nnue_train crate の `src` だけを走査する。native path
-/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 77 本の
+/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 79 本の
 /// inventory tripwire も発火しなくなる。workspace 全体を走査し、`cuda_launch!` を含む
 /// production source が既知の許可 path 配下だけにあることを固定する。
 #[test]
@@ -658,6 +657,98 @@ fn create_layerstack_trainer_with_batch(
         );
         operation()
     }
+}
+
+#[test]
+fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut trainer = create_layerstack_trainer(&context, true)?;
+    let mut bucketed = trainer.to_layerstack_weights()?;
+    for (i, value) in bucketed.l2_w.iter_mut().enumerate() {
+        *value = i as f32 * 0.01;
+    }
+    for (i, value) in bucketed.l2_b.iter_mut().enumerate() {
+        *value = i as f32 * -0.02;
+    }
+    for (i, value) in bucketed.l3_w.iter_mut().enumerate() {
+        *value = i as f32 * 0.03;
+    }
+    for (i, value) in bucketed.l3_b.iter_mut().enumerate() {
+        *value = i as f32 * -0.04;
+    }
+    trainer.load_layerstack_weights(&bucketed)?;
+    trainer.enable_stack_shared_delta()?;
+
+    let l2_group_len = bucketed.l2_w.len() / bucketed.num_buckets;
+    let l2_bias_len = bucketed.l2_b.len() / bucketed.num_buckets;
+    let l3_group_len = bucketed.l3_w.len() / bucketed.num_buckets;
+    let l2_shared = vec![0.25; l2_group_len];
+    let l2_b_shared = vec![-0.5; l2_bias_len];
+    let l3_shared = vec![0.75; l3_group_len];
+    let l3_b_shared = vec![-1.0];
+    trainer.set_stack_shared_delta_for_test(&l2_shared, &l2_b_shared, &l3_shared, &l3_b_shared)?;
+
+    let raw = trainer.raw_checkpoint_state_to_host()?;
+    assert_eq!(raw.1.len(), 14);
+    assert_eq!(raw.1[10].0, "l2_shared_weight");
+    assert_eq!(raw.1[13].0, "l3_shared_bias");
+
+    let folded = trainer.to_layerstack_weights()?;
+    for bucket in 0..bucketed.num_buckets {
+        for (i, shared_value) in l2_shared.iter().enumerate() {
+            let index = bucket * l2_group_len + i;
+            assert_eq!(folded.l2_w[index], bucketed.l2_w[index] + shared_value);
+        }
+        for (i, shared_value) in l2_b_shared.iter().enumerate() {
+            let index = bucket * l2_bias_len + i;
+            assert_eq!(folded.l2_b[index], bucketed.l2_b[index] + shared_value);
+        }
+        for (i, shared_value) in l3_shared.iter().enumerate() {
+            let index = bucket * l3_group_len + i;
+            assert_eq!(folded.l3_w[index], bucketed.l3_w[index] + shared_value);
+        }
+        assert_eq!(folded.l3_b[bucket], bucketed.l3_b[bucket] + l3_b_shared[0]);
+    }
+    Ok(())
+}
+
+#[test]
+fn stack_shared_delta_reduce_grad_sums_bucket_axis() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut trainer = create_layerstack_trainer(&context, true)?;
+    trainer.enable_stack_shared_delta()?;
+    let weights = trainer.to_layerstack_weights()?;
+    let group_len = weights.l2_w.len() / weights.num_buckets;
+    let bucketed_grad: Vec<f32> = (0..weights.l2_w.len())
+        .map(|i| (i / group_len) as f32 * 10.0 + (i % group_len) as f32 * 0.001)
+        .collect();
+    let shared_grad = trainer.reduce_l2_weight_grad_for_test(&bucketed_grad)?;
+    for (i, actual) in shared_grad.iter().enumerate() {
+        let expected: f32 = (0..weights.num_buckets)
+            .map(|bucket| bucketed_grad[bucket * group_len + i])
+            .sum();
+        assert_eq!(*actual, expected, "gradient cell {i}");
+    }
+    Ok(())
+}
+
+#[test]
+fn stack_shared_delta_step_zero_forward_matches_control() -> Result<(), Box<dyn std::error::Error>>
+{
+    let context = CudaContext::new(0)?;
+    let mut control = create_layerstack_trainer(&context, true)?;
+    let initial = control.to_layerstack_weights()?;
+    let mut shared = create_layerstack_trainer(&context, true)?;
+    shared.load_layerstack_weights(&initial)?;
+    shared.enable_stack_shared_delta()?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % initial.num_buckets) as i32;
+    }
+    let control_loss = control.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?.loss;
+    let shared_loss = shared.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?.loss;
+    assert_eq!(shared_loss.to_bits(), control_loss.to_bits());
+    Ok(())
 }
 
 #[test]
@@ -1197,20 +1288,30 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
 
-    for source_is_native in [false, true] {
+    for (shared_delta, source_is_native) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let source_name = if source_is_native { "native" } else { "oxide" };
+        let variant = if shared_delta { "shared" } else { "bucket" };
         let path = std::env::temp_dir().join(format!(
-            "tatara-layerstack-native-resume-{source_name}-{}.ckpt",
+            "tatara-layerstack-native-resume-{variant}-{source_name}-{}.ckpt",
             std::process::id()
         ));
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut source =
                 create_layerstack_trainer_with_options(&context, source_is_native, options)?;
+            if shared_delta {
+                source.enable_stack_shared_delta()?;
+            }
             for _ in 0..5 {
                 let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             }
             let checkpoint_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(checkpoint_state.0, 5);
+            // shared 有効時は 4 group が L3 の後ろへ挿入され、PSQT はその後ろへずれる。
+            let psqt_idx = if shared_delta { 14 } else { 10 };
+            assert_eq!(checkpoint_state.1.len(), psqt_idx + 1);
+            assert_eq!(checkpoint_state.1[psqt_idx].0, "psqt_w");
             source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
             let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let oracle_state = source.raw_checkpoint_state_to_host()?;
@@ -1219,6 +1320,10 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
 
             let mut oxide = create_layerstack_trainer_with_options(&context, false, options)?;
             let mut native = create_layerstack_trainer_with_options(&context, true, options)?;
+            if shared_delta {
+                oxide.enable_stack_shared_delta()?;
+                native.enable_stack_shared_delta()?;
+            }
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
                 let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);

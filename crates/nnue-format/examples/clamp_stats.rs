@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("net: {path}");
     println!("--- i8 dense weights (train-time clamp ±127/64) ---");
     stats("l1_w", &w.l1_w, dense_bnd);
-    stats("l1f_w", &w.l1f_w, dense_bnd);
+    stats("l1_shared_weight", &w.l1_shared_weight, dense_bnd);
     stats("l2_w", &w.l2_w, dense_bnd);
     stats("l3_w", &w.l3_w, dense_bnd);
     println!("--- i16 FT (clamp 無し、飽和境界 ±32767/127) ---");

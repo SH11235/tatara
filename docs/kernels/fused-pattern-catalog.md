@@ -48,7 +48,7 @@ LayerStack アーキの FT 後処理と、bucket 別重み行列 (bucket 数は
 | Pattern | 用途 |
 |---|---|
 | `ft_post_perspective_fwd` / `_grad` | FT 出力後処理を 1 kernel に集約 (bias add → CReLU → pairwise_mul → ×127/128)、両 perspective まとめて combined 出力 |
-| `dense_mm_fwd` / `_bwd_input` / `_bwd_weight` / `bias_grad` | bucket 非依存 dense 層 (L1f shared weight) の forward / backward |
+| `dense_mm_fwd` / `_bwd_input` / `_bwd_weight` / `bias_grad` | bucket 非依存 dense 層 (L1 shared weight) の forward / backward |
 | `dense_mm_fwd_bucket` / `_bwd_input_bucket` / `_bwd_weight_bucket` / `bias_grad_bucket` | per-bucket dense 層 (L1 / L2 / L3) の forward / backward。position ごとに bucket の重み行列を選ぶ |
 | `count_buckets` / `exclusive_scan_aligned` / `scatter_bucket_perm` / `permute_rows_f32` / `inverse_permute_rows_f32` | batch を bucket 順 (16-align padding) に並べ替える batch sort。sorted 系 dense kernel の前処理と出力の逆 permute |
 | `psqt_diff_sparse_fwd_inplace` / `psqt_diff_sparse_bwd` | per-bucket PSQT shortcut (`--psqt`) の forward 加算 / weight gradient |

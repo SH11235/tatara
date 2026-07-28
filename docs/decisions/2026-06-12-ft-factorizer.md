@@ -8,7 +8,7 @@ HalfKP / HalfKA 系 feature set の FT 重みは (king bucket × piece-input ord
 テーブルで、実戦の玉位置が囲いに偏在するためセルの大半は勾配がほとんど
 届かず初期値近傍に留まる。nnue-pytorch は学習時のみ仮想特徴 (king bucket
 非依存の piece-input ordinal) を追加し、export 時に実重みへ畳み込む factorizer で
-この偏りを補っている。本リポの LayerStack は L1 に同型の機構 (`l1f` shared
+この偏りを補っている。本リポの LayerStack は L1 に同型の機構 (`l1_shared` shared
 + per-bucket delta) を持つが、FT には無かった。
 
 piece-input 仮想行 の行は king bucket を問わず全局面から勾配を受ける (実効データ
@@ -101,7 +101,7 @@ raw checkpoint header の feature-set 節に factorizer flag を追加する
 ### 5. export は量子化・飽和検査の前に畳み込む
 
 `W_real[(kb, p)] += W_virtual[p]` の畳み込みを base 形状の host buffer 構築
-として先に行い、その配列に i16 飽和検査 → 量子化を掛ける (`l1f` merge と
+として先に行い、その配列に i16 飽和検査 → 量子化を掛ける (`l1_shared` merge と
 同型の操作)。畳み込み後の weight 表現は spec も base に落とす — 出力物が
 plain な base net であることを型で表す。
 

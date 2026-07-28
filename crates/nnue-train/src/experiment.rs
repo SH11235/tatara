@@ -90,6 +90,10 @@ pub struct Params {
     /// 無効の run では省略 (factorizer 以前の run の JSON と同形)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_factorize: Option<bool>,
+    /// Enables shared-delta parameterization for LayerStack L2/L3. L1 already
+    /// has a shared term in the base architecture and is therefore not represented here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_shared_delta: Option<bool>,
     /// FT 出力次元 (per-perspective)。入力次元ではない点に注意。
     pub l0: usize,
     pub l1: usize,
@@ -134,7 +138,7 @@ pub struct Params {
     /// lr_mult。per-group override flag を一つでも指定した run でのみ 6 値すべてを
     /// `Some` で記録し、全未指定の既定 run では省略する (大域 `weight_decay` と
     /// lr_mult=1.0 が全 group に適用され、`weight_decay` フィールドで足りるため)。
-    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1f/L2/L3 weight、`bias` は全 bias。
+    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1 shared/L2/L3 weight、`bias` は全 bias。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_weight_decay: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,7 +190,7 @@ pub struct Params {
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
-    /// 重み初期化の override 要約 (`--init-{ft,l1,l1f,l2,l3}` で差し替えた層名)。
+    /// 重み初期化の override 要約 (`--init-{ft,l1,l1-shared,l2,l3}` で差し替えた層名)。
     /// override の無い既定の run では省略する。field 名は experiment.json schema
     /// 互換のため従来どおり `init_preset`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -612,6 +616,7 @@ mod tests {
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
             ft_factorize: None,
+            stack_shared_delta: None,
             l0: 1536,
             l1: 16,
             l2: 32,

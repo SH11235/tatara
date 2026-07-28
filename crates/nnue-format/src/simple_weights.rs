@@ -4,7 +4,7 @@
 //! binary に (de)serialise する **GPU 非依存・pure CPU** module。LayerStack の
 //! [`crate::layerstack_weights`] と並ぶ、もう一方のアーキ用フォーマット。
 //!
-//! ## Simple architecture (bucket 無し / PSQT 無し / skip 無し / L1f 無し)
+//! ## Simple architecture (bucket 無し / PSQT 無し / skip 無し / L1 shared 無し)
 //!
 //! - FT: `ft_in → ft_out`、weight + bias 共有 stm/nstm (`ft_in` は feature set 依存、
 //!   `ft_out` は CLI 設定値)

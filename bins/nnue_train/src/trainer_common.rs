@@ -602,7 +602,7 @@ pub(crate) fn copy_host_to_device_async_f32(
 }
 
 // ===========================================================================
-// cuBLAS FFI — `dense_mm_bwd_weight_tiled` (L1f weight bwd) を `cublasSgemm_v2`
+// cuBLAS FFI — `dense_mm_bwd_weight_tiled` (L1 shared weight bwd) を `cublasSgemm_v2`
 // に置換。CUDA Toolkit 12.x の dynamic link で取得 (`build.rs` で
 // `cargo:rustc-link-lib=dylib=cublas`)。
 // ===========================================================================
@@ -686,7 +686,7 @@ impl CublasHandle {
     /// `false` では `CUBLAS_DEFAULT_MATH` (純 FP32 path、TC 不使用) を使う。
     ///
     /// 本 handle は fwd (`sgemm_fwd_rowmajor`) / bwd (`sgemm_xt_y_rowmajor`)
-    /// 双方で共有されるため、L1f forward と weight backward の両 Sgemm に同
+    /// 双方で共有されるため、L1 shared forward と weight backward の両 Sgemm に同
     /// mode が効く。
     pub(crate) fn new(
         stream: &CudaStream,
@@ -727,7 +727,7 @@ impl CublasHandle {
     }
 
     /// row-major C[M, N] = A[M, K] @ B[K, N]、`alpha=1`, `beta=0` (overwrite)。
-    /// fwd_L1f 用: combined[B, ft_out] @ l1f_w[ft_out, l1_out] → l1f_out[B, l1_out]。
+    /// fwd_l1_shared 用: combined[B, ft_out] @ l1_shared_weight[ft_out, l1_out] → l1_shared_out[B, l1_out]。
     ///
     /// col-major cuBLAS で row-major matmul を計算する転置 trick: 同 memory 表現
     /// を cublas は col-major と解釈するので、`A_rm[m, k]` は `A_cm[k, m]`、
