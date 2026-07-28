@@ -175,7 +175,7 @@ own net, see the [setup guide](docs/setup.md).
 |---|---|
 | **NNUE** | Efficiently Updatable Neural Network — a lightweight evaluation function used by shogi / chess engines |
 | **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
-| **L1f** | The bucket-independent (shared across all buckets) L1 dense layer of the LayerStack architecture; its output is added to the per-bucket L1 output |
+| **LayerStack shared parameters** | `l1_shared_weight` and `l1_shared_bias` are the bucket-independent L1 terms initialized by `--init-l1-shared`; `--stack-shared-delta` adds zero-initialized shared terms to L2/L3 during training |
 | **PSV** | PackedSfenValue — a training-data format from bullet-shogi (one position + score + WDL) |
 | **HCPE** | HuffmanCodedPosAndEval — the 38-byte Apery / dlshogi position, score, move, and game-result format |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |

@@ -1102,13 +1102,61 @@ impl GpuTrainer {
         self.sync_stack_forward_weights()
     }
 
-    fn sync_stack_forward_weights(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(f) = self.stack_shared_delta.as_ref() else {
+    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    pub(crate) fn set_stack_shared_delta_for_test(
+        &mut self,
+        l2_w: &[f32],
+        l2_b: &[f32],
+        l3_w: &[f32],
+        l3_b: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let f = self
+            .stack_shared_delta
+            .as_mut()
+            .ok_or("stack shared delta is disabled")?;
+        f.l2.w = DeviceBuffer::from_host(&self.stream, l2_w)?;
+        f.l2.b = DeviceBuffer::from_host(&self.stream, l2_b)?;
+        f.l3.w = DeviceBuffer::from_host(&self.stream, l3_w)?;
+        f.l3.b = DeviceBuffer::from_host(&self.stream, l3_b)?;
+        self.sync_stack_forward_weights()
+    }
+
+    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    pub(crate) fn reduce_l2_weight_grad_for_test(
+        &mut self,
+        bucketed_grad: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let group_len = self.ws.l2_out * self.ws.l2_in();
+        if bucketed_grad.len() != self.num_buckets * group_len {
+            return Err("invalid bucketed gradient length".into());
+        }
+        self.l2_w_grad = DeviceBuffer::from_host(&self.stream, bucketed_grad)?;
+        let f = self
+            .stack_shared_delta
+            .as_mut()
+            .ok_or("stack shared delta is disabled")?;
+        unsafe {
+            cuda_launch! {
+                kernel: stack_shared_delta_reduce_grad,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(group_len),
+                args: [
+                    slice(self.l2_w_grad), slice_mut(f.l2.w_grad),
+                    self.num_buckets as u32, group_len as u32
+                ]
+            }
+        }?;
+        f.l2.w_grad.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    fn sync_stack_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(f) = self.stack_shared_delta.as_mut() else {
             return Ok(());
         };
         let fold = |bucketed: &DeviceBuffer<f32>,
                     shared: &DeviceBuffer<f32>,
-                    folded: &DeviceBuffer<f32>,
+                    mut folded: &mut DeviceBuffer<f32>,
                     group_len: usize|
          -> Result<(), Box<dyn std::error::Error>> {
             unsafe {
@@ -1118,7 +1166,7 @@ impl GpuTrainer {
                     module: self.module,
                     config: cfg_1d(self.num_buckets * group_len),
                     args: [
-                        slice(bucketed), slice(shared), slice(folded),
+                        slice(bucketed), slice(shared), slice_mut(folded),
                         self.num_buckets as u32, group_len as u32
                     ]
                 }
@@ -1128,12 +1176,12 @@ impl GpuTrainer {
         fold(
             &self.l2_w,
             &f.l2.w,
-            &f.l2.folded_w,
+            &mut f.l2.folded_w,
             self.ws.l2_out * self.ws.l2_in(),
         )?;
-        fold(&self.l2_b, &f.l2.b, &f.l2.folded_b, self.ws.l2_out)?;
-        fold(&self.l3_w, &f.l3.w, &f.l3.folded_w, self.ws.l2_out)?;
-        fold(&self.l3_b, &f.l3.b, &f.l3.folded_b, 1)?;
+        fold(&self.l2_b, &f.l2.b, &mut f.l2.folded_b, self.ws.l2_out)?;
+        fold(&self.l3_w, &f.l3.w, &mut f.l3.folded_w, self.ws.l2_out)?;
+        fold(&self.l3_b, &f.l3.b, &mut f.l3.folded_b, 1)?;
         Ok(())
     }
 
@@ -1680,7 +1728,7 @@ impl GpuTrainer {
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。
     pub(crate) fn assert_all_weights_finite(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let groups: [(&DeviceBuffer<f32>, &str); 10] = [
+        let mut groups: Vec<(&DeviceBuffer<f32>, &str)> = vec![
             (&self.ft_w, "ft_w"),
             (&self.ft_b, "ft_b"),
             (&self.l1_w, "l1_w"),
@@ -1692,6 +1740,14 @@ impl GpuTrainer {
             (&self.l3_w, "l3_w"),
             (&self.l3_b, "l3_b"),
         ];
+        if let Some(f) = self.stack_shared_delta.as_ref() {
+            groups.extend([
+                (&f.l2.w, "l2_shared_weight"),
+                (&f.l2.b, "l2_shared_bias"),
+                (&f.l3.w, "l3_shared_weight"),
+                (&f.l3.b, "l3_shared_bias"),
+            ]);
+        }
         for (buf, name) in groups {
             let v = buf.to_host_vec(&self.stream)?;
             for (i, &x) in v.iter().enumerate() {
@@ -2990,14 +3046,14 @@ impl GpuTrainer {
             }
         }?;
 
-        if let Some(f) = self.stack_shared_delta.as_ref() {
+        if let Some(f) = self.stack_shared_delta.as_mut() {
             unsafe {
                 cuda_launch! {
                     kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_out),
                     args: [
-                        slice(self.l3_w_grad), slice(f.l3.w_grad),
+                        slice(self.l3_w_grad), slice_mut(f.l3.w_grad),
                         self.num_buckets as u32, l2_out as u32
                     ]
                 }
@@ -3008,7 +3064,7 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module,
                     config: cfg_1d(1),
                     args: [
-                        slice(self.l3_b_grad), slice(f.l3.b_grad),
+                        slice(self.l3_b_grad), slice_mut(f.l3.b_grad),
                         self.num_buckets as u32, 1_u32
                     ]
                 }
@@ -3134,7 +3190,7 @@ impl GpuTrainer {
             }
         }?;
 
-        if let Some(f) = self.stack_shared_delta.as_ref() {
+        if let Some(f) = self.stack_shared_delta.as_mut() {
             let l2_group_len = l2_out * l2_in;
             unsafe {
                 cuda_launch! {
@@ -3142,7 +3198,7 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_group_len),
                     args: [
-                        slice(self.l2_w_grad), slice(f.l2.w_grad),
+                        slice(self.l2_w_grad), slice_mut(f.l2.w_grad),
                         self.num_buckets as u32, l2_group_len as u32
                     ]
                 }
@@ -3153,7 +3209,7 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module,
                     config: cfg_1d(l2_out),
                     args: [
-                        slice(self.l2_b_grad), slice(f.l2.b_grad),
+                        slice(self.l2_b_grad), slice_mut(f.l2.b_grad),
                         self.num_buckets as u32, l2_out as u32
                     ]
                 }
@@ -3955,12 +4011,6 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
             norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
-            if let Some(f) = self.stack_shared_delta.as_mut() {
-                norm_loss_group!(f.l2.w, l2_out, l2_in, 1, l2_in);
-                norm_loss_group!(f.l3.w, 1, l2_out, 1, l2_out);
-                norm_loss_group!(f.l2.b, 1, 0, 1, l2_out);
-                norm_loss_group!(f.l3.b, 1, 0, 1, 1);
-            }
             // PSQT shortcut weight (任意): psqt_w[feat*num_buckets + bucket] を
             // bucket 列ごと (= per-output-neuron) に正規化する (pitch=1 /
             // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —

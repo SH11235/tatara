@@ -741,6 +741,8 @@ impl LayerStackWeights {
         let l1_bias_scale = (QA * QB) as f64; // = 8128
         let l2_bias_scale = 127.0 * qb_f; // = 8128 (QA == 127 前提)
         let l3_bias_scale = 127.0 * qb_f; // = 8128
+        warn_if_i8_clamp_saturates("l2_w", &self.l2_w, qb_f);
+        warn_if_i8_clamp_saturates("l3_w", &self.l3_w, qb_f);
 
         let fc_hash = compute_fc_hash(ft_out, l2_out);
         for buc in 0..num_buckets {
@@ -1416,6 +1418,27 @@ fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
     }
 }
 
+fn count_i8_clamp_saturations(values: &[f32], scale: f64) -> usize {
+    values
+        .iter()
+        .filter(|&&v| {
+            let q = (scale * v as f64).round();
+            q < i8::MIN as f64 || q > i8::MAX as f64
+        })
+        .count()
+}
+
+fn warn_if_i8_clamp_saturates(name: &str, values: &[f32], scale: f64) {
+    let n = count_i8_clamp_saturations(values, scale);
+    if n > 0 {
+        eprintln!(
+            "[nnue-format] warning: {name} has {n}/{} elements saturating i8 quantisation; \
+             folded values are clamped on export",
+            values.len()
+        );
+    }
+}
+
 // =============================================================================
 // tests
 // =============================================================================
@@ -1622,6 +1645,18 @@ mod tests {
         // round 後判定: 32767.4→32767 (範囲内)、32767.5→32768 (飽和)。
         assert_eq!(count_i16_saturations(&[32767.4], 1.0), 0);
         assert_eq!(count_i16_saturations(&[32767.5], 1.0), 1);
+    }
+
+    #[test]
+    fn count_i8_clamp_saturations_matches_export_bounds() {
+        assert_eq!(
+            count_i8_clamp_saturations(&[-128.0, 127.0, -129.0, 128.0], 1.0),
+            2
+        );
+        assert_eq!(
+            count_i8_clamp_saturations(&[-128.49, 127.49, -128.5, 127.5], 1.0),
+            2
+        );
     }
 
     /// テストで使う feature set spec (現 production の halfka-hm-merged)。

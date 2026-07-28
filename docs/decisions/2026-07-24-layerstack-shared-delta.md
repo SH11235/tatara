@@ -16,6 +16,8 @@ parameters, preserving the existing LayerStack file format and engine ABI.
 
 - The control path is unchanged when the flag is absent.
 - Enabling the flag is step-zero equivalent to the control initialization.
+- Norm loss remains on the existing L1 shared parameters for run compatibility,
+  but excludes zero-initialized L2/L3 deltas because it would push them away from zero.
 - The implementation works for every supported bucket count and is not tied to
   KingRank9; Progress8 uses the same runtime bucket count.
 - Raw checkpoints append the four shared parameter groups

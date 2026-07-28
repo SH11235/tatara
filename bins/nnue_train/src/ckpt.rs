@@ -711,7 +711,8 @@ pub(crate) fn load_raw_checkpoint_file(
     let header = read_raw_ckpt_header(&mut r, expected_arch)?;
     if header.num_groups != expected_groups.len() as u64 {
         return Err(invalid_data(format!(
-            "raw checkpoint num_groups {} != expected {}",
+            "raw checkpoint num_groups {} != expected {}; for LayerStack, check whether \
+             --stack-shared-delta matches the checkpoint",
             header.num_groups,
             expected_groups.len()
         )));

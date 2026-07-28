@@ -159,7 +159,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 |---|---|
 | **NNUE** | Efficiently Updatable Neural Network — 将棋 / チェスエンジンで使われる軽量評価関数 |
 | **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
-| **L1f** | LayerStack アーキの bucket 非依存 (全 bucket 共有) L1 dense 層。出力は per-bucket L1 の出力に加算される |
+| **LayerStack shared parameter** | `l1_shared_weight` / `l1_shared_bias` は `--init-l1-shared` で初期化する bucket 非依存の L1 項。`--stack-shared-delta` は学習時の L2/L3 にゼロ初期化した shared 項を追加する |
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
 | **HCPE** | HuffmanCodedPosAndEval — Apery / dlshogi の 38-byte 局面・score・指し手・対局結果 format |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
