@@ -236,7 +236,11 @@ pub(crate) fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_args(args, batch_size)?;
     if args.mode == NativeBenchModeArg::Compare && !cfg!(feature = "native-cuda") {
-        return Err("--mode compare requires --features native-cuda (cuda-oxide is unavailable in native-cuda-host builds)".into());
+        return Err(
+            "--mode compare requires --no-default-features --features native-cuda \
+             (cuda-oxide is unavailable in native-cuda-host builds)"
+                .into(),
+        );
     }
 
     let timestamp_unix_ms = unix_timestamp_ms()?;

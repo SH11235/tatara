@@ -50,7 +50,8 @@ pub(crate) fn load_kernel_module_with_fallback(
     #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
     if std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native")) {
         return Err(gpu_runtime::Error::KernelArtifact(
-            "native CUDA was requested, but nnue-train was built without --features native-cuda"
+            "native CUDA comparison was requested; rebuild with \
+             --no-default-features --features native-cuda"
                 .into(),
         ));
     }

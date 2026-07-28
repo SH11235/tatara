@@ -23,7 +23,10 @@
 //!   必要になった段階で `cuda-async` 込みで再公開する。
 
 #[cfg(all(feature = "cuda-oxide", feature = "native-cuda"))]
-compile_error!("gpu-runtime backends are mutually exclusive");
+compile_error!(
+    "gpu-runtime backends are mutually exclusive; for nnue-trainer's comparison oracle, retry \
+     with `--no-default-features --features native-cuda`"
+);
 #[cfg(not(any(feature = "cuda-oxide", feature = "native-cuda")))]
 compile_error!("gpu-runtime requires either `cuda-oxide` or `native-cuda`");
 

@@ -61,24 +61,25 @@ and clock-lock permission do not belong in the tracked profile.
 
 ## Running
 
-Build the backend to measure. On Linux/WSL, the default build measures cuda-oxide:
+Build the backend to measure. The default build measures the portable CUDA C++
+host backend:
 
 ```sh
 cargo build -p nnue-trainer --release
 target/release/nnue-train bench-pos
 ```
 
-On native Windows, build the CUDA C++ portable host backend:
+The same command works on native Windows:
 
 ```powershell
-cargo build -p nnue-trainer --release --no-default-features --features native-cuda-host
+cargo build -p nnue-trainer --release
 target\release\nnue-train.exe bench-pos
 ```
 
-The same portable host backend can be measured on Linux/WSL:
+To measure the opt-in cuda-oxide backend on Linux/WSL:
 
 ```sh
-cargo build -p nnue-trainer --release --no-default-features --features native-cuda-host
+cargo build -p nnue-trainer --release --no-default-features --features cuda-oxide
 target/release/nnue-train bench-pos
 ```
 

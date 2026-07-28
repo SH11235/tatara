@@ -50,7 +50,7 @@ cuda-oxide versus CUDA C++, supported on Linux/WSL:
 
 ```sh
 bash scripts/build-kernels.sh
-cargo run -p nnue-trainer --release --features native-cuda -- \
+cargo run -p nnue-trainer --release --no-default-features --features native-cuda -- \
   native-bench --mode compare --architecture all --precision all
 ```
 

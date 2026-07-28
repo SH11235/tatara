@@ -11,13 +11,16 @@ networks on NVIDIA GPUs. The trainer, data pipeline, and CUDA Driver API runtime
 are written in Rust, while the native GPU backend compiles hand-fused CUDA C++
 kernels with NVCC into an embedded fat binary.
 
-The [cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend is
-also maintained as the default Cargo feature and as a numerical and performance
-reference for the native backend. A `native-cuda-host` build uses only the
-NVCC-built kernels and portable Rust host runtime, without cuda-oxide. The
-`native-cuda` feature enables parity and benchmark comparisons across both
-device backends; it builds the NVCC fat binary only, so generate the cuda-oxide
-PTX first with `bash scripts/build-kernels.sh` (see
+The default `native-cuda-host` feature uses only the NVCC-built kernels and
+portable Rust host runtime. The
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend remains
+available as an opt-in numerical and performance oracle. Keeping both paths
+preserves the GPU/CPU equivalence-test coverage used to validate the native
+backend. The `native-cuda` feature enables parity and benchmark comparisons
+across both device backends; invoke it with
+`--no-default-features --features native-cuda`. It builds the NVCC fat binary
+only, so generate the cuda-oxide PTX first with
+`bash scripts/build-kernels.sh` (see
 [docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md)).
 
 Hand-fusing the GPU kernels makes it **very fast** — the measured cuda-oxide
@@ -118,8 +121,8 @@ from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000)
   crates
 - **NVIDIA GPU** (see the backend-specific support matrix in `docs/setup.md`)
 - **CUDA Toolkit 12.x** (verified with 12.9)
-- **NVCC** for `native-cuda-host`; **LLVM 21+** and `cargo-oxide` for the default
-  cuda-oxide backend
+- **NVCC** for the default `native-cuda-host` backend; **LLVM 21+** and
+  `cargo-oxide` for the opt-in cuda-oxide oracle and `progress-kpabs-train`
 - **Rust nightly** (pinned in `rust-toolchain.toml`)
 
 For the native CUDA C++ build command, cuda-oxide setup, detailed per-OS

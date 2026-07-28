@@ -26,8 +26,8 @@ echo "== cargo clippy --workspace --all-targets -- -D warnings =="
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== native CUDA feature compile coverage =="
-cargo check -p nnue-trainer --features native-cuda
-cargo check -p nnue-trainer --no-default-features --features native-cuda-host
+cargo check -p nnue-trainer
+cargo check -p nnue-trainer --no-default-features --features native-cuda
 
 # kernel source を編集したあと `cargo-oxide build` を忘れると、kernel loader の
 # 鮮度チェックが `.ptx` vs `.ll` の mtime しか見ないため、test も本番 run も古い

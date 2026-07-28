@@ -2,19 +2,18 @@
 
 # Development environment setup
 
-tatara is built around **cuda-oxide** (NVIDIA Labs' Rust → PTX rustc backend),
-so you need to set up both the host (LLVM 21+, ideally LLVM 22) and the GPU
-(sm_80+ officially supported). Ampere (sm_86) is the primary target; Turing
-(sm_75) also works via the `CUDA_OXIDE_TARGET=sm_75` environment variable (for
-the constraints, see the "sub-Ampere GPU" section and the GPU matrix at the
-end).
+tatara defaults to CUDA C++ kernels built by NVCC and a portable Rust CUDA
+Driver API host runtime. The cuda-oxide Rust → PTX path remains available as an
+opt-in oracle for numerical and performance parity and is still used by
+`progress-kpabs-train`. Keeping it preserves the GPU/CPU equivalence-test
+coverage used to validate the native backend.
 
 ## Supported OSes
 
 | OS | Status | Steps |
 |---|---|---|
 | Linux | First-class support (verified on Ubuntu 22.04 / 24.04) | Follow the steps in this file directly |
-| Windows | WSL2 is the default backend. The CUDA C++ backend also supports native Windows experimentally | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
+| Windows | The default CUDA C++ backend supports WSL2 and native Windows experimentally | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
 | macOS | GPU builds unsupported | Work on a remote Linux machine with an NVIDIA GPU (see below) |
 
 cuda-oxide and this repo's GPU crates require an **NVIDIA GPU + the CUDA
@@ -25,7 +24,7 @@ a remote Linux machine with an NVIDIA GPU (an in-house server or a GPU cloud
 instance) and use your local macOS for SSH / editing. Editing a CPU-only crate
 (`shogi-format` / `shogi-features` / `nnue-format`, etc.) on its own and running
 `cargo test -p <crate>` works on macOS, but running `cargo build` across the
-whole workspace fails on the cuda-oxide-dependent build.
+whole workspace fails on the CUDA-dependent builds.
 
 ## Native Windows (experimental)
 
@@ -34,8 +33,7 @@ CUDA C++ kernels through a portable Rust
 CUDA Driver API runtime. The build, GPU smoke tests, and one native trainer step
 have been verified on Windows 11 with an RTX 5090, driver 596.36, CUDA Toolkit
 12.9.86, Visual Studio 2022 (MSVC 19.44), and Rust nightly-2026-04-03. This is
-currently an experimental backend; cuda-oxide on Linux / WSL2 remains the
-default.
+currently the default backend.
 
 ### Prerequisites
 
@@ -81,17 +79,17 @@ the CP932 code page. Set `$env:CL = '/utf-8'` in Developer PowerShell and retry.
 
 ### Build and smoke tests
 
-Disable default features and select only `native-cuda-host`:
+The default feature set selects only `native-cuda-host`:
 
 ```powershell
 cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
   Select-String 'cuda-core|cuda-host|cuda-device'
 # Expect no output
 
-cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo build -p nnue-trainer --release
 cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+cargo test -p nnue-trainer --release
+cargo run -p nnue-trainer --release -- simple
 ```
 
 The last command runs a GPU smoke test without training data, restricted to the
@@ -102,7 +100,7 @@ paths, TF32, AdamW, norm loss, and both checkpoint formats in one short run:
 
 ```powershell
 $smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+cargo run -p nnue-trainer --release -- simple `
   --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
   --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
   --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
@@ -119,7 +117,7 @@ The run must finish normally and both files must be non-empty.
 For an OS-to-OS throughput comparison with the same fixed in-memory fixtures, run:
 
 ```powershell
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+cargo run -p nnue-trainer --release -- `
   native-bench --architecture all --precision all
 ```
 
@@ -141,9 +139,8 @@ The cuda-oxide installation documentation (linked under "Related" at the end)
 explicitly states "cuda-oxide currently targets Linux only. Windows is not
 supported." On top of that, cuda-oxide is an experimental backend tied directly to the rustc
 internal ABI, and this repo's `build.rs` also resolves the CUDA toolkit root
-using Linux paths (`/usr/local/cuda` / `lib64/libcublas.so`). So for the GPU
-crates (`gpu-runtime` / `bins/*`) with the default backend on Windows, use
-**WSL2 + Ubuntu**. NVIDIA GPUs
+using Linux paths (`/usr/local/cuda` / `lib64/libcublas.so`). Use
+**WSL2 + Ubuntu** when opting into cuda-oxide. NVIDIA GPUs
 are visible through CUDA from WSL2, so inside WSL2 the Linux steps in this file
 work as-is (cuda-oxide is also officially tested on Ubuntu 24.04).
 

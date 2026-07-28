@@ -16,28 +16,28 @@ cargo test -p cuda-native-runtime --features native-cuda --release -- \
     --nocapture --test-threads=1
 
 echo "== native CUDA production launch inventory =="
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     native_inventory_parser -- --nocapture
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     every_production_cuda_launch_is_exported -- --nocapture
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     cuda_launch_stays_within_known_production_roots -- --nocapture
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     native_bucket_capacity_matches_host -- --nocapture
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     simple_native_ -- --nocapture --test-threads=1
 
 echo "== LayerStack CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     layerstack_native_ -- --nocapture --test-threads=1
 
 echo "== cuda-oxide host fingerprint =="
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$hybrid_log"
-cargo test -p nnue-trainer --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
     standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee -a "$hybrid_log"
 

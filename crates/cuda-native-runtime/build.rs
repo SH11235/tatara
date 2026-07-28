@@ -32,11 +32,17 @@ fn main() {
     }
 
     let nvcc = find_nvcc();
-    let compute = env::var("TATARA_CUDA_COMPUTE").unwrap_or_else(|_| "75".into());
+    let (compute, source) = match env::var("TATARA_CUDA_COMPUTE") {
+        Ok(compute) => (compute, "TATARA_CUDA_COMPUTE"),
+        Err(_) => detect_compute_capability()
+            .map(|compute| (compute, "nvidia-smi"))
+            .unwrap_or_else(|| ("75".into(), "fallback")),
+    };
     assert!(
         !compute.is_empty() && compute.bytes().all(|byte| byte.is_ascii_digit()),
         "TATARA_CUDA_COMPUTE must be a numeric compute capability such as 75 or 120"
     );
+    println!("cargo:warning=CUDA compute capability: {compute} ({source})");
     let codegen = format!("arch=compute_{compute},code=compute_{compute}");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"))
         .join("tatara_native.fatbin");
@@ -64,6 +70,38 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("failed to execute {}: {e}", nvcc.display()));
     assert!(status.success(), "NVCC failed with status {status}");
+}
+
+fn detect_compute_capability() -> Option<String> {
+    let mut candidates = vec![PathBuf::from("nvidia-smi")];
+    if cfg!(target_os = "linux") {
+        candidates.push(PathBuf::from("/usr/lib/wsl/lib/nvidia-smi"));
+    }
+
+    for candidate in candidates {
+        let Ok(output) = Command::new(candidate)
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let first = String::from_utf8(output.stdout).ok()?;
+        let value = first.lines().next()?.trim();
+        let (major, minor) = value.split_once('.')?;
+        if !major.is_empty()
+            && !minor.is_empty()
+            && major.bytes().all(|byte| byte.is_ascii_digit())
+            && minor.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            // nvidia-smi output is not tracked by Cargo, so replacing the GPU alone does not
+            // rerun this build script; set TATARA_CUDA_COMPUTE to force a tracked rebuild.
+            return Some(format!("{major}{minor}"));
+        }
+    }
+    None
 }
 
 fn find_nvcc() -> PathBuf {

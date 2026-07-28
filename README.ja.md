@@ -11,12 +11,14 @@ GPU で学習するツール。trainer、data pipeline、CUDA Driver API runtime
 Rust で書かれ、native GPU backend は hand-fuse した CUDA C++ kernel を NVCC で
 fat binary に compile して実行ファイルへ埋め込む。
 
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide) の Rust → PTX backend も Cargo の
-既定 feature および native backend の数値・性能 reference として保守している。
-`native-cuda-host` build は cuda-oxide を使わず、NVCC で build した kernel と
-portable Rust host runtime だけを使う。`native-cuda` feature は数値 parity と
-benchmark 比較のため両方の device backend を有効化するが、build されるのは
-NVCC fat binary のみ — cuda-oxide 側の PTX は事前に
+既定の `native-cuda-host` feature は cuda-oxide を使わず、NVCC で build した
+kernel と portable Rust host runtime だけを使う。
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide) の Rust → PTX backend は opt-in の
+数値・性能 oracle として保守する。両経路を残すことで、native backend の検証に使う
+GPU/CPU 等価テスト資産も維持できる。`native-cuda` feature は数値 parity と benchmark
+比較のため両方の device backend を有効化し、
+`--no-default-features --features native-cuda` で指定する。build されるのは NVCC
+fat binary のみなので、cuda-oxide 側の PTX は事前に
 `bash scripts/build-kernels.sh` で生成しておく
 ([docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md) 参照)。
 
@@ -108,8 +110,8 @@ sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` /
   `native-cuda-host` で native Windows を実験的にサポート、macOS は GPU ビルド非対応
 - **NVIDIA GPU** (backend 別の対応表は `docs/setup.ja.md` 参照)
 - **CUDA Toolkit 12.x** (12.9 で動作確認)
-- `native-cuda-host` は **NVCC**、既定の cuda-oxide backend は **LLVM 21+** と
-  `cargo-oxide`
+- 既定の `native-cuda-host` backend は **NVCC**、opt-in の cuda-oxide oracle と
+  `progress-kpabs-train` は **LLVM 21+** と `cargo-oxide`
 - **Rust nightly** (`rust-toolchain.toml` で固定)
 
 native CUDA C++ の build command、cuda-oxide のセットアップ、OS 別の詳細手順、

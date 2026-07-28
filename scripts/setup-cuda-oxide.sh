@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# cuda-oxide の kernel ビルドツール `cargo-oxide` と、その codegen backend
+# opt-in の cuda-oxide oracle と cuda-oxide 専用の progress_kpabs_train に使う
+# kernel ビルドツール `cargo-oxide` と、その codegen backend
 # cache (`~/.cargo/cuda-oxide/`) を、本リポジトリが pin している cuda-oxide の
 # git rev に揃えるセットアップスクリプト。
 #

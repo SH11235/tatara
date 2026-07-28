@@ -2,18 +2,17 @@
 
 # 開発環境セットアップ
 
-tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
-に据えるため、host (LLVM 21+, できれば LLVM 22) と GPU (sm_80+ 公式) の両方を
-整える必要がある。Ampere (sm_86) を primary に、Turing (sm_75) も
-`CUDA_OXIDE_TARGET=sm_75` 環境変数で動作する (制約は「sub-Ampere GPU」節と
-末尾の GPU マトリクス参照)。
+tatara は NVCC で build する CUDA C++ kernel と portable Rust CUDA Driver API
+host runtime を既定にする。cuda-oxide の Rust → PTX 経路は数値・性能 parity の
+opt-in oracle として、また `progress-kpabs-train` 用として維持する。両経路を残すことで
+native backend の検証に使う GPU/CPU 等価テスト資産も維持できる。
 
 ## 対応 OS
 
 | OS | 位置づけ | 手順 |
 |---|---|---|
 | Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | WSL2 は既定 backend。CUDA C++ backend により native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
+| Windows | 既定の CUDA C++ backend は WSL2 に加え native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
 | macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
 
 cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
@@ -23,7 +22,7 @@ Intel Mac いずれも) ため、macOS 単体では GPU crate (`gpu-runtime` / `
 マシン (社内サーバや GPU クラウドインスタンス) 上でビルド・学習し、手元の
 macOS は SSH / エディタとして使う。CPU-only crate (`shogi-format` /
 `shogi-features` / `nnue-format` 等) 単体の編集と `cargo test -p <crate>` は
-macOS でも可能だが、`cargo build` を workspace 全体に掛けると cuda-oxide 依存の
+macOS でも可能だが、`cargo build` を workspace 全体に掛けると CUDA 依存の
 ビルドで失敗する。
 
 ## Windows native (実験的)
@@ -32,8 +31,7 @@ macOS でも可能だが、`cargo build` を workspace 全体に掛けると cud
 kernel を portable Rust CUDA Driver API runtime から
 起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
 Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
-1 step を確認済み。現時点では実験 backend であり、既定 backend は引き続き
-Linux / WSL2 の cuda-oxide である。
+1 step を確認済み。現時点では実験 backend だが、Cargo の既定 backend である。
 
 ### 前提の install
 
@@ -77,17 +75,17 @@ NVCC で直接 compile するときに warning C4819 と、直後の定数につ
 
 ### build と smoke test
 
-既定 feature を無効化し、必ず `native-cuda-host` だけを指定する:
+既定 feature は `native-cuda-host` だけを選択する:
 
 ```powershell
 cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
   Select-String 'cuda-core|cuda-host|cuda-device'
 # 出力が空であること
 
-cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo build -p nnue-trainer --release
 cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+cargo test -p nnue-trainer --release
+cargo run -p nnue-trainer --release -- simple
 ```
 
 最後のコマンドは教師データを使わず、nativeの対応範囲に限定したGPU smokeを実行する。
@@ -98,7 +96,7 @@ norm loss、2 種の checkpoint format を短い 1 run でまとめて確認す�
 
 ```powershell
 $smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+cargo run -p nnue-trainer --release -- simple `
   --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
   --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
   --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
@@ -115,7 +113,7 @@ Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckp
 同一の固定memory上fixtureでOS間throughputを比較する場合は次を実行する:
 
 ```powershell
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+cargo run -p nnue-trainer --release -- `
   native-bench --architecture all --precision all
 ```
 
@@ -137,8 +135,7 @@ currently targets Linux only. Windows is not supported." と明記する。加�
 cuda-oxide は rustc internal
 ABI に直結する experimental backend で、本リポの `build.rs` も CUDA toolkit
 root を Linux パス (`/usr/local/cuda` / `lib64/libcublas.so`) で解決する。
-したがって既定の cuda-oxide backend で GPU crate (`gpu-runtime` / `bins/*`) を
-使う場合は **WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
+cuda-oxide を opt-in する場合は **WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
 WSL2 内では本ファイルの Linux 手順がそのまま通る (cuda-oxide が公式にテスト
 しているのも Ubuntu 24.04)。
 

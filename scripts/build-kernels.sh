@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# GPU の compute capability を検出して、kernel を持つ全 bin の GPU kernel を
-# ビルドする。
+# opt-in の cuda-oxide 経路と cuda-oxide 専用の progress_kpabs_train 用に、
+# GPU の compute capability を検出して Rust → PTX kernel をビルドする。
 #
 # cargo-oxide の target auto-detect は kernel features から sm_80 を選ぶ。sm_80
 # PTX は Ampere 以降 (sm_80 / 86 / 89 / 90 …) で前方互換に動くため、Ampere+ では
