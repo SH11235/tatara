@@ -13,7 +13,7 @@ coverage used to validate the native backend.
 | OS | Status | Steps |
 |---|---|---|
 | Linux | First-class support (verified on Ubuntu 22.04 / 24.04) | Follow the steps in this file directly |
-| Windows | The default CUDA C++ backend supports WSL2 and native Windows experimentally | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
+| Windows | The default CUDA C++ backend supports WSL2; native Windows support is experimental | For native Windows see "Native Windows (experimental)"; for WSL2 see "Preparing Windows (WSL2)" |
 | macOS | GPU builds unsupported | Work on a remote Linux machine with an NVIDIA GPU (see below) |
 
 cuda-oxide and this repo's GPU crates require an **NVIDIA GPU + the CUDA
@@ -33,7 +33,7 @@ CUDA C++ kernels through a portable Rust
 CUDA Driver API runtime. The build, GPU smoke tests, and one native trainer step
 have been verified on Windows 11 with an RTX 5090, driver 596.36, CUDA Toolkit
 12.9.86, Visual Studio 2022 (MSVC 19.44), and Rust nightly-2026-04-03. This is
-currently the default backend.
+currently the default backend, but its native Windows support is experimental.
 
 ### Prerequisites
 

@@ -78,6 +78,9 @@ target\release\nnue-train.exe bench-pos
 
 To measure the opt-in cuda-oxide backend on Linux/WSL:
 
+First run `scripts/setup-cuda-oxide.sh` and `scripts/build-kernels.sh` to install
+the required LLVM-based toolchain and generate the PTX loaded at runtime.
+
 ```sh
 cargo build -p nnue-trainer --release --no-default-features --features cuda-oxide
 target/release/nnue-train bench-pos

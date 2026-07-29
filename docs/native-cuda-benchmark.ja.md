@@ -35,14 +35,14 @@ round-robin（`row % 9`）で決定的に設定し、trainer/GPU throughputだ�
 WindowsとLinux/WSLで使えるCUDA C++単体計測:
 
 ```sh
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- \
+cargo run -p nnue-trainer --release -- \
   native-bench --architecture all --precision all
 ```
 
 PowerShellでは次のように実行する。
 
 ```powershell
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+cargo run -p nnue-trainer --release -- `
   native-bench --architecture all --precision all
 ```
 

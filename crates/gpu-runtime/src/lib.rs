@@ -24,8 +24,8 @@
 
 #[cfg(all(feature = "cuda-oxide", feature = "native-cuda"))]
 compile_error!(
-    "gpu-runtime backends are mutually exclusive; for nnue-trainer's comparison oracle, retry \
-     with `--no-default-features --features native-cuda`"
+    "gpu-runtime backends are mutually exclusive; inspect the dependency feature graph to find \
+     what enables `cuda-oxide` and `native-cuda`"
 );
 #[cfg(not(any(feature = "cuda-oxide", feature = "native-cuda")))]
 compile_error!("gpu-runtime requires either `cuda-oxide` or `native-cuda`");

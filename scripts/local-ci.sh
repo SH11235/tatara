@@ -29,6 +29,10 @@ echo "== native CUDA feature compile coverage =="
 cargo check -p nnue-trainer
 cargo check -p nnue-trainer --no-default-features --features native-cuda
 
+echo "== cuda-oxide-only compile and lint coverage =="
+cargo check -p nnue-trainer --no-default-features --features cuda-oxide
+cargo clippy -p nnue-trainer --all-targets --no-default-features --features cuda-oxide -- -D warnings
+
 # kernel source を編集したあと `cargo-oxide build` を忘れると、kernel loader の
 # 鮮度チェックが `.ptx` vs `.ll` の mtime しか見ないため、test も本番 run も古い
 # kernel のまま silent に走る。test の前に必ず再生成して artifact を source と
@@ -40,6 +44,11 @@ bash scripts/build-kernels.sh
 
 echo "== bash scripts/check-native-cuda-parity.sh =="
 bash scripts/check-native-cuda-parity.sh
+
+# equivalence test は cuda-oxide feature gate 配下にあり、既定構成の
+# `cargo test --workspace` では skip される。oracle 構成で明示的に走らせる。
+echo "== cuda-oxide GPU/CPU equivalence tests =="
+cargo test -p nnue-trainer --release --no-default-features --features cuda-oxide
 
 echo "== cargo test --workspace --release =="
 cargo test --workspace --release

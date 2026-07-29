@@ -12,7 +12,7 @@ native backend の検証に使う GPU/CPU 等価テスト資産も維持でき�
 | OS | 位置づけ | 手順 |
 |---|---|---|
 | Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | 既定の CUDA C++ backend は WSL2 に加え native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
+| Windows | 既定の CUDA C++ backend は WSL2 に対応し、native Windows 対応のみ実験的 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
 | macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
 
 cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
@@ -31,7 +31,7 @@ macOS でも可能だが、`cargo build` を workspace 全体に掛けると CUD
 kernel を portable Rust CUDA Driver API runtime から
 起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
 Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
-1 step を確認済み。現時点では実験 backend だが、Cargo の既定 backend である。
+1 step を確認済み。Cargo の既定 backend だが、native Windows 対応は実験的である。
 
 ### 前提の install
 

@@ -76,6 +76,9 @@ target\release\nnue-train.exe bench-pos
 
 Linux/WSLでopt-inのcuda-oxide backendを測定する場合:
 
+先に`scripts/setup-cuda-oxide.sh`と`scripts/build-kernels.sh`を実行し、必要な
+LLVM toolchainを導入してruntimeでloadするPTXを生成する。
+
 ```sh
 cargo build -p nnue-trainer --release --no-default-features --features cuda-oxide
 target/release/nnue-train bench-pos
