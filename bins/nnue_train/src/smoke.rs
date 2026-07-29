@@ -8,11 +8,11 @@ use shogi_features::FeatureSet;
 use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*};
 
 fn native_simple_smoke_scope() -> bool {
-    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    #[cfg(any(feature = "oxide-parity", feature = "native"))]
     {
         crate::kernel_module::native_backend_requested()
     }
-    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
+    #[cfg(not(any(feature = "oxide-parity", feature = "native")))]
     {
         false
     }

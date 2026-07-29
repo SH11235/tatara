@@ -26,7 +26,7 @@ macOS でも可能だが、`cargo build` を workspace 全体に掛けると CUD
 
 ## Windows native (実験的)
 
-`native-cuda-host` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
+`native` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
 kernel を portable Rust CUDA Driver API runtime から
 起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
 Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
@@ -74,10 +74,10 @@ NVCC で直接 compile するときに warning C4819 と、直後の定数につ
 
 ### build と smoke test
 
-既定 feature は `native-cuda-host` だけを選択する:
+既定 feature は `native` だけを選択する:
 
 ```powershell
-cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
+cargo tree -p nnue-trainer --no-default-features --features native |
   Select-String 'cuda-core|cuda-host|cuda-device'
 # 出力が空であること
 

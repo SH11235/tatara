@@ -53,9 +53,9 @@ Driver APIのportable runtimeを独立して整備し、kernel coverageの完成
 
 ## Backend feature構成
 
-- 既定buildは`native-cuda-host` featureを使う。
-- `native-cuda`はcuda-oxide hostからCUDA C++ fat binaryを起動する比較用構成である。
-- `native-cuda-host`はCUDA C++ fat binaryとportable Driver API host runtimeだけを使う。
+- 既定buildは`native` featureを使う。
+- `oxide-parity`はcuda-oxide hostからCUDA C++ fat binaryを起動する比較用構成である。
+- `native`はCUDA C++ fat binaryとportable Driver API host runtimeだけを使う。
   Linux / WSL2 / native Windowsで次のようにbuildする。
 
 ```bash
@@ -64,10 +64,10 @@ cargo build -p nnue-trainer \
 ```
 
 cuda-oxideは廃止せず、CPU referenceとの等価テスト資産を維持する数値・性能oracleとして
-opt-inで残す。両device backendを比較する`native-cuda`構成は、既定featureと相互排他の
-ため`--no-default-features --features native-cuda`でbuildする。
+opt-inで残す。両device backendを比較する`oxide-parity`構成は、既定featureと相互排他の
+ため`--no-default-features --features oxide-parity`でbuildする。
 
-`native-cuda-host`で現在対応するのは、HalfKaHmMergedを含むSimpleとLayerStackである。
+`native`で現在対応するのは、HalfKaHmMergedを含むSimpleとLayerStackである。
 SimpleはCReLU / SCReLU / Pairwiseと任意のhidden dimension、LayerStackは可変層次元と
 bucket mode、PSQT、feature factorizer、threat / effect featureを扱う。両architectureで
 FP32 / FP16 option/state（TF32有効または無効）、factorizer、Sigmoid / WRM（拡張設定を

@@ -21,7 +21,7 @@
     "rustc": "rustc fixture",
     "git_commit": "0123456789abcdef",
     "dirty": false,
-    "cargo_features": ["native-cuda"],
+    "cargo_features": ["oxide-parity"],
     "command_line": ["nnue-train", "native-bench"]
   },
   "measurements": [

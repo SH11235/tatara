@@ -82,7 +82,7 @@ First run `scripts/setup-cuda-oxide.sh` and `scripts/build-kernels.sh` to instal
 the required LLVM-based toolchain and generate the PTX loaded at runtime.
 
 ```sh
-cargo build -p nnue-trainer --release --no-default-features --features cuda-oxide
+cargo build -p nnue-trainer --release --no-default-features --features oxide
 target/release/nnue-train bench-pos
 ```
 

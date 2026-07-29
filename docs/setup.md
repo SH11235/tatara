@@ -26,7 +26,7 @@ whole workspace fails on the CUDA-dependent builds.
 
 ## Native Windows (experimental)
 
-The `native-cuda-host` feature does not use cuda-oxide. It launches NVCC-built
+The `native` feature does not use cuda-oxide. It launches NVCC-built
 CUDA C++ kernels through a portable Rust
 CUDA Driver API runtime. The build, GPU smoke tests, and one native trainer step
 have been verified on Windows 11 with an RTX 5090, driver 596.36, CUDA Toolkit
@@ -77,10 +77,10 @@ the CP932 code page. Set `$env:CL = '/utf-8'` in Developer PowerShell and retry.
 
 ### Build and smoke tests
 
-The default feature set selects only `native-cuda-host`:
+The default feature set selects only `native`:
 
 ```powershell
-cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
+cargo tree -p nnue-trainer --no-default-features --features native |
   Select-String 'cuda-core|cuda-host|cuda-device'
 # Expect no output
 

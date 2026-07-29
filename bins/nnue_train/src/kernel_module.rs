@@ -2,12 +2,12 @@ use gpu_runtime::{CudaContext, CudaModule};
 
 pub(crate) use gpu_runtime::{BLOCK_DIM, grid_dim_1d};
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 thread_local! {
     static NATIVE_BACKEND_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 pub(crate) fn with_native_backend<T>(native: bool, operation: impl FnOnce() -> T) -> T {
     struct Restore(Option<bool>);
     impl Drop for Restore {
@@ -21,17 +21,17 @@ pub(crate) fn with_native_backend<T>(native: bool, operation: impl FnOnce() -> T
     operation()
 }
 
-#[cfg(all(test, feature = "native-cuda"))]
+#[cfg(all(test, feature = "oxide-parity"))]
 pub(crate) fn with_test_native_backend<T>(native: bool, operation: impl FnOnce() -> T) -> T {
     with_native_backend(native, operation)
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 pub(crate) fn native_backend_requested() -> bool {
-    #[cfg(feature = "native-cuda-host")]
+    #[cfg(feature = "native")]
     return true;
 
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "oxide-parity")]
     {
         if let Some(native) = NATIVE_BACKEND_OVERRIDE.get() {
             return native;
@@ -47,26 +47,26 @@ pub(crate) fn load_kernel_module_with_fallback(
     ctx: &std::sync::Arc<CudaContext>,
     name: &str,
 ) -> gpu_runtime::Result<std::sync::Arc<CudaModule>> {
-    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
+    #[cfg(not(any(feature = "oxide-parity", feature = "native")))]
     if std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native")) {
         return Err(gpu_runtime::Error::KernelArtifact(
             "native CUDA comparison was requested; rebuild with \
-             --no-default-features --features native-cuda"
+             --no-default-features --features oxide-parity"
                 .into(),
         ));
     }
 
-    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    #[cfg(any(feature = "oxide-parity", feature = "native"))]
     if native_backend_requested() {
-        #[cfg(feature = "native-cuda-host")]
+        #[cfg(feature = "native")]
         return ctx.load_module_from_image(cuda_native_runtime::NATIVE_KERNEL_FATBIN);
-        #[cfg(feature = "native-cuda")]
+        #[cfg(feature = "oxide-parity")]
         return ctx
             .load_module_from_image(cuda_native_runtime::NATIVE_KERNEL_FATBIN)
             .map_err(Into::into);
     }
 
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     {
         gpu_runtime::load_kernel_module_with_fallback(
             ctx,
@@ -75,7 +75,7 @@ pub(crate) fn load_kernel_module_with_fallback(
         )
     }
 
-    #[cfg(not(feature = "cuda-oxide"))]
+    #[cfg(not(feature = "oxide"))]
     Err(gpu_runtime::Error::KernelArtifact(format!(
         "native CUDA module `{name}` was not selected"
     )))

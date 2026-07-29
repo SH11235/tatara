@@ -129,7 +129,7 @@ for bin in nnue_train; do
     # 最適化レベルでは f32::sqrt / f32::exp が std 呼び出しのまま残り、device
     # code から禁止 crate を呼んだとして codegen backend が panic するため明示する。
     cargo-oxide build --emit-nvvm-ir --arch "$nvvm_target" \
-      -- --release --no-default-features --features cuda-oxide
+      -- --release --no-default-features --features oxide
   )
 
   ll="$repo_root/$bin.ll"

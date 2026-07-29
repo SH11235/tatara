@@ -34,7 +34,7 @@ use crate::{
     trainer_simple::SimpleGpuTrainer,
 };
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 use crate::kernel_module::with_native_backend;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -235,10 +235,10 @@ pub(crate) fn run(
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_args(args, batch_size)?;
-    if args.mode == NativeBenchModeArg::Compare && !cfg!(feature = "native-cuda") {
+    if args.mode == NativeBenchModeArg::Compare && !cfg!(feature = "oxide-parity") {
         return Err(
-            "--mode compare requires --no-default-features --features native-cuda \
-             (cuda-oxide is unavailable in native-cuda-host builds)"
+            "--mode compare requires --no-default-features --features oxide-parity \
+             (cuda-oxide is unavailable in native builds)"
                 .into(),
         );
     }
@@ -535,13 +535,13 @@ fn create_with_backend<T>(
     backend: Backend,
     operation: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "oxide-parity")]
     return with_native_backend(backend.is_native(), operation);
 
-    #[cfg(feature = "native-cuda-host")]
+    #[cfg(feature = "native")]
     {
         if !backend.is_native() {
-            return Err("cuda-oxide is unavailable in native-cuda-host builds".into());
+            return Err("cuda-oxide is unavailable in native builds".into());
         }
         operation()
     }
@@ -803,9 +803,9 @@ fn capture_environment(device: usize) -> EnvironmentReport {
         git_commit: command_output("git", &["rev-parse", "HEAD"]),
         dirty: git_dirty(),
         cargo_features: [
-            cfg!(feature = "cuda-oxide").then_some("cuda-oxide"),
-            cfg!(feature = "native-cuda").then_some("native-cuda"),
-            cfg!(feature = "native-cuda-host").then_some("native-cuda-host"),
+            cfg!(feature = "oxide").then_some("oxide"),
+            cfg!(feature = "oxide-parity").then_some("oxide-parity"),
+            cfg!(feature = "native").then_some("native"),
         ]
         .into_iter()
         .flatten()
@@ -980,7 +980,7 @@ mod tests {
                 rustc: Some("rustc test".into()),
                 git_commit: Some("0123456789abcdef".into()),
                 dirty: Some(false),
-                cargo_features: vec!["native-cuda"],
+                cargo_features: vec!["oxide-parity"],
                 command_line: vec!["nnue-train".into(), "native-bench".into()],
             },
             measurements: vec![measurement],

@@ -928,9 +928,9 @@ fn capture_environment(dirty: Option<bool>) -> EnvironmentReport {
         git_commit: command_output("git", &["rev-parse", "HEAD"]),
         dirty,
         cargo_features: [
-            cfg!(feature = "cuda-oxide").then_some("cuda-oxide"),
-            cfg!(feature = "native-cuda").then_some("native-cuda"),
-            cfg!(feature = "native-cuda-host").then_some("native-cuda-host"),
+            cfg!(feature = "oxide").then_some("oxide"),
+            cfg!(feature = "oxide-parity").then_some("oxide-parity"),
+            cfg!(feature = "native").then_some("native"),
         ]
         .into_iter()
         .flatten()
@@ -1223,7 +1223,7 @@ mod tests {
                 rustc: Some("rustc test".into()),
                 git_commit: Some("0123456789abcdef".into()),
                 dirty: Some(false),
-                cargo_features: vec!["native-cuda-host"],
+                cargo_features: vec!["native"],
                 command_line: vec!["nnue-train".into(), "bench-pos".into()],
             },
             summaries: summarize_cases(std::slice::from_ref(&case)),

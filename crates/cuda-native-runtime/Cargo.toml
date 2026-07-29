@@ -10,6 +10,7 @@ publish = false
 
 [features]
 default = []
+# Compiles CUDA C++ sources to an embedded fatbin; host backend selection belongs to consumers.
 native-cuda = []
 
 [lints]

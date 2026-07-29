@@ -80,7 +80,7 @@ Linux/WSLでopt-inのcuda-oxide backendを測定する場合:
 LLVM toolchainを導入してruntimeでloadするPTXを生成する。
 
 ```sh
-cargo build -p nnue-trainer --release --no-default-features --features cuda-oxide
+cargo build -p nnue-trainer --release --no-default-features --features oxide
 target/release/nnue-train bench-pos
 ```
 

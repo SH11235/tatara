@@ -16,50 +16,50 @@ cargo test -p cuda-native-runtime --features native-cuda --release -- \
     --nocapture --test-threads=1
 
 echo "== native CUDA production launch inventory =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     native_inventory_parser -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     every_production_cuda_launch_is_exported -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     cuda_launch_stays_within_known_production_roots -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     native_bucket_capacity_matches_host -- --nocapture
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     simple_native_ -- --nocapture --test-threads=1
 
 echo "== LayerStack CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     layerstack_native_ -- --nocapture --test-threads=1
 
 echo "== cuda-oxide host fingerprint =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$hybrid_log"
-cargo test -p nnue-trainer --no-default-features --features native-cuda --release \
+cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
     standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee -a "$hybrid_log"
 
 echo "== portable host fingerprint =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+cargo test -p nnue-trainer --no-default-features --features native --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+cargo test -p nnue-trainer --no-default-features --features native --release \
     standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee -a "$portable_log"
 
 echo "== portable host Simple configuration matrix =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+cargo test -p nnue-trainer --no-default-features --features native --release \
     complete_simple_native_configuration_matrix_runs_one_step -- --nocapture --test-threads=1
 
 echo "== portable host LayerStack configuration matrices =="
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release \
+cargo test -p nnue-trainer --no-default-features --features native --release \
     complete_layerstack_native_ -- --nocapture --test-threads=1
 
 echo "== portable host CLI smoke =="
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- layerstack
+cargo run -p nnue-trainer --no-default-features --features native --release -- simple
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack
 
 echo "== portable host full Simple CLI training =="
 portable_cli_args=(
@@ -73,13 +73,13 @@ portable_cli_args=(
     --optimizer adamw --weight-decay 0.0001
     --norm-loss --norm-loss-factor 0.0001 --all-optim
 )
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple \
+cargo run -p nnue-trainer --no-default-features --features native --release -- simple \
     "${portable_cli_args[@]}" --net-id native-simple-cli --superbatches 1
 test -s "$portable_cli_dir/native-simple-cli-1.bin"
 test -s "$portable_cli_dir/native-simple-cli-1.ckpt"
 
 echo "== portable host Simple CLI resume =="
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple \
+cargo run -p nnue-trainer --no-default-features --features native --release -- simple \
     "${portable_cli_args[@]}" --net-id native-simple-cli-resume --superbatches 2 \
     --resume "$portable_cli_dir/native-simple-cli-1.ckpt"
 test -s "$portable_cli_dir/native-simple-cli-resume-2.bin"
@@ -95,25 +95,25 @@ portable_layerstack_cli_args=(
     --batches-per-superbatch 1 --batch-size 16 --threads 1 --save-rate 1
     --win-rate-model --optimizer ranger
 )
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
     "${portable_layerstack_cli_args[@]}" --net-id native-layerstack-cli --superbatches 1
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-1.bin"
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-1.ckpt"
 
 echo "== portable host LayerStack CLI resume =="
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
     "${portable_layerstack_cli_args[@]}" --net-id native-layerstack-cli-resume --superbatches 2 \
     --resume "$portable_layerstack_cli_dir/native-layerstack-cli-1.ckpt"
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-resume-2.bin"
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-resume-2.ckpt"
 
 echo "== portable host LayerStack CLI eval-only =="
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
     "${portable_layerstack_cli_args[@]}" --net-id native-layerstack-cli-eval \
     --resume "$portable_layerstack_cli_dir/native-layerstack-cli-1.ckpt" --eval-only
 
 echo "== portable host LayerStack YaneuraOu output =="
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
     "${portable_layerstack_cli_args[@]}" --output-format yaneuraou \
     --net-id native-layerstack-cli-yo --superbatches 1
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-yo-1.bin"

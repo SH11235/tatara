@@ -11,14 +11,14 @@ networks on NVIDIA GPUs. The trainer, data pipeline, and CUDA Driver API runtime
 are written in Rust, while the native GPU backend compiles hand-fused CUDA C++
 kernels with NVCC into an embedded fat binary.
 
-The default `native-cuda-host` feature uses only the NVCC-built kernels and
+The default `native` feature uses only the NVCC-built kernels and
 portable Rust host runtime. The
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend remains
 available as an opt-in numerical and performance oracle. Keeping both paths
 preserves the GPU/CPU equivalence-test coverage used to validate the native
-backend. The `native-cuda` feature enables parity and benchmark comparisons
+backend. The `oxide-parity` feature enables parity and benchmark comparisons
 across both device backends; invoke it with
-`--no-default-features --features native-cuda`. It builds the NVCC fat binary
+`--no-default-features --features oxide-parity`. It builds the NVCC fat binary
 only, so generate the cuda-oxide PTX first with
 `bash scripts/build-kernels.sh` (see
 [docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md)).
@@ -117,11 +117,11 @@ from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000)
 ### Requirements
 
 - **OS** — Linux is first-class; Windows is supported via WSL2, with experimental
-  native Windows support through `native-cuda-host`; macOS cannot build the GPU
+  native Windows support through `native`; macOS cannot build the GPU
   crates
 - **NVIDIA GPU** (see the backend-specific support matrix in `docs/setup.md`)
 - **CUDA Toolkit 12.x** (verified with 12.9)
-- **NVCC** for the default `native-cuda-host` backend; **LLVM 21+** and
+- **NVCC** for the default `native` backend; **LLVM 21+** and
   `cargo-oxide` for the opt-in cuda-oxide oracle
 - **Rust nightly** (pinned in `rust-toolchain.toml`)
 
