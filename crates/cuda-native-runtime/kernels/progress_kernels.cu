@@ -3,7 +3,9 @@
 #include <stdint.h>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
-#error "progress kernels require compute capability 6.0 or newer for double atomicAdd"
+// 表示専用の旧 GPU が刺さった混載機では検出値が最小 GPU に引かれてここへ来る。
+// 学習に使う GPU を TATARA_CUDA_COMPUTE で明示すれば回避できる。
+#error "progress kernels require compute capability 6.0 or newer for double atomicAdd; set TATARA_CUDA_COMPUTE to the capability of the GPU used for training"
 #endif
 
 // CUDA legacy atomic functions provide device-scope relaxed read-modify-write operations.
