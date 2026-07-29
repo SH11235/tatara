@@ -1,6 +1,7 @@
 # GPU カーネルは cuda-oxide で書く
 
-- **Status**: Accepted
+- **Status**: Superseded by `2026-07-18-native-cuda-backend.md` および
+  `2026-07-30-native-backend-default.md`
 - **Date**: 2026-05-09
 
 ## Context

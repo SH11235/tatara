@@ -110,8 +110,8 @@ sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` /
   `native` で native Windows を実験的にサポート、macOS は GPU ビルド非対応
 - **NVIDIA GPU** (backend 別の対応表は `docs/setup.ja.md` 参照)
 - **CUDA Toolkit 12.x** (12.9 で動作確認)
-- 既定の `native` backend は **NVCC**、opt-in の cuda-oxide oracle と
-  `progress-kpabs-train` は **LLVM 21+** と `cargo-oxide`
+- 既定の `native` backend は **NVCC**、opt-in の cuda-oxide oracle は
+  **LLVM 21+** と `cargo-oxide`
 - **Rust nightly** (`rust-toolchain.toml` で固定)
 
 native CUDA C++ の build command、cuda-oxide のセットアップ、OS 別の詳細手順、

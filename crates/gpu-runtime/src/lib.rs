@@ -1,15 +1,18 @@
-//! cuda-oxide host 側 API の薄い wrapper。
+//! GPU host runtime の薄い wrapper。backend は feature で排他選択する。
 //!
-//! GPU カーネルは cuda-oxide で書く (docs/decisions/ 参照)。`cuda-core` と
-//! `cuda-host` の主要 type を再 export しつつ、`Error` で `DriverError` /
-//! `LtoirError` を `thiserror` 経由でラップする。kernel artifact の探索と
-//! `.ll`→`.ptx` 変換は [`kernel_loader`] に置く。
+//! - `native`: CUDA C++ kernel を CUDA Driver API から launch する portable runtime
+//! - `oxide`: cuda-oxide host API (`cuda-core` / `cuda-host`) を再 export し、
+//!   `Error` で `DriverError` / `LtoirError` を `thiserror` 経由でラップする。
+//!   kernel artifact の探索と `.ll`→`.ptx` 変換は [`kernel_loader`] に置く
+//!
+//! どちらの backend も同じ型名 (`CudaContext` / `DeviceBuffer` / `CudaStream` 等) と
+//! `BLOCK_DIM` / `grid_dim_1d` を公開するため、上位 crate は backend を意識せずに書ける。
 //!
 //! ## 設計方針
 //!
-//! 「薄く」をモットーに、cuda-oxide の type-safe API を再発明せず素直に
-//! 透過する。命名 alias (`DeviceAlloc`, `Stream`) は **type alias** で提供し、
-//! cuda-oxide 側の名前 (`DeviceBuffer`, `CudaStream`) も並行して公開する。
+//! 「薄く」をモットーに、backend が提供する type-safe API を再発明せず素直に
+//! 透過する。`oxide` では命名 alias (`DeviceAlloc`, `Stream`) を **type alias** で
+//! 提供し、cuda-oxide 側の名前 (`DeviceBuffer`, `CudaStream`) も並行して公開する。
 //!
 //! `KernelLauncher` 相当は **新規 struct を作らず**、cuda-oxide が提供する
 //! `cuda_launch!` macro を error context だけ付与する薄い macro で包む方針。
