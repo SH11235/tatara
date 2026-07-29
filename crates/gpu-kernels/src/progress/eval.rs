@@ -1,9 +1,7 @@
 //! Evaluation (loss + histogram only) kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn eval`) は `src/main.rs` に inline 定義されている
-//! (cuda-oxide rustc-codegen-cuda backend は bin entry 経由でしか PTX 化しない
-//! ため)。本 module の `eval_cpu` は GPU と同じロジックを host に書き写した
-//! もの。
+//! GPU 側は CUDA C++ の `progress_eval`。本 module の `eval_cpu` は GPU と
+//! 同じロジックを host に書き写したもの。
 //!
 //! ## アルゴリズム
 //!

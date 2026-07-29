@@ -157,6 +157,14 @@ pub struct Context {
     inner: Arc<ContextInner>,
 }
 
+impl Clone for Context {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl Context {
     pub fn new(ordinal: i32) -> Result<Self> {
         let mut device = 0;

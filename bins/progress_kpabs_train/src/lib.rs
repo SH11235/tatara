@@ -8,8 +8,7 @@
 //!   progress.bin I/O / CLI Args を提供し、bin (`src/main.rs`) と integration
 //!   test (`tests/*`) の両方から呼べる。
 //!
-//! GPU 側 `#[kernel]` (forward / grad / adam_step / eval) は cuda-oxide の
-//! rustc-codegen-cuda backend 制約 (bin entry から到達可能な kernel のみが
-//! NVPTX IR 化される) のため `src/main.rs` に inline 配置している。
+//! GPU kernel (forward / grad / adam_step / eval) は CUDA C++ source として
+//! `cuda-native-runtime` に置く。
 
 pub mod host;

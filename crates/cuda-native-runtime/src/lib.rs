@@ -17,3 +17,7 @@ pub use runtime::{
 #[cfg(feature = "native-cuda")]
 pub const NATIVE_KERNEL_FATBIN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/tatara_native.fatbin"));
+
+#[cfg(feature = "native-cuda")]
+pub const PROGRESS_KERNEL_FATBIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tatara_progress.fatbin"));

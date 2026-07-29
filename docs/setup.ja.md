@@ -4,8 +4,7 @@
 
 tatara は NVCC で build する CUDA C++ kernel と portable Rust CUDA Driver API
 host runtime を既定にする。cuda-oxide の Rust → PTX 経路は数値・性能 parity の
-opt-in oracle として、また `progress-kpabs-train` 用として維持する。両経路を残すことで
-native backend の検証に使う GPU/CPU 等価テスト資産も維持できる。
+opt-in oracle として維持する。
 
 ## 対応 OS
 
@@ -304,8 +303,8 @@ cuda-oxide の rev を bump したとき (library 側 `Cargo.toml` を更新し�
 bash scripts/build-kernels.sh
 ```
 
-これは GPU の世代を `nvidia-smi` で判定し、kernel を持つ全 bin
-(`nnue_train` / `progress_kpabs_train`) を `cargo-oxide build` でビルドする。
+これは GPU の世代を `nvidia-smi` で判定し、`nnue_train` の oracle kernel を
+`cargo-oxide build` でビルドする。
 Ampere+ は既定 (sm_80 PTX、前方互換)、Turing (sm_75) は `CUDA_OXIDE_TARGET` を
 自動設定するので、環境変数を手で打つ必要はない。
 
@@ -336,7 +335,7 @@ Turing GPU では `CUDA_ERROR_INVALID_PTX` (driver error 218) で load が失敗
 バイパスする一級 override で、`llc -mcpu=sm_75` までそのまま流れる:
 
 ```bash
-cd bins/progress_kpabs_train
+cd bins/nnue_train
 CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 ```
 
@@ -354,16 +353,15 @@ CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 - `cluster.*` — Thread Block Cluster (sm_90+)
 
 これらを含む IR を sm_75 PTX に compile すると `llc` か CUDA driver の JIT
-load 段階で失敗する。KP-abs progress 系の単純な kernel (forward / grad scatter
-/ adam_step / eval) は sm_75 の適用範囲内。fused optimizer step や async copy /
-Hopper 専用 ops を使う kernel は sm_80+ GPU が要る。
+load 段階で失敗する。fused optimizer step や async copy / Hopper 専用 ops を
+使う kernel は sm_80+ GPU が要る。
 
 `cargo-oxide build` が生成した `.ll` (build を実行した bin ディレクトリに出る)
 を grep して sm_80+ op の混入を確認できる:
 
 ```bash
 grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
-  bins/progress_kpabs_train/progress_kpabs_train.ll
+  bins/nnue_train/nnue_train.ll
 # (出力なし = OK)
 ```
 

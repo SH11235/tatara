@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=TATARA_CUDA_COMPUTE");
     println!("cargo:rerun-if-changed=kernels/native_kernels.cu");
+    println!("cargo:rerun-if-changed=kernels/progress_kernels.cu");
 
     if env::var_os("CARGO_FEATURE_NATIVE_CUDA").is_none() {
         return;
@@ -70,32 +71,42 @@ fn main() {
         "TATARA_CUDA_COMPUTE must be a numeric compute capability such as 75 or 120"
     );
     let codegen = format!("arch=compute_{compute},code=compute_{compute}");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"))
-        .join("tatara_native.fatbin");
-    // Keep NVCC's default fmad=true for native throughput. CUDA C++ and cuda-oxide parity allows
-    // the resulting mul-add rounding differences with a 2e-6 tolerance instead of bit equality.
-    let mut command = Command::new(&nvcc);
-    command.args([
-        "--fatbin",
-        "--std=c++17",
-        "-O3",
-        "--generate-code",
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    // Keep NVCC's default fmad=true for native throughput. Numerical equivalence tests allow the
+    // resulting fused mul-add rounding differences instead of requiring bit equality.
+    compile_fatbin(
+        &nvcc,
         &codegen,
-    ]);
+        "kernels/native_kernels.cu",
+        &output_dir.join("tatara_native.fatbin"),
+    );
+    compile_fatbin(
+        &nvcc,
+        &codegen,
+        "kernels/progress_kernels.cu",
+        &output_dir.join("tatara_progress.fatbin"),
+    );
+}
+
+fn compile_fatbin(nvcc: &Path, codegen: &str, source: &str, output: &Path) {
+    let mut command = Command::new(nvcc);
+    command.args(["--fatbin", "--std=c++17", "-O3", "--generate-code", codegen]);
     if env::consts::OS == "windows" {
         // build script と NVCC は host 上で動くため、host compiler の引数は target OS
         // ではなく host OS で分岐する。
-        // native_kernels.cu は UTF-8 の日本語コメントを含む。MSVC の既定 code page が
-        // CP932 の環境では、コメント中の byte 列を誤解釈して後続の定義までコメント扱いに
-        // することがあるため、NVCC の host compiler に source encoding を明示する。
+        // kernel source は UTF-8 の日本語コメントを含む。MSVC の既定 code page が
+        // CP932 の環境では後続の定義までコメント扱いにすることがあるため明示する。
         command.args(["-Xcompiler", "/utf-8"]);
     }
     let status = command
-        .args(["kernels/native_kernels.cu", "-o"])
-        .arg(&output)
+        .args([source, "-o"])
+        .arg(output)
         .status()
         .unwrap_or_else(|e| panic!("failed to execute {}: {e}", nvcc.display()));
-    assert!(status.success(), "NVCC failed with status {status}");
+    assert!(
+        status.success(),
+        "NVCC failed for {source} with status {status}"
+    );
 }
 
 fn detect_compute_capability() -> Option<u32> {

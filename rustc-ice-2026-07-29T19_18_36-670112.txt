@@ -1,0 +1,54 @@
+thread 'rustc' panicked at src/collector.rs:1088:17:
+
+
+╔════════════════════════════════════════════════════════════════════╗
+║             CUDA-OXIDE: FORBIDDEN CRATE IN DEVICE CODE             ║
+╠════════════════════════════════════════════════════════════════════╣
+║ Device code calls: std::f32::<impl f32>::sqrt                      ║
+║ From crate: 'std'                                                  ║
+║                                                                    ║
+║ Only these crates are allowed in device code:                      ║
+║   • Local crate (your kernel code)                                 ║
+║   • cuda_device (GPU intrinsics)                                     ║
+║   • core (no_std standard library)                                 ║
+║                                                                    ║
+║ The 'std' crate cannot run on GPU (requires OS/heap).              ║
+╚════════════════════════════════════════════════════════════════════╝
+
+
+stack backtrace:
+   0:     0x7fd29e999bab - <std[ca0b0bcade21542d]::backtrace::Backtrace>::create
+   1:     0x7fd29e999af5 - <std[ca0b0bcade21542d]::backtrace::Backtrace>::force_capture
+   2:     0x7fd29d9b086b - std[ca0b0bcade21542d]::panicking::update_hook::<alloc[1873db2efb56cea0]::boxed::Box<rustc_driver_impl[a544dc0f85200ca5]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7fd29e9ac6a2 - std[ca0b0bcade21542d]::panicking::panic_with_hook
+   4:     0x7fd29e98f088 - std[ca0b0bcade21542d]::panicking::panic_handler::{closure#0}
+   5:     0x7fd29e9835d9 - std[ca0b0bcade21542d]::sys::backtrace::__rust_end_short_backtrace::<std[ca0b0bcade21542d]::panicking::panic_handler::{closure#0}, !>
+   6:     0x7fd29e990aed - __rustc[2170a97d85da7901]::rust_begin_unwind
+   7:     0x7fd29b4a3d7c - core[db70abf3441067d4]::panicking::panic_fmt
+   8:     0x7fd28b12c580 - <rustc_codegen_cuda[f92bbf638fe42b6c]::collector::DeviceCollector>::process_call_operand
+                               at /home/sh11235/.cargo/cuda-oxide/src/crates/rustc-codegen-cuda/src/collector.rs:1088:17
+   9:     0x7fd28b12822e - <rustc_codegen_cuda[f92bbf638fe42b6c]::collector::DeviceCollector>::process_terminator
+                               at /home/sh11235/.cargo/cuda-oxide/src/crates/rustc-codegen-cuda/src/collector.rs:990:18
+  10:     0x7fd28b13483f - <rustc_codegen_cuda[f92bbf638fe42b6c]::collector::DeviceCollector>::collect
+                               at /home/sh11235/.cargo/cuda-oxide/src/crates/rustc-codegen-cuda/src/collector.rs:907:30
+  11:     0x7fd28b13787a - rustc_codegen_cuda[f92bbf638fe42b6c]::collector::collect_device_functions
+                               at /home/sh11235/.cargo/cuda-oxide/src/crates/rustc-codegen-cuda/src/collector.rs:762:15
+  12:     0x7fd28b170a27 - <rustc_codegen_cuda[f92bbf638fe42b6c]::CudaCodegenBackend as rustc_codegen_ssa[f60af1802d65b892]::traits::backend::CodegenBackend>::codegen_crate
+                               at /home/sh11235/.cargo/cuda-oxide/src/crates/rustc-codegen-cuda/src/lib.rs:574:41
+  13:     0x7fd2a01fe9b2 - <rustc_interface[e25ca096212c0b43]::queries::Linker>::codegen_and_build_linker
+  14:     0x7fd2a01f954d - rustc_interface[e25ca096212c0b43]::interface::run_compiler::<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}
+  15:     0x7fd2a01e2ffe - std[ca0b0bcade21542d]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[e25ca096212c0b43]::util::run_in_thread_with_globals<rustc_interface[e25ca096212c0b43]::util::run_in_thread_pool_with_globals<rustc_interface[e25ca096212c0b43]::interface::run_compiler<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  16:     0x7fd2a01e38a0 - <std[ca0b0bcade21542d]::thread::lifecycle::spawn_unchecked<rustc_interface[e25ca096212c0b43]::util::run_in_thread_with_globals<rustc_interface[e25ca096212c0b43]::util::run_in_thread_pool_with_globals<rustc_interface[e25ca096212c0b43]::interface::run_compiler<(), rustc_driver_impl[a544dc0f85200ca5]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[db70abf3441067d4]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  17:     0x7fd2a01e472c - <std[ca0b0bcade21542d]::sys::thread::unix::Thread>::new::thread_start
+  18:     0x7fd299a94a83 - start_thread
+                               at ./nptl/pthread_create.c:442:8
+  19:     0x7fd299b26890 - __GI___clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:81:0
+  20:                0x0 - <unknown>
+
+
+rustc version: 1.96.0-nightly (55e86c996 2026-04-02)
+platform: x86_64-unknown-linux-gnu
+
+query stack during panic:
+end of query stack

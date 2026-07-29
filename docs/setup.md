@@ -4,9 +4,7 @@
 
 tatara defaults to CUDA C++ kernels built by NVCC and a portable Rust CUDA
 Driver API host runtime. The cuda-oxide Rust → PTX path remains available as an
-opt-in oracle for numerical and performance parity and is still used by
-`progress-kpabs-train`. Keeping it preserves the GPU/CPU equivalence-test
-coverage used to validate the native backend.
+opt-in oracle for numerical and performance parity.
 
 ## Supported OSes
 
@@ -315,8 +313,8 @@ the actual kernels. From the repository root:
 bash scripts/build-kernels.sh
 ```
 
-This detects the GPU generation with `nvidia-smi` and builds every binary that
-has kernels (`nnue_train` / `progress_kpabs_train`) with `cargo-oxide build`.
+This detects the GPU generation with `nvidia-smi` and builds the `nnue_train`
+oracle kernels with `cargo-oxide build`.
 Ampere+ uses the default (sm_80 PTX, forward-compatible) and Turing (sm_75) has
 `CUDA_OXIDE_TARGET` set automatically, so you do not need to type the
 environment variable by hand.
@@ -351,7 +349,7 @@ first-class override that bypasses `select_target()` and flows all the way
 through to `llc -mcpu=sm_75`:
 
 ```bash
-cd bins/progress_kpabs_train
+cd bins/nnue_train
 CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 ```
 
@@ -369,16 +367,15 @@ ops:
 - `cluster.*` — Thread Block Cluster (sm_90+)
 
 Compiling IR that contains these to sm_75 PTX fails either at `llc` or at the
-CUDA driver's JIT load stage. The simple KP-abs progress kernels (forward / grad
-scatter / adam_step / eval) are within sm_75's scope. Kernels that use a fused
-optimizer step or async copy / Hopper-only ops require an sm_80+ GPU.
+CUDA driver's JIT load stage. Kernels that use a fused optimizer step or async
+copy / Hopper-only ops require an sm_80+ GPU.
 
 You can grep the `.ll` that `cargo-oxide build` produces (it appears in the
 binary's directory where you ran the build) to check for sm_80+ ops:
 
 ```bash
 grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
-  bins/progress_kpabs_train/progress_kpabs_train.ll
+  bins/nnue_train/nnue_train.ll
 # (no output = OK)
 ```
 

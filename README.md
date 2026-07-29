@@ -122,7 +122,7 @@ from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000)
 - **NVIDIA GPU** (see the backend-specific support matrix in `docs/setup.md`)
 - **CUDA Toolkit 12.x** (verified with 12.9)
 - **NVCC** for the default `native-cuda-host` backend; **LLVM 21+** and
-  `cargo-oxide` for the opt-in cuda-oxide oracle and `progress-kpabs-train`
+  `cargo-oxide` for the opt-in cuda-oxide oracle
 - **Rust nightly** (pinned in `rust-toolchain.toml`)
 
 For the native CUDA C++ build command, cuda-oxide setup, detailed per-OS

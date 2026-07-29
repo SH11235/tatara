@@ -11,7 +11,7 @@ rust-version = { workspace = true }
 workspace = true
 
 [features]
-default = ["cuda-oxide"]
+default = ["native-cuda"]
 cuda-oxide = ["dep:cuda-core", "dep:cuda-host"]
 native-cuda = ["dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
 

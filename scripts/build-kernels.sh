@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# opt-in の cuda-oxide 経路と cuda-oxide 専用の progress_kpabs_train 用に、
-# GPU の compute capability を検出して Rust → PTX kernel をビルドする。
+# opt-in の cuda-oxide 経路用に、GPU の compute capability を検出して
+# Rust → PTX kernel をビルドする。
 #
 # cargo-oxide の target auto-detect は kernel features から sm_80 を選ぶ。sm_80
 # PTX は Ampere 以降 (sm_80 / 86 / 89 / 90 …) で前方互換に動くため、Ampere+ では
@@ -120,10 +120,17 @@ if [[ -z "$llvm_link" || -z "$opt_bin" || -z "$llc_bin" || -z "$libdevice" ]]; t
   exit 1
 fi
 
-# kernel を持つ bin をすべてビルドする。
-for bin in nnue_train progress_kpabs_train; do
+# cuda-oxide oracle kernel を持つ bin をビルドする。
+for bin in nnue_train; do
   echo "[build-kernels] cargo-oxide build: bins/$bin (modern NVVM IR: $nvvm_target)"
-  ( cd "bins/$bin" && cargo-oxide build --emit-nvvm-ir --arch "$nvvm_target" )
+  (
+    cd "bins/$bin"
+    # cargo へ引数を渡すと cargo-oxide 既定の --release が外れる。debug の
+    # 最適化レベルでは f32::sqrt / f32::exp が std 呼び出しのまま残り、device
+    # code から禁止 crate を呼んだとして codegen backend が panic するため明示する。
+    cargo-oxide build --emit-nvvm-ir --arch "$nvvm_target" \
+      -- --release --no-default-features --features cuda-oxide
+  )
 
   ll="$repo_root/$bin.ll"
   if [[ ! -f "$ll" ]]; then
