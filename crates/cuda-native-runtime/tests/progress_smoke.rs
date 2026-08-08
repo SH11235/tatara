@@ -112,6 +112,11 @@ fn progress_kernels_match_cpu_references() {
         assert!((actual - expected).abs() < FLOAT_TOLERANCE);
     }
 
+    // grad / eval の検証対象は各 kernel 単体の等価性。GPU forward の preds は
+    // `expf` と Rust `f32::exp` の ULP 差で CPU 参照とずれ、loss (err^2 の f64
+    // 累積) は 1e-8 許容を超え得るため、両実装への入力を CPU preds に揃える。
+    preds_device.copy_from(&expected_preds).unwrap();
+
     let targets_device = DeviceBuffer::from_slice(&context, &targets).unwrap();
     let norms_device = DeviceBuffer::from_slice(&context, &norms).unwrap();
     let grad_device = DeviceBuffer::<f32>::zeroed(&context, n_weights).unwrap();
