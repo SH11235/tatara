@@ -187,6 +187,12 @@ pub struct Params {
     /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i32>,
+    /// `--score-override` の入力ファイル basename。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_override: Option<String>,
+    /// `--score-override-mask` の入力ファイル basename。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_override_mask: Option<String>,
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
@@ -659,6 +665,8 @@ mod tests {
             wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
             score_clamp_abs: None,
+            score_override: None,
+            score_override_mask: None,
             init_from: None,
             init_preset: None,
             test_data: None,

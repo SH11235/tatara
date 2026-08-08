@@ -36,6 +36,142 @@ use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, S
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
 
+/// Streaming reader for a score sidecar aligned to the records of one PSV file.
+/// The optional bitmap uses LSB-first bits; a set bit preserves the PSV score.
+#[derive(Debug)]
+pub(crate) struct ScoreOverrideReader {
+    score_path: PathBuf,
+    mask_path: Option<PathBuf>,
+    scores: BufReader<File>,
+    mask: Option<BufReader<File>>,
+    record_index: u64,
+    mask_byte_index: u64,
+    mask_byte: u8,
+}
+
+impl ScoreOverrideReader {
+    pub(crate) fn new(
+        data_path: &Path,
+        score_path: &Path,
+        mask_path: Option<&Path>,
+        start_offset: u64,
+    ) -> io::Result<Self> {
+        let data_size = std::fs::metadata(data_path)?.len();
+        if !data_size.is_multiple_of(PSV_RECORD_BYTES) {
+            return Err(io::Error::other(format!(
+                "data file {} size {data_size} is not a multiple of PSV record size ({PSV_RECORD_BYTES} bytes)",
+                data_path.display()
+            )));
+        }
+        if !start_offset.is_multiple_of(PSV_RECORD_BYTES) || start_offset > data_size {
+            return Err(io::Error::other(format!(
+                "score override start offset {start_offset} is not an aligned offset in data file {}",
+                data_path.display()
+            )));
+        }
+        let records = data_size / PSV_RECORD_BYTES;
+        let expected_score_size = records
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("score override size calculation overflowed u64"))?;
+        let actual_score_size = std::fs::metadata(score_path)?.len();
+        if actual_score_size != expected_score_size {
+            return Err(io::Error::other(format!(
+                "score override file {} size {actual_score_size} does not match data file {}: expected {expected_score_size} bytes for {records} records",
+                score_path.display(),
+                data_path.display()
+            )));
+        }
+        if let Some(path) = mask_path {
+            let expected_mask_size = records.div_ceil(8);
+            let actual_mask_size = std::fs::metadata(path)?.len();
+            if actual_mask_size != expected_mask_size {
+                return Err(io::Error::other(format!(
+                    "score override mask {} size {actual_mask_size} does not match data file {}: expected {expected_mask_size} bytes for {records} records",
+                    path.display(),
+                    data_path.display()
+                )));
+            }
+            if !records.is_multiple_of(8) {
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(expected_mask_size - 1))?;
+                let mut final_byte = [0_u8; 1];
+                file.read_exact(&mut final_byte)?;
+                let used_mask = (1_u16 << (records % 8)) as u8 - 1;
+                if final_byte[0] & !used_mask != 0 {
+                    return Err(io::Error::other(format!(
+                        "score override mask {} has non-zero unused bits in its final byte",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let mut reader = Self {
+            score_path: score_path.to_path_buf(),
+            mask_path: mask_path.map(Path::to_path_buf),
+            scores: BufReader::with_capacity(1024 * 1024, File::open(score_path)?),
+            mask: match mask_path {
+                Some(path) => Some(BufReader::with_capacity(1024 * 1024, File::open(path)?)),
+                None => None,
+            },
+            record_index: 0,
+            mask_byte_index: u64::MAX,
+            mask_byte: 0,
+        };
+        reader.seek_to(start_offset / PSV_RECORD_BYTES)?;
+        Ok(reader)
+    }
+
+    pub(crate) fn seek_to(&mut self, record_index: u64) -> io::Result<()> {
+        self.scores.seek(SeekFrom::Start(record_index * 2))?;
+        if let Some(mask) = &mut self.mask {
+            mask.seek(SeekFrom::Start(record_index / 8))?;
+        }
+        self.record_index = record_index;
+        self.mask_byte_index = u64::MAX;
+        Ok(())
+    }
+
+    pub(crate) fn apply(&mut self, psv: &mut PackedSfenValue) -> io::Result<()> {
+        let mut score = [0_u8; 2];
+        self.scores.read_exact(&mut score).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed reading score override {}: {err}",
+                    self.score_path.display()
+                ),
+            )
+        })?;
+        let preserve = if let Some(mask) = &mut self.mask {
+            let byte_index = self.record_index / 8;
+            if self.mask_byte_index != byte_index {
+                mask.read_exact(std::slice::from_mut(&mut self.mask_byte))
+                    .map_err(|err| {
+                        io::Error::new(
+                            err.kind(),
+                            format!(
+                                "failed reading score override mask {}: {err}",
+                                self.mask_path
+                                    .as_deref()
+                                    .expect("mask path is present")
+                                    .display()
+                            ),
+                        )
+                    })?;
+                self.mask_byte_index = byte_index;
+            }
+            self.mask_byte & (1 << (self.record_index % 8)) != 0
+        } else {
+            false
+        };
+        self.record_index += 1;
+        if !preserve {
+            psv.set_score(i16::from_le_bytes(score));
+        }
+        Ok(())
+    }
+}
+
 /// Sequential reader for 38-byte Apery / dlshogi HCPE records.
 pub struct HcpeFileLoader {
     reader: BufReader<File>,
@@ -520,6 +656,7 @@ struct PsvEpochReader {
     start_offset: u64,
     end_offset: u64,
     loader: PsvFileLoader,
+    score_override: Option<ScoreOverrideReader>,
     score_drop_abs: Option<i32>,
     score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
@@ -538,13 +675,21 @@ impl PsvEpochReader {
         end_offset: u64,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
+        score_override: Option<&Path>,
+        score_override_mask: Option<&Path>,
     ) -> io::Result<Self> {
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let score_override = score_override
+            .map(|score_path| {
+                ScoreOverrideReader::new(path, score_path, score_override_mask, start_offset)
+            })
+            .transpose()?;
         Ok(Self {
             path: path.to_path_buf(),
             start_offset,
             end_offset,
             loader,
+            score_override,
             score_drop_abs,
             score_clamp_abs,
             pushed_this_epoch: 0,
@@ -558,6 +703,11 @@ impl PsvEpochReader {
         loop {
             match self.loader.next_psv()? {
                 Some(mut psv) => {
+                    // Sidecar indices are based on the complete PSV file. Applying the
+                    // replacement before filtering matches a materialized PSV variant.
+                    if let Some(score_override) = &mut self.score_override {
+                        score_override.apply(&mut psv)?;
+                    }
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
                     if let Some(t) = self.score_drop_abs
@@ -596,6 +746,9 @@ impl PsvEpochReader {
                     self.pushed_this_epoch = 0;
                     self.loader =
                         PsvFileLoader::new_range(&self.path, self.start_offset, self.end_offset)?;
+                    if let Some(score_override) = &mut self.score_override {
+                        score_override.seek_to(self.start_offset / PSV_RECORD_BYTES)?;
+                    }
                 }
             }
         }
@@ -706,6 +859,40 @@ impl BucketedPrefetchedLoader {
         train_end_offset: u64,
         monitor_active: bool,
     ) -> io::Result<Self> {
+        Self::spawn_with_score_override(
+            path,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            num_workers,
+            bucket_mode,
+            feature_set,
+            compute_bucket,
+            num_buckets,
+            train_end_offset,
+            monitor_active,
+            None,
+            None,
+        )
+    }
+
+    /// Spawns a loader with an optional streaming score sidecar and preserve mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_score_override(
+        path: &Path,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        num_workers: usize,
+        bucket_mode: impl Into<BucketMode>,
+        feature_set: FeatureSetSpec,
+        compute_bucket: bool,
+        num_buckets: usize,
+        train_end_offset: u64,
+        monitor_active: bool,
+        score_override: Option<&Path>,
+        score_override_mask: Option<&Path>,
+    ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
             "BucketedPrefetchedLoader requires num_buckets >= 1"
@@ -725,6 +912,8 @@ impl BucketedPrefetchedLoader {
             train_end_offset,
             score_drop_abs,
             score_clamp_abs,
+            score_override,
+            score_override_mask,
         )?));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
@@ -986,6 +1175,240 @@ mod tests {
             .parent()
             .unwrap()
             .join("shogi-format/tests/data/sample.psv")
+    }
+
+    fn synthetic_override_files(
+        name: &str,
+        base_scores: &[i16],
+        override_scores: &[i16],
+        mask: Option<&[u8]>,
+    ) -> (PathBuf, PathBuf, Option<PathBuf>) {
+        assert_eq!(base_scores.len(), override_scores.len());
+        let prefix = std::env::temp_dir().join(format!(
+            "nnue-train-score-override-{name}-{}",
+            std::process::id()
+        ));
+        let data = prefix.with_extension("psv");
+        let scores = prefix.with_extension("scores");
+        let mask_path = mask.map(|_| prefix.with_extension("mask"));
+        let mut data_bytes = Vec::with_capacity(base_scores.len() * PSV_RECORD_BYTES as usize);
+        let mut score_bytes = Vec::with_capacity(override_scores.len() * 2);
+        for (&base, &replacement) in base_scores.iter().zip(override_scores) {
+            let mut record = [0_u8; PSV_RECORD_BYTES as usize];
+            record[32..34].copy_from_slice(&base.to_le_bytes());
+            data_bytes.extend_from_slice(&record);
+            score_bytes.extend_from_slice(&replacement.to_le_bytes());
+        }
+        std::fs::write(&data, data_bytes).unwrap();
+        std::fs::write(&scores, score_bytes).unwrap();
+        if let (Some(path), Some(bytes)) = (&mask_path, mask) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        (data, scores, mask_path)
+    }
+
+    fn remove_override_files(data: &Path, scores: &Path, mask: Option<&Path>) {
+        let _ = std::fs::remove_file(data);
+        let _ = std::fs::remove_file(scores);
+        if let Some(path) = mask {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn score_override_replaces_all_scores_and_wraps() {
+        let base = [1, 2, 3];
+        let replacement = [101, -202, 303];
+        let (data, scores, _) = synthetic_override_files("all-wrap", &base, &replacement, None);
+        let mut reader = PsvEpochReader::new_range(
+            &data,
+            0,
+            3 * PSV_RECORD_BYTES,
+            None,
+            None,
+            Some(&scores),
+            None,
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..6).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        remove_override_files(&data, &scores, None);
+        assert_eq!(got, [101, -202, 303, 101, -202, 303]);
+    }
+
+    #[test]
+    fn score_override_mask_preserves_lsb_first_boundary_records() {
+        let base: Vec<i16> = (0..17).map(|i| i as i16).collect();
+        let replacement: Vec<i16> = (0..17).map(|i| 1000 + i as i16).collect();
+        // Preserve indices 0, 7, 8, and 16, covering both sides of byte boundaries
+        // and the final partial bitmap byte. Unused bits remain zero.
+        let mask = [0b1000_0001, 0b0000_0001, 0b0000_0001];
+        let (data, scores, mask_path) =
+            synthetic_override_files("mask-boundary", &base, &replacement, Some(&mask));
+        let mut reader = PsvEpochReader::new_range(
+            &data,
+            0,
+            17 * PSV_RECORD_BYTES,
+            None,
+            None,
+            Some(&scores),
+            mask_path.as_deref(),
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..17).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        remove_override_files(&data, &scores, mask_path.as_deref());
+        for i in 0..17 {
+            let expected = if [0, 7, 8, 16].contains(&i) {
+                base[i]
+            } else {
+                replacement[i]
+            };
+            assert_eq!(got[i], expected, "record {i}");
+        }
+    }
+
+    #[test]
+    fn score_override_range_uses_full_file_record_indices() {
+        let base = [0, 1, 2, 3, 4];
+        let replacement = [100, 101, 102, 103, 104];
+        let (data, scores, _) = synthetic_override_files("range", &base, &replacement, None);
+        let mut reader = PsvEpochReader::new_range(
+            &data,
+            2 * PSV_RECORD_BYTES,
+            5 * PSV_RECORD_BYTES,
+            None,
+            None,
+            Some(&scores),
+            None,
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        remove_override_files(&data, &scores, None);
+        assert_eq!(got, [102, 103, 104, 102]);
+    }
+
+    #[test]
+    fn score_override_mask_range_wraps_from_non_byte_aligned_record() {
+        let base: Vec<i16> = (0..12).map(|i| i as i16).collect();
+        let replacement: Vec<i16> = (0..12).map(|i| 100 + i as i16).collect();
+        let mask = [0b1000_1000, 0b0000_0101];
+        let (data, scores, mask_path) =
+            synthetic_override_files("mask-range-wrap", &base, &replacement, Some(&mask));
+        let mut reader = PsvEpochReader::new_range(
+            &data,
+            3 * PSV_RECORD_BYTES,
+            11 * PSV_RECORD_BYTES,
+            None,
+            None,
+            Some(&scores),
+            mask_path.as_deref(),
+        )
+        .unwrap();
+
+        let got: Vec<i16> = (0..10).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        remove_override_files(&data, &scores, mask_path.as_deref());
+        assert_eq!(got, [3, 104, 105, 106, 7, 8, 109, 10, 3, 104]);
+    }
+
+    #[test]
+    fn score_override_matches_materialized_psv_and_precedes_drop_clamp() {
+        let base = [10, 20, 30];
+        let replacement = [500, 50, -250];
+        let (data, scores, _) = synthetic_override_files("equivalence", &base, &replacement, None);
+        let materialized = data.with_extension("materialized.psv");
+        let mut bytes = std::fs::read(&data).unwrap();
+        for (record, score) in bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .zip(replacement)
+        {
+            record[32..34].copy_from_slice(&score.to_le_bytes());
+        }
+        std::fs::write(&materialized, bytes).unwrap();
+        let mut overridden = PsvEpochReader::new_range(
+            &data,
+            0,
+            3 * PSV_RECORD_BYTES,
+            Some(400),
+            Some(100),
+            Some(&scores),
+            None,
+        )
+        .unwrap();
+        let mut concrete = PsvEpochReader::new_range(
+            &materialized,
+            0,
+            3 * PSV_RECORD_BYTES,
+            Some(400),
+            Some(100),
+            None,
+            None,
+        )
+        .unwrap();
+        let override_scores: Vec<i16> =
+            (0..4).map(|_| overridden.next().unwrap().score()).collect();
+        let concrete_scores: Vec<i16> = (0..4).map(|_| concrete.next().unwrap().score()).collect();
+        drop(overridden);
+        drop(concrete);
+        let _ = std::fs::remove_file(&materialized);
+        remove_override_files(&data, &scores, None);
+        assert_eq!(override_scores, concrete_scores);
+        assert_eq!(override_scores, [50, -100, 50, -100]);
+    }
+
+    #[test]
+    fn score_override_rejects_sidecar_and_mask_size_mismatches() {
+        let base = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let replacement = [0; 9];
+        let (data, scores, mask) =
+            synthetic_override_files("bad-size", &base, &replacement, Some(&[0_u8; 2]));
+        for delta in [-2_i64, 2] {
+            let bad = scores.with_extension(format!("scores-{delta}"));
+            let size = (replacement.len() as i64 * 2 + delta) as usize;
+            std::fs::write(&bad, vec![0_u8; size]).unwrap();
+            let err = ScoreOverrideReader::new(&data, &bad, None, 0).unwrap_err();
+            let _ = std::fs::remove_file(&bad);
+            assert!(err.to_string().contains("expected 18 bytes"));
+        }
+        for delta in [-1_i64, 1] {
+            let bad = scores.with_extension(format!("mask-{delta}"));
+            let size = (2_i64 + delta) as usize;
+            std::fs::write(&bad, vec![0_u8; size]).unwrap();
+            let err = ScoreOverrideReader::new(&data, &scores, Some(&bad), 0).unwrap_err();
+            let _ = std::fs::remove_file(&bad);
+            assert!(err.to_string().contains("expected 2 bytes"));
+        }
+        remove_override_files(&data, &scores, mask.as_deref());
+        assert!(mask.is_some());
+    }
+
+    #[test]
+    fn score_override_rejects_nonzero_unused_mask_bits() {
+        let base = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let replacement = [0; 9];
+        let mask = [0_u8, 0b0000_0010];
+        let (data, scores, mask_path) =
+            synthetic_override_files("unused-mask-bits", &base, &replacement, Some(&mask));
+
+        let err = match PsvEpochReader::new_range(
+            &data,
+            0,
+            9 * PSV_RECORD_BYTES,
+            None,
+            None,
+            Some(&scores),
+            mask_path.as_deref(),
+        ) {
+            Ok(_) => panic!("non-zero unused mask bits must be rejected"),
+            Err(err) => err,
+        };
+        remove_override_files(&data, &scores, mask_path.as_deref());
+        assert!(
+            err.to_string().contains("non-zero unused bits"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1691,7 +2114,8 @@ mod tests {
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
         let mut reader =
-            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None).unwrap();
+            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None, None)
+                .unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
@@ -1717,8 +2141,16 @@ mod tests {
         ));
         std::fs::write(&tmp, &bytes).expect("write synthetic psv");
 
-        let mut reader =
-            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100)).unwrap();
+        let mut reader = PsvEpochReader::new_range(
+            &tmp,
+            0,
+            bytes.len() as u64,
+            Some(32000),
+            Some(100),
+            None,
+            None,
+        )
+        .unwrap();
         let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
         std::fs::remove_file(&tmp).ok();
         assert_eq!(got, vec![0, 50, -50, 100, -100]);
