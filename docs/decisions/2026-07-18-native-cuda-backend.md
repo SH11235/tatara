@@ -30,11 +30,6 @@ checkpoint、dataloader、schedule、trainer orchestrationを両backendで共有
 fat binaryはrelease buildで生成して実行fileへ埋め込める構造にする。利用者環境での
 runtime compileを必須にしない。source buildではNVCCを使用する。
 
-実装順は、WSL上で既存host pipelineとcuBLASを維持したままcuda-oxide互換のkernel ABIへ
-CUDA C++ fat binaryを差し込み、device側の数値・性能parityを先に確立する。その間に
-Driver APIのportable runtimeを独立して整備し、kernel coverageの完成後にtrainerのhost型を
-置き換える。最後に同じruntime境界をnative Windowsでbuild・実機検証する。
-
 ## Consequences
 
 - Windows native trainerをcuda-oxideのWindows対応から独立して実装できる。
@@ -48,8 +43,8 @@ Driver APIのportable runtimeを独立して整備し、kernel coverageの完成
   bit一致ではない。同一GPU上のhost runtime比較では追加の強い回帰検査としてbit fingerprintも使う。
 - CUDA C++化だけでは高速化を保証しない。既存throughputを維持することを移植時の基準とし、
   NVIDIA固有intrinsicやlibraryによる最適化はparity確立後に個別計測する。
-- native backendが全kernelを実装するまでは、対応architectureとprecision optionを明示して
-  unsupported構成を起動前に拒否する。
+- native backendは対応architectureとprecision optionを明示し、unsupported構成を
+  起動前に拒否する。対応範囲は「Backend feature構成」の対応一覧が正である。
 
 ## Backend feature構成
 
