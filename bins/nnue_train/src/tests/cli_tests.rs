@@ -27,6 +27,40 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
+#[test]
+fn score_override_flags_require_training_data_and_sidecar() {
+    let parsed = Cli::try_parse_from([
+        "nnue-train",
+        "--data",
+        "base.psv",
+        "--score-override",
+        "scores.bin",
+        "--score-override-mask",
+        "preserve.mask",
+        "simple",
+    ])
+    .unwrap();
+    assert_eq!(parsed.score_override, Some(PathBuf::from("scores.bin")));
+    assert_eq!(
+        parsed.score_override_mask,
+        Some(PathBuf::from("preserve.mask"))
+    );
+    assert!(
+        Cli::try_parse_from(["nnue-train", "--score-override", "scores.bin", "simple"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "nnue-train",
+            "--data",
+            "base.psv",
+            "--score-override-mask",
+            "preserve.mask",
+            "simple"
+        ])
+        .is_err()
+    );
+}
+
 /// `--ft-factorize` / `--no-ft-factorize` は global flag。任意 subcommand の後ろに
 /// 付けても global 引数として parse される (層は `simple` でも `layerstack` でも同じ)。
 fn cli_with_factorize(argv: &[&str]) -> Cli {

@@ -761,6 +761,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         loss,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
+        score_override: cli.score_override.clone(),
+        score_override_mask: cli.score_override_mask.clone(),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -812,7 +814,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 if tail_bytes >= file_size {
                     return Err("--test-tail-positions leaves no data to evaluate".into());
                 }
-                nnue_train::validation::HeldoutSet::load_from_range(
+                nnue_train::validation::HeldoutSet::load_from_range_with_override(
                     data,
                     file_size - tail_bytes,
                     file_size,
@@ -823,6 +825,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     &bucket_mode,
                     cfg.feature_set,
                     cfg.num_buckets,
+                    cfg.score_override.as_deref(),
+                    cfg.score_override_mask.as_deref(),
                 )?
             }
             _ => {
@@ -1508,6 +1512,8 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
+        score_override: cli.score_override.as_deref().map(file_basename),
+        score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1672,6 +1678,8 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
+        score_override: cli.score_override.as_deref().map(file_basename),
+        score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
@@ -1986,6 +1994,8 @@ pub(crate) fn run_simple_training(
         loss,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
+        score_override: cli.score_override.clone(),
+        score_override_mask: cli.score_override_mask.clone(),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,

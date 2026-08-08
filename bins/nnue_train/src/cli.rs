@@ -215,6 +215,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(i16).range(1..))]
     pub(crate) score_clamp_abs: Option<i16>,
 
+    /// Read little-endian i16 teacher scores from this record-aligned sidecar.
+    #[arg(long, global = true, requires = "data")]
+    pub(crate) score_override: Option<PathBuf>,
+
+    /// Preserve the base PSV score where the corresponding LSB-first bitmap bit is set.
+    #[arg(long, global = true, requires = "score_override")]
+    pub(crate) score_override_mask: Option<PathBuf>,
+
     /// Inject weights from a quantised NNUE binary before training starts
     /// (pretrained start). The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and

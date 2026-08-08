@@ -424,6 +424,10 @@ pub struct TrainingConfig {
     /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
     /// 消費側の縮小 cast (wrap) を型で不可能にするため。
     pub score_clamp_abs: Option<i16>,
+    /// Little-endian i16 score sidecar aligned to every record in `data_path`.
+    pub score_override: Option<PathBuf>,
+    /// LSB-first bitmap whose set bits preserve scores from `data_path`.
+    pub score_override_mask: Option<PathBuf>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
@@ -497,6 +501,11 @@ impl TrainingConfig {
             ));
         }
         self.loss.validate()?;
+        if self.score_override_mask.is_some() && self.score_override.is_none() {
+            return Err(io::Error::other(
+                "score_override_mask requires score_override",
+            ));
+        }
         if let Some(t) = self.score_drop_abs
             && t < 1
         {
@@ -683,7 +692,18 @@ where
         None => file_size,
     };
 
-    let mut loader = BucketedPrefetchedLoader::spawn(
+    if cfg.score_override.is_some()
+        && data_path.extension().is_some_and(|ext| {
+            ext.to_str()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
+        })
+    {
+        return Err(io::Error::other(
+            "score_override is only supported for PSV training data, not HCPE",
+        ));
+    }
+
+    let mut loader = BucketedPrefetchedLoader::spawn_with_score_override(
         data_path,
         cfg.batch_size,
         cfg.score_drop_abs,
@@ -695,11 +715,13 @@ where
         cfg.num_buckets,
         train_end_offset,
         cfg.monitor_active_features,
+        cfg.score_override.as_deref(),
+        cfg.score_override_mask.as_deref(),
     )?;
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -709,6 +731,8 @@ where
         cfg.loss,
         cfg.score_drop_abs,
         cfg.score_clamp_abs,
+        cfg.score_override,
+        cfg.score_override_mask,
         cfg.threads.max(1),
     );
 
@@ -738,7 +762,7 @@ where
             Some(set)
         }
         (None, Some(_)) => {
-            let set = crate::validation::HeldoutSet::load_from_range(
+            let set = crate::validation::HeldoutSet::load_from_range_with_override(
                 data_path,
                 train_end_offset,
                 file_size,
@@ -749,6 +773,8 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
+                cfg.score_override.as_deref(),
+                cfg.score_override_mask.as_deref(),
             )?;
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
@@ -1288,6 +1314,8 @@ mod tests {
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
             score_clamp_abs: None,
+            score_override: None,
+            score_override_mask: None,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -1501,6 +1529,8 @@ mod tests {
             wrm_weight_boost_w2: None,
             score_drop_abs: None,
             score_clamp_abs: None,
+            score_override: None,
+            score_override_mask: None,
             init_from: None,
             init_preset: None,
             test_data: None,

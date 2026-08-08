@@ -26,7 +26,7 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvFileLoader};
+use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvFileLoader, ScoreOverrideReader};
 use crate::trainer::{LossKind, TrainerBackend};
 
 /// held-out validation 1 回分の集計結果。
@@ -132,10 +132,56 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
+        Self::load_from_range_with_override(
+            path,
+            start_offset,
+            end_offset,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            test_positions,
+            bucket_mode,
+            feature_set,
+            num_buckets,
+            None,
+            None,
+        )
+    }
+
+    /// Equivalent to [`Self::load_from_range`], with scores read from a
+    /// full-file sidecar before score filtering and clamping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_from_range_with_override(
+        path: &Path,
+        start_offset: u64,
+        end_offset: u64,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        test_positions: usize,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
+        feature_set: FeatureSetSpec,
+        num_buckets: usize,
+        score_override: Option<&Path>,
+        score_override_mask: Option<&Path>,
+    ) -> io::Result<Self> {
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let mut score_override = score_override
+            .map(|score_path| {
+                ScoreOverrideReader::new(path, score_path, score_override_mask, start_offset)
+            })
+            .transpose()?;
         Self::load_boards(
             loader,
-            |loader| Ok(loader.next_psv()?.map(|psv| psv.decode())),
+            |loader| {
+                let Some(mut psv) = loader.next_psv()? else {
+                    return Ok(None);
+                };
+                if let Some(score_override) = &mut score_override {
+                    score_override.apply(&mut psv)?;
+                }
+                Ok(Some(psv.decode()))
+            },
             path,
             batch_size,
             score_drop_abs,
