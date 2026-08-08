@@ -47,8 +47,10 @@ bash scripts/check-native-cuda-parity.sh
 
 # equivalence test は oxide feature gate 配下にあり、既定構成の
 # `cargo test --workspace` では skip される。oracle 構成で明示的に走らせる。
+# 各 test が独立に CUDA context と device buffer を確保するため、並列実行は
+# VRAM を食い潰して out of memory になり得る (12 GB GPU で実測)。直列で回す。
 echo "== cuda-oxide GPU/CPU equivalence tests =="
-cargo test -p nnue-trainer --release --no-default-features --features oxide
+cargo test -p nnue-trainer --release --no-default-features --features oxide -- --test-threads=1
 
 echo "== cargo test --workspace --release =="
 cargo test --workspace --release
