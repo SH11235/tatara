@@ -373,7 +373,7 @@ pub(crate) struct SimpleGpuTrainer {
     fv_scale: i32,
 }
 
-#[cfg(all(test, feature = "native-cuda"))]
+#[cfg(all(test, feature = "oxide-parity"))]
 pub(crate) type SimpleRawCheckpointState = (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
 impl Drop for SimpleGpuTrainer {
@@ -680,7 +680,7 @@ impl SimpleGpuTrainer {
 
     /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
     /// download する。resume の無中断学習 oracle との比較に使う。
-    #[cfg(all(test, feature = "native-cuda"))]
+    #[cfg(all(test, feature = "oxide-parity"))]
     pub(crate) fn raw_checkpoint_state_to_host(
         &self,
     ) -> Result<SimpleRawCheckpointState, Box<dyn std::error::Error>> {

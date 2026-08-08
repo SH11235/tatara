@@ -312,7 +312,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ArchCommand::BenchPos(_) => {
             return Err("bench-pos must be dispatched before run_training".into());
         }
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => {
             return Err("native-bench must be dispatched before training".into());
         }

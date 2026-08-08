@@ -1,6 +1,6 @@
-# Channel は upstream cuda-oxide の rust-toolchain.toml に追従する
-# (cuda-oxide が ABI-unstable な rustc internal API を直接使うため、
-#  channel ずれは link-time fail を引き起こす)。
+# Channel は cuda-oxide の ABI-unstable な rustc codegen API と、trainer が使う
+# f16 言語機能のため nightly に固定する。cuda-oxide 利用時は upstream の
+# rust-toolchain.toml と揃え、codegen backend の ABI ずれを防ぐ。
 [toolchain]
 channel = "nightly-2026-04-03"
 components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]

@@ -1,9 +1,7 @@
 //! Adam optimizer step kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn adam_step`) は `src/main.rs` に inline 定義されている
-//! (cuda-oxide rustc-codegen-cuda backend は bin entry 経由でしか PTX 化しない
-//! ため)。本 module の `adam_step_cpu` は GPU と同じ更新式を host に書き写した
-//! もの。
+//! GPU 側は CUDA C++ の `progress_adam_step`。本 module の `adam_step_cpu` は
+//! GPU と同じ更新式を host に書き写したもの。
 //!
 //! ## アルゴリズム
 //!
@@ -27,10 +25,8 @@
 //!
 //! - 1 thread = 1 index で aliasing なし、atomics 不要 (`grad` kernel の scatter
 //!   path とは異なる)。
-//! - `bc.max(1e-30)` は本 CPU reference では `bc.max(1e-30f32)`。GPU kernel 側は
-//!   `f32::max` が cuda-oxide で lowering 失敗するため `if bc > 1e-30 { bc }
-//!   else { 1e-30 }` に展開している (`src/main.rs::adam_step` の comment 参照)。
-//! - `v_hat.sqrt()` は cuda-oxide が `__nv_sqrtf` (libdevice) に lowering する。
+//! - bias correction denominator は `max(bc, 1e-30)` で保護する。
+//! - GPU 側の `sqrtf` と比較するため、reference も f32 の平方根を使う。
 //! - `weights.len() == m.len() == v.len() == grad.len() == n` を host 側
 //!   invariant として要求する。
 

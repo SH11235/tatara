@@ -1,10 +1,8 @@
 //! Backward (loss + gradient + histogram) kernel の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn grad`) は `src/main.rs` に inline 定義されている
-//! (cuda-oxide の rustc-codegen-cuda backend は bin entry 経由で到達可能な
-//! kernel しか PTX 化しないため)。本 module の `grad_cpu` は GPU と同じ
-//! ロジックを host に書き写したもので、host loop の numerical equivalence test
-//! の reference に使う。
+//! GPU 側は CUDA C++ の `progress_grad`。本 module の `grad_cpu` は GPU と
+//! 同じロジックを host に書き写したもので、numerical equivalence test の
+//! reference に使う。
 //!
 //! ## アルゴリズム
 //!

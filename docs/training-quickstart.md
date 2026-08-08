@@ -3,8 +3,9 @@
 # Training quickstart
 
 The shortest path to training a shogi NNUE from scratch with `nnue-train`. GPUs:
-Ampere+ (sm_80+) is official, Turing uses `CUDA_OXIDE_TARGET=sm_75`. For setting
-up the toolchain and CUDA / LLVM, see [docs/setup.md](setup.md).
+Ampere+ (sm_80+) is official; the default build detects the compute capability
+of the installed GPU (Turing included) with `nvidia-smi` automatically. For
+setting up the toolchain and CUDA / NVCC, see [docs/setup.md](setup.md).
 
 A trained NNUE is defined by choosing an architecture (`simple` / `layerstack`)
 and an input feature set (for the options, see "What you can train" in the
@@ -205,15 +206,15 @@ target/release/nnue-train --data <PSV> \
 
 | Symptom | Cause / fix |
 |---|---|
-| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | On the first build you need to generate the `.ll` with `cd bins/nnue_train && cargo-oxide build`. For details, see [docs/setup.md](setup.md) |
+| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | Opt-in `oxide` builds only: on the first build you need to generate the `.ll` with `cd bins/nnue_train && cargo-oxide build`. For details, see [docs/setup.md](setup.md) |
 | `libcublas.so` link / load errors | The CUDA Toolkit is in none of `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH`. Specify it explicitly with `CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` (both build.rs and runtime resolve via the same chain) |
-| `CUDA_ERROR_INVALID_PTX` (driver error 218) | On a sub-Ampere GPU (sm_75) with `CUDA_OXIDE_TARGET` unset. Export `CUDA_OXIDE_TARGET=sm_75`, then rebuild and rerun |
+| `CUDA_ERROR_INVALID_PTX` (driver error 218) | The embedded PTX does not match the GPU. The default build detects the target with `nvidia-smi`, but the detected value is not tracked by Cargo — after swapping the GPU, rebuild with `cargo clean -p cuda-native-runtime` first. On opt-in `oxide` builds with a sub-Ampere GPU (sm_75), export `CUDA_OXIDE_TARGET=sm_75`, then rebuild and rerun |
 | pos/s extremely low (< 500K on an RTX 3080 Ti) | Increase `--threads` (start from your physical core count, see "Key options") and check whether the dataloader's prefetch is keeping up. `NNUE_TRAIN_STEP_PROFILE=1` prints the ms spent in each phase (h2d / fwd / bwd / optimizer) to stderr so you can see the breakdown |
 | rejected with `--batch-size must be a multiple of 16` | The tiled dense matmul kernels require `b % 16 == 0`, so the CLI rejects other values at startup. Pass a multiple of 16 (the default 16384 satisfies the condition) |
 
 ## Related
 
-- [docs/setup.md](setup.md) — toolchain (LLVM / CUDA / cuda-oxide) setup
+- [docs/setup.md](setup.md) — toolchain (CUDA / NVCC, opt-in cuda-oxide) setup
 - [Game-progress buckets: preparing `progress.bin`](progress-bin.md) — training and surveying the LayerStack bucket coefficients
 - [Held-out validation](held-out-validation.md) — `test_loss` / `test_acc` setup and how to read the metrics
 - [Training schedules](training-schedule.md) — learning-rate and WDL lambda scheduling

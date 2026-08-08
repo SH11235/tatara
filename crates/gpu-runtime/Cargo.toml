@@ -11,9 +11,10 @@ rust-version = { workspace = true }
 workspace = true
 
 [features]
-default = ["cuda-oxide"]
-cuda-oxide = ["dep:cuda-core", "dep:cuda-host"]
-native-cuda = ["dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
+default = ["native"]
+oxide = ["dep:cuda-core", "dep:cuda-host"]
+# The native host backend launches embedded CUDA C++ kernels through the portable Driver API.
+native = ["dep:cuda-native-runtime", "cuda-native-runtime/native-cuda"]
 
 # cuda-oxide host API。git rev pin と選定理由は root Cargo.toml の
 # [workspace.dependencies] に集約。
@@ -25,4 +26,4 @@ thiserror = "2"
 
 [[example]]
 name = "vecadd_demo"
-required-features = ["cuda-oxide"]
+required-features = ["oxide"]

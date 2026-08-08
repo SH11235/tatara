@@ -5,13 +5,13 @@
 
 #[cfg(test)]
 mod cli_tests;
-#[cfg(all(test, feature = "cuda-oxide"))]
+#[cfg(all(test, feature = "oxide"))]
 mod ft_factorize_tests;
-#[cfg(all(test, feature = "cuda-oxide"))]
+#[cfg(all(test, feature = "oxide"))]
 mod gpu_cpu_equivalence_tests;
 #[cfg(test)]
 mod native_bench_schema_tests;
-#[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+#[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
 mod native_cuda_tests;
 #[cfg(test)]
 mod raw_ckpt_format_tests;

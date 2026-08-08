@@ -60,24 +60,27 @@ lock権限はtracked profileへ入れない。
 
 ## 実行
 
-測定対象backendでbuildする。Linux/WSLのdefault buildはcuda-oxideを測る。
+測定対象backendでbuildする。default buildはportable CUDA C++ host backendを測る。
 
 ```sh
 cargo build -p nnue-trainer --release
 target/release/nnue-train bench-pos
 ```
 
-native WindowsではCUDA C++ portable host backendをbuildする。
+native Windowsでも同じcommandを使う。
 
 ```powershell
-cargo build -p nnue-trainer --release --no-default-features --features native-cuda-host
+cargo build -p nnue-trainer --release
 target\release\nnue-train.exe bench-pos
 ```
 
-Linux/WSLでも同じportable host backendを測定できる。
+Linux/WSLでopt-inのcuda-oxide backendを測定する場合:
+
+先に`scripts/setup-cuda-oxide.sh`と`scripts/build-kernels.sh`を実行し、必要な
+LLVM toolchainを導入してruntimeでloadするPTXを生成する。
 
 ```sh
-cargo build -p nnue-trainer --release --no-default-features --features native-cuda-host
+cargo build -p nnue-trainer --release --no-default-features --features oxide
 target/release/nnue-train bench-pos
 ```
 

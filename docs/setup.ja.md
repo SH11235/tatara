@@ -2,18 +2,16 @@
 
 # 開発環境セットアップ
 
-tatara は **cuda-oxide** (NVIDIA Labs の Rust → PTX rustc backend) を中核
-に据えるため、host (LLVM 21+, できれば LLVM 22) と GPU (sm_80+ 公式) の両方を
-整える必要がある。Ampere (sm_86) を primary に、Turing (sm_75) も
-`CUDA_OXIDE_TARGET=sm_75` 環境変数で動作する (制約は「sub-Ampere GPU」節と
-末尾の GPU マトリクス参照)。
+tatara は NVCC で build する CUDA C++ kernel と portable Rust CUDA Driver API
+host runtime を既定にする。cuda-oxide の Rust → PTX 経路は数値・性能 parity の
+opt-in oracle として維持する。
 
 ## 対応 OS
 
 | OS | 位置づけ | 手順 |
 |---|---|---|
 | Linux | 一級サポート (Ubuntu 22.04 / 24.04 で確認) | 本ファイルの手順をそのまま実行 |
-| Windows | WSL2 は既定 backend。CUDA C++ backend により native Windows も実験的に対応 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
+| Windows | 既定の CUDA C++ backend は WSL2 に対応し、native Windows 対応のみ実験的 | native は「Windows native (実験的)」、WSL2 は「Windows (WSL2) の準備」 |
 | macOS | GPU ビルドは非対応 | リモートの Linux + NVIDIA GPU で作業 (下記) |
 
 cuda-oxide と本リポの GPU crate は **NVIDIA GPU + CUDA Toolkit** を前提とする。
@@ -23,17 +21,16 @@ Intel Mac いずれも) ため、macOS 単体では GPU crate (`gpu-runtime` / `
 マシン (社内サーバや GPU クラウドインスタンス) 上でビルド・学習し、手元の
 macOS は SSH / エディタとして使う。CPU-only crate (`shogi-format` /
 `shogi-features` / `nnue-format` 等) 単体の編集と `cargo test -p <crate>` は
-macOS でも可能だが、`cargo build` を workspace 全体に掛けると cuda-oxide 依存の
+macOS でも可能だが、`cargo build` を workspace 全体に掛けると CUDA 依存の
 ビルドで失敗する。
 
 ## Windows native (実験的)
 
-`native-cuda-host` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
+`native` feature は cuda-oxide を使わず、NVCC で build した CUDA C++
 kernel を portable Rust CUDA Driver API runtime から
 起動する。Windows 11、RTX 5090、driver 596.36、CUDA Toolkit 12.9.86、Visual
 Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、trainer の
-1 step を確認済み。現時点では実験 backend であり、既定 backend は引き続き
-Linux / WSL2 の cuda-oxide である。
+1 step を確認済み。Cargo の既定 backend だが、native Windows 対応は実験的である。
 
 ### 前提の install
 
@@ -77,17 +74,17 @@ NVCC で直接 compile するときに warning C4819 と、直後の定数につ
 
 ### build と smoke test
 
-既定 feature を無効化し、必ず `native-cuda-host` だけを指定する:
+既定 feature は `native` だけを選択する:
 
 ```powershell
-cargo tree -p nnue-trainer --no-default-features --features native-cuda-host |
+cargo tree -p nnue-trainer --no-default-features --features native |
   Select-String 'cuda-core|cuda-host|cuda-device'
 # 出力が空であること
 
-cargo build -p nnue-trainer --no-default-features --features native-cuda-host --release
+cargo build -p nnue-trainer --release
 cargo test -p cuda-native-runtime --features native-cuda --release -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple
+cargo test -p nnue-trainer --release
+cargo run -p nnue-trainer --release -- simple
 ```
 
 最後のコマンドは教師データを使わず、nativeの対応範囲に限定したGPU smokeを実行する。
@@ -98,7 +95,7 @@ norm loss、2 種の checkpoint format を短い 1 run でまとめて確認す�
 
 ```powershell
 $smokeOut = Join-Path ([System.IO.Path]::GetTempPath()) 'tatara-native-simple-cli'
-cargo run -p nnue-trainer --no-default-features --features native-cuda-host --release -- simple `
+cargo run -p nnue-trainer --release -- simple `
   --data crates/shogi-format/tests/data/sample.psv --output $smokeOut --net-id native-simple-cli `
   --feature-set halfka-hm-merged --arch 8x2-8-8 --activation pairwise `
   --superbatches 1 --batches-per-superbatch 1 --batch-size 64 --threads 1 --save-rate 1 `
@@ -115,7 +112,7 @@ Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckp
 同一の固定memory上fixtureでOS間throughputを比較する場合は次を実行する:
 
 ```powershell
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+cargo run -p nnue-trainer --release -- `
   native-bench --architecture all --precision all
 ```
 
@@ -137,8 +134,7 @@ currently targets Linux only. Windows is not supported." と明記する。加�
 cuda-oxide は rustc internal
 ABI に直結する experimental backend で、本リポの `build.rs` も CUDA toolkit
 root を Linux パス (`/usr/local/cuda` / `lib64/libcublas.so`) で解決する。
-したがって既定の cuda-oxide backend で GPU crate (`gpu-runtime` / `bins/*`) を
-使う場合は **WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
+cuda-oxide を opt-in する場合は **WSL2 + Ubuntu** を使う。WSL2 からは NVIDIA GPU が CUDA 経由で見えるため、
 WSL2 内では本ファイルの Linux 手順がそのまま通る (cuda-oxide が公式にテスト
 しているのも Ubuntu 24.04)。
 
@@ -172,11 +168,17 @@ cargo test --workspace --exclude gpu-runtime --exclude progress-kpabs-train --ex
 | 項目 | 要件 | 備考 |
 |---|---|---|
 | OS | Linux / WSL2、実験 backend は native Windows | 「対応 OS」参照 |
-| CUDA Toolkit | 12.x (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
+| CUDA Toolkit | compute_75 以降に対応する NVCC (12.9 で確認) | nvcc, libNVVM, nvJitLink, **libcublas** |
 | LLVM | **21+ (floor)、22 推奨** | apt.llvm.org が jammy / noble の両方に LLVM 20/21/22 を提供。`llc-22` が PATH にあれば cuda-oxide が優先する |
 | Clang | **clang-21 or 22** + `libclang-common-{21,22}-dev` | `cuda-bindings` の bindgen に必要 (LLVM 22 にしても clang-21/22 のどちらかが要る) |
 | Rust | nightly-2026-04-03 (cuda-oxide pinned) | `rust-toolchain.toml` で固定 |
-| GPU | **公式: Ampere+ (sm_80+)**。Turing (sm_75) も `CUDA_OXIDE_TARGET=sm_75` で動作 | RTX 30/40/50, A100, H100, B200 等 |
+| GPU | **公式: Ampere+ (sm_80+)**。native CUDA は Turing (sm_75) にも対応し、cuda-oxide では `CUDA_OXIDE_TARGET=sm_75` が必要 | 埋め込む PTX architecture は install 済み nvcc が報告する範囲が上限 |
+
+既定の native backend は `nvidia-smi` が報告する最小の compute capability を選び、
+すべての可視 GPU で JIT 可能な PTX を生成する。GPU が install 済み toolkit より
+新しい場合は `nvcc --list-gpu-arch` が報告する最大の virtual architecture へ丸め、
+CUDA driver が新しい GPU 向けにその PTX を JIT compile する。
+`TATARA_CUDA_COMPUTE` はこの選択を明示的に上書きする場合だけ設定する。
 
 ## CUDA toolkit root の解決
 
@@ -301,8 +303,8 @@ cuda-oxide の rev を bump したとき (library 側 `Cargo.toml` を更新し�
 bash scripts/build-kernels.sh
 ```
 
-これは GPU の世代を `nvidia-smi` で判定し、kernel を持つ全 bin
-(`nnue_train` / `progress_kpabs_train`) を `cargo-oxide build` でビルドする。
+これは GPU の世代を `nvidia-smi` で判定し、`nnue_train` の oracle kernel を
+`cargo-oxide build` でビルドする。
 Ampere+ は既定 (sm_80 PTX、前方互換)、Turing (sm_75) は `CUDA_OXIDE_TARGET` を
 自動設定するので、環境変数を手で打つ必要はない。
 
@@ -333,7 +335,7 @@ Turing GPU では `CUDA_ERROR_INVALID_PTX` (driver error 218) で load が失敗
 バイパスする一級 override で、`llc -mcpu=sm_75` までそのまま流れる:
 
 ```bash
-cd bins/progress_kpabs_train
+cd bins/nnue_train
 CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 ```
 
@@ -351,16 +353,15 @@ CUDA_OXIDE_TARGET=sm_75 cargo-oxide build
 - `cluster.*` — Thread Block Cluster (sm_90+)
 
 これらを含む IR を sm_75 PTX に compile すると `llc` か CUDA driver の JIT
-load 段階で失敗する。KP-abs progress 系の単純な kernel (forward / grad scatter
-/ adam_step / eval) は sm_75 の適用範囲内。fused optimizer step や async copy /
-Hopper 専用 ops を使う kernel は sm_80+ GPU が要る。
+load 段階で失敗する。fused optimizer step や async copy / Hopper 専用 ops を
+使う kernel は sm_80+ GPU が要る。
 
 `cargo-oxide build` が生成した `.ll` (build を実行した bin ディレクトリに出る)
 を grep して sm_80+ op の混入を確認できる:
 
 ```bash
 grep -E '(cp\.async|wgmma|tcgen05|tma\.|cluster\.)' \
-  bins/progress_kpabs_train/progress_kpabs_train.ll
+  bins/nnue_train/nnue_train.ll
 # (出力なし = OK)
 ```
 
@@ -385,14 +386,14 @@ kernel を改変しないユーザーも初回は `cargo-oxide build` が必要�
 
 | 世代 | sm | 代表的な GPU | 標準ビルドで動作 | `CUDA_OXIDE_TARGET=sm_XX` |
 |---|---|---|---|---|
-| Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | 未検証 (LLVM IR 互換性も要確認) |
-| Volta | sm_70 | V100, Titan V | ✗ | 動く可能性 (未検証) |
-| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✗ | ✅ 確認済み |
+| Pascal | sm_60/61 | GTX 10xx, P100 | 未検証 (kernel は double `atomicAdd` のため cc 6.0+ が必要、それ以上の制約は無い) | 未検証 (LLVM IR 互換性も要確認) |
+| Volta | sm_70 | V100, Titan V | 未検証 | 動く可能性 (未検証) |
+| Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✅ | ✅ 確認済み |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
 | Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ 確認済み (primary) | n/a |
 | Ada | sm_89 | RTX 40xx | ✅ | n/a |
 | Hopper | sm_90 | H100, H200 | ✅ | n/a |
-| Blackwell | sm_100/120 | B100, B200, RTX 50xx | ✅ | n/a |
+| Blackwell | sm_100/120 | B100, B200, RTX 50xx | install 済み nvcc が対応。未対応なら nvcc の対応上限向け PTX を生成 | n/a |
 
 cuda-oxide の rev は本リポジトリの `Cargo.toml` (`[workspace.dependencies]`) に
 pin し、`scripts/setup-cuda-oxide.sh` が `cargo-oxide` を同 rev に揃える。LLVM は

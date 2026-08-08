@@ -19,12 +19,5 @@ path = "src/main.rs"
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }
-gpu-runtime = { workspace = true, features = ["cuda-oxide"] }
+cuda-native-runtime = { workspace = true, features = ["native-cuda"] }
 clap = { workspace = true }
-
-# cuda-oxide deps: device 側 API (#[kernel] / DisjointSlice / atomics) と host 側
-# launch (cuda_launch! macro)。`cuda-core` は macro 展開で参照されるため explicit
-# dep。git rev pin は root Cargo.toml の [workspace.dependencies] に集約。
-cuda-core = { workspace = true }
-cuda-device = { workspace = true }
-cuda-host = { workspace = true }

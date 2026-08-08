@@ -53,3 +53,6 @@
 .idea/
 .vscode/
 *.swp
+
+# rustc / codegen backend の crash dump
+rustc-ice-*.txt

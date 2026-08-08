@@ -26,8 +26,12 @@ echo "== cargo clippy --workspace --all-targets -- -D warnings =="
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== native CUDA feature compile coverage =="
-cargo check -p nnue-trainer --features native-cuda
-cargo check -p nnue-trainer --no-default-features --features native-cuda-host
+cargo check -p nnue-trainer
+cargo check -p nnue-trainer --no-default-features --features oxide-parity
+
+echo "== cuda-oxide-only compile and lint coverage =="
+cargo check -p nnue-trainer --no-default-features --features oxide
+cargo clippy -p nnue-trainer --all-targets --no-default-features --features oxide -- -D warnings
 
 # kernel source を編集したあと `cargo-oxide build` を忘れると、kernel loader の
 # 鮮度チェックが `.ptx` vs `.ll` の mtime しか見ないため、test も本番 run も古い
@@ -40,6 +44,13 @@ bash scripts/build-kernels.sh
 
 echo "== bash scripts/check-native-cuda-parity.sh =="
 bash scripts/check-native-cuda-parity.sh
+
+# equivalence test は oxide feature gate 配下にあり、既定構成の
+# `cargo test --workspace` では skip される。oracle 構成で明示的に走らせる。
+# 各 test が独立に CUDA context と device buffer を確保するため、並列実行は
+# VRAM を食い潰して out of memory になり得る (12 GB GPU で実測)。直列で回す。
+echo "== cuda-oxide GPU/CPU equivalence tests =="
+cargo test -p nnue-trainer --release --no-default-features --features oxide -- --test-threads=1
 
 echo "== cargo test --workspace --release =="
 cargo test --workspace --release
