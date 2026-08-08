@@ -3,8 +3,9 @@
 # 学習 Quickstart
 
 `nnue-train` で将棋 NNUE を 1 から学習するための最短手順。GPU は Ampere+
-(sm_80+) 公式、Turing は `CUDA_OXIDE_TARGET=sm_75`。toolchain と CUDA / LLVM の
-準備は [docs/setup.ja.md](setup.ja.md) を参照。
+(sm_80+) 公式。既定ビルドは搭載 GPU の compute capability (Turing 含む) を
+`nvidia-smi` で自動検出する。toolchain と CUDA / NVCC の準備は
+[docs/setup.ja.md](setup.ja.md) を参照。
 
 学習する NNUE はアーキテクチャ(`simple` / `layerstack`)と入力 feature set を
 選んで決める(選択肢は [README](../README.ja.md) の「学習できる NNUE」を参照)。
@@ -187,15 +188,15 @@ target/release/nnue-train --data <PSV> \
 
 | 症状 | 原因 / 対応 |
 |---|---|
-| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | 初回ビルド時 `cd bins/nnue_train && cargo-oxide build` で `.ll` を生成する必要がある。詳細は [docs/setup.ja.md](setup.ja.md) |
+| `kernel artifact nnue_train.{cubin,ptx,ll} not found` | opt-in の `oxide` ビルドのみ: 初回ビルド時 `cd bins/nnue_train && cargo-oxide build` で `.ll` を生成する必要がある。詳細は [docs/setup.ja.md](setup.ja.md) |
 | `libcublas.so` 系の link / load エラー | CUDA Toolkit が `/usr/local/cuda` / `CUDA_HOME` / `CUDA_PATH` のいずれにも無い。`CUDA_TOOLKIT_PATH=/path/to/cuda-12.x` で明示する (build.rs / runtime 両方が同じ chain で解決) |
-| `CUDA_ERROR_INVALID_PTX` (driver error 218) | sub-Ampere GPU (sm_75) で `CUDA_OXIDE_TARGET` 未設定。`CUDA_OXIDE_TARGET=sm_75` を export してから再ビルド + 実行 |
+| `CUDA_ERROR_INVALID_PTX` (driver error 218) | 埋め込み PTX が GPU と不一致。既定ビルドは `nvidia-smi` でターゲットを自動検出するが、検出値は Cargo が追跡しないため GPU 交換後は `cargo clean -p cuda-native-runtime` してから再ビルドする。opt-in の `oxide` ビルドで sub-Ampere GPU (sm_75) の場合は `CUDA_OXIDE_TARGET=sm_75` を export してから再ビルド + 実行 |
 | pos/s が極端に低い (< 500K on RTX 3080 Ti) | `--threads` を増やし (CPU 物理コア数を目安に、上記「主な option」参照)、dataloader の prefetch が間に合っているか確認。`NNUE_TRAIN_STEP_PROFILE=1` で各 phase (h2d / fwd / bwd / optimizer) の所要 ms を stderr に出して内訳を確認できる |
 | `--batch-size must be a multiple of 16` で reject | tiled dense matmul kernel が `b % 16 == 0` を要求するため、CLI が起動時に明示エラーで reject する。16 の倍数を渡す (既定の 16384 は条件を満たす) |
 
 ## 関連
 
-- [docs/setup.ja.md](setup.ja.md) — toolchain (LLVM / CUDA / cuda-oxide) セットアップ
+- [docs/setup.ja.md](setup.ja.md) — toolchain (CUDA / NVCC、opt-in cuda-oxide) セットアップ
 - [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) — LayerStack の bucket 係数の学習と確認
 - [held-out validation](held-out-validation.ja.md) — `test_loss` / `test_acc` の有効化と指標の読み方
 - [学習スケジュール](training-schedule.ja.md) — 学習率と WDL lambda のスケジューリング

@@ -386,8 +386,8 @@ kernel を改変しないユーザーも初回は `cargo-oxide build` が必要�
 
 | 世代 | sm | 代表的な GPU | 標準ビルドで動作 | `CUDA_OXIDE_TARGET=sm_XX` |
 |---|---|---|---|---|
-| Pascal | sm_60/61 | GTX 10xx, P100 | ✗ | 未検証 (LLVM IR 互換性も要確認) |
-| Volta | sm_70 | V100, Titan V | ✗ | 動く可能性 (未検証) |
+| Pascal | sm_60/61 | GTX 10xx, P100 | 未検証 (kernel は double `atomicAdd` のため cc 6.0+ が必要、それ以上の制約は無い) | 未検証 (LLVM IR 互換性も要確認) |
+| Volta | sm_70 | V100, Titan V | 未検証 | 動く可能性 (未検証) |
 | Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✅ | ✅ 確認済み |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
 | Ampere | sm_86 | RTX 3080 Ti, RTX 30xx, A40, A10 | ✅ 確認済み (primary) | n/a |
