@@ -30,11 +30,6 @@ checkpoint、dataloader、schedule、trainer orchestrationを両backendで共有
 fat binaryはrelease buildで生成して実行fileへ埋め込める構造にする。利用者環境での
 runtime compileを必須にしない。source buildではNVCCを使用する。
 
-実装順は、WSL上で既存host pipelineとcuBLASを維持したままcuda-oxide互換のkernel ABIへ
-CUDA C++ fat binaryを差し込み、device側の数値・性能parityを先に確立する。その間に
-Driver APIのportable runtimeを独立して整備し、kernel coverageの完成後にtrainerのhost型を
-置き換える。最後に同じruntime境界をnative Windowsでbuild・実機検証する。
-
 ## Consequences
 
 - Windows native trainerをcuda-oxideのWindows対応から独立して実装できる。
@@ -48,22 +43,26 @@ Driver APIのportable runtimeを独立して整備し、kernel coverageの完成
   bit一致ではない。同一GPU上のhost runtime比較では追加の強い回帰検査としてbit fingerprintも使う。
 - CUDA C++化だけでは高速化を保証しない。既存throughputを維持することを移植時の基準とし、
   NVIDIA固有intrinsicやlibraryによる最適化はparity確立後に個別計測する。
-- native backendが全kernelを実装するまでは、対応architectureとprecision optionを明示して
-  unsupported構成を起動前に拒否する。
+- native backendは対応architectureとprecision optionを明示し、unsupported構成を
+  起動前に拒否する。対応範囲は「Backend feature構成」の対応一覧が正である。
 
 ## Backend feature構成
 
-- 既定buildは`cuda-oxide` featureを使い、従来のdevice/host実装を維持する。
-- `native-cuda`はcuda-oxide hostからCUDA C++ fat binaryを起動する比較用構成である。
-- `native-cuda-host`はCUDA C++ fat binaryとportable Driver API host runtimeだけを使う。
-  Windowsへ持ち込む対象はこの構成であり、次のようにcuda-oxide依存を無効化してbuildする。
+- 既定buildは`native` featureを使う。
+- `oxide-parity`はcuda-oxide hostからCUDA C++ fat binaryを起動する比較用構成である。
+- `native`はCUDA C++ fat binaryとportable Driver API host runtimeだけを使う。
+  Linux / WSL2 / native Windowsで次のようにbuildする。
 
 ```bash
 cargo build -p nnue-trainer \
-  --no-default-features --features native-cuda-host --release
+  --release
 ```
 
-`native-cuda-host`で現在対応するのは、HalfKaHmMergedを含むSimpleとLayerStackである。
+cuda-oxideは廃止せず、CPU referenceとの等価テスト資産を維持する数値・性能oracleとして
+opt-inで残す。両device backendを比較する`oxide-parity`構成は、既定featureと相互排他の
+ため`--no-default-features --features oxide-parity`でbuildする。
+
+`native`で現在対応するのは、HalfKaHmMergedを含むSimpleとLayerStackである。
 SimpleはCReLU / SCReLU / Pairwiseと任意のhidden dimension、LayerStackは可変層次元と
 bucket mode、PSQT、feature factorizer、threat / effect featureを扱う。両architectureで
 FP32 / FP16 option/state（TF32有効または無効）、factorizer、Sigmoid / WRM（拡張設定を

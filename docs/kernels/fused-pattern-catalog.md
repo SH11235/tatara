@@ -5,14 +5,13 @@ fused kernel は [fused kernel strategy ADR](../decisions/2026-05-09-fused-kerne
 が定めた「runtime fusion を build-time hand-fused kernel で代替する」方針の産物。
 LayerStack dense kernel と progress trainer kernel もここに併記する。
 
-GPU 側 `#[kernel]` 定義は cuda-oxide の bin-crate reachability 制約により bin
-crate 内に置く: `nnue-train` は `bins/nnue_train/src/kernels/` の 3 file
-(`common` / `layerstack` / `simple`)、`progress-kpabs-train` は
-`bins/progress_kpabs_train/src/main.rs`。主要 kernel には `crates/gpu-kernels/`
-配下に reference CPU 実装があり、GPU↔CPU の数値同等性テストは
-`bins/nnue_train/src/tests/gpu_cpu_equivalence_tests.rs` が持つ
-(progress trainer kernel の同等性テストは `bins/progress_kpabs_train/src/main.rs`
-内のテスト)。ただし **全 kernel が同等性テストで照合されているわけではない**
+cuda-oxide oracle の `#[kernel]` 定義は `bins/nnue_train/src/kernels/` に置く。
+progress trainer の CUDA C++ kernel は
+`crates/cuda-native-runtime/kernels/progress_kernels.cu` に置く。主要 kernel
+には `crates/gpu-kernels/` 配下に reference CPU 実装があり、GPU↔CPU の数値
+同等性テストは `bins/nnue_train/src/tests/gpu_cpu_equivalence_tests.rs` と
+`crates/cuda-native-runtime/tests/progress_smoke.rs` が持つ。ただし **全 kernel
+が同等性テストで照合されているわけではない**
 (Simple 専用 kernel の多くと、trainer から launch されない compile-reach 維持
 kernel は smoke と学習 run での検証のみ)。照合カバレッジの真実源は同テストファイル。
 

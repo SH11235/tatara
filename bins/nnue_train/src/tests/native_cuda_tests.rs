@@ -8,9 +8,9 @@ use nnue_train::{
 };
 use shogi_features::{EffectBucketConfig, FeatureSet, FtFactorizeMode, ThreatProfile};
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 use crate::kernel_module::with_test_native_backend;
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 use crate::trainer_simple::SimpleRawCheckpointState;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
@@ -26,7 +26,7 @@ const NATIVE_WEIGHT_ABS_TOLERANCE: f32 = 2.0e-9;
 const NATIVE_FIRST_MOMENT_ABS_TOLERANCE: f32 = 2.0e-10;
 const NATIVE_SECOND_MOMENT_ABS_TOLERANCE: f32 = 8.0e-12;
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 #[derive(Clone, Copy)]
 struct StateTolerances {
     weight: f32,
@@ -34,7 +34,7 @@ struct StateTolerances {
     second_moment: f32,
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 const LARGE_BATCH_STATE_TOLERANCES: StateTolerances = StateTolerances {
     weight: 5.0e-8,
     first_moment: 5.0e-7,
@@ -506,10 +506,8 @@ fn cuda_launch_stays_within_known_production_roots() {
     // native trainer が launch する crate。ここ以外に `cuda_launch!` が現れたら、native
     // export 検査 (`every_production_cuda_launch_is_exported`) の走査外になっていないか確認する。
     const NATIVE_LAUNCH_ROOT: &str = "bins/nnue_train/src";
-    // `cuda_launch!` を含むが native path ではない既知の場所。gpu-runtime は macro 定義と
-    // example、progress_kpabs_train は cuda-oxide 固定 backend。
-    const NON_NATIVE_LAUNCH_ROOTS: [&str; 2] =
-        ["crates/gpu-runtime", "bins/progress_kpabs_train/src"];
+    // `cuda_launch!` を含むが本検査の対象外の既知の場所 (macro 定義本体と example)。
+    const NON_NATIVE_LAUNCH_ROOTS: [&str; 1] = ["crates/gpu-runtime"];
 
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -647,14 +645,11 @@ fn create_layerstack_trainer_with_batch(
             &LayerStackInit::default_uniform(),
         )
     };
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "oxide-parity")]
     return with_test_native_backend(native, operation);
-    #[cfg(feature = "native-cuda-host")]
+    #[cfg(feature = "native")]
     {
-        assert!(
-            native,
-            "native-host build cannot create a cuda-oxide trainer"
-        );
+        assert!(native, "native build cannot create a cuda-oxide trainer");
         operation()
     }
 }
@@ -793,7 +788,7 @@ fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_layerstack_native_matches_cuda_oxide(
@@ -804,7 +799,7 @@ fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn large_batch_multistep_layerstack_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_layerstack_native_matches_cuda_oxide_with_batch(
@@ -819,7 +814,7 @@ fn large_batch_multistep_layerstack_native_matches_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn large_batch_multistep_all_optim_layerstack_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_layerstack_native_matches_cuda_oxide_with_batch(
@@ -840,7 +835,7 @@ fn large_batch_multistep_all_optim_layerstack_native_matches_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn complete_layerstack_native_configuration_matrix_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     for (name, options, loss) in layerstack_configuration_matrix() {
@@ -1078,7 +1073,7 @@ fn complete_layerstack_native_feature_matrix_runs_one_step()
     Ok(())
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_layerstack_native_matches_cuda_oxide(
     options: LayerStackTestOptions,
     loss: LossKind,
@@ -1087,7 +1082,7 @@ fn assert_layerstack_native_matches_cuda_oxide(
     assert_layerstack_native_matches_cuda_oxide_with_batch(options, loss, steps, SMOKE_BATCH)
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_layerstack_native_matches_cuda_oxide_with_batch(
     options: LayerStackTestOptions,
     loss: LossKind,
@@ -1131,7 +1126,7 @@ fn assert_layerstack_native_matches_cuda_oxide_with_batch(
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn all_threat_and_effect_profiles_layerstack_native_match_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     let base = FeatureSet::HalfKp.spec();
@@ -1173,7 +1168,7 @@ fn all_threat_and_effect_profiles_layerstack_native_match_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn production_ft_width_layerstack_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     // 既定の parity 構成は ft_out=128 のみで、`ft_out / 16` tile/grid や大 stride でだけ出る
@@ -1189,7 +1184,7 @@ fn production_ft_width_layerstack_native_matches_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     // TF32 L1 経路は有効 bucket segment のみ cuBLAS で上書きする。ある行の bucket が
@@ -1266,7 +1261,7 @@ fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
@@ -1379,7 +1374,7 @@ fn create_trainer_with_options(
     norm_loss_factor: Option<f32>,
     precision: PrecisionFlags,
 ) -> Result<SimpleGpuTrainer, Box<dyn std::error::Error>> {
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "oxide-parity")]
     let result = with_test_native_backend(native, || {
         SimpleGpuTrainer::new(
             context,
@@ -1393,12 +1388,9 @@ fn create_trainer_with_options(
             &SimpleInit::default_uniform(),
         )
     });
-    #[cfg(feature = "native-cuda-host")]
+    #[cfg(feature = "native")]
     let result = {
-        assert!(
-            native,
-            "native-host build cannot create a cuda-oxide trainer"
-        );
+        assert!(native, "native build cannot create a cuda-oxide trainer");
         SimpleGpuTrainer::new(
             context,
             batch_size,
@@ -1595,14 +1587,14 @@ fn assert_native_configuration_runs(
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn standard_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step(standard_id())
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn factorized_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1611,7 +1603,7 @@ fn factorized_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn screlu_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut id = standard_id();
@@ -1620,7 +1612,7 @@ fn screlu_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dy
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn pairwise_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1629,7 +1621,7 @@ fn pairwise_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn wide_hidden_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1639,7 +1631,7 @@ fn wide_hidden_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn radam_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
 {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1650,7 +1642,7 @@ fn radam_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn adamw_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
 {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1661,7 +1653,7 @@ fn adamw_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn tf32_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn std::error::Error>>
 {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1675,7 +1667,7 @@ fn tf32_simple_native_matches_cuda_oxide_after_one_step() -> Result<(), Box<dyn 
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn ft_fp16_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1689,7 +1681,7 @@ fn ft_fp16_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn ft_fp16_out_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1704,7 +1696,7 @@ fn ft_fp16_out_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn ft_fp16_out_screlu_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1721,7 +1713,7 @@ fn ft_fp16_out_screlu_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn ft_fp16_out_pairwise_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1738,7 +1730,7 @@ fn ft_fp16_out_pairwise_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn fp16_optimizer_state_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1752,7 +1744,7 @@ fn fp16_optimizer_state_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn all_fp16_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1768,7 +1760,7 @@ fn all_fp16_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn factorized_all_fp16_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut id = standard_id();
@@ -1786,7 +1778,7 @@ fn factorized_all_fp16_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn all_fp16_adamw_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_options(
@@ -1802,7 +1794,7 @@ fn all_fp16_adamw_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn all_fp16_ranger_lookahead_simple_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_with_training_options_and_steps(
@@ -1821,7 +1813,7 @@ fn all_fp16_ranger_lookahead_simple_native_matches_cuda_oxide()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn all_feature_sets_simple_native_match_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     for feature_set in FeatureSet::ALL {
@@ -1836,7 +1828,7 @@ fn all_feature_sets_simple_native_match_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn norm_loss_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_training_options(
@@ -1849,7 +1841,7 @@ fn norm_loss_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn sigmoid_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_native_matches_cuda_oxide_after_one_step_with_training_options(
@@ -1862,7 +1854,7 @@ fn sigmoid_simple_native_matches_cuda_oxide_after_one_step()
 }
 
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn extended_wrm_simple_native_matches_cuda_oxide_after_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
     let extended = match SMOKE_LOSS_WRM {
@@ -1895,7 +1887,7 @@ fn extended_wrm_simple_native_matches_cuda_oxide_after_one_step()
     )
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_native_matches_cuda_oxide_after_one_step(
     id: SimpleId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1906,7 +1898,7 @@ fn assert_native_matches_cuda_oxide_after_one_step(
     )
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_native_matches_cuda_oxide_after_one_step_with_options(
     id: SimpleId,
     optimizer: OptimizerKind,
@@ -1921,7 +1913,7 @@ fn assert_native_matches_cuda_oxide_after_one_step_with_options(
     )
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_native_matches_cuda_oxide_after_one_step_with_training_options(
     id: SimpleId,
     optimizer: OptimizerKind,
@@ -1939,7 +1931,7 @@ fn assert_native_matches_cuda_oxide_after_one_step_with_training_options(
     )
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
     id: SimpleId,
     optimizer: OptimizerKind,
@@ -1980,7 +1972,7 @@ fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
     assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_trainers_close(
     id: SimpleId,
     oxide_loss: f64,
@@ -2022,7 +2014,7 @@ fn assert_trainers_close(
 /// 続く 6 step 目 (lookahead 発火点) の結果も無中断の 6 step 状態と比較する。保存元も
 /// 両 backend を試すため、双方向の resume を覆う。
 #[test]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
@@ -2119,7 +2111,7 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
     Ok(())
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_checkpoint_state_bit_identical(
     path: &str,
     expected: &SimpleRawCheckpointState,
@@ -2159,7 +2151,7 @@ fn assert_checkpoint_state_bit_identical(
     }
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_checkpoint_state_close(
     path: &str,
     expected: &SimpleRawCheckpointState,
@@ -2177,7 +2169,7 @@ fn assert_checkpoint_state_close(
     );
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_checkpoint_state_close_with_tolerances(
     path: &str,
     expected: &SimpleRawCheckpointState,
@@ -2210,7 +2202,7 @@ fn assert_checkpoint_state_close_with_tolerances(
     }
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_checkpoint_state_delta_close(
     path: &str,
     baseline: &SimpleRawCheckpointState,
@@ -2293,7 +2285,7 @@ fn assert_checkpoint_state_delta_close(
     }
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn state_abs_tolerance(state_name: &str, tolerances: StateTolerances) -> f32 {
     match state_name {
         "first moment" => tolerances.first_moment,
@@ -2303,12 +2295,12 @@ fn state_abs_tolerance(state_name: &str, tolerances: StateTolerances) -> f32 {
     }
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_weight_group_close(name: &str, expected: &[f32], actual: &[f32]) {
     assert_weight_group_close_with_abs(name, expected, actual, NATIVE_WEIGHT_ABS_TOLERANCE);
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "oxide-parity")]
 fn assert_weight_group_close_with_abs(
     name: &str,
     expected: &[f32],

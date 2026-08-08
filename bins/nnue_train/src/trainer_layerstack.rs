@@ -45,7 +45,7 @@ pub(crate) struct StepOptions<'a> {
     prof_t0: &'a mut std::time::Instant,
 }
 
-#[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+#[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
 pub(crate) type LayerStackRawCheckpointState =
     (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
@@ -1102,7 +1102,7 @@ impl GpuTrainer {
         self.sync_stack_forward_weights()
     }
 
-    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
     pub(crate) fn set_stack_shared_delta_for_test(
         &mut self,
         l2_w: &[f32],
@@ -1121,7 +1121,7 @@ impl GpuTrainer {
         self.sync_stack_forward_weights()
     }
 
-    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
     pub(crate) fn reduce_l2_weight_grad_for_test(
         &mut self,
         bucketed_grad: &[f32],
@@ -1542,7 +1542,7 @@ impl GpuTrainer {
     /// bucket index (padding 行は `-1`) を host へ download する。TF32 経路は有効 bucket segment
     /// だけを cuBLAS で上書きするため、padding 行の 0 初期化が無いと prior step の残差が残る。
     /// その 0 初期化を直接固定する test に使う。
-    #[cfg(all(test, feature = "native-cuda"))]
+    #[cfg(all(test, feature = "oxide-parity"))]
     pub(crate) fn l1_bucket_sorted_and_index_to_host_for_test(
         &self,
     ) -> Result<(Vec<f32>, Vec<i32>), Box<dyn std::error::Error>> {
@@ -1552,7 +1552,7 @@ impl GpuTrainer {
         ))
     }
 
-    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
     pub(crate) fn raw_checkpoint_state_to_host(
         &self,
     ) -> Result<LayerStackRawCheckpointState, Box<dyn std::error::Error>> {

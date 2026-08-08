@@ -637,7 +637,7 @@ pub(crate) enum ArchCommand {
     #[command(name = "bench-pos")]
     BenchPos(BenchPosArgs),
     /// Run the fixed native CUDA throughput benchmark and write a JSON report.
-    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    #[cfg(any(feature = "oxide-parity", feature = "native"))]
     #[command(name = "native-bench")]
     NativeBench(NativeBenchArgs),
 }
@@ -652,7 +652,7 @@ impl ArchCommand {
             ArchCommand::BenchPos(_) => {
                 unreachable!("bench-pos does not select a training architecture")
             }
-            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => {
                 unreachable!("native-bench does not select a training architecture")
             }
@@ -683,7 +683,7 @@ pub(crate) struct BenchPosArgs {
     pub(crate) allow_dirty: bool,
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 #[derive(Args, Debug)]
 pub(crate) struct NativeBenchArgs {
     /// Fixed fixture profile. Changing fixture defaults requires a new profile version.
@@ -727,14 +727,14 @@ pub(crate) struct NativeBenchArgs {
     pub(crate) allow_dirty: bool,
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum NativeBenchProfileArg {
     #[default]
     V1,
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum NativeBenchArchitectureArg {
     Layerstack,
@@ -743,7 +743,7 @@ pub(crate) enum NativeBenchArchitectureArg {
     All,
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum NativeBenchPrecisionArg {
     Fp32,
@@ -753,7 +753,7 @@ pub(crate) enum NativeBenchPrecisionArg {
     All,
 }
 
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum NativeBenchModeArg {
     #[default]

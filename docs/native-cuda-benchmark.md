@@ -35,14 +35,14 @@ round-robin bucket indices (`row % 9`). This isolates trainer/GPU throughput. Us
 CUDA C++ only, supported on Windows and Linux/WSL:
 
 ```sh
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- \
+cargo run -p nnue-trainer --release -- \
   native-bench --architecture all --precision all
 ```
 
 The same command in PowerShell is:
 
 ```powershell
-cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+cargo run -p nnue-trainer --release -- `
   native-bench --architecture all --precision all
 ```
 
@@ -50,7 +50,7 @@ cuda-oxide versus CUDA C++, supported on Linux/WSL:
 
 ```sh
 bash scripts/build-kernels.sh
-cargo run -p nnue-trainer --release --features native-cuda -- \
+cargo run -p nnue-trainer --release --no-default-features --features oxide-parity -- \
   native-bench --mode compare --architecture all --precision all
 ```
 

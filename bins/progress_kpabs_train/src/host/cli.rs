@@ -8,7 +8,7 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "progress-kpabs-train")]
-#[command(about = "KP-absolute progress trainer (cuda-oxide kernels)")]
+#[command(about = "KP-absolute progress trainer (native CUDA kernels)")]
 pub struct Args {
     /// Training data PSV file(s) (`.bin`). Separate multiple files with `,`.
     /// When omitted, `run_training` returns an error (effectively required).

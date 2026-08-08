@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# cuda-oxide の kernel ビルドツール `cargo-oxide` と、その codegen backend
+# opt-in の cuda-oxide oracle に使う kernel ビルドツール `cargo-oxide` と、
+# その codegen backend
 # cache (`~/.cargo/cuda-oxide/`) を、本リポジトリが pin している cuda-oxide の
 # git rev に揃えるセットアップスクリプト。
 #
@@ -214,5 +215,4 @@ fi
 echo
 echo "次のステップ — kernel を PTX 化してビルド (CUDA_OXIDE_TARGET は GPU 世代に合わせる):"
 echo "  (cd bins/nnue_train           && CUDA_OXIDE_TARGET=sm_86 cargo-oxide build)"
-echo "  (cd bins/progress_kpabs_train && CUDA_OXIDE_TARGET=sm_86 cargo-oxide build)"
 echo "GPU 世代と sm_XX の対応は docs/setup.md のサポート GPU マトリクスを参照。"

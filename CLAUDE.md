@@ -120,5 +120,5 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 ## 作業前 checklist
 
 - 設計判断は ADR (`docs/decisions/`) に記録する
-- cuda-oxide / nightly toolchain の構成は壊さない、host 側 unsafe は妥当性を
-  コメントで明記する
+- native CUDA 既定 backend / cuda-oxide oracle / nightly toolchain の構成は壊さない、
+  host 側 unsafe は妥当性をコメントで明記する

@@ -1,15 +1,18 @@
-//! cuda-oxide host 側 API の薄い wrapper。
+//! GPU host runtime の薄い wrapper。backend は feature で排他選択する。
 //!
-//! GPU カーネルは cuda-oxide で書く (docs/decisions/ 参照)。`cuda-core` と
-//! `cuda-host` の主要 type を再 export しつつ、`Error` で `DriverError` /
-//! `LtoirError` を `thiserror` 経由でラップする。kernel artifact の探索と
-//! `.ll`→`.ptx` 変換は [`kernel_loader`] に置く。
+//! - `native`: CUDA C++ kernel を CUDA Driver API から launch する portable runtime
+//! - `oxide`: cuda-oxide host API (`cuda-core` / `cuda-host`) を再 export し、
+//!   `Error` で `DriverError` / `LtoirError` を `thiserror` 経由でラップする。
+//!   kernel artifact の探索と `.ll`→`.ptx` 変換は [`kernel_loader`] に置く
+//!
+//! どちらの backend も同じ型名 (`CudaContext` / `DeviceBuffer` / `CudaStream` 等) と
+//! `BLOCK_DIM` / `grid_dim_1d` を公開するため、上位 crate は backend を意識せずに書ける。
 //!
 //! ## 設計方針
 //!
-//! 「薄く」をモットーに、cuda-oxide の type-safe API を再発明せず素直に
-//! 透過する。命名 alias (`DeviceAlloc`, `Stream`) は **type alias** で提供し、
-//! cuda-oxide 側の名前 (`DeviceBuffer`, `CudaStream`) も並行して公開する。
+//! 「薄く」をモットーに、backend が提供する type-safe API を再発明せず素直に
+//! 透過する。`oxide` では命名 alias (`DeviceAlloc`, `Stream`) を **type alias** で
+//! 提供し、cuda-oxide 側の名前 (`DeviceBuffer`, `CudaStream`) も並行して公開する。
 //!
 //! `KernelLauncher` 相当は **新規 struct を作らず**、cuda-oxide が提供する
 //! `cuda_launch!` macro を error context だけ付与する薄い macro で包む方針。
@@ -22,40 +25,43 @@
 //!   するが、本 crate は `cuda-async` を dep にしていない。非同期 launch が
 //!   必要になった段階で `cuda-async` 込みで再公開する。
 
-#[cfg(all(feature = "cuda-oxide", feature = "native-cuda"))]
-compile_error!("gpu-runtime backends are mutually exclusive");
-#[cfg(not(any(feature = "cuda-oxide", feature = "native-cuda")))]
-compile_error!("gpu-runtime requires either `cuda-oxide` or `native-cuda`");
+#[cfg(all(feature = "oxide", feature = "native"))]
+compile_error!(
+    "gpu-runtime backends are mutually exclusive; inspect the dependency feature graph to find \
+     what enables `oxide` and `native`"
+);
+#[cfg(not(any(feature = "oxide", feature = "native")))]
+compile_error!("gpu-runtime requires either `oxide` or `native`");
 
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub mod kernel_loader;
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 mod native_backend;
 
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub use cuda_core::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, DeviceBuffer, DriverError,
     LaunchConfig,
 };
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub use cuda_host::LtoirError;
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub use kernel_loader::{BLOCK_DIM, grid_dim_1d, load_kernel_module_with_fallback};
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 pub use native_backend::{
     CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, KernelArgs, LaunchConfig,
 };
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 pub const BLOCK_DIM: u32 = 256;
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 pub fn grid_dim_1d(n: usize, block: u32) -> (u32, u32, u32) {
     (((n as u32).max(1)).div_ceil(block), 1, 1)
 }
 
 #[doc(hidden)]
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub use cuda_host as __cuda_host;
 
 /// CUDA kernel を起動し、失敗時に kernel 名を付与する。
@@ -66,7 +72,7 @@ pub use cuda_host as __cuda_host;
 /// 下層 macro は field 順不同だが、この wrapper の arm は `kernel:` が先頭の launch
 /// のみ受理する。順序を変えた launch は分かりにくい macro error になるため先頭に書く。
 #[macro_export]
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 macro_rules! cuda_launch {
     (kernel: $kernel:path, $($rest:tt)*) => {
         $crate::__cuda_host::cuda_launch! {
@@ -82,7 +88,7 @@ macro_rules! cuda_launch {
 
 #[doc(hidden)]
 #[macro_export]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 macro_rules! __native_cuda_push_args {
     ($args:ident;) => {};
     ($args:ident; slice($buffer:expr) $(, $($rest:tt)*)?) => {{
@@ -100,7 +106,7 @@ macro_rules! __native_cuda_push_args {
 }
 
 #[macro_export]
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 macro_rules! cuda_launch {
     (
         kernel: $kernel:path,
@@ -127,15 +133,15 @@ macro_rules! cuda_launch {
 /// (`gpu-runtime` 自身ではない)。kernel artifact を自 crate に同梱するケース
 /// ではそのまま使える。任意 path から PTX を読みたい場合は
 /// `CudaContext::load_module_from_file(path)` を直接使うこと。
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub use cuda_host::load_kernel_module;
 
 /// `DeviceBuffer<T>` の短縮名 alias。
 ///
 /// `gpu_runtime::DeviceAlloc<T>` でも `gpu_runtime::DeviceBuffer<T>` でも同じ。
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub type DeviceAlloc<T> = DeviceBuffer<T>;
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 pub type DeviceAlloc<T> = DeviceBuffer<T>;
 
 /// `CudaStream` の短縮名 alias。
@@ -151,18 +157,18 @@ pub type Stream = CudaStream;
 /// kernel launch failure の独自分類はここに variant を増やす想定。
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     #[error(transparent)]
     Cuda(#[from] DriverError),
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     #[error(transparent)]
     NativeCuda(#[from] cuda_native_runtime::NativeCudaError),
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     #[error(transparent)]
     Ltoir(#[from] LtoirError),
     /// CUDA kernel launch の失敗。
     #[error("CUDA kernel launch `{kernel}` failed: {source}")]
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     KernelLaunch {
         kernel: &'static str,
         #[source]
@@ -182,9 +188,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub fn create_compute_stream(
     ctx: &std::sync::Arc<CudaContext>,
 ) -> Result<std::sync::Arc<CudaStream>> {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     return Ok(ctx.default_stream());
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     ctx.new_stream()
 }
 
@@ -195,7 +201,7 @@ pub fn create_compute_stream(
 /// `DriverError` でも検出できるよう `&dyn Error` を受ける。判定は driver の
 /// `cuGetErrorName` ([`DriverError::error_name`]) が返す symbolic name で行い、
 /// `cuda_bindings` の `CUresult` 内部表現に依存しない。OOM 以外では true を返さない。
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 pub fn is_out_of_memory(err: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(e) = err.downcast_ref::<DriverError>() {
         return driver_error_is_out_of_memory(e);
@@ -209,14 +215,14 @@ pub fn is_out_of_memory(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-#[cfg(feature = "cuda-oxide")]
+#[cfg(feature = "oxide")]
 fn driver_error_is_out_of_memory(e: &DriverError) -> bool {
     e.error_name()
         .map(|name| name.to_bytes() == b"CUDA_ERROR_OUT_OF_MEMORY")
         .unwrap_or(false)
 }
 
-#[cfg(feature = "native-cuda")]
+#[cfg(feature = "native")]
 pub use native_backend::is_out_of_memory;
 
 /// Fills a device allocation byte-wise on `stream`.
@@ -225,7 +231,7 @@ pub fn memset_d8_async<T: Copy>(
     value: u8,
     stream: &CudaStream,
 ) -> Result<()> {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     // SAFETY: buffer owns exactly num_bytes and stream/context compatibility is caller-owned.
     unsafe {
         cuda_core::memory::memset_d8_async(
@@ -235,7 +241,7 @@ pub fn memset_d8_async<T: Copy>(
             stream.cu_stream(),
         )?;
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     buffer.fill_byte_async(value, stream)?;
     Ok(())
 }
@@ -251,7 +257,7 @@ pub unsafe fn memcpy_htod_async<T: Copy>(
     stream: &CudaStream,
 ) -> Result<()> {
     assert!(values.len() <= buffer.len());
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     // SAFETY: capacity is checked and caller owns the source lifetime.
     unsafe {
         cuda_core::memory::memcpy_htod_async(
@@ -261,7 +267,7 @@ pub unsafe fn memcpy_htod_async<T: Copy>(
             stream.cu_stream(),
         )?;
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     // SAFETY: capacity is checked and caller owns the source lifetime.
     unsafe {
         buffer.copy_from_host_async(stream, values)?;
@@ -280,7 +286,7 @@ pub unsafe fn memcpy_dtoh_async<T: Copy>(
     stream: &CudaStream,
 ) -> Result<()> {
     assert!(values.len() <= buffer.len());
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     // SAFETY: capacity is checked and caller owns exclusive destination access.
     unsafe {
         cuda_core::memory::memcpy_dtoh_async(
@@ -290,7 +296,7 @@ pub unsafe fn memcpy_dtoh_async<T: Copy>(
             stream.cu_stream(),
         )?;
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     // SAFETY: capacity is checked and caller owns exclusive destination access.
     unsafe {
         buffer.copy_to_host_async(stream, values)?;
@@ -304,7 +310,7 @@ pub unsafe fn memcpy_dtoh_async<T: Copy>(
 ///
 /// The returned pointer must be released exactly once with [`free_pinned_host`].
 pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut std::ffi::c_void> {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     {
         use cuda_core::IntoResult as _;
         let mut raw = std::ptr::null_mut();
@@ -319,7 +325,7 @@ pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut std::ffi::c_void> {
         }
         Ok(raw)
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     // SAFETY: ownership transfers to caller.
     unsafe {
         native_backend::alloc_pinned_host(bytes)
@@ -332,14 +338,14 @@ pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut std::ffi::c_void> {
 ///
 /// `raw` must be a live allocation from [`alloc_pinned_host`] with no in-flight transfer.
 pub unsafe fn free_pinned_host(raw: *mut std::ffi::c_void) -> Result<()> {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     {
         use cuda_core::IntoResult as _;
         // SAFETY: caller guarantees raw is live and no transfer is in flight.
         unsafe { cuda_core::sys::cuMemFreeHost(raw).result()? };
         Ok(())
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     // SAFETY: caller guarantees raw is live and no transfer is in flight.
     unsafe {
         native_backend::free_pinned_host(raw)
@@ -348,7 +354,7 @@ pub unsafe fn free_pinned_host(raw: *mut std::ffi::c_void) -> Result<()> {
 
 /// Returns `(multiprocessor_count, max_threads_per_multiprocessor)`.
 pub fn device_occupancy_attributes(ctx: &CudaContext) -> Result<(i32, i32)> {
-    #[cfg(feature = "cuda-oxide")]
+    #[cfg(feature = "oxide")]
     {
         use cuda_core::IntoResult as _;
         ctx.bind_to_thread()?;
@@ -371,7 +377,7 @@ pub fn device_occupancy_attributes(ctx: &CudaContext) -> Result<(i32, i32)> {
             Ok((sm.assume_init(), threads.assume_init()))
         }
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(feature = "native")]
     ctx.occupancy_attributes()
 }
 

@@ -1,9 +1,7 @@
 //! Forward pass の reference CPU 実装。
 //!
-//! GPU 側 (`#[kernel] fn forward`) は `src/main.rs` に inline 定義されている
-//! (cuda-oxide の rustc-codegen-cuda backend は bin entry 経由で到達可能な
-//! kernel しか PTX 化しないため)。本 module の `forward_cpu` は GPU と同じ
-//! ロジックを host に書き写したもので、host loop の numerical equivalence test
+//! GPU 側は CUDA C++ の `progress_forward`。本 module の `forward_cpu` は
+//! GPU と同じロジックを host に書き写したもので、numerical equivalence test
 //! の reference に使う。
 //!
 //! ## アルゴリズム
@@ -19,7 +17,7 @@
 //!
 //! ## 実装メモ
 //!
-//! - `(-z).exp()` は cuda-oxide が libdevice 経由で `__nv_expf` に lowering する。
+//! - GPU 側の `expf` と比較するため、reference も f32 の指数関数を使う。
 
 /// Reference CPU 実装。
 ///

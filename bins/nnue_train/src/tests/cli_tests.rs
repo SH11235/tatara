@@ -242,7 +242,7 @@ fn bench_pos_subcommand_uses_tracked_and_local_defaults() {
 }
 
 #[test]
-#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[cfg(any(feature = "oxide-parity", feature = "native"))]
 fn native_bench_subcommand_has_fixed_v1_defaults() {
     let cli = Cli::try_parse_from(["nnue-train", "native-bench"])
         .expect("native-bench subcommand should parse");
@@ -294,7 +294,7 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
         ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
 }
@@ -445,7 +445,7 @@ fn simple_accepts_tf32_flag() {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
         ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
 }
@@ -714,7 +714,7 @@ fn simple_activation_arg_parses_and_maps() {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
             ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };
         assert_eq!(SimpleActivation::from_canonical_name(&act), Some(want));
