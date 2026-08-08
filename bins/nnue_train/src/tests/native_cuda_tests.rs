@@ -506,11 +506,8 @@ fn cuda_launch_stays_within_known_production_roots() {
     // native trainer が launch する crate。ここ以外に `cuda_launch!` が現れたら、native
     // export 検査 (`every_production_cuda_launch_is_exported`) の走査外になっていないか確認する。
     const NATIVE_LAUNCH_ROOT: &str = "bins/nnue_train/src";
-    // `cuda_launch!` を含むが本検査の対象外の既知の場所。gpu-runtime は macro 定義と
-    // example、progress_kpabs_train は別 fatbin (`progress_kernels.cu`) を持ち、その
-    // export は cuda-native-runtime 側の inventory test が見る。
-    const NON_NATIVE_LAUNCH_ROOTS: [&str; 2] =
-        ["crates/gpu-runtime", "bins/progress_kpabs_train/src"];
+    // `cuda_launch!` を含むが本検査の対象外の既知の場所 (macro 定義本体と example)。
+    const NON_NATIVE_LAUNCH_ROOTS: [&str; 1] = ["crates/gpu-runtime"];
 
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
