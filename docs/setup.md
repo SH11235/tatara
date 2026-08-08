@@ -401,7 +401,7 @@ prebuilt `.ptx`, so even users who do not modify the kernels need
 
 | Generation | sm | Representative GPUs | Works with a standard build | `CUDA_OXIDE_TARGET=sm_XX` |
 |---|---|---|---|---|
-| Pascal | sm_60/61 | GTX 10xx, P100 | Untested (the kernels require cc 6.0+ for double `atomicAdd`; nothing older is gated out) | Untested (LLVM IR compatibility also unverified) |
+| Pascal | sm_60/61 | GTX 10xx, P100 | Untested (the kernels require cc 6.0+ for double `atomicAdd` and nothing beyond that) | Untested (LLVM IR compatibility also unverified) |
 | Volta | sm_70 | V100, Titan V | Untested | May work (untested) |
 | Turing | sm_75 | RTX 2070 SUPER, GTX 16xx, T4 | ✅ | ✅ Verified |
 | Ampere | sm_80 | A100, A30 | ✅ | n/a |
