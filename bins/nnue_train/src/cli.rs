@@ -36,10 +36,14 @@ impl FromStr for TeacherShuffleBufferMib {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MIN_MIB: usize = 256;
+#[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
+#[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> usize {
     let memory_mib = memory_bytes / (1024 * 1024);
     let per_window_mib = memory_mib / AUTO_TEACHER_BUFFER_MEMORY_DIVISOR;
@@ -48,6 +52,7 @@ pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> us
         .clamp(AUTO_TEACHER_BUFFER_MIN_MIB, AUTO_TEACHER_BUFFER_MAX_MIB)
 }
 
+#[cfg(feature = "gpu")]
 impl TeacherShuffleBufferMib {
     pub(crate) fn resolve(self) -> usize {
         match self {

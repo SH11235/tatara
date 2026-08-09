@@ -48,7 +48,6 @@ fn teacher_shuffle_window_defaults_and_overrides_parse() {
         configured.teacher_shuffle_buffer_mib,
         TeacherShuffleBufferMib::Explicit(512)
     );
-    assert_eq!(configured.teacher_shuffle_buffer_mib.resolve(), 512);
     assert!(configured.no_teacher_shuffle);
     assert_eq!(configured.teacher_shuffle_seed, 42);
 }

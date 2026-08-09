@@ -13,7 +13,7 @@ publish = false
 [features]
 # `--no-default-features` は CI 用の CPU-testable subset のみを compile し、生成 binary では学習を実行できない。
 default = ["gpu", "native"]
-gpu = ["dep:gpu-runtime"]
+gpu = ["dep:gpu-runtime", "dep:sysinfo"]
 oxide = [
     "gpu",
     "dep:cuda-core",
@@ -54,7 +54,7 @@ clap = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"], optional = true }
 
 # cuda-oxide device 側 API (`#[kernel]` / DisjointSlice / atomics) + host 側
 # launch (`cuda_launch!` macro)。`cuda-core` は `cuda_launch!` の展開で参照
