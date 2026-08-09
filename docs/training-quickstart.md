@@ -101,7 +101,7 @@ change for real training are:
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
-| `--teacher-shuffle-buffer-mib` | 256 | Teacher-data read-ahead and shuffle window size in MiB, per window. Two windows are used, so additional raw-PSV memory is approximately twice this value. Set it to `0` to restore direct sequential reading without windows |
+| `--teacher-shuffle-buffer-mib` | auto | Teacher-data read-ahead and shuffle window size in MiB, per window. `auto` uses 1/16 of the smaller of total RAM and the cgroup limit, clamped to 256–4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value. Pass a number to fix the size, or `0` for direct sequential reading without windows |
 | `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering |
 | `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index. The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
@@ -111,18 +111,24 @@ change for real training are:
 
 ### Teacher-data read-ahead and shuffle
 
-By default, a producer thread reads PSV records sequentially into 256 MiB windows. While the CPU
-dataloader consumes one window, the producer prepares the next. A completed window is reordered
+The default `auto` size is 1/16 of the smaller of total RAM and the cgroup memory limit, clamped to
+256–4096 MiB per window. A producer thread reads PSV records sequentially into windows of that
+size. While the CPU dataloader consumes one window, the producer prepares the next. A completed window is reordered
 with Fisher–Yates. A partial window at physical EOF is processed without mixing records from the
 next dataset epoch, and the next epoch uses a different seed that includes its epoch number. This
 avoids repeating exactly the same order when training makes multiple passes over an already
 pre-shuffled PSV.
 
-Additional raw memory is approximately `2 × --teacher-shuffle-buffer-mib`: about 512 MiB by
-default, or about 8 GiB with `--teacher-shuffle-buffer-mib 4096`. A larger window can absorb longer
+As a guide, machines limited to 8/16/32/64 GiB or more resolve to 512 MiB/1 GiB/2 GiB/4 GiB per
+window. The startup `auto -> N MiB x2` message and `experiment.json` record the resolved value.
+The calculation does not use currently available memory, so other processes and page-cache state
+do not change the result for a fixed memory limit.
+
+Additional raw memory is approximately twice the effective value; an explicit
+`--teacher-shuffle-buffer-mib 4096` adds about 8 GiB. A larger window can absorb longer
 HDD stalls, but it also increases the delay before the first batch, CPU time spent shuffling, and
-random memory traffic. Start with the default, observe throughput and memory usage, and increase it
-gradually only when needed. `--threads` controls decode workers; it does not parallelise the
+random memory traffic. Use an explicit value such as 256 when throughput or lower memory usage is
+more important. `--threads` controls decode workers; it does not parallelise the
 producer's window shuffle.
 
 ```bash

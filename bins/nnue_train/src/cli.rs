@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 #[cfg(any(feature = "gpu", test))]
@@ -14,6 +15,56 @@ fn parse_positive_i32(value: &str) -> Result<i32, String> {
         return Err("fv_scale must be greater than zero".to_string());
     }
     Ok(parsed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeacherShuffleBufferMib {
+    Auto,
+    Explicit(usize),
+}
+
+impl FromStr for TeacherShuffleBufferMib {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        value.parse::<usize>().map(Self::Explicit).map_err(|_| {
+            "teacher shuffle buffer must be 'auto' or a non-negative integer MiB value".to_string()
+        })
+    }
+}
+
+const AUTO_TEACHER_BUFFER_MIN_MIB: usize = 256;
+const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
+const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
+
+pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> usize {
+    let memory_mib = memory_bytes / (1024 * 1024);
+    let per_window_mib = memory_mib / AUTO_TEACHER_BUFFER_MEMORY_DIVISOR;
+    usize::try_from(per_window_mib)
+        .unwrap_or(usize::MAX)
+        .clamp(AUTO_TEACHER_BUFFER_MIN_MIB, AUTO_TEACHER_BUFFER_MAX_MIB)
+}
+
+impl TeacherShuffleBufferMib {
+    pub(crate) fn resolve(self) -> usize {
+        match self {
+            Self::Explicit(mib) => mib,
+            Self::Auto => {
+                let mut system = sysinfo::System::new();
+                system.refresh_memory();
+                let host_bytes = system.total_memory();
+                let effective_bytes = system
+                    .cgroup_limits()
+                    .map(|limits| limits.total_memory)
+                    .filter(|&bytes| bytes > 0)
+                    .map_or(host_bytes, |limit| host_bytes.min(limit));
+                auto_teacher_shuffle_buffer_mib_for_bytes(effective_bytes)
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -404,11 +455,11 @@ pub(crate) struct Cli {
     /// order within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
-    /// Raw PSV shuffle window size in MiB, per window. Two windows are kept so the next one can
-    /// be read while the current one is consumed; the default therefore uses about 512 MiB of raw
-    /// teacher-data memory. Set to 0 to restore direct sequential reading.
-    #[arg(long, default_value_t = 256, global = true)]
-    pub(crate) teacher_shuffle_buffer_mib: usize,
+    /// Raw PSV shuffle window size in MiB, per window. The default `auto` uses 1/16 of total RAM
+    /// (or the cgroup limit), clamped to 256..=4096 MiB. Two windows are kept, so raw teacher-data
+    /// memory is approximately twice the resolved value. Set to 0 for direct sequential reading.
+    #[arg(long, default_value = "auto", global = true)]
+    pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.
     #[arg(long, global = true)]
     pub(crate) no_teacher_shuffle: bool,

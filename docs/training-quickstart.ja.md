@@ -92,7 +92,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
-| `--teacher-shuffle-buffer-mib` | 256 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。2窓を使うためraw PSVの追加メモリは概ね指定値の2倍。`0`で窓を使わない直接逐次読みへ戻す |
+| `--teacher-shuffle-buffer-mib` | auto | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。`auto`は総RAMまたはcgroup上限の小さい方の1/16を、256–4096 MiB/窓に収めて使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍。数値で固定でき、`0`で窓を使わない直接逐次読みへ戻す |
 | `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途 |
 | `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
@@ -102,16 +102,21 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 
 ### 教師データの先読みとshuffle
 
-既定ではproducer threadがPSVを256 MiBずつ逐次読みし、一方の窓をCPU dataloaderが
-消費している間に次の窓を準備する。窓が完成するとFisher–Yatesで並べ替える。
+既定の`auto`では、総RAMとcgroupメモリ上限の小さい方の1/16を1窓の大きさとし、
+256–4096 MiBに収める。producer threadがPSVをその大きさずつ逐次読みし、一方の窓を
+CPU dataloaderが消費している間に次の窓を準備する。窓が完成するとFisher–Yatesで並べ替える。
 physical EOFに達した末尾のpartial窓は次のdataset epochと混ぜずに処理し、次epochでは
 epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも、複数周の学習で毎回同じ
 順序を繰り返さずに済む。
 
-追加rawメモリは概ね`2 × --teacher-shuffle-buffer-mib`。既定は約512 MiB、
-`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。大きな窓はHDDの長いstallを
+`auto`の目安は、RAM 8/16/32/64 GiB以上に対して1窓512 MiB/1 GiB/2 GiB/4 GiB。
+起動ログの`auto -> N MiB x2`と`experiment.json`には解決後の実効値を記録する。
+空きメモリ量は使わないため、同じメモリ上限なら他プロセスやpage cacheの状態で値は変わらない。
+
+追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
+大きな窓はHDDの長いstallを
 吸収しやすい一方、初回batchまでの読込時間、窓shuffleのCPU時間、random memory
-trafficも増やす。まず既定値でpos/sとメモリを確認し、必要な場合だけ段階的に増やす。
+trafficも増やす。速度やメモリを優先する場合は256などの明示値で固定する。
 `--threads`はdecode worker数であり、producerの窓shuffle自体は並列化しない。
 
 ```bash

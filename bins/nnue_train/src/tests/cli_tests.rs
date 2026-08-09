@@ -30,7 +30,10 @@ fn cli_definition_is_valid() {
 #[test]
 fn teacher_shuffle_window_defaults_and_overrides_parse() {
     let defaults = simple_cli(&[]);
-    assert_eq!(defaults.teacher_shuffle_buffer_mib, 256);
+    assert_eq!(
+        defaults.teacher_shuffle_buffer_mib,
+        TeacherShuffleBufferMib::Auto
+    );
     assert!(!defaults.no_teacher_shuffle);
     assert_eq!(defaults.teacher_shuffle_seed, 0);
 
@@ -41,9 +44,26 @@ fn teacher_shuffle_window_defaults_and_overrides_parse() {
         "--teacher-shuffle-seed",
         "42",
     ]);
-    assert_eq!(configured.teacher_shuffle_buffer_mib, 512);
+    assert_eq!(
+        configured.teacher_shuffle_buffer_mib,
+        TeacherShuffleBufferMib::Explicit(512)
+    );
+    assert_eq!(configured.teacher_shuffle_buffer_mib.resolve(), 512);
     assert!(configured.no_teacher_shuffle);
     assert_eq!(configured.teacher_shuffle_seed, 42);
+}
+
+#[test]
+fn teacher_shuffle_auto_uses_one_sixteenth_with_bounds() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(1), 256);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(4 * GIB), 256);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(8 * GIB), 512);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(16 * GIB), 1024);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(32 * GIB), 2048);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(64 * GIB), 4096);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(128 * GIB), 4096);
 }
 
 #[test]

@@ -23,11 +23,13 @@ window at physical EOF is emitted separately, so records from different epochs n
 shuffle window.
 
 The window size is configured in MiB per window and is aligned down to a whole training batch.
-The default is 256 MiB per window, for approximately 512 MiB of raw teacher records across both
-windows. This keeps shuffle's random memory traffic short while still providing several seconds
-of teacher data for typical LayerStack throughput. A zero size selects the direct reader. Shuffle
-can be disabled independently to compare double-buffered I/O with and without reordered training
-data.
+The default `auto` size is one sixteenth of the smaller of total system RAM and the process cgroup
+memory limit, clamped to 256 MiB through 4096 MiB per window. This gives larger-memory training
+machines a wider shuffle range while bounding the two raw windows to roughly one eighth of the
+effective memory limit and at most 8 GiB. Current free memory is deliberately excluded so the same
+machine or container configuration resolves consistently across runs. A numeric value fixes the
+window size; zero selects the direct reader. Shuffle can be disabled independently to compare
+double-buffered I/O with and without reordered training data.
 
 Score sidecars, score filtering, and score clamping are applied before records enter a shuffle
 window. Their record indexing therefore remains tied to the original PSV file.
@@ -43,4 +45,4 @@ parallel.
 - Shuffle is bounded by the configured window; it is not a uniform permutation of the full file.
 - Peak raw teacher-data capacity is approximately twice the configured size, in addition to
   decoded batch buffers and model state.
-- Runs record the effective buffer size, shuffle state, and seed in experiment metadata.
+- Runs print and record the effective buffer size, shuffle state, and seed in experiment metadata.

@@ -39,6 +39,20 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
+#[cfg(feature = "gpu")]
+fn resolve_teacher_shuffle_buffer_mib(cli: &Cli) -> usize {
+    let resolved = cli.teacher_shuffle_buffer_mib.resolve();
+    match cli.teacher_shuffle_buffer_mib {
+        TeacherShuffleBufferMib::Auto => println!(
+            "[train] teacher shuffle window: auto -> {resolved} MiB x2 (total RAM or cgroup limit / 16, clamped to 256..=4096 MiB/window)"
+        ),
+        TeacherShuffleBufferMib::Explicit(_) => {
+            println!("[train] teacher shuffle window: explicit {resolved} MiB x2")
+        }
+    }
+    resolved
+}
+
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn layerstack_export_fv_scale(
     override_value: Option<i32>,
@@ -336,6 +350,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let shared = validate_shared_cli(cli, layerstack.ft_fp16_out, layerstack.tf32)?;
     let feature_set = shared.feature_set;
+    let teacher_shuffle_buffer_mib = resolve_teacher_shuffle_buffer_mib(cli);
 
     // Threat profile の解決。`off` は base と bit-identical (None)。
     let threat_profile = match layerstack.threat_profile.as_str() {
@@ -763,7 +778,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         score_clamp_abs: cli.score_clamp_abs,
         score_override: cli.score_override.clone(),
         score_override_mask: cli.score_override_mask.clone(),
-        teacher_shuffle_buffer_mib: cli.teacher_shuffle_buffer_mib,
+        teacher_shuffle_buffer_mib,
         teacher_shuffle: !cli.no_teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         threads: cli.threads,
@@ -859,6 +874,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         resumed_superbatch,
         resume_parent_id,
         data,
+        teacher_shuffle_buffer_mib,
         lr_scheduler.to_string(),
         fv_scale,
     );
@@ -1414,6 +1430,7 @@ pub(crate) fn build_experiment_logger(
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
     data: &Path,
+    teacher_shuffle_buffer_mib: usize,
     lr_schedule: String,
     fv_scale: Option<i32>,
 ) -> ExperimentLogger {
@@ -1517,8 +1534,8 @@ pub(crate) fn build_experiment_logger(
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         score_override: cli.score_override.as_deref().map(file_basename),
         score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
-        teacher_shuffle_buffer_mib: cli.teacher_shuffle_buffer_mib,
-        teacher_shuffle: !cli.no_teacher_shuffle && cli.teacher_shuffle_buffer_mib != 0,
+        teacher_shuffle_buffer_mib,
+        teacher_shuffle: !cli.no_teacher_shuffle && teacher_shuffle_buffer_mib != 0,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
@@ -1594,6 +1611,7 @@ pub(crate) fn build_experiment_logger_simple(
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
     data: &Path,
+    teacher_shuffle_buffer_mib: usize,
     ft_fp16: bool,
     ft_fp16_out: bool,
     fp16_opt_state: bool,
@@ -1686,8 +1704,8 @@ pub(crate) fn build_experiment_logger_simple(
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         score_override: cli.score_override.as_deref().map(file_basename),
         score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
-        teacher_shuffle_buffer_mib: cli.teacher_shuffle_buffer_mib,
-        teacher_shuffle: !cli.no_teacher_shuffle && cli.teacher_shuffle_buffer_mib != 0,
+        teacher_shuffle_buffer_mib,
+        teacher_shuffle: !cli.no_teacher_shuffle && teacher_shuffle_buffer_mib != 0,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
@@ -1795,6 +1813,7 @@ pub(crate) fn run_simple_training(
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
+    let teacher_shuffle_buffer_mib = resolve_teacher_shuffle_buffer_mib(cli);
     if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
             "--norm-loss-factor must be finite and >= 0 (got {})",
@@ -2005,7 +2024,7 @@ pub(crate) fn run_simple_training(
         score_clamp_abs: cli.score_clamp_abs,
         score_override: cli.score_override.clone(),
         score_override_mask: cli.score_override_mask.clone(),
-        teacher_shuffle_buffer_mib: cli.teacher_shuffle_buffer_mib,
+        teacher_shuffle_buffer_mib,
         teacher_shuffle: !cli.no_teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         threads: cli.threads,
@@ -2028,6 +2047,7 @@ pub(crate) fn run_simple_training(
         resumed_superbatch,
         resume_parent_id,
         data,
+        teacher_shuffle_buffer_mib,
         ft_fp16,
         ft_fp16_out,
         fp16_opt_state,
@@ -2308,6 +2328,7 @@ mod tests {
             None,
             None,
             &data,
+            cli.teacher_shuffle_buffer_mib.resolve(),
             false,
             false,
             false,
