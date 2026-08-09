@@ -28,6 +28,25 @@ fn cli_definition_is_valid() {
 }
 
 #[test]
+fn teacher_shuffle_window_defaults_and_overrides_parse() {
+    let defaults = simple_cli(&[]);
+    assert_eq!(defaults.teacher_shuffle_buffer_mib, 256);
+    assert!(!defaults.no_teacher_shuffle);
+    assert_eq!(defaults.teacher_shuffle_seed, 0);
+
+    let configured = simple_cli(&[
+        "--teacher-shuffle-buffer-mib",
+        "512",
+        "--no-teacher-shuffle",
+        "--teacher-shuffle-seed",
+        "42",
+    ]);
+    assert_eq!(configured.teacher_shuffle_buffer_mib, 512);
+    assert!(configured.no_teacher_shuffle);
+    assert_eq!(configured.teacher_shuffle_seed, 42);
+}
+
+#[test]
 fn score_override_flags_require_training_data_and_sidecar() {
     let parsed = Cli::try_parse_from([
         "nnue-train",

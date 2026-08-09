@@ -24,8 +24,10 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
@@ -697,9 +699,10 @@ impl PsvEpochReader {
         })
     }
 
-    /// 次の使える PSV を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
-    /// 全 drop で `MAX_BARREN_PASSES` 周しても 0 件なら `io::Error` を返す。
-    fn next(&mut self) -> io::Result<PackedSfenValue> {
+    /// 現在の epoch にある次の使える PSV を返す。physical EOF では reader を次
+    /// epoch の先頭へ戻して `None` を返す。これにより window shuffle 側は epoch
+    /// 境界を跨がず、末尾の partial window も独立して shuffle できる。
+    fn next_in_epoch(&mut self) -> io::Result<Option<PackedSfenValue>> {
         loop {
             match self.loader.next_psv()? {
                 Some(mut psv) => {
@@ -724,7 +727,7 @@ impl PsvEpochReader {
                         psv.set_score(psv.score().clamp(-c, c));
                     }
                     self.pushed_this_epoch += 1;
-                    return Ok(psv);
+                    return Ok(Some(psv));
                 }
                 None => {
                     if self.pushed_this_epoch == 0 {
@@ -749,8 +752,220 @@ impl PsvEpochReader {
                     if let Some(score_override) = &mut self.score_override {
                         score_override.seek_to(self.start_offset / PSV_RECORD_BYTES)?;
                     }
+                    return Ok(None);
                 }
             }
+        }
+    }
+
+    /// 次の使える PSV を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
+    /// 全 drop で `MAX_BARREN_PASSES` 周しても 0 件なら `io::Error` を返す。
+    fn next(&mut self) -> io::Result<PackedSfenValue> {
+        loop {
+            if let Some(psv) = self.next_in_epoch()? {
+                return Ok(psv);
+            }
+        }
+    }
+}
+
+const MIB_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn shuffle_window_records(
+    buffer_mib: usize,
+    batch_size: usize,
+) -> io::Result<Option<usize>> {
+    if buffer_mib == 0 {
+        return Ok(None);
+    }
+    let bytes = buffer_mib
+        .checked_mul(MIB_BYTES)
+        .ok_or_else(|| io::Error::other("teacher shuffle buffer size overflow"))?;
+    let records = bytes / PSV_RECORD_BYTES as usize;
+    let aligned = records / batch_size * batch_size;
+    if aligned == 0 {
+        return Err(io::Error::other(format!(
+            "teacher shuffle buffer ({buffer_mib} MiB) is smaller than one raw batch ({} bytes)",
+            batch_size * PSV_RECORD_BYTES as usize
+        )));
+    }
+    Ok(Some(aligned))
+}
+
+/// Small deterministic PRNG used only for Fisher-Yates indices. Keeping this local avoids
+/// coupling training-data order to the version or algorithm of an external RNG crate.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+fn shuffle_window(values: &mut [PackedSfenValue], seed: u64, epoch: u64, window: u64) {
+    let mut rng = SplitMix64(
+        seed ^ epoch.wrapping_mul(0xd6e8_feb8_6659_fd93)
+            ^ window.wrapping_mul(0xa5a3_56e4_e27f_886d),
+    );
+    for i in (1..values.len()).rev() {
+        values.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+    }
+}
+
+struct PsvWindow {
+    records: Vec<PackedSfenValue>,
+    next: usize,
+}
+
+/// Two-window producer/consumer reader. The producer fills the next raw PSV window while the
+/// decode workers consume the current one. `window_records` is per window, so resident raw PSV
+/// capacity is approximately `2 * window_records * 40` bytes.
+struct WindowedPsvReader {
+    ready_rx: mpsc::Receiver<io::Result<PsvWindow>>,
+    empty_tx: Option<mpsc::Sender<Vec<PackedSfenValue>>>,
+    current: Option<PsvWindow>,
+    stop: Arc<AtomicBool>,
+    producer: Option<thread::JoinHandle<()>>,
+}
+
+impl WindowedPsvReader {
+    fn spawn(mut source: PsvEpochReader, window_records: usize, shuffle: bool, seed: u64) -> Self {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (empty_tx, empty_rx) = mpsc::channel::<Vec<PackedSfenValue>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = Arc::clone(&stop);
+        let producer = thread::spawn(move || {
+            let mut allocated = 0usize;
+            let mut spare = None;
+            let mut epoch = 0u64;
+            let mut window = 0u64;
+            loop {
+                if producer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut records = if let Some(records) = spare.take() {
+                    records
+                } else if allocated < 2 {
+                    allocated += 1;
+                    let mut records = Vec::new();
+                    if let Err(e) = records.try_reserve_exact(window_records) {
+                        let _ = ready_tx.send(Err(io::Error::other(format!(
+                            "failed to allocate teacher shuffle window for {window_records} records: {e}"
+                        ))));
+                        return;
+                    }
+                    records
+                } else {
+                    loop {
+                        match empty_rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(records) => break records,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if producer_stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                };
+                records.clear();
+                let mut reached_epoch_end = false;
+                while records.len() < window_records {
+                    if producer_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match source.next_in_epoch() {
+                        Ok(Some(psv)) => records.push(psv),
+                        Ok(None) => {
+                            reached_epoch_end = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    }
+                }
+                if records.is_empty() {
+                    if reached_epoch_end {
+                        epoch = epoch.wrapping_add(1);
+                        window = 0;
+                    }
+                    spare = Some(records);
+                    continue;
+                }
+                if shuffle {
+                    shuffle_window(&mut records, seed, epoch, window);
+                }
+                if ready_tx.send(Ok(PsvWindow { records, next: 0 })).is_err() {
+                    return;
+                }
+                window = window.wrapping_add(1);
+                if reached_epoch_end {
+                    epoch = epoch.wrapping_add(1);
+                    window = 0;
+                }
+            }
+        });
+        Self {
+            ready_rx,
+            empty_tx: Some(empty_tx),
+            current: None,
+            stop,
+            producer: Some(producer),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<PackedSfenValue> {
+        loop {
+            if let Some(window) = &mut self.current
+                && window.next < window.records.len()
+            {
+                let value = window.records[window.next];
+                window.next += 1;
+                return Ok(value);
+            }
+            if let Some(old) = self.current.take()
+                && self
+                    .empty_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(old.records).is_err())
+            {
+                return Err(io::Error::other("PSV window producer stopped"));
+            }
+            self.current = Some(
+                self.ready_rx
+                    .recv()
+                    .map_err(|_| io::Error::other("PSV window producer stopped"))??,
+            );
+        }
+    }
+}
+
+impl Drop for WindowedPsvReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.empty_tx.take();
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+    }
+}
+
+enum TrainingPsvReader {
+    Direct(Box<PsvEpochReader>),
+    Windowed(WindowedPsvReader),
+}
+
+impl TrainingPsvReader {
+    fn next(&mut self) -> io::Result<PackedSfenValue> {
+        match self {
+            Self::Direct(reader) => reader.next(),
+            Self::Windowed(reader) => reader.next(),
         }
     }
 }
@@ -873,6 +1088,9 @@ impl BucketedPrefetchedLoader {
             monitor_active,
             None,
             None,
+            0,
+            false,
+            0,
         )
     }
 
@@ -892,6 +1110,9 @@ impl BucketedPrefetchedLoader {
         monitor_active: bool,
         score_override: Option<&Path>,
         score_override_mask: Option<&Path>,
+        teacher_shuffle_buffer_mib: usize,
+        teacher_shuffle: bool,
+        teacher_shuffle_seed: u64,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
@@ -906,7 +1127,7 @@ impl BucketedPrefetchedLoader {
         // が最大 1、main が最大 1。
         let n_slots = prefetch_depth + num_workers + 1;
 
-        let reader = Arc::new(Mutex::new(PsvEpochReader::new_range(
+        let source = PsvEpochReader::new_range(
             path,
             0,
             train_end_offset,
@@ -914,7 +1135,17 @@ impl BucketedPrefetchedLoader {
             score_clamp_abs,
             score_override,
             score_override_mask,
-        )?));
+        )?;
+        let reader = match shuffle_window_records(teacher_shuffle_buffer_mib, batch_size)? {
+            Some(window_records) => TrainingPsvReader::Windowed(WindowedPsvReader::spawn(
+                source,
+                window_records,
+                teacher_shuffle,
+                teacher_shuffle_seed,
+            )),
+            None => TrainingPsvReader::Direct(Box::new(source)),
+        };
+        let reader = Arc::new(Mutex::new(reader));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
             Some(Arc::new(Mutex::new(vec![
@@ -1213,6 +1444,91 @@ mod tests {
         if let Some(path) = mask {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    fn windowed_score_reader(
+        data: &Path,
+        records: usize,
+        window_records: usize,
+        shuffle: bool,
+        seed: u64,
+        score_override: Option<&Path>,
+    ) -> WindowedPsvReader {
+        let source = PsvEpochReader::new_range(
+            data,
+            0,
+            records as u64 * PSV_RECORD_BYTES,
+            None,
+            None,
+            score_override,
+            None,
+        )
+        .unwrap();
+        WindowedPsvReader::spawn(source, window_records, shuffle, seed)
+    }
+
+    #[test]
+    fn shuffle_window_size_is_per_window_and_batch_aligned() {
+        assert_eq!(shuffle_window_records(0, 65_536).unwrap(), None);
+        let records = shuffle_window_records(4096, 65_536).unwrap().unwrap();
+        assert_eq!(records % 65_536, 0);
+        assert!(records * PSV_RECORD_BYTES as usize <= 4096 * MIB_BYTES);
+        assert!((records + 65_536) * PSV_RECORD_BYTES as usize > 4096 * MIB_BYTES);
+        assert!(shuffle_window_records(1, 65_536).is_err());
+    }
+
+    #[test]
+    fn window_shuffle_is_reproducible_and_epoch_specific() {
+        let base = [0, 1, 2, 3, 4, 5];
+        let (data, scores, _) = synthetic_override_files("window-epochs", &base, &base, None);
+        let read_two_epochs = || {
+            let mut reader = windowed_score_reader(&data, base.len(), 3, true, 1234, None);
+            (0..base.len() * 2)
+                .map(|_| reader.next().unwrap().score())
+                .collect::<Vec<_>>()
+        };
+        let first = read_two_epochs();
+        let second = read_two_epochs();
+        remove_override_files(&data, &scores, None);
+
+        assert_eq!(first, second);
+        for epoch in first.chunks_exact(base.len()) {
+            let mut values = epoch.to_vec();
+            values.sort_unstable();
+            assert_eq!(values, base);
+        }
+        assert_ne!(&first[..base.len()], &first[base.len()..]);
+        // A window never mixes records from either side of its physical boundary.
+        for window in first.chunks_exact(3) {
+            assert!(window.iter().all(|v| *v < 3) || window.iter().all(|v| *v >= 3));
+        }
+    }
+
+    #[test]
+    fn window_shuffle_applies_score_sidecar_before_reordering() {
+        let base = [1, 2, 3, 4, 5];
+        let replacement = [101, 102, 103, 104, 105];
+        let (data, scores, _) =
+            synthetic_override_files("window-sidecar", &base, &replacement, None);
+        let mut reader =
+            windowed_score_reader(&data, base.len(), base.len(), true, 9, Some(&scores));
+        let mut got = (0..base.len())
+            .map(|_| reader.next().unwrap().score())
+            .collect::<Vec<_>>();
+        drop(reader);
+        remove_override_files(&data, &scores, None);
+        got.sort_unstable();
+        assert_eq!(got, replacement);
+    }
+
+    #[test]
+    fn dropping_partially_consumed_window_stops_producer() {
+        let base = [1, 2, 3, 4, 5];
+        let (data, scores, _) = synthetic_override_files("window-drop", &base, &base, None);
+        let mut reader = windowed_score_reader(&data, base.len(), 1_000_000, true, 0, None);
+        let _ = reader.next().unwrap();
+        drop(reader);
+        remove_override_files(&data, &scores, None);
     }
 
     #[test]

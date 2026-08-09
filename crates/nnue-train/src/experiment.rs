@@ -220,6 +220,9 @@ pub struct Params {
     pub ft_fp16: bool,
     pub ft_fp16_out: bool,
     pub fp16_opt_state: bool,
+    pub teacher_shuffle_buffer_mib: usize,
+    pub teacher_shuffle: bool,
+    pub teacher_shuffle_seed: u64,
     pub threads: usize,
 }
 
@@ -676,6 +679,9 @@ mod tests {
             ft_fp16: true,
             ft_fp16_out: true,
             fp16_opt_state: false,
+            teacher_shuffle_buffer_mib: 256,
+            teacher_shuffle: true,
+            teacher_shuffle_seed: 0,
             threads: 16,
         }
     }

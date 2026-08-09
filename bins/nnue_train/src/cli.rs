@@ -399,11 +399,22 @@ pub(crate) struct Cli {
     pub(crate) norm_loss_factor: f32,
     /// Number of dataloader prefetch workers. Each worker does PSV parsing +
     /// HalfKA_hm sparse extraction + progress8kpabs bucket computation in a
-    /// single `decode()` call and supplies positions ahead of time. `1` gives
-    /// deterministic sequential reads; `>= 2` parses in parallel (position order
-    /// within an epoch is non-deterministic, which is fine for training).
+    /// single `decode()` call and supplies positions ahead of time. `1` preserves
+    /// the reader's deterministic order; `>= 2` parses in parallel (batch delivery
+    /// order within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
+    /// Raw PSV shuffle window size in MiB, per window. Two windows are kept so the next one can
+    /// be read while the current one is consumed; the default therefore uses about 512 MiB of raw
+    /// teacher-data memory. Set to 0 to restore direct sequential reading.
+    #[arg(long, default_value_t = 256, global = true)]
+    pub(crate) teacher_shuffle_buffer_mib: usize,
+    /// Keep double-buffered sequential I/O but do not shuffle records within each window.
+    #[arg(long, global = true)]
+    pub(crate) no_teacher_shuffle: bool,
+    /// Base seed for deterministic per-epoch, per-window teacher-data shuffle.
+    #[arg(long, default_value_t = 0, global = true)]
+    pub(crate) teacher_shuffle_seed: u64,
 
     /// Fast mode that runs the FT weight (`ft_w`) forward pass through an FP16
     /// mirror. With the default `false`, it is bit-identical to the FP32 path.
