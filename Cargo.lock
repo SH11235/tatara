@@ -834,6 +834,7 @@ dependencies = [
  "proc-macro2",
  "serde",
  "serde_json",
+ "sha2",
  "shogi-features",
  "shogi-format",
  "sysinfo",

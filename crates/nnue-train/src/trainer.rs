@@ -57,7 +57,9 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
+use crate::dataloader::{
+    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES,
+};
 use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
 
@@ -436,6 +438,8 @@ pub struct TrainingConfig {
     pub teacher_shuffle: bool,
     /// Base seed for deterministic per-epoch, per-window shuffle.
     pub teacher_shuffle_seed: u64,
+    /// PSV record 内の DL score と padding gate bit を解釈する方式。
+    pub dual_label_psv: Option<DualLabelMode>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で reader の決定論的順序を維持、`>= 2` で並列パース (1 epoch 内の
     /// batch delivery 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
@@ -512,6 +516,13 @@ impl TrainingConfig {
         if self.score_override_mask.is_some() && self.score_override.is_none() {
             return Err(io::Error::other(
                 "score_override_mask requires score_override",
+            ));
+        }
+        if self.dual_label_psv.is_some()
+            && (self.score_override.is_some() || self.score_override_mask.is_some())
+        {
+            return Err(io::Error::other(
+                "dual_label_psv conflicts with score_override and score_override_mask",
             ));
         }
         crate::dataloader::shuffle_window_records(
@@ -704,18 +715,18 @@ where
         None => file_size,
     };
 
-    if cfg.score_override.is_some()
+    if (cfg.score_override.is_some() || cfg.dual_label_psv.is_some())
         && data_path.extension().is_some_and(|ext| {
             ext.to_str()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
         })
     {
         return Err(io::Error::other(
-            "score_override is only supported for PSV training data, not HCPE",
+            "score_override and dual_label_psv are only supported for PSV training data, not HCPE",
         ));
     }
 
-    let mut loader = BucketedPrefetchedLoader::spawn_with_score_override(
+    let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
         data_path,
         cfg.batch_size,
         cfg.score_drop_abs,
@@ -732,11 +743,12 @@ where
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
+        cfg.dual_label_psv,
     )?;
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | teacher-window {} MiB x2 | teacher-shuffle {} seed {} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | dual-label-psv {:?} | teacher-window {} MiB x2 | teacher-shuffle {} seed {} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -748,6 +760,7 @@ where
         cfg.score_clamp_abs,
         cfg.score_override,
         cfg.score_override_mask,
+        cfg.dual_label_psv.map(DualLabelMode::canonical_name),
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
@@ -760,7 +773,7 @@ where
     // 指定は reject 済みなので exhaustive な 4-arm match で意図を明示。
     let heldout = match (&cfg.test_data, cfg.test_tail_positions) {
         (Some(test_path), None) => {
-            let set = crate::validation::HeldoutSet::load(
+            let set = crate::validation::HeldoutSet::load_with_dual_label(
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
@@ -769,6 +782,7 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
+                cfg.dual_label_psv,
             )?;
             println!(
                 "[train] held-out validation (external file): data={} | {} batches x bs {} ({} positions)",
@@ -780,7 +794,7 @@ where
             Some(set)
         }
         (None, Some(_)) => {
-            let set = crate::validation::HeldoutSet::load_from_range_with_override(
+            let set = crate::validation::HeldoutSet::load_from_range_with_score_sources(
                 data_path,
                 train_end_offset,
                 file_size,
@@ -793,6 +807,7 @@ where
                 cfg.num_buckets,
                 cfg.score_override.as_deref(),
                 cfg.score_override_mask.as_deref(),
+                cfg.dual_label_psv,
             )?;
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
@@ -1337,6 +1352,7 @@ mod tests {
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
+            dual_label_psv: None,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -1552,6 +1568,7 @@ mod tests {
             score_clamp_abs: None,
             score_override: None,
             score_override_mask: None,
+            dual_label_psv: None,
             init_from: None,
             init_preset: None,
             test_data: None,
@@ -2337,6 +2354,24 @@ mod tests {
             }
             .validate()
             .is_ok()
+        );
+        assert!(
+            TrainingConfig {
+                dual_label_psv: Some(DualLabelMode::All),
+                score_override: Some(PathBuf::from("scores.i16")),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                dual_label_psv: Some(DualLabelMode::Gated),
+                score_override_mask: Some(PathBuf::from("entered.bits")),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
         );
         // score-clamp-abs は >= 1 (上限 i16::MAX は型で保証)。
         for bad in [0, -1] {

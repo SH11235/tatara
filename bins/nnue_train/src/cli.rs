@@ -356,6 +356,17 @@ pub(crate) struct Cli {
     #[arg(long, global = true, requires = "score_override")]
     pub(crate) score_override_mask: Option<PathBuf>,
 
+    /// Read the teacher score from the DL label embedded at bytes 34-35 of each PSV record.
+    /// `all` uses it for every record; `gated` preserves the base score when padding bit 0 is set.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        requires = "data",
+        conflicts_with_all = ["score_override", "score_override_mask"]
+    )]
+    pub(crate) dual_label_psv: Option<DualLabelPsvArg>,
+
     /// Inject weights from a quantised NNUE binary before training starts
     /// (pretrained start). The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and
@@ -720,6 +731,42 @@ impl Cli {
     pub(crate) fn ft_factorize_enabled(&self) -> bool {
         !self.no_ft_factorize
     }
+
+    pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
+        let is_hcpe = |path: &std::path::Path| {
+            path.extension().is_some_and(|ext| {
+                ext.to_str()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
+            })
+        };
+        if (self.score_override.is_some() || self.dual_label_psv.is_some())
+            && self.data.as_deref().is_some_and(is_hcpe)
+        {
+            return Err(
+                "--score-override and --dual-label-psv require PSV training data, not HCPE"
+                    .to_string(),
+            );
+        }
+        if self.dual_label_psv.is_some() && self.test_data.as_deref().is_some_and(is_hcpe) {
+            return Err("--dual-label-psv requires PSV held-out data, not HCPE".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum DualLabelPsvArg {
+    All,
+    Gated,
+}
+
+impl From<DualLabelPsvArg> for nnue_train::dataloader::DualLabelMode {
+    fn from(value: DualLabelPsvArg) -> Self {
+        match value {
+            DualLabelPsvArg::All => Self::All,
+            DualLabelPsvArg::Gated => Self::Gated,
+        }
+    }
 }
 
 /// `--lr-schedule` の選択肢。lib 側 schedule 型への runtime selection。
@@ -781,6 +828,9 @@ pub(crate) enum ArchCommand {
     /// Run reproducible end-to-end training benchmarks from TOML configuration.
     #[command(name = "bench-pos")]
     BenchPos(BenchPosArgs),
+    /// Hash the deterministic CPU dataloader batch stream without initializing a GPU.
+    #[command(name = "loader-digest")]
+    LoaderDigest(LoaderDigestArgs),
     /// Run the fixed native CUDA throughput benchmark and write a JSON report.
     #[cfg(any(feature = "oxide-parity", feature = "native"))]
     #[command(name = "native-bench")]
@@ -797,12 +847,22 @@ impl ArchCommand {
             ArchCommand::BenchPos(_) => {
                 unreachable!("bench-pos does not select a training architecture")
             }
+            ArchCommand::LoaderDigest(_) => {
+                unreachable!("loader-digest does not select a training architecture")
+            }
             #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => {
                 unreachable!("native-bench does not select a training architecture")
             }
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct LoaderDigestArgs {
+    /// Number of full batches to include in the digest.
+    #[arg(long)]
+    pub(crate) batches: usize,
 }
 
 #[derive(Args, Debug)]

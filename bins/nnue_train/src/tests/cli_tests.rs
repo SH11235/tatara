@@ -173,6 +173,79 @@ fn score_override_flags_require_training_data_and_sidecar() {
     );
 }
 
+#[test]
+fn dual_label_psv_requires_data_and_conflicts_with_sidecars() {
+    let parsed = Cli::try_parse_from([
+        "nnue-train",
+        "--data",
+        "dual.psv",
+        "--dual-label-psv",
+        "gated",
+        "simple",
+    ])
+    .unwrap();
+    assert_eq!(parsed.dual_label_psv, Some(DualLabelPsvArg::Gated));
+
+    assert!(Cli::try_parse_from(["nnue-train", "--dual-label-psv", "all", "simple"]).is_err());
+    for sidecar_args in [
+        vec!["--score-override", "scores.bin"],
+        vec![
+            "--score-override",
+            "scores.bin",
+            "--score-override-mask",
+            "entered.bits",
+        ],
+    ] {
+        let mut args = vec![
+            "nnue-train",
+            "--data",
+            "dual.psv",
+            "--dual-label-psv",
+            "gated",
+        ];
+        args.extend(sidecar_args);
+        args.push("simple");
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}
+
+#[test]
+fn inline_and_sidecar_score_sources_reject_hcpe_input() {
+    for args in [
+        vec!["--score-override", "scores.bin"],
+        vec!["--dual-label-psv", "all"],
+    ] {
+        let mut argv = vec!["nnue-train", "--data", "teacher.hcpe"];
+        argv.extend(args);
+        argv.push("simple");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(cli.validate_score_sources().is_err());
+    }
+}
+
+#[test]
+fn loader_digest_uses_global_loader_arguments() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "loader-digest",
+        "--data",
+        "teacher.psv",
+        "--batch-size",
+        "32",
+        "--batches",
+        "3",
+        "--dual-label-psv",
+        "all",
+    ])
+    .unwrap();
+    assert_eq!(cli.batch_size, 32);
+    assert_eq!(cli.dual_label_psv, Some(DualLabelPsvArg::All));
+    let ArchCommand::LoaderDigest(args) = cli.arch else {
+        panic!("expected loader-digest");
+    };
+    assert_eq!(args.batches, 3);
+}
+
 /// `--ft-factorize` / `--no-ft-factorize` は global flag。任意 subcommand の後ろに
 /// 付けても global 引数として parse される (層は `simple` でも `layerstack` でも同じ)。
 fn cli_with_factorize(argv: &[&str]) -> Cli {
@@ -406,6 +479,7 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
         ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
+        ArchCommand::LoaderDigest(_) => unreachable!("layerstack subcommand was requested"),
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
@@ -557,6 +631,7 @@ fn simple_accepts_tf32_flag() {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
         ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
+        ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
@@ -826,6 +901,7 @@ fn simple_activation_arg_parses_and_maps() {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
             ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
+            ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
             #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };

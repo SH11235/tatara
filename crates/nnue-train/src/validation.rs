@@ -26,7 +26,10 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvFileLoader, ScoreOverrideReader};
+use crate::dataloader::{
+    Batch, BucketMode, DualLabelMode, HcpeFileLoader, PSV_RECORD_BYTES, PsvFileLoader,
+    ScoreOverrideReader,
+};
 use crate::trainer::{LossKind, TrainerBackend};
 
 /// held-out validation 1 回分の集計結果。
@@ -79,10 +82,41 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
+        Self::load_with_dual_label(
+            path,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            test_positions,
+            bucket_mode,
+            feature_set,
+            num_buckets,
+            None,
+        )
+    }
+
+    /// [`Self::load`] と同じ検証集合を dual-label PSV score 解釈付きで読む。
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_dual_label(
+        path: &Path,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        test_positions: usize,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
+        feature_set: FeatureSetSpec,
+        num_buckets: usize,
+        dual_label_psv: Option<DualLabelMode>,
+    ) -> io::Result<Self> {
         if path.extension().is_some_and(|ext| {
             ext.to_str()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
         }) {
+            if dual_label_psv.is_some() {
+                return Err(io::Error::other(
+                    "dual_label_psv is only supported for PSV validation data, not HCPE",
+                ));
+            }
             let loader = HcpeFileLoader::new(path)?;
             return Self::load_boards(
                 loader,
@@ -99,7 +133,7 @@ impl HeldoutSet {
         }
 
         let file_size = std::fs::metadata(path)?.len();
-        Self::load_from_range(
+        Self::load_from_range_with_score_sources(
             path,
             0,
             file_size,
@@ -110,6 +144,9 @@ impl HeldoutSet {
             bucket_mode,
             feature_set,
             num_buckets,
+            None,
+            None,
+            dual_label_psv,
         )
     }
 
@@ -165,12 +202,52 @@ impl HeldoutSet {
         score_override: Option<&Path>,
         score_override_mask: Option<&Path>,
     ) -> io::Result<Self> {
+        Self::load_from_range_with_score_sources(
+            path,
+            start_offset,
+            end_offset,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            test_positions,
+            bucket_mode,
+            feature_set,
+            num_buckets,
+            score_override,
+            score_override_mask,
+            None,
+        )
+    }
+
+    /// PSV range を sidecar または dual-label の明示的な score source で読む。
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_from_range_with_score_sources(
+        path: &Path,
+        start_offset: u64,
+        end_offset: u64,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        test_positions: usize,
+        bucket_mode: &(impl Copy + Into<BucketMode>),
+        feature_set: FeatureSetSpec,
+        num_buckets: usize,
+        score_override: Option<&Path>,
+        score_override_mask: Option<&Path>,
+        dual_label_psv: Option<DualLabelMode>,
+    ) -> io::Result<Self> {
+        if dual_label_psv.is_some() && (score_override.is_some() || score_override_mask.is_some()) {
+            return Err(io::Error::other(
+                "dual_label_psv conflicts with score_override and score_override_mask",
+            ));
+        }
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         let mut score_override = score_override
             .map(|score_path| {
                 ScoreOverrideReader::new(path, score_path, score_override_mask, start_offset)
             })
             .transpose()?;
+        let mut record_index = start_offset / PSV_RECORD_BYTES;
         Self::load_boards(
             loader,
             |loader| {
@@ -180,6 +257,10 @@ impl HeldoutSet {
                 if let Some(score_override) = &mut score_override {
                     score_override.apply(&mut psv)?;
                 }
+                if let Some(mode) = dual_label_psv {
+                    mode.apply(&mut psv, record_index, path)?;
+                }
+                record_index += 1;
                 Ok(Some(psv.decode()))
             },
             path,
