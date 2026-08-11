@@ -55,32 +55,45 @@ pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> us
 /// 自プロセスの cgroup v2 directory とその mountpoint を解決する。mountinfo の
 /// 行形式は `id parent maj:min <root> <mountpoint> ... - <fstype> <source> <opts>`。
 /// `/proc/self/cgroup` の v2 パス (`0::<path>`) は cgroup namespace root 相対
-/// なので、mount root が `/` 以外なら prefix を剥がして mountpoint に付け直す。
-/// v2 エントリ / cgroup2 mount が無い環境は `None`。
+/// なので、自 cgroup を包含する mount root を `Path::strip_prefix` (component
+/// 境界を見る) で選び、剥がした残りを mountpoint に付け直す。包含する mount が
+/// 複数あるときは root が最浅のものを使う (祖先の `memory.max` が最も広く
+/// 見える)。v2 エントリ / 包含する cgroup2 mount が無い環境は `None`。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn cgroup_v2_self_dir(
     proc_self_mountinfo: &str,
     proc_self_cgroup: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let cgroup_path = proc_self_cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?;
-    let (mount_root, mountpoint) = proc_self_mountinfo.lines().find_map(|line| {
-        let (mount_fields, fs_fields) = line.split_once(" - ")?;
+    let cgroup_path = std::path::Path::new(
+        proc_self_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?,
+    );
+    let mut best: Option<(std::path::PathBuf, std::path::PathBuf, usize)> = None;
+    for line in proc_self_mountinfo.lines() {
+        let Some((mount_fields, fs_fields)) = line.split_once(" - ") else {
+            continue;
+        };
         if fs_fields.split_whitespace().next() != Some("cgroup2") {
-            return None;
+            continue;
         }
         let mut fields = mount_fields.split_whitespace();
-        let root = fields.nth(3)?;
-        let mountpoint = fields.next()?;
-        Some((root, mountpoint))
-    })?;
-    let rel = cgroup_path
-        .strip_prefix(mount_root.trim_end_matches('/'))
-        .unwrap_or(cgroup_path);
-    let mountpoint = std::path::PathBuf::from(mountpoint);
-    let dir = mountpoint.join(rel.trim_start_matches('/'));
-    Some((mountpoint, dir))
+        let Some(root) = fields.nth(3) else { continue };
+        let Some(mountpoint) = fields.next() else {
+            continue;
+        };
+        let root = std::path::Path::new(root);
+        let Ok(rel) = cgroup_path.strip_prefix(root) else {
+            continue;
+        };
+        let depth = root.components().count();
+        if best.as_ref().is_none_or(|(_, _, d)| depth < *d) {
+            let mountpoint = std::path::PathBuf::from(mountpoint);
+            let dir = mountpoint.join(rel);
+            best = Some((mountpoint, dir, depth));
+        }
+    }
+    best.map(|(mountpoint, dir, _)| (mountpoint, dir))
 }
 
 /// 自 cgroup dir から mountpoint までの各祖先の `memory.max` の最小値を返す。

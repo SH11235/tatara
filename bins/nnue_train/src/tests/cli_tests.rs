@@ -89,6 +89,23 @@ fn cgroup_v2_self_dir_resolves_mountpoint_and_mount_root() {
         ))
     );
 
+    // 自 cgroup を包含しない mount (/other, component 境界違いの /ten) は skip し、
+    // 包含する mount のうち root が最浅のものを選ぶ。
+    let multi = "\
+35 20 0:30 /other /run/other rw - cgroup2 cgroup2 rw\n\
+36 20 0:30 /ten /run/ten rw - cgroup2 cgroup2 rw\n\
+37 20 0:30 /tenant /run/scoped rw - cgroup2 cgroup2 rw\n\
+38 20 0:30 / /run/full rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(multi, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/run/full"),
+            PathBuf::from("/run/full/tenant/job")
+        ))
+    );
+    let non_containing = "35 20 0:30 /other /run/other rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(cgroup_v2_self_dir(non_containing, "0::/tenant/job\n"), None);
+
     assert_eq!(cgroup_v2_self_dir(mountinfo, "4:memory:/foo\n"), None);
     assert_eq!(
         cgroup_v2_self_dir("23 20 0:21 / /proc rw - proc proc rw\n", "0::/a\n"),
