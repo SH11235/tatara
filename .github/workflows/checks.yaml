@@ -54,6 +54,9 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --exclude gpu-runtime --exclude progress-kpabs-train --exclude nnue-trainer -- -D warnings
           cargo clippy -p nnue-trainer --no-default-features --all-targets -- -D warnings
+          # gpu-runtime の backend feature なし stub 構成。CUDA 不要でこの runner で
+          # build できるため、gate 漏れ (backend 依存 item の cfg 抜け) をここで検出する。
+          cargo clippy -p gpu-runtime --no-default-features --all-targets -- -D warnings
 
       - name: cargo test
         if: steps.ws.outputs.empty == 'false'
