@@ -95,17 +95,10 @@ header は不要 (git log で確認可能)。
 
 ### 2.3 ADR (`docs/decisions/`) のルール
 
-- ファイル名: `YYYY-MM-DD-<slug>.md` 形式
-- 連番 (`0NNN-...`) はリジェクト (並行 PR 衝突)
-- 内容: 現在のアーキの WHY のみ。執行済 workflow / 完了済ロードマップは削除
-  候補
-- 不要になった ADR は削除して良い (古い ADR は immutable とは限らない、ただし
-  削除時は他の ADR / doc からのリンク切れを修正する)
-
-```bash
-ls docs/decisions/ | grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-.+\.md$'
-# 出力ゼロを期待 (= 全 ADR が date-based slug)
-```
+- **新規 ADR の追加はリジェクト** (本リポは ADR ベースの開発をしていない。
+  設計の WHY はコード近傍のコメント / PR description が担当)
+- 既存分は legacy。不要になったら削除して良い (削除時は他 doc からの
+  リンク切れを修正する)
 
 ### 2.4 directory tree の現状反映
 
@@ -151,7 +144,7 @@ done
 | 内容種別 | 置き場 |
 |---|---|
 | 試行 → revert 経緯 | git log / revert commit message |
-| アーキ判断 (採用 / 不採用の理由) | ADR (`docs/decisions/`) |
+| アーキ判断 (採用 / 不採用の理由) | コード近傍のコメント / PR description |
 | dated 計測ログ | `docs/experiments/` (gitignored、commit 不可) |
 | 「現状こうなっている」事実 | reference doc 本体 |
 
