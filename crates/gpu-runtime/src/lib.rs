@@ -1,4 +1,6 @@
 //! GPU host runtime の薄い wrapper。backend は feature で排他選択する。
+//! backend feature なしでは backend 依存 API を全て持たない空の stub として
+//! コンパイルされる (workspace 一括の `--no-default-features` lint を通すため)。
 //!
 //! - `native`: CUDA C++ kernel を CUDA Driver API から launch する portable runtime
 //! - `oxide`: cuda-oxide host API (`cuda-core` / `cuda-host`) を再 export し、
@@ -30,8 +32,6 @@ compile_error!(
     "gpu-runtime backends are mutually exclusive; inspect the dependency feature graph to find \
      what enables `oxide` and `native`"
 );
-#[cfg(not(any(feature = "oxide", feature = "native")))]
-compile_error!("gpu-runtime requires either `oxide` or `native`");
 
 #[cfg(feature = "oxide")]
 pub mod kernel_loader;
@@ -145,6 +145,7 @@ pub type DeviceAlloc<T> = DeviceBuffer<T>;
 pub type DeviceAlloc<T> = DeviceBuffer<T>;
 
 /// `CudaStream` の短縮名 alias。
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub type Stream = CudaStream;
 
 /// gpu-runtime の error。
@@ -185,6 +186,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Creates the trainer's compute stream while preserving backend-specific ordering semantics.
 /// cuda-oxide uses its context default stream; the native backend returns a fallible non-blocking
 /// stream so allocation failures propagate through trainer construction instead of panicking.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub fn create_compute_stream(
     ctx: &std::sync::Arc<CudaContext>,
 ) -> Result<std::sync::Arc<CudaStream>> {
@@ -226,6 +228,7 @@ fn driver_error_is_out_of_memory(e: &DriverError) -> bool {
 pub use native_backend::is_out_of_memory;
 
 /// Fills a device allocation byte-wise on `stream`.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub fn memset_d8_async<T: Copy>(
     buffer: &DeviceBuffer<T>,
     value: u8,
@@ -251,6 +254,7 @@ pub fn memset_d8_async<T: Copy>(
 /// # Safety
 ///
 /// The caller must keep `values` alive and immutable until stream completion.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub unsafe fn memcpy_htod_async<T: Copy>(
     buffer: &DeviceBuffer<T>,
     values: &[T],
@@ -280,6 +284,7 @@ pub unsafe fn memcpy_htod_async<T: Copy>(
 /// # Safety
 ///
 /// The caller must keep `values` alive and must not access it until stream completion.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub unsafe fn memcpy_dtoh_async<T: Copy>(
     values: &mut [T],
     buffer: &DeviceBuffer<T>,
@@ -309,6 +314,7 @@ pub unsafe fn memcpy_dtoh_async<T: Copy>(
 /// # Safety
 ///
 /// The returned pointer must be released exactly once with [`free_pinned_host`].
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut std::ffi::c_void> {
     #[cfg(feature = "oxide")]
     {
@@ -337,6 +343,7 @@ pub unsafe fn alloc_pinned_host(bytes: usize) -> Result<*mut std::ffi::c_void> {
 /// # Safety
 ///
 /// `raw` must be a live allocation from [`alloc_pinned_host`] with no in-flight transfer.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub unsafe fn free_pinned_host(raw: *mut std::ffi::c_void) -> Result<()> {
     #[cfg(feature = "oxide")]
     {
@@ -353,6 +360,7 @@ pub unsafe fn free_pinned_host(raw: *mut std::ffi::c_void) -> Result<()> {
 }
 
 /// Returns `(multiprocessor_count, max_threads_per_multiprocessor)`.
+#[cfg(any(feature = "oxide", feature = "native"))]
 pub fn device_occupancy_attributes(ctx: &CudaContext) -> Result<(i32, i32)> {
     #[cfg(feature = "oxide")]
     {
@@ -382,6 +390,7 @@ pub fn device_occupancy_attributes(ctx: &CudaContext) -> Result<(i32, i32)> {
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "oxide", feature = "native"))]
 mod tests {
     use super::*;
 

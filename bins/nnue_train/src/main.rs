@@ -8,6 +8,9 @@
 //! 関数は [`kernels`] module、host 側コード (kernel loader / checkpoint format /
 //! trainer / CLI / smoke test) と GPU↔CPU 同等性テストは各 sibling module に置く。
 
+#[cfg(all(feature = "gpu", not(any(feature = "oxide", feature = "native"))))]
+compile_error!("feature `gpu` requires a backend: enable `native` (default) or `oxide`");
+
 #[cfg(feature = "gpu")]
 use clap::Parser;
 
