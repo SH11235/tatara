@@ -428,9 +428,17 @@ pub struct TrainingConfig {
     pub score_override: Option<PathBuf>,
     /// LSB-first bitmap whose set bits preserve scores from `data_path`.
     pub score_override_mask: Option<PathBuf>,
+    /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
+    /// one while decode workers consume the other. `0` restores direct sequential reading.
+    pub teacher_shuffle_buffer_mib: usize,
+    /// Shuffle records within each raw PSV window. Callers pass the effective value
+    /// (`false` when the buffer size is zero) so config, logs, and experiment metadata agree.
+    pub teacher_shuffle: bool,
+    /// Base seed for deterministic per-epoch, per-window shuffle.
+    pub teacher_shuffle_seed: u64,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
-    /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
-    /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
+    /// `1` で reader の決定論的順序を維持、`>= 2` で並列パース (1 epoch 内の
+    /// batch delivery 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
     pub threads: usize,
     /// `Some` のとき held-out validation 用 PSV / HCPE file。各 superbatch 末に
     /// forward-only 検証を走らせ test_loss / test_accuracy を report する。
@@ -506,6 +514,10 @@ impl TrainingConfig {
                 "score_override_mask requires score_override",
             ));
         }
+        crate::dataloader::shuffle_window_records(
+            self.teacher_shuffle_buffer_mib,
+            self.batch_size,
+        )?;
         if let Some(t) = self.score_drop_abs
             && t < 1
         {
@@ -717,11 +729,14 @@ where
         cfg.monitor_active_features,
         cfg.score_override.as_deref(),
         cfg.score_override_mask.as_deref(),
+        cfg.teacher_shuffle_buffer_mib,
+        cfg.teacher_shuffle,
+        cfg.teacher_shuffle_seed,
     )?;
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | teacher-window {} MiB x2 | teacher-shuffle {} seed {} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -733,6 +748,9 @@ where
         cfg.score_clamp_abs,
         cfg.score_override,
         cfg.score_override_mask,
+        cfg.teacher_shuffle_buffer_mib,
+        cfg.teacher_shuffle,
+        cfg.teacher_shuffle_seed,
         cfg.threads.max(1),
     );
 
@@ -1316,6 +1334,9 @@ mod tests {
             score_clamp_abs: None,
             score_override: None,
             score_override_mask: None,
+            teacher_shuffle_buffer_mib: 0,
+            teacher_shuffle: false,
+            teacher_shuffle_seed: 0,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -1540,6 +1561,9 @@ mod tests {
             ft_fp16: false,
             ft_fp16_out: false,
             fp16_opt_state: false,
+            teacher_shuffle_buffer_mib: 0,
+            teacher_shuffle: false,
+            teacher_shuffle_seed: 0,
             threads: 1,
         }
     }

@@ -28,6 +28,118 @@ fn cli_definition_is_valid() {
 }
 
 #[test]
+fn teacher_shuffle_window_defaults_and_overrides_parse() {
+    let defaults = simple_cli(&[]);
+    assert_eq!(
+        defaults.teacher_shuffle_buffer_mib,
+        TeacherShuffleBufferMib::Auto
+    );
+    assert!(!defaults.no_teacher_shuffle);
+    assert_eq!(defaults.teacher_shuffle_seed, 0);
+
+    let configured = simple_cli(&[
+        "--teacher-shuffle-buffer-mib",
+        "512",
+        "--no-teacher-shuffle",
+        "--teacher-shuffle-seed",
+        "42",
+    ]);
+    assert_eq!(
+        configured.teacher_shuffle_buffer_mib,
+        TeacherShuffleBufferMib::Explicit(512)
+    );
+    assert!(configured.no_teacher_shuffle);
+    assert_eq!(configured.teacher_shuffle_seed, 42);
+}
+
+#[test]
+fn teacher_shuffle_auto_uses_one_sixteenth_capped() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(1), 0);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(GIB / 2), 32);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(2 * GIB), 128);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(4 * GIB), 256);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(8 * GIB), 512);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(16 * GIB), 1024);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(32 * GIB), 2048);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(64 * GIB), 4096);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(128 * GIB), 4096);
+}
+
+#[test]
+fn cgroup_v2_self_dir_resolves_mountpoint_and_mount_root() {
+    let mountinfo = "\
+23 20 0:21 / /proc rw - proc proc rw\n\
+36 20 0:30 / /run/cgroup2 rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(mountinfo, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/run/cgroup2"),
+            PathBuf::from("/run/cgroup2/tenant/job")
+        ))
+    );
+
+    let bind_rooted = "36 20 0:30 /tenant /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(bind_rooted, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/sys/fs/cgroup"),
+            PathBuf::from("/sys/fs/cgroup/job")
+        ))
+    );
+
+    // 自 cgroup を包含しない mount (/other, component 境界違いの /ten) は skip し、
+    // 包含する mount のうち root が最浅のものを選ぶ。
+    let multi = "\
+35 20 0:30 /other /run/other rw - cgroup2 cgroup2 rw\n\
+36 20 0:30 /ten /run/ten rw - cgroup2 cgroup2 rw\n\
+37 20 0:30 /tenant /run/scoped rw - cgroup2 cgroup2 rw\n\
+38 20 0:30 / /run/full rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(multi, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/run/full"),
+            PathBuf::from("/run/full/tenant/job")
+        ))
+    );
+    let non_containing = "35 20 0:30 /other /run/other rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(cgroup_v2_self_dir(non_containing, "0::/tenant/job\n"), None);
+
+    assert_eq!(cgroup_v2_self_dir(mountinfo, "4:memory:/foo\n"), None);
+    assert_eq!(
+        cgroup_v2_self_dir("23 20 0:21 / /proc rw - proc proc rw\n", "0::/a\n"),
+        None
+    );
+}
+
+#[test]
+fn cgroup_v2_nested_memory_max_takes_tightest_ancestor() {
+    let root = std::env::temp_dir().join(format!("cgroup-v2-test-{}", std::process::id()));
+    let nested = root.join("user.slice/app.scope");
+    std::fs::create_dir_all(&nested).unwrap();
+    let write = |dir: &std::path::Path, value: &str| {
+        std::fs::write(dir.join("memory.max"), value).unwrap();
+    };
+
+    write(&root, "max\n");
+    write(&nested, "max\n");
+    assert_eq!(cgroup_v2_nested_memory_max(&root, &nested), None);
+    write(&root.join("user.slice"), "1073741824\n");
+    assert_eq!(
+        cgroup_v2_nested_memory_max(&root, &nested),
+        Some(1_073_741_824)
+    );
+    write(&nested, "536870912\n");
+    assert_eq!(
+        cgroup_v2_nested_memory_max(&root, &nested),
+        Some(536_870_912)
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn score_override_flags_require_training_data_and_sidecar() {
     let parsed = Cli::try_parse_from([
         "nnue-train",

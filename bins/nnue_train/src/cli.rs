@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 #[cfg(any(feature = "gpu", test))]
@@ -14,6 +15,138 @@ fn parse_positive_i32(value: &str) -> Result<i32, String> {
         return Err("fv_scale must be greater than zero".to_string());
     }
     Ok(parsed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeacherShuffleBufferMib {
+    Auto,
+    Explicit(usize),
+}
+
+impl FromStr for TeacherShuffleBufferMib {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        value.parse::<usize>().map(Self::Explicit).map_err(|_| {
+            "teacher shuffle buffer must be 'auto' or a non-negative integer MiB value".to_string()
+        })
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
+#[cfg(any(feature = "gpu", test))]
+const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
+
+/// メモリ量に対する 1 窓の MiB。下限 floor は置かず、2 窓合計が常に総量の 1/8 に
+/// 収まるようにする。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> usize {
+    let memory_mib = memory_bytes / (1024 * 1024);
+    let per_window_mib = memory_mib / AUTO_TEACHER_BUFFER_MEMORY_DIVISOR;
+    usize::try_from(per_window_mib)
+        .unwrap_or(usize::MAX)
+        .min(AUTO_TEACHER_BUFFER_MAX_MIB)
+}
+
+/// 自プロセスの cgroup v2 directory とその mountpoint を解決する。mountinfo の
+/// 行形式は `id parent maj:min <root> <mountpoint> ... - <fstype> <source> <opts>`。
+/// `/proc/self/cgroup` の v2 パス (`0::<path>`) は cgroup namespace root 相対
+/// なので、自 cgroup を包含する mount root を `Path::strip_prefix` (component
+/// 境界を見る) で選び、剥がした残りを mountpoint に付け直す。包含する mount が
+/// 複数あるときは root が最浅のものを使う (祖先の `memory.max` が最も広く
+/// 見える)。v2 エントリ / 包含する cgroup2 mount が無い環境は `None`。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn cgroup_v2_self_dir(
+    proc_self_mountinfo: &str,
+    proc_self_cgroup: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cgroup_path = std::path::Path::new(
+        proc_self_cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?,
+    );
+    let mut best: Option<(std::path::PathBuf, std::path::PathBuf, usize)> = None;
+    for line in proc_self_mountinfo.lines() {
+        let Some((mount_fields, fs_fields)) = line.split_once(" - ") else {
+            continue;
+        };
+        if fs_fields.split_whitespace().next() != Some("cgroup2") {
+            continue;
+        }
+        let mut fields = mount_fields.split_whitespace();
+        let Some(root) = fields.nth(3) else { continue };
+        let Some(mountpoint) = fields.next() else {
+            continue;
+        };
+        let root = std::path::Path::new(root);
+        let Ok(rel) = cgroup_path.strip_prefix(root) else {
+            continue;
+        };
+        let depth = root.components().count();
+        if best.as_ref().is_none_or(|(_, _, d)| depth < *d) {
+            let mountpoint = std::path::PathBuf::from(mountpoint);
+            let dir = mountpoint.join(rel);
+            best = Some((mountpoint, dir, depth));
+        }
+    }
+    best.map(|(mountpoint, dir, _)| (mountpoint, dir))
+}
+
+/// 自 cgroup dir から mountpoint までの各祖先の `memory.max` の最小値を返す。
+/// sysinfo の `cgroup_limits` は namespace root の固定パスしか読まず nested
+/// cgroup (systemd slice 等) の上限を見逃すため自前で解決する。上限なし
+/// (`max`) は数値 parse 失敗として skip。数値 limit が無ければ `None`。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn cgroup_v2_nested_memory_max(
+    mountpoint: &std::path::Path,
+    self_dir: &std::path::Path,
+) -> Option<u64> {
+    let mut dir = self_dir.to_path_buf();
+    let mut tightest: Option<u64> = None;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
+            && let Ok(bytes) = text.trim().parse::<u64>()
+        {
+            tightest = Some(tightest.map_or(bytes, |t| t.min(bytes)));
+        }
+        if dir == *mountpoint || !dir.pop() {
+            break;
+        }
+    }
+    tightest
+}
+
+#[cfg(feature = "gpu")]
+impl TeacherShuffleBufferMib {
+    pub(crate) fn resolve(self) -> usize {
+        match self {
+            Self::Explicit(mib) => mib,
+            Self::Auto => {
+                let mut system = sysinfo::System::new();
+                system.refresh_memory();
+                let host_bytes = system.total_memory();
+                let mut effective_bytes = system
+                    .cgroup_limits()
+                    .map(|limits| limits.total_memory)
+                    .filter(|&bytes| bytes > 0)
+                    .map_or(host_bytes, |limit| host_bytes.min(limit));
+                if let (Ok(mountinfo), Ok(proc_self_cgroup)) = (
+                    std::fs::read_to_string("/proc/self/mountinfo"),
+                    std::fs::read_to_string("/proc/self/cgroup"),
+                ) && let Some((mountpoint, self_dir)) =
+                    cgroup_v2_self_dir(&mountinfo, &proc_self_cgroup)
+                    && let Some(nested) = cgroup_v2_nested_memory_max(&mountpoint, &self_dir)
+                {
+                    effective_bytes = effective_bytes.min(nested);
+                }
+                auto_teacher_shuffle_buffer_mib_for_bytes(effective_bytes)
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -399,11 +532,23 @@ pub(crate) struct Cli {
     pub(crate) norm_loss_factor: f32,
     /// Number of dataloader prefetch workers. Each worker does PSV parsing +
     /// HalfKA_hm sparse extraction + progress8kpabs bucket computation in a
-    /// single `decode()` call and supplies positions ahead of time. `1` gives
-    /// deterministic sequential reads; `>= 2` parses in parallel (position order
-    /// within an epoch is non-deterministic, which is fine for training).
+    /// single `decode()` call and supplies positions ahead of time. `1` preserves
+    /// the reader's deterministic order; `>= 2` parses in parallel (batch delivery
+    /// order within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
+    /// Raw PSV shuffle window size in MiB, per window. The default `auto` uses 1/16 of total RAM
+    /// (or the cgroup limit, including nested cgroup v2 limits), capped at 4096 MiB. Two windows
+    /// are kept, so raw teacher-data memory is approximately twice the resolved value. Set to 0
+    /// for direct sequential reading.
+    #[arg(long, default_value = "auto", global = true)]
+    pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
+    /// Keep double-buffered sequential I/O but do not shuffle records within each window.
+    #[arg(long, global = true)]
+    pub(crate) no_teacher_shuffle: bool,
+    /// Base seed for deterministic per-epoch, per-window teacher-data shuffle.
+    #[arg(long, default_value_t = 0, global = true)]
+    pub(crate) teacher_shuffle_seed: u64,
 
     /// Fast mode that runs the FT weight (`ft_w`) forward pass through an FP16
     /// mirror. With the default `false`, it is bit-identical to the FP32 path.

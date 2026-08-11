@@ -92,10 +92,53 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
+| `--teacher-shuffle-buffer-mib` | auto | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍。数値で固定でき、`0`で窓を使わない直接逐次読みへ戻す |
+| `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途 |
+| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` は KP-absolute 進行度で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
 | `--num-buckets` (`layerstack`) | 9 | `progress8kpabs` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
+
+### 教師データの先読みとshuffle
+
+既定の`auto`では、総RAMとcgroupメモリ上限 (nested cgroup v2の上限を含む) の小さい方の
+1/16を1窓の大きさとし (上限4096 MiB)、2窓合計が利用可能メモリの1/8に収まるようにする。producer threadがPSVをその大きさずつ逐次読みし、一方の窓を
+CPU dataloaderが消費している間に次の窓を準備する。窓が完成するとFisher–Yatesで並べ替える。
+physical EOFに達した末尾のpartial窓は次のdataset epochと混ぜずに処理し、次epochでは
+epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも、複数周の学習で毎回同じ
+順序を繰り返さずに済む。
+
+`auto`の目安は、RAM 8/16/32/64 GiB以上に対して1窓512 MiB/1 GiB/2 GiB/4 GiB。
+起動ログの`auto -> N MiB x2`と`experiment.json`には解決後の実効値を記録する。
+空きメモリ量は使わないため、同じメモリ上限なら他プロセスやpage cacheの状態で値は変わらない。
+
+追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
+大きな窓はHDDの長いstallを
+吸収しやすい一方、初回batchまでの読込時間、窓shuffleのCPU時間、random memory
+trafficも増やす。速度やメモリを優先する場合は256などの明示値で固定する。
+`--threads`はdecode worker数であり、producerの窓shuffle自体は並列化しない。
+
+```bash
+# 1 GiB/窓 (raw PSVは最大約2 GiB追加)、base seedを固定
+target/release/nnue-train ... \
+  --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
+  layerstack ...
+
+# 二重バッファのI/O効果だけを測る
+target/release/nnue-train ... \
+  --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
+  layerstack ...
+
+# 窓を使わない直接逐次読み
+target/release/nnue-train ... \
+  --teacher-shuffle-buffer-mib 0 \
+  layerstack ...
+```
+
+score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で適用してから
+窓内shuffleする。`--resume`時は教師streamをファイル先頭から開き直すため、
+checkpointは窓の途中位置やdataset epoch番号を復元しない。
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。
