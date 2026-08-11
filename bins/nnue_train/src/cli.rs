@@ -37,19 +37,49 @@ impl FromStr for TeacherShuffleBufferMib {
 }
 
 #[cfg(any(feature = "gpu", test))]
-const AUTO_TEACHER_BUFFER_MIN_MIB: usize = 256;
-#[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
+/// メモリ量に対する 1 窓の MiB。下限 floor は置かない: 1/16 × 2 窓で常に総量の
+/// 1/8 に収まるという不変条件を守るため (floor があると小さい memory limit を
+/// 窓 2 枚で食い潰す)。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> usize {
     let memory_mib = memory_bytes / (1024 * 1024);
     let per_window_mib = memory_mib / AUTO_TEACHER_BUFFER_MEMORY_DIVISOR;
     usize::try_from(per_window_mib)
         .unwrap_or(usize::MAX)
-        .clamp(AUTO_TEACHER_BUFFER_MIN_MIB, AUTO_TEACHER_BUFFER_MAX_MIB)
+        .min(AUTO_TEACHER_BUFFER_MAX_MIB)
+}
+
+/// cgroup v2 の nested memory limit を解決する。sysinfo の `cgroup_limits` は
+/// cgroup namespace root の固定パス (`/sys/fs/cgroup/memory.max`) しか読まず、
+/// systemd slice / cgroupns 無しコンテナ等の nested cgroup に掛かる上限を
+/// 見逃すため、`/proc/self/cgroup` の v2 パス (`0::<path>`) から自分の cgroup を
+/// 特定し、root までの各祖先の `memory.max` の最小値を返す。上限なし (`max`) は
+/// 数値 parse 失敗として skip する。v2 エントリが無い (v1 のみ) 環境は `None`。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn cgroup_v2_nested_memory_max(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &str,
+) -> Option<u64> {
+    let rel = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let mut dir = cgroup_root.join(rel.trim_start_matches('/'));
+    let mut tightest: Option<u64> = None;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
+            && let Ok(bytes) = text.trim().parse::<u64>()
+        {
+            tightest = Some(tightest.map_or(bytes, |t| t.min(bytes)));
+        }
+        if dir == *cgroup_root || !dir.pop() {
+            break;
+        }
+    }
+    tightest
 }
 
 #[cfg(feature = "gpu")]
@@ -61,11 +91,19 @@ impl TeacherShuffleBufferMib {
                 let mut system = sysinfo::System::new();
                 system.refresh_memory();
                 let host_bytes = system.total_memory();
-                let effective_bytes = system
+                let mut effective_bytes = system
                     .cgroup_limits()
                     .map(|limits| limits.total_memory)
                     .filter(|&bytes| bytes > 0)
                     .map_or(host_bytes, |limit| host_bytes.min(limit));
+                if let Ok(proc_self_cgroup) = std::fs::read_to_string("/proc/self/cgroup")
+                    && let Some(nested) = cgroup_v2_nested_memory_max(
+                        std::path::Path::new("/sys/fs/cgroup"),
+                        &proc_self_cgroup,
+                    )
+                {
+                    effective_bytes = effective_bytes.min(nested);
+                }
                 auto_teacher_shuffle_buffer_mib_for_bytes(effective_bytes)
             }
         }
@@ -461,8 +499,9 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
     /// Raw PSV shuffle window size in MiB, per window. The default `auto` uses 1/16 of total RAM
-    /// (or the cgroup limit), clamped to 256..=4096 MiB. Two windows are kept, so raw teacher-data
-    /// memory is approximately twice the resolved value. Set to 0 for direct sequential reading.
+    /// (or the cgroup limit, including nested cgroup v2 limits), capped at 4096 MiB. Two windows
+    /// are kept, so raw teacher-data memory is approximately twice the resolved value. Set to 0
+    /// for direct sequential reading.
     #[arg(long, default_value = "auto", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.

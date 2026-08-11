@@ -24,9 +24,10 @@ shuffle window.
 
 The window size is configured in MiB per window and is aligned down to a whole training batch.
 The default `auto` size is one sixteenth of the smaller of total system RAM and the process cgroup
-memory limit, clamped to 256 MiB through 4096 MiB per window. This gives larger-memory training
-machines a wider shuffle range while bounding the two raw windows to roughly one eighth of the
-effective memory limit and at most 8 GiB. Current free memory is deliberately excluded so the same
+memory limit (including nested cgroup v2 limits), capped at 4096 MiB per window. There is no
+lower floor, so the two raw windows together always stay within roughly one eighth of the
+effective memory limit (at most 8 GiB), giving larger-memory machines a wider shuffle range
+without overcommitting small containers. Current free memory is deliberately excluded so the same
 machine or container configuration resolves consistently across runs. A numeric value fixes the
 window size; zero selects the direct reader. Shuffle can be disabled independently to compare
 double-buffered I/O with and without reordered training data.

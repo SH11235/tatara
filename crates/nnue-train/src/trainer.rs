@@ -431,7 +431,8 @@ pub struct TrainingConfig {
     /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
     /// one while decode workers consume the other. `0` restores direct sequential reading.
     pub teacher_shuffle_buffer_mib: usize,
-    /// Shuffle records within each raw PSV window. Ignored when the buffer size is zero.
+    /// Shuffle records within each raw PSV window. Callers pass the effective value
+    /// (`false` when the buffer size is zero) so config, logs, and experiment metadata agree.
     pub teacher_shuffle: bool,
     /// Base seed for deterministic per-epoch, per-window shuffle.
     pub teacher_shuffle_seed: u64,
@@ -748,7 +749,7 @@ where
         cfg.score_override,
         cfg.score_override_mask,
         cfg.teacher_shuffle_buffer_mib,
-        cfg.teacher_shuffle && cfg.teacher_shuffle_buffer_mib != 0,
+        cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
         cfg.threads.max(1),
     );

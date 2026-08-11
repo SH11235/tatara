@@ -53,16 +53,53 @@ fn teacher_shuffle_window_defaults_and_overrides_parse() {
 }
 
 #[test]
-fn teacher_shuffle_auto_uses_one_sixteenth_with_bounds() {
+fn teacher_shuffle_auto_uses_one_sixteenth_capped() {
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(1), 256);
+    // 下限 floor なし: 小さい memory limit でも 2 窓合計が常に 1/8 に収まる。
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(1), 0);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(GIB / 2), 32);
+    assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(2 * GIB), 128);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(4 * GIB), 256);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(8 * GIB), 512);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(16 * GIB), 1024);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(32 * GIB), 2048);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(64 * GIB), 4096);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(128 * GIB), 4096);
+}
+
+#[test]
+fn cgroup_v2_nested_memory_max_takes_tightest_ancestor() {
+    let root = std::env::temp_dir().join(format!("cgroup-v2-test-{}", std::process::id()));
+    let nested = root.join("user.slice/app.scope");
+    std::fs::create_dir_all(&nested).unwrap();
+    let write = |dir: &std::path::Path, value: &str| {
+        std::fs::write(dir.join("memory.max"), value).unwrap();
+    };
+
+    // v2 エントリなし (v1 のみ) は None。
+    assert_eq!(cgroup_v2_nested_memory_max(&root, "4:memory:/foo\n"), None);
+    // どの階層にも limit なし ("max") は None。
+    write(&root, "max\n");
+    write(&nested, "max\n");
+    assert_eq!(
+        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
+        None
+    );
+    // 中間階層の limit が最小ならそれを返す (leaf は無制限のまま)。
+    write(&root.join("user.slice"), "1073741824\n");
+    assert_eq!(
+        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
+        Some(1_073_741_824)
+    );
+    // leaf にさらに小さい limit があれば min を取る。
+    write(&nested, "536870912\n");
+    assert_eq!(
+        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
+        Some(536_870_912)
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

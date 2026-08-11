@@ -935,7 +935,10 @@ impl WindowedPsvReader {
                     .as_ref()
                     .is_some_and(|tx| tx.send(old.records).is_err())
             {
-                return Err(io::Error::other("PSV window producer stopped"));
+                // empty_rx が閉じている = producer は終了済み。producer は終了直前に
+                // 詳細な io::Error を ready channel へ queue していることがあるため、
+                // ここでは失敗にせず下の recv でそのエラーを表面化させる。
+                self.empty_tx = None;
             }
             self.current = Some(
                 self.ready_rx
@@ -968,6 +971,15 @@ impl TrainingPsvReader {
             Self::Windowed(reader) => reader.next(),
         }
     }
+
+    /// Windowed のとき producer の stop flag を返す。reader の Mutex を取らずに
+    /// 外側 (loader の Drop) から producer を止めるために使う。
+    fn producer_stop_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Windowed(reader) => Some(Arc::clone(&reader.stop)),
+        }
+    }
 }
 
 // =============================================================================
@@ -995,9 +1007,11 @@ type BatchSlot = (Batch, Vec<i32>);
 /// - **decode-once**: worker は `psv.decode()` した `ShogiBoard` を
 ///   `Batch::push_decoded` (feature 抽出) と [`BucketMode::bucket_board`] の両方に
 ///   渡す。`pos.decode()` は 1 局面 1 回。
-/// - **並列パース**: worker は短い critical section (共有 `Mutex<PsvEpochReader>`
-///   を lock して `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は
-///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`FeatureSetSpec` は
+/// - **並列パース**: worker は短い critical section (共有 reader を lock して
+///   `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
+///   外で decode + 特徴抽出を並列に行う。ただし windowed reader では窓境界で
+///   producer の次窓完成を lock 保持のまま待ち得るため、`Drop` は先に producer を
+///   止めて join の stall を防ぐ (`producer_stop`)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
@@ -1035,6 +1049,11 @@ pub struct BucketedPrefetchedLoader {
     active_hist: Option<Arc<Mutex<Vec<u64>>>>,
     /// worker thread handle (`Drop` で join する)。
     handles: Vec<thread::JoinHandle<()>>,
+    /// windowed reader 使用時のみ `Some`。`Drop` の先頭で set し、window 充填中の
+    /// producer を record 境界で止める (これが無いと reader lock を持つ worker が
+    /// 次 window の完成まで `recv` で block し、join が窓 1 枚分の読み込み時間
+    /// stall する)。
+    producer_stop: Option<Arc<AtomicBool>>,
 }
 
 impl BucketedPrefetchedLoader {
@@ -1145,6 +1164,7 @@ impl BucketedPrefetchedLoader {
             )),
             None => TrainingPsvReader::Direct(Box::new(source)),
         };
+        let producer_stop = reader.producer_stop_flag();
         let reader = Arc::new(Mutex::new(reader));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
@@ -1293,6 +1313,7 @@ impl BucketedPrefetchedLoader {
             err_slot,
             active_hist,
             handles,
+            producer_stop,
         })
     }
 
@@ -1364,23 +1385,30 @@ impl Drop for BucketedPrefetchedLoader {
     /// **close-then-join**: 先に loader 側の channel endpoint を落としてから
     /// worker thread を join する。
     ///
-    /// 1. `result_rx` (result channel の **受信側**) を drop → worker の
+    /// 1. windowed reader 使用時は producer の stop flag を set。reader lock を
+    ///    持ったまま `ready_rx.recv()` で次 window を待つ worker がいても、
+    ///    producer が record 境界で止まり channel を閉じて unblock される
+    ///    (これが無いと join が窓 1 枚分の読み込み時間 stall する)。
+    /// 2. `result_rx` (result channel の **受信側**) を drop → worker の
     ///    `result_tx.send(...)` が `Err` を返し、worker が `break`。
-    /// 2. `pool_tx` (pool channel の **送信側**、`recycle` 用) を drop → worker の
+    /// 3. `pool_tx` (pool channel の **送信側**、`recycle` 用) を drop → worker の
     ///    `pool_rx.recv()` が `Err` を返し、pool 借用待ちの worker も `break`。
-    /// 3. 各 worker thread を `join` する。手順 1/2 で全 worker は次の channel 操作で
-    ///    速やかに抜けるので join は hang しない (他の lock holder は兄弟 worker の
-    ///    短い critical section のみ)。
+    /// 4. 各 worker thread を `join` する。手順 1..=3 で全 worker は次の channel
+    ///    操作で速やかに抜けるので join は hang しない。
     ///
     /// この順序を守らないと (= channel を閉じる前に join すると) worker が
     /// `result_tx.send` / `pool_rx.recv` で永久に block して deadlock する。
     /// `spawn` 内の thread spawn が途中で失敗するケースは無い (`thread::spawn` は
     /// 失敗時 panic する) ので `handles` は常に完全だが、`drain(..)` で空でも安全。
     fn drop(&mut self) {
-        // 1 & 2: channel endpoint を先に落として worker を unblock。
+        // 1: window producer を record 境界で止める (worker unblock の前提)。
+        if let Some(stop) = &self.producer_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        // 2 & 3: channel endpoint を先に落として worker を unblock。
         self.result_rx = None;
         self.pool_tx = None;
-        // 3: 全 worker を join (channel が閉じているので速やかに終了する)。
+        // 4: 全 worker を join (channel が閉じているので速やかに終了する)。
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
