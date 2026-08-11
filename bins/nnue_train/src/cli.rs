@@ -356,8 +356,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, requires = "score_override")]
     pub(crate) score_override_mask: Option<PathBuf>,
 
-    /// Read the teacher score from the DL label embedded at bytes 34-35 of each PSV record.
-    /// `all` uses it for every record; `gated` preserves the base score when padding bit 0 is set.
+    /// Read the teacher score from the DL label embedded at bytes 34-35 of each `--data`
+    /// PSV record. `all` uses it for every record; `gated` preserves the base score when
+    /// padding bit 0 is set. This also applies to a same-file tail reserved by
+    /// `--test-tail-positions`. An external `--test-data` file is always read unchanged.
     #[arg(
         long,
         global = true,
@@ -746,9 +748,6 @@ impl Cli {
                 "--score-override and --dual-label-psv require PSV training data, not HCPE"
                     .to_string(),
             );
-        }
-        if self.dual_label_psv.is_some() && self.test_data.as_deref().is_some_and(is_hcpe) {
-            return Err("--dual-label-psv requires PSV held-out data, not HCPE".to_string());
         }
         Ok(())
     }

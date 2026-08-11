@@ -246,6 +246,32 @@ fn loader_digest_uses_global_loader_arguments() {
     assert_eq!(args.batches, 3);
 }
 
+#[test]
+fn loader_digest_rejects_heldout_sources() {
+    for (flag, value) in [
+        ("--test-tail-positions", "16"),
+        ("--test-data", "heldout.psv"),
+    ] {
+        let cli = Cli::try_parse_from([
+            "nnue-train",
+            "loader-digest",
+            "--data",
+            "teacher.psv",
+            flag,
+            value,
+            "--batches",
+            "1",
+        ])
+        .unwrap();
+        let ArchCommand::LoaderDigest(args) = &cli.arch else {
+            panic!("expected loader-digest");
+        };
+        let err = crate::loader_digest::run(&cli, args)
+            .expect_err("loader-digest must reject held-out source flags");
+        assert!(err.to_string().contains(flag), "got: {err}");
+    }
+}
+
 /// `--ft-factorize` / `--no-ft-factorize` は global flag。任意 subcommand の後ろに
 /// 付けても global 引数として parse される (層は `simple` でも `layerstack` でも同じ)。
 fn cli_with_factorize(argv: &[&str]) -> Cli {

@@ -9,6 +9,12 @@ use shogi_features::FeatureSet;
 use crate::cli::{Cli, LoaderDigestArgs};
 
 pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.test_tail_positions.is_some() {
+        return Err("loader-digest does not support --test-tail-positions".into());
+    }
+    if cli.test_data.is_some() {
+        return Err("loader-digest does not support --test-data".into());
+    }
     let data = cli.data.as_deref().ok_or("loader-digest requires --data")?;
     if cli.batch_size == 0 {
         return Err("--batch-size must be >= 1".into());

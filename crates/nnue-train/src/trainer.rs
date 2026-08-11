@@ -773,7 +773,7 @@ where
     // 指定は reject 済みなので exhaustive な 4-arm match で意図を明示。
     let heldout = match (&cfg.test_data, cfg.test_tail_positions) {
         (Some(test_path), None) => {
-            let set = crate::validation::HeldoutSet::load_with_dual_label(
+            let set = crate::validation::HeldoutSet::load(
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
@@ -782,7 +782,6 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
-                cfg.dual_label_psv,
             )?;
             println!(
                 "[train] held-out validation (external file): data={} | {} batches x bs {} ({} positions)",

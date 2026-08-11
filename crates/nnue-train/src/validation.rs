@@ -82,41 +82,10 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
-        Self::load_with_dual_label(
-            path,
-            batch_size,
-            score_drop_abs,
-            score_clamp_abs,
-            test_positions,
-            bucket_mode,
-            feature_set,
-            num_buckets,
-            None,
-        )
-    }
-
-    /// [`Self::load`] と同じ検証集合を dual-label PSV score 解釈付きで読む。
-    #[allow(clippy::too_many_arguments)]
-    pub fn load_with_dual_label(
-        path: &Path,
-        batch_size: usize,
-        score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i16>,
-        test_positions: usize,
-        bucket_mode: &(impl Copy + Into<BucketMode>),
-        feature_set: FeatureSetSpec,
-        num_buckets: usize,
-        dual_label_psv: Option<DualLabelMode>,
-    ) -> io::Result<Self> {
         if path.extension().is_some_and(|ext| {
             ext.to_str()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
         }) {
-            if dual_label_psv.is_some() {
-                return Err(io::Error::other(
-                    "dual_label_psv is only supported for PSV validation data, not HCPE",
-                ));
-            }
             let loader = HcpeFileLoader::new(path)?;
             return Self::load_boards(
                 loader,
@@ -146,7 +115,7 @@ impl HeldoutSet {
             num_buckets,
             None,
             None,
-            dual_label_psv,
+            None,
         )
     }
 
@@ -430,6 +399,27 @@ mod tests {
             .join("shogi-format/tests/data/sample.psv")
     }
 
+    fn sample_psv_variant(
+        name: &str,
+        records: usize,
+        mut edit: impl FnMut(usize, &mut [u8]),
+    ) -> PathBuf {
+        let mut bytes = std::fs::read(sample_psv_path()).expect("read sample PSV");
+        bytes.truncate(records * PSV_RECORD_BYTES as usize);
+        for (index, record) in bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .enumerate()
+        {
+            edit(index, record);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "nnue-train-heldout-{name}-{}.psv",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("write sample PSV variant");
+        path
+    }
+
     #[test]
     #[ignore = "requires an external HCPE file"]
     fn heldout_set_loads_external_hcpe() {
@@ -606,6 +596,68 @@ mod tests {
         .expect("load tail range");
         assert_eq!(set.n_batches(), 1, "EOF で 2 batch 目は埋まらない");
         assert_eq!(set.n_positions(), 16);
+    }
+
+    #[test]
+    fn tail_heldout_applies_gated_dual_label_scores() {
+        let path = sample_psv_variant("dual-tail", 16, |index, record| {
+            let base = 100 + index as i16;
+            let dl = 1000 + index as i16;
+            record[32..34].copy_from_slice(&base.to_le_bytes());
+            record[34..36].copy_from_slice(&dl.to_le_bytes());
+            record[39] = u8::from(index == 8 || index == 15);
+        });
+        let set = HeldoutSet::load_from_range_with_score_sources(
+            &path,
+            8 * PSV_RECORD_BYTES,
+            16 * PSV_RECORD_BYTES,
+            8,
+            None,
+            None,
+            8,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+            None,
+            None,
+            Some(DualLabelMode::Gated),
+        )
+        .expect("load dual-label tail held-out set");
+        let scores = &set.batches[0].0.score[..8];
+        assert_eq!(scores[0], 108.0, "gate bit preserves the first base score");
+        assert_eq!(scores[7], 115.0, "gate bit preserves the last base score");
+        assert_eq!(
+            &scores[1..7],
+            &[1009.0, 1010.0, 1011.0, 1012.0, 1013.0, 1014.0]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn external_test_data_load_keeps_base_psv_scores() {
+        let path = sample_psv_variant("external-base", 8, |index, record| {
+            let base = 200 + index as i16;
+            let dl = -1000 - index as i16;
+            record[32..34].copy_from_slice(&base.to_le_bytes());
+            record[34..36].copy_from_slice(&dl.to_le_bytes());
+            record[39] = 0;
+        });
+        let set = HeldoutSet::load(
+            &path,
+            8,
+            None,
+            None,
+            8,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+        )
+        .expect("load external test data as plain PSV");
+        assert_eq!(
+            &set.batches[0].0.score[..8],
+            &[200.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

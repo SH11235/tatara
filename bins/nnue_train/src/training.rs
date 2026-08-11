@@ -8,7 +8,9 @@ use nnue_format::LayerStackWeights;
 #[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 #[cfg(any(feature = "gpu", test))]
-use nnue_train::dataloader::{BucketMode, DualLabelMode};
+use nnue_train::dataloader::BucketMode;
+#[cfg(feature = "gpu")]
+use nnue_train::dataloader::DualLabelMode;
 #[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
@@ -815,7 +817,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         }
         let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
-            (Some(test_path), None) => nnue_train::validation::HeldoutSet::load_with_dual_label(
+            (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
@@ -824,7 +826,6 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 &bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
-                cfg.dual_label_psv,
             )?,
             (None, Some(n)) => {
                 if n == 0 {

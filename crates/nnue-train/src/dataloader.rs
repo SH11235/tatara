@@ -1661,6 +1661,32 @@ mod tests {
     }
 
     #[test]
+    fn window_shuffle_applies_dual_label_before_reordering() {
+        let base = [1, 2, 3, 4, 5];
+        let dl = [101, 102, 103, 104, 105];
+        let path = synthetic_dual_file("window", &base, &dl, &[0; 5]);
+        let source = PsvEpochReader::new_range(
+            &path,
+            0,
+            base.len() as u64 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        let mut reader = WindowedPsvReader::spawn(source, base.len(), true, 9);
+        let mut got = (0..base.len())
+            .map(|_| reader.next().unwrap().score())
+            .collect::<Vec<_>>();
+        drop(reader);
+        let _ = std::fs::remove_file(path);
+        got.sort_unstable();
+        assert_eq!(got, dl);
+    }
+
+    #[test]
     fn dropping_partially_consumed_window_stops_producer() {
         let base = [1, 2, 3, 4, 5];
         let (data, scores, _) = synthetic_override_files("window-drop", &base, &base, None);
@@ -2733,6 +2759,62 @@ mod tests {
     #[test]
     fn bucketed_loader_multi_worker() {
         run_bucketed_smoke(4);
+    }
+
+    #[test]
+    fn bucketed_multi_worker_surfaces_dual_label_reserved_bit_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "nnue-train-dual-label-worker-error-{}.psv",
+            std::process::id()
+        ));
+        let mut bytes = std::fs::read(sample_psv_path()).expect("read sample PSV");
+        for (index, record) in bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .enumerate()
+        {
+            let dl = 1000 + index as i16;
+            record[34..36].copy_from_slice(&dl.to_le_bytes());
+            record[39] = 0;
+        }
+        bytes[31 * PSV_RECORD_BYTES as usize + 39] = 2;
+        std::fs::write(&path, bytes).expect("write invalid dual-label PSV");
+
+        let end = full_range_end(&path);
+        let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &path,
+            8,
+            None,
+            None,
+            4,
+            BucketMode::KingRank9,
+            test_spec(),
+            false,
+            1,
+            end,
+            false,
+            None,
+            None,
+            0,
+            false,
+            0,
+            Some(DualLabelMode::All),
+        )
+        .expect("spawn multi-worker dual-label loader");
+        let mut error = None;
+        for _ in 0..64 {
+            match loader.next_batch() {
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+                Ok(Some(slot)) => loader.recycle(slot),
+                Ok(None) => break,
+            }
+        }
+        let err = error.expect("reserved-bit worker error must reach next_batch");
+        assert!(err.to_string().contains("record 31"), "got: {err}");
+        drop(loader);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
