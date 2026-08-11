@@ -39,9 +39,8 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
-/// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。有効値の真理値は
-/// `TrainingConfig` / experiment logger / 起動ログの全てでこの値を使う
-/// (buffer 0 のとき `teacher_shuffle: true` のような矛盾した記録を残さない)。
+/// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。config / experiment
+/// logger / 起動ログは全てこの値を使う (導出を重複させて矛盾した記録を残さない)。
 #[cfg(feature = "gpu")]
 fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
     let resolved = cli.teacher_shuffle_buffer_mib.resolve();

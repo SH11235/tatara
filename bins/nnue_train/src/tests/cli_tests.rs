@@ -56,7 +56,6 @@ fn teacher_shuffle_window_defaults_and_overrides_parse() {
 fn teacher_shuffle_auto_uses_one_sixteenth_capped() {
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    // 下限 floor なし: 小さい memory limit でも 2 窓合計が常に 1/8 に収まる。
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(1), 0);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(GIB / 2), 32);
     assert_eq!(auto_teacher_shuffle_buffer_mib_for_bytes(2 * GIB), 128);
@@ -69,6 +68,35 @@ fn teacher_shuffle_auto_uses_one_sixteenth_capped() {
 }
 
 #[test]
+fn cgroup_v2_self_dir_resolves_mountpoint_and_mount_root() {
+    let mountinfo = "\
+23 20 0:21 / /proc rw - proc proc rw\n\
+36 20 0:30 / /run/cgroup2 rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(mountinfo, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/run/cgroup2"),
+            PathBuf::from("/run/cgroup2/tenant/job")
+        ))
+    );
+
+    let bind_rooted = "36 20 0:30 /tenant /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+    assert_eq!(
+        cgroup_v2_self_dir(bind_rooted, "0::/tenant/job\n"),
+        Some((
+            PathBuf::from("/sys/fs/cgroup"),
+            PathBuf::from("/sys/fs/cgroup/job")
+        ))
+    );
+
+    assert_eq!(cgroup_v2_self_dir(mountinfo, "4:memory:/foo\n"), None);
+    assert_eq!(
+        cgroup_v2_self_dir("23 20 0:21 / /proc rw - proc proc rw\n", "0::/a\n"),
+        None
+    );
+}
+
+#[test]
 fn cgroup_v2_nested_memory_max_takes_tightest_ancestor() {
     let root = std::env::temp_dir().join(format!("cgroup-v2-test-{}", std::process::id()));
     let nested = root.join("user.slice/app.scope");
@@ -77,25 +105,17 @@ fn cgroup_v2_nested_memory_max_takes_tightest_ancestor() {
         std::fs::write(dir.join("memory.max"), value).unwrap();
     };
 
-    // v2 エントリなし (v1 のみ) は None。
-    assert_eq!(cgroup_v2_nested_memory_max(&root, "4:memory:/foo\n"), None);
-    // どの階層にも limit なし ("max") は None。
     write(&root, "max\n");
     write(&nested, "max\n");
-    assert_eq!(
-        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
-        None
-    );
-    // 中間階層の limit が最小ならそれを返す (leaf は無制限のまま)。
+    assert_eq!(cgroup_v2_nested_memory_max(&root, &nested), None);
     write(&root.join("user.slice"), "1073741824\n");
     assert_eq!(
-        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
+        cgroup_v2_nested_memory_max(&root, &nested),
         Some(1_073_741_824)
     );
-    // leaf にさらに小さい limit があれば min を取る。
     write(&nested, "536870912\n");
     assert_eq!(
-        cgroup_v2_nested_memory_max(&root, "0::/user.slice/app.scope\n"),
+        cgroup_v2_nested_memory_max(&root, &nested),
         Some(536_870_912)
     );
 

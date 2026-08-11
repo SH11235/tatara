@@ -41,9 +41,8 @@ const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
-/// メモリ量に対する 1 窓の MiB。下限 floor は置かない: 1/16 × 2 窓で常に総量の
-/// 1/8 に収まるという不変条件を守るため (floor があると小さい memory limit を
-/// 窓 2 枚で食い潰す)。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
+/// メモリ量に対する 1 窓の MiB。下限 floor は置かず、2 窓合計が常に総量の 1/8 に
+/// 収まるようにする。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> usize {
     let memory_mib = memory_bytes / (1024 * 1024);
@@ -53,21 +52,47 @@ pub(crate) fn auto_teacher_shuffle_buffer_mib_for_bytes(memory_bytes: u64) -> us
         .min(AUTO_TEACHER_BUFFER_MAX_MIB)
 }
 
-/// cgroup v2 の nested memory limit を解決する。sysinfo の `cgroup_limits` は
-/// cgroup namespace root の固定パス (`/sys/fs/cgroup/memory.max`) しか読まず、
-/// systemd slice / cgroupns 無しコンテナ等の nested cgroup に掛かる上限を
-/// 見逃すため、`/proc/self/cgroup` の v2 パス (`0::<path>`) から自分の cgroup を
-/// 特定し、root までの各祖先の `memory.max` の最小値を返す。上限なし (`max`) は
-/// 数値 parse 失敗として skip する。v2 エントリが無い (v1 のみ) 環境は `None`。
+/// 自プロセスの cgroup v2 directory とその mountpoint を解決する。mountinfo の
+/// 行形式は `id parent maj:min <root> <mountpoint> ... - <fstype> <source> <opts>`。
+/// `/proc/self/cgroup` の v2 パス (`0::<path>`) は cgroup namespace root 相対
+/// なので、mount root が `/` 以外なら prefix を剥がして mountpoint に付け直す。
+/// v2 エントリ / cgroup2 mount が無い環境は `None`。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn cgroup_v2_nested_memory_max(
-    cgroup_root: &std::path::Path,
+pub(crate) fn cgroup_v2_self_dir(
+    proc_self_mountinfo: &str,
     proc_self_cgroup: &str,
-) -> Option<u64> {
-    let rel = proc_self_cgroup
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cgroup_path = proc_self_cgroup
         .lines()
         .find_map(|line| line.strip_prefix("0::"))?;
-    let mut dir = cgroup_root.join(rel.trim_start_matches('/'));
+    let (mount_root, mountpoint) = proc_self_mountinfo.lines().find_map(|line| {
+        let (mount_fields, fs_fields) = line.split_once(" - ")?;
+        if fs_fields.split_whitespace().next() != Some("cgroup2") {
+            return None;
+        }
+        let mut fields = mount_fields.split_whitespace();
+        let root = fields.nth(3)?;
+        let mountpoint = fields.next()?;
+        Some((root, mountpoint))
+    })?;
+    let rel = cgroup_path
+        .strip_prefix(mount_root.trim_end_matches('/'))
+        .unwrap_or(cgroup_path);
+    let mountpoint = std::path::PathBuf::from(mountpoint);
+    let dir = mountpoint.join(rel.trim_start_matches('/'));
+    Some((mountpoint, dir))
+}
+
+/// 自 cgroup dir から mountpoint までの各祖先の `memory.max` の最小値を返す。
+/// sysinfo の `cgroup_limits` は namespace root の固定パスしか読まず nested
+/// cgroup (systemd slice 等) の上限を見逃すため自前で解決する。上限なし
+/// (`max`) は数値 parse 失敗として skip。数値 limit が無ければ `None`。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn cgroup_v2_nested_memory_max(
+    mountpoint: &std::path::Path,
+    self_dir: &std::path::Path,
+) -> Option<u64> {
+    let mut dir = self_dir.to_path_buf();
     let mut tightest: Option<u64> = None;
     loop {
         if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
@@ -75,7 +100,7 @@ pub(crate) fn cgroup_v2_nested_memory_max(
         {
             tightest = Some(tightest.map_or(bytes, |t| t.min(bytes)));
         }
-        if dir == *cgroup_root || !dir.pop() {
+        if dir == *mountpoint || !dir.pop() {
             break;
         }
     }
@@ -96,11 +121,12 @@ impl TeacherShuffleBufferMib {
                     .map(|limits| limits.total_memory)
                     .filter(|&bytes| bytes > 0)
                     .map_or(host_bytes, |limit| host_bytes.min(limit));
-                if let Ok(proc_self_cgroup) = std::fs::read_to_string("/proc/self/cgroup")
-                    && let Some(nested) = cgroup_v2_nested_memory_max(
-                        std::path::Path::new("/sys/fs/cgroup"),
-                        &proc_self_cgroup,
-                    )
+                if let (Ok(mountinfo), Ok(proc_self_cgroup)) = (
+                    std::fs::read_to_string("/proc/self/mountinfo"),
+                    std::fs::read_to_string("/proc/self/cgroup"),
+                ) && let Some((mountpoint, self_dir)) =
+                    cgroup_v2_self_dir(&mountinfo, &proc_self_cgroup)
+                    && let Some(nested) = cgroup_v2_nested_memory_max(&mountpoint, &self_dir)
                 {
                     effective_bytes = effective_bytes.min(nested);
                 }
