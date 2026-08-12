@@ -550,11 +550,13 @@ pub(crate) struct Cli {
     /// order within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
-    /// Raw PSV shuffle window size in MiB, per window. The default `auto` uses 1/16 of total RAM
-    /// (or the cgroup limit, including nested cgroup v2 limits), capped at 4096 MiB. Two windows
-    /// are kept, so raw teacher-data memory is approximately twice the resolved value. Set to 0
-    /// for direct sequential reading.
-    #[arg(long, default_value = "auto", global = true)]
+    /// Raw PSV shuffle window size in MiB, per window. The default 0 reads the teacher
+    /// sequentially without windows (teachers are expected to be pre-shuffled on disk).
+    /// A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle;
+    /// `auto` sizes the window to 1/16 of total RAM (or the cgroup limit, including nested
+    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so raw teacher-data
+    /// memory is approximately twice the resolved value.
+    #[arg(long, default_value = "0", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.
     #[arg(long, global = true)]

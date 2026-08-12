@@ -58,6 +58,9 @@ fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
         TeacherShuffleBufferMib::Auto => println!(
             "[train] teacher shuffle window: auto -> {resolved} MiB x2 (total RAM or cgroup limit / 16, capped at 4096 MiB/window)"
         ),
+        TeacherShuffleBufferMib::Explicit(0) => {
+            println!("[train] teacher shuffle window: disabled (direct sequential read)")
+        }
         TeacherShuffleBufferMib::Explicit(_) => {
             println!("[train] teacher shuffle window: explicit {resolved} MiB x2")
         }
