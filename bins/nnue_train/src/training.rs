@@ -54,15 +54,19 @@ fn dual_label_param(cli: &Cli) -> Option<String> {
 #[cfg(feature = "gpu")]
 fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
     let resolved = cli.teacher_shuffle_buffer_mib.resolve();
-    match cli.teacher_shuffle_buffer_mib {
-        TeacherShuffleBufferMib::Auto => println!(
-            "[train] teacher shuffle window: auto -> {resolved} MiB x2 (total RAM or cgroup limit / 16, capped at 4096 MiB/window)"
-        ),
-        TeacherShuffleBufferMib::Explicit(_) => {
-            println!("[train] teacher shuffle window: explicit {resolved} MiB x2")
-        }
+    let shuffle = TeacherShuffleBufferMib::effective_shuffle(resolved, cli.no_teacher_shuffle);
+    println!(
+        "[train] teacher shuffle window: {}",
+        cli.teacher_shuffle_buffer_mib
+            .describe(resolved, shuffle, cli.teacher_shuffle_seed)
+    );
+    if resolved == 0 && (cli.no_teacher_shuffle || cli.teacher_shuffle_seed != 0) {
+        eprintln!(
+            "[train] warning: --no-teacher-shuffle / --teacher-shuffle-seed have no effect \
+             without --teacher-shuffle-buffer-mib > 0"
+        );
     }
-    (resolved, !cli.no_teacher_shuffle && resolved != 0)
+    (resolved, shuffle)
 }
 
 #[cfg(any(feature = "gpu", test))]

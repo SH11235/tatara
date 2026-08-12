@@ -101,9 +101,9 @@ change for real training are:
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
-| `--teacher-shuffle-buffer-mib` | auto | Teacher-data read-ahead and shuffle window size in MiB, per window. `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value. Pass a number to fix the size, or `0` for direct sequential reading without windows |
-| `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering |
-| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index. The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
+| `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value |
+| `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering. Takes effect only when `--teacher-shuffle-buffer-mib > 0` |
+| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
 | `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
@@ -111,10 +111,12 @@ change for real training are:
 
 ### Teacher-data read-ahead and shuffle
 
-The default `auto` size is 1/16 of the smaller of total RAM and the cgroup memory limit (including
+The default (`--teacher-shuffle-buffer-mib 0`) reads the teacher sequentially without windows,
+assuming teachers are pre-shuffled on disk. Passing a positive value or `auto` enables windowing;
+`auto` sizes each window to 1/16 of the smaller of total RAM and the cgroup memory limit (including
 nested cgroup v2 limits), capped at 4096 MiB per window, so both windows together stay within 1/8
-of available memory. A producer thread reads PSV records sequentially into windows of that
-size. While the CPU dataloader consumes one window, the producer prepares the next. A completed window is reordered
+of available memory. With windowing enabled, a producer thread reads PSV records sequentially into
+windows of that size. While the CPU dataloader consumes one window, the producer prepares the next. A completed window is reordered
 with Fisher–Yates. A partial window at physical EOF is processed without mixing records from the
 next dataset epoch, and the next epoch uses a different seed that includes its epoch number. This
 avoids repeating exactly the same order when training makes multiple passes over an already
@@ -128,8 +130,8 @@ do not change the result for a fixed memory limit.
 Additional raw memory is approximately twice the effective value; an explicit
 `--teacher-shuffle-buffer-mib 4096` adds about 8 GiB. A larger window can absorb longer
 HDD stalls, but it also increases the delay before the first batch, CPU time spent shuffling, and
-random memory traffic. Use an explicit value such as 256 when throughput or lower memory usage is
-more important. `--threads` controls decode workers; it does not parallelise the
+random memory traffic. When windowing is enabled, a small explicit value such as 256 keeps the
+first-batch delay, memory, and shuffle cost low. `--threads` controls decode workers; it does not parallelise the
 producer's window shuffle.
 
 ```bash
@@ -143,9 +145,9 @@ target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
   layerstack ...
 
-# Restore direct sequential reading
+# Memory-sized read-ahead window plus shuffle (opt-in for slow storage)
 target/release/nnue-train ... \
-  --teacher-shuffle-buffer-mib 0 \
+  --teacher-shuffle-buffer-mib auto \
   layerstack ...
 ```
 

@@ -36,6 +36,28 @@ impl FromStr for TeacherShuffleBufferMib {
     }
 }
 
+impl TeacherShuffleBufferMib {
+    /// resolve 済み窓サイズと `--no-teacher-shuffle` から実効 shuffle を決める。
+    /// training と loader-digest で判定を一致させるための単一実装。
+    pub(crate) fn effective_shuffle(resolved_mib: usize, no_teacher_shuffle: bool) -> bool {
+        !no_teacher_shuffle && resolved_mib != 0
+    }
+
+    /// 起動ログ用の実効設定の説明文。training と loader-digest で共通に使い、
+    /// 同一設定の run が同じ文字列で grep できるようにする。
+    pub(crate) fn describe(self, resolved_mib: usize, shuffle: bool, seed: u64) -> String {
+        let auto_note = match self {
+            Self::Auto => " (auto)",
+            Self::Explicit(_) => "",
+        };
+        if resolved_mib == 0 {
+            format!("disabled (direct sequential read){auto_note}")
+        } else {
+            format!("{resolved_mib} MiB x2{auto_note}, shuffle {shuffle}, seed {seed}")
+        }
+    }
+}
+
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]
@@ -550,16 +572,20 @@ pub(crate) struct Cli {
     /// order within an epoch is non-deterministic, which is fine for training).
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
-    /// Raw PSV shuffle window size in MiB, per window. The default `auto` uses 1/16 of total RAM
-    /// (or the cgroup limit, including nested cgroup v2 limits), capped at 4096 MiB. Two windows
-    /// are kept, so raw teacher-data memory is approximately twice the resolved value. Set to 0
-    /// for direct sequential reading.
-    #[arg(long, default_value = "auto", global = true)]
+    /// Raw PSV shuffle window size in MiB, per window. The default 0 reads the teacher
+    /// sequentially without windows (teachers are expected to be pre-shuffled on disk).
+    /// A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle;
+    /// `auto` sizes the window to 1/16 of total RAM (or the cgroup limit, including nested
+    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so raw teacher-data
+    /// memory is approximately twice the resolved value.
+    #[arg(long, default_value = "0", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.
+    /// Takes effect only when --teacher-shuffle-buffer-mib is greater than 0.
     #[arg(long, global = true)]
     pub(crate) no_teacher_shuffle: bool,
     /// Base seed for deterministic per-epoch, per-window teacher-data shuffle.
+    /// Takes effect only when --teacher-shuffle-buffer-mib is greater than 0.
     #[arg(long, default_value_t = 0, global = true)]
     pub(crate) teacher_shuffle_seed: u64,
 

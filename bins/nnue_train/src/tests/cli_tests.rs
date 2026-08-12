@@ -32,10 +32,16 @@ fn teacher_shuffle_window_defaults_and_overrides_parse() {
     let defaults = simple_cli(&[]);
     assert_eq!(
         defaults.teacher_shuffle_buffer_mib,
-        TeacherShuffleBufferMib::Auto
+        TeacherShuffleBufferMib::Explicit(0)
     );
     assert!(!defaults.no_teacher_shuffle);
     assert_eq!(defaults.teacher_shuffle_seed, 0);
+
+    let auto = simple_cli(&["--teacher-shuffle-buffer-mib", "auto"]);
+    assert_eq!(
+        auto.teacher_shuffle_buffer_mib,
+        TeacherShuffleBufferMib::Auto
+    );
 
     let configured = simple_cli(&[
         "--teacher-shuffle-buffer-mib",
