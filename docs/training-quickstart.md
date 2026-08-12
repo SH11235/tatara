@@ -102,8 +102,8 @@ change for real training are:
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value |
-| `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering |
-| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index. The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
+| `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering. Takes effect only when `--teacher-shuffle-buffer-mib > 0` |
+| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
 | `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
@@ -145,9 +145,9 @@ target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
   layerstack ...
 
-# Restore direct sequential reading
+# Memory-sized read-ahead window plus shuffle (opt-in for slow storage)
 target/release/nnue-train ... \
-  --teacher-shuffle-buffer-mib 0 \
+  --teacher-shuffle-buffer-mib auto \
   layerstack ...
 ```
 

@@ -581,9 +581,11 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "0", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.
+    /// Takes effect only when --teacher-shuffle-buffer-mib is greater than 0.
     #[arg(long, global = true)]
     pub(crate) no_teacher_shuffle: bool,
     /// Base seed for deterministic per-epoch, per-window teacher-data shuffle.
+    /// Takes effect only when --teacher-shuffle-buffer-mib is greater than 0.
     #[arg(long, default_value_t = 0, global = true)]
     pub(crate) teacher_shuffle_seed: u64,
 

@@ -93,8 +93,8 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍 |
-| `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途 |
-| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
+| `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途。`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある |
+| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` は KP-absolute 進行度で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
@@ -133,9 +133,9 @@ target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
   layerstack ...
 
-# 窓を使わない直接逐次読み
+# メモリ量に応じた窓サイズで先読み + shuffle (遅いストレージ向けのopt-in)
 target/release/nnue-train ... \
-  --teacher-shuffle-buffer-mib 0 \
+  --teacher-shuffle-buffer-mib auto \
   layerstack ...
 ```
 

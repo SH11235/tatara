@@ -60,6 +60,12 @@ fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
         cli.teacher_shuffle_buffer_mib
             .describe(resolved, shuffle, cli.teacher_shuffle_seed)
     );
+    if resolved == 0 && (cli.no_teacher_shuffle || cli.teacher_shuffle_seed != 0) {
+        eprintln!(
+            "[train] warning: --no-teacher-shuffle / --teacher-shuffle-seed have no effect \
+             without --teacher-shuffle-buffer-mib > 0"
+        );
+    }
     (resolved, shuffle)
 }
 
