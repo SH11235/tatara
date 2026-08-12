@@ -16,8 +16,9 @@ does not decouple longer storage stalls from GPU consumption.
 
 ## Decision
 
-Training uses two raw PSV windows. A producer fills one window sequentially while decode workers
-consume the other. Each completed window is shuffled with deterministic Fisher-Yates ordering;
+Training can opt into a windowed reader with two raw PSV windows. When enabled, a producer fills
+one window sequentially while decode workers consume the other. Each completed window is shuffled
+with deterministic Fisher-Yates ordering;
 the seed includes the configured base seed, physical dataset epoch, and window index. A partial
 window at physical EOF is emitted separately, so records from different epochs never share a
 shuffle window.
@@ -44,8 +45,10 @@ parallel.
 
 ## Consequences
 
-- Storage access remains sequential and the producer can absorb multi-second throughput stalls.
-- Later dataset passes use different local orderings without requiring dataset-sized memory.
+- With windowing enabled, storage access remains sequential and the producer can absorb
+  multi-second throughput stalls, and later dataset passes use different local orderings
+  without requiring dataset-sized memory. The default reader keeps the previous direct
+  sequential behavior.
 - Shuffle is bounded by the configured window; it is not a uniform permutation of the full file.
 - Peak raw teacher-data capacity is approximately twice the configured size, in addition to
   decoded batch buffers and model state.
