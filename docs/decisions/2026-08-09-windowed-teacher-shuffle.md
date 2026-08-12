@@ -47,8 +47,8 @@ parallel.
 
 - With windowing enabled, storage access remains sequential and the producer can absorb
   multi-second throughput stalls, and later dataset passes use different local orderings
-  without requiring dataset-sized memory. The default reader keeps the previous direct
-  sequential behavior.
+  without requiring dataset-sized memory. The default reader uses direct sequential
+  reads without windows.
 - Shuffle is bounded by the configured window; it is not a uniform permutation of the full file.
 - Peak raw teacher-data capacity is approximately twice the configured size, in addition to
   decoded batch buffers and model state.
