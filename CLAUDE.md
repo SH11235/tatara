@@ -90,10 +90,9 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **doc 冒頭の dated header 禁止**: `作成: YYYY-MM-DD`、`改訂: YYYY-MM-DD` 等。
   履歴は git log で見る。ADR のように Status / Date field が doc の意味の一部と
   なる場合は OK。
-- **設計判断 doc (ADR) は `docs/decisions/YYYY-MM-DD-<slug>.md`**。連番
-  (`0NNN-`) は並行 PR で衝突するので使わない。slug は内容トピック。
-- **ADR は現アーキの WHY を残す**。執行済 workflow / 完了済ロードマップを ADR
-  に残さない (古くなったら削除して良い、ADR は immutable とは限らない)。
+- **新規 ADR は書かない** (本リポは ADR ベースの開発をしていない)。設計の WHY は
+  コード近傍のコメント / PR description が担当する。`docs/decisions/` の既存分は
+  legacy で、古くなったら削除して良い。
 - **実験ログ doc は `docs/experiments/` に置く。同 directory は `.gitignore` 済み**
   で git 管理外 (頻繁に更新する作業記録のため)。worktree / PR の対象外、checkout 内
   で直接編集する。`docs/decisions/` (ADR) 等 tracked な doc は通常どおり PR。
@@ -119,6 +118,5 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 
 ## 作業前 checklist
 
-- 設計判断は ADR (`docs/decisions/`) に記録する
 - native CUDA 既定 backend / cuda-oxide oracle / nightly toolchain の構成は壊さない、
   host 側 unsafe は妥当性をコメントで明記する

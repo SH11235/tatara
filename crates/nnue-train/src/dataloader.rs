@@ -38,6 +38,59 @@ use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, S
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
 
+/// 拡張子が `.hcpe` (大文字小文字不問) の教師ファイルか判定する。score 差し替え系
+/// (sidecar / dual-label) の適用可否判定を CLI 層と loader 層で一致させるための共有述語。
+pub fn is_hcpe_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ext.to_str()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
+    })
+}
+
+/// 40-byte PSV record 内の二つの score label から学習用 score を選ぶ方式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualLabelMode {
+    /// 全 record で offset 34..36 の DL score を使う。
+    All,
+    /// padding bit 0 が立つ record では offset 32..34 の base score を温存する。
+    Gated,
+}
+
+impl DualLabelMode {
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Gated => "gated",
+        }
+    }
+
+    /// dual-label PSV の予約 bit を検査し、選択した score を record に反映する。
+    pub fn apply(
+        self,
+        psv: &mut PackedSfenValue,
+        record_index: u64,
+        path: &Path,
+    ) -> io::Result<()> {
+        let (dl_score, gate) = {
+            let bytes = psv.as_bytes_mut();
+            (i16::from_le_bytes([bytes[34], bytes[35]]), bytes[39])
+        };
+        if gate & !1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "dual-label PSV record {record_index} in {} has non-zero reserved padding bits: 0x{gate:02x}",
+                    path.display()
+                ),
+            ));
+        }
+        if self == Self::All || gate & 1 == 0 {
+            psv.set_score(dl_score);
+        }
+        Ok(())
+    }
+}
+
 /// Streaming reader for a score sidecar aligned to the records of one PSV file.
 /// The optional bitmap uses LSB-first bits; a set bit preserves the PSV score.
 #[derive(Debug)]
@@ -659,6 +712,8 @@ struct PsvEpochReader {
     end_offset: u64,
     loader: PsvFileLoader,
     score_override: Option<ScoreOverrideReader>,
+    dual_label_psv: Option<DualLabelMode>,
+    record_index: u64,
     score_drop_abs: Option<i32>,
     score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
@@ -671,6 +726,7 @@ impl PsvEpochReader {
     /// `path` を `[start_offset, end_offset)` 範囲で epoch wrap させる reader。
     /// wrap 時の再 open も同 range で行う。`PsvFileLoader::new_range` 同様の
     /// 範囲・alignment 検証はここでは行わず、`new_range` 内で検証する。
+    #[allow(clippy::too_many_arguments)]
     fn new_range(
         path: &Path,
         start_offset: u64,
@@ -679,7 +735,13 @@ impl PsvEpochReader {
         score_clamp_abs: Option<i16>,
         score_override: Option<&Path>,
         score_override_mask: Option<&Path>,
+        dual_label_psv: Option<DualLabelMode>,
     ) -> io::Result<Self> {
+        if dual_label_psv.is_some() && (score_override.is_some() || score_override_mask.is_some()) {
+            return Err(io::Error::other(
+                "dual_label_psv conflicts with score_override and score_override_mask",
+            ));
+        }
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         let score_override = score_override
             .map(|score_path| {
@@ -692,6 +754,8 @@ impl PsvEpochReader {
             end_offset,
             loader,
             score_override,
+            dual_label_psv,
+            record_index: start_offset / PSV_RECORD_BYTES,
             score_drop_abs,
             score_clamp_abs,
             pushed_this_epoch: 0,
@@ -706,10 +770,15 @@ impl PsvEpochReader {
         loop {
             match self.loader.next_psv()? {
                 Some(mut psv) => {
+                    let record_index = self.record_index;
+                    self.record_index += 1;
                     // Sidecar indices are based on the complete PSV file. Applying the
                     // replacement before filtering matches a materialized PSV variant.
                     if let Some(score_override) = &mut self.score_override {
                         score_override.apply(&mut psv)?;
+                    }
+                    if let Some(mode) = self.dual_label_psv {
+                        mode.apply(&mut psv, record_index, &self.path)?;
                     }
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
@@ -749,6 +818,7 @@ impl PsvEpochReader {
                     self.pushed_this_epoch = 0;
                     self.loader =
                         PsvFileLoader::new_range(&self.path, self.start_offset, self.end_offset)?;
+                    self.record_index = self.start_offset / PSV_RECORD_BYTES;
                     if let Some(score_override) = &mut self.score_override {
                         score_override.seek_to(self.start_offset / PSV_RECORD_BYTES)?;
                     }
@@ -1141,6 +1211,48 @@ impl BucketedPrefetchedLoader {
         teacher_shuffle: bool,
         teacher_shuffle_seed: u64,
     ) -> io::Result<Self> {
+        Self::spawn_with_score_sources(
+            path,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            num_workers,
+            bucket_mode,
+            feature_set,
+            compute_bucket,
+            num_buckets,
+            train_end_offset,
+            monitor_active,
+            score_override,
+            score_override_mask,
+            teacher_shuffle_buffer_mib,
+            teacher_shuffle,
+            teacher_shuffle_seed,
+            None,
+        )
+    }
+
+    /// Spawns a loader with one explicit score source selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_score_sources(
+        path: &Path,
+        batch_size: usize,
+        score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
+        num_workers: usize,
+        bucket_mode: impl Into<BucketMode>,
+        feature_set: FeatureSetSpec,
+        compute_bucket: bool,
+        num_buckets: usize,
+        train_end_offset: u64,
+        monitor_active: bool,
+        score_override: Option<&Path>,
+        score_override_mask: Option<&Path>,
+        teacher_shuffle_buffer_mib: usize,
+        teacher_shuffle: bool,
+        teacher_shuffle_seed: u64,
+        dual_label_psv: Option<DualLabelMode>,
+    ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
             "BucketedPrefetchedLoader requires num_buckets >= 1"
@@ -1162,6 +1274,7 @@ impl BucketedPrefetchedLoader {
             score_clamp_abs,
             score_override,
             score_override_mask,
+            dual_label_psv,
         )?;
         let reader = match shuffle_window_records(teacher_shuffle_buffer_mib, batch_size)? {
             Some(window_records) => TrainingPsvReader::Windowed(WindowedPsvReader::spawn(
@@ -1496,6 +1609,7 @@ mod tests {
             None,
             score_override,
             None,
+            None,
         )
         .unwrap();
         WindowedPsvReader::spawn(source, window_records, shuffle, seed)
@@ -1556,6 +1670,32 @@ mod tests {
     }
 
     #[test]
+    fn window_shuffle_applies_dual_label_before_reordering() {
+        let base = [1, 2, 3, 4, 5];
+        let dl = [101, 102, 103, 104, 105];
+        let path = synthetic_dual_file("window", &base, &dl, &[0; 5]);
+        let source = PsvEpochReader::new_range(
+            &path,
+            0,
+            base.len() as u64 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        let mut reader = WindowedPsvReader::spawn(source, base.len(), true, 9);
+        let mut got = (0..base.len())
+            .map(|_| reader.next().unwrap().score())
+            .collect::<Vec<_>>();
+        drop(reader);
+        let _ = std::fs::remove_file(path);
+        got.sort_unstable();
+        assert_eq!(got, dl);
+    }
+
+    #[test]
     fn dropping_partially_consumed_window_stops_producer() {
         let base = [1, 2, 3, 4, 5];
         let (data, scores, _) = synthetic_override_files("window-drop", &base, &base, None);
@@ -1563,6 +1703,155 @@ mod tests {
         let _ = reader.next().unwrap();
         drop(reader);
         remove_override_files(&data, &scores, None);
+    }
+
+    fn synthetic_dual_file(
+        name: &str,
+        base_scores: &[i16],
+        dl_scores: &[i16],
+        gates: &[u8],
+    ) -> PathBuf {
+        assert_eq!(base_scores.len(), dl_scores.len());
+        assert_eq!(base_scores.len(), gates.len());
+        let path = std::env::temp_dir().join(format!(
+            "nnue-train-dual-label-{name}-{}.psv",
+            std::process::id()
+        ));
+        let mut bytes = Vec::with_capacity(base_scores.len() * PSV_RECORD_BYTES as usize);
+        for ((&base, &dl), &gate) in base_scores.iter().zip(dl_scores).zip(gates) {
+            let mut record = [0_u8; PSV_RECORD_BYTES as usize];
+            record[32..34].copy_from_slice(&base.to_le_bytes());
+            record[34..36].copy_from_slice(&dl.to_le_bytes());
+            record[39] = gate;
+            bytes.extend_from_slice(&record);
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn dual_label_all_replaces_every_score_and_wraps() {
+        let base = [1, 2, 3];
+        let dl = [101, -202, 303];
+        let path = synthetic_dual_file("all-wrap", &base, &dl, &[1, 0, 1]);
+        let mut reader = PsvEpochReader::new_range(
+            &path,
+            0,
+            3 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..6).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, [101, -202, 303, 101, -202, 303]);
+    }
+
+    #[test]
+    fn dual_label_gated_preserves_boundary_records() {
+        let base: Vec<i16> = (0..17).map(|i| i as i16).collect();
+        let dl: Vec<i16> = (0..17).map(|i| 1000 + i as i16).collect();
+        let gates: Vec<u8> = (0..17)
+            .map(|i| u8::from([0, 7, 8, 16].contains(&i)))
+            .collect();
+        let path = synthetic_dual_file("gated-boundaries", &base, &dl, &gates);
+        let mut reader = PsvEpochReader::new_range(
+            &path,
+            0,
+            17 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::Gated),
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..17).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        for i in 0..17 {
+            let expected = if [0, 7, 8, 16].contains(&i) {
+                base[i]
+            } else {
+                dl[i]
+            };
+            assert_eq!(got[i], expected, "record {i}");
+        }
+    }
+
+    #[test]
+    fn dual_label_rejects_reserved_padding_bits_with_index_and_path() {
+        let path = synthetic_dual_file("reserved-bits", &[1, 2, 3], &[11, 12, 13], &[0, 2, 0]);
+        let mut reader = PsvEpochReader::new_range(
+            &path,
+            0,
+            3 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        assert_eq!(reader.next().unwrap().score(), 11);
+        let err = match reader.next() {
+            Ok(_) => panic!("reserved padding bits must be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("record 1"), "got: {message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "got: {message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dual_label_range_uses_absolute_record_indices_and_wraps() {
+        let base = [0, 1, 2, 3, 4];
+        let dl = [100, 101, 102, 103, 104];
+        let path = synthetic_dual_file("range", &base, &dl, &[0; 5]);
+        let mut reader = PsvEpochReader::new_range(
+            &path,
+            2 * PSV_RECORD_BYTES,
+            5 * PSV_RECORD_BYTES,
+            None,
+            None,
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, [102, 103, 104, 102]);
+    }
+
+    #[test]
+    fn dual_label_selection_precedes_score_drop_and_clamp() {
+        let path =
+            synthetic_dual_file("drop-clamp-order", &[10, 20, 30], &[500, 50, -250], &[0; 3]);
+        let mut reader = PsvEpochReader::new_range(
+            &path,
+            0,
+            3 * PSV_RECORD_BYTES,
+            Some(400),
+            Some(100),
+            None,
+            None,
+            Some(DualLabelMode::All),
+        )
+        .unwrap();
+        let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, [50, -100, 50, -100]);
     }
 
     #[test]
@@ -1577,6 +1866,7 @@ mod tests {
             None,
             None,
             Some(&scores),
+            None,
             None,
         )
         .unwrap();
@@ -1603,6 +1893,7 @@ mod tests {
             None,
             Some(&scores),
             mask_path.as_deref(),
+            None,
         )
         .unwrap();
         let got: Vec<i16> = (0..17).map(|_| reader.next().unwrap().score()).collect();
@@ -1631,6 +1922,7 @@ mod tests {
             None,
             Some(&scores),
             None,
+            None,
         )
         .unwrap();
         let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
@@ -1654,6 +1946,7 @@ mod tests {
             None,
             Some(&scores),
             mask_path.as_deref(),
+            None,
         )
         .unwrap();
 
@@ -1685,6 +1978,7 @@ mod tests {
             Some(100),
             Some(&scores),
             None,
+            None,
         )
         .unwrap();
         let mut concrete = PsvEpochReader::new_range(
@@ -1693,6 +1987,7 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             Some(400),
             Some(100),
+            None,
             None,
             None,
         )
@@ -1750,6 +2045,7 @@ mod tests {
             None,
             Some(&scores),
             mask_path.as_deref(),
+            None,
         ) {
             Ok(_) => panic!("non-zero unused mask bits must be rejected"),
             Err(err) => err,
@@ -2253,6 +2549,130 @@ mod tests {
         std::fs::metadata(path).expect("stat sample.psv").len()
     }
 
+    fn assert_inline_matches_sidecar(mode: DualLabelMode, preserve: &[usize]) {
+        let base_path = sample_psv_path();
+        let base_bytes = std::fs::read(&base_path).expect("read sample PSV");
+        let records = base_bytes.len() / PSV_RECORD_BYTES as usize;
+        let suffix = mode.canonical_name();
+        let prefix = std::env::temp_dir().join(format!(
+            "nnue-train-dual-label-stream-{suffix}-{}",
+            std::process::id()
+        ));
+        let dual_path = prefix.with_extension("psv");
+        let score_path = prefix.with_extension("i16");
+        let mask_path = prefix.with_extension("bits");
+        let mut dual_bytes = base_bytes.clone();
+        let mut score_bytes = Vec::with_capacity(records * 2);
+        let mut mask = vec![0_u8; records.div_ceil(8)];
+        for (index, record) in dual_bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .enumerate()
+        {
+            let score = (index as i16).wrapping_mul(37).wrapping_sub(1400);
+            score_bytes.extend_from_slice(&score.to_le_bytes());
+            record[34..36].copy_from_slice(&score.to_le_bytes());
+            let is_preserved = preserve.contains(&index);
+            record[39] = u8::from(is_preserved);
+            if is_preserved {
+                mask[index / 8] |= 1 << (index % 8);
+            }
+        }
+        std::fs::write(&dual_path, dual_bytes).unwrap();
+        std::fs::write(&score_path, score_bytes).unwrap();
+        if mode == DualLabelMode::Gated {
+            std::fs::write(&mask_path, &mask).unwrap();
+        }
+
+        let end = base_bytes.len() as u64;
+        let mut sidecar = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &base_path,
+            16,
+            None,
+            None,
+            1,
+            BucketMode::Progress8KpAbs,
+            test_spec(),
+            false,
+            1,
+            end,
+            false,
+            Some(&score_path),
+            (mode == DualLabelMode::Gated).then_some(mask_path.as_path()),
+            0,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        let mut inline = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &dual_path,
+            16,
+            None,
+            None,
+            1,
+            BucketMode::Progress8KpAbs,
+            test_spec(),
+            false,
+            1,
+            end,
+            false,
+            None,
+            None,
+            0,
+            false,
+            0,
+            Some(mode),
+        )
+        .unwrap();
+
+        // 13 × 16 = 208 positions, so the 100-record fixture wraps twice.
+        for batch_index in 0..13 {
+            let sidecar_slot = sidecar.next_batch().unwrap().expect("sidecar batch");
+            let inline_slot = inline.next_batch().unwrap().expect("inline batch");
+            let (sidecar_batch, sidecar_buckets) = &sidecar_slot;
+            let (inline_batch, inline_buckets) = &inline_slot;
+            assert_eq!(sidecar_batch.n_positions, inline_batch.n_positions);
+            assert_eq!(sidecar_buckets, inline_buckets);
+            let n = sidecar_batch.n_positions;
+            assert_eq!(
+                &sidecar_batch.score[..n],
+                &inline_batch.score[..n],
+                "score batch {batch_index}"
+            );
+            assert_eq!(&sidecar_batch.wdl[..n], &inline_batch.wdl[..n]);
+            assert_eq!(&sidecar_batch.nnz[..n], &inline_batch.nnz[..n]);
+            for position in 0..n {
+                let nnz = sidecar_batch.nnz[position] as usize;
+                let start = position * sidecar_batch.max_active;
+                assert_eq!(
+                    &sidecar_batch.stm_indices[start..start + nnz],
+                    &inline_batch.stm_indices[start..start + nnz]
+                );
+                assert_eq!(
+                    &sidecar_batch.nstm_indices[start..start + nnz],
+                    &inline_batch.nstm_indices[start..start + nnz]
+                );
+            }
+            sidecar.recycle(sidecar_slot);
+            inline.recycle(inline_slot);
+        }
+        drop(sidecar);
+        drop(inline);
+        let _ = std::fs::remove_file(&dual_path);
+        let _ = std::fs::remove_file(&score_path);
+        let _ = std::fs::remove_file(&mask_path);
+    }
+
+    #[test]
+    fn bucketed_stream_gated_dual_label_is_bit_identical_to_masked_sidecar() {
+        assert_inline_matches_sidecar(DualLabelMode::Gated, &[0, 7, 8, 16, 63, 64, 99]);
+    }
+
+    #[test]
+    fn bucketed_stream_all_dual_label_is_bit_identical_to_unmasked_sidecar() {
+        assert_inline_matches_sidecar(DualLabelMode::All, &[]);
+    }
+
     fn run_bucketed_smoke(num_workers: usize) {
         // sample.psv は 100 records (Loss=50 / Win=50、Draw なし)。
         let progress = ShogiProgressKPAbs; // zero weights → 全 bucket 4
@@ -2348,6 +2768,62 @@ mod tests {
     #[test]
     fn bucketed_loader_multi_worker() {
         run_bucketed_smoke(4);
+    }
+
+    #[test]
+    fn bucketed_multi_worker_surfaces_dual_label_reserved_bit_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "nnue-train-dual-label-worker-error-{}.psv",
+            std::process::id()
+        ));
+        let mut bytes = std::fs::read(sample_psv_path()).expect("read sample PSV");
+        for (index, record) in bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .enumerate()
+        {
+            let dl = 1000 + index as i16;
+            record[34..36].copy_from_slice(&dl.to_le_bytes());
+            record[39] = 0;
+        }
+        bytes[31 * PSV_RECORD_BYTES as usize + 39] = 2;
+        std::fs::write(&path, bytes).expect("write invalid dual-label PSV");
+
+        let end = full_range_end(&path);
+        let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &path,
+            8,
+            None,
+            None,
+            4,
+            BucketMode::KingRank9,
+            test_spec(),
+            false,
+            1,
+            end,
+            false,
+            None,
+            None,
+            0,
+            false,
+            0,
+            Some(DualLabelMode::All),
+        )
+        .expect("spawn multi-worker dual-label loader");
+        let mut error = None;
+        for _ in 0..64 {
+            match loader.next_batch() {
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+                Ok(Some(slot)) => loader.recycle(slot),
+                Ok(None) => break,
+            }
+        }
+        let err = error.expect("reserved-bit worker error must reach next_batch");
+        assert!(err.to_string().contains("record 31"), "got: {err}");
+        drop(loader);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2464,7 +2940,7 @@ mod tests {
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
         let mut reader =
-            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None, None)
+            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None, None, None)
                 .unwrap();
         for i in 0..100 {
             let _psv = reader
@@ -2497,6 +2973,7 @@ mod tests {
             bytes.len() as u64,
             Some(32000),
             Some(100),
+            None,
             None,
             None,
         )

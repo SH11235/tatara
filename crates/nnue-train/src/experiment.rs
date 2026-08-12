@@ -193,6 +193,9 @@ pub struct Params {
     /// `--score-override-mask` の入力ファイル basename。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_override_mask: Option<String>,
+    /// PSV record 内の DL score 選択方式 (`all` / `gated`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dual_label_psv: Option<String>,
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
@@ -670,6 +673,7 @@ mod tests {
             score_clamp_abs: None,
             score_override: None,
             score_override_mask: None,
+            dual_label_psv: None,
             init_from: None,
             init_preset: None,
             test_data: None,
@@ -856,9 +860,29 @@ mod tests {
         assert!(v.get("lineage").is_none());
         assert!(v["params"].get("wrm_in_scaling").is_none());
         assert!(v["params"].get("progress_coeff").is_none());
+        assert!(v["params"].get("dual_label_psv").is_none());
         // linear WDL taper を使わない run では start/end は省略 (constant lambda は `wdl`)。
         assert!(v["params"].get("start_wdl").is_none());
         assert!(v["params"].get("end_wdl").is_none());
+    }
+
+    #[test]
+    fn dual_label_mode_is_serialized() {
+        let mut params = sample_params();
+        params.dual_label_psv = Some("gated".to_string());
+        let doc = ExperimentDoc::new(
+            "net-dual-label".to_string(),
+            "net".to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train".to_string(),
+            None,
+            params,
+            sample_data(),
+            Some(nnue_format::layerstack_weights::FV_SCALE),
+        );
+        let value = serde_json::to_value(&doc).expect("serialise");
+        assert_eq!(value["params"]["dual_label_psv"], "gated");
     }
 
     #[test]

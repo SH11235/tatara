@@ -10,6 +10,8 @@ use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 #[cfg(any(feature = "gpu", test))]
 use nnue_train::dataloader::BucketMode;
 #[cfg(feature = "gpu")]
+use nnue_train::dataloader::DualLabelMode;
+#[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
@@ -38,6 +40,14 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 #[cfg(any(feature = "gpu", test))]
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
+
+/// experiment.json へ記録する dual-label mode の canonical 名。両 logger で共有する。
+#[cfg(feature = "gpu")]
+fn dual_label_param(cli: &Cli) -> Option<String> {
+    cli.dual_label_psv
+        .map(DualLabelMode::from)
+        .map(|mode| mode.canonical_name().to_string())
+}
 
 /// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。config / experiment
 /// logger / 起動ログは全てこの値を使う (導出を重複させて矛盾した記録を残さない)。
@@ -240,6 +250,7 @@ fn validate_shared_cli(
     ft_fp16_out_raw: bool,
     tf32_raw: bool,
 ) -> Result<SharedCliValidation, Box<dyn std::error::Error>> {
+    cli.validate_score_sources()?;
     let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
         .ok_or_else(|| -> Box<dyn std::error::Error> {
             let names: Vec<&str> = FeatureSet::ALL
@@ -327,6 +338,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
         ArchCommand::BenchPos(_) => {
             return Err("bench-pos must be dispatched before run_training".into());
+        }
+        ArchCommand::LoaderDigest(_) => {
+            return Err("loader-digest must be dispatched before run_training".into());
         }
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => {
@@ -783,6 +797,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
+        dual_label_psv: cli.dual_label_psv.map(DualLabelMode::from),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -834,7 +849,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 if tail_bytes >= file_size {
                     return Err("--test-tail-positions leaves no data to evaluate".into());
                 }
-                nnue_train::validation::HeldoutSet::load_from_range_with_override(
+                nnue_train::validation::HeldoutSet::load_from_range_with_score_sources(
                     data,
                     file_size - tail_bytes,
                     file_size,
@@ -847,6 +862,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     cfg.num_buckets,
                     cfg.score_override.as_deref(),
                     cfg.score_override_mask.as_deref(),
+                    cfg.dual_label_psv,
                 )?
             }
             _ => {
@@ -1541,6 +1557,7 @@ pub(crate) fn build_experiment_logger(
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
+        dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1712,6 +1729,7 @@ pub(crate) fn build_experiment_logger_simple(
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
+        dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
@@ -2032,6 +2050,7 @@ pub(crate) fn run_simple_training(
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
+        dual_label_psv: cli.dual_label_psv.map(DualLabelMode::from),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,

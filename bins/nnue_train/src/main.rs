@@ -11,7 +11,6 @@
 #[cfg(all(feature = "gpu", not(any(feature = "oxide", feature = "native"))))]
 compile_error!("feature `gpu` requires a backend: enable `native` (default) or `oxide`");
 
-#[cfg(feature = "gpu")]
 use clap::Parser;
 
 // ===========================================================================
@@ -35,6 +34,7 @@ mod ft_factorize_host;
 mod kernel_module;
 #[cfg(feature = "oxide")]
 mod kernels;
+mod loader_digest;
 #[cfg(any(feature = "oxide-parity", feature = "native"))]
 mod native_bench;
 #[cfg(feature = "gpu")]
@@ -52,7 +52,6 @@ mod training;
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "gpu")]
 use cli::Cli;
 #[cfg(feature = "gpu")]
 use smoke::smoke_test;
@@ -67,12 +66,18 @@ pub(crate) use kernels::*;
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    if let Err(e) = cli.validate_score_sources() {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(1);
+    }
     // 診断 flag (--eval-only / --threat-ablate / --threat-norm-dump) は学習データを
     // 読まない経路 (norm-dump / --test-data 評価) を持つため、--data 不在でも
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
     // smoke test に落ちて何もせず成功扱いになる。
     #[cfg(any(feature = "oxide-parity", feature = "native"))]
-    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+    let result = if let cli::ArchCommand::LoaderDigest(args) = &cli.arch {
+        loader_digest::run(&cli, args)
+    } else if let cli::ArchCommand::BenchPos(args) = &cli.arch {
         bench_pos::run(args)
     } else if let cli::ArchCommand::NativeBench(args) = &cli.arch {
         native_bench::run(args, cli.batch_size)
@@ -86,7 +91,9 @@ fn main() -> std::process::ExitCode {
         smoke_test(cli.arch.kind())
     };
     #[cfg(not(any(feature = "oxide-parity", feature = "native")))]
-    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+    let result = if let cli::ArchCommand::LoaderDigest(args) = &cli.arch {
+        loader_digest::run(&cli, args)
+    } else if let cli::ArchCommand::BenchPos(args) = &cli.arch {
         bench_pos::run(args)
     } else if cli.data.is_some()
         || cli.eval_only
@@ -108,6 +115,20 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(feature = "gpu"))]
 fn main() -> std::process::ExitCode {
-    eprintln!("nnue-train requires the default `gpu` feature");
-    std::process::ExitCode::from(1)
+    let cli = Cli::parse();
+    if let Err(e) = cli.validate_score_sources() {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(1);
+    }
+    let result = match &cli.arch {
+        cli::ArchCommand::LoaderDigest(args) => loader_digest::run(&cli, args),
+        _ => Err("nnue-train training commands require the default `gpu` feature".into()),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
 }
