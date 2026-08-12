@@ -119,7 +119,7 @@ epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも�
 追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
 大きな窓はHDDの長いstallを
 吸収しやすい一方、初回batchまでの読込時間、窓shuffleのCPU時間、random memory
-trafficも増やす。速度やメモリを優先する場合は256などの明示値で固定する。
+trafficも増やす。窓を使う場合、256などの小さい明示値は初回読込・メモリ・shuffleコストを抑える。
 `--threads`はdecode worker数であり、producerの窓shuffle自体は並列化しない。
 
 ```bash

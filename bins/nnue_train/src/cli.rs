@@ -36,6 +36,28 @@ impl FromStr for TeacherShuffleBufferMib {
     }
 }
 
+impl TeacherShuffleBufferMib {
+    /// resolve 済み窓サイズと `--no-teacher-shuffle` から実効 shuffle を決める。
+    /// training と loader-digest で判定を一致させるための単一実装。
+    pub(crate) fn effective_shuffle(resolved_mib: usize, no_teacher_shuffle: bool) -> bool {
+        !no_teacher_shuffle && resolved_mib != 0
+    }
+
+    /// 起動ログ用の実効設定の説明文。training と loader-digest で共通に使い、
+    /// 同一設定の run が同じ文字列で grep できるようにする。
+    pub(crate) fn describe(self, resolved_mib: usize, shuffle: bool, seed: u64) -> String {
+        let auto_note = match self {
+            Self::Auto => " (auto)",
+            Self::Explicit(_) => "",
+        };
+        if resolved_mib == 0 {
+            format!("disabled (direct sequential read){auto_note}")
+        } else {
+            format!("{resolved_mib} MiB x2{auto_note}, shuffle {shuffle}, seed {seed}")
+        }
+    }
+}
+
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]

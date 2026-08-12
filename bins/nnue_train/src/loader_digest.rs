@@ -30,14 +30,17 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         TeacherShuffleBufferMib::Explicit(mib) => mib,
         TeacherShuffleBufferMib::Auto => 0,
     };
-    let teacher_shuffle = !cli.no_teacher_shuffle && teacher_shuffle_buffer_mib != 0;
-    let window_note = match cli.teacher_shuffle_buffer_mib {
-        TeacherShuffleBufferMib::Auto => " (auto -> 0)",
-        TeacherShuffleBufferMib::Explicit(_) => "",
-    };
+    let teacher_shuffle = TeacherShuffleBufferMib::effective_shuffle(
+        teacher_shuffle_buffer_mib,
+        cli.no_teacher_shuffle,
+    );
     println!(
-        "[digest] teacher window {teacher_shuffle_buffer_mib} MiB x2{window_note}, shuffle {teacher_shuffle}, seed {} | decode workers pinned to 1 (--threads is not used)",
-        cli.teacher_shuffle_seed
+        "[digest] teacher shuffle window: {} | decode workers pinned to 1 (--threads is not used)",
+        cli.teacher_shuffle_buffer_mib.describe(
+            teacher_shuffle_buffer_mib,
+            teacher_shuffle,
+            cli.teacher_shuffle_seed
+        )
     );
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
         data,

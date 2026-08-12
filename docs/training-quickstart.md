@@ -130,8 +130,8 @@ do not change the result for a fixed memory limit.
 Additional raw memory is approximately twice the effective value; an explicit
 `--teacher-shuffle-buffer-mib 4096` adds about 8 GiB. A larger window can absorb longer
 HDD stalls, but it also increases the delay before the first batch, CPU time spent shuffling, and
-random memory traffic. Use an explicit value such as 256 when throughput or lower memory usage is
-more important. `--threads` controls decode workers; it does not parallelise the
+random memory traffic. When windowing is enabled, a small explicit value such as 256 keeps the
+first-batch delay, memory, and shuffle cost low. `--threads` controls decode workers; it does not parallelise the
 producer's window shuffle.
 
 ```bash
