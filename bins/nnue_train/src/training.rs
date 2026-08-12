@@ -43,6 +43,14 @@ const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
 /// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。config / experiment
 /// logger / 起動ログは全てこの値を使う (導出を重複させて矛盾した記録を残さない)。
+/// experiment.json へ記録する dual-label mode の canonical 名。両 logger で共有する。
+#[cfg(any(feature = "gpu", test))]
+fn dual_label_param(cli: &Cli) -> Option<String> {
+    cli.dual_label_psv
+        .map(DualLabelMode::from)
+        .map(|mode| mode.canonical_name().to_string())
+}
+
 #[cfg(feature = "gpu")]
 fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
     let resolved = cli.teacher_shuffle_buffer_mib.resolve();
@@ -1549,10 +1557,7 @@ pub(crate) fn build_experiment_logger(
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
-        dual_label_psv: cli
-            .dual_label_psv
-            .map(DualLabelMode::from)
-            .map(|mode| mode.canonical_name().to_string()),
+        dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1724,10 +1729,7 @@ pub(crate) fn build_experiment_logger_simple(
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
-        dual_label_psv: cli
-            .dual_label_psv
-            .map(DualLabelMode::from)
-            .map(|mode| mode.canonical_name().to_string()),
+        dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),

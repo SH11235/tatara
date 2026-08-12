@@ -735,14 +735,11 @@ impl Cli {
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
-        let is_hcpe = |path: &std::path::Path| {
-            path.extension().is_some_and(|ext| {
-                ext.to_str()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
-            })
-        };
         if (self.score_override.is_some() || self.dual_label_psv.is_some())
-            && self.data.as_deref().is_some_and(is_hcpe)
+            && self
+                .data
+                .as_deref()
+                .is_some_and(nnue_train::dataloader::is_hcpe_path)
         {
             return Err(
                 "--score-override and --dual-label-psv require PSV training data, not HCPE"
@@ -828,6 +825,9 @@ pub(crate) enum ArchCommand {
     #[command(name = "bench-pos")]
     BenchPos(BenchPosArgs),
     /// Hash the deterministic CPU dataloader batch stream without initializing a GPU.
+    /// Decode workers are pinned to 1 for batch-order determinism (--threads is ignored).
+    /// Explicit --teacher-shuffle-buffer-mib / --no-teacher-shuffle / --teacher-shuffle-seed
+    /// are honored; the machine-dependent `auto` resolves to 0 (direct sequential reading).
     #[command(name = "loader-digest")]
     LoaderDigest(LoaderDigestArgs),
     /// Run the fixed native CUDA throughput benchmark and write a JSON report.

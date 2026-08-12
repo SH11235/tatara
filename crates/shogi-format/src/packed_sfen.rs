@@ -259,6 +259,11 @@ impl PackedSfen {
 /// - bytes 36-37: game_ply (u16, little-endian)
 /// - byte 38:     game_result (i8)
 /// - byte 39:     padding (u8)
+///
+/// dual-label PSV variant (`nnue-train` の `--dual-label-psv`) は bytes 34-35 を
+/// DL score (i16 LE)、byte 39 bit0 を entered gate bit として転用する。形式を
+/// 区別する field は無いため、dual-label file に対して `move16()` を指し手として
+/// 解釈してはならない。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PackedSfenValue {

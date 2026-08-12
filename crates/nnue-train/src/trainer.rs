@@ -716,10 +716,7 @@ where
     };
 
     if (cfg.score_override.is_some() || cfg.dual_label_psv.is_some())
-        && data_path.extension().is_some_and(|ext| {
-            ext.to_str()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
-        })
+        && crate::dataloader::is_hcpe_path(data_path)
     {
         return Err(io::Error::other(
             "score_override and dual_label_psv are only supported for PSV training data, not HCPE",

@@ -82,10 +82,7 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
-        if path.extension().is_some_and(|ext| {
-            ext.to_str()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
-        }) {
+        if crate::dataloader::is_hcpe_path(path) {
             let loader = HcpeFileLoader::new(path)?;
             return Self::load_boards(
                 loader,

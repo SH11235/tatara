@@ -38,6 +38,15 @@ use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, S
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
 
+/// 拡張子が `.hcpe` (大文字小文字不問) の教師ファイルか判定する。score 差し替え系
+/// (sidecar / dual-label) の適用可否判定を CLI 層と loader 層で一致させるための共有述語。
+pub fn is_hcpe_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ext.to_str()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
+    })
+}
+
 /// 40-byte PSV record 内の二つの score label から学習用 score を選ぶ方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DualLabelMode {

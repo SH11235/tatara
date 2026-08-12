@@ -1,12 +1,8 @@
-use std::io;
-
-use nnue_train::dataloader::{
-    BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES,
-};
+use nnue_train::dataloader::{BucketMode, BucketedPrefetchedLoader, DualLabelMode};
 use sha2::{Digest, Sha256};
 use shogi_features::FeatureSet;
 
-use crate::cli::{Cli, LoaderDigestArgs};
+use crate::cli::{Cli, LoaderDigestArgs, TeacherShuffleBufferMib};
 
 pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std::error::Error>> {
     if cli.test_tail_positions.is_some() {
@@ -25,18 +21,24 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
     let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
         .ok_or_else(|| format!("unknown feature set: {}", cli.feature_set))?
         .spec();
+    // record 長の倍数検査は loader (PsvFileLoader::open_range) が行う。
     let file_size = std::fs::metadata(data)?.len();
-    if !file_size.is_multiple_of(PSV_RECORD_BYTES) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "data file {} size {file_size} is not a multiple of PSV record size ({PSV_RECORD_BYTES} bytes)",
-                data.display()
-            ),
-        )
-        .into());
-    }
     let dual_label_psv = cli.dual_label_psv.map(DualLabelMode::from);
+    // `auto` は machine のメモリ量に依存し digest が machine 間で比較できなくなる
+    // ため、digest では 0 (直接逐次読み) に解決する。明示値はそのまま使う。
+    let teacher_shuffle_buffer_mib = match cli.teacher_shuffle_buffer_mib {
+        TeacherShuffleBufferMib::Explicit(mib) => mib,
+        TeacherShuffleBufferMib::Auto => 0,
+    };
+    let teacher_shuffle = !cli.no_teacher_shuffle && teacher_shuffle_buffer_mib != 0;
+    let window_note = match cli.teacher_shuffle_buffer_mib {
+        TeacherShuffleBufferMib::Auto => " (auto -> 0)",
+        TeacherShuffleBufferMib::Explicit(_) => "",
+    };
+    println!(
+        "[digest] teacher window {teacher_shuffle_buffer_mib} MiB x2{window_note}, shuffle {teacher_shuffle}, seed {} | decode workers pinned to 1 (--threads is not used)",
+        cli.teacher_shuffle_seed
+    );
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
         data,
         cli.batch_size,
@@ -51,9 +53,9 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         false,
         cli.score_override.as_deref(),
         cli.score_override_mask.as_deref(),
-        0,
-        false,
-        0,
+        teacher_shuffle_buffer_mib,
+        teacher_shuffle,
+        cli.teacher_shuffle_seed,
         dual_label_psv,
     )?;
 
