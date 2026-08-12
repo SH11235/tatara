@@ -42,7 +42,7 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
 /// experiment.json へ記録する dual-label mode の canonical 名。両 logger で共有する。
-#[cfg(any(feature = "gpu", test))]
+#[cfg(feature = "gpu")]
 fn dual_label_param(cli: &Cli) -> Option<String> {
     cli.dual_label_psv
         .map(DualLabelMode::from)
