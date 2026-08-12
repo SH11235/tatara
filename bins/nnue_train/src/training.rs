@@ -41,8 +41,6 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
-/// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。config / experiment
-/// logger / 起動ログは全てこの値を使う (導出を重複させて矛盾した記録を残さない)。
 /// experiment.json へ記録する dual-label mode の canonical 名。両 logger で共有する。
 #[cfg(any(feature = "gpu", test))]
 fn dual_label_param(cli: &Cli) -> Option<String> {
@@ -51,6 +49,8 @@ fn dual_label_param(cli: &Cli) -> Option<String> {
         .map(|mode| mode.canonical_name().to_string())
 }
 
+/// 窓サイズと「shuffle 有効」の実効値を一箇所で確定する。config / experiment
+/// logger / 起動ログは全てこの値を使う (導出を重複させて矛盾した記録を残さない)。
 #[cfg(feature = "gpu")]
 fn resolve_teacher_shuffle(cli: &Cli) -> (usize, bool) {
     let resolved = cli.teacher_shuffle_buffer_mib.resolve();
