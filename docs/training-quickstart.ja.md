@@ -113,7 +113,7 @@ epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも�
 順序を繰り返さずに済む。
 
 `auto`の目安は、RAM 8/16/32/64 GiB以上に対して1窓512 MiB/1 GiB/2 GiB/4 GiB。
-起動ログの`auto -> N MiB x2`と`experiment.json`には解決後の実効値を記録する。
+起動ログの`N MiB x2 (auto)`と`experiment.json`には解決後の実効値を記録する。
 空きメモリ量は使わないため、同じメモリ上限なら他プロセスやpage cacheの状態で値は変わらない。
 
 追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。

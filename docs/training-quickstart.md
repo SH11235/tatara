@@ -123,7 +123,7 @@ avoids repeating exactly the same order when training makes multiple passes over
 pre-shuffled PSV.
 
 As a guide, machines limited to 8/16/32/64 GiB or more resolve to 512 MiB/1 GiB/2 GiB/4 GiB per
-window. The startup `auto -> N MiB x2` message and `experiment.json` record the resolved value.
+window. The startup `N MiB x2 (auto)` message and `experiment.json` record the resolved value.
 The calculation does not use currently available memory, so other processes and page-cache state
 do not change the result for a fixed memory limit.
 
