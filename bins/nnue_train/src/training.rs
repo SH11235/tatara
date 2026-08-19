@@ -10,7 +10,7 @@ use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
 #[cfg(any(feature = "gpu", test))]
 use nnue_train::dataloader::BucketMode;
 #[cfg(feature = "gpu")]
-use nnue_train::dataloader::DualLabelMode;
+use nnue_train::dataloader::{DualLabelMode, ScoreSource};
 #[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
@@ -796,12 +796,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         loss,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
-        score_override: cli.score_override.clone(),
-        score_override_mask: cli.score_override_mask.clone(),
+        score_source: cli.score_source().map(ScoreSource::to_path_buf),
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
-        dual_label_psv: cli.dual_label_psv.map(DualLabelMode::from),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -864,9 +862,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     &bucket_mode,
                     cfg.feature_set,
                     cfg.num_buckets,
-                    cfg.score_override.as_deref(),
-                    cfg.score_override_mask.as_deref(),
-                    cfg.dual_label_psv,
+                    cfg.score_source.as_ref().map(ScoreSource::as_deref),
                 )?
             }
             _ => {
@@ -2049,12 +2045,10 @@ pub(crate) fn run_simple_training(
         loss,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
-        score_override: cli.score_override.clone(),
-        score_override_mask: cli.score_override_mask.clone(),
+        score_source: cli.score_source().map(ScoreSource::to_path_buf),
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
-        dual_label_psv: cli.dual_label_psv.map(DualLabelMode::from),
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,

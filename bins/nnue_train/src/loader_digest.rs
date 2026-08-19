@@ -1,4 +1,4 @@
-use nnue_train::dataloader::{BucketMode, BucketedPrefetchedLoader, DualLabelMode};
+use nnue_train::dataloader::{BucketMode, BucketedPrefetchedLoader};
 use sha2::{Digest, Sha256};
 use shogi_features::FeatureSet;
 
@@ -23,7 +23,6 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         .spec();
     // record 長の倍数検査は loader (PsvFileLoader::open_range) が行う。
     let file_size = std::fs::metadata(data)?.len();
-    let dual_label_psv = cli.dual_label_psv.map(DualLabelMode::from);
     // `auto` は machine のメモリ量に依存し digest が machine 間で比較できなくなる
     // ため、digest では 0 (直接逐次読み) に解決する。明示値はそのまま使う。
     let teacher_shuffle_buffer_mib = match cli.teacher_shuffle_buffer_mib {
@@ -54,12 +53,10 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         1,
         file_size,
         false,
-        cli.score_override.as_deref(),
-        cli.score_override_mask.as_deref(),
+        cli.score_source(),
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         cli.teacher_shuffle_seed,
-        dual_label_psv,
     )?;
 
     let mut hasher = Sha256::new();

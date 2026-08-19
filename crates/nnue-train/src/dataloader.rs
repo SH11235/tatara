@@ -56,6 +56,40 @@ pub enum DualLabelMode {
     Gated,
 }
 
+/// PSV の base score を差し替える入力源。
+///
+/// sidecar の score と任意 mask は一つの variant に束ね、dual-label PSV とは
+/// variant を分けることで、同時指定や mask 単独の状態を表現できないようにする。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreSource<P> {
+    Sidecar { scores: P, mask: Option<P> },
+    DualLabel(DualLabelMode),
+}
+
+impl<P: AsRef<Path>> ScoreSource<P> {
+    pub fn as_deref(&self) -> ScoreSource<&Path> {
+        match self {
+            Self::Sidecar { scores, mask } => ScoreSource::Sidecar {
+                scores: scores.as_ref(),
+                mask: mask.as_ref().map(AsRef::as_ref),
+            },
+            Self::DualLabel(mode) => ScoreSource::DualLabel(*mode),
+        }
+    }
+}
+
+impl ScoreSource<&Path> {
+    pub fn to_path_buf(self) -> ScoreSource<PathBuf> {
+        match self {
+            Self::Sidecar { scores, mask } => ScoreSource::Sidecar {
+                scores: scores.to_path_buf(),
+                mask: mask.map(Path::to_path_buf),
+            },
+            Self::DualLabel(mode) => ScoreSource::DualLabel(mode),
+        }
+    }
+}
+
 impl DualLabelMode {
     pub const fn canonical_name(self) -> &'static str {
         match self {
@@ -726,28 +760,23 @@ impl PsvEpochReader {
     /// `path` を `[start_offset, end_offset)` 範囲で epoch wrap させる reader。
     /// wrap 時の再 open も同 range で行う。`PsvFileLoader::new_range` 同様の
     /// 範囲・alignment 検証はここでは行わず、`new_range` 内で検証する。
-    #[allow(clippy::too_many_arguments)]
     fn new_range(
         path: &Path,
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
-        score_override: Option<&Path>,
-        score_override_mask: Option<&Path>,
-        dual_label_psv: Option<DualLabelMode>,
+        score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        if dual_label_psv.is_some() && (score_override.is_some() || score_override_mask.is_some()) {
-            return Err(io::Error::other(
-                "dual_label_psv conflicts with score_override and score_override_mask",
-            ));
-        }
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
-        let score_override = score_override
-            .map(|score_path| {
-                ScoreOverrideReader::new(path, score_path, score_override_mask, start_offset)
-            })
-            .transpose()?;
+        let (score_override, dual_label_psv) = match score_source {
+            Some(ScoreSource::Sidecar { scores, mask }) => (
+                Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
+                None,
+            ),
+            Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
+            None => (None, None),
+        };
         Ok(Self {
             path: path.to_path_buf(),
             start_offset,
@@ -1171,46 +1200,6 @@ impl BucketedPrefetchedLoader {
         train_end_offset: u64,
         monitor_active: bool,
     ) -> io::Result<Self> {
-        Self::spawn_with_score_override(
-            path,
-            batch_size,
-            score_drop_abs,
-            score_clamp_abs,
-            num_workers,
-            bucket_mode,
-            feature_set,
-            compute_bucket,
-            num_buckets,
-            train_end_offset,
-            monitor_active,
-            None,
-            None,
-            0,
-            false,
-            0,
-        )
-    }
-
-    /// Spawns a loader with an optional streaming score sidecar and preserve mask.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_score_override(
-        path: &Path,
-        batch_size: usize,
-        score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i16>,
-        num_workers: usize,
-        bucket_mode: impl Into<BucketMode>,
-        feature_set: FeatureSetSpec,
-        compute_bucket: bool,
-        num_buckets: usize,
-        train_end_offset: u64,
-        monitor_active: bool,
-        score_override: Option<&Path>,
-        score_override_mask: Option<&Path>,
-        teacher_shuffle_buffer_mib: usize,
-        teacher_shuffle: bool,
-        teacher_shuffle_seed: u64,
-    ) -> io::Result<Self> {
         Self::spawn_with_score_sources(
             path,
             batch_size,
@@ -1223,12 +1212,10 @@ impl BucketedPrefetchedLoader {
             num_buckets,
             train_end_offset,
             monitor_active,
-            score_override,
-            score_override_mask,
-            teacher_shuffle_buffer_mib,
-            teacher_shuffle,
-            teacher_shuffle_seed,
             None,
+            0,
+            false,
+            0,
         )
     }
 
@@ -1246,12 +1233,10 @@ impl BucketedPrefetchedLoader {
         num_buckets: usize,
         train_end_offset: u64,
         monitor_active: bool,
-        score_override: Option<&Path>,
-        score_override_mask: Option<&Path>,
+        score_source: Option<ScoreSource<&Path>>,
         teacher_shuffle_buffer_mib: usize,
         teacher_shuffle: bool,
         teacher_shuffle_seed: u64,
-        dual_label_psv: Option<DualLabelMode>,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
@@ -1272,9 +1257,7 @@ impl BucketedPrefetchedLoader {
             train_end_offset,
             score_drop_abs,
             score_clamp_abs,
-            score_override,
-            score_override_mask,
-            dual_label_psv,
+            score_source,
         )?;
         let reader = match shuffle_window_records(teacher_shuffle_buffer_mib, batch_size)? {
             Some(window_records) => TrainingPsvReader::Windowed(WindowedPsvReader::spawn(
@@ -1607,9 +1590,7 @@ mod tests {
             records as u64 * PSV_RECORD_BYTES,
             None,
             None,
-            score_override,
-            None,
-            None,
+            score_override.map(|scores| ScoreSource::Sidecar { scores, mask: None }),
         )
         .unwrap();
         WindowedPsvReader::spawn(source, window_records, shuffle, seed)
@@ -1680,9 +1661,7 @@ mod tests {
             base.len() as u64 * PSV_RECORD_BYTES,
             None,
             None,
-            None,
-            None,
-            Some(DualLabelMode::All),
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
         )
         .unwrap();
         let mut reader = WindowedPsvReader::spawn(source, base.len(), true, 9);
@@ -1740,9 +1719,7 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             None,
             None,
-            None,
-            None,
-            Some(DualLabelMode::All),
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
         )
         .unwrap();
         let got: Vec<i16> = (0..6).map(|_| reader.next().unwrap().score()).collect();
@@ -1765,9 +1742,7 @@ mod tests {
             17 * PSV_RECORD_BYTES,
             None,
             None,
-            None,
-            None,
-            Some(DualLabelMode::Gated),
+            Some(ScoreSource::DualLabel(DualLabelMode::Gated)),
         )
         .unwrap();
         let got: Vec<i16> = (0..17).map(|_| reader.next().unwrap().score()).collect();
@@ -1792,9 +1767,7 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             None,
             None,
-            None,
-            None,
-            Some(DualLabelMode::All),
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
         )
         .unwrap();
         assert_eq!(reader.next().unwrap().score(), 11);
@@ -1822,9 +1795,7 @@ mod tests {
             5 * PSV_RECORD_BYTES,
             None,
             None,
-            None,
-            None,
-            Some(DualLabelMode::All),
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
         )
         .unwrap();
         let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
@@ -1843,9 +1814,7 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             Some(400),
             Some(100),
-            None,
-            None,
-            Some(DualLabelMode::All),
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
         )
         .unwrap();
         let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
@@ -1865,9 +1834,10 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             None,
             None,
-            Some(&scores),
-            None,
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: None,
+            }),
         )
         .unwrap();
         let got: Vec<i16> = (0..6).map(|_| reader.next().unwrap().score()).collect();
@@ -1891,9 +1861,10 @@ mod tests {
             17 * PSV_RECORD_BYTES,
             None,
             None,
-            Some(&scores),
-            mask_path.as_deref(),
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: mask_path.as_deref(),
+            }),
         )
         .unwrap();
         let got: Vec<i16> = (0..17).map(|_| reader.next().unwrap().score()).collect();
@@ -1920,9 +1891,10 @@ mod tests {
             5 * PSV_RECORD_BYTES,
             None,
             None,
-            Some(&scores),
-            None,
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: None,
+            }),
         )
         .unwrap();
         let got: Vec<i16> = (0..4).map(|_| reader.next().unwrap().score()).collect();
@@ -1944,9 +1916,10 @@ mod tests {
             11 * PSV_RECORD_BYTES,
             None,
             None,
-            Some(&scores),
-            mask_path.as_deref(),
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: mask_path.as_deref(),
+            }),
         )
         .unwrap();
 
@@ -1976,9 +1949,10 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             Some(400),
             Some(100),
-            Some(&scores),
-            None,
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: None,
+            }),
         )
         .unwrap();
         let mut concrete = PsvEpochReader::new_range(
@@ -1987,8 +1961,6 @@ mod tests {
             3 * PSV_RECORD_BYTES,
             Some(400),
             Some(100),
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -2043,9 +2015,10 @@ mod tests {
             9 * PSV_RECORD_BYTES,
             None,
             None,
-            Some(&scores),
-            mask_path.as_deref(),
-            None,
+            Some(ScoreSource::Sidecar {
+                scores: scores.as_path(),
+                mask: mask_path.as_deref(),
+            }),
         ) {
             Ok(_) => panic!("non-zero unused mask bits must be rejected"),
             Err(err) => err,
@@ -2596,12 +2569,13 @@ mod tests {
             1,
             end,
             false,
-            Some(&score_path),
-            (mode == DualLabelMode::Gated).then_some(mask_path.as_path()),
+            Some(ScoreSource::Sidecar {
+                scores: score_path.as_path(),
+                mask: (mode == DualLabelMode::Gated).then_some(mask_path.as_path()),
+            }),
             0,
             false,
             0,
-            None,
         )
         .unwrap();
         let mut inline = BucketedPrefetchedLoader::spawn_with_score_sources(
@@ -2616,12 +2590,10 @@ mod tests {
             1,
             end,
             false,
-            None,
-            None,
+            Some(ScoreSource::DualLabel(mode)),
             0,
             false,
             0,
-            Some(mode),
         )
         .unwrap();
 
@@ -2801,12 +2773,10 @@ mod tests {
             1,
             end,
             false,
-            None,
-            None,
+            Some(ScoreSource::DualLabel(DualLabelMode::All)),
             0,
             false,
             0,
-            Some(DualLabelMode::All),
         )
         .expect("spawn multi-worker dual-label loader");
         let mut error = None;
@@ -2940,8 +2910,7 @@ mod tests {
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
         let mut reader =
-            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None, None, None)
-                .unwrap();
+            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None).unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
@@ -2967,17 +2936,9 @@ mod tests {
         ));
         std::fs::write(&tmp, &bytes).expect("write synthetic psv");
 
-        let mut reader = PsvEpochReader::new_range(
-            &tmp,
-            0,
-            bytes.len() as u64,
-            Some(32000),
-            Some(100),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut reader =
+            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100), None)
+                .unwrap();
         let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
         std::fs::remove_file(&tmp).ok();
         assert_eq!(got, vec![0, 50, -50, 100, -100]);
