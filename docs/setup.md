@@ -40,7 +40,11 @@ currently the default backend, but its native Windows support is experimental.
 2. Install Visual Studio 2022 or Build Tools 2022 with "Desktop development
    with C++". Use Developer PowerShell for VS 2022 if `cl.exe` is not visible
    from a regular PowerShell session. When building from Git Bash or scripts,
-   invoke cargo through a cmd wrapper that calls `vcvars64.bat` first. Builds
+   invoke cargo through a cmd wrapper that first calls `vcvars64.bat` (shipped
+   with Visual Studio at `C:\Program Files\Microsoft Visual Studio\2022\
+Community\VC\Auxiliary\Build\vcvars64.bat`) in the same cmd session —
+   environment changes are per-process, so running it in a separate window has
+   no effect. Builds
    without `cl.exe` on PATH fail with
    `NVCC failed for kernels/native_kernels.cu with status exit code: 1`; the
    underlying `nvcc fatal : Cannot find compiler 'cl.exe' in PATH` is only
