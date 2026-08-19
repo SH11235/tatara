@@ -39,7 +39,12 @@ currently the default backend, but its native Windows support is experimental.
    The driver alone does not provide `nvcc.exe`, `cuda.lib`, or `cublas.lib`.
 2. Install Visual Studio 2022 or Build Tools 2022 with "Desktop development
    with C++". Use Developer PowerShell for VS 2022 if `cl.exe` is not visible
-   from a regular PowerShell session.
+   from a regular PowerShell session. When building from Git Bash or scripts,
+   invoke cargo through a cmd wrapper that calls `vcvars64.bat` first. Builds
+   without `cl.exe` on PATH fail with
+   `NVCC failed for kernels/native_kernels.cu with status exit code: 1`; the
+   underlying `nvcc fatal : Cannot find compiler 'cl.exe' in PATH` is only
+   visible with `-vv`.
 3. Install Rustup. The first `cargo` invocation in the repository installs the
    pinned nightly from `rust-toolchain.toml`.
 4. On Windows 11 with Smart App Control enabled, unsigned build-script and test

@@ -38,7 +38,12 @@ Studio 2022 (MSVC 19.44)、Rust nightly-2026-04-03 で build、GPU smoke、train
    だけでは `nvcc.exe`、`cuda.lib`、`cublas.lib` が無いため build できない。
 2. Visual Studio 2022 または Build Tools 2022 で「C++ によるデスクトップ開発」を
    install する。通常の PowerShell で `cl.exe` が見えない場合は Developer
-   PowerShell for VS 2022 を使う。
+   PowerShell for VS 2022 を使う。Git Bash やスクリプトから build する場合は
+   `vcvars64.bat` を先に call した cmd 経由で cargo を起動する。`cl.exe` が
+   見えない環境での build は
+   `NVCC failed for kernels/native_kernels.cu with status exit code: 1` で
+   失敗する (真のエラー `nvcc fatal : Cannot find compiler 'cl.exe' in PATH`
+   は `-vv` を付けないと表示されない)。
 3. Rustup を install する。repository 内で最初に `cargo` を実行すると
    `rust-toolchain.toml` の pinned nightly が install される。
 4. Smart App Control が有効な Windows 11 では、Cargo が生成する未署名の build
