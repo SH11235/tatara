@@ -63,67 +63,53 @@ use training::run_training;
 #[cfg(feature = "oxide")]
 pub(crate) use kernels::*;
 
-#[cfg(feature = "gpu")]
-fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    if let Err(e) = cli.validate_score_sources() {
-        eprintln!("error: {e}");
-        return std::process::ExitCode::from(1);
-    }
+fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // 診断 flag (--eval-only / --threat-ablate / --threat-norm-dump) は学習データを
     // 読まない経路 (norm-dump / --test-data 評価) を持つため、--data 不在でも
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
     // smoke test に落ちて何もせず成功扱いになる。
-    #[cfg(any(feature = "oxide-parity", feature = "native"))]
-    let result = if let cli::ArchCommand::LoaderDigest(args) = &cli.arch {
-        loader_digest::run(&cli, args)
-    } else if let cli::ArchCommand::BenchPos(args) = &cli.arch {
-        bench_pos::run(args)
-    } else if let cli::ArchCommand::NativeBench(args) = &cli.arch {
-        native_bench::run(args, cli.batch_size)
-    } else if cli.data.is_some()
-        || cli.eval_only
-        || cli.threat_ablate.is_some()
-        || cli.threat_norm_dump
-    {
-        run_training(&cli)
-    } else {
-        smoke_test(cli.arch.kind())
-    };
-    #[cfg(not(any(feature = "oxide-parity", feature = "native")))]
-    let result = if let cli::ArchCommand::LoaderDigest(args) = &cli.arch {
-        loader_digest::run(&cli, args)
-    } else if let cli::ArchCommand::BenchPos(args) = &cli.arch {
-        bench_pos::run(args)
-    } else if cli.data.is_some()
-        || cli.eval_only
-        || cli.threat_ablate.is_some()
-        || cli.threat_norm_dump
-    {
-        run_training(&cli)
-    } else {
-        smoke_test(cli.arch.kind())
-    };
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::ExitCode::from(1)
+    match &cli.arch {
+        cli::ArchCommand::LoaderDigest(args) => loader_digest::run(cli, args),
+        cli::ArchCommand::BenchPos(args) => {
+            #[cfg(feature = "gpu")]
+            {
+                bench_pos::run(args)
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _ = args;
+                Err("nnue-train training commands require the default `gpu` feature".into())
+            }
+        }
+        #[cfg(any(feature = "oxide-parity", feature = "native"))]
+        cli::ArchCommand::NativeBench(args) => native_bench::run(args, cli.batch_size),
+        cli::ArchCommand::LayerStack(_) | cli::ArchCommand::Simple(_) => {
+            #[cfg(feature = "gpu")]
+            {
+                if cli.data.is_some()
+                    || cli.eval_only
+                    || cli.threat_ablate.is_some()
+                    || cli.threat_norm_dump
+                {
+                    run_training(cli)
+                } else {
+                    smoke_test(cli.arch.kind())
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Err("nnue-train training commands require the default `gpu` feature".into())
+            }
         }
     }
 }
 
-#[cfg(not(feature = "gpu"))]
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    if let Err(e) = cli.validate_score_sources() {
-        eprintln!("error: {e}");
-        return std::process::ExitCode::from(1);
-    }
-    let result = match &cli.arch {
-        cli::ArchCommand::LoaderDigest(args) => loader_digest::run(&cli, args),
-        _ => Err("nnue-train training commands require the default `gpu` feature".into()),
-    };
+    let result = cli
+        .validate_score_sources()
+        .map_err(Into::into)
+        .and_then(|()| dispatch(&cli));
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

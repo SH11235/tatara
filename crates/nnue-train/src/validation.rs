@@ -22,13 +22,15 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(test)]
+use crate::dataloader::DualLabelMode;
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
-    Batch, BucketMode, DualLabelMode, HcpeFileLoader, PSV_RECORD_BYTES, PsvFileLoader,
-    ScoreOverrideReader,
+    Batch, BucketMode, HcpeFileLoader, PSV_RECORD_BYTES, PsvFileLoader, ScoreOverrideReader,
+    ScoreSource,
 };
 use crate::trainer::{LossKind, TrainerBackend};
 
@@ -111,8 +113,6 @@ impl HeldoutSet {
             feature_set,
             num_buckets,
             None,
-            None,
-            None,
         )
     }
 
@@ -135,39 +135,6 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
-        Self::load_from_range_with_override(
-            path,
-            start_offset,
-            end_offset,
-            batch_size,
-            score_drop_abs,
-            score_clamp_abs,
-            test_positions,
-            bucket_mode,
-            feature_set,
-            num_buckets,
-            None,
-            None,
-        )
-    }
-
-    /// Equivalent to [`Self::load_from_range`], with scores read from a
-    /// full-file sidecar before score filtering and clamping.
-    #[allow(clippy::too_many_arguments)]
-    pub fn load_from_range_with_override(
-        path: &Path,
-        start_offset: u64,
-        end_offset: u64,
-        batch_size: usize,
-        score_drop_abs: Option<i32>,
-        score_clamp_abs: Option<i16>,
-        test_positions: usize,
-        bucket_mode: &(impl Copy + Into<BucketMode>),
-        feature_set: FeatureSetSpec,
-        num_buckets: usize,
-        score_override: Option<&Path>,
-        score_override_mask: Option<&Path>,
-    ) -> io::Result<Self> {
         Self::load_from_range_with_score_sources(
             path,
             start_offset,
@@ -179,8 +146,6 @@ impl HeldoutSet {
             bucket_mode,
             feature_set,
             num_buckets,
-            score_override,
-            score_override_mask,
             None,
         )
     }
@@ -198,21 +163,17 @@ impl HeldoutSet {
         bucket_mode: &(impl Copy + Into<BucketMode>),
         feature_set: FeatureSetSpec,
         num_buckets: usize,
-        score_override: Option<&Path>,
-        score_override_mask: Option<&Path>,
-        dual_label_psv: Option<DualLabelMode>,
+        score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        if dual_label_psv.is_some() && (score_override.is_some() || score_override_mask.is_some()) {
-            return Err(io::Error::other(
-                "dual_label_psv conflicts with score_override and score_override_mask",
-            ));
-        }
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
-        let mut score_override = score_override
-            .map(|score_path| {
-                ScoreOverrideReader::new(path, score_path, score_override_mask, start_offset)
-            })
-            .transpose()?;
+        let (mut score_override, dual_label_psv) = match score_source {
+            Some(ScoreSource::Sidecar { scores, mask }) => (
+                Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
+                None,
+            ),
+            Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
+            None => (None, None),
+        };
         let mut record_index = start_offset / PSV_RECORD_BYTES;
         Self::load_boards(
             loader,
@@ -615,9 +576,7 @@ mod tests {
             &BucketMode::KingRank9,
             test_spec(),
             9,
-            None,
-            None,
-            Some(DualLabelMode::Gated),
+            Some(ScoreSource::DualLabel(DualLabelMode::Gated)),
         )
         .expect("load dual-label tail held-out set");
         let scores = &set.batches[0].0.score[..8];

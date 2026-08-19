@@ -163,6 +163,12 @@ fn score_override_flags_require_training_data_and_sidecar() {
         parsed.score_override_mask,
         Some(PathBuf::from("preserve.mask"))
     );
+    let Some(nnue_train::dataloader::ScoreSource::Sidecar { scores, mask }) = parsed.score_source()
+    else {
+        panic!("expected sidecar score source");
+    };
+    assert_eq!(scores, std::path::Path::new("scores.bin"));
+    assert_eq!(mask, Some(std::path::Path::new("preserve.mask")));
     assert!(
         Cli::try_parse_from(["nnue-train", "--score-override", "scores.bin", "simple"]).is_err()
     );
@@ -191,6 +197,12 @@ fn dual_label_psv_requires_data_and_conflicts_with_sidecars() {
     ])
     .unwrap();
     assert_eq!(parsed.dual_label_psv, Some(DualLabelPsvArg::Gated));
+    assert_eq!(
+        parsed.score_source(),
+        Some(nnue_train::dataloader::ScoreSource::DualLabel(
+            nnue_train::dataloader::DualLabelMode::Gated
+        ))
+    );
 
     assert!(Cli::try_parse_from(["nnue-train", "--dual-label-psv", "all", "simple"]).is_err());
     for sidecar_args in [
@@ -275,6 +287,39 @@ fn loader_digest_rejects_heldout_sources() {
         let err = crate::loader_digest::run(&cli, args)
             .expect_err("loader-digest must reject held-out source flags");
         assert!(err.to_string().contains(flag), "got: {err}");
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn gpu_free_dispatch_runs_loader_digest() {
+    let data = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/shogi-format/tests/data/sample.psv");
+    let cli = Cli::try_parse_from([
+        "nnue-train".into(),
+        "loader-digest".into(),
+        "--data".into(),
+        data.into_os_string(),
+        "--batch-size".into(),
+        "8".into(),
+        "--batches".into(),
+        "1".into(),
+    ])
+    .expect("loader-digest CLI should parse without GPU features");
+    crate::dispatch(&cli).expect("loader-digest should run without GPU features");
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn gpu_free_dispatch_rejects_training_commands() {
+    const EXPECTED: &str = "nnue-train training commands require the default `gpu` feature";
+
+    for command in ["bench-pos", "layerstack"] {
+        let cli = Cli::try_parse_from(["nnue-train", command])
+            .expect("training command CLI should parse without GPU features");
+        let err = crate::dispatch(&cli)
+            .expect_err("training command must be rejected without GPU features");
+        assert!(err.to_string().contains(EXPECTED), "{command}: got: {err}");
     }
 }
 

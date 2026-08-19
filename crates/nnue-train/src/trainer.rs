@@ -58,7 +58,7 @@ use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
-    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES,
+    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES, ScoreSource,
 };
 use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
@@ -426,10 +426,8 @@ pub struct TrainingConfig {
     /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
     /// 消費側の縮小 cast (wrap) を型で不可能にするため。
     pub score_clamp_abs: Option<i16>,
-    /// Little-endian i16 score sidecar aligned to every record in `data_path`.
-    pub score_override: Option<PathBuf>,
-    /// LSB-first bitmap whose set bits preserve scores from `data_path`.
-    pub score_override_mask: Option<PathBuf>,
+    /// PSV の base score を差し替える sidecar または record 内 dual-label。
+    pub score_source: Option<ScoreSource<PathBuf>>,
     /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
     /// one while decode workers consume the other. `0` restores direct sequential reading.
     pub teacher_shuffle_buffer_mib: usize,
@@ -438,8 +436,6 @@ pub struct TrainingConfig {
     pub teacher_shuffle: bool,
     /// Base seed for deterministic per-epoch, per-window shuffle.
     pub teacher_shuffle_seed: u64,
-    /// PSV record 内の DL score と padding gate bit を解釈する方式。
-    pub dual_label_psv: Option<DualLabelMode>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で reader の決定論的順序を維持、`>= 2` で並列パース (1 epoch 内の
     /// batch delivery 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
@@ -513,18 +509,6 @@ impl TrainingConfig {
             ));
         }
         self.loss.validate()?;
-        if self.score_override_mask.is_some() && self.score_override.is_none() {
-            return Err(io::Error::other(
-                "score_override_mask requires score_override",
-            ));
-        }
-        if self.dual_label_psv.is_some()
-            && (self.score_override.is_some() || self.score_override_mask.is_some())
-        {
-            return Err(io::Error::other(
-                "dual_label_psv conflicts with score_override and score_override_mask",
-            ));
-        }
         crate::dataloader::shuffle_window_records(
             self.teacher_shuffle_buffer_mib,
             self.batch_size,
@@ -715,9 +699,7 @@ where
         None => file_size,
     };
 
-    if (cfg.score_override.is_some() || cfg.dual_label_psv.is_some())
-        && crate::dataloader::is_hcpe_path(data_path)
-    {
+    if cfg.score_source.is_some() && crate::dataloader::is_hcpe_path(data_path) {
         return Err(io::Error::other(
             "score_override and dual_label_psv are only supported for PSV training data, not HCPE",
         ));
@@ -735,13 +717,17 @@ where
         cfg.num_buckets,
         train_end_offset,
         cfg.monitor_active_features,
-        cfg.score_override.as_deref(),
-        cfg.score_override_mask.as_deref(),
+        cfg.score_source.as_ref().map(ScoreSource::as_deref),
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
-        cfg.dual_label_psv,
     )?;
+
+    let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
+        Some(ScoreSource::Sidecar { scores, mask }) => (Some(scores), mask.as_ref(), None),
+        Some(ScoreSource::DualLabel(mode)) => (None, None, Some(*mode)),
+        None => (None, None, None),
+    };
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
@@ -755,9 +741,9 @@ where
         cfg.loss,
         cfg.score_drop_abs,
         cfg.score_clamp_abs,
-        cfg.score_override,
-        cfg.score_override_mask,
-        cfg.dual_label_psv.map(DualLabelMode::canonical_name),
+        score_override,
+        score_override_mask,
+        dual_label_psv.map(DualLabelMode::canonical_name),
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
@@ -801,9 +787,7 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
-                cfg.score_override.as_deref(),
-                cfg.score_override_mask.as_deref(),
-                cfg.dual_label_psv,
+                cfg.score_source.as_ref().map(ScoreSource::as_deref),
             )?;
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
@@ -1343,12 +1327,10 @@ mod tests {
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
             score_clamp_abs: None,
-            score_override: None,
-            score_override_mask: None,
+            score_source: None,
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
-            dual_label_psv: None,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -2350,24 +2332,6 @@ mod tests {
             }
             .validate()
             .is_ok()
-        );
-        assert!(
-            TrainingConfig {
-                dual_label_psv: Some(DualLabelMode::All),
-                score_override: Some(PathBuf::from("scores.i16")),
-                ..base_cfg()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            TrainingConfig {
-                dual_label_psv: Some(DualLabelMode::Gated),
-                score_override_mask: Some(PathBuf::from("entered.bits")),
-                ..base_cfg()
-            }
-            .validate()
-            .is_err()
         );
         // score-clamp-abs は >= 1 (上限 i16::MAX は型で保証)。
         for bad in [0, -1] {

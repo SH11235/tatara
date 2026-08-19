@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
@@ -760,8 +760,23 @@ impl Cli {
         !self.no_ft_factorize
     }
 
+    pub(crate) fn score_source(&self) -> Option<nnue_train::dataloader::ScoreSource<&Path>> {
+        if let Some(scores) = self.score_override.as_deref() {
+            Some(nnue_train::dataloader::ScoreSource::Sidecar {
+                scores,
+                mask: self.score_override_mask.as_deref(),
+            })
+        } else {
+            self.dual_label_psv.map(|mode| {
+                nnue_train::dataloader::ScoreSource::DualLabel(
+                    nnue_train::dataloader::DualLabelMode::from(mode),
+                )
+            })
+        }
+    }
+
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
-        if (self.score_override.is_some() || self.dual_label_psv.is_some())
+        if self.score_source().is_some()
             && self
                 .data
                 .as_deref()
