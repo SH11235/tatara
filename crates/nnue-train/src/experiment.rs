@@ -301,6 +301,9 @@ pub struct ExperimentDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub command: String,
+    /// `control.json` で適用された実効終了 superbatch。control 未適用なら省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_superbatches: Option<usize>,
     /// resume した run のみ持つ。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
@@ -349,6 +352,7 @@ impl ExperimentDoc {
             status: STATUS_RUNNING.to_string(),
             commit,
             command,
+            target_superbatches: None,
             lineage,
             params,
             data,
@@ -399,6 +403,12 @@ impl ExperimentLogger {
     /// 書き込み先 path。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `control.json` で適用された実効終了 superbatch を記録する。
+    pub fn set_target_superbatches(&mut self, target: usize) {
+        self.doc.target_superbatches = Some(target);
+        self.touch();
     }
 
     /// 1 superbatch 完了を記録する。`history` に 1 点追加し、`results` 集約値
@@ -858,6 +868,7 @@ mod tests {
         let v = serde_json::to_value(&doc).expect("serialise");
         assert!(v.get("commit").is_none());
         assert!(v.get("lineage").is_none());
+        assert!(v.get("target_superbatches").is_none());
         assert!(v["params"].get("wrm_in_scaling").is_none());
         assert!(v["params"].get("progress_coeff").is_none());
         assert!(v["params"].get("dual_label_psv").is_none());

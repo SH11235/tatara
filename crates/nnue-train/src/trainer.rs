@@ -9,7 +9,10 @@
 //! ## ループ構造
 //!
 //! ```text
-//! for sb in start_superbatch..=end_superbatch:
+//! effective_end = end_superbatch
+//! sb = start_superbatch
+//! while sb <= effective_end:
+//!     poll output_dir/control.json and update effective_end
 //!     for batch_idx in 0..batches_per_superbatch:
 //!         lr  = lr_scheduler.lr(batch_idx, sb)
 //!         wdl = wdl_scheduler.blend(batch_idx, sb, end_superbatch)
@@ -17,7 +20,7 @@
 //!           (EOF → 同 file を開き直す = 次 epoch)
 //!         loss += backend.train_step(batch, buckets, lr, wdl, loss_kind)
 //!     report(sb, loss / positions, pos/s, ETA)
-//!     if sb % save_rate == 0 || sb == end_superbatch:
+//!     if sb % save_rate == 0 || sb == effective_end:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
 //!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + optimizer state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
@@ -49,10 +52,12 @@
 //! 駆動で順序非依存なので training には影響しない。決定論的順序が必要なら
 //! `cfg.threads = 1` を指定する。
 
-use std::io::{self, IsTerminal, Write};
+use std::fs::OpenOptions;
+use std::io::{self, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
@@ -60,7 +65,7 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use crate::dataloader::{
     Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES, ScoreSource,
 };
-use crate::experiment::ExperimentLogger;
+use crate::experiment::{ExperimentLogger, format_utc_iso, now_epoch_secs};
 use crate::schedule::{LrScheduler, WdlScheduler};
 
 // =============================================================================
@@ -633,6 +638,82 @@ impl ActiveHistStats {
 // run — superbatch loop
 // =============================================================================
 
+#[derive(Clone, Copy)]
+struct ControlState {
+    target_superbatches: usize,
+}
+
+#[derive(Deserialize)]
+struct ControlFile {
+    target_superbatches: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ControlHistoryEntry {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    timestamp: String,
+    target_superbatches: usize,
+    superbatch: usize,
+}
+
+fn apply_control(
+    control_path: &Path,
+    history_path: &Path,
+    applied: &mut ControlState,
+    current_superbatch: usize,
+    configured_end: usize,
+) -> Option<usize> {
+    let text = match std::fs::read_to_string(control_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!(
+                "[control] warning: failed to read {}: {e}; ignoring",
+                control_path.display()
+            );
+            return None;
+        }
+    };
+    let parsed: ControlFile = match serde_json::from_str(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!(
+                "[control] warning: failed to parse {}: {e}; ignoring",
+                control_path.display()
+            );
+            return None;
+        }
+    };
+    let requested = parsed.target_superbatches?;
+    let target = requested.max(current_superbatch).min(configured_end);
+    if target == applied.target_superbatches {
+        return None;
+    }
+
+    applied.target_superbatches = target;
+    println!("[control] applied: target_superbatches={target} (superbatch={current_superbatch})");
+    let entry = ControlHistoryEntry {
+        kind: "control",
+        timestamp: format_utc_iso(now_epoch_secs()),
+        target_superbatches: target,
+        superbatch: current_superbatch,
+    };
+    if let Err(e) = append_control_history(history_path, &entry) {
+        eprintln!(
+            "[control] warning: failed to append {}: {e}; training will continue",
+            history_path.display()
+        );
+    }
+    Some(target)
+}
+
+fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
+    file.write_all(b"\n")
+}
+
 /// superbatch training loop を実行し、`cfg.output_dir` 配下に checkpoint を書き出す。
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
@@ -644,6 +725,10 @@ impl ActiveHistStats {
 /// - `experiment`: `Some` のとき、run 開始時・superbatch ごと・正常終了時に
 ///   experiment.json を atomic に書き出す。書き込み失敗は warning のみで
 ///   training は止めない。`None` なら構造化ログを残さない
+///
+/// 各 superbatch の開始時に `cfg.output_dir/control.json` を読み、
+/// `target_superbatches` があれば元の終了点を超えない範囲で実効終了点を更新する。
+/// LR / WDL schedule の horizon は `cfg.end_superbatch` のまま変えない。
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
@@ -841,7 +926,25 @@ where
     let mut prev_fp16_clamp_count: u64 = 0;
     let mut prev_fp16_clamp_elems: u64 = 0;
 
-    for sb in cfg.start_superbatch..=cfg.end_superbatch {
+    let control_path = cfg.output_dir.join("control.json");
+    let control_history_path = cfg.output_dir.join("control_history.jsonl");
+    let mut control = ControlState {
+        target_superbatches: cfg.end_superbatch,
+    };
+    let mut sb = cfg.start_superbatch;
+    loop {
+        if let Some(target) = apply_control(
+            &control_path,
+            &control_history_path,
+            &mut control,
+            sb,
+            cfg.end_superbatch,
+        ) && let Some(log) = experiment.as_mut()
+        {
+            log.set_target_superbatches(target);
+            write_experiment_log(log);
+        }
+
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
@@ -884,7 +987,7 @@ where
                     "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
                     progress_terminator,
                     sb,
-                    cfg.end_superbatch,
+                    control.target_superbatches,
                     pct,
                     done,
                     cfg.batches_per_superbatch,
@@ -919,7 +1022,8 @@ where
             sb_loss / sb_positions as f64
         };
         let pos_per_sec = sb_positions as f64 / sb_secs;
-        let remaining_positions = positions_per_sb.saturating_mul((cfg.end_superbatch - sb) as u64);
+        let remaining_positions =
+            positions_per_sb.saturating_mul((control.target_superbatches - sb) as u64);
         let eta_secs = if pos_per_sec > 0.0 {
             remaining_positions as f64 / pos_per_sec
         } else {
@@ -959,7 +1063,7 @@ where
         println!(
             "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}{}",
             sb,
-            cfg.end_superbatch,
+            control.target_superbatches,
             mean_loss,
             pos_per_sec,
             lr_now,
@@ -1003,7 +1107,7 @@ where
             );
         }
 
-        let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
+        let saved = sb.is_multiple_of(cfg.save_rate) || sb == control.target_superbatches;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
@@ -1043,6 +1147,11 @@ where
             }
             write_experiment_log(log);
         }
+
+        if sb == control.target_superbatches {
+            break;
+        }
+        sb += 1;
     }
 
     // 最後に残った batch を recycle: 直前 sb 末の `flush_pending_loss` 内 event sync で
@@ -1066,7 +1175,7 @@ where
     println!(
         "[train] done in {} ({} superbatches)",
         format_hms(run_start.elapsed().as_secs_f64()),
-        cfg.end_superbatch + 1 - cfg.start_superbatch,
+        sb + 1 - cfg.start_superbatch,
     );
 
     if let Some(log) = experiment.as_mut() {
@@ -1169,7 +1278,7 @@ fn format_hms(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::{ConstantWDL, StepLR};
+    use crate::schedule::{ConstantWDL, LinearDecayLR, LinearWDL, StepLR};
 
     fn sample_psv_path() -> PathBuf {
         // crates/nnue-train/Cargo.toml から相対で shogi-format/tests/data/sample.psv。
@@ -1191,6 +1300,8 @@ mod tests {
         last_buckets: Vec<i32>,
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
+        seen_wdl: Vec<f32>,
+        write_checkpoints: bool,
         /// `validate_step` の呼び出し回数 (held-out validation の検証用)。
         validate_steps: usize,
         /// `read_fp16_clamp_count` の呼び出し回数。`--monitor-fp16-clamps` が
@@ -1213,11 +1324,18 @@ mod tests {
                 last_buckets: Vec::new(),
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
+                seen_wdl: Vec::new(),
+                write_checkpoints: false,
                 validate_steps: 0,
                 clamp_reads: 0,
                 clamp_count_sim: 0,
                 clamp_elems_sim: 0,
             }
+        }
+
+        fn with_file_writes(mut self) -> Self {
+            self.write_checkpoints = true;
+            self
         }
     }
 
@@ -1250,6 +1368,7 @@ mod tests {
             self.last_buckets = bucket_idx.to_vec();
             self.max_batch_positions = self.max_batch_positions.max(batch.n_positions);
             self.seen_lr.push(lr);
+            self.seen_wdl.push(wdl_lambda);
             self.clamp_count_sim += 7;
             self.clamp_elems_sim += 100;
             // 単調減少する dummy loss (loss 推移の monotonic decreasing assertion 用)。
@@ -1290,6 +1409,9 @@ mod tests {
             _output_format: OutputFormat,
         ) -> io::Result<()> {
             self.saves.push(path.to_path_buf());
+            if self.write_checkpoints {
+                std::fs::write(path, b"mock quantised checkpoint")?;
+            }
             Ok(())
         }
 
@@ -1302,6 +1424,9 @@ mod tests {
         ) -> io::Result<()> {
             self.resume_saves.push((path.to_path_buf(), superbatch));
             self.resume_run_ids.push(run_id.to_string());
+            if self.write_checkpoints {
+                std::fs::write(path, b"mock resume checkpoint")?;
+            }
             Ok(())
         }
 
@@ -1340,6 +1465,19 @@ mod tests {
             monitor_fp16_clamps: false,
             monitor_active_features: false,
         }
+    }
+
+    fn temp_output_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-control-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temporary output directory");
+        dir
     }
 
     fn run_drives_superbatches_with_threads(threads: usize) {
@@ -1563,6 +1701,28 @@ mod tests {
         }
     }
 
+    fn experiment_logger(path: PathBuf, id: &str) -> ExperimentLogger {
+        use crate::experiment::{DataInfo, ExperimentDoc};
+
+        let doc = ExperimentDoc::new(
+            id.to_string(),
+            id.to_string(),
+            1_747_000_000,
+            None,
+            "nnue-train --data sample.psv".to_string(),
+            None,
+            experiment_params(),
+            DataInfo {
+                name: "sample.psv".to_string(),
+                positions: 1_000,
+                total_positions: 0,
+                dataset_passes: 0.0,
+            },
+            Some(nnue_format::layerstack_weights::FV_SCALE),
+        );
+        ExperimentLogger::new(path, doc)
+    }
+
     #[test]
     fn run_writes_experiment_json() {
         // `run` に ExperimentLogger を渡すと、run 完了時に status "completed" の
@@ -1640,6 +1800,272 @@ mod tests {
         assert_eq!(backend.resume_run_ids, vec!["exp-test", "exp-test"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_stops_after_current_superbatch_and_records_completion() {
+        let output_dir = temp_output_dir("stop-current");
+        std::fs::write(
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 0}"#,
+        )
+        .expect("write control.json");
+        let experiment_path = output_dir.join("experiment.json");
+        let mut logger = experiment_logger(experiment_path.clone(), "control-stop");
+        let cfg = TrainingConfig {
+            output_dir: output_dir.clone(),
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let mut backend = MockBackend::new().with_file_writes();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            Some(&mut logger),
+        )
+        .expect("controlled run ok");
+
+        assert_eq!(backend.steps, cfg.batches_per_superbatch);
+        assert_eq!(backend.saves, vec![output_dir.join("test-1.bin")]);
+        assert_eq!(
+            backend.resume_saves,
+            vec![(output_dir.join("test-1.ckpt"), 1)]
+        );
+        assert!(output_dir.join("test-1.bin").is_file());
+        assert!(output_dir.join("test-1.ckpt").is_file());
+
+        let experiment: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&experiment_path).expect("read experiment.json"),
+        )
+        .expect("parse experiment.json");
+        assert_eq!(experiment["status"], "completed");
+        assert_eq!(experiment["target_superbatches"], 1);
+        assert_eq!(experiment["history"].as_array().unwrap().len(), 1);
+        assert_eq!(experiment["checkpoints"].as_array().unwrap().len(), 2);
+
+        let history = std::fs::read_to_string(output_dir.join("control_history.jsonl"))
+            .expect("read control history");
+        let records: Vec<serde_json::Value> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid history record"))
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["type"], "control");
+        assert_eq!(records[0]["target_superbatches"], 1);
+        assert_eq!(records[0]["superbatch"], 1);
+        assert!(records[0]["timestamp"].as_str().unwrap().ends_with('Z'));
+
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn missing_unreadable_and_malformed_control_do_not_stop_training() {
+        for case in ["missing", "unreadable", "malformed"] {
+            let output_dir = temp_output_dir(case);
+            let control_path = output_dir.join("control.json");
+            match case {
+                "unreadable" => std::fs::create_dir(&control_path).expect("create control dir"),
+                "malformed" => {
+                    std::fs::write(&control_path, "{ not json").expect("write malformed control")
+                }
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let cfg = TrainingConfig {
+                output_dir: output_dir.clone(),
+                threads: 1,
+                ..base_cfg()
+            };
+            let progress = ShogiProgressKPAbs;
+            let lr = StepLR {
+                start: 1.0e-3,
+                gamma: 0.9,
+                step: 1,
+            };
+            let wdl = ConstantWDL { value: 0.0 };
+            let mut backend = MockBackend::new();
+
+            run(
+                &mut backend,
+                &sample_psv_path(),
+                &progress,
+                &lr,
+                &wdl,
+                &cfg,
+                None,
+            )
+            .expect("invalid or absent control must not fail training");
+
+            assert_eq!(backend.steps, 6, "case={case}");
+            assert!(!output_dir.join("control_history.jsonl").exists());
+            let _ = std::fs::remove_dir_all(&output_dir);
+        }
+    }
+
+    #[test]
+    fn control_target_at_or_above_configured_end_is_noop() {
+        let output_dir = temp_output_dir("no-extension");
+        std::fs::write(
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 99}"#,
+        )
+        .expect("write control.json");
+        let cfg = TrainingConfig {
+            output_dir: output_dir.clone(),
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let mut backend = MockBackend::new().with_file_writes();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("run ok");
+
+        assert_eq!(backend.steps, 6);
+        assert!(!output_dir.join("control_history.jsonl").exists());
+        assert!(output_dir.join("test-3.bin").is_file());
+        assert!(output_dir.join("test-3.ckpt").is_file());
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn control_history_append_failure_does_not_stop_training() {
+        let output_dir = temp_output_dir("history-unwritable");
+        std::fs::write(
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 2}"#,
+        )
+        .expect("write control.json");
+        std::fs::create_dir(output_dir.join("control_history.jsonl"))
+            .expect("create directory at history path");
+        let cfg = TrainingConfig {
+            output_dir: output_dir.clone(),
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let mut backend = MockBackend::new();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("history failure must not fail training");
+
+        assert_eq!(backend.steps, 4);
+        assert_eq!(backend.saves, vec![output_dir.join("test-2.bin")]);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn control_keeps_original_lr_and_wdl_schedule_horizon() {
+        let baseline_dir = temp_output_dir("schedule-baseline");
+        let controlled_dir = temp_output_dir("schedule-controlled");
+        std::fs::write(
+            controlled_dir.join("control.json"),
+            r#"{"target_superbatches": 2, "unknown_field": true}"#,
+        )
+        .expect("write control.json");
+        let base = TrainingConfig {
+            end_superbatch: 4,
+            save_rate: 10,
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = LinearDecayLR {
+            initial_lr: 1.0e-3,
+            final_lr: 1.0e-4,
+            final_superbatch: base.end_superbatch,
+        };
+        let wdl = LinearWDL {
+            start: 0.1,
+            end: 0.9,
+        };
+
+        let baseline_cfg = TrainingConfig {
+            output_dir: baseline_dir.clone(),
+            ..base.clone()
+        };
+        let mut baseline = MockBackend::new();
+        run(
+            &mut baseline,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &baseline_cfg,
+            None,
+        )
+        .expect("baseline run ok");
+
+        let controlled_cfg = TrainingConfig {
+            output_dir: controlled_dir.clone(),
+            ..base
+        };
+        let mut controlled = MockBackend::new();
+        run(
+            &mut controlled,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &controlled_cfg,
+            None,
+        )
+        .expect("controlled run ok");
+
+        assert_eq!(controlled.steps, 4);
+        assert_eq!(controlled.seen_lr, baseline.seen_lr[..controlled.steps]);
+        assert_eq!(controlled.seen_wdl, baseline.seen_wdl[..controlled.steps]);
+        assert_eq!(controlled.saves, vec![controlled_dir.join("test-2.bin")]);
+        assert_eq!(
+            controlled.resume_saves,
+            vec![(controlled_dir.join("test-2.ckpt"), 2)]
+        );
+        let history = std::fs::read_to_string(controlled_dir.join("control_history.jsonl"))
+            .expect("read control history");
+        assert_eq!(history.lines().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&baseline_dir);
+        let _ = std::fs::remove_dir_all(&controlled_dir);
     }
 
     #[test]
