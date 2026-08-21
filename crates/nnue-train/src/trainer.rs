@@ -1131,8 +1131,7 @@ where
             );
         }
 
-        #[allow(clippy::manual_is_multiple_of)]
-        let saved = sb % cfg.save_rate == 0 || sb == control.effective_target;
+        let saved = sb.is_multiple_of(cfg.save_rate) || sb == control.effective_target;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
