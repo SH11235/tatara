@@ -228,6 +228,11 @@ is normal and ignored. Read or parse failures produce a warning but do not stop
 training. LR and WDL schedules retain their original horizon; only progress and
 ETA use the shortened target.
 
+Before resuming in the same output directory, remove `control.json` or replace
+it with the new target. A target below the resumed run's starting superbatch is
+treated as stale state from the previous run, ignored with a warning, and not
+recorded in `control_history.jsonl`.
+
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state
 > (fine-tuning / continued training); `--resume` restores both weights and

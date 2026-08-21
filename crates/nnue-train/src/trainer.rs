@@ -638,9 +638,19 @@ impl ActiveHistStats {
 // run — superbatch loop
 // =============================================================================
 
-#[derive(Clone, Copy)]
 struct ControlState {
-    target_superbatches: usize,
+    effective_target: usize,
+    ignored_stale_target: Option<usize>,
+}
+
+impl ControlState {
+    fn should_warn_stale(&mut self, requested: usize) -> bool {
+        if self.ignored_stale_target == Some(requested) {
+            return false;
+        }
+        self.ignored_stale_target = Some(requested);
+        true
+    }
 }
 
 #[derive(Deserialize)]
@@ -662,6 +672,7 @@ fn apply_control(
     history_path: &Path,
     applied: &mut ControlState,
     current_superbatch: usize,
+    start_superbatch: usize,
     configured_end: usize,
 ) -> Option<usize> {
     let text = match std::fs::read_to_string(control_path) {
@@ -686,12 +697,23 @@ fn apply_control(
         }
     };
     let requested = parsed.target_superbatches?;
+    if requested < start_superbatch {
+        if applied.should_warn_stale(requested) {
+            eprintln!(
+                "[control] warning: ignoring stale target_superbatches={requested} from {} below run start_superbatch={start_superbatch}",
+                control_path.display()
+            );
+        }
+        return None;
+    }
+    applied.ignored_stale_target = None;
+
     let target = requested.max(current_superbatch).min(configured_end);
-    if target == applied.target_superbatches {
+    if target == applied.effective_target {
         return None;
     }
 
-    applied.target_superbatches = target;
+    applied.effective_target = target;
     println!("[control] applied: target_superbatches={target} (superbatch={current_superbatch})");
     let entry = ControlHistoryEntry {
         kind: "control",
@@ -929,7 +951,8 @@ where
     let control_path = cfg.output_dir.join("control.json");
     let control_history_path = cfg.output_dir.join("control_history.jsonl");
     let mut control = ControlState {
-        target_superbatches: cfg.end_superbatch,
+        effective_target: cfg.end_superbatch,
+        ignored_stale_target: None,
     };
     let mut sb = cfg.start_superbatch;
     loop {
@@ -938,6 +961,7 @@ where
             &control_history_path,
             &mut control,
             sb,
+            cfg.start_superbatch,
             cfg.end_superbatch,
         ) && let Some(log) = experiment.as_mut()
         {
@@ -987,7 +1011,7 @@ where
                     "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
                     progress_terminator,
                     sb,
-                    control.target_superbatches,
+                    control.effective_target,
                     pct,
                     done,
                     cfg.batches_per_superbatch,
@@ -1023,7 +1047,7 @@ where
         };
         let pos_per_sec = sb_positions as f64 / sb_secs;
         let remaining_positions =
-            positions_per_sb.saturating_mul((control.target_superbatches - sb) as u64);
+            positions_per_sb.saturating_mul((control.effective_target - sb) as u64);
         let eta_secs = if pos_per_sec > 0.0 {
             remaining_positions as f64 / pos_per_sec
         } else {
@@ -1063,7 +1087,7 @@ where
         println!(
             "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}{}",
             sb,
-            control.target_superbatches,
+            control.effective_target,
             mean_loss,
             pos_per_sec,
             lr_now,
@@ -1107,7 +1131,8 @@ where
             );
         }
 
-        let saved = sb.is_multiple_of(cfg.save_rate) || sb == control.target_superbatches;
+        #[allow(clippy::manual_is_multiple_of)]
+        let saved = sb % cfg.save_rate == 0 || sb == control.effective_target;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
@@ -1148,7 +1173,7 @@ where
             write_experiment_log(log);
         }
 
-        if sb == control.target_superbatches {
+        if sb == control.effective_target {
             break;
         }
         sb += 1;
@@ -1440,7 +1465,7 @@ mod tests {
         TrainingConfig {
             net_id: "test".to_string(),
             feature_set: shogi_features::FeatureSet::HalfKaHmMerged.spec(),
-            output_dir: PathBuf::from("/tmp/nnue-train-trainer-test-unused"),
+            output_dir: unique_output_path("unused"),
             start_superbatch: 1,
             end_superbatch: 3,
             batches_per_superbatch: 2,
@@ -1467,15 +1492,22 @@ mod tests {
         }
     }
 
+    fn unique_output_path(label: &str) -> PathBuf {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let sequence = NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "nnue-train-trainer-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            if !path.exists() {
+                return path;
+            }
+        }
+    }
+
     fn temp_output_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nnue-train-control-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = unique_output_path(label);
         std::fs::create_dir_all(&dir).expect("create temporary output directory");
         dir
     }
@@ -1515,22 +1547,16 @@ mod tests {
         assert_eq!(
             backend.saves,
             vec![
-                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-2.bin"),
-                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-3.bin"),
+                cfg.output_dir.join("test-2.bin"),
+                cfg.output_dir.join("test-3.bin"),
             ]
         );
         // raw resume checkpoint は同 superbatch で `{net_id}-{sb}.ckpt` に保存される。
         assert_eq!(
             backend.resume_saves,
             vec![
-                (
-                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-2.ckpt"),
-                    2
-                ),
-                (
-                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-3.ckpt"),
-                    3
-                ),
+                (cfg.output_dir.join("test-2.ckpt"), 2),
+                (cfg.output_dir.join("test-3.ckpt"), 3),
             ]
         );
         // 各 superbatch で lr が gamma 倍 (StepLR step=1, gamma=0.9)。batch 内は一定。
@@ -1598,21 +1624,15 @@ mod tests {
         assert_eq!(
             backend.saves,
             vec![
-                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-4.bin"),
-                PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-5.bin"),
+                cfg.output_dir.join("test-4.bin"),
+                cfg.output_dir.join("test-5.bin"),
             ]
         );
         assert_eq!(
             backend.resume_saves,
             vec![
-                (
-                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-4.ckpt"),
-                    4
-                ),
-                (
-                    PathBuf::from("/tmp/nnue-train-trainer-test-unused/test-5.ckpt"),
-                    5
-                ),
+                (cfg.output_dir.join("test-4.ckpt"), 4),
+                (cfg.output_dir.join("test-5.ckpt"), 5),
             ]
         );
         // lr schedule: sb 3 (1st batch) = start * gamma^((3-1)/1) = start * gamma^2。
@@ -1728,8 +1748,6 @@ mod tests {
         // `run` に ExperimentLogger を渡すと、run 完了時に status "completed" の
         // experiment.json が書かれ、history が superbatch 数、checkpoints が
         // 保存した .bin/.ckpt 名で埋まることを検証する。
-        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger};
-
         let dir = std::env::temp_dir().join(format!(
             "nnue-train-exp-{}-{}",
             std::process::id(),
@@ -1740,25 +1758,7 @@ mod tests {
         ));
         let json_path = dir.join("experiments").join("exp-test.json");
 
-        let params = experiment_params();
-        let data = DataInfo {
-            name: "sample.psv".to_string(),
-            positions: 1_000,
-            total_positions: 0,
-            dataset_passes: 0.0,
-        };
-        let doc = ExperimentDoc::new(
-            "exp-test".to_string(),
-            "exp".to_string(),
-            1_747_000_000,
-            None,
-            "nnue-train --data sample.psv".to_string(),
-            None,
-            params,
-            data,
-            Some(nnue_format::layerstack_weights::FV_SCALE),
-        );
-        let mut logger = ExperimentLogger::new(json_path.clone(), doc);
+        let mut logger = experiment_logger(json_path.clone(), "exp-test");
 
         let progress = ShogiProgressKPAbs;
         let lr = StepLR {
@@ -1807,7 +1807,7 @@ mod tests {
         let output_dir = temp_output_dir("stop-current");
         std::fs::write(
             output_dir.join("control.json"),
-            r#"{"target_superbatches": 0}"#,
+            r#"{"target_superbatches": 1}"#,
         )
         .expect("write control.json");
         let experiment_path = output_dir.join("experiment.json");
@@ -1851,7 +1851,7 @@ mod tests {
         )
         .expect("parse experiment.json");
         assert_eq!(experiment["status"], "completed");
-        assert_eq!(experiment["target_superbatches"], 1);
+        assert_eq!(experiment["results"]["target_superbatches"], 1);
         assert_eq!(experiment["history"].as_array().unwrap().len(), 1);
         assert_eq!(experiment["checkpoints"].as_array().unwrap().len(), 2);
 
@@ -1867,6 +1867,116 @@ mod tests {
         assert_eq!(records[0]["superbatch"], 1);
         assert!(records[0]["timestamp"].as_str().unwrap().ends_with('Z'));
 
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn repeated_stale_control_warning_is_deduplicated() {
+        let mut control = ControlState {
+            effective_target: 5,
+            ignored_stale_target: None,
+        };
+
+        assert!(control.should_warn_stale(2));
+        assert!(!control.should_warn_stale(2));
+        assert!(control.should_warn_stale(1));
+        control.ignored_stale_target = None;
+        assert!(control.should_warn_stale(2));
+    }
+
+    #[test]
+    fn stale_control_before_resume_start_is_ignored() {
+        let output_dir = temp_output_dir("resume-stale");
+        std::fs::write(
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 2}"#,
+        )
+        .expect("write stale control.json");
+        let cfg = TrainingConfig {
+            output_dir: output_dir.clone(),
+            start_superbatch: 3,
+            end_superbatch: 5,
+            save_rate: 10,
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let mut backend = MockBackend::new().with_file_writes();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("stale control must not stop resumed training");
+
+        assert_eq!(backend.steps, 3 * cfg.batches_per_superbatch);
+        assert_eq!(backend.saves, vec![output_dir.join("test-5.bin")]);
+        assert_eq!(
+            backend.resume_saves,
+            vec![(output_dir.join("test-5.ckpt"), 5)]
+        );
+        assert!(!output_dir.join("control_history.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn valid_control_after_resume_start_stops_at_target() {
+        let output_dir = temp_output_dir("resume-valid");
+        std::fs::write(
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 4}"#,
+        )
+        .expect("write control.json");
+        let cfg = TrainingConfig {
+            output_dir: output_dir.clone(),
+            start_superbatch: 3,
+            end_superbatch: 5,
+            save_rate: 10,
+            threads: 1,
+            ..base_cfg()
+        };
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let mut backend = MockBackend::new().with_file_writes();
+
+        run(
+            &mut backend,
+            &sample_psv_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("valid control must stop resumed training at target");
+
+        assert_eq!(backend.steps, 2 * cfg.batches_per_superbatch);
+        assert_eq!(backend.saves, vec![output_dir.join("test-4.bin")]);
+        assert_eq!(
+            backend.resume_saves,
+            vec![(output_dir.join("test-4.ckpt"), 4)]
+        );
+        assert!(output_dir.join("test-4.bin").is_file());
+        assert!(output_dir.join("test-4.ckpt").is_file());
+        let history = std::fs::read_to_string(output_dir.join("control_history.jsonl"))
+            .expect("read control history");
+        assert_eq!(history.lines().count(), 1);
         let _ = std::fs::remove_dir_all(&output_dir);
     }
 
@@ -2105,8 +2215,6 @@ mod tests {
     fn run_with_test_data_records_validation_in_experiment_json() {
         // held-out validation の結果が run → record_superbatch → experiment.json
         // の history / results まで配線されていることを検証する。
-        use crate::experiment::{DataInfo, ExperimentDoc, ExperimentLogger};
-
         let dir = std::env::temp_dir().join(format!(
             "nnue-train-exp-val-{}-{}",
             std::process::id(),
@@ -2116,23 +2224,7 @@ mod tests {
                 .unwrap_or(0)
         ));
         let json_path = dir.join("experiments").join("exp-val.json");
-        let doc = ExperimentDoc::new(
-            "exp-val".to_string(),
-            "exp".to_string(),
-            1_747_000_000,
-            None,
-            "nnue-train --data sample.psv --test-data sample.psv".to_string(),
-            None,
-            experiment_params(),
-            DataInfo {
-                name: "sample.psv".to_string(),
-                positions: 1_000,
-                total_positions: 0,
-                dataset_passes: 0.0,
-            },
-            Some(nnue_format::layerstack_weights::FV_SCALE),
-        );
-        let mut logger = ExperimentLogger::new(json_path.clone(), doc);
+        let mut logger = experiment_logger(json_path.clone(), "exp-val");
 
         let progress = ShogiProgressKPAbs;
         let lr = StepLR {

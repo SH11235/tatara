@@ -206,6 +206,10 @@ status は `completed` になる。
 無視する。読込失敗や壊れた JSON は warning のみで学習を継続する。LR / WDL
 schedule は元の horizon を維持し、進捗と ETA だけが短縮後の target を使う。
 
+同じ output directory で resume する前に、`control.json` を削除するか新しい target
+へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った
+stale な値として warning とともに無視され、`control_history.jsonl` にも記録されない。
+
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
