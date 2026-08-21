@@ -1870,6 +1870,33 @@ mod tests {
     }
 
     #[test]
+    fn control_target_below_current_superbatch_clamps_to_current() {
+        // run 途中で現在 sb より小さい (ただし start 以上の) target を書いた
+        // 「今すぐ止めたい」ケース: 実効 target は現在 sb に clamp され、history
+        // にも clamp 後の値が記録される。
+        let output_dir = temp_output_dir("clamp-current");
+        let control_path = output_dir.join("control.json");
+        let history_path = output_dir.join("control_history.jsonl");
+        std::fs::write(&control_path, r#"{"target_superbatches": 3}"#).expect("write control.json");
+        let mut control = ControlState {
+            effective_target: 8,
+            ignored_stale_target: None,
+        };
+
+        let applied = apply_control(&control_path, &history_path, &mut control, 5, 1, 8);
+
+        assert_eq!(applied, Some(5));
+        assert_eq!(control.effective_target, 5);
+        let history = std::fs::read_to_string(&history_path).expect("read control history");
+        let record: serde_json::Value =
+            serde_json::from_str(history.lines().next().expect("one record"))
+                .expect("valid history record");
+        assert_eq!(record["target_superbatches"], 5);
+        assert_eq!(record["superbatch"], 5);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
     fn repeated_stale_control_warning_is_deduplicated() {
         let mut control = ControlState {
             effective_target: 5,
