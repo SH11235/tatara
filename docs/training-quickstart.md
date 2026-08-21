@@ -207,6 +207,32 @@ the curve is reproduced on resume independently of `--superbatches`; see
 [Horizon and resuming](training-schedule.md#horizon-and-resuming) for the
 precedence rules.
 
+### Stopping at a superbatch boundary
+
+To shorten a running job without interrupting a superbatch, write `control.json`
+under its output directory:
+
+```json
+{"target_superbatches": 1000}
+```
+
+The trainer polls this file at the start of each superbatch. The target is
+clamped between the superbatch being started and the original `--superbatches`
+value, so it cannot extend the run. The selected final superbatch runs to
+completion and always writes both `.bin` and `.ckpt`, even when it is not a
+`--save-rate` boundary. Training then follows the normal completion path and
+marks `experiment.json` as `completed`.
+
+Applied changes are appended to `control_history.jsonl`. A missing control file
+is normal and ignored. Read or parse failures produce a warning but do not stop
+training. LR and WDL schedules retain their original horizon; only progress and
+ETA use the shortened target.
+
+Before resuming in the same output directory, remove `control.json` or replace
+it with the new target. A target below the resumed run's starting superbatch is
+treated as stale state from the previous run, ignored with a warning, and not
+recorded in `control_history.jsonl`.
+
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state
 > (fine-tuning / continued training); `--resume` restores both weights and

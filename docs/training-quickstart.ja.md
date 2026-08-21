@@ -187,6 +187,29 @@ horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存
 時に `--superbatches` に依らず curve が再現される。優先順位の詳細は
 [Horizon と resume](training-schedule.ja.md#horizon-と-resume) を参照。
 
+### superbatch 境界で停止する
+
+実行中の学習を superbatch の途中で中断せず短縮するには、output directory 直下に
+`control.json` を書く:
+
+```json
+{"target_superbatches": 1000}
+```
+
+trainer は各 superbatch の開始時にこのファイルを読む。target は開始する
+superbatch 以上、元の `--superbatches` 以下に clamp されるため、学習を延長しない。
+選ばれた最終 superbatch は最後まで実行され、`--save-rate` の境界でなくても `.bin`
+と `.ckpt` を両方保存する。その後は通常の完了経路を通り、`experiment.json` の
+status は `completed` になる。
+
+適用した変更は `control_history.jsonl` に追記される。ファイル不在は通常状態として
+無視する。読込失敗や壊れた JSON は warning のみで学習を継続する。LR / WDL
+schedule は元の horizon を維持し、進捗と ETA だけが短縮後の target を使う。
+
+同じ output directory で resume する前に、`control.json` を削除するか新しい target
+へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った
+stale な値として warning とともに無視され、`control_history.jsonl` にも記録されない。
+
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する

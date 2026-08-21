@@ -251,6 +251,9 @@ pub struct DataInfo {
 pub struct Results {
     pub training_time_seconds: u64,
     pub fv_scale: Option<i32>,
+    /// `control.json` で適用された実効終了 superbatch。control 未適用なら省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_superbatches: Option<usize>,
     /// 最小 loss と、それを記録した superbatch。1 点も記録されていなければ省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_loss: Option<f64>,
@@ -355,6 +358,7 @@ impl ExperimentDoc {
             results: Results {
                 training_time_seconds: 0,
                 fv_scale,
+                target_superbatches: None,
                 best_loss: None,
                 best_loss_superbatch: None,
                 best_test_loss: None,
@@ -399,6 +403,12 @@ impl ExperimentLogger {
     /// 書き込み先 path。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `control.json` で適用された実効終了 superbatch を記録する。
+    pub fn set_target_superbatches(&mut self, target: usize) {
+        self.doc.results.target_superbatches = Some(target);
+        self.touch();
     }
 
     /// 1 superbatch 完了を記録する。`history` に 1 点追加し、`results` 集約値
@@ -858,6 +868,7 @@ mod tests {
         let v = serde_json::to_value(&doc).expect("serialise");
         assert!(v.get("commit").is_none());
         assert!(v.get("lineage").is_none());
+        assert!(v["results"].get("target_superbatches").is_none());
         assert!(v["params"].get("wrm_in_scaling").is_none());
         assert!(v["params"].get("progress_coeff").is_none());
         assert!(v["params"].get("dual_label_psv").is_none());
