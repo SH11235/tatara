@@ -388,12 +388,34 @@ fn simple_accepts_consumed_global_flags() {
 #[test]
 fn simple_rejects_loss_wdl_requires_win_rate_model() {
     // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
-    assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
+    let err = require_simple_win_rate_model(&simple_cli(&[]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "when --fv-scale is omitted, --scale must equal --wrm-nnue2score even with \
+             --init-from"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("--init-from retains the input net's value"),
+        "{err}"
+    );
+    assert!(
+        err.contains("Setting --fv-scale explicitly waives the equality requirement"),
+        "{err}"
+    );
     // WRM の出力 scale と export の scale が不一致なら reject。
     let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
         .unwrap_err()
         .to_string();
     assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
+    assert!(err.contains("when --fv-scale is omitted"), "{err}");
+    assert!(
+        err.contains("set --fv-scale explicitly to waive this equality requirement"),
+        "{err}"
+    );
     // 一致する WRM は accept (identity 退化の設定でも受理される)。
     assert!(
         require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
@@ -416,6 +438,49 @@ fn simple_rejects_loss_wdl_requires_win_rate_model() {
         ]))
         .is_ok()
     );
+
+    // 明示 fv_scale が export scale を決める場合、未使用の --scale は WRM と不一致でもよい。
+    let with_override = Cli::try_parse_from([
+        "nnue-train",
+        "simple",
+        "--win-rate-model",
+        "--scale",
+        "290",
+        "--fv-scale",
+        "14",
+    ])
+    .expect("simple cli with fv_scale should parse");
+    assert!(require_simple_win_rate_model(&with_override).is_ok());
+
+    // --init-from は fv_scale を引き継ぐが、override 無しの等値要件は維持する。
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&[
+            "--win-rate-model",
+            "--init-from",
+            "input.bin",
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
+fn simple_fv_scale_override_still_requires_positive_finite_scale() {
+    for invalid in ["0", "-1", "NaN", "inf"] {
+        let scale_arg = format!("--scale={invalid}");
+        let cli = Cli::try_parse_from([
+            "nnue-train",
+            "simple",
+            "--win-rate-model",
+            &scale_arg,
+            "--fv-scale",
+            "14",
+        ])
+        .expect("simple cli with fv_scale should parse");
+        let err = require_simple_win_rate_model(&cli)
+            .expect_err("invalid --scale must be rejected even with --fv-scale")
+            .to_string();
+        assert!(err.contains("--scale must be finite and > 0"), "{err}");
+    }
 }
 
 #[test]
@@ -476,6 +541,10 @@ fn simple_fv_scale_warning_rejects_nonzero_wdl_lambda() {
     let mut nonzero_taper = exact_wrm.to_vec();
     nonzero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.5"]);
     assert!(simple_fv_scale_warning(&simple_cli(&nonzero_taper), None).is_some());
+
+    let mut taper_to_zero = exact_wrm.to_vec();
+    taper_to_zero.extend(["--start-wdl", "0.5", "--end-wdl", "0.0"]);
+    assert!(simple_fv_scale_warning(&simple_cli(&taper_to_zero), None).is_some());
 
     let mut zero_taper = exact_wrm.to_vec();
     zero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.0"]);
@@ -541,6 +610,17 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
         "{help}"
     );
     assert!(help.contains("every `--resume` invocation"), "{help}");
+
+    let root_help = Cli::command().render_long_help().to_string();
+    assert!(
+        root_help
+            .contains("derive the exported `fv_scale` when `simple --fv-scale` and `--init-from`"),
+        "{root_help}"
+    );
+    assert!(
+        root_help.contains("must equal `--wrm-nnue2score` whether or not `--init-from` is set"),
+        "{root_help}"
+    );
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch

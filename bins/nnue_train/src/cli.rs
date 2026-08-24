@@ -350,7 +350,8 @@ pub(crate) struct Cli {
     /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
     /// loss uses the `--wrm-*` scaling instead). The simple trainer uses it to
     /// derive the exported `fv_scale` when `simple --fv-scale` and `--init-from`
-    /// are both omitted, so it stays in effect even under the WRM there.
+    /// are both omitted. When `simple --fv-scale` is omitted, `--scale` must
+    /// equal `--wrm-nnue2score` whether or not `--init-from` is set.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 

@@ -1199,9 +1199,9 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
 /// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
 /// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
 ///
-/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は override
-/// 未指定時に `--scale` から算出される。両者が異なると量子化 net の評価値が同じ比率で
-/// ずれるため、一致を必須とする。
+/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は override と
+/// `--init-from` がともに未指定のとき `--scale` から算出される。override 未指定時は
+/// `--init-from` の有無にかかわらず両 scale の一致を必須とする。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
@@ -1213,16 +1213,23 @@ pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std
              degenerate the WRM to identity with --scale <scale> --wrm-in-offset 0 \
              --wrm-target-offset 0 --wrm-in-scaling <scale> --wrm-target-scaling <scale> \
              --wrm-nnue2score <scale> (pass the same explicit <scale> to all four scale options; \
-             the simple trainer \
-             derives fv_scale from --scale even under the WRM unless --fv-scale is set, so \
-             omitting --scale silently shifts the evaluation scale)."
+             when --fv-scale is omitted, --scale must equal --wrm-nnue2score even with \
+             --init-from. Fresh and resumed training derive fv_scale from --scale, while \
+             --init-from retains the input net's value. Setting --fv-scale explicitly waives \
+             the equality requirement)."
                 .into(),
         );
     }
-    if cli.scale != cli.wrm_nnue2score {
+    if !(cli.scale.is_finite() && cli.scale > 0.0) {
+        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
+    }
+    let fv_scale_is_overridden =
+        matches!(&cli.arch, ArchCommand::Simple(args) if args.fv_scale.is_some());
+    if !fv_scale_is_overridden && cli.scale != cli.wrm_nnue2score {
         return Err(format!(
-            "the simple trainer requires matching training and export score scales: \
-             --scale ({}) must equal --wrm-nnue2score ({})",
+            "the simple trainer requires matching training and export score scales when \
+             --fv-scale is omitted: --scale ({}) must equal --wrm-nnue2score ({}); set \
+             --fv-scale explicitly to waive this equality requirement",
             cli.scale, cli.wrm_nnue2score
         )
         .into());
@@ -1936,12 +1943,6 @@ pub(crate) fn run_simple_training(
         l2_out,
     };
 
-    // Simple は loss kind に関わらず `cli.scale` を量子化 `fv_scale` の算出で参照
-    // するため、WRM 経路でも finite / 正値を要求する (LayerStack は WRM 時に scale
-    // を参照しないので sigmoid 経路でのみ検証していた)。
-    if !(cli.scale.is_finite() && cli.scale > 0.0) {
-        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
-    }
     // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
     // ため、simple の loss は WRM に限られる。
     let loss = build_wrm_loss(cli)?;
