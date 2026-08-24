@@ -250,7 +250,7 @@ fn arch_identity(id: &SimpleId) -> String {
 }
 
 /// arch 文字列全体 (`<identity>,fv_scale=<N>`)。`fv_scale` は推論時の評価値
-/// スケールで identity には含めない (学習 `--scale` 由来で同一 topology でも変動)。
+/// スケールで identity には含めない (同一 topology でも変動する)。
 pub fn build_arch_str(id: &SimpleId, fv_scale: i32) -> String {
     format!("{},fv_scale={}", arch_identity(id), fv_scale)
 }
@@ -314,7 +314,7 @@ pub fn network_hash(id: &SimpleId) -> u32 {
 pub struct SimpleWeights {
     /// この weight の構造化 identity。
     pub id: SimpleId,
-    /// 推論時の評価値スケール ([`simple_fv_scale`] で算出)。arch 文字列に記録する。
+    /// 推論時の評価値スケール。通常は [`simple_fv_scale`] で算出し、arch 文字列に記録する。
     pub fv_scale: i32,
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,

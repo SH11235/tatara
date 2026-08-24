@@ -8,7 +8,7 @@ use nnue_format::{ArchKind, SimpleActivation};
 use crate::cli::*;
 use crate::training::{
     per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
-    validate_bucket_mode, validate_output_format,
+    simple_fv_scale_warning, validate_bucket_mode, validate_output_format,
 };
 
 use clap::CommandFactory;
@@ -388,34 +388,77 @@ fn simple_accepts_consumed_global_flags() {
 #[test]
 fn simple_rejects_loss_wdl_requires_win_rate_model() {
     // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
-    assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
+    assert!(require_simple_win_rate_model(&simple_cli(&[]), None).is_err());
     // WRM の出力 scale と export の scale が不一致なら reject。
-    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
+    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
     // 一致する WRM は accept (identity 退化の設定でも受理される)。
     assert!(
-        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
+        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"]), None)
+            .is_ok()
     );
     assert!(
-        require_simple_win_rate_model(&simple_cli(&[
-            "--win-rate-model",
-            "--scale",
-            "600",
-            "--wrm-in-offset",
-            "0",
-            "--wrm-target-offset",
-            "0",
-            "--wrm-in-scaling",
-            "600",
-            "--wrm-target-scaling",
-            "600",
-            "--wrm-nnue2score",
-            "600",
-        ]))
+        require_simple_win_rate_model(
+            &simple_cli(&[
+                "--win-rate-model",
+                "--scale",
+                "600",
+                "--wrm-in-offset",
+                "0",
+                "--wrm-target-offset",
+                "0",
+                "--wrm-in-scaling",
+                "600",
+                "--wrm-target-scaling",
+                "600",
+                "--wrm-nnue2score",
+                "600",
+            ]),
+            None
+        )
         .is_ok()
     );
+}
+
+#[test]
+fn simple_warns_when_derived_fv_scale_is_only_approximate() {
+    let base = ["--win-rate-model", "--scale", "600"];
+    let warning = simple_fv_scale_warning(&simple_cli(&base), None).expect("warning");
+    assert!(warning.contains("label-scale approximation"));
+    assert!(warning.contains("--fv-scale"));
+
+    let mut parameters = simple_cli(&[
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--wrm-in-offset",
+        "0",
+        "--wrm-target-offset",
+        "0",
+        "--wrm-in-scaling",
+        "600",
+        "--wrm-target-scaling",
+        "600",
+    ]);
+    assert_eq!(simple_fv_scale_warning(&parameters, None), None);
+
+    let set_differences: [fn(&mut Cli); 4] = [
+        |cli: &mut Cli| cli.wrm_in_scaling = 500.0,
+        |cli: &mut Cli| cli.wrm_target_scaling = 500.0,
+        |cli: &mut Cli| cli.wrm_in_offset = 1.0,
+        |cli: &mut Cli| cli.wrm_target_offset = 1.0,
+    ];
+    for set_difference in set_differences {
+        set_difference(&mut parameters);
+        assert!(simple_fv_scale_warning(&parameters, None).is_some());
+        assert_eq!(simple_fv_scale_warning(&parameters, Some(14)), None);
+        parameters.wrm_in_scaling = 600.0;
+        parameters.wrm_target_scaling = 600.0;
+        parameters.wrm_in_offset = 0.0;
+        parameters.wrm_target_offset = 0.0;
+    }
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch

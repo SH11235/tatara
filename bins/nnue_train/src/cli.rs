@@ -349,8 +349,8 @@ pub(crate) struct Cli {
     /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
     /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
     /// loss uses the `--wrm-*` scaling instead). The simple trainer always uses
-    /// it to derive the exported `fv_scale`, so it stays in effect even under
-    /// the WRM there.
+    /// it to derive the exported `fv_scale` when `simple --fv-scale` is omitted,
+    /// so it stays in effect even under the WRM there.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 
@@ -1188,6 +1188,11 @@ pub(crate) enum EffectBucketFactorizeShare {
 /// Simple 4 層アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct SimpleArgs {
+    /// Evaluation scale written to the Simple architecture string. When
+    /// omitted, it is derived from `--scale`.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
+    pub(crate) fv_scale: Option<i32>,
+
     /// Layer-dimension preset (`<l1>x2-<l2>-<l3>`). l1 is the accumulator (FT
     /// output) dimension; l2 / l3 are the hidden-layer dimensions. Each can be
     /// overridden individually with `--l1` / `--l2` / `--l3`.

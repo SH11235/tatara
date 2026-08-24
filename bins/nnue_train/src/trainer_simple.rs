@@ -368,8 +368,9 @@ pub(crate) struct SimpleGpuTrainer {
     /// norm-loss の per-group L2 norm 作業領域。長さは対象テンソル中の最大 group 数
     /// (`norm_loss_factor` が `None` のときは 1 の dummy)。
     norm_scratch: DeviceBuffer<f32>,
-    /// 推論時の評価値スケール (`round(QA * QB / 学習 scale)`)。量子化 checkpoint
-    /// 出力の arch 文字列に書く (`SimpleWeights::fv_scale`)。
+    /// 推論時の評価値スケール。CLI override 未指定時は
+    /// `round(QA * QB / 学習 scale)`。量子化 checkpoint 出力の arch 文字列に書く
+    /// (`SimpleWeights::fv_scale`)。
     fv_scale: i32,
 }
 
@@ -2856,11 +2857,14 @@ impl SimpleGpuTrainer {
         Ok(())
     }
 
-    /// export される `.bin` の arch 文字列に書かれる実効 `fv_scale`。`--init-from` で
-    /// weights を読むと入力 `.bin` の値で上書きされるため、CLI の `--scale` から再計算
-    /// せずこの値を使う (experiment.json が `.bin` と食い違うのを防ぐ)。
+    /// export される `.bin` の arch 文字列に書かれる実効 `fv_scale`。
     pub(crate) fn fv_scale(&self) -> i32 {
         self.fv_scale
+    }
+
+    /// export される `.bin` の arch 文字列へ書く `fv_scale` を設定する。
+    pub(crate) fn set_fv_scale(&mut self, fv_scale: i32) {
+        self.fv_scale = fv_scale;
     }
 
     /// resume 用 raw f32 checkpoint を `path` に atomic に書き出す (LayerStack の
