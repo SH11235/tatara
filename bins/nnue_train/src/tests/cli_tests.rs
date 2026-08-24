@@ -388,77 +388,159 @@ fn simple_accepts_consumed_global_flags() {
 #[test]
 fn simple_rejects_loss_wdl_requires_win_rate_model() {
     // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
-    assert!(require_simple_win_rate_model(&simple_cli(&[]), None).is_err());
+    assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
     // WRM の出力 scale と export の scale が不一致なら reject。
-    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]), None)
+    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
         .unwrap_err()
         .to_string();
     assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
     // 一致する WRM は accept (identity 退化の設定でも受理される)。
     assert!(
-        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"]), None)
-            .is_ok()
+        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
     );
     assert!(
-        require_simple_win_rate_model(
-            &simple_cli(&[
-                "--win-rate-model",
-                "--scale",
-                "600",
-                "--wrm-in-offset",
-                "0",
-                "--wrm-target-offset",
-                "0",
-                "--wrm-in-scaling",
-                "600",
-                "--wrm-target-scaling",
-                "600",
-                "--wrm-nnue2score",
-                "600",
-            ]),
-            None
-        )
+        require_simple_win_rate_model(&simple_cli(&[
+            "--win-rate-model",
+            "--scale",
+            "600",
+            "--wrm-in-offset",
+            "0",
+            "--wrm-target-offset",
+            "0",
+            "--wrm-in-scaling",
+            "600",
+            "--wrm-target-scaling",
+            "600",
+            "--wrm-nnue2score",
+            "600",
+        ]))
         .is_ok()
     );
 }
 
 #[test]
-fn simple_warns_when_derived_fv_scale_is_only_approximate() {
-    let base = ["--win-rate-model", "--scale", "600"];
-    let warning = simple_fv_scale_warning(&simple_cli(&base), None).expect("warning");
-    assert!(warning.contains("label-scale approximation"));
-    assert!(warning.contains("--fv-scale"));
-
+fn simple_fv_scale_warning_accepts_equal_offset_magnitudes() {
     let mut parameters = simple_cli(&[
         "--win-rate-model",
         "--scale",
         "600",
-        "--wrm-in-offset",
-        "0",
-        "--wrm-target-offset",
-        "0",
         "--wrm-in-scaling",
         "600",
         "--wrm-target-scaling",
         "600",
     ]);
+    assert_eq!(parameters.wrm_in_offset, 270.0);
+    assert_eq!(parameters.wrm_target_offset, 270.0);
     assert_eq!(simple_fv_scale_warning(&parameters, None), None);
 
-    let set_differences: [fn(&mut Cli); 4] = [
-        |cli: &mut Cli| cli.wrm_in_scaling = 500.0,
-        |cli: &mut Cli| cli.wrm_target_scaling = 500.0,
-        |cli: &mut Cli| cli.wrm_in_offset = 1.0,
-        |cli: &mut Cli| cli.wrm_target_offset = 1.0,
+    parameters.wrm_target_offset = -270.0;
+    assert_eq!(simple_fv_scale_warning(&parameters, None), None);
+}
+
+#[test]
+fn simple_fv_scale_warning_rejects_scaling_or_offset_magnitude_mismatch() {
+    let mut parameters = simple_cli(&[
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--wrm-in-scaling",
+        "600",
+        "--wrm-target-scaling",
+        "600",
+    ]);
+
+    parameters.wrm_in_scaling = 500.0;
+    assert!(simple_fv_scale_warning(&parameters, None).is_some());
+    parameters.wrm_in_scaling = 600.0;
+
+    parameters.wrm_target_offset = 269.0;
+    assert!(simple_fv_scale_warning(&parameters, None).is_some());
+}
+
+#[test]
+fn simple_fv_scale_warning_rejects_nonzero_wdl_lambda() {
+    let exact_wrm = [
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--wrm-in-scaling",
+        "600",
+        "--wrm-target-scaling",
+        "600",
     ];
-    for set_difference in set_differences {
-        set_difference(&mut parameters);
-        assert!(simple_fv_scale_warning(&parameters, None).is_some());
-        assert_eq!(simple_fv_scale_warning(&parameters, Some(14)), None);
-        parameters.wrm_in_scaling = 600.0;
-        parameters.wrm_target_scaling = 600.0;
-        parameters.wrm_in_offset = 0.0;
-        parameters.wrm_target_offset = 0.0;
-    }
+
+    let mut constant_wdl = exact_wrm.to_vec();
+    constant_wdl.extend(["--wdl", "0.3333333"]);
+    assert!(simple_fv_scale_warning(&simple_cli(&constant_wdl), None).is_some());
+
+    let mut nonzero_taper = exact_wrm.to_vec();
+    nonzero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.5"]);
+    assert!(simple_fv_scale_warning(&simple_cli(&nonzero_taper), None).is_some());
+
+    let mut zero_taper = exact_wrm.to_vec();
+    zero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.0"]);
+    assert_eq!(
+        simple_fv_scale_warning(&simple_cli(&zero_taper), None),
+        None
+    );
+}
+
+#[test]
+fn simple_fv_scale_warning_skips_init_from_and_override() {
+    let approximate = ["--win-rate-model", "--scale", "600"];
+    let warning = simple_fv_scale_warning(&simple_cli(&approximate), None).expect("warning");
+    assert!(warning.contains("label-scale approximation"));
+    assert!(warning.contains("--fv-scale"));
+
+    let with_init = simple_cli(&[
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--init-from",
+        "input.bin",
+    ]);
+    assert_eq!(simple_fv_scale_warning(&with_init, None), None);
+
+    let with_resume = simple_cli(&[
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--resume",
+        "state.ckpt",
+    ]);
+    assert!(simple_fv_scale_warning(&with_resume, None).is_some());
+
+    let all_mismatched = simple_cli(&[
+        "--win-rate-model",
+        "--scale",
+        "600",
+        "--wrm-in-scaling",
+        "500",
+        "--wrm-target-scaling",
+        "600",
+        "--wrm-in-offset",
+        "1",
+        "--wrm-target-offset",
+        "2",
+        "--wdl",
+        "0.3333333",
+    ]);
+    assert_eq!(simple_fv_scale_warning(&all_mismatched, Some(14)), None);
+}
+
+#[test]
+fn simple_fv_scale_help_describes_init_and_resume_behavior() {
+    let help = Cli::command()
+        .find_subcommand_mut("simple")
+        .expect("simple subcommand")
+        .render_long_help()
+        .to_string();
+    assert!(help.contains("--init-from"), "{help}");
+    assert!(
+        help.contains("Raw checkpoints do not store `fv_scale`"),
+        "{help}"
+    );
+    assert!(help.contains("every `--resume` invocation"), "{help}");
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch

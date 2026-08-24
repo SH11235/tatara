@@ -37,10 +37,10 @@
 //! `scale = 1/scale_param` を掛けるため net_output は **cp 単位** (`out ≈ cp`) で
 //! 収束する。一方 WRM loss は `scorenet = out * nnue2score` (= `out * 600`) を
 //! cp 単位とみなすため、net_output は **`out ≈ cp / nnue2score` (O(1))** で収束する。
-//! 量子化 net の `fv_scale` は `QA * QB / (net 出力 1 単位あたりの cp)` で決まり、
-//! WRM では概ね `nnue2score` に対応する。その量子化フォーマット向けの net を学習
-//! するには WRM loss を使う (sigmoid-MSE で学習した net は byte レイアウトは互換だが
-//! 数値スケールが大きくずれて量子化後に破綻する)。
+//! 量子化 net の `fv_scale` は `QA * QB / (net 出力 1 単位が表す cp)` で決まる。
+//! WRM では、この分母の cp/output 比を主に `nnue2score` が定める。その量子化
+//! フォーマット向けの net を学習するには WRM loss を使う (sigmoid-MSE で学習した net
+//! は byte レイアウトは互換だが数値スケールが大きくずれて量子化後に破綻する)。
 //!
 //! ## 定数
 //!

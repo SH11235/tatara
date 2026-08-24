@@ -1203,10 +1203,7 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
 /// 未指定時に `--scale` から算出される。両者が異なると量子化 net の評価値が同じ比率で
 /// ずれるため、一致を必須とする。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn require_simple_win_rate_model(
-    cli: &Cli,
-    fv_scale_override: Option<i32>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
         return Err(
             "the simple trainer requires --win-rate-model: the plain sigmoid loss \
@@ -1215,9 +1212,10 @@ pub(crate) fn require_simple_win_rate_model(
              (the sign-based test accuracy will not surface this). To recover a plain sigmoid, \
              degenerate the WRM to identity with --scale <scale> --wrm-in-offset 0 \
              --wrm-target-offset 0 --wrm-in-scaling <scale> --wrm-target-scaling <scale> \
-             --wrm-nnue2score <scale> (use the same <scale> everywhere; the simple trainer \
+             --wrm-nnue2score <scale> (pass the same explicit <scale> to all four scale options; \
+             the simple trainer \
              derives fv_scale from --scale even under the WRM unless --fv-scale is set, so \
-             omitting the common scale silently shifts the evaluation scale)."
+             omitting --scale silently shifts the evaluation scale)."
                 .into(),
         );
     }
@@ -1229,9 +1227,6 @@ pub(crate) fn require_simple_win_rate_model(
         )
         .into());
     }
-    if let Some(warning) = simple_fv_scale_warning(cli, fv_scale_override) {
-        eprintln!("[train] warning: {warning}");
-    }
     Ok(())
 }
 
@@ -1240,14 +1235,17 @@ pub(crate) fn simple_fv_scale_warning(
     cli: &Cli,
     fv_scale_override: Option<i32>,
 ) -> Option<&'static str> {
-    (fv_scale_override.is_none()
-        && (cli.wrm_in_scaling != cli.wrm_target_scaling
-            || cli.wrm_in_offset != 0.0
-            || cli.wrm_target_offset != 0.0))
-        .then_some(
-            "derived fv_scale is only a label-scale approximation when WRM input/target scaling or \
-         offsets differ; set --fv-scale explicitly to use a measured evaluation scale",
-        )
+    let wdl_is_always_zero =
+        cli.wdl == 0.0 && cli.start_wdl.unwrap_or(0.0) == 0.0 && cli.end_wdl.unwrap_or(0.0) == 0.0;
+    let derived_scale_is_exact = cli.wrm_in_scaling == cli.wrm_target_scaling
+        && cli.wrm_in_offset.abs() == cli.wrm_target_offset.abs()
+        && wdl_is_always_zero;
+
+    (fv_scale_override.is_none() && cli.init_from.is_none() && !derived_scale_is_exact).then_some(
+        "derived fv_scale is only a label-scale approximation unless WRM input/target scaling \
+         matches, offset magnitudes match, and WDL lambda stays zero; set --fv-scale explicitly \
+         to use a measured evaluation scale",
+    )
 }
 
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
@@ -1860,7 +1858,10 @@ pub(crate) fn run_simple_training(
     // 等では `--data` 不在でも本 driver に dispatch するため、後段の `data.expect` より前で
     // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
     reject_simple_unsupported_flags(cli)?;
-    require_simple_win_rate_model(cli, simple_args.fv_scale)?;
+    require_simple_win_rate_model(cli)?;
+    if let Some(warning) = simple_fv_scale_warning(cli, simple_args.fv_scale) {
+        eprintln!("[train] warning: {warning}");
+    }
     let data = cli
         .data
         .as_ref()
