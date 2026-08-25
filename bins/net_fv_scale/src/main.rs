@@ -436,6 +436,8 @@ mod tests {
         LayerStackWeights, SimpleActivation, SimpleId, SimpleWeights, save_yaneuraou,
     };
     use shogi_features::FeatureSet;
+    #[cfg(windows)]
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const ARCH_WITHOUT_SCALE: &str = "Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)])))))";
@@ -622,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlink_output_without_modifying_link_or_target() {
+    fn rejects_symlink_output_or_skips_without_windows_privilege() {
         let temp = TestDir::new();
         let input_path = temp.path.join("input.bin");
         let target_path = temp.path.join("model.bin");
@@ -633,10 +635,22 @@ mod tests {
         let target = b"original model";
         fs::write(&input_path, input).unwrap();
         fs::write(&target_path, target).unwrap();
+        #[cfg(windows)]
         if let Err(error) = symlink_file(link_target, &output_path) {
-            eprintln!("skipping symlink test because a file symlink could not be created: {error}");
-            return;
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                writeln!(
+                    io::stdout().lock(),
+                    "SKIPPED: file symlink creation requires Windows symlink privilege: {error}"
+                )
+                .unwrap();
+                return;
+            }
+            panic!("failed to create file symlink for test: {error}");
         }
+
+        #[cfg(not(windows))]
+        symlink_file(link_target, &output_path).unwrap();
 
         let error = rewrite_file(&input_path, &output_path, Rewrite::Set(37)).unwrap_err();
         let message = error.to_string();
