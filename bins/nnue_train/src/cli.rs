@@ -349,9 +349,10 @@ pub(crate) struct Cli {
     /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
     /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
     /// loss uses the `--wrm-*` scaling instead). The simple trainer uses it to
-    /// derive the exported `fv_scale` when `simple --fv-scale` and `--init-from`
-    /// are both omitted. When `simple --fv-scale` is omitted, `--scale` must
-    /// equal `--wrm-nnue2score` whether or not `--init-from` is set.
+    /// derive the exported `fv_scale` when `simple --fv-scale` is omitted and
+    /// neither `--init-from` nor a v9+ `--resume` checkpoint supplies a value.
+    /// When `simple --fv-scale` is omitted, `--scale` must equal
+    /// `--wrm-nnue2score` whether or not weights are loaded.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 
@@ -1191,8 +1192,9 @@ pub(crate) enum EffectBucketFactorizeShare {
 pub(crate) struct SimpleArgs {
     /// Evaluation scale written to the Simple architecture string. When
     /// omitted, it is derived from `--scale`, except that `--init-from` retains
-    /// the input net's value. Raw checkpoints do not store `fv_scale`, so repeat
-    /// this option on every `--resume` invocation to preserve an override.
+    /// the input net's value and v9+ raw checkpoints retain their saved value.
+    /// When resuming a v8 or earlier checkpoint, repeat this option to preserve
+    /// an override; otherwise the value is derived from `--scale`.
     #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
     pub(crate) fv_scale: Option<i32>,
 

@@ -2902,14 +2902,16 @@ impl SimpleGpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                fv_scale: Some(self.fv_scale()),
             },
             &self.raw_ckpt_group_sources(),
         )
     }
 
     /// `--resume` 用に raw f32 checkpoint を読み戻す。返り値は完了 `(superbatch,
-    /// producer run id, LR-schedule horizon)` で、caller は通常 `superbatch + 1`
-    /// から resume する。horizon は version 5+ で保存されていれば `Some`。
+    /// producer run id, LR-schedule horizon, fv_scale)` で、caller は通常
+    /// `superbatch + 1` から resume する。horizon は version 5+、fv_scale は
+    /// version 9+ で保存されていれば `Some`。
     ///
     /// header (`arch_kind=Simple`, `topology=[ft_out, l1_out, l2_out]`, feature set)
     /// と group 本体の読み出し・照合は [`load_raw_checkpoint_file`] が担当する。
@@ -2918,7 +2920,7 @@ impl SimpleGpuTrainer {
     pub(crate) fn load_raw_checkpoint(
         &mut self,
         path: &Path,
-    ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
+    ) -> Result<SimpleRawCkptResumeState, Box<dyn std::error::Error>> {
         let topology: [u64; 3] = [
             self.id.ft_out as u64,
             self.id.l1_out as u64,
@@ -2970,7 +2972,12 @@ impl SimpleGpuTrainer {
         up!(7, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = header.step_count;
-        Ok((header.superbatch, header.producer_run_id, header.lr_horizon))
+        Ok((
+            header.superbatch,
+            header.producer_run_id,
+            header.lr_horizon,
+            header.fv_scale,
+        ))
     }
 
     /// raw checkpoint format の全 weight group を format の group 順 (= ft_w, ft_b,

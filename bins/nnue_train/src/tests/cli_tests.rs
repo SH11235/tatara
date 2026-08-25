@@ -394,12 +394,12 @@ fn simple_rejects_loss_wdl_requires_win_rate_model() {
     assert!(
         err.contains(
             "when --fv-scale is omitted, --scale must equal --wrm-nnue2score even with \
-             --init-from"
+             --init-from or --resume"
         ),
         "{err}"
     );
     assert!(
-        err.contains("--init-from retains the input net's value"),
+        err.contains("--init-from and v9+ resume checkpoints retain their loaded values"),
         "{err}"
     );
     assert!(
@@ -496,10 +496,10 @@ fn simple_fv_scale_warning_accepts_equal_offset_magnitudes() {
     ]);
     assert_eq!(parameters.wrm_in_offset, 270.0);
     assert_eq!(parameters.wrm_target_offset, 270.0);
-    assert_eq!(simple_fv_scale_warning(&parameters, None), None);
+    assert_eq!(simple_fv_scale_warning(&parameters, true), None);
 
     parameters.wrm_target_offset = -270.0;
-    assert_eq!(simple_fv_scale_warning(&parameters, None), None);
+    assert_eq!(simple_fv_scale_warning(&parameters, true), None);
 }
 
 #[test]
@@ -515,11 +515,11 @@ fn simple_fv_scale_warning_rejects_scaling_or_offset_magnitude_mismatch() {
     ]);
 
     parameters.wrm_in_scaling = 500.0;
-    assert!(simple_fv_scale_warning(&parameters, None).is_some());
+    assert!(simple_fv_scale_warning(&parameters, true).is_some());
     parameters.wrm_in_scaling = 600.0;
 
     parameters.wrm_target_offset = 269.0;
-    assert!(simple_fv_scale_warning(&parameters, None).is_some());
+    assert!(simple_fv_scale_warning(&parameters, true).is_some());
 }
 
 #[test]
@@ -536,28 +536,28 @@ fn simple_fv_scale_warning_rejects_nonzero_wdl_lambda() {
 
     let mut constant_wdl = exact_wrm.to_vec();
     constant_wdl.extend(["--wdl", "0.3333333"]);
-    assert!(simple_fv_scale_warning(&simple_cli(&constant_wdl), None).is_some());
+    assert!(simple_fv_scale_warning(&simple_cli(&constant_wdl), true).is_some());
 
     let mut nonzero_taper = exact_wrm.to_vec();
     nonzero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.5"]);
-    assert!(simple_fv_scale_warning(&simple_cli(&nonzero_taper), None).is_some());
+    assert!(simple_fv_scale_warning(&simple_cli(&nonzero_taper), true).is_some());
 
     let mut taper_to_zero = exact_wrm.to_vec();
     taper_to_zero.extend(["--start-wdl", "0.5", "--end-wdl", "0.0"]);
-    assert!(simple_fv_scale_warning(&simple_cli(&taper_to_zero), None).is_some());
+    assert!(simple_fv_scale_warning(&simple_cli(&taper_to_zero), true).is_some());
 
     let mut zero_taper = exact_wrm.to_vec();
     zero_taper.extend(["--start-wdl", "0.0", "--end-wdl", "0.0"]);
     assert_eq!(
-        simple_fv_scale_warning(&simple_cli(&zero_taper), None),
+        simple_fv_scale_warning(&simple_cli(&zero_taper), true),
         None
     );
 }
 
 #[test]
-fn simple_fv_scale_warning_skips_init_from_and_override() {
+fn simple_fv_scale_warning_only_emits_for_derived_effective_value() {
     let approximate = ["--win-rate-model", "--scale", "600"];
-    let warning = simple_fv_scale_warning(&simple_cli(&approximate), None).expect("warning");
+    let warning = simple_fv_scale_warning(&simple_cli(&approximate), true).expect("warning");
     assert!(warning.contains("label-scale approximation"));
     assert!(warning.contains("--fv-scale"));
 
@@ -568,7 +568,7 @@ fn simple_fv_scale_warning_skips_init_from_and_override() {
         "--init-from",
         "input.bin",
     ]);
-    assert_eq!(simple_fv_scale_warning(&with_init, None), None);
+    assert_eq!(simple_fv_scale_warning(&with_init, false), None);
 
     let with_resume = simple_cli(&[
         "--win-rate-model",
@@ -577,7 +577,8 @@ fn simple_fv_scale_warning_skips_init_from_and_override() {
         "--resume",
         "state.ckpt",
     ]);
-    assert!(simple_fv_scale_warning(&with_resume, None).is_some());
+    assert!(simple_fv_scale_warning(&with_resume, true).is_some());
+    assert_eq!(simple_fv_scale_warning(&with_resume, false), None);
 
     let all_mismatched = simple_cli(&[
         "--win-rate-model",
@@ -594,7 +595,7 @@ fn simple_fv_scale_warning_skips_init_from_and_override() {
         "--wdl",
         "0.3333333",
     ]);
-    assert_eq!(simple_fv_scale_warning(&all_mismatched, Some(14)), None);
+    assert_eq!(simple_fv_scale_warning(&all_mismatched, false), None);
 }
 
 #[test]
@@ -606,19 +607,20 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
         .to_string();
     assert!(help.contains("--init-from"), "{help}");
     assert!(
-        help.contains("Raw checkpoints do not store `fv_scale`"),
+        help.contains("v9+ raw checkpoints retain their saved value"),
         "{help}"
     );
-    assert!(help.contains("every `--resume` invocation"), "{help}");
+    assert!(help.contains("v8 or earlier checkpoint"), "{help}");
 
     let root_help = Cli::command().render_long_help().to_string();
     assert!(
-        root_help
-            .contains("derive the exported `fv_scale` when `simple --fv-scale` and `--init-from`"),
+        root_help.contains(
+            "derive the exported `fv_scale` when `simple --fv-scale` is omitted and neither"
+        ),
         "{root_help}"
     );
     assert!(
-        root_help.contains("must equal `--wrm-nnue2score` whether or not `--init-from` is set"),
+        root_help.contains("must equal `--wrm-nnue2score` whether or not weights are loaded"),
         "{root_help}"
     );
 }

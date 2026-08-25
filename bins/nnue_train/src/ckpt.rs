@@ -15,10 +15,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 8):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 9):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (8)             (4 bytes)
+//   version      u32 (9)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -37,6 +37,7 @@ use crate::trainer_common::MomentBuf;
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
 //   step_count   u64  (optimizer step counter)
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
+//   fv_scale     i32  (v9+、Simple の実効 evaluation scale。0 = 未記録)
 //   num_groups   u64
 //   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
 //   固有 — 各 trainer の `raw_ckpt_group_sources` を参照):
@@ -48,7 +49,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=8 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=9 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -101,13 +102,18 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   interpreted as "progress8kpabs" (the only mode that existed when they were
 ///   written).
 ///
-/// `load_raw_checkpoint` accepts versions 1..=8. Version 1 is interpreted as
+/// - `9`: an `i32` `fv_scale` follows the LR-schedule horizon. `0` means "not
+///   recorded"; positive values preserve the Simple trainer's effective export
+///   scale across resume. Negative values are rejected as corrupt.
+///
+/// `load_raw_checkpoint` accepts versions 1..=9. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 8 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 9 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
-/// versions 1..=5; the feature hash is absent for versions 1..=6.
-pub(crate) const RAW_CKPT_VERSION: u32 = 8;
+/// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
+/// is absent (`None`) for versions 1..=8.
+pub(crate) const RAW_CKPT_VERSION: u32 = 9;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -122,6 +128,10 @@ pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 /// `build_lr_scheduler` に渡す。
 #[cfg(feature = "gpu")]
 pub(crate) type RawCkptResumeState = (usize, Option<String>, Option<usize>);
+
+/// Simple raw checkpoint の resume metadata。末尾は保存済み `fv_scale`。
+#[cfg(feature = "gpu")]
+pub(crate) type SimpleRawCkptResumeState = (usize, Option<String>, Option<usize>, Option<i32>);
 
 /// raw checkpoint 1 group 分の device-side 参照。weight name + 要素数 +
 /// `(w, m, v, slow)` device buffer の借用。trainer が format の group 順に並べた
@@ -233,9 +243,9 @@ pub(crate) struct RawCkptArch<'a> {
     pub(crate) topology: &'a [u64],
 }
 
-/// raw checkpoint header の counter / lineage 部 (arch identity 以外の可変 field)。
+/// raw checkpoint header の arch identity 以外の metadata。
 /// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
-#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
 pub(crate) struct RawCkptMeta<'a> {
     /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
     /// `lineage.parent_id` に使う)。空文字列は「未記録」。
@@ -246,6 +256,8 @@ pub(crate) struct RawCkptMeta<'a> {
     pub(crate) step_count: u64,
     /// LR-schedule horizon (horizon を持たない schedule では `None`)。
     pub(crate) lr_horizon: Option<usize>,
+    /// Simple の export に使う実効 evaluation scale。LayerStack は `None`。
+    pub(crate) fv_scale: Option<i32>,
 }
 
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
@@ -262,6 +274,8 @@ pub(crate) struct RawCkptHeader {
     /// LR-schedule horizon (version 5+ かつ horizon を持つ schedule なら `Some`)。
     /// version 1..=4 や horizon を持たない schedule では `None`。
     pub(crate) lr_horizon: Option<usize>,
+    /// Simple の実効 evaluation scale。version 1..=8 または未記録なら `None`。
+    pub(crate) fv_scale: Option<i32>,
 }
 
 /// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
@@ -269,10 +283,7 @@ pub(crate) struct RawCkptHeader {
 pub(crate) fn write_raw_ckpt_header<W: Write>(
     w: &mut W,
     arch: &RawCkptArch,
-    run_id: &str,
-    superbatch: u64,
-    step_count: u64,
-    lr_horizon: Option<usize>,
+    meta: &RawCkptMeta,
     num_groups: u64,
 ) -> std::io::Result<()> {
     w.write_all(&RAW_CKPT_MAGIC)?;
@@ -289,8 +300,8 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     // feature mapping hash (v7+)。
     w.write_all(&arch.feature_set.feature_hash().to_le_bytes())?;
     // producer run id (v3+)。
-    w.write_all(&(run_id.len() as u32).to_le_bytes())?;
-    w.write_all(run_id.as_bytes())?;
+    w.write_all(&(meta.run_id.len() as u32).to_le_bytes())?;
+    w.write_all(meta.run_id.as_bytes())?;
     // arch_kind + topology header (v4+)。
     let arch_name = arch.arch_kind.canonical_name();
     w.write_all(&(arch_name.len() as u32).to_le_bytes())?;
@@ -303,22 +314,25 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     for &dim in arch.topology {
         w.write_all(&dim.to_le_bytes())?;
     }
-    w.write_all(&superbatch.to_le_bytes())?;
-    w.write_all(&step_count.to_le_bytes())?;
+    w.write_all(&(meta.superbatch as u64).to_le_bytes())?;
+    w.write_all(&meta.step_count.to_le_bytes())?;
     // LR-schedule horizon (v5+)。0 = horizon 無し (step / constant / drop)。
-    w.write_all(&(lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
+    w.write_all(&(meta.lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
+    // Simple evaluation scale (v9+)。0 = 未記録。
+    w.write_all(&meta.fv_scale.unwrap_or(0).to_le_bytes())?;
     w.write_all(&num_groups.to_le_bytes())?;
     Ok(())
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=8 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=9 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
 /// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
 /// version 7 は feature-set header に feature hash、version 8 は arch kind の直後に
-/// bucket mode 名を持つ。version 7 以前の LayerStack は `progress8kpabs` と解釈する。
+/// bucket mode 名、version 9 は LR-schedule horizon の直後に `fv_scale` を持つ。
+/// version 7 以前の LayerStack は `progress8kpabs` と解釈する。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -586,6 +600,20 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         None
     };
 
+    // Simple evaluation scale は version 9+。0 は「未記録」扱いで `None`。
+    let fv_scale = if version >= 9 {
+        read_exact_or_invalid(r, &mut buf4, "fv_scale")?;
+        let value = i32::from_le_bytes(buf4);
+        if value < 0 {
+            return Err(invalid_data(format!(
+                "raw checkpoint fv_scale {value} is invalid (must be non-negative)"
+            )));
+        }
+        (value != 0).then_some(value)
+    } else {
+        None
+    };
+
     read_exact_or_invalid(r, &mut buf8, "num_groups")?;
     let num_groups = u64::from_le_bytes(buf8);
 
@@ -595,6 +623,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         num_groups,
         producer_run_id,
         lr_horizon,
+        fv_scale,
     })
 }
 
@@ -649,15 +678,8 @@ pub(crate) fn save_raw_checkpoint_file(
     // flush 失敗で残骸を残さないため)。
     let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
-        write_raw_ckpt_header(
-            &mut w,
-            arch,
-            run_id,
-            meta.superbatch as u64,
-            meta.step_count,
-            meta.lr_horizon,
-            groups.len() as u64,
-        )?;
+        let header_meta = RawCkptMeta { run_id, ..*meta };
+        write_raw_ckpt_header(&mut w, arch, &header_meta, groups.len() as u64)?;
         for g in groups {
             let (w_host, m_host, v_host, slow_host) = g.to_host(stream)?;
             // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。

@@ -2081,10 +2081,12 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
                 precision,
             )?;
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
-                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
+                let (superbatch, producer, horizon, fv_scale) =
+                    trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
                 assert_eq!(producer.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
+                assert_eq!(fv_scale, Some(16));
                 let loaded_state = trainer.raw_checkpoint_state_to_host()?;
                 assert_checkpoint_state_bit_identical(
                     &format!("{source_name} to {backend_name} load"),
