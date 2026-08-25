@@ -55,6 +55,7 @@ fn rewrite_file(
     output_path: &Path,
     rewrite: Rewrite,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reject_symlink_output(output_path)?;
     if paths_alias(input_path, output_path)? {
         return Err(format!(
             "input and output refer to the same file: `{}`",
@@ -67,6 +68,21 @@ fn rewrite_file(
     let output = rewrite_fv_scale(&input, rewrite)?;
     write_atomic(output_path, &output)?;
     Ok(())
+}
+
+fn reject_symlink_output(output_path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(output_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`--output` path `{}` is a symlink; specify the link target path directly",
+                output_path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn paths_alias(input_path: &Path, output_path: &Path) -> io::Result<bool> {
@@ -606,6 +622,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_symlink_output_without_modifying_link_or_target() {
+        let temp = TestDir::new();
+        let input_path = temp.path.join("input.bin");
+        let target_path = temp.path.join("model.bin");
+        let output_path = temp.path.join("current.nnue");
+        let partial_path = partial_path(&output_path);
+        let link_target = Path::new("model.bin");
+        let input = layerstack_file(LAYERSTACK_NNUE_VERSION, ARCH_WITHOUT_SCALE);
+        let target = b"original model";
+        fs::write(&input_path, input).unwrap();
+        fs::write(&target_path, target).unwrap();
+        if let Err(error) = symlink_file(link_target, &output_path) {
+            eprintln!("skipping symlink test because a file symlink could not be created: {error}");
+            return;
+        }
+
+        let error = rewrite_file(&input_path, &output_path, Rewrite::Set(37)).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("`--output`"));
+        assert!(message.contains("symlink"));
+        assert!(message.contains("link target path directly"));
+        assert_eq!(fs::read(&target_path).unwrap(), target);
+        assert!(
+            fs::symlink_metadata(&output_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&output_path).unwrap(), link_target);
+        assert!(!partial_path.exists());
+    }
+
+    #[test]
+    fn rewrite_file_creates_and_overwrites_regular_output() {
+        let temp = TestDir::new();
+        let input_path = temp.path.join("input.bin");
+        let output_path = temp.path.join("output.bin");
+        let partial_path = partial_path(&output_path);
+        let input = layerstack_file(LAYERSTACK_NNUE_VERSION, ARCH_WITHOUT_SCALE);
+        fs::write(&input_path, &input).unwrap();
+
+        rewrite_file(&input_path, &output_path, Rewrite::Set(37)).unwrap();
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            rewrite_fv_scale(&input, Rewrite::Set(37)).unwrap()
+        );
+
+        rewrite_file(&input_path, &output_path, Rewrite::Set(41)).unwrap();
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            rewrite_fv_scale(&input, Rewrite::Set(41)).unwrap()
+        );
+        assert!(!partial_path.exists());
+    }
+
+    #[test]
     fn unavailable_file_identity_does_not_claim_a_match() {
         let unavailable = io::Error::new(io::ErrorKind::Unsupported, "identity unavailable");
 
@@ -851,6 +924,24 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn symlink_file(_target: &Path, _link: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file symlinks are unsupported on this platform",
+        ))
     }
 
     struct TestDir {
