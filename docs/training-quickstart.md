@@ -55,9 +55,8 @@ value. Set `simple --fv-scale <N>` to write `N` and waive that equality
 requirement.
 
 The derived value is a nominal scale based on the training labels, not
-necessarily the playing-strength optimum. A measured case differed by a factor
-of two; determine the optimum through games and bake it in with `--fv-scale`, or
-set the engine-side option.
+necessarily the playing-strength optimum. Determine the optimum through games
+and bake it in with `--fv-scale`, or set the engine-side option.
 
 `simple` defaults to `--arch 256x2-32-32` / `--activation crelu`. For how to
 choose `--superbatches` and the additional options you can pass, see "Key

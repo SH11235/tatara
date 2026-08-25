@@ -55,7 +55,9 @@ side take independent offset / scaling values.
 
 On the `simple` trainer, omitting `simple --fv-scale` requires
 `--scale = --wrm-nnue2score`. To tune `--wrm-nnue2score` independently of
-`--scale`, set the measured export scale with `simple --fv-scale <N>`.
+`--scale`, set the measured export scale with `simple --fv-scale <N>`. Raw
+checkpoints do not store `fv_scale`, so repeat `simple --fv-scale <N>` on every
+`--resume` invocation that must preserve the chosen value.
 
 `--wdl` (the `lambda` above) blends the target between the WRM win-rate and the
 WDL label ({0, 0.5, 1}). At the default 0 the target is `target_wrm` only; at 1

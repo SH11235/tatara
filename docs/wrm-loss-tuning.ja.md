@@ -50,7 +50,9 @@ prediction 側と target 側で offset / scaling を独立に指定できる。
 
 `simple` トレーナで `simple --fv-scale` を省略する場合は
 `--scale = --wrm-nnue2score` が必須。`--wrm-nnue2score` を `--scale` と独立に
-調整するには、実測した export scale を `simple --fv-scale <N>` で指定する。
+調整するには、実測した export scale を `simple --fv-scale <N>` で指定する。raw
+checkpoint は `fv_scale` を保存しないため、選んだ値を保つには `--resume` のたびに
+`simple --fv-scale <N>` を再指定する。
 
 `--wdl` (上式の `lambda`) は target を WRM 勝率と WDL ラベル ({0, 0.5, 1}) で混ぜる
 係数。既定 0 では target = `target_wrm` のみ、1 で純 WDL になる。

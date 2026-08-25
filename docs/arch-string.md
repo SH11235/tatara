@@ -83,7 +83,7 @@ pairwise 乗算で FT 出力が半減することを `/2` と `-Pairwise` suffix
 
 `fv_scale=<N>` は推論時に評価値スケールへ戻す係数。Simple で
 `--fv-scale` を省略したときは `round(127 × QB / --scale)` (活性化出力が常に
-127-scale のため活性化非依存)で、`--init-from` では入力 net の値を引き継ぐ。
+127-scale のため活性化非依存) で、`--init-from` では入力 net の値を引き継ぐ。
 `--fv-scale <N>` を明示すると `N` を書き出す。topology と独立に値が変わるため、
 **identity 照合には含めない** (後述)。
 

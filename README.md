@@ -75,9 +75,8 @@ an explicit or `--init-from`-inherited value, pass it with `--fv-scale` on every
 `--resume` invocation.
 
 The derived value is a nominal scale based on the training labels, not
-necessarily the playing-strength optimum. A measured case differed by a factor
-of two; determine the optimum through games and bake it in with `--fv-scale`, or
-set the engine-side option.
+necessarily the playing-strength optimum. Determine the optimum through games
+and bake it in with `--fv-scale`, or set the engine-side option.
 
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*
