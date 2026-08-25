@@ -637,8 +637,7 @@ mod tests {
         fs::write(&target_path, target).unwrap();
         #[cfg(windows)]
         if let Err(error) = symlink_file(link_target, &output_path) {
-            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
-            {
+            if error.raw_os_error() == Some(1314) {
                 writeln!(
                     io::stdout().lock(),
                     "SKIPPED: file symlink creation requires Windows symlink privilege: {error}"
