@@ -99,6 +99,23 @@ fn simple_fv_scale_after_load(
     override_value.or(checkpoint_value).unwrap_or(loaded_value)
 }
 
+#[cfg(any(feature = "gpu", test))]
+fn validate_simple_effective_fv_scale(
+    fv_scale: i32,
+    source: &str,
+    score_scale: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if fv_scale <= 0 {
+        return Err(format!(
+            "effective fv_scale resolved to {fv_scale} from {source}, but it must be positive; \
+             lower --scale (currently {score_scale}) so round(8128 / --scale) is at least 1, \
+             or set a positive --fv-scale explicitly"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Default)]
 struct OomFeatureConfig<'a> {
@@ -2050,11 +2067,22 @@ pub(crate) fn run_simple_training(
         (None, None, None, None)
     };
 
-    trainer.set_fv_scale(simple_fv_scale_after_load(
+    let effective_fv_scale = simple_fv_scale_after_load(
         simple_args.fv_scale,
         checkpoint_fv_scale,
         trainer.fv_scale(),
-    ));
+    );
+    let fv_scale_source = if simple_args.fv_scale.is_some() {
+        "the --fv-scale override"
+    } else if checkpoint_fv_scale.is_some() {
+        "the raw checkpoint"
+    } else if cli.init_from.is_some() {
+        "the --init-from .bin"
+    } else {
+        "the --scale-derived value"
+    };
+    validate_simple_effective_fv_scale(effective_fv_scale, fv_scale_source, cli.scale)?;
+    trainer.set_fv_scale(effective_fv_scale);
     println!("[train] fv_scale: {}", trainer.fv_scale());
     let fv_scale_is_derived =
         simple_args.fv_scale.is_none() && cli.init_from.is_none() && checkpoint_fv_scale.is_none();
@@ -2225,6 +2253,21 @@ mod shared_cli_tests {
         assert_eq!(simple_fv_scale_after_load(None, Some(14), derived), 14);
         assert_eq!(simple_fv_scale_after_load(None, None, derived), derived);
         assert_eq!(simple_fv_scale_after_load(None, None, loaded_from_bin), 7);
+    }
+
+    #[test]
+    fn simple_scale_that_derives_zero_fv_scale_is_rejected() {
+        let score_scale = 20_000.0;
+        let fv_scale = simple_export_fv_scale(None, score_scale);
+        assert_eq!(fv_scale, 0);
+
+        let err =
+            validate_simple_effective_fv_scale(fv_scale, "the --scale-derived value", score_scale)
+                .expect_err("zero effective fv_scale must reject");
+        let message = err.to_string();
+        assert!(message.contains("resolved to 0 from the --scale-derived value"));
+        assert!(message.contains("lower --scale (currently 20000)"));
+        assert!(message.contains("set a positive --fv-scale explicitly"));
     }
     use clap::Parser;
 

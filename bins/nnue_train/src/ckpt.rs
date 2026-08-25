@@ -123,7 +123,7 @@ pub(crate) const MAX_RUN_ID_BYTES: usize = 256;
 #[cfg(feature = "gpu")]
 pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
-/// `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer run id,
+/// LayerStack の `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer run id,
 /// LR-schedule horizon)`。caller は superbatch+1 から resume し、horizon を
 /// `build_lr_scheduler` に渡す。
 #[cfg(feature = "gpu")]

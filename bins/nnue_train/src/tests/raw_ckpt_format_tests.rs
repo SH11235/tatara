@@ -53,7 +53,7 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=8 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
     assert_eq!(RAW_CKPT_VERSION, 9);
@@ -239,14 +239,17 @@ fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
     off + 4 + arch_name_len
 }
 
-fn downgrade_v9_to_v8(buf: &mut Vec<u8>) {
+fn downgrade_v9_to_v8(buf: &mut Vec<u8>, written_fv_scale: Option<i32>) {
     let fv_scale_off = buf.len() - 4 - 8;
+    let stored_fv_scale =
+        i32::from_le_bytes(buf[fv_scale_off..fv_scale_off + 4].try_into().unwrap());
+    assert_eq!(stored_fv_scale, written_fv_scale.unwrap_or(0));
     buf.drain(fv_scale_off..fv_scale_off + 4);
     buf[4..8].copy_from_slice(&8u32.to_le_bytes());
 }
 
 fn downgrade_v8_to_v7(buf: &mut Vec<u8>, arch: &RawCkptArch) {
-    downgrade_v9_to_v8(buf);
+    downgrade_v9_to_v8(buf, None);
     let off = bucket_mode_field_offset(buf, arch);
     let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     buf.drain(off..off + 4 + len);
@@ -291,7 +294,8 @@ fn raw_ckpt_v8_reads_fv_scale_as_none_and_preserves_other_fields() {
     let arch = simple_arch();
     let mut buf = Vec::new();
     write_raw_ckpt_header_with_fv_scale(&mut buf, &arch, Some(14));
-    downgrade_v9_to_v8(&mut buf);
+    downgrade_v9_to_v8(&mut buf, Some(14));
+    assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
 
     let header = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!(header.fv_scale, None);
@@ -310,6 +314,14 @@ fn remove_v7_feature_hash(buf: &mut Vec<u8>, arch: &RawCkptArch) {
     buf.drain(feature_hash_off..feature_hash_off + 4);
 }
 
+fn downgrade_v6_to_v5(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    remove_v7_feature_hash(buf, arch);
+    let factorizer_off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8 + 8;
+    assert_eq!(buf[factorizer_off], 0);
+    buf.drain(factorizer_off..factorizer_off + 1);
+    buf[4..8].copy_from_slice(&5u32.to_le_bytes());
+}
+
 #[test]
 fn raw_ckpt_v8_bucket_modes_round_trip() {
     for arch in [
@@ -319,8 +331,13 @@ fn raw_ckpt_v8_bucket_modes_round_trip() {
     ] {
         let mut buf = Vec::new();
         write_raw_ckpt_header(&mut buf, &arch, "bucket-mode-roundtrip", 2, 20, None, 10).unwrap();
+        downgrade_v9_to_v8(&mut buf, None);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
         let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
         assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+        assert_eq!(h.producer_run_id.as_deref(), Some("bucket-mode-roundtrip"));
+        assert_eq!(h.lr_horizon, None);
+        assert_eq!(h.fv_scale, None);
     }
 }
 
@@ -341,6 +358,8 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
             10,
         )
         .unwrap();
+        downgrade_v9_to_v8(&mut buf, None);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
         let err = read_raw_ckpt_header(
             &mut Cursor::new(&buf),
             &layerstack_arch_with_mode(requested),
@@ -562,12 +581,15 @@ fn raw_ckpt_header_v5_round_trips_with_lr_horizon() {
     let arch = layerstack_arch();
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &arch, "net-20260520-1234", 7, 99, Some(123), 10).unwrap();
+    downgrade_v6_to_v5(&mut buf, &arch);
+    assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 5);
     let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!(h.superbatch, 7);
     assert_eq!(h.step_count, 99);
     assert_eq!(h.num_groups, 10);
     assert_eq!(h.producer_run_id.as_deref(), Some("net-20260520-1234"));
     assert_eq!(h.lr_horizon, Some(123));
+    assert_eq!(h.fv_scale, None);
 }
 
 #[test]

@@ -477,6 +477,11 @@ impl SimpleWeights {
         let fv_scale: i32 = fv_scale_str
             .parse()
             .map_err(|_| invalid(format!("invalid fv_scale in arch_str: `{fv_scale_str}`")))?;
+        if fv_scale <= 0 {
+            return Err(invalid(format!(
+                "invalid fv_scale in arch_str: `{fv_scale_str}` (must be positive)"
+            )));
+        }
 
         // ft_hash
         reader.read_exact(&mut buf4)?;
@@ -933,6 +938,26 @@ mod tests {
         let err = SimpleWeights::load(&mut std::io::Cursor::new(&buf), screlu)
             .expect_err("activation mismatch must reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_rejects_non_positive_fv_scale_in_arch_str() {
+        let id = test_id(SimpleActivation::CReLU);
+        for fv_scale in [0, -16] {
+            let mut buf = Vec::new();
+            SimpleWeights::zeroed(id, fv_scale)
+                .save_quantised(&mut buf)
+                .unwrap();
+
+            let err = SimpleWeights::load(&mut std::io::Cursor::new(&buf), id)
+                .expect_err("non-positive fv_scale must reject");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains(&format!("`{fv_scale}`"))
+                    && err.to_string().contains("must be positive"),
+                "error should identify the invalid fv_scale: {err}"
+            );
+        }
     }
 
     #[test]
