@@ -46,9 +46,17 @@ target/release/nnue-train \
 The `simple` trainer requires `--win-rate-model`: its int8 output layer cannot
 represent the centipawn-scale output that the plain sigmoid loss converges to,
 so the plain-sigmoid path is rejected up front. The `--wrm-*` values above
-degenerate the WRM to a plain sigmoid; keep `--scale` and every
-`--wrm-*-scaling` / `--wrm-nnue2score` on the same value, because the simple
-trainer derives the exported `fv_scale` from `--scale`.
+degenerate the WRM to a plain sigmoid, so this configuration uses the same value
+for `--scale`, every `--wrm-*-scaling`, and `--wrm-nnue2score`. When
+`simple --fv-scale` is omitted, `--scale` must equal `--wrm-nnue2score`,
+including with `--init-from`; the exported `fv_scale` is
+`round(127 × QB / --scale)`, except that `--init-from` retains the input net's
+value. Set `simple --fv-scale <N>` to write `N` and waive that equality
+requirement.
+
+The derived value is a nominal scale based on the training labels, not
+necessarily the playing-strength optimum. Determine the optimum through games
+and bake it in with `--fv-scale`, or set the engine-side option.
 
 `simple` defaults to `--arch 256x2-32-32` / `--activation crelu`. For how to
 choose `--superbatches` and the additional options you can pass, see "Key
@@ -96,7 +104,8 @@ change for real training are:
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
 | `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~1.8 GB (default LayerStack arch) ≈ 36 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
-| `--win-rate-model` | OFF (layerstack) / required (simple) | WRM (win-rate-model) loss. Converges to `net_output ≈ cp / --wrm-nnue2score`. On `layerstack` it is optional (without it, plain sigmoid-MSE). The `simple` trainer requires it and also requires `--scale = --wrm-nnue2score`, because `--scale` determines the exported `fv_scale`; the example above uses 290 for both, producing `FV_SCALE=28`. See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
+| `--win-rate-model` | OFF (layerstack) / required (simple) | WRM (win-rate-model) loss. Converges to `net_output ≈ cp / --wrm-nnue2score`. On `layerstack` it is optional (without it, plain sigmoid-MSE). The `simple` trainer requires it; when `simple --fv-scale` is omitted, it also requires `--scale = --wrm-nnue2score`. The example above uses 290 for both, producing `FV_SCALE=28`. See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
+| `--fv-scale` (`simple`) | none | Positive integer evaluation scale written to the exported architecture string. When omitted, it is `round(127 × QB / --scale)`, except that `--init-from` inherits the input net's value; omission requires `--scale = --wrm-nnue2score`, including with `--init-from`. Raw checkpoints do not store it, so pass an explicit or inherited value on every `--resume` invocation that must preserve it |
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99), `radam` (rectified Adam without lookahead, beta1=0.9), or `adamw` (Adam without bias correction, beta1=0.9). When resuming from a raw `.ckpt`, pass the same value as the original run |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
@@ -181,9 +190,11 @@ flags, how to pick the held-out source, and how to read the metrics.
 
 ## Interrupting and resuming training
 
-A raw `.ckpt` saves everything: **weights + optimizer state
-(m / v / slow / step) + the current superbatch number**. Even if it stops on a
-power loss or a GPU error, you can fully resume. Add `--resume` to the same
+A raw `.ckpt` saves the full training state: **weights + optimizer state
+(m / v / slow / step) + the current superbatch number**. It does not save
+`fv_scale`; to preserve an explicit or `--init-from`-inherited value, pass it
+again with `simple --fv-scale <N>` on every resume invocation. Even after a
+power loss or a GPU error, you can fully resume by adding `--resume` to the same
 options + architecture subcommand used for training:
 
 ```bash

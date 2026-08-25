@@ -85,6 +85,16 @@ pub(crate) fn layerstack_export_fv_scale(
     })
 }
 
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn simple_export_fv_scale(override_value: Option<i32>, score_scale: f32) -> i32 {
+    override_value.unwrap_or_else(|| nnue_format::simple_weights::simple_fv_scale(score_scale))
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn simple_fv_scale_after_load(override_value: Option<i32>, loaded_value: i32) -> i32 {
+    override_value.unwrap_or(loaded_value)
+}
+
 #[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Default)]
 struct OomFeatureConfig<'a> {
@@ -1189,8 +1199,9 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
 /// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
 /// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
 ///
-/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は `--scale` から
-/// 算出される。両者が異なると量子化 net の評価値が同じ比率でずれるため、一致を必須とする。
+/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は override と
+/// `--init-from` がともに未指定のとき `--scale` から算出される。override 未指定時は
+/// `--init-from` の有無にかかわらず両 scale の一致を必須とする。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !cli.win_rate_model {
@@ -1201,21 +1212,47 @@ pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std
              (the sign-based test accuracy will not surface this). To recover a plain sigmoid, \
              degenerate the WRM to identity with --scale <scale> --wrm-in-offset 0 \
              --wrm-target-offset 0 --wrm-in-scaling <scale> --wrm-target-scaling <scale> \
-             --wrm-nnue2score <scale> (use the same <scale> everywhere; the simple trainer \
-             derives fv_scale from --scale even under the WRM, so omitting it silently shifts \
-             the evaluation scale)."
+             --wrm-nnue2score <scale> (pass the same explicit <scale> to all four scale options; \
+             when --fv-scale is omitted, --scale must equal --wrm-nnue2score even with \
+             --init-from. Fresh and resumed training derive fv_scale from --scale, while \
+             --init-from retains the input net's value. Setting --fv-scale explicitly waives \
+             the equality requirement)."
                 .into(),
         );
     }
-    if cli.scale != cli.wrm_nnue2score {
+    if !(cli.scale.is_finite() && cli.scale > 0.0) {
+        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
+    }
+    let fv_scale_is_overridden =
+        matches!(&cli.arch, ArchCommand::Simple(args) if args.fv_scale.is_some());
+    if !fv_scale_is_overridden && cli.scale != cli.wrm_nnue2score {
         return Err(format!(
-            "the simple trainer requires matching training and export score scales: \
-             --scale ({}) must equal --wrm-nnue2score ({})",
+            "the simple trainer requires matching training and export score scales when \
+             --fv-scale is omitted: --scale ({}) must equal --wrm-nnue2score ({}); set \
+             --fv-scale explicitly to waive this equality requirement",
             cli.scale, cli.wrm_nnue2score
         )
         .into());
     }
     Ok(())
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn simple_fv_scale_warning(
+    cli: &Cli,
+    fv_scale_override: Option<i32>,
+) -> Option<&'static str> {
+    let wdl_is_always_zero =
+        cli.wdl == 0.0 && cli.start_wdl.unwrap_or(0.0) == 0.0 && cli.end_wdl.unwrap_or(0.0) == 0.0;
+    let derived_scale_is_exact = cli.wrm_in_scaling == cli.wrm_target_scaling
+        && cli.wrm_in_offset.abs() == cli.wrm_target_offset.abs()
+        && wdl_is_always_zero;
+
+    (fv_scale_override.is_none() && cli.init_from.is_none() && !derived_scale_is_exact).then_some(
+        "derived fv_scale is only a label-scale approximation unless WRM input/target scaling \
+         matches, offset magnitudes match, and WDL lambda stays zero; set --fv-scale explicitly \
+         to use a measured evaluation scale",
+    )
 }
 
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
@@ -1639,8 +1676,8 @@ pub(crate) fn build_experiment_logger_simple(
     fp16_opt_state: bool,
     tf32: bool,
     lr_schedule: String,
-    // export される `.bin` の実効値。`--init-from` で入力 `.bin` の値に上書きされるため、
-    // CLI の `--scale` から再計算せず trainer の値を渡す。
+    // export される `.bin` の実効値。入力 weight と CLI override の解決後に trainer
+    // が保持する値を渡す。
     fv_scale: i32,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
@@ -1829,6 +1866,9 @@ pub(crate) fn run_simple_training(
     // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
     reject_simple_unsupported_flags(cli)?;
     require_simple_win_rate_model(cli)?;
+    if let Some(warning) = simple_fv_scale_warning(cli, simple_args.fv_scale) {
+        eprintln!("[train] warning: {warning}");
+    }
     let data = cli
         .data
         .as_ref()
@@ -1903,12 +1943,6 @@ pub(crate) fn run_simple_training(
         l2_out,
     };
 
-    // Simple は loss kind に関わらず `cli.scale` を量子化 `fv_scale` の算出で参照
-    // するため、WRM 経路でも finite / 正値を要求する (LayerStack は WRM 時に scale
-    // を参照しないので sigmoid 経路でのみ検証していた)。
-    if !(cli.scale.is_finite() && cli.scale > 0.0) {
-        return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
-    }
     // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
     // ため、simple の loss は WRM に限られる。
     let loss = build_wrm_loss(cli)?;
@@ -1928,9 +1962,10 @@ pub(crate) fn run_simple_training(
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
     println!("[train] optimizer: {}", shared.optimizer.name());
     // 推論側 evaluation scale。FT 活性化出力は活性化に依らず 127-scale のため
-    // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
-    // は前段で有限・正値を保証済。
-    let fv_scale = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+    // fv_scale も活性化非依存。override 未指定時は
+    // round(FT_OUTPUT_QA × QB / 学習 scale) で導出する。`cli.scale` は前段で
+    // 有限・正値を保証済。
+    let fv_scale = simple_export_fv_scale(simple_args.fv_scale, cli.scale);
     let norm_loss_factor = if cli.norm_loss {
         println!(
             "[train] norm loss active (factor = {})",
@@ -2012,6 +2047,12 @@ pub(crate) fn run_simple_training(
     } else {
         (None, None, None)
     };
+
+    trainer.set_fv_scale(simple_fv_scale_after_load(
+        simple_args.fv_scale,
+        trainer.fv_scale(),
+    ));
+    println!("[train] fv_scale: {}", trainer.fv_scale());
 
     // forward が読む FT weight (factorizer の comb / `--ft-fp16` mirror) を学習開始時の
     // `ft_w` (init / --init-from / --resume いずれか) から一度同期する。以降は factorizer
@@ -2142,6 +2183,46 @@ mod shared_cli_tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn simple_fv_scale_derives_or_uses_override() {
+        assert_eq!(simple_export_fv_scale(None, 1200.0), 7);
+        assert_eq!(simple_export_fv_scale(Some(14), 1200.0), 14);
+
+        let cli =
+            Cli::try_parse_from(["nnue-trainer", "simple", "--fv-scale", "14"]).expect("cli parse");
+        let ArchCommand::Simple(args) = cli.arch else {
+            unreachable!()
+        };
+        assert_eq!(args.fv_scale, Some(14));
+
+        for invalid in ["0", "-1"] {
+            let error = Cli::try_parse_from(["nnue-trainer", "simple", "--fv-scale", invalid])
+                .expect_err("non-positive fv_scale must be rejected")
+                .to_string();
+            assert!(
+                error.contains("fv_scale must be greater than zero"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_fv_scale_override_wins_after_init_or_resume_load() {
+        let loaded_from_bin = 7;
+        let current_during_resume = simple_export_fv_scale(None, 1200.0);
+
+        assert_eq!(simple_fv_scale_after_load(Some(14), loaded_from_bin), 14);
+        assert_eq!(
+            simple_fv_scale_after_load(Some(14), current_during_resume),
+            14
+        );
+        assert_eq!(simple_fv_scale_after_load(None, loaded_from_bin), 7);
+        assert_eq!(
+            simple_fv_scale_after_load(None, current_during_resume),
+            current_during_resume
+        );
     }
     use clap::Parser;
 

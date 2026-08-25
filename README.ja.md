@@ -60,8 +60,17 @@ cargo run --release --bin nnue-train -- \
 
 simple トレーナは win-rate-model loss のみ対応 (int8 出力層が plain sigmoid loss の
 収束する centipawn スケール出力を表現できない)。上記の `--wrm-*` は WRM を plain
-sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` / `--wrm-nnue2score`
-は同じ値に揃える (`--scale` が書き出す `fv_scale` も決めるため)。
+sigmoid へ恒等退化させるため、この設定では `--scale`、各
+`--wrm-*-scaling`、`--wrm-nnue2score` に同じ値を使う。`simple --fv-scale` を
+省略した場合は `--init-from` 使用時も `--scale = --wrm-nnue2score` が必須で、
+書き出す `fv_scale` は `round(127 × QB / --scale)` になる。ただし
+`--init-from` では入力 net の値を引き継ぐ。
+`simple --fv-scale <N>` を明示すると `N` を書き出し、この等値要件を免除する。
+raw checkpoint は `fv_scale` を保存しないため、明示値や `--init-from` の継承値を
+保つには `--resume` のたびに `--fv-scale` で指定する。
+
+導出値は学習ラベル基準の公称値であり、対局での最適値とは限らない。対局で最適値を
+測って `--fv-scale` で焼き込むか、エンジン側 option で指定する。
 
 *tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 
@@ -170,7 +179,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
-| **QA / QB / FV_SCALE** | 量子化スケール定数。QA = FT weight / bias の量子化 multiplier (`simple` アーキでは活性化で決まる: CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)。活性化出力は活性化関数に依らず常に 127-scale のため、FV_SCALE = `round(127 × QB / 学習 scale)` が net 出力を centipawn 評価値へ戻す係数になる |
+| **QA / QB / FV_SCALE** | 量子化スケール定数。QA = FT weight / bias の量子化 multiplier (`simple` アーキでは活性化で決まる: CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)。FV_SCALE は net 出力を centipawn 評価値へ戻す係数。`simple` の活性化出力は常に 127-scale のため、既定値は `round(127 × QB / 学習 scale)`。`--fv-scale` で上書きでき、省略時の `--init-from` では入力 net の値を引き継ぐ |
 | **WDL** | Win/Draw/Loss — 対局結果ターゲット (1.0 / 0.5 / 0.0)。WDL lambda で教師 score と blend する。[docs/training-schedule.ja.md](docs/training-schedule.ja.md) を参照 |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |

@@ -81,10 +81,11 @@ pairwise 乗算で FT 出力が半減することを `/2` と `-Pairwise` suffix
 
 ### fv_scale
 
-`fv_scale=<N>` は推論時に評価値スケールへ戻す係数 (`round(127 × QB / 学習 scale)`。
-活性化出力が常に 127-scale のため活性化非依存)。
-学習の `--scale` 由来なので、同じ topology でも学習設定が違えば値が変わる。この
-ため **identity 照合には含めない** (後述)。
+`fv_scale=<N>` は推論時に評価値スケールへ戻す係数。Simple で
+`--fv-scale` を省略したときは `round(127 × QB / --scale)` (活性化出力が常に
+127-scale のため活性化非依存) で、`--init-from` では入力 net の値を引き継ぐ。
+`--fv-scale <N>` を明示すると `N` を書き出す。topology と独立に値が変わるため、
+**identity 照合には含めない** (後述)。
 
 ## LayerStack の例
 
@@ -116,16 +117,16 @@ pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 
 Simple は bucket 無しの 4 層アーキ (FT + dense 3 層) で、層次元が文字列上の dense 層チェーンと
 そのまま対応する。`HalfKaHmMerged` feature set・FT 出力 256・隠れ層 32/32 の場合。
 
-活性化 `crelu` (`fv_scale=13`):
+活性化 `crelu` (`fv_scale=28`):
 
 ```
-Features=HalfKaHmMerged(Friend)[73305->256x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32](ClippedReLU[32](AffineTransformSparseInput[32<-512](InputSlice[512(0:512)]))))),fv_scale=13
+Features=HalfKaHmMerged(Friend)[73305->256x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32](ClippedReLU[32](AffineTransformSparseInput[32<-512](InputSlice[512(0:512)]))))),fv_scale=28
 ```
 
-活性化 `screlu` (`fv_scale=27`):
+活性化 `screlu` (`fv_scale=28`):
 
 ```
-Features=HalfKaHmMerged(Friend)[73305->256x2],Network=AffineTransform[1<-32](SqrClippedReLU[32](AffineTransform[32<-32](SqrClippedReLU[32](AffineTransformSparseInput[32<-512](InputSlice[512(0:512)]))))),fv_scale=27
+Features=HalfKaHmMerged(Friend)[73305->256x2],Network=AffineTransform[1<-32](SqrClippedReLU[32](AffineTransform[32<-32](SqrClippedReLU[32](AffineTransformSparseInput[32<-512](InputSlice[512(0:512)]))))),fv_scale=28
 ```
 
 最内から読むと (crelu の例):
@@ -158,8 +159,9 @@ Simple 固有の点:
 - LayerStack: `Features=...` トークンの前方一致 + network hash で照合する。
 - Simple: identity 部全体の一致で照合する。
 
-`fv_scale` は学習 `--scale` 由来で同一アーキでも変動するため、identity 照合の対象に
-しない (ファイルには記録するが照合では無視する)。
+`fv_scale` は学習 scale からの導出、明示 override、入力 net からの継承で
+同一アーキでも変動するため、identity 照合の対象にしない (ファイルには
+記録するが照合では無視する)。
 
 ## 関連
 

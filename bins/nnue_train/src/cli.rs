@@ -348,9 +348,10 @@ pub(crate) struct Cli {
 
     /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
     /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
-    /// loss uses the `--wrm-*` scaling instead). The simple trainer always uses
-    /// it to derive the exported `fv_scale`, so it stays in effect even under
-    /// the WRM there.
+    /// loss uses the `--wrm-*` scaling instead). The simple trainer uses it to
+    /// derive the exported `fv_scale` when `simple --fv-scale` and `--init-from`
+    /// are both omitted. When `simple --fv-scale` is omitted, `--scale` must
+    /// equal `--wrm-nnue2score` whether or not `--init-from` is set.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 
@@ -444,9 +445,9 @@ pub(crate) struct Cli {
 
     /// Use the win-rate-model loss. When set, uses the `loss_wrm` kernel
     /// (applies WRM to both prediction and target); otherwise uses `loss_wdl`
-    /// (plain sigmoid-MSE + `--scale`). The net_output scale becomes
-    /// `out ≈ cp / --wrm-nnue2score`, matching the scale that quantisation
-    /// (`QA=127/QB=64/FV_SCALE=28`) assumes.
+    /// (plain sigmoid-MSE + `--scale`). The learned net-output scale is governed
+    /// by `--wrm-nnue2score`; the exported `fv_scale` determines how that output
+    /// is converted back to engine scores.
     #[arg(long, global = true)]
     pub(crate) win_rate_model: bool,
     /// In-scaling for the WRM prediction side (default 340). Independent of the
@@ -1188,6 +1189,13 @@ pub(crate) enum EffectBucketFactorizeShare {
 /// Simple 4 層アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct SimpleArgs {
+    /// Evaluation scale written to the Simple architecture string. When
+    /// omitted, it is derived from `--scale`, except that `--init-from` retains
+    /// the input net's value. Raw checkpoints do not store `fv_scale`, so repeat
+    /// this option on every `--resume` invocation to preserve an override.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
+    pub(crate) fv_scale: Option<i32>,
+
     /// Layer-dimension preset (`<l1>x2-<l2>-<l3>`). l1 is the accumulator (FT
     /// output) dimension; l2 / l3 are the hidden-layer dimensions. Each can be
     /// overridden individually with `--l1` / `--l2` / `--l3`.

@@ -65,8 +65,18 @@ cargo run --release --bin nnue-train -- \
 The simple trainer only supports the win-rate-model loss (its int8 output
 layer cannot represent the centipawn-scale output that the plain sigmoid loss
 converges to). The `--wrm-*` values above degenerate the WRM to a plain
-sigmoid; use the same scale for `--scale` and every `--wrm-*-scaling` /
-`--wrm-nnue2score`, since `--scale` also sets the exported `fv_scale`.
+sigmoid, so this configuration uses the same value for `--scale`, every
+`--wrm-*-scaling`, and `--wrm-nnue2score`. When `simple --fv-scale` is omitted,
+`--scale` must equal `--wrm-nnue2score`, including with `--init-from`; the
+exported `fv_scale` is `round(127 × QB / --scale)`, except that `--init-from`
+retains the input net's value. Set `simple --fv-scale <N>` to write `N` and waive
+that equality requirement. Raw checkpoints do not store `fv_scale`; to preserve
+an explicit or `--init-from`-inherited value, pass it with `--fv-scale` on every
+`--resume` invocation.
+
+The derived value is a nominal scale based on the training labels, not
+necessarily the playing-strength optimum. Determine the optimum through games
+and bake it in with `--fv-scale`, or set the engine-side option.
 
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*
@@ -190,7 +200,7 @@ own net, see the [setup guide](docs/setup.md).
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
-| **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). Activation outputs are always on a 127 scale regardless of activation, so FV_SCALE = `round(127 × QB / training scale)` is the factor that converts the net output back to a centipawn evaluation |
+| **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). FV_SCALE converts the net output back to a centipawn evaluation. On `simple`, activation outputs are always on a 127 scale, so the default is `round(127 × QB / training scale)`; `--fv-scale` overrides it, while `--init-from` retains the input net's value when the override is omitted |
 | **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
 | **CV** | Coefficient of variation — sample standard deviation divided by the mean, reported as a percentage for benchmark run-to-run variability |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
