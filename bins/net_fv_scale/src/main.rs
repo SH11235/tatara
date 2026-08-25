@@ -106,9 +106,18 @@ fn same_file_identity(
     _left: &fs::Metadata,
     _right: &fs::Metadata,
 ) -> io::Result<bool> {
-    Ok(windows_file_identity(left_path)? == windows_file_identity(right_path)?)
+    Ok(file_identities_match(
+        windows_file_identity(left_path),
+        windows_file_identity(right_path),
+    ))
 }
 
+/// Returns the volume serial number and 64-bit file index reported by Windows.
+///
+/// The 64-bit index is suitable for the NTFS volumes used in practice here, but Microsoft does
+/// not guarantee its uniqueness on ReFS; `FILE_ID_INFO` is required for a 128-bit ReFS identity.
+/// This API can also fail on network filesystems, so callers treat failure as an unavailable
+/// identity and fall back to comparing canonical paths.
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> io::Result<(u32, u64)> {
     use std::fs::File;
@@ -160,6 +169,11 @@ fn windows_file_identity(path: &Path) -> io::Result<(u32, u64)> {
     Ok((information.volume_serial_number, file_index))
 }
 
+#[cfg(any(windows, test))]
+fn file_identities_match<T: PartialEq>(left: io::Result<T>, right: io::Result<T>) -> bool {
+    matches!((left, right), (Ok(left), Ok(right)) if left == right)
+}
+
 #[cfg(not(any(unix, windows)))]
 fn same_file_identity(
     _left_path: &Path,
@@ -176,12 +190,46 @@ fn partial_path(output_path: &Path) -> PathBuf {
     PathBuf::from(partial)
 }
 
+/// Replaces `output_path` atomically after writing its complete contents to a partial file.
+///
+/// On Unix, an existing output's permissions are copied to the partial file before replacement.
+/// On Windows, rename replaces the file object and may replace a file-specific ACL with an ACL
+/// inherited from the parent directory; preserving the complete ACL would require `ReplaceFile`.
 fn write_atomic(output_path: &Path, contents: &[u8]) -> io::Result<()> {
     let partial_path = partial_path(output_path);
+    let absolute_partial_path = std::path::absolute(&partial_path)?;
+    #[cfg(unix)]
+    let output_permissions = match fs::metadata(output_path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
     let mut partial = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&partial_path)?;
+        .open(&partial_path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "partial output `{}` already exists; remove it manually and retry: {error}",
+                        absolute_partial_path.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+
+    #[cfg(unix)]
+    if let Some(permissions) = output_permissions
+        && let Err(error) = partial.set_permissions(permissions)
+    {
+        drop(partial);
+        return Err(cleanup_partial(&partial_path, error));
+    }
 
     let write_result = partial.write_all(contents).and_then(|()| partial.flush());
     drop(partial);
@@ -558,6 +606,13 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_file_identity_does_not_claim_a_match() {
+        let unavailable = io::Error::new(io::ErrorKind::Unsupported, "identity unavailable");
+
+        assert!(!file_identities_match(Err(unavailable), Ok(7_u8)));
+    }
+
+    #[test]
     fn atomic_write_replaces_output_and_removes_partial() {
         let temp = TestDir::new();
         let output_path = temp.path.join("output.bin");
@@ -568,6 +623,42 @@ mod tests {
 
         assert_eq!(fs::read(output_path).unwrap(), b"new");
         assert!(!partial_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_output_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TestDir::new();
+        let output_path = temp.path.join("output.bin");
+        fs::write(&output_path, b"old").unwrap();
+        fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&output_path, b"new").unwrap();
+
+        assert_eq!(fs::metadata(output_path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn atomic_write_reports_stale_partial_with_absolute_path() {
+        let temp = TestDir::new();
+        let output_path = temp.path.join("output.bin");
+        let partial_path = partial_path(&output_path);
+        fs::write(&partial_path, b"stale").unwrap();
+
+        let error = write_atomic(&output_path, b"new").unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains(
+                &std::path::absolute(partial_path)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(message.contains("remove it manually"));
     }
 
     #[test]
