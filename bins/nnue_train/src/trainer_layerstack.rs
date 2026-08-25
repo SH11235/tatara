@@ -1605,6 +1605,7 @@ impl GpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                fv_scale: None,
             },
             &self.raw_ckpt_group_sources(),
         )

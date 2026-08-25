@@ -53,10 +53,10 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=7 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 8);
+    assert_eq!(RAW_CKPT_VERSION, 9);
 }
 
 #[test]
@@ -165,6 +165,49 @@ fn simple_arch() -> RawCkptArch<'static> {
     }
 }
 
+fn write_raw_ckpt_header<W: std::io::Write>(
+    w: &mut W,
+    arch: &RawCkptArch,
+    run_id: &str,
+    superbatch: u64,
+    step_count: u64,
+    lr_horizon: Option<usize>,
+    num_groups: u64,
+) -> std::io::Result<()> {
+    crate::ckpt::write_raw_ckpt_header(
+        w,
+        arch,
+        &RawCkptMeta {
+            run_id,
+            superbatch: superbatch.try_into().expect("test superbatch fits usize"),
+            step_count,
+            lr_horizon,
+            fv_scale: None,
+        },
+        num_groups,
+    )
+}
+
+fn write_raw_ckpt_header_with_fv_scale(
+    buf: &mut Vec<u8>,
+    arch: &RawCkptArch,
+    fv_scale: Option<i32>,
+) {
+    crate::ckpt::write_raw_ckpt_header(
+        buf,
+        arch,
+        &RawCkptMeta {
+            run_id: "fv-scale-test",
+            superbatch: 9,
+            step_count: 90,
+            lr_horizon: Some(120),
+            fv_scale,
+        },
+        8,
+    )
+    .unwrap();
+}
+
 /// `layerstack_arch` の FT factorizer 有効版。
 fn layerstack_arch_factorized() -> RawCkptArch<'static> {
     RawCkptArch {
@@ -196,11 +239,71 @@ fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
     off + 4 + arch_name_len
 }
 
+fn downgrade_v9_to_v8(buf: &mut Vec<u8>, written_fv_scale: Option<i32>) {
+    let fv_scale_off = buf.len() - 4 - 8;
+    let stored_fv_scale =
+        i32::from_le_bytes(buf[fv_scale_off..fv_scale_off + 4].try_into().unwrap());
+    assert_eq!(stored_fv_scale, written_fv_scale.unwrap_or(0));
+    buf.drain(fv_scale_off..fv_scale_off + 4);
+    buf[4..8].copy_from_slice(&8u32.to_le_bytes());
+}
+
 fn downgrade_v8_to_v7(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    downgrade_v9_to_v8(buf, None);
     let off = bucket_mode_field_offset(buf, arch);
     let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     buf.drain(off..off + 4 + len);
     buf[4..8].copy_from_slice(&7u32.to_le_bytes());
+}
+
+#[test]
+fn raw_ckpt_v9_fv_scale_round_trips() {
+    let arch = simple_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header_with_fv_scale(&mut buf, &arch, Some(14));
+
+    let header = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!(header.fv_scale, Some(14));
+}
+
+#[test]
+fn raw_ckpt_v9_zero_fv_scale_reads_as_none() {
+    let arch = simple_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header_with_fv_scale(&mut buf, &arch, Some(0));
+
+    let header = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!(header.fv_scale, None);
+}
+
+#[test]
+fn raw_ckpt_v9_rejects_negative_fv_scale() {
+    let arch = simple_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header_with_fv_scale(&mut buf, &arch, Some(-14));
+
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch)
+        .expect_err("negative fv_scale must be rejected");
+    let io_err = err.downcast::<std::io::Error>().expect("is io::Error");
+    assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(io_err.to_string().contains("fv_scale -14"));
+}
+
+#[test]
+fn raw_ckpt_v8_reads_fv_scale_as_none_and_preserves_other_fields() {
+    let arch = simple_arch();
+    let mut buf = Vec::new();
+    write_raw_ckpt_header_with_fv_scale(&mut buf, &arch, Some(14));
+    downgrade_v9_to_v8(&mut buf, Some(14));
+    assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
+
+    let header = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    assert_eq!(header.fv_scale, None);
+    assert_eq!(header.superbatch, 9);
+    assert_eq!(header.step_count, 90);
+    assert_eq!(header.lr_horizon, Some(120));
+    assert_eq!(header.producer_run_id.as_deref(), Some("fv-scale-test"));
+    assert_eq!(header.num_groups, 8);
 }
 
 fn remove_v7_feature_hash(buf: &mut Vec<u8>, arch: &RawCkptArch) {
@@ -209,6 +312,14 @@ fn remove_v7_feature_hash(buf: &mut Vec<u8>, arch: &RawCkptArch) {
     let max_active_off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8;
     let feature_hash_off = max_active_off + 8 + 1;
     buf.drain(feature_hash_off..feature_hash_off + 4);
+}
+
+fn downgrade_v6_to_v5(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    remove_v7_feature_hash(buf, arch);
+    let factorizer_off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8 + 8;
+    assert_eq!(buf[factorizer_off], 0);
+    buf.drain(factorizer_off..factorizer_off + 1);
+    buf[4..8].copy_from_slice(&5u32.to_le_bytes());
 }
 
 #[test]
@@ -220,8 +331,13 @@ fn raw_ckpt_v8_bucket_modes_round_trip() {
     ] {
         let mut buf = Vec::new();
         write_raw_ckpt_header(&mut buf, &arch, "bucket-mode-roundtrip", 2, 20, None, 10).unwrap();
+        downgrade_v9_to_v8(&mut buf, None);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
         let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
         assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+        assert_eq!(h.producer_run_id.as_deref(), Some("bucket-mode-roundtrip"));
+        assert_eq!(h.lr_horizon, None);
+        assert_eq!(h.fv_scale, None);
     }
 }
 
@@ -242,6 +358,8 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
             10,
         )
         .unwrap();
+        downgrade_v9_to_v8(&mut buf, None);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 8);
         let err = read_raw_ckpt_header(
             &mut Cursor::new(&buf),
             &layerstack_arch_with_mode(requested),
@@ -463,12 +581,15 @@ fn raw_ckpt_header_v5_round_trips_with_lr_horizon() {
     let arch = layerstack_arch();
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &arch, "net-20260520-1234", 7, 99, Some(123), 10).unwrap();
+    downgrade_v6_to_v5(&mut buf, &arch);
+    assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 5);
     let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     assert_eq!(h.superbatch, 7);
     assert_eq!(h.step_count, 99);
     assert_eq!(h.num_groups, 10);
     assert_eq!(h.producer_run_id.as_deref(), Some("net-20260520-1234"));
     assert_eq!(h.lr_horizon, Some(123));
+    assert_eq!(h.fv_scale, None);
 }
 
 #[test]

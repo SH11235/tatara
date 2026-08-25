@@ -81,11 +81,11 @@ pairwise 乗算で FT 出力が半減することを `/2` と `-Pairwise` suffix
 
 ### fv_scale
 
-`fv_scale=<N>` は推論時に評価値スケールへ戻す係数。Simple で
-`--fv-scale` を省略したときは `round(127 × QB / --scale)` (活性化出力が常に
-127-scale のため活性化非依存) で、`--init-from` では入力 net の値を引き継ぐ。
-`--fv-scale <N>` を明示すると `N` を書き出す。topology と独立に値が変わるため、
-**identity 照合には含めない** (後述)。
+`fv_scale=<N>` は推論時に評価値スケールへ戻す係数。Simple では明示した
+`--fv-scale <N>` が常に最優先で `N` を書き出す。省略時は v9 以降の `--resume`
+checkpoint に保存された値、`--init-from` の入力 net の値、
+`round(127 × QB / --scale)` (活性化出力が常に 127-scale のため活性化非依存) の順に
+解決する。topology と独立に値が変わるため、**identity 照合には含めない** (後述)。
 
 ## LayerStack の例
 
@@ -159,8 +159,8 @@ Simple 固有の点:
 - LayerStack: `Features=...` トークンの前方一致 + network hash で照合する。
 - Simple: identity 部全体の一致で照合する。
 
-`fv_scale` は学習 scale からの導出、明示 override、入力 net からの継承で
-同一アーキでも変動するため、identity 照合の対象にしない (ファイルには
+`fv_scale` は学習 scale からの導出、明示 override、checkpoint や入力 net からの
+継承で同一アーキでも変動するため、identity 照合の対象にしない (ファイルには
 記録するが照合では無視する)。
 
 ## 関連

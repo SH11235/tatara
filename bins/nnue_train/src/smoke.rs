@@ -235,10 +235,17 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
-    let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
+    let (sb, _producer, _lr_horizon, checkpoint_fv_scale) =
+        trainer_r.load_raw_checkpoint(&raw_path)?;
     trainer_r.sync_ft_forward_weights()?;
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
+    }
+    if checkpoint_fv_scale != Some(smoke_fv_scale) {
+        return Err(format!(
+            "raw round-trip fv_scale mismatch: got {checkpoint_fv_scale:?}, want {smoke_fv_scale}"
+        )
+        .into());
     }
     let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     let _ = std::fs::remove_file(&raw_path);
