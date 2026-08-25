@@ -1,5 +1,7 @@
-use std::fs;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser};
 use nnue_format::{
@@ -28,7 +30,7 @@ struct Args {
     /// Set fv_scale in the range 1..=128.
     #[arg(long, value_name = "N", value_parser = parse_fv_scale)]
     fv_scale: Option<u8>,
-    /// Remove fv_scale from the architecture string.
+    /// Remove fv_scale from a LayerStack architecture string. Simple/HalfKP loaders require it.
     #[arg(long)]
     remove: bool,
 }
@@ -45,10 +47,165 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(value) => Rewrite::Set(value),
         None => Rewrite::Remove,
     };
-    let input = fs::read(&args.input)?;
+    rewrite_file(&args.input, &args.output, rewrite)
+}
+
+fn rewrite_file(
+    input_path: &Path,
+    output_path: &Path,
+    rewrite: Rewrite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if paths_alias(input_path, output_path)? {
+        return Err(format!(
+            "input and output refer to the same file: `{}`",
+            input_path.display()
+        )
+        .into());
+    }
+
+    let input = fs::read(input_path)?;
     let output = rewrite_fv_scale(&input, rewrite)?;
-    fs::write(&args.output, output)?;
+    write_atomic(output_path, &output)?;
     Ok(())
+}
+
+fn paths_alias(input_path: &Path, output_path: &Path) -> io::Result<bool> {
+    let input_metadata = fs::metadata(input_path)?;
+    let output_metadata = match fs::metadata(output_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    if same_file_identity(input_path, output_path, &input_metadata, &output_metadata)? {
+        return Ok(true);
+    }
+
+    Ok(matches!(
+        (fs::canonicalize(input_path), fs::canonicalize(output_path)),
+        (Ok(input), Ok(output)) if input == output
+    ))
+}
+
+#[cfg(unix)]
+fn same_file_identity(
+    _left_path: &Path,
+    _right_path: &Path,
+    left: &fs::Metadata,
+    right: &fs::Metadata,
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_file_identity(
+    left_path: &Path,
+    right_path: &Path,
+    _left: &fs::Metadata,
+    _right: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(windows_file_identity(left_path)? == windows_file_identity(right_path)?)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> io::Result<(u32, u64)> {
+    use std::fs::File;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetFileInformationByHandle"]
+        fn get_file_information_by_handle(
+            file: RawHandle,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let file = File::open(path)?;
+    let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+    // SAFETY: `file` owns a valid handle and `information` points to enough writable memory for
+    // the Windows API structure. The value is read only after the call reports success.
+    if unsafe { get_file_information_by_handle(file.as_raw_handle(), information.as_mut_ptr()) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle initialized the complete structure on success.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Ok((information.volume_serial_number, file_index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(
+    _left_path: &Path,
+    _right_path: &Path,
+    _left: &fs::Metadata,
+    _right: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn partial_path(output_path: &Path) -> PathBuf {
+    let mut partial = OsString::from(output_path.as_os_str());
+    partial.push(".partial");
+    PathBuf::from(partial)
+}
+
+fn write_atomic(output_path: &Path, contents: &[u8]) -> io::Result<()> {
+    let partial_path = partial_path(output_path);
+    let mut partial = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial_path)?;
+
+    let write_result = partial.write_all(contents).and_then(|()| partial.flush());
+    drop(partial);
+    if let Err(error) = write_result {
+        return Err(cleanup_partial(&partial_path, error));
+    }
+
+    if let Err(error) = fs::rename(&partial_path, output_path) {
+        return Err(cleanup_partial(&partial_path, error));
+    }
+    Ok(())
+}
+
+fn cleanup_partial(partial_path: &Path, operation_error: io::Error) -> io::Error {
+    match fs::remove_file(partial_path) {
+        Ok(()) => operation_error,
+        Err(cleanup_error) => io::Error::new(
+            operation_error.kind(),
+            format!(
+                "{operation_error}; also failed to remove `{}`: {cleanup_error}",
+                partial_path.display()
+            ),
+        ),
+    }
 }
 
 fn parse_fv_scale(value: &str) -> Result<u8, String> {
@@ -209,10 +366,13 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
-    use nnue_format::LayerStackWeights;
+    use clap::{CommandFactory, Parser};
     use nnue_format::layerstack_weights::DEFAULT_NUM_BUCKETS;
+    use nnue_format::{
+        LayerStackWeights, SimpleActivation, SimpleId, SimpleWeights, save_yaneuraou,
+    };
     use shogi_features::FeatureSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const ARCH_WITHOUT_SCALE: &str = "Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](AffineTransform[16<-3072](InputSlice[3072(0:3072)])))))";
     const SIMPLE_ARCH_WITHOUT_SCALE: &str = "Features=HalfKP(Friend)[125388->256x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32](ClippedReLU[32](AffineTransformSparseInput[32<-512](InputSlice[512(0:512)])))))";
@@ -220,6 +380,8 @@ mod tests {
     const TEST_FT_OUT: usize = 8;
     const TEST_L1_OUT: usize = 4;
     const TEST_L2_OUT: usize = 3;
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn real_layerstack_file_round_trips_set_and_remove() {
@@ -335,6 +497,89 @@ mod tests {
             Args::try_parse_from(["net_fv_scale", "--input", "a.bin", "--output", "b.bin",])
                 .is_err()
         );
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("LayerStack architecture string"));
+        assert!(help.contains("Simple/HalfKP loaders require it"));
+    }
+
+    #[test]
+    fn real_simple_file_round_trips_set() {
+        let id = SimpleId {
+            feature_set: FeatureSet::HalfKp.spec(),
+            activation: SimpleActivation::CReLU,
+            ft_out: TEST_FT_OUT,
+            l1_out: TEST_L1_OUT,
+            l2_out: TEST_L2_OUT,
+        };
+        let net = SimpleWeights::zeroed(id, 7);
+        let mut input = Vec::new();
+        net.save_quantised(&mut input).unwrap();
+
+        let output = rewrite_fv_scale(&input, Rewrite::Set(37)).unwrap();
+        let loaded = SimpleWeights::load(&mut std::io::Cursor::new(&output), id).unwrap();
+
+        assert_eq!(loaded.fv_scale, 37);
+        assert!(arch_str(&output).ends_with(",fv_scale=37"));
+    }
+
+    #[test]
+    fn real_yaneuraou_file_with_simple_version_is_rejected() {
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let net =
+            LayerStackWeights::zeroed(spec, 32, TEST_L1_OUT, TEST_L2_OUT, DEFAULT_NUM_BUCKETS);
+        let mut input = Vec::new();
+        save_yaneuraou(&mut input, &net).unwrap();
+        assert_eq!(read_u32(&input, 0).unwrap(), SIMPLE_NNUE_VERSION);
+
+        let error = rewrite_fv_scale(&input, Rewrite::Set(37)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a simple HalfKP architecture")
+        );
+    }
+
+    #[test]
+    fn rejects_hard_link_output_alias_without_changing_input() {
+        let temp = TestDir::new();
+        let input_path = temp.path.join("input.bin");
+        let output_path = temp.path.join("output.bin");
+        let input = layerstack_file(LAYERSTACK_NNUE_VERSION, ARCH_WITHOUT_SCALE);
+        fs::write(&input_path, &input).unwrap();
+        fs::hard_link(&input_path, &output_path).unwrap();
+
+        let error = rewrite_file(&input_path, &output_path, Rewrite::Set(37)).unwrap_err();
+
+        assert!(error.to_string().contains("refer to the same file"));
+        assert_eq!(fs::read(&input_path).unwrap(), input);
+        assert_eq!(fs::read(&output_path).unwrap(), input);
+    }
+
+    #[test]
+    fn atomic_write_replaces_output_and_removes_partial() {
+        let temp = TestDir::new();
+        let output_path = temp.path.join("output.bin");
+        let partial_path = partial_path(&output_path);
+        fs::write(&output_path, b"old").unwrap();
+
+        write_atomic(&output_path, b"new").unwrap();
+
+        assert_eq!(fs::read(output_path).unwrap(), b"new");
+        assert!(!partial_path.exists());
+    }
+
+    #[test]
+    fn atomic_write_cleans_partial_when_rename_fails() {
+        let temp = TestDir::new();
+        let output_path = temp.path.join("output-dir");
+        let partial_path = partial_path(&output_path);
+        fs::create_dir(&output_path).unwrap();
+
+        assert!(write_atomic(&output_path, b"new").is_err());
+
+        assert!(!partial_path.exists());
     }
 
     #[test]
@@ -515,5 +760,25 @@ mod tests {
             DEFAULT_NUM_BUCKETS,
         )
         .unwrap();
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("net-fv-scale-{}-{sequence}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).unwrap();
+        }
     }
 }
