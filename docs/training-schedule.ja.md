@@ -3,7 +3,8 @@
 # 学習スケジュール
 
 1 つの run には独立した 2 つの scheduler がある: **学習率**（`--lr-schedule`）と
-**WDL lambda**（`--wdl` / `--start-wdl` / `--end-wdl`）。どちらも CLI 引数と
+**WDL lambda**（`--wdl` / `--start-wdl` / `--end-wdl` /
+`--wdl-cycle-delta`）。どちらも CLI 引数と
 superbatch index の関数として run ごとに再計算される。学習手順そのものは
 [docs/training-quickstart.ja.md](training-quickstart.ja.md) を、各フラグの正確な
 構文・範囲・default は `nnue-train --help` を参照（フラグ単位の説明はヘルプ
@@ -106,8 +107,12 @@ taper は `--start-wdl` に縮退する。
 `base + d` まで warmup してから base まで cooldown する。warmup の長さは
 `--wdl-cycle-warmup-pct`（既定 `0.25`）で指定する。`--wdl-schedule-superbatch`
 を指定すると horizon を固定でき、省略時は `--superbatches` を使う。schedule は
-superbatch index の関数なので resume 後も同じ曲線を続ける。delta は負でもよいが、
-`--wdl` との和が `[0, 1]` に収まる必要がある。
+superbatch index の関数なので、horizon の入力が変わらない限り resume 後も同じ
+曲線を続ける。学習率と違い horizon は checkpoint に保存されないため、resume で
+`--superbatches` を延長しうる run では `--wdl-schedule-superbatch` を明示して
+曲線を固定すること。horizon が 1 superbatch だと cycle の区間が無く lambda は
+base のまま。`--wdl-cycle-warmup-pct 1.0` では cooldown が無く、horizon で
+base へ戻る。delta は負でもよいが、`--wdl` との和が `[0, 1]` に収まる必要がある。
 
 ### 引き分けと validation
 

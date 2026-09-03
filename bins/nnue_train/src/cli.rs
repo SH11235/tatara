@@ -371,7 +371,7 @@ pub(crate) struct Cli {
 
     /// Train positions whose WDL label is 0.5 (a draw, or a position without a
     /// game result) on the score target only (lambda 0). Genuine draws such as
-    /// repetition draws are excluded too.
+    /// repetition draws also use the score-only target.
     #[arg(long, global = true)]
     pub(crate) wdl_ignore_draws: bool,
 

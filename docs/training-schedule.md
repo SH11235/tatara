@@ -3,7 +3,8 @@
 # Training schedules
 
 A run has two independent schedulers: the **learning rate** (`--lr-schedule`) and
-the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl`). Both are recomputed
+the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl` /
+`--wdl-cycle-delta`). Both are recomputed
 each run as a function of the CLI arguments and the superbatch index. For the
 per-run training steps themselves see
 [docs/training-quickstart.md](training-quickstart.md); for the exact flag syntax,
@@ -116,7 +117,13 @@ warmup occupies `--wdl-cycle-warmup-pct` of the horizon (default `0.25`). The
 delta may be negative, provided `--wdl` plus the delta remains in `[0, 1]`. Set
 `--wdl-schedule-superbatch` to make the horizon explicit; otherwise it is
 `--superbatches`. The schedule is a function of the superbatch index, so resume
-continues the same curve. Values are required to remain in `[0, 1]`.
+continues the same curve as long as the horizon inputs are unchanged; unlike
+the learning-rate horizon it is not stored in the checkpoint, so a run that may
+be extended with a larger `--superbatches` on resume should pass
+`--wdl-schedule-superbatch` explicitly to pin the curve. A single-superbatch
+horizon leaves no room for the cycle, so lambda stays at the base. With
+`--wdl-cycle-warmup-pct 1.0` there is no cooldown: lambda returns to the base
+at the horizon instead of easing back.
 
 ### Draws and validation
 

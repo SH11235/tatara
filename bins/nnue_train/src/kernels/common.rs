@@ -88,7 +88,8 @@ pub fn loss_wdl(
 ///
 /// - target: `pt = (score - target_offset)/target_scaling`、`pmt = (-score -
 ///   target_offset)/target_scaling`、`target_wrm = 0.5*(1 + sigmoid(pt) - sigmoid(pmt))`、
-///   `target = lambda*wdl + (1-lambda)*target_wrm`。`target_offset` / `target_scaling` は
+///   `target = lambda*wdl + (1-lambda)*target_wrm` (`ignore_draws` 有効時は
+///   `wdl == 0.5` の行のみ lambda を 0 に置換)。`target_offset` / `target_scaling` は
 ///   WRM target sigmoid の中心と入力スケールで、CLI `--wrm-target-offset` /
 ///   `--wrm-target-scaling` から渡る (既定 270 / 380、score 分布に応じて再調整可)。
 /// - prediction: `scorenet = out * nnue2score`、`q = sigmoid((scorenet - in_offset)/in_scaling)`、

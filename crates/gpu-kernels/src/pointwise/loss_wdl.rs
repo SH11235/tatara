@@ -12,7 +12,8 @@
 //! per position i:
 //!     p   = sigmoid(out[i] * scale)            # NNUE eval を確率に
 //!     ys  = sigmoid(score[i] * scale)          # 教師 cp score を確率に
-//!     y   = lambda * wdl[i] + (1 - lambda) * ys     # WDL blend
+//!     lam = (ignore_draws && wdl[i] == 0.5) ? 0 : lambda   # result 欠損行は score のみ
+//!     y   = lam * wdl[i] + (1 - lam) * ys      # WDL blend
 //!     err = p - y
 //!     loss_acc += err^2                        # un-normalized sum
 //!     dl_dout[i] = 2 * err * p * (1 - p) * scale * per_pos_norm[i]
