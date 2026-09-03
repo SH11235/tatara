@@ -3202,64 +3202,66 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let wdl = vec![1.0_f32, 0.0, 0.5, 1.0];
     let b = out.len();
     let per_pos_norm = 1.0_f32 / b as f32;
-    let lambda = 0.0_f32;
+    for &(lambda, ignore_draws) in &[(0.0_f32, false), (0.7, true)] {
+        let mut dl_cpu = vec![0.0_f32; b];
+        let mut loss_cpu = 0.0_f64;
+        loss_wrm_cpu(
+            &out,
+            &score,
+            &wdl,
+            &vec![per_pos_norm; b],
+            &mut dl_cpu,
+            &mut loss_cpu,
+            lambda,
+            WRM_NNUE2SCORE,
+            WRM_IN_SCALING,
+            WRM_IN_OFFSET,
+            WRM_TARGET_OFFSET,
+            WRM_TARGET_SCALING,
+            2.0,
+            0.0,
+            0.0,
+            0.5,
+            false,
+            ignore_draws,
+            b,
+        );
 
-    let mut dl_cpu = vec![0.0_f32; b];
-    let mut loss_cpu = 0.0_f64;
-    loss_wrm_cpu(
-        &out,
-        &score,
-        &wdl,
-        &vec![per_pos_norm; b],
-        &mut dl_cpu,
-        &mut loss_cpu,
-        lambda,
-        WRM_NNUE2SCORE,
-        WRM_IN_SCALING,
-        WRM_IN_OFFSET,
-        WRM_TARGET_OFFSET,
-        WRM_TARGET_SCALING,
-        2.0,
-        0.0,
-        0.0,
-        0.5,
-        false,
-        b,
-    );
-
-    let out_dev = DeviceBuffer::from_host(&stream, &out)?;
-    let score_dev = DeviceBuffer::from_host(&stream, &score)?;
-    let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
-    let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
-    let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
-    unsafe {
-        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-        // stream の完了を待つ同期点まで生存する device allocation。
-        cuda_launch! {
-            kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
-            args: [
-                slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                slice_mut(dl_dev), slice(loss_dev), lambda,
-                WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-                2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
-            ]
-        }
-    }?;
-    stream.synchronize()?;
-    // libdevice exp と std exp の差で grad は ~ulp レベルずれるため relative tolerance。
-    assert_close_rel(
-        "loss_wrm/default grad",
-        &dl_dev.to_host_vec(&stream)?,
-        &dl_cpu,
-        1e-4,
-    );
-    let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
-    let diff = (loss_gpu - loss_cpu).abs();
-    assert!(
-        diff <= 1e-4 * (1.0 + loss_cpu.abs()),
-        "loss_wrm/default loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
-    );
+        let out_dev = DeviceBuffer::from_host(&stream, &out)?;
+        let score_dev = DeviceBuffer::from_host(&stream, &score)?;
+        let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
+        let mut dl_dev = DeviceBuffer::<f32>::zeroed(&stream, b)?;
+        let loss_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        let sum_w_dev = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
+                args: [
+                    slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
+                    slice_mut(dl_dev), slice(loss_dev), lambda,
+                    WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
+                    2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32,
+                    ignore_draws as u32, b as u32
+                ]
+            }
+        }?;
+        stream.synchronize()?;
+        // libdevice exp と std exp の差で grad は ~ulp レベルずれるため relative tolerance。
+        assert_close_rel(
+            &format!("loss_wrm/default lambda={lambda} ignore_draws={ignore_draws} grad"),
+            &dl_dev.to_host_vec(&stream)?,
+            &dl_cpu,
+            1e-4,
+        );
+        let loss_gpu = loss_dev.to_host_vec(&stream)?[0];
+        let diff = (loss_gpu - loss_cpu).abs();
+        assert!(
+            diff <= 1e-4 * (1.0 + loss_cpu.abs()),
+            "loss_wrm/default lambda={lambda} ignore_draws={ignore_draws} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+        );
+    }
     Ok(())
 }
 
@@ -3301,6 +3303,7 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         w1,
         w2,
         true,
+        false,
         b,
     );
 
@@ -3330,7 +3333,7 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
                 slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
                 slice_mut(dl_dev), slice(loss_dev), lambda,
                 WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, 0_u32, b as u32
             ]
         }
     }?;
@@ -3387,6 +3390,7 @@ fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::E
         0.0,
         0.5,
         false,
+        false,
         b,
     );
 
@@ -3405,7 +3409,7 @@ fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::E
                 slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
                 slice_mut(dl_dev), slice(loss_dev), lambda,
                 WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-                2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, b as u32
+                2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, 0_u32, b as u32
             ]
         }
     }?;
@@ -3462,6 +3466,7 @@ fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::
         w1,
         w2,
         true,
+        false,
         b,
     );
 
@@ -3491,7 +3496,7 @@ fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::
                 slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
                 slice_mut(dl_dev), slice(loss_dev), lambda,
                 WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
-                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, b as u32
+                pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, 0_u32, b as u32
             ]
         }
     }?;
@@ -5617,7 +5622,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let out_dev = DeviceBuffer::from_host(&stream, &out)?;
     let score_dev = DeviceBuffer::from_host(&stream, &score)?;
     let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
-    for &lambda in &[0.0_f32, 0.7, 1.0] {
+    for &(lambda, ignore_draws) in &[(0.0_f32, false), (0.7, true), (1.0, false)] {
         let mut dl_cpu = vec![0.0_f32; b];
         let mut loss_cpu = 0.0_f64;
         loss_wdl_cpu(
@@ -5629,6 +5634,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             &mut loss_cpu,
             lambda,
             scale,
+            ignore_draws,
             b,
         );
 
@@ -5640,7 +5646,8 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             cuda_launch! {
                 kernel: loss_wdl, stream: stream, module: module, config: cfg_1d(b),
                 args: [slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                       slice_mut(dl_dev), slice(loss_dev), lambda, scale, b as u32]
+                       slice_mut(dl_dev), slice(loss_dev), lambda, scale,
+                       ignore_draws as u32, b as u32]
             }
         }?;
         stream.synchronize()?;

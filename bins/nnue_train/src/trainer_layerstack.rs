@@ -128,6 +128,7 @@ impl<'a> StepContext<'a> {
 // ===========================================================================
 
 pub(crate) struct GpuTrainer {
+    pub(crate) wdl_ignore_draws: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
     device_occupancy: DeviceOccupancy,
@@ -935,6 +936,7 @@ impl GpuTrainer {
         // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
+            wdl_ignore_draws: false,
             stream: stream.clone(),
             module,
             device_occupancy,
@@ -2764,7 +2766,7 @@ impl GpuTrainer {
                             batch.per_pos_norm,
                             slice_mut(self.ws.dy_net_output),
                             slice(self.loss_acc),
-                            wdl_lambda, scale, b_u32
+                            wdl_lambda, scale, self.wdl_ignore_draws as u32, b_u32
                         ]
                     }
                 }?;
@@ -2822,6 +2824,7 @@ impl GpuTrainer {
                             pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
                             slice(self.weight_sum_acc),
                             if extended { 1_u32 } else { 0_u32 },
+                            self.wdl_ignore_draws as u32,
                             b_u32
                         ]
                     }

@@ -93,7 +93,7 @@
 /// 本 CPU 実装は同値に、1 周目で `Σw` を f32 weight の f64 和として求め、2 周目で
 /// grad を `w_i / Σw`、loss 寄与を `L_i * w_i * n / Σw` とする。
 ///
-/// 引数 18 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// 引数 19 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
 /// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wrm_cpu(
@@ -114,6 +114,7 @@ pub fn loss_wrm_cpu(
     weight_boost_w1: f32,
     weight_boost_w2: f32,
     extended: bool,
+    ignore_draws: bool,
     n: usize,
 ) {
     // extended のときだけ先に Σw を確定させる (GPU の wrm_weight_sum 相当)。
@@ -139,7 +140,12 @@ pub fn loss_wrm_cpu(
         let pt = (s - target_offset) / target_scaling;
         let pmt = (-s - target_offset) / target_scaling;
         let target_wrm = 0.5_f32 * (1.0_f32 + sigmoid_f32(pt) - sigmoid_f32(pmt));
-        let target = lambda * wdl[i] + (1.0_f32 - lambda) * target_wrm;
+        let lam = if ignore_draws && wdl[i] == 0.5 {
+            0.0
+        } else {
+            lambda
+        };
+        let target = lam * wdl[i] + (1.0_f32 - lam) * target_wrm;
 
         // prediction: WRM applied to net output (scorenet = out * nnue2score)
         let scorenet = out[i] * nnue2score;
@@ -243,6 +249,7 @@ mod tests {
             0.0,
             0.0,
             0.5,
+            false,
             false,
             n,
         );
@@ -676,6 +683,7 @@ mod tests {
             w1,
             w2,
             true,
+            false,
             n,
         );
 
@@ -784,6 +792,7 @@ mod tests {
             0.0, // w1 → weights ≡ 1
             0.5, // w2 (w1=0 なので無関係)
             true,
+            false,
             n,
         );
 
@@ -833,6 +842,7 @@ mod tests {
                 w1,
                 0.5,
                 true,
+                false,
                 n,
             );
             (acc, dl)
@@ -882,6 +892,7 @@ mod tests {
                 0.0,
                 0.5,
                 true,
+                false,
                 1,
             );
             acc
@@ -937,6 +948,7 @@ mod tests {
             w1,
             w2,
             true,
+            false,
             n,
         );
 
@@ -963,6 +975,7 @@ mod tests {
                 w1,
                 w2,
                 true,
+                false,
                 n,
             );
             a
@@ -983,5 +996,41 @@ mod tests {
                 diff / scale
             );
         }
+    }
+
+    #[test]
+    fn ignore_draws_uses_score_target_for_draws_only() {
+        let out = [0.4_f32, -0.7, 0.2];
+        let score = [200.0_f32, -300.0, 100.0];
+        let wdl = [0.5_f32, 0.0, 1.0];
+        let run = |i: usize, lambda: f32, ignore_draws: bool| {
+            let mut grad = [0.0_f32];
+            let mut loss = 0.0_f64;
+            loss_wrm_cpu(
+                &out[i..=i],
+                &score[i..=i],
+                &wdl[i..=i],
+                &[1.0],
+                &mut grad,
+                &mut loss,
+                lambda,
+                600.0,
+                340.0,
+                270.0,
+                270.0,
+                380.0,
+                2.0,
+                0.0,
+                0.0,
+                0.5,
+                false,
+                ignore_draws,
+                1,
+            );
+            (loss, grad[0])
+        };
+        assert_eq!(run(0, 0.8, true), run(0, 0.0, false));
+        assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
+        assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
     }
 }

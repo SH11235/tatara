@@ -424,6 +424,8 @@ pub struct TrainingConfig {
     pub keep_raw_checkpoints: Option<usize>,
     /// どの loss kernel で学習するか (sigmoid-MSE / WRM) + 固定パラメータ。
     pub loss: LossKind,
+    /// validation に使う WDL lambda。未指定時は各 superbatch の training lambda。
+    pub validation_wdl: Option<f32>,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
     /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
@@ -1055,16 +1057,16 @@ where
         };
         let lr_now = lr_scheduler.lr(0, sb);
         let wdl_now = wdl_scheduler.blend(0, sb, cfg.end_superbatch);
+        let validation_wdl = cfg.validation_wdl.unwrap_or(wdl_now);
 
         // held-out validation: superbatch 末に forward-only 検証を 1 回走らせる
         // (`--test-data` 指定時のみ)。training step と同じ loss kind と、当 superbatch
         // 代表の wdl_lambda (`wdl_now` = batch_idx 0 の blend、sb 末 report と同値) で
-        // 測り、test_loss を同 superbatch の training loss と比較可能にする。superbatch
-        // 内で wdl が変動する scheduler (`WarmupWDL` の warmup 区間など) では
-        // batch_idx 0 の値で代表させる近似になる (sb 末 report と同じ扱い)。
+        // 測り、test_loss を同 superbatch の training loss と比較可能にする。
+        // `validation_wdl` が指定された場合は全 validation でその固定値を使う。
         let validation = match &heldout {
             Some(set) => {
-                let report = set.evaluate(backend, wdl_now, cfg.loss)?;
+                let report = set.evaluate(backend, validation_wdl, cfg.loss)?;
                 if !report.mean_loss.is_finite() {
                     eprintln!(
                         "[train] warning: superbatch {sb} held-out validation loss is \
@@ -1078,8 +1080,12 @@ where
         };
         let val_str = match &validation {
             Some(r) => format!(
-                " | test_loss {:.6} | test_acc {:.4}",
-                r.mean_loss, r.accuracy
+                " | test_loss {:.6} | test_acc {:.4}{}",
+                r.mean_loss,
+                r.accuracy,
+                cfg.validation_wdl
+                    .map(|_| format!(" | validation_wdl {:.3}", validation_wdl))
+                    .unwrap_or_default()
             ),
             None => String::new(),
         };
@@ -1474,6 +1480,7 @@ mod tests {
             output_format: OutputFormat::Tatara,
             keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
+            validation_wdl: None,
             score_drop_abs: None,
             score_clamp_abs: None,
             score_source: None,
@@ -1678,6 +1685,11 @@ mod tests {
             wdl: 0.0,
             start_wdl: None,
             end_wdl: None,
+            wdl_cycle_delta: None,
+            wdl_cycle_warmup_pct: None,
+            wdl_schedule_superbatch: None,
+            validation_wdl: None,
+            wdl_ignore_draws: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,

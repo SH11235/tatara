@@ -295,6 +295,7 @@ fn wrm_default_matches_cpu_reference() {
         0.0,
         0.5,
         false,
+        false,
         n,
     );
 
@@ -320,6 +321,7 @@ fn wrm_default_matches_cpu_reference() {
     let mut input_offset = 270.0_f32;
     let mut target_offset = 270.0_f32;
     let mut target_scaling = 380.0_f32;
+    let mut ignore_draws = 0_u32;
     let mut count = n as u32;
     let mut args = [
         arg(&mut output_ptr),
@@ -334,6 +336,7 @@ fn wrm_default_matches_cpu_reference() {
         arg(&mut input_offset),
         arg(&mut target_offset),
         arg(&mut target_scaling),
+        arg(&mut ignore_draws),
         arg(&mut count),
     ];
     // SAFETY: args exactly match native_loss_wrm_default; block size matches shared storage.

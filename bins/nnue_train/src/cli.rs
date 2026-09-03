@@ -330,7 +330,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1e4, global = true)]
     pub(crate) lr_final_div_factor: f32,
 
-    /// WDL blend lambda (constant). Mutually exclusive with the linear-taper
+    /// WDL blend lambda (constant and the base of a cosine cycle). Mutually exclusive with the linear-taper
     /// pair `--start-wdl` / `--end-wdl`.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) wdl: f32,
@@ -345,6 +345,40 @@ pub(crate) struct Cli {
     /// `--start-wdl`. Conflicts with `--wdl`.
     #[arg(long, global = true, conflicts_with = "wdl")]
     pub(crate) end_wdl: Option<f32>,
+
+    /// Add a cosine cycle around the `--wdl` base. A negative delta is allowed
+    /// when the sum of `--wdl` and delta remains in [0, 1].
+    #[arg(
+        long,
+        global = true,
+        allow_negative_numbers = true,
+        conflicts_with_all = ["start_wdl", "end_wdl"]
+    )]
+    pub(crate) wdl_cycle_delta: Option<f32>,
+
+    /// Fraction of the cycle horizon used for the warmup.
+    #[arg(
+        long,
+        default_value_t = 0.25,
+        global = true,
+        requires = "wdl_cycle_delta"
+    )]
+    pub(crate) wdl_cycle_warmup_pct: f32,
+
+    /// Horizon of the WDL cycle in superbatches; defaults to `--superbatches`.
+    #[arg(long, global = true, requires = "wdl_cycle_delta")]
+    pub(crate) wdl_schedule_superbatch: Option<usize>,
+
+    /// Train positions whose WDL label is 0.5 (a draw, or a position without a
+    /// game result) on the score target only (lambda 0). Genuine draws such as
+    /// repetition draws are excluded too.
+    #[arg(long, global = true)]
+    pub(crate) wdl_ignore_draws: bool,
+
+    /// Fixed WDL lambda for held-out validation. If omitted, validation uses the
+    /// training lambda schedule.
+    #[arg(long, global = true)]
+    pub(crate) validation_wdl: Option<f32>,
 
     /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
     /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM

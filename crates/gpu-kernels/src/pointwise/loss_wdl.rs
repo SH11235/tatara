@@ -57,7 +57,7 @@
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 score sigmoid)
 /// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
 ///
-/// 引数 9 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
+/// 引数 10 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
 /// を allow する。
 #[allow(clippy::too_many_arguments)]
 pub fn loss_wdl_cpu(
@@ -69,12 +69,18 @@ pub fn loss_wdl_cpu(
     loss_acc: &mut f64,
     lambda: f32,
     scale: f32,
+    ignore_draws: bool,
     n: usize,
 ) {
     for i in 0..n {
         let p = sigmoid_f32(out[i] * scale);
         let ys = sigmoid_f32(score[i] * scale);
-        let y = lambda * wdl[i] + (1.0_f32 - lambda) * ys;
+        let lam = if ignore_draws && wdl[i] == 0.5 {
+            0.0
+        } else {
+            lambda
+        };
+        let y = lam * wdl[i] + (1.0_f32 - lam) * ys;
         let err = p - y;
         let norm = per_pos_norm[i];
         *loss_acc += (err as f64) * (err as f64);
@@ -117,6 +123,7 @@ mod tests {
             &mut loss_acc,
             lambda,
             scale,
+            false,
             3,
         );
 
@@ -168,6 +175,7 @@ mod tests {
             &mut loss_acc,
             1.0,
             1.0,
+            false,
             1,
         );
         assert_eq!(dl_dout[0], 0.0_f32);
@@ -197,6 +205,7 @@ mod tests {
             &mut loss_acc_a,
             0.0,
             1.0,
+            false,
             4,
         );
 
@@ -211,6 +220,7 @@ mod tests {
             &mut loss_acc_b,
             0.0,
             1.0,
+            false,
             4,
         );
 
@@ -246,6 +256,7 @@ mod tests {
             &mut loss_acc,
             0.5,
             0.0,
+            false,
             3,
         );
         for &g in &dl_dout {
@@ -270,7 +281,18 @@ mod tests {
     fn empty_input_yields_no_changes() {
         let mut dl_dout: Vec<f32> = vec![];
         let mut loss_acc = 7.0_f64;
-        loss_wdl_cpu(&[], &[], &[], &[], &mut dl_dout, &mut loss_acc, 0.5, 1.0, 0);
+        loss_wdl_cpu(
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut dl_dout,
+            &mut loss_acc,
+            0.5,
+            1.0,
+            false,
+            0,
+        );
         assert!(dl_dout.is_empty());
         assert_eq!(loss_acc, 7.0);
     }
@@ -294,6 +316,7 @@ mod tests {
             &mut loss_acc,
             0.0,
             1.0,
+            false,
             1,
         );
         let p = sigmoid_f32(1.0);
@@ -304,5 +327,32 @@ mod tests {
             approx_eq_f64(loss_acc, expected, 1e-12),
             "loss_acc: got {loss_acc} exp {expected}"
         );
+    }
+
+    #[test]
+    fn ignore_draws_uses_score_target_for_draws_only() {
+        let out = [0.4_f32, -0.7, 0.2];
+        let score = [200.0_f32, -300.0, 100.0];
+        let wdl = [0.5_f32, 0.0, 1.0];
+        let run = |i: usize, lambda: f32, ignore_draws: bool| {
+            let mut grad = [0.0_f32];
+            let mut loss = 0.0_f64;
+            loss_wdl_cpu(
+                &out[i..=i],
+                &score[i..=i],
+                &wdl[i..=i],
+                &[1.0],
+                &mut grad,
+                &mut loss,
+                lambda,
+                1.0,
+                ignore_draws,
+                1,
+            );
+            (loss, grad[0])
+        };
+        assert_eq!(run(0, 0.8, true), run(0, 0.0, false));
+        assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
+        assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
     }
 }

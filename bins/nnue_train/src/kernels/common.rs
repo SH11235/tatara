@@ -50,6 +50,7 @@ pub fn loss_wdl(
     loss_acc: &[f64],
     lambda: f32,
     scale: f32,
+    ignore_draws: u32,
     n: u32,
 ) {
     let i = thread::index_1d();
@@ -58,7 +59,12 @@ pub fn loss_wdl(
     }
     let p = 1.0_f32 / (1.0_f32 + (-(out[i.get()] * scale)).exp());
     let ys = 1.0_f32 / (1.0_f32 + (-(score[i.get()] * scale)).exp());
-    let y = lambda * wdl[i.get()] + (1.0_f32 - lambda) * ys;
+    let lam = if ignore_draws != 0 && wdl[i.get()] == 0.5 {
+        0.0
+    } else {
+        lambda
+    };
+    let y = lam * wdl[i.get()] + (1.0_f32 - lam) * ys;
     let err = p - y;
     let norm = per_pos_norm;
 
@@ -149,6 +155,7 @@ pub fn loss_wrm(
     weight_boost_w2: f32,
     sum_w_acc: &[f64], // extended のときのみ参照 (Σw、wrm_weight_sum が事前 reduce)
     extended: u32,     // 0 = 二乗誤差 (bit-identical)、1 = nnue-pytorch 一般化 loss
+    ignore_draws: u32,
     n: u32,
 ) {
     use core::ptr::addr_of_mut;
@@ -169,7 +176,12 @@ pub fn loss_wrm(
         let sig_pt = 1.0_f32 / (1.0_f32 + (-((s - target_offset) / target_scaling)).exp());
         let sig_pmt = 1.0_f32 / (1.0_f32 + (-((-s - target_offset) / target_scaling)).exp());
         let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
-        let target = lambda * wdl[i.get()] + (1.0_f32 - lambda) * target_wrm;
+        let lam = if ignore_draws != 0 && wdl[i.get()] == 0.5 {
+            0.0
+        } else {
+            lambda
+        };
+        let target = lam * wdl[i.get()] + (1.0_f32 - lam) * target_wrm;
 
         // --- prediction (WRM applied to net output) ---
         let scorenet = out[i.get()] * nnue2score;

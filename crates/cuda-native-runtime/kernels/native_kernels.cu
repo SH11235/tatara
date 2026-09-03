@@ -33,6 +33,7 @@ extern "C" __global__ void native_loss_wrm_default(
     float input_offset,
     float target_offset,
     float target_scaling,
+    unsigned int ignore_draws,
     unsigned int n
 ) {
     __shared__ double partial[256];
@@ -45,7 +46,8 @@ extern "C" __global__ void native_loss_wrm_default(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float target = lambda * wdl[i] + (1.0F - lambda) * target_wrm;
+        const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+        const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
 
         const float score_net = output[i] * nnue2score;
         const float q = 1.0F / (1.0F + expf(-((score_net - input_offset) / input_scaling)));
@@ -430,6 +432,7 @@ extern "C" __global__ void loss_wrm(
     const double* weight_sum_accumulator,
     unsigned long long,
     unsigned int extended,
+    unsigned int ignore_draws,
     unsigned int n
 ) {
     __shared__ double partial[256];
@@ -442,7 +445,8 @@ extern "C" __global__ void loss_wrm(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float target = lambda * wdl[i] + (1.0F - lambda) * target_wrm;
+        const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+        const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
         const float score_net = output[i] * nnue2score;
         const float q = 1.0F / (1.0F + expf(-((score_net - input_offset) / input_scaling)));
         const float qm = 1.0F / (1.0F + expf(-((-score_net - input_offset) / input_scaling)));
@@ -502,6 +506,7 @@ extern "C" __global__ void loss_wdl(
     unsigned long long,
     float lambda,
     float scale,
+    unsigned int ignore_draws,
     unsigned int n
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -510,7 +515,8 @@ extern "C" __global__ void loss_wdl(
     }
     const float prediction = 1.0F / (1.0F + expf(-(output[i] * scale)));
     const float score_target = 1.0F / (1.0F + expf(-(score[i] * scale)));
-    const float target = lambda * wdl[i] + (1.0F - lambda) * score_target;
+    const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+    const float target = lam * wdl[i] + (1.0F - lam) * score_target;
     const float error = prediction - target;
     output_gradient[i] = 2.0F * error * prediction * (1.0F - prediction)
         * scale * per_pos_norm;

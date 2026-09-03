@@ -276,8 +276,7 @@ impl HeldoutSet {
     /// backend の forward + loss のみを全検証 batch に回し、平均 loss と
     /// sign-agreement accuracy を集計する。weight は一切更新しない。
     ///
-    /// `wdl_lambda` / `loss` は training step と同じ値を渡す (test_loss を同
-    /// superbatch の training loss と比較可能にするため)。
+    /// `wdl_lambda` / `loss` は caller が validation 用に選んだ値を渡す。
     pub fn evaluate<B: TrainerBackend>(
         &self,
         backend: &mut B,

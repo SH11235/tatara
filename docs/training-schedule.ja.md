@@ -100,6 +100,22 @@ target/release/nnue-train --data <psv> --start-wdl 0.0 --end-wdl 0.5 ... simple
 superbatch が 1 つだけの run（`--superbatches 1`）は補間する区間が無いため、
 taper は `--start-wdl` に縮退する。
 
+### cosine cycle（`--wdl-cycle-delta`）
+
+`--wdl-cycle-delta <d>` は `--wdl` を base とし、half-cosine で
+`base + d` まで warmup してから base まで cooldown する。warmup の長さは
+`--wdl-cycle-warmup-pct`（既定 `0.25`）で指定する。`--wdl-schedule-superbatch`
+を指定すると horizon を固定でき、省略時は `--superbatches` を使う。schedule は
+superbatch index の関数なので resume 後も同じ曲線を続ける。delta は負でもよいが、
+`--wdl` との和が `[0, 1]` に収まる必要がある。
+
+### 引き分けと validation
+
+`--wdl-ignore-draws` を指定すると WDL が `0.5` の局面は lambda=0 として教師
+score の target を使う。他のラベルには選択した schedule を使う。
+`--validation-wdl <value>` を指定すると held-out validation と eval-only の lambda を
+固定でき、省略時は training schedule を使う。
+
 ## 値の記録先
 
 実効スケジュールは run の `experiment.json` の `params` に記録される。`lr_schedule`
@@ -108,6 +124,10 @@ taper は `--start-wdl` に縮退する。
 フィールドは常に存在し（一定 lambda の値）、線形 taper のときは追加で
 `start_wdl` / `end_wdl` が記録される（taper でないときは省略）。taper 時は
 scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` の値は
-使われない。`test_loss` は各 superbatch で `train_loss` と同じ `lambda` で
-計算されるので、両者は同じスケールに乗る（[held-out validation](held-out-validation.ja.md)
+使われない。`--validation-wdl` 未指定なら `test_loss` は各 superbatch で
+`train_loss` と同じ `lambda` で計算されるので、両者は同じスケールに乗る
+（[held-out validation](held-out-validation.ja.md)
 の「指標の読み方」を参照）。
+cycle run では `wdl_cycle_delta` と `wdl_cycle_warmup_pct` も記録され、
+`wdl_schedule_superbatch` は明示した場合のみ記録される。`validation_wdl` は
+指定時のみ、`wdl_ignore_draws` は true の場合のみ記録される。

@@ -475,6 +475,52 @@ impl Display for LinearWDL {
     }
 }
 
+/// WDL lambda cycle with a cosine warmup and cooldown around `base`.
+/// Progress uses the same superbatch increments as `OneCycleLR`: the first
+/// superbatch is already `1 / warmup_sb` into warmup rather than at `base`.
+#[derive(Clone, Copy, Debug)]
+pub struct CycleWDL {
+    pub base: f32,
+    pub delta: f32,
+    pub warmup_pct: f32,
+    pub horizon: Option<usize>,
+}
+
+impl WdlScheduler for CycleWDL {
+    fn blend(&self, _batch: usize, superbatch: usize, max: usize) -> f32 {
+        let horizon = self.horizon.unwrap_or(max);
+        let warmup = ((self.warmup_pct * horizon as f32).round() as usize).min(horizon);
+        let c = if superbatch >= horizon {
+            0.0
+        } else if superbatch <= warmup {
+            let p = superbatch as f32 / warmup.max(1) as f32;
+            cosine_interp(0.0, 1.0, p.min(1.0))
+        } else {
+            let denom = (horizon - warmup).max(1) as f32;
+            let p = (superbatch - warmup) as f32 / denom;
+            cosine_interp(1.0, 0.0, p.min(1.0))
+        };
+        (self.base + self.delta * c).clamp(0.0, 1.0)
+    }
+}
+
+impl Display for CycleWDL {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let horizon = self
+            .horizon
+            .map_or_else(|| "max".to_string(), |v| v.to_string());
+        let warmup = self
+            .horizon
+            .map(|h| (self.warmup_pct * h as f32).round().to_string())
+            .unwrap_or_else(|| format!("{}% of max", self.warmup_pct * 100.0));
+        write!(
+            f,
+            "cycle base {} delta {} warmup to superbatch {} back to base at superbatch {}",
+            self.base, self.delta, warmup, horizon
+        )
+    }
+}
+
 /// `warmup_batches` 期間 (superbatch=1 内) で sub-scheduler の lambda を warmup。
 #[derive(Clone, Debug)]
 pub struct WarmupWDL<W: WdlScheduler> {
@@ -539,6 +585,7 @@ impl<First: WdlScheduler, Second: WdlScheduler> Display for SequenceWDL<First, S
 pub enum WdlSchedulerEnum {
     Constant(ConstantWDL),
     Linear(LinearWDL),
+    Cycle(CycleWDL),
 }
 
 impl WdlSchedulerEnum {
@@ -551,6 +598,15 @@ impl WdlSchedulerEnum {
     pub fn linear(start: f32, end: f32) -> Self {
         Self::Linear(LinearWDL { start, end })
     }
+
+    pub fn cycle(base: f32, delta: f32, warmup_pct: f32, horizon: Option<usize>) -> Self {
+        Self::Cycle(CycleWDL {
+            base,
+            delta,
+            warmup_pct,
+            horizon,
+        })
+    }
 }
 
 impl WdlScheduler for WdlSchedulerEnum {
@@ -558,6 +614,7 @@ impl WdlScheduler for WdlSchedulerEnum {
         match self {
             Self::Constant(s) => s.blend(batch, superbatch, max),
             Self::Linear(s) => s.blend(batch, superbatch, max),
+            Self::Cycle(s) => s.blend(batch, superbatch, max),
         }
     }
 }
@@ -567,6 +624,7 @@ impl Display for WdlSchedulerEnum {
         match self {
             Self::Constant(s) => Display::fmt(s, f),
             Self::Linear(s) => Display::fmt(s, f),
+            Self::Cycle(s) => Display::fmt(s, f),
         }
     }
 }
@@ -842,6 +900,45 @@ mod tests {
         // max=1 のとき grad = 1/1、superbatch=1 で start + 1*0 = 0.0。
         let v = w.blend(0, 1, 1);
         assert!(v.is_finite());
+    }
+
+    #[test]
+    fn cycle_wdl_has_cosine_warmup_and_cooldown() {
+        let w = CycleWDL {
+            base: 0.2,
+            delta: 0.3,
+            warmup_pct: 0.25,
+            horizon: Some(8),
+        };
+        assert!((w.blend(0, 1, 99) - 0.35).abs() < EPS);
+        assert!((w.blend(0, 2, 99) - 0.5).abs() < EPS);
+        assert!((w.blend(0, 5, 99) - 0.35).abs() < EPS);
+        assert!((w.blend(0, 8, 99) - 0.2).abs() < EPS);
+        assert!((w.blend(0, 9, 99) - 0.2).abs() < EPS);
+    }
+
+    #[test]
+    fn cycle_wdl_clamps_and_uses_max_without_horizon() {
+        let w = CycleWDL {
+            base: 0.9,
+            delta: 0.3,
+            warmup_pct: 0.0,
+            horizon: None,
+        };
+        assert!((w.blend(0, 1, 4) - 1.0).abs() < EPS);
+        assert_eq!(w.blend(0, 4, 4), 0.9);
+    }
+
+    #[test]
+    fn cycle_wdl_warmup_pct_one_returns_to_base_at_horizon() {
+        let w = CycleWDL {
+            base: 0.2,
+            delta: 0.3,
+            warmup_pct: 1.0,
+            horizon: Some(4),
+        };
+        assert!((w.blend(0, 2, 4) - 0.35).abs() < EPS);
+        assert_eq!(w.blend(0, 4, 4), 0.2);
     }
 
     #[test]

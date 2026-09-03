@@ -1205,6 +1205,7 @@ fn wdl_taper_flags_parse_global_and_conflict_with_wdl() {
     match build_wdl_scheduler(&cli).expect("constant scheduler") {
         WdlSchedulerEnum::Constant(c) => assert_eq!(c.value, 0.0),
         WdlSchedulerEnum::Linear(_) => panic!("expected constant WDL"),
+        WdlSchedulerEnum::Cycle(_) => panic!("expected constant WDL"),
     }
 
     // 両指定で linear taper。`global = true` なので subcommand 後置でも accept。
@@ -1224,6 +1225,7 @@ fn wdl_taper_flags_parse_global_and_conflict_with_wdl() {
             assert_eq!(l.end, 0.0);
         }
         WdlSchedulerEnum::Constant(_) => panic!("expected linear WDL"),
+        WdlSchedulerEnum::Cycle(_) => panic!("expected linear WDL"),
     }
 
     // `--wdl` と `--start-wdl` / `--end-wdl` の同時指定は parse 時に reject。
@@ -1271,4 +1273,76 @@ fn build_wdl_scheduler_rejects_partial_and_out_of_range() {
     ])
     .expect("parses");
     assert!(build_wdl_scheduler(&nan).is_err());
+}
+
+#[test]
+fn cycle_wdl_flags_parse_and_build() {
+    use crate::training::build_wdl_scheduler;
+    use nnue_train::schedule::WdlSchedulerEnum;
+
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--wdl",
+        "0.2",
+        "--wdl-cycle-delta",
+        "0.3",
+        "--wdl-cycle-warmup-pct",
+        "0.5",
+        "--wdl-schedule-superbatch",
+        "8",
+        "simple",
+    ])
+    .expect("cycle flags parse globally after subcommand-independent options");
+    match build_wdl_scheduler(&cli).expect("cycle scheduler") {
+        WdlSchedulerEnum::Cycle(cycle) => {
+            assert_eq!(cycle.base, 0.2);
+            assert_eq!(cycle.delta, 0.3);
+            assert_eq!(cycle.warmup_pct, 0.5);
+            assert_eq!(cycle.horizon, Some(8));
+        }
+        _ => panic!("expected cycle scheduler"),
+    }
+    let post_subcommand = Cli::try_parse_from([
+        "nnue-trainer",
+        "simple",
+        "--wdl",
+        "0.2",
+        "--wdl-cycle-delta",
+        "0.3",
+    ])
+    .expect("cycle flags parse after subcommand");
+    assert!(matches!(
+        build_wdl_scheduler(&post_subcommand).expect("cycle scheduler"),
+        WdlSchedulerEnum::Cycle(_)
+    ));
+    assert!(
+        Cli::try_parse_from([
+            "nnue-train",
+            "--wdl-cycle-delta",
+            "0.3",
+            "--start-wdl",
+            "0",
+            "simple"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from(["nnue-train", "--wdl-cycle-warmup-pct", "0.5", "simple"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from(["nnue-train", "--wdl-schedule-superbatch", "1", "simple"]).is_err()
+    );
+
+    let invalid = simple_cli(&["--wdl-cycle-delta", "0.3", "--wdl-cycle-warmup-pct", "1.5"]);
+    assert!(build_wdl_scheduler(&invalid).is_err());
+    let invalid = simple_cli(&["--wdl-cycle-delta", "0.3", "--wdl-schedule-superbatch", "0"]);
+    assert!(build_wdl_scheduler(&invalid).is_err());
+    let invalid = simple_cli(&["--wdl", "0.9", "--wdl-cycle-delta", "0.2"]);
+    assert!(build_wdl_scheduler(&invalid).is_err());
+    let negative = simple_cli(&["--wdl", "0.5", "--wdl-cycle-delta", "-0.3"]);
+    assert!(build_wdl_scheduler(&negative).is_ok());
+    let invalid = simple_cli(&["--wdl", "0.2", "--wdl-cycle-delta", "-0.3"]);
+    assert!(build_wdl_scheduler(&invalid).is_err());
+    let invalid = simple_cli(&["--validation-wdl", "1.5"]);
+    assert!(build_wdl_scheduler(&invalid).is_err());
 }

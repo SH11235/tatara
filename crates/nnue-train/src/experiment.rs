@@ -132,6 +132,16 @@ pub struct Params {
     pub start_wdl: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_wdl: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wdl_cycle_delta: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wdl_cycle_warmup_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wdl_schedule_superbatch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_wdl: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wdl_ignore_draws: bool,
     pub scale: f32,
     pub weight_decay: f32,
     /// optimizer の param-group (ft / dense / bias) ごとの有効 weight_decay と
@@ -658,6 +668,11 @@ mod tests {
             wdl: 0.0,
             start_wdl: None,
             end_wdl: None,
+            wdl_cycle_delta: None,
+            wdl_cycle_warmup_pct: None,
+            wdl_schedule_superbatch: None,
+            validation_wdl: None,
+            wdl_ignore_draws: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
