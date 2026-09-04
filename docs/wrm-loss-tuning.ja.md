@@ -56,6 +56,7 @@ v9 以降の raw checkpoint はこの値を保存するため再指定不要。v
 
 `--wdl` (上式の `lambda`) は target を WRM 勝率と WDL ラベル ({0, 0.5, 1}) で混ぜる
 係数。既定 0 では target = `target_wrm` のみ、1 で純 WDL になる。
+`--wdl-ignore-draws` を指定すると、WDL ラベルが `0.5` の局面は教師 score の target を使う。
 
 ## loss の一般化 (pow_exp / asymmetry / weight boost)
 

@@ -3,7 +3,8 @@
 # 学習スケジュール
 
 1 つの run には独立した 2 つの scheduler がある: **学習率**（`--lr-schedule`）と
-**WDL lambda**（`--wdl` / `--start-wdl` / `--end-wdl`）。どちらも CLI 引数と
+**WDL lambda**（`--wdl` / `--start-wdl` / `--end-wdl` /
+`--wdl-cycle-delta`）。どちらも CLI 引数と
 superbatch index の関数として run ごとに再計算される。学習手順そのものは
 [docs/training-quickstart.ja.md](training-quickstart.ja.md) を、各フラグの正確な
 構文・範囲・default は `nnue-train --help` を参照（フラグ単位の説明はヘルプ
@@ -100,6 +101,26 @@ target/release/nnue-train --data <psv> --start-wdl 0.0 --end-wdl 0.5 ... simple
 superbatch が 1 つだけの run（`--superbatches 1`）は補間する区間が無いため、
 taper は `--start-wdl` に縮退する。
 
+### cosine cycle（`--wdl-cycle-delta`）
+
+`--wdl-cycle-delta <d>` は `--wdl` を base とし、half-cosine で
+`base + d` まで warmup してから base まで cooldown する。warmup の長さは
+`--wdl-cycle-warmup-pct`（既定 `0.25`）で指定する。`--wdl-schedule-superbatch`
+を指定すると horizon を固定でき、省略時は `--superbatches` を使う。schedule は
+superbatch index の関数なので、horizon の入力が変わらない限り resume 後も同じ
+曲線を続ける。学習率と違い horizon は checkpoint に保存されないため、resume で
+`--superbatches` を延長しうる run では `--wdl-schedule-superbatch` を明示して
+曲線を固定すること。horizon が 1 superbatch だと cycle の区間が無く lambda は
+base のまま。`--wdl-cycle-warmup-pct 1.0` では cooldown が無く、horizon で
+base へ戻る。delta は負でもよいが、`--wdl` との和が `[0, 1]` に収まる必要がある。
+
+### 引き分けと validation
+
+`--wdl-ignore-draws` を指定すると WDL が `0.5` の局面は lambda=0 として教師
+score の target を使う。他のラベルには選択した schedule を使う。
+`--validation-wdl <value>` を指定すると held-out validation と eval-only の lambda を
+固定でき、省略時は training schedule を使う。
+
 ## 値の記録先
 
 実効スケジュールは run の `experiment.json` の `params` に記録される。`lr_schedule`
@@ -108,6 +129,10 @@ taper は `--start-wdl` に縮退する。
 フィールドは常に存在し（一定 lambda の値）、線形 taper のときは追加で
 `start_wdl` / `end_wdl` が記録される（taper でないときは省略）。taper 時は
 scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` の値は
-使われない。`test_loss` は各 superbatch で `train_loss` と同じ `lambda` で
-計算されるので、両者は同じスケールに乗る（[held-out validation](held-out-validation.ja.md)
+使われない。`--validation-wdl` 未指定なら `test_loss` は各 superbatch で
+`train_loss` と同じ `lambda` で計算されるので、両者は同じスケールに乗る
+（[held-out validation](held-out-validation.ja.md)
 の「指標の読み方」を参照）。
+cycle run では `wdl_cycle_delta` と `wdl_cycle_warmup_pct` も記録され、
+`wdl_schedule_superbatch` は明示した場合のみ記録される。`validation_wdl` は
+指定時のみ、`wdl_ignore_draws` は true の場合のみ記録される。

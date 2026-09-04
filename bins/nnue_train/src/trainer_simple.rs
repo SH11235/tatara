@@ -224,6 +224,7 @@ impl SimpleGpuWorkspace {
 /// は次元が小さく untiled `dense_mm_*` で残す。FT は専用 `sparse_ft_*` kernel、活性化と
 /// loss は固有 kernel。
 pub(crate) struct SimpleGpuTrainer {
+    pub(crate) wdl_ignore_draws: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
     /// `dense_bias_grad_tiled` の grid 上限を実機 SM 数から導出するための occupancy
@@ -512,6 +513,7 @@ impl SimpleGpuTrainer {
         };
         let norm_scratch = DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?;
         Ok(Self {
+            wdl_ignore_draws: false,
             ft_w,
             ft_b,
             l1_w,
@@ -1434,6 +1436,7 @@ impl SimpleGpuTrainer {
                             slice(self.loss_acc),
                             wdl_lambda,
                             scale,
+                            self.wdl_ignore_draws as u32,
                             b_u32
                         ]
                     }
@@ -1493,6 +1496,7 @@ impl SimpleGpuTrainer {
                             pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
                             slice(self.weight_sum_acc),
                             if extended { 1_u32 } else { 0_u32 },
+                            self.wdl_ignore_draws as u32,
                             b_u32
                         ]
                     }

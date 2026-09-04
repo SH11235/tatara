@@ -738,6 +738,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             e
         }
     })?;
+    trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }
@@ -825,6 +826,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
+        validation_wdl: cli.validation_wdl,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
         score_source: cli.score_source().map(ScoreSource::to_path_buf),
@@ -856,7 +858,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         if cfg.test_positions == 0 {
             return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
         }
-        let wdl_lambda = wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch);
+        let wdl_lambda = cli
+            .validation_wdl
+            .unwrap_or_else(|| wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch));
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
             (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
                 test_path,
@@ -1263,8 +1267,10 @@ pub(crate) fn simple_fv_scale_warning(
     cli: &Cli,
     fv_scale_is_derived: bool,
 ) -> Option<&'static str> {
-    let wdl_is_always_zero =
-        cli.wdl == 0.0 && cli.start_wdl.unwrap_or(0.0) == 0.0 && cli.end_wdl.unwrap_or(0.0) == 0.0;
+    let wdl_is_always_zero = cli.wdl == 0.0
+        && cli.wdl_cycle_delta.unwrap_or(0.0) == 0.0
+        && cli.start_wdl.unwrap_or(0.0) == 0.0
+        && cli.end_wdl.unwrap_or(0.0) == 0.0;
     let derived_scale_is_exact = cli.wrm_in_scaling == cli.wrm_target_scaling
         && cli.wrm_in_offset.abs() == cli.wrm_target_offset.abs()
         && wdl_is_always_zero;
@@ -1363,8 +1369,8 @@ pub(crate) fn build_wrm_loss(cli: &Cli) -> Result<LossKind, Box<dyn std::error::
 /// を両方指定すると `start → end` の線形 taper、いずれも未指定なら `--wdl` の
 /// 一定 lambda になる。片方だけの指定は error。`--wdl` と `--start-wdl` /
 /// `--end-wdl` の同時指定は clap の `conflicts_with` で parse 時に reject される。
-/// すべての値が finite かつ `[0.0, 1.0]` であることを要求する (kernel に NaN /
-/// 範囲外を流さない)。
+/// base と schedule の値が finite かつ `[0.0, 1.0]` に収まることを要求する
+/// (kernel に NaN / 範囲外を流さない)。cycle delta は負でもよい。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_wdl_scheduler(
     cli: &Cli,
@@ -1374,6 +1380,40 @@ pub(crate) fn build_wdl_scheduler(
             return Err(format!("{name} must be finite and in [0.0, 1.0] (got {value})").into());
         }
         Ok(value)
+    }
+
+    if let Some(value) = cli.validation_wdl {
+        check("--validation-wdl", value)?;
+    }
+
+    if cli.wdl_cycle_delta.is_some() && (cli.start_wdl.is_some() || cli.end_wdl.is_some()) {
+        return Err("--wdl-cycle-delta cannot be combined with --start-wdl or --end-wdl".into());
+    }
+    if cli.wdl_cycle_delta.is_some()
+        && (!cli.wdl_cycle_warmup_pct.is_finite()
+            || !(0.0..=1.0).contains(&cli.wdl_cycle_warmup_pct))
+    {
+        return Err(format!(
+            "--wdl-cycle-warmup-pct must be finite and in [0.0, 1.0] (got {})",
+            cli.wdl_cycle_warmup_pct
+        )
+        .into());
+    }
+    if cli.wdl_cycle_delta.is_some() && cli.wdl_schedule_superbatch == Some(0) {
+        return Err("--wdl-schedule-superbatch must be >= 1".into());
+    }
+    if let Some(delta) = cli.wdl_cycle_delta {
+        let base = check("--wdl", cli.wdl)?;
+        if !delta.is_finite() {
+            return Err(format!("--wdl-cycle-delta must be finite (got {delta})").into());
+        }
+        check("--wdl plus --wdl-cycle-delta", base + delta)?;
+        return Ok(WdlSchedulerEnum::cycle(
+            base,
+            delta,
+            cli.wdl_cycle_warmup_pct,
+            Some(cli.wdl_schedule_superbatch.unwrap_or(cli.superbatches)),
+        ));
     }
 
     match (cli.start_wdl, cli.end_wdl) {
@@ -1582,6 +1622,13 @@ pub(crate) fn build_experiment_logger(
         wdl: finite_or_zero(cli.wdl),
         start_wdl: cli.start_wdl.map(finite_or_zero),
         end_wdl: cli.end_wdl.map(finite_or_zero),
+        wdl_cycle_delta: cli.wdl_cycle_delta.map(finite_or_zero),
+        wdl_cycle_warmup_pct: cli
+            .wdl_cycle_delta
+            .map(|_| finite_or_zero(cli.wdl_cycle_warmup_pct)),
+        wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
+        validation_wdl: cli.validation_wdl.map(finite_or_zero),
+        wdl_ignore_draws: cli.wdl_ignore_draws,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
@@ -1757,6 +1804,13 @@ pub(crate) fn build_experiment_logger_simple(
         wdl: finite_or_zero(cli.wdl),
         start_wdl: cli.start_wdl.map(finite_or_zero),
         end_wdl: cli.end_wdl.map(finite_or_zero),
+        wdl_cycle_delta: cli.wdl_cycle_delta.map(finite_or_zero),
+        wdl_cycle_warmup_pct: cli
+            .wdl_cycle_delta
+            .map(|_| finite_or_zero(cli.wdl_cycle_warmup_pct)),
+        wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
+        validation_wdl: cli.validation_wdl.map(finite_or_zero),
+        wdl_ignore_draws: cli.wdl_ignore_draws,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
@@ -2040,6 +2094,7 @@ pub(crate) fn run_simple_training(
             e
         }
     })?;
+    trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
 
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon, checkpoint_fv_scale): (
         Option<usize>,
@@ -2120,6 +2175,7 @@ pub(crate) fn run_simple_training(
         output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
+        validation_wdl: cli.validation_wdl,
         score_drop_abs: cli.score_drop_abs,
         score_clamp_abs: cli.score_clamp_abs,
         score_source: cli.score_source().map(ScoreSource::to_path_buf),

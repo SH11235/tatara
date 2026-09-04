@@ -3,7 +3,8 @@
 # Training schedules
 
 A run has two independent schedulers: the **learning rate** (`--lr-schedule`) and
-the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl`). Both are recomputed
+the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl` /
+`--wdl-cycle-delta`). Both are recomputed
 each run as a function of the CLI arguments and the superbatch index. For the
 per-run training steps themselves see
 [docs/training-quickstart.md](training-quickstart.md); for the exact flag syntax,
@@ -108,6 +109,29 @@ This linear scheduling of the blend follows nnue-pytorch's
 A single-superbatch run (`--superbatches 1`) has no interval to interpolate
 over, so the taper collapses to `--start-wdl`.
 
+### Cosine cycle (`--wdl-cycle-delta`)
+
+`--wdl-cycle-delta <d>` uses `--wdl` as the base and applies a half-cosine
+warmup to `base + d`, followed by a half-cosine cooldown to the base. The
+warmup occupies `--wdl-cycle-warmup-pct` of the horizon (default `0.25`). The
+delta may be negative, provided `--wdl` plus the delta remains in `[0, 1]`. Set
+`--wdl-schedule-superbatch` to make the horizon explicit; otherwise it is
+`--superbatches`. The schedule is a function of the superbatch index, so resume
+continues the same curve as long as the horizon inputs are unchanged; unlike
+the learning-rate horizon it is not stored in the checkpoint, so a run that may
+be extended with a larger `--superbatches` on resume should pass
+`--wdl-schedule-superbatch` explicitly to pin the curve. A single-superbatch
+horizon leaves no room for the cycle, so lambda stays at the base. With
+`--wdl-cycle-warmup-pct 1.0` there is no cooldown: lambda returns to the base
+at the horizon instead of easing back.
+
+### Draws and validation
+
+`--wdl-ignore-draws` makes positions whose WDL label is `0.5` use lambda zero,
+so their target is derived from the teacher score. `--validation-wdl <value>`
+fixes lambda for held-out validation and eval-only runs; without it, validation
+uses the training schedule.
+
 ## Where the values are recorded
 
 The effective schedules are written to the run's `experiment.json` under
@@ -116,6 +140,11 @@ effective horizon (so a resumed run shows the restored horizon, not the
 `--superbatches`-derived default). The `wdl` field is always present (the
 constant lambda); a linear taper additionally records `start_wdl` / `end_wdl`
 (omitted otherwise), and in that case the scheduler derives `lambda` from those
-endpoints and ignores `wdl`. `test_loss` is computed with the same `lambda` as
-`train_loss` at each superbatch, so the two stay on one scale (see "Reading the
+endpoints and ignores `wdl`. Unless `--validation-wdl` is set, `test_loss` is
+computed with the same `lambda` as `train_loss` at each superbatch, so the two stay
+on one scale (see "Reading the
 metrics" in [Held-out validation](held-out-validation.md)).
+Cycle runs also record `wdl_cycle_delta`, `wdl_cycle_warmup_pct`, and
+`wdl_schedule_superbatch` (the latter only when explicitly set).
+`validation_wdl` is recorded only when specified, and `wdl_ignore_draws` only
+when true.

@@ -64,6 +64,8 @@ falls back to the `--scale`-derived value.
 WDL label ({0, 0.5, 1}). At the default 0 the target is `target_wrm` only; at 1
 it is pure WDL.
 
+With `--wdl-ignore-draws`, positions whose WDL label is `0.5` use the teacher-score target.
+
 ## Generalized loss form (pow_exp / asymmetry / weight boost)
 
 By default the WRM loss is the plain squared error `mean((qf - target)^2)`. Four
