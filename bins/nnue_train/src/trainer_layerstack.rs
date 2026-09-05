@@ -289,6 +289,14 @@ pub(crate) struct GpuTrainer {
     bucket_mode: BucketMode,
     optimizer: OptimizerKind,
     step_count: u64,
+    /// true なら forward + loss (`validate`) 専用 trainer。optimizer state
+    /// (`m` / `v` / `slow`)・全 `*_grad`・backward workspace を 0-byte で確保して
+    /// device memory を forward 経路の分だけに抑える ([`GpuTrainer::new_forward_only`])。
+    /// 学習 (`step`) と resume checkpoint 書き出し (`save_raw_checkpoint`) は
+    /// 0-byte buffer を読み書きしてしまうため明示エラーで拒否し、weight load 経路
+    /// (`load_layerstack_weights` / `load_raw_checkpoint`) は optimizer state の
+    /// 確保・upload を行わない。
+    forward_only: bool,
 }
 
 /// PSQT shortcut の weight + optimizer state を集約した sub-struct。
@@ -311,14 +319,16 @@ pub(crate) struct PsqtState {
 
 impl PsqtState {
     /// 与えた初期 weight (長さ `train_ft_in * num_buckets`) で確保する。optimizer state
-    /// は `m`/`v` = 0、`slow` = 0、`grad` = 0。`fold_len` が `Some(base_ft_in *
-    /// num_buckets)` のとき forward 用 comb (`w_fold`) を確保する (factorizer 有効時)。
+    /// は `m`/`v` = 0、`slow` = 0、`grad` = 0 (forward-only trainer では 0-byte)。
+    /// `fold_len` が `Some(base_ft_in * num_buckets)` のとき forward 用 comb
+    /// (`w_fold`) を確保する (factorizer 有効時)。
     fn new(
         stream: &CudaStream,
         initial_w: &[f32],
         fold_len: Option<usize>,
+        forward_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let n = initial_w.len();
+        let n = if forward_only { 0 } else { initial_w.len() };
         Ok(Self {
             w: DeviceBuffer::from_host(stream, initial_w)?,
             w_m: DeviceBuffer::<f32>::zeroed(stream, n)?,
@@ -491,6 +501,7 @@ impl GpuWorkspace {
         ft_fp16_out: bool,
         tf32: bool,
         feature_set: FeatureSetSpec,
+        forward_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
             (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
@@ -508,6 +519,11 @@ impl GpuWorkspace {
         // FT activation の f32 buffer size。ft_fp16_out 時は f16 版を使うので f32 版は
         // placeholder (`ft_out` 要素) のみ。
         let ft_act_f32_n = if ft_fp16_out { ft_out } else { batch * ft_out };
+        // forward-only では backward 専用 buffer (activation-grad / inverse-index
+        // scratch / sorted-grad) を 0-byte で確保する (tf32 off の
+        // `dcombined_from_l1_sorted` と同じ dead-allocation 回避手法)。forward と
+        // loss kernel が触る buffer (`dy_net_output` 含む) は実長のまま。
+        let bwd_len = |n: usize| if forward_only { 0 } else { n };
         let alloc_h = |on: bool| -> Result<Option<DeviceBuffer<f16>>, Box<dyn std::error::Error>> {
             if on {
                 Ok(Some(DeviceBuffer::<f16>::zeroed(stream, batch * ft_out)?))
@@ -526,8 +542,8 @@ impl GpuWorkspace {
             ft_nstm_out: z(ft_act_f32_n)?,
             ft_stm_out_h: alloc_h(ft_fp16_out)?,
             ft_nstm_out_h: alloc_h(ft_fp16_out)?,
-            dft_stm_out_h: alloc_h(ft_fp16_out)?,
-            dft_nstm_out_h: alloc_h(ft_fp16_out)?,
+            dft_stm_out_h: alloc_h(ft_fp16_out && !forward_only)?,
+            dft_nstm_out_h: alloc_h(ft_fp16_out && !forward_only)?,
             combined: z(batch * ft_out)?,
             l1_bucket: z(batch * l1_out)?,
             l1_shared_out: z(batch * l1_out)?,
@@ -542,25 +558,28 @@ impl GpuWorkspace {
             l3_out: z(batch)?,
             net_output: z(batch)?,
             dy_net_output: z(batch)?,
-            dl2_acted: z(batch * l2_out)?,
-            dl2_out: z(batch * l2_out)?,
-            dl2_input: z(batch * l2_in)?,
-            dl2_pre: z(batch * l2_in)?,
-            dl1_sqr: z(batch * l1_effective)?,
-            dl1_main_from_concat: z(batch * l1_effective)?,
-            dl1_main_from_sqr: z(batch * l1_effective)?,
-            dl1_main: z(batch * l1_effective)?,
-            dl1_total: z(batch * l1_out)?,
-            dcombined_from_l1_shared: z(batch * ft_out)?,
-            dcombined_from_l1: z(batch * ft_out)?,
-            dft_stm_out: z(ft_act_f32_n)?,
-            dft_nstm_out: z(ft_act_f32_n)?,
-            feat_counts: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
-            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in + 1)?,
-            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024))?,
-            feat_block_offsets: DeviceBuffer::<u32>::zeroed(stream, ft_in.div_ceil(1024) + 1)?,
-            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, ft_in)?,
-            feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
+            dl2_acted: z(bwd_len(batch * l2_out))?,
+            dl2_out: z(bwd_len(batch * l2_out))?,
+            dl2_input: z(bwd_len(batch * l2_in))?,
+            dl2_pre: z(bwd_len(batch * l2_in))?,
+            dl1_sqr: z(bwd_len(batch * l1_effective))?,
+            dl1_main_from_concat: z(bwd_len(batch * l1_effective))?,
+            dl1_main_from_sqr: z(bwd_len(batch * l1_effective))?,
+            dl1_main: z(bwd_len(batch * l1_effective))?,
+            dl1_total: z(bwd_len(batch * l1_out))?,
+            dcombined_from_l1_shared: z(bwd_len(batch * ft_out))?,
+            dcombined_from_l1: z(bwd_len(batch * ft_out))?,
+            dft_stm_out: z(bwd_len(ft_act_f32_n))?,
+            dft_nstm_out: z(bwd_len(ft_act_f32_n))?,
+            feat_counts: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
+            feat_offsets: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in + 1))?,
+            feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in.div_ceil(1024)))?,
+            feat_block_offsets: DeviceBuffer::<u32>::zeroed(
+                stream,
+                bwd_len(ft_in.div_ceil(1024) + 1),
+            )?,
+            feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
+            feat_positions: DeviceBuffer::<u32>::zeroed(stream, bwd_len(batch * max_active))?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
@@ -586,15 +605,15 @@ impl GpuWorkspace {
             )?,
             combined_sorted: z(padded_sort_batch(batch, num_buckets) * ft_out)?,
             l1_bucket_sorted: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
-            dl1_total_sorted: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
+            dl1_total_sorted: z(bwd_len(padded_sort_batch(batch, num_buckets) * l1_out))?,
             // tf32 の per-bucket L1 input-bwd 経路のみが使う (bs65536/ft1536 で ~400MB)。
             // tf32 off では参照されないため 0-byte で確保し dead allocation を避ける。
-            dcombined_from_l1_sorted: if tf32 {
+            dcombined_from_l1_sorted: if tf32 && !forward_only {
                 z(padded_sort_batch(batch, num_buckets) * ft_out)?
             } else {
                 z(0)?
             },
-            dl2_out_sorted: z(padded_sort_batch(batch, num_buckets) * l2_out)?,
+            dl2_out_sorted: z(bwd_len(padded_sort_batch(batch, num_buckets) * l2_out))?,
         })
     }
 
@@ -795,6 +814,88 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_impl(
+            ctx,
+            batch_size,
+            ft_out,
+            l1_out,
+            l2_out,
+            num_buckets,
+            bucket_mode,
+            precision,
+            feature_set,
+            optimizer,
+            optim_groups,
+            norm_loss_factor,
+            psqt_init,
+            init_spec,
+            false,
+        )
+    }
+
+    /// forward + loss 専用 trainer を構築する ([`Self::new`] の forward-only 版)。
+    ///
+    /// optimizer state (`m` / `v` / `slow`)・全 `*_grad`・backward 専用 workspace を
+    /// 0-byte で確保するため、同一構成の学習 trainer より device memory 使用量が
+    /// 大幅に小さい (FT weight 系だけで optimizer state 4 本分 = weight の 4 倍、
+    /// backward activation-grad で batch × ft_out 級 4 本分が消える)。`validate` /
+    /// `validate_step` と weight load 経路のみ使用可で、`step` と
+    /// `save_raw_checkpoint` は明示エラーになる。held-out 評価 (`--eval-only`) が
+    /// 使う。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_forward_only(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch_size: usize,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        num_buckets: usize,
+        bucket_mode: BucketMode,
+        precision: PrecisionFlags,
+        feature_set: FeatureSetSpec,
+        optimizer: OptimizerKind,
+        optim_groups: OptimGroupConfig,
+        norm_loss_factor: Option<f32>,
+        psqt_init: Option<&[f32]>,
+        init_spec: &LayerStackInit,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_impl(
+            ctx,
+            batch_size,
+            ft_out,
+            l1_out,
+            l2_out,
+            num_buckets,
+            bucket_mode,
+            precision,
+            feature_set,
+            optimizer,
+            optim_groups,
+            norm_loss_factor,
+            psqt_init,
+            init_spec,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_impl(
+        ctx: &std::sync::Arc<CudaContext>,
+        batch_size: usize,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        num_buckets: usize,
+        bucket_mode: BucketMode,
+        precision: PrecisionFlags,
+        feature_set: FeatureSetSpec,
+        optimizer: OptimizerKind,
+        optim_groups: OptimGroupConfig,
+        norm_loss_factor: Option<f32>,
+        psqt_init: Option<&[f32]>,
+        init_spec: &LayerStackInit,
+        forward_only: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
@@ -830,6 +931,11 @@ impl GpuTrainer {
         let l2_b_n = num_buckets * l2_out;
         let l3_w_n = num_buckets * l2_out;
         let l3_b_n = num_buckets;
+
+        // forward-only では optimizer state (`m` / `v` / `slow`) と `*_grad` を
+        // 0-byte で確保する (tf32 off の `dcombined_from_l1_sorted` と同じ
+        // dead-allocation 回避手法)。学習 trainer では実長。
+        let opt_len = |n: usize| if forward_only { 0 } else { n };
 
         // weight / bias の初期値を `init_spec` から生成する。fan_in は各層の入力次元
         // (FT=ft_in、L1/L1 shared=ft_out、L2=l2_in、L3=l2_out)、bias は対応 weight と同じ
@@ -900,9 +1006,14 @@ impl GpuTrainer {
                 if feature_set.ft_factorize() {
                     let mut w = init.to_vec();
                     w.resize(train_ft_in * num_buckets, 0.0);
-                    Some(PsqtState::new(&stream, &w, Some(base_expected))?)
+                    Some(PsqtState::new(
+                        &stream,
+                        &w,
+                        Some(base_expected),
+                        forward_only,
+                    )?)
                 } else {
-                    Some(PsqtState::new(&stream, init, None)?)
+                    Some(PsqtState::new(&stream, init, None, forward_only)?)
                 }
             }
             None => None,
@@ -942,10 +1053,10 @@ impl GpuTrainer {
             device_occupancy,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
-            ft_w_m: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, ft_w_n, precision.fp16_opt_state)?,
-            ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
-            ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_w_n)?,
+            ft_w_m: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
+            ft_w_v: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
+            ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_w_n))?,
+            ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_w_n))?,
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
             // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
             // = base と同値)。いずれも `sync_ft_forward_weights` が初期同期する。
@@ -967,54 +1078,60 @@ impl GpuTrainer {
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
             empty_threat_pair_starts: DeviceBuffer::from_host(&stream, &[0_u32])?,
             ft_b: DeviceBuffer::from_host(&stream, &ft_b_init)?,
-            ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
-            ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
-            ft_b_slow: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
-            ft_b_grad: DeviceBuffer::<f32>::zeroed(&stream, ft_b_n)?,
+            ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_b_n))?,
+            ft_b_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_b_n))?,
+            ft_b_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_b_n))?,
+            ft_b_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_b_n))?,
             // L1
             l1_w: DeviceBuffer::from_host(&stream, &l1_w_init)?,
-            l1_w_m: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
-            l1_w_v: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
-            l1_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
-            l1_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_w_n)?,
+            l1_w_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_w_n))?,
+            l1_w_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_w_n))?,
+            l1_w_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_w_n))?,
+            l1_w_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_w_n))?,
             l1_b: DeviceBuffer::from_host(&stream, &l1_b_init)?,
-            l1_b_m: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
-            l1_b_v: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
-            l1_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
-            l1_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_b_n)?,
+            l1_b_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_b_n))?,
+            l1_b_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_b_n))?,
+            l1_b_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_b_n))?,
+            l1_b_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_b_n))?,
             // L1 shared
             l1_shared_weight: DeviceBuffer::from_host(&stream, &l1_shared_weight_init)?,
-            l1_shared_weight_m: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
-            l1_shared_weight_v: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
-            l1_shared_weight_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
-            l1_shared_weight_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_weight_n)?,
+            l1_shared_weight_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_weight_n))?,
+            l1_shared_weight_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_weight_n))?,
+            l1_shared_weight_slow: DeviceBuffer::<f32>::zeroed(
+                &stream,
+                opt_len(l1_shared_weight_n),
+            )?,
+            l1_shared_weight_grad: DeviceBuffer::<f32>::zeroed(
+                &stream,
+                opt_len(l1_shared_weight_n),
+            )?,
             l1_shared_bias: DeviceBuffer::from_host(&stream, &l1_shared_bias_init)?,
-            l1_shared_bias_m: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
-            l1_shared_bias_v: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
-            l1_shared_bias_slow: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
-            l1_shared_bias_grad: DeviceBuffer::<f32>::zeroed(&stream, l1_shared_bias_n)?,
+            l1_shared_bias_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_bias_n))?,
+            l1_shared_bias_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_bias_n))?,
+            l1_shared_bias_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_bias_n))?,
+            l1_shared_bias_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l1_shared_bias_n))?,
             // L2
             l2_w: DeviceBuffer::from_host(&stream, &l2_w_init)?,
-            l2_w_m: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
-            l2_w_v: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
-            l2_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
-            l2_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_w_n)?,
+            l2_w_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_w_n))?,
+            l2_w_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_w_n))?,
+            l2_w_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_w_n))?,
+            l2_w_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_w_n))?,
             l2_b: DeviceBuffer::from_host(&stream, &l2_b_init)?,
-            l2_b_m: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
-            l2_b_v: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
-            l2_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
-            l2_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l2_b_n)?,
+            l2_b_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_b_n))?,
+            l2_b_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_b_n))?,
+            l2_b_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_b_n))?,
+            l2_b_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l2_b_n))?,
             // L3
             l3_w: DeviceBuffer::from_host(&stream, &l3_w_init)?,
-            l3_w_m: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
-            l3_w_v: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
-            l3_w_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
-            l3_w_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_w_n)?,
+            l3_w_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_w_n))?,
+            l3_w_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_w_n))?,
+            l3_w_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_w_n))?,
+            l3_w_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_w_n))?,
             l3_b: DeviceBuffer::from_host(&stream, &l3_b_init)?,
-            l3_b_m: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
-            l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
-            l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
-            l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, l3_b_n)?,
+            l3_b_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_b_n))?,
+            l3_b_v: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_b_n))?,
+            l3_b_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_b_n))?,
+            l3_b_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(l3_b_n))?,
             stack_shared_delta: None,
             psqt,
             // 中間 activation workspace (`batch_size` 分。最低 1 で確保して
@@ -1030,6 +1147,7 @@ impl GpuTrainer {
                 precision.ft_fp16_out,
                 precision.tf32,
                 feature_set,
+                forward_only,
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -1051,6 +1169,7 @@ impl GpuTrainer {
             bucket_mode,
             optimizer,
             step_count: 0,
+            forward_only,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
         // step / validate 可能にする (zero のままの buffer を初回 forward が読む
@@ -1069,6 +1188,9 @@ impl GpuTrainer {
             return Ok(());
         }
         let z = |n| DeviceBuffer::<f32>::zeroed(&self.stream, n);
+        // forward-only trainer では optimizer state (`m` / `v` / `slow`) と grad を
+        // 0-byte で確保する。master (`w` / `b`) と forward が読む folded は実長。
+        let opt_len = |n: usize| if self.forward_only { 0 } else { n };
         let layer = |w_n: usize,
                      b_n: usize,
                      bucket_w_n: usize,
@@ -1076,15 +1198,15 @@ impl GpuTrainer {
          -> Result<SharedDenseLayerState, Box<dyn std::error::Error>> {
             Ok(SharedDenseLayerState {
                 w: z(w_n)?,
-                w_m: z(w_n)?,
-                w_v: z(w_n)?,
-                w_slow: z(w_n)?,
-                w_grad: z(w_n)?,
+                w_m: z(opt_len(w_n))?,
+                w_v: z(opt_len(w_n))?,
+                w_slow: z(opt_len(w_n))?,
+                w_grad: z(opt_len(w_n))?,
                 b: z(b_n)?,
-                b_m: z(b_n)?,
-                b_v: z(b_n)?,
-                b_slow: z(b_n)?,
-                b_grad: z(b_n)?,
+                b_m: z(opt_len(b_n))?,
+                b_v: z(opt_len(b_n))?,
+                b_slow: z(opt_len(b_n))?,
+                b_grad: z(opt_len(b_n))?,
                 folded_w: z(bucket_w_n)?,
                 folded_b: z(bucket_b_n)?,
             })
@@ -1211,6 +1333,7 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let forward_only = self.forward_only;
         // 本経路は companion buffer (`ft_w_m`/`v`/`grad`/`slow`) を base 長で
         // 再確保するため、factorize 有効 trainer (train 長の `ft_w`) には適用
         // できない (spec 等値性でも弾かれるが、長さ不変条件をここで閉じる)。
@@ -1244,68 +1367,72 @@ impl GpuTrainer {
         self.l2_b = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
         self.l3_w = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
         self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
-        // Optimizer state reset:
+        // Optimizer state reset (forward-only trainer は optimizer state を持たない
+        // ため skip し、0-byte のまま維持する):
         // - m, v: 0 (fresh start)
         // - slow: loaded weights と同値 (warm-start anchor: 初回 lookahead lerp が
         //   0 でなく読み込んだ重みの方へ寄る。`slow = 0` だと alpha 倍に縮む)
         // - grad: 0
-        let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
-            DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
-        };
-        let ft_out = self.ws.ft_out;
-        let l1_out = self.ws.l1_out;
-        let l2_out = self.ws.l2_out;
-        let l2_in = self.ws.l2_in();
-        let ft_w_n = self.feature_set.ft_in() * ft_out;
-        let ft_b_n = ft_out;
-        let l1_w_n = self.num_buckets * l1_out * ft_out;
-        let l1_b_n = self.num_buckets * l1_out;
-        let l1_shared_weight_n = ft_out * l1_out;
-        let l1_shared_bias_n = l1_out;
-        let l2_w_n = self.num_buckets * l2_out * l2_in;
-        let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
-        let l3_b_n = self.num_buckets;
-        self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
-        self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
-        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
-        self.ft_w_grad = zeros_f32(ft_w_n)?;
-        self.ft_b_m = zeros_f32(ft_b_n)?;
-        self.ft_b_v = zeros_f32(ft_b_n)?;
-        self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
-        self.ft_b_grad = zeros_f32(ft_b_n)?;
-        self.l1_w_m = zeros_f32(l1_w_n)?;
-        self.l1_w_v = zeros_f32(l1_w_n)?;
-        self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
-        self.l1_w_grad = zeros_f32(l1_w_n)?;
-        self.l1_b_m = zeros_f32(l1_b_n)?;
-        self.l1_b_v = zeros_f32(l1_b_n)?;
-        self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
-        self.l1_b_grad = zeros_f32(l1_b_n)?;
-        self.l1_shared_weight_m = zeros_f32(l1_shared_weight_n)?;
-        self.l1_shared_weight_v = zeros_f32(l1_shared_weight_n)?;
-        self.l1_shared_weight_slow = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
-        self.l1_shared_weight_grad = zeros_f32(l1_shared_weight_n)?;
-        self.l1_shared_bias_m = zeros_f32(l1_shared_bias_n)?;
-        self.l1_shared_bias_v = zeros_f32(l1_shared_bias_n)?;
-        self.l1_shared_bias_slow = DeviceBuffer::from_host(&self.stream, &w.l1_shared_bias)?;
-        self.l1_shared_bias_grad = zeros_f32(l1_shared_bias_n)?;
-        self.l2_w_m = zeros_f32(l2_w_n)?;
-        self.l2_w_v = zeros_f32(l2_w_n)?;
-        self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
-        self.l2_w_grad = zeros_f32(l2_w_n)?;
-        self.l2_b_m = zeros_f32(l2_b_n)?;
-        self.l2_b_v = zeros_f32(l2_b_n)?;
-        self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
-        self.l2_b_grad = zeros_f32(l2_b_n)?;
-        self.l3_w_m = zeros_f32(l3_w_n)?;
-        self.l3_w_v = zeros_f32(l3_w_n)?;
-        self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
-        self.l3_w_grad = zeros_f32(l3_w_n)?;
-        self.l3_b_m = zeros_f32(l3_b_n)?;
-        self.l3_b_v = zeros_f32(l3_b_n)?;
-        self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
-        self.l3_b_grad = zeros_f32(l3_b_n)?;
+        if !self.forward_only {
+            let zeros_f32 = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+                DeviceBuffer::<f32>::zeroed(&self.stream, n).map_err(Into::into)
+            };
+            let ft_out = self.ws.ft_out;
+            let l1_out = self.ws.l1_out;
+            let l2_out = self.ws.l2_out;
+            let l2_in = self.ws.l2_in();
+            let ft_w_n = self.feature_set.ft_in() * ft_out;
+            let ft_b_n = ft_out;
+            let l1_w_n = self.num_buckets * l1_out * ft_out;
+            let l1_b_n = self.num_buckets * l1_out;
+            let l1_shared_weight_n = ft_out * l1_out;
+            let l1_shared_bias_n = l1_out;
+            let l2_w_n = self.num_buckets * l2_out * l2_in;
+            let l2_b_n = self.num_buckets * l2_out;
+            let l3_w_n = self.num_buckets * l2_out;
+            let l3_b_n = self.num_buckets;
+            self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
+            self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
+            self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+            self.ft_w_grad = zeros_f32(ft_w_n)?;
+            self.ft_b_m = zeros_f32(ft_b_n)?;
+            self.ft_b_v = zeros_f32(ft_b_n)?;
+            self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+            self.ft_b_grad = zeros_f32(ft_b_n)?;
+            self.l1_w_m = zeros_f32(l1_w_n)?;
+            self.l1_w_v = zeros_f32(l1_w_n)?;
+            self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
+            self.l1_w_grad = zeros_f32(l1_w_n)?;
+            self.l1_b_m = zeros_f32(l1_b_n)?;
+            self.l1_b_v = zeros_f32(l1_b_n)?;
+            self.l1_b_slow = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
+            self.l1_b_grad = zeros_f32(l1_b_n)?;
+            self.l1_shared_weight_m = zeros_f32(l1_shared_weight_n)?;
+            self.l1_shared_weight_v = zeros_f32(l1_shared_weight_n)?;
+            self.l1_shared_weight_slow =
+                DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
+            self.l1_shared_weight_grad = zeros_f32(l1_shared_weight_n)?;
+            self.l1_shared_bias_m = zeros_f32(l1_shared_bias_n)?;
+            self.l1_shared_bias_v = zeros_f32(l1_shared_bias_n)?;
+            self.l1_shared_bias_slow = DeviceBuffer::from_host(&self.stream, &w.l1_shared_bias)?;
+            self.l1_shared_bias_grad = zeros_f32(l1_shared_bias_n)?;
+            self.l2_w_m = zeros_f32(l2_w_n)?;
+            self.l2_w_v = zeros_f32(l2_w_n)?;
+            self.l2_w_slow = DeviceBuffer::from_host(&self.stream, &w.l2_w)?;
+            self.l2_w_grad = zeros_f32(l2_w_n)?;
+            self.l2_b_m = zeros_f32(l2_b_n)?;
+            self.l2_b_v = zeros_f32(l2_b_n)?;
+            self.l2_b_slow = DeviceBuffer::from_host(&self.stream, &w.l2_b)?;
+            self.l2_b_grad = zeros_f32(l2_b_n)?;
+            self.l3_w_m = zeros_f32(l3_w_n)?;
+            self.l3_w_v = zeros_f32(l3_w_n)?;
+            self.l3_w_slow = DeviceBuffer::from_host(&self.stream, &w.l3_w)?;
+            self.l3_w_grad = zeros_f32(l3_w_n)?;
+            self.l3_b_m = zeros_f32(l3_b_n)?;
+            self.l3_b_v = zeros_f32(l3_b_n)?;
+            self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
+            self.l3_b_grad = zeros_f32(l3_b_n)?;
+        }
         // PSQT (任意): trainer 側で psqt が enabled なら weight 側も `Some` を要求。
         // load 側で `Some` でも trainer が `None` の組合せ (誤って PSQT 無し trainer に
         // PSQT 含む weights を入れる) も同じく reject する。
@@ -1319,10 +1446,12 @@ impl GpuTrainer {
                     )));
                 }
                 psqt.w = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                psqt.w_m = zeros_f32(n)?;
-                psqt.w_v = zeros_f32(n)?;
-                psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                psqt.w_grad = zeros_f32(n)?;
+                if !forward_only {
+                    psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+                    psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+                    psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
+                    psqt.w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+                }
             }
             (Some(_), None) => {
                 return Err(invalid_data(
@@ -1584,6 +1713,15 @@ impl GpuTrainer {
         run_id: &str,
         lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // forward-only trainer の optimizer state は 0-byte のため、resume 可能な
+        // checkpoint を構成できない (D2H が group 長と食い違う)。
+        if self.forward_only {
+            return Err(
+                "save_raw_checkpoint is not available on a forward-only trainer (it has no \
+                 optimizer state to save)"
+                    .into(),
+            );
+        }
         let ft_out = self.ws.ft_out;
         // PSQT 有り ckpt は `[..., num_buckets, num_buckets]` (5 dims) で PSQT 無し
         // (4 dims) と弁別する。PSQT 無し ckpt を PSQT 有り設定で `--resume` すると
@@ -1657,22 +1795,29 @@ impl GpuTrainer {
 
         // host → device upload (`loaded` の順序は `raw_ckpt_group_sources` = format の
         // group 順)。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ量子化して
-        // 載せ直す (checkpoint は真値 f32、mode 非依存)。
+        // 載せ直す (checkpoint は真値 f32、mode 非依存)。forward-only trainer は
+        // optimizer state (`m` / `v` / `slow`) を持たないため weight のみ載せ、
+        // state は 0-byte のまま維持する (file 側は全 group を読了・検証済み)。
+        let forward_only = self.forward_only;
         let (ftw_w, ftw_m, ftw_v, ftw_slow) = &loaded[0];
         self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
-        self.ft_w_m =
-            MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
-        self.ft_w_v =
-            MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
-        self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
+        if !forward_only {
+            self.ft_w_m =
+                MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
+            self.ft_w_v =
+                MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
+            self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
+        }
 
         macro_rules! up {
             ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                 let (w, m, v, s) = &loaded[$idx];
                 self.$w = DeviceBuffer::from_host(&self.stream, w)?;
-                self.$m = DeviceBuffer::from_host(&self.stream, m)?;
-                self.$v = DeviceBuffer::from_host(&self.stream, v)?;
-                self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                if !forward_only {
+                    self.$m = DeviceBuffer::from_host(&self.stream, m)?;
+                    self.$v = DeviceBuffer::from_host(&self.stream, v)?;
+                    self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                }
             }};
         }
         up!(1, ft_b, ft_b_m, ft_b_v, ft_b_slow);
@@ -1702,9 +1847,11 @@ impl GpuTrainer {
                 ($idx:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                     let (w, m, v, s) = &loaded[$idx];
                     f.$layer.$w = DeviceBuffer::from_host(&self.stream, w)?;
-                    f.$layer.$m = DeviceBuffer::from_host(&self.stream, m)?;
-                    f.$layer.$v = DeviceBuffer::from_host(&self.stream, v)?;
-                    f.$layer.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                    if !forward_only {
+                        f.$layer.$m = DeviceBuffer::from_host(&self.stream, m)?;
+                        f.$layer.$v = DeviceBuffer::from_host(&self.stream, v)?;
+                        f.$layer.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                    }
                 }};
             }
             up_shared!(10, l2, w, w_m, w_v, w_slow);
@@ -1719,9 +1866,11 @@ impl GpuTrainer {
         if let Some(psqt) = self.psqt.as_mut() {
             let (w_host, m_host, v_host, slow_host) = &loaded[psqt_idx];
             psqt.w = DeviceBuffer::from_host(&self.stream, w_host)?;
-            psqt.w_m = DeviceBuffer::from_host(&self.stream, m_host)?;
-            psqt.w_v = DeviceBuffer::from_host(&self.stream, v_host)?;
-            psqt.w_slow = DeviceBuffer::from_host(&self.stream, slow_host)?;
+            if !forward_only {
+                psqt.w_m = DeviceBuffer::from_host(&self.stream, m_host)?;
+                psqt.w_v = DeviceBuffer::from_host(&self.stream, v_host)?;
+                psqt.w_slow = DeviceBuffer::from_host(&self.stream, slow_host)?;
+            }
         }
 
         self.step_count = header.step_count;
@@ -1892,6 +2041,15 @@ impl GpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
+        // forward-only trainer は optimizer state と backward workspace を 0-byte で
+        // 確保しているため、backward / optimizer kernel の launch は out-of-bounds に
+        // なる。学習経路への直入りをここで閉じる。
+        if self.forward_only {
+            return Err(
+                "step is not available on a forward-only trainer (it has no optimizer state);                  construct the trainer with GpuTrainer::new to train"
+                    .into(),
+            );
+        }
         // 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
         // `synchronize()` + 経過時間を stderr に出す (粗い h2d / forward / backward /
         // optimizer / teardown breakdown 用)。未設定なら追加の sync ゼロ。
