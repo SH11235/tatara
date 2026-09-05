@@ -742,6 +742,68 @@ fn forward_only_validate_matches_training_trainer() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// 量子化 .bin を `--init-from` 相当で読み込んだ forward-only trainer が、同じ
+/// .bin を読み込んだ学習 trainer の `validate` と bit 一致する
+/// (`--eval-only --init-from <bin>` 経路。リスコア基盤の本命入力)。
+#[test]
+fn forward_only_init_from_quantised_bin_matches_training_trainer()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::trainer::{OutputFormat, TrainerBackend};
+
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions::standard();
+    let mut source = create_layerstack_trainer(&context, true)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(120.0);
+    batch.wdl.fill(0.65);
+    // 1 step 学習して初期値から動かした重みを量子化 .bin に書く (量子化往復を
+    // 含む実 --init-from 入力を作る)。
+    let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let path = std::env::temp_dir().join(format!(
+        "tatara-forward-only-initfrom-{}.bin",
+        std::process::id()
+    ));
+    TrainerBackend::save_checkpoint(&mut source, &path, None, OutputFormat::Tatara)?;
+
+    let weights = {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path)?);
+        nnue_format::LayerStackWeights::load_quantised_with_psqt(
+            &mut reader,
+            options.feature_set,
+            options.ft_out,
+            options.l1_out,
+            options.l2_out,
+            options.num_buckets,
+            false,
+        )?
+    };
+
+    let mut control = create_layerstack_trainer(&context, true)?;
+    control.load_layerstack_weights(&weights)?;
+    control.sync_ft_forward_weights()?;
+    let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
+    forward_only.load_layerstack_weights(&weights)?;
+    forward_only.sync_ft_forward_weights()?;
+
+    let control_out = control.validate(&batch.as_ref(), 0.25, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.25, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_out.loss.to_bits(), control_out.loss.to_bits());
+    assert_eq!(forward_out.net_output.len(), control_out.net_output.len());
+    for (i, (f, c)) in forward_out
+        .net_output
+        .iter()
+        .zip(control_out.net_output.iter())
+        .enumerate()
+    {
+        assert_eq!(f.to_bits(), c.to_bits(), "net_output[{i}]");
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
 /// forward-only trainer の `load_raw_checkpoint` は weight のみを載せ (optimizer
 /// state は 0-byte のまま)、学習 trainer が書いた checkpoint からの `validate` が
 /// 学習 trainer と bit 一致する (`--eval-only --resume` 経路)。

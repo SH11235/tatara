@@ -837,8 +837,10 @@ impl GpuTrainer {
     ///
     /// optimizer state (`m` / `v` / `slow`)・全 `*_grad`・backward 専用 workspace を
     /// 0-byte で確保するため、同一構成の学習 trainer より device memory 使用量が
-    /// 大幅に小さい (FT weight 系だけで optimizer state 4 本分 = weight の 4 倍、
-    /// backward activation-grad で batch × ft_out 級 4 本分が消える)。`validate` /
+    /// 大幅に小さい。FT weight 系では `m` / `v` / `slow` / `grad` の companion
+    /// buffer 4 本が消える (`--fp16-opt-state` 時の `m` / `v` は f16 なので削減量は
+    /// f32 換算 3 本分)。batch 比例の backward activation-grad も `dft_*` /
+    /// `dcombined_*` の `batch × ft_out` 級 4 本を筆頭に確保しない。`validate` /
     /// `validate_step` と weight load 経路のみ使用可で、`step` と
     /// `save_raw_checkpoint` は明示エラーになる。held-out 評価 (`--eval-only`) が
     /// 使う。
@@ -2046,7 +2048,8 @@ impl GpuTrainer {
         // なる。学習経路への直入りをここで閉じる。
         if self.forward_only {
             return Err(
-                "step is not available on a forward-only trainer (it has no optimizer state);                  construct the trainer with GpuTrainer::new to train"
+                "step is not available on a forward-only trainer (it has no optimizer state); \
+                 construct the trainer with GpuTrainer::new to train"
                     .into(),
             );
         }
