@@ -383,6 +383,7 @@ dependencies = [
  "clap",
  "gpu-kernels",
  "nnue-format",
+ "nnue-train",
  "shogi-features",
  "shogi-format",
 ]

@@ -309,10 +309,9 @@ pub enum BucketMode {
 }
 
 impl BucketMode {
-    /// `progresskpabs` の非推奨 alias。綴りに含まれる「8」は bucket 数ではない
-    /// (bucket 数は別途 `--num-buckets` で決まり、既定 9)。数字が意味を持たない
-    /// 名前のため canonical 名からは外しているが、既存 checkpoint の header と
-    /// 既存起動スクリプトがこの綴りを使うので入力としては受理し続ける。
+    /// `progresskpabs` として受理する非推奨 alias 綴り。checkpoint header にも
+    /// CLI 入力にも現れうる。綴り中の「8」は bucket 数を意味しない (bucket 数は
+    /// `--num-buckets` と format の格納値が持つ)。
     pub const LEGACY_PROGRESS_KPABS_NAME: &'static str = "progress8kpabs";
 
     /// checkpoint / experiment metadata に記録する canonical 名。
@@ -334,6 +333,27 @@ impl BucketMode {
             Self::LEGACY_PROGRESS_KPABS_NAME => Some((Self::ProgressKpAbs, true)),
             "kingrank9" => Some((Self::KingRank9, false)),
             _ => None,
+        }
+    }
+
+    /// `--bucket-mode` CLI 入力向けのパース。全 CLI (trainer / eval_sfen 等) が
+    /// 同一のエラー文・非推奨警告文を出すための単一パース点。alias 綴りのときは
+    /// 呼び出し元がそのまま表示する警告文を `Some` で返す。
+    pub fn parse_cli(name: &str) -> Result<(Self, Option<String>), String> {
+        match Self::parse(name) {
+            Some((mode, true)) => {
+                let warning = format!(
+                    "[deprecated] --bucket-mode {} is renamed to {}; the old spelling will \
+                     stop being accepted in a future release",
+                    Self::LEGACY_PROGRESS_KPABS_NAME,
+                    mode.canonical_name(),
+                );
+                Ok((mode, Some(warning)))
+            }
+            Some((mode, false)) => Ok((mode, None)),
+            None => Err(format!(
+                "--bucket-mode '{name}' is unknown (expected 'progresskpabs' or 'kingrank9')"
+            )),
         }
     }
 
@@ -1571,6 +1591,37 @@ mod tests {
             assert_eq!(parsed.canonical_name(), mode.canonical_name());
             assert!(!legacy);
         }
+    }
+
+    #[test]
+    fn bucket_mode_parse_cli_emits_deprecation_warning_only_for_alias() {
+        // canonical 名は警告なしで通る。
+        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+            let (parsed, warning) = BucketMode::parse_cli(mode.canonical_name()).unwrap();
+            assert_eq!(parsed.canonical_name(), mode.canonical_name());
+            assert!(warning.is_none(), "canonical name must not warn");
+        }
+
+        // alias 綴りは受理しつつ、両綴りを含む [deprecated] 警告文を返す。
+        let (parsed, warning) =
+            BucketMode::parse_cli(BucketMode::LEGACY_PROGRESS_KPABS_NAME).unwrap();
+        assert!(matches!(parsed, BucketMode::ProgressKpAbs));
+        let warning = warning.expect("alias input must carry a warning");
+        assert!(warning.starts_with("[deprecated]"), "{warning}");
+        assert!(
+            warning.contains(BucketMode::LEGACY_PROGRESS_KPABS_NAME),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(BucketMode::ProgressKpAbs.canonical_name()),
+            "{warning}"
+        );
+
+        // 未知名は canonical 名 2 種を列挙するエラー文。
+        let err = BucketMode::parse_cli("progress9kpabs").unwrap_err();
+        assert!(err.contains("unknown"), "{err}");
+        assert!(err.contains("progresskpabs"), "{err}");
+        assert!(err.contains("kingrank9"), "{err}");
     }
 
     /// shogi-format crate test fixture (100 records × 40 bytes = 4000 bytes)。

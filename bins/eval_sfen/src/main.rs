@@ -7,6 +7,7 @@ use nnue_format::layerstack_weights::{
     DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, LEGACY_NNUE_VERSION_BUCKETS9,
     NNUE_VERSION, QA, QB,
 };
+use nnue_train::dataloader::BucketMode;
 use shogi_features::{
     EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
     ThreatProfile, kingrank9_bucket_board,
@@ -44,50 +45,49 @@ struct Args {
     debug: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let (weights, spec) = load_layerstack(&args.nnue_file)?;
-    let progress = match args.bucket_mode.as_str() {
-        // "progress8kpabs" は非推奨 alias。「8」は bucket 数ではない (bucket 数は
-        // net file の格納値) が、既存スクリプト互換のため受理する。
-        mode @ ("progresskpabs" | "progress8kpabs") => {
-            if mode == "progress8kpabs" {
-                eprintln!(
-                    "[deprecated] --bucket-mode progress8kpabs is renamed to progresskpabs; \
-                     the old spelling will stop being accepted in a future release"
-                );
-            }
-            let path = args
-                .progress_coeff
-                .as_deref()
-                .ok_or("--progress-coeff is required with --bucket-mode progresskpabs")?;
-            Some(
-                ShogiProgressKPAbs::load_from_bin(path)
-                    .map_err(|e| format!("failed to load progress coeff: {e}"))?,
-            )
-        }
-        "kingrank9" => {
-            if weights.num_buckets != KINGRANK9_NUM_BUCKETS {
+/// bucket mode と関連引数・net 格納値の整合を検証し、progresskpabs なら coefficient
+/// file の path を返す。
+///
+/// - progresskpabs: `--progress-coeff` 必須 (指定 path を `Some` で返す)。
+/// - kingrank9: net の格納 bucket 数は 9 のみ、`--progress-coeff` は不可。
+fn validate_mode_args(
+    mode: BucketMode,
+    progress_coeff: Option<&Path>,
+    stored_num_buckets: usize,
+) -> Result<Option<&Path>, String> {
+    match mode {
+        BucketMode::ProgressKpAbs => progress_coeff
+            .ok_or_else(|| "--progress-coeff is required with --bucket-mode progresskpabs".into())
+            .map(Some),
+        BucketMode::KingRank9 => {
+            if stored_num_buckets != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
-                    "--bucket-mode kingrank9 requires a 9-bucket net (file has {})",
-                    weights.num_buckets
-                )
-                .into());
+                    "--bucket-mode kingrank9 requires a 9-bucket net (file has {stored_num_buckets})"
+                ));
             }
-            if args.progress_coeff.is_some() {
+            if progress_coeff.is_some() {
                 return Err(
                     "--progress-coeff is not used with --bucket-mode kingrank9; remove it".into(),
                 );
             }
-            None
+            Ok(None)
         }
-        other => {
-            return Err(format!(
-                "--bucket-mode '{other}' is unknown (expected 'progresskpabs' or 'kingrank9')"
-            )
-            .into());
-        }
-    };
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let (weights, spec) = load_layerstack(&args.nnue_file)?;
+    let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    let progress = validate_mode_args(mode, args.progress_coeff.as_deref(), weights.num_buckets)?
+        .map(|path| {
+            ShogiProgressKPAbs::load_from_bin(path)
+                .map_err(|e| format!("failed to load progress coeff: {e}"))
+        })
+        .transpose()?;
     let positions = if args.sfen.is_empty() {
         vec!["startpos".to_string()]
     } else {
@@ -658,4 +658,54 @@ fn remove_hand(board: &mut ShogiBoard, color: Color, pt: PieceType) -> Result<()
     }
     hand.set(pt, count - 1);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_mode_arg_shares_trainer_parse() {
+        // canonical / 非推奨 alias / 未知名の判定は trainer と同じ
+        // `BucketMode::parse_cli` に委譲する (エラー文・警告文も共通)。
+        let (mode, warning) = BucketMode::parse_cli("progresskpabs").unwrap();
+        assert!(matches!(mode, BucketMode::ProgressKpAbs));
+        assert!(warning.is_none());
+
+        let (mode, warning) =
+            BucketMode::parse_cli(BucketMode::LEGACY_PROGRESS_KPABS_NAME).unwrap();
+        assert!(matches!(mode, BucketMode::ProgressKpAbs));
+        assert!(
+            warning
+                .expect("alias must warn")
+                .starts_with("[deprecated]")
+        );
+
+        let err = BucketMode::parse_cli("unknown").unwrap_err();
+        assert!(err.contains("progresskpabs"), "{err}");
+        assert!(err.contains("kingrank9"), "{err}");
+    }
+
+    #[test]
+    fn validate_mode_args_checks_coeff_and_stored_bucket_count() {
+        let coeff = Path::new("progress.bin");
+
+        // progresskpabs: coeff 必須、指定 path を素通しで返す。
+        let path = validate_mode_args(BucketMode::ProgressKpAbs, Some(coeff), 9)
+            .expect("coeff supplied")
+            .expect("progresskpabs returns the coeff path");
+        assert_eq!(path, coeff);
+        let err = validate_mode_args(BucketMode::ProgressKpAbs, None, 9).unwrap_err();
+        assert!(err.contains("--progress-coeff is required"), "{err}");
+
+        // kingrank9: 格納 9 bucket のみ、coeff 不可。
+        assert!(matches!(
+            validate_mode_args(BucketMode::KingRank9, None, 9),
+            Ok(None)
+        ));
+        let err = validate_mode_args(BucketMode::KingRank9, None, 8).unwrap_err();
+        assert!(err.contains("requires a 9-bucket net"), "{err}");
+        let err = validate_mode_args(BucketMode::KingRank9, Some(coeff), 9).unwrap_err();
+        assert!(err.contains("not used"), "{err}");
+    }
 }
