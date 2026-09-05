@@ -747,7 +747,7 @@ fn yaneuraou_output_format_parses_and_simple_rejects_it() {
     .expect("KingRank9 should support YaneuraOu output");
     let error = validate_output_format(
         OutputFormatArg::Yaneuraou,
-        nnue_train::dataloader::BucketMode::Progress8KpAbs,
+        nnue_train::dataloader::BucketMode::ProgressKpAbs,
     )
     .unwrap_err();
     assert!(error.to_string().contains("--bucket-mode kingrank9"));
@@ -792,8 +792,27 @@ fn kingrank9_bucket_mode_validation() {
     let unknown = layerstack_args(&["--bucket-mode", "unknown"]);
     let err = validate_bucket_mode(&unknown).unwrap_err().to_string();
     assert!(err.contains("unknown"), "{err}");
-    assert!(err.contains("progress8kpabs"), "{err}");
+    assert!(err.contains("progresskpabs"), "{err}");
     assert!(err.contains("kingrank9"), "{err}");
+}
+
+#[test]
+fn progresskpabs_bucket_mode_accepts_canonical_and_legacy_alias() {
+    let canonical = layerstack_args(&["--bucket-mode", "progresskpabs"]);
+    assert!(matches!(
+        validate_bucket_mode(&canonical),
+        Ok(nnue_train::dataloader::BucketMode::ProgressKpAbs)
+    ));
+
+    // 非推奨 alias も同じ mode として受理される (警告は stderr のみ)。
+    let legacy = layerstack_args(&[
+        "--bucket-mode",
+        nnue_train::dataloader::BucketMode::LEGACY_PROGRESS_KPABS_NAME,
+    ]);
+    assert!(matches!(
+        validate_bucket_mode(&legacy),
+        Ok(nnue_train::dataloader::BucketMode::ProgressKpAbs)
+    ));
 }
 
 #[test]

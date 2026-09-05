@@ -121,7 +121,7 @@ impl<'a> StepContext<'a> {
 }
 
 // ===========================================================================
-// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progress8kpabs 9 buckets)
+// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progresskpabs 9 buckets)
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。

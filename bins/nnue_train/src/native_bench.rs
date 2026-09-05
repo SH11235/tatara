@@ -489,7 +489,7 @@ fn create_layerstack_trainer(
             16,
             32,
             9,
-            BucketMode::Progress8KpAbs,
+            BucketMode::ProgressKpAbs,
             precision,
             fixture_feature_set(Architecture::Layerstack),
             OptimizerKind::Ranger,

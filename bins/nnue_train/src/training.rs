@@ -214,18 +214,33 @@ fn parse_effect_bucket_config(
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
 ) -> Result<BucketMode, Box<dyn std::error::Error>> {
-    match args.bucket_mode.as_str() {
-        "progress8kpabs" => {
+    let Some((mode, legacy_alias)) = BucketMode::parse(&args.bucket_mode) else {
+        return Err(format!(
+            "--bucket-mode '{}' is unknown (expected 'progresskpabs' or 'kingrank9')",
+            args.bucket_mode
+        )
+        .into());
+    };
+    if legacy_alias {
+        eprintln!(
+            "[deprecated] --bucket-mode {} is renamed to {}; the old spelling will stop being \
+             accepted in a future release",
+            BucketMode::LEGACY_PROGRESS_KPABS_NAME,
+            mode.canonical_name(),
+        );
+    }
+    match mode {
+        BucketMode::ProgressKpAbs => {
             if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
                 return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progress8kpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progresskpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
                     args.num_buckets
                 )
                 .into());
             }
-            Ok(BucketMode::Progress8KpAbs)
+            Ok(BucketMode::ProgressKpAbs)
         }
-        "kingrank9" => {
+        BucketMode::KingRank9 => {
             if args.num_buckets != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
                     "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
@@ -240,10 +255,6 @@ pub(crate) fn validate_bucket_mode(
             }
             Ok(BucketMode::KingRank9)
         }
-        other => Err(format!(
-            "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
-        )
-        .into()),
     }
 }
 
@@ -255,7 +266,7 @@ pub(crate) fn validate_output_format(
     if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
     {
         return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress8kpabs routing is not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progresskpabs routing is not representable in YaneuraOu SFNN"
                 .into(),
         );
     }
@@ -556,12 +567,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     std::fs::create_dir_all(&cli.output)?;
 
-    // progress8kpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
+    // progresskpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
-    if matches!(bucket_mode, BucketMode::Progress8KpAbs) {
+    if matches!(bucket_mode, BucketMode::ProgressKpAbs) {
         match &layerstack.progress_coeff {
             Some(p) => {
-                println!("[train] loading progress8kpabs coeff: {}", p.display());
+                println!("[train] loading progresskpabs coeff: {}", p.display());
                 ShogiProgressKPAbs::load_from_bin(p).map_err(
                     |e| -> Box<dyn std::error::Error> {
                         format!("failed to load --progress-coeff {}: {e}", p.display()).into()

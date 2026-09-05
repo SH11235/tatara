@@ -594,7 +594,7 @@ impl LayerStackTestOptions {
             l1_out: 16,
             l2_out: 32,
             num_buckets: 2,
-            bucket_mode: BucketMode::Progress8KpAbs,
+            bucket_mode: BucketMode::ProgressKpAbs,
             precision: PrecisionFlags::default(),
             optimizer: OptimizerKind::Ranger,
             norm_loss_factor: None,

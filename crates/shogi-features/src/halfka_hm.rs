@@ -76,7 +76,7 @@ impl ShogiHalfKA_hm {
     /// `map_features` の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
     /// dataloader が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ呼んで
-    /// その `ShogiBoard` を HalfKA_hm 特徴抽出と progress8kpabs bucket 計算の
+    /// その `ShogiBoard` を HalfKA_hm 特徴抽出と progresskpabs bucket 計算の
     /// 両方で使い回すための入口 (`pos.decode()` を呼ぶ `map_features` と完全に
     /// 同じインデックスを emit する)。
     pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, f: F) {

@@ -23,11 +23,13 @@ struct Args {
     #[arg(long)]
     nnue_file: PathBuf,
 
-    /// Bucket assignment used when the net was trained: progress8kpabs or kingrank9.
-    #[arg(long, default_value = "progress8kpabs")]
+    /// Bucket assignment used when the net was trained: progresskpabs or
+    /// kingrank9. The deprecated spelling progress8kpabs is accepted as an
+    /// alias of progresskpabs.
+    #[arg(long, default_value = "progresskpabs")]
     bucket_mode: String,
 
-    /// progress8kpabs coefficient file. Required in progress8kpabs mode and unused in kingrank9 mode.
+    /// progresskpabs coefficient file. Required in progresskpabs mode and unused in kingrank9 mode.
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 
@@ -46,11 +48,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (weights, spec) = load_layerstack(&args.nnue_file)?;
     let progress = match args.bucket_mode.as_str() {
-        "progress8kpabs" => {
+        // "progress8kpabs" は非推奨 alias。「8」は bucket 数ではない (bucket 数は
+        // net file の格納値) が、既存スクリプト互換のため受理する。
+        mode @ ("progresskpabs" | "progress8kpabs") => {
+            if mode == "progress8kpabs" {
+                eprintln!(
+                    "[deprecated] --bucket-mode progress8kpabs is renamed to progresskpabs; \
+                     the old spelling will stop being accepted in a future release"
+                );
+            }
             let path = args
                 .progress_coeff
                 .as_deref()
-                .ok_or("--progress-coeff is required with --bucket-mode progress8kpabs")?;
+                .ok_or("--progress-coeff is required with --bucket-mode progresskpabs")?;
             Some(
                 ShogiProgressKPAbs::load_from_bin(path)
                     .map_err(|e| format!("failed to load progress coeff: {e}"))?,
@@ -73,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         other => {
             return Err(format!(
-                "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
+                "--bucket-mode '{other}' is unknown (expected 'progresskpabs' or 'kingrank9')"
             )
             .into());
         }

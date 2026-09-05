@@ -15,7 +15,7 @@ benchmarkである。benchmark条件、計時、run順序、統計、環境情�
 
 | Architecture | Fixture |
 |---|---|
-| LayerStack | `layerstack-halfka-hm-merged-factorized-v1`: factorized HalfKaHmMerged、FT 1536、L1 16、L2 32、Progress8KpAbs trainerと同じ9-bucket形状 |
+| LayerStack | `layerstack-halfka-hm-merged-factorized-v1`: factorized HalfKaHmMerged、FT 1536、L1 16、L2 32、ProgressKpAbs trainerと同じ9-bucket形状 |
 | Simple | `simple-halfkp-factorized-v1`: factorized HalfKP、CReLU、FT 256、L1 32、L2 32 |
 
 既定では各architectureについて次の2 precisionを測る。

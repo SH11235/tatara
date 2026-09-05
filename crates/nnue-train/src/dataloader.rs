@@ -303,17 +303,37 @@ impl HcpeFileLoader {
 pub enum BucketMode {
     /// KP-absolute progress 推定値を `num_buckets` 等分する。
     #[default]
-    Progress8KpAbs,
+    ProgressKpAbs,
     /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
     KingRank9,
 }
 
 impl BucketMode {
+    /// `progresskpabs` の非推奨 alias。綴りに含まれる「8」は bucket 数ではない
+    /// (bucket 数は別途 `--num-buckets` で決まり、既定 9)。数字が意味を持たない
+    /// 名前のため canonical 名からは外しているが、既存 checkpoint の header と
+    /// 既存起動スクリプトがこの綴りを使うので入力としては受理し続ける。
+    pub const LEGACY_PROGRESS_KPABS_NAME: &'static str = "progress8kpabs";
+
     /// checkpoint / experiment metadata に記録する canonical 名。
+    /// 推論エンジン rshogi の `LayerStackBucketMode::as_str()` と同じ綴り。
     pub const fn canonical_name(self) -> &'static str {
         match self {
-            Self::Progress8KpAbs => "progress8kpabs",
+            Self::ProgressKpAbs => "progresskpabs",
             Self::KingRank9 => "kingrank9",
+        }
+    }
+
+    /// bucket mode 名をパースする。canonical 名 (`progresskpabs` / `kingrank9`)
+    /// に加え、[`Self::LEGACY_PROGRESS_KPABS_NAME`] も受理する。返り値の bool は
+    /// legacy alias 経由で一致したかで、CLI 入力の呼び出し元が非推奨警告を出す
+    /// 判断に使う (checkpoint header の読み戻しでは警告不要なので無視する)。
+    pub fn parse(name: &str) -> Option<(Self, bool)> {
+        match name {
+            "progresskpabs" => Some((Self::ProgressKpAbs, false)),
+            Self::LEGACY_PROGRESS_KPABS_NAME => Some((Self::ProgressKpAbs, true)),
+            "kingrank9" => Some((Self::KingRank9, false)),
+            _ => None,
         }
     }
 
@@ -321,7 +341,7 @@ impl BucketMode {
     #[inline]
     pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
         match self {
-            Self::Progress8KpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
+            Self::ProgressKpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
             Self::KingRank9 => kingrank9_bucket_board(board),
         }
     }
@@ -329,7 +349,7 @@ impl BucketMode {
 
 impl From<ShogiProgressKPAbs> for BucketMode {
     fn from(_: ShogiProgressKPAbs) -> Self {
-        Self::Progress8KpAbs
+        Self::ProgressKpAbs
     }
 }
 
@@ -1169,7 +1189,7 @@ impl BucketedPrefetchedLoader {
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
     /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
     /// `[-c, c]` に飽和させる (`--score-clamp-abs`)。
-    /// `bucket_mode` は output bucket の算出方式。`Progress8KpAbs` の重みは
+    /// `bucket_mode` は output bucket の算出方式。`ProgressKpAbs` の重みは
     /// process-global なので呼び出し前に `ShogiProgressKPAbs::load_from_bin` 済で
     /// あること、未ロードなら全 bucket 4。`KingRank9` は外部重みを参照しない。
     /// `feature_set` は sparse index 化に使う feature set spec で、全 worker が共有する。
@@ -1526,6 +1546,31 @@ mod tests {
     /// テストで使う feature set spec (現 production の halfka-hm-merged)。
     fn test_spec() -> FeatureSetSpec {
         FeatureSet::HalfKaHmMerged.spec()
+    }
+
+    #[test]
+    fn bucket_mode_parse_accepts_canonical_names_and_legacy_alias() {
+        assert!(matches!(
+            BucketMode::parse("progresskpabs"),
+            Some((BucketMode::ProgressKpAbs, false))
+        ));
+        assert!(matches!(
+            BucketMode::parse("kingrank9"),
+            Some((BucketMode::KingRank9, false))
+        ));
+        // 非推奨 alias は legacy flag 付きで受理。
+        assert!(matches!(
+            BucketMode::parse(BucketMode::LEGACY_PROGRESS_KPABS_NAME),
+            Some((BucketMode::ProgressKpAbs, true))
+        ));
+        assert!(BucketMode::parse("progress9kpabs").is_none());
+        assert!(BucketMode::parse("").is_none());
+        // canonical 名は parse と round-trip する。
+        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+            let (parsed, legacy) = BucketMode::parse(mode.canonical_name()).unwrap();
+            assert_eq!(parsed.canonical_name(), mode.canonical_name());
+            assert!(!legacy);
+        }
     }
 
     /// shogi-format crate test fixture (100 records × 40 bytes = 4000 bytes)。
@@ -2563,7 +2608,7 @@ mod tests {
             None,
             None,
             1,
-            BucketMode::Progress8KpAbs,
+            BucketMode::ProgressKpAbs,
             test_spec(),
             false,
             1,
@@ -2584,7 +2629,7 @@ mod tests {
             None,
             None,
             1,
-            BucketMode::Progress8KpAbs,
+            BucketMode::ProgressKpAbs,
             test_spec(),
             false,
             1,

@@ -33,7 +33,7 @@ cargo run --release -p nnue-trainer -- \
 ```
 
 `--output-format` の既定値は `tatara`。`yaneuraou` は plain LayerStack と KingRank9 の
-組合せだけを受理し、`progress8kpabs`、Simple、PSQT、Threat、EffectBucket は明示的に
+組合せだけを受理し、`progresskpabs`、Simple、PSQT、Threat、EffectBucket は明示的に
 エラーにする。学習 config から bucket routing mode を判定できるため、この経路では
 `--assume-kingrank9` は不要。
 
@@ -90,7 +90,7 @@ YaneuraOu SFNN に受け皿が無いため、次を含む `.bin` は明示的に
 
 量子化 `.bin` は bucket routing mode を記録しないため、変換前に学習時の
 `--bucket-mode kingrank9` を確認し、`--assume-kingrank9` で明示する。既定の
-`progress8kpabs` で学習した 9 bucket net は、YaneuraOu と bucket の選択規則が
+`progresskpabs` で学習した 9 bucket net は、YaneuraOu と bucket の選択規則が
 異なるため変換できない。
 
 前提として、YaneuraOu 側は `DISTINGUISH_GOLDS` 無効 (既定) で build する。有効

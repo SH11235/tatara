@@ -13,14 +13,14 @@ id = "layerstack-fp32"
 architecture = "layerstack"
 feature_set = "halfka-hm-merged"
 global_args = ["--ft-factorize"]
-architecture_args = ["--bucket-mode", "progress8kpabs"]
+architecture_args = ["--bucket-mode", "progresskpabs"]
 
 [[cases]]
 id = "layerstack-all-optim"
 architecture = "layerstack"
 feature_set = "halfka-hm-merged"
 global_args = ["--ft-factorize", "--all-optim"]
-architecture_args = ["--bucket-mode", "progress8kpabs"]
+architecture_args = ["--bucket-mode", "progresskpabs"]
 
 [[cases]]
 id = "simple-halfkp-fp32"

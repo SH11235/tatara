@@ -1,6 +1,7 @@
 //! raw checkpoint format helper tests (GPU 不要)。
 
 use nnue_format::ArchKind;
+use nnue_train::dataloader::BucketMode;
 use shogi_features::{EffectBucketConfig, FeatureSet};
 
 use crate::{arch::*, ckpt::*};
@@ -138,7 +139,7 @@ const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(
 );
 
 fn layerstack_arch() -> RawCkptArch<'static> {
-    layerstack_arch_with_mode("progress8kpabs")
+    layerstack_arch_with_mode("progresskpabs")
 }
 
 fn layerstack_arch_with_mode(bucket_mode: &'static str) -> RawCkptArch<'static> {
@@ -213,7 +214,7 @@ fn layerstack_arch_factorized() -> RawCkptArch<'static> {
     RawCkptArch {
         feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
         arch_kind: ArchKind::LayerStack,
-        bucket_mode: Some("progress8kpabs"),
+        bucket_mode: Some("progresskpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
@@ -225,7 +226,7 @@ fn layerstack_arch_effect_bucket(config: EffectBucketConfig) -> RawCkptArch<'sta
             .spec()
             .with_effect_bucket_config(config),
         arch_kind: ArchKind::LayerStack,
-        bucket_mode: Some("progress8kpabs"),
+        bucket_mode: Some("progresskpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
@@ -325,7 +326,7 @@ fn downgrade_v6_to_v5(buf: &mut Vec<u8>, arch: &RawCkptArch) {
 #[test]
 fn raw_ckpt_v8_bucket_modes_round_trip() {
     for arch in [
-        layerstack_arch_with_mode("progress8kpabs"),
+        layerstack_arch_with_mode("progresskpabs"),
         layerstack_arch_with_mode("kingrank9"),
         simple_arch(),
     ] {
@@ -342,10 +343,35 @@ fn raw_ckpt_v8_bucket_modes_round_trip() {
 }
 
 #[test]
+fn raw_ckpt_v8_accepts_legacy_progresskpabs_alias() {
+    // 旧綴り "progress8kpabs" を格納した checkpoint は canonical 名
+    // "progresskpabs" を expected とする読み出しで受理される。
+    let legacy = layerstack_arch_with_mode(BucketMode::LEGACY_PROGRESS_KPABS_NAME);
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &legacy, "legacy-alias", 3, 30, None, 10).unwrap();
+    downgrade_v9_to_v8(&mut buf, None);
+
+    let canonical = layerstack_arch_with_mode(BucketMode::ProgressKpAbs.canonical_name());
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &canonical).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (3, 30, 10));
+
+    // 旧綴り格納でも kingrank9 との cross-mode resume は canonical 名で拒否される。
+    let err = read_raw_ckpt_header(
+        &mut Cursor::new(&buf),
+        &layerstack_arch_with_mode("kingrank9"),
+    )
+    .expect_err("legacy-alias checkpoint must not resume as kingrank9");
+    assert_eq!(
+        err.to_string(),
+        "checkpoint bucket mode 'progresskpabs' does not match --bucket-mode 'kingrank9'"
+    );
+}
+
+#[test]
 fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
     for (written, requested) in [
-        ("progress8kpabs", "kingrank9"),
-        ("kingrank9", "progress8kpabs"),
+        ("progresskpabs", "kingrank9"),
+        ("kingrank9", "progresskpabs"),
     ] {
         let mut buf = Vec::new();
         write_raw_ckpt_header(
@@ -375,8 +401,8 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
 }
 
 #[test]
-fn raw_ckpt_v7_layerstack_defaults_to_progress8kpabs() {
-    let progress = layerstack_arch_with_mode("progress8kpabs");
+fn raw_ckpt_v7_layerstack_defaults_to_progresskpabs() {
+    let progress = layerstack_arch_with_mode("progresskpabs");
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &progress, "legacy-v7", 7, 70, Some(100), 10).unwrap();
     downgrade_v8_to_v7(&mut buf, &progress);
@@ -391,7 +417,7 @@ fn raw_ckpt_v7_layerstack_defaults_to_progress8kpabs() {
     .expect_err("v7 layerstack checkpoint must not resume as kingrank9");
     assert_eq!(
         err.to_string(),
-        "checkpoint bucket mode 'progress8kpabs' does not match --bucket-mode 'kingrank9'"
+        "checkpoint bucket mode 'progresskpabs' does not match --bucket-mode 'kingrank9'"
     );
 }
 
@@ -523,7 +549,7 @@ fn layerstack_arch_threat_factorized() -> RawCkptArch<'static> {
             .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
             .with_ft_factorize(),
         arch_kind: ArchKind::LayerStack,
-        bucket_mode: Some("progress8kpabs"),
+        bucket_mode: Some("progresskpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
@@ -673,7 +699,7 @@ fn raw_ckpt_header_rejects_wrong_topology() {
     let written = RawCkptArch {
         feature_set: fs,
         arch_kind: ArchKind::LayerStack,
-        bucket_mode: Some("progress8kpabs"),
+        bucket_mode: Some("progresskpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &wrong_topo,
     };

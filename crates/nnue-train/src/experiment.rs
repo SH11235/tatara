@@ -102,7 +102,7 @@ pub struct Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_buckets: Option<usize>,
     pub optimizer: String,
-    /// bucket mode の canonical 名 (`progress8kpabs` 等)。bucket 無しアーキでは未指定。
+    /// bucket mode の canonical 名 (`progresskpabs` 等)。bucket 無しアーキでは未指定。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket_mode: Option<String>,
     /// per-perspective 活性化の canonical 名 (`crelu` / `screlu`)。LayerStack のように
@@ -654,7 +654,7 @@ mod tests {
             l2: 32,
             num_buckets: Some(9),
             optimizer: "ranger".to_string(),
-            bucket_mode: Some("progress8kpabs".to_string()),
+            bucket_mode: Some("progresskpabs".to_string()),
             activation: None,
             progress_coeff: Some("progress.bin".to_string()),
             lr: 8.75e-4,
