@@ -654,6 +654,190 @@ fn create_layerstack_trainer_with_batch(
     }
 }
 
+fn create_layerstack_trainer_forward_only(
+    context: &std::sync::Arc<CudaContext>,
+    native: bool,
+    options: LayerStackTestOptions,
+) -> Result<LayerStackGpuTrainer, Box<dyn std::error::Error>> {
+    let psqt_init = options
+        .psqt
+        .then(|| vec![0.0_f32; options.feature_set.ft_in() * options.num_buckets]);
+    let operation = || {
+        LayerStackGpuTrainer::new_forward_only(
+            context,
+            SMOKE_BATCH,
+            options.ft_out,
+            options.l1_out,
+            options.l2_out,
+            options.num_buckets,
+            options.bucket_mode,
+            options.precision,
+            options.feature_set,
+            options.optimizer,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            options.norm_loss_factor,
+            psqt_init.as_deref(),
+            &LayerStackInit::default_uniform(),
+        )
+    };
+    #[cfg(feature = "oxide-parity")]
+    return with_test_native_backend(native, operation);
+    #[cfg(feature = "native")]
+    {
+        assert!(native, "native build cannot create a cuda-oxide trainer");
+        operation()
+    }
+}
+
+/// forward-only trainer は同一重み・同一 batch で学習 trainer の `validate` と
+/// bit 一致する (optimizer state / backward workspace の 0-byte 化は forward +
+/// loss 経路の数値に影響しない)。学習経路 (`step`) と resume checkpoint 書き出し
+/// (`save_raw_checkpoint`) は明示エラー。
+#[test]
+fn forward_only_validate_matches_training_trainer() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut control = create_layerstack_trainer(&context, true)?;
+    let initial = control.to_layerstack_weights()?;
+    let mut forward_only =
+        create_layerstack_trainer_forward_only(&context, true, LayerStackTestOptions::standard())?;
+    forward_only.load_layerstack_weights(&initial)?;
+    forward_only.sync_ft_forward_weights()?;
+
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % initial.num_buckets) as i32;
+    }
+    batch.score.fill(150.0);
+    batch.wdl.fill(0.7);
+    let control_out = control.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_out.loss.to_bits(), control_out.loss.to_bits());
+    assert_eq!(
+        forward_out.net_output.len(),
+        control_out.net_output.len(),
+        "net_output length"
+    );
+    for (i, (f, c)) in forward_out
+        .net_output
+        .iter()
+        .zip(control_out.net_output.iter())
+        .enumerate()
+    {
+        assert_eq!(f.to_bits(), c.to_bits(), "net_output[{i}]");
+    }
+
+    let step_err = forward_only
+        .step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)
+        .expect_err("step must be rejected on a forward-only trainer");
+    assert!(step_err.to_string().contains("forward-only"), "{step_err}");
+
+    let ckpt_path = std::env::temp_dir().join(format!(
+        "tatara-forward-only-reject-{}.ckpt",
+        std::process::id()
+    ));
+    let save_err = forward_only
+        .save_raw_checkpoint(&ckpt_path, 1, "forward-only-test", None)
+        .expect_err("save_raw_checkpoint must be rejected on a forward-only trainer");
+    assert!(save_err.to_string().contains("forward-only"), "{save_err}");
+    Ok(())
+}
+
+/// 量子化 .bin を `--init-from` 相当で読み込んだ forward-only trainer が、同じ
+/// .bin を読み込んだ学習 trainer の `validate` と bit 一致する
+/// (`--eval-only --init-from <bin>` 経路。リスコア基盤の本命入力)。
+#[test]
+fn forward_only_init_from_quantised_bin_matches_training_trainer()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::trainer::{OutputFormat, TrainerBackend};
+
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions::standard();
+    let mut source = create_layerstack_trainer(&context, true)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(120.0);
+    batch.wdl.fill(0.65);
+    // 1 step 学習して初期値から動かした重みを量子化 .bin に書く (量子化往復を
+    // 含む実 --init-from 入力を作る)。
+    let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let path = std::env::temp_dir().join(format!(
+        "tatara-forward-only-initfrom-{}.bin",
+        std::process::id()
+    ));
+    TrainerBackend::save_checkpoint(&mut source, &path, None, OutputFormat::Tatara)?;
+
+    let weights = {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path)?);
+        nnue_format::LayerStackWeights::load_quantised_with_psqt(
+            &mut reader,
+            options.feature_set,
+            options.ft_out,
+            options.l1_out,
+            options.l2_out,
+            options.num_buckets,
+            false,
+        )?
+    };
+
+    let mut control = create_layerstack_trainer(&context, true)?;
+    control.load_layerstack_weights(&weights)?;
+    control.sync_ft_forward_weights()?;
+    let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
+    forward_only.load_layerstack_weights(&weights)?;
+    forward_only.sync_ft_forward_weights()?;
+
+    let control_out = control.validate(&batch.as_ref(), 0.25, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.25, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_out.loss.to_bits(), control_out.loss.to_bits());
+    assert_eq!(forward_out.net_output.len(), control_out.net_output.len());
+    for (i, (f, c)) in forward_out
+        .net_output
+        .iter()
+        .zip(control_out.net_output.iter())
+        .enumerate()
+    {
+        assert_eq!(f.to_bits(), c.to_bits(), "net_output[{i}]");
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// forward-only trainer の `load_raw_checkpoint` は weight のみを載せ (optimizer
+/// state は 0-byte のまま)、学習 trainer が書いた checkpoint からの `validate` が
+/// 学習 trainer と bit 一致する (`--eval-only --resume` 経路)。
+#[test]
+fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut control = create_layerstack_trainer(&context, true)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % 2) as i32;
+    }
+    batch.score.fill(80.0);
+    batch.wdl.fill(0.6);
+    // 1 step 学習して optimizer state を非自明にしてから checkpoint を書く。
+    let _ = control.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let path = std::env::temp_dir().join(format!(
+        "tatara-forward-only-resume-{}.ckpt",
+        std::process::id()
+    ));
+    control.save_raw_checkpoint(&path, 1, "forward-only-resume", None)?;
+
+    let mut forward_only =
+        create_layerstack_trainer_forward_only(&context, true, LayerStackTestOptions::standard())?;
+    let (superbatch, _, _) = forward_only.load_raw_checkpoint(&path)?;
+    forward_only.sync_ft_forward_weights()?;
+    assert_eq!(superbatch, 1);
+
+    let control_out = control.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_out.loss.to_bits(), control_out.loss.to_bits());
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
 #[test]
 fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;

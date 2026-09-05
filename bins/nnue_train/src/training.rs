@@ -699,7 +699,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    let mut trainer = GpuTrainer::new(
+    // --eval-only は forward + loss しか使わないため、optimizer state と backward
+    // workspace を確保しない forward-only trainer で構築する (同一 batch size でも
+    // device memory が学習構成より大幅に小さく、12GB 級 GPU で大 batch の評価が通る)。
+    let construct = if cli.eval_only {
+        GpuTrainer::new_forward_only
+    } else {
+        GpuTrainer::new
+    };
+    let mut trainer = construct(
         &ctx,
         cli.batch_size,
         layerstack.ft_out,
