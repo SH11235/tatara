@@ -82,8 +82,12 @@ fn file_size_mtime_ns(path: &Path) -> std::io::Result<(u64, u128)> {
 impl LoadedArtifact {
     /// ロードに使った byte 列そのものから identity を作る (.bin / progress 係数用)。
     /// stat の size が byte 列と食い違う場合は既に差し替えられているので error。
-    pub(crate) fn from_loaded_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<Self> {
-        let canonical = path.canonicalize()?;
+    ///
+    /// `canonical` は **呼び出し側が起動時に一度だけ canonicalize 済みの path** を
+    /// 渡す契約 (ここで解決し直すと、2 回の解決の間の symlink 差し替えで
+    /// 「ロード・hash・検証が同一実体を見る」不変条件が崩れる)。
+    pub(crate) fn from_loaded_bytes(canonical: &Path, bytes: &[u8]) -> std::io::Result<Self> {
+        let canonical = canonical.to_path_buf();
         let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
         if size != bytes.len() as u64 {
             return Err(std::io::Error::other(format!(
@@ -103,8 +107,10 @@ impl LoadedArtifact {
     /// file を streaming で hash して identity を作る (.ckpt のように一括読みが
     /// 重い artifact 用)。hash とロードの間の差し替えは、ロード直後に
     /// [`Self::verify_unchanged`] を呼んで stat 等値で検出する契約。
-    pub(crate) fn hash_file(path: &Path) -> std::io::Result<Self> {
-        let canonical = path.canonicalize()?;
+    /// `canonical` の契約は [`Self::from_loaded_bytes`] と同じ (解決済み path を
+    /// そのまま使い、ここでは解決し直さない)。
+    pub(crate) fn hash_file(canonical: &Path) -> std::io::Result<Self> {
+        let canonical = canonical.to_path_buf();
         let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
         let mut file = std::fs::File::open(&canonical)?;
         let mut hasher = Sha256::new();
@@ -197,10 +203,10 @@ impl Fingerprint {
         cfg: &RescoreConfig<'_>,
         input_records: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let input_canonical = cfg
-            .input
-            .canonicalize()
-            .map_err(|e| format!("failed to canonicalize input {}: {e}", cfg.input.display()))?;
+        // `cfg.input` は呼び出し側 (training.rs) が起動時に一度だけ canonicalize
+        // 済み。loader の worker open と同じ path をそのまま identity に使う
+        // (ここで解決し直すと worker が読む実体と乖離し得る)。
+        let input_canonical = cfg.input.to_path_buf();
         let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_canonical)?;
 
         // ビルド識別。crate version は forward 実装が変わっても動かないことが

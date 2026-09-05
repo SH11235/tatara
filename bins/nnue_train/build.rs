@@ -53,18 +53,41 @@ fn git_commit() -> Option<String> {
     })
 }
 
-/// `.git` 実体 directory の絶対 path (worktree では `.git` が file のため
-/// `rev-parse` で実体を引く)。
-fn git_dir() -> Option<String> {
+/// `git rev-parse <arg>` の 1 行出力。
+fn rev_parse(arg: &str) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--absolute-git-dir"])
+        .args(["rev-parse", "--path-format=absolute", arg])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let dir = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!dir.is_empty()).then_some(dir)
+    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// commit id の変化を追うための rerun-if-changed 対象。
+///
+/// - worktree gitdir の `HEAD` (checkout / detach) と `index` (dirty 判定の元)
+/// - **common git dir** の `refs/` (branch の実体 ref は worktree gitdir でなく
+///   共有側にあり、ref だけ動く更新 — merge や commit — は worktree 側 HEAD を
+///   変えない) と `packed-refs` (loose ref が pack 済みのとき)。個別 ref file は
+///   pack されると消えるため、`refs/` directory ごと walk 対象にする
+fn git_rerun_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(git_dir) = rev_parse("--absolute-git-dir") {
+        paths.push(format!("{git_dir}/HEAD"));
+        paths.push(format!("{git_dir}/index"));
+    }
+    if let Some(common) = rev_parse("--git-common-dir") {
+        paths.push(format!("{common}/refs"));
+        let packed = format!("{common}/packed-refs");
+        // 存在しない path の rerun-if-changed は毎 build 再実行になるため存在時のみ。
+        if Path::new(&packed).exists() {
+            paths.push(packed);
+        }
+    }
+    paths
 }
 
 fn cuda_root_candidates() -> Vec<PathBuf> {
@@ -110,9 +133,8 @@ fn main() {
     // なり binary の identity として成立しない。
     let commit = git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=TATARA_BUILD_COMMIT={commit}");
-    if let Some(dir) = git_dir() {
-        println!("cargo:rerun-if-changed={dir}/HEAD");
-        println!("cargo:rerun-if-changed={dir}/index");
+    for path in git_rerun_paths() {
+        println!("cargo:rerun-if-changed={path}");
     }
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
