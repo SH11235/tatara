@@ -541,7 +541,6 @@ fn validate_board(board: &ShogiBoard) -> Result<(), String> {
 pub const SCORE_RECORD_BYTES: u64 = 2;
 
 /// [`ScoreSidecarWriter::open`] の結果。
-#[derive(Debug)]
 pub enum SidecarOpen {
     /// `.done` marker と sidecar が現在の fingerprint に一致 — 再生成不要。
     Complete,
@@ -551,6 +550,18 @@ pub enum SidecarOpen {
         writer: ScoreSidecarWriter,
         resume_records: u64,
     },
+}
+
+/// sidecar の書き込み先。本番は [`File`] で、write エラー注入テストが差し替える。
+trait SidecarSink: Write + Send {
+    /// OS buffer まで含めて永続化する ([`File::sync_all`] 相当)。
+    fn sync_all(&self) -> io::Result<()>;
+}
+
+impl SidecarSink for File {
+    fn sync_all(&self) -> io::Result<()> {
+        File::sync_all(self)
+    }
 }
 
 /// little-endian i16 score sidecar の追記 writer + marker 管理。
@@ -563,19 +574,25 @@ pub enum SidecarOpen {
 ///   in-progress marker を削除する。
 /// - 途中終了 (drop) は marker と書き込み済み prefix を残す — prefix は常に
 ///   入力と行対応しているので、次回そのまま resume できる。
+/// - **write エラー後は毒化する**: 部分書き込みされた slice を同一 writer で
+///   retry すると prefix の二重 append や record 途中への継ぎ足しが起きるため、
+///   以降の `write_scores` / `finish` は同じエラーを返し続ける。復旧は次回
+///   起動時の `open` (件数ベース resume。2 byte 境界で切れていない末尾は硬い
+///   エラー) が担う。
 ///
 /// fingerprint は呼び出し側 (rescore driver) が組み立てる不透明な text で、
 /// 入力・net・routing・スケール等「出力を変える全条件」を書き込む契約。writer は
 /// byte 等値でのみ比較する。
-#[derive(Debug)]
 pub struct ScoreSidecarWriter {
-    out: BufWriter<File>,
+    out: BufWriter<Box<dyn SidecarSink>>,
     path: PathBuf,
     fingerprint: String,
     /// 書き込み済み record 数 (resume 分を含む)。
     written: u64,
     /// 完了時に一致すべき総 record 数。
     expected: u64,
+    /// write エラー後の毒化メッセージ (module doc の fail-closed 方針と同じ思想)。
+    poisoned: Option<String>,
 }
 
 /// `<sidecar>.in-progress` の path。
@@ -671,20 +688,45 @@ impl ScoreSidecarWriter {
         let file = File::options().create(true).append(true).open(sidecar)?;
         Ok(SidecarOpen::Writer {
             writer: Self {
-                out: BufWriter::with_capacity(1 << 20, file),
+                out: BufWriter::with_capacity(1 << 20, Box::new(file)),
                 path: sidecar.to_path_buf(),
                 fingerprint: fingerprint.to_string(),
                 written: resume_records,
                 expected: expected_records,
+                poisoned: None,
             },
             resume_records,
         })
     }
 
+    /// write エラー注入テスト用: marker 判定を通さず任意 sink の writer を作る。
+    /// buffer 容量 0 で write が即座に sink へ到達する。
+    #[cfg(test)]
+    fn with_sink_for_test(
+        sink: Box<dyn SidecarSink>,
+        sidecar: &Path,
+        expected_records: u64,
+        fingerprint: &str,
+    ) -> Self {
+        Self {
+            out: BufWriter::with_capacity(0, sink),
+            path: sidecar.to_path_buf(),
+            fingerprint: fingerprint.to_string(),
+            written: 0,
+            expected: expected_records,
+            poisoned: None,
+        }
+    }
+
     /// 1 chunk 分の score を追記する。呼び出し側は **エラーの無い完結した chunk**
     /// だけを渡す契約 (途中行までの書き込みは行対応を壊すため、chunk 単位で
-    /// all-or-nothing)。
+    /// all-or-nothing)。write エラーは slice の一部だけが出力へ残った可能性が
+    /// あるため writer を毒化する (超過検出は 1 byte も書く前に返すので毒化
+    /// しない)。
     pub fn write_scores(&mut self, scores: &[i16]) -> io::Result<()> {
+        if let Some(message) = &self.poisoned {
+            return Err(io::Error::other(message.clone()));
+        }
         let new_total = self.written + scores.len() as u64;
         if new_total > self.expected {
             return Err(io::Error::other(format!(
@@ -696,7 +738,16 @@ impl ScoreSidecarWriter {
             )));
         }
         for &score in scores {
-            self.out.write_all(&score.to_le_bytes())?;
+            if let Err(e) = self.out.write_all(&score.to_le_bytes()) {
+                let message = format!(
+                    "sidecar write to {} failed and may have left a partial record \
+                     ({e}); this writer is poisoned — restart to resume from the \
+                     in-progress marker",
+                    self.path.display()
+                );
+                self.poisoned = Some(message.clone());
+                return Err(io::Error::new(e.kind(), message));
+            }
         }
         self.written = new_total;
         Ok(())
@@ -709,10 +760,16 @@ impl ScoreSidecarWriter {
 
     /// 全件書き込みを検証して `.done` へ昇格する。
     ///
-    /// 件数不足は error で、その場合 in-progress marker は残る (次回 resume 可能)。
-    /// `.done` は一時 file + rename で atomic に書き、その後 in-progress marker を
-    /// 削除する (この順序なら間で停止しても次回は `.done` を正として回収できる)。
+    /// 件数不足・毒化済みは error で、その場合 in-progress marker は残る (次回
+    /// resume 可能)。昇格前に**物理ファイルサイズ = 論理 record 数 × 2** を検証
+    /// する (write エラーの取りこぼしや外部からの混入で崩れた sidecar に `.done`
+    /// を付けない)。`.done` は一時 file + rename で atomic に書き、その後
+    /// in-progress marker を削除する (この順序なら間で停止しても次回は `.done`
+    /// を正として回収できる)。
     pub fn finish(mut self) -> io::Result<()> {
+        if let Some(message) = &self.poisoned {
+            return Err(io::Error::other(message.clone()));
+        }
         if self.written != self.expected {
             return Err(io::Error::other(format!(
                 "sidecar {} has {} of {} expected records; keeping the in-progress \
@@ -724,6 +781,17 @@ impl ScoreSidecarWriter {
         }
         self.out.flush()?;
         self.out.get_ref().sync_all()?;
+        let physical = std::fs::metadata(&self.path)?.len();
+        if physical != self.written * SCORE_RECORD_BYTES {
+            return Err(io::Error::other(format!(
+                "sidecar {} physical size {physical} does not match the {} written \
+                 records ({} bytes); the file was modified or a write was torn — \
+                 keeping the in-progress marker instead of promoting",
+                self.path.display(),
+                self.written,
+                self.written * SCORE_RECORD_BYTES
+            )));
+        }
 
         let done = done_marker_path(&self.path);
         let tmp = append_extension(&self.path, ".done.tmp");
@@ -1279,6 +1347,90 @@ mod tests {
             .expect_err("overflow must fail");
         assert!(err.to_string().contains("exceed"), "{err}");
         drop(writer);
+        cleanup_sidecar(&path);
+    }
+
+    /// `fail_after` byte 書いた後の write を失敗させる sink (部分書き込み注入)。
+    struct FailingSink {
+        accepted: usize,
+        fail_after: usize,
+    }
+
+    impl Write for FailingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.accepted >= self.fail_after {
+                return Err(io::Error::other("injected write failure"));
+            }
+            let n = buf.len().min(self.fail_after - self.accepted);
+            self.accepted += n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SidecarSink for FailingSink {
+        fn sync_all(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 部分書き込み後の write エラーで writer が毒化され、同一 writer での retry
+    /// (prefix の二重 append / record 途中への継ぎ足し) と `.done` 昇格が拒否される。
+    #[test]
+    fn sidecar_writer_poisons_after_partial_write_failure() {
+        let path = temp_sidecar("poison");
+        cleanup_sidecar(&path);
+        // 5 byte (= record 2.5 個分) 受理後に失敗 → slice 途中の部分書き込み。
+        let sink = Box::new(FailingSink {
+            accepted: 0,
+            fail_after: 5,
+        });
+        let mut writer = ScoreSidecarWriter::with_sink_for_test(sink, &path, 10, "fp-poison");
+        let err = writer
+            .write_scores(&[1, 2, 3, 4])
+            .expect_err("partial write must fail");
+        assert!(err.to_string().contains("poisoned"), "{err}");
+        assert_eq!(
+            writer.written(),
+            0,
+            "failed chunk must not advance the counter"
+        );
+
+        let retry_err = writer
+            .write_scores(&[1])
+            .expect_err("a poisoned writer must reject retries");
+        assert!(retry_err.to_string().contains("poisoned"), "{retry_err}");
+
+        let finish_err = writer
+            .finish()
+            .expect_err("a poisoned writer must not promote");
+        assert!(finish_err.to_string().contains("poisoned"), "{finish_err}");
+        cleanup_sidecar(&path);
+    }
+
+    /// 論理カウンタが揃っていても物理サイズが一致しない sidecar は `.done` へ
+    /// 昇格しない (外部からの混入 / torn write の検出網)。
+    #[test]
+    fn sidecar_writer_finish_rejects_physical_size_mismatch() {
+        let path = temp_sidecar("physmismatch");
+        cleanup_sidecar(&path);
+        let (mut writer, _) = open_writer(&path, 3, "fp-phys");
+        writer.write_scores(&[1, 2, 3]).unwrap();
+        // writer の buffer が flush される前に、外部プロセス相当の 1 byte 混入を
+        // 模す (finish の flush で正常 6 byte が後続し、物理 7 byte になる)。
+        {
+            let mut external = File::options().append(true).open(&path).unwrap();
+            external.write_all(&[0xAA]).unwrap();
+        }
+        let err = writer
+            .finish()
+            .expect_err("physical size mismatch must not promote");
+        assert!(err.to_string().contains("physical size"), "{err}");
+        assert!(in_progress_marker_path(&path).exists());
+        assert!(!done_marker_path(&path).exists());
         cleanup_sidecar(&path);
     }
 
