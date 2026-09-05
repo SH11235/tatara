@@ -1232,6 +1232,179 @@ fn forward_only_matches_with_stack_shared_delta() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// rescore driver の end-to-end。forward-only trainer + 実 PSV fixture で:
+/// sidecar の行数・値 (validate_step の forward と bit 整合する i16 変換)・
+/// `.done` / `.meta.json`・決定論・完了 skip・件数 resume の bit 一致・
+/// fingerprint (score_scale) 変更での再生成、を一括で固定する。
+#[test]
+fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::rescore::{OrderedPsvLoader, done_marker_path, in_progress_marker_path};
+    use nnue_train::trainer::TrainerBackend;
+
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions::standard();
+    let mut trainer = create_layerstack_trainer_forward_only(&context, true, options)?;
+
+    // 300 records の入力 (chunk = SMOKE_BATCH = 16 → 満杯 18 chunk + 端数 12 の
+    // padding 経路も通る。trainer の workspace 容量が SMOKE_BATCH のため)。
+    let sample = {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("bins/nnue_train has a parent dir")
+            .parent()
+            .expect("repository root")
+            .join("crates/shogi-format/tests/data/sample.psv");
+        std::fs::read(path).expect("read sample.psv fixture")
+    };
+    let base = std::env::temp_dir().join(format!("tatara-rescore-driver-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base)?;
+    let input = base.join("in.psv");
+    let mut input_bytes = Vec::new();
+    for _ in 0..3 {
+        input_bytes.extend_from_slice(&sample);
+    }
+    std::fs::write(&input, &input_bytes)?;
+    // net_path は fingerprint の同一性にだけ使われる (重みは trainer にロード済み)。
+    let net = base.join("net.bin");
+    std::fs::write(&net, b"fingerprint identity stand-in")?;
+
+    // 未学習の test net は |net_output| が微小 (1e-4 級) のため、production 級の
+    // scale (数百〜千) では全ラベルが 0 に丸まり、値の比較が縮退する。テストでは
+    // 非 0 ラベルが出る大きさまで scale を上げる。
+    let score_scale = 2.0e6_f32;
+    let score_clip = 10_000_i16;
+    fn make_cfg<'a>(
+        input: &'a std::path::Path,
+        net: &'a std::path::Path,
+        output_dir: &'a std::path::Path,
+        scale: f32,
+        score_clip: i16,
+        options: LayerStackTestOptions,
+    ) -> crate::rescore_driver::RescoreConfig<'a> {
+        crate::rescore_driver::RescoreConfig {
+            input,
+            output_dir,
+            score_scale: scale,
+            score_clip,
+            batch_size: SMOKE_BATCH,
+            feature_set: options.feature_set,
+            bucket_mode: options.bucket_mode,
+            num_buckets: options.num_buckets,
+            net_path: net,
+            weights_source: "init-from-bin",
+            arch: crate::training::layerstack_architecture(
+                options.ft_out,
+                options.l1_out,
+                options.l2_out,
+                options.num_buckets,
+            ),
+            progress_coeff: None,
+        }
+    }
+
+    let dir_a = base.join("a");
+    crate::rescore_driver::run_rescore(
+        &mut trainer,
+        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+    )?;
+    let sidecar_a = dir_a.join("in.psv.scores.i16");
+    let bytes_a = std::fs::read(&sidecar_a)?;
+    assert_eq!(bytes_a.len(), 300 * 2, "one i16 per input record");
+    assert!(
+        bytes_a.iter().any(|&byte| byte != 0),
+        "labels are all zero; the scale-change contrast below would be vacuous"
+    );
+    assert!(done_marker_path(&sidecar_a).exists());
+    assert!(!in_progress_marker_path(&sidecar_a).exists());
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        dir_a.join("in.psv.scores.i16.meta.json"),
+    )?)?;
+    assert_eq!(meta["label_kind"], serde_json::json!("fp32_dequantised"));
+    assert_eq!(meta["input_records"], serde_json::json!("300"));
+    assert!(meta["net_sha256"].as_str().is_some_and(|s| s.len() == 64));
+
+    // 期待値: 同じ chunk 列を validate_step (loss 込み forward) に通した
+    // net_output から同式で変換した i16 列。forward_step が loss 手前まで同一の
+    // forward であることも同時に固定する。
+    let mut expected = Vec::with_capacity(300 * 2);
+    let mut reference_loader = OrderedPsvLoader::spawn(
+        &input,
+        SMOKE_BATCH,
+        16,
+        2,
+        options.bucket_mode,
+        options.num_buckets,
+        options.feature_set,
+        0,
+    )?;
+    while let Some(chunk) = reference_loader.next_chunk()? {
+        let out = TrainerBackend::validate_step(
+            &mut trainer,
+            &chunk.batch,
+            &chunk.buckets,
+            0.0,
+            SMOKE_LOSS_WRM,
+        )?;
+        for &value in &out.net_output[..chunk.n_real] {
+            let cp = (value * score_scale)
+                .round()
+                .clamp(-f32::from(score_clip), f32::from(score_clip));
+            expected.extend_from_slice(&(cp as i16).to_le_bytes());
+        }
+        reference_loader.recycle(chunk);
+    }
+    assert_eq!(bytes_a, expected, "sidecar must match the validate forward");
+
+    // 決定論: 別 dir への 2 回目が bit 一致。
+    let dir_b = base.join("b");
+    crate::rescore_driver::run_rescore(
+        &mut trainer,
+        &make_cfg(&input, &net, &dir_b, score_scale, score_clip, options),
+    )?;
+    let sidecar_b = dir_b.join("in.psv.scores.i16");
+    assert_eq!(std::fs::read(&sidecar_b)?, bytes_a);
+
+    // 完了 skip: 同 dir 再実行で sidecar が変化しない。
+    crate::rescore_driver::run_rescore(
+        &mut trainer,
+        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+    )?;
+    assert_eq!(std::fs::read(&sidecar_a)?, bytes_a);
+
+    // 件数 resume: `.done` の fingerprint text を in-progress に移し、sidecar を
+    // 100 records に切り詰めてから再実行 → 一気通貫と bit 一致で `.done` 復帰。
+    let fingerprint_text = std::fs::read_to_string(done_marker_path(&sidecar_a))?;
+    std::fs::write(in_progress_marker_path(&sidecar_a), &fingerprint_text)?;
+    std::fs::remove_file(done_marker_path(&sidecar_a))?;
+    std::fs::File::options()
+        .write(true)
+        .open(&sidecar_a)?
+        .set_len(100 * 2)?;
+    crate::rescore_driver::run_rescore(
+        &mut trainer,
+        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+    )?;
+    assert_eq!(std::fs::read(&sidecar_a)?, bytes_a);
+    assert!(done_marker_path(&sidecar_a).exists());
+    assert!(!in_progress_marker_path(&sidecar_a).exists());
+
+    // fingerprint 変更 (score_scale): 既存 sidecar は再生成され、値が変わる。
+    crate::rescore_driver::run_rescore(
+        &mut trainer,
+        &make_cfg(&input, &net, &dir_a, 1.0e6, score_clip, options),
+    )?;
+    let bytes_rescaled = std::fs::read(&sidecar_a)?;
+    assert_eq!(bytes_rescaled.len(), 300 * 2);
+    assert_ne!(
+        bytes_rescaled, bytes_a,
+        "a different score scale must change the labels"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
 #[test]
 fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;

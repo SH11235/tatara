@@ -347,6 +347,7 @@ const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
 fn simple_rejects_layerstack_only_global_flags() {
     // eval / threat 系は layerstack の eval・threat 経路専用 → simple では reject。
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--eval-only"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--rescore-input", "x.psv"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
     // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
@@ -623,6 +624,106 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
         root_help.contains("must equal `--wrm-nnue2score` whether or not weights are loaded"),
         "{root_help}"
     );
+}
+
+/// `--rescore-input` の flag 整合検証は GPU context を作る前に走る。誤指定が
+/// clean な `Err` で返り、必須 flag の欠落・併用不可の組合せが素通りしないことを
+/// 実経路 (`run_training`) で固定する。
+#[cfg(feature = "gpu")]
+#[test]
+fn rescore_cli_validation_rejects_bad_combinations() {
+    let run = |argv: &[&str]| {
+        let mut full = vec!["nnue-train"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("cli should parse");
+        crate::training::run_training(&cli)
+            .expect_err("invalid rescore flags must return a clean Err")
+            .to_string()
+    };
+
+    let err = run(&["--rescore-input", "x.psv", "layerstack"]);
+    assert!(err.contains("--init-from"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--rescore-output"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--rescore-score-scale"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--data",
+        "d.psv",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("cannot be combined"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+        "--tf32",
+    ]);
+    assert!(err.contains("FP32"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--eval-only",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("mutually exclusive"), "{err}");
+
+    // progresskpabs は係数必須 (学習側の「全 bucket 4」縮退を rescore に持ち込まない)。
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--progress-coeff"), "{err}");
+
+    // rescore 専用 flag の単独指定 (rescore-input 無し) も明示 reject。
+    let err = run(&["--rescore-score-scale", "1200", "layerstack"]);
+    assert!(err.contains("only used with --rescore-input"), "{err}");
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch

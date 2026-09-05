@@ -7,6 +7,16 @@ use nnue_format::ArchKind;
 
 use crate::arch::*;
 
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| "the score scale must be a positive finite number".to_string())?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err("the score scale must be a positive finite number".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_positive_i32(value: &str) -> Result<i32, String> {
     let parsed = value
         .parse::<i32>()
@@ -439,6 +449,31 @@ pub(crate) struct Cli {
     /// (--test-tail-positions or --test-data).
     #[arg(long, global = true)]
     pub(crate) eval_only: bool,
+
+    /// Rescore mode: read every record of this PSV in input order, run the
+    /// forward pass of the loaded network (via --init-from / --resume), and
+    /// write a little-endian i16 score sidecar `<input name>.scores.i16` into
+    /// --rescore-output. No training happens; unrelated to --data. Requires
+    /// --rescore-output and --rescore-score-scale.
+    #[arg(long, global = true)]
+    pub(crate) rescore_input: Option<PathBuf>,
+
+    /// Output directory for the rescore sidecar, its completion markers, and
+    /// the `.meta.json` companion. Used only with --rescore-input.
+    #[arg(long, global = true)]
+    pub(crate) rescore_output: Option<PathBuf>,
+
+    /// Centipawn conversion for the rescore sidecar: `score = net_output *
+    /// this` before rounding and clipping. Must be given explicitly (there is
+    /// no safe default; pass the nnue2score value the net generation was
+    /// trained with). Used only with --rescore-input.
+    #[arg(long, global = true, value_parser = parse_positive_f32)]
+    pub(crate) rescore_score_scale: Option<f32>,
+
+    /// Saturate rescore sidecar scores to +/- this value. The default matches
+    /// the rshogi rescore_psv default so GPU and CPU sidecars stay comparable.
+    #[arg(long, global = true, default_value_t = 10000)]
+    pub(crate) rescore_score_clip: i16,
 
     /// Zero a subset of the loaded threat FT rows before eval/train, to measure
     /// that subset's eval contribution (threat net + --init-from only). One of:

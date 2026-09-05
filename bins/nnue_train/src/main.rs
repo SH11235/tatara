@@ -38,6 +38,8 @@ mod loader_digest;
 #[cfg(any(feature = "oxide-parity", feature = "native"))]
 mod native_bench;
 #[cfg(feature = "gpu")]
+mod rescore_driver;
+#[cfg(feature = "gpu")]
 mod smoke;
 #[cfg(feature = "gpu")]
 mod threat_ablate;
@@ -88,6 +90,7 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             {
                 if cli.data.is_some()
                     || cli.eval_only
+                    || cli.rescore_input.is_some()
                     || cli.threat_ablate.is_some()
                     || cli.threat_norm_dump
                 {
