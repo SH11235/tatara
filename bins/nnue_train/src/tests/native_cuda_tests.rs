@@ -15,7 +15,9 @@ use crate::trainer_simple::SimpleRawCheckpointState;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
     trainer_common::{BatchData, PrecisionFlags},
-    trainer_layerstack::{GpuTrainer as LayerStackGpuTrainer, OptimGroupConfig},
+    trainer_layerstack::{
+        FactorizerVirtualBlock, GpuTrainer as LayerStackGpuTrainer, OptimGroupConfig,
+    },
     trainer_simple::SimpleGpuTrainer,
 };
 
@@ -1002,13 +1004,17 @@ fn forward_only_matches_with_threat_features_and_ablation() -> Result<(), Box<dy
 fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
 -> Result<(), Box<dyn std::error::Error>> {
     let standard = LayerStackTestOptions::standard();
-    let configs: Vec<(&str, LayerStackTestOptions)> = vec![
+    // 各 variant の寄与対照は、その variant 固有の仮想 block だけを 0 化する
+    // (全仮想行を消すと、毎構成で学習される通常 piece 行の寄与だけで出力差が
+    // 成立してしまい、variant 固有 fold の空振りを検出できない)。
+    let configs: Vec<(&str, LayerStackTestOptions, FactorizerVirtualBlock)> = vec![
         (
             "base-factorized",
             LayerStackTestOptions {
                 feature_set: standard.feature_set.with_ft_factorize(),
                 ..standard
             },
+            FactorizerVirtualBlock::Piece,
         ),
         (
             "threat-factorized",
@@ -1019,6 +1025,7 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
                     .with_ft_factorize(),
                 ..standard
             },
+            FactorizerVirtualBlock::ThreatPairs,
         ),
         (
             "effect-factorized-pool",
@@ -1029,6 +1036,7 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
                     .with_ft_factorize_mode(FtFactorizeMode::PoolEffectBuckets),
                 ..standard
             },
+            FactorizerVirtualBlock::Piece,
         ),
         (
             "effect-factorized-per-bucket",
@@ -1039,6 +1047,7 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
                     .with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket),
                 ..standard
             },
+            FactorizerVirtualBlock::Piece,
         ),
         (
             "psqt-factorized",
@@ -1047,11 +1056,12 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
                 psqt: true,
                 ..standard
             },
+            FactorizerVirtualBlock::Psqt,
         ),
     ];
 
     let context = CudaContext::new(0)?;
-    for (name, options) in configs {
+    for (name, options, contrast_block) in configs {
         eprintln!("[forward-only] factorizer variant: {name}");
         let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
         let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
@@ -1087,16 +1097,17 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
         {
             assert_eq!(f.to_bits(), c.to_bits(), "{name}: net_output[{i}]");
         }
-        // fold 分岐の寄与を分離する: 同一 checkpoint のまま仮想行 (と PSQT の
-        // 仮想 block) だけを 0 化して再 fold した対照と比較する。dense / base 行
-        // は同一なので、出力差 = 仮想行の fold 寄与そのもの。
-        forward_only.zero_factorizer_virtual_rows_for_test()?;
+        // fold 分岐の寄与を分離する: 同一 checkpoint のまま variant 固有の仮想
+        // block だけを 0 化して再 fold した対照と比較する。dense / base 行と
+        // 指定外の仮想 block は同一なので、出力差 = その block の fold 寄与
+        // そのもの。
+        forward_only.zero_factorizer_virtual_block_for_test(contrast_block)?;
         forward_only.sync_ft_forward_weights()?;
         let unfolded_out = forward_only.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
         assert_outputs_differ(
             &forward_out.net_output,
             &unfolded_out.net_output,
-            "folding the trained virtual rows",
+            "folding the variant-specific virtual block",
         );
         let _ = std::fs::remove_file(&path);
     }
