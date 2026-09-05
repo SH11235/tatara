@@ -903,9 +903,7 @@ fn assert_forward_only_validate_matches(
 /// 0-byte の f16 MomentBuf 構築も同時にカバーする。
 #[test]
 fn forward_only_matches_with_ft_fp16_activation() -> Result<(), Box<dyn std::error::Error>> {
-    let fp32_out =
-        assert_forward_only_validate_matches(LayerStackTestOptions::standard(), &mut |_| Ok(()))?;
-    for (ft_fp16_out, fp16_opt_state) in [(false, false), (true, false), (true, true)] {
+    let with_precision = |ft_fp16_out: bool, fp16_opt_state: bool| {
         let mut options = LayerStackTestOptions::standard();
         options.precision = PrecisionFlags {
             ft_fp16: true,
@@ -913,9 +911,37 @@ fn forward_only_matches_with_ft_fp16_activation() -> Result<(), Box<dyn std::err
             fp16_opt_state,
             ..PrecisionFlags::default()
         };
-        let fp16_out = assert_forward_only_validate_matches(options, &mut |_| Ok(()))?;
-        // f16 mirror が実際に forward で読まれている (純 FP32 と出力が異なる)。
-        assert_outputs_differ(&fp16_out, &fp32_out, "the FP16 forward path");
+        options
+    };
+    let fp32_out =
+        assert_forward_only_validate_matches(LayerStackTestOptions::standard(), &mut |_| Ok(()))?;
+
+    // ft_fp16 (weight の f16 mirror) の寄与: 純 FP32 との比較で分離する。
+    let weight_fp16_out =
+        assert_forward_only_validate_matches(with_precision(false, false), &mut |_| Ok(()))?;
+    assert_outputs_differ(&weight_fp16_out, &fp32_out, "the FP16 weight mirror");
+
+    // ft_fp16_out (FT activation の f16 化) の寄与: ft_fp16 を固定して ON/OFF を
+    // 比較する (純 FP32 との比較では weight mirror の差だけで通ってしまう)。
+    let act_fp16_out =
+        assert_forward_only_validate_matches(with_precision(true, false), &mut |_| Ok(()))?;
+    assert_outputs_differ(&act_fp16_out, &weight_fp16_out, "the FP16 activation path");
+
+    // fp16_opt_state は optimizer state の形式のみで forward 出力へは寄与しない
+    // 設計 — 0-byte f16 MomentBuf の構築 parity と、出力が変わらないことを固定する。
+    let opt_state_out =
+        assert_forward_only_validate_matches(with_precision(true, true), &mut |_| Ok(()))?;
+    assert_eq!(
+        opt_state_out.len(),
+        act_fp16_out.len(),
+        "fp16_opt_state must not change the output length"
+    );
+    for (i, (a, b)) in opt_state_out.iter().zip(act_fp16_out.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "fp16_opt_state must not change net_output[{i}]"
+        );
     }
     Ok(())
 }
@@ -1043,9 +1069,6 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
         control.save_raw_checkpoint(&path, 1, "forward-only-factorize", None)?;
 
         let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
-        // resume が実際に状態を注入していること (= fold 経路の寄与) を、resume
-        // しない同構成 forward-only との出力差で担保する。
-        let fresh_out = forward_only.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
         forward_only.load_raw_checkpoint(&path)?;
         forward_only.sync_ft_forward_weights()?;
 
@@ -1064,10 +1087,16 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
         {
             assert_eq!(f.to_bits(), c.to_bits(), "{name}: net_output[{i}]");
         }
+        // fold 分岐の寄与を分離する: 同一 checkpoint のまま仮想行 (と PSQT の
+        // 仮想 block) だけを 0 化して再 fold した対照と比較する。dense / base 行
+        // は同一なので、出力差 = 仮想行の fold 寄与そのもの。
+        forward_only.zero_factorizer_virtual_rows_for_test()?;
+        forward_only.sync_ft_forward_weights()?;
+        let unfolded_out = forward_only.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
         assert_outputs_differ(
             &forward_out.net_output,
-            &fresh_out.net_output,
-            "resuming the trained checkpoint",
+            &unfolded_out.net_output,
+            "folding the trained virtual rows",
         );
         let _ = std::fs::remove_file(&path);
     }

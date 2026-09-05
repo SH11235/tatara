@@ -1228,6 +1228,36 @@ impl GpuTrainer {
         self.sync_stack_forward_weights()
     }
 
+    /// FT factorizer の仮想行 (`ft_w` の `[ft_in, train_ft_in)` 行) と、PSQT
+    /// 有効時は `psqt.w` の同仮想 block を 0 化する。base 実行と dense 層は
+    /// 変えないため、fold の寄与 (仮想行が forward 出力を変えること) だけを
+    /// 分離して検証できる。呼び出し後は `sync_ft_forward_weights` で forward 用
+    /// comb を再生成すること。
+    #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
+    pub(crate) fn zero_factorizer_virtual_rows_for_test(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.feature_set.ft_factorize() {
+            return Err("the trainer has no factorizer virtual rows".into());
+        }
+        let ft_out = self.ws.ft_out;
+        let base_len = self.feature_set.ft_in() * ft_out;
+        let mut host = self.ft_w.to_host_vec(&self.stream)?;
+        for value in &mut host[base_len..] {
+            *value = 0.0;
+        }
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &host)?;
+        if let Some(psqt) = self.psqt.as_mut() {
+            let base_len = self.feature_set.ft_in() * self.num_buckets;
+            let mut host = psqt.w.to_host_vec(&self.stream)?;
+            for value in &mut host[base_len..] {
+                *value = 0.0;
+            }
+            psqt.w = DeviceBuffer::from_host(&self.stream, &host)?;
+        }
+        Ok(())
+    }
+
     #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
     pub(crate) fn set_stack_shared_delta_for_test(
         &mut self,
