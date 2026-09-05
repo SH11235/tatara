@@ -26,6 +26,8 @@
 //!   GpuTrainer` (= `TrainerBackend` impl) が担う
 //! - `validation`: held-out 検証データでの per-superbatch loss / accuracy 計測
 //!   (`HeldoutSet` + sign-agreement accuracy)
+//! - `rescore`: 教師 pool relabel 用の順序保存・並列 decode chunk loader と
+//!   i16 score sidecar writer (`OrderedPsvLoader` / `ScoreSidecarWriter`)
 //! - `experiment`: 学習 run ごとの構造化ログ (experiment.json) を組み立て
 //!   incremental に書き出す (`ExperimentLogger` / `ExperimentDoc`)
 //! - `init`: 重み初期化の汎用記述 (`Dist` / `Scale` / `LayerInit`) と決定論的
@@ -36,6 +38,7 @@ pub mod dataloader;
 pub mod experiment;
 pub mod init;
 pub mod optimizer;
+pub mod rescore;
 pub mod schedule;
 pub mod trainer;
 pub mod validation;
