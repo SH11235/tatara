@@ -343,6 +343,19 @@ impl PsqtState {
     }
 }
 
+/// [`GpuTrainer::zero_factorizer_virtual_block_for_test`] が 0 化する仮想 block。
+#[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
+#[derive(Clone, Copy)]
+pub(crate) enum FactorizerVirtualBlock {
+    /// piece-input 仮想行 (全 factorizer 構成が持つ。effect-bucket mode では
+    /// mode ごとの行数)。
+    Piece,
+    /// threat within-pair 仮想行 (threat profile + factorizer 構成のみ)。
+    ThreatPairs,
+    /// PSQT (`psqt.w`) 側の仮想 block (PSQT + factorizer 構成のみ)。
+    Psqt,
+}
+
 impl Drop for GpuTrainer {
     fn drop(&mut self) {
         // 残り queue 済 GPU 操作 (`loss_ring` の async D2H が `loss_acc` を read する、
@@ -1226,6 +1239,54 @@ impl GpuTrainer {
             l3: layer(l3_w_n, 1, self.num_buckets * l3_w_n, self.num_buckets)?,
         });
         self.sync_stack_forward_weights()
+    }
+
+    /// FT factorizer の仮想行のうち **指定 block だけ** を 0 化する。base 実行と
+    /// dense 層、指定外の仮想 block は変えないため、その block の fold 寄与
+    /// (block の仮想行が forward 出力を変えること) だけを分離して検証できる。
+    /// 呼び出し後は `sync_ft_forward_weights` で forward 用 comb を再生成する
+    /// こと。仮想行の layout は `[実行 | virtual piece rows | virtual
+    /// threat-pair rows]` ([`FeatureSetSpec::train_ft_in`] の並び)。
+    #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
+    pub(crate) fn zero_factorizer_virtual_block_for_test(
+        &mut self,
+        block: FactorizerVirtualBlock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.feature_set.ft_factorize() {
+            return Err("the trainer has no factorizer virtual rows".into());
+        }
+        let ft_out = self.ws.ft_out;
+        let ft_in = self.feature_set.ft_in();
+        let threat_pair_rows = self.feature_set.threat_factorize_pair_count();
+        let piece_rows = self.feature_set.ft_factorize_virtual_rows() - threat_pair_rows;
+        let (row_start, row_end) = match block {
+            FactorizerVirtualBlock::Piece => (ft_in, ft_in + piece_rows),
+            FactorizerVirtualBlock::ThreatPairs => {
+                if threat_pair_rows == 0 {
+                    return Err("the trainer has no threat-pair virtual rows".into());
+                }
+                (ft_in + piece_rows, ft_in + piece_rows + threat_pair_rows)
+            }
+            FactorizerVirtualBlock::Psqt => {
+                let psqt = self
+                    .psqt
+                    .as_mut()
+                    .ok_or("the trainer has no PSQT virtual block")?;
+                let base_len = ft_in * self.num_buckets;
+                let mut host = psqt.w.to_host_vec(&self.stream)?;
+                for value in &mut host[base_len..] {
+                    *value = 0.0;
+                }
+                psqt.w = DeviceBuffer::from_host(&self.stream, &host)?;
+                return Ok(());
+            }
+        };
+        let mut host = self.ft_w.to_host_vec(&self.stream)?;
+        for value in &mut host[row_start * ft_out..row_end * ft_out] {
+            *value = 0.0;
+        }
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &host)?;
+        Ok(())
     }
 
     #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
