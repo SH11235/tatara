@@ -838,6 +838,167 @@ fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// 同一 options で学習 trainer と forward-only trainer を作り、`prepare` を両方へ
+/// 適用した後、同じ batch の `validate` (loss + net_output) が bit 一致することを
+/// 検証する共通 helper。重み初期化は決定論的
+/// ([`LayerStackInit::default_uniform`]) なので、`prepare` が両者に同じ操作を
+/// する限り重みは一致し、差が出るとすれば forward-only の 0-byte 化した buffer に
+/// forward / loss 経路が触れている場合に限られる。
+type PrepareTrainer<'a> =
+    &'a mut dyn FnMut(&mut LayerStackGpuTrainer) -> Result<(), Box<dyn std::error::Error>>;
+
+fn assert_forward_only_validate_matches(
+    options: LayerStackTestOptions,
+    prepare: PrepareTrainer<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
+    prepare(&mut control)?;
+    prepare(&mut forward_only)?;
+
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(90.0);
+    batch.wdl.fill(0.55);
+    let control_out = control.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+    assert_eq!(
+        forward_out.loss.to_bits(),
+        control_out.loss.to_bits(),
+        "loss must be bit-identical"
+    );
+    assert_eq!(forward_out.net_output.len(), control_out.net_output.len());
+    for (i, (f, c)) in forward_out
+        .net_output
+        .iter()
+        .zip(control_out.net_output.iter())
+        .enumerate()
+    {
+        assert_eq!(f.to_bits(), c.to_bits(), "net_output[{i}]");
+    }
+    Ok(())
+}
+
+/// FT weight FP16 (`--ft-fp16`) と FT activation FP16 (`--ft-fp16-out`) の
+/// forward-only。forward が読む f16 mirror (`ft_w_h`) と forward 側 activation
+/// (`ft_*_out_h`) は実長のまま確保され、0-byte 化されるのは backward 側
+/// (`dft_*_h`) だけであることの検証。`--fp16-opt-state` は optimizer 専用だが
+/// 0-byte の f16 MomentBuf 構築も同時にカバーする。
+#[test]
+fn forward_only_matches_with_ft_fp16_activation() -> Result<(), Box<dyn std::error::Error>> {
+    for (ft_fp16_out, fp16_opt_state) in [(false, false), (true, false), (true, true)] {
+        let mut options = LayerStackTestOptions::standard();
+        options.precision = PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out,
+            fp16_opt_state,
+            ..PrecisionFlags::default()
+        };
+        assert_forward_only_validate_matches(options, &mut |_| Ok(()))?;
+    }
+    Ok(())
+}
+
+/// threat feature 有効 net の forward-only と、`--threat-ablate` の実経路
+/// (host 側で threat 行を 0 化した重みを `load_layerstack_weights` で注入して
+/// 評価する。`--eval-only --threat-ablate` は forward-only trainer で構築される)。
+#[test]
+fn forward_only_matches_with_threat_features_and_ablation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut options = LayerStackTestOptions::standard();
+    options.feature_set = FeatureSet::HalfKp
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide);
+
+    assert_forward_only_validate_matches(options, &mut |_| Ok(()))?;
+
+    let ft_out = options.ft_out;
+    assert_forward_only_validate_matches(options, &mut |trainer| {
+        let mut weights = trainer.to_layerstack_weights()?;
+        let stats = crate::threat_ablate::apply(&mut weights, ft_out, "all")
+            .map_err(std::io::Error::other)?;
+        assert!(stats.zeroed_dims > 0, "ablation must zero threat rows");
+        trainer.load_layerstack_weights(&weights)?;
+        trainer.sync_ft_forward_weights()?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// FT factorizer 有効構成の forward-only。量子化 .bin は仮想行を持たないため
+/// `load_layerstack_weights` では入れられず、この構成が生きるのは
+/// `--eval-only --resume <ckpt>` 経路のみ — 学習 trainer が書いた raw ckpt を
+/// forward-only へ resume して bit 一致を検証する。
+#[test]
+fn forward_only_matches_with_ft_factorizer_via_ckpt_resume()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut options = LayerStackTestOptions::standard();
+    options.feature_set = FeatureSet::HalfKp.spec().with_ft_factorize();
+
+    let context = CudaContext::new(0)?;
+    let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(70.0);
+    batch.wdl.fill(0.6);
+    // 1 step 学習して仮想行を含む master を初期値から動かしてから ckpt を書く。
+    let _ = control.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let path = std::env::temp_dir().join(format!(
+        "tatara-forward-only-factorize-{}.ckpt",
+        std::process::id()
+    ));
+    control.save_raw_checkpoint(&path, 1, "forward-only-factorize", None)?;
+
+    let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
+    forward_only.load_raw_checkpoint(&path)?;
+    forward_only.sync_ft_forward_weights()?;
+
+    let control_out = control.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    let forward_out = forward_only.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_out.loss.to_bits(), control_out.loss.to_bits());
+    for (i, (f, c)) in forward_out
+        .net_output
+        .iter()
+        .zip(control_out.net_output.iter())
+        .enumerate()
+    {
+        assert_eq!(f.to_bits(), c.to_bits(), "net_output[{i}]");
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// PSQT shortcut 有効構成の forward-only (PSQT weight は実長、optimizer state
+/// だけが 0-byte)。
+#[test]
+fn forward_only_matches_with_psqt() -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = LayerStackTestOptions::standard();
+    options.psqt = true;
+    assert_forward_only_validate_matches(options, &mut |_| Ok(()))
+}
+
+/// stack-shared-delta 有効構成の forward-only。shared term の master と forward が
+/// 読む folded は実長のまま確保され、両 trainer に同じ shared 値を入れると
+/// validate が bit 一致する。
+#[test]
+fn forward_only_matches_with_stack_shared_delta() -> Result<(), Box<dyn std::error::Error>> {
+    let options = LayerStackTestOptions::standard();
+    let l2_in = (options.l1_out - 1) * 2;
+    let l2_shared = vec![0.25_f32; options.l2_out * l2_in];
+    let l2_b_shared = vec![-0.5_f32; options.l2_out];
+    let l3_shared = vec![0.75_f32; options.l2_out];
+    let l3_b_shared = vec![-1.0_f32];
+    assert_forward_only_validate_matches(options, &mut |trainer| {
+        trainer.enable_stack_shared_delta()?;
+        trainer.set_stack_shared_delta_for_test(&l2_shared, &l2_b_shared, &l3_shared, &l3_b_shared)
+    })
+}
+
 #[test]
 fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error::Error>> {
     let context = CudaContext::new(0)?;
