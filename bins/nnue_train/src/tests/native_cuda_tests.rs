@@ -1265,9 +1265,11 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
         input_bytes.extend_from_slice(&sample);
     }
     std::fs::write(&input, &input_bytes)?;
-    // net_path は fingerprint の同一性にだけ使われる (重みは trainer にロード済み)。
+    // net の identity は fingerprint の同一性にだけ使われる (重みは trainer に
+    // ロード済み)。--init-from と同じく「読んだ byte 列」から固定する。
     let net = base.join("net.bin");
-    std::fs::write(&net, b"fingerprint identity stand-in")?;
+    let net_bytes = b"fingerprint identity stand-in".to_vec();
+    std::fs::write(&net, &net_bytes)?;
 
     // 未学習の test net は |net_output| が微小 (1e-4 級) のため、production 級の
     // scale (数百〜千) では全ラベルが 0 に丸まり、値の比較が縮退する。テストでは
@@ -1277,6 +1279,7 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     fn make_cfg<'a>(
         input: &'a std::path::Path,
         net: &'a std::path::Path,
+        net_bytes: &[u8],
         output_dir: &'a std::path::Path,
         scale: f32,
         score_clip: i16,
@@ -1291,7 +1294,8 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
             feature_set: options.feature_set,
             bucket_mode: options.bucket_mode,
             num_buckets: options.num_buckets,
-            net_path: net,
+            net: crate::rescore_driver::LoadedArtifact::from_loaded_bytes(net, net_bytes)
+                .expect("net identity"),
             weights_source: "init-from-bin",
             arch: crate::training::layerstack_architecture(
                 options.ft_out,
@@ -1299,6 +1303,11 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
                 options.l2_out,
                 options.num_buckets,
             ),
+            threat_profile: "off".to_string(),
+            effect_bucket: "off".to_string(),
+            ft_factorize: "off",
+            psqt: false,
+            stack_shared_delta: false,
             progress_coeff: None,
         }
     }
@@ -1306,7 +1315,15 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let dir_a = base.join("a");
     crate::rescore_driver::run_rescore(
         &mut trainer,
-        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+        &make_cfg(
+            &input,
+            &net,
+            &net_bytes,
+            &dir_a,
+            score_scale,
+            score_clip,
+            options,
+        ),
     )?;
     let sidecar_a = dir_a.join("in.psv.scores.i16");
     let bytes_a = std::fs::read(&sidecar_a)?;
@@ -1323,6 +1340,9 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(meta["label_kind"], serde_json::json!("fp32_dequantised"));
     assert_eq!(meta["input_records"], serde_json::json!("300"));
     assert!(meta["net_sha256"].as_str().is_some_and(|s| s.len() == 64));
+    assert!(meta["git_commit"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(meta["threat_profile"], serde_json::json!("off"));
+    assert_eq!(meta["ft_factorize"], serde_json::json!("off"));
 
     // 期待値: 同じ chunk 列を validate_step (loss 込み forward) に通した
     // net_output から同式で変換した i16 列。forward_step が loss 手前まで同一の
@@ -1360,7 +1380,15 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let dir_b = base.join("b");
     crate::rescore_driver::run_rescore(
         &mut trainer,
-        &make_cfg(&input, &net, &dir_b, score_scale, score_clip, options),
+        &make_cfg(
+            &input,
+            &net,
+            &net_bytes,
+            &dir_b,
+            score_scale,
+            score_clip,
+            options,
+        ),
     )?;
     let sidecar_b = dir_b.join("in.psv.scores.i16");
     assert_eq!(std::fs::read(&sidecar_b)?, bytes_a);
@@ -1368,7 +1396,15 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     // 完了 skip: 同 dir 再実行で sidecar が変化しない。
     crate::rescore_driver::run_rescore(
         &mut trainer,
-        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+        &make_cfg(
+            &input,
+            &net,
+            &net_bytes,
+            &dir_a,
+            score_scale,
+            score_clip,
+            options,
+        ),
     )?;
     assert_eq!(std::fs::read(&sidecar_a)?, bytes_a);
 
@@ -1383,7 +1419,15 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
         .set_len(100 * 2)?;
     crate::rescore_driver::run_rescore(
         &mut trainer,
-        &make_cfg(&input, &net, &dir_a, score_scale, score_clip, options),
+        &make_cfg(
+            &input,
+            &net,
+            &net_bytes,
+            &dir_a,
+            score_scale,
+            score_clip,
+            options,
+        ),
     )?;
     assert_eq!(std::fs::read(&sidecar_a)?, bytes_a);
     assert!(done_marker_path(&sidecar_a).exists());
@@ -1392,7 +1436,7 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     // fingerprint 変更 (score_scale): 既存 sidecar は再生成され、値が変わる。
     crate::rescore_driver::run_rescore(
         &mut trainer,
-        &make_cfg(&input, &net, &dir_a, 1.0e6, score_clip, options),
+        &make_cfg(&input, &net, &net_bytes, &dir_a, 1.0e6, score_clip, options),
     )?;
     let bytes_rescaled = std::fs::read(&sidecar_a)?;
     assert_eq!(bytes_rescaled.len(), 300 * 2);

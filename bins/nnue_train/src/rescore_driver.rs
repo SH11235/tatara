@@ -9,9 +9,12 @@
 //! ```
 //!
 //! 不変条件は「sidecar 行 `i` = 入力 record `i`」。fingerprint には出力を変える
-//! 全条件 (net の sha256、routing、progress 係数の sha256、score 変換、batch
-//! size) を書き、条件が 1 つでも変われば既存 sidecar は再生成される。完了時は
-//! `.done` marker (fingerprint text) に加えて機械可読な `.meta.json` を書く。
+//! 全条件 — net / progress 係数の **ロードに使った byte 列そのものの sha256**
+//! ([`LoadedArtifact`])、routing と arch 構成の全 provenance、score 変換、
+//! ビルド識別 (crate version + git commit) — を書き、条件が 1 つでも変われば
+//! 既存 sidecar は再生成される。`.done` 昇格前には入力 / net / 係数の現物が
+//! ロード時から差し替わっていないことを stat で再検証する。完了時は `.done`
+//! marker (fingerprint text) に加えて機械可読な `.meta.json` を書く。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,7 +33,90 @@ use crate::trainer_layerstack::GpuTrainer;
 /// GPU tiled dense kernel の `b % 16 == 0` 制約に合わせる chunk padding 単位。
 const PAD_MULTIPLE: usize = 16;
 
-/// [`run_rescore`] に渡す設定 (CLI から解決済みの値)。
+/// ロード済み artifact (net / progress 係数) の識別情報。
+///
+/// sha256 は **ロードに使った byte 列そのもの** (または stream hash 直後にロード
+/// して stat 等値を確認したもの) から計算する。ロード後に path を開き直して
+/// hash すると、その間の差し替えで「実際に評価した重みと違う識別情報」が完成
+/// sidecar に付く。
+pub(crate) struct LoadedArtifact {
+    pub(crate) canonical: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mtime_ns: u128,
+    pub(crate) sha256: String,
+}
+
+/// file の `(len, modified_unix_ns)`。
+fn file_size_mtime_ns(path: &Path) -> std::io::Result<(u64, u128)> {
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|_| std::io::Error::other("file mtime is before the UNIX epoch"))?;
+    Ok((meta.len(), mtime.as_nanos()))
+}
+
+impl LoadedArtifact {
+    /// ロードに使った byte 列そのものから identity を作る (.bin / progress 係数用)。
+    /// stat の size が byte 列と食い違う場合は既に差し替えられているので error。
+    pub(crate) fn from_loaded_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<Self> {
+        let canonical = path.canonicalize()?;
+        let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
+        if size != bytes.len() as u64 {
+            return Err(std::io::Error::other(format!(
+                "{} changed while loading (read {} bytes, file is now {size} bytes)",
+                canonical.display(),
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            canonical,
+            size,
+            mtime_ns,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    /// file を streaming で hash して identity を作る (.ckpt のように一括読みが
+    /// 重い artifact 用)。hash とロードの間の差し替えは、ロード直後に
+    /// [`Self::verify_unchanged`] を呼んで stat 等値で検出する契約。
+    pub(crate) fn hash_file(path: &Path) -> std::io::Result<Self> {
+        let canonical = path.canonicalize()?;
+        let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
+        let mut file = std::fs::File::open(&canonical)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0_u8; 1 << 20];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Self {
+            canonical,
+            size,
+            mtime_ns,
+            sha256: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    /// 現物が identity 記録時から差し替わっていないかを stat で検証する。
+    pub(crate) fn verify_unchanged(&self, what: &str) -> std::io::Result<()> {
+        let (size, mtime_ns) = file_size_mtime_ns(&self.canonical)?;
+        if (size, mtime_ns) != (self.size, self.mtime_ns) {
+            return Err(std::io::Error::other(format!(
+                "{what} {} changed since it was loaded (size {} -> {size}); the loaded \
+                 data no longer matches the file on disk — restart the run",
+                self.canonical.display(),
+                self.size
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// [`run_rescore`] に渡す設定 (CLI から解決済みの値 + ロード時に固定した identity)。
 pub(crate) struct RescoreConfig<'a> {
     /// 入力 PSV (全 record を原順序で relabel する)。
     pub(crate) input: &'a Path,
@@ -45,48 +131,39 @@ pub(crate) struct RescoreConfig<'a> {
     pub(crate) feature_set: FeatureSetSpec,
     pub(crate) bucket_mode: BucketMode,
     pub(crate) num_buckets: usize,
-    /// ロードした weights ファイル (`--init-from` の .bin または `--resume` の .ckpt)。
-    pub(crate) net_path: &'a Path,
+    /// ロードした weights の identity (`--init-from` の .bin は読んだ byte 列から、
+    /// `--resume` の .ckpt は stream hash + ロード後 stat 検証で固定済み)。
+    pub(crate) net: LoadedArtifact,
     /// weights の種別: `"init-from-bin"` (量子化 → 逆量子化 fp32) /
     /// `"resume-ckpt"` (fp32 master)。
     pub(crate) weights_source: &'a str,
     /// arch 識別子 ([`crate::training::layerstack_architecture`] の値)。
     pub(crate) arch: String,
-    /// progresskpabs の係数ファイル (kingrank9 では `None`)。
-    pub(crate) progress_coeff: Option<&'a Path>,
-}
-
-/// file 全体の sha256 (hex) を streaming で計算する (net は数百 MB あるため
-/// 一括読みしない)。
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0_u8; 1 << 20];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// file の `(len, modified_unix_ns)`。
-fn file_size_mtime_ns(path: &Path) -> std::io::Result<(u64, u128)> {
-    let meta = std::fs::metadata(path)?;
-    let mtime = meta
-        .modified()?
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_err(|_| std::io::Error::other("file mtime is before the UNIX epoch"))?;
-    Ok((meta.len(), mtime.as_nanos()))
+    /// threat profile の CLI 名 (`off` 含む)。
+    pub(crate) threat_profile: String,
+    /// effect bucket 構成の CLI 名 (`off` 含む)。
+    pub(crate) effect_bucket: String,
+    /// FT factorizer mode (`off` / `base` / `pool-effect-buckets` /
+    /// `per-effect-bucket`)。
+    pub(crate) ft_factorize: &'static str,
+    /// PSQT shortcut の有無。
+    pub(crate) psqt: bool,
+    /// stack-shared-delta の有無。
+    pub(crate) stack_shared_delta: bool,
+    /// progresskpabs の係数 identity (kingrank9 では `None`)。ロードに使った
+    /// byte 列から固定済み。
+    pub(crate) progress_coeff: Option<LoadedArtifact>,
 }
 
 /// fingerprint の key=value 対。text marker と `.meta.json` の両方をこの単一の
 /// リストから作る (二重管理で項目がずれると「marker は一致するのに meta は別条件」
-/// という取り違えの温床になる)。
+/// という取り違えの温床になる)。入力の identity は `.done` 昇格前の再検証用に
+/// 別 field で保持する。
 struct Fingerprint {
     pairs: Vec<(&'static str, String)>,
+    input_canonical: PathBuf,
+    input_size: u64,
+    input_mtime_ns: u128,
 }
 
 impl Fingerprint {
@@ -99,39 +176,39 @@ impl Fingerprint {
             .canonicalize()
             .map_err(|e| format!("failed to canonicalize input {}: {e}", cfg.input.display()))?;
         let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_canonical)?;
-        let net_canonical = cfg
-            .net_path
-            .canonicalize()
-            .map_err(|e| format!("failed to canonicalize net {}: {e}", cfg.net_path.display()))?;
-        let (net_size, _) = file_size_mtime_ns(&net_canonical)?;
-        let net_sha256 = sha256_file(&net_canonical)?;
+
+        // ビルド識別。crate version は forward 実装が変わっても動かないことが
+        // あるため、git commit (dirty 印付き) を併記して「同 version の別実装」で
+        // 旧 sidecar を無言 skip しないようにする。repo 外で実行されて commit が
+        // 取れない場合は "unknown" (その環境同士では判別できない制約は残る)。
+        let git_commit = crate::training::git_commit().unwrap_or_else(|| "unknown".to_string());
 
         let mut pairs: Vec<(&'static str, String)> = vec![
             ("version", "1".to_string()),
             ("mode", "gpu-nnue-fp32".to_string()),
             ("tool_version", env!("CARGO_PKG_VERSION").to_string()),
+            ("git_commit", git_commit),
             ("input_path", input_canonical.display().to_string()),
             ("input_size", input_size.to_string()),
             ("input_mtime_ns", input_mtime_ns.to_string()),
             ("input_records", input_records.to_string()),
-            ("net_path", net_canonical.display().to_string()),
-            ("net_size", net_size.to_string()),
-            ("net_sha256", net_sha256),
+            ("net_path", cfg.net.canonical.display().to_string()),
+            ("net_size", cfg.net.size.to_string()),
+            ("net_sha256", cfg.net.sha256.clone()),
             ("weights_source", cfg.weights_source.to_string()),
             ("arch", cfg.arch.clone()),
             ("feature_set", cfg.feature_set.canonical_name().to_string()),
+            ("threat_profile", cfg.threat_profile.clone()),
+            ("effect_bucket", cfg.effect_bucket.clone()),
+            ("ft_factorize", cfg.ft_factorize.to_string()),
+            ("psqt", cfg.psqt.to_string()),
+            ("stack_shared_delta", cfg.stack_shared_delta.to_string()),
             ("bucket_mode", cfg.bucket_mode.canonical_name().to_string()),
             ("num_buckets", cfg.num_buckets.to_string()),
         ];
-        if let Some(coeff) = cfg.progress_coeff {
-            let coeff_canonical = coeff.canonicalize().map_err(|e| {
-                format!(
-                    "failed to canonicalize progress coeff {}: {e}",
-                    coeff.display()
-                )
-            })?;
-            pairs.push(("progress_coeff_path", coeff_canonical.display().to_string()));
-            pairs.push(("progress_coeff_sha256", sha256_file(&coeff_canonical)?));
+        if let Some(coeff) = &cfg.progress_coeff {
+            pairs.push(("progress_coeff_path", coeff.canonical.display().to_string()));
+            pairs.push(("progress_coeff_sha256", coeff.sha256.clone()));
         }
         pairs.push((
             "score_scale_bits",
@@ -140,7 +217,12 @@ impl Fingerprint {
         pairs.push(("score_scale", format!("{}", cfg.score_scale)));
         pairs.push(("score_clip", cfg.score_clip.to_string()));
         pairs.push(("batch_size", cfg.batch_size.to_string()));
-        Ok(Self { pairs })
+        Ok(Self {
+            pairs,
+            input_canonical,
+            input_size,
+            input_mtime_ns,
+        })
     }
 
     /// marker に書く text (key=value 行、[`ScoreSidecarWriter`] は byte 等値比較)。
@@ -153,6 +235,30 @@ impl Fingerprint {
             out.push('\n');
         }
         out
+    }
+
+    /// 入力 / net / progress 係数の現物が fingerprint 構築時 (= ロード時) から
+    /// 差し替わっていないことを stat で検証する。`.done` 昇格前に呼び、上書き・
+    /// 差し替えを完成 sidecar に紛れ込ませない。
+    fn verify_sources_unchanged(
+        &self,
+        cfg: &RescoreConfig<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (size, mtime_ns) = file_size_mtime_ns(&self.input_canonical)?;
+        if (size, mtime_ns) != (self.input_size, self.input_mtime_ns) {
+            return Err(format!(
+                "input {} changed while rescoring (size {} -> {size}); refusing to promote \
+                 the sidecar — restart the run",
+                self.input_canonical.display(),
+                self.input_size
+            )
+            .into());
+        }
+        cfg.net.verify_unchanged("net")?;
+        if let Some(coeff) = &cfg.progress_coeff {
+            coeff.verify_unchanged("--progress-coeff")?;
+        }
+        Ok(())
     }
 
     /// `.meta.json` の内容。fingerprint 全項目 + ラベル種別と変換式の注記。
@@ -284,6 +390,10 @@ pub(crate) fn run_rescore(
             last_log = Instant::now();
         }
     }
+    // 昇格前に入力 / net / 係数の差し替えを検出する (差し替え後のロード済み weight
+    // でも評価自体は正しいが、marker が指す実体と一致しない sidecar を完成扱いに
+    // しない)。
+    fingerprint.verify_sources_unchanged(cfg)?;
     writer.finish()?;
     write_meta_json(&sidecar, &fingerprint, cfg)?;
 
@@ -307,4 +417,171 @@ fn write_meta_json(
     let json = serde_json::to_string_pretty(&fingerprint.meta_json(cfg))?;
     std::fs::write(&path, json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shogi_features::FeatureSet;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tatara-rescore-fp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn test_config<'a>(
+        input: &'a Path,
+        output_dir: &'a Path,
+        net: LoadedArtifact,
+        coeff: Option<LoadedArtifact>,
+    ) -> RescoreConfig<'a> {
+        RescoreConfig {
+            input,
+            output_dir,
+            score_scale: 1200.0,
+            score_clip: 10_000,
+            batch_size: 16,
+            feature_set: FeatureSet::HalfKp.spec(),
+            bucket_mode: BucketMode::ProgressKpAbs,
+            num_buckets: 9,
+            net,
+            weights_source: "init-from-bin",
+            arch: "LayerStack-128-16-32-9bucket".to_string(),
+            threat_profile: "off".to_string(),
+            effect_bucket: "off".to_string(),
+            ft_factorize: "off",
+            psqt: false,
+            stack_shared_delta: false,
+            progress_coeff: coeff,
+        }
+    }
+
+    #[test]
+    fn loaded_artifact_hashes_loaded_bytes_and_detects_swap() {
+        let dir = temp_dir("artifact");
+        let path = dir.join("net.bin");
+        let bytes = b"net weights v1".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let artifact = LoadedArtifact::from_loaded_bytes(&path, &bytes).unwrap();
+        assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        artifact
+            .verify_unchanged("net")
+            .expect("unchanged file must verify");
+
+        // stream hash 版も同じ identity を作る。
+        let streamed = LoadedArtifact::hash_file(&path).unwrap();
+        assert_eq!(streamed.sha256, artifact.sha256);
+        assert_eq!(streamed.size, artifact.size);
+
+        // 差し替え (サイズ変更) は stat 検証で検出。
+        std::fs::write(&path, b"swapped to different content").unwrap();
+        let err = artifact
+            .verify_unchanged("net")
+            .expect_err("swapped file must be detected");
+        assert!(
+            err.to_string().contains("changed since it was loaded"),
+            "{err}"
+        );
+
+        // 読んだ byte 列と現物サイズの不一致 (読み中の差し替え) も検出。
+        let err = LoadedArtifact::from_loaded_bytes(&path, &bytes)
+            .map(|_| ())
+            .expect_err("size mismatch must be detected");
+        assert!(err.to_string().contains("changed while loading"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_records_build_identity_and_arch_provenance() {
+        let dir = temp_dir("provenance");
+        let input = dir.join("in.psv");
+        std::fs::write(&input, vec![0_u8; 40 * 2]).unwrap();
+        let net_path = dir.join("net.bin");
+        let net_bytes = b"net bytes".to_vec();
+        std::fs::write(&net_path, &net_bytes).unwrap();
+        let coeff_path = dir.join("progress.bin");
+        let coeff_bytes = b"coeff bytes".to_vec();
+        std::fs::write(&coeff_path, &coeff_bytes).unwrap();
+
+        let net = LoadedArtifact::from_loaded_bytes(&net_path, &net_bytes).unwrap();
+        let coeff = LoadedArtifact::from_loaded_bytes(&coeff_path, &coeff_bytes).unwrap();
+        let coeff_sha = coeff.sha256.clone();
+        let out_dir = dir.join("out");
+        let cfg = test_config(&input, &out_dir, net, Some(coeff));
+        let fingerprint = Fingerprint::build(&cfg, 2).unwrap();
+        let text = fingerprint.text();
+
+        // ビルド識別: version だけでなく git commit も入る (同 version の別実装で
+        // 旧 sidecar を無言 skip しない)。
+        assert!(text.contains("tool_version="), "{text}");
+        assert!(text.contains("git_commit="), "{text}");
+        assert!(
+            !text.contains("git_commit=\n"),
+            "commit value must not be empty: {text}"
+        );
+
+        // ロード内容の sha が素通しで入る。
+        assert!(
+            text.contains(&format!("net_sha256={:x}", Sha256::digest(&net_bytes))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("progress_coeff_sha256={coeff_sha}")),
+            "{text}"
+        );
+
+        // arch provenance: 生成条件を復元できる全構成 flag。
+        for key in [
+            "arch=LayerStack-128-16-32-9bucket",
+            "feature_set=",
+            "threat_profile=off",
+            "effect_bucket=off",
+            "ft_factorize=off",
+            "psqt=false",
+            "stack_shared_delta=false",
+            "bucket_mode=progresskpabs",
+            "num_buckets=9",
+            "score_scale_bits=0x",
+            "batch_size=16",
+        ] {
+            assert!(text.contains(key), "missing {key} in: {text}");
+        }
+
+        // meta.json も同じリストから生成される。
+        let meta = fingerprint.meta_json(&cfg);
+        assert_eq!(meta["label_kind"], serde_json::json!("fp32_dequantised"));
+        assert_eq!(meta["threat_profile"], serde_json::json!("off"));
+        assert_eq!(meta["ft_factorize"], serde_json::json!("off"));
+        assert_eq!(meta["psqt"], serde_json::json!("false"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_verify_detects_source_swaps_before_promotion() {
+        let dir = temp_dir("verify");
+        let input = dir.join("in.psv");
+        std::fs::write(&input, vec![0_u8; 40]).unwrap();
+        let net_path = dir.join("net.bin");
+        let net_bytes = b"net".to_vec();
+        std::fs::write(&net_path, &net_bytes).unwrap();
+        let net = LoadedArtifact::from_loaded_bytes(&net_path, &net_bytes).unwrap();
+        let out_dir = dir.join("out");
+        let cfg = test_config(&input, &out_dir, net, None);
+        let fingerprint = Fingerprint::build(&cfg, 1).unwrap();
+        fingerprint
+            .verify_sources_unchanged(&cfg)
+            .expect("unchanged sources must verify");
+
+        // 入力の上書き (サイズ変更) を昇格前検証が検出する。
+        std::fs::write(&input, vec![0_u8; 40 * 2]).unwrap();
+        let err = fingerprint
+            .verify_sources_unchanged(&cfg)
+            .expect_err("input swap must be detected");
+        assert!(err.to_string().contains("changed while rescoring"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

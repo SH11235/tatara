@@ -470,9 +470,12 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_parser = parse_positive_f32)]
     pub(crate) rescore_score_scale: Option<f32>,
 
-    /// Saturate rescore sidecar scores to +/- this value. The default matches
-    /// the rshogi rescore_psv default so GPU and CPU sidecars stay comparable.
-    #[arg(long, global = true, default_value_t = 10000)]
+    /// Saturate rescore sidecar scores to +/- this value (must be >= 1; 0 or a
+    /// negative value would clamp every label to a constant). The default
+    /// matches the rshogi rescore_psv default so GPU and CPU sidecars stay
+    /// comparable.
+    #[arg(long, global = true, default_value_t = 10000,
+          value_parser = clap::value_parser!(i16).range(1..))]
     pub(crate) rescore_score_clip: i16,
 
     /// Zero a subset of the loaded threat FT rows before eval/train, to measure

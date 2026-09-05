@@ -724,6 +724,53 @@ fn rescore_cli_validation_rejects_bad_combinations() {
     // rescore 専用 flag の単独指定 (rescore-input 無し) も明示 reject。
     let err = run(&["--rescore-score-scale", "1200", "layerstack"]);
     assert!(err.contains("only used with --rescore-input"), "{err}");
+
+    // batch サイズの下限 (loader の 16 行 padding 前提)。0 は %16 検査を素通り
+    // するため専用の floor が要る。
+    for bad_batch in ["0", "8"] {
+        let err = run(&[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "out",
+            "--rescore-score-scale",
+            "1200",
+            "--batch-size",
+            bad_batch,
+            "layerstack",
+            "--init-from",
+            "net.bin",
+        ]);
+        assert!(
+            err.contains("--batch-size >= 16"),
+            "batch {bad_batch}: {err}"
+        );
+    }
+}
+
+/// `--rescore-score-clip` は 1 以上のみ受理 (0 / 負は全ラベルが定数化する)。
+#[test]
+fn rescore_score_clip_rejects_non_positive_values() {
+    for bad in ["0", "-1"] {
+        assert!(
+            Cli::try_parse_from(["nnue-train", "--rescore-score-clip", bad, "layerstack"]).is_err(),
+            "--rescore-score-clip {bad} must be a parse error"
+        );
+    }
+    assert!(Cli::try_parse_from(["nnue-train", "--rescore-score-clip", "1", "layerstack"]).is_ok());
+}
+
+/// 学習範囲検査の免除は「学習しない経路」に限る。
+#[test]
+fn training_range_exemption_covers_eval_only_and_rescore() {
+    use crate::training::training_range_exempt;
+    let plain = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
+    assert!(!training_range_exempt(&plain));
+    let eval = Cli::try_parse_from(["nnue-train", "--eval-only", "layerstack"]).unwrap();
+    assert!(training_range_exempt(&eval));
+    let rescore =
+        Cli::try_parse_from(["nnue-train", "--rescore-input", "x.psv", "layerstack"]).unwrap();
+    assert!(training_range_exempt(&rescore));
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
