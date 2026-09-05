@@ -24,11 +24,13 @@ use std::process::Command;
 /// build 時点の git commit (short) を返す。working tree が clean でなければ
 /// `-dirty` を付ける。repo 外 build や git 不在では `None`。
 ///
-/// 検出の限界: rerun 追跡は HEAD / index の変化のみで、`git add` されていない
-/// 編集は次の index 変化まで反映されない (dirty 判定が古い binary が残り得る)。
-/// 厳密な identity が要る運用は clean checkout でのビルドが前提で、rescore
-/// driver 側も dirty / unknown ビルドでは fingerprint を一致不能にして完了
-/// skip / resume を無効化する。
+/// 検出の限界: commit の変化 (checkout / commit / ref 更新) は
+/// [`git_rerun_paths`] の HEAD / index / refs / packed-refs 追跡で再ビルドに
+/// 反映されるが、**dirty 判定**は `git add` されていない working tree の編集を
+/// 見る手段がなく、次の index 変化まで古い判定の binary が残り得る。厳密な
+/// identity が要る運用は clean checkout でのビルドが前提で、rescore driver 側も
+/// dirty / unknown ビルドでは fingerprint を一致不能にして完了 skip / resume を
+/// 無効化する。
 fn git_commit() -> Option<String> {
     let rev = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
