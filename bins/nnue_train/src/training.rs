@@ -672,10 +672,18 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 if cli.rescore_input.is_some() {
                     // fingerprint の sha256 をロードに使った byte 列そのものから
                     // 計算する (読み直すと差し替え時に hash と実体が乖離する)。
-                    let bytes = std::fs::read(p)?;
-                    rescore_coeff_identity = Some(
-                        crate::rescore_driver::LoadedArtifact::from_loaded_bytes(p, &bytes)?,
-                    );
+                    // 読みと identity は同じ canonical path。
+                    let canonical = p.canonicalize().map_err(|e| {
+                        format!(
+                            "failed to canonicalize --progress-coeff {}: {e}",
+                            p.display()
+                        )
+                    })?;
+                    let bytes = std::fs::read(&canonical)?;
+                    rescore_coeff_identity =
+                        Some(crate::rescore_driver::LoadedArtifact::from_loaded_bytes(
+                            &canonical, &bytes,
+                        )?);
                     ShogiProgressKPAbs::load_from_bytes(&bytes).map_err(
                         |e| -> Box<dyn std::error::Error> {
                             format!("failed to load --progress-coeff {}: {e}", p.display()).into()
@@ -889,9 +897,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 書くため、file を一括で読んでから同じ buffer で parse する。学習経路は
         // 従来どおり streaming (数百 MB を余分に保持しない)。
         let mut weights = if cli.rescore_input.is_some() {
-            let bytes = std::fs::read(init)?;
+            // hash とロードの対象を同じ実体にするため、canonical path に解決して
+            // から読む (symlink 差し替えで両者が乖離しないように)。
+            let canonical = init.canonicalize().map_err(|e| {
+                format!("failed to canonicalize --init-from {}: {e}", init.display())
+            })?;
+            let bytes = std::fs::read(&canonical)?;
             rescore_net_identity = Some(crate::rescore_driver::LoadedArtifact::from_loaded_bytes(
-                init, &bytes,
+                &canonical, &bytes,
             )?);
             let mut reader = std::io::Cursor::new(&bytes[..]);
             LayerStackWeights::load_quantised_with_psqt(
@@ -930,10 +943,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     } else if let Some(ckpt) = &cli.resume {
         // rescore は .ckpt (数 GB 級) を stream hash → 直後にロード → stat 等値の
         // 検証で identity を固定する (hash とロードの間の差し替えを検出可能にする)。
-        if cli.rescore_input.is_some() {
-            rescore_net_identity = Some(crate::rescore_driver::LoadedArtifact::hash_file(ckpt)?);
-        }
-        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(ckpt)?;
+        // hash とロードは同じ canonical path を使う (symlink 差し替えで「hash した
+        // 物」と「読んだ物」が乖離しないように)。
+        let ckpt = if cli.rescore_input.is_some() {
+            let canonical = ckpt
+                .canonicalize()
+                .map_err(|e| format!("failed to canonicalize --resume {}: {e}", ckpt.display()))?;
+            rescore_net_identity = Some(crate::rescore_driver::LoadedArtifact::hash_file(
+                &canonical,
+            )?);
+            canonical
+        } else {
+            ckpt.clone()
+        };
+        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(&ckpt)?;
         if let Some(identity) = &rescore_net_identity {
             identity.verify_unchanged("--resume checkpoint")?;
         }
@@ -1011,7 +1034,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     if let Some(rescore_input) = &cli.rescore_input {
         // flag 整合は validate_rescore_cli で検証済み。ここでは解決済みの値と
-        // ロード時に固定した identity を driver へ渡すだけ。
+        // ロード時に固定した identity を driver へ渡すだけ。入力 PSV も一度だけ
+        // canonical に解決し、fingerprint / loader / 最終検証の全消費を同じ実体に
+        // 揃える (worker が chunk ごとに open する path も canonical になる)。
+        let rescore_input = rescore_input.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize --rescore-input {}: {e}",
+                rescore_input.display()
+            )
+        })?;
         let weights_source = if cli.init_from.is_some() {
             "init-from-bin"
         } else {
@@ -1027,7 +1058,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             "off"
         };
         let rescore_cfg = crate::rescore_driver::RescoreConfig {
-            input: rescore_input,
+            input: &rescore_input,
             output_dir: cli
                 .rescore_output
                 .as_deref()

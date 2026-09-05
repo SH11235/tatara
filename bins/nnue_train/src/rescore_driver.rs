@@ -15,6 +15,18 @@
 //! 既存 sidecar は再生成される。`.done` 昇格前には入力 / net / 係数の現物が
 //! ロード時から差し替わっていないことを stat で再検証する。完了時は `.done`
 //! marker (fingerprint text) に加えて機械可読な `.meta.json` を書く。
+//!
+//! ## identity 検証の範囲 (残余リスク)
+//!
+//! - **内容 hash で守られるのは、一括読みした byte 列から identity を作る
+//!   `--init-from` の .bin と progress 係数のみ。**
+//! - `--resume` の .ckpt と入力 PSV の変更検出は stat (size + mtime) 等値で、
+//!   同サイズかつ mtime を書き戻した置換は検出できない。
+//! - build 識別 (`git_commit`) が `unknown` (repo 外 build) または `-dirty`
+//!   (未 commit 変更込み build) の場合、同じ識別で別内容の binary があり得る
+//!   ため、fingerprint に起動ごとの nonce を混ぜて **完了 skip と resume を
+//!   無効化する** (常に最初から再生成)。campaign 実行は clean checkout で
+//!   build した binary が前提。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -32,6 +44,17 @@ use crate::trainer_layerstack::GpuTrainer;
 
 /// GPU tiled dense kernel の `b % 16 == 0` 制約に合わせる chunk padding 単位。
 const PAD_MULTIPLE: usize = 16;
+
+/// build 時に埋め込んだ git commit (short、dirty なら `-dirty` 付き、repo 外
+/// build は `unknown`)。埋め込みは `build.rs` (`TATARA_BUILD_COMMIT`)。
+const BUILD_COMMIT: &str = env!("TATARA_BUILD_COMMIT");
+
+/// build 識別が binary の内容を一意に指すか。`unknown` / `-dirty` は同じ識別で
+/// 別内容の binary があり得るため false (fingerprint は nonce 入りになり、完了
+/// skip と resume が無効化される)。
+fn build_is_reproducible() -> bool {
+    BUILD_COMMIT != "unknown" && !BUILD_COMMIT.ends_with("-dirty")
+}
 
 /// ロード済み artifact (net / progress 係数) の識別情報。
 ///
@@ -101,7 +124,10 @@ impl LoadedArtifact {
         })
     }
 
-    /// 現物が identity 記録時から差し替わっていないかを stat で検証する。
+    /// 現物が identity 記録時から差し替わっていないかを **stat (size + mtime)
+    /// 等値のみ** で検証する。同サイズかつ mtime を書き戻した置換は検出できない
+    /// (module doc の残余リスク。内容 hash で守られるのは byte 列から identity を
+    /// 作った経路のみ)。
     pub(crate) fn verify_unchanged(&self, what: &str) -> std::io::Result<()> {
         let (size, mtime_ns) = file_size_mtime_ns(&self.canonical)?;
         if (size, mtime_ns) != (self.size, self.mtime_ns) {
@@ -178,10 +204,10 @@ impl Fingerprint {
         let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_canonical)?;
 
         // ビルド識別。crate version は forward 実装が変わっても動かないことが
-        // あるため、git commit (dirty 印付き) を併記して「同 version の別実装」で
-        // 旧 sidecar を無言 skip しないようにする。repo 外で実行されて commit が
-        // 取れない場合は "unknown" (その環境同士では判別できない制約は残る)。
-        let git_commit = crate::training::git_commit().unwrap_or_else(|| "unknown".to_string());
+        // あるため、build 時に埋め込んだ git commit (dirty 印付き、`build.rs`) を
+        // 併記して「同 version の別実装」で旧 sidecar を無言 skip しないように
+        // する。
+        let git_commit = BUILD_COMMIT.to_string();
 
         let mut pairs: Vec<(&'static str, String)> = vec![
             ("version", "1".to_string()),
@@ -217,6 +243,16 @@ impl Fingerprint {
         pairs.push(("score_scale", format!("{}", cfg.score_scale)));
         pairs.push(("score_clip", cfg.score_clip.to_string()));
         pairs.push(("batch_size", cfg.batch_size.to_string()));
+        if !build_is_reproducible() {
+            // unknown / dirty build は「同じ識別で別内容の binary」があり得るため
+            // 既存 marker と決して一致しない nonce を混ぜる (module doc 参照)。
+            // 完了 skip も resume も効かず、毎回最初から再生成になる。
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            pairs.push(("build_nonce", nonce.to_string()));
+        }
         Ok(Self {
             pairs,
             input_canonical,
@@ -325,6 +361,14 @@ pub(crate) fn run_rescore(
         return Err(format!("--rescore-input {} is empty", cfg.input.display()).into());
     }
 
+    if !build_is_reproducible() {
+        eprintln!(
+            "[rescore] warning: this binary was built from a {BUILD_COMMIT} tree; the \
+             fingerprint includes a per-run nonce, so completion skip and resume are \
+             disabled and the sidecar is always regenerated from scratch. Build from a \
+             clean checkout for campaign runs."
+        );
+    }
     let fingerprint = Fingerprint::build(cfg, total_records)?;
     let fingerprint_text = fingerprint.text();
 
@@ -557,6 +601,36 @@ mod tests {
         assert_eq!(meta["threat_profile"], serde_json::json!("off"));
         assert_eq!(meta["ft_factorize"], serde_json::json!("off"));
         assert_eq!(meta["psqt"], serde_json::json!("false"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 既知の制約の固定 (module doc の残余リスク): stat (size + mtime) 検証は、
+    /// 同サイズ + mtime を書き戻した置換を**検出できない**。内容 hash (sha256) は
+    /// 当然一致しなくなる — この乖離が .ckpt / 入力 PSV 側の残余リスクの正体で、
+    /// .bin / 係数が「ロードした byte 列から hash」で守られるのと対照的。
+    #[test]
+    fn stat_verification_cannot_detect_mtime_preserving_swap() {
+        let dir = temp_dir("mtime-swap");
+        let path = dir.join("artifact.bin");
+        std::fs::write(&path, b"AAAA").unwrap();
+        let artifact = LoadedArtifact::hash_file(&path).unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // 同サイズの別内容へ置換し、mtime を書き戻す。
+        std::fs::write(&path, b"BBBB").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        drop(file);
+
+        artifact
+            .verify_unchanged("artifact")
+            .expect("stat-only verification accepts an mtime-preserving swap (known limit)");
+        let swapped = LoadedArtifact::hash_file(&path).unwrap();
+        assert_ne!(
+            swapped.sha256, artifact.sha256,
+            "the content hash does diverge — only the stat check misses the swap"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

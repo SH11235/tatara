@@ -179,8 +179,14 @@ nnue-train   --rescore-input /path/to/pool.psv   --rescore-output /path/to/score
   (raw `.ckpt`。fp32 master のラベル) から。どちらを使ったかは sidecar の
   `.meta.json` に記録される。
 - 中断再開可能: `.in-progress` marker がラベルを変える全条件 (net sha256、
-  routing、progress 係数、score 変換) の fingerprint を持ち、一致する中断 run は
-  記録済み record 数から追記する。条件が 1 つでも変われば最初から作り直す。
+  routing、progress 係数、score 変換、build commit) の fingerprint を持ち、
+  一致する中断 run は記録済み record 数から追記する。条件が 1 つでも変われば
+  最初から作り直す。正直な制約が 2 つある: 内容 hash で守られるのは
+  `--init-from` の `.bin` と progress 係数 (ロードした byte 列から hash) で、
+  `--resume` の `.ckpt` と入力 PSV は size + mtime 検証のみ — 同サイズかつ
+  mtime を書き戻した置換は検出できない。また dirty / repo 外 build の binary
+  では完了 skip と resume が無効化される (fingerprint に起動ごとの nonce が
+  入る) ため、campaign 実行は clean checkout でビルドすること。
 - 学習側 filter (`--score-drop-abs` 等) と低精度 flag (`--tf32` / `--ft-fp16`
   等) は reject される: sidecar は全 record をカバーし、ラベルは常に strict
   FP32 forward で作る。

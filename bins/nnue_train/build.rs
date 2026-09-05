@@ -1,3 +1,6 @@
+//! cuBLAS の dynamic link 設定と、rescore fingerprint 用の build 時 git commit
+//! 埋め込み (`TATARA_BUILD_COMMIT`)。
+//!
 //! cuBLAS の dynamic link 設定。`dense_mm_bwd_weight_tiled` (L1 shared weight bwd) を
 //! `cublasSgemm_v2` で置換するため。
 //!
@@ -16,6 +19,53 @@
 //! `-lcublas` が見つからなければ ld が報告)。
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// build 時点の git commit (short) を返す。working tree が clean でなければ
+/// `-dirty` を付ける。repo 外 build や git 不在では `None`。
+///
+/// 検出の限界: rerun 追跡は HEAD / index の変化のみで、`git add` されていない
+/// 編集は次の index 変化まで反映されない (dirty 判定が古い binary が残り得る)。
+/// 厳密な identity が要る運用は clean checkout でのビルドが前提で、rescore
+/// driver 側も dirty / unknown ビルドでは fingerprint を一致不能にして完了
+/// skip / resume を無効化する。
+fn git_commit() -> Option<String> {
+    let rev = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !rev.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(rev.stdout).ok()?.trim().to_string();
+    if commit.is_empty() {
+        return None;
+    }
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok();
+    let is_dirty = dirty.is_some_and(|out| out.status.success() && !out.stdout.is_empty());
+    Some(if is_dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    })
+}
+
+/// `.git` 実体 directory の絶対 path (worktree では `.git` が file のため
+/// `rev-parse` で実体を引く)。
+fn git_dir() -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!dir.is_empty()).then_some(dir)
+}
 
 fn cuda_root_candidates() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -55,6 +105,16 @@ fn find_cuda_lib_dir(roots: &[PathBuf], target_os: &str) -> Option<PathBuf> {
 }
 
 fn main() {
+    // rescore fingerprint 用に build 時の commit id を埋め込む。runtime に実行時
+    // CWD で git を呼ぶ方式は、実行場所によって unknown / 無関係 repo の commit に
+    // なり binary の identity として成立しない。
+    let commit = git_commit().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=TATARA_BUILD_COMMIT={commit}");
+    if let Some(dir) = git_dir() {
+        println!("cargo:rerun-if-changed={dir}/HEAD");
+        println!("cargo:rerun-if-changed={dir}/index");
+    }
+
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
     if std::env::var_os("CARGO_FEATURE_GPU").is_none() {
         return;
