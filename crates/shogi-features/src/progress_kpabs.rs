@@ -40,7 +40,7 @@ impl ShogiProgressKPAbs {
 
     /// 指定局面の KP-absolute 有効 index を全列挙し、`f` に渡す。
     ///
-    /// `progress8kpabs` で使う特徴展開そのもの。
+    /// `progresskpabs` で使う特徴展開そのもの。
     pub fn for_each_active_index(pos: &PackedSfenValue, f: impl FnMut(usize)) {
         Self::for_each_active_index_board(&pos.decode(), f);
     }

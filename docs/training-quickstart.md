@@ -22,7 +22,7 @@ examples:
 | File | Format | Purpose | Approx. size |
 |---|---|---|---:|
 | Training data PSV | `PackedSfenValue` × N (fixed 40 bytes / position) | Passed via `--data` | Hundreds of GB |
-| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progress8kpabs` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
+| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progresskpabs` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
 | (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
 
 ## Example 1: Training a HalfKP NNUE (simple architecture)
@@ -65,7 +65,7 @@ options" below.
 ## Example 2: Training a LayerStack NNUE
 
 The `layerstack` architecture supports two bucket modes. The default
-`progress8kpabs` mode uses 2–9 game-progress buckets; prepare `progress.bin`
+`progresskpabs` mode uses 2–9 game-progress buckets; prepare `progress.bin`
 with `progress-kpabs-train` and inspect it with `progress-bucket-survey`, as
 described in [Game-progress buckets: preparing `progress.bin`](progress-bin.md).
 `kingrank9` matches YaneuraOu KingRank9: it normalises both king ranks to the
@@ -115,8 +115,8 @@ change for real training are:
 | `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
-| `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
-| `--num-buckets` (`layerstack`) | 9 | In `progress8kpabs` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9 |
+| `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
+| `--num-buckets` (`layerstack`) | 9 | In `progresskpabs` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9 |
 
 ### Teacher-data read-ahead and shuffle
 

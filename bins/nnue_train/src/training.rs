@@ -214,18 +214,22 @@ fn parse_effect_bucket_config(
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
 ) -> Result<BucketMode, Box<dyn std::error::Error>> {
-    match args.bucket_mode.as_str() {
-        "progress8kpabs" => {
+    let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    match mode {
+        BucketMode::ProgressKpAbs => {
             if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
                 return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progress8kpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progresskpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
                     args.num_buckets
                 )
                 .into());
             }
-            Ok(BucketMode::Progress8KpAbs)
+            Ok(BucketMode::ProgressKpAbs)
         }
-        "kingrank9" => {
+        BucketMode::KingRank9 => {
             if args.num_buckets != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
                     "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
@@ -240,10 +244,6 @@ pub(crate) fn validate_bucket_mode(
             }
             Ok(BucketMode::KingRank9)
         }
-        other => Err(format!(
-            "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
-        )
-        .into()),
     }
 }
 
@@ -255,7 +255,7 @@ pub(crate) fn validate_output_format(
     if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
     {
         return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress8kpabs routing is not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progresskpabs routing is not representable in YaneuraOu SFNN"
                 .into(),
         );
     }
@@ -556,12 +556,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     std::fs::create_dir_all(&cli.output)?;
 
-    // progress8kpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
+    // progresskpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
-    if matches!(bucket_mode, BucketMode::Progress8KpAbs) {
+    if matches!(bucket_mode, BucketMode::ProgressKpAbs) {
         match &layerstack.progress_coeff {
             Some(p) => {
-                println!("[train] loading progress8kpabs coeff: {}", p.display());
+                println!("[train] loading progresskpabs coeff: {}", p.display());
                 ShogiProgressKPAbs::load_from_bin(p).map_err(
                     |e| -> Box<dyn std::error::Error> {
                         format!("failed to load --progress-coeff {}: {e}", p.display()).into()
@@ -922,6 +922,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let mut experiment = build_experiment_logger(
         cli,
         layerstack,
+        bucket_mode,
         feature_set,
         start_superbatch,
         resumed_superbatch,
@@ -1542,6 +1543,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
+    bucket_mode: BucketMode,
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
@@ -1608,7 +1610,9 @@ pub(crate) fn build_experiment_logger(
         l2: layerstack.l2,
         num_buckets: Some(layerstack.num_buckets),
         optimizer: cli.optimizer.to_ascii_lowercase(),
-        bucket_mode: Some(layerstack.bucket_mode.clone()),
+        // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
+        // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
+        bucket_mode: Some(bucket_mode.canonical_name().to_string()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
         lr: finite_or_zero(cli.lr),
@@ -2495,6 +2499,59 @@ mod tests {
             init_summary_for_log(&cli).as_deref(),
             Some("overrides: ft,l2")
         );
+    }
+
+    /// `params.bucket_mode` は CLI の生文字列ではなくパース済み mode の canonical 名
+    /// を記録する。非推奨 alias で起動した run の experiment.json にも alias 綴りが
+    /// 混入しないことを固定する。
+    #[test]
+    fn layerstack_logger_records_canonical_bucket_mode_for_alias_input() {
+        let dir = std::env::temp_dir().join(format!("tatara-bucket-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let data = dir.join("teacher.psv");
+        std::fs::write(&data, [0u8; PSV_RECORD_BYTES as usize]).expect("write teacher");
+
+        let out = dir.join("out");
+        let out_str = out.to_str().expect("utf8 path");
+        let cli = Cli::try_parse_from([
+            "nnue-trainer",
+            "--output",
+            out_str,
+            "layerstack",
+            "--bucket-mode",
+            BucketMode::LEGACY_PROGRESS_KPABS_NAME,
+        ])
+        .expect("cli parse");
+        let ArchCommand::LayerStack(ref layerstack) = cli.arch else {
+            unreachable!("layerstack subcommand was requested");
+        };
+        let bucket_mode = validate_bucket_mode(layerstack).expect("alias must be accepted");
+
+        let logger = build_experiment_logger(
+            &cli,
+            layerstack,
+            bucket_mode,
+            FeatureSet::HalfKaHmMerged.spec(),
+            1,
+            None,
+            None,
+            &data,
+            256,
+            false,
+            "step".to_string(),
+            None,
+        );
+        logger.write().expect("write experiment.json");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(logger.path()).expect("read json"))
+                .expect("parse json");
+        assert_eq!(
+            json["params"]["bucket_mode"],
+            serde_json::json!(BucketMode::ProgressKpAbs.canonical_name())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `results.fv_scale` は builder に渡された実効値 (trainer が export に使う値) を

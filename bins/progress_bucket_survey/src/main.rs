@@ -4,7 +4,7 @@
 //! `progress-kpabs-train` produces `progress.bin` (KP-absolute progress
 //! coefficients) that the LayerStack architecture uses to route each position
 //! to an output bucket. This tool loads a `progress.bin`, assigns sampled PSV
-//! positions to their progress8kpabs buckets, and prints the resulting
+//! positions to their progresskpabs buckets, and prints the resulting
 //! histogram — a quick way to check the buckets are not badly skewed.
 //!
 //! ```bash
@@ -26,7 +26,7 @@ use shogi_format::PackedSfenValue;
 
 #[derive(Parser, Debug)]
 #[command(name = "progress-bucket-survey")]
-#[command(about = "Survey the progress8kpabs bucket distribution of a progress.bin over PSV data")]
+#[command(about = "Survey the progresskpabs bucket distribution of a progress.bin over PSV data")]
 struct Args {
     /// PSV data files (`.bin`). Pass several as a comma-separated list.
     #[arg(long)]

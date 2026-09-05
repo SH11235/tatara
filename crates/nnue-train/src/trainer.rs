@@ -743,7 +743,7 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Resul
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
 /// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
 /// - `bucket_mode`: dataloader と held-out validation に共通の bucket 算出方式。
-///   progress8kpabs の重みは process-global なので呼び出し前に load 済であること
+///   progresskpabs の重みは process-global なので呼び出し前に load 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
 /// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
 /// - `experiment`: `Some` のとき、run 開始時・superbatch ごと・正常終了時に
@@ -1671,7 +1671,7 @@ mod tests {
             l2: 32,
             num_buckets: Some(9),
             optimizer: "ranger".to_string(),
-            bucket_mode: Some("progress8kpabs".to_string()),
+            bucket_mode: Some("progresskpabs".to_string()),
             activation: None,
             progress_coeff: None,
             lr: 1.0e-3,

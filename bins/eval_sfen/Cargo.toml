@@ -19,5 +19,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 gpu-kernels = { workspace = true }
 nnue-format = { workspace = true }
+# bucket mode 名のパース (canonical 名 + 非推奨 alias) を trainer と共有する。
+nnue-train = { workspace = true }
 shogi-features = { workspace = true }
 shogi-format = { workspace = true }

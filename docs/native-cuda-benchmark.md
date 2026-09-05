@@ -15,7 +15,7 @@ Changing a fixture default requires a new profile version.
 
 | Architecture | Fixture |
 |---|---|
-| LayerStack | `layerstack-halfka-hm-merged-factorized-v1`: factorized HalfKaHmMerged, FT 1536, L1 16, L2 32, 9-bucket Progress8KpAbs trainer shape |
+| LayerStack | `layerstack-halfka-hm-merged-factorized-v1`: factorized HalfKaHmMerged, FT 1536, L1 16, L2 32, 9-bucket ProgressKpAbs trainer shape |
 | Simple | `simple-halfkp-factorized-v1`: factorized HalfKP, CReLU, FT 256, L1 32, L2 32 |
 
 Each architecture is measured with both precision configurations by default:

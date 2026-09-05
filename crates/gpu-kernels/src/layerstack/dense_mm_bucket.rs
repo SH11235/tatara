@@ -3,7 +3,7 @@
 //! GPU 側 (`#[kernel] fn dense_mm_fwd_bucket` / `dense_mm_bwd_input_bucket` /
 //! `dense_mm_bwd_weight_bucket` / `bias_grad_bucket`) は `bins/nnue_train/src/
 //! main.rs` に inline 定義 (cuda-oxide bin-entry 制約)。LayerStack の per-bucket
-//! Affine (L1 (16,1536) / L2 (32,30) / L3 (1,32)) を、progress8kpabs の
+//! Affine (L1 (16,1536) / L2 (32,30) / L3 (1,32)) を、progresskpabs の
 //! 9 bucket から per-position の `bucket_idx[b]` で select する。
 //!
 //! ## Layout 規約 (kernel と完全一致させる — テストの核心)

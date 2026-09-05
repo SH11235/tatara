@@ -47,7 +47,7 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         cli.score_drop_abs,
         cli.score_clamp_abs,
         1,
-        BucketMode::Progress8KpAbs,
+        BucketMode::ProgressKpAbs,
         feature_set,
         false,
         1,

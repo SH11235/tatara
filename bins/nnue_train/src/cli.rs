@@ -602,7 +602,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 1e-4, global = true)]
     pub(crate) norm_loss_factor: f32,
     /// Number of dataloader prefetch workers. Each worker does PSV parsing +
-    /// HalfKA_hm sparse extraction + progress8kpabs bucket computation in a
+    /// HalfKA_hm sparse extraction + progresskpabs bucket computation in a
     /// single `decode()` call and supplies positions ahead of time. `1` preserves
     /// the reader's deterministic order; `>= 2` parses in parallel (batch delivery
     /// order within an epoch is non-deterministic, which is fine for training).
@@ -1053,16 +1053,18 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
     pub(crate) fv_scale: Option<i32>,
 
-    /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
-    /// king squares x 1548 KP-abs piece inputs). When omitted in progress8kpabs
+    /// progresskpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
+    /// king squares x 1548 KP-abs piece inputs). When omitted in progresskpabs
     /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
     /// 0.5`). Do not specify this option in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// Bucket assignment: `progress8kpabs` uses the KP-absolute progress model;
-    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets.
-    #[arg(long, default_value = "progress8kpabs")]
+    /// Bucket assignment: `progresskpabs` uses the KP-absolute progress model;
+    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets. The
+    /// deprecated spelling `progress8kpabs` is accepted as an alias of
+    /// `progresskpabs` (the digit is not the bucket count; see `--num-buckets`).
+    #[arg(long, default_value = "progresskpabs")]
     pub(crate) bucket_mode: String,
 
     /// Output dimension of the FT (feature transformer) per perspective. Must be
@@ -1089,7 +1091,7 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
 
-    /// LayerStack output bucket count. In progress8kpabs mode, each position is
+    /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
     /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
     /// in the per-bucket weight backward kernels. The default 9 keeps the

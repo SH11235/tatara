@@ -5,6 +5,7 @@ use std::path::Path;
 #[cfg(feature = "gpu")]
 use gpu_runtime::{CudaStream, DeviceBuffer};
 use nnue_format::ArchKind;
+use nnue_train::dataloader::BucketMode;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
 #[cfg(feature = "gpu")]
@@ -31,7 +32,8 @@ use crate::trainer_common::MomentBuf;
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
 //   arch_kind    UTF-8 [arch_len]     (arch kind canonical 名、例 "layerstack")
 //   bucket_mode_len u32              (v8+、bucket mode 名の長さ、bucket 無しは 0)
-//   bucket_mode  UTF-8 [bucket_mode_len] (例 "progress8kpabs" / "kingrank9")
+//   bucket_mode  UTF-8 [bucket_mode_len] (例 "progresskpabs" / "kingrank9"。
+//                reader は非推奨 alias "progress8kpabs" も progresskpabs として受理)
 //   topo_count   u64                 (topology 次元の個数)
 //   topology     u64 [topo_count]     (arch 固有の層次元列)
 //   superbatch   u64  (この checkpoint が表す完了 superbatch、resume はこの +1 から)
@@ -98,9 +100,10 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///
 /// - `8`: a bucket-mode name (length-prefixed UTF-8, empty when the architecture
 ///   has no bucket concept) follows the arch-kind name. Cross-bucket-mode resumes
-///   are rejected. For v<=7 layerstack checkpoints the mode is absent and is
-///   interpreted as "progress8kpabs" (the only mode that existed when they were
-///   written).
+///   are rejected. The reader also accepts the deprecated alias spelling
+///   "progress8kpabs" and treats it as "progresskpabs". For v<=7 layerstack
+///   checkpoints the mode is absent and is interpreted as "progresskpabs" (the
+///   only mode that existed when they were written).
 ///
 /// - `9`: an `i32` `fv_scale` follows the LR-schedule horizon. `0` means "not
 ///   recorded"; positive values preserve the Simple trainer's effective export
@@ -332,7 +335,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 /// `step_count` の後に LR-schedule horizon の `u64` を持つ (`0` = horizon 無し)。
 /// version 7 は feature-set header に feature hash、version 8 は arch kind の直後に
 /// bucket mode 名、version 9 は LR-schedule horizon の直後に `fv_scale` を持つ。
-/// version 7 以前の LayerStack は `progress8kpabs` と解釈する。
+/// version 7 以前の LayerStack は `progresskpabs` と解釈する。
 pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
@@ -524,9 +527,17 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             let bucket_mode = String::from_utf8(bucket_mode_bytes).map_err(|_| {
                 invalid_data("raw checkpoint bucket mode name is not valid UTF-8".to_string())
             })?;
-            (!bucket_mode.is_empty()).then_some(bucket_mode)
+            // 旧名 alias で書かれた checkpoint も canonical 名の checkpoint と同じ
+            // mode として照合する。未知の mode 名は正規化せずそのまま比較に回し、
+            // 下の不一致エラーで surface させる。
+            (!bucket_mode.is_empty()).then(|| {
+                BucketMode::parse(&bucket_mode)
+                    .map_or(bucket_mode, |(mode, _)| mode.canonical_name().to_string())
+            })
         } else if ckpt_arch == ArchKind::LayerStack {
-            Some("progress8kpabs".to_string())
+            // bucket-mode header を持たない version の LayerStack は、当時唯一の
+            // mode だった progresskpabs として照合する。
+            Some(BucketMode::ProgressKpAbs.canonical_name().to_string())
         } else {
             None
         };
@@ -566,9 +577,10 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
              always 'layerstack', requested '{}' (cannot resume across architectures)",
             expected.arch_kind.canonical_name()
         )));
-    } else if expected.bucket_mode != Some("progress8kpabs") {
+    } else if expected.bucket_mode != Some(BucketMode::ProgressKpAbs.canonical_name()) {
         return Err(invalid_data(format!(
-            "checkpoint bucket mode 'progress8kpabs' does not match --bucket-mode '{}'",
+            "checkpoint bucket mode '{}' does not match --bucket-mode '{}'",
+            BucketMode::ProgressKpAbs.canonical_name(),
             expected.bucket_mode.unwrap_or("")
         )));
     }
