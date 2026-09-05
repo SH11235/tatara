@@ -17,12 +17,20 @@
 //! [消費側]  GPU forward → i16 変換 → ScoreSidecarWriter で追記
 //! ```
 //!
-//! - back-pressure: slot pool (bounded channel)。in-flight chunk 数は slot 数で
-//!   上限され、pending の再整列 buffer も同じ上限に収まる。
-//! - fail-closed: worker の I/O エラー / active-feature 超過は共有 error slot に
-//!   格納して全 worker が停止し、[`OrderedPsvLoader::next_chunk`] が `Err` を返す。
-//!   エラー以降の chunk は 1 個も yield されない (書きかけ防止は writer 側の
-//!   「chunk 単位でしか書かない」規約と合わせて成立する)。
+//! - back-pressure: slot pool (bounded channel)。各 in-flight chunk (worker 保有 /
+//!   result channel 内 / 消費側 pending) が slot を 1 個ずつ占有し、slot 総数が
+//!   有限なので再整列 buffer もメモリも有界。
+//! - fail-closed: worker のエラーは result channel 経由で `Err` として届き
+//!   (blocking 中の相手を必ず起床させる)、worker 内 panic もエラーに変換して同じ
+//!   経路で伝搬する。さらに全 worker 終了時に受領 chunk 数 = 期待 chunk 数を
+//!   検証するため、chunk の欠損が正常終了 (`Ok(None)`) に化けることはない。
+//!   一度 `Err` を返した loader は毒化され、以降の [`OrderedPsvLoader::next_chunk`]
+//!   も同じエラーを返し続ける。
+//! - record 検証: `PackedSfenValue::decode` は checked ではなく、壊れた record も
+//!   何らかの局面に化ける。安価な整合性検証 ([`validate_board`]) で検出可能な
+//!   破損 (玉の欠落 / 重複、駒数超過等) は硬いエラーにする。完全な合法性検証は
+//!   しない — 入力は教師生成パイプラインが書いた正当な PSV であることが契約で、
+//!   本検証はその契約違反の検出網にすぎない。
 //!
 //! [`BucketedPrefetchedLoader`]: crate::dataloader::BucketedPrefetchedLoader
 
@@ -35,6 +43,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use shogi_features::FeatureSetSpec;
+use shogi_format::ShogiBoard;
+use shogi_format::types::{Color, HAND_PIECE_TYPES, PieceType, Square};
 
 use crate::dataloader::{Batch, BucketMode, PSV_RECORD_BYTES, PsvFileLoader};
 
@@ -56,10 +66,19 @@ pub struct RescoreChunk {
     pub n_real: usize,
 }
 
-/// worker → 消費側 channel を流れる slot。
-type ChunkSlot = RescoreChunk;
 /// pool を還流する空 slot (Batch + bucket buffer の再利用)。
 type EmptySlot = (Batch, Vec<i32>);
+
+/// panic payload から人間可読なメッセージを取り出す。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
 
 /// PSV file を record 順を保存したまま並列 decode する chunk loader。
 ///
@@ -71,7 +90,8 @@ type EmptySlot = (Batch, Vec<i32>);
 /// - **無フィルタ・wrap なし**: score-drop / clamp を適用せず、EOF で終了する。
 ///   yield される実 record 数の合計は必ず `remaining_records()` に一致する
 ///   (一致し得ない状態は error)。
-/// - **fail-closed**: 途中のエラーで以降の chunk を 1 個も yield しない。
+/// - **fail-closed**: worker のエラー / panic は `next_chunk` の `Err` として
+///   伝搬し、以降の chunk を 1 個も yield しない (module doc 参照)。
 ///
 /// progresskpabs mode の重みは process-global なので、呼び出し前に
 /// `ShogiProgressKPAbs::load_from_bin` 済みであること (未ロードなら全 bucket 4 —
@@ -79,17 +99,26 @@ type EmptySlot = (Batch, Vec<i32>);
 ///
 /// [`BucketedPrefetchedLoader`]: crate::dataloader::BucketedPrefetchedLoader
 pub struct OrderedPsvLoader {
-    /// 完成 chunk を worker → 消費側で渡す。`Drop` で先に落とすため `Option`。
-    result_rx: Option<mpsc::Receiver<ChunkSlot>>,
-    /// 消費済み slot を worker へ返す ring。`Drop` で先に落とすため `Option`。
+    /// worker → 消費側。完成 chunk (`Ok`) と worker のエラー / panic (`Err`) の
+    /// 両方がこの channel を流れるため、消費側は blocking recv のままエラーに
+    /// 気付ける (side channel だと recv 待ちのまま永久に起きない)。
+    /// `Drop` / 毒化で先に落とすため `Option`。
+    result_rx: Option<mpsc::Receiver<io::Result<RescoreChunk>>>,
+    /// 消費済み slot を worker へ返す ring。`Drop` / 毒化で先に落とすため `Option`。
     pool_tx: Option<mpsc::SyncSender<EmptySlot>>,
-    /// worker が検出した最初のエラー。
-    err_slot: Arc<Mutex<Option<io::Error>>>,
-    /// seq 順再整列: 期待 seq より先に届いた chunk の待機所。in-flight 総数が
-    /// slot pool で上限されるため、この map も同じ上限に収まる。
-    pending: BTreeMap<u64, ChunkSlot>,
+    /// seq 順再整列: 期待 seq より先に届いた chunk の待機所。in-flight chunk が
+    /// slot を占有するため、この map も slot 総数で有界。
+    pending: BTreeMap<u64, RescoreChunk>,
     /// 次に返すべき chunk 番号。
     next_seq: u64,
+    /// これまでに result channel から受領した chunk 数 (pending 行き含む)。
+    /// 全 worker 終了時に `expected_chunks` と照合し、欠損を正常終了に見せない。
+    chunks_received: u64,
+    /// yield されるべき chunk の総数 (= `remaining_records / chunk_records` 切上げ)。
+    expected_chunks: u64,
+    /// 一度 `Err` を返したらそのメッセージを保持し、以降の `next_chunk` も同じ
+    /// エラーを返す (エラー後の呼び出しが `Ok(None)` = 完了に化けるのを防ぐ)。
+    poisoned: Option<String>,
     /// file 全体の record 数。
     total_records: u64,
     /// 読み出し開始 record (resume 用)。`[start_record, total_records)` を yield する。
@@ -162,12 +191,16 @@ impl OrderedPsvLoader {
                 ),
             ));
         }
+        let chunk_records_u64 = chunk_records as u64;
+        let expected_chunks = (total_records - start_record).div_ceil(chunk_records_u64);
 
         // slot pool: worker が同時に持つ分 + 消費側 (pending + 手元) が持つ分。
         // 2 倍 + 2 で「遅い chunk を待つ間に他 worker が先の chunk を進める」余裕を
-        // 確保しつつ、pending の再整列 buffer を bounded に保つ。
+        // 確保する。result channel は「全 slot が結果として滞留 + 各 worker の
+        // エラー 1 件」まで格納できる容量にし、エラー送信が block しないようにする。
         let n_slots = num_workers * 2 + 2;
-        let (result_tx, result_rx) = mpsc::sync_channel::<ChunkSlot>(n_slots);
+        let (result_tx, result_rx) =
+            mpsc::sync_channel::<io::Result<RescoreChunk>>(n_slots + num_workers);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<EmptySlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
@@ -180,8 +213,6 @@ impl OrderedPsvLoader {
         }
         let pool_rx = Arc::new(Mutex::new(pool_rx));
         let next_chunk_counter = Arc::new(AtomicU64::new(0));
-        let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
-        let chunk_records_u64 = chunk_records as u64;
         let path = path.to_path_buf();
 
         let mut handles = Vec::with_capacity(num_workers);
@@ -190,16 +221,11 @@ impl OrderedPsvLoader {
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
             let counter = Arc::clone(&next_chunk_counter);
-            let err_slot = Arc::clone(&err_slot);
             let handle = thread::spawn(move || {
                 loop {
-                    // 先行エラーがあれば新規 chunk に着手しない (fail-closed)。
-                    if err_slot.lock().expect("err_slot mutex poisoned").is_some() {
-                        return;
-                    }
-                    // 空 slot を借りてから seq を claim する。この順序により
-                    // 「最小の未 claim seq は、次に slot を得た worker が必ず担当
-                    // する」が保証され、pending が slot 総数を超えて溜まらない。
+                    // 空 slot を借りてから seq を claim する。claim 済み chunk は
+                    // 必ず slot を伴うため、in-flight chunk 数 (= pending の上限)
+                    // が slot 総数で抑えられる。
                     let (mut batch, mut buckets) = {
                         let rx = pool_rx.lock().expect("pool_rx mutex poisoned");
                         match rx.recv() {
@@ -214,35 +240,42 @@ impl OrderedPsvLoader {
                     }
                     let last = (first + chunk_records_u64).min(total_records);
 
-                    match decode_chunk_into(
-                        &path,
-                        first,
-                        last,
-                        pad_multiple,
-                        bucket_mode,
-                        num_buckets,
-                        &mut batch,
-                        &mut buckets,
-                    ) {
-                        Ok(n_real) => {
+                    // decode 中の panic (index 演算・下層の assert 等) も握って
+                    // エラーとして送る。放置すると thread だけが死に、結果 channel
+                    // 経由では何も伝わらず deadlock か silent EOF になる。
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_chunk_into(
+                            &path,
+                            first,
+                            last,
+                            pad_multiple,
+                            bucket_mode,
+                            num_buckets,
+                            &mut batch,
+                            &mut buckets,
+                        )
+                    }));
+                    let error = match outcome {
+                        Ok(Ok(n_real)) => {
                             let chunk = RescoreChunk {
                                 seq,
                                 batch,
                                 buckets,
                                 n_real,
                             };
-                            if result_tx.send(chunk).is_err() {
+                            if result_tx.send(Ok(chunk)).is_err() {
                                 return; // 消費側が drop 済み
                             }
+                            continue;
                         }
-                        Err(e) => {
-                            let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
-                            return;
-                        }
-                    }
+                        Ok(Err(e)) => e,
+                        Err(payload) => io::Error::other(format!(
+                            "decode worker panicked on records [{first}, {last}): {}",
+                            panic_message(payload.as_ref())
+                        )),
+                    };
+                    let _ = result_tx.send(Err(error));
+                    return;
                 }
             });
             handles.push(handle);
@@ -252,9 +285,11 @@ impl OrderedPsvLoader {
         Ok(Self {
             result_rx: Some(result_rx),
             pool_tx: Some(pool_tx),
-            err_slot,
             pending: BTreeMap::new(),
             next_seq: 0,
+            chunks_received: 0,
+            expected_chunks,
+            poisoned: None,
             total_records,
             start_record,
             handles,
@@ -274,22 +309,28 @@ impl OrderedPsvLoader {
     /// 次の chunk を **seq 昇順で** 返す。
     ///
     /// - `Ok(Some(chunk))`: `chunk.seq` は前回 +1 (初回は 0)。
-    /// - `Ok(None)`: 全 chunk を返し終えた (実 record 合計 = `remaining_records()`)。
-    /// - `Err(e)`: worker がエラーを検出した。以降の chunk は返らない。
+    /// - `Ok(None)`: 全 chunk (`remaining_records()` 分) を返し終えた。受領
+    ///   chunk 数の照合を通った場合のみ返る。
+    /// - `Err(e)`: worker のエラー / panic、または chunk 欠損。loader は毒化され、
+    ///   以降の呼び出しも同じエラーを返す。
     ///
     /// 消費後は [`Self::recycle`] で slot を返すこと (返さないと pool が枯れて
     /// 以降の decode が止まる)。
     pub fn next_chunk(&mut self) -> io::Result<Option<RescoreChunk>> {
+        if let Some(message) = &self.poisoned {
+            return Err(io::Error::other(message.clone()));
+        }
         loop {
             if let Some(chunk) = self.pending.remove(&self.next_seq) {
                 self.next_seq += 1;
                 return Ok(Some(chunk));
             }
             let Some(result_rx) = self.result_rx.as_ref() else {
-                return Ok(None); // Drop 途中の防御 (通常到達しない)
+                return Ok(None); // 完了済み
             };
             match result_rx.recv() {
-                Ok(chunk) => {
+                Ok(Ok(chunk)) => {
+                    self.chunks_received += 1;
                     if chunk.seq == self.next_seq {
                         self.next_seq += 1;
                         return Ok(Some(chunk));
@@ -297,30 +338,39 @@ impl OrderedPsvLoader {
                     let evicted = self.pending.insert(chunk.seq, chunk);
                     debug_assert!(evicted.is_none(), "duplicate chunk seq");
                 }
+                Ok(Err(e)) => return Err(self.poison(e)),
                 Err(_) => {
-                    // 全 worker 終了。エラー → pending の残り → 完了、の順で解決。
-                    if let Some(e) = self
-                        .err_slot
-                        .lock()
-                        .expect("err_slot mutex poisoned")
-                        .take()
-                    {
-                        return Err(e);
+                    // 全 worker が result_tx を落とした = 終了済み。catch_unwind の
+                    // 外 (channel 送信等) で panic した worker はエラーを送れない
+                    // ため、join でも panic を確認する (backstop)。
+                    if let Some(e) = self.join_worker_panics() {
+                        return Err(self.poison(e));
                     }
                     if let Some(chunk) = self.pending.remove(&self.next_seq) {
                         self.next_seq += 1;
                         return Ok(Some(chunk));
                     }
-                    if self.pending.is_empty() {
-                        return Ok(None);
+                    if self.chunks_received != self.expected_chunks {
+                        let e = io::Error::other(format!(
+                            "decode workers exited after delivering {} of {} chunks; \
+                             refusing to treat the missing tail as a clean EOF",
+                            self.chunks_received, self.expected_chunks
+                        ));
+                        return Err(self.poison(e));
                     }
-                    // エラー無しで seq に穴が空くのは契約違反 (worker のバグ)。
-                    // 欠損のまま完了扱いにすると行対応が壊れるため明示エラー。
-                    return Err(io::Error::other(format!(
-                        "chunk {} is missing while later chunks exist; refusing to \
-                         continue with a gap in the record order",
-                        self.next_seq
-                    )));
+                    if !self.pending.is_empty() {
+                        // 受領数が合うのに next_seq が欠けている = seq 重複等の
+                        // 内部契約違反。欠損のまま完了扱いにしない。
+                        let e = io::Error::other(format!(
+                            "chunk {} is missing while later chunks exist; refusing to \
+                             continue with a gap in the record order",
+                            self.next_seq
+                        ));
+                        return Err(self.poison(e));
+                    }
+                    self.result_rx = None;
+                    self.pool_tx = None;
+                    return Ok(None);
                 }
             }
         }
@@ -332,6 +382,31 @@ impl OrderedPsvLoader {
             // worker が全て終了した後は返せなくてよい (エラーは無視して捨てる)。
             let _ = pool_tx.send((chunk.batch, chunk.buckets));
         }
+    }
+
+    /// エラーで停止する: channel を閉じて全 worker を起こし、join してから
+    /// 毒化する。以降の `next_chunk` は同じメッセージのエラーを返す。
+    fn poison(&mut self, error: io::Error) -> io::Error {
+        self.pool_tx.take();
+        self.result_rx.take();
+        self.pending.clear();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+        self.poisoned = Some(error.to_string());
+        error
+    }
+
+    /// 全 worker (終了済み) を join し、panic していれば最初の 1 件をエラーに
+    /// して返す。result channel が閉じた後にのみ呼ぶこと。
+    fn join_worker_panics(&mut self) -> Option<io::Error> {
+        let mut first_panic = None;
+        for handle in self.handles.drain(..) {
+            if let Err(payload) = handle.join() {
+                first_panic.get_or_insert_with(|| panic_message(payload.as_ref()));
+            }
+        }
+        first_panic.map(|message| io::Error::other(format!("decode worker panicked: {message}")))
     }
 }
 
@@ -368,6 +443,17 @@ fn decode_chunk_into(
     let mut last_decoded = None;
     while let Some(psv) = loader.next_psv()? {
         let board = psv.decode();
+        if let Err(reason) = validate_board(&board) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "record {} in {} decodes to a corrupt position ({reason}); \
+                     refusing to write a score for it",
+                    first + batch.n_positions as u64,
+                    path.display()
+                ),
+            ));
+        }
         let pushed = batch.push_decoded(&board)?;
         debug_assert!(pushed, "Batch::push_decoded refused below chunk capacity");
         buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
@@ -393,6 +479,62 @@ fn decode_chunk_into(
         }
     }
     Ok(n_real)
+}
+
+/// decode 済み局面の安価な整合性検証。
+///
+/// `PackedSfenValue::decode` は checked ではなく、壊れた record も何らかの
+/// `ShogiBoard` に化けるため、検出可能な破損だけでも硬いエラーにする:
+///
+/// - 玉が両陣営に 1 枚ずつ盤上にあり、`black_king_sq` / `white_king_sq` の
+///   マスと一致する
+/// - 盤上 + 持ち駒の総数が 40 枚以下 (将棋の全駒数)
+///
+/// 完全な合法性検証はしない (入力は教師生成パイプラインが書いた正当な PSV で
+/// あることが契約)。
+fn validate_board(board: &ShogiBoard) -> Result<(), String> {
+    let mut on_board = 0_u32;
+    let mut black_kings = 0_u32;
+    let mut white_kings = 0_u32;
+    for piece in &board.board {
+        if piece.piece_type == PieceType::None {
+            continue;
+        }
+        on_board += 1;
+        if piece.piece_type == PieceType::King {
+            match piece.color {
+                Color::Black => black_kings += 1,
+                Color::White => white_kings += 1,
+            }
+        }
+    }
+    if black_kings != 1 || white_kings != 1 {
+        return Err(format!(
+            "kings on board: black {black_kings} / white {white_kings} (expected exactly 1 each)"
+        ));
+    }
+    let king_matches = |sq: Square, color: Color| {
+        sq.index() < 81 && {
+            let piece = board.board[sq.index()];
+            piece.piece_type == PieceType::King && piece.color == color
+        }
+    };
+    if !king_matches(board.black_king_sq, Color::Black)
+        || !king_matches(board.white_king_sq, Color::White)
+    {
+        return Err("king square fields do not match the board".to_string());
+    }
+    let mut in_hand = 0_u32;
+    for pt in HAND_PIECE_TYPES {
+        in_hand += u32::from(board.black_hand.count(pt)) + u32::from(board.white_hand.count(pt));
+    }
+    let total = on_board + in_hand;
+    if total > 40 {
+        return Err(format!(
+            "{total} pieces on board + in hand (shogi has at most 40)"
+        ));
+    }
+    Ok(())
 }
 
 /// i16 score sidecar の record サイズ (little-endian i16)。
@@ -616,6 +758,7 @@ fn truncate_if_exists(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use shogi_features::FeatureSet;
+    use std::time::Duration;
 
     fn test_spec() -> FeatureSetSpec {
         FeatureSet::HalfKaHmMerged.spec()
@@ -678,6 +821,17 @@ mod tests {
             loader.recycle(chunk);
         }
         (scores, buckets, shapes)
+    }
+
+    /// loader をエラーが出るまで消費して、そのエラーを返す (timeout 付き実行用)。
+    fn drain_until_error(mut loader: OrderedPsvLoader) -> io::Result<()> {
+        loop {
+            match loader.next_chunk() {
+                Ok(Some(chunk)) => loader.recycle(chunk),
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     #[test]
@@ -866,7 +1020,7 @@ mod tests {
         // spawn 後に file が縮むと、該当 chunk の short read が error として
         // 伝搬し、以降の chunk は yield されない。
         let path = temp_psv("shrink", 500); // 50k records
-        let mut loader = OrderedPsvLoader::spawn(
+        let loader = OrderedPsvLoader::spawn(
             &path,
             16,
             16,
@@ -883,24 +1037,122 @@ mod tests {
             .unwrap()
             .set_len(40 * 100)
             .unwrap();
-        let mut yielded = 0_u64;
-        let err = loop {
-            match loader.next_chunk() {
-                Ok(Some(chunk)) => {
-                    yielded += chunk.n_real as u64;
-                    loader.recycle(chunk);
-                }
-                Ok(None) => panic!("shrunk input must not complete cleanly"),
-                Err(e) => break e,
-            }
-        };
-        assert!(yielded < 50_000, "some tail chunks must be missing");
+        let err = drain_until_error(loader).expect_err("shrunk input must not complete cleanly");
         let msg = err.to_string();
         assert!(
             msg.contains("the input changed") || msg.contains("range"),
             "unexpected error: {msg}"
         );
-        drop(loader);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// worker ≥ 2 でのエラー: 消費側が deadlock せず、正常完了にも化けず、
+    /// timeout 内に `Err` で停止する。
+    #[test]
+    fn ordered_loader_error_with_multiple_workers_fails_fast_without_deadlock() {
+        let path = temp_psv("mwerr", 500); // 50k records
+        let loader = OrderedPsvLoader::spawn(
+            &path,
+            16,
+            16,
+            4,
+            BucketMode::ProgressKpAbs,
+            9,
+            test_spec(),
+            0,
+        )
+        .expect("spawn loader");
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(40 * 100)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            let _ = tx.send(drain_until_error(loader));
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(result) => {
+                let err = result.expect_err("shrunk input must not complete cleanly");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("the input changed") || msg.contains("range"),
+                    "unexpected error: {msg}"
+                );
+            }
+            Err(_) => panic!("consumer deadlocked after a worker error"),
+        }
+        let _ = consumer.join();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// worker 内 panic はエラーに変換されて伝搬し、silent EOF (`Ok(None)`) に
+    /// 化けない。エラー後の loader は毒化され、以降の呼び出しも同じエラー。
+    #[test]
+    fn ordered_loader_propagates_worker_panic_and_stays_poisoned() {
+        let path = temp_psv("panic", 2);
+        // ProgressKpAbs の bucket_board は num_buckets > 256 を worker 内 assert で
+        // 拒否する。spawn 自体は通るため、panic → エラー変換の検証に使える。
+        let mut loader = OrderedPsvLoader::spawn(
+            &path,
+            16,
+            16,
+            2,
+            BucketMode::ProgressKpAbs,
+            257,
+            test_spec(),
+            0,
+        )
+        .expect("spawn loader");
+        let err = loop {
+            match loader.next_chunk() {
+                Ok(Some(chunk)) => loader.recycle(chunk),
+                Ok(None) => panic!("panicking workers must not look like a clean EOF"),
+                Err(e) => break e,
+            }
+        };
+        assert!(err.to_string().contains("panicked"), "{err}");
+
+        let err2 = loader
+            .next_chunk()
+            .map(|_| ())
+            .expect_err("a poisoned loader must keep failing");
+        assert!(err2.to_string().contains("panicked"), "{err2}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 破損 record (decode が矛盾した局面に化けるもの) は fail-closed の
+    /// エラーになり、score が書かれる側に流れない。
+    #[test]
+    fn ordered_loader_rejects_corrupt_record() {
+        // 正常 3 records + 全 0 の 40 bytes (玉が両陣営に置けない) + 正常 1 record。
+        let sample = sample_psv_bytes();
+        let mut bytes = sample[..40 * 3].to_vec();
+        bytes.extend_from_slice(&[0_u8; 40]);
+        bytes.extend_from_slice(&sample[..40]);
+        let path =
+            std::env::temp_dir().join(format!("tatara-rescore-corrupt-{}.psv", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let loader = OrderedPsvLoader::spawn(
+            &path,
+            16,
+            16,
+            1,
+            BucketMode::ProgressKpAbs,
+            9,
+            test_spec(),
+            0,
+        )
+        .expect("spawn loader");
+        let err = drain_until_error(loader).expect_err("corrupt record must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupt position") || msg.contains("panicked"),
+            "unexpected error: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1010,7 +1262,9 @@ mod tests {
         cleanup_sidecar(&path);
         std::fs::write(&path, [0_u8; 5]).unwrap();
         std::fs::write(in_progress_marker_path(&path), "fp-odd").unwrap();
-        let err = ScoreSidecarWriter::open(&path, 10, "fp-odd").expect_err("odd size must fail");
+        let err = ScoreSidecarWriter::open(&path, 10, "fp-odd")
+            .map(|_| ())
+            .expect_err("odd size must fail");
         assert!(err.to_string().contains("not a multiple"), "{err}");
         // 事後検出不能なため自己修復せず、file はそのまま残る。
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 5);
