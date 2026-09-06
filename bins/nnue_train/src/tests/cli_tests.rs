@@ -626,6 +626,163 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
     );
 }
 
+/// `validate_rescore_cli` の reject 行列を GPU 非依存で固定する (直接呼び出し)。
+/// non-GPU ビルド (GitHub CI の `--no-default-features`) でも検証ロジック自体は
+/// compile されるため、ここで消費とカバレッジを兼ねる。run 経路 (GPU context
+/// 越し) の配線は下の `rescore_cli_validation_rejects_bad_combinations` が担う。
+#[test]
+fn validate_rescore_cli_covers_the_reject_matrix() {
+    let parse_and_check = |argv: &[&str]| -> Result<(), String> {
+        let mut full = vec!["nnue-train"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("cli should parse");
+        let ArchCommand::LayerStack(ref layerstack) = cli.arch else {
+            unreachable!("layerstack subcommand was requested");
+        };
+        crate::training::validate_rescore_cli(&cli, layerstack).map_err(|e| e.to_string())
+    };
+    let reject = |argv: &[&str], needle: &str| {
+        let err = parse_and_check(argv).expect_err("combination must be rejected");
+        assert!(err.contains(needle), "expected '{needle}' in: {err}");
+    };
+
+    // 完全指定は通る。
+    parse_and_check(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--batch-size",
+        "16",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ])
+    .expect("a fully specified rescore invocation must validate");
+
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--eval-only",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "mutually exclusive",
+    );
+    reject(&["--rescore-input", "x.psv", "layerstack"], "--init-from");
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--rescore-output",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--rescore-score-scale",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--data",
+            "d.psv",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "cannot be combined",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--score-drop-abs",
+            "3000",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--score-drop-abs",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--threat-ablate",
+            "all",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--threat-ablate",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+            "--tf32",
+        ],
+        "FP32",
+    );
+    for bad_batch in ["0", "8"] {
+        reject(
+            &[
+                "--rescore-input",
+                "x.psv",
+                "--rescore-output",
+                "o",
+                "--rescore-score-scale",
+                "1200",
+                "--batch-size",
+                bad_batch,
+                "layerstack",
+                "--init-from",
+                "n.bin",
+            ],
+            "--batch-size >= 16",
+        );
+    }
+    reject(
+        &["--rescore-score-scale", "1200", "layerstack"],
+        "only used with --rescore-input",
+    );
+}
+
 /// `--rescore-input` の flag 整合検証は GPU context を作る前に走る。誤指定が
 /// clean な `Err` で返り、必須 flag の欠落・併用不可の組合せが素通りしないことを
 /// 実経路 (`run_training`) で固定する。
