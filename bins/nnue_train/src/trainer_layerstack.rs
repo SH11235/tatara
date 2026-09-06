@@ -19,6 +19,7 @@ struct StepContext<'a> {
     wdl_lambda: f32,
     loss: LossKind,
     validate: bool,
+    forward_output: bool,
     profile_step: bool,
     prof_t0: &'a mut std::time::Instant,
     b: usize,
@@ -41,6 +42,9 @@ pub(crate) struct StepOptions<'a> {
     wdl_lambda: f32,
     loss: LossKind,
     validate: bool,
+    /// true なら loss kernel を launch せず、forward 完了時点で `net_output` を
+    /// 読んで early return する ([`GpuTrainer::forward_step`] 用)。
+    forward_output: bool,
     profile_step: bool,
     prof_t0: &'a mut std::time::Instant,
 }
@@ -100,6 +104,7 @@ impl<'a> StepContext<'a> {
             wdl_lambda: options.wdl_lambda,
             loss: options.loss,
             validate: options.validate,
+            forward_output: options.forward_output,
             profile_step: options.profile_step,
             prof_t0: options.prof_t0,
             b,
@@ -2131,6 +2136,7 @@ impl GpuTrainer {
                 wdl_lambda,
                 loss,
                 validate: false,
+                forward_output: false,
                 profile_step,
                 prof_t0: &mut prof_t0,
             },
@@ -2204,10 +2210,51 @@ impl GpuTrainer {
                 wdl_lambda,
                 loss,
                 validate: true,
+                forward_output: false,
                 profile_step,
                 prof_t0: &mut prof_t0,
             },
         )
+    }
+
+    /// forward だけを実行して per-position の net 出力を返す (loss kernel を
+    /// launch しない)。weight / optimizer state は一切更新しないため forward-only
+    /// trainer でも使える。リスコア driver が i16 score sidecar のラベル値を
+    /// 作るための入口で、forward 部の数値は [`GpuTrainer::validate`] と同一
+    /// (同じ kernel 列の loss 手前まで)。
+    pub(crate) fn forward_step(
+        &mut self,
+        batch: &nnue_train::dataloader::Batch,
+        bucket_idx: &[i32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        if batch.feature_set != self.feature_set {
+            return Err(format!(
+                "batch feature set '{}' does not match trainer feature set '{}'",
+                batch.feature_set.canonical_name(),
+                self.feature_set.canonical_name(),
+            )
+            .into());
+        }
+        let data = BatchData::from_batch_ref(batch, bucket_idx);
+        // 直前の GPU work 完了を待つ (validate と同じ理由: in-flight compute と
+        // input buffer を取り合わない)。
+        self.stream.synchronize()?;
+        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
+        let mut prof_t0 = std::time::Instant::now();
+        let out = self.step_impl(
+            &data,
+            StepOptions {
+                lr: 0.0,
+                wdl_lambda: 0.0,
+                // forward_output 経路は loss kernel を launch しないため未使用。
+                loss: LossKind::Sigmoid { scale: 1.0 },
+                validate: true,
+                forward_output: true,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
+        )?;
+        Ok(out.net_output)
     }
 
     /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
@@ -2269,6 +2316,7 @@ impl GpuTrainer {
             wdl_lambda,
             loss,
             validate,
+            forward_output,
             profile_step,
             b,
             b_u32,
@@ -2966,6 +3014,19 @@ impl GpuTrainer {
                     ]
                 }
             }?;
+        }
+
+        // rescore の forward_step: loss kernel を launch せず `net_output` だけを
+        // 同期読み出しして early return する (score / wdl 入力は損失計算にしか
+        // 使われないため、リスコアでは読まれない)。
+        if forward_output {
+            let mut net_output = self.ws.net_output.to_host_vec(&self.stream)?;
+            net_output.truncate(b);
+            prof_tick!("forward_output_io");
+            return Ok(Some(StepOutput {
+                loss: 0.0,
+                net_output,
+            }));
         }
 
         // -- Forward step 15: loss kernel → dy_net_output + loss_acc --

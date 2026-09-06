@@ -210,6 +210,99 @@ fn parse_effect_bucket_config(
     Ok(config)
 }
 
+/// 学習範囲 (start_superbatch <= --superbatches) の検査を免除する経路か。
+/// `--eval-only` / `--rescore-input` は学習しないため、最終 checkpoint
+/// (start = saved_sb + 1 > --superbatches) からの `--resume` も正当。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn training_range_exempt(cli: &Cli) -> bool {
+    cli.eval_only || cli.rescore_input.is_some()
+}
+
+/// `--rescore-input` の flag 整合を検証する。リスコアの不変条件は「全行・原順序・
+/// 無フィルタ・strict fp32」なので、行を落とす / score を変える / 数値精度を変える
+/// flag との併用は silent に無視せず明示 reject する (`--eval-only` と同じ検証方針)。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_rescore_cli(
+    cli: &Cli,
+    layerstack: &LayerstackArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.rescore_input.is_none() {
+        for (name, given) in [
+            ("--rescore-output", cli.rescore_output.is_some()),
+            ("--rescore-score-scale", cli.rescore_score_scale.is_some()),
+        ] {
+            if given {
+                return Err(format!("{name} is only used with --rescore-input").into());
+            }
+        }
+        return Ok(());
+    }
+    if cli.eval_only {
+        return Err("--rescore-input and --eval-only are mutually exclusive".into());
+    }
+    if cli.init_from.is_none() && cli.resume.is_none() {
+        return Err(
+            "--rescore-input requires --init-from (.bin) or --resume (.ckpt) — the weights \
+             that produce the score labels"
+                .into(),
+        );
+    }
+    if cli.rescore_output.is_none() {
+        return Err("--rescore-input requires --rescore-output (the sidecar directory)".into());
+    }
+    if cli.rescore_score_scale.is_none() {
+        return Err(
+            "--rescore-input requires an explicit --rescore-score-scale (no default: pass the \
+             nnue2score value the net generation was trained with, e.g. 1200 for the n2s1200 \
+             generation)"
+                .into(),
+        );
+    }
+    if cli.data.is_some() || cli.test_data.is_some() || cli.test_tail_positions.is_some() {
+        return Err(
+            "--rescore-input cannot be combined with --data / --test-data / \
+             --test-tail-positions (rescore reads every record of --rescore-input in order, \
+             with no training-side filtering)"
+                .into(),
+        );
+    }
+    if cli.score_drop_abs.is_some() || cli.score_clamp_abs.is_some() {
+        return Err(
+            "--rescore-input cannot be combined with --score-drop-abs / --score-clamp-abs; \
+             the sidecar must cover every record and input scores are not read"
+                .into(),
+        );
+    }
+    if cli.threat_ablate.is_some() || cli.threat_norm_dump {
+        return Err(
+            "--rescore-input cannot be combined with --threat-ablate / --threat-norm-dump".into(),
+        );
+    }
+    if cli.batch_size < 16 {
+        return Err(format!(
+            "--rescore-input requires --batch-size >= 16 (got {}); the loader pads the \
+             final chunk to a multiple of 16 and the chunk size must cover at least one \
+             padded tile",
+            cli.batch_size
+        )
+        .into());
+    }
+    if cli.ft_fp16
+        || layerstack.ft_fp16_out
+        || cli.fp16_opt_state
+        || cli.all_optim
+        || layerstack.tf32
+    {
+        return Err(
+            "--rescore-input cannot be combined with --tf32 / --ft-fp16 / --ft-fp16-out / \
+             --fp16-opt-state / --all-optim; rescore labels are produced with the strict \
+             FP32 forward path"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
@@ -398,6 +491,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     if cli.eval_only && cli.init_from.is_none() && cli.resume.is_none() {
         return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
     }
+    validate_rescore_cli(cli, layerstack)?;
 
     let shared = validate_shared_cli(cli, layerstack.ft_fp16_out, layerstack.tf32)?;
     let feature_set = shared.feature_set;
@@ -494,6 +588,18 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
     validate_output_format(cli.output_format, bucket_mode)?;
+    // 学習は progress 係数未指定を全 bucket 4 に縮退させるが、リスコアで同じ縮退を
+    // 許すと全行が誤 routing のラベルになる。rescore 経路のみ明示エラーにする。
+    if cli.rescore_input.is_some()
+        && matches!(bucket_mode, BucketMode::ProgressKpAbs)
+        && layerstack.progress_coeff.is_none()
+    {
+        return Err(
+            "--rescore-input with --bucket-mode progresskpabs requires --progress-coeff \
+             (without it every position would silently fall into bucket 4)"
+                .into(),
+        );
+    }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -558,15 +664,38 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     // progresskpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
+    let mut rescore_coeff_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
     if matches!(bucket_mode, BucketMode::ProgressKpAbs) {
         match &layerstack.progress_coeff {
             Some(p) => {
                 println!("[train] loading progresskpabs coeff: {}", p.display());
-                ShogiProgressKPAbs::load_from_bin(p).map_err(
-                    |e| -> Box<dyn std::error::Error> {
-                        format!("failed to load --progress-coeff {}: {e}", p.display()).into()
-                    },
-                )?;
+                if cli.rescore_input.is_some() {
+                    // fingerprint の sha256 をロードに使った byte 列そのものから
+                    // 計算する (読み直すと差し替え時に hash と実体が乖離する)。
+                    // 読みと identity は同じ canonical path。
+                    let canonical = p.canonicalize().map_err(|e| {
+                        format!(
+                            "failed to canonicalize --progress-coeff {}: {e}",
+                            p.display()
+                        )
+                    })?;
+                    let bytes = std::fs::read(&canonical)?;
+                    rescore_coeff_identity =
+                        Some(crate::rescore_driver::LoadedArtifact::from_loaded_bytes(
+                            &canonical, &bytes,
+                        )?);
+                    ShogiProgressKPAbs::load_from_bytes(&bytes).map_err(
+                        |e| -> Box<dyn std::error::Error> {
+                            format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+                        },
+                    )?;
+                } else {
+                    ShogiProgressKPAbs::load_from_bin(p).map_err(
+                        |e| -> Box<dyn std::error::Error> {
+                            format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+                        },
+                    )?;
+                }
             }
             None => eprintln!(
                 "[train] note: --progress-coeff not given; all positions map to bucket 4 (sigmoid(0) = 0.5)"
@@ -699,10 +828,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
-    // --eval-only は forward + loss しか使わないため、optimizer state と backward
-    // workspace を確保しない forward-only trainer で構築する (同一 batch size でも
-    // device memory が学習構成より大幅に小さく、12GB 級 GPU で大 batch の評価が通る)。
-    let construct = if cli.eval_only {
+    // --eval-only と --rescore-input は forward (+ eval-only は loss) しか使わない
+    // ため、optimizer state と backward workspace を確保しない forward-only trainer
+    // で構築する (同一 batch size でも device memory が学習構成より大幅に小さく、
+    // 12GB 級 GPU で大 batch が通る)。
+    let construct = if cli.eval_only || cli.rescore_input.is_some() {
         GpuTrainer::new_forward_only
     } else {
         GpuTrainer::new
@@ -752,6 +882,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
+    // rescore の fingerprint 用に、ロード時点で固定した artifact identity。
+    let mut rescore_net_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
         Option<usize>,
         Option<String>,
@@ -761,16 +893,41 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             "[train] injecting pretrained weights from {} (optimizer state reset)",
             init.display()
         );
-        let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
-        let mut weights = LayerStackWeights::load_quantised_with_psqt(
-            &mut reader,
-            feature_set,
-            layerstack.ft_out,
-            layerstack.l1,
-            layerstack.l2,
-            layerstack.num_buckets,
-            layerstack.psqt,
-        )?;
+        // rescore は fingerprint に「ロードに使った byte 列そのもの」の sha256 を
+        // 書くため、file を一括で読んでから同じ buffer で parse する。学習経路は
+        // 従来どおり streaming (数百 MB を余分に保持しない)。
+        let mut weights = if cli.rescore_input.is_some() {
+            // hash とロードの対象を同じ実体にするため、canonical path に解決して
+            // から読む (symlink 差し替えで両者が乖離しないように)。
+            let canonical = init.canonicalize().map_err(|e| {
+                format!("failed to canonicalize --init-from {}: {e}", init.display())
+            })?;
+            let bytes = std::fs::read(&canonical)?;
+            rescore_net_identity = Some(crate::rescore_driver::LoadedArtifact::from_loaded_bytes(
+                &canonical, &bytes,
+            )?);
+            let mut reader = std::io::Cursor::new(&bytes[..]);
+            LayerStackWeights::load_quantised_with_psqt(
+                &mut reader,
+                feature_set,
+                layerstack.ft_out,
+                layerstack.l1,
+                layerstack.l2,
+                layerstack.num_buckets,
+                layerstack.psqt,
+            )?
+        } else {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(init)?);
+            LayerStackWeights::load_quantised_with_psqt(
+                &mut reader,
+                feature_set,
+                layerstack.ft_out,
+                layerstack.l1,
+                layerstack.l2,
+                layerstack.num_buckets,
+                layerstack.psqt,
+            )?
+        };
         if let Some(spec) = cli.threat_ablate.as_deref() {
             let stats = crate::threat_ablate::apply(&mut weights, layerstack.ft_out, spec)
                 .map_err(std::io::Error::other)?;
@@ -784,7 +941,25 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         trainer.load_layerstack_weights(&weights)?;
         (None, None, None)
     } else if let Some(ckpt) = &cli.resume {
-        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(ckpt)?;
+        // rescore は .ckpt (数 GB 級) を stream hash → 直後にロード → stat 等値の
+        // 検証で identity を固定する (hash とロードの間の差し替えを検出可能にする)。
+        // hash とロードは同じ canonical path を使う (symlink 差し替えで「hash した
+        // 物」と「読んだ物」が乖離しないように)。
+        let ckpt = if cli.rescore_input.is_some() {
+            let canonical = ckpt
+                .canonicalize()
+                .map_err(|e| format!("failed to canonicalize --resume {}: {e}", ckpt.display()))?;
+            rescore_net_identity = Some(crate::rescore_driver::LoadedArtifact::hash_file(
+                &canonical,
+            )?);
+            canonical
+        } else {
+            ckpt.clone()
+        };
+        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(&ckpt)?;
+        if let Some(identity) = &rescore_net_identity {
+            identity.verify_unchanged("--resume checkpoint")?;
+        }
         println!(
             "[train] resuming from {} at superbatch {}",
             ckpt.display(),
@@ -804,9 +979,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
     let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
-    // eval-only は学習しないので train-range 制約を課さない。これを課すと最終
-    // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価できない。
-    if start_superbatch > cli.superbatches && !cli.eval_only {
+    // 学習しない経路には train-range 制約を課さない。これを課すと最終
+    // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価 /
+    // リスコアできない。
+    if start_superbatch > cli.superbatches && !training_range_exempt(cli) {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
             cli.superbatches
@@ -855,6 +1031,63 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 開始時の `ft_w` (init / --init-from / --resume いずれか) と一度同期する。
     // 以降は optimizer (mirror) または step 末の fold (comb) が維持する。
     trainer.sync_ft_forward_weights()?;
+
+    if let Some(rescore_input) = &cli.rescore_input {
+        // flag 整合は validate_rescore_cli で検証済み。ここでは解決済みの値と
+        // ロード時に固定した identity を driver へ渡すだけ。入力 PSV も一度だけ
+        // canonical に解決し、fingerprint / loader / 最終検証の全消費を同じ実体に
+        // 揃える (worker が chunk ごとに open する path も canonical になる)。
+        let rescore_input = rescore_input.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize --rescore-input {}: {e}",
+                rescore_input.display()
+            )
+        })?;
+        let weights_source = if cli.init_from.is_some() {
+            "init-from-bin"
+        } else {
+            "resume-ckpt"
+        };
+        let ft_factorize = if feature_set.ft_factorize() {
+            match feature_set.ft_factorize_mode() {
+                shogi_features::FtFactorizeMode::Base => "base",
+                shogi_features::FtFactorizeMode::PoolEffectBuckets => "pool-effect-buckets",
+                shogi_features::FtFactorizeMode::PerEffectBucket => "per-effect-bucket",
+            }
+        } else {
+            "off"
+        };
+        let rescore_cfg = crate::rescore_driver::RescoreConfig {
+            input: &rescore_input,
+            output_dir: cli
+                .rescore_output
+                .as_deref()
+                .ok_or("--rescore-input requires --rescore-output")?,
+            score_scale: cli
+                .rescore_score_scale
+                .ok_or("--rescore-input requires --rescore-score-scale")?,
+            score_clip: cli.rescore_score_clip,
+            batch_size: cli.batch_size,
+            feature_set,
+            bucket_mode,
+            num_buckets: layerstack.num_buckets,
+            net: rescore_net_identity.ok_or("--rescore-input requires --init-from or --resume")?,
+            weights_source,
+            arch: layerstack_architecture(
+                layerstack.ft_out,
+                layerstack.l1,
+                layerstack.l2,
+                layerstack.num_buckets,
+            ),
+            threat_profile: layerstack.threat_profile.clone(),
+            effect_bucket: layerstack.effect_bucket_config.clone(),
+            ft_factorize,
+            psqt: layerstack.psqt,
+            stack_shared_delta: layerstack.stack_shared_delta,
+            progress_coeff: rescore_coeff_identity,
+        };
+        return crate::rescore_driver::run_rescore(&mut trainer, &rescore_cfg);
+    }
 
     if cli.eval_only {
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
@@ -1212,6 +1445,16 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
         return Err(
             "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
              layerstack subcommand"
+                .into(),
+        );
+    }
+    if cli.rescore_input.is_some()
+        || cli.rescore_output.is_some()
+        || cli.rescore_score_scale.is_some()
+    {
+        return Err(
+            "--rescore-input / --rescore-output / --rescore-score-scale are only supported \
+             with the layerstack subcommand"
                 .into(),
         );
     }

@@ -106,6 +106,13 @@ impl ShogiProgressKPAbs {
     pub fn load_from_bin(path: &Path) -> Result<Self, String> {
         let bytes =
             std::fs::read(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+        Self::load_from_bytes(&bytes)
+    }
+
+    /// [`Self::load_from_bin`] のバイト列版。呼び出し側がロード内容の hash 検証を
+    /// 行う場合に、検証したバイト列と同一の内容から重みを構築できる (ここで
+    /// ファイルを読み直すと、その間の差し替えで hash とロード内容が乖離する)。
+    pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
         if bytes.len() != expected {
             return Err(format!(

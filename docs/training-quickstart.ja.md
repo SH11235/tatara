@@ -162,6 +162,35 @@ checkpointは窓の途中位置やdataset epoch番号を復元しない。
 
 所要時間は GPU と構成 (FP16 モード有無) で大きく変わる。
 
+## 教師 pool のリスコア (score sidecar)
+
+`--rescore-input` は PSV の全 record を学習済み net の forward で relabel し、
+little-endian i16 の score sidecar (`<入力名>.scores.i16`、入力順に 1 record
+1 score) を書き出す:
+
+```bash
+nnue-train   --rescore-input /path/to/pool.psv   --rescore-output /path/to/scores/   --rescore-score-scale 1200   --batch-size 65536   layerstack   --init-from /path/to/net.bin   --ft-out 3072 --l1 16 --l2 32 --num-buckets 9   --bucket-mode progresskpabs --progress-coeff /path/to/progress.bin
+```
+
+- `--rescore-score-scale` に既定値はない。net 世代の学習に使った
+  `--wrm-nnue2score` を渡す (`score = net_output * scale` を丸めて
+  `± --rescore-score-clip` に飽和)。
+- 重みは `--init-from` (量子化 `.bin`。ラベルは量子化往復を通る) か `--resume`
+  (raw `.ckpt`。fp32 master のラベル) から。どちらを使ったかは sidecar の
+  `.meta.json` に記録される。
+- 中断再開可能: `.in-progress` marker がラベルを変える全条件 (net sha256、
+  routing、progress 係数、score 変換、build commit) の fingerprint を持ち、
+  一致する中断 run は記録済み record 数から追記する。条件が 1 つでも変われば
+  最初から作り直す。正直な制約が 2 つある: 内容 hash で守られるのは
+  `--init-from` の `.bin` と progress 係数 (ロードした byte 列から hash) で、
+  `--resume` の `.ckpt` と入力 PSV は size + mtime 検証のみ — 同サイズかつ
+  mtime を書き戻した置換は検出できない。また dirty / repo 外 build の binary
+  では完了 skip と resume が無効化される (fingerprint に起動ごとの nonce が
+  入る) ため、campaign 実行は clean checkout でビルドすること。
+- 学習側 filter (`--score-drop-abs` 等) と低精度 flag (`--tf32` / `--ft-fp16`
+  等) は reject される: sidecar は全 record をカバーし、ラベルは常に strict
+  FP32 forward で作る。
+
 ## held-out validation
 
 過学習や数値発散 (NaN) を SPRT 自己対局を待たずに早期検知するには、held-out

@@ -179,6 +179,37 @@ overfitting.
 The time it takes varies greatly with the GPU and the configuration (whether
 FP16 modes are on).
 
+## Rescoring a teacher pool (score sidecar)
+
+`--rescore-input` relabels every record of a PSV file with the forward pass of a
+trained network and writes a little-endian i16 score sidecar
+(`<input name>.scores.i16`, one score per input record, in input order):
+
+```bash
+nnue-train   --rescore-input /path/to/pool.psv   --rescore-output /path/to/scores/   --rescore-score-scale 1200   --batch-size 65536   layerstack   --init-from /path/to/net.bin   --ft-out 3072 --l1 16 --l2 32 --num-buckets 9   --bucket-mode progresskpabs --progress-coeff /path/to/progress.bin
+```
+
+- `--rescore-score-scale` has no default: pass the `--wrm-nnue2score` value the
+  net generation was trained with (`score = net_output * scale`, rounded and
+  clipped to `+/- --rescore-score-clip`).
+- Weights come from `--init-from` (a quantised `.bin`; labels go through the
+  quantise/dequantise round trip) or `--resume` (a raw `.ckpt`; fp32 master
+  labels). The sidecar's `.meta.json` records which one was used.
+- The run is resumable: an `.in-progress` marker holds a fingerprint of every
+  label-affecting condition (net sha256, routing, progress coefficients,
+  score conversion, build commit), and a matching interrupted run appends from
+  the recorded record count. Any changed condition regenerates the sidecar
+  from scratch. Two honest limits: content hashing covers the `--init-from`
+  `.bin` and the progress coefficients (hashed from the loaded bytes); the
+  `--resume` `.ckpt` and the input PSV are guarded by size + mtime checks
+  only, so a same-size replacement with a restored mtime is not detected.
+  A binary built from a dirty or unknown git tree disables completion skip
+  and resume entirely (the fingerprint gets a per-run nonce) — build from a
+  clean checkout for campaign runs.
+- Training-side filters (`--score-drop-abs` etc.) and reduced-precision flags
+  (`--tf32`, `--ft-fp16`, ...) are rejected: the sidecar covers every record
+  and labels always use the strict FP32 forward path.
+
 ## Held-out validation
 
 To watch for overfitting and divergence (NaN) without waiting for SPRT

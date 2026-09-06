@@ -347,6 +347,7 @@ const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
 fn simple_rejects_layerstack_only_global_flags() {
     // eval / threat 系は layerstack の eval・threat 経路専用 → simple では reject。
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--eval-only"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--rescore-input", "x.psv"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
     // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
@@ -623,6 +624,310 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
         root_help.contains("must equal `--wrm-nnue2score` whether or not weights are loaded"),
         "{root_help}"
     );
+}
+
+/// `validate_rescore_cli` の reject 行列を GPU 非依存で固定する (直接呼び出し)。
+/// non-GPU ビルド (GitHub CI の `--no-default-features`) でも検証ロジック自体は
+/// compile されるため、ここで消費とカバレッジを兼ねる。run 経路 (GPU context
+/// 越し) の配線は下の `rescore_cli_validation_rejects_bad_combinations` が担う。
+#[test]
+fn validate_rescore_cli_covers_the_reject_matrix() {
+    let parse_and_check = |argv: &[&str]| -> Result<(), String> {
+        let mut full = vec!["nnue-train"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("cli should parse");
+        let ArchCommand::LayerStack(ref layerstack) = cli.arch else {
+            unreachable!("layerstack subcommand was requested");
+        };
+        crate::training::validate_rescore_cli(&cli, layerstack).map_err(|e| e.to_string())
+    };
+    let reject = |argv: &[&str], needle: &str| {
+        let err = parse_and_check(argv).expect_err("combination must be rejected");
+        assert!(err.contains(needle), "expected '{needle}' in: {err}");
+    };
+
+    // 完全指定は通る。
+    parse_and_check(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--batch-size",
+        "16",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ])
+    .expect("a fully specified rescore invocation must validate");
+
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--eval-only",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "mutually exclusive",
+    );
+    reject(&["--rescore-input", "x.psv", "layerstack"], "--init-from");
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--rescore-output",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--rescore-score-scale",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--data",
+            "d.psv",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "cannot be combined",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--score-drop-abs",
+            "3000",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--score-drop-abs",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "--threat-ablate",
+            "all",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+        ],
+        "--threat-ablate",
+    );
+    reject(
+        &[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "o",
+            "--rescore-score-scale",
+            "1200",
+            "layerstack",
+            "--init-from",
+            "n.bin",
+            "--tf32",
+        ],
+        "FP32",
+    );
+    for bad_batch in ["0", "8"] {
+        reject(
+            &[
+                "--rescore-input",
+                "x.psv",
+                "--rescore-output",
+                "o",
+                "--rescore-score-scale",
+                "1200",
+                "--batch-size",
+                bad_batch,
+                "layerstack",
+                "--init-from",
+                "n.bin",
+            ],
+            "--batch-size >= 16",
+        );
+    }
+    reject(
+        &["--rescore-score-scale", "1200", "layerstack"],
+        "only used with --rescore-input",
+    );
+}
+
+/// `--rescore-input` の flag 整合検証は GPU context を作る前に走る。誤指定が
+/// clean な `Err` で返り、必須 flag の欠落・併用不可の組合せが素通りしないことを
+/// 実経路 (`run_training`) で固定する。
+#[cfg(feature = "gpu")]
+#[test]
+fn rescore_cli_validation_rejects_bad_combinations() {
+    let run = |argv: &[&str]| {
+        let mut full = vec!["nnue-train"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("cli should parse");
+        crate::training::run_training(&cli)
+            .expect_err("invalid rescore flags must return a clean Err")
+            .to_string()
+    };
+
+    let err = run(&["--rescore-input", "x.psv", "layerstack"]);
+    assert!(err.contains("--init-from"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--rescore-output"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--rescore-score-scale"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--data",
+        "d.psv",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("cannot be combined"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+        "--tf32",
+    ]);
+    assert!(err.contains("FP32"), "{err}");
+
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "--eval-only",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("mutually exclusive"), "{err}");
+
+    // progresskpabs は係数必須 (学習側の「全 bucket 4」縮退を rescore に持ち込まない)。
+    let err = run(&[
+        "--rescore-input",
+        "x.psv",
+        "--rescore-output",
+        "out",
+        "--rescore-score-scale",
+        "1200",
+        "layerstack",
+        "--init-from",
+        "net.bin",
+    ]);
+    assert!(err.contains("--progress-coeff"), "{err}");
+
+    // rescore 専用 flag の単独指定 (rescore-input 無し) も明示 reject。
+    let err = run(&["--rescore-score-scale", "1200", "layerstack"]);
+    assert!(err.contains("only used with --rescore-input"), "{err}");
+
+    // batch サイズの下限 (loader の 16 行 padding 前提)。0 は %16 検査を素通り
+    // するため専用の floor が要る。
+    for bad_batch in ["0", "8"] {
+        let err = run(&[
+            "--rescore-input",
+            "x.psv",
+            "--rescore-output",
+            "out",
+            "--rescore-score-scale",
+            "1200",
+            "--batch-size",
+            bad_batch,
+            "layerstack",
+            "--init-from",
+            "net.bin",
+        ]);
+        assert!(
+            err.contains("--batch-size >= 16"),
+            "batch {bad_batch}: {err}"
+        );
+    }
+}
+
+/// `--rescore-score-clip` は 1 以上のみ受理 (0 / 負は全ラベルが定数化する)。
+#[test]
+fn rescore_score_clip_rejects_non_positive_values() {
+    for bad in ["0", "-1"] {
+        assert!(
+            Cli::try_parse_from(["nnue-train", "--rescore-score-clip", bad, "layerstack"]).is_err(),
+            "--rescore-score-clip {bad} must be a parse error"
+        );
+    }
+    assert!(Cli::try_parse_from(["nnue-train", "--rescore-score-clip", "1", "layerstack"]).is_ok());
+}
+
+/// 学習範囲検査の免除は「学習しない経路」に限る。
+#[test]
+fn training_range_exemption_covers_eval_only_and_rescore() {
+    use crate::training::training_range_exempt;
+    let plain = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
+    assert!(!training_range_exempt(&plain));
+    let eval = Cli::try_parse_from(["nnue-train", "--eval-only", "layerstack"]).unwrap();
+    assert!(training_range_exempt(&eval));
+    let rescore =
+        Cli::try_parse_from(["nnue-train", "--rescore-input", "x.psv", "layerstack"]).unwrap();
+    assert!(training_range_exempt(&rescore));
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
