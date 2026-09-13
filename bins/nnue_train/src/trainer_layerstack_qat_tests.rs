@@ -371,3 +371,146 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
     std::fs::remove_file(path)?;
     Ok(())
 }
+
+#[test]
+fn qat_norm_loss_updates_masters_with_diagnostics_and_lookahead() -> TestResult {
+    let ctx = CudaContext::new(0)?;
+    let lr = 0.01;
+    let factor = 0.25;
+    for mode in [QatMode::Off, QatMode::Dense] {
+        for factorize in [false, true] {
+            for diagnostic in [false, true] {
+                let features = if factorize {
+                    FeatureSet::HalfKaHmMerged.spec().with_ft_factorize()
+                } else {
+                    FeatureSet::HalfKaHmMerged.spec()
+                };
+                let mut t = trainer_with_features(&ctx, 128, false, features)?;
+                t.optimizer = OptimizerKind::Ranger;
+                t.step_count = 4;
+                t.norm_loss_factor = Some(factor);
+                t.norm_scratch = DeviceBuffer::zeroed(&t.stream, 128)?;
+                // Off-grid masters and zero data gradients isolate regularization from QAT
+                // rounding, weight decay and adaptive updates. Slow weights start at zero.
+                t.ft_w = DeviceBuffer::from_host(&t.stream, &vec![0.001; t.ft_w.len()])?;
+                for weight in [
+                    &mut t.ft_b,
+                    &mut t.l1_w,
+                    &mut t.l1_b,
+                    &mut t.l1_shared_weight,
+                    &mut t.l1_shared_bias,
+                    &mut t.l2_w,
+                    &mut t.l2_b,
+                    &mut t.l3_w,
+                    &mut t.l3_b,
+                ] {
+                    *weight = DeviceBuffer::from_host(&t.stream, &vec![0.03; weight.len()])?;
+                }
+                t.sync_ft_forward_weights()?;
+                t.configure_qat(Some(mode))?;
+                if diagnostic {
+                    t.configure_precision_diagnostic(&ctx, vec![5, 6], 16, 42)?;
+                }
+                ctx.synchronize()?;
+                let batch = BatchData::smoke_dummy(16, features);
+                let mut data = batch.as_ref();
+                data.per_pos_norm = 0.0;
+                let mut expected = [0.03_f32; 9];
+                let lengths = [128, 128, 32, 128, 16, 30, 64, 32, 2];
+                let mut expected_ft = 0.001_f32;
+                let mut previous_records = Vec::new();
+                for step in 5..=7 {
+                    let before_ft = expected_ft;
+                    let regularize = |v: f32, n: usize| {
+                        let norm = (n as f64).sqrt() * f64::from(v.abs());
+                        (f64::from(v)
+                            * (1.0
+                                - f64::from(lr)
+                                    * 2.0
+                                    * f64::from(factor)
+                                    * (1.0 - 1.0 / (norm + f64::from(EPS)))))
+                            as f32
+                    };
+                    let norm_ft = regularize(before_ft, features.train_ft_in());
+                    let lookahead = if step == 6 { RANGER_ALPHA } else { 1.0 };
+                    expected_ft = norm_ft * lookahead;
+                    for (v, n) in expected.iter_mut().zip(lengths) {
+                        *v = regularize(*v, n) * lookahead;
+                    }
+                    t.step(&data, lr, 0.0, SMOKE_LOSS_WRM)?;
+                    assert!(
+                        t.ws.dy_net_output
+                            .to_host_vec(&t.stream)?
+                            .iter()
+                            .all(|v| *v == 0.0)
+                    );
+                    for ((name, weight), expected) in [
+                        ("ft_b", &t.ft_b),
+                        ("l1_w", &t.l1_w),
+                        ("l1_b", &t.l1_b),
+                        ("l1_shared_weight", &t.l1_shared_weight),
+                        ("l1_shared_bias", &t.l1_shared_bias),
+                        ("l2_w", &t.l2_w),
+                        ("l2_b", &t.l2_b),
+                        ("l3_w", &t.l3_w),
+                        ("l3_b", &t.l3_b),
+                    ]
+                    .into_iter()
+                    .zip(expected)
+                    {
+                        let actual = weight.to_host_vec(&t.stream)?;
+                        assert!(
+                            actual.iter().all(|v| (*v - expected).abs() < 1.0e-7),
+                            "{mode:?} factorize={factorize} diagnostic={diagnostic} step={step} {name}: {} != {expected}",
+                            actual[0]
+                        );
+                    }
+                    if let Some(d) = &t.precision_diagnostic {
+                        let records = d.records.to_host_vec(&t.stream)?;
+                        if step == 7 {
+                            assert_eq!(
+                                records, previous_records,
+                                "unselected step writes no observation"
+                            );
+                        } else {
+                            for r in records.chunks_exact(13) {
+                                assert!(
+                                    (r[12] - before_ft).abs() < 1.0e-7,
+                                    "snapshot must precede norm loss"
+                                );
+                                assert!(
+                                    (r[6] - norm_ft).abs() < 1.0e-7,
+                                    "optimizer must see regularized master"
+                                );
+                                assert_eq!(
+                                    r[6], r[7],
+                                    "zero gradient and decay leave optimizer input unchanged"
+                                );
+                                assert_eq!(r[8], 0.0);
+                                assert!(
+                                    (r[9] - expected_ft).abs() < 1.0e-7,
+                                    "snapshot must follow Lookahead"
+                                );
+                            }
+                        }
+                        previous_records = records;
+                    }
+                    if factorize {
+                        let combined = t
+                            .ft_w_fold32
+                            .as_ref()
+                            .expect("factorized FT")
+                            .to_host_vec(&t.stream)?;
+                        t.sync_ft_forward_weights()?;
+                        assert_eq!(
+                            combined,
+                            t.ft_w_fold32.as_ref().unwrap().to_host_vec(&t.stream)?,
+                            "forward fold must include regularization and Lookahead"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

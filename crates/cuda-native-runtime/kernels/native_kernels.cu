@@ -1209,7 +1209,7 @@ extern "C" __global__ void gather_and_sum_per_feature_add_fp16(
     );
 }
 
-template <bool HalfState, bool Mirror>
+template <bool HalfState, bool Mirror, bool Observe = false>
 __device__ __forceinline__ void native_radam_step_fp16(
     float* weights,
     void* momentum_storage,
@@ -1227,11 +1227,32 @@ __device__ __forceinline__ void native_radam_step_fp16(
     float max_weight,
     float momentum_scale,
     float velocity_scale,
-    unsigned int n
+    unsigned int n,
+    const unsigned int* sample_indices = nullptr,
+    unsigned int sample_count = 0,
+    float* observations = nullptr
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) {
         return;
+    }
+    float* record = nullptr;
+    if (Observe) {
+        unsigned int lo = 0, hi = sample_count;
+        while (lo < hi) {
+            const unsigned int mid = lo + (hi - lo) / 2;
+            if (sample_indices[mid] < i) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < sample_count && sample_indices[lo] == i) {
+            record = observations + lo * 13;
+            record[0] = HalfState ? __half2float(static_cast<__half*>(momentum_storage)[i])
+                                 : static_cast<float*>(momentum_storage)[i];
+            record[3] = HalfState ? __half2float(static_cast<__half*>(velocity_storage)[i])
+                                 : static_cast<float*>(velocity_storage)[i];
+            record[6] = weights[i];
+            record[8] = gradient[i];
+        }
     }
     const float g = gradient[i];
     const float rate = learning_rate * step_size;
@@ -1268,8 +1289,69 @@ __device__ __forceinline__ void native_radam_step_fp16(
     p -= rate * value;
     p = p < min_weight ? min_weight : (p > max_weight ? max_weight : p);
     weights[i] = p;
+    if (Observe && record != nullptr) {
+        record[1] = momentum * momentum_scale;
+        record[2] = HalfState ? __half2float(static_cast<__half*>(momentum_storage)[i]) : momentum;
+        record[4] = velocity * velocity_scale;
+        record[5] = HalfState ? __half2float(static_cast<__half*>(velocity_storage)[i]) : velocity;
+        record[7] = p;
+    }
     if (Mirror) {
         mirror[i] = __float2half_rn(p);
+    }
+}
+
+extern "C" __global__ void precision_radam_step(
+    float* weights, unsigned long long,
+    void* momentum, unsigned long long,
+    void* velocity, unsigned long long,
+    float* gradient, unsigned long long,
+    __half* mirror, unsigned long long,
+    const unsigned int* indices, unsigned long long,
+    float* observations, unsigned long long,
+    float learning_rate, float step_size, int denom, float decay, float beta1, float beta2,
+    float epsilon, float min_weight, float max_weight, float m_scale, float v_scale,
+    unsigned int n, unsigned int samples, int half_state, int write_mirror
+) {
+    if (half_state) {
+        if (write_mirror) {
+            native_radam_step_fp16<true, true, true>(weights, momentum, velocity, gradient, mirror,
+                learning_rate, step_size, denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+                m_scale, v_scale, n, indices, samples, observations);
+        } else {
+            native_radam_step_fp16<true, false, true>(weights, momentum, velocity, gradient, mirror,
+                learning_rate, step_size, denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+                m_scale, v_scale, n, indices, samples, observations);
+        }
+    } else {
+        if (write_mirror) {
+            native_radam_step_fp16<false, true, true>(weights, momentum, velocity, gradient, mirror,
+                learning_rate, step_size, denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+                1.0F, 1.0F, n, indices, samples, observations);
+        } else {
+            native_radam_step_fp16<false, false, true>(weights, momentum, velocity, gradient, mirror,
+                learning_rate, step_size, denom, decay, beta1, beta2, epsilon, min_weight, max_weight,
+                1.0F, 1.0F, n, indices, samples, observations);
+            const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+            // Match the FP32 non-mirror entry point's gradient-clear contract.
+            if (i < n) gradient[i] = 0.0F;
+        }
+    }
+}
+
+extern "C" __global__ void precision_snapshot(
+    const float* weights, unsigned long long,
+    const __half* mirror, unsigned long long,
+    const unsigned int* indices, unsigned long long,
+    float* observations, unsigned long long,
+    unsigned int samples, unsigned int base_elements, int has_mirror, int after
+) {
+    const unsigned int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= samples) return;
+    const unsigned int i = indices[k];
+    observations[k * 13 + (after ? 9 : 12)] = weights[i];
+    if (has_mirror && i < base_elements) {
+        observations[k * 13 + (after ? 11 : 10)] = __half2float(mirror[i]);
     }
 }
 

@@ -2,6 +2,127 @@ use std::path::Path;
 #[path = "trainer_layerstack_qat.rs"]
 mod qat_impl;
 
+#[cfg(feature = "native")]
+impl GpuTrainer {
+    pub(crate) fn configure_precision_diagnostic(
+        &mut self,
+        ctx: &CudaContext,
+        steps: Vec<u64>,
+        count: usize,
+        seed: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.precision_diagnostic = Some(crate::precision_diagnostics::Diagnostic::new(
+            &self.stream,
+            self.ft_w.len(),
+            steps,
+            count,
+            seed,
+        )?);
+        // Native zeroed allocations use the default stream rather than the compute stream.
+        ctx.synchronize()?;
+        Ok(())
+    }
+
+    fn precision_snapshot(&self, after: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let d = self
+            .precision_diagnostic
+            .as_ref()
+            .expect("configured diagnostic");
+        let mirror = self.ft_w_h.as_ref().unwrap_or(&d.dummy_mirror);
+        // SAFETY: indices are unique and bounded by the training FT allocation. Mirror reads
+        // are bounded by base_elements, and records has thirteen floats per sampled element.
+        unsafe {
+            cuda_launch! {
+                kernel: precision_snapshot,
+                stream: self.stream, module: self.module, config: cfg_1d(d.indices.len()),
+                args: [slice(self.ft_w), slice(mirror), slice(d.device_indices), slice(d.records),
+                    d.indices.len() as u32, (self.feature_set.ft_in() * self.ws.ft_out) as u32,
+                    i32::from(self.ft_w_h.is_some()), i32::from(after)]
+            }
+        }?;
+        Ok(())
+    }
+
+    fn precision_optimizer(
+        &self,
+        lr: f32,
+        step_size: f32,
+        denom: i32,
+        decay: f32,
+        beta1: f32,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(d) = self
+            .precision_diagnostic
+            .as_ref()
+            .filter(|d| d.steps.contains(&self.step_count))
+        else {
+            return Ok(false);
+        };
+        let mirror = self.ft_w_h.as_ref().unwrap_or(&d.dummy_mirror);
+        macro_rules! launch_precision {
+            ($m:expr, $v:expr) => {{
+                // SAFETY: indices are bounded by the FT buffers, and record capacity is
+                // thirteen floats per sample. All allocations remain live through readback.
+                unsafe {
+                    cuda_launch! {
+                        kernel: precision_radam_step,
+                        stream: self.stream, module: self.module, config: cfg_1d(self.ft_w.len()),
+                        args: [slice(self.ft_w), slice($m), slice($v), slice(self.ft_w_grad),
+                            slice(mirror), slice(d.device_indices), slice(d.records),
+                            lr, step_size, denom, decay, beta1, BETA2, EPS,
+                            W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE, FT_OPT_V_SCALE,
+                            self.ft_w.len() as u32, d.indices.len() as u32,
+                            i32::from(self.fp16_opt_state),
+                            i32::from(self.ft_w_h.is_some() && !self.feature_set.ft_factorize())]
+                    }
+                }
+            }};
+        }
+        match (&self.ft_w_m, &self.ft_w_v) {
+            (MomentBuf::F16(m), MomentBuf::F16(v)) => {
+                launch_precision!(m, v)?;
+            }
+            (MomentBuf::F32(m), MomentBuf::F32(v)) => {
+                launch_precision!(m, v)?;
+            }
+            _ => unreachable!("FT moments share precision"),
+        }
+        Ok(true)
+    }
+
+    fn precision_finish(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.precision_snapshot(true)?;
+        let d = self
+            .precision_diagnostic
+            .as_ref()
+            .expect("configured diagnostic");
+        let records = d.records.to_host_vec(&self.stream)?;
+        let base_elements = (self.feature_set.ft_in() * self.ws.ft_out) as u32;
+        let groups = crate::precision_diagnostics::summarize(
+            &d.indices,
+            &records,
+            base_elements,
+            self.fp16_opt_state,
+            self.ft_w_h.is_some(),
+        );
+        let report = serde_json::json!({
+            "schema_version": 1, "step": self.step_count, "scope": "single_optimizer_step",
+            "backend": "native-cuda", "sampling": "uniform_elements_without_replacement_fixed_splitmix64",
+            "seed": d.seed, "sample_count": d.indices.len(), "population_elements": self.ft_w.len(),
+            "base_elements": base_elements, "ft_out": self.ws.ft_out,
+            "moment_storage": if self.fp16_opt_state { "scaled_fp16" } else { "fp32" },
+            "m_scale": if self.fp16_opt_state { FT_OPT_M_SCALE } else { 1.0 },
+            "v_scale": if self.fp16_opt_state { FT_OPT_V_SCALE } else { 1.0 },
+            "forward_fp16_enabled": self.ft_w_h.is_some(), "factorized_forward": self.feature_set.ft_factorize(),
+            "norm_loss_factor": self.norm_loss_factor,
+            "lookahead_applied": self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K),
+            "base": groups[0], "virtual": groups[1],
+        });
+        println!("[precision] {report}");
+        Ok(())
+    }
+}
+
 use gpu_kernels::sparse::ft_factorize::FT_FACTORIZE_BASE;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
@@ -301,6 +422,8 @@ pub(crate) struct GpuTrainer {
     bucket_mode: BucketMode,
     optimizer: OptimizerKind,
     step_count: u64,
+    #[cfg(feature = "native")]
+    precision_diagnostic: Option<crate::precision_diagnostics::Diagnostic>,
     /// true なら forward + loss (`validate`) 専用 trainer。optimizer state
     /// (`m` / `v` / `slow`)・全 `*_grad`・backward workspace を 0-byte で確保して
     /// device memory を forward 経路の分だけに抑える ([`GpuTrainer::new_forward_only`])。
@@ -1201,6 +1324,8 @@ impl GpuTrainer {
             bucket_mode,
             optimizer,
             step_count: 0,
+            #[cfg(feature = "native")]
+            precision_diagnostic: None,
             forward_only,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -3202,7 +3327,6 @@ impl GpuTrainer {
         context: &mut StepContext<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let StepContext {
-            lr,
             loss: _,
             profile_step,
             b,
@@ -3240,11 +3364,6 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_b_n = ft_out;
-        let l1_b_n = self.num_buckets * l1_out;
-        let l1_shared_bias_n = l1_out;
-        let l2_b_n = self.num_buckets * l2_out;
-        let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
         // `gather_and_sum_per_feature_overwrite` が実 block の全 (feature, ri) cell
         // を sum (off_start==off_end の時も sum=0) で書き切り、factorizer の仮想
@@ -4297,6 +4416,60 @@ impl GpuTrainer {
         }
         prof_tick!("bwd_ftbwd");
 
+        #[cfg(feature = "native")]
+        if self
+            .precision_diagnostic
+            .as_ref()
+            .is_some_and(|d| d.steps.contains(&(self.step_count + 1)))
+        {
+            self.precision_snapshot(false)?;
+        }
+
+        Ok(())
+    }
+
+    fn optimizer_step(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            profile_step,
+            ft_out,
+            l1_out,
+            l2_in,
+            l2_out,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_b_n = ft_out;
+        let l1_w_n = self.num_buckets * l1_out * ft_out;
+        let l1_b_n = self.num_buckets * l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
+        let l2_w_n = self.num_buckets * l2_out * l2_in;
+        let l2_b_n = self.num_buckets * l2_out;
+        let l3_w_n = self.num_buckets * l2_out;
+        let l3_b_n = self.num_buckets;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
+        }
+
+        // QAT restores FP32 masters before entering this method; regularization must
+        // update those masters, after the pre-norm-loss diagnostic snapshot.
         // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
         // radam step の **前** に適用する。理由: (1) radam の per-layer clamp が最後の
         // 演算になり clamp 不変条件を保つ、(2) forward 用 FT weight (`ft_w_h` mirror /
@@ -4379,49 +4552,6 @@ impl GpuTrainer {
             prof_tick!("norm_loss");
         }
 
-        Ok(())
-    }
-
-    fn optimizer_step(
-        &mut self,
-        context: &mut StepContext<'_>,
-    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
-        let StepContext {
-            lr,
-            profile_step,
-            ft_out,
-            l1_out,
-            l2_in,
-            l2_out,
-            ..
-        } = *context;
-        let prof_t0 = &mut *context.prof_t0;
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
-        let ft_b_n = ft_out;
-        let l1_w_n = self.num_buckets * l1_out * ft_out;
-        let l1_b_n = self.num_buckets * l1_out;
-        let l1_shared_weight_n = ft_out * l1_out;
-        let l1_shared_bias_n = l1_out;
-        let l2_w_n = self.num_buckets * l2_out * l2_in;
-        let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
-        let l3_b_n = self.num_buckets;
-
-        macro_rules! prof_tick {
-            ($label:expr) => {
-                if profile_step {
-                    self.stream.synchronize()?;
-                    let now = std::time::Instant::now();
-                    eprintln!(
-                        "[step-profile] {:<10} {:8.3} ms",
-                        $label,
-                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
-                    );
-                    *prof_t0 = now;
-                }
-            };
-        }
-
         // ===== OPTIMIZER STEP =====
         // 3 種 (ranger / radam / adamw) とも element 更新は同じ radam_step kernel。
         // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
@@ -4451,68 +4581,74 @@ impl GpuTrainer {
         // のみ更新し step 末の fold が comb を再生成する (`launch_ft_fold`)。
         let ft_factorize = self.feature_set.ft_factorize();
         let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
-        match (&mut self.ft_w_m, &mut self.ft_w_v) {
-            (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
-                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: radam_step_f16state_mirror,
-                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-                                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
-                        }
-                    }?;
-                } else {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: radam_step_f16state,
-                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
-                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-                                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
-                        }
-                    }?;
+        #[cfg(feature = "native")]
+        let diagnosed = self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
+        #[cfg(not(feature = "native"))]
+        let diagnosed = false;
+        if !diagnosed {
+            match (&mut self.ft_w_m, &mut self.ft_w_v) {
+                (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
+                    let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                    if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                        unsafe {
+                            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                            // stream の完了を待つ同期点まで生存する device allocation。
+                            cuda_launch! {
+                                kernel: radam_step_f16state_mirror,
+                                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                                args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
+                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
+                            }
+                        }?;
+                    } else {
+                        unsafe {
+                            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                            // stream の完了を待つ同期点まで生存する device allocation。
+                            cuda_launch! {
+                                kernel: radam_step_f16state,
+                                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                                args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                       slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
+                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
+                            }
+                        }?;
+                    }
                 }
-            }
-            (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
-                let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: radam_step_fp16_mirror,
-                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                   ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
-                        }
-                    }?;
-                } else {
-                    unsafe {
-                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                        // stream の完了を待つ同期点まで生存する device allocation。
-                        cuda_launch! {
-                            kernel: radam_step,
-                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
-                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                   slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, BETA2,
-                                   EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
-                        }
-                    }?;
+                (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
+                    let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
+                    if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                        unsafe {
+                            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                            // stream の完了を待つ同期点まで生存する device allocation。
+                            cuda_launch! {
+                                kernel: radam_step_fp16_mirror,
+                                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                                args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                       slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
+                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                            }
+                        }?;
+                    } else {
+                        unsafe {
+                            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                            // stream の完了を待つ同期点まで生存する device allocation。
+                            cuda_launch! {
+                                kernel: radam_step,
+                                stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                                args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                       slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, BETA2,
+                                       EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                            }
+                        }?;
+                    }
                 }
+                // m / v は同じ flag で `MomentBuf::zeroed` され、load/init でも同期するので
+                // 精度が食い違うことはない。
+                _ => unreachable!("ft_w m and v moment buffers always share precision"),
             }
-            // m / v は同じ flag で `MomentBuf::zeroed` され、load/init でも同期するので
-            // 精度が食い違うことはない。
-            _ => unreachable!("ft_w m and v moment buffers always share precision"),
         }
         // 一様 (非 FT) weight group を 1 配列に集約し、radam pass / lerp pass をそれぞれ
         // loop 1 本に畳む。各 group は buffer と要素数・clamp だけが異なり、scalar
@@ -4811,6 +4947,10 @@ impl GpuTrainer {
             self.launch_ft_fold()?;
         }
         self.sync_stack_forward_weights()?;
+        #[cfg(feature = "native")]
+        if diagnosed {
+            self.precision_finish()?;
+        }
         prof_tick!("optimizer");
 
         // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の

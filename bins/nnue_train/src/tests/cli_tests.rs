@@ -3,6 +3,71 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+
+#[test]
+fn precision_cli_scope_and_bounds() {
+    let default = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
+    assert!(default.precision_steps.is_empty());
+    assert!(default.validate_score_sources().is_ok());
+    for tail in [
+        vec!["--precision-steps", "0"],
+        vec!["--precision-steps", "1", "--precision-samples", "0"],
+        vec!["--precision-steps", "1", "--precision-samples", "65537"],
+        vec!["--precision-steps", "1", "--eval-only"],
+        vec!["--precision-steps", "1", "--threat-norm-dump"],
+    ] {
+        let mut args = vec!["nnue-train", "--data", "input.psv", "layerstack"];
+        args.extend(tail);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.validate_score_sources().is_err());
+    }
+    for args in [
+        vec!["nnue-train", "--precision-steps", "1", "layerstack"],
+        vec![
+            "nnue-train",
+            "--data",
+            "input.psv",
+            "--precision-steps",
+            "1",
+            "simple",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(args)
+                .unwrap()
+                .validate_score_sources()
+                .is_err()
+        );
+    }
+    for option in ["--precision-samples", "--precision-seed"] {
+        assert!(Cli::try_parse_from(["nnue-train", option, "1", "layerstack"]).is_err());
+    }
+    for args in [
+        vec![
+            "nnue-train",
+            "--data",
+            "input.psv",
+            "--precision-steps",
+            "1,6",
+            "layerstack",
+        ],
+        vec![
+            "nnue-train",
+            "--data",
+            "input.psv",
+            "layerstack",
+            "--precision-steps",
+            "1,6",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.precision_steps, vec![1, 6]);
+        assert_eq!(
+            cli.validate_score_sources().is_ok(),
+            cfg!(feature = "native")
+        );
+    }
+}
 use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;
@@ -1068,7 +1133,9 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
         ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
-        ArchCommand::LoaderDigest(_) => unreachable!("layerstack subcommand was requested"),
+        ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+            unreachable!("layerstack subcommand was requested")
+        }
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
@@ -1239,7 +1306,9 @@ fn simple_accepts_tf32_flag() {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
         ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-        ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
+        ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+            panic!("expected Simple subcommand")
+        }
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
@@ -1509,7 +1578,9 @@ fn simple_activation_arg_parses_and_maps() {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
             ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-            ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
+            ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+                panic!("expected Simple subcommand")
+            }
             #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };

@@ -1662,6 +1662,8 @@ mod tests {
     fn experiment_params() -> crate::experiment::Params {
         crate::experiment::Params {
             qat: "off".into(),
+            trainer_build: None,
+            trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
