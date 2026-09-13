@@ -464,6 +464,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let layerstack = match &cli.arch {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
+        ArchCommand::BuildInfo => {
+            return Err("build-info does not run training".into());
+        }
         ArchCommand::BenchPos(_) => {
             return Err("bench-pos must be dispatched before run_training".into());
         }
@@ -1689,34 +1692,6 @@ pub(crate) fn file_basename(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// tatara の git revision を best-effort で取得する。git が見つからない、
-/// または git repository 外で実行された場合は `None`。working tree に未 commit
-/// の変更があれば `-dirty` を付ける。
-#[cfg(feature = "gpu")]
-pub(crate) fn git_commit() -> Option<String> {
-    let rev = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !rev.status.success() {
-        return None;
-    }
-    let commit = String::from_utf8(rev.stdout).ok()?.trim().to_string();
-    if commit.is_empty() {
-        return None;
-    }
-    let dirty = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok();
-    let is_dirty = dirty.is_some_and(|out| out.status.success() && !out.stdout.is_empty());
-    Some(if is_dirty {
-        format!("{commit}-dirty")
-    } else {
-        commit
-    })
-}
-
 /// 初期化方式を experiment.json 用に要約する。override が無い既定の run、および
 /// `--init-from` / `--resume` で重みが上書きされる run では `None` を返す (初期化
 /// 選択が実 weight に効かないので記録しても reader を混乱させるだけ)。override が
@@ -1846,6 +1821,8 @@ pub(crate) fn build_experiment_logger(
         cli.bias_lr_mult,
     );
     let params = Params {
+        trainer_build: Some(crate::build_identity::trainer_build()),
+        trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture: layerstack_architecture(
             layerstack.ft_out,
             layerstack.l1,
@@ -1944,7 +1921,7 @@ pub(crate) fn build_experiment_logger(
         id,
         name,
         start_secs,
-        git_commit(),
+        crate::build_identity::experiment_commit(),
         command,
         lineage,
         params,
@@ -2035,6 +2012,8 @@ pub(crate) fn build_experiment_logger_simple(
 
     let is_wrm = cli.win_rate_model;
     let params = Params {
+        trainer_build: Some(crate::build_identity::trainer_build()),
+        trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture,
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
@@ -2122,7 +2101,7 @@ pub(crate) fn build_experiment_logger_simple(
         net_id_compact,
         name,
         start_secs,
-        git_commit(),
+        crate::build_identity::experiment_commit(),
         command,
         lineage,
         params,

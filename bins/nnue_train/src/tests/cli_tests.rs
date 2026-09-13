@@ -1068,7 +1068,9 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
         ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
-        ArchCommand::LoaderDigest(_) => unreachable!("layerstack subcommand was requested"),
+        ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+            unreachable!("layerstack subcommand was requested")
+        }
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
@@ -1239,7 +1241,9 @@ fn simple_accepts_tf32_flag() {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
         ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-        ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
+        ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+            panic!("expected Simple subcommand")
+        }
         #[cfg(any(feature = "oxide-parity", feature = "native"))]
         ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
@@ -1509,7 +1513,9 @@ fn simple_activation_arg_parses_and_maps() {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
             ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
-            ArchCommand::LoaderDigest(_) => panic!("expected Simple subcommand"),
+            ArchCommand::BuildInfo | ArchCommand::LoaderDigest(_) => {
+                panic!("expected Simple subcommand")
+            }
             #[cfg(any(feature = "oxide-parity", feature = "native"))]
             ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };

@@ -47,7 +47,7 @@ const PAD_MULTIPLE: usize = 16;
 
 /// build 時に埋め込んだ git commit (short、dirty なら `-dirty` 付き、repo 外
 /// build は `unknown`)。埋め込みは `build.rs` (`TATARA_BUILD_COMMIT`)。
-const BUILD_COMMIT: &str = env!("TATARA_BUILD_COMMIT");
+use crate::build_identity::BUILD_COMMIT;
 
 /// build 識別が binary の内容を一意に指すか。`unknown` / `-dirty` は同じ識別で
 /// 別内容の binary があり得るため false (fingerprint は nonce 入りになり、完了

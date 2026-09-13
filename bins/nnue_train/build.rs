@@ -1,4 +1,4 @@
-//! cuBLAS の dynamic link 設定と、rescore fingerprint 用の build 時 git commit
+//! cuBLAS の dynamic link 設定と、training / rescore 用の build 時 git commit
 //! 埋め込み (`TATARA_BUILD_COMMIT`)。
 //!
 //! cuBLAS の dynamic link 設定。`dense_mm_bwd_weight_tiled` (L1 shared weight bwd) を
@@ -21,76 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// build 時点の git commit (short) を返す。working tree が clean でなければ
-/// `-dirty` を付ける。repo 外 build や git 不在では `None`。
-///
-/// 検出の限界: commit の変化 (checkout / commit / ref 更新) は
-/// [`git_rerun_paths`] の HEAD / index / refs / packed-refs 追跡で再ビルドに
-/// 反映されるが、**dirty 判定**は `git add` されていない working tree の編集を
-/// 見る手段がなく、次の index 変化まで古い判定の binary が残り得る。厳密な
-/// identity が要る運用は clean checkout でのビルドが前提で、rescore driver 側も
-/// dirty / unknown ビルドでは fingerprint を一致不能にして完了 skip / resume を
-/// 無効化する。
-fn git_commit() -> Option<String> {
-    let rev = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !rev.status.success() {
-        return None;
-    }
-    let commit = String::from_utf8(rev.stdout).ok()?.trim().to_string();
-    if commit.is_empty() {
-        return None;
-    }
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok();
-    let is_dirty = dirty.is_some_and(|out| out.status.success() && !out.stdout.is_empty());
-    Some(if is_dirty {
-        format!("{commit}-dirty")
-    } else {
-        commit
-    })
-}
-
-/// `git rev-parse <arg>` の 1 行出力。
-fn rev_parse(arg: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", arg])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!value.is_empty()).then_some(value)
-}
-
-/// commit id の変化を追うための rerun-if-changed 対象。
-///
-/// - worktree gitdir の `HEAD` (checkout / detach) と `index` (dirty 判定の元)
-/// - **common git dir** の `refs/` (branch の実体 ref は worktree gitdir でなく
-///   共有側にあり、ref だけ動く更新 — merge や commit — は worktree 側 HEAD を
-///   変えない) と `packed-refs` (loose ref が pack 済みのとき)。個別 ref file は
-///   pack されると消えるため、`refs/` directory ごと walk 対象にする
-fn git_rerun_paths() -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(git_dir) = rev_parse("--absolute-git-dir") {
-        paths.push(format!("{git_dir}/HEAD"));
-        paths.push(format!("{git_dir}/index"));
-    }
-    if let Some(common) = rev_parse("--git-common-dir") {
-        paths.push(format!("{common}/refs"));
-        let packed = format!("{common}/packed-refs");
-        // 存在しない path の rerun-if-changed は毎 build 再実行になるため存在時のみ。
-        if Path::new(&packed).exists() {
-            paths.push(packed);
-        }
-    }
-    paths
-}
+mod build_identity;
 
 fn cuda_root_candidates() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -130,15 +61,49 @@ fn find_cuda_lib_dir(roots: &[PathBuf], target_os: &str) -> Option<PathBuf> {
 }
 
 fn main() {
-    // rescore fingerprint 用に build 時の commit id を埋め込む。runtime に実行時
-    // CWD で git を呼ぶ方式は、実行場所によって unknown / 無関係 repo の commit に
-    // なり binary の identity として成立しない。
-    let commit = git_commit().unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=TATARA_BUILD_COMMIT={commit}");
-    for path in git_rerun_paths() {
-        println!("cargo:rerun-if-changed={path}");
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest"));
+    let root = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let identity = build_identity::capture(root);
+    let legacy = match (&identity.short_commit, identity.dirty) {
+        (Some(commit), Some(false)) => commit.clone(),
+        (Some(commit), Some(true)) => format!("{commit}-dirty"),
+        _ => "unknown".to_owned(),
+    };
+    println!("cargo:rustc-env=TATARA_BUILD_COMMIT={legacy}");
+    println!(
+        "cargo:rustc-env=TATARA_BUILD_FULL_COMMIT={}",
+        identity.commit.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "cargo:rustc-env=TATARA_BUILD_DIRTY={}",
+        match identity.dirty {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+    );
+    for path in build_identity::rerun_paths(root) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
-
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_identity.rs");
+    for key in ["TARGET", "PROFILE", "OPT_LEVEL", "DEBUG"] {
+        println!(
+            "cargo:rustc-env=TATARA_BUILD_{key}={}",
+            std::env::var(key).expect("Cargo build setting")
+        );
+    }
+    let rustc = Command::new(std::env::var_os("RUSTC").expect("Cargo rustc"))
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=TATARA_BUILD_RUSTC={}", rustc.trim());
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
     if std::env::var_os("CARGO_FEATURE_GPU").is_none() {
         return;
