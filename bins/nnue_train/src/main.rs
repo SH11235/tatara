@@ -37,6 +37,8 @@ mod kernels;
 mod loader_digest;
 #[cfg(any(feature = "oxide-parity", feature = "native"))]
 mod native_bench;
+#[cfg(feature = "native")]
+mod precision_diagnostics;
 #[cfg(feature = "gpu")]
 mod rescore_driver;
 #[cfg(feature = "gpu")]
