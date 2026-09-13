@@ -931,6 +931,8 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
+    /// Print embedded trainer build information as JSON without initializing a GPU.
+    BuildInfo,
     /// Bucketed LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
@@ -958,6 +960,7 @@ impl ArchCommand {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
             ArchCommand::Simple(_) => ArchKind::Simple,
+            ArchCommand::BuildInfo => panic!("build-info has no training architecture"),
             ArchCommand::BenchPos(_) => {
                 unreachable!("bench-pos does not select a training architecture")
             }

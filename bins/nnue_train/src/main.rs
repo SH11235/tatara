@@ -25,6 +25,7 @@ use clap::Parser;
 mod arch;
 #[cfg(any(feature = "gpu", test))]
 mod bench_pos;
+mod build_identity;
 #[cfg(any(feature = "gpu", test))]
 mod ckpt;
 mod cli;
@@ -71,6 +72,13 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
     // smoke test に落ちて何もせず成功扱いになる。
     match &cli.arch {
+        cli::ArchCommand::BuildInfo => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_identity::trainer_build())?
+            );
+            Ok(())
+        }
         cli::ArchCommand::LoaderDigest(args) => loader_digest::run(cli, args),
         cli::ArchCommand::BenchPos(args) => {
             #[cfg(feature = "gpu")]

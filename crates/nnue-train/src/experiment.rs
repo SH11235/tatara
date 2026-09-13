@@ -80,6 +80,13 @@ pub struct Lineage {
 /// `nnue-lab` のパラメータ差分表が run 間で比較できるようにするため。
 #[derive(Debug, Clone, Serialize)]
 pub struct Params {
+    /// Build provenance, independent of recipe and runtime working directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trainer_build: Option<TrainerBuild>,
+    /// Backend selected for this run; parity builds can select either kernel implementation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trainer_backend: Option<String>,
+
     pub architecture: String,
     /// 入力 feature set の canonical 名 (`halfka-hm-merged` 等)。
     pub feature_set: String,
@@ -296,6 +303,19 @@ pub struct HistoryEntry {
     pub test_accuracy: Option<f64>,
 }
 
+/// Compiler and source information embedded in the trainer executable.
+/// A null dirty state means Git status could not be determined.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrainerBuild {
+    pub commit: Option<String>,
+    pub dirty: Option<bool>,
+    pub backend: String,
+    pub rustc: String,
+    pub target: String,
+    pub profile: String,
+    pub opt_level: String,
+    pub debug: String,
+}
 /// experiment.json として serialise される本体。フィールドは `nnue-lab`
 /// ExperimentJsonV1 の key 名と一致させる。
 #[derive(Debug, Clone, Serialize)]
@@ -644,6 +664,8 @@ mod tests {
 
     fn sample_params() -> Params {
         Params {
+            trainer_build: None,
+            trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,
