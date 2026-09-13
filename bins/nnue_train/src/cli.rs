@@ -1129,6 +1129,11 @@ pub(crate) enum NativeBenchModeArg {
 /// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
+    /// Dense weight/bias and activation quantization with straight-through gradients.
+    /// Omitted: inherit raw checkpoint mode, or off for fresh training.
+    #[arg(long, value_enum)]
+    pub(crate) qat: Option<crate::qat::QatMode>,
+
     /// Evaluation scale written to the LayerStack architecture string. When
     /// omitted, sigmoid loss derives it from `--scale`; WRM loss leaves the
     /// token out so the consuming engine can supply it through its FV_SCALE

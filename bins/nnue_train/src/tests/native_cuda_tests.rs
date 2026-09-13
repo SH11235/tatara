@@ -482,20 +482,21 @@ fn every_simple_native_kernel_is_exported() {
 fn every_layerstack_native_kernel_is_exported() {
     let launch_sources = [
         include_str!("../trainer_layerstack.rs"),
+        include_str!("../trainer_layerstack_qat.rs"),
         include_str!("../ft_factorize_host.rs"),
     ];
     let mut required = std::collections::BTreeSet::new();
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 65, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 71, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 81, "production kernel inventory changed");
+    assert_eq!(required.len(), 87, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 

@@ -147,6 +147,8 @@ For building the kernels and running the smoke test, see
 
 ## Documentation
 
+- [Dense QAT continuation](docs/dense-qat.md): compare ordinary and quantization-aware tails from the same raw checkpoint.
+
 - [Setup guide](docs/setup.md) — per-OS guidance, native CUDA / cuda-oxide build
   setup, supported-GPU matrix, CUDA toolkit root resolution
 - [Training quickstart](docs/training-quickstart.md) — per-architecture training
@@ -189,6 +191,8 @@ own net, see the [setup guide](docs/setup.md).
 
 | Abbreviation | Meaning |
 |---|---|
+| **QAT** | Quantization-aware training — training with quantization in the forward pass |
+| **STE** | Straight-through estimator — using a surrogate gradient through rounding |
 | **NNUE** | Efficiently Updatable Neural Network — a lightweight evaluation function used by shogi / chess engines |
 | **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
 | **LayerStack shared parameters** | `l1_shared_weight` and `l1_shared_bias` are the bucket-independent L1 terms initialized by `--init-l1-shared`; `--stack-shared-delta` adds zero-initialized shared terms to L2/L3 during training |

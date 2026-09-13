@@ -16,10 +16,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 9):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 10):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (9)             (4 bytes)
+//   version      u32 (10)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -40,6 +40,7 @@ use crate::trainer_common::MomentBuf;
 //   step_count   u64  (optimizer step counter)
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
 //   fv_scale     i32  (v9+、Simple の実効 evaluation scale。0 = 未記録)
+//   qat_mode     u32  (v10+, 0 = off, 1 = dense LayerStack)
 //   num_groups   u64
 //   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
 //   固有 — 各 trainer の `raw_ckpt_group_sources` を参照):
@@ -51,7 +52,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=9 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=10 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -109,14 +110,17 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   recorded"; positive values preserve the Simple trainer's effective export
 ///   scale across resume. Negative values are rejected as corrupt.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=9. Version 1 is interpreted as
+/// - `10`: a u32 QAT mode follows fv_scale: 0 = off, 1 = dense LayerStack.
+///   Earlier versions imply off. Unknown modes and dense Simple files are rejected.
+///
+/// `load_raw_checkpoint` accepts versions 1..=10. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 9 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 10 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8.
-pub(crate) const RAW_CKPT_VERSION: u32 = 9;
+pub(crate) const RAW_CKPT_VERSION: u32 = 10;
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -250,6 +254,7 @@ pub(crate) struct RawCkptArch<'a> {
 /// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
 #[derive(Clone, Copy)]
 pub(crate) struct RawCkptMeta<'a> {
+    pub(crate) qat_dense: bool,
     /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
     /// `lineage.parent_id` に使う)。空文字列は「未記録」。
     pub(crate) run_id: &'a str,
@@ -266,6 +271,7 @@ pub(crate) struct RawCkptMeta<'a> {
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
 #[derive(Debug)]
 pub(crate) struct RawCkptHeader {
+    pub(crate) qat_dense: bool,
     /// この checkpoint が表す完了 superbatch 番号。
     pub(crate) superbatch: usize,
     /// optimizer step counter (ranger では lookahead lerp の周期判定にも使う)。
@@ -323,12 +329,13 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(&(meta.lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
     // Simple evaluation scale (v9+)。0 = 未記録。
     w.write_all(&meta.fv_scale.unwrap_or(0).to_le_bytes())?;
+    w.write_all(&u32::from(meta.qat_dense).to_le_bytes())?;
     w.write_all(&num_groups.to_le_bytes())?;
     Ok(())
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=9 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=10 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
@@ -626,10 +633,21 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         None
     };
 
+    let qat_dense = if version >= 10 {
+        read_exact_or_invalid(r, &mut buf4, "QAT mode")?;
+        match u32::from_le_bytes(buf4) {
+            0 => false,
+            1 if expected.arch_kind == ArchKind::LayerStack => true,
+            value => return Err(invalid_data(format!("unsupported QAT mode {value}"))),
+        }
+    } else {
+        false
+    };
     read_exact_or_invalid(r, &mut buf8, "num_groups")?;
     let num_groups = u64::from_le_bytes(buf8);
 
     Ok(RawCkptHeader {
+        qat_dense,
         superbatch,
         step_count,
         num_groups,

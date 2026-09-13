@@ -1,6 +1,93 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+// Quantize the effective L1 sum once; shared storage is input-major.
+extern "C" __global__ void qat_weight(
+    const float* w, unsigned long long n,
+    const float* shared, unsigned long long,
+    float* out, unsigned long long,
+    unsigned int inputs, unsigned int outputs, unsigned int merge, unsigned int bias
+) {
+    const unsigned long long i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float value = w[i];
+    if (merge) value += shared[bias ? i % outputs : (i % inputs) * outputs + (i / inputs) % outputs];
+    const double scale = bias ? 8128.0 : 64.0;
+    double q = round(static_cast<double>(value) * scale);
+    q = fmin(bias ? 2147483647.0 : 127.0, fmax(bias ? -2147483648.0 : -128.0, q));
+    out[i] = static_cast<float>(q / scale);
+}
+
+// Integer MAC avoids flooring an activation just below its lattice point after a floating sum.
+extern "C" __global__ void qat_dense(
+    const float* x, unsigned long long,
+    const float* w, unsigned long long,
+    const float* bias, unsigned long long,
+    const float* shared_bias, unsigned long long,
+    const int* bucket, unsigned long long,
+    float* out, unsigned long long,
+    int* raw, unsigned long long,
+    unsigned int batch, unsigned int inputs, unsigned int outputs, unsigned int merge
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * outputs) return;
+    const unsigned int row = i / outputs;
+    const unsigned int neuron = bucket[row] * outputs + i % outputs;
+    float b = bias[neuron];
+    if (merge) b += shared_bias[i % outputs];
+    long long sum = static_cast<long long>(fmin(2147483647.0, fmax(-2147483648.0, round(static_cast<double>(b) * 8128.0))));
+    for (unsigned int j = 0; j < inputs; ++j)
+        sum += llround(static_cast<double>(x[row * inputs + j]) * 127.0)
+             * llround(static_cast<double>(w[neuron * inputs + j]) * 64.0);
+    raw[i] = static_cast<int>(sum);
+    out[i] = static_cast<float>(static_cast<double>(raw[i]) / 8128.0);
+}
+
+extern "C" __global__ void qat_activation(
+    float* x, unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = static_cast<float>(floor(fmin(127.0, fmax(0.0, static_cast<double>(x[i]) * 127.0)))) / 127.0F;
+}
+
+extern "C" __global__ void qat_l1_activation(
+    const int* raw, unsigned long long,
+    float* out, unsigned long long,
+    unsigned int batch, unsigned int outputs
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int main = outputs - 1;
+    if (i >= batch * main) return;
+    const unsigned int row = i / main, col = i % main;
+    const long long q = raw[row * outputs + col];
+    out[row * main * 2 + col] = static_cast<float>(min(127LL, (q * q) >> 19)) / 127.0F;
+    out[row * main * 2 + main + col] = static_cast<float>(fmin(127.0, fmax(0.0, floor(q / 64.0)))) / 127.0F;
+}
+
+extern "C" __global__ void qat_relu_activation(
+    const int* raw, unsigned long long,
+    float* out, unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double q = raw[i];
+    out[i] = static_cast<float>(fmin(127.0, fmax(0.0, floor(q / 64.0)))) / 127.0F;
+}
+
+extern "C" __global__ void qat_output(
+    const int* l1, unsigned long long,
+    const int* l3, unsigned long long,
+    float* out, unsigned long long,
+    unsigned int batch, unsigned int outputs
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch) return;
+    const int raw = static_cast<int>(static_cast<long long>(l3[i]) + l1[i * outputs + outputs - 1]);
+    out[i] = static_cast<float>(static_cast<double>(raw) / 8128.0);
+}
+
 // LayerStack bucket 数の上限。per-bucket accumulator を register array で持つ kernel が
 // この値で配列を確保する。各アクセスは `min(num_buckets, kMaxSupportedNumBuckets)` で
 // clamp するので範囲外 index (UB) にはならないが、host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS`

@@ -989,6 +989,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         (None, None, None)
     };
 
+    trainer.configure_qat(layerstack.qat)?;
+    if trainer.qat_mode != crate::qat::QatMode::Off && cli.rescore_input.is_some() {
+        return Err("--rescore-input does not support dense QAT; use --qat off".into());
+    }
+    println!(
+        "[train] QAT={} (FT weight/accumulator and final score division excluded)",
+        trainer.qat_mode.name()
+    );
+
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
     let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     // 学習しない経路には train-range 制約を課さない。これを課すと最終
@@ -1175,6 +1184,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let mut experiment = build_experiment_logger(
         cli,
         layerstack,
+        trainer.qat_mode,
         bucket_mode,
         feature_set,
         start_superbatch,
@@ -1778,6 +1788,7 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
+    qat: crate::qat::QatMode,
     bucket_mode: BucketMode,
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
@@ -1830,6 +1841,7 @@ pub(crate) fn build_experiment_logger(
         cli.bias_lr_mult,
     );
     let params = Params {
+        qat: qat.name().into(),
         trainer_build: Some(crate::build_identity::trainer_build()),
         trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture: layerstack_architecture(
@@ -2021,6 +2033,7 @@ pub(crate) fn build_experiment_logger_simple(
 
     let is_wrm = cli.win_rate_model;
     let params = Params {
+        qat: "off".into(),
         trainer_build: Some(crate::build_identity::trainer_build()),
         trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture,
@@ -2769,6 +2782,7 @@ mod tests {
         let logger = build_experiment_logger(
             &cli,
             layerstack,
+            crate::qat::QatMode::Dense,
             bucket_mode,
             FeatureSet::HalfKaHmMerged.spec(),
             1,
@@ -2788,6 +2802,11 @@ mod tests {
         assert_eq!(
             json["params"]["bucket_mode"],
             serde_json::json!(BucketMode::ProgressKpAbs.canonical_name())
+        );
+        assert_eq!(json["params"]["qat"], "dense");
+        assert!(
+            layerstack.qat.is_none(),
+            "metadata uses the inherited effective mode"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

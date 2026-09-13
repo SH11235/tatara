@@ -1,4 +1,6 @@
 use std::path::Path;
+#[path = "trainer_layerstack_qat.rs"]
+mod qat_impl;
 
 #[cfg(feature = "native")]
 impl GpuTrainer {
@@ -254,6 +256,11 @@ impl<'a> StepContext<'a> {
 // ===========================================================================
 
 pub(crate) struct GpuTrainer {
+    pub(crate) qat_mode: crate::qat::QatMode,
+    #[cfg(feature = "native")]
+    qat_buffers: Vec<DeviceBuffer<f32>>,
+    #[cfg(feature = "native")]
+    qat_raw: Vec<DeviceBuffer<i32>>,
     pub(crate) wdl_ignore_draws: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -1190,6 +1197,11 @@ impl GpuTrainer {
         // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
+            qat_mode: crate::qat::QatMode::Off,
+            #[cfg(feature = "native")]
+            qat_buffers: Vec::new(),
+            #[cfg(feature = "native")]
+            qat_raw: Vec::new(),
             wdl_ignore_draws: false,
             stream: stream.clone(),
             module,
@@ -1934,6 +1946,7 @@ impl GpuTrainer {
                 topology,
             },
             &RawCkptMeta {
+                qat_dense: self.qat_mode == crate::qat::QatMode::Dense,
                 run_id,
                 superbatch,
                 step_count: self.step_count,
@@ -1985,6 +1998,12 @@ impl GpuTrainer {
             },
             &expected_groups,
         )?;
+
+        self.qat_mode = if header.qat_dense {
+            crate::qat::QatMode::Dense
+        } else {
+            crate::qat::QatMode::Off
+        };
 
         // host → device upload (`loaded` の順序は `raw_ckpt_group_sources` = format の
         // group 順)。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ量子化して
@@ -2425,10 +2444,27 @@ impl GpuTrainer {
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
         let mut context = StepContext::new(self, batch, options)?;
-        if let Some(output) = self.forward(batch, &mut context)? {
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.configure_qat(None)?;
+        }
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_prepare()?;
+        }
+        let result: Result<Option<StepOutput>, Box<dyn std::error::Error>> = (|| {
+            if let Some(output) = self.forward(batch, &mut context)? {
+                return Ok(Some(output));
+            }
+            self.backward(&mut context)?;
+            Ok(None)
+        })();
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_swap();
+        }
+        if let Some(output) = result? {
             return Ok(output);
         }
-        self.backward(&mut context)?;
         self.optimizer_step(&mut context)
     }
 
@@ -2686,6 +2722,10 @@ impl GpuTrainer {
             }?;
         }
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(0, b)?;
+        }
         prof_tick!("fwd_ftpost");
 
         // Forward L1 (per-bucket dense)。bucket sort で row を bucket_idx 昇順に並べ替え、
@@ -2938,6 +2978,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(1, b)?;
+        }
         // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3023,6 +3067,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(1, b)?;
+        }
         prof_tick!("fwd_L1tail");
 
         // -- Forward step 11: L2 per-bucket dense → l2_dense_out (B × l2_out) --
@@ -3051,6 +3099,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(2, b)?;
+        }
         // -- Forward step 12: l2_acted = CReLU(l2_dense_out) (B × l2_out) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3068,6 +3120,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(2, b)?;
+        }
         prof_tick!("fwd_L2");
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
@@ -3096,6 +3152,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(3, b)?;
+        }
         // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -3114,6 +3174,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(3, b)?;
+        }
         // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
         // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
         // factorizer 有効時は畳み込み済み comb (`psqt.w_fold`、base 形状) を読む
@@ -3263,7 +3327,6 @@ impl GpuTrainer {
         context: &mut StepContext<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let StepContext {
-            lr,
             loss: _,
             profile_step,
             b,
@@ -3301,11 +3364,6 @@ impl GpuTrainer {
         // `memset_async(0)` で既存 buffer を reset (`ft_w_grad` だけで ~450MB の
         // `cudaMalloc`/`cudaFree` を毎 step 走らせるのを避けるため)。
         // `dl1_total` も `slice_scatter_2d` の host 契約 (「dst を 0 初期化」) を守るため reset。
-        let ft_b_n = ft_out;
-        let l1_b_n = self.num_buckets * l1_out;
-        let l1_shared_bias_n = l1_out;
-        let l2_b_n = self.num_buckets * l2_out;
-        let l3_b_n = self.num_buckets;
         // ft_w_grad の memset_zero は意図的に省略している: phase D iter 0 (stm) の
         // `gather_and_sum_per_feature_overwrite` が実 block の全 (feature, ri) cell
         // を sum (off_start==off_end の時も sum=0) で書き切り、factorizer の仮想
@@ -4367,6 +4425,51 @@ impl GpuTrainer {
             self.precision_snapshot(false)?;
         }
 
+        Ok(())
+    }
+
+    fn optimizer_step(
+        &mut self,
+        context: &mut StepContext<'_>,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let StepContext {
+            lr,
+            profile_step,
+            ft_out,
+            l1_out,
+            l2_in,
+            l2_out,
+            ..
+        } = *context;
+        let prof_t0 = &mut *context.prof_t0;
+        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_b_n = ft_out;
+        let l1_w_n = self.num_buckets * l1_out * ft_out;
+        let l1_b_n = self.num_buckets * l1_out;
+        let l1_shared_weight_n = ft_out * l1_out;
+        let l1_shared_bias_n = l1_out;
+        let l2_w_n = self.num_buckets * l2_out * l2_in;
+        let l2_b_n = self.num_buckets * l2_out;
+        let l3_w_n = self.num_buckets * l2_out;
+        let l3_b_n = self.num_buckets;
+
+        macro_rules! prof_tick {
+            ($label:expr) => {
+                if profile_step {
+                    self.stream.synchronize()?;
+                    let now = std::time::Instant::now();
+                    eprintln!(
+                        "[step-profile] {:<10} {:8.3} ms",
+                        $label,
+                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
+                    );
+                    *prof_t0 = now;
+                }
+            };
+        }
+
+        // QAT restores FP32 masters before entering this method; regularization must
+        // update those masters, after the pre-norm-loss diagnostic snapshot.
         // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
         // radam step の **前** に適用する。理由: (1) radam の per-layer clamp が最後の
         // 演算になり clamp 不変条件を保つ、(2) forward 用 FT weight (`ft_w_h` mirror /
@@ -4447,49 +4550,6 @@ impl GpuTrainer {
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
             prof_tick!("norm_loss");
-        }
-
-        Ok(())
-    }
-
-    fn optimizer_step(
-        &mut self,
-        context: &mut StepContext<'_>,
-    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
-        let StepContext {
-            lr,
-            profile_step,
-            ft_out,
-            l1_out,
-            l2_in,
-            l2_out,
-            ..
-        } = *context;
-        let prof_t0 = &mut *context.prof_t0;
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
-        let ft_b_n = ft_out;
-        let l1_w_n = self.num_buckets * l1_out * ft_out;
-        let l1_b_n = self.num_buckets * l1_out;
-        let l1_shared_weight_n = ft_out * l1_out;
-        let l1_shared_bias_n = l1_out;
-        let l2_w_n = self.num_buckets * l2_out * l2_in;
-        let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
-        let l3_b_n = self.num_buckets;
-
-        macro_rules! prof_tick {
-            ($label:expr) => {
-                if profile_step {
-                    self.stream.synchronize()?;
-                    let now = std::time::Instant::now();
-                    eprintln!(
-                        "[step-profile] {:<10} {:8.3} ms",
-                        $label,
-                        now.duration_since(*prof_t0).as_secs_f64() * 1000.0
-                    );
-                    *prof_t0 = now;
-                }
-            };
         }
 
         // ===== OPTIMIZER STEP =====

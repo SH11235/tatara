@@ -80,6 +80,7 @@ pub struct Lineage {
 /// `nnue-lab` のパラメータ差分表が run 間で比較できるようにするため。
 #[derive(Debug, Clone, Serialize)]
 pub struct Params {
+    pub qat: String,
     /// Build provenance, independent of recipe and runtime working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trainer_build: Option<TrainerBuild>,
@@ -664,6 +665,7 @@ mod tests {
 
     fn sample_params() -> Params {
         Params {
+            qat: "off".into(),
             trainer_build: None,
             trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),

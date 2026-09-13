@@ -1661,6 +1661,7 @@ mod tests {
     /// experiment.json テスト用の最小 `Params` (sigmoid loss、held-out 既定 None)。
     fn experiment_params() -> crate::experiment::Params {
         crate::experiment::Params {
+            qat: "off".into(),
             trainer_build: None,
             trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
