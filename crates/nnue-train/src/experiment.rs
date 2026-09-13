@@ -80,6 +80,7 @@ pub struct Lineage {
 /// `nnue-lab` のパラメータ差分表が run 間で比較できるようにするため。
 #[derive(Debug, Clone, Serialize)]
 pub struct Params {
+    pub qat: String,
     pub architecture: String,
     /// 入力 feature set の canonical 名 (`halfka-hm-merged` 等)。
     pub feature_set: String,
@@ -644,6 +645,7 @@ mod tests {
 
     fn sample_params() -> Params {
         Params {
+            qat: "off".into(),
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             feature_set: "halfka-hm-merged".to_string(),
             ft_in: 73_305,

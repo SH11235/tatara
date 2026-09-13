@@ -57,7 +57,61 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 9);
+    assert_eq!(RAW_CKPT_VERSION, 10);
+}
+
+#[test]
+fn qat_mode_header_roundtrip_and_legacy_default() {
+    let arch = layerstack_arch();
+    let mut bytes = Vec::new();
+    crate::ckpt::write_raw_ckpt_header(
+        &mut bytes,
+        &arch,
+        &RawCkptMeta {
+            qat_dense: true,
+            run_id: "qat",
+            superbatch: 1201,
+            step_count: 10,
+            lr_horizon: None,
+            fv_scale: None,
+        },
+        10,
+    )
+    .unwrap();
+    assert!(
+        read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch)
+            .unwrap()
+            .qat_dense
+    );
+    let offset = bytes.len() - 12;
+    let mut invalid = bytes.clone();
+    invalid[offset..offset + 4].copy_from_slice(&2_u32.to_le_bytes());
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&invalid), &arch).is_err());
+    bytes.drain(offset..offset + 4);
+    bytes[4..8].copy_from_slice(&9_u32.to_le_bytes());
+    assert!(
+        !read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch)
+            .unwrap()
+            .qat_dense
+    );
+    let simple = simple_arch();
+    bytes.clear();
+    crate::ckpt::write_raw_ckpt_header(
+        &mut bytes,
+        &simple,
+        &RawCkptMeta {
+            qat_dense: true,
+            run_id: "invalid-simple-qat",
+            superbatch: 1,
+            step_count: 1,
+            lr_horizon: None,
+            fv_scale: Some(14),
+        },
+        8,
+    )
+    .unwrap();
+    let error = read_raw_ckpt_header(&mut Cursor::new(&bytes), &simple).unwrap_err();
+    assert!(error.to_string().contains("unsupported QAT mode 1"));
 }
 
 #[test]
@@ -179,6 +233,7 @@ fn write_raw_ckpt_header<W: std::io::Write>(
         w,
         arch,
         &RawCkptMeta {
+            qat_dense: false,
             run_id,
             superbatch: superbatch.try_into().expect("test superbatch fits usize"),
             step_count,
@@ -198,6 +253,7 @@ fn write_raw_ckpt_header_with_fv_scale(
         buf,
         arch,
         &RawCkptMeta {
+            qat_dense: false,
             run_id: "fv-scale-test",
             superbatch: 9,
             step_count: 90,
@@ -241,6 +297,8 @@ fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
 }
 
 fn downgrade_v9_to_v8(buf: &mut Vec<u8>, written_fv_scale: Option<i32>) {
+    let qat_off = buf.len() - 4 - 8;
+    buf.drain(qat_off..qat_off + 4);
     let fv_scale_off = buf.len() - 4 - 8;
     let stored_fv_scale =
         i32::from_le_bytes(buf[fv_scale_off..fv_scale_off + 4].try_into().unwrap());

@@ -1,4 +1,6 @@
 use std::path::Path;
+#[path = "trainer_layerstack_qat.rs"]
+mod qat_impl;
 
 use gpu_kernels::sparse::ft_factorize::FT_FACTORIZE_BASE;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
@@ -133,6 +135,11 @@ impl<'a> StepContext<'a> {
 // ===========================================================================
 
 pub(crate) struct GpuTrainer {
+    pub(crate) qat_mode: crate::qat::QatMode,
+    #[cfg(feature = "native")]
+    qat_buffers: Vec<DeviceBuffer<f32>>,
+    #[cfg(feature = "native")]
+    qat_raw: Vec<DeviceBuffer<i32>>,
     pub(crate) wdl_ignore_draws: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -1067,6 +1074,11 @@ impl GpuTrainer {
         // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
+            qat_mode: crate::qat::QatMode::Off,
+            #[cfg(feature = "native")]
+            qat_buffers: Vec::new(),
+            #[cfg(feature = "native")]
+            qat_raw: Vec::new(),
             wdl_ignore_draws: false,
             stream: stream.clone(),
             module,
@@ -1809,6 +1821,7 @@ impl GpuTrainer {
                 topology,
             },
             &RawCkptMeta {
+                qat_dense: self.qat_mode == crate::qat::QatMode::Dense,
                 run_id,
                 superbatch,
                 step_count: self.step_count,
@@ -1860,6 +1873,12 @@ impl GpuTrainer {
             },
             &expected_groups,
         )?;
+
+        self.qat_mode = if header.qat_dense {
+            crate::qat::QatMode::Dense
+        } else {
+            crate::qat::QatMode::Off
+        };
 
         // host → device upload (`loaded` の順序は `raw_ckpt_group_sources` = format の
         // group 順)。ft_w の m / v は当該 run の精度 (`fp16_opt_state`) へ量子化して
@@ -2300,10 +2319,27 @@ impl GpuTrainer {
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
         let mut context = StepContext::new(self, batch, options)?;
-        if let Some(output) = self.forward(batch, &mut context)? {
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.configure_qat(None)?;
+        }
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_prepare()?;
+        }
+        let result: Result<Option<StepOutput>, Box<dyn std::error::Error>> = (|| {
+            if let Some(output) = self.forward(batch, &mut context)? {
+                return Ok(Some(output));
+            }
+            self.backward(&mut context)?;
+            Ok(None)
+        })();
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_swap();
+        }
+        if let Some(output) = result? {
             return Ok(output);
         }
-        self.backward(&mut context)?;
         self.optimizer_step(&mut context)
     }
 
@@ -2561,6 +2597,10 @@ impl GpuTrainer {
             }?;
         }
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(0, b)?;
+        }
         prof_tick!("fwd_ftpost");
 
         // Forward L1 (per-bucket dense)。bucket sort で row を bucket_idx 昇順に並べ替え、
@@ -2813,6 +2853,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(1, b)?;
+        }
         // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -2898,6 +2942,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(1, b)?;
+        }
         prof_tick!("fwd_L1tail");
 
         // -- Forward step 11: L2 per-bucket dense → l2_dense_out (B × l2_out) --
@@ -2926,6 +2974,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(2, b)?;
+        }
         // -- Forward step 12: l2_acted = CReLU(l2_dense_out) (B × l2_out) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -2943,6 +2995,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(2, b)?;
+        }
         prof_tick!("fwd_L2");
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
@@ -2971,6 +3027,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_dense_forward(3, b)?;
+        }
         // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -2989,6 +3049,10 @@ impl GpuTrainer {
             }
         }?;
 
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            self.qat_activations(3, b)?;
+        }
         // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
         // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
         // factorizer 有効時は畳み込み済み comb (`psqt.w_fold`、base 形状) を読む

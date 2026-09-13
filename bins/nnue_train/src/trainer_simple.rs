@@ -2902,6 +2902,7 @@ impl SimpleGpuTrainer {
                 topology: &topology,
             },
             &RawCkptMeta {
+                qat_dense: false,
                 run_id,
                 superbatch,
                 step_count: self.step_count,

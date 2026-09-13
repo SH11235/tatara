@@ -37,6 +37,7 @@ mod kernels;
 mod loader_digest;
 #[cfg(any(feature = "oxide-parity", feature = "native"))]
 mod native_bench;
+mod qat;
 #[cfg(feature = "gpu")]
 mod rescore_driver;
 #[cfg(feature = "gpu")]
@@ -89,6 +90,7 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "gpu")]
             {
                 if cli.data.is_some()
+                    || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some())
                     || cli.eval_only
                     || cli.rescore_input.is_some()
                     || cli.threat_ablate.is_some()
