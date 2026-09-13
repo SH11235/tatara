@@ -157,6 +157,8 @@ For building the kernels and running the smoke test, see
   throughput measurement on Linux/WSL and native Windows
 - [Held-out validation](docs/held-out-validation.md) — `test_loss` / `test_acc`
   setup, choosing the held-out source, and reading the metrics
+- [FT precision diagnostics](docs/precision-diagnostics.md) — sampled moment
+  storage errors and master / forward-copy changes at selected training steps
 - [Training schedules](docs/training-schedule.md) — scheduling the learning rate
   (`--lr-schedule`) and the WDL lambda (`--wdl` / `--start-wdl` / `--end-wdl`)
   across a run

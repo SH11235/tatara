@@ -880,6 +880,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         }
     })?;
     trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
+    #[cfg(feature = "native")]
+    if !cli.precision_steps.is_empty() {
+        trainer.configure_precision_diagnostic(
+            &ctx,
+            cli.precision_steps.clone(),
+            cli.precision_samples,
+            cli.precision_seed,
+        )?;
+    }
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }

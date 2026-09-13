@@ -488,14 +488,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 63, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 65, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 79, "production kernel inventory changed");
+    assert_eq!(required.len(), 81, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -1579,6 +1579,93 @@ fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std
         "[native-layerstack-host-parity] loss_bits={:016x}, state_fingerprint_1e6={fingerprint:016x}",
         loss.to_bits()
     );
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn precision_diagnostic_training_on_off_equivalence() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    for enabled in [false, true] {
+        for factorize in [false, true] {
+            for half in [false, true] {
+                let mut options = LayerStackTestOptions::standard();
+                if factorize {
+                    options.feature_set = options.feature_set.with_ft_factorize();
+                }
+                options.precision = PrecisionFlags {
+                    tf32: true,
+                    ft_fp16: true,
+                    ft_fp16_out: true,
+                    fp16_opt_state: half,
+                };
+                options.norm_loss_factor = Some(1.0e-4);
+                let mut control =
+                    create_layerstack_trainer_with_batch(&context, true, options, 16)?;
+                let mut observed =
+                    create_layerstack_trainer_with_batch(&context, true, options, 16)?;
+                if enabled {
+                    observed.configure_precision_diagnostic(&context, vec![1, 6], 64, 20260913)?;
+                }
+                let mut batch = BatchData::smoke_dummy(16, options.feature_set);
+                batch.score.fill(200.0);
+                for step in 1..=7 {
+                    let a = control.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                    let b = observed.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                    assert!(
+                        (a - b).abs() <= 1.0e-9 + NATIVE_PARITY_TOLERANCE * a.abs().max(b.abs()),
+                        "step={step}"
+                    );
+                }
+                let a = control.raw_checkpoint_state_to_host()?;
+                let b = observed.raw_checkpoint_state_to_host()?;
+                assert_eq!(a.0, b.0);
+                for ((name, a), (_, b)) in a.1.iter().zip(&b.1) {
+                    for (field, (a, b)) in [&a.0, &a.1, &a.2, &a.3]
+                        .into_iter()
+                        .zip([&b.0, &b.1, &b.2, &b.3])
+                        .enumerate()
+                    {
+                        assert_eq!(a.len(), b.len());
+                        let mismatches = a
+                            .iter()
+                            .zip(b)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        if mismatches > 0 {
+                            eprintln!(
+                                "[precision-equivalence] enabled={enabled} half={half} factorize={factorize} group={name} field={field} differing_bits={mismatches}"
+                            );
+                        }
+                        let abs_tolerance = match field {
+                            1 => NATIVE_FIRST_MOMENT_ABS_TOLERANCE,
+                            2 => NATIVE_SECOND_MOMENT_ABS_TOLERANCE,
+                            _ => NATIVE_WEIGHT_ABS_TOLERANCE,
+                        };
+                        // Independent backward passes use atomic sums; exact optimizer parity
+                        // is tested separately with identical synthetic gradient buffers.
+                        assert!(
+                            a.iter().zip(b).all(|(a, b)| (a - b).abs()
+                                <= abs_tolerance
+                                    + NATIVE_PARITY_TOLERANCE as f32 * a.abs().max(b.abs())),
+                            "{name}, half={half}, factorize={factorize}"
+                        );
+                    }
+                }
+                let a = control.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+                let b = observed.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+                assert_eq!(a.net_output.len(), b.net_output.len());
+                assert!(
+                    a.net_output
+                        .iter()
+                        .zip(&b.net_output)
+                        .all(|(a, b)| (a - b).abs()
+                            <= NATIVE_WEIGHT_ABS_TOLERANCE
+                                + NATIVE_PARITY_TOLERANCE as f32 * a.abs().max(b.abs()))
+                );
+            }
+        }
+    }
     Ok(())
 }
 

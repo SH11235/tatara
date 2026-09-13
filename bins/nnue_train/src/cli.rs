@@ -725,6 +725,29 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) monitor_fp16_clamps: bool,
 
+    /// Observe FT precision at these absolute optimizer steps (1-based, comma-separated).
+    /// Requires native CUDA and LayerStack; each record covers one sampled step.
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub(crate) precision_steps: Vec<u64>,
+
+    /// Fixed uniform FT element sample size, without replacement (maximum 65536).
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 1024,
+        requires = "precision_steps"
+    )]
+    pub(crate) precision_samples: usize,
+
+    /// Seed for the fixed FT element sample; independent of training randomness.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 20260913,
+        requires = "precision_steps"
+    )]
+    pub(crate) precision_seed: u64,
+
     /// Log a histogram of the real active-feature count per position (the value
     /// returned by the feature extractor before `-1` padding) at the end of every
     /// superbatch. Used to check how much of the `max_active` sparse capacity is
@@ -850,6 +873,25 @@ impl Cli {
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
+        if !self.precision_steps.is_empty() {
+            if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {
+                return Err("--precision-steps requires native CUDA and LayerStack (cuda-oxide is unsupported)".into());
+            }
+            if self.precision_steps.contains(&0) || !(1..=65536).contains(&self.precision_samples) {
+                return Err(
+                    "--precision-steps must be positive; --precision-samples must be in 1..=65536"
+                        .into(),
+                );
+            }
+            if self.data.is_none()
+                || self.eval_only
+                || self.threat_norm_dump
+                || self.rescore_input.is_some()
+                || self.threat_ablate.is_some()
+            {
+                return Err("--precision-steps requires a training run with --data".into());
+            }
+        }
         if self.score_source().is_some()
             && self
                 .data
