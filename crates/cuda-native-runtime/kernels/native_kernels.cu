@@ -29,16 +29,29 @@ extern "C" __global__ void qat_dense(
     int* raw, unsigned long long,
     unsigned int batch, unsigned int inputs, unsigned int outputs, unsigned int merge
 ) {
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lanes = inputs >= 256 ? 32 : 1;
+    const unsigned int lane = thread % lanes;
+    const unsigned int i = thread / lanes;
     if (i >= batch * outputs) return;
     const unsigned int row = i / outputs;
     const unsigned int neuron = bucket[row] * outputs + i % outputs;
     float b = bias[neuron];
     if (merge) b += shared_bias[i % outputs];
-    long long sum = static_cast<long long>(fmin(2147483647.0, fmax(-2147483648.0, round(static_cast<double>(b) * 8128.0))));
-    for (unsigned int j = 0; j < inputs; ++j)
-        sum += llround(static_cast<double>(x[row * inputs + j]) * 127.0)
-             * llround(static_cast<double>(w[neuron * inputs + j]) * 64.0);
+    long long sum = 0;
+    for (unsigned int j = lane; j < inputs; j += lanes)
+        // Inputs are on the [0,127]/127 lattice and weights on the i8/64 lattice.
+        // Their f32 round trips are far from half-integers, so nearest-even recovers
+        // the same integers as half-away rounding without general f64 conversion.
+        sum += static_cast<long long>(__float2int_rn(x[row * inputs + j] * 127.0F))
+             * __float2int_rn(w[neuron * inputs + j] * 64.0F);
+    // Quantized products sum exactly in i64; warp reduction preserves integer results.
+    if (lanes == 32) {
+        for (unsigned int offset = 16; offset; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if (lane != 0) return;
+    sum += static_cast<long long>(fmin(2147483647.0, fmax(-2147483648.0, round(static_cast<double>(b) * 8128.0))));
     raw[i] = static_cast<int>(sum);
     out[i] = static_cast<float>(static_cast<double>(raw[i]) / 8128.0);
 }
