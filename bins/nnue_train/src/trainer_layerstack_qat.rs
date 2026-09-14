@@ -4,6 +4,16 @@ use super::*;
 #[path = "trainer_layerstack_qat_tests.rs"]
 mod tests;
 
+#[cfg(feature = "native")]
+fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usize, &'static str> {
+    let lanes = if inputs >= 256 { 32 } else { 1 };
+    batch
+        .checked_mul(outputs)
+        .and_then(|n| n.checked_mul(lanes))
+        .filter(|&n| u32::try_from(n).is_ok())
+        .ok_or("dense QAT launch exceeds the supported u32 thread count")
+}
+
 impl GpuTrainer {
     #[cfg(feature = "native")]
     pub(super) fn qat_activations(
@@ -172,11 +182,12 @@ impl GpuTrainer {
             ),
             _ => unreachable!(),
         };
+        let threads = qat_dense_threads(batch, inputs, outputs)?;
         // SAFETY: workspace and weight dimensions match the selected layer; batch buckets were validated.
         unsafe {
             cuda_launch! {
                 kernel: qat_dense, stream: self.stream, module: self.module,
-                config: cfg_1d(batch * outputs),
+                config: cfg_1d(threads),
                 args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
                     batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
             }

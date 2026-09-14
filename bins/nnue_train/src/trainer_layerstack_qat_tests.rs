@@ -5,6 +5,28 @@ use shogi_features::FeatureSet;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn qat_dense_launch_rejects_thread_count_overflow() {
+    assert_eq!(qat_dense_threads(65536, 1536, 16), Ok(33554432));
+    assert_eq!(qat_dense_threads(524288, 32, 256), Ok(134217728));
+    assert!(qat_dense_threads(524288, 256, 256).is_err());
+    assert!(qat_dense_threads(usize::MAX, 256, 256).is_err());
+}
+
+#[test]
+fn qat_dense_lattice_integer_recovery_is_exact() {
+    for value in 0..=127 {
+        let x = value as f32 / 127.0;
+        assert_eq!((f64::from(x) * 127.0).round() as i32, value);
+        assert_eq!((x * 127.0).round_ties_even() as i32, value);
+    }
+    for value in -128..=127 {
+        let w = value as f32 / 64.0;
+        assert_eq!((f64::from(w) * 64.0).round() as i32, value);
+        assert_eq!((w * 64.0).round_ties_even() as i32, value);
+    }
+}
+
+#[test]
 fn qat_trains_with_fp16_tf32_and_factorizer() -> TestResult {
     let ctx = CudaContext::new(0)?;
     let features = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
