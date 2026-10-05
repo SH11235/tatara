@@ -361,7 +361,7 @@ macro_rules! trainer_backend_impl {
                 let weights = self
                     .$weights()
                     .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
-                nnue_train::artifact::write_atomic(path, |writer| {
+                nnue_train::artifact::write_atomic_keeping_read_only(path, |writer| {
                     weights.save_quantised_export(writer, fv_scale, output_format)
                 })
             }
