@@ -218,6 +218,27 @@ pub(crate) fn training_range_exempt(cli: &Cli) -> bool {
     cli.eval_only || cli.rescore_input.is_some()
 }
 
+/// Resolve the rescore input once and reject a known HCPE target before sidecar handling.
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn canonicalize_rescore_input(
+    input: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let canonical = input.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize --rescore-input {}: {e}",
+            input.display()
+        )
+    })?;
+    if nnue_train::dataloader::is_hcpe_path(&canonical) {
+        return Err(format!(
+            "--rescore-input requires PSV, not HCPE: {}",
+            canonical.display()
+        )
+        .into());
+    }
+    Ok(canonical)
+}
+
 /// `--rescore-input` の flag 整合を検証する。リスコアの不変条件は「全行・原順序・
 /// 無フィルタ・strict fp32」なので、行を落とす / score を変える / 数値精度を変える
 /// flag との併用は silent に無視せず明示 reject する (`--eval-only` と同じ検証方針)。
@@ -236,6 +257,15 @@ pub(crate) fn validate_rescore_cli(
             }
         }
         return Ok(());
+    }
+    if let Some(input) = &cli.rescore_input
+        && nnue_train::dataloader::is_hcpe_path(input)
+    {
+        return Err(format!(
+            "--rescore-input requires PSV, not HCPE: {}",
+            input.display()
+        )
+        .into());
     }
     if cli.eval_only {
         return Err("--rescore-input and --eval-only are mutually exclusive".into());
@@ -1058,12 +1088,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // ロード時に固定した identity を driver へ渡すだけ。入力 PSV も一度だけ
         // canonical に解決し、fingerprint / loader / 最終検証の全消費を同じ実体に
         // 揃える (worker が chunk ごとに open する path も canonical になる)。
-        let rescore_input = rescore_input.canonicalize().map_err(|e| {
-            format!(
-                "failed to canonicalize --rescore-input {}: {e}",
-                rescore_input.display()
-            )
-        })?;
+        let rescore_input = canonicalize_rescore_input(rescore_input)?;
         let weights_source = if cli.init_from.is_some() {
             "init-from-bin"
         } else {

@@ -33,6 +33,8 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
 use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
+use crate::teacher_input::validate_psv_board;
+
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
 /// 40-byte struct). Used everywhere we compute byte offsets, validate range
 /// alignment, or convert between record counts and file sizes.
@@ -566,6 +568,7 @@ pub struct PsvFileLoader {
     /// 残りどれだけ読めるか (byte)。range 末尾に達したら 1 record 分を切らず
     /// EOF 扱いにするための gate。`new()` 経路では file_size と一致。
     remaining_bytes: u64,
+    record_index: u64,
 }
 
 impl PsvFileLoader {
@@ -594,6 +597,15 @@ impl PsvFileLoader {
         start: u64,
         end: u64,
     ) -> io::Result<Self> {
+        if is_hcpe_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "PSV input required; HCPE is not supported here: {}",
+                    path.display()
+                ),
+            ));
+        }
         if start > end {
             return Err(io::Error::other(format!(
                 "PsvFileLoader range start ({start}) > end ({end}) for {}",
@@ -620,6 +632,7 @@ impl PsvFileLoader {
             eof: false,
             path: path.to_path_buf(),
             remaining_bytes: end - start,
+            record_index: start / PSV_RECORD_BYTES,
         })
     }
 
@@ -648,6 +661,7 @@ impl PsvFileLoader {
             }
             n if n == PSV_RECORD_BYTES as usize => {
                 self.remaining_bytes -= PSV_RECORD_BYTES;
+                self.record_index += 1;
                 Ok(Some(psv))
             }
             n => {
@@ -664,22 +678,27 @@ impl PsvFileLoader {
                     total += got;
                 }
                 self.remaining_bytes -= PSV_RECORD_BYTES;
+                self.record_index += 1;
                 Ok(Some(psv))
             }
         }
     }
 
     /// `batch` を batch_size まで PSV で埋める。詰めた件数を返す (EOF で
-    /// 0 → end-of-stream)。
+    /// 0 → end-of-stream)。各局面を1回decodeして構造検証し、不正な教師は
+    /// pathと元ファイルの0始まりのrecord番号を持つエラーで拒否する。
     pub fn fill_batch(&mut self, batch: &mut Batch) -> io::Result<usize> {
         batch.reset();
         loop {
             if batch.n_positions >= batch.batch_size {
                 break;
             }
+            let record_index = self.record_index;
             match self.next_psv()? {
                 Some(psv) => {
-                    let ok = batch.push(&psv)?;
+                    let board = psv.decode();
+                    validate_psv_board(&board, &self.path, Some(record_index))?;
+                    let ok = batch.push_decoded(&board)?;
                     debug_assert!(ok, "batch.push should not refuse below batch_size");
                 }
                 None => break,
@@ -794,6 +813,13 @@ struct PsvEpochReader {
     pushed_this_epoch: u64,
     /// 1 epoch 丸ごと 0 push だった連続回数。
     barren_passes: u32,
+    stop: Arc<AtomicBool>,
+    /// テスト用: physical record 読み出し後の境界に制御した取消を注入する。
+    #[cfg(test)]
+    after_record: Option<Box<dyn FnMut() + Send>>,
+    /// テスト用: EOF を観測してから次 epoch を開くまでの境界を制御する。
+    #[cfg(test)]
+    after_eof: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl PsvEpochReader {
@@ -829,6 +855,11 @@ impl PsvEpochReader {
             score_clamp_abs,
             pushed_this_epoch: 0,
             barren_passes: 0,
+            stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_record: None,
+            #[cfg(test)]
+            after_eof: None,
         })
     }
 
@@ -837,10 +868,15 @@ impl PsvEpochReader {
     /// 境界を跨がず、末尾の partial window も独立して shuffle できる。
     fn next_in_epoch(&mut self) -> io::Result<Option<PackedSfenValue>> {
         loop {
+            self.check_cancelled()?;
             match self.loader.next_psv()? {
                 Some(mut psv) => {
                     let record_index = self.record_index;
                     self.record_index += 1;
+                    #[cfg(test)]
+                    if let Some(after_record) = &mut self.after_record {
+                        after_record();
+                    }
                     // Sidecar indices are based on the complete PSV file. Applying the
                     // replacement before filtering matches a materialized PSV variant.
                     if let Some(score_override) = &mut self.score_override {
@@ -868,6 +904,11 @@ impl PsvEpochReader {
                     return Ok(Some(psv));
                 }
                 None => {
+                    #[cfg(test)]
+                    if let Some(after_eof) = &mut self.after_eof {
+                        after_eof();
+                    }
+                    self.check_cancelled()?;
                     if self.pushed_this_epoch == 0 {
                         self.barren_passes += 1;
                         if self.barren_passes >= MAX_BARREN_PASSES {
@@ -895,6 +936,16 @@ impl PsvEpochReader {
                 }
             }
         }
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("PSV input cancelled: {}", self.path.display()),
+            ));
+        }
+        Ok(())
     }
 
     /// 次の使える PSV を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
@@ -978,7 +1029,7 @@ impl WindowedPsvReader {
     fn spawn(mut source: PsvEpochReader, window_records: usize, shuffle: bool, seed: u64) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (empty_tx, empty_rx) = mpsc::channel::<Vec<PackedSfenValue>>();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&source.stop);
         let producer_stop = Arc::clone(&stop);
         let producer = thread::spawn(move || {
             let mut allocated = 0usize;
@@ -1027,7 +1078,9 @@ impl WindowedPsvReader {
                             break;
                         }
                         Err(e) => {
-                            let _ = ready_tx.send(Err(e));
+                            if !producer_stop.load(Ordering::Relaxed) {
+                                let _ = ready_tx.send(Err(e));
+                            }
                             return;
                         }
                     }
@@ -1068,6 +1121,12 @@ impl WindowedPsvReader {
             return Err(io::Error::other(msg.clone()));
         }
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "PSV input cancelled",
+                ));
+            }
             if let Some(window) = &mut self.current
                 && window.next < window.records.len()
             {
@@ -1123,11 +1182,11 @@ impl TrainingPsvReader {
         }
     }
 
-    /// reader の Mutex を取らずに loader の Drop から producer を止めるための flag。
-    fn producer_stop_flag(&self) -> Option<Arc<AtomicBool>> {
+    /// reader の Mutex を取らずに、Drop から direct / windowed 入力を止める flag。
+    fn stop_flag(&self) -> Arc<AtomicBool> {
         match self {
-            Self::Direct(_) => None,
-            Self::Windowed(reader) => Some(Arc::clone(&reader.stop)),
+            Self::Direct(reader) => Arc::clone(&reader.stop),
+            Self::Windowed(reader) => Arc::clone(&reader.stop),
         }
     }
 }
@@ -1160,7 +1219,7 @@ type BatchSlot = (Batch, Vec<i32>);
 /// - **並列パース**: worker は短い critical section (共有 reader を lock して
 ///   `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
 ///   外で decode + 特徴抽出を並列に行う。windowed reader では窓境界で lock 保持の
-///   まま次窓完成を待ち得る (`Drop` は先に producer を止める; `producer_stop`)。`FeatureSetSpec` は
+///   まま次窓完成を待ち得る (`Drop` は共通 stop flag で先に入力を止める)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
@@ -1198,9 +1257,11 @@ pub struct BucketedPrefetchedLoader {
     active_hist: Option<Arc<Mutex<Vec<u64>>>>,
     /// worker thread handle (`Drop` で join する)。
     handles: Vec<thread::JoinHandle<()>>,
-    /// windowed reader 使用時のみ `Some`。`Drop` の先頭で set しないと、reader lock を
-    /// 持つ worker が次 window の完成待ちで block し、join が窓 1 枚分 stall する。
-    producer_stop: Option<Arc<AtomicBool>>,
+    /// Drop が reader lock を取らずに、filtered scan と epoch reopen を止める flag。
+    stop: Arc<AtomicBool>,
+    /// テスト用: Drop の stop 設定と scan の再開を channel で同期する。
+    #[cfg(test)]
+    after_stop: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl BucketedPrefetchedLoader {
@@ -1284,13 +1345,6 @@ impl BucketedPrefetchedLoader {
         );
         assert!(batch_size >= 1, "batch_size must be >= 1");
         let bucket_mode = bucket_mode.into();
-        let num_workers = num_workers.max(1);
-        let prefetch_depth = prefetch_depth_for(num_workers);
-        // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
-        // block しないようにする: result channel に最大 prefetch_depth、各 worker
-        // が最大 1、main が最大 1。
-        let n_slots = prefetch_depth + num_workers + 1;
-
         let source = PsvEpochReader::new_range(
             path,
             0,
@@ -1308,7 +1362,39 @@ impl BucketedPrefetchedLoader {
             )),
             None => TrainingPsvReader::Direct(Box::new(source)),
         };
-        let producer_stop = reader.producer_stop_flag();
+        Ok(Self::spawn_with_reader(
+            path,
+            batch_size,
+            num_workers,
+            bucket_mode,
+            feature_set,
+            compute_bucket,
+            num_buckets,
+            monitor_active,
+            reader,
+        ))
+    }
+
+    /// Start decode workers for an already configured reader.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_reader(
+        path: &Path,
+        batch_size: usize,
+        num_workers: usize,
+        bucket_mode: BucketMode,
+        feature_set: FeatureSetSpec,
+        compute_bucket: bool,
+        num_buckets: usize,
+        monitor_active: bool,
+        reader: TrainingPsvReader,
+    ) -> Self {
+        let num_workers = num_workers.max(1);
+        let prefetch_depth = prefetch_depth_for(num_workers);
+        // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
+        // block しないようにする: result channel に最大 prefetch_depth、各 worker
+        // が最大 1、main が最大 1。
+        let n_slots = prefetch_depth + num_workers + 1;
+        let stop = reader.stop_flag();
         let reader = Arc::new(Mutex::new(reader));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
@@ -1340,6 +1426,8 @@ impl BucketedPrefetchedLoader {
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
+            let worker_stop = Arc::clone(&stop);
+            let input_path = path.to_path_buf();
             let handle = thread::spawn(move || {
                 // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
                 let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
@@ -1378,6 +1466,9 @@ impl BucketedPrefetchedLoader {
                         }
                         drop(rdr);
                         if let Some(e) = failed {
+                            if worker_stop.load(Ordering::Relaxed) {
+                                return;
+                            }
                             // reader が exhausted: error を slot に置いて worker 終了
                             // (借りた slot は捨てる; main は next_batch の err_slot 確認で気付く)。
                             let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
@@ -1392,9 +1483,16 @@ impl BucketedPrefetchedLoader {
                     // のとき) position bucket の両方に使う。`compute_bucket=false`
                     // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
-                    let mut overflow: Option<io::Error> = None;
+                    let mut batch_error: Option<io::Error> = None;
                     for psv in &scratch {
+                        if worker_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
                         let board = psv.decode();
+                        if let Err(error) = validate_psv_board(&board, &input_path, None) {
+                            batch_error = Some(error);
+                            break;
+                        }
                         match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
@@ -1407,7 +1505,7 @@ impl BucketedPrefetchedLoader {
                                 // 積んで worker 終了。単一 worker error なので channel は
                                 // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
                                 // 明示エラーを返す (借りた slot は捨てる)。
-                                overflow = Some(e);
+                                batch_error = Some(e);
                                 break;
                             }
                         }
@@ -1415,7 +1513,7 @@ impl BucketedPrefetchedLoader {
                             buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
                         }
                     }
-                    if let Some(e) = overflow {
+                    if let Some(e) = batch_error {
                         let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
                         if slot.is_none() {
                             *slot = Some(e);
@@ -1451,14 +1549,16 @@ impl BucketedPrefetchedLoader {
         // は loader struct が `pool_tx` を保持 (recycle 用)、`result_tx` は drop。
         drop(result_tx);
 
-        Ok(Self {
+        Self {
             result_rx: Some(result_rx),
             pool_tx: Some(pool_tx),
             err_slot,
             active_hist,
             handles,
-            producer_stop,
-        })
+            stop,
+            #[cfg(test)]
+            after_stop: None,
+        }
     }
 
     /// `--monitor-active-features` の histogram の現時点 snapshot を返す
@@ -1529,33 +1629,39 @@ impl Drop for BucketedPrefetchedLoader {
     /// **close-then-join**: 先に loader 側の channel endpoint を落としてから
     /// worker thread を join する。
     ///
-    /// 1. windowed reader 使用時は producer の stop flag を set → producer が record
-    ///    境界で止まり channel が閉じ、次 window 待ちの worker も unblock される。
+    /// 1. 共通 stop flag を set → direct / windowed の filtered scan と epoch reopen
+    ///    を record 境界で止め、次 window 待ちの worker も unblock する。
     /// 2. `result_rx` (result channel の **受信側**) を drop → worker の
     ///    `result_tx.send(...)` が `Err` を返し、worker が `break`。
     /// 3. `pool_tx` (pool channel の **送信側**、`recycle` 用) を drop → worker の
     ///    `pool_rx.recv()` が `Err` を返し、pool 借用待ちの worker も `break`。
     /// 4. 各 worker thread を `join` する。手順 1..=3 で全 worker は次の channel
-    ///    操作で速やかに抜けるので join は hang しない。
+    ///    操作または record 境界で抜ける。OS 内で block している read の取消はしない。
     ///
     /// この順序を守らないと (= channel を閉じる前に join すると) worker が
     /// `result_tx.send` / `pool_rx.recv` で永久に block して deadlock する。
     /// `spawn` 内の thread spawn が途中で失敗するケースは無い (`thread::spawn` は
     /// 失敗時 panic する) ので `handles` は常に完全だが、`drain(..)` で空でも安全。
     fn drop(&mut self) {
-        // 1: window producer を止める (worker unblock の前提)。
-        if let Some(stop) = &self.producer_stop {
-            stop.store(true, Ordering::Relaxed);
+        // 1: reader を止める (worker unblock の前提)。
+        self.stop.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(after_stop) = &mut self.after_stop {
+            after_stop();
         }
         // 2 & 3: channel endpoint を先に落として worker を unblock。
         self.result_rx = None;
         self.pool_tx = None;
-        // 4: 全 worker を join (channel が閉じているので速やかに終了する)。
+        // 4: record 処理と channel 操作から抜けた全 worker を join。
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dataloader_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

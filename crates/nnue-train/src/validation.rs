@@ -187,8 +187,10 @@ impl HeldoutSet {
                 if let Some(mode) = dual_label_psv {
                     mode.apply(&mut psv, record_index, path)?;
                 }
+                let board = psv.decode();
+                crate::teacher_input::validate_psv_board(&board, path, Some(record_index))?;
                 record_index += 1;
-                Ok(Some(psv.decode()))
+                Ok(Some(board))
             },
             path,
             batch_size,

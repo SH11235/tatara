@@ -41,5 +41,6 @@ pub mod init;
 pub mod optimizer;
 pub mod rescore;
 pub mod schedule;
+mod teacher_input;
 pub mod trainer;
 pub mod validation;

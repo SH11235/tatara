@@ -164,6 +164,25 @@ Score sidecars, `--score-drop-abs`, and `--score-clamp-abs` are applied in origi
 before records enter the shuffle window. On `--resume`, the teacher stream is reopened from the
 start; checkpoints do not restore a position within a window or the dataset epoch number.
 
+Training input (`--data`), `loader-digest`, and PSV rescoring require 40-byte PSV records.
+Files named `.hcpe` (case-insensitive) are rejected by PSV readers, even when their total
+length is also divisible by 40. Separate held-out input (`--test-data`) still supports HCPE.
+Before feature extraction, decoded PSV teacher positions must contain one king of each
+colour, consistent king-square fields, and at most 40 pieces on the board and in hand.
+Handicap positions with both kings remain supported. This checks structure, not move legality
+or every possible corruption of the format. Diagnostics include the input path and, for
+sequential finite or held-out reads, the original zero-based file record number. Training
+workers report the path without guessing an original record number, with or without windowing.
+
+Training validates only records retained after sidecar/dual-label selection and `--score-drop-abs`;
+PSV held-out reads validate decoded records before score filtering, and rescoring validates every record.
+Training input validation is therefore not an audit of records excluded by filtering.
+
+Dropping the training loader cancels both direct and windowed readers at record boundaries,
+including while high-score records are skipped and before the next dataset epoch is opened.
+Cancellation during normal shutdown is not an experiment failure. A read already blocked
+inside the operating system must return before shutdown can finish.
+
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 and the like can be left at their defaults; pass them only when you want to
 change them.

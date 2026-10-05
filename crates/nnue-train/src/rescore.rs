@@ -43,10 +43,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use shogi_features::FeatureSetSpec;
-use shogi_format::ShogiBoard;
-use shogi_format::types::{Color, HAND_PIECE_TYPES, PieceType, Square};
 
 use crate::dataloader::{Batch, BucketMode, PSV_RECORD_BYTES, PsvFileLoader};
+use crate::teacher_input::validate_board;
 
 /// 入力順 1 chunk 分の decode 結果。
 ///
@@ -479,62 +478,6 @@ fn decode_chunk_into(
         }
     }
     Ok(n_real)
-}
-
-/// decode 済み局面の安価な整合性検証。
-///
-/// `PackedSfenValue::decode` は checked ではなく、壊れた record も何らかの
-/// `ShogiBoard` に化けるため、検出可能な破損だけでも硬いエラーにする:
-///
-/// - 玉が両陣営に 1 枚ずつ盤上にあり、`black_king_sq` / `white_king_sq` の
-///   マスと一致する
-/// - 盤上 + 持ち駒の総数が 40 枚以下 (将棋の全駒数)
-///
-/// 完全な合法性検証はしない (入力は教師生成パイプラインが書いた正当な PSV で
-/// あることが契約)。
-fn validate_board(board: &ShogiBoard) -> Result<(), String> {
-    let mut on_board = 0_u32;
-    let mut black_kings = 0_u32;
-    let mut white_kings = 0_u32;
-    for piece in &board.board {
-        if piece.piece_type == PieceType::None {
-            continue;
-        }
-        on_board += 1;
-        if piece.piece_type == PieceType::King {
-            match piece.color {
-                Color::Black => black_kings += 1,
-                Color::White => white_kings += 1,
-            }
-        }
-    }
-    if black_kings != 1 || white_kings != 1 {
-        return Err(format!(
-            "kings on board: black {black_kings} / white {white_kings} (expected exactly 1 each)"
-        ));
-    }
-    let king_matches = |sq: Square, color: Color| {
-        sq.index() < 81 && {
-            let piece = board.board[sq.index()];
-            piece.piece_type == PieceType::King && piece.color == color
-        }
-    };
-    if !king_matches(board.black_king_sq, Color::Black)
-        || !king_matches(board.white_king_sq, Color::White)
-    {
-        return Err("king square fields do not match the board".to_string());
-    }
-    let mut in_hand = 0_u32;
-    for pt in HAND_PIECE_TYPES {
-        in_hand += u32::from(board.black_hand.count(pt)) + u32::from(board.white_hand.count(pt));
-    }
-    let total = on_board + in_hand;
-    if total > 40 {
-        return Err(format!(
-            "{total} pieces on board + in hand (shogi has at most 40)"
-        ));
-    }
-    Ok(())
 }
 
 /// i16 score sidecar の record サイズ (little-endian i16)。

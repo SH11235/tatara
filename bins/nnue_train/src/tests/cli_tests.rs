@@ -691,6 +691,48 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rescore_input_resolution_rejects_hcpe_symlink_targets() {
+    struct FixtureDir(PathBuf);
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "tatara-rescore-input-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let dir = FixtureDir(path);
+    let hcpe = dir.0.join("teacher.HCPE");
+    let psv = dir.0.join("teacher.psv");
+    let hcpe_alias = dir.0.join("pool.psv");
+    let psv_alias = dir.0.join("valid-pool.psv");
+    // The HCPE record size permits an input whose length is also divisible by 40.
+    std::fs::write(&hcpe, vec![0_u8; 20 * 38]).unwrap();
+    std::fs::write(&psv, vec![0_u8; 40]).unwrap();
+    std::os::unix::fs::symlink(&hcpe, &hcpe_alias).unwrap();
+    std::os::unix::fs::symlink(&psv, &psv_alias).unwrap();
+    let error = crate::training::canonicalize_rescore_input(&hcpe_alias)
+        .expect_err("canonical HCPE must be rejected before sidecar completion handling");
+    assert!(error.to_string().contains("requires PSV, not HCPE"));
+    assert!(
+        error
+            .to_string()
+            .contains(hcpe.canonicalize().unwrap().to_str().unwrap())
+    );
+    assert_eq!(
+        crate::training::canonicalize_rescore_input(&psv_alias).unwrap(),
+        psv.canonicalize().unwrap()
+    );
+}
+
 /// `validate_rescore_cli` の reject 行列を GPU 非依存で固定する (直接呼び出し)。
 /// non-GPU ビルド (GitHub CI の `--no-default-features`) でも検証ロジック自体は
 /// compile されるため、ここで消費とカバレッジを兼ねる。run 経路 (GPU context
@@ -726,6 +768,25 @@ fn validate_rescore_cli_covers_the_reject_matrix() {
         "net.bin",
     ])
     .expect("a fully specified rescore invocation must validate");
+
+    for input in ["teacher.hcpe", "teacher.HCPE"] {
+        reject(
+            &[
+                "--rescore-input",
+                input,
+                "--rescore-output",
+                "out",
+                "--rescore-score-scale",
+                "1200",
+                "--batch-size",
+                "16",
+                "layerstack",
+                "--init-from",
+                "net.bin",
+            ],
+            "requires PSV, not HCPE",
+        );
+    }
 
     reject(
         &[

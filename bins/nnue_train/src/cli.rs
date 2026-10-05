@@ -899,7 +899,7 @@ impl Cli {
                 .is_some_and(nnue_train::dataloader::is_hcpe_path)
         {
             return Err(
-                "--score-override and --dual-label-psv require PSV training data, not HCPE"
+                "training --data requires PSV, not HCPE; --test-data supports HCPE heldout"
                     .to_string(),
             );
         }
