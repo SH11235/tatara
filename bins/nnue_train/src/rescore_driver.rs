@@ -69,6 +69,16 @@ pub(crate) struct LoadedArtifact {
     pub(crate) sha256: String,
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 15) as usize]));
+    }
+    output
+}
+
 /// file の `(len, modified_unix_ns)`。
 fn file_size_mtime_ns(path: &Path) -> std::io::Result<(u64, u128)> {
     let meta = std::fs::metadata(path)?;
@@ -100,7 +110,7 @@ impl LoadedArtifact {
             canonical,
             size,
             mtime_ns,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(&Sha256::digest(bytes)),
         })
     }
 
@@ -126,7 +136,7 @@ impl LoadedArtifact {
             canonical,
             size,
             mtime_ns,
-            sha256: format!("{:x}", hasher.finalize()),
+            sha256: sha256_hex(&hasher.finalize()),
         })
     }
 
@@ -517,7 +527,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let artifact = LoadedArtifact::from_loaded_bytes(&path, &bytes).unwrap();
-        assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(
+            artifact.sha256,
+            "fc11ebe5516bfd5500b7b00ea8a26219e2709cf6d57c63c940ce117c450f0b4d"
+        );
         artifact
             .verify_unchanged("net")
             .expect("unchanged file must verify");
@@ -576,7 +589,9 @@ mod tests {
 
         // ロード内容の sha が素通しで入る。
         assert!(
-            text.contains(&format!("net_sha256={:x}", Sha256::digest(&net_bytes))),
+            text.contains(
+                "net_sha256=cc74ad5652ab9bd655f048daf2754d067c6f07472cbdf0a58827cbb5799db949"
+            ),
             "{text}"
         );
         assert!(

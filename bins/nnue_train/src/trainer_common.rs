@@ -361,15 +361,9 @@ macro_rules! trainer_backend_impl {
                 let weights = self
                     .$weights()
                     .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                weights.save_quantised_export(&mut writer, fv_scale, output_format)?;
-                std::io::Write::flush(&mut writer)?;
-                Ok(())
+                nnue_train::artifact::write_atomic_keeping_read_only(path, |writer| {
+                    weights.save_quantised_export(writer, fv_scale, output_format)
+                })
             }
 
             fn save_resume_checkpoint(

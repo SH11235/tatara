@@ -221,6 +221,47 @@ flags, how to pick the held-out source, and how to read the metrics.
 
 ## Interrupting and resuming training
 
+Quantised `.bin` exports, raw `.ckpt` checkpoints, experiment JSON, and rescore
+completion markers are written to a uniquely named temporary file in the
+destination directory, flushed and synced, then renamed over the destination.
+A failure before the rename keeps the previous complete artifact and removes
+the temporary file. The rescore score sidecar itself is still appended in place
+and resumed through its in-progress marker.
+
+On Unix the parent directory is synced after the rename. If that sync fails,
+the complete new file is already in place, so training continues and a
+`[artifact] warning:` line is printed; the rename may not survive a crash or
+power loss until the filesystem persists it by itself. Filesystems that do not
+support directory sync skip the step without a warning. On Windows no directory
+sync is attempted.
+
+Consequences of replacing by rename:
+
+- The output directory must be writable, even when the destination file itself
+  already exists and is writable.
+- Replacing an existing file needs room for the old and the new file at the
+  same time.
+- A destination symlink is replaced by a regular file, and other hardlinks keep
+  the old contents.
+- Unix permission bits of an existing regular file are preserved; ownership and
+  ACLs become those of the writing process. New files follow the current umask.
+- An existing `.bin` export that cannot be opened for writing (for example after
+  `chmod a-w`) is not replaced and the save fails with a permission error.
+  `.ckpt`, experiment JSON and completion markers are replaced regardless of
+  their own write permission, so protect those through the directory.
+
+A forced kill, Ctrl-C during a save, OOM kill or power loss can leave the
+temporary file behind. It is hidden and named after its destination:
+`.<destination file name>.<random>.tatara-tmp` (for example
+`.rshogi-100.ckpt.Ab3xYz.tatara-tmp`), and can be as large as the artifact.
+Leftovers are never read as checkpoints and are not removed automatically,
+because another writer may still be using them; delete them once no trainer is
+writing to that directory.
+
+Replacement on Windows goes through the standard library rename. It has not
+been exercised by automated tests; if a program holding the destination open
+blocks the replacement, close it and retry.
+
 A raw `.ckpt` saves the full training state: **weights + optimizer state
 (m / v / slow / step) + the current superbatch number**. Format v9 and later
 also save `fv_scale`, so it does not need to be respecified. When resuming a v8

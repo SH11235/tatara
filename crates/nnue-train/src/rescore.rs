@@ -794,13 +794,9 @@ impl ScoreSidecarWriter {
         }
 
         let done = done_marker_path(&self.path);
-        let tmp = append_extension(&self.path, ".done.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(self.fingerprint.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &done)?;
+        crate::artifact::write_atomic(&done, |writer| {
+            writer.write_all(self.fingerprint.as_bytes())
+        })?;
         remove_if_exists(&in_progress_marker_path(&self.path))?;
         Ok(())
     }

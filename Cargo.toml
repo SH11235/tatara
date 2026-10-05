@@ -34,7 +34,7 @@ gpu-runtime = { path = "crates/gpu-runtime", default-features = false }
 cuda-native-runtime = { path = "crates/cuda-native-runtime" }
 nnue-format = { path = "crates/nnue-format" }
 nnue-train = { path = "crates/nnue-train" }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 
 # cuda-oxide (Rust → PTX rustc backend)。ABI が rustc internal に張り付いた
 # alpha crate のため git commit pin で取り込み、rev はこの 3 行を単一情報源と
