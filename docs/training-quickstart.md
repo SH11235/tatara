@@ -221,6 +221,25 @@ flags, how to pick the held-out source, and how to read the metrics.
 
 ## Interrupting and resuming training
 
+Both quantised `.bin` exports and raw `.ckpt` checkpoints are written to unique
+files in the destination directory, flushed and synced, then atomically
+published. A failed write keeps the previous complete artifact. Experiment JSON
+and rescore completion markers use the same publication path. On Unix the parent
+directory is synced after replacement. Filesystems that do not support directory
+sync skip that step, so crash durability depends on the filesystem. Other final
+sync failures are reported even though the complete new file is already visible;
+inspect it before retrying.
+
+Replacement publishes a new regular file: a destination symlink is replaced,
+and other hardlinks retain the old file. Unix permission bits are preserved for
+an existing regular file; ownership and ACLs are not preserved. New files follow
+the current umask. A forced kill, OOM kill or power loss can leave `.tatara-*`
+temporary files. They are not removed automatically because another writer may
+still be using them; remove leftovers only after confirming no writer is active.
+On Windows, a reader without delete sharing can prevent replacement; close that
+reader and retry. Windows shared-reader replacement is not covered by automated
+tests.
+
 A raw `.ckpt` saves the full training state: **weights + optimizer state
 (m / v / slow / step) + the current superbatch number**. Format v9 and later
 also save `fv_scale`, so it does not need to be respecified. When resuming a v8

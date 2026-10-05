@@ -663,8 +663,8 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
 /// slow[f32×len]` (全 little-endian)。device → host download は group 単位で write と
 /// interleave するので、host 側のピークは最大 group (ft_w、~113M f32 = ~450MB) 1 個分。
 ///
-/// `<path>.tmp` へ `BufWriter` で書いてから `std::fs::rename` で atomic に置換する
-/// (書き込み途中で crash しても `<path>` は前回の完全な checkpoint のまま)。
+/// 排他的な一時ファイルへ書き込み、同期してから atomic に置換する。
+/// 書き込み途中で停止しても `path` は前回の完全な checkpoint のまま。
 ///
 /// `meta.run_id` が空文字列、または [`MAX_RUN_ID_BYTES`] 超過 (warning を出して
 /// 省略) のときは run id を持たない checkpoint になり、resume 時の
@@ -692,24 +692,9 @@ pub(crate) fn save_raw_checkpoint_file(
         meta.run_id
     };
 
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = {
-        let mut p = path.as_os_str().to_os_string();
-        p.push(".tmp");
-        std::path::PathBuf::from(p)
-    };
-
-    // write+flush 本体を closure に括り、`fs::rename` 前の error path で
-    // 中途半端な `<path>.tmp` を best-effort で消す (device→host download / write /
-    // flush 失敗で残骸を残さないため)。
-    let write_tmp = || -> Result<(), Box<dyn std::error::Error>> {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+    nnue_train::artifact::write_atomic(path, |w| -> Result<(), Box<dyn std::error::Error>> {
         let header_meta = RawCkptMeta { run_id, ..*meta };
-        write_raw_ckpt_header(&mut w, arch, &header_meta, groups.len() as u64)?;
+        write_raw_ckpt_header(w, arch, &header_meta, groups.len() as u64)?;
         for g in groups {
             let (w_host, m_host, v_host, slow_host) = g.to_host(stream)?;
             // 念のため device buffer の要素数を arch 期待値と照合 (内部整合性)。
@@ -728,23 +713,13 @@ pub(crate) fn save_raw_checkpoint_file(
                 }
             }
             w.write_all(&(g.len as u64).to_le_bytes())?;
-            write_f32_slice(&mut w, &w_host)?;
-            write_f32_slice(&mut w, &m_host)?;
-            write_f32_slice(&mut w, &v_host)?;
-            write_f32_slice(&mut w, &slow_host)?;
+            write_f32_slice(w, &w_host)?;
+            write_f32_slice(w, &m_host)?;
+            write_f32_slice(w, &v_host)?;
+            write_f32_slice(w, &slow_host)?;
         }
-        w.flush()?;
         Ok(())
-    };
-    if let Err(e) = write_tmp() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    Ok(())
+    })
 }
 
 /// raw checkpoint を読み、header 照合 + 全 group の host `Vec` を返す (`--resume` 用)。

@@ -34,6 +34,7 @@
 //!   サンプラ (`sample`) + 各アーキの既定値 (`LayerStackInit::default_uniform` /
 //!   `SimpleInit::default_uniform`)。bin 側 trainer 構築子が初期重みを生成するのに使う
 
+pub mod artifact;
 pub mod dataloader;
 pub mod experiment;
 pub mod init;

@@ -540,36 +540,12 @@ impl ExperimentLogger {
 
     /// 現在の [`ExperimentDoc`] を experiment.json に atomic に書き出す。
     ///
-    /// `<path>.tmp` に書いてから同一ディレクトリ内で `rename` する。書き込み
-    /// 途中で crash しても `<path>` は前回の完全な JSON のまま残る。
+    /// 書き込みと同期が成功するまで既存の JSON を保持する。
     pub fn write(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = {
-            let mut p = self.path.as_os_str().to_os_string();
-            p.push(".tmp");
-            PathBuf::from(p)
-        };
-        let json = serde_json::to_string_pretty(&self.doc).map_err(io::Error::other)?;
-        let write_tmp = || -> io::Result<()> {
-            let mut w = io::BufWriter::new(std::fs::File::create(&tmp_path)?);
-            w.write_all(json.as_bytes())?;
-            w.write_all(b"\n")?;
-            w.flush()?;
-            Ok(())
-        };
-        if let Err(e) = write_tmp() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        Ok(())
+        crate::artifact::write_atomic(&self.path, |writer| {
+            serde_json::to_writer_pretty(&mut *writer, &self.doc).map_err(io::Error::other)?;
+            writer.write_all(b"\n")
+        })
     }
 
     /// `last_updated_at` を現在時刻に更新する。

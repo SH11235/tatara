@@ -908,11 +908,10 @@ fn write_report(
         mode_name(mode),
     );
     let path = output_dir.join(filename);
-    let temporary = path.with_extension("json.tmp");
-    let mut json = serde_json::to_vec_pretty(report)?;
-    json.push(b'\n');
-    fs::write(&temporary, json)?;
-    fs::rename(&temporary, &path)?;
+    nnue_train::artifact::write_atomic(&path, |writer| {
+        serde_json::to_writer_pretty(&mut *writer, report).map_err(std::io::Error::other)?;
+        std::io::Write::write_all(writer, b"\n")
+    })?;
     Ok(path)
 }
 

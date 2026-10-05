@@ -201,6 +201,23 @@ validation を有効化する。勾配更新に一切使わない局面を毎 su
 
 ## 学習中断・再開
 
+量子化 `.bin` と raw `.ckpt` は出力先と同じディレクトリに排他的な一時ファイルを
+確保し、書き込み・flush・同期後に atomic に公開する。書き込み失敗時は前回の
+完全な成果物を保持する。experiment JSON とリスコアの完了 marker も共通の保存
+処理を使う。Unix では置換後に親ディレクトリを同期する。ディレクトリ同期に
+非対応のファイルシステムではこの同期を省略し、クラッシュ時の耐久性はその
+ファイルシステムに依存する。他の同期エラーは完全な新ファイルが公開済みでも
+報告するため、再試行前に確認する。
+
+置換では新しい通常ファイルを公開する。出力先の symlink は置換され、他の
+hardlink は旧ファイルを指したままになる。既存の通常ファイルの Unix permission
+bits は維持するが、所有者と ACL は維持しない。新規ファイルは現在の umask に
+従う。強制終了・OOM kill・電源断では `.tatara-*` 一時ファイルが残ることがある。
+他の writer が使用中の可能性があるため自動削除せず、writer が動いていないことを
+確認してから残留ファイルを削除する。Windows では delete sharing を許可しない
+reader が置換を妨げることがあるため、reader を閉じて再試行する。Windows の
+共有 reader が開いている状態での置換は自動テストの対象外。
+
 raw `.ckpt` は学習状態の **weight + optimizer state (m / v / slow / step) + 現在の
 superbatch 番号** を保存する。format v9 以降は `fv_scale` も保存するため再指定不要。
 v8 以前から resume する場合は override を保つため `simple --fv-scale <N>` を再指定し、
