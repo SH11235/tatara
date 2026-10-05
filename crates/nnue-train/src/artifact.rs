@@ -121,7 +121,15 @@ where
         }
         permissions
     };
-    let mut temporary = builder.tempfile_in(parent)?;
+    let mut temporary = match builder.tempfile_in(parent) {
+        Ok(temporary) => temporary,
+        // 出力名を含む一時ファイル名は出力名より長い。Windows の path 長上限のように、
+        // 出力自体は作れても一時ファイル名だけが収まらない場合は短い名前で作り直す。
+        Err(_) if prefix != FALLBACK_TEMPORARY_PREFIX => builder
+            .prefix(FALLBACK_TEMPORARY_PREFIX)
+            .tempfile_in(parent)?,
+        Err(error) => return Err(error.into()),
+    };
     {
         let mut writer = BufWriter::new(temporary.as_file_mut());
         write(&mut writer)?;
@@ -328,7 +336,6 @@ mod tests {
 
     #[test]
     fn overlong_destination_names_fall_back_to_a_generic_temporary_prefix() -> io::Result<()> {
-        let directory = tempfile::tempdir()?;
         let attributed = "a".repeat(MAX_ATTRIBUTED_NAME_BYTES);
         let generic = "a".repeat(240);
         assert_eq!(
@@ -339,12 +346,17 @@ mod tests {
             temporary_prefix(Path::new(&generic)),
             OsString::from(FALLBACK_TEMPORARY_PREFIX)
         );
-        for name in [attributed, generic] {
-            let path = directory.path().join(name);
-            write_atomic(&path, |writer| writer.write_all(b"complete"))?;
-            assert_eq!(std::fs::read(&path)?, b"complete");
+        // Windows では出力 path 自体が既定の path 長上限を超えるため、実ファイルでの確認は Unix に限る。
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir()?;
+            for name in [attributed, generic] {
+                let path = directory.path().join(name);
+                write_atomic(&path, |writer| writer.write_all(b"complete"))?;
+                assert_eq!(std::fs::read(&path)?, b"complete");
+            }
+            assert_eq!(std::fs::read_dir(directory.path())?.count(), 2);
         }
-        assert_eq!(std::fs::read_dir(directory.path())?.count(), 2);
         Ok(())
     }
 
