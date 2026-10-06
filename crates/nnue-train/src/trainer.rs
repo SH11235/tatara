@@ -775,6 +775,12 @@ where
 {
     cfg.validate()?;
 
+    if crate::dataloader::is_hcpe_path(data_path) {
+        return Err(io::Error::other(
+            "training data requires PSV, not HCPE; held-out validation supports HCPE",
+        ));
+    }
+
     // data file の byte サイズを取って PSV alignment を確認。
     // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
     // 決まるため、tail 経路に入る前に確実に reject する。
@@ -807,12 +813,6 @@ where
         }
         None => file_size,
     };
-
-    if cfg.score_source.is_some() && crate::dataloader::is_hcpe_path(data_path) {
-        return Err(io::Error::other(
-            "training data requires PSV, not HCPE; held-out validation supports HCPE",
-        ));
-    }
 
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
         data_path,
@@ -1516,6 +1516,34 @@ mod tests {
         let dir = unique_output_path(label);
         std::fs::create_dir_all(&dir).expect("create temporary output directory");
         dir
+    }
+
+    #[test]
+    fn run_rejects_hcpe_training_data_without_a_score_source() {
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = base_cfg();
+        assert!(cfg.score_source.is_none());
+        let mut backend = MockBackend::new();
+        for name in ["teacher.hcpe", "teacher.HCPE"] {
+            let error = run(
+                &mut backend,
+                Path::new(name),
+                &progress,
+                &lr,
+                &wdl,
+                &cfg,
+                None,
+            )
+            .expect_err("HCPE training data must be rejected");
+            assert!(error.to_string().contains("requires PSV, not HCPE"));
+        }
+        assert_eq!(backend.steps, 0);
     }
 
     fn run_drives_superbatches_with_threads(threads: usize) {
