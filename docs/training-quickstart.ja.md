@@ -151,6 +151,21 @@ score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で
 窓内shuffleする。`--resume`時は教師streamをファイル先頭から開き直すため、
 checkpointは窓の途中位置やdataset epoch番号を復元しない。
 
+学習入力(`--data`)、`loader-digest`、PSVの再評価は40バイト固定長のPSVを使う。
+PSV readerは、総サイズが40の倍数でも`.hcpe`拡張子(大文字小文字不問)を拒否する。
+別の検証入力(`--test-data`)では引き続きHCPEを使える。
+レコードと局面の正当性を保証する生成処理で作ったPSV教師を使う。
+学習はその内容を信頼し、起動時の全件走査やdecode済み局面ごとの構造検証は行わない。
+dataset epochをまたぐ場合も含め、学習中は入力ファイルを変更しない。
+教師を再生成するときは別のファイルに出力する。
+PSVの再評価では、スコアを書き出す前の玉の配置・総駒数の構造検証を引き続き行う。
+この検証は、指し手の合法性やあらゆる形式破損を検証するものではない。
+
+学習loaderをdropすると、direct・windowed双方をレコード境界で取り消す。
+高スコアのレコードを読み飛ばしている間や、次のdataset epochを開き直す前も停止を確認する。
+通常終了時の取消はexperimentの失敗として扱わない。OS内で既にblockしているreadは取り消せず、
+そのreadが返るまで終了処理が待つ場合がある。
+
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。
 

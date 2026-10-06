@@ -810,7 +810,7 @@ where
 
     if cfg.score_source.is_some() && crate::dataloader::is_hcpe_path(data_path) {
         return Err(io::Error::other(
-            "score_override and dual_label_psv are only supported for PSV training data, not HCPE",
+            "training data requires PSV, not HCPE; held-out validation supports HCPE",
         ));
     }
 
