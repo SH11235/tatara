@@ -167,16 +167,12 @@ start; checkpoints do not restore a position within a window or the dataset epoc
 Training input (`--data`), `loader-digest`, and PSV rescoring require 40-byte PSV records.
 Files named `.hcpe` (case-insensitive) are rejected by PSV readers, even when their total
 length is also divisible by 40. Separate held-out input (`--test-data`) still supports HCPE.
-Before feature extraction, decoded PSV teacher positions must contain one king of each
-colour, consistent king-square fields, and at most 40 pieces on the board and in hand.
-Handicap positions with both kings remain supported. This checks structure, not move legality
-or every possible corruption of the format. Diagnostics include the input path and, for
-sequential finite or held-out reads, the original zero-based file record number. Training
-workers report the path without guessing an original record number, with or without windowing.
-
-Training validates only records retained after sidecar/dual-label selection and `--score-drop-abs`;
-PSV held-out reads validate decoded records before score filtering, and rescoring validates every record.
-Training input validation is therefore not an audit of records excluded by filtering.
+Use PSV data produced by a generator that guarantees valid records and positions. Training
+trusts that content: it does not scan the entire file at startup or structurally validate each
+decoded position. Keep the input file unchanged throughout training, including across dataset
+epochs; write regenerated data to a different file.
+PSV rescoring retains its structural checks for king placement and total piece count before
+writing scores. These checks do not verify move legality or every possible format corruption.
 
 Dropping the training loader cancels both direct and windowed readers at record boundaries,
 including while high-score records are skipped and before the next dataset epoch is opened.

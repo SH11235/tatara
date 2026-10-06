@@ -77,9 +77,8 @@ fn cancellation_after_eof_does_not_reopen_or_report_barren_failure() {
     assert_eq!(reader.barren_passes, MAX_BARREN_PASSES - 1);
 }
 
-fn spawn_controlled_reader(path: &Path, reader: TrainingPsvReader) -> BucketedPrefetchedLoader {
+fn spawn_controlled_reader(reader: TrainingPsvReader) -> BucketedPrefetchedLoader {
     BucketedPrefetchedLoader::spawn_with_reader(
-        path,
         1,
         1,
         BucketMode::KingRank9,
@@ -119,7 +118,7 @@ fn drop_during_filtered_scan_joins_workers_without_recording_an_error() {
         } else {
             TrainingPsvReader::Direct(Box::new(source))
         };
-        let mut loader = spawn_controlled_reader(&path, reader);
+        let mut loader = spawn_controlled_reader(reader);
         let stop = Arc::clone(&loader.stop);
         let error_slot = Arc::clone(&loader.err_slot);
         let (stopped_tx, stopped_rx) = mpsc::channel();
@@ -150,21 +149,18 @@ fn drop_during_filtered_scan_joins_workers_without_recording_an_error() {
 }
 
 #[test]
-fn cancellation_after_record_read_skips_worker_decode_and_errors() {
+fn cancellation_after_record_read_does_not_publish_a_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("duplicate-kings.psv");
-    let mut corrupt = sample_record(0);
-    let bytes = corrupt.as_bytes_mut();
-    bytes[0] = (bytes[0] & 1) | ((bytes[1] & 127) << 1);
-    std::fs::write(&path, corrupt.as_bytes()).unwrap();
+    let path = dir.path().join("teacher.psv");
+    std::fs::write(&path, sample_record(0).as_bytes()).unwrap();
     let mut source =
         PsvEpochReader::new_range(&path, 0, PSV_RECORD_BYTES, None, None, None).unwrap();
     let stop = Arc::clone(&source.stop);
     source.after_record = Some(Box::new(move || stop.store(true, Ordering::Relaxed)));
-    let mut loader = spawn_controlled_reader(&path, TrainingPsvReader::Direct(Box::new(source)));
+    let mut loader = spawn_controlled_reader(TrainingPsvReader::Direct(Box::new(source)));
     assert!(
         loader.next_batch().unwrap().is_none(),
-        "cancelled worker must not decode a malformed record or publish a batch"
+        "cancelled worker must not publish a batch"
     );
     assert!(loader.err_slot.lock().unwrap().is_none());
 }

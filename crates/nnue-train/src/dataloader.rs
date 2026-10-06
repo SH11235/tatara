@@ -33,8 +33,6 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
 use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
-use crate::teacher_input::validate_psv_board;
-
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
 /// 40-byte struct). Used everywhere we compute byte offsets, validate range
 /// alignment, or convert between record counts and file sizes.
@@ -568,7 +566,6 @@ pub struct PsvFileLoader {
     /// 残りどれだけ読めるか (byte)。range 末尾に達したら 1 record 分を切らず
     /// EOF 扱いにするための gate。`new()` 経路では file_size と一致。
     remaining_bytes: u64,
-    record_index: u64,
 }
 
 impl PsvFileLoader {
@@ -632,7 +629,6 @@ impl PsvFileLoader {
             eof: false,
             path: path.to_path_buf(),
             remaining_bytes: end - start,
-            record_index: start / PSV_RECORD_BYTES,
         })
     }
 
@@ -661,7 +657,6 @@ impl PsvFileLoader {
             }
             n if n == PSV_RECORD_BYTES as usize => {
                 self.remaining_bytes -= PSV_RECORD_BYTES;
-                self.record_index += 1;
                 Ok(Some(psv))
             }
             n => {
@@ -678,27 +673,22 @@ impl PsvFileLoader {
                     total += got;
                 }
                 self.remaining_bytes -= PSV_RECORD_BYTES;
-                self.record_index += 1;
                 Ok(Some(psv))
             }
         }
     }
 
     /// `batch` を batch_size まで PSV で埋める。詰めた件数を返す (EOF で
-    /// 0 → end-of-stream)。各局面を1回decodeして構造検証し、不正な教師は
-    /// pathと元ファイルの0始まりのrecord番号を持つエラーで拒否する。
+    /// 0 → end-of-stream)。
     pub fn fill_batch(&mut self, batch: &mut Batch) -> io::Result<usize> {
         batch.reset();
         loop {
             if batch.n_positions >= batch.batch_size {
                 break;
             }
-            let record_index = self.record_index;
             match self.next_psv()? {
                 Some(psv) => {
-                    let board = psv.decode();
-                    validate_psv_board(&board, &self.path, Some(record_index))?;
-                    let ok = batch.push_decoded(&board)?;
+                    let ok = batch.push(&psv)?;
                     debug_assert!(ok, "batch.push should not refuse below batch_size");
                 }
                 None => break,
@@ -1363,7 +1353,6 @@ impl BucketedPrefetchedLoader {
             None => TrainingPsvReader::Direct(Box::new(source)),
         };
         Ok(Self::spawn_with_reader(
-            path,
             batch_size,
             num_workers,
             bucket_mode,
@@ -1378,7 +1367,6 @@ impl BucketedPrefetchedLoader {
     /// Start decode workers for an already configured reader.
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_reader(
-        path: &Path,
         batch_size: usize,
         num_workers: usize,
         bucket_mode: BucketMode,
@@ -1427,7 +1415,6 @@ impl BucketedPrefetchedLoader {
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
             let worker_stop = Arc::clone(&stop);
-            let input_path = path.to_path_buf();
             let handle = thread::spawn(move || {
                 // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
                 let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
@@ -1483,16 +1470,12 @@ impl BucketedPrefetchedLoader {
                     // のとき) position bucket の両方に使う。`compute_bucket=false`
                     // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
-                    let mut batch_error: Option<io::Error> = None;
+                    let mut overflow: Option<io::Error> = None;
                     for psv in &scratch {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
                         let board = psv.decode();
-                        if let Err(error) = validate_psv_board(&board, &input_path, None) {
-                            batch_error = Some(error);
-                            break;
-                        }
                         match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
@@ -1505,7 +1488,7 @@ impl BucketedPrefetchedLoader {
                                 // 積んで worker 終了。単一 worker error なので channel は
                                 // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
                                 // 明示エラーを返す (借りた slot は捨てる)。
-                                batch_error = Some(e);
+                                overflow = Some(e);
                                 break;
                             }
                         }
@@ -1513,7 +1496,7 @@ impl BucketedPrefetchedLoader {
                             buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
                         }
                     }
-                    if let Some(e) = batch_error {
+                    if let Some(e) = overflow {
                         let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
                         if slot.is_none() {
                             *slot = Some(e);
