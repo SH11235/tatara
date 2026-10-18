@@ -508,8 +508,9 @@ pub(crate) struct Cli {
     /// the training parameters and the training data name, leaving out the
     /// superbatch count (unless a WDL schedule ends at it), the start
     /// superbatch, initialisation, and settings that do not change the
-    /// training (build, backend, threads, external validation data and its
-    /// WDL). Checkpoints written before this was recorded leave it out unless
+    /// training data or how it is learned (build, backend, threads, the
+    /// shuffle window size, external validation data and its WDL).
+    /// Checkpoints written before this was recorded leave it out unless
     /// this option is given.
     #[arg(long, global = true, requires = "resume")]
     pub(crate) lineage_kind: Option<LineageKindArg>,
