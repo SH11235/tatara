@@ -2205,7 +2205,12 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
             let psqt_idx = if shared_delta { 14 } else { 10 };
             assert_eq!(checkpoint_state.1.len(), psqt_idx + 1);
             assert_eq!(checkpoint_state.1[psqt_idx].0, "psqt_w");
-            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            source.save_raw_checkpoint(
+                &path,
+                17,
+                &nnue_train::trainer::CheckpointProducer::run_id_only(source_name),
+                Some(42),
+            )?;
             let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let oracle_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(oracle_state.0, 6);
@@ -2220,7 +2225,7 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
                 let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
-                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
                 let loaded_state = trainer.raw_checkpoint_state_to_host()?;
                 assert_checkpoint_state_bit_identical(
@@ -2954,7 +2959,12 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
             }
             let checkpoint_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(checkpoint_state.0, 5, "checkpoint source step count");
-            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            source.save_raw_checkpoint(
+                &path,
+                17,
+                &nnue_train::trainer::CheckpointProducer::run_id_only(source_name),
+                Some(42),
+            )?;
             let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let oracle_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(oracle_state.0, 6, "uninterrupted oracle step count");
@@ -2982,7 +2992,7 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
                 let (superbatch, producer, horizon, fv_scale) =
                     trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
-                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
                 assert_eq!(fv_scale, Some(16));
                 let loaded_state = trainer.raw_checkpoint_state_to_host()?;
