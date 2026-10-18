@@ -92,8 +92,10 @@ pub struct Lineage {
 
 /// レシピの指紋から除く params の key。resume で変わるのが当然の値 (総 superbatch 数・開始位置・
 /// 初期化指定) と、学習に使う局面・重み更新を変えない設定 (build・backend・スレッド数・
-/// 外部の検証データとその WDL)。LR schedule の表記は resume で checkpoint の horizon が復元
-/// されるので、同じレシピの続きなら変わらず、指紋に残す。
+/// 外部の検証データとその WDL)。shuffle の窓サイズは既定 (`auto`) ではホストのメモリ量から
+/// 決まり、同じ再開でも機械によって値が変わる一方、変わるのは窓の中の局面の順序だけなので除く。
+/// LR schedule の表記は resume で checkpoint の horizon が復元されるので、同じレシピの続きなら
+/// 変わらず、指紋に残す。
 const NON_RECIPE_PARAMS: &[&str] = &[
     "superbatches",
     "start_superbatch",
@@ -102,6 +104,7 @@ const NON_RECIPE_PARAMS: &[&str] = &[
     "trainer_build",
     "trainer_backend",
     "threads",
+    "teacher_shuffle_buffer_mib",
     "test_data",
     "test_positions",
     "validation_wdl",
@@ -724,14 +727,12 @@ mod tests {
         extended.threads += 8;
         extended.trainer_backend = Some("native".to_string());
         extended.validation_wdl = Some(0.25);
+        extended.teacher_shuffle_buffer_mib += 256;
         assert_eq!(recipe_fingerprint(&extended, "teacher.psv"), fingerprint);
 
         let mut schedule = sample_params();
         schedule.lr_schedule = "constant".to_string();
         assert_ne!(recipe_fingerprint(&schedule, "teacher.psv"), fingerprint);
-        let mut shuffle = sample_params();
-        shuffle.teacher_shuffle_buffer_mib += 256;
-        assert_ne!(recipe_fingerprint(&shuffle, "teacher.psv"), fingerprint);
         let mut holdout = sample_params();
         holdout.test_tail_positions = Some(10_000);
         assert_ne!(recipe_fingerprint(&holdout, "teacher.psv"), fingerprint);
@@ -787,7 +788,7 @@ mod tests {
         assert!(json.get("kind").is_none());
     }
 
-    const RECIPE_FINGERPRINT_PIN: u64 = 14_472_493_478_800_421_797;
+    const RECIPE_FINGERPRINT_PIN: u64 = 8_836_379_816_406_004_536;
 
     fn sample_params() -> Params {
         Params {

@@ -16,10 +16,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 10):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 11):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (10)             (4 bytes)
+//   version      u32 (11)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -41,6 +41,9 @@ use crate::trainer_common::MomentBuf;
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
 //   fv_scale     i32  (v9+、Simple の実効 evaluation scale。0 = 未記録)
 //   qat_mode     u32  (v10+, 0 = off, 1 = dense LayerStack)
+//   net_id_len   u32  (v11+、producer net id の長さ、0 = 未記録)
+//   net_id       UTF-8 [net_id_len] (この checkpoint を書いた run の net id)
+//   recipe_fp    u64  (v11+、producer のレシピの指紋。0 = 未記録)
 //   num_groups   u64
 //   then for each of num_groups groups (group 順と各 group の名前 / 要素数は arch
 //   固有 — 各 trainer の `raw_ckpt_group_sources` を参照):
@@ -52,7 +55,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=10 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=11 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -130,6 +133,7 @@ pub(crate) const RAW_CKPT_VERSION: u32 = 11;
 
 /// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
 /// `lineage.parent_id` と、resume した run が続きか派生かの判定に使う。
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResumeProducer {
     pub(crate) run_id: Option<String>,
@@ -137,6 +141,7 @@ pub(crate) struct ResumeProducer {
     pub(crate) recipe_fingerprint: Option<u64>,
 }
 
+#[cfg(feature = "gpu")]
 impl RawCkptHeader {
     pub(crate) fn producer(&self) -> ResumeProducer {
         ResumeProducer {

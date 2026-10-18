@@ -266,10 +266,6 @@ pub struct ValidationStepOutput {
 // TrainerBackend — 1 batch 分の forward → loss → backward → optimizer step
 // =============================================================================
 
-/// 1 batch 分の training step を実行する backend。
-///
-/// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
-/// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 /// resume 用 checkpoint を書き出す学習 run の識別情報。
 #[derive(Debug, Clone, Copy)]
 pub struct CheckpointProducer<'a> {
@@ -292,6 +288,10 @@ impl<'a> CheckpointProducer<'a> {
     }
 }
 
+/// 1 batch 分の training step を実行する backend。
+///
+/// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
+/// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
     /// 1 batch 分 (forward → loss kernel → backward → optimizer step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
