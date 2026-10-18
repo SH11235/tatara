@@ -12,7 +12,9 @@ use nnue_train::dataloader::BucketMode;
 #[cfg(feature = "gpu")]
 use nnue_train::dataloader::{DualLabelMode, ScoreSource};
 #[cfg(feature = "gpu")]
-use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
+use nnue_train::experiment::{
+    DataInfo, ExperimentDoc, ExperimentLogger, Lineage, LineageKind, Params,
+};
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
 #[cfg(any(feature = "gpu", test))]
@@ -926,9 +928,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 保存済 LR horizon を決める。
     // rescore の fingerprint 用に、ロード時点で固定した artifact identity。
     let mut rescore_net_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
-    let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
+    let (resumed_superbatch, resume_producer, resumed_lr_horizon): (
         Option<usize>,
-        Option<String>,
+        Option<crate::ckpt::ResumeProducer>,
         Option<usize>,
     ) = if let Some(init) = &cli.init_from {
         println!(
@@ -998,7 +1000,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         } else {
             ckpt.clone()
         };
-        let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(&ckpt)?;
+        let (sb, producer, lr_horizon) = trainer.load_raw_checkpoint(&ckpt)?;
         if let Some(identity) = &rescore_net_identity {
             identity.verify_unchanged("--resume checkpoint")?;
         }
@@ -1007,14 +1009,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             ckpt.display(),
             sb + 1
         );
-        if parent_id.is_none() {
+        if producer.run_id.is_none() {
             println!(
                 "[train] note: {} predates producer run id embedding; \
                  experiment.json lineage.parent_id will be omitted",
                 ckpt.display()
             );
         }
-        (Some(sb), parent_id, lr_horizon)
+        (Some(sb), Some(producer), lr_horizon)
     } else {
         (None, None, None)
     };
@@ -1214,7 +1216,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         feature_set,
         start_superbatch,
         resumed_superbatch,
-        resume_parent_id,
+        resume_producer,
         data,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
@@ -1810,6 +1812,53 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
 /// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "gpu")]
+/// `--resume` した run の lineage。親 run の id は resume 元 `*.ckpt` (format version 3+)
+/// に埋め込まれたもので、version 1/2 の `*.ckpt` では省略される。続きか派生か
+/// (`kind`) は [`resolve_lineage_kind`] で決める。
+pub(crate) fn build_lineage(
+    cli: &Cli,
+    producer: Option<&crate::ckpt::ResumeProducer>,
+    resumed_from_superbatch: usize,
+    params: &Params,
+    data_info: &DataInfo,
+) -> Option<Lineage> {
+    let ckpt = cli.resume.as_ref()?;
+    let recipe = nnue_train::experiment::recipe_fingerprint(params, &data_info.name);
+    Some(Lineage {
+        parent_id: producer.and_then(|p| p.run_id.clone()),
+        resumed_from_checkpoint: file_basename(ckpt),
+        resumed_from_superbatch,
+        kind: resolve_lineage_kind(
+            cli.lineage_kind.map(Into::into),
+            producer,
+            &cli.net_id,
+            recipe,
+        ),
+    })
+}
+
+/// resume した run が親の続きか派生か。指定があればそれを使い、無ければ親 checkpoint の
+/// net id とレシピの指紋が今回の run と一致するかで決める。親 checkpoint がどちらかを
+/// 記録していなければ (format version 10 以前) 判定せず `None`。
+pub(crate) fn resolve_lineage_kind(
+    requested: Option<LineageKind>,
+    producer: Option<&crate::ckpt::ResumeProducer>,
+    net_id: &str,
+    recipe_fingerprint: u64,
+) -> Option<LineageKind> {
+    if requested.is_some() {
+        return requested;
+    }
+    let producer = producer?;
+    let same_net = producer.net_id.as_deref()? == net_id;
+    let same_recipe = producer.recipe_fingerprint? == recipe_fingerprint;
+    Some(if same_net && same_recipe {
+        LineageKind::Resume
+    } else {
+        LineageKind::Fork
+    })
+}
+
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
@@ -1818,7 +1867,7 @@ pub(crate) fn build_experiment_logger(
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
-    resume_parent_id: Option<String>,
+    resume_producer: Option<crate::ckpt::ResumeProducer>,
     data: &Path,
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
@@ -1841,15 +1890,6 @@ pub(crate) fn build_experiment_logger(
         } else {
             cli.net_id.clone()
         }
-    });
-
-    let lineage = cli.resume.as_ref().map(|ckpt| Lineage {
-        // resume 元 `*.ckpt` (format version 3+) に埋め込まれた親 run の
-        // experiment.json `id`。version 1/2 の `*.ckpt` には無く `None` になり、
-        // その resume run の lineage は checkpoint 参照のみになる。
-        parent_id: resume_parent_id.clone(),
-        resumed_from_checkpoint: file_basename(ckpt),
-        resumed_from_superbatch: resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
     });
 
     let is_wrm = cli.win_rate_model;
@@ -1960,6 +2000,13 @@ pub(crate) fn build_experiment_logger(
     };
 
     let data_info = build_data_info(cli, data);
+    let lineage = build_lineage(
+        cli,
+        resume_producer.as_ref(),
+        resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
+        &params,
+        &data_info,
+    );
 
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     let json_path = cli.output.join("experiments").join(format!("{id}.json"));
@@ -2013,7 +2060,7 @@ pub(crate) fn build_experiment_logger_simple(
     id: SimpleId,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
-    resume_parent_id: Option<String>,
+    resume_producer: Option<crate::ckpt::ResumeProducer>,
     data: &Path,
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
@@ -2039,12 +2086,6 @@ pub(crate) fn build_experiment_logger_simple(
         } else {
             cli.net_id.clone()
         }
-    });
-
-    let lineage = cli.resume.as_ref().map(|ckpt| Lineage {
-        parent_id: resume_parent_id.clone(),
-        resumed_from_checkpoint: file_basename(ckpt),
-        resumed_from_superbatch: resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
     });
 
     let architecture = format!(
@@ -2138,6 +2179,13 @@ pub(crate) fn build_experiment_logger_simple(
     };
 
     let data_info = build_data_info(cli, data);
+    let lineage = build_lineage(
+        cli,
+        resume_producer.as_ref(),
+        resumed_superbatch.unwrap_or(start_superbatch.saturating_sub(1)),
+        &params,
+        &data_info,
+    );
 
     let command = std::env::args().collect::<Vec<_>>().join(" ");
     let json_path = cli
@@ -2377,9 +2425,9 @@ pub(crate) fn run_simple_training(
     })?;
     trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
 
-    let (resumed_superbatch, resume_parent_id, resumed_lr_horizon, checkpoint_fv_scale): (
+    let (resumed_superbatch, resume_producer, resumed_lr_horizon, checkpoint_fv_scale): (
         Option<usize>,
-        Option<String>,
+        Option<crate::ckpt::ResumeProducer>,
         Option<usize>,
         Option<i32>,
     ) = if let Some(init) = &cli.init_from {
@@ -2392,13 +2440,13 @@ pub(crate) fn run_simple_training(
         trainer.load_simple_weights(&weights)?;
         (None, None, None, None)
     } else if let Some(ckpt) = &cli.resume {
-        let (sb, parent_id, lr_horizon, fv_scale) = trainer.load_raw_checkpoint(ckpt)?;
+        let (sb, producer, lr_horizon, fv_scale) = trainer.load_raw_checkpoint(ckpt)?;
         println!(
             "[train] resuming from {} at superbatch {}",
             ckpt.display(),
             sb + 1
         );
-        (Some(sb), parent_id, lr_horizon, fv_scale)
+        (Some(sb), Some(producer), lr_horizon, fv_scale)
     } else {
         (None, None, None, None)
     };
@@ -2481,7 +2529,7 @@ pub(crate) fn run_simple_training(
         id,
         start_superbatch,
         resumed_superbatch,
-        resume_parent_id,
+        resume_producer,
         data,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
@@ -2979,5 +3027,58 @@ mod tests {
         assert!(!m2.contains("smaller `--threat-profile`"));
         assert!(m2.contains("lower `--l1`"));
         assert!(m2.contains("smaller `--batch-size`"));
+    }
+
+    fn producer(net_id: Option<&str>, fingerprint: Option<u64>) -> crate::ckpt::ResumeProducer {
+        crate::ckpt::ResumeProducer {
+            run_id: Some("run-a".to_string()),
+            net_id: net_id.map(str::to_string),
+            recipe_fingerprint: fingerprint,
+        }
+    }
+
+    #[test]
+    fn lineage_kind_follows_net_id_and_recipe() {
+        let same = producer(Some("net-a"), Some(7));
+        assert_eq!(
+            resolve_lineage_kind(None, Some(&same), "net-a", 7),
+            Some(LineageKind::Resume)
+        );
+        assert_eq!(
+            resolve_lineage_kind(None, Some(&same), "net-b", 7),
+            Some(LineageKind::Fork)
+        );
+        assert_eq!(
+            resolve_lineage_kind(None, Some(&same), "net-a", 8),
+            Some(LineageKind::Fork)
+        );
+    }
+
+    #[test]
+    fn lineage_kind_is_unknown_for_old_checkpoints_unless_requested() {
+        let legacy = producer(None, None);
+        assert_eq!(resolve_lineage_kind(None, Some(&legacy), "net-a", 7), None);
+        assert_eq!(resolve_lineage_kind(None, None, "net-a", 7), None);
+        assert_eq!(
+            resolve_lineage_kind(
+                Some(LineageKind::Fork),
+                Some(&producer(Some("net-a"), Some(7))),
+                "net-a",
+                7
+            ),
+            Some(LineageKind::Fork)
+        );
+        assert_eq!(
+            resolve_lineage_kind(Some(LineageKind::Resume), Some(&legacy), "net-a", 7),
+            Some(LineageKind::Resume)
+        );
+    }
+
+    #[test]
+    fn lineage_kind_flag_requires_resume() {
+        let argv = ["nnue-trainer", "--lineage-kind", "fork", "layerstack"];
+        assert!(Cli::try_parse_from(argv).is_err());
+        let cli = parse(&["--resume", "net-a-420.ckpt", "--lineage-kind", "fork"]);
+        assert_eq!(cli.lineage_kind, Some(crate::cli::LineageKindArg::Fork));
     }
 }

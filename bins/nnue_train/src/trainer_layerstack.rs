@@ -130,7 +130,7 @@ use nnue_format::LayerStackWeights;
 use nnue_train::dataloader::BucketMode;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::OptimizerKind;
-use nnue_train::trainer::LossKind;
+use nnue_train::trainer::{CheckpointProducer, LossKind};
 use shogi_features::FeatureSetSpec;
 
 use crate::ft_factorize_host::{self, FoldComb};
@@ -1915,7 +1915,7 @@ impl GpuTrainer {
         &self,
         path: &Path,
         superbatch: usize,
-        run_id: &str,
+        producer: &CheckpointProducer,
         lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // forward-only trainer の optimizer state は 0-byte のため、resume 可能な
@@ -1947,7 +1947,9 @@ impl GpuTrainer {
             },
             &RawCkptMeta {
                 qat_dense: self.qat_mode == crate::qat::QatMode::Dense,
-                run_id,
+                run_id: producer.run_id,
+                net_id: producer.net_id,
+                recipe_fingerprint: producer.recipe_fingerprint,
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
@@ -2087,7 +2089,7 @@ impl GpuTrainer {
 
         self.step_count = header.step_count;
         self.sync_stack_forward_weights()?;
-        Ok((header.superbatch, header.producer_run_id, header.lr_horizon))
+        Ok((header.superbatch, header.producer(), header.lr_horizon))
     }
 
     /// 全 weight buffer を host に読み出して NaN/Inf がないことを assert する smoke 用 helper。

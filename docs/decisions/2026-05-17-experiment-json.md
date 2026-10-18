@@ -93,7 +93,8 @@ producer 自身の version は `generator.version` が別に持つ。
   "lineage": {                        // ※5  --resume した run のみ
     "parent_id": "rshogi-20260516t221000z-31002",
     "resumed_from_checkpoint": "rshogi-200.ckpt",
-    "resumed_from_superbatch": 200
+    "resumed_from_superbatch": 200,
+    "kind": "resume"                  // "resume" (続き) / "fork" (派生)。判定できなければ省略
   },
 
   "params": {                         // passthrough — 未知キーも保持される

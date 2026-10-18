@@ -370,10 +370,10 @@ macro_rules! trainer_backend_impl {
                 &mut self,
                 path: &std::path::Path,
                 superbatch: usize,
-                run_id: &str,
+                producer: &nnue_train::trainer::CheckpointProducer,
                 lr_horizon: Option<usize>,
             ) -> std::io::Result<()> {
-                self.save_raw_checkpoint(path, superbatch, run_id, lr_horizon)
+                self.save_raw_checkpoint(path, superbatch, producer, lr_horizon)
                     // `io::Error` は downcast して `ErrorKind` を保持したまま返す。
                     .map_err(|e| match e.downcast::<std::io::Error>() {
                         Ok(io_err) => *io_err,

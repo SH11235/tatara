@@ -5837,7 +5837,12 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
         "layerstack-roundtrip-{suffix}-{}.ckpt",
         std::process::id()
     ));
-    saver.save_raw_checkpoint(&path, 3, "roundtrip-test", Some(42))?;
+    saver.save_raw_checkpoint(
+        &path,
+        3,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("roundtrip-test"),
+        Some(42),
+    )?;
 
     let mut loader = new_trainer()?;
     let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
@@ -5877,7 +5882,12 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
         "layerstack-roundtrip-{suffix}-resave-{}.ckpt",
         std::process::id()
     ));
-    loader.save_raw_checkpoint(&path2, 3, "roundtrip-test", Some(42))?;
+    loader.save_raw_checkpoint(
+        &path2,
+        3,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("roundtrip-test"),
+        Some(42),
+    )?;
     let bytes1 = std::fs::read(&path)?;
     let bytes2 = std::fs::read(&path2)?;
     let _ = std::fs::remove_file(&path);
@@ -6095,8 +6105,18 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
     let dir = std::env::temp_dir();
     let fac_path = dir.join(format!("simple-fac-{}.ckpt", std::process::id()));
     let base_path = dir.join(format!("simple-base-{}.ckpt", std::process::id()));
-    mk(fac_id)?.save_raw_checkpoint(&fac_path, 1, "t", None)?;
-    mk(base_id)?.save_raw_checkpoint(&base_path, 1, "t", None)?;
+    mk(fac_id)?.save_raw_checkpoint(
+        &fac_path,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("t"),
+        None,
+    )?;
+    mk(base_id)?.save_raw_checkpoint(
+        &base_path,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("t"),
+        None,
+    )?;
 
     // factorize checkpoint を非 factorize trainer に load → reject。
     assert!(

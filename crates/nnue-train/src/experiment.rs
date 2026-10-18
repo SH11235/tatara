@@ -63,6 +63,16 @@ impl Generator {
     }
 }
 
+/// resume した run が親 run の続きか、親から派生した別の実験か。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineageKind {
+    /// 同じ学習の続き (中断からの再開や、総 superbatch 数を延ばした継続)。
+    Resume,
+    /// 親の checkpoint から設定を変えて始めた別の実験。
+    Fork,
+}
+
 /// resume した run が持つ、親 run / resume 元 checkpoint への参照。
 #[derive(Debug, Clone, Serialize)]
 pub struct Lineage {
@@ -73,6 +83,54 @@ pub struct Lineage {
     pub resumed_from_checkpoint: String,
     /// resume 元 checkpoint が表す完了 superbatch。
     pub resumed_from_superbatch: usize,
+    /// 親の続きか派生か。`--lineage-kind` の指定、無ければ親 checkpoint の net id と
+    /// レシピの指紋との比較で決める。親 checkpoint が指紋を持たない (version 10 以前)
+    /// うえ指定も無ければ省略する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<LineageKind>,
+}
+
+/// レシピの指紋から除く params の key。resume で変わるのが当然の値 (総 superbatch 数・開始位置・
+/// 初期化指定・horizon を含む schedule 表記) と、学習結果を変えない実行環境 (build・backend・
+/// スレッド数・読み込みバッファ・検証データ) の設定。
+const NON_RECIPE_PARAMS: &[&str] = &[
+    "superbatches",
+    "start_superbatch",
+    "init_from",
+    "init_preset",
+    "lr_schedule",
+    "trainer_build",
+    "trainer_backend",
+    "threads",
+    "teacher_shuffle_buffer_mib",
+    "test_data",
+    "test_positions",
+    "test_tail_positions",
+];
+
+/// 学習のレシピ (params から `NON_RECIPE_PARAMS` を除いたものと教師データ名) の指紋。
+/// resume 元 checkpoint に埋め込み、resume した run が同じレシピの続きかを判定するのに使う。
+/// key を整列した JSON の FNV-1a 64 で、値は版をまたいで比較するので計算方法を変えない。
+pub fn recipe_fingerprint(params: &Params, data_name: &str) -> u64 {
+    let value = serde_json::to_value(params).expect("Params serializes to JSON");
+    let mut recipe: std::collections::BTreeMap<String, serde_json::Value> = match value {
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .filter(|(key, _)| !NON_RECIPE_PARAMS.contains(&key.as_str()))
+            .collect(),
+        _ => std::collections::BTreeMap::new(),
+    };
+    recipe.insert(
+        "data".to_string(),
+        serde_json::Value::String(data_name.to_string()),
+    );
+    let canonical = serde_json::to_string(&recipe).expect("recipe serializes to JSON");
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
@@ -431,6 +489,11 @@ impl ExperimentLogger {
         &self.doc.id
     }
 
+    /// この run のレシピの指紋 ([`recipe_fingerprint`])。
+    pub fn recipe_fingerprint(&self) -> u64 {
+        recipe_fingerprint(&self.doc.params, &self.doc.data.name)
+    }
+
     /// 書き込み先 path。
     pub fn path(&self) -> &Path {
         &self.path
@@ -637,6 +700,43 @@ mod tests {
         let results = serde_json::to_value(&doc.results).expect("serialise results");
         assert!(results.get("fv_scale").is_some());
         assert!(results["fv_scale"].is_null());
+    }
+
+    #[test]
+    fn recipe_fingerprint_ignores_resume_and_environment_settings() {
+        let base = sample_params();
+        let fingerprint = recipe_fingerprint(&base, "teacher.psv");
+
+        let mut extended = sample_params();
+        extended.superbatches += 800;
+        extended.start_superbatch = 421;
+        extended.init_preset = Some("overrides: ft".to_string());
+        extended.lr_schedule = "different horizon".to_string();
+        extended.threads += 8;
+        extended.trainer_backend = Some("native".to_string());
+        assert_eq!(recipe_fingerprint(&extended, "teacher.psv"), fingerprint);
+
+        let mut changed = sample_params();
+        changed.qat = "dense".to_string();
+        assert_ne!(recipe_fingerprint(&changed, "teacher.psv"), fingerprint);
+        let mut changed_lr = sample_params();
+        changed_lr.lr *= 0.5;
+        assert_ne!(recipe_fingerprint(&changed_lr, "teacher.psv"), fingerprint);
+        assert_ne!(recipe_fingerprint(&base, "other.psv"), fingerprint);
+    }
+
+    #[test]
+    fn lineage_kind_serializes_lowercase_and_is_omitted_when_unknown() {
+        let lineage = |kind| Lineage {
+            parent_id: None,
+            resumed_from_checkpoint: "net-420.ckpt".to_string(),
+            resumed_from_superbatch: 420,
+            kind,
+        };
+        let json = serde_json::to_value(lineage(Some(LineageKind::Fork))).unwrap();
+        assert_eq!(json["kind"], "fork");
+        let json = serde_json::to_value(lineage(None)).unwrap();
+        assert!(json.get("kind").is_none());
     }
 
     fn sample_params() -> Params {

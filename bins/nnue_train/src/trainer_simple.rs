@@ -4,7 +4,7 @@ use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfi
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{self, SimpleInit, WeightShape};
 use nnue_train::optimizer::OptimizerKind;
-use nnue_train::trainer::LossKind;
+use nnue_train::trainer::{CheckpointProducer, LossKind};
 
 use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
@@ -2883,7 +2883,7 @@ impl SimpleGpuTrainer {
         &self,
         path: &Path,
         superbatch: usize,
-        run_id: &str,
+        producer: &CheckpointProducer,
         lr_horizon: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let topology: [u64; 3] = [
@@ -2903,7 +2903,9 @@ impl SimpleGpuTrainer {
             },
             &RawCkptMeta {
                 qat_dense: false,
-                run_id,
+                run_id: producer.run_id,
+                net_id: producer.net_id,
+                recipe_fingerprint: producer.recipe_fingerprint,
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
@@ -2979,7 +2981,7 @@ impl SimpleGpuTrainer {
         self.step_count = header.step_count;
         Ok((
             header.superbatch,
-            header.producer_run_id,
+            header.producer(),
             header.lr_horizon,
             header.fv_scale,
         ))

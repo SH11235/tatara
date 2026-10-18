@@ -739,7 +739,12 @@ fn forward_only_validate_matches_training_trainer() -> Result<(), Box<dyn std::e
         std::process::id()
     ));
     let save_err = forward_only
-        .save_raw_checkpoint(&ckpt_path, 1, "forward-only-test", None)
+        .save_raw_checkpoint(
+            &ckpt_path,
+            1,
+            &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-test"),
+            None,
+        )
         .expect_err("save_raw_checkpoint must be rejected on a forward-only trainer");
     assert!(save_err.to_string().contains("forward-only"), "{save_err}");
     Ok(())
@@ -826,7 +831,12 @@ fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std:
         "tatara-forward-only-resume-{}.ckpt",
         std::process::id()
     ));
-    control.save_raw_checkpoint(&path, 1, "forward-only-resume", None)?;
+    control.save_raw_checkpoint(
+        &path,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-resume"),
+        None,
+    )?;
 
     let mut forward_only =
         create_layerstack_trainer_forward_only(&context, true, LayerStackTestOptions::standard())?;
@@ -1077,7 +1087,12 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
             "tatara-forward-only-factorize-{name}-{}.ckpt",
             std::process::id()
         ));
-        control.save_raw_checkpoint(&path, 1, "forward-only-factorize", None)?;
+        control.save_raw_checkpoint(
+            &path,
+            1,
+            &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-factorize"),
+            None,
+        )?;
 
         let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
         forward_only.load_raw_checkpoint(&path)?;

@@ -113,14 +113,39 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `10`: a u32 QAT mode follows fv_scale: 0 = off, 1 = dense LayerStack.
 ///   Earlier versions imply off. Unknown modes and dense Simple files are rejected.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=10. Version 1 is interpreted as
+/// - `11`: the producer net id (length-prefixed UTF-8, empty = not recorded) and
+///   a `u64` recipe fingerprint (`0` = not recorded) follow the QAT mode.
+///   `--resume` compares them with the resuming run to record whether it
+///   continues the producer's training or forks a new experiment from it.
+///
+/// `load_raw_checkpoint` accepts versions 1..=11. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 10 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 11 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
-/// is absent (`None`) for versions 1..=8.
-pub(crate) const RAW_CKPT_VERSION: u32 = 10;
+/// is absent (`None`) for versions 1..=8; the producer net id and recipe
+/// fingerprint are absent (`None`) for versions 1..=10.
+pub(crate) const RAW_CKPT_VERSION: u32 = 11;
+
+/// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
+/// `lineage.parent_id` と、resume した run が続きか派生かの判定に使う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResumeProducer {
+    pub(crate) run_id: Option<String>,
+    pub(crate) net_id: Option<String>,
+    pub(crate) recipe_fingerprint: Option<u64>,
+}
+
+impl RawCkptHeader {
+    pub(crate) fn producer(&self) -> ResumeProducer {
+        ResumeProducer {
+            run_id: self.producer_run_id.clone(),
+            net_id: self.producer_net_id.clone(),
+            recipe_fingerprint: self.producer_recipe_fingerprint,
+        }
+    }
+}
 
 /// `*.ckpt` の producer run id のバイト数上限。run id は `{net_id}-{時刻}-{pid}`
 /// 程度で高々数十バイト。破損 file の巨大な length 値で過大確保しないための上限。
@@ -130,15 +155,15 @@ pub(crate) const MAX_RUN_ID_BYTES: usize = 256;
 #[cfg(feature = "gpu")]
 pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
-/// LayerStack の `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer run id,
+/// LayerStack の `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer の識別情報,
 /// LR-schedule horizon)`。caller は superbatch+1 から resume し、horizon を
 /// `build_lr_scheduler` に渡す。
 #[cfg(feature = "gpu")]
-pub(crate) type RawCkptResumeState = (usize, Option<String>, Option<usize>);
+pub(crate) type RawCkptResumeState = (usize, ResumeProducer, Option<usize>);
 
 /// Simple raw checkpoint の resume metadata。末尾は保存済み `fv_scale`。
 #[cfg(feature = "gpu")]
-pub(crate) type SimpleRawCkptResumeState = (usize, Option<String>, Option<usize>, Option<i32>);
+pub(crate) type SimpleRawCkptResumeState = (usize, ResumeProducer, Option<usize>, Option<i32>);
 
 /// raw checkpoint 1 group 分の device-side 参照。weight name + 要素数 +
 /// `(w, m, v, slow)` device buffer の借用。trainer が format の group 順に並べた
@@ -266,6 +291,10 @@ pub(crate) struct RawCkptMeta<'a> {
     pub(crate) lr_horizon: Option<usize>,
     /// Simple の export に使う実効 evaluation scale。LayerStack は `None`。
     pub(crate) fv_scale: Option<i32>,
+    /// この checkpoint を書き出す run の net id。空文字列は「未記録」。
+    pub(crate) net_id: &'a str,
+    /// この checkpoint を書き出す run のレシピの指紋。実験ログが無ければ `None`。
+    pub(crate) recipe_fingerprint: Option<u64>,
 }
 
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
@@ -285,6 +314,10 @@ pub(crate) struct RawCkptHeader {
     pub(crate) lr_horizon: Option<usize>,
     /// Simple の実効 evaluation scale。version 1..=8 または未記録なら `None`。
     pub(crate) fv_scale: Option<i32>,
+    /// producer run の net id (version 11+ かつ記録ありなら `Some`)。
+    pub(crate) producer_net_id: Option<String>,
+    /// producer run のレシピの指紋 (version 11+ かつ記録ありなら `Some`)。
+    pub(crate) producer_recipe_fingerprint: Option<u64>,
 }
 
 /// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
@@ -330,6 +363,16 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     // Simple evaluation scale (v9+)。0 = 未記録。
     w.write_all(&meta.fv_scale.unwrap_or(0).to_le_bytes())?;
     w.write_all(&u32::from(meta.qat_dense).to_le_bytes())?;
+    // producer net id + recipe fingerprint (v11+)。過長な net id は lineage の判定材料に
+    // すぎないので、埋め込みを省略して保存は続ける。
+    let net_id = if meta.net_id.len() > MAX_RUN_ID_BYTES {
+        ""
+    } else {
+        meta.net_id
+    };
+    w.write_all(&(net_id.len() as u32).to_le_bytes())?;
+    w.write_all(net_id.as_bytes())?;
+    w.write_all(&meta.recipe_fingerprint.unwrap_or(0).to_le_bytes())?;
     w.write_all(&num_groups.to_le_bytes())?;
     Ok(())
 }
@@ -643,6 +686,31 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     } else {
         false
     };
+
+    // producer net id + recipe fingerprint は version 11+。空 / 0 は「未記録」で `None`。
+    let (producer_net_id, producer_recipe_fingerprint) = if version >= 11 {
+        read_exact_or_invalid(r, &mut buf4, "producer net id length")?;
+        let net_id_len = u32::from_le_bytes(buf4) as usize;
+        if net_id_len > MAX_RUN_ID_BYTES {
+            return Err(invalid_data(format!(
+                "raw checkpoint producer net id length {net_id_len} is implausible \
+                 (max {MAX_RUN_ID_BYTES})"
+            )));
+        }
+        let mut net_id_bytes = vec![0u8; net_id_len];
+        read_exact_or_invalid(r, &mut net_id_bytes, "producer net id")?;
+        let net_id = String::from_utf8(net_id_bytes).map_err(|_| {
+            invalid_data("raw checkpoint producer net id is not valid UTF-8".to_string())
+        })?;
+        read_exact_or_invalid(r, &mut buf8, "recipe fingerprint")?;
+        let fingerprint = u64::from_le_bytes(buf8);
+        (
+            (!net_id.is_empty()).then_some(net_id),
+            (fingerprint != 0).then_some(fingerprint),
+        )
+    } else {
+        (None, None)
+    };
     read_exact_or_invalid(r, &mut buf8, "num_groups")?;
     let num_groups = u64::from_le_bytes(buf8);
 
@@ -654,6 +722,8 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         producer_run_id,
         lr_horizon,
         fv_scale,
+        producer_net_id,
+        producer_recipe_fingerprint,
     })
 }
 

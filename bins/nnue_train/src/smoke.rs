@@ -223,7 +223,12 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     // raw f32 checkpoint round-trip: save -> 新 trainer で load -> 同 batch で forward。
     // raw checkpoint は f32 を bit-identical に保つので loss は完全一致するはず。
     let raw_path = std::env::temp_dir().join(format!("simple-smoke-{}.ckpt", std::process::id()));
-    trainer.save_raw_checkpoint(&raw_path, 1, "smoke", None)?;
+    trainer.save_raw_checkpoint(
+        &raw_path,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("smoke"),
+        None,
+    )?;
     let mut trainer_r = SimpleGpuTrainer::new(
         &ctx,
         SMOKE_BATCH,
