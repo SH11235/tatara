@@ -1808,13 +1808,10 @@ pub(crate) fn build_simple_init_spec(cli: &Cli) -> Result<SimpleInit, Box<dyn st
     Ok(spec)
 }
 
-/// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
-/// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "gpu")]
 /// `--resume` した run の lineage。親 run の id は resume 元 `*.ckpt` (format version 3+)
 /// に埋め込まれたもので、version 1/2 の `*.ckpt` では省略される。続きか派生か
 /// (`kind`) は [`resolve_lineage_kind`] で決める。
+#[cfg(feature = "gpu")]
 pub(crate) fn build_lineage(
     cli: &Cli,
     producer: Option<&crate::ckpt::ResumeProducer>,
@@ -1840,6 +1837,7 @@ pub(crate) fn build_lineage(
 /// resume した run が親の続きか派生か。指定があればそれを使い、無ければ親 checkpoint の
 /// net id とレシピの指紋が今回の run と一致するかで決める。親 checkpoint がどちらかを
 /// 記録していなければ (format version 10 以前) 判定せず `None`。
+#[cfg(feature = "gpu")]
 pub(crate) fn resolve_lineage_kind(
     requested: Option<LineageKind>,
     producer: Option<&crate::ckpt::ResumeProducer>,
@@ -1859,6 +1857,10 @@ pub(crate) fn resolve_lineage_kind(
     })
 }
 
+/// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
+/// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
     layerstack: &LayerstackArgs,
