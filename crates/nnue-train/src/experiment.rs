@@ -95,7 +95,8 @@ pub struct Lineage {
 /// 外部の検証データとその WDL)。shuffle の窓サイズは既定 (`auto`) ではホストのメモリ量から
 /// 決まり、同じ再開でも機械によって値が変わる一方、変わるのは窓の中の局面の順序だけなので除く。
 /// LR schedule の表記は resume で checkpoint の horizon が復元されるので、同じレシピの続きなら
-/// 変わらず、指紋に残す。
+/// 変わらず、指紋に残す。`lr_gamma` / `lr_step` は効く schedule (step / drop) では表記に現れ、
+/// それ以外では学習に効かないので除く。
 const NON_RECIPE_PARAMS: &[&str] = &[
     "superbatches",
     "start_superbatch",
@@ -104,6 +105,8 @@ const NON_RECIPE_PARAMS: &[&str] = &[
     "trainer_build",
     "trainer_backend",
     "threads",
+    "lr_gamma",
+    "lr_step",
     "teacher_shuffle_buffer_mib",
     "test_data",
     "test_positions",
@@ -728,6 +731,8 @@ mod tests {
         extended.trainer_backend = Some("native".to_string());
         extended.validation_wdl = Some(0.25);
         extended.teacher_shuffle_buffer_mib += 256;
+        extended.lr_gamma = 0.5;
+        extended.lr_step += 3;
         assert_eq!(recipe_fingerprint(&extended, "teacher.psv"), fingerprint);
 
         let mut schedule = sample_params();
@@ -788,7 +793,7 @@ mod tests {
         assert!(json.get("kind").is_none());
     }
 
-    const RECIPE_FINGERPRINT_PIN: u64 = 8_836_379_816_406_004_536;
+    const RECIPE_FINGERPRINT_PIN: u64 = 9_919_731_180_111_153_735;
 
     fn sample_params() -> Params {
         Params {

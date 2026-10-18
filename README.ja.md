@@ -182,6 +182,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **WRM** | Win-rate model loss (bullet `--win-rate-model` 由来) |
 | **QA / QB / FV_SCALE** | 量子化スケール定数。QA = FT weight / bias の量子化 multiplier (`simple` アーキでは活性化で決まる: CReLU / Pairwise は 127、SCReLU は 255)、QB = dense weight の scale (64)。FV_SCALE は net 出力を centipawn 評価値へ戻す係数。`simple` の活性化出力は常に 127-scale のため、既定値は `round(127 × QB / 学習 scale)`。`--fv-scale` で上書きでき、省略時は v9 以降の resume checkpoint、次に `--init-from` の入力 net から値を引き継ぐ |
 | **WDL** | Win/Draw/Loss — 対局結果ターゲット (1.0 / 0.5 / 0.0)。WDL lambda で教師 score と blend する。[docs/training-schedule.ja.md](docs/training-schedule.ja.md) を参照 |
+| **FNV-1a** | Fowler–Noll–Vo hash の 1a 版。暗号用途ではない簡単なハッシュで、学習器は resume 用 checkpoint に保存するレシピの指紋に 64 bit 版を使う |
 | **SPRT** | Sequential Probability Ratio Test — 2 つの net を対局させ棋力差を逐次検定する手法。学習済 net の品質確認に使う |
 | **superbatch** | bullet 用語で「複数 batch を 1 単位として lr/wdl scheduler を進める」単位 |
 | **PTX** | Parallel Thread Execution — NVIDIA GPU 向け仮想 ISA。CUDA C++ / Rust → PTX (`.ptx` テキスト) → CUDA driver の JIT が SASS (実機機械語) に compile して実行。世代非依存に配布可 (sm_80 向け PTX を sm_86/89/90 が forward-compat で実行できる)。`docs/setup.ja.md` のサポート GPU マトリクス参照 |

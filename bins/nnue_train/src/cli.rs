@@ -509,7 +509,9 @@ pub(crate) struct Cli {
     /// superbatch count (unless a WDL schedule ends at it), the start
     /// superbatch, initialisation, and settings that do not change the
     /// training data or how it is learned (build, backend, threads, the
-    /// shuffle window size, external validation data and its WDL).
+    /// shuffle window size, external validation data and its WDL, and the LR
+    /// gamma / step, which the recorded LR schedule already covers whenever
+    /// they apply).
     /// Checkpoints written before this was recorded leave it out unless
     /// this option is given.
     #[arg(long, global = true, requires = "resume")]
