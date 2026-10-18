@@ -5847,7 +5847,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
     let mut loader = new_trainer()?;
     let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
     assert_eq!(superbatch, 3);
-    assert_eq!(producer.as_deref(), Some("roundtrip-test"));
+    assert_eq!(producer.run_id.as_deref(), Some("roundtrip-test"));
     assert_eq!(lr_horizon, Some(42));
 
     // 全 group (PSQT 有効時は psqt_w 含む 11、無効時 10) の w/m/v/slow が bit 一致。

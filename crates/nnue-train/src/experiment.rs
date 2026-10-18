@@ -91,21 +91,20 @@ pub struct Lineage {
 }
 
 /// レシピの指紋から除く params の key。resume で変わるのが当然の値 (総 superbatch 数・開始位置・
-/// 初期化指定・horizon を含む schedule 表記) と、学習結果を変えない実行環境 (build・backend・
-/// スレッド数・読み込みバッファ・検証データ) の設定。
+/// 初期化指定) と、学習に使う局面・重み更新を変えない設定 (build・backend・スレッド数・
+/// 外部の検証データとその WDL)。LR schedule の表記は resume で checkpoint の horizon が復元
+/// されるので、同じレシピの続きなら変わらず、指紋に残す。
 const NON_RECIPE_PARAMS: &[&str] = &[
     "superbatches",
     "start_superbatch",
     "init_from",
     "init_preset",
-    "lr_schedule",
     "trainer_build",
     "trainer_backend",
     "threads",
-    "teacher_shuffle_buffer_mib",
     "test_data",
     "test_positions",
-    "test_tail_positions",
+    "validation_wdl",
 ];
 
 /// 学習のレシピ (params から `NON_RECIPE_PARAMS` を除いたものと教師データ名) の指紋。
@@ -124,6 +123,17 @@ pub fn recipe_fingerprint(params: &Params, data_name: &str) -> u64 {
         "data".to_string(),
         serde_json::Value::String(data_name.to_string()),
     );
+    // WDL の taper / cycle は、horizon (`wdl_schedule_superbatch`) を指定しなければ総 superbatch
+    // 数を終端に使う。その場合は総 superbatch 数を延ばすと同じ superbatch の WDL が変わるので、
+    // 終端として指紋に含める。
+    let wdl_scheduled =
+        params.start_wdl.is_some() || params.end_wdl.is_some() || params.wdl_cycle_delta.is_some();
+    if wdl_scheduled && params.wdl_schedule_superbatch.is_none() {
+        recipe.insert(
+            "wdl_horizon".to_string(),
+            serde_json::Value::from(params.superbatches),
+        );
+    }
     let canonical = serde_json::to_string(&recipe).expect("recipe serializes to JSON");
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in canonical.as_bytes() {
@@ -711,10 +721,20 @@ mod tests {
         extended.superbatches += 800;
         extended.start_superbatch = 421;
         extended.init_preset = Some("overrides: ft".to_string());
-        extended.lr_schedule = "different horizon".to_string();
         extended.threads += 8;
         extended.trainer_backend = Some("native".to_string());
+        extended.validation_wdl = Some(0.25);
         assert_eq!(recipe_fingerprint(&extended, "teacher.psv"), fingerprint);
+
+        let mut schedule = sample_params();
+        schedule.lr_schedule = "constant".to_string();
+        assert_ne!(recipe_fingerprint(&schedule, "teacher.psv"), fingerprint);
+        let mut shuffle = sample_params();
+        shuffle.teacher_shuffle_buffer_mib += 256;
+        assert_ne!(recipe_fingerprint(&shuffle, "teacher.psv"), fingerprint);
+        let mut holdout = sample_params();
+        holdout.test_tail_positions = Some(10_000);
+        assert_ne!(recipe_fingerprint(&holdout, "teacher.psv"), fingerprint);
 
         let mut changed = sample_params();
         changed.qat = "dense".to_string();
@@ -723,6 +743,34 @@ mod tests {
         changed_lr.lr *= 0.5;
         assert_ne!(recipe_fingerprint(&changed_lr, "teacher.psv"), fingerprint);
         assert_ne!(recipe_fingerprint(&base, "other.psv"), fingerprint);
+    }
+
+    #[test]
+    fn recipe_fingerprint_counts_the_superbatch_count_as_the_wdl_horizon() {
+        let mut taper = sample_params();
+        taper.start_wdl = Some(0.0);
+        taper.end_wdl = Some(1.0);
+        taper.wdl_schedule_superbatch = None;
+        let fingerprint = recipe_fingerprint(&taper, "teacher.psv");
+        let mut longer = taper.clone();
+        longer.superbatches += 800;
+        assert_ne!(recipe_fingerprint(&longer, "teacher.psv"), fingerprint);
+
+        taper.wdl_schedule_superbatch = Some(400);
+        longer.wdl_schedule_superbatch = Some(400);
+        assert_eq!(
+            recipe_fingerprint(&longer, "teacher.psv"),
+            recipe_fingerprint(&taper, "teacher.psv")
+        );
+    }
+
+    /// 指紋は checkpoint に保存して版をまたいで比較するので、計算方法が変わったら検出する。
+    #[test]
+    fn recipe_fingerprint_is_stable() {
+        assert_eq!(
+            recipe_fingerprint(&sample_params(), "teacher.psv"),
+            RECIPE_FINGERPRINT_PIN
+        );
     }
 
     #[test]
@@ -738,6 +786,8 @@ mod tests {
         let json = serde_json::to_value(lineage(None)).unwrap();
         assert!(json.get("kind").is_none());
     }
+
+    const RECIPE_FINGERPRINT_PIN: u64 = 14_472_493_478_800_421_797;
 
     fn sample_params() -> Params {
         Params {
