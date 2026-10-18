@@ -504,11 +504,13 @@ pub(crate) struct Cli {
     /// With `--resume`, record in experiment.json whether this run continues the
     /// checkpoint's training (`resume`) or starts a new experiment from it
     /// (`fork`). When omitted, it is `resume` if the net id and the training
-    /// recipe (parameters other than the superbatch count, the start position,
-    /// initialisation, the LR-schedule summary, and the run environment such as
-    /// threads and the validation data, plus the training data name) match the
-    /// checkpoint's run, and `fork` otherwise. Checkpoints written before this
-    /// was recorded leave it out unless this option is given.
+    /// recipe match the checkpoint's run, and `fork` otherwise. The recipe is
+    /// the training parameters and the training data name, leaving out the
+    /// superbatch count (unless a WDL schedule ends at it), the start
+    /// superbatch, initialisation, and settings that do not change the
+    /// training (build, backend, threads, external validation data and its
+    /// WDL). Checkpoints written before this was recorded leave it out unless
+    /// this option is given.
     #[arg(long, global = true, requires = "resume")]
     pub(crate) lineage_kind: Option<LineageKindArg>,
 
