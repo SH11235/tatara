@@ -209,6 +209,7 @@ own net, see the [setup guide](docs/setup.md).
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
 | **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). FV_SCALE converts the net output back to a centipawn evaluation. On `simple`, activation outputs are always on a 127 scale, so the default is `round(127 × QB / training scale)`; `--fv-scale` overrides it, while omission retains the value from a v9+ resume checkpoint, then from an `--init-from` input net |
 | **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
+| **FNV-1a** | Fowler–Noll–Vo hash, variant 1a — a simple non-cryptographic hash. The trainer uses its 64-bit form for the recipe fingerprint stored in resume checkpoints |
 | **CV** | Coefficient of variation — sample standard deviation divided by the mean, reported as a percentage for benchmark run-to-run variability |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
 | **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |

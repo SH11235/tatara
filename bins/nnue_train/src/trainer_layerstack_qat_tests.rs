@@ -335,7 +335,12 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
     batch.bucket_idx.fill(0);
     batch.score.fill(200.0);
     let path = std::env::temp_dir().join(format!("tatara-qat-{}.ckpt", std::process::id()));
-    t.save_raw_checkpoint(&path, 1200, "qat-test", None)?;
+    t.save_raw_checkpoint(
+        &path,
+        1200,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("qat-test"),
+        None,
+    )?;
     for mode in [QatMode::Off, QatMode::Dense] {
         t.load_raw_checkpoint(&path)?;
         t.configure_qat(Some(mode))?;
@@ -383,7 +388,12 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
         }
         assert_eq!(t.step_count, 1);
     }
-    t.save_raw_checkpoint(&path, 1201, "qat-tail", None)?;
+    t.save_raw_checkpoint(
+        &path,
+        1201,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("qat-tail"),
+        None,
+    )?;
     t.configure_qat(Some(QatMode::Off))?;
     t.load_raw_checkpoint(&path)?;
     t.configure_qat(None)?;

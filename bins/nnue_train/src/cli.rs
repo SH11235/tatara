@@ -501,6 +501,22 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 
+    /// With `--resume`, record in experiment.json whether this run continues the
+    /// checkpoint's training (`resume`) or starts a new experiment from it
+    /// (`fork`). When omitted, it is `resume` if the net id and the training
+    /// recipe match the checkpoint's run, and `fork` otherwise. The recipe is
+    /// the training parameters and the training data name, leaving out the
+    /// superbatch count (unless a WDL schedule ends at it), the start
+    /// superbatch, initialisation, and settings that do not change the
+    /// training data or how it is learned (build, backend, threads, the
+    /// shuffle window size, external validation data and its WDL, and the LR
+    /// gamma / step, which the recorded LR schedule already covers whenever
+    /// they apply).
+    /// Checkpoints written before this was recorded leave it out unless
+    /// this option is given.
+    #[arg(long, global = true, requires = "resume")]
+    pub(crate) lineage_kind: Option<LineageKindArg>,
+
     /// Superbatch number to start training from (1-indexed, inclusive). When
     /// omitted: with `--resume`, the checkpoint's superbatch + 1; otherwise 1.
     /// An error if outside `1 <= N <= --superbatches` (may be set explicitly to
@@ -904,6 +920,21 @@ impl Cli {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum LineageKindArg {
+    Resume,
+    Fork,
+}
+
+impl From<LineageKindArg> for nnue_train::experiment::LineageKind {
+    fn from(value: LineageKindArg) -> Self {
+        match value {
+            LineageKindArg::Resume => Self::Resume,
+            LineageKindArg::Fork => Self::Fork,
+        }
     }
 }
 

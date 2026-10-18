@@ -57,7 +57,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 10);
+    assert_eq!(RAW_CKPT_VERSION, 11);
 }
 
 #[test]
@@ -74,10 +74,13 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             step_count: 10,
             lr_horizon: None,
             fv_scale: None,
+            net_id: "",
+            recipe_fingerprint: None,
         },
         10,
     )
     .unwrap();
+    downgrade_v11_to_v10(&mut bytes);
     assert!(
         read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch)
             .unwrap()
@@ -106,6 +109,8 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             step_count: 1,
             lr_horizon: None,
             fv_scale: Some(14),
+            net_id: "",
+            recipe_fingerprint: None,
         },
         8,
     )
@@ -239,6 +244,8 @@ fn write_raw_ckpt_header<W: std::io::Write>(
             step_count,
             lr_horizon,
             fv_scale: None,
+            net_id: "",
+            recipe_fingerprint: None,
         },
         num_groups,
     )
@@ -259,6 +266,8 @@ fn write_raw_ckpt_header_with_fv_scale(
             step_count: 90,
             lr_horizon: Some(120),
             fv_scale,
+            net_id: "",
+            recipe_fingerprint: None,
         },
         8,
     )
@@ -296,7 +305,19 @@ fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
     off + 4 + arch_name_len
 }
 
+/// v11 の producer net id (空) と recipe fingerprint を外して v10 の layout にする。
+fn downgrade_v11_to_v10(buf: &mut Vec<u8>) {
+    let tail_off = buf.len() - 8 - 8 - 4;
+    assert_eq!(
+        u32::from_le_bytes(buf[tail_off..tail_off + 4].try_into().unwrap()),
+        0
+    );
+    buf.drain(tail_off..tail_off + 4 + 8);
+    buf[4..8].copy_from_slice(&10u32.to_le_bytes());
+}
+
 fn downgrade_v9_to_v8(buf: &mut Vec<u8>, written_fv_scale: Option<i32>) {
+    downgrade_v11_to_v10(buf);
     let qat_off = buf.len() - 4 - 8;
     buf.drain(qat_off..qat_off + 4);
     let fv_scale_off = buf.len() - 4 - 8;
@@ -794,4 +815,47 @@ fn raw_ckpt_header_rejects_unsupported_version() {
     // magic (4 bytes) 直後の version u32 を範囲外の値に書き換える。
     buf[4..8].copy_from_slice(&99u32.to_le_bytes());
     assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &layerstack_arch()).is_err());
+}
+
+#[test]
+fn raw_ckpt_v11_producer_identity_round_trips() {
+    let arch = layerstack_arch();
+    let write = |net_id: &str, recipe_fingerprint: Option<u64>| {
+        let mut bytes = Vec::new();
+        crate::ckpt::write_raw_ckpt_header(
+            &mut bytes,
+            &arch,
+            &RawCkptMeta {
+                qat_dense: false,
+                run_id: "run-a",
+                superbatch: 420,
+                step_count: 1,
+                lr_horizon: None,
+                fv_scale: None,
+                net_id,
+                recipe_fingerprint,
+            },
+            10,
+        )
+        .unwrap();
+        bytes
+    };
+
+    let header =
+        read_raw_ckpt_header(&mut Cursor::new(&write("net-a", Some(0xfeed))), &arch).unwrap();
+    assert_eq!(header.producer_net_id.as_deref(), Some("net-a"));
+    assert_eq!(header.producer_recipe_fingerprint, Some(0xfeed));
+    assert_eq!(header.producer_run_id.as_deref(), Some("run-a"));
+    assert_eq!(header.num_groups, 10);
+
+    let unrecorded = read_raw_ckpt_header(&mut Cursor::new(&write("", None)), &arch).unwrap();
+    assert_eq!(unrecorded.producer_net_id, None);
+    assert_eq!(unrecorded.producer_recipe_fingerprint, None);
+
+    let mut legacy = write("", None);
+    downgrade_v11_to_v10(&mut legacy);
+    let legacy = read_raw_ckpt_header(&mut Cursor::new(&legacy), &arch).unwrap();
+    assert_eq!(legacy.producer_net_id, None);
+    assert_eq!(legacy.producer_recipe_fingerprint, None);
+    assert_eq!(legacy.superbatch, 420);
 }

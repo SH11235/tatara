@@ -22,7 +22,7 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == effective_end:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + optimizer state (resume 用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, producer, lr_horizon)  # raw f32 + optimizer state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
@@ -266,6 +266,28 @@ pub struct ValidationStepOutput {
 // TrainerBackend — 1 batch 分の forward → loss → backward → optimizer step
 // =============================================================================
 
+/// resume 用 checkpoint を書き出す学習 run の識別情報。
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointProducer<'a> {
+    /// experiment.json の `id` (resume 時の `lineage.parent_id`)。実験ログが無ければ空文字列。
+    pub run_id: &'a str,
+    /// 出力ファイル名の元になる net id。
+    pub net_id: &'a str,
+    /// レシピの指紋 ([`crate::experiment::recipe_fingerprint`])。実験ログが無ければ `None`。
+    pub recipe_fingerprint: Option<u64>,
+}
+
+impl<'a> CheckpointProducer<'a> {
+    /// run id だけを持つ識別情報 (net id とレシピの指紋は「未記録」)。
+    pub fn run_id_only(run_id: &'a str) -> Self {
+        Self {
+            run_id,
+            net_id: "",
+            recipe_fingerprint: None,
+        }
+    }
+}
+
 /// 1 batch 分の training step を実行する backend。
 ///
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
@@ -342,9 +364,8 @@ pub trait TrainerBackend {
     ///
     /// backend 側は device → host download → file 書き出し (`.tmp` へ書いてから
     /// `rename` で atomic に置換) を行う。本 crate は GPU 非依存なので device I/O は
-    /// backend 任せ。`run_id` はこの checkpoint を書き出す学習 run の experiment.json
-    /// `id` で、`*.ckpt` に producer run id として埋め込まれ、resume 時に lineage の
-    /// 親参照になる (空文字列なら埋め込まない)。
+    /// backend 任せ。`producer` はこの checkpoint を書き出す学習 run の識別情報で、
+    /// `*.ckpt` に埋め込まれて resume 時の lineage (親参照と、続きか派生かの判定) に使う。
     ///
     /// `lr_horizon` は LR schedule の終端 superbatch ([`LrScheduler::horizon`])。
     /// `*.ckpt` に埋め込まれ、resume 時に curve を `--superbatches` から独立に
@@ -353,7 +374,7 @@ pub trait TrainerBackend {
         &mut self,
         path: &Path,
         superbatch: usize,
-        run_id: &str,
+        producer: &CheckpointProducer,
         lr_horizon: Option<usize>,
     ) -> io::Result<()>;
 
@@ -1147,11 +1168,17 @@ where
             // 実験ログがあれば run id を渡し `*.ckpt` に埋め込む (resume 時に
             // その run が lineage の親として参照される)。
             let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));
-            let run_id = experiment
-                .as_deref()
-                .map(ExperimentLogger::id)
-                .unwrap_or("");
-            backend.save_resume_checkpoint(&raw_path, sb, run_id, lr_scheduler.horizon())?;
+            let producer = CheckpointProducer {
+                run_id: experiment
+                    .as_deref()
+                    .map(ExperimentLogger::id)
+                    .unwrap_or(""),
+                net_id: &cfg.net_id,
+                recipe_fingerprint: experiment
+                    .as_deref()
+                    .map(ExperimentLogger::recipe_fingerprint),
+            };
+            backend.save_resume_checkpoint(&raw_path, sb, &producer, lr_scheduler.horizon())?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
 
             if let Some(keep) = cfg.keep_raw_checkpoints {
@@ -1449,11 +1476,11 @@ mod tests {
             &mut self,
             path: &Path,
             superbatch: usize,
-            run_id: &str,
+            producer: &CheckpointProducer,
             _lr_horizon: Option<usize>,
         ) -> io::Result<()> {
             self.resume_saves.push((path.to_path_buf(), superbatch));
-            self.resume_run_ids.push(run_id.to_string());
+            self.resume_run_ids.push(producer.run_id.to_string());
             if self.write_checkpoints {
                 std::fs::write(path, b"mock resume checkpoint")?;
             }

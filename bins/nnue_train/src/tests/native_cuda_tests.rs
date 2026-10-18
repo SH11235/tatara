@@ -739,7 +739,12 @@ fn forward_only_validate_matches_training_trainer() -> Result<(), Box<dyn std::e
         std::process::id()
     ));
     let save_err = forward_only
-        .save_raw_checkpoint(&ckpt_path, 1, "forward-only-test", None)
+        .save_raw_checkpoint(
+            &ckpt_path,
+            1,
+            &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-test"),
+            None,
+        )
         .expect_err("save_raw_checkpoint must be rejected on a forward-only trainer");
     assert!(save_err.to_string().contains("forward-only"), "{save_err}");
     Ok(())
@@ -826,7 +831,12 @@ fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std:
         "tatara-forward-only-resume-{}.ckpt",
         std::process::id()
     ));
-    control.save_raw_checkpoint(&path, 1, "forward-only-resume", None)?;
+    control.save_raw_checkpoint(
+        &path,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-resume"),
+        None,
+    )?;
 
     let mut forward_only =
         create_layerstack_trainer_forward_only(&context, true, LayerStackTestOptions::standard())?;
@@ -1077,7 +1087,12 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
             "tatara-forward-only-factorize-{name}-{}.ckpt",
             std::process::id()
         ));
-        control.save_raw_checkpoint(&path, 1, "forward-only-factorize", None)?;
+        control.save_raw_checkpoint(
+            &path,
+            1,
+            &nnue_train::trainer::CheckpointProducer::run_id_only("forward-only-factorize"),
+            None,
+        )?;
 
         let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
         forward_only.load_raw_checkpoint(&path)?;
@@ -2190,7 +2205,12 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
             let psqt_idx = if shared_delta { 14 } else { 10 };
             assert_eq!(checkpoint_state.1.len(), psqt_idx + 1);
             assert_eq!(checkpoint_state.1[psqt_idx].0, "psqt_w");
-            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            source.save_raw_checkpoint(
+                &path,
+                17,
+                &nnue_train::trainer::CheckpointProducer::run_id_only(source_name),
+                Some(42),
+            )?;
             let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let oracle_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(oracle_state.0, 6);
@@ -2205,7 +2225,7 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
                 let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
-                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
                 let loaded_state = trainer.raw_checkpoint_state_to_host()?;
                 assert_checkpoint_state_bit_identical(
@@ -2939,7 +2959,12 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
             }
             let checkpoint_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(checkpoint_state.0, 5, "checkpoint source step count");
-            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            source.save_raw_checkpoint(
+                &path,
+                17,
+                &nnue_train::trainer::CheckpointProducer::run_id_only(source_name),
+                Some(42),
+            )?;
             let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let oracle_state = source.raw_checkpoint_state_to_host()?;
             assert_eq!(oracle_state.0, 6, "uninterrupted oracle step count");
@@ -2967,7 +2992,7 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
                 let (superbatch, producer, horizon, fv_scale) =
                     trainer.load_raw_checkpoint(&path)?;
                 assert_eq!(superbatch, 17);
-                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
                 assert_eq!(fv_scale, Some(16));
                 let loaded_state = trainer.raw_checkpoint_state_to_host()?;
