@@ -4,11 +4,21 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 # 同一 PR の続けざまの push は前の run をキャンセルする
 concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # nnue-format 等の数値テストは opt-level 0 だと 1 binary で ~50s 掛かる。
+  # debug-assertions / overflow-checks は opt-level と独立なので検査内容は変わらない。
+  CARGO_PROFILE_DEV_OPT_LEVEL: 1
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   checks:
@@ -17,14 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml の components (rustc-dev / rust-analyzer / llvm-tools 等) は
+      # GPU 開発用で CI では使わず、自動インストールさせると毎回 ~20s 掛かる。
+      # channel だけ読んで minimal profile で入れ、RUSTUP_TOOLCHAIN で toml を素通りさせる。
       - name: install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          # rust-toolchain.toml の channel (nightly-2026-04-03) を honor。
-          # rustfmt は rust-toolchain.toml に含めていないのでここで明示確保。
-          components: rustfmt, clippy
+        run: |
+          channel=$(sed -nE 's/^channel\s*=\s*"([^"]+)"/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
 
+      # PR ごとに ~150MB 保存すると main の cache を押し出すため、保存は main だけにする。
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # workspace.members が空 (`[]`) のときは `cargo --workspace` が
       #   "manifest is virtual, and the workspace has no members"
