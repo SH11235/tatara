@@ -317,7 +317,8 @@ pub trait TrainerBackend {
     /// `Σ err²` を drain して返す。default 実装は `0.0` を返す (同期 readback 実装
     /// 向け)。
     ///
-    /// caller (本 crate の [`run`]) は **superbatch 末尾** で呼び出すこと。背景:
+    /// caller は superbatch 末尾、または非有限 loss による停止前に呼び出す。
+    /// 戻る前に pending な入力転送を完了し、batch の破棄を安全にすること。背景:
     /// async pipeline では `train_step` の N 番目の呼出が `step N-1` の loss を
     /// 返し、最後の batch (`step N_per_sb - 1`) の loss は呼出されないまま残る。
     /// `flush_pending_loss` を sb 末で 1 回呼んでこの残量を sb_loss に加算することで、
@@ -1018,6 +1019,22 @@ where
             sb_loss += loss;
             sb_positions += n_pos as u64;
 
+            if !sb_loss.is_finite() {
+                let mut reason = format!(
+                    "non-finite training loss reported at superbatch {sb}, batch {}: {sb_loss}",
+                    batch_idx + 1,
+                );
+                // The reported loss can lag behind the queued transfer of the current batch.
+                if let Err(error) = backend.flush_pending_loss() {
+                    reason.push_str(&format!("; failed to drain pending work: {error}"));
+                }
+                return Err(record_training_failure(
+                    &mut experiment,
+                    reason,
+                    run_start.elapsed().as_secs_f64(),
+                ));
+            }
+
             // batch 進捗 print: `progress_every` batches ごとに sb 内 pos/s + % +
             // batch count を stderr に出す。TTY なら `\r` で上書き、pipe なら `\n`
             // で改行 (`tee` log が editor で binary 判定されないよう)。
@@ -1068,6 +1085,15 @@ where
         } else {
             sb_loss / sb_positions as f64
         };
+        if !mean_loss.is_finite() {
+            return Err(record_training_failure(
+                &mut experiment,
+                format!(
+                    "non-finite training loss after pending loss at superbatch {sb}: {mean_loss}"
+                ),
+                run_start.elapsed().as_secs_f64(),
+            ));
+        }
         let pos_per_sec = sb_positions as f64 / sb_secs;
         let remaining_positions =
             positions_per_sb.saturating_mul((control.effective_target - sb) as u64);
@@ -1242,6 +1268,18 @@ where
     Ok(())
 }
 
+fn record_training_failure(
+    experiment: &mut Option<&mut ExperimentLogger>,
+    reason: String,
+    elapsed_seconds: f64,
+) -> io::Error {
+    if let Some(log) = experiment.as_mut() {
+        log.mark_failed(reason.clone(), elapsed_seconds);
+        write_experiment_log(log);
+    }
+    io::Error::other(reason)
+}
+
 /// experiment.json を書き出し、失敗時は warning のみ出して training を止めない
 /// (構造化ログは補助情報であり、書き込み失敗で学習を落とさない)。
 fn write_experiment_log(log: &ExperimentLogger) {
@@ -1349,6 +1387,9 @@ mod tests {
     /// 最小 backend。GPU には触らず、loss は単調減少する dummy 値を返す。
     struct MockBackend {
         steps: usize,
+        step_loss: Option<(usize, f64)>,
+        pending_losses: std::collections::VecDeque<f64>,
+        flush_calls: usize,
         saves: Vec<PathBuf>,
         /// raw resume checkpoint の保存呼び出し (path, superbatch)。
         resume_saves: Vec<(PathBuf, usize)>,
@@ -1375,6 +1416,9 @@ mod tests {
         fn new() -> Self {
             Self {
                 steps: 0,
+                step_loss: None,
+                pending_losses: std::collections::VecDeque::new(),
+                flush_calls: 0,
                 saves: Vec::new(),
                 resume_saves: Vec::new(),
                 resume_run_ids: Vec::new(),
@@ -1428,8 +1472,18 @@ mod tests {
             self.seen_wdl.push(wdl_lambda);
             self.clamp_count_sim += 7;
             self.clamp_elems_sim += 100;
+            if let Some((step, value)) = self.step_loss
+                && self.steps == step
+            {
+                return Ok(value);
+            }
             // 単調減少する dummy loss (loss 推移の monotonic decreasing assertion 用)。
             Ok(1.0 / self.steps as f64)
+        }
+
+        fn flush_pending_loss(&mut self) -> io::Result<f64> {
+            self.flush_calls += 1;
+            Ok(self.pending_losses.pop_front().unwrap_or(0.0))
         }
 
         fn validate_step(
@@ -1810,6 +1864,107 @@ mod tests {
             Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         ExperimentLogger::new(path, doc)
+    }
+
+    #[test]
+    fn non_finite_training_loss_preserves_completed_checkpoints() {
+        for loss in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for from_pending in [false, true] {
+                for completed in [0, 1] {
+                    let dir = temp_output_dir("non-finite-loss");
+                    let json_path = dir.join("experiment.json");
+                    let mut logger = experiment_logger(json_path.clone(), "non-finite-loss");
+                    let cfg = TrainingConfig {
+                        output_dir: dir.clone(),
+                        batches_per_superbatch: 1,
+                        save_rate: 1,
+                        keep_raw_checkpoints: Some(1),
+                        threads: 1,
+                        ..base_cfg()
+                    };
+                    let mut backend = MockBackend::new().with_file_writes();
+                    if from_pending {
+                        backend
+                            .pending_losses
+                            .extend(std::iter::repeat_n(0.0, completed));
+                        backend.pending_losses.push_back(loss);
+                    } else {
+                        backend.step_loss = Some((completed + 1, loss));
+                    }
+                    let error = run(
+                        &mut backend,
+                        &sample_psv_path(),
+                        &ShogiProgressKPAbs,
+                        &StepLR {
+                            start: 1e-3,
+                            gamma: 0.9,
+                            step: 1,
+                        },
+                        &ConstantWDL { value: 0.0 },
+                        &cfg,
+                        Some(&mut logger),
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains("non-finite training loss"));
+                    assert_eq!(backend.steps, completed + 1);
+                    assert_eq!(backend.flush_calls, completed + 1);
+                    assert_eq!(backend.saves.len(), completed);
+                    assert_eq!(backend.resume_saves.len(), completed);
+                    assert!(!dir.join(format!("test-{}.bin", completed + 1)).exists());
+                    assert!(!dir.join(format!("test-{}.ckpt", completed + 1)).exists());
+                    if completed == 1 {
+                        assert_eq!(
+                            std::fs::read(dir.join("test-1.bin")).unwrap(),
+                            b"mock quantised checkpoint"
+                        );
+                        assert_eq!(
+                            std::fs::read(dir.join("test-1.ckpt")).unwrap(),
+                            b"mock resume checkpoint"
+                        );
+                    }
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+                    assert_eq!(value["status"], "running");
+                    assert_eq!(value["results"]["interrupted"], true);
+                    assert_eq!(value["results"]["failure_reason"], error.to_string());
+                    assert_eq!(value["history"].as_array().unwrap().len(), completed);
+                    assert_eq!(
+                        value["checkpoints"].as_array().unwrap().len(),
+                        completed * 2
+                    );
+                    std::fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loss_accumulation_overflow_fails_without_an_experiment_logger() {
+        let mut backend = MockBackend::new();
+        backend.step_loss = Some((1, f64::MAX));
+        backend.pending_losses.push_back(f64::MAX);
+        let cfg = TrainingConfig {
+            batches_per_superbatch: 1,
+            threads: 1,
+            ..base_cfg()
+        };
+        let error = run(
+            &mut backend,
+            &sample_psv_path(),
+            &ShogiProgressKPAbs,
+            &StepLR {
+                start: 1e-3,
+                gamma: 0.9,
+                step: 1,
+            },
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-finite training loss"));
+        assert!(backend.saves.is_empty());
+        assert!(backend.resume_saves.is_empty());
     }
 
     #[test]
