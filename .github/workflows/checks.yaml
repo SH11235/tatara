@@ -36,6 +36,9 @@ jobs:
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache は導入済み全 toolchain の rustc version を key に含める。runner image
+          # 同梱の stable は image の版ごとに異なり key が揺れて cache miss になるため外す。
+          rustup toolchain uninstall stable
 
       # PR ごとに ~150MB 保存すると main の cache を押し出すため、保存は main だけにする。
       - uses: Swatinem/rust-cache@v2
