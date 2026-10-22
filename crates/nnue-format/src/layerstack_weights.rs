@@ -171,14 +171,33 @@ pub fn read_leb128_tensor_i16<R: Read>(
             format!("invalid LEB128 block size: {compressed_size}"),
         ));
     }
+    if let Some(n) = expected_count
+        && (compressed_size < n || compressed_size > n.saturating_mul(10))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LEB128 block size cannot encode the expected tensor count",
+        ));
+    }
     let mut compressed = vec![0u8; compressed_size];
     reader.read_exact(&mut compressed)?;
 
     let mut result = Vec::new();
     let mut pos = 0;
     while pos < compressed.len() {
+        if expected_count == Some(result.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LEB128 tensor contains more values than expected",
+            ));
+        }
         let (val, consumed) = decode_single_leb128(&compressed[pos..])?;
-        result.push(val as i16);
+        result.push(i16::try_from(val).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LEB128 tensor value is outside i16 range",
+            )
+        })?);
         pos += consumed;
     }
     if let Some(n) = expected_count
@@ -208,6 +227,13 @@ fn decode_single_leb128(data: &[u8]) -> io::Result<(i64, usize)> {
         }
         let b = data[pos];
         pos += 1;
+        // Only the sign bit fits in the tenth byte of a signed 64-bit value.
+        if shift == 63 && b != 0 && b != 0x7f {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LEB128 value overflows i64",
+            ));
+        }
         result |= ((b & 0x7f) as i64) << shift;
         shift += 7;
         if b & 0x80 == 0 {
@@ -1681,6 +1707,97 @@ mod tests {
             assert_eq!(decoded, v, "encode/decode mismatch for {v}");
             assert_eq!(consumed, buf.len());
         }
+    }
+
+    #[test]
+    fn leb128_tensor_roundtrips_every_i16_value() {
+        let values: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        let mut encoded = Vec::new();
+        write_leb128_tensor_i16(&mut encoded, &values).unwrap();
+        assert_eq!(
+            read_leb128_tensor_i16(&mut encoded.as_slice(), Some(values.len())).unwrap(),
+            values
+        );
+    }
+
+    fn leb128_block(payload: &[u8]) -> Vec<u8> {
+        let mut block = LEB128_MAGIC.to_vec();
+        block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        block.extend_from_slice(payload);
+        block
+    }
+
+    #[test]
+    fn leb128_tensor_rejects_values_outside_i16() {
+        for value in [32768, -32769, 65536, i64::MIN, i64::MAX] {
+            let mut payload = Vec::new();
+            encode_signed_leb128(value, &mut payload);
+            for count in [None, Some(1)] {
+                let error = read_leb128_tensor_i16(&mut leb128_block(&payload).as_slice(), count)
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("outside i16 range"));
+            }
+        }
+    }
+
+    #[test]
+    fn signed_leb128_checks_tenth_byte_without_truncation() {
+        for last in [0x01, 0x02, 0x7e, 0x80, 0xff] {
+            let mut payload = vec![0x80; 9];
+            payload.push(last);
+            assert_eq!(
+                decode_single_leb128(&payload).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for value in [i64::MIN, i64::MAX] {
+            let mut payload = Vec::new();
+            encode_signed_leb128(value, &mut payload);
+            assert_eq!(decode_single_leb128(&payload).unwrap(), (value, 10));
+        }
+        assert_eq!(
+            decode_single_leb128(&[0x80]).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            decode_single_leb128(&[0x80; 11]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn leb128_tensor_checks_count_and_block_boundaries() {
+        for (payload, expected) in [(vec![0, 0], 1), (vec![0], 2)] {
+            assert_eq!(
+                read_leb128_tensor_i16(&mut leb128_block(&payload).as_slice(), Some(expected))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut header = LEB128_MAGIC.to_vec();
+        header.extend_from_slice(&11_u32.to_le_bytes());
+        assert_eq!(
+            read_leb128_tensor_i16(&mut header.as_slice(), Some(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut padded_zero = vec![0x80; 9];
+        padded_zero.push(0);
+        assert_eq!(
+            read_leb128_tensor_i16(&mut leb128_block(&padded_zero).as_slice(), Some(1)).unwrap(),
+            [0]
+        );
+        let mut truncated = leb128_block(&[0, 1]);
+        truncated.pop();
+        assert_eq!(
+            read_leb128_tensor_i16(&mut truncated.as_slice(), Some(2))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
