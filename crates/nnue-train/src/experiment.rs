@@ -360,6 +360,9 @@ pub struct Results {
     pub mean_pos_per_sec: u64,
     /// run が error で中断されたか (`mark_interrupted` 済か)。
     pub interrupted: bool,
+    /// Failure details; absent for successful or externally interrupted runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 /// superbatch 1 点分の training loss と、有効時の held-out validation メトリクス。
@@ -469,6 +472,7 @@ impl ExperimentDoc {
                 best_test_loss_superbatch: None,
                 mean_pos_per_sec: 0,
                 interrupted: false,
+                failure_reason: None,
             },
             history: Vec::new(),
             checkpoints: Vec::new(),
@@ -524,6 +528,7 @@ impl ExperimentLogger {
     /// (`best_loss` / `best_test_loss` / `mean_pos_per_sec` /
     /// `training_time_seconds`) と `data.total_positions` / `data.dataset_passes`
     /// を更新する。
+    /// 非有限な training loss は失敗として記録し、履歴と集約値には加えない。
     ///
     /// `elapsed_seconds` は run 開始からの経過秒 (wall time)。`test_loss` /
     /// `test_accuracy` は held-out validation を走らせた場合のメトリクス
@@ -539,26 +544,21 @@ impl ExperimentLogger {
         test_loss: Option<f64>,
         test_accuracy: Option<f64>,
     ) {
-        self.positions_trained = self.positions_trained.saturating_add(sb_positions);
-
-        // JSON 数値に NaN / Inf は表現できない。非有限 loss (sb_positions == 0 の
-        // 防御分岐等) は 0.0 として記録し warning を出す。best_loss には混ぜない。
-        let loss = if mean_loss.is_finite() {
-            mean_loss
-        } else {
-            eprintln!(
-                "[train] warning: superbatch {superbatch} loss is non-finite ({mean_loss}); \
-                 recording 0.0 in experiment.json"
+        if !mean_loss.is_finite() {
+            self.mark_failed(
+                format!("non-finite training loss at superbatch {superbatch}: {mean_loss}"),
+                elapsed_seconds,
             );
-            0.0
-        };
+            return;
+        }
+        self.positions_trained = self.positions_trained.saturating_add(sb_positions);
         // held-out メトリクスは非有限値を JSON に出せないため None に落とす
         // (0.0 だと best_test_loss を誤って更新するので 0.0 化はしない)。
         let test_loss = test_loss.filter(|v| v.is_finite());
         let test_accuracy = test_accuracy.filter(|v| v.is_finite());
         self.doc.history.push(HistoryEntry {
             superbatch,
-            loss,
+            loss: mean_loss,
             test_loss,
             test_accuracy,
         });
@@ -604,6 +604,9 @@ impl ExperimentLogger {
 
     /// run の正常終了を記録する (`status = "completed"`)。
     pub fn mark_finished(&mut self, elapsed_seconds: f64) {
+        if self.doc.results.failure_reason.is_some() {
+            return;
+        }
         self.doc.status = STATUS_COMPLETED.to_string();
         self.doc.results.training_time_seconds = elapsed_seconds.max(0.0).round() as u64;
         self.touch();
@@ -613,6 +616,21 @@ impl ExperimentLogger {
     /// 残し (`nnue-lab` enum 制約)、[`Results::interrupted`] を立てる。
     pub fn mark_interrupted(&mut self) {
         self.doc.results.interrupted = true;
+        self.touch();
+    }
+
+    /// Keep the existing status vocabulary while preserving a diagnostic for a failed run.
+    pub fn mark_failed(&mut self, reason: String, elapsed_seconds: f64) {
+        self.doc.status = STATUS_RUNNING.to_string();
+        self.doc.results.interrupted = true;
+        self.doc.results.failure_reason = Some(reason);
+        let elapsed = elapsed_seconds.max(0.0);
+        self.doc.results.training_time_seconds = elapsed.round() as u64;
+        self.doc.results.mean_pos_per_sec = if elapsed > 0.0 {
+            (self.positions_trained as f64 / elapsed).round() as u64
+        } else {
+            0
+        };
         self.touch();
     }
 
@@ -937,12 +955,28 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_loss_is_recorded_as_zero() {
-        let mut logger = ExperimentLogger::new(PathBuf::from("/tmp/unused.json"), sample_doc());
-        logger.record_superbatch(1, f64::NAN, 1_000, 1.0, None, None);
-        assert_eq!(logger.doc.history[0].loss, 0.0);
-        // best_loss は非有限 loss を採らない。
-        assert_eq!(logger.doc.results.best_loss, None);
+    fn non_finite_loss_records_failure_without_a_history_point() {
+        for loss in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut logger = ExperimentLogger::new(PathBuf::from("unused.json"), sample_doc());
+            logger.record_superbatch(1, 0.04, 1_000, 1.0, None, None);
+            logger.record_superbatch(2, loss, 1_000, 2.0, None, None);
+            logger.mark_finished(3.0);
+            let value = serde_json::to_value(&logger.doc).unwrap();
+            assert_eq!(value["status"], "running");
+            assert_eq!(value["results"]["interrupted"], true);
+            assert!(
+                value["results"]["failure_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("superbatch 2")
+            );
+            assert_eq!(value["history"].as_array().unwrap().len(), 1);
+            assert_eq!(value["history"][0]["loss"], 0.04);
+            assert_eq!(value["results"]["best_loss"], 0.04);
+            assert_eq!(value["results"]["training_time_seconds"], 2);
+            assert_eq!(value["results"]["mean_pos_per_sec"], 500);
+            assert_eq!(value["data"]["total_positions"], 1_000);
+        }
     }
 
     #[test]
