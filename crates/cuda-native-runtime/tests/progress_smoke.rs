@@ -11,7 +11,7 @@ fn arg<T>(value: &mut T) -> *mut c_void {
     ptr::from_mut(value).cast()
 }
 
-fn slice_args<T: Copy>(buffer: &DeviceBuffer<T>) -> (u64, u64) {
+fn slice_args<T: cuda_native_runtime::DeviceElement>(buffer: &DeviceBuffer<T>) -> (u64, u64) {
     (buffer.device_ptr(), buffer.len() as u64)
 }
 

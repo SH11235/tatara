@@ -1,5 +1,7 @@
 use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr, sync::Arc};
 
+use crate::DeviceElement;
+
 type CuDevice = i32;
 type CuDevicePtr = u64;
 type CuResult = i32;
@@ -441,15 +443,30 @@ impl Function {
     }
 }
 
-pub struct DeviceBuffer<T> {
+/// An initialized allocation of numeric scalar values.
+///
+/// ```compile_fail
+/// use cuda_native_runtime::{Context, DeviceBuffer};
+/// fn invalid(context: &Context) {
+///     let _ = DeviceBuffer::<std::num::NonZeroU32>::zeroed(context, 1);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use cuda_native_runtime::{Context, DeviceBuffer};
+/// fn invalid(context: &Context) {
+///     let _ = DeviceBuffer::<u32>::uninitialized(context, 1);
+/// }
+/// ```
+pub struct DeviceBuffer<T: DeviceElement> {
     raw: CuDevicePtr,
     len: usize,
     context: Arc<ContextInner>,
     marker: PhantomData<T>,
 }
 
-impl<T: Copy> DeviceBuffer<T> {
-    pub fn uninitialized(context: &Context, len: usize) -> Result<Self> {
+impl<T: DeviceElement> DeviceBuffer<T> {
+    fn allocate(context: &Context, len: usize) -> Result<Self> {
         if len == 0 {
             return Ok(Self {
                 raw: 0,
@@ -474,17 +491,18 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 
     pub fn zeroed(context: &Context, len: usize) -> Result<Self> {
-        let buffer = Self::uninitialized(context, len)?;
+        let buffer = Self::allocate(context, len)?;
         if len == 0 {
             return Ok(buffer);
         }
-        // SAFETY: allocation is live and its exact byte length was checked in uninitialized.
+        // SAFETY: allocate checked the extent, and zero is a valid value for every DeviceElement.
         unsafe { check(cuMemsetD8_v2(buffer.raw, 0, len * size_of::<T>()))? };
+        synchronize_default_stream()?;
         Ok(buffer)
     }
 
     pub fn from_slice(context: &Context, values: &[T]) -> Result<Self> {
-        let buffer = Self::uninitialized(context, values.len())?;
+        let buffer = Self::allocate(context, values.len())?;
         buffer.copy_from(values)?;
         Ok(buffer)
     }
@@ -501,8 +519,9 @@ impl<T: Copy> DeviceBuffer<T> {
                 self.raw,
                 values.as_ptr().cast(),
                 self.len * size_of::<T>(),
-            ))
+            ))?;
         }
+        synchronize_default_stream()
     }
 
     /// Enqueues a host-to-device transfer from page-locked memory.
@@ -678,7 +697,7 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 }
 
-impl<T> Drop for DeviceBuffer<T> {
+impl<T: DeviceElement> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if self.raw == 0 {
             return;
@@ -691,14 +710,22 @@ impl<T> Drop for DeviceBuffer<T> {
     }
 }
 
-pub struct PinnedBuffer<T: Copy> {
+/// Page-locked storage restricted to scalars supported by CUDA allocation alignment.
+///
+/// ```compile_fail
+/// use cuda_native_runtime::{Context, PinnedBuffer};
+/// fn invalid(context: &Context) {
+///     let _ = PinnedBuffer::<bool>::new(context, 1);
+/// }
+/// ```
+pub struct PinnedBuffer<T: DeviceElement> {
     raw: *mut c_void,
     len: usize,
     context: Arc<ContextInner>,
     marker: PhantomData<T>,
 }
 
-impl<T: Copy + Default> PinnedBuffer<T> {
+impl<T: DeviceElement + Default> PinnedBuffer<T> {
     pub fn new(context: &Context, len: usize) -> Result<Self> {
         if len == 0 {
             return Ok(Self {
@@ -712,6 +739,10 @@ impl<T: Copy + Default> PinnedBuffer<T> {
         let bytes = len
             .checked_mul(size_of::<T>())
             .expect("pinned allocation byte size overflowed");
+        assert!(
+            bytes <= isize::MAX as usize,
+            "pinned allocation exceeds slice size limit"
+        );
         let mut raw = ptr::null_mut();
         // SAFETY: raw points to local output storage and bytes is non-zero.
         unsafe { check(cuMemHostAlloc(&mut raw, bytes, CU_MEMHOSTALLOC_PORTABLE))? };
@@ -722,7 +753,7 @@ impl<T: Copy + Default> PinnedBuffer<T> {
             marker: PhantomData,
         };
         for index in 0..len {
-            // SAFETY: CUDA allocated storage for len T values and every slot is written once.
+            // SAFETY: CUDA's host alignment covers these scalars; each checked slot is written once.
             unsafe { buffer.raw.cast::<T>().add(index).write(T::default()) };
         }
         Ok(buffer)
@@ -735,7 +766,7 @@ impl<T: Copy + Default> PinnedBuffer<T> {
     }
 }
 
-impl<T: Copy> PinnedBuffer<T> {
+impl<T: DeviceElement> PinnedBuffer<T> {
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: every slot is initialized by new and remains live for self's lifetime.
         unsafe { std::slice::from_raw_parts(self.raw.cast(), self.len) }
@@ -755,7 +786,7 @@ impl<T: Copy> PinnedBuffer<T> {
     }
 }
 
-impl<T: Copy> Drop for PinnedBuffer<T> {
+impl<T: DeviceElement> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         if self.len == 0 {
             return;
@@ -771,6 +802,12 @@ impl<T: Copy> Drop for PinnedBuffer<T> {
 fn set_current(context: &ContextInner) -> Result<()> {
     // SAFETY: context is retained by an Arc for the duration of the call.
     unsafe { check(cuCtxSetCurrent(context.raw)) }
+}
+
+fn synchronize_default_stream() -> Result<()> {
+    // Non-blocking consumer streams do not wait for default-stream initialization or staged H2D.
+    // SAFETY: the caller selected the allocation's context; null denotes its default stream.
+    unsafe { check(cuStreamSynchronize(ptr::null_mut())) }
 }
 
 fn ensure_same_context(left: &ContextInner, right: &ContextInner) {

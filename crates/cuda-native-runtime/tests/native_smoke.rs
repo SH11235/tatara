@@ -98,6 +98,55 @@ fn zero_length_pinned_buffer_is_a_noop_allocation() {
 }
 
 #[test]
+fn initialized_numeric_buffers_preserve_float_bits() {
+    let context = Context::new(0).unwrap();
+    let zeroed = DeviceBuffer::<f32>::zeroed(&context, 4).unwrap();
+    let mut output = [1.0_f32; 4];
+    zeroed.copy_to(&mut output).unwrap();
+    assert_eq!(output.map(f32::to_bits), [0; 4]);
+
+    let bits = [0x8000_0000, 0x7fc0_1234, 0x7f80_0000, 0xff80_0000];
+    let device = DeviceBuffer::from_slice(&context, &bits.map(f32::from_bits)).unwrap();
+    device.copy_to(&mut output).unwrap();
+    assert_eq!(output.map(f32::to_bits), bits);
+}
+
+#[test]
+fn synchronous_upload_is_ready_on_a_nonblocking_stream() {
+    let context = Context::new(0).unwrap();
+    let stream = context.create_stream().unwrap();
+    let input: Vec<u32> = (0..32_771).collect();
+    let mut output = PinnedBuffer::<u32>::new(&context, input.len()).unwrap();
+    let device = DeviceBuffer::from_slice(&context, &input).unwrap();
+    // SAFETY: output remains exclusively borrowed until the stream completes.
+    unsafe { device.copy_to_pinned_async(&mut output, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    assert_eq!(output.as_slice(), input.as_slice());
+
+    let replacement: Vec<u32> = input.iter().map(|v| !v).collect();
+    device.copy_from(&replacement).unwrap();
+    // SAFETY: output remains exclusively borrowed until the stream completes.
+    unsafe { device.copy_to_pinned_async(&mut output, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    assert_eq!(output.as_slice(), replacement.as_slice());
+}
+
+#[test]
+fn pinned_numeric_buffers_support_alignment_and_byte_fills() {
+    let context = Context::new(0).unwrap();
+    let stream = context.create_stream().unwrap();
+    let mut host = PinnedBuffer::<u128>::new(&context, 3).unwrap();
+    assert!(host.as_slice().as_ptr().is_aligned());
+    assert_eq!(host.as_slice(), &[0; 3]);
+    let device = DeviceBuffer::<u128>::zeroed(&context, 3).unwrap();
+    device.fill_byte_async(0xff, &stream).unwrap();
+    // SAFETY: host stays exclusively borrowed until stream synchronization below.
+    unsafe { device.copy_to_pinned_async(&mut host, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    assert_eq!(host.as_slice(), &[u128::MAX; 3]);
+}
+
+#[test]
 fn layerstack_fp16_fused_gradient_preserves_nan() {
     let context = Context::new(0).unwrap();
     let stream = context.create_stream().unwrap();

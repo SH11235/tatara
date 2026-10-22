@@ -183,11 +183,11 @@ impl CudaModule {
     }
 }
 
-pub struct DeviceBuffer<T: Copy> {
+pub struct DeviceBuffer<T: native::DeviceElement> {
     inner: native::DeviceBuffer<T>,
 }
 
-impl<T: Copy> DeviceBuffer<T> {
+impl<T: native::DeviceElement> DeviceBuffer<T> {
     pub fn from_host(stream: &CudaStream, values: &[T]) -> Result<Self> {
         let inner = native::DeviceBuffer::from_slice(&stream.context.inner, values)?;
         Ok(Self { inner })
@@ -270,7 +270,7 @@ impl KernelArgs {
         self.storage.push(storage);
     }
 
-    pub fn push_slice<T: Copy>(&mut self, buffer: &DeviceBuffer<T>) {
+    pub fn push_slice<T: native::DeviceElement>(&mut self, buffer: &DeviceBuffer<T>) {
         self.push_scalar(buffer.cu_deviceptr());
         self.push_scalar(buffer.len() as u64);
     }

@@ -505,7 +505,7 @@ pub(crate) fn cfg_norm_loss_reduce(n_groups: usize, group_len: usize) -> LaunchC
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
 /// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
 /// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
-pub(crate) fn memset_zero<T: Copy>(
+pub(crate) fn memset_zero<T: gpu_runtime::DeviceElement>(
     stream: &CudaStream,
     buf: &DeviceBuffer<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {

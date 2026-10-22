@@ -27,6 +27,8 @@
 //!   するが、本 crate は `cuda-async` を dep にしていない。非同期 launch が
 //!   必要になった段階で `cuda-async` 込みで再公開する。
 
+pub use cuda_native_runtime::DeviceElement;
+
 #[cfg(all(feature = "oxide", feature = "native"))]
 compile_error!(
     "gpu-runtime backends are mutually exclusive; inspect the dependency feature graph to find \
@@ -229,7 +231,7 @@ pub use native_backend::is_out_of_memory;
 
 /// Fills a device allocation byte-wise on `stream`.
 #[cfg(any(feature = "oxide", feature = "native"))]
-pub fn memset_d8_async<T: Copy>(
+pub fn memset_d8_async<T: DeviceElement>(
     buffer: &DeviceBuffer<T>,
     value: u8,
     stream: &CudaStream,
@@ -255,7 +257,7 @@ pub fn memset_d8_async<T: Copy>(
 ///
 /// The caller must keep `values` alive and immutable until stream completion.
 #[cfg(any(feature = "oxide", feature = "native"))]
-pub unsafe fn memcpy_htod_async<T: Copy>(
+pub unsafe fn memcpy_htod_async<T: DeviceElement>(
     buffer: &DeviceBuffer<T>,
     values: &[T],
     stream: &CudaStream,
@@ -285,7 +287,7 @@ pub unsafe fn memcpy_htod_async<T: Copy>(
 ///
 /// The caller must keep `values` alive and must not access it until stream completion.
 #[cfg(any(feature = "oxide", feature = "native"))]
-pub unsafe fn memcpy_dtoh_async<T: Copy>(
+pub unsafe fn memcpy_dtoh_async<T: DeviceElement>(
     values: &mut [T],
     buffer: &DeviceBuffer<T>,
     stream: &CudaStream,
