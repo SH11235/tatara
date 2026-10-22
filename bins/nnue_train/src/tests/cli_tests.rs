@@ -691,9 +691,8 @@ fn simple_fv_scale_help_describes_init_and_resume_behavior() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn rescore_input_resolution_rejects_hcpe_symlink_targets() {
+fn rescore_input_resolution_validates_canonical_paths() {
     struct FixtureDir(PathBuf);
     impl Drop for FixtureDir {
         fn drop(&mut self) {
@@ -712,14 +711,10 @@ fn rescore_input_resolution_rejects_hcpe_symlink_targets() {
     let dir = FixtureDir(path);
     let hcpe = dir.0.join("teacher.HCPE");
     let psv = dir.0.join("teacher.psv");
-    let hcpe_alias = dir.0.join("pool.psv");
-    let psv_alias = dir.0.join("valid-pool.psv");
     // The HCPE record size permits an input whose length is also divisible by 40.
     std::fs::write(&hcpe, vec![0_u8; 20 * 38]).unwrap();
     std::fs::write(&psv, vec![0_u8; 40]).unwrap();
-    std::os::unix::fs::symlink(&hcpe, &hcpe_alias).unwrap();
-    std::os::unix::fs::symlink(&psv, &psv_alias).unwrap();
-    let error = crate::training::canonicalize_rescore_input(&hcpe_alias)
+    let error = crate::training::canonicalize_rescore_input(&hcpe)
         .expect_err("canonical HCPE must be rejected before sidecar completion handling");
     assert!(error.to_string().contains("requires PSV, not HCPE"));
     assert!(
@@ -728,9 +723,35 @@ fn rescore_input_resolution_rejects_hcpe_symlink_targets() {
             .contains(hcpe.canonicalize().unwrap().to_str().unwrap())
     );
     assert_eq!(
-        crate::training::canonicalize_rescore_input(&psv_alias).unwrap(),
+        crate::training::canonicalize_rescore_input(&psv).unwrap(),
         psv.canonicalize().unwrap()
     );
+    let missing = dir.0.join("missing.psv");
+    let error = crate::training::canonicalize_rescore_input(&missing).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to canonicalize --rescore-input")
+    );
+
+    #[cfg(unix)]
+    {
+        let hcpe_alias = dir.0.join("pool.psv");
+        let psv_alias = dir.0.join("valid-pool.psv");
+        std::os::unix::fs::symlink(&hcpe, &hcpe_alias).unwrap();
+        std::os::unix::fs::symlink(&psv, &psv_alias).unwrap();
+        let error = crate::training::canonicalize_rescore_input(&hcpe_alias).unwrap_err();
+        assert!(error.to_string().contains("requires PSV, not HCPE"));
+        assert!(
+            error
+                .to_string()
+                .contains(hcpe.canonicalize().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            crate::training::canonicalize_rescore_input(&psv_alias).unwrap(),
+            psv.canonicalize().unwrap()
+        );
+    }
 }
 
 /// `validate_rescore_cli` の reject 行列を GPU 非依存で固定する (直接呼び出し)。
