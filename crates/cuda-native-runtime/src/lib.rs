@@ -1,4 +1,8 @@
 #![cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+#![feature(f16)]
+
+mod element;
+pub use element::DeviceElement;
 
 // 実体は build script が `include!` して使う。lib からは呼ばないため、test を走らせる
 // ためだけに compile する。
