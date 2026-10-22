@@ -41,8 +41,7 @@ clap = { version = "4.6", features = ["derive"] }
 # する。kernel をビルドする cargo-oxide ツールも同じ rev でなければ codegen
 # backend ABI がずれるため、scripts/setup-cuda-oxide.sh が Cargo.lock からこの
 # rev を読んで `cargo install --rev` する。channel は rust-toolchain.toml と
-# 必ず一致させる (ずれると link-time fail)。選定理由は
-# docs/decisions/2026-05-09-cuda-oxide-adoption.md、手順は docs/setup.md。
+# 必ず一致させる (ずれると link-time fail)。手順は docs/setup.md。
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }

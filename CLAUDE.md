@@ -88,14 +88,13 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **ATTRIBUTION.md は license attribution のみ**。vendor 作業履歴 / CHANGELOG /
   PR ごとの追加内容は書かない (CHANGELOG が必要になれば別 file に分ける)。
 - **doc 冒頭の dated header 禁止**: `作成: YYYY-MM-DD`、`改訂: YYYY-MM-DD` 等。
-  履歴は git log で見る。ADR のように Status / Date field が doc の意味の一部と
-  なる場合は OK。
-- **新規 ADR は書かない** (本リポは ADR ベースの開発をしていない)。設計の WHY は
-  コード近傍のコメント / PR description が担当する。`docs/decisions/` の既存分は
-  legacy で、古くなったら削除して良い。
+  履歴は git log で見る。
+- **ADR・設計判断・計測結果の記録は repo に置かない** (`docs/decisions/` も作らない)。
+  repo に入れる文書は利用者向けだけ。設計の WHY はコード近傍のコメント / PR description
+  が担当し、repo 外の記録への参照で済ませない。
 - **実験ログ doc は `docs/experiments/` に置く。同 directory は `.gitignore` 済み**
   で git 管理外 (頻繁に更新する作業記録のため)。worktree / PR の対象外、checkout 内
-  で直接編集する。`docs/decisions/` (ADR) 等 tracked な doc は通常どおり PR。
+  で直接編集する。tracked な doc は通常どおり PR。
 - **GitHub Issue を立てない課題の spec は `docs/issue/` に置く。同 directory も
   `.gitignore` 済み**で git 管理外。1 file = 1 issue とし、対応 PR の merge 後に
   file を削除する (= close)。運用詳細は同 directory の README.md。

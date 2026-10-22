@@ -438,8 +438,7 @@ fetch される**。ある機械で初めて何らかの `cargo-oxide` コマン
 対応: `bash scripts/setup-cuda-oxide.sh` がこれを検知・修復するようになった。
 pin rev + 手元の rustc nightly version を backend cache に stamp として
 書き込み、次回実行時にこの stamp が食い違っていれば pin rev から cache を
-作り直す (仕組みの詳細は
-[該当 ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) を参照)。
+作り直す。
 既に揃っていれば再実行しても no-op。それでも解消しない場合の最終手段として
 `rm -rf ~/.cargo/cuda-oxide` してから再実行する。
 
@@ -468,10 +467,6 @@ cargo build
 
 ## 関連
 
-- [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
-  採用判断と Consequences
-- [cuda-oxide backend cache pin ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) —
-  `setup-cuda-oxide.sh` が codegen backend cache も検証する理由
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)
 - [cuda-oxide atomics example README (LLVM 22 syncscope の根拠)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)
