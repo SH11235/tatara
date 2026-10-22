@@ -624,7 +624,13 @@ impl ExperimentLogger {
         self.doc.status = STATUS_RUNNING.to_string();
         self.doc.results.interrupted = true;
         self.doc.results.failure_reason = Some(reason);
-        self.doc.results.training_time_seconds = elapsed_seconds.max(0.0).round() as u64;
+        let elapsed = elapsed_seconds.max(0.0);
+        self.doc.results.training_time_seconds = elapsed.round() as u64;
+        self.doc.results.mean_pos_per_sec = if elapsed > 0.0 {
+            (self.positions_trained as f64 / elapsed).round() as u64
+        } else {
+            0
+        };
         self.touch();
     }
 
@@ -967,6 +973,8 @@ mod tests {
             assert_eq!(value["history"].as_array().unwrap().len(), 1);
             assert_eq!(value["history"][0]["loss"], 0.04);
             assert_eq!(value["results"]["best_loss"], 0.04);
+            assert_eq!(value["results"]["training_time_seconds"], 2);
+            assert_eq!(value["results"]["mean_pos_per_sec"], 500);
             assert_eq!(value["data"]["total_positions"], 1_000);
         }
     }
