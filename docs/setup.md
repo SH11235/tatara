@@ -455,9 +455,8 @@ rev-matched environment never sees.
 
 Fix: `bash scripts/setup-cuda-oxide.sh` now detects and repairs this — it
 stamps the backend cache with the pinned rev + your rustc nightly version,
-and rebuilds the cache from the pinned rev whenever that stamp doesn't match
-(see [the ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) for the
-mechanism). Re-running it is a no-op if everything already matches. As a
+and rebuilds the cache from the pinned rev whenever that stamp doesn't match.
+Re-running it is a no-op if everything already matches. As a
 last resort, if the script doesn't get you unstuck, `rm -rf
 ~/.cargo/cuda-oxide` and re-run the script.
 
@@ -486,10 +485,6 @@ the broken `rust-std` / `rustc-dev` archives. There is no need to delete
 
 ## Related
 
-- [cuda-oxide adoption ADR](decisions/2026-05-09-cuda-oxide-adoption.md) —
-  the adoption decision and its Consequences
-- [cuda-oxide backend cache pin ADR](decisions/2026-07-04-cuda-oxide-backend-cache-pin.md) —
-  why `setup-cuda-oxide.sh` also validates the codegen backend cache
 - [cuda-oxide upstream](https://github.com/NVlabs/cuda-oxide)
 - [cuda-oxide-book installation requirements](https://nvlabs.github.io/cuda-oxide/getting-started/installation.html)
 - [cuda-oxide atomics example README (the basis for LLVM 22 syncscope)](https://github.com/NVlabs/cuda-oxide/blob/main/crates/rustc-codegen-cuda/examples/atomics/README.md)

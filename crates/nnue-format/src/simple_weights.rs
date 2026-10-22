@@ -63,8 +63,7 @@ use shogi_features::FeatureSetSpec;
 /// は形式世代スタンプであり、アーキの弁別子ではない (全 NNUE ファイルで単一値、
 /// アーキは file 内 `kHashValue = FeatureTransformer::GetHashValue() ^
 /// Network::GetHashValue()` で識別する)。本 format の `network_hash` は同 hash 機構の
-/// 移植。詳細は
-/// `docs/decisions/2026-05-20-simple-quantised-format-engine-consumer.md` を参照。
+/// 移植。
 pub const NNUE_VERSION: u32 = 0x7AF32F16;
 
 /// dense 層 weight の量子化 multiplier。

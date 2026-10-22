@@ -144,8 +144,6 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
   の有効化、held-out source の選び方、指標の読み方
 - [Training schedules](docs/training-schedule.ja.md) — 学習率 (`--lr-schedule`) と
   WDL lambda (`--wdl` / `--start-wdl` / `--end-wdl`) のスケジューリング
-- [ADR (Architecture Decision Records)](docs/decisions/) — 設計判断とその
-  rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ

@@ -107,4 +107,4 @@ loss の一般化を有効にすると、報告される loss 値だけでなく
 ## 関連
 
 - [学習 Quickstart](training-quickstart.ja.md) — `--win-rate-model` を含む主な option
-- [experiment.json スキーマ](decisions/2026-05-17-experiment-json.md) — WRM パラメータの記録形式
+- experiment.json の形式は `crates/nnue-train/src/experiment.rs` の型定義 (rustdoc) — WRM パラメータの記録形式

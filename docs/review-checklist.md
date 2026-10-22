@@ -90,15 +90,13 @@ rg -n -e '^\s*作成:\s*[0-9]{4}-[0-9]{2}' \
      docs/ README.md CLAUDE.md ATTRIBUTION.md
 ```
 
-ADR の `**Date**: YYYY-MM-DD` field は意味の一部なので OK。それ以外で日付
-header は不要 (git log で確認可能)。
+日付 header は不要 (git log で確認可能)。
 
-### 2.3 ADR (`docs/decisions/`) のルール
+### 2.3 設計判断の記録 (ADR) のルール
 
-- **新規 ADR の追加はリジェクト** (本リポは ADR ベースの開発をしていない。
-  設計の WHY はコード近傍のコメント / PR description が担当)
-- 既存分は legacy。不要になったら削除して良い (削除時は他 doc からの
-  リンク切れを修正する)
+- **ADR・設計判断・計測結果の記録の追加はリジェクト** (`docs/decisions/` も作らない)。
+  設計の WHY はコード近傍のコメント / PR description が担当し、repo 外の記録への
+  参照で済ませない
 
 ### 2.4 directory tree の現状反映
 
@@ -217,12 +215,12 @@ rg -n '///.*\[\x60' bins
 
 ### 4.1 連番ファイル名の回避
 
-ADR 以外も「`0NNN-` で始まる連番ファイル」は並行 PR 衝突を招く。新しい連番
+「`0NNN-` で始まる連番ファイル」は並行 PR 衝突を招く。新しい連番
 ファイル種を作るときは date-based slug or topic-only slug を検討する。
 
 ```bash
 rg -l '^[0-9]{4}-' --files docs/
-# date-based でないファイルが ADR 以外で見つかったら設計再考
+# date-based でないファイルが見つかったら設計再考
 ```
 
 ### 4.2 path 参照の追従

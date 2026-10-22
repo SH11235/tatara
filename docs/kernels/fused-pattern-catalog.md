@@ -1,8 +1,7 @@
 # Fused kernel pattern catalog
 
 本リポジトリの GPU kernel の **責務 / 配置ファイル** を一覧する。pointwise の
-fused kernel は [fused kernel strategy ADR](../decisions/2026-05-09-fused-kernel-strategy.md)
-が定めた「runtime fusion を build-time hand-fused kernel で代替する」方針の産物。
+fused kernel は「runtime fusion を build-time hand-fused kernel で代替する」方針の産物。
 LayerStack dense kernel と progress trainer kernel もここに併記する。
 
 cuda-oxide oracle の `#[kernel]` 定義は `bins/nnue_train/src/kernels/` に置く。
@@ -96,7 +95,7 @@ host-side wait (launch overhead) が支配的になり、training の実 batch s
 
 ## 新規 fused kernel を追加するとき
 
-fused kernel strategy ADR が想定する「新しい optimizer / activation を試す時はパターンを追加する必要がある」運用に従う。手順:
+新しい optimizer / activation を試すときは、ここにパターンを追加する。手順:
 
 1. 本 catalog にエントリを追加
 2. `crates/gpu-kernels/` 配下に reference CPU 実装 + 数値同等性テスト

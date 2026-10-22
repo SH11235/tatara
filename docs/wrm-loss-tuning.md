@@ -121,4 +121,4 @@ value, so its effect on playing strength must likewise be validated with SPRT.
 ## Related
 
 - [training Quickstart](training-quickstart.md) — the main options, including `--win-rate-model`
-- [experiment.json schema](decisions/2026-05-17-experiment-json.md) — how the WRM parameters are recorded
+- The experiment.json format is defined by the types in `crates/nnue-train/src/experiment.rs` (rustdoc) — how the WRM parameters are recorded

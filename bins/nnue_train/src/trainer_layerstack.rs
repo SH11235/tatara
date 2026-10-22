@@ -4531,7 +4531,7 @@ impl GpuTrainer {
             // (pitch=1, stride=out)、L1 / L2 / L3 は [bucket*out, in] contiguous row
             // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
             // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
-            // prior と整合する方向の intended 仕様、ADR 参照)。
+            // prior と整合する方向の intended 仕様)。
             norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
             norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);

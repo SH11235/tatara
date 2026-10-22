@@ -4,7 +4,6 @@
 //! 機械可読な JSON として残す。出力 1 ファイルはそのまま実験管理 Web アプリ
 //! `nnue-lab` の取り込み口 (`ExperimentJsonV1` zod schema) に投入できる。
 //!
-//! format の設計根拠は `docs/decisions/2026-05-17-experiment-json.md` を参照。
 //! 要点:
 //!
 //! - `nnue-lab` ExperimentJsonV1 の互換 superset。必須フィールド (`id` / `name`
@@ -14,7 +13,7 @@
 //!   held-out validation メトリクスで、`history[]` 要素 (passthrough 非対象) にも
 //!   `test_loss` / `test_accuracy` を足す。これは `nnue-lab` の history schema
 //!   拡張を要する coupled change で、未拡張の `nnue-lab` では両キーが取り込み時に
-//!   削除される (ADR `docs/decisions/2026-05-17-experiment-json.md` 参照)。
+//!   削除される。
 //! - 1 run = 1 ファイル。crash 耐性は incremental write で得る:
 //!   superbatch ごとに temp file + rename で全体を atomic に書き直すため、
 //!   中断時も最後の書き込みが `status: "running"` の妥当な JSON として残る。
@@ -35,7 +34,7 @@ use serde::Serialize;
 /// `HistoryEntry::test_loss` / `test_accuracy`、`Results::best_test_loss`
 /// (+ superbatch)、`Params::test_data` / `test_positions`。いずれも `--test-data`
 /// 未指定の run では出力されない。`history[]` 要素への追加分は `nnue-lab` 側の
-/// history schema 拡張が要る (ADR `2026-05-17-experiment-json.md` 参照)。
+/// history schema 拡張が要る。
 pub const SCHEMA_VERSION: u32 = 2;
 
 // `results.fv_scale` はアーキと loss により異なるため、呼び出し側が実際に export

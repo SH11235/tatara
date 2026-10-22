@@ -164,8 +164,6 @@ For building the kernels and running the smoke test, see
 - [Training schedules](docs/training-schedule.md) — scheduling the learning rate
   (`--lr-schedule`) and the WDL lambda (`--wdl` / `--start-wdl` / `--end-wdl`)
   across a run
-- [ADR (Architecture Decision Records)](docs/decisions/) — design decisions and
-  their rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — which kernel
   does what
 - [Arch string](docs/arch-string.md) — how the architecture-description string
