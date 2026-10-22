@@ -8,6 +8,160 @@ use crate::{arch::*, ckpt::*};
 
 use std::io::Cursor;
 
+struct LimitedIo<T> {
+    inner: T,
+    remaining: usize,
+    max_request: usize,
+}
+
+impl<T: std::io::Read> std::io::Read for LimitedIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.max_request = self.max_request.max(buf.len());
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let len = buf.len().min(self.remaining).min(997);
+        let n = self.inner.read(&mut buf[..len])?;
+        self.remaining -= n;
+        Ok(n)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for LimitedIo<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.max_request = self.max_request.max(buf.len());
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let n = self
+            .inner
+            .write(&buf[..buf.len().min(self.remaining).min(997)])?;
+        self.remaining -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn f32_io_is_byte_exact_across_chunks_and_short_operations() {
+    let bits = [
+        0,
+        0x8000_0000,
+        1,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_1234,
+        0xffff_ffff,
+    ];
+    let data: Vec<f32> = bits
+        .into_iter()
+        .cycle()
+        .take(2_097_155)
+        .map(f32::from_bits)
+        .collect();
+    let expected: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut writer = LimitedIo {
+        inner: Vec::new(),
+        remaining: usize::MAX,
+        max_request: 0,
+    };
+    write_f32_slice(&mut writer, &data).unwrap();
+    assert_eq!(writer.inner, expected);
+    assert!(writer.max_request <= 4 * 1024 * 1024);
+    let mut reader = LimitedIo {
+        inner: Cursor::new(&expected),
+        remaining: usize::MAX,
+        max_request: 0,
+    };
+    let output = read_f32_vec_io(&mut reader, data.len(), "weights").unwrap();
+    assert!(reader.max_request <= 4 * 1024 * 1024);
+    assert_eq!(
+        output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(reader.inner.position(), expected.len() as u64);
+}
+
+#[test]
+fn f32_io_propagates_mid_tensor_errors() {
+    let data = vec![1.0; 2_097_155];
+    let mut writer = LimitedIo {
+        inner: Vec::new(),
+        remaining: 4_194_307,
+        max_request: 0,
+    };
+    assert_eq!(
+        write_f32_slice(&mut writer, &data).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let mut reader = LimitedIo {
+        inner: Cursor::new(vec![0; data.len() * 4]),
+        remaining: 4_194_307,
+        max_request: 0,
+    };
+    assert_eq!(
+        read_f32_vec_io(&mut reader, data.len(), "weights")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let error =
+        read_f32_vec_io(&mut Cursor::new(vec![0; 4_194_307]), data.len(), "weights").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("weights"));
+}
+
+#[test]
+fn f32_read_rejects_unrepresentable_allocation_sizes() {
+    for n in [usize::MAX, isize::MAX as usize / 4 + 1] {
+        assert_eq!(
+            read_f32_vec_io(&mut Cursor::new([]), n, "weights")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn failed_chunked_checkpoint_write_keeps_existing_artifact() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tatara-chunked-checkpoint-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("checkpoint.ckpt");
+    std::fs::write(&path, b"previous checkpoint").unwrap();
+    let result = nnue_train::artifact::write_atomic(&path, |writer| {
+        let mut failing = LimitedIo {
+            inner: writer,
+            remaining: 4_194_307,
+            max_request: 0,
+        };
+        write_f32_slice(&mut failing, &vec![1.0; 2_097_155])
+    });
+    assert_eq!(
+        result.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous checkpoint");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn write_then_read_f32_slice_round_trips() {
     let data: Vec<f32> = vec![0.0, 1.0, -1.0, 3.5, f32::MIN_POSITIVE, -42.25, 1e9];

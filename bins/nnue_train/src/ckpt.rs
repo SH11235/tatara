@@ -863,15 +863,17 @@ pub(crate) fn invalid_data(msg: String) -> Box<dyn std::error::Error> {
 
 /// f32 slice を little-endian で `w` に書き出す (`bytemuck` 不使用、依存を増やさない)。
 pub(crate) fn write_f32_slice<W: std::io::Write>(w: &mut W, data: &[f32]) -> std::io::Result<()> {
-    // 4 byte ずつの write_all は遅いので、一旦 byte Vec に詰めてから 1 回で書く
-    // (group は最大 113M f32 = ~450MB (ft_w)、呼び出し側は BufWriter で wrap 済だが
-    //  chunk write の方が更に system call が減る)。
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for &x in data {
-        bytes.extend_from_slice(&x.to_le_bytes());
+    let mut bytes = vec![0_u8; data.len().min(F32_IO_CHUNK_BYTES / 4) * 4];
+    for chunk in data.chunks(F32_IO_CHUNK_BYTES / 4) {
+        for (&value, dest) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+            dest.copy_from_slice(&value.to_le_bytes());
+        }
+        w.write_all(&bytes[..chunk.len() * 4])?;
     }
-    w.write_all(&bytes)
+    Ok(())
 }
+
+const F32_IO_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// `r.read_exact(buf)` を呼び、`UnexpectedEof` (= file が途中で切れている、破損 / 部分書き)
 /// を `InvalidData` + context message に正規化する。raw checkpoint の robustness contract
@@ -902,19 +904,22 @@ pub(crate) fn read_f32_vec_io<R: std::io::Read>(
     n: usize,
     what: &str,
 ) -> std::io::Result<Vec<f32>> {
-    let mut bytes = vec![
-        0u8;
-        n.checked_mul(4).ok_or_else(|| {
+    n.checked_mul(4)
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("f32 vec len {n} overflows byte count"),
+                format!("f32 vec len {n} exceeds allocation size limit"),
             )
-        })?
-    ];
-    read_exact_or_invalid(r, &mut bytes, what)?;
+        })?;
     let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    let mut bytes = vec![0_u8; n.min(F32_IO_CHUNK_BYTES / 4) * 4];
+    while out.len() < n {
+        let chunk_bytes = ((n - out.len()).min(F32_IO_CHUNK_BYTES / 4)) * 4;
+        read_exact_or_invalid(r, &mut bytes[..chunk_bytes], what)?;
+        for chunk in bytes[..chunk_bytes].chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
     }
     Ok(out)
 }
