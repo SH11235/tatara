@@ -490,6 +490,7 @@ impl<T: DeviceElement> DeviceBuffer<T> {
         })
     }
 
+    /// Returns after zero initialization is complete, including for non-blocking consumers.
     pub fn zeroed(context: &Context, len: usize) -> Result<Self> {
         let buffer = Self::allocate(context, len)?;
         if len == 0 {
@@ -501,12 +502,14 @@ impl<T: DeviceElement> DeviceBuffer<T> {
         Ok(buffer)
     }
 
+    /// Returns after the upload is complete, including for non-blocking consumers.
     pub fn from_slice(context: &Context, values: &[T]) -> Result<Self> {
         let buffer = Self::allocate(context, values.len())?;
         buffer.copy_from(values)?;
         Ok(buffer)
     }
 
+    /// Returns after the upload is complete, including for non-blocking consumers.
     pub fn copy_from(&self, values: &[T]) -> Result<()> {
         assert_eq!(values.len(), self.len, "host and device lengths differ");
         if self.len == 0 {
@@ -553,6 +556,7 @@ impl<T: DeviceElement> DeviceBuffer<T> {
         }
     }
 
+    /// Callers must first wait for outstanding producer work on non-blocking streams.
     pub fn copy_to(&self, values: &mut [T]) -> Result<()> {
         assert_eq!(values.len(), self.len, "host and device lengths differ");
         if self.len == 0 {
@@ -710,7 +714,7 @@ impl<T: DeviceElement> Drop for DeviceBuffer<T> {
     }
 }
 
-/// Page-locked storage restricted to scalars supported by CUDA allocation alignment.
+/// Page-locked storage with checked scalar alignment.
 ///
 /// ```compile_fail
 /// use cuda_native_runtime::{Context, PinnedBuffer};
@@ -752,8 +756,12 @@ impl<T: DeviceElement + Default> PinnedBuffer<T> {
             context: Arc::clone(&context.inner),
             marker: PhantomData,
         };
+        assert!(
+            buffer.raw.cast::<T>().is_aligned(),
+            "pinned allocation is misaligned"
+        );
         for index in 0..len {
-            // SAFETY: CUDA's host alignment covers these scalars; each checked slot is written once.
+            // SAFETY: extent and alignment were checked; every slot is initialized before exposure.
             unsafe { buffer.raw.cast::<T>().add(index).write(T::default()) };
         }
         Ok(buffer)
