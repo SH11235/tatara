@@ -742,6 +742,11 @@ fn rescore_input_resolution_validates_canonical_paths() {
         std::os::unix::fs::symlink(&psv, &psv_alias).unwrap();
         let error = crate::training::canonicalize_rescore_input(&hcpe_alias).unwrap_err();
         assert!(error.to_string().contains("requires PSV, not HCPE"));
+        assert!(
+            error
+                .to_string()
+                .contains(hcpe.canonicalize().unwrap().to_str().unwrap())
+        );
         assert_eq!(
             crate::training::canonicalize_rescore_input(&psv_alias).unwrap(),
             psv.canonicalize().unwrap()
