@@ -8,8 +8,8 @@
 //!   ため上限は 256 (`bucket = num_buckets - 1` が `u8::MAX` に収まる)
 //! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
 //! - Q16 bucket 割当 (`*_q16` 系): 係数を `round(w * 65536)` の i32、和を i64、閾値を
-//!   `round(ln(i / (N - i)) * 65536)` (`i = 1..N`) とする整数版。YaneuraOu SFNN の progress
-//!   routing と rshogi の `progresskpabsq16` が同じ量子化を使う。整数和は加算順に依存しないので、
+//!   `round(ln(i / (N - i)) * 65536)` (`i = 1..N`) とする整数版。推論エンジン rshogi の
+//!   `progresskpabsq16` が同じ量子化を使う。整数和は加算順に依存しないので、
 //!   推論側が差分更新しても学習時と同じ bucket になる
 
 use std::path::Path;
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn q16_thresholds_match_inference_table() {
-        // 推論側 (rshogi `progress_q16.rs` の THRESHOLDS、YaneuraOu の progress routing) と
+        // 推論側 (rshogi `progress_q16.rs` の THRESHOLDS) と
         // 同じ値。N = 8 / 9 / 16 を固定値で照合し、全 N で閾値の両側の割当を確認する。
         let expected: [(usize, &[i64]); 3] = [
             (8, &[-127527, -71999, -33477, 0, 33477, 71999, 127527]),
