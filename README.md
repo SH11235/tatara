@@ -198,6 +198,7 @@ own net, see the [setup guide](docs/setup.md).
 | **DL** | Deep learning — the model-derived score label stored alongside the base search score in a dual-label PSV |
 | **HCPE** | HuffmanCodedPosAndEval — the 38-byte Apery / dlshogi position, score, move, and game-result format |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
+| **Q16** | Fixed-point values scaled by 65536 (16 fractional bits). `--bucket-mode progresskpabsq16` quantises the progress coefficients and bucket thresholds this way |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
 | **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
 | **EffectBucket** | Feature-set extension that maps each base feature row to `base_index * NB + effect_bucket`, where `EffectBucket=<config>` in the arch string records the bucket count and whether king features are bucketed |

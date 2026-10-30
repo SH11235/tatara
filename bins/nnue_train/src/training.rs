@@ -381,7 +381,7 @@ pub(crate) fn validate_output_format(
     if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
     {
         return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress routing is not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress routing cannot be exported to YaneuraOu SFNN"
                 .into(),
         );
     }

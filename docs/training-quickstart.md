@@ -70,9 +70,9 @@ with `progress-kpabs-train` and inspect it with `progress-bucket-survey`, as
 described in [Game-progress buckets: preparing `progress.bin`](progress-bin.md).
 `progresskpabsq16` uses the same `progress.bin` and bucket count but sums the
 coefficients as integers (`round(w * 65536)`) and compares against integer
-thresholds, the routing used by YaneuraOu SFNN progress nets and rshogi
-`LS_BUCKET_MODE=progresskpabsq16`. Its buckets differ from `progresskpabs` only
-for positions within about 1e-4 of a boundary in logit space. Train, rescore and
+thresholds, the routing used by rshogi `LS_BUCKET_MODE=progresskpabsq16`. Its
+buckets differ from `progresskpabs` only for positions very close to a bucket
+boundary, where the coefficient rounding decides the side. Train, rescore and
 run inference with the same mode.
 `kingrank9` matches YaneuraOu KingRank9: it normalises both king ranks to the
 side-to-move perspective and selects one of a fixed 3x3 grid of 9 buckets. It

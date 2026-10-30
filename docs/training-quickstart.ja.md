@@ -62,9 +62,9 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
 `progresskpabsq16` は同じ `progress.bin` と bucket 数を使い、係数を整数
-(`round(w * 65536)`) で合計して整数の閾値と比べる。YaneuraOu SFNN の progress net と
-rshogi の `LS_BUCKET_MODE=progresskpabsq16` が使う routing で、`progresskpabs` と bucket が
-変わるのは logit 空間で境界から 1e-4 程度以内の局面だけ。学習・リスコア・推論は同じ mode に揃える。
+(`round(w * 65536)`) で合計して整数の閾値と比べる。rshogi の
+`LS_BUCKET_MODE=progresskpabsq16` が使う routing で、`progresskpabs` と bucket が
+変わるのは、bucket の境界のごく近くで係数の丸めが向きを決める局面だけ。学習・リスコア・推論は同じ mode に揃える。
 `kingrank9` は YaneuraOu KingRank9 と同じく、双方の玉段を手番側視点へ正規化して
 3x3 の固定 9 bucket に分ける。この mode では `progress.bin` は使わない。
 
