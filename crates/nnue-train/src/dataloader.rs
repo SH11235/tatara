@@ -304,6 +304,9 @@ pub enum BucketMode {
     /// KP-absolute progress 推定値を `num_buckets` 等分する。
     #[default]
     ProgressKpAbs,
+    /// [`Self::ProgressKpAbs`] と同じ係数・同じ等分を、Q16 整数の logit 和と整数閾値で
+    /// 判定する。境界のごく近くの局面だけ f32 版と bucket が変わる。
+    ProgressKpAbsQ16,
     /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
     KingRank9,
 }
@@ -319,17 +322,24 @@ impl BucketMode {
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::ProgressKpAbs => "progresskpabs",
+            Self::ProgressKpAbsQ16 => "progresskpabsq16",
             Self::KingRank9 => "kingrank9",
         }
     }
 
-    /// bucket mode 名をパースする。canonical 名 (`progresskpabs` / `kingrank9`)
+    /// progress 係数ファイル (`--progress-coeff`) で bucket を決める mode か。
+    pub const fn uses_progress_coeff(self) -> bool {
+        matches!(self, Self::ProgressKpAbs | Self::ProgressKpAbsQ16)
+    }
+
+    /// bucket mode 名をパースする。canonical 名 (`progresskpabs` / `progresskpabsq16` / `kingrank9`)
     /// に加え、[`Self::LEGACY_PROGRESS_KPABS_NAME`] も受理する。返り値の bool は
     /// legacy alias 経由で一致したかで、CLI 入力の呼び出し元が非推奨警告を出す
     /// 判断に使う (checkpoint header の読み戻しでは警告不要なので無視する)。
     pub fn parse(name: &str) -> Option<(Self, bool)> {
         match name {
             "progresskpabs" => Some((Self::ProgressKpAbs, false)),
+            "progresskpabsq16" => Some((Self::ProgressKpAbsQ16, false)),
             Self::LEGACY_PROGRESS_KPABS_NAME => Some((Self::ProgressKpAbs, true)),
             "kingrank9" => Some((Self::KingRank9, false)),
             _ => None,
@@ -352,7 +362,7 @@ impl BucketMode {
             }
             Some((mode, false)) => Ok((mode, None)),
             None => Err(format!(
-                "--bucket-mode '{name}' is unknown (expected 'progresskpabs' or 'kingrank9')"
+                "--bucket-mode '{name}' is unknown (expected 'progresskpabs', 'progresskpabsq16' or 'kingrank9')"
             )),
         }
     }
@@ -362,6 +372,7 @@ impl BucketMode {
     pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
         match self {
             Self::ProgressKpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
+            Self::ProgressKpAbsQ16 => ShogiProgressKPAbs.bucket_q16_board(board, num_buckets),
             Self::KingRank9 => kingrank9_bucket_board(board),
         }
     }
@@ -1260,7 +1271,7 @@ impl BucketedPrefetchedLoader {
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
     /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
     /// `[-c, c]` に飽和させる (`--score-clamp-abs`)。
-    /// `bucket_mode` は output bucket の算出方式。`ProgressKpAbs` の重みは
+    /// `bucket_mode` は output bucket の算出方式。`ProgressKpAbs` / `ProgressKpAbsQ16` の重みは
     /// process-global なので呼び出し前に `ShogiProgressKPAbs::load_from_bin` 済で
     /// あること、未ロードなら全 bucket 4。`KingRank9` は外部重みを参照しない。
     /// `feature_set` は sparse index 化に使う feature set spec で、全 worker が共有する。
@@ -1667,6 +1678,10 @@ mod tests {
             BucketMode::parse("kingrank9"),
             Some((BucketMode::KingRank9, false))
         ));
+        assert!(matches!(
+            BucketMode::parse("progresskpabsq16"),
+            Some((BucketMode::ProgressKpAbsQ16, false))
+        ));
         // 非推奨 alias は legacy flag 付きで受理。
         assert!(matches!(
             BucketMode::parse(BucketMode::LEGACY_PROGRESS_KPABS_NAME),
@@ -1675,7 +1690,11 @@ mod tests {
         assert!(BucketMode::parse("progress9kpabs").is_none());
         assert!(BucketMode::parse("").is_none());
         // canonical 名は parse と round-trip する。
-        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+        for mode in [
+            BucketMode::ProgressKpAbs,
+            BucketMode::ProgressKpAbsQ16,
+            BucketMode::KingRank9,
+        ] {
             let (parsed, legacy) = BucketMode::parse(mode.canonical_name()).unwrap();
             assert_eq!(parsed.canonical_name(), mode.canonical_name());
             assert!(!legacy);
@@ -1685,7 +1704,11 @@ mod tests {
     #[test]
     fn bucket_mode_parse_cli_emits_deprecation_warning_only_for_alias() {
         // canonical 名は警告なしで通る。
-        for mode in [BucketMode::ProgressKpAbs, BucketMode::KingRank9] {
+        for mode in [
+            BucketMode::ProgressKpAbs,
+            BucketMode::ProgressKpAbsQ16,
+            BucketMode::KingRank9,
+        ] {
             let (parsed, warning) = BucketMode::parse_cli(mode.canonical_name()).unwrap();
             assert_eq!(parsed.canonical_name(), mode.canonical_name());
             assert!(warning.is_none(), "canonical name must not warn");
@@ -1706,10 +1729,11 @@ mod tests {
             "{warning}"
         );
 
-        // 未知名は canonical 名 2 種を列挙するエラー文。
+        // 未知名は canonical 名を列挙するエラー文。
         let err = BucketMode::parse_cli("progress9kpabs").unwrap_err();
         assert!(err.contains("unknown"), "{err}");
-        assert!(err.contains("progresskpabs"), "{err}");
+        assert!(err.contains("'progresskpabs'"), "{err}");
+        assert!(err.contains("progresskpabsq16"), "{err}");
         assert!(err.contains("kingrank9"), "{err}");
     }
 

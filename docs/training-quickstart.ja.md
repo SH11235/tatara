@@ -19,7 +19,7 @@
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
 | 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
-| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progresskpabs` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
+| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progresskpabs` / `progresskpabsq16` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)
@@ -57,10 +57,14 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキには 2 つの bucket mode がある。既定の `progresskpabs` は
+`layerstack` アーキには 3 つの bucket mode がある。既定の `progresskpabs` は
 局面進行度を 2–9 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
 学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
+`progresskpabsq16` は同じ `progress.bin` と bucket 数を使い、係数を整数
+(`round(w * 65536)`) で合計して整数の閾値と比べる。YaneuraOu SFNN の progress net と
+rshogi の `LS_BUCKET_MODE=progresskpabsq16` が使う routing で、`progresskpabs` と bucket が
+変わるのは logit 空間で境界から 1e-4 程度以内の局面だけ。学習・リスコア・推論は同じ mode に揃える。
 `kingrank9` は YaneuraOu KingRank9 と同じく、双方の玉段を手番側視点へ正規化して
 3x3 の固定 9 bucket に分ける。この mode では `progress.bin` は使わない。
 
@@ -105,8 +109,8 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
-| `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
-| `--num-buckets` (`layerstack`) | 9 | `progresskpabs` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
+| `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
+| `--num-buckets` (`layerstack`) | 9 | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
 
 ### 教師データの先読みとshuffle
 
