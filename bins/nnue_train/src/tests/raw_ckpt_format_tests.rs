@@ -560,6 +560,7 @@ fn downgrade_v6_to_v5(buf: &mut Vec<u8>, arch: &RawCkptArch) {
 fn raw_ckpt_v8_bucket_modes_round_trip() {
     for arch in [
         layerstack_arch_with_mode("progresskpabs"),
+        layerstack_arch_with_mode("progresskpabsq16"),
         layerstack_arch_with_mode("kingrank9"),
         simple_arch(),
     ] {
@@ -605,6 +606,8 @@ fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
     for (written, requested) in [
         ("progresskpabs", "kingrank9"),
         ("kingrank9", "progresskpabs"),
+        ("progresskpabs", "progresskpabsq16"),
+        ("progresskpabsq16", "progresskpabs"),
     ] {
         let mut buf = Vec::new();
         write_raw_ckpt_header(

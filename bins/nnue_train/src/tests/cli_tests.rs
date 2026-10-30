@@ -1270,6 +1270,19 @@ fn progresskpabs_bucket_mode_accepts_canonical_and_legacy_alias() {
 }
 
 #[test]
+fn progresskpabsq16_bucket_mode_shares_progress_bucket_range() {
+    let valid = layerstack_args(&["--bucket-mode", "progresskpabsq16", "--num-buckets", "8"]);
+    assert!(matches!(
+        validate_bucket_mode(&valid),
+        Ok(nnue_train::dataloader::BucketMode::ProgressKpAbsQ16)
+    ));
+
+    let too_few = layerstack_args(&["--bucket-mode", "progresskpabsq16", "--num-buckets", "1"]);
+    let err = validate_bucket_mode(&too_few).unwrap_err().to_string();
+    assert!(err.contains("for progresskpabsq16"), "{err}");
+}
+
+#[test]
 fn simple_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::Simple);

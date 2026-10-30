@@ -93,7 +93,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// - **fail-closed**: worker のエラー / panic は `next_chunk` の `Err` として
 ///   伝搬し、以降の chunk を 1 個も yield しない (module doc 参照)。
 ///
-/// progresskpabs mode の重みは process-global なので、呼び出し前に
+/// progress 系 mode (progresskpabs / progresskpabsq16) の重みは process-global なので、呼び出し前に
 /// `ShogiProgressKPAbs::load_from_bin` 済みであること (未ロードなら全 bucket 4 —
 /// [`BucketedPrefetchedLoader`] と同じ契約)。
 ///

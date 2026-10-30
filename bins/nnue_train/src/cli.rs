@@ -1172,14 +1172,20 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
     pub(crate) fv_scale: Option<i32>,
 
-    /// progresskpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
-    /// king squares x 1548 KP-abs piece inputs). When omitted in progresskpabs
-    /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
-    /// 0.5`). Do not specify this option in kingrank9 mode.
+    /// Progress coefficient file (`progress.bin`; f64 LE x 125388 = 81
+    /// king squares x 1548 KP-abs piece inputs) for progresskpabs and
+    /// progresskpabsq16. When omitted in those modes, every position falls in
+    /// bucket 4 (zero weights → `sigmoid(0) = 0.5`). Do not specify this option
+    /// in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// Bucket assignment: `progresskpabs` uses the KP-absolute progress model;
+    /// Bucket assignment: `progresskpabs` uses the KP-absolute progress model
+    /// with an f32 sum; `progresskpabsq16` uses the same model with the
+    /// coefficients quantised to `round(w * 65536)` and integer bucket
+    /// thresholds, the routing that YaneuraOu SFNN progress nets and rshogi's
+    /// `progresskpabsq16` use at inference. The two modes differ only for
+    /// positions within about 1e-4 of a bucket boundary in logit space.
     /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets. The
     /// deprecated spelling `progress8kpabs` is accepted as an alias of
     /// `progresskpabs` (the digit is not the bucket count; see `--num-buckets`).
@@ -1210,8 +1216,9 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
 
-    /// LayerStack output bucket count. In progresskpabs mode, each position is
-    /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
+    /// LayerStack output bucket count. In progresskpabs / progresskpabsq16 mode,
+    /// each position is routed to `min(N-1, floor(p * N))` and N must be in
+    /// `[2, 9]`. In
     /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
     /// in the per-bucket weight backward kernels. The default 9 keeps the
     /// binning and weight-buffer shape identical to the standard layout and

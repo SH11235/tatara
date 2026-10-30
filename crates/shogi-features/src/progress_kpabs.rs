@@ -7,6 +7,10 @@
 //!   に対し `min(num_buckets - 1, floor(p * num_buckets))`。返り値が `u8` の
 //!   ため上限は 256 (`bucket = num_buckets - 1` が `u8::MAX` に収まる)
 //! - 重み読込: `progress.bin` (f64 little-endian × 125_388 個、`8 * 125_388 = 1_003_104` bytes 固定)
+//! - Q16 bucket 割当 (`*_q16` 系): 係数を `round(w * 65536)` の i32、和を i64、閾値を
+//!   `round(ln(i / (N - i)) * 65536)` (`i = 1..N`) とする整数版。YaneuraOu SFNN の progress
+//!   routing と rshogi の `progresskpabsq16` が同じ量子化を使う。整数和は加算順に依存しないので、
+//!   推論側が差分更新しても学習時と同じ bucket になる
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -18,9 +22,18 @@ use shogi_format::{BonaPiece, Color, PackedSfenValue, ShogiBoard};
 /// KP-absolute 特徴の次元数: `81 * FE_OLD_END`。
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
-static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
+static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<LoadedWeights> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS_Q16: [i32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
+    [0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+static Q16_THRESHOLDS: OnceLock<Box<[Box<[i64]>]>> = OnceLock::new();
+
+/// Q16 の量子化は f32 へ丸める前の f64 から行う (f32 経由だと推論側と値がずれる)。
+struct LoadedWeights {
+    f32: Box<[f32]>,
+    q16: Box<[i32]>,
+}
 
 /// Progress-based N-bucket assignment using KP-absolute features.
 ///
@@ -34,7 +47,15 @@ impl ShogiProgressKPAbs {
         SHOGI_PROGRESS_KP_ABS_WEIGHTS
             .get()
             .map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS, |weights| {
-                weights.as_ref()
+                weights.f32.as_ref()
+            })
+    }
+
+    fn weights_q16() -> &'static [i32] {
+        SHOGI_PROGRESS_KP_ABS_WEIGHTS
+            .get()
+            .map_or(&SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS_Q16, |weights| {
+                weights.q16.as_ref()
             })
     }
 
@@ -122,18 +143,26 @@ impl ShogiProgressKPAbs {
             ));
         }
 
-        let weights: Vec<f32> = bytes
+        let raw: Vec<f64> = bytes
             .chunks_exact(std::mem::size_of::<f64>())
-            .map(|chunk| {
-                f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32
-            })
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")))
             .collect();
+        // 非有限値は f32 routing では sigmoid が NaN になって bucket 0 に、Q16 では飽和
+        // キャストで端の値になり、どちらも誤 routing を黙って続けるので読込時に弾く。
+        if let Some(i) = raw.iter().position(|w| !w.is_finite()) {
+            return Err(format!(
+                "progress.bin coefficient {i} is not finite ({})",
+                raw[i]
+            ));
+        }
+        let weights = LoadedWeights {
+            f32: raw.iter().map(|&w| w as f32).collect(),
+            q16: raw.iter().map(|&w| quantize_q16(w)).collect(),
+        };
 
-        SHOGI_PROGRESS_KP_ABS_WEIGHTS
-            .set(weights.into_boxed_slice())
-            .map_err(|_| {
-                "KP-absolute progress weights are already loaded in this process".to_string()
-            })?;
+        SHOGI_PROGRESS_KP_ABS_WEIGHTS.set(weights).map_err(|_| {
+            "KP-absolute progress weights are already loaded in this process".to_string()
+        })?;
 
         Ok(Self)
     }
@@ -177,6 +206,52 @@ impl ShogiProgressKPAbs {
         let raw = (p * num_buckets as f32).floor() as i32;
         raw.clamp(0, n_i32 - 1) as u8
     }
+
+    /// Q16 logit 和 (`Σ round(w * 65536)`)。重み未ロードでは常に 0。
+    pub fn progress_q16_sum_board(&self, board: &ShogiBoard) -> i64 {
+        q16_sum_with(board, Self::weights_q16())
+    }
+
+    /// Q16 版の N-bucket 割当。`num_buckets` の範囲は [`Self::bucket_board`] と同じ。
+    /// 重み未ロード (和 0) では [`Self::bucket_board`] と同じく `floor(N / 2)` を返す。
+    pub fn bucket_q16_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+        q16_sum_to_bucket(self.progress_q16_sum_board(board), num_buckets)
+    }
+}
+
+fn quantize_q16(weight: f64) -> i32 {
+    // `as` は i32 の範囲外を端の値へ飽和させる。
+    (weight * 65536.0).round() as i32
+}
+
+fn q16_sum_with(board: &ShogiBoard, weights: &[i32]) -> i64 {
+    let mut sum = 0i64;
+    ShogiProgressKPAbs::for_each_active_index_board(board, |idx| sum += i64::from(weights[idx]));
+    sum
+}
+
+/// Q16 logit 和を bucket へ変換する。閾値と等しい和は上側の bucket に入る
+/// (f32 版の `floor(p * N)` で `p = i / N` ちょうどが bucket `i` になるのと同じ向き)。
+pub fn q16_sum_to_bucket(sum: i64, num_buckets: usize) -> u8 {
+    assert!(
+        (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
+        "num_buckets must be in [1, {MAX_NUM_BUCKETS}] (got {num_buckets})"
+    );
+    let thresholds = &Q16_THRESHOLDS.get_or_init(build_q16_thresholds)[num_buckets];
+    thresholds.partition_point(|&t| t <= sum) as u8
+}
+
+fn build_q16_thresholds() -> Box<[Box<[i64]>]> {
+    (0..=MAX_NUM_BUCKETS)
+        .map(|n| {
+            (1..n)
+                .map(|i| {
+                    let p = i as f64 / n as f64;
+                    ((p / (1.0 - p)).ln() * 65536.0).round() as i64
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// `ShogiProgressKPAbs::bucket{,_board}` が受け付ける `num_buckets` の上限。
@@ -298,6 +373,83 @@ mod tests {
             let want = ((0.5_f32 * n as f32).floor() as i32).clamp(0, n as i32 - 1) as u8;
             let got = p.bucket_board(&board, n);
             assert_eq!(got, want, "bucket_board mismatch for N={n}");
+        }
+    }
+
+    #[test]
+    fn q16_thresholds_match_inference_table() {
+        // 推論側 (rshogi `progress_q16.rs` の THRESHOLDS、YaneuraOu の progress routing) と
+        // 同じ値。N = 8 / 9 / 16 を固定値で照合し、全 N で閾値の両側の割当を確認する。
+        let expected: [(usize, &[i64]); 3] = [
+            (8, &[-127527, -71999, -33477, 0, 33477, 71999, 127527]),
+            (
+                9,
+                &[-136278, -82101, -45426, -14624, 14624, 45426, 82101, 136278],
+            ),
+            (
+                16,
+                &[
+                    -177475, -127527, -96098, -71999, -51672, -33477, -16470, 0, 16470, 33477,
+                    51672, 71999, 96098, 127527, 177475,
+                ],
+            ),
+        ];
+        let table = Q16_THRESHOLDS.get_or_init(build_q16_thresholds);
+        for (n, want) in expected {
+            assert_eq!(&*table[n], want, "N={n}");
+        }
+        for n in 1..=MAX_NUM_BUCKETS {
+            assert_eq!(q16_sum_to_bucket(i64::MIN, n), 0);
+            assert_eq!(q16_sum_to_bucket(i64::MAX, n) as usize, n - 1);
+            for (i, &t) in table[n].iter().enumerate() {
+                assert_eq!(q16_sum_to_bucket(t - 1, n) as usize, i, "N={n}");
+                assert_eq!(q16_sum_to_bucket(t, n) as usize, i + 1, "N={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn q16_quantization_rounds_half_away_from_zero_and_saturates() {
+        let got: Vec<i32> = [
+            0.5 / 65536.0,
+            -0.5 / 65536.0,
+            1.49 / 65536.0,
+            -1.49 / 65536.0,
+            f64::MAX,
+            -f64::MAX,
+        ]
+        .into_iter()
+        .map(quantize_q16)
+        .collect();
+        assert_eq!(got, [1, -1, 1, -1, i32::MAX, i32::MIN]);
+    }
+
+    #[test]
+    fn q16_zero_weights_match_f32_bucket() {
+        let board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: shogi_format::types::Square::new(4, 8),
+            white_king_sq: shogi_format::types::Square::new(4, 0),
+            ..Default::default()
+        };
+        let p = ShogiProgressKPAbs;
+        assert_eq!(p.progress_q16_sum_board(&board), 0);
+        for n in 1..=16 {
+            assert_eq!(
+                p.bucket_q16_board(&board, n),
+                p.bucket_board(&board, n),
+                "N={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_non_finite_coefficients() {
+        let mut bytes = vec![0u8; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * 8];
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            bytes[8..16].copy_from_slice(&value.to_le_bytes());
+            let err = ShogiProgressKPAbs::load_from_bytes(&bytes).err().unwrap();
+            assert!(err.contains("coefficient 1 is not finite"), "{err}");
         }
     }
 
