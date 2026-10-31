@@ -15,6 +15,20 @@ const YO_NETWORK_HASH: u32 = 0x6333_718a;
 /// YaneuraOu SFNN が要求する KingRank9 LayerStack 数。
 pub const YANEURAOU_LAYER_STACKS: usize = 9;
 
+/// progress kp abs routing で受理する LayerStack 数の上限 (tatara `progresskpabs` と同じ範囲)。
+pub const MAX_PROGRESS_KPABS_BUCKETS: usize = 9;
+
+/// YaneuraOu SFNN の LayerStack 選択規則。Network 構造名の末尾 token に対応し、
+/// weights 自体には記録されないため caller が学習 config 等から指定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YaneuraOuRouting {
+    /// 両玉の段 3x3 (`_K3K3`)。LayerStack は常に 9。
+    KingRank9,
+    /// KP 絶対値の進行度を N 等分した bucket (`_PROGRESS<N>`、N=1 は suffix なし)。
+    /// YaneuraOu は進行度係数を評価ファイルと同じ directory の `progress.bin` から読む。
+    ProgressKpAbs,
+}
+
 const MAX_FT_OUT: usize = 8192;
 const MAX_HIDDEN_DIM: usize = 4096;
 
@@ -52,14 +66,25 @@ const YO_FEATURES: [YoFeature; 5] = [
     },
 ];
 
+/// LayerStack weights を KingRank9 routing の YaneuraOu SFNNWithoutPsqt 形式で書き出す。
+///
+/// [`save_yaneuraou_with_routing`] に [`YaneuraOuRouting::KingRank9`] を渡すのと同じ。
+pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> io::Result<()> {
+    save_yaneuraou_with_routing(writer, weights, YaneuraOuRouting::KingRank9)
+}
+
 /// LayerStack weights を YaneuraOu SFNNWithoutPsqt 形式で書き出す。
 ///
 /// feature set と各層次元は weights の shape から決定する。YaneuraOu SFNN が
-/// 表現できない拡張 feature、PSQT、KingRank9 以外の bucket 数は reject する。
+/// 表現できない拡張 feature、PSQT、routing と合わない bucket 数は reject する。
 /// bucket routing mode 自体は weights に含まれないため、caller は学習 config 等から
-/// KingRank9 であることを確認してから呼ぶ必要がある。
-pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> io::Result<()> {
-    let arch = architecture(weights)?;
+/// routing を確認してから渡す必要がある。
+pub fn save_yaneuraou_with_routing<W: Write>(
+    writer: &mut W,
+    weights: &LayerStackWeights,
+    routing: YaneuraOuRouting,
+) -> io::Result<()> {
+    let arch = architecture(weights, routing)?;
     validate_weights(&arch, weights)?;
 
     let ft_out = arch.ft_out;
@@ -80,7 +105,7 @@ pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> 
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_b, QA as f64))?;
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_w, QA as f64))?;
 
-    for bucket in 0..YANEURAOU_LAYER_STACKS {
+    for bucket in 0..arch.num_buckets {
         write_u32(writer, YO_NETWORK_HASH)?;
 
         // L1 shared term は通常 export 前に L1 へ fold 済み。未 fold の weights を
@@ -119,9 +144,14 @@ struct Architecture {
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    num_buckets: usize,
+    routing: YaneuraOuRouting,
 }
 
-fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
+fn architecture(
+    weights: &LayerStackWeights,
+    routing: YaneuraOuRouting,
+) -> io::Result<Architecture> {
     let feature_set = FeatureSet::ALL
         .into_iter()
         .find(|feature_set| feature_set.spec() == weights.feature_set)
@@ -129,11 +159,20 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
     let ft_out = weights.ft_b.len();
     let l1_out = weights.l1_shared_bias.len();
     let num_buckets = weights.num_buckets;
-    if num_buckets != YANEURAOU_LAYER_STACKS {
-        return invalid_input(format!(
-            "YaneuraOu SFNN requires {} LayerStacks (KingRank9), but weights have {num_buckets} buckets",
-            YANEURAOU_LAYER_STACKS
-        ));
+    match routing {
+        YaneuraOuRouting::KingRank9 if num_buckets != YANEURAOU_LAYER_STACKS => {
+            return invalid_input(format!(
+                "YaneuraOu SFNN requires {YANEURAOU_LAYER_STACKS} LayerStacks (KingRank9), but weights have {num_buckets} buckets"
+            ));
+        }
+        YaneuraOuRouting::ProgressKpAbs
+            if num_buckets == 0 || num_buckets > MAX_PROGRESS_KPABS_BUCKETS =>
+        {
+            return invalid_input(format!(
+                "progress kp abs routing supports 1..={MAX_PROGRESS_KPABS_BUCKETS} LayerStacks, but weights have {num_buckets} buckets"
+            ));
+        }
+        _ => {}
     }
     let l2_out = weights.l2_b.len().checked_div(num_buckets).unwrap_or(0);
     Ok(Architecture {
@@ -141,6 +180,8 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
         ft_out,
         l1_out,
         l2_out,
+        num_buckets,
+        routing,
     })
 }
 
@@ -151,7 +192,15 @@ fn arch_string(arch: &Architecture) -> String {
         .expect("every FeatureSet has a YaneuraOu mapping");
     let input_size = arch.feature_set.spec().ft_in();
     let h1 = arch.l1_out - 1;
-    let network = if arch.feature_set == FeatureSet::HalfKaHmMerged
+    // 生成器 (`nnue_arch_gen.py`) は layer stack token を `_` で連結し、bucket が 1 つの
+    // ときは token を付けない。`SFNN-1536` は KingRank9 の既定構造に限る。
+    let layer_stack_token = match arch.routing {
+        YaneuraOuRouting::KingRank9 => "_k3k3".to_string(),
+        YaneuraOuRouting::ProgressKpAbs if arch.num_buckets == 1 => String::new(),
+        YaneuraOuRouting::ProgressKpAbs => format!("_progress{}", arch.num_buckets),
+    };
+    let network = if arch.routing == YaneuraOuRouting::KingRank9
+        && arch.feature_set == FeatureSet::HalfKaHmMerged
         && arch.ft_out == 1536
         && arch.l1_out == 16
         && arch.l2_out == 32
@@ -159,14 +208,14 @@ fn arch_string(arch: &Architecture) -> String {
         "SFNN-1536".to_string()
     } else {
         format!(
-            "SFNN_{}_{}_{}_{}_k3k3",
+            "SFNN_{}_{}_{}_{}{layer_stack_token}",
             feature.gen_key, arch.ft_out, h1, arch.l2_out
         )
         .to_ascii_uppercase()
     };
     format!(
-        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={YANEURAOU_LAYER_STACKS}}}",
-        feature.yo_name, arch.ft_out
+        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
+        feature.yo_name, arch.ft_out, arch.num_buckets
     )
 }
 
@@ -197,15 +246,11 @@ fn validate_weights(arch: &Architecture, weights: &LayerStackWeights) -> io::Res
     let lengths = [
         ("ft_b", weights.ft_b.len(), arch.ft_out),
         ("ft_w", weights.ft_w.len(), spec.ft_in() * arch.ft_out),
-        (
-            "l1_b",
-            weights.l1_b.len(),
-            YANEURAOU_LAYER_STACKS * arch.l1_out,
-        ),
+        ("l1_b", weights.l1_b.len(), arch.num_buckets * arch.l1_out),
         (
             "l1_w",
             weights.l1_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l1_out * arch.ft_out,
+            arch.num_buckets * arch.l1_out * arch.ft_out,
         ),
         ("l1_shared_bias", weights.l1_shared_bias.len(), arch.l1_out),
         (
@@ -213,22 +258,14 @@ fn validate_weights(arch: &Architecture, weights: &LayerStackWeights) -> io::Res
             weights.l1_shared_weight.len(),
             arch.ft_out * arch.l1_out,
         ),
-        (
-            "l2_b",
-            weights.l2_b.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out,
-        ),
-        ("l3_b", weights.l3_b.len(), YANEURAOU_LAYER_STACKS),
+        ("l2_b", weights.l2_b.len(), arch.num_buckets * arch.l2_out),
+        ("l3_b", weights.l3_b.len(), arch.num_buckets),
         (
             "l2_w",
             weights.l2_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out * l2_in,
+            arch.num_buckets * arch.l2_out * l2_in,
         ),
-        (
-            "l3_w",
-            weights.l3_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out,
-        ),
+        ("l3_w", weights.l3_w.len(), arch.num_buckets * arch.l2_out),
     ];
     for (name, actual, expected) in lengths {
         if actual != expected {
@@ -324,7 +361,7 @@ mod tests {
             YANEURAOU_LAYER_STACKS,
         );
         assert_eq!(
-            arch_string(&architecture(&weights).unwrap()),
+            arch_string(&architecture(&weights, YaneuraOuRouting::KingRank9).unwrap()),
             "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->1536x2],Network=SFNN-1536{LayerStack=9}"
         );
     }
@@ -370,7 +407,10 @@ mod tests {
                 l2_out,
                 YANEURAOU_LAYER_STACKS,
             );
-            assert_eq!(arch_string(&architecture(&weights).unwrap()), expected);
+            assert_eq!(
+                arch_string(&architecture(&weights, YaneuraOuRouting::KingRank9).unwrap()),
+                expected
+            );
         }
     }
 
@@ -379,6 +419,69 @@ mod tests {
         let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 8);
         let error = save_yaneuraou(&mut Vec::new(), &weights).unwrap_err();
         assert!(error.to_string().contains("KingRank9"), "{error}");
+    }
+
+    #[test]
+    fn progress_kpabs_architecture_names_follow_generator_tokens() {
+        let cases = [
+            (
+                FeatureSet::HalfKaHmMerged,
+                2304,
+                16,
+                64,
+                8,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->2304x2],Network=SFNN_HALFKAHM2_2304_15_64_PROGRESS8{LayerStack=8}",
+            ),
+            (
+                FeatureSet::HalfKaHmMerged,
+                1536,
+                16,
+                32,
+                9,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->1536x2],Network=SFNN_HALFKAHM2_1536_15_32_PROGRESS9{LayerStack=9}",
+            ),
+            (
+                FeatureSet::HalfKp,
+                512,
+                16,
+                32,
+                1,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKP(Friend)[125388->512x2],Network=SFNN_HALFKP_512_15_32{LayerStack=1}",
+            ),
+        ];
+        for (feature_set, ft_out, l1_out, l2_out, buckets, expected) in cases {
+            let weights =
+                LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, buckets);
+            let arch = architecture(&weights, YaneuraOuRouting::ProgressKpAbs).unwrap();
+            assert_eq!(arch_string(&arch), expected);
+        }
+    }
+
+    #[test]
+    fn progress_kpabs_rejects_bucket_counts_outside_supported_range() {
+        let weights = LayerStackWeights::zeroed(
+            FeatureSet::HalfKaHmMerged.spec(),
+            128,
+            16,
+            32,
+            MAX_PROGRESS_KPABS_BUCKETS + 1,
+        );
+        let error =
+            save_yaneuraou_with_routing(&mut Vec::new(), &weights, YaneuraOuRouting::ProgressKpAbs)
+                .unwrap_err();
+        assert!(error.to_string().contains("progress kp abs"), "{error}");
+    }
+
+    #[test]
+    fn progress_kpabs_export_writes_one_network_per_bucket() {
+        let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 4, 3, 5);
+        let mut output = Vec::new();
+        save_yaneuraou_with_routing(&mut output, &weights, YaneuraOuRouting::ProgressKpAbs)
+            .unwrap();
+        let hash = YO_NETWORK_HASH.to_le_bytes();
+        // 全ゼロ weights では network hash の byte 列は各 LayerStack の先頭にしか現れない。
+        let count = output.windows(4).filter(|window| *window == hash).count();
+        assert_eq!(count, 5);
     }
 
     #[test]

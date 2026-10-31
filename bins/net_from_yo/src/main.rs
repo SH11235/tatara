@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use clap::Parser;
-use nnue_format::LayerStackWeights;
+use clap::{ArgGroup, Parser};
 use nnue_format::layerstack_weights::{QA, QB, pad32, read_leb128_tensor_i16};
+use nnue_format::{LayerStackWeights, MAX_PROGRESS_KPABS_BUCKETS, YaneuraOuRouting};
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
 /// YaneuraOu SFNNwoPSQT ビルドが評価ファイルに埋め込む 4 つのハッシュ。SFNNwoPSQT
@@ -21,7 +21,7 @@ const YO_LEB128_PREFIX: u8 = b'_';
 const MAX_FT_OUT: usize = 8192;
 const MAX_HIDDEN_DIM: usize = 4096;
 /// YaneuraOu SFNN KingRank9 の bucket 数。3x3 で常に 9。
-const REQUIRED_BUCKETS: usize = 9;
+const KINGRANK9_BUCKETS: usize = 9;
 
 /// tatara feature set と YaneuraOu SFNN feature の対応 (net_to_yo と対称)。
 ///
@@ -62,6 +62,27 @@ const YO_FEATURES: [YoFeature; 5] = [
     },
 ];
 
+/// Network 構造名の layer stack token が示す LayerStack の並び。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerStackLayout {
+    /// `_K3K3` または既定 `SFNN-1536`。9 stack。
+    King3x3,
+    /// `_PROGRESS<N>`。N stack。
+    Progress(usize),
+    /// token なし。1 stack。
+    Single,
+}
+
+impl LayerStackLayout {
+    fn stack_count(self) -> usize {
+        match self {
+            Self::King3x3 => KINGRANK9_BUCKETS,
+            Self::Progress(buckets) => buckets,
+            Self::Single => 1,
+        }
+    }
+}
+
 /// YaneuraOu arch 文字列から読み取った変換対象アーキ。
 #[derive(Debug, Clone, Copy)]
 struct DetectedArch {
@@ -70,10 +91,16 @@ struct DetectedArch {
     l1_out: usize,
     l2_out: usize,
     num_buckets: usize,
+    layout: LayerStackLayout,
 }
 
 #[derive(Parser)]
 #[command(about = "Convert a YaneuraOu SFNN evaluation file to a tatara LayerStack net")]
+#[command(group(
+    ArgGroup::new("routing")
+        .required(true)
+        .args(["assume_kingrank9", "assume_progresskpabs"])
+))]
 struct Args {
     /// YaneuraOu nn.bin
     #[arg(long)]
@@ -85,6 +112,13 @@ struct Args {
     /// Quantised `.bin` files do not record their bucket routing mode.
     #[arg(long)]
     assume_kingrank9: bool,
+    /// Assert that the net uses progress kp abs routing (1-9 buckets).
+    /// Accepts `..._PROGRESS<N>` and single-stack networks, which keep their stack
+    /// count, and 9-stack `..._K3K3` files whose first N stacks are selected by
+    /// progress. For the latter the original N is not recorded in the output and
+    /// must be set separately when evaluating.
+    #[arg(long)]
+    assume_progresskpabs: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,11 +126,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    require_kingrank9_assertion(args.assume_kingrank9)?;
+    let routing = routing_from_assertions(args.assume_kingrank9, args.assume_progresskpabs)?;
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
-    let weights = read_yo(&mut reader)?;
+    let weights = read_yo(&mut reader, routing)?;
     reject_trailing_data(&mut reader)?;
 
     let output = File::create(&args.output)?;
@@ -106,17 +140,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
-    if !assume_kingrank9 {
-        return invalid_input(
-            "YaneuraOu SFNN files do not identify the bucket routing rule; pass \
-             --assume-kingrank9 only after confirming that the net uses king-rank routing",
-        );
+fn routing_from_assertions(
+    assume_kingrank9: bool,
+    assume_progresskpabs: bool,
+) -> io::Result<YaneuraOuRouting> {
+    match (assume_kingrank9, assume_progresskpabs) {
+        (true, false) => Ok(YaneuraOuRouting::KingRank9),
+        (false, true) => Ok(YaneuraOuRouting::ProgressKpAbs),
+        _ => invalid_input(
+            "YaneuraOu SFNN files do not fully identify the bucket routing rule; pass exactly \
+             one of --assume-kingrank9 or --assume-progresskpabs after confirming how the net \
+             selects its LayerStack",
+        ),
     }
-    Ok(())
 }
 
-fn read_yo<R: BufRead>(reader: &mut R) -> io::Result<LayerStackWeights> {
+/// 構造名の layer stack token と利用者が主張した routing の整合を確認する。
+/// 9 stack の `_K3K3` は、progress routing の net を 9 枠のまま書き出した評価ファイルにも
+/// 使われる (先頭 N 枠を進行度で選ぶ YaneuraOu 派生 build がある) ため、progress の主張でも受理する。
+fn check_routing(layout: LayerStackLayout, routing: YaneuraOuRouting) -> io::Result<()> {
+    match (routing, layout) {
+        (YaneuraOuRouting::KingRank9, LayerStackLayout::King3x3) => Ok(()),
+        (YaneuraOuRouting::KingRank9, _) => invalid_data(format!(
+            "--assume-kingrank9 requires a K3K3 network with {KINGRANK9_BUCKETS} LayerStacks, but the file has {} LayerStack(s) without a K3K3 token",
+            layout.stack_count()
+        )),
+        (YaneuraOuRouting::ProgressKpAbs, _) => {
+            let buckets = layout.stack_count();
+            if buckets > MAX_PROGRESS_KPABS_BUCKETS {
+                return invalid_data(format!(
+                    "progress kp abs routing supports up to {MAX_PROGRESS_KPABS_BUCKETS} LayerStacks, but the file has {buckets}"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_yo<R: BufRead>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result<LayerStackWeights> {
     expect_u32(reader, YO_VERSION, "version")?;
     expect_u32(reader, YO_TOP_HASH, "top-level hash")?;
 
@@ -133,6 +194,7 @@ fn read_yo<R: BufRead>(reader: &mut R) -> io::Result<LayerStackWeights> {
         )
     })?;
     let detected = parse_yo_arch(arch)?;
+    check_routing(detected.layout, routing)?;
 
     expect_u32(reader, YO_FT_HASH, "feature-transformer hash")?;
     consume_optional_leb128_prefix(reader)?;
@@ -209,12 +271,11 @@ fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
             ))
         })
         .and_then(parse_usize)?;
-    let (l1_out, l2_out) = parse_network_dims(network, feature, ft_out)?;
+    let (l1_out, l2_out, layout) = parse_network_dims(network, feature, ft_out)?;
 
     // 外部ファイル由来の arch 由来次元を、壊れた値 (0 次元 / 巨大値 → overflow・過大
-    // allocation) の前に弾く健全性ガード (net_to_yo と対称)。受理する Network 名は
-    // いずれも 3x3=9 bucket を意味し、`--assume-kingrank9` も 9 を主張するので
-    // num_buckets != 9 は自己矛盾として reject する。
+    // allocation) の前に弾く健全性ガード (net_to_yo と対称)。LayerStack 数は構造名の
+    // token が示す数と一致しなければ自己矛盾として reject する。
     if ft_out == 0 || ft_out > MAX_FT_OUT || ft_out % 32 != 0 {
         return invalid_data(format!(
             "unsupported FT output dimension {ft_out} (expected a positive multiple of 32 up to {MAX_FT_OUT})"
@@ -231,9 +292,10 @@ fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
             "unsupported L1 output dimension {l1_out} (L2 input {l2_in} must be 1..={MAX_HIDDEN_DIM})"
         ));
     }
-    if num_buckets != REQUIRED_BUCKETS {
+    if num_buckets != layout.stack_count() {
         return invalid_data(format!(
-            "unsupported LayerStack count {num_buckets} (YaneuraOu SFNN KingRank9 is always {REQUIRED_BUCKETS})"
+            "LayerStack count {num_buckets} disagrees with Network `{network}` (expected {})",
+            layout.stack_count()
         ));
     }
 
@@ -243,12 +305,13 @@ fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
         l1_out,
         l2_out,
         num_buckets,
+        layout,
     })
 }
 
-/// Network 構造名から L1/L2 出力次元を復元する。既定 `SFNN-1536`(-V2) は
-/// `HalfKA_hm2`/1536 専用で 16/32、それ以外は生成器同形の
-/// `SFNN_<GEN_KEY>_<ft>_<h1>_<h2>_K3K3` から `l1_out = h1 + 1`, `l2_out = h2` を取る。
+/// Network 構造名から L1/L2 出力次元と layer stack token を復元する。既定 `SFNN-1536`(-V2) は
+/// `HalfKA_hm2`/1536 専用で 16/32・K3K3、それ以外は生成器同形の
+/// `SFNN_<GEN_KEY>_<ft>_<h1>_<h2>[_K3K3 | _PROGRESS<N>]` から `l1_out = h1 + 1`, `l2_out = h2` を取る。
 /// `nnue_arch_gen.py` は生成名を大文字化する (`arch.upper()`) ため、実 YaneuraOu net
 /// の構造名は大文字だが、大小どちらの綴りも受理する。
 /// `feature`/`ft_out` は Features トークンとの整合を照合するために受け取る。
@@ -256,7 +319,7 @@ fn parse_network_dims(
     network: &str,
     feature: &YoFeature,
     ft_out: usize,
-) -> io::Result<(usize, usize)> {
+) -> io::Result<(usize, usize, LayerStackLayout)> {
     // 生成名の casing は環境差があるため大文字に正規化して照合する
     // (数字・アンダースコアは大文字化の影響を受けない)。
     let net_upper = network.to_ascii_uppercase();
@@ -267,18 +330,33 @@ fn parse_network_dims(
                 feature.yo_name
             ));
         }
-        return Ok((16, 32));
+        return Ok((16, 32, LayerStackLayout::King3x3));
     }
-    let body = net_upper
-        .strip_prefix("SFNN_")
-        .and_then(|s| s.strip_suffix("_K3K3"))
-        .ok_or_else(|| {
-            invalid_data_err(format!(
-                "unsupported Network structure `{network}` (expected SFNN-1536 or SFNN_<key>_<ft>_<h1>_<h2>_k3k3)"
-            ))
-        })?;
+    let body = net_upper.strip_prefix("SFNN_").ok_or_else(|| {
+        invalid_data_err(format!(
+            "unsupported Network structure `{network}` (expected SFNN-1536 or SFNN_<key>_<ft>_<h1>_<h2>[_k3k3|_progress<N>])"
+        ))
+    })?;
     let parts: Vec<&str> = body.split('_').collect();
-    if parts.len() != 4 || parts[0] != feature.gen_key.to_ascii_uppercase() {
+    let layout = match parts.get(4..) {
+        Some([]) => LayerStackLayout::Single,
+        Some(["K3K3"]) => LayerStackLayout::King3x3,
+        Some([token]) if token.starts_with("PROGRESS") => {
+            let buckets = parse_usize(&token["PROGRESS".len()..])?;
+            if buckets == 0 {
+                return invalid_data(format!(
+                    "Network `{network}` has a zero progress bucket count"
+                ));
+            }
+            LayerStackLayout::Progress(buckets)
+        }
+        _ => {
+            return invalid_data(format!(
+                "unsupported Network structure `{network}` (supported layer stack tokens are none, k3k3, or a single progress<N>)"
+            ));
+        }
+    };
+    if parts.len() < 4 || parts[0] != feature.gen_key.to_ascii_uppercase() {
         return invalid_data(format!(
             "Network structure `{network}` does not match feature `{}`",
             feature.gen_key
@@ -300,7 +378,7 @@ fn parse_network_dims(
             "Network `{network}` hidden dimensions out of range (h1={h1}, h2={h2}, max {MAX_HIDDEN_DIM})"
         ));
     }
-    Ok((h1 + 1, h2))
+    Ok((h1 + 1, h2, layout))
 }
 
 fn between<'a>(haystack: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -613,7 +691,7 @@ mod tests {
         ];
         for (fs, ft_out, l1_out, l2_out) in configs {
             let spec = fs.spec();
-            let mut w = LayerStackWeights::zeroed(spec, ft_out, l1_out, l2_out, REQUIRED_BUCKETS);
+            let mut w = LayerStackWeights::zeroed(spec, ft_out, l1_out, l2_out, KINGRANK9_BUCKETS);
             // 量子化格子上の値 (k/QA, k/QB, k/(QA*QB)) を入れて厳密復元を確認する。
             for (i, v) in w.ft_b.iter_mut().enumerate() {
                 *v = ((i % 7) as i16 - 3) as f32 / QA as f32;
@@ -644,7 +722,7 @@ mod tests {
             let bytes = build_yo_bytes(&w, &arch, ft_out, l1_out, l2_out);
 
             let mut reader = Cursor::new(bytes);
-            let parsed = read_yo(&mut reader).expect("read_yo");
+            let parsed = read_yo(&mut reader, YaneuraOuRouting::KingRank9).expect("read_yo");
             reject_trailing_data(&mut reader).expect("no trailing data");
 
             assert_eq!(parsed.ft_b, w.ft_b, "{fs:?} ft_b");
@@ -695,7 +773,7 @@ mod tests {
                 header(YO_VERSION, YO_TOP_HASH, 0xDEAD_BEEF, &arch),
             ),
         ] {
-            let error = read_yo(&mut Cursor::new(bytes)).unwrap_err();
+            let error = read_yo(&mut Cursor::new(bytes), YaneuraOuRouting::KingRank9).unwrap_err();
             assert!(
                 error.to_string().contains(label),
                 "expected `{label}` in: {error}"
@@ -709,7 +787,9 @@ mod tests {
             "ModelType=SFNNWithPsqt;Features=HalfKA_hm2(Friend)[73305->1536x2],Network=SFNN-1536{LayerStack=9}",
         );
         assert_eq!(
-            read_yo(&mut Cursor::new(bad_arch)).unwrap_err().kind(),
+            read_yo(&mut Cursor::new(bad_arch), YaneuraOuRouting::KingRank9)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -718,7 +798,7 @@ mod tests {
     fn read_yo_rejects_corrupt_layerstack_hash_and_trailing_garbage() {
         let (fs, ft_out, l1_out, l2_out) = (FeatureSet::HalfKaHmMerged, 32, 4, 8);
         // 全ゼロ weights: 0x6333718A の出現は per-bucket network hash だけになる。
-        let w = LayerStackWeights::zeroed(fs.spec(), ft_out, l1_out, l2_out, REQUIRED_BUCKETS);
+        let w = LayerStackWeights::zeroed(fs.spec(), ft_out, l1_out, l2_out, KINGRANK9_BUCKETS);
         let arch = yo_arch(fs, ft_out, l1_out, l2_out);
         let good = build_yo_bytes(&w, &arch, ft_out, l1_out, l2_out);
 
@@ -726,7 +806,7 @@ mod tests {
         let mut trailing = good.clone();
         trailing.push(0xAB);
         let mut reader = Cursor::new(trailing);
-        read_yo(&mut reader).unwrap();
+        read_yo(&mut reader, YaneuraOuRouting::KingRank9).unwrap();
         assert_eq!(
             reject_trailing_data(&mut reader).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -740,7 +820,7 @@ mod tests {
             .position(|w| w == needle)
             .expect("network hash present");
         corrupt[pos] ^= 0xFF;
-        let error = read_yo(&mut Cursor::new(corrupt)).unwrap_err();
+        let error = read_yo(&mut Cursor::new(corrupt), YaneuraOuRouting::KingRank9).unwrap_err();
         assert!(
             error.to_string().contains("LayerStack hash"),
             "got: {error}"
@@ -851,10 +931,169 @@ mod tests {
     }
 
     #[test]
-    fn kingrank9_requires_an_explicit_assertion() {
-        let error = require_kingrank9_assertion(false).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("--assume-kingrank9"));
-        require_kingrank9_assertion(true).unwrap();
+    fn routing_requires_exactly_one_explicit_assertion() {
+        for (kingrank9, progress) in [(false, false), (true, true)] {
+            let error = routing_from_assertions(kingrank9, progress).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--assume-kingrank9"));
+        }
+        assert_eq!(
+            routing_from_assertions(true, false).unwrap(),
+            YaneuraOuRouting::KingRank9
+        );
+        assert_eq!(
+            routing_from_assertions(false, true).unwrap(),
+            YaneuraOuRouting::ProgressKpAbs
+        );
+    }
+
+    const PROGRESS8_ARCH: &str = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->2304x2],Network=SFNN_HALFKAHM2_2304_15_64_PROGRESS8{LayerStack=8}";
+
+    #[test]
+    fn parse_yo_arch_detects_layer_stack_tokens() {
+        let k3k3 = parse_yo_arch(&yo_arch(FeatureSet::HalfKaHmMerged, 2304, 16, 64)).unwrap();
+        assert_eq!(k3k3.layout, LayerStackLayout::King3x3);
+        assert_eq!(k3k3.num_buckets, 9);
+
+        let progress = parse_yo_arch(PROGRESS8_ARCH).unwrap();
+        assert_eq!(progress.layout, LayerStackLayout::Progress(8));
+        assert_eq!(progress.num_buckets, 8);
+        assert_eq!(
+            (progress.ft_out, progress.l1_out, progress.l2_out),
+            (2304, 16, 64)
+        );
+
+        let single = parse_yo_arch(
+            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->512x2],Network=SFNN_HALFKAHM2_512_15_32{LayerStack=1}",
+        )
+        .unwrap();
+        assert_eq!(single.layout, LayerStackLayout::Single);
+        assert_eq!(single.num_buckets, 1);
+
+        let count_mismatch = PROGRESS8_ARCH.replace("{LayerStack=8}", "{LayerStack=9}");
+        assert!(
+            parse_yo_arch(&count_mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("disagrees")
+        );
+        let combined =
+            PROGRESS8_ARCH.replace("_PROGRESS8{LayerStack=8}", "_K3K3_PROGRESS8{LayerStack=72}");
+        assert!(
+            parse_yo_arch(&combined)
+                .unwrap_err()
+                .to_string()
+                .contains("layer stack tokens")
+        );
+    }
+
+    /// bucket ごとに異なる量子化格子上の値を入れた weights。
+    fn distinct_weights(
+        fs: FeatureSet,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        buckets: usize,
+    ) -> LayerStackWeights {
+        let mut w = LayerStackWeights::zeroed(fs.spec(), ft_out, l1_out, l2_out, buckets);
+        for (i, v) in w.ft_w.iter_mut().enumerate() {
+            *v = ((i % 5) as i16 - 2) as f32 / QA as f32;
+        }
+        for (i, v) in w.l1_w.iter_mut().enumerate() {
+            *v = ((i % 9) as i8 - 4) as f32 / QB as f32;
+        }
+        for (i, v) in w.l2_w.iter_mut().enumerate() {
+            *v = ((i % 11) as i8 - 5) as f32 / QB as f32;
+        }
+        for (i, v) in w.l3_b.iter_mut().enumerate() {
+            *v = (i as i32 - 3) as f32 / (QA * QB) as f32;
+        }
+        w
+    }
+
+    fn assert_same_weights(parsed: &LayerStackWeights, w: &LayerStackWeights) {
+        assert_eq!(parsed.num_buckets, w.num_buckets);
+        assert_eq!(parsed.ft_w, w.ft_w);
+        assert_eq!(parsed.l1_w, w.l1_w);
+        assert_eq!(parsed.l2_w, w.l2_w);
+        assert_eq!(parsed.l3_b, w.l3_b);
+    }
+
+    #[test]
+    fn shared_writer_output_reads_back_for_each_progress_bucket_count() {
+        for buckets in [1_usize, 8, MAX_PROGRESS_KPABS_BUCKETS] {
+            let w = distinct_weights(FeatureSet::HalfKaHmMerged, 32, 4, 8, buckets);
+            let mut bytes = Vec::new();
+            nnue_format::save_yaneuraou_with_routing(
+                &mut bytes,
+                &w,
+                YaneuraOuRouting::ProgressKpAbs,
+            )
+            .unwrap();
+            let mut reader = Cursor::new(bytes);
+            let parsed = read_yo(&mut reader, YaneuraOuRouting::ProgressKpAbs).unwrap();
+            reject_trailing_data(&mut reader).unwrap();
+            assert_same_weights(&parsed, &w);
+        }
+    }
+
+    #[test]
+    fn k3k3_file_read_as_progress_keeps_all_nine_stacks() {
+        let w = distinct_weights(FeatureSet::HalfKaHmMerged, 32, 4, 8, KINGRANK9_BUCKETS);
+        let mut bytes = Vec::new();
+        nnue_format::save_yaneuraou(&mut bytes, &w).unwrap();
+        let mut reader = Cursor::new(bytes);
+        let parsed = read_yo(&mut reader, YaneuraOuRouting::ProgressKpAbs).unwrap();
+        reject_trailing_data(&mut reader).unwrap();
+        assert_same_weights(&parsed, &w);
+    }
+
+    #[test]
+    fn routing_assertion_must_match_layer_stack_layout() {
+        use LayerStackLayout::{King3x3, Progress, Single};
+        use YaneuraOuRouting::{KingRank9, ProgressKpAbs};
+        check_routing(King3x3, KingRank9).unwrap();
+        for layout in [Progress(8), Single] {
+            assert!(
+                check_routing(layout, KingRank9)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("K3K3")
+            );
+        }
+        // 9 枠の K3K3 は progress routing の net の書き出しにも使われる。
+        for layout in [King3x3, Progress(1), Progress(8), Single] {
+            check_routing(layout, ProgressKpAbs).unwrap();
+        }
+        assert!(
+            check_routing(Progress(16), ProgressKpAbs)
+                .unwrap_err()
+                .to_string()
+                .contains("up to")
+        );
+    }
+
+    #[test]
+    fn read_yo_round_trips_progress_layer_stacks() {
+        let (fs, ft_out, l1_out, l2_out, buckets) = (FeatureSet::HalfKaHmMerged, 32, 4, 8, 8);
+        let mut w = LayerStackWeights::zeroed(fs.spec(), ft_out, l1_out, l2_out, buckets);
+        for (i, v) in w.l3_b.iter_mut().enumerate() {
+            *v = (i as i32 - 3) as f32 / (QA * QB) as f32;
+        }
+        for (i, v) in w.l1_w.iter_mut().enumerate() {
+            *v = ((i % 9) as i8 - 4) as f32 / QB as f32;
+        }
+        let arch = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->32x2],Network=SFNN_HALFKAHM2_32_3_8_PROGRESS8{LayerStack=8}";
+        let bytes = build_yo_bytes(&w, arch, ft_out, l1_out, l2_out);
+
+        let mut reader = Cursor::new(bytes.clone());
+        let parsed = read_yo(&mut reader, YaneuraOuRouting::ProgressKpAbs).unwrap();
+        reject_trailing_data(&mut reader).unwrap();
+        assert_eq!(parsed.num_buckets, buckets);
+        assert_eq!(parsed.l3_b, w.l3_b);
+        assert_eq!(parsed.l1_w, w.l1_w);
+
+        let error = read_yo(&mut Cursor::new(bytes), YaneuraOuRouting::KingRank9).unwrap_err();
+        assert!(error.to_string().contains("K3K3"), "got: {error}");
     }
 }

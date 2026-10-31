@@ -2,14 +2,13 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
-use nnue_format::{LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou};
+use nnue_format::{
+    LayerStackWeights, MAX_PROGRESS_KPABS_BUCKETS, YANEURAOU_LAYER_STACKS, YaneuraOuRouting,
+    save_yaneuraou_with_routing,
+};
 use shogi_features::FeatureSet;
-
-/// LayerStack バケット数。YaneuraOu SFNN は KingRank9 (3x3) 固定で、変換対象も
-/// これに揃える。
-const YO_LAYER_STACKS: usize = YANEURAOU_LAYER_STACKS;
 
 /// 変換対象の SFNN 次元上限。実在アーキは十分収まり、壊れた arch 文字列 (0 次元 /
 /// 巨大値) が overflow や過大 allocation を起こす前に弾くための健全性ガード。
@@ -23,10 +22,16 @@ struct DetectedArch {
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    num_buckets: usize,
 }
 
 #[derive(Parser)]
 #[command(about = "Convert a tatara LayerStack net to a YaneuraOu SFNN evaluation file")]
+#[command(group(
+    ArgGroup::new("routing")
+        .required(true)
+        .args(["assume_kingrank9", "assume_progresskpabs"])
+))]
 struct Args {
     /// tatara LayerStack quantised .bin
     #[arg(long)]
@@ -38,6 +43,12 @@ struct Args {
     /// Quantised `.bin` files do not record their bucket routing mode.
     #[arg(long)]
     assume_kingrank9: bool,
+    /// Assert that the input was trained with `--bucket-mode progresskpabs` (1-9 buckets).
+    /// The output names the network `..._PROGRESS<N>` with one LayerStack per bucket,
+    /// and YaneuraOu reads the progress coefficients from `progress.bin` next to `nn.bin`.
+    /// A single-bucket net is written without the suffix and needs no `progress.bin`.
+    #[arg(long)]
+    assume_progresskpabs: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,10 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    require_kingrank9_assertion(args.assume_kingrank9)?;
+    let routing = routing_from_assertions(args.assume_kingrank9, args.assume_progresskpabs)?;
 
     let detect_input = File::open(&args.input)?;
-    let arch = detect_arch(&mut BufReader::new(detect_input))?;
+    let arch = detect_arch(&mut BufReader::new(detect_input), routing)?;
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
@@ -58,30 +69,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arch.ft_out,
         arch.l1_out,
         arch.l2_out,
-        YO_LAYER_STACKS,
+        arch.num_buckets,
     )?;
     reject_trailing_data(&mut reader)?;
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    save_yaneuraou(&mut writer, &weights)?;
+    save_yaneuraou_with_routing(&mut writer, &weights, routing)?;
     writer.flush()?;
     Ok(())
 }
 
-fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
-    if !assume_kingrank9 {
-        return invalid_input(
-            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9",
-        );
+fn routing_from_assertions(
+    assume_kingrank9: bool,
+    assume_progresskpabs: bool,
+) -> io::Result<YaneuraOuRouting> {
+    match (assume_kingrank9, assume_progresskpabs) {
+        (true, false) => Ok(YaneuraOuRouting::KingRank9),
+        (false, true) => Ok(YaneuraOuRouting::ProgressKpAbs),
+        _ => invalid_input(
+            "tatara .bin files do not record bucket routing; pass exactly one of --assume-kingrank9 or --assume-progresskpabs after confirming the --bucket-mode the net was trained with",
+        ),
     }
-    Ok(())
 }
 
 /// `.bin` header (version + network_hash + arch_str + num_buckets) を読み、変換
-/// 可能な SFNN アーキかを判定する。PSQT / threat / effect bucket / 非 9 bucket /
-/// 未知 feature は YaneuraOu SFNN に受け皿が無いため明示的に reject する。
-fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
+/// 可能な SFNN アーキかを判定する。PSQT / threat / effect bucket / routing と合わない
+/// bucket 数 / 未知 feature は YaneuraOu SFNN に受け皿が無いため明示的に reject する。
+fn detect_arch<R: Read>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result<DetectedArch> {
     let version = read_u32(reader)?;
     if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
         return invalid_input(format!(
@@ -101,17 +116,29 @@ fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
 
     // num_buckets は現行 version のみ header に持ち、legacy は暗黙 9。
     let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
-        YO_LAYER_STACKS
+        YANEURAOU_LAYER_STACKS
     } else {
         read_u32(reader)? as usize
     };
-    if num_buckets != YO_LAYER_STACKS {
-        return invalid_input(format!(
-            "YaneuraOu SFNN requires {YO_LAYER_STACKS} LayerStacks (KingRank9), but the input has {num_buckets} buckets"
-        ));
+    match routing {
+        YaneuraOuRouting::KingRank9 if num_buckets != YANEURAOU_LAYER_STACKS => {
+            return invalid_input(format!(
+                "YaneuraOu SFNN requires {YANEURAOU_LAYER_STACKS} LayerStacks (KingRank9), but the input has {num_buckets} buckets"
+            ));
+        }
+        YaneuraOuRouting::ProgressKpAbs
+            if num_buckets == 0 || num_buckets > MAX_PROGRESS_KPABS_BUCKETS =>
+        {
+            return invalid_input(format!(
+                "progress kp abs routing supports 1..={MAX_PROGRESS_KPABS_BUCKETS} LayerStacks, but the input has {num_buckets} buckets"
+            ));
+        }
+        _ => {}
     }
 
-    parse_arch_str(arch_str)
+    let mut arch = parse_arch_str(arch_str)?;
+    arch.num_buckets = num_buckets;
+    Ok(arch)
 }
 
 /// tatara `build_arch_str` が生成する arch 文字列から feature set と隠れ層次元を
@@ -172,6 +199,7 @@ fn parse_arch_str(arch_str: &str) -> io::Result<DetectedArch> {
         ft_out,
         l1_out,
         l2_out,
+        num_buckets: YANEURAOU_LAYER_STACKS,
     })
 }
 
@@ -191,9 +219,7 @@ fn reject_trailing_data<R: Read>(reader: &mut R) -> io::Result<()> {
     if reader.read(&mut byte)? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "tatara input has trailing data after the expected {YO_LAYER_STACKS} LayerStacks"
-            ),
+            "tatara input has trailing data after the last LayerStack",
         ));
     }
     Ok(())
@@ -229,6 +255,7 @@ mod tests {
             ft_out,
             l1_out,
             l2_out,
+            num_buckets: YANEURAOU_LAYER_STACKS,
         }
     }
 
@@ -371,12 +398,17 @@ mod tests {
         );
 
         let non9 = header_bytes(NNUE_VERSION, &arch_str, Some(4));
-        let error = detect_arch(&mut std::io::Cursor::new(non9)).unwrap_err();
+        let error =
+            detect_arch(&mut std::io::Cursor::new(non9), YaneuraOuRouting::KingRank9).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("LayerStacks"), "got: {error}");
 
         let legacy = header_bytes(LEGACY_NNUE_VERSION_BUCKETS9, &arch_str, None);
-        let arch = detect_arch(&mut std::io::Cursor::new(legacy)).expect("legacy implicit 9");
+        let arch = detect_arch(
+            &mut std::io::Cursor::new(legacy),
+            YaneuraOuRouting::KingRank9,
+        )
+        .expect("legacy implicit 9");
         assert_eq!(arch.feature_set, FeatureSet::HalfKaHmMerged);
         assert_eq!(arch.ft_out, 1536);
         assert_eq!(arch.l1_out, 16);
@@ -391,11 +423,57 @@ mod tests {
     }
 
     #[test]
-    fn kingrank9_requires_an_explicit_assertion() {
-        let error = require_kingrank9_assertion(false).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("--assume-kingrank9"));
-        require_kingrank9_assertion(true).unwrap();
+    fn detect_arch_accepts_progress_bucket_counts_in_range() {
+        let arch_str = build_arch_str(
+            FeatureSet::HalfKaHmMerged.spec().arch_feature_name(),
+            73305,
+            1536,
+            16,
+            30,
+            32,
+            Some(28),
+            None,
+            None,
+            None,
+        );
+        for buckets in [1_u32, 8, 9] {
+            let bytes = header_bytes(NNUE_VERSION, &arch_str, Some(buckets));
+            let arch = detect_arch(
+                &mut std::io::Cursor::new(bytes),
+                YaneuraOuRouting::ProgressKpAbs,
+            )
+            .expect("progress bucket count in range");
+            assert_eq!(arch.num_buckets, buckets as usize);
+        }
+        for buckets in [0_u32, 10] {
+            let bytes = header_bytes(NNUE_VERSION, &arch_str, Some(buckets));
+            let error = detect_arch(
+                &mut std::io::Cursor::new(bytes),
+                YaneuraOuRouting::ProgressKpAbs,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("progress kp abs"),
+                "got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_requires_exactly_one_explicit_assertion() {
+        for (kingrank9, progress) in [(false, false), (true, true)] {
+            let error = routing_from_assertions(kingrank9, progress).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--assume-kingrank9"));
+        }
+        assert_eq!(
+            routing_from_assertions(true, false).unwrap(),
+            YaneuraOuRouting::KingRank9
+        );
+        assert_eq!(
+            routing_from_assertions(false, true).unwrap(),
+            YaneuraOuRouting::ProgressKpAbs
+        );
     }
 
     /// zeroed weights から合成した tatara `.bin` を返す。
@@ -404,9 +482,10 @@ mod tests {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> Vec<u8> {
         let weights =
-            LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, YO_LAYER_STACKS);
+            LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, num_buckets);
         let mut bytes = Vec::new();
         weights
             .save_quantised(&mut bytes, Some(nnue_format::layerstack_weights::FV_SCALE))
@@ -416,12 +495,13 @@ mod tests {
 
     /// 合成 `.bin` を `detect_arch` → `load_quantised` → `write_yo` のフル経路に
     /// 通し、YaneuraOu 出力バイト列を返す。detect が期待アーキと一致することも確認。
-    fn convert(bytes: &[u8], expect: &DetectedArch) -> Vec<u8> {
-        let arch = detect_arch(&mut std::io::Cursor::new(bytes)).expect("detect");
+    fn convert(bytes: &[u8], expect: &DetectedArch, routing: YaneuraOuRouting) -> Vec<u8> {
+        let arch = detect_arch(&mut std::io::Cursor::new(bytes), routing).expect("detect");
         assert_eq!(arch.feature_set, expect.feature_set);
         assert_eq!(arch.ft_out, expect.ft_out);
         assert_eq!(arch.l1_out, expect.l1_out);
         assert_eq!(arch.l2_out, expect.l2_out);
+        assert_eq!(arch.num_buckets, expect.num_buckets);
 
         let mut load_reader = std::io::Cursor::new(bytes);
         let weights = LayerStackWeights::load_quantised(
@@ -430,14 +510,40 @@ mod tests {
             arch.ft_out,
             arch.l1_out,
             arch.l2_out,
-            YO_LAYER_STACKS,
+            arch.num_buckets,
         )
         .expect("load_quantised");
         reject_trailing_data(&mut load_reader).expect("no trailing data");
 
         let mut out = Vec::new();
-        save_yaneuraou(&mut out, &weights).expect("save_yaneuraou");
+        save_yaneuraou_with_routing(&mut out, &weights, routing).expect("save_yaneuraou");
         out
+    }
+
+    fn yo_arch_str(out: &[u8]) -> &str {
+        let arch_len = u32::from_le_bytes(out[8..12].try_into().unwrap()) as usize;
+        std::str::from_utf8(&out[12..12 + arch_len]).unwrap()
+    }
+
+    #[test]
+    fn progress_pipeline_names_network_by_bucket_count() {
+        let cases = [
+            (
+                8_usize,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->256x2],Network=SFNN_HALFKAHM2_256_15_64_PROGRESS8{LayerStack=8}",
+            ),
+            (
+                1,
+                "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->256x2],Network=SFNN_HALFKAHM2_256_15_64{LayerStack=1}",
+            ),
+        ];
+        for (buckets, expected_arch) in cases {
+            let mut expect = detected(FeatureSet::HalfKaHmMerged, 256, 16, 64);
+            expect.num_buckets = buckets;
+            let bytes = synthetic_bin(FeatureSet::HalfKaHmMerged, 256, 16, 64, buckets);
+            let out = convert(&bytes, &expect, YaneuraOuRouting::ProgressKpAbs);
+            assert_eq!(yo_arch_str(&out), expected_arch);
+        }
     }
 
     #[test]
@@ -483,8 +589,8 @@ mod tests {
         ];
         for (fs, ft_out, l1_out, l2_out, expected_arch) in configs {
             let expect = detected(fs, ft_out, l1_out, l2_out);
-            let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out);
-            let out = convert(&bytes, &expect);
+            let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out, YANEURAOU_LAYER_STACKS);
+            let out = convert(&bytes, &expect, YaneuraOuRouting::KingRank9);
 
             assert_eq!(
                 u32::from_le_bytes(out[0..4].try_into().unwrap()),

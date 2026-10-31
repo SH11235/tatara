@@ -1,6 +1,6 @@
 # YaneuraOu SFNN net の tatara への逆変換
 
-`net_from_yo` は YaneuraOu の SFNN 評価ファイル (nn.bin) を tatara の 9 bucket
+`net_from_yo` は YaneuraOu の SFNN 評価ファイル (nn.bin) を tatara の
 LayerStack `.bin` へ逆変換する (`net_to_yo` の逆)。feature set と FT 出力 / 隠れ層の
 次元は YaneuraOu の arch 文字列から自動検出するため、追加の指定は要らない。
 
@@ -8,7 +8,7 @@ LayerStack `.bin` へ逆変換する (`net_to_yo` の逆)。feature set と FT �
 cargo run --release -p net-from-yo -- \
   --input /path/to/yaneuraou/nn.bin \
   --output /path/to/tatara.bin \
-  --assume-kingrank9
+  --assume-kingrank9   # progress kp abs の net は --assume-progresskpabs
 ```
 
 ## 対応する feature set と次元
@@ -27,22 +27,31 @@ cargo run --release -p net-from-yo -- \
 FT 出力・隠れ層次元は arch 文字列から検出する。`Features=<name>(Friend)[<in>-><ft>x2]`
 から feature と FT 出力を、`Network=` から L1/L2 出力を取る (既定 `SFNN-1536`(-V2) は
 `HalfKA_hm2`/1536 専用で L1=16/L2=32、それ以外は生成器同形の
-`SFNN_<key>_<ft>_<h1>_<h2>_k3k3` から `l1_out = h1 + 1`, `l2_out = h2`)。
+`SFNN_<key>_<ft>_<h1>_<h2>[_k3k3 | _progress<N>]` から `l1_out = h1 + 1`, `l2_out = h2`)。
+LayerStack 数は末尾 token から決まり、`_k3k3` は 9、`_progress<N>` は N、token なしは 1。
 
 ## 変換できない入力
 
 - version / top-level / feature-transformer / 各 LayerStack ハッシュのいずれかが
   YaneuraOu SFNNwoPSQT の固定値と一致しない (SFNN 以外・破損ファイル)
 - `ModelType=SFNNWithoutPsqt` でない (PSQT 付き) / 未知 feature
-- LayerStack が 9 でない (YaneuraOu SFNN KingRank9 は常に 9)
+- `LayerStack=<n>` が Network 名の末尾 token の示す数と食い違う、`_k3k3_progress<N>` の
+  ような複合 token、hand / 玉位置 9x9 等の他の token
+- routing の主張と合わない (`--assume-kingrank9` に既定名 `SFNN-1536`(-V2) と `_k3k3` 以外、
+  `--assume-progresskpabs` に 10 以上の LayerStack)
 - Network 名の FT 次元が Features の FT 次元と食い違う、baseline 名なのに
   `HalfKA_hm2`/1536 でない等、arch 内の不整合
 - FT 出力が 32 の倍数でない / 上限超過等、健全性ガード範囲外
 
-量子化 `.bin` は bucket routing mode を記録しないため、変換前に元 net が KingRank9
-routing であることを確認し、`--assume-kingrank9` で明示する。生成器の Network 名
-(`SFNN-1536` / `*_k3k3`) はいずれも 3x3=9 bucket を意味するが、routing 規則自体は
-ファイルから判別できないため、フラグでの明示を必須にしている。
+YaneuraOu の派生実装には、9 stack の `_k3k3` 名の評価ファイルを読み、先頭 N 枠を進行度で
+選んで使う build がある。このため Network 名だけでは routing を判別できず、
+`--assume-kingrank9` か `--assume-progresskpabs` のどちらか一方の明示を必須にしている。
+`--assume-progresskpabs` では `_progress<N>`・token なし・9 stack の `_k3k3` を受理し、
+ファイルにある LayerStack 数のまま書き出す。進行度係数 (YaneuraOu では `nn.bin` と同じ
+directory の `progress.bin`) と、9 stack の `_k3k3` 名で書かれた net の元の progress bucket 数は
+ファイルに記録されない。tatara のツールは保存された bucket 数で進行度を等分するため、
+後者の net は tatara では元の評価を再現できない (rshogi では bucket 数を別に指定できる)。
+詳細は [tatara ↔ YaneuraOu 変換](net-to-yaneuraou.md) の「bucket routing」節。
 
 ## ファイル形式
 
