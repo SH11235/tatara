@@ -4,12 +4,27 @@ use super::*;
 #[path = "trainer_layerstack_qat_tests.rs"]
 mod tests;
 
+/// Wide layers (`inputs >= QAT_DENSE_WIDE_INPUTS`) run `qat_dense_wide`: one warp per row and
+/// group of `QAT_DENSE_WIDE_GROUP` outputs, so each input row is read once per group instead of
+/// once per output. Narrow layers keep one thread per output.
+#[cfg(feature = "native")]
+const QAT_DENSE_WIDE_INPUTS: usize = 256;
+#[cfg(feature = "native")]
+const QAT_DENSE_WIDE_GROUP: usize = 8;
+
 #[cfg(feature = "native")]
 fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usize, &'static str> {
-    let lanes = if inputs >= 256 { 32 } else { 1 };
-    batch
-        .checked_mul(outputs)
-        .and_then(|n| n.checked_mul(lanes))
+    // `qat_dense_wide` accumulates the dot product in a 32-bit int (see the kernel).
+    if inputs > 131_072 {
+        return Err("dense QAT supports at most 131072 inputs per layer");
+    }
+    let per_row = if inputs >= QAT_DENSE_WIDE_INPUTS {
+        outputs.div_ceil(QAT_DENSE_WIDE_GROUP).checked_mul(32)
+    } else {
+        Some(outputs)
+    };
+    per_row
+        .and_then(|n| n.checked_mul(batch))
         .filter(|&n| u32::try_from(n).is_ok())
         .ok_or("dense QAT launch exceeds the supported u32 thread count")
 }
@@ -185,11 +200,20 @@ impl GpuTrainer {
         let threads = qat_dense_threads(batch, inputs, outputs)?;
         // SAFETY: workspace and weight dimensions match the selected layer; batch buckets were validated.
         unsafe {
-            cuda_launch! {
-                kernel: qat_dense, stream: self.stream, module: self.module,
-                config: cfg_1d(threads),
-                args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
-                    batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
+            if inputs >= QAT_DENSE_WIDE_INPUTS {
+                cuda_launch! {
+                    kernel: qat_dense_wide, stream: self.stream, module: self.module,
+                    config: cfg_1d(threads),
+                    args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
+                        batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
+                }
+            } else {
+                cuda_launch! {
+                    kernel: qat_dense, stream: self.stream, module: self.module,
+                    config: cfg_1d(threads),
+                    args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
+                        batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
+                }
             }
         }?;
         Ok(())
