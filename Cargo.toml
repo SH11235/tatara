@@ -17,6 +17,7 @@ members = [
     "bins/net_from_yo",
     "bins/net_to_yo",
     "bins/threat_symmetric_survey",
+    "bins/ckpt_average",
 ]
 
 [workspace.package]
