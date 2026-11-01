@@ -44,6 +44,18 @@ pub(crate) enum FoldComb<'a> {
     F32(&'a mut DeviceBuffer<f32>),
 }
 
+/// fold kernel に渡す `(ft_bounds, piece_inputs, kernel_pack)`。fold を内包する kernel
+/// (fused FT optimizer) が `ft_fold_virtual*` と同じ仮想行を引くために使う。
+#[cfg(feature = "native")]
+pub(crate) fn fold_kernel_args(feature_set: &FeatureSetSpec) -> (u64, u32, u32) {
+    let (base_ft_in, ft_in, pi, nb, mode) = params(feature_set);
+    (
+        ft_bounds(base_ft_in, ft_in),
+        pi as u32,
+        kernel_pack(nb, mode),
+    )
+}
+
 /// fold/reduce に共通する派生量 `(base_ft_in, ft_in, pi, nb, mode)`。
 ///
 /// `base_ft_in` は piece-input 仮想行を持つ実行の行数 (effect bucket では base+bucket

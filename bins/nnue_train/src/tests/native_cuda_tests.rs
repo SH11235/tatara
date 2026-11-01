@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 71, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 72, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 87, "production kernel inventory changed");
+    assert_eq!(required.len(), 88, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3233,4 +3233,161 @@ fn assert_weight_group_close_with_abs(
     eprintln!(
         "[native-parity] {name}: max_abs_diff={maximum_difference:.3e}, max_bound={maximum_bound:.3e}"
     );
+}
+
+/// 2 本の値列が有限で、最大絶対差が `expected` の最大絶対値の `relative` 倍以内か。
+#[cfg(feature = "native")]
+fn assert_states_close(what: &str, actual: &[f32], expected: &[f32], relative: f32) {
+    assert_eq!(actual.len(), expected.len(), "{what}: length");
+    let mut scale = 0.0_f32;
+    let mut max_diff = 0.0_f32;
+    for (index, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            a.is_finite() && e.is_finite(),
+            "{what}[{index}] not finite: {a} vs {e}"
+        );
+        scale = scale.max(e.abs());
+        max_diff = max_diff.max((a - e).abs());
+    }
+    assert!(
+        max_diff <= relative * scale.max(f32::MIN_POSITIVE),
+        "{what}: max diff {max_diff:e} (scale {scale:e})"
+    );
+}
+
+/// `ft_fused_optimizer_step` と、norm-loss / RAdam / lookahead / fold を別々に launch する経路が
+/// 同じ学習状態 (master・moment・slow・device 上の mirror / comb・勾配 buffer) を作ることを、
+/// lookahead を跨ぐ step 数で確かめる。nstm 側 sparse backward の atomicAdd 順序で勾配が揺れる
+/// ため、bit 一致ではなく小さい相対 tolerance で比べる。
+#[cfg(feature = "native")]
+#[test]
+fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    let fp32 = PrecisionFlags::default();
+    let all_optim = PrecisionFlags {
+        tf32: true,
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+    };
+    let fp16_weights_only = PrecisionFlags {
+        ft_fp16: true,
+        ..PrecisionFlags::default()
+    };
+    let norm = Some(1.0e-2);
+    let ranger = OptimizerKind::Ranger;
+    let hm_factorized = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
+    let threat_factorized = standard
+        .feature_set
+        .with_threat_profile(ThreatProfile::CrossSide)
+        .with_ft_factorize();
+    let effect_pool = standard
+        .feature_set
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
+        .with_ft_factorize_mode(FtFactorizeMode::PoolEffectBuckets);
+    let effect_per_bucket = standard
+        .feature_set
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
+        .with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket);
+    let plain = standard.feature_set;
+    let configs = [
+        ("hm-factorized-fp32", hm_factorized, fp32, ranger, norm),
+        (
+            "hm-factorized-all-optim",
+            hm_factorized,
+            all_optim,
+            ranger,
+            norm,
+        ),
+        (
+            "threat-factorized-all-optim",
+            threat_factorized,
+            all_optim,
+            ranger,
+            norm,
+        ),
+        (
+            "threat-factorized-fp32",
+            threat_factorized,
+            fp32,
+            ranger,
+            norm,
+        ),
+        (
+            "effect-pool-all-optim",
+            effect_pool,
+            all_optim,
+            ranger,
+            norm,
+        ),
+        (
+            "effect-per-bucket-fp32",
+            effect_per_bucket,
+            fp32,
+            ranger,
+            norm,
+        ),
+        ("plain-fp16-mirror", plain, fp16_weights_only, ranger, norm),
+        ("plain-all-optim-mirror", plain, all_optim, ranger, norm),
+        ("plain-fp32-radam", plain, fp32, OptimizerKind::RAdam, None),
+    ];
+    for (name, feature_set, precision, optimizer, norm_loss_factor) in configs {
+        let options = LayerStackTestOptions {
+            feature_set,
+            precision,
+            optimizer,
+            norm_loss_factor,
+            ..standard
+        };
+        let mut fused = create_layerstack_trainer_with_options(&context, true, options)?;
+        let mut separate = create_layerstack_trainer_with_options(&context, true, options)?;
+        separate.set_ft_fused_optimizer_enabled_for_test(false);
+        assert_eq!(
+            fused.raw_checkpoint_state_to_host()?,
+            separate.raw_checkpoint_state_to_host()?,
+            "{name}: initial state differs"
+        );
+
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (row % options.num_buckets) as i32;
+        }
+        batch.score.fill(70.0);
+        batch.wdl.fill(0.6);
+        for _ in 0..7 {
+            let _ = fused.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let _ = separate.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        }
+        let (fused_steps, fused_groups) = fused.raw_checkpoint_state_to_host()?;
+        let (separate_steps, separate_groups) = separate.raw_checkpoint_state_to_host()?;
+        assert_eq!(fused_steps, separate_steps);
+        for ((group, a), (_, b)) in fused_groups.iter().zip(&separate_groups) {
+            for (part, x, y) in [
+                ("w", &a.0, &b.0),
+                ("m", &a.1, &b.1),
+                ("v", &a.2, &b.2),
+                ("slow", &a.3, &b.3),
+            ] {
+                assert_states_close(&format!("{name}: {group}.{part}"), x, y, 1.0e-5);
+            }
+        }
+        let (fused_forward, fused_grad) = fused.ft_forward_state_to_host_for_test()?;
+        let (separate_forward, separate_grad) = separate.ft_forward_state_to_host_for_test()?;
+        assert_eq!(
+            fused_forward.is_some(),
+            separate_forward.is_some(),
+            "{name}: forward buffer"
+        );
+        if let (Some(f), Some(s)) = (&fused_forward, &separate_forward) {
+            assert_states_close(&format!("{name}: forward weights"), f, s, 1.0e-3);
+        }
+        assert_states_close(
+            &format!("{name}: ft gradient"),
+            &fused_grad,
+            &separate_grad,
+            1.0e-4,
+        );
+    }
+    Ok(())
 }
