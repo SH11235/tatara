@@ -38,11 +38,21 @@ struct Args {
     ema_decay: Option<f64>,
     /// fv_scale written into the architecture string. Pass the training run's --fv-scale;
     /// omit it when that run exported without one.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", value_parser = parse_positive_i32)]
     fv_scale: Option<i32>,
     /// Quantised .bin with the same architecture to compare the output against.
     #[arg(long, value_name = "BIN")]
     reference: Option<PathBuf>,
+}
+
+fn parse_positive_i32(value: &str) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| "fv_scale must be an integer greater than zero".to_string())?;
+    if parsed <= 0 {
+        return Err("fv_scale must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,13 +78,17 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|p| raw_ckpt::read_ckpt_info(p).map_err(|e| format!("{}: {e}", p.display())))
         .collect::<Result<Vec<_>, _>>()?;
+    for (path, info) in paths.iter().zip(&infos) {
+        raw_ckpt::layerstack_layout(&info.identity)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let first_key = infos[0].identity.compat_key();
     for (path, info) in paths.iter().zip(&infos).skip(1) {
-        if info.identity != infos[0].identity {
+        let key = info.identity.compat_key();
+        if key != first_key {
             return Err(format!(
-                "{} does not match the first checkpoint's architecture ({:?} vs {:?})",
+                "{} does not match the first checkpoint's architecture ({key:?} vs {first_key:?})",
                 path.display(),
-                info.identity,
-                infos[0].identity
             )
             .into());
         }
@@ -194,6 +208,23 @@ mod tests {
             fv_scale: Some(14),
             reference: None,
         }
+    }
+
+    #[test]
+    fn rejects_non_positive_fv_scale() {
+        for value in ["0", "-1", "x"] {
+            assert!(parse_positive_i32(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_positive_i32("14"), Ok(14));
+        let parsed = Args::try_parse_from([
+            "ckpt_average",
+            "--output",
+            "o.bin",
+            "--fv-scale",
+            "0",
+            "a.ckpt",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[test]

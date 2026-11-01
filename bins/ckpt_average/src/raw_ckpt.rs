@@ -50,6 +50,38 @@ pub(crate) struct CkptIdentity {
     pub(crate) group_lens: Vec<u64>,
 }
 
+/// 平均してよいかの判定に使う構成。version の違いで表記が変わる項目は trainer の reader と
+/// 同じ規則で正規化し、`max_active` / feature hash は各 checkpoint を
+/// [`layerstack_layout`] で個別に検証するので比較から外す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompatKey {
+    feature_set_name: String,
+    ft_factorize: bool,
+    bucket_mode: String,
+    topology: Vec<u64>,
+    qat_dense: bool,
+    group_lens: Vec<u64>,
+}
+
+impl CkptIdentity {
+    pub(crate) fn compat_key(&self) -> CompatKey {
+        // v7 以前の LayerStack checkpoint は bucket mode を持たず、trainer は唯一の mode
+        // "progresskpabs" として読む。"progress8kpabs" は同じ mode の旧名。
+        let bucket_mode = match self.bucket_mode.as_str() {
+            "" | "progress8kpabs" => "progresskpabs".to_string(),
+            other => other.to_string(),
+        };
+        CompatKey {
+            feature_set_name: self.feature_set_name.clone(),
+            ft_factorize: self.ft_factorize,
+            bucket_mode,
+            topology: self.topology.clone(),
+            qat_dense: self.qat_dense,
+            group_lens: self.group_lens.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CkptInfo {
     pub(crate) version: u32,
@@ -435,15 +467,27 @@ pub(crate) mod tests {
         out.extend(s.as_bytes());
     }
 
-    /// v11 の LayerStack checkpoint を書く。`w` は `weight(group, index)`、optimizer state は
-    /// 平均に混入すれば結果が壊れる値 (NaN / 巨大値) で埋める。
+    /// v11 の factorized LayerStack checkpoint を書く。
     pub(crate) fn write_ckpt(
         path: &Path,
         superbatch: u64,
         topology: [u64; 4],
         weight: impl Fn(usize, usize) -> f32,
     ) {
-        let spec = train_spec();
+        write_ckpt_versioned(path, 11, train_spec(), superbatch, topology, weight);
+    }
+
+    /// trainer の raw checkpoint writer が `version` で書く header の LayerStack checkpoint を
+    /// 書く。`w` は `weight(group, index)`、optimizer state は平均に混入すれば結果が壊れる値
+    /// (NaN / 巨大値) で埋める。
+    pub(crate) fn write_ckpt_versioned(
+        path: &Path,
+        version: u32,
+        spec: FeatureSetSpec,
+        superbatch: u64,
+        topology: [u64; 4],
+        weight: impl Fn(usize, usize) -> f32,
+    ) {
         let lay = LayerStackLayout {
             train_spec: spec,
             ft_out: topology[0] as usize,
@@ -453,27 +497,41 @@ pub(crate) mod tests {
         };
         let mut out = Vec::new();
         out.extend(MAGIC);
-        out.extend(11u32.to_le_bytes());
+        out.extend(version.to_le_bytes());
         put_name(&mut out, spec.canonical_name());
         out.extend((spec.train_ft_in() as u64).to_le_bytes());
         out.extend(topology[0].to_le_bytes());
         out.extend((spec.max_active() as u64).to_le_bytes());
-        out.push(1);
-        out.extend(spec.feature_hash().to_le_bytes());
+        if version >= 6 {
+            out.push(u8::from(spec.ft_factorize()));
+        }
+        if version >= 7 {
+            out.extend(spec.feature_hash().to_le_bytes());
+        }
         put_name(&mut out, "test-run");
         put_name(&mut out, "layerstack");
-        put_name(&mut out, "progresskpabs");
+        if version >= 8 {
+            put_name(&mut out, "progresskpabs");
+        }
         out.extend(4u64.to_le_bytes());
         for d in topology {
             out.extend(d.to_le_bytes());
         }
         out.extend(superbatch.to_le_bytes());
         out.extend((superbatch * 10).to_le_bytes());
-        out.extend(0u64.to_le_bytes());
-        out.extend(0i32.to_le_bytes());
-        out.extend(1u32.to_le_bytes());
-        put_name(&mut out, "test-net");
-        out.extend(0u64.to_le_bytes());
+        if version >= 5 {
+            out.extend(0u64.to_le_bytes());
+        }
+        if version >= 9 {
+            out.extend(0i32.to_le_bytes());
+        }
+        if version >= 10 {
+            out.extend(1u32.to_le_bytes());
+        }
+        if version >= 11 {
+            put_name(&mut out, "test-net");
+            out.extend(0u64.to_le_bytes());
+        }
         out.extend(10u64.to_le_bytes());
         for (g, len) in lay.group_lens().into_iter().enumerate() {
             out.extend((len as u64).to_le_bytes());
@@ -570,6 +628,61 @@ pub(crate) mod tests {
         let mut id = read_ckpt_info(&path).unwrap().identity;
         id.feature_hash = id.feature_hash.map(|h| h ^ 1);
         assert!(layerstack_layout(&id).is_err());
+    }
+
+    #[test]
+    fn older_versions_share_the_compat_key_of_current_checkpoints() {
+        let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
+        let current = temp_path("compat-v11.ckpt");
+        let older = temp_path("compat-v8.ckpt");
+        let no_mode = temp_path("compat-v7.ckpt");
+        write_ckpt(&current, 40, topo, pattern(1.0));
+        write_ckpt_versioned(&older, 8, train_spec(), 20, topo, pattern(1.0));
+        write_ckpt_versioned(&no_mode, 7, train_spec(), 20, topo, pattern(1.0));
+        let v11 = read_ckpt_info(&current).unwrap().identity;
+        let v8 = read_ckpt_info(&older).unwrap().identity;
+        let v7 = read_ckpt_info(&no_mode).unwrap().identity;
+        assert!(layerstack_layout(&v7).is_ok());
+        assert_eq!(v7.compat_key(), v8.compat_key());
+        // QAT mode is recorded from v10 on, so a v8 checkpoint reads as QAT off.
+        let mut v11_without_qat = v11.clone();
+        v11_without_qat.qat_dense = false;
+        assert_eq!(v8.compat_key(), v11_without_qat.compat_key());
+        let mut alias = v11.clone();
+        alias.bucket_mode = "progress8kpabs".to_string();
+        assert_eq!(alias.compat_key(), v11.compat_key());
+        let mut other_mode = v11.clone();
+        other_mode.bucket_mode = "progressq16".to_string();
+        assert_ne!(other_mode.compat_key(), v11.compat_key());
+    }
+
+    #[test]
+    fn rejects_unsupported_versions() {
+        let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
+        for version in [MIN_VERSION - 1, MAX_VERSION + 1] {
+            let path = temp_path(&format!("version-{version}.ckpt"));
+            write_ckpt_versioned(&path, version, train_spec(), 20, topo, pattern(1.0));
+            let err = read_ckpt_info(&path).unwrap_err();
+            assert!(err.to_string().contains("not supported"), "{err}");
+        }
+    }
+
+    #[test]
+    fn non_factorized_checkpoint_exports_master_weights_unchanged() {
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
+        let path = temp_path("plain.ckpt");
+        write_ckpt_versioned(&path, 11, spec, 20, topo, pattern(1.0));
+        let info = read_ckpt_info(&path).unwrap();
+        assert!(!info.identity.ft_factorize);
+        let lay = layerstack_layout(&info.identity).unwrap();
+        assert_eq!(lay.export_spec(), spec);
+        let groups = weighted_average(&[path.as_path()], &[info], &[1.0]).unwrap();
+        let weights = to_layerstack_weights(&lay, groups);
+        assert_eq!(weights.ft_w.len(), spec.train_ft_in() * FT_OUT);
+        for (i, &v) in weights.ft_w.iter().enumerate() {
+            assert_eq!(v, pattern(1.0)(0, i));
+        }
     }
 
     #[test]
