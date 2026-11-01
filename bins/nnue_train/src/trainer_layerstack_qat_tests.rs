@@ -548,3 +548,82 @@ fn qat_norm_loss_updates_masters_with_diagnostics_and_lookahead() -> TestResult 
     }
     Ok(())
 }
+
+/// `qat_dense_wide` が `qat_dense` と raw / 出力の bit 列まで一致することを、行・bucket・
+/// 入出力の位置ごとに異なる格子値と、出力数が 8 の倍数でない寸法・積の極値で確かめる。
+#[test]
+fn qat_dense_wide_matches_qat_dense() -> TestResult {
+    let ctx = CudaContext::new(0)?;
+    let t = trainer(&ctx, 1536, true)?;
+    let batch = 5_usize;
+    let buckets = 3_usize;
+    for (inputs, outputs) in [(256, 1), (257, 7), (1536, 8), (1536, 9), (3072, 17)] {
+        let x: Vec<f32> = (0..batch * inputs)
+            .map(|i| {
+                let k = if i % 11 == 0 { 127 } else { (i * 37 + 5) % 128 };
+                k as f32 / 127.0
+            })
+            .collect();
+        let w: Vec<f32> = (0..buckets * outputs * inputs)
+            .map(|i| {
+                let v = match i % 13 {
+                    0 => -128,
+                    1 => 127,
+                    _ => ((i * 53 + 17) % 256) as i32 - 128,
+                };
+                v as f32 / 64.0
+            })
+            .collect();
+        let bias: Vec<f32> = (0..buckets * outputs)
+            .map(|i| ((i * 977) % 20001) as f32 / 8128.0 - 1.2)
+            .collect();
+        let shared: Vec<f32> = (0..outputs).map(|i| (i as f32 - 3.5) / 8128.0).collect();
+        let bucket: Vec<i32> = (0..batch).map(|r| ((r * 2) % buckets) as i32).collect();
+        let x_dev = DeviceBuffer::from_host(&t.stream, &x)?;
+        let w_dev = DeviceBuffer::from_host(&t.stream, &w)?;
+        let bias_dev = DeviceBuffer::from_host(&t.stream, &bias)?;
+        let shared_dev = DeviceBuffer::from_host(&t.stream, &shared)?;
+        let bucket_dev = DeviceBuffer::from_host(&t.stream, &bucket)?;
+        let mut outs = Vec::new();
+        for wide in [false, true] {
+            let mut out = DeviceBuffer::<f32>::zeroed(&t.stream, batch * outputs)?;
+            let mut raw = DeviceBuffer::<i32>::zeroed(&t.stream, batch * outputs)?;
+            let threads = if wide {
+                qat_dense_threads(batch, inputs, outputs)?
+            } else {
+                batch * outputs * 32
+            };
+            // SAFETY: buffers are sized for `batch` rows of `inputs` / `outputs` and every
+            // bucket index is below `buckets`.
+            unsafe {
+                if wide {
+                    cuda_launch! {
+                        kernel: qat_dense_wide, stream: t.stream, module: t.module,
+                        config: cfg_1d(threads),
+                        args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(shared_dev),
+                            slice(bucket_dev), slice_mut(out), slice_mut(raw),
+                            batch as u32, inputs as u32, outputs as u32, 1u32]
+                    }
+                } else {
+                    cuda_launch! {
+                        kernel: qat_dense, stream: t.stream, module: t.module,
+                        config: cfg_1d(threads),
+                        args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(shared_dev),
+                            slice(bucket_dev), slice_mut(out), slice_mut(raw),
+                            batch as u32, inputs as u32, outputs as u32, 1u32]
+                    }
+                }
+            }?;
+            let out: Vec<u32> = out
+                .to_host_vec(&t.stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            outs.push((raw.to_host_vec(&t.stream)?, out));
+        }
+        assert_eq!(outs[0], outs[1], "inputs={inputs} outputs={outputs}");
+    }
+    assert!(qat_dense_threads(1, 131_073, 16).is_err());
+    assert!(qat_dense_threads(1, 131_072, 16).is_ok());
+    Ok(())
+}
