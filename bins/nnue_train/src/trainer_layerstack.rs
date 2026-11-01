@@ -2,8 +2,171 @@ use std::path::Path;
 #[path = "trainer_layerstack_qat.rs"]
 mod qat_impl;
 
+/// Per-step scalars of the FT RAdam update consumed by the fused FT optimizer kernel.
+#[cfg(feature = "native")]
+#[derive(Clone, Copy)]
+struct FtFusedStep {
+    lr: f32,
+    step_size: f32,
+    denom: i32,
+    weight_decay: f32,
+    beta1: f32,
+    lookahead: bool,
+}
+
+/// `(FT forward weights, FT gradient)` read back by tests.
+#[cfg(all(test, feature = "native"))]
+type FtForwardTestState = (Option<Vec<f32>>, Vec<f32>);
+
+#[cfg(feature = "native")]
+const FT_FUSED_HALF_STATE: u32 = 1;
+#[cfg(feature = "native")]
+const FT_FUSED_NORM_LOSS: u32 = 1 << 1;
+#[cfg(feature = "native")]
+const FT_FUSED_LOOKAHEAD: u32 = 1 << 2;
+#[cfg(feature = "native")]
+const FT_FUSED_OUT_MIRROR_F16: u32 = 1 << 4;
+#[cfg(feature = "native")]
+const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
+#[cfg(feature = "native")]
+const FT_FUSED_OUT_COMB_F32: u32 = 3 << 4;
+
 #[cfg(feature = "native")]
 impl GpuTrainer {
+    /// Whether this step updates FT weights with `ft_fused_optimizer_step` instead of the
+    /// separate norm-loss / RAdam / lookahead / fold launches. Precision-diagnostic steps keep
+    /// the separate path because they record per-element optimizer internals, and the PSQT
+    /// shortcut keeps it because its fold shares `launch_ft_fold`.
+    fn ft_fused_optimizer_applies(&self) -> bool {
+        let diagnostic_step = self
+            .precision_diagnostic
+            .as_ref()
+            .is_some_and(|d| d.steps.contains(&self.step_count));
+        !diagnostic_step && self.psqt.is_none() && !self.ft_fused_optimizer_disabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ft_fused_optimizer_enabled_for_test(&mut self, enabled: bool) {
+        self.ft_fused_optimizer_disabled = !enabled;
+    }
+
+    /// Device-side FT forward weights (FP16 mirror or factorizer comb, widened to `f32`) and
+    /// the FT gradient buffer, for comparing optimizer paths in tests.
+    #[cfg(test)]
+    pub(crate) fn ft_forward_state_to_host_for_test(
+        &self,
+    ) -> Result<FtForwardTestState, Box<dyn std::error::Error>> {
+        let forward = if let Some(half) = self.ft_w_h.as_ref() {
+            Some(
+                half.to_host_vec(&self.stream)?
+                    .into_iter()
+                    .map(|value| value as f32)
+                    .collect(),
+            )
+        } else if let Some(comb) = self.ft_w_fold32.as_ref() {
+            Some(comb.to_host_vec(&self.stream)?)
+        } else {
+            None
+        };
+        Ok((forward, self.ft_w_grad.to_host_vec(&self.stream)?))
+    }
+
+    /// Launches the fused FT update. With the factorizer, virtual rows are updated first and
+    /// real rows second, so the comb written by the second launch reads final virtual rows.
+    /// `norm_lr` is the scheduled LR the separate `norm_loss_apply` path uses.
+    fn launch_ft_fused_optimizer(
+        &mut self,
+        ft_out: usize,
+        norm_lr: f32,
+        step: FtFusedStep,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ft_factorize = self.feature_set.ft_factorize();
+        let train_n = self.feature_set.train_ft_in() * ft_out;
+        let real_n = self.feature_set.ft_in() * ft_out;
+        let (bounds, piece_inputs, fold_mode) = if ft_factorize {
+            ft_factorize_host::fold_kernel_args(&self.feature_set)
+        } else {
+            (0, 0, 0)
+        };
+        let mut flags = 0;
+        if matches!(self.ft_w_m, MomentBuf::F16(_)) {
+            flags |= FT_FUSED_HALF_STATE;
+        }
+        let norm_factor = self.norm_loss_factor.unwrap_or(0.0);
+        if self.norm_loss_factor.is_some() {
+            flags |= FT_FUSED_NORM_LOSS;
+        }
+        if step.lookahead {
+            flags |= FT_FUSED_LOOKAHEAD;
+        }
+        let output_flags = if ft_factorize {
+            if self.ft_fp16 {
+                FT_FUSED_OUT_COMB_F16
+            } else {
+                FT_FUSED_OUT_COMB_F32
+            }
+        } else if self.ft_w_h.is_some() {
+            FT_FUSED_OUT_MIRROR_F16
+        } else {
+            0
+        };
+        // (begin, end, forward output flags) per launch.
+        let ranges: [(usize, usize, u32); 2] = if ft_factorize {
+            [(real_n, train_n, 0), (0, real_n, output_flags)]
+        } else {
+            [(0, train_n, output_flags), (0, 0, 0)]
+        };
+        for (begin, end, out) in ranges {
+            if begin == end {
+                continue;
+            }
+            let launch_flags = flags | out;
+            // Unused pointer slots (`slow` without lookahead, `norms` without norm-loss, the
+            // forward output when `out == 0`) receive a live buffer the kernel never reads.
+            macro_rules! launch {
+                ($m:expr, $v:expr, $forward:expr) => {
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。`[begin, end)` は
+                        // train 形状の `ft_w` / moment / grad / slow の範囲内で、forward output は
+                        // `out != 0` のとき `end` 以上の長さを持つ (comb は real 行、mirror は train 行)。
+                        cuda_launch! {
+                            kernel: ft_fused_optimizer_step,
+                            stream: self.stream, module: self.module, config: cfg_1d(end - begin),
+                            args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
+                                   slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
+                                   slice(self.norm_scratch), slice_mut($forward),
+                                   slice(self.threat_pair_starts), bounds, ft_out as u32,
+                                   piece_inputs, fold_mode, begin as u64, end as u64,
+                                   norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
+                                   step.weight_decay, step.beta1, BETA2, EPS,
+                                   W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE,
+                                   FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
+                        }
+                    }?
+                };
+            }
+            macro_rules! with_forward {
+                ($m:expr, $v:expr) => {
+                    match (out, self.ft_w_h.as_mut(), self.ft_w_fold32.as_mut()) {
+                        (FT_FUSED_OUT_COMB_F32, _, Some(comb)) => launch!($m, $v, comb),
+                        (FT_FUSED_OUT_MIRROR_F16 | FT_FUSED_OUT_COMB_F16, Some(half), _) => {
+                            launch!($m, $v, half)
+                        }
+                        (0, _, _) => launch!($m, $v, self.ft_w_slow),
+                        _ => unreachable!("fused FT output buffer matches the precision flags"),
+                    }
+                };
+            }
+            match (&mut self.ft_w_m, &mut self.ft_w_v) {
+                (MomentBuf::F16(m), MomentBuf::F16(v)) => with_forward!(m, v),
+                (MomentBuf::F32(m), MomentBuf::F32(v)) => with_forward!(m, v),
+                _ => unreachable!("ft_w m and v moment buffers always share precision"),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn configure_precision_diagnostic(
         &mut self,
         ctx: &CudaContext,
@@ -424,6 +587,10 @@ pub(crate) struct GpuTrainer {
     step_count: u64,
     #[cfg(feature = "native")]
     precision_diagnostic: Option<crate::precision_diagnostics::Diagnostic>,
+    /// Forces the separate norm-loss / RAdam / lookahead / fold launches for FT weights so
+    /// tests can compare them against the fused kernel. Always `false` outside tests.
+    #[cfg(feature = "native")]
+    ft_fused_optimizer_disabled: bool,
     /// true なら forward + loss (`validate`) 専用 trainer。optimizer state
     /// (`m` / `v` / `slow`)・全 `*_grad`・backward workspace を 0-byte で確保して
     /// device memory を forward 経路の分だけに抑える ([`GpuTrainer::new_forward_only`])。
@@ -1326,6 +1493,8 @@ impl GpuTrainer {
             step_count: 0,
             #[cfg(feature = "native")]
             precision_diagnostic: None,
+            #[cfg(feature = "native")]
+            ft_fused_optimizer_disabled: false,
             forward_only,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -4470,6 +4639,14 @@ impl GpuTrainer {
             };
         }
 
+        // The step counter advances before regularization so the fused FT path can be decided
+        // against the precision-diagnostic schedule, which is keyed by the post-increment count.
+        self.step_count += 1;
+        #[cfg(feature = "native")]
+        let ft_fused = self.ft_fused_optimizer_applies();
+        #[cfg(not(feature = "native"))]
+        let ft_fused = false;
+
         // QAT restores FP32 masters before entering this method; regularization must
         // update those masters, after the pre-norm-loss diagnostic snapshot.
         // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
@@ -4532,7 +4709,9 @@ impl GpuTrainer {
             // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
             // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
             // prior と整合する方向の intended 仕様)。
-            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+            if !ft_fused {
+                norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+            }
             norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
@@ -4551,6 +4730,33 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_shared_bias, 1, 0, 1, l1_shared_bias_n);
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
+            // fused FT path: only the column norms are computed here. They stay in
+            // `norm_scratch` (no later launch on this stream touches it) and the fused
+            // kernel applies the correction element-wise before its RAdam step.
+            if ft_fused {
+                memset_zero(&self.stream, &self.norm_scratch)?;
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: norm_loss_reduce,
+                        stream: self.stream, module: self.module,
+                        config: cfg_norm_loss_reduce(ft_out, ft_w_rows),
+                        args: [slice(self.ft_w), slice(self.norm_scratch),
+                               ft_out as u32, 1u32, ft_out as u32, ft_w_rows as u32]
+                    }
+                }?;
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: norm_loss_finalize,
+                        stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_out),
+                        args: [slice_mut(self.norm_scratch), ft_out as u32]
+                    }
+                }?;
+            }
             prof_tick!("norm_loss");
         }
 
@@ -4558,7 +4764,8 @@ impl GpuTrainer {
         // 3 種 (ranger / radam / adamw) とも element 更新は同じ radam_step kernel。
         // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
         // 有無だけで表現する ([`OptimizerKind`])。
-        self.step_count += 1;
+        let lookahead_now =
+            self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K);
         let (step_size, denom) =
             self.optimizer
                 .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
@@ -4587,7 +4794,21 @@ impl GpuTrainer {
         let diagnosed = self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
         #[cfg(not(feature = "native"))]
         let diagnosed = false;
-        if !diagnosed {
+        if ft_fused {
+            #[cfg(feature = "native")]
+            self.launch_ft_fused_optimizer(
+                ft_out,
+                lr,
+                FtFusedStep {
+                    lr: ft_lr,
+                    step_size,
+                    denom,
+                    weight_decay: ft_wd,
+                    beta1,
+                    lookahead: lookahead_now,
+                },
+            )?;
+        } else if !diagnosed {
             match (&mut self.ft_w_m, &mut self.ft_w_v) {
                 (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                     let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
@@ -4886,8 +5107,10 @@ impl GpuTrainer {
         // 再度書き換えるので、`--ft-fp16` 時は FT weight の lerp も FP16 mirror 同時更新
         // variant を使い、forward 用 `ft_w_h` を lerp 後の最終値で同期し直す (factorizer
         // 有効時は radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
-        if self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K) {
-            if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+        if lookahead_now {
+            // The fused FT kernel has already applied the lookahead to `ft_w`.
+            if ft_fused {
+            } else if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。
@@ -4945,7 +5168,7 @@ impl GpuTrainer {
         }
         // factorizer: master (`ft_w`) の本 step の全更新 (norm loss / radam /
         // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
-        if ft_factorize {
+        if ft_factorize && !ft_fused {
             self.launch_ft_fold()?;
         }
         self.sync_stack_forward_weights()?;
