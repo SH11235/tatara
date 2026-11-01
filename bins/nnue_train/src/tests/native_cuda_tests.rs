@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 72, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 73, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 88, "production kernel inventory changed");
+    assert_eq!(required.len(), 89, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 

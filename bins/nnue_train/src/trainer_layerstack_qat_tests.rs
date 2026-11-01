@@ -6,9 +6,11 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn qat_dense_launch_rejects_thread_count_overflow() {
-    assert_eq!(qat_dense_threads(65536, 1536, 16), Ok(33554432));
+    // Wide layers launch one warp per row and group of eight outputs.
+    assert_eq!(qat_dense_threads(65536, 1536, 16), Ok(4194304));
+    assert_eq!(qat_dense_threads(65536, 1536, 17), Ok(6291456));
     assert_eq!(qat_dense_threads(524288, 32, 256), Ok(134217728));
-    assert!(qat_dense_threads(524288, 256, 256).is_err());
+    assert!(qat_dense_threads(4194304, 256, 256).is_err());
     assert!(qat_dense_threads(usize::MAX, 256, 256).is_err());
 }
 
