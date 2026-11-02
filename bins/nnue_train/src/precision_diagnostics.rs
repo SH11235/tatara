@@ -199,8 +199,9 @@ mod tests {
 
     #[test]
     fn cuda_storage_events_and_optimizer_bits() -> Result<(), Box<dyn std::error::Error>> {
-        use gpu_runtime::{CudaContext, DeviceBuffer, KernelArgs, LaunchConfig};
-        let ctx = CudaContext::new(0)?;
+        use crate::tests::gpu_test_context::test_cuda_context;
+        use gpu_runtime::{DeviceBuffer, KernelArgs, LaunchConfig};
+        let ctx = test_cuda_context()?;
         let stream = ctx.new_stream()?;
         let module = ctx.load_module_from_image(cuda_native_runtime::NATIVE_KERNEL_FATBIN)?;
         for selected in [&[0_u32, 1, 2, 3, 4][..], &[0_u32, 2, 4][..]] {

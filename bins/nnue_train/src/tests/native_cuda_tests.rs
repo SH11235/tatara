@@ -8,6 +8,7 @@ use nnue_train::{
 };
 use shogi_features::{EffectBucketConfig, FeatureSet, FtFactorizeMode, ThreatProfile};
 
+use super::gpu_test_context::{test_cuda_context, test_cuda_context_reserving_gib};
 #[cfg(feature = "oxide-parity")]
 use crate::kernel_module::with_test_native_backend;
 #[cfg(feature = "oxide-parity")]
@@ -698,7 +699,7 @@ fn create_layerstack_trainer_forward_only(
 /// (`save_raw_checkpoint`) は明示エラー。
 #[test]
 fn forward_only_validate_matches_training_trainer() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut control = create_layerstack_trainer(&context, true)?;
     let initial = control.to_layerstack_weights()?;
     let mut forward_only =
@@ -758,7 +759,7 @@ fn forward_only_init_from_quantised_bin_matches_training_trainer()
 -> Result<(), Box<dyn std::error::Error>> {
     use nnue_train::trainer::{OutputFormat, TrainerBackend};
 
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let options = LayerStackTestOptions::standard();
     let mut source = create_layerstack_trainer(&context, true)?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
@@ -817,7 +818,7 @@ fn forward_only_init_from_quantised_bin_matches_training_trainer()
 /// 学習 trainer と bit 一致する (`--eval-only --resume` 経路)。
 #[test]
 fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut control = create_layerstack_trainer(&context, true)?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
     for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
@@ -878,7 +879,7 @@ fn assert_forward_only_validate_matches(
     options: LayerStackTestOptions,
     prepare: PrepareTrainer<'_>,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
     let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
     prepare(&mut control)?;
@@ -1071,7 +1072,7 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
         ),
     ];
 
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context_reserving_gib(3)?;
     for (name, options, contrast_block) in configs {
         eprintln!("[forward-only] factorizer variant: {name}");
         let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
@@ -1178,7 +1179,7 @@ fn create_layerstack_trainer_custom_psqt(
 #[test]
 fn forward_only_matches_with_nonzero_psqt_and_psqt_contributes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut options = LayerStackTestOptions::standard();
     options.psqt = true;
     let n = options.feature_set.ft_in() * options.num_buckets;
@@ -1257,7 +1258,7 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     use nnue_train::rescore::{OrderedPsvLoader, done_marker_path, in_progress_marker_path};
     use nnue_train::trainer::TrainerBackend;
 
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let options = LayerStackTestOptions::standard();
     let mut trainer = create_layerstack_trainer_forward_only(&context, true, options)?;
 
@@ -1467,7 +1468,7 @@ fn rescore_driver_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut trainer = create_layerstack_trainer(&context, true)?;
     let mut bucketed = trainer.to_layerstack_weights()?;
     for (i, value) in bucketed.l2_w.iter_mut().enumerate() {
@@ -1520,7 +1521,7 @@ fn stack_shared_delta_fold_and_folded_export() -> Result<(), Box<dyn std::error:
 
 #[test]
 fn stack_shared_delta_reduce_grad_sums_bucket_axis() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut trainer = create_layerstack_trainer(&context, true)?;
     trainer.enable_stack_shared_delta()?;
     let weights = trainer.to_layerstack_weights()?;
@@ -1541,7 +1542,7 @@ fn stack_shared_delta_reduce_grad_sums_bucket_axis() -> Result<(), Box<dyn std::
 #[test]
 fn stack_shared_delta_step_zero_forward_matches_control() -> Result<(), Box<dyn std::error::Error>>
 {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut control = create_layerstack_trainer(&context, true)?;
     let initial = control.to_layerstack_weights()?;
     let mut shared = create_layerstack_trainer(&context, true)?;
@@ -1559,7 +1560,7 @@ fn stack_shared_delta_step_zero_forward_matches_control() -> Result<(), Box<dyn 
 
 #[test]
 fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut trainer = create_layerstack_trainer(&context, true)?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
     for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
@@ -1601,7 +1602,7 @@ fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std
 #[cfg(feature = "native")]
 #[test]
 fn precision_diagnostic_training_on_off_equivalence() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     for enabled in [false, true] {
         for factorize in [false, true] {
             for half in [false, true] {
@@ -1746,7 +1747,7 @@ fn complete_layerstack_native_configuration_matrix_matches_cuda_oxide()
 #[test]
 fn complete_layerstack_native_configuration_matrix_runs_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context_reserving_gib(2)?;
     for (name, options, loss) in layerstack_configuration_matrix() {
         eprintln!("[native-host] LayerStack configuration: {name}");
         let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
@@ -1911,7 +1912,7 @@ fn layerstack_configuration_matrix() -> Vec<(&'static str, LayerStackTestOptions
 #[test]
 fn complete_layerstack_native_feature_matrix_runs_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context_reserving_gib(4)?;
     let base = FeatureSet::HalfKp.spec();
     let threats = [
         ThreatProfile::Full,
@@ -1987,7 +1988,7 @@ fn assert_layerstack_native_matches_cuda_oxide_with_batch(
     steps: usize,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut oxide = create_layerstack_trainer_with_batch(&context, false, options, batch_size)?;
     let mut native = create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
     let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
@@ -2089,7 +2090,7 @@ fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
     // 有効→invalid に変わると、その行の sorted 出力は更新されず前 step 値が残り得る。
     // 手書き kernel / cuda-oxide は同じ行を 0 で埋めるので、native TF32 もそれに一致する
     // ことを 2-step で確認する。
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let options = LayerStackTestOptions {
         precision: PrecisionFlags {
             tf32: true,
@@ -2162,7 +2163,7 @@ fn tf32_invalid_bucket_layerstack_native_matches_cuda_oxide()
 #[cfg(feature = "oxide-parity")]
 fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let options = LayerStackTestOptions {
         feature_set: FeatureSet::HalfKp.spec().with_ft_factorize(),
         precision: PrecisionFlags {
@@ -2315,7 +2316,7 @@ fn create_trainer_with_options(
 
 #[test]
 fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let id = standard_id();
     let mut trainer = create_trainer(&context, id, true, SMOKE_BATCH)?;
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
@@ -2352,7 +2353,7 @@ fn standard_simple_crelu_runs_one_native_training_step() -> Result<(), Box<dyn s
 #[test]
 fn complete_simple_native_configuration_matrix_runs_one_step()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let all_fp16 = PrecisionFlags {
         ft_fp16: true,
         ft_fp16_out: true,
@@ -2843,7 +2844,7 @@ fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
     loss: LossKind,
     steps: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let mut oxide = create_trainer_with_options(
         &context,
         id,
@@ -2920,7 +2921,7 @@ fn assert_trainers_close(
 #[cfg(feature = "oxide-parity")]
 fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let id = SimpleId {
         feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
         activation: SimpleActivation::Pairwise,
@@ -3263,7 +3264,7 @@ fn assert_states_close(what: &str, actual: &[f32], expected: &[f32], relative: f
 #[cfg(feature = "native")]
 #[test]
 fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context_reserving_gib(4)?;
     let standard = LayerStackTestOptions::standard();
     let fp32 = PrecisionFlags::default();
     let all_optim = PrecisionFlags {
@@ -3411,7 +3412,7 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
 #[cfg(feature = "native")]
 #[test]
 fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
     let configs = [
         ("halfkp", standard.feature_set),
@@ -3500,7 +3501,7 @@ fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::err
 #[test]
 fn ft_post_grad_reads_sorted_l1_gradient_like_inverse_permute()
 -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
     let tf32_only = PrecisionFlags {
         tf32: true,
@@ -3542,7 +3543,7 @@ fn ft_post_grad_reads_sorted_l1_gradient_like_inverse_permute()
 #[cfg(feature = "native")]
 #[test]
 fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
     let all_optim = PrecisionFlags {
         tf32: true,
@@ -3584,7 +3585,7 @@ fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std:
 #[cfg(feature = "native")]
 #[test]
 fn l1_shared_bwd_input_wide_tile_matches_narrow_tile() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
     for l1_out in [16, 17, 32] {
         let options = LayerStackTestOptions { l1_out, ..standard };
@@ -3607,7 +3608,7 @@ fn l1_shared_bwd_input_wide_tile_matches_narrow_tile() -> Result<(), Box<dyn std
 #[cfg(feature = "native")]
 #[test]
 fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context_reserving_gib(2)?;
     let standard = LayerStackTestOptions::standard();
     let hm = FeatureSet::HalfKaHmMerged.spec();
     let configs = [
@@ -3743,7 +3744,7 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
 #[cfg(feature = "native")]
 #[test]
 fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
     let all_optim = PrecisionFlags {
         tf32: true,
@@ -3832,7 +3833,7 @@ fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::
 #[cfg(feature = "native")]
 #[test]
 fn fused_ft_norms_follow_external_weight_writes() -> Result<(), Box<dyn std::error::Error>> {
-    let context = CudaContext::new(0)?;
+    let context = test_cuda_context()?;
     let options = LayerStackTestOptions {
         optimizer: OptimizerKind::Ranger,
         norm_loss_factor: Some(1.0),
