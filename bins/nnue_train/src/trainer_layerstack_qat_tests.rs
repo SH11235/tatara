@@ -698,84 +698,106 @@ fn qat_dense_wide_matches_qat_dense() -> TestResult {
     Ok(())
 }
 
-fn trainer_with_dims(
-    ctx: &std::sync::Arc<CudaContext>,
-    width: usize,
-    l1_out: usize,
-    num_buckets: usize,
-) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
-    GpuTrainer::new(
-        ctx,
-        16,
-        width,
-        l1_out,
-        32,
-        num_buckets,
-        BucketMode::ProgressKpAbs,
-        PrecisionFlags {
-            tf32: false,
-            ft_fp16: false,
-            ft_fp16_out: false,
-            fp16_opt_state: false,
-        },
-        FeatureSet::HalfKaHmMerged.spec(),
-        OptimizerKind::RAdam,
-        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
-        None,
-        None,
-        &LayerStackInit::default_uniform(),
-    )
-}
-
-/// `qat_dense_wide_sorted` の raw / 出力が `qat_dense_wide` と bit 単位で一致すること。
+/// `qat_dense_wide_sorted` の raw / 出力が `qat_dense_wide` と bit 単位で一致すること。行の並べ替え
+/// (bucket ごとに 16 行境界から始まり、端を -1 で埋める) は L1 の bucket sort と同じ形を host で作る。
 #[test]
 fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
     let ctx = CudaContext::new(0)?;
-    let mixed = vec![0, 3, 3, 1, 7, 0, 3, 5, 5, 5, 2, 0, 7, 1, 3, 6];
-    for (width, l1_out, buckets) in [
-        (128, 16, mixed.clone()),
-        (640, 16, mixed.clone()),
-        (640, 17, vec![4; 16]),
-        (1536, 33, mixed),
-    ] {
-        let mut t = trainer_with_dims(&ctx, width, l1_out, 8)?;
-        let mut net = t.to_layerstack_weights()?;
-        net.ft_b.fill(0.5);
-        for (i, b) in net.l1_b.iter_mut().enumerate() {
-            *b = (i as f32 - 40.0) / 8128.0 * 37.0;
+    let t = trainer(&ctx, 128, true)?;
+    let batch = 40_usize;
+    let buckets = 4_usize;
+    for (inputs, outputs) in [(128, 16), (640, 17), (1536, 33)] {
+        let x: Vec<f32> = (0..batch * inputs)
+            .map(|i| ((i * 37 + 5 + (i / inputs) * 11) % 128) as f32 / 127.0)
+            .collect();
+        let w: Vec<f32> = (0..buckets * outputs * inputs)
+            .map(|i| (((i * 53 + 17) % 256) as i32 - 128) as f32 / 64.0)
+            .collect();
+        let bias: Vec<f32> = (0..buckets * outputs)
+            .map(|i| ((i * 977) % 20001) as f32 / 8128.0 - 1.2)
+            .collect();
+        let shared: Vec<f32> = (0..outputs).map(|i| (i as f32 - 3.5) / 8128.0).collect();
+        // bucket 1 は 16 行ちょうど、他は端数を持つ。
+        let bucket: Vec<i32> = (0..batch)
+            .map(|r| if r < 16 { 1 } else { [0, 2, 3, 0, 3][r % 5] })
+            .collect();
+        let mut permutation = Vec::new();
+        let mut bucket_sorted = Vec::new();
+        for b in 0..buckets as i32 {
+            for (row, _) in bucket.iter().enumerate().filter(|&(_, &v)| v == b) {
+                permutation.push(row as i32);
+                bucket_sorted.push(b);
+            }
+            while permutation.len() % 16 != 0 {
+                permutation.push(-1);
+                bucket_sorted.push(-1);
+            }
         }
-        for (i, b) in net.l1_shared_bias.iter_mut().enumerate() {
-            *b = (i as f32 - 7.5) / 8128.0 * 11.0;
+        permutation.extend([-1; 16]);
+        bucket_sorted.extend([-1; 16]);
+        let padded = permutation.len();
+        let mut x_sorted = vec![0.0_f32; padded * inputs];
+        for (sorted_row, &row) in permutation.iter().enumerate() {
+            if let Ok(row) = usize::try_from(row) {
+                x_sorted[sorted_row * inputs..][..inputs]
+                    .copy_from_slice(&x[row * inputs..][..inputs]);
+            }
         }
-        t.load_layerstack_weights(&net)?;
-        t.sync_ft_forward_weights()?;
-        t.configure_qat(Some(QatMode::Dense))?;
-        let mut batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
-        batch.bucket_idx = buckets;
-        let data = batch.as_ref();
-        let mut now = std::time::Instant::now();
-        let mut context = StepContext::new(
-            &t,
-            &data,
-            StepOptions {
-                lr: 0.0,
-                wdl_lambda: 0.0,
-                loss: SMOKE_LOSS_WRM,
-                validate: false,
-                forward_output: false,
-                profile_step: false,
-                prof_t0: &mut now,
-            },
-        )?;
-        t.qat_prepare()?;
-        t.forward(&data, &mut context)?;
-        let (sorted_raw, wide_raw, sorted_out, wide_out) =
-            t.qat_dense_l1_sorted_and_wide_for_test(16)?;
-        t.qat_swap();
-        let name = format!("ft_out {width}, l1_out {l1_out}");
-        assert!(wide_raw.iter().any(|&v| v != 0), "{name}: raw is all zero");
-        assert_eq!(sorted_raw, wide_raw, "{name}: raw differs");
-        assert_eq!(sorted_out, wide_out, "{name}: output differs");
+        let upload_f32 = |v: &[f32]| DeviceBuffer::from_host(&t.stream, v);
+        let upload_i32 = |v: &[i32]| DeviceBuffer::from_host(&t.stream, v);
+        let (x_dev, x_sorted_dev, w_dev) =
+            (upload_f32(&x)?, upload_f32(&x_sorted)?, upload_f32(&w)?);
+        let (bias_dev, shared_dev) = (upload_f32(&bias)?, upload_f32(&shared)?);
+        let (bucket_dev, bucket_sorted_dev, permutation_dev) = (
+            upload_i32(&bucket)?,
+            upload_i32(&bucket_sorted)?,
+            upload_i32(&permutation)?,
+        );
+        let mut results = Vec::new();
+        for sorted in [false, true] {
+            let out = DeviceBuffer::<f32>::zeroed(&t.stream, batch * outputs)?;
+            let raw = DeviceBuffer::<i32>::zeroed(&t.stream, batch * outputs)?;
+            // SAFETY: `x` has `batch` rows and `x_sorted` / the sorted arrays `padded` rows of
+            // `inputs`; every bucket index is below `buckets` and every non-padding permutation
+            // entry is a row below `batch`.
+            unsafe {
+                if sorted {
+                    cuda_launch! {
+                        kernel: qat_dense_wide_sorted, stream: t.stream, module: t.module,
+                        config: LaunchConfig {
+                            grid_dim: ((padded / 16) as u32, outputs.div_ceil(16) as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(shared_dev),
+                            slice(bucket_sorted_dev), slice(permutation_dev), slice(out), slice(raw),
+                            inputs as u32, outputs as u32, 1u32]
+                    }
+                } else {
+                    cuda_launch! {
+                        kernel: qat_dense_wide, stream: t.stream, module: t.module,
+                        config: cfg_1d(batch * outputs.div_ceil(QAT_DENSE_WIDE_GROUP) * 32),
+                        args: [slice(x_dev), slice(w_dev), slice(bias_dev), slice(shared_dev),
+                            slice(bucket_dev), slice(out), slice(raw),
+                            batch as u32, inputs as u32, outputs as u32, 1u32]
+                    }
+                }
+            }?;
+            let out: Vec<u32> = out
+                .to_host_vec(&t.stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            results.push((raw.to_host_vec(&t.stream)?, out));
+        }
+        // bucket 1 の 16 行 (1 tile) で raw が行ごとに違うこと。
+        let tile_rows: std::collections::BTreeSet<&[i32]> =
+            results[0].0.chunks(outputs).take(16).collect();
+        assert!(
+            tile_rows.len() > 8,
+            "inputs={inputs}: rows of one tile are not distinct"
+        );
+        assert_eq!(results[0], results[1], "inputs={inputs} outputs={outputs}");
     }
     Ok(())
 }

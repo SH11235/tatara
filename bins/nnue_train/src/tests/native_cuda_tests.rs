@@ -3494,6 +3494,49 @@ fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// f16 勾配の sparse backward gather が、本番の起動形状 (1 thread 2 列) でも 1 thread 1 列でも
+/// bit 単位で同じ勾配を書くこと (overwrite / active overwrite / add の 3 種、書き込み先は
+/// 0 以外の値で初期化)。
+#[cfg(feature = "native")]
+#[test]
+fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    let all_optim = PrecisionFlags {
+        tf32: true,
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+    };
+    // ft_out 256 で列 slice が複数になる。factorizer の仮想行は gather の起動形状に関係しない。
+    for (name, feature_set, ft_out) in [("halfka-hm", FeatureSet::HalfKaHmMerged.spec(), 256)] {
+        let options = LayerStackTestOptions {
+            feature_set,
+            precision: all_optim,
+            ft_out,
+            ..standard
+        };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+        // 1 feature を全局面の nstm に出し、4 本の部分和を回す unroll 部と端数を通す。
+        let max_active = feature_set.max_active();
+        let shared_feature = batch.nstm_indices[0];
+        for position in 1..SMOKE_BATCH - 1 {
+            batch.nstm_indices[position * max_active] = shared_feature;
+        }
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        for (variant, (pairs, single, changed)) in trainer
+            .ft_gather_fp16_shapes_for_test()?
+            .into_iter()
+            .enumerate()
+        {
+            assert!(changed > 0, "{name}: variant {variant} wrote no cell");
+            assert_eq!(pairs, single, "{name}: variant {variant} differs");
+        }
+    }
+    Ok(())
+}
+
 /// L1 shared 層の入力勾配を 64 入力 tile で計算する kernel が、16 入力 tile の kernel と bit 単位で
 /// 同じ値を書くこと。`l1_out` = 17 で reduction 軸の端数 slice も通す。
 #[cfg(feature = "native")]
