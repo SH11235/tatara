@@ -32,6 +32,35 @@ const FT_FUSED_OUT_MIRROR_F16: u32 = 1 << 4;
 const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
 #[cfg(feature = "native")]
 const FT_FUSED_OUT_COMB_F32: u32 = 3 << 4;
+#[cfg(feature = "native")]
+const FT_FUSED_ACCUMULATE_NORMS: u32 = 1 << 6;
+/// Elements each `ft_fused_optimizer_step` thread updates in its grid-stride loop. The norm
+/// accumulation costs one atomic per thread, while capping the grid at a few resident waves
+/// starves the update of memory parallelism; a handful of elements per thread keeps the grid
+/// large enough to stay bandwidth-bound.
+#[cfg(feature = "native")]
+const FT_FUSED_ELEMENTS_PER_THREAD: usize = 4;
+
+/// Launch shape for `ft_fused_optimizer_step` over `n` elements: the block count is a multiple
+/// of `ft_out / gcd(ft_out, BLOCK_DIM)`, which makes the grid stride a multiple of `ft_out`.
+#[cfg(feature = "native")]
+fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
+    let block = BLOCK_DIM as usize;
+    let (mut a, mut b) = (ft_out, block);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let unit = ft_out / a;
+    let blocks = n
+        .div_ceil(block * FT_FUSED_ELEMENTS_PER_THREAD)
+        .div_ceil(unit)
+        * unit;
+    LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
 
 #[cfg(feature = "native")]
 impl GpuTrainer {
@@ -46,6 +75,51 @@ impl GpuTrainer {
             .as_ref()
             .is_some_and(|d| d.steps.contains(&step));
         !diagnostic_step && self.psqt.is_none() && !self.ft_fused_optimizer_disabled
+    }
+
+    /// Leaves the per-column FT norms for this fused step in `ft_norms` and zeroes
+    /// `ft_norm_sums` for the kernel to accumulate into. The norms come from the squared sums of
+    /// the previous fused step when they describe the current weights, otherwise from a reduce
+    /// pass over `ft_w`.
+    fn prepare_ft_fused_norms(&mut self, ft_out: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if self.ft_norm_sums_current {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation (いずれも `ft_out` 要素)。
+                cuda_launch! {
+                    kernel: norm_loss_finalize_f64,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_out),
+                    args: [slice(self.ft_norm_sums), slice_mut(self.ft_norms), ft_out as u32]
+                }
+            }?;
+        } else {
+            let rows = self.feature_set.train_ft_in();
+            memset_zero(&self.stream, &self.ft_norms)?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: norm_loss_reduce,
+                    stream: self.stream, module: self.module,
+                    config: cfg_norm_loss_reduce(ft_out, rows),
+                    args: [slice(self.ft_w), slice(self.ft_norms),
+                           ft_out as u32, 1u32, ft_out as u32, rows as u32]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: norm_loss_finalize,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_out),
+                    args: [slice_mut(self.ft_norms), ft_out as u32]
+                }
+            }?;
+        }
+        memset_zero(&self.stream, &self.ft_norm_sums)?;
+        Ok(())
     }
 
     /// Marks the FT rows either perspective uses in this batch in `ws.ft_active_rows`.
@@ -131,6 +205,18 @@ impl GpuTrainer {
         self.ft_fused_optimizer_disabled = !enabled;
     }
 
+    /// Per-column FT squared sums the last fused step accumulated for the current weights, or
+    /// `None` when the next fused step recomputes them with a reduce pass.
+    #[cfg(test)]
+    pub(crate) fn ft_fused_norm_sums_to_host_for_test(
+        &self,
+    ) -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
+        if !self.ft_norm_sums_current {
+            return Ok(None);
+        }
+        Ok(Some(self.ft_norm_sums.to_host_vec(&self.stream)?))
+    }
+
     /// Device-side FT forward weights (FP16 mirror or factorizer comb, widened to `f32`) and
     /// the FT gradient buffer, for comparing optimizer paths in tests.
     #[cfg(test)]
@@ -185,7 +271,7 @@ impl GpuTrainer {
         }
         let norm_factor = self.norm_loss_factor.unwrap_or(0.0);
         if self.norm_loss_factor.is_some() {
-            flags |= FT_FUSED_NORM_LOSS;
+            flags |= FT_FUSED_NORM_LOSS | FT_FUSED_ACCUMULATE_NORMS;
         }
         if step.lookahead {
             flags |= FT_FUSED_LOOKAHEAD;
@@ -215,9 +301,9 @@ impl GpuTrainer {
                 continue;
             }
             let launch_flags = flags | out;
-            // Unused pointer slots (`slow` without lookahead, `norms` without norm-loss, the
-            // active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when `out == 0`)
-            // receive a live buffer the kernel never reads.
+            // Unused pointer slots (`slow` without lookahead, the norm buffers without norm-loss,
+            // the active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when
+            // `out == 0`) receive a live buffer the kernel never touches.
             macro_rules! launch {
                 ($m:expr, $v:expr, $forward:expr) => {
                     unsafe {
@@ -225,12 +311,15 @@ impl GpuTrainer {
                         // stream の完了を待つ同期点まで生存する device allocation。`[begin, end)` は
                         // train 形状の `ft_w` / moment / grad / slow の範囲内で、forward output は
                         // `out != 0` のとき `end` 以上の長さを持つ (comb は real 行、mirror は train 行)。
+                        // norm 系 buffer は `ft_out` 要素。
                         cuda_launch! {
                             kernel: ft_fused_optimizer_step,
-                            stream: self.stream, module: self.module, config: cfg_1d(end - begin),
+                            stream: self.stream, module: self.module,
+                            config: ft_fused_launch_config(end - begin, ft_out),
                             args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
-                                   slice(self.norm_scratch), slice(self.ws.ft_active_rows),
+                                   slice(self.ft_norms), slice_mut(self.ft_norm_sums),
+                                   slice(self.ws.ft_active_rows),
                                    slice_mut($forward),
                                    slice(self.threat_pair_starts), bounds, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
@@ -259,6 +348,9 @@ impl GpuTrainer {
                 (MomentBuf::F32(m), MomentBuf::F32(v)) => with_forward!(m, v),
                 _ => unreachable!("ft_w m and v moment buffers always share precision"),
             }
+        }
+        if self.norm_loss_factor.is_some() {
+            self.ft_norm_sums_current = true;
         }
         Ok(())
     }
@@ -691,6 +783,16 @@ pub(crate) struct GpuTrainer {
     /// other real rows hold stale values, so only the fused FT optimizer may consume the step.
     #[cfg(feature = "native")]
     ft_grad_active_rows_only: bool,
+    /// Per-column FT norms read by the fused FT optimizer (`ft_out` floats).
+    #[cfg(feature = "native")]
+    ft_norms: DeviceBuffer<f32>,
+    /// Per-column squared sums of the weights the fused FT optimizer wrote (`ft_out` doubles).
+    #[cfg(feature = "native")]
+    ft_norm_sums: DeviceBuffer<f64>,
+    /// `ft_norm_sums` describes the current `ft_w`. Every write to `ft_w` outside the fused
+    /// kernel must clear it.
+    #[cfg(feature = "native")]
+    ft_norm_sums_current: bool,
     /// true なら forward + loss (`validate`) 専用 trainer。optimizer state
     /// (`m` / `v` / `slow`)・全 `*_grad`・backward workspace を 0-byte で確保して
     /// device memory を forward 経路の分だけに抑える ([`GpuTrainer::new_forward_only`])。
@@ -1601,6 +1703,12 @@ impl GpuTrainer {
             ft_fused_optimizer_disabled: false,
             #[cfg(feature = "native")]
             ft_grad_active_rows_only: false,
+            #[cfg(feature = "native")]
+            ft_norms: DeviceBuffer::<f32>::zeroed(&stream, ft_out)?,
+            #[cfg(feature = "native")]
+            ft_norm_sums: DeviceBuffer::<f64>::zeroed(&stream, ft_out)?,
+            #[cfg(feature = "native")]
+            ft_norm_sums_current: false,
             forward_only,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -1703,6 +1811,10 @@ impl GpuTrainer {
             *value = 0.0;
         }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &host)?;
+        #[cfg(feature = "native")]
+        {
+            self.ft_norm_sums_current = false;
+        }
         Ok(())
     }
 
@@ -1839,6 +1951,10 @@ impl GpuTrainer {
         }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        #[cfg(feature = "native")]
+        {
+            self.ft_norm_sums_current = false;
+        }
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
         self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
         self.l1_shared_weight = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
@@ -2290,6 +2406,10 @@ impl GpuTrainer {
         let forward_only = self.forward_only;
         let (ftw_w, ftw_m, ftw_v, ftw_slow) = &loaded[0];
         self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
+        #[cfg(feature = "native")]
+        {
+            self.ft_norm_sums_current = false;
+        }
         if !forward_only {
             self.ft_w_m =
                 MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
@@ -4784,6 +4904,10 @@ impl GpuTrainer {
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
         #[cfg(feature = "native")]
+        if !ft_fused {
+            self.ft_norm_sums_current = false;
+        }
+        #[cfg(feature = "native")]
         if self.ft_grad_active_rows_only && !ft_fused {
             return Err(
                 "FT gradient covers only the batch's active rows, but this step does \
@@ -4875,32 +4999,11 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_shared_bias, 1, 0, 1, l1_shared_bias_n);
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
             norm_loss_group!(self.l3_b, 1, 0, 1, l3_b_n);
-            // fused FT path: only the column norms are computed here. They stay in
-            // `norm_scratch` (no later launch on this stream touches it) and the fused
-            // kernel applies the correction element-wise before its RAdam step.
+            // fused FT path: only the column norms are prepared here; the fused kernel applies
+            // the correction element-wise before its RAdam step.
+            #[cfg(feature = "native")]
             if ft_fused {
-                memset_zero(&self.stream, &self.norm_scratch)?;
-                unsafe {
-                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                    // stream の完了を待つ同期点まで生存する device allocation。
-                    cuda_launch! {
-                        kernel: norm_loss_reduce,
-                        stream: self.stream, module: self.module,
-                        config: cfg_norm_loss_reduce(ft_out, ft_w_rows),
-                        args: [slice(self.ft_w), slice(self.norm_scratch),
-                               ft_out as u32, 1u32, ft_out as u32, ft_w_rows as u32]
-                    }
-                }?;
-                unsafe {
-                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                    // stream の完了を待つ同期点まで生存する device allocation。
-                    cuda_launch! {
-                        kernel: norm_loss_finalize,
-                        stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_out),
-                        args: [slice_mut(self.norm_scratch), ft_out as u32]
-                    }
-                }?;
+                self.prepare_ft_fused_norms(ft_out)?;
             }
             prof_tick!("norm_loss");
         }
