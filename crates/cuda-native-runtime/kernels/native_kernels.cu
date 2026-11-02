@@ -56,6 +56,60 @@ extern "C" __global__ void qat_dense(
     out[i] = static_cast<float>(static_cast<double>(raw[i]) / 8128.0);
 }
 
+// `qat_dense` for wide inputs: one warp per (row, group of 8 outputs). Each lane quantizes its
+// strided slice of the input row once and accumulates it into all outputs of the group, so the
+// row is read once per group rather than once per output. Products are bounded by 127 * 128 and
+// a row has at most `inputs` of them, so for `inputs <= 131072` the dot product fits in `int`
+// and the result matches the `long long` accumulation of `qat_dense` bit for bit.
+extern "C" __global__ void qat_dense_wide(
+    const float* x, unsigned long long,
+    const float* w, unsigned long long,
+    const float* bias, unsigned long long,
+    const float* shared_bias, unsigned long long,
+    const int* bucket, unsigned long long,
+    float* out, unsigned long long,
+    int* raw, unsigned long long,
+    unsigned int batch, unsigned int inputs, unsigned int outputs, unsigned int merge
+) {
+    constexpr unsigned int GROUP = 8;
+    const unsigned int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lane = thread % 32;
+    const unsigned int warp = thread / 32;
+    const unsigned int groups = (outputs + GROUP - 1) / GROUP;
+    if (warp >= batch * groups) return;
+    const unsigned int row = warp / groups;
+    const unsigned int first = (warp % groups) * GROUP;
+    const unsigned int count = outputs - first < GROUP ? outputs - first : GROUP;
+    const unsigned int neuron_base = static_cast<unsigned int>(bucket[row]) * outputs + first;
+    int sums[GROUP] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (unsigned int j = lane; j < inputs; j += 32) {
+        const int q = __float2int_rn(x[static_cast<unsigned long long>(row) * inputs + j] * 127.0F);
+#pragma unroll
+        for (unsigned int o = 0; o < GROUP; ++o) {
+            if (o < count) {
+                sums[o] += q * __float2int_rn(
+                    w[static_cast<unsigned long long>(neuron_base + o) * inputs + j] * 64.0F
+                );
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned int o = 0; o < GROUP; ++o) {
+        for (unsigned int offset = 16; offset; offset >>= 1)
+            sums[o] += __shfl_down_sync(0xffffffff, sums[o], offset);
+    }
+    if (lane != 0) return;
+    for (unsigned int o = 0; o < count; ++o) {
+        const unsigned int i = row * outputs + first + o;
+        float b = bias[neuron_base + o];
+        if (merge) b += shared_bias[first + o];
+        const long long sum = static_cast<long long>(sums[o])
+            + static_cast<long long>(fmin(2147483647.0, fmax(-2147483648.0, round(static_cast<double>(b) * 8128.0))));
+        raw[i] = static_cast<int>(sum);
+        out[i] = static_cast<float>(static_cast<double>(raw[i]) / 8128.0);
+    }
+}
+
 extern "C" __global__ void qat_activation(
     float* x, unsigned long long,
     unsigned int n
