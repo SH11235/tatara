@@ -3236,6 +3236,70 @@ extern "C" __global__ void dense_mm_bwd_input_tiled(
     input_gradient[static_cast<unsigned long long>(row) * input_dimension + input_index] = accumulator;
 }
 
+// `dense_mm_bwd_input_tiled` with a 16-row x 64-input tile per block; each thread owns 4 inputs
+// spaced 16 apart. The tile's output-gradient rows and weight rows pass through shared memory in
+// 16-wide slices of the reduction axis, so global reads are contiguous row segments and each
+// staged gradient value feeds 4 outputs. Every output accumulates `output_index` in ascending
+// order like the narrow kernel, so both write identical values. `input_dimension` must be a
+// multiple of 64 and the grid `(batch / 16) * (input_dimension / 64)` blocks.
+extern "C" __global__ void dense_mm_bwd_input_tiled_wide(
+    const float* output_gradient,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension
+) {
+    __shared__ float gradient_tile[16][17];
+    __shared__ float weight_tile[64][17];
+    const unsigned int input_tiles = input_dimension / 64U;
+    const unsigned int batch_tile = blockIdx.x / input_tiles;
+    const unsigned int input_tile = blockIdx.x % input_tiles;
+    const unsigned int local_row = threadIdx.x >> 4;
+    const unsigned int local_column = threadIdx.x & 15U;
+    const unsigned int row = batch_tile * 16U + local_row;
+    float accumulators[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    for (unsigned int base = 0; base < output_dimension; base += 16U) {
+        const unsigned int output_index = base + local_column;
+        const bool in_range = output_index < output_dimension;
+        gradient_tile[local_row][local_column] =
+            row < batch && in_range
+                ? output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index]
+                : 0.0F;
+#pragma unroll
+        for (unsigned int part = 0; part < 4U; ++part) {
+            const unsigned int weight_row = input_tile * 64U + part * 16U + local_row;
+            weight_tile[part * 16U + local_row][local_column] =
+                weight_row < input_dimension && in_range
+                    ? weights[static_cast<unsigned long long>(weight_row) * output_dimension + output_index]
+                    : 0.0F;
+        }
+        __syncthreads();
+        const unsigned int count = min(16U, output_dimension - base);
+        for (unsigned int j = 0; j < count; ++j) {
+            const float gradient = gradient_tile[local_row][j];
+#pragma unroll
+            for (unsigned int part = 0; part < 4U; ++part) {
+                accumulators[part] += gradient * weight_tile[part * 16U + local_column][j];
+            }
+        }
+        __syncthreads();
+    }
+    if (row < batch) {
+#pragma unroll
+        for (unsigned int part = 0; part < 4U; ++part) {
+            const unsigned int input_index = input_tile * 64U + part * 16U + local_column;
+            if (input_index < input_dimension) {
+                input_gradient[static_cast<unsigned long long>(row) * input_dimension + input_index] =
+                    accumulators[part];
+            }
+        }
+    }
+}
+
 extern "C" __global__ void dense_mm_bwd_input_bucket_tiled_sorted_scatter(
     const float* output_gradient,
     unsigned long long,

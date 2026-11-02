@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 82, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 83, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 98, "production kernel inventory changed");
+    assert_eq!(required.len(), 99, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3490,6 +3490,28 @@ fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::err
                 cell % ft_out
             );
         }
+    }
+    Ok(())
+}
+
+/// L1 shared 層の入力勾配を 64 入力 tile で計算する kernel が、16 入力 tile の kernel と bit 単位で
+/// 同じ値を書くこと。`l1_out` = 17 で reduction 軸の端数 slice も通す。
+#[cfg(feature = "native")]
+#[test]
+fn l1_shared_bwd_input_wide_tile_matches_narrow_tile() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    for l1_out in [16, 17, 32] {
+        let options = LayerStackTestOptions { l1_out, ..standard };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let (wide, narrow) = trainer.l1_shared_bwd_input_bits_for_test(SMOKE_BATCH)?;
+        assert!(
+            narrow.iter().any(|&bits| bits & 0x7fff_ffff != 0),
+            "l1_out {l1_out}: input gradient is all zero"
+        );
+        assert_eq!(wide, narrow, "l1_out {l1_out}: wide tile differs");
     }
     Ok(())
 }

@@ -312,6 +312,69 @@ impl GpuTrainer {
         Ok(())
     }
 
+    /// FP32 L1 shared-weight input gradient `output[b, ft_out] = dl1_total @ l1_shared_weight`
+    /// with `dense_mm_bwd_input_tiled_wide` (`ft_out` is a multiple of 128).
+    fn launch_l1_shared_bwd_input_wide(
+        &self,
+        b: usize,
+        output: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        debug_assert!(ft_out.is_multiple_of(64) && b.is_multiple_of(16));
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。`output` は
+            // `b * ft_out`、`dl1_total` は `b * l1_out`、weight は `ft_out * l1_out` 要素以上。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled_wide,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (((b / 16) * (ft_out / 64)) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.dl1_total), slice(self.l1_shared_weight), slice(output),
+                       b as u32, ft_out as u32, l1_out as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    /// Runs the wide and the narrow L1 shared input-gradient kernels on the last step's
+    /// `dl1_total`, returning both outputs as bit patterns.
+    #[cfg(test)]
+    pub(crate) fn l1_shared_bwd_input_bits_for_test(
+        &self,
+        b: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        let wide = DeviceBuffer::<f32>::zeroed(&self.stream, b * ft_out)?;
+        let narrow = DeviceBuffer::<f32>::zeroed(&self.stream, b * ft_out)?;
+        self.launch_l1_shared_bwd_input_wide(b, &wide)?;
+        unsafe {
+            // SAFETY: 同上 (`dense_mm_bwd_input_tiled` は 16 入力の tile)。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_tiled,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (((b / 16) * (ft_out / 16)) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.dl1_total), slice(self.l1_shared_weight), slice(narrow),
+                       b as u32, ft_out as u32, l1_out as u32]
+            }
+        }?;
+        let bits = |buffer: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+            Ok(buffer
+                .to_host_vec(&self.stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        Ok((bits(&wide)?, bits(&narrow)?))
+    }
+
     /// stm-side overwrite gather that skips rows outside `ws.ft_active_rows`.
     fn launch_ft_stm_gather_active(
         &self,
@@ -4549,9 +4612,11 @@ impl GpuTrainer {
         // -- Backward 5 reverse: L1 shared dense grad --
         // L1 shared input bwd: `dcombined[b][i] = sum_o dl1_total[b][o] * l1_shared_weight[i][o]`
         // (in_dim=ft_out, out_dim=l1_out)。`self.tf32` で cuBLAS Sgemm (X @ Y^T、beta=0
-        // overwrite) と手書き tiled kernel を分岐する。手書き kernel は 16×16 tile
-        // (block=256 = 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)、out_dim は
-        // reduction 軸で kernel 内 16 幅 out-tile loop で消化するため grid に現れない。
+        // overwrite) と手書き tiled kernel を分岐する。手書き kernel の block は 256 thread で、
+        // native は 16 batch × 64 in_dim の tile (`dense_mm_bwd_input_tiled_wide`、1 thread 4 cell、
+        // grid=batch/16 × in_dim/64)、cuda-oxide / oxide-parity は 16 batch × 16 in_dim の tile
+        // (`dense_mm_bwd_input_tiled`、grid=batch/16 × in_dim/16)。out_dim は reduction 軸で
+        // kernel 内のループで消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
         if self.tf32 {
             // C[b, ft_out] = dl1_total[b, l1_out] @ l1_shared_weight[ft_out, l1_out]^T (reduce 軸 l1_out)。
@@ -4571,6 +4636,9 @@ impl GpuTrainer {
                 )?;
             }
         } else {
+            #[cfg(feature = "native")]
+            self.launch_l1_shared_bwd_input_wide(b, &self.ws.dcombined_from_l1_shared)?;
+            #[cfg(not(feature = "native"))]
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
