@@ -1532,6 +1532,66 @@ extern "C" __global__ void simple_bias_grad_dual_fp16(
     atomicAdd(bias_gradient + output, sum);
 }
 
+// Sums the f16 gradients of `Columns` adjacent columns `row .. row + Columns` of one feature.
+// Each column keeps its own four interleaved partial sums, so the result per cell does not depend
+// on `Columns`; `Columns == 2` reads both halves with one 4-byte load.
+template <bool Add, unsigned int Columns>
+__device__ __forceinline__ void gather_feature_gradient_fp16_columns(
+    const __half* output_gradient,
+    const unsigned int* positions,
+    unsigned int start,
+    unsigned int end,
+    float* weight_gradient,
+    unsigned int feature,
+    unsigned int row,
+    unsigned int ft_output,
+    float inverse_gradient_scale
+) {
+    float sums[4][Columns] = {};
+    auto add_position = [&](unsigned int slot, unsigned int index) {
+        const __half* source =
+            output_gradient + static_cast<unsigned long long>(positions[index]) * ft_output + row;
+        if (Columns == 2) {
+            const unsigned int packed = *reinterpret_cast<const unsigned int*>(source);
+            sums[slot][0] +=
+                __half2float(__ushort_as_half(static_cast<unsigned short>(packed & 0xffffU)));
+            sums[slot][1] += __half2float(__ushort_as_half(static_cast<unsigned short>(packed >> 16)));
+        } else {
+            sums[slot][0] += __half2float(source[0]);
+        }
+    };
+    unsigned int i = start;
+    const unsigned int unroll_end = end >= start + 3 ? end - 3 : start;
+    while (i < unroll_end) {
+        add_position(0, i);
+        add_position(1, i + 1);
+        add_position(2, i + 2);
+        add_position(3, i + 3);
+        i += 4;
+    }
+    while (i < end) {
+        add_position(0, i);
+        ++i;
+    }
+#pragma unroll
+    for (unsigned int column = 0; column < Columns; ++column) {
+        const float sum = (sums[0][column] + sums[1][column]) + (sums[2][column] + sums[3][column]);
+        const unsigned long long output_index =
+            static_cast<unsigned long long>(feature) * ft_output + row + column;
+        const float scaled = sum * inverse_gradient_scale;
+        if (Add) {
+            if (sum != 0.0F) {
+                atomicAdd(weight_gradient + output_index, scaled);
+            }
+        } else {
+            weight_gradient[output_index] = scaled;
+        }
+    }
+}
+
+// Each thread covers `ft_output / (gridDim.y * blockDim.x)` adjacent columns: 2 when the grid
+// spans the columns with half as many threads (the native launch, 64 x 2 blocks over
+// `ft_output / 128` slices), otherwise 1.
 template <bool Add>
 __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     const __half* output_gradient,
@@ -1543,8 +1603,9 @@ __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     unsigned int ft_output,
     float inverse_gradient_scale
 ) {
+    const bool pairs = ft_output / (gridDim.y * blockDim.x) == 2U;
     const unsigned int feature = blockIdx.x * blockDim.y + threadIdx.y;
-    const unsigned int row = blockIdx.y * blockDim.x + threadIdx.x;
+    const unsigned int row = (blockIdx.y * blockDim.x + threadIdx.x) * (pairs ? 2U : 1U);
     if (feature >= n_features || row >= ft_output) {
         return;
     }
@@ -1553,43 +1614,16 @@ __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     }
     const unsigned int start = offsets[feature];
     const unsigned int end = offsets[feature + 1];
-    float sum0 = 0.0F;
-    float sum1 = 0.0F;
-    float sum2 = 0.0F;
-    float sum3 = 0.0F;
-    unsigned int i = start;
-    const unsigned int unroll_end = end >= start + 3 ? end - 3 : start;
-    while (i < unroll_end) {
-        sum0 += __half2float(output_gradient[
-            static_cast<unsigned long long>(positions[i]) * ft_output + row
-        ]);
-        sum1 += __half2float(output_gradient[
-            static_cast<unsigned long long>(positions[i + 1]) * ft_output + row
-        ]);
-        sum2 += __half2float(output_gradient[
-            static_cast<unsigned long long>(positions[i + 2]) * ft_output + row
-        ]);
-        sum3 += __half2float(output_gradient[
-            static_cast<unsigned long long>(positions[i + 3]) * ft_output + row
-        ]);
-        i += 4;
-    }
-    while (i < end) {
-        sum0 += __half2float(output_gradient[
-            static_cast<unsigned long long>(positions[i]) * ft_output + row
-        ]);
-        ++i;
-    }
-    const float sum = (sum0 + sum1) + (sum2 + sum3);
-    const unsigned long long output_index =
-        static_cast<unsigned long long>(feature) * ft_output + row;
-    const float scaled = sum * inverse_gradient_scale;
-    if (Add) {
-        if (sum != 0.0F) {
-            atomicAdd(weight_gradient + output_index, scaled);
-        }
+    if (pairs) {
+        gather_feature_gradient_fp16_columns<Add, 2>(
+            output_gradient, positions, start, end, weight_gradient, feature, row, ft_output,
+            inverse_gradient_scale
+        );
     } else {
-        weight_gradient[output_index] = scaled;
+        gather_feature_gradient_fp16_columns<Add, 1>(
+            output_gradient, positions, start, end, weight_gradient, feature, row, ft_output,
+            inverse_gradient_scale
+        );
     }
 }
 

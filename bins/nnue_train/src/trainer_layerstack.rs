@@ -18,6 +18,11 @@ struct FtFusedStep {
 #[cfg(all(test, feature = "native"))]
 type FtForwardTestState = (Option<Vec<f32>>, Vec<f32>);
 
+/// `(production-shape gradient bits, one-column gradient bits, cells changed from the initial
+/// pattern)` read back by tests.
+#[cfg(all(test, feature = "native"))]
+type FtGatherShapeTestState = (Vec<u32>, Vec<u32>, usize);
+
 /// `(position order, ordered activation bits, unordered activation bits)` read back by tests.
 #[cfg(all(test, feature = "native"))]
 type FtForwardOrderTestState = (Vec<i32>, Vec<u32>, Vec<u32>);
@@ -70,22 +75,24 @@ fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
 /// spans features and the grid's `y` walks column slices. Blocks sweep every feature for one
 /// column slice before the next, so a slice narrow enough for the gradient rows of the positions
 /// in flight to stay in L2 cuts DRAM traffic; on the native backend that slice is 256 bytes of a
-/// row, with several features per block so the narrow block still fills the SM. The cuda-oxide
-/// kernels index features by `blockIdx.x` alone and keep one feature per 128-column block.
+/// row, with several features per block so the narrow block still fills the SM. The native f16
+/// kernel covers its 128-column slice with 64 threads, 2 columns each (it derives that from the
+/// grid). The cuda-oxide kernels index features by `blockIdx.x` alone and keep one feature per
+/// 128-column block.
 fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> LaunchConfig {
-    let (columns, features) = if cfg!(feature = "native") {
-        if half_gradient { (128, 1) } else { (64, 4) }
+    let (threads, features, slice) = if cfg!(feature = "native") {
+        if half_gradient {
+            (64, 2, 128)
+        } else {
+            (64, 4, 64)
+        }
     } else {
-        (128, 1)
+        (128, 1, 128)
     };
-    debug_assert!(ft_out.is_multiple_of(columns));
+    debug_assert!(ft_out.is_multiple_of(slice));
     LaunchConfig {
-        grid_dim: (
-            ft_in.div_ceil(features) as u32,
-            (ft_out / columns) as u32,
-            1,
-        ),
-        block_dim: (columns as u32, features as u32, 1),
+        grid_dim: (ft_in.div_ceil(features) as u32, (ft_out / slice) as u32, 1),
+        block_dim: (threads as u32, features as u32, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -373,6 +380,82 @@ impl GpuTrainer {
                 .collect())
         };
         Ok((bits(&wide)?, bits(&narrow)?))
+    }
+
+    /// Runs the f16 sparse-backward gather kernels (overwrite, active overwrite, add) on the last
+    /// backward's nstm inverse index and gradients, once with the production launch shape and
+    /// once with one column per thread, each starting from the same nonzero pattern.
+    #[cfg(test)]
+    pub(crate) fn ft_gather_fp16_shapes_for_test(
+        &self,
+    ) -> Result<Vec<FtGatherShapeTestState>, Box<dyn std::error::Error>> {
+        let (ft_in, ft_out) = (self.ws.ft_in, self.ws.ft_out);
+        let dft = self
+            .ws
+            .dft_nstm_out_h
+            .as_ref()
+            .ok_or("ft_fp16_out is disabled")?;
+        let production = ft_gather_launch_config(ft_in, ft_out, true);
+        let one_column = LaunchConfig {
+            grid_dim: (ft_in as u32, (ft_out / 128) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let scale = 0.75_f32;
+        // Rows the kernels skip or add to keep this pattern, so both launches start equal.
+        let sentinel: Vec<f32> = (0..ft_in * ft_out)
+            .map(|i| (i % 7) as f32 * 0.125 - 0.25)
+            .collect();
+        let mut results = Vec::new();
+        for variant in 0..3 {
+            let mut bits = Vec::new();
+            for config in [production, one_column] {
+                let grad = DeviceBuffer::from_host(&self.stream, &sentinel)?;
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // 直後の読み出し (stream 同期) まで生存する device allocation。
+                unsafe {
+                    match variant {
+                        0 => cuda_launch! {
+                            kernel: gather_and_sum_per_feature_overwrite_fp16,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(dft), slice(self.ws.feat_positions),
+                                   slice(self.ws.feat_offsets), slice(grad),
+                                   ft_in as u32, ft_out as u32, scale]
+                        },
+                        1 => cuda_launch! {
+                            kernel: gather_and_sum_per_feature_overwrite_fp16_active,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(dft), slice(self.ws.feat_positions),
+                                   slice(self.ws.feat_offsets), slice(grad),
+                                   slice(self.ws.ft_active_rows), ft_in as u32, ft_out as u32,
+                                   scale]
+                        },
+                        _ => cuda_launch! {
+                            kernel: gather_and_sum_per_feature_add_fp16,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(dft), slice(self.ws.feat_positions),
+                                   slice(self.ws.feat_offsets), slice(grad),
+                                   ft_in as u32, ft_out as u32, scale]
+                        },
+                    }
+                }?;
+                bits.push(
+                    grad.to_host_vec(&self.stream)?
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let one = bits.pop().expect("two launches");
+            let prod = bits.pop().expect("two launches");
+            let changed = one
+                .iter()
+                .zip(&sentinel)
+                .filter(|&(&got, &initial)| got != initial.to_bits())
+                .count();
+            results.push((prod, one, changed));
+        }
+        Ok(results)
     }
 
     /// stm-side overwrite gather that skips rows outside `ws.ft_active_rows`.
@@ -5138,8 +5221,8 @@ impl GpuTrainer {
                 }
             }?;
             prof_tick!("phC_scat");
-            // D: gather_and_sum_per_feature。1 thread = (feature, column) 1 cell
-            // (`ft_gather_launch_config`)。
+            // D: gather_and_sum_per_feature。1 thread = 1 feature の 1 列 (native の f16 は
+            // 隣接 2 列、`ft_gather_launch_config`)。
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
             // overwrite kernel が全 cell (`active_rows_only` 時は active 行の全 cell) を
             // 書き切るため grad_w の host 事前 memset は不要。nstm 側が足す行は必ず active。

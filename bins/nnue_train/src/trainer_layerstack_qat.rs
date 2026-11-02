@@ -13,9 +13,6 @@ const QAT_DENSE_WIDE_INPUTS: usize = 256;
 #[cfg(feature = "native")]
 const QAT_DENSE_WIDE_GROUP: usize = 8;
 
-#[cfg(all(test, feature = "native"))]
-type QatDenseCompareState = (Vec<i32>, Vec<i32>, Vec<u32>, Vec<u32>);
-
 #[cfg(feature = "native")]
 fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usize, &'static str> {
     // `qat_dense_wide` accumulates the dot product in a 32-bit int (see the kernel).
@@ -257,45 +254,5 @@ impl GpuTrainer {
             }
         }?;
         Ok(())
-    }
-
-    /// Runs `qat_dense_wide` and `qat_dense_wide_sorted` for layer 1 on the last forward's
-    /// inputs, returning `(sorted raw, wide raw, sorted out bits, wide out bits)`.
-    #[cfg(all(test, feature = "native"))]
-    pub(super) fn qat_dense_l1_sorted_and_wide_for_test(
-        &self,
-        batch: usize,
-    ) -> Result<QatDenseCompareState, Box<dyn std::error::Error>> {
-        let n = batch * self.ws.l1_out;
-        let sorted_out = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-        let sorted_raw = DeviceBuffer::<i32>::zeroed(&self.stream, n)?;
-        let wide_out = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-        let wide_raw = DeviceBuffer::<i32>::zeroed(&self.stream, n)?;
-        self.qat_dense_l1_sorted(batch, &sorted_out, &sorted_raw)?;
-        let (inputs, outputs) = (self.ws.ft_out, self.ws.l1_out);
-        let threads = batch * outputs.div_ceil(QAT_DENSE_WIDE_GROUP) * 32;
-        // SAFETY: same buffers and dimensions as the layer-1 launch in `qat_dense_forward`, with
-        // one warp per row and output group as `qat_dense_wide` expects for any input width.
-        unsafe {
-            cuda_launch! {
-                kernel: qat_dense_wide, stream: self.stream, module: self.module,
-                config: cfg_1d(threads),
-                args: [slice(self.ws.combined), slice(self.l1_w), slice(self.qat_buffers[1]),
-                    slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice(wide_out),
-                    slice(wide_raw), batch as u32, inputs as u32, outputs as u32, 1u32]
-            }
-        }?;
-        let bits = |b: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-            Ok(b.to_host_vec(&self.stream)?
-                .iter()
-                .map(|v| v.to_bits())
-                .collect())
-        };
-        Ok((
-            sorted_raw.to_host_vec(&self.stream)?,
-            wide_raw.to_host_vec(&self.stream)?,
-            bits(&sorted_out)?,
-            bits(&wide_out)?,
-        ))
     }
 }
