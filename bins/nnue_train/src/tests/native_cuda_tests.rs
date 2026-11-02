@@ -3405,6 +3405,95 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// FP32 の sparse FT backward (inverse-index gather) が書く `ft_w_grad` が、host で
+/// `dft_stm` / `dft_nstm` を各局面の active feature 行へ足し込んだ値と一致すること。
+/// `ft_in` が 1 block あたりの feature 数で割り切れない構成も含める。
+#[cfg(feature = "native")]
+#[test]
+fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    let configs = [
+        ("halfkp", standard.feature_set),
+        ("halfka-hm", FeatureSet::HalfKaHmMerged.spec()),
+        (
+            "threat",
+            standard
+                .feature_set
+                .with_threat_profile(ThreatProfile::CrossSide),
+        ),
+    ];
+    assert!(
+        configs
+            .iter()
+            .any(|(_, feature_set)| feature_set.ft_in() % 4 != 0),
+        "no configuration leaves a partial feature block"
+    );
+    for ((name, feature_set), fused) in configs
+        .into_iter()
+        .flat_map(|config| [(config, false), (config, true)])
+    {
+        let options = LayerStackTestOptions {
+            feature_set,
+            ..standard
+        };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        // optimizer kernel は読んだ勾配を 0 に戻すので backward までで止める。fused optimizer が
+        // 有効だと batch に出ない行は書かれず、test hook がその行を 0 として返す。
+        trainer.set_ft_fused_optimizer_enabled_for_test(fused);
+        trainer.set_skip_optimizer_for_test(true);
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+        batch.nnz[1] = 0;
+        batch.nnz[2] = 3;
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let (dft_stm, dft_nstm) = trainer.ft_output_grads_to_host_for_test(SMOKE_BATCH)?;
+        let (_, grad) = trainer.ft_forward_state_to_host_for_test()?;
+        let (ft_in, ft_out, max_active) = (
+            feature_set.ft_in(),
+            options.ft_out,
+            feature_set.max_active(),
+        );
+        let mut expected = vec![0.0_f64; ft_in * ft_out];
+        let mut magnitude = vec![0.0_f64; ft_in * ft_out];
+        for (indices, dft) in [
+            (&batch.stm_indices, &dft_stm),
+            (&batch.nstm_indices, &dft_nstm),
+        ] {
+            for position in 0..SMOKE_BATCH {
+                let row = &dft[position * ft_out..][..ft_out];
+                for &feature in &indices[position * max_active..][..batch.nnz[position] as usize] {
+                    let Ok(feature) = usize::try_from(feature) else {
+                        continue;
+                    };
+                    for (column, &value) in row.iter().enumerate() {
+                        expected[feature * ft_out + column] += f64::from(value);
+                        magnitude[feature * ft_out + column] += f64::from(value).abs();
+                    }
+                }
+            }
+        }
+        assert!(
+            magnitude.iter().any(|&m| m > 0.0),
+            "{name}: backward produced no FT gradient"
+        );
+        // f32 で n 項を足す誤差は項の絶対値和の n * 2^-24 程度に収まる。
+        for (cell, ((&got, &want), &bound)) in grad[..ft_in * ft_out]
+            .iter()
+            .zip(&expected)
+            .zip(&magnitude)
+            .enumerate()
+        {
+            assert!(
+                (f64::from(got) - want).abs() <= 1.0e-5 * bound,
+                "{name} (fused {fused}): feature {} column {}: {got} vs {want}",
+                cell / ft_out,
+                cell % ft_out
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 玉 bucket 順の FT forward が、順序なしの `sparse_ft_forward*` と bit 単位で同じ activation を
 /// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。途中の `-1` と、
 /// base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
