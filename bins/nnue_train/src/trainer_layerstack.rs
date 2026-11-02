@@ -25,6 +25,8 @@ const FT_FUSED_NORM_LOSS: u32 = 1 << 1;
 #[cfg(feature = "native")]
 const FT_FUSED_LOOKAHEAD: u32 = 1 << 2;
 #[cfg(feature = "native")]
+const FT_FUSED_ACTIVE_ROWS: u32 = 1 << 3;
+#[cfg(feature = "native")]
 const FT_FUSED_OUT_MIRROR_F16: u32 = 1 << 4;
 #[cfg(feature = "native")]
 const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
@@ -36,13 +38,92 @@ impl GpuTrainer {
     /// Whether this step updates FT weights with `ft_fused_optimizer_step` instead of the
     /// separate norm-loss / RAdam / lookahead / fold launches. Precision-diagnostic steps keep
     /// the separate path because they record per-element optimizer internals, and the PSQT
-    /// shortcut keeps it because its fold shares `launch_ft_fold`.
-    fn ft_fused_optimizer_applies(&self) -> bool {
+    /// shortcut keeps it because its fold shares `launch_ft_fold`. `step` is the post-increment
+    /// step count the optimizer runs under.
+    fn ft_fused_optimizer_applies(&self, step: u64) -> bool {
         let diagnostic_step = self
             .precision_diagnostic
             .as_ref()
-            .is_some_and(|d| d.steps.contains(&self.step_count));
+            .is_some_and(|d| d.steps.contains(&step));
         !diagnostic_step && self.psqt.is_none() && !self.ft_fused_optimizer_disabled
+    }
+
+    /// Marks the FT rows either perspective uses in this batch in `ws.ft_active_rows`.
+    fn mark_ft_active_rows(&self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        memset_zero(&self.stream, &self.ws.ft_active_rows)?;
+        let max_active = self.ws.max_active;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。index 列は
+            // `b * max_active` 要素、`ft_active_rows` は `ft_in` 要素で、範囲外 feature は
+            // kernel が捨てる。
+            cuda_launch! {
+                kernel: mark_active_feature_rows,
+                stream: self.stream, module: self.module, config: cfg_1d(b * max_active),
+                args: [slice(self.ws.stm_idx_dev), slice(self.ws.nstm_idx_dev),
+                       slice(self.ws.nnz_dev), slice(self.ws.ft_active_rows),
+                       b as u32, max_active as u32, self.ws.ft_in as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    /// stm-side overwrite gather that skips rows outside `ws.ft_active_rows`.
+    fn launch_ft_stm_gather_active(
+        &self,
+        config: LaunchConfig,
+        dft_inv_scale: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (ft_in, ft_out) = (self.ws.ft_in as u32, self.ws.ft_out as u32);
+        if self.ft_fp16_out {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite_fp16_active,
+                    stream: self.stream, module: self.module, config: config,
+                    args: [slice(self.ws.dft_stm_out_h.as_ref()
+                               .expect("dft_stm_out_h is Some when ft_fp16_out is enabled")),
+                           slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                           slice(self.ft_w_grad), slice(self.ws.ft_active_rows),
+                           ft_in, ft_out, dft_inv_scale]
+                }
+            }?;
+        } else {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite_active,
+                    stream: self.stream, module: self.module, config: config,
+                    args: [slice(self.ws.dft_stm_out), slice(self.ws.feat_positions),
+                           slice(self.ws.feat_offsets), slice(self.ft_w_grad),
+                           slice(self.ws.ft_active_rows), ft_in, ft_out]
+                }
+            }?;
+        }
+        Ok(())
+    }
+
+    /// Factorizer virtual-row gradient reduction that reads rows outside `ws.ft_active_rows`
+    /// as zero.
+    fn launch_ft_reduce_active(&self, ft_out: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let (bounds, piece_inputs, fold_mode) =
+            ft_factorize_host::fold_kernel_args(&self.feature_set);
+        let virtual_rows = self.feature_set.ft_factorize_virtual_rows();
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。勾配は train 形状、
+            // `ft_active_rows` は実行数 (`bounds` の上位 32 bit) と同じ長さ。
+            cuda_launch! {
+                kernel: ft_reduce_virtual_grad_active,
+                stream: self.stream, module: self.module, config: cfg_1d(virtual_rows * ft_out),
+                args: [slice(self.ft_w_grad), slice(self.ws.ft_active_rows),
+                       slice(self.threat_pair_starts), bounds, ft_out as u32, piece_inputs,
+                       fold_mode]
+            }
+        }?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -68,7 +149,17 @@ impl GpuTrainer {
         } else {
             None
         };
-        Ok((forward, self.ft_w_grad.to_host_vec(&self.stream)?))
+        let mut grad = self.ft_w_grad.to_host_vec(&self.stream)?;
+        // Rows the last backward skipped hold stale values that the fused step read as zero.
+        if self.ft_grad_active_rows_only {
+            let active = self.ws.ft_active_rows.to_host_vec(&self.stream)?;
+            for (row, chunk) in grad.chunks_mut(self.ws.ft_out).enumerate() {
+                if active.get(row) == Some(&0) {
+                    chunk.fill(0.0);
+                }
+            }
+        }
+        Ok((forward, grad))
     }
 
     /// Launches the fused FT update. With the factorizer, virtual rows are updated first and
@@ -99,6 +190,9 @@ impl GpuTrainer {
         if step.lookahead {
             flags |= FT_FUSED_LOOKAHEAD;
         }
+        if self.ft_grad_active_rows_only {
+            flags |= FT_FUSED_ACTIVE_ROWS;
+        }
         let output_flags = if ft_factorize {
             if self.ft_fp16 {
                 FT_FUSED_OUT_COMB_F16
@@ -122,7 +216,8 @@ impl GpuTrainer {
             }
             let launch_flags = flags | out;
             // Unused pointer slots (`slow` without lookahead, `norms` without norm-loss, the
-            // forward output when `out == 0`) receive a live buffer the kernel never reads.
+            // active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when `out == 0`)
+            // receive a live buffer the kernel never reads.
             macro_rules! launch {
                 ($m:expr, $v:expr, $forward:expr) => {
                     unsafe {
@@ -135,7 +230,8 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(end - begin),
                             args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
-                                   slice(self.norm_scratch), slice_mut($forward),
+                                   slice(self.norm_scratch), slice(self.ws.ft_active_rows),
+                                   slice_mut($forward),
                                    slice(self.threat_pair_starts), bounds, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
                                    norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
@@ -591,6 +687,10 @@ pub(crate) struct GpuTrainer {
     /// tests can compare them against the fused kernel. Always `false` outside tests.
     #[cfg(feature = "native")]
     ft_fused_optimizer_disabled: bool,
+    /// The last backward wrote FT gradient rows only for features in `ws.ft_active_rows`; the
+    /// other real rows hold stale values, so only the fused FT optimizer may consume the step.
+    #[cfg(feature = "native")]
+    ft_grad_active_rows_only: bool,
     /// true なら forward + loss (`validate`) 専用 trainer。optimizer state
     /// (`m` / `v` / `slow`)・全 `*_grad`・backward workspace を 0-byte で確保して
     /// device memory を forward 経路の分だけに抑える ([`GpuTrainer::new_forward_only`])。
@@ -764,6 +864,8 @@ pub(crate) struct GpuWorkspace {
     feat_block_offsets: DeviceBuffer<u32>, // ceil(ft_in/1024)+1: scan level 2 (block totals)
     feat_write_ctr: DeviceBuffer<u32>, // ft_in: scatter atomic counter
     feat_positions: DeviceBuffer<u32>, // up to batch * max_active: sorted positions
+    #[cfg(feature = "native")]
+    ft_active_rows: DeviceBuffer<u32>, // ft_in: 1 when either perspective uses the feature
 
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
     // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
@@ -895,6 +997,8 @@ impl GpuWorkspace {
             )?,
             feat_write_ctr: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, bwd_len(batch * max_active))?,
+            #[cfg(feature = "native")]
+            ft_active_rows: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
@@ -1495,6 +1599,8 @@ impl GpuTrainer {
             precision_diagnostic: None,
             #[cfg(feature = "native")]
             ft_fused_optimizer_disabled: false,
+            #[cfg(feature = "native")]
+            ft_grad_active_rows_only: false,
             forward_only,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
@@ -3546,6 +3652,8 @@ impl GpuTrainer {
         // を sum (off_start==off_end の時も sum=0) で書き切り、factorizer の仮想
         // block も `ft_reduce_virtual_grad` が overwrite で書き切るため、ここで
         // 450MB を reset するのは無意味 (毎 step の no-op を排除する論理整理)。
+        // fused FT optimizer が消費する step では batch に出る行だけを書き、残りの行は
+        // fused kernel が勾配 0 として扱う (`ft_active_rows`)。
         memset_zero(&self.stream, &self.ft_b_grad)?;
         memset_zero(&self.stream, &self.l1_w_grad)?;
         memset_zero(&self.stream, &self.l1_b_grad)?;
@@ -4380,6 +4488,20 @@ impl GpuTrainer {
         // block は loop 後の `ft_reduce_virtual_grad` が実 block の縮約で埋める。
         let ft_in = self.ws.ft_in;
         let max_active = self.ws.max_active;
+        // When the fused FT optimizer consumes this gradient, rows no position uses are neither
+        // written here nor read there (they take a zero gradient); every other consumer needs
+        // the full overwrite.
+        #[cfg(feature = "native")]
+        let active_rows_only = self.ft_fused_optimizer_applies(self.step_count + 1);
+        #[cfg(not(feature = "native"))]
+        let active_rows_only = false;
+        #[cfg(feature = "native")]
+        {
+            self.ft_grad_active_rows_only = active_rows_only;
+            if active_rows_only {
+                self.mark_ft_active_rows(b)?;
+            }
+        }
         for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
             .into_iter()
             .enumerate()
@@ -4489,7 +4611,8 @@ impl GpuTrainer {
             prof_tick!("phC_scat");
             // D: gather_and_sum_per_feature。block grid = (ft_in, ft_out/128), block_dim=128.
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
-            // overwrite kernel が全 cell を書き切るため grad_w の host 事前 memset は不要。
+            // overwrite kernel が全 cell (`active_rows_only` 時は active 行の全 cell) を
+            // 書き切るため grad_w の host 事前 memset は不要。nstm 側が足す行は必ず active。
             let d_config = LaunchConfig {
                 grid_dim: (ft_in as u32, (ft_out / 128) as u32, 1),
                 block_dim: (128, 1, 1),
@@ -4498,7 +4621,10 @@ impl GpuTrainer {
             // iter 0 = stm (dft_stm_out / overwrite)、iter 1 = nstm (dft_nstm_out / add)。
             // `ft_fp16_out` 時は dft が f16 なので f16 入力版の gather kernel を使う。
             if iter_idx == 0 {
-                if self.ft_fp16_out {
+                if active_rows_only {
+                    #[cfg(feature = "native")]
+                    self.launch_ft_stm_gather_active(d_config, dft_inv_scale)?;
+                } else if self.ft_fp16_out {
                     unsafe {
                         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                         // stream の完了を待つ同期点まで生存する device allocation。
@@ -4582,14 +4708,19 @@ impl GpuTrainer {
         // 同じ pair に属する threat 実行の勾配和で埋める。stm / nstm 両方の gather が
         // 実 block を確定させた後に 1 launch で仮想 block を埋める。
         if self.feature_set.ft_factorize() {
-            ft_factorize_host::launch_ft_reduce(
-                &self.stream,
-                &self.module,
-                &self.feature_set,
-                ft_out,
-                &self.ft_w_grad,
-                &self.threat_pair_starts,
-            )?;
+            if active_rows_only {
+                #[cfg(feature = "native")]
+                self.launch_ft_reduce_active(ft_out)?;
+            } else {
+                ft_factorize_host::launch_ft_reduce(
+                    &self.stream,
+                    &self.module,
+                    &self.feature_set,
+                    ft_out,
+                    &self.ft_w_grad,
+                    &self.threat_pair_starts,
+                )?;
+            }
         }
         prof_tick!("bwd_ftbwd");
 
@@ -4649,9 +4780,17 @@ impl GpuTrainer {
         // against the precision-diagnostic schedule, which is keyed by the post-increment count.
         self.step_count += 1;
         #[cfg(feature = "native")]
-        let ft_fused = self.ft_fused_optimizer_applies();
+        let ft_fused = self.ft_fused_optimizer_applies(self.step_count);
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
+        #[cfg(feature = "native")]
+        if self.ft_grad_active_rows_only && !ft_fused {
+            return Err(
+                "FT gradient covers only the batch's active rows, but this step does \
+                        not use the fused FT optimizer"
+                    .into(),
+            );
+        }
 
         // QAT restores FP32 masters before entering this method; regularization must
         // update those masters, after the pre-norm-loss diagnostic snapshot.
