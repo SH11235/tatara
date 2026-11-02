@@ -110,6 +110,85 @@ extern "C" __global__ void qat_dense_wide(
     }
 }
 
+// `qat_dense_wide` over bucket-sorted rows, writing to `permutation[sorted_row]`. A 16-row tile
+// shares one bucket because bucket segments start on 16-row boundaries, so its quantized weights
+// are staged in shared memory once per tile. The partial sums are integers, so combining the 16
+// lanes of a row in any order reproduces `qat_dense_wide` exactly.
+extern "C" __global__ void qat_dense_wide_sorted(
+    const float* x_sorted, unsigned long long,
+    const float* w, unsigned long long,
+    const float* bias, unsigned long long,
+    const float* shared_bias, unsigned long long,
+    const int* bucket_sorted, unsigned long long,
+    const int* permutation, unsigned long long,
+    float* out, unsigned long long,
+    int* raw, unsigned long long,
+    unsigned int inputs, unsigned int outputs, unsigned int merge
+) {
+    constexpr unsigned int ROWS = 16;
+    constexpr unsigned int GROUP = 16;
+    constexpr unsigned int CHUNK = 512;
+    __shared__ int weight_tile[GROUP][CHUNK];
+    const unsigned int tile_row = blockIdx.x * ROWS;
+    const int bucket = bucket_sorted[tile_row];
+    if (bucket < 0) {
+        return;
+    }
+    const unsigned int first = blockIdx.y * GROUP;
+    const unsigned int count = outputs - first < GROUP ? outputs - first : GROUP;
+    const unsigned int neuron_base = static_cast<unsigned int>(bucket) * outputs + first;
+    const unsigned int local_row = threadIdx.x / GROUP;
+    const unsigned int lane = threadIdx.x % GROUP;
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(tile_row + local_row) * inputs;
+    int sums[GROUP] = {};
+    for (unsigned int base = 0; base < inputs; base += CHUNK) {
+        const unsigned int width = inputs - base < CHUNK ? inputs - base : CHUNK;
+        for (unsigned int k = threadIdx.x; k < GROUP * CHUNK; k += blockDim.x) {
+            const unsigned int o = k / CHUNK;
+            const unsigned int j = k % CHUNK;
+            weight_tile[o][j] = o < count && j < width
+                ? __float2int_rn(
+                      w[static_cast<unsigned long long>(neuron_base + o) * inputs + base + j] * 64.0F
+                  )
+                : 0;
+        }
+        __syncthreads();
+        for (unsigned int j = lane; j < width; j += GROUP) {
+            const int q = __float2int_rn(x_sorted[row_base + base + j] * 127.0F);
+#pragma unroll
+            for (unsigned int o = 0; o < GROUP; ++o) {
+                sums[o] += q * weight_tile[o][j];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int o = 0; o < GROUP; ++o) {
+        for (unsigned int offset = GROUP / 2; offset; offset >>= 1) {
+            sums[o] += __shfl_xor_sync(0xffffffff, sums[o], offset, GROUP);
+        }
+    }
+    const int row = permutation[tile_row + local_row];
+    if (row < 0 || lane >= count) {
+        return;
+    }
+    int total = 0;
+#pragma unroll
+    for (unsigned int o = 0; o < GROUP; ++o) {
+        if (o == lane) {
+            total = sums[o];
+        }
+    }
+    const unsigned int i = static_cast<unsigned int>(row) * outputs + first + lane;
+    float b = bias[neuron_base + lane];
+    if (merge) b += shared_bias[first + lane];
+    const long long sum = static_cast<long long>(total)
+        + static_cast<long long>(fmin(2147483647.0, fmax(-2147483648.0, round(static_cast<double>(b) * 8128.0))));
+    raw[i] = static_cast<int>(sum);
+    out[i] = static_cast<float>(static_cast<double>(raw[i]) / 8128.0);
+}
+
 // `floor(clamp(x * 127, 0, 127)) / 127` evaluated in single precision without rounding the
 // product first. While `x * 127` is finite, `product` is its nearest float and `error`, from
 // `fmaf`, the exact remainder. Inside the unsaturated range, a `product` that is not an integer

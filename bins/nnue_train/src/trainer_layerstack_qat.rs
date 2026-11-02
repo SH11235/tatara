@@ -4,13 +4,17 @@ use super::*;
 #[path = "trainer_layerstack_qat_tests.rs"]
 mod tests;
 
-/// Wide layers (`inputs >= QAT_DENSE_WIDE_INPUTS`) run `qat_dense_wide`: one warp per row and
-/// group of `QAT_DENSE_WIDE_GROUP` outputs, so each input row is read once per group instead of
-/// once per output. Narrow layers keep one thread per output.
+/// Layer 1 runs `qat_dense_wide_sorted` over the bucket-sorted rows of its forward. Other wide
+/// layers (`inputs >= QAT_DENSE_WIDE_INPUTS`) run `qat_dense_wide`: one warp per row and group of
+/// `QAT_DENSE_WIDE_GROUP` outputs, so each input row is read once per group instead of once per
+/// output. Narrow layers keep one thread per output.
 #[cfg(feature = "native")]
 const QAT_DENSE_WIDE_INPUTS: usize = 256;
 #[cfg(feature = "native")]
 const QAT_DENSE_WIDE_GROUP: usize = 8;
+
+#[cfg(all(test, feature = "native"))]
+type QatDenseCompareState = (Vec<i32>, Vec<i32>, Vec<u32>, Vec<u32>);
 
 #[cfg(feature = "native")]
 fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usize, &'static str> {
@@ -198,6 +202,9 @@ impl GpuTrainer {
             _ => unreachable!(),
         };
         let threads = qat_dense_threads(batch, inputs, outputs)?;
+        if layer == 1 {
+            return self.qat_dense_l1_sorted(batch, &self.ws.l1_total, &self.qat_raw[0]);
+        }
         // SAFETY: workspace and weight dimensions match the selected layer; batch buckets were validated.
         unsafe {
             if inputs >= QAT_DENSE_WIDE_INPUTS {
@@ -217,5 +224,78 @@ impl GpuTrainer {
             }
         }?;
         Ok(())
+    }
+
+    /// Dense QAT layer 1 with `qat_dense_wide_sorted`, reading `combined_sorted` and the bucket
+    /// permutation the L1 bucket sort of the same forward built. Writes `output` / `raw` in the
+    /// original row order like `qat_dense_wide`.
+    #[cfg(feature = "native")]
+    pub(super) fn qat_dense_l1_sorted(
+        &self,
+        batch: usize,
+        output: &DeviceBuffer<f32>,
+        raw: &DeviceBuffer<i32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let padded_b = padded_sort_batch(batch, self.num_buckets);
+        let (inputs, outputs) = (self.ws.ft_out, self.ws.l1_out);
+        debug_assert!(padded_b.is_multiple_of(16));
+        // SAFETY: `combined_sorted` holds `padded_b * ft_out` floats, the sorted bucket and
+        // permutation arrays `padded_b` entries, and `output` / `raw` `batch * l1_out` entries;
+        // every non-padding permutation entry is a row below `batch`.
+        unsafe {
+            cuda_launch! {
+                kernel: qat_dense_wide_sorted, stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: ((padded_b / 16) as u32, outputs.div_ceil(16) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.combined_sorted), slice(self.l1_w), slice(self.qat_buffers[1]),
+                    slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_sorted_dev),
+                    slice(self.ws.bucket_perm_dev), slice(output), slice(raw),
+                    inputs as u32, outputs as u32, 1u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    /// Runs `qat_dense_wide` and `qat_dense_wide_sorted` for layer 1 on the last forward's
+    /// inputs, returning `(sorted raw, wide raw, sorted out bits, wide out bits)`.
+    #[cfg(all(test, feature = "native"))]
+    pub(super) fn qat_dense_l1_sorted_and_wide_for_test(
+        &self,
+        batch: usize,
+    ) -> Result<QatDenseCompareState, Box<dyn std::error::Error>> {
+        let n = batch * self.ws.l1_out;
+        let sorted_out = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+        let sorted_raw = DeviceBuffer::<i32>::zeroed(&self.stream, n)?;
+        let wide_out = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+        let wide_raw = DeviceBuffer::<i32>::zeroed(&self.stream, n)?;
+        self.qat_dense_l1_sorted(batch, &sorted_out, &sorted_raw)?;
+        let (inputs, outputs) = (self.ws.ft_out, self.ws.l1_out);
+        let threads = batch * outputs.div_ceil(QAT_DENSE_WIDE_GROUP) * 32;
+        // SAFETY: same buffers and dimensions as the layer-1 launch in `qat_dense_forward`, with
+        // one warp per row and output group as `qat_dense_wide` expects for any input width.
+        unsafe {
+            cuda_launch! {
+                kernel: qat_dense_wide, stream: self.stream, module: self.module,
+                config: cfg_1d(threads),
+                args: [slice(self.ws.combined), slice(self.l1_w), slice(self.qat_buffers[1]),
+                    slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice(wide_out),
+                    slice(wide_raw), batch as u32, inputs as u32, outputs as u32, 1u32]
+            }
+        }?;
+        let bits = |b: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+            Ok(b.to_host_vec(&self.stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        Ok((
+            sorted_raw.to_host_vec(&self.stream)?,
+            wide_raw.to_host_vec(&self.stream)?,
+            bits(&sorted_out)?,
+            bits(&wide_out)?,
+        ))
     }
 }
