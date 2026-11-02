@@ -697,3 +697,85 @@ fn qat_dense_wide_matches_qat_dense() -> TestResult {
     assert!(qat_dense_threads(1, 131_072, 16).is_ok());
     Ok(())
 }
+
+fn trainer_with_dims(
+    ctx: &std::sync::Arc<CudaContext>,
+    width: usize,
+    l1_out: usize,
+    num_buckets: usize,
+) -> Result<GpuTrainer, Box<dyn std::error::Error>> {
+    GpuTrainer::new(
+        ctx,
+        16,
+        width,
+        l1_out,
+        32,
+        num_buckets,
+        BucketMode::ProgressKpAbs,
+        PrecisionFlags {
+            tf32: false,
+            ft_fp16: false,
+            ft_fp16_out: false,
+            fp16_opt_state: false,
+        },
+        FeatureSet::HalfKaHmMerged.spec(),
+        OptimizerKind::RAdam,
+        OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+        None,
+        None,
+        &LayerStackInit::default_uniform(),
+    )
+}
+
+/// `qat_dense_wide_sorted` の raw / 出力が `qat_dense_wide` と bit 単位で一致すること。
+#[test]
+fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
+    let ctx = CudaContext::new(0)?;
+    let mixed = vec![0, 3, 3, 1, 7, 0, 3, 5, 5, 5, 2, 0, 7, 1, 3, 6];
+    for (width, l1_out, buckets) in [
+        (128, 16, mixed.clone()),
+        (640, 16, mixed.clone()),
+        (640, 17, vec![4; 16]),
+        (1536, 33, mixed),
+    ] {
+        let mut t = trainer_with_dims(&ctx, width, l1_out, 8)?;
+        let mut net = t.to_layerstack_weights()?;
+        net.ft_b.fill(0.5);
+        for (i, b) in net.l1_b.iter_mut().enumerate() {
+            *b = (i as f32 - 40.0) / 8128.0 * 37.0;
+        }
+        for (i, b) in net.l1_shared_bias.iter_mut().enumerate() {
+            *b = (i as f32 - 7.5) / 8128.0 * 11.0;
+        }
+        t.load_layerstack_weights(&net)?;
+        t.sync_ft_forward_weights()?;
+        t.configure_qat(Some(QatMode::Dense))?;
+        let mut batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
+        batch.bucket_idx = buckets;
+        let data = batch.as_ref();
+        let mut now = std::time::Instant::now();
+        let mut context = StepContext::new(
+            &t,
+            &data,
+            StepOptions {
+                lr: 0.0,
+                wdl_lambda: 0.0,
+                loss: SMOKE_LOSS_WRM,
+                validate: false,
+                forward_output: false,
+                profile_step: false,
+                prof_t0: &mut now,
+            },
+        )?;
+        t.qat_prepare()?;
+        t.forward(&data, &mut context)?;
+        let (sorted_raw, wide_raw, sorted_out, wide_out) =
+            t.qat_dense_l1_sorted_and_wide_for_test(16)?;
+        t.qat_swap();
+        let name = format!("ft_out {width}, l1_out {l1_out}");
+        assert!(wide_raw.iter().any(|&v| v != 0), "{name}: raw is all zero");
+        assert_eq!(sorted_raw, wide_raw, "{name}: raw differs");
+        assert_eq!(sorted_out, wide_out, "{name}: output differs");
+    }
+    Ok(())
+}
