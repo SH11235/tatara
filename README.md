@@ -98,7 +98,7 @@ vector.
 
 | Architecture | Subcommand | Structure |
 |---|---|---|
-| **LayerStack** | `layerstack` | Specializes the output layer per position bucket. `--bucket-mode progresskpabs` uses progress coefficients and 2–9 buckets; `--bucket-mode kingrank9` uses YaneuraOu KingRank9 with exactly 9 buckets and no progress coefficients. FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
+| **LayerStack** | `layerstack` | Specializes the output layer per position bucket. `--bucket-mode progresskpabs` uses progress coefficients and 2–9 buckets (`progresskpabsq16` is the same routing with integer Q16 arithmetic); `--bucket-mode kingrank9` uses YaneuraOu KingRank9 with exactly 9 buckets and no progress coefficients. FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
 | **Simple** | `simple` | A plain NNUE with no bucket split (FT → 2 hidden layers → single output). Layer dimensions are set with `--arch <l1>x2-<l2>-<l3>` (`l1` = FT output, `l2`/`l3` = hidden layers; default `256x2-32-32`); activation crelu / screlu / pairwise |
 
 ### Input feature set
@@ -198,6 +198,7 @@ own net, see the [setup guide](docs/setup.md).
 | **DL** | Deep learning — the model-derived score label stored alongside the base search score in a dual-label PSV |
 | **HCPE** | HuffmanCodedPosAndEval — the 38-byte Apery / dlshogi position, score, move, and game-result format |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
+| **Q16** | Fixed-point values scaled by 65536 (16 fractional bits). `--bucket-mode progresskpabsq16` quantises the progress coefficients and bucket thresholds this way |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
 | **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
 | **EffectBucket** | Feature-set extension that maps each base feature row to `base_index * NB + effect_bucket`, where `EffectBucket=<config>` in the arch string records the bucket count and whether king features are bucketed |

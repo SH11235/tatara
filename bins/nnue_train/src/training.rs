@@ -344,15 +344,16 @@ pub(crate) fn validate_bucket_mode(
         eprintln!("{warning}");
     }
     match mode {
-        BucketMode::ProgressKpAbs => {
+        BucketMode::ProgressKpAbs | BucketMode::ProgressKpAbsQ16 => {
             if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
                 return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progresskpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for {} (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    mode.canonical_name(),
                     args.num_buckets
                 )
                 .into());
             }
-            Ok(BucketMode::ProgressKpAbs)
+            Ok(mode)
         }
         BucketMode::KingRank9 => {
             if args.num_buckets != KINGRANK9_NUM_BUCKETS {
@@ -380,7 +381,7 @@ pub(crate) fn validate_output_format(
     if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
     {
         return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progresskpabs routing is not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress routing cannot be exported to YaneuraOu SFNN"
                 .into(),
         );
     }
@@ -626,14 +627,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 学習は progress 係数未指定を全 bucket 4 に縮退させるが、リスコアで同じ縮退を
     // 許すと全行が誤 routing のラベルになる。rescore 経路のみ明示エラーにする。
     if cli.rescore_input.is_some()
-        && matches!(bucket_mode, BucketMode::ProgressKpAbs)
+        && bucket_mode.uses_progress_coeff()
         && layerstack.progress_coeff.is_none()
     {
-        return Err(
-            "--rescore-input with --bucket-mode progresskpabs requires --progress-coeff \
-             (without it every position would silently fall into bucket 4)"
-                .into(),
-        );
+        return Err(format!(
+            "--rescore-input with --bucket-mode {} requires --progress-coeff \
+             (without it every position would silently fall into bucket 4)",
+            bucket_mode.canonical_name()
+        )
+        .into());
     }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
@@ -697,13 +699,17 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     std::fs::create_dir_all(&cli.output)?;
 
-    // progresskpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
+    // progress 系 mode のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
     let mut rescore_coeff_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
-    if matches!(bucket_mode, BucketMode::ProgressKpAbs) {
+    if bucket_mode.uses_progress_coeff() {
         match &layerstack.progress_coeff {
             Some(p) => {
-                println!("[train] loading progresskpabs coeff: {}", p.display());
+                println!(
+                    "[train] loading {} coeff: {}",
+                    bucket_mode.canonical_name(),
+                    p.display()
+                );
                 if cli.rescore_input.is_some() {
                     // fingerprint の sha256 をロードに使った byte 列そのものから
                     // 計算する (読み直すと差し替え時に hash と実体が乖離する)。

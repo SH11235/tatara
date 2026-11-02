@@ -34,7 +34,7 @@ cargo run --release -p nnue-trainer -- \
 ```
 
 `--output-format` の既定値は `tatara`。`yaneuraou` は plain LayerStack と KingRank9 の
-組合せだけを受理し、`progresskpabs`、Simple、PSQT、Threat、EffectBucket は明示的に
+組合せだけを受理し、`progresskpabs`、`progresskpabsq16`、Simple、PSQT、Threat、EffectBucket は明示的に
 エラーにする。学習 config から bucket routing mode を判定できるため、この経路では
 `--assume-kingrank9` は不要。`progresskpabs` で学習した net は tatara `.bin` で出力し、
 `net_to_yo --assume-progresskpabs` で変換する。

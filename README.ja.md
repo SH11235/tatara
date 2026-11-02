@@ -173,6 +173,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
 | **HCPE** | HuffmanCodedPosAndEval — Apery / dlshogi の 38-byte 局面・score・指し手・対局結果 format |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
+| **Q16** | 65536 倍 (小数部 16 bit) の固定小数点。`--bucket-mode progresskpabsq16` は progress 係数と bucket 閾値をこの形で量子化する |
 | **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
 | **PSQT** | Piece-Square Table — 駒種×マスごとの線形評価テーブル。LayerStack の `--psqt` で per-bucket PSQT 出力を network 出力に加算し、dense 経路は非マテリアル構造の学習に専念できる |
 | **CReLU / SCReLU / Pairwise** | NNUE の活性化関数。CReLU = Clipped ReLU、SCReLU = Squared Clipped ReLU、Pairwise = 前半と後半の要素積で入力次元を半減。`simple` アーキの `--activation` で選択 |

@@ -10,7 +10,7 @@ use nnue_format::layerstack_weights::{
 use nnue_train::dataloader::BucketMode;
 use shogi_features::{
     EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
-    ThreatProfile, kingrank9_bucket_board,
+    ThreatProfile,
 };
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
@@ -24,13 +24,13 @@ struct Args {
     #[arg(long)]
     nnue_file: PathBuf,
 
-    /// Bucket assignment used when the net was trained: progresskpabs or
-    /// kingrank9. The deprecated spelling progress8kpabs is accepted as an
-    /// alias of progresskpabs.
+    /// Bucket assignment used when the net was trained: progresskpabs,
+    /// progresskpabsq16 or kingrank9. The deprecated spelling progress8kpabs is
+    /// accepted as an alias of progresskpabs.
     #[arg(long, default_value = "progresskpabs")]
     bucket_mode: String,
 
-    /// progresskpabs coefficient file. Required in progresskpabs mode and unused in kingrank9 mode.
+    /// Progress coefficient file. Required in progresskpabs / progresskpabsq16 mode and unused in kingrank9 mode.
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
 
@@ -45,10 +45,10 @@ struct Args {
     debug: bool,
 }
 
-/// bucket mode と関連引数・net 格納値の整合を検証し、progresskpabs なら coefficient
+/// bucket mode と関連引数・net 格納値の整合を検証し、progress 系 mode なら coefficient
 /// file の path を返す。
 ///
-/// - progresskpabs: `--progress-coeff` 必須 (指定 path を `Some` で返す)。
+/// - progresskpabs / progresskpabsq16: `--progress-coeff` 必須 (指定 path を `Some` で返す)。
 /// - kingrank9: net の格納 bucket 数は 9 のみ、`--progress-coeff` は不可。
 fn validate_mode_args(
     mode: BucketMode,
@@ -56,8 +56,13 @@ fn validate_mode_args(
     stored_num_buckets: usize,
 ) -> Result<Option<&Path>, String> {
     match mode {
-        BucketMode::ProgressKpAbs => progress_coeff
-            .ok_or_else(|| "--progress-coeff is required with --bucket-mode progresskpabs".into())
+        BucketMode::ProgressKpAbs | BucketMode::ProgressKpAbsQ16 => progress_coeff
+            .ok_or_else(|| {
+                format!(
+                    "--progress-coeff is required with --bucket-mode {}",
+                    mode.canonical_name()
+                )
+            })
             .map(Some),
         BucketMode::KingRank9 => {
             if stored_num_buckets != KINGRANK9_NUM_BUCKETS {
@@ -82,12 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
-    let progress = validate_mode_args(mode, args.progress_coeff.as_deref(), weights.num_buckets)?
-        .map(|path| {
-            ShogiProgressKPAbs::load_from_bin(path)
-                .map_err(|e| format!("failed to load progress coeff: {e}"))
-        })
-        .transpose()?;
+    if let Some(path) =
+        validate_mode_args(mode, args.progress_coeff.as_deref(), weights.num_buckets)?
+    {
+        ShogiProgressKPAbs::load_from_bin(path)
+            .map_err(|e| format!("failed to load progress coeff: {e}"))?;
+    }
     let positions = if args.sfen.is_empty() {
         vec!["startpos".to_string()]
     } else {
@@ -96,10 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for pos in positions {
         let board = parse_position(&pos)?;
-        let bucket = progress.map_or_else(
-            || kingrank9_bucket_board(&board),
-            |progress| progress.bucket_board(&board, weights.num_buckets),
-        ) as usize;
+        let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
         let raw = forward_one_raw(&weights, spec, &board, bucket)?;
         let cp = raw / args.fv_scale;
         if args.debug {
@@ -697,6 +699,12 @@ mod tests {
         assert_eq!(path, coeff);
         let err = validate_mode_args(BucketMode::ProgressKpAbs, None, 9).unwrap_err();
         assert!(err.contains("--progress-coeff is required"), "{err}");
+        let path = validate_mode_args(BucketMode::ProgressKpAbsQ16, Some(coeff), 8)
+            .expect("coeff supplied")
+            .expect("progresskpabsq16 returns the coeff path");
+        assert_eq!(path, coeff);
+        let err = validate_mode_args(BucketMode::ProgressKpAbsQ16, None, 8).unwrap_err();
+        assert!(err.contains("progresskpabsq16"), "{err}");
 
         // kingrank9: 格納 9 bucket のみ、coeff 不可。
         assert!(matches!(

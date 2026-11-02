@@ -192,7 +192,7 @@ pub(crate) struct RescoreConfig<'a> {
     pub(crate) psqt: bool,
     /// stack-shared-delta の有無。
     pub(crate) stack_shared_delta: bool,
-    /// progresskpabs の係数 identity (kingrank9 では `None`)。ロードに使った
+    /// progress 系 mode の係数 identity (kingrank9 では `None`)。ロードに使った
     /// byte 列から固定済み。
     pub(crate) progress_coeff: Option<LoadedArtifact>,
 }
