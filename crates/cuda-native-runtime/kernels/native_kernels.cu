@@ -1044,12 +1044,23 @@ extern "C" __global__ void ft_king_group_keys(
     keys[i] = static_cast<int>(perspective * king_buckets + group);
 }
 
-__device__ __forceinline__ float ft_forward_load(float value) {
-    return value;
+// Loads 4 consecutive FT weights as one vector access. `source` must be aligned to 4 elements.
+__device__ __forceinline__ void ft_forward_load4(const float* source, float* values) {
+    const float4 packed = *reinterpret_cast<const float4*>(source);
+    values[0] = packed.x;
+    values[1] = packed.y;
+    values[2] = packed.z;
+    values[3] = packed.w;
 }
 
-__device__ __forceinline__ float ft_forward_load(__half value) {
-    return __half2float(value);
+// The four `__half` bit patterns arrive as one 8-byte integer load and are converted with
+// `__ushort_as_half`, so no integer object is read through a `__half2` pointer.
+__device__ __forceinline__ void ft_forward_load4(const __half* source, float* values) {
+    const uint2 packed = *reinterpret_cast<const uint2*>(source);
+    values[0] = __half2float(__ushort_as_half(static_cast<unsigned short>(packed.x & 0xffffU)));
+    values[1] = __half2float(__ushort_as_half(static_cast<unsigned short>(packed.x >> 16)));
+    values[2] = __half2float(__ushort_as_half(static_cast<unsigned short>(packed.y & 0xffffU)));
+    values[3] = __half2float(__ushort_as_half(static_cast<unsigned short>(packed.y >> 16)));
 }
 
 __device__ __forceinline__ void ft_forward_store(float* destination, float value) {
@@ -1093,11 +1104,14 @@ __device__ __forceinline__ void native_sparse_ft_forward_ordered(
     for (int active = 0; active < row_nonzero_count; ++active) {
         const int column = indices[index_base + static_cast<unsigned int>(active)];
         if (column >= 0 && static_cast<unsigned int>(column) < columns) {
+            // `rows` and `row` are multiples of 4, so `weight_base` keeps the vector load aligned.
             const unsigned long long weight_base =
                 static_cast<unsigned long long>(column) * rows + row;
+            float values[4];
+            ft_forward_load4(weight + weight_base, values);
 #pragma unroll
             for (unsigned int lane = 0; lane < 4; ++lane) {
-                sums[lane] += ft_forward_load(weight[weight_base + lane]);
+                sums[lane] += values[lane];
             }
         }
     }
