@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 78, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 82, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 94, "production kernel inventory changed");
+    assert_eq!(required.len(), 98, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3401,6 +3401,143 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             &separate_grad,
             1.0e-4,
         );
+    }
+    Ok(())
+}
+
+/// 玉 bucket 順の FT forward が、順序なしの `sparse_ft_forward*` と bit 単位で同じ activation を
+/// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。途中の `-1` と、
+/// base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
+#[cfg(feature = "native")]
+#[test]
+fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    let hm = FeatureSet::HalfKaHmMerged.spec();
+    let configs = [
+        (
+            "plain-fp32",
+            standard.feature_set,
+            PrecisionFlags::default(),
+        ),
+        (
+            "hm-factorized-fp32",
+            hm.with_ft_factorize(),
+            PrecisionFlags::default(),
+        ),
+        (
+            "effect-bucket-fp32",
+            standard
+                .feature_set
+                .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2),
+            PrecisionFlags::default(),
+        ),
+        (
+            "threat-ft-fp16",
+            standard
+                .feature_set
+                .with_threat_profile(ThreatProfile::CrossSide),
+            PrecisionFlags {
+                ft_fp16: true,
+                ..PrecisionFlags::default()
+            },
+        ),
+        (
+            "hm-factorized-all-optim",
+            hm.with_ft_factorize(),
+            PrecisionFlags {
+                tf32: true,
+                ft_fp16: true,
+                ft_fp16_out: true,
+                fp16_opt_state: true,
+            },
+        ),
+    ];
+    for (name, feature_set, precision) in configs {
+        let options = LayerStackTestOptions {
+            feature_set,
+            precision,
+            ..standard
+        };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        let max_active = feature_set.max_active();
+        let king_buckets = feature_set.king_buckets();
+        let king_stride = feature_set.piece_inputs()
+            * feature_set
+                .effect_bucket_config()
+                .map_or(1, |config| config.nb);
+        let base_columns = king_stride * king_buckets;
+        let n_pos = SMOKE_BATCH;
+        let mut batch = BatchData::smoke_dummy(n_pos, feature_set);
+        // 実局面と同じく 1 局面の base 特徴は 1 つの玉 bucket の範囲に収める。
+        let mut state = 0x9e37_79b9_u32;
+        for (perspective, indices) in [&mut batch.stm_indices, &mut batch.nstm_indices]
+            .into_iter()
+            .enumerate()
+        {
+            for position in 0..n_pos {
+                let king = (position * 7 + perspective * 3) % king_buckets;
+                for index in &mut indices[position * max_active..][..max_active] {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *index = (king * king_stride + (state >> 8) as usize % king_stride) as i32;
+                }
+            }
+        }
+        batch.nnz[1] = 0;
+        batch.nnz[2] = 3;
+        batch.stm_indices[3 * max_active] = -1;
+        batch.stm_indices[4 * max_active..5 * max_active].fill(-1);
+        let ft_in = feature_set.ft_in();
+        if ft_in > base_columns {
+            for (slot, index) in batch.nstm_indices[5 * max_active..6 * max_active]
+                .iter_mut()
+                .enumerate()
+            {
+                *index = (base_columns + slot % (ft_in - base_columns)) as i32;
+            }
+        }
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let (order, ordered, unordered) = trainer.ft_forward_orders_to_host_for_test(n_pos)?;
+        assert_eq!(ordered, unordered, "{name}: ordered FT forward differs");
+
+        let king_of = |indices: &[i32], position: usize| -> usize {
+            indices[position * max_active..][..batch.nnz[position] as usize]
+                .iter()
+                .filter_map(|&column| usize::try_from(column).ok())
+                .filter(|&column| column < base_columns)
+                .min()
+                .map_or(king_buckets - 1, |column| column / king_stride)
+        };
+        for (perspective, indices) in [&batch.stm_indices, &batch.nstm_indices]
+            .into_iter()
+            .enumerate()
+        {
+            let base = perspective * n_pos;
+            let positions: Vec<usize> = order[base..base + n_pos]
+                .iter()
+                .map(|&entry| entry as usize - base)
+                .collect();
+            let mut sorted = positions.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..n_pos).collect::<Vec<_>>(),
+                "{name}: perspective {perspective} order is not a permutation"
+            );
+            let kings: Vec<usize> = positions.iter().map(|&p| king_of(indices, p)).collect();
+            assert!(
+                kings.is_sorted(),
+                "{name}: perspective {perspective} order is not grouped by king: {kings:?}"
+            );
+            let distinct = kings
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert!(
+                distinct > n_pos / 2,
+                "{name}: perspective {perspective} keys collapse to {distinct} buckets"
+            );
+        }
     }
     Ok(())
 }
