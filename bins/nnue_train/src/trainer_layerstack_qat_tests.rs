@@ -1,5 +1,6 @@
 use super::*;
 use crate::qat::QatMode;
+use crate::tests::gpu_test_context::{test_cuda_context, test_cuda_context_reserving_gib};
 use shogi_features::FeatureSet;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -30,7 +31,7 @@ fn qat_dense_lattice_integer_recovery_is_exact() {
 
 #[test]
 fn qat_trains_with_fp16_tf32_and_factorizer() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let features = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
     let mut t = GpuTrainer::new(
         &ctx,
@@ -73,7 +74,7 @@ fn qat_trains_with_fp16_tf32_and_factorizer() -> TestResult {
 /// bit 単位で同じ値を書くこと。格子点 `k / 127` の前後 1 ulp、範囲外、特殊値を含める。
 #[test]
 fn qat_activation_matches_double_definition() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let t = trainer(&ctx, 128, false)?;
     let mut values = vec![
         0.0_f32,
@@ -141,7 +142,7 @@ fn qat_activation_matches_double_definition() -> TestResult {
 
 #[test]
 fn qat_activation_boundaries_and_main_ste() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let mut t = trainer(&ctx, 128, false)?;
     let mut net = t.to_layerstack_weights()?;
     net.ft_w.fill(0.0);
@@ -268,7 +269,7 @@ fn quant_weight(w: f32) -> i64 {
 
 #[test]
 fn qat_preserves_ft_factorizer_fold_order() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let features = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
     let mut t = trainer_with_features(&ctx, 128, true, features)?;
     let mut weights = vec![0.0; features.train_ft_in() * 128];
@@ -292,7 +293,7 @@ fn quant_bias(b: f32) -> i64 {
 
 #[test]
 fn qat_integer_forward_export_and_master_preservation() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context_reserving_gib(2)?;
     for width in [1536, 3072] {
         let mut t = trainer(&ctx, width, true)?;
         let mut net = t.to_layerstack_weights()?;
@@ -395,7 +396,7 @@ fn qat_integer_forward_export_and_master_preservation() -> TestResult {
 
 #[test]
 fn qat_skip_ste_and_same_raw_branches() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let mut t = trainer(&ctx, 128, false)?;
     let mut net = t.to_layerstack_weights()?;
     net.ft_w.fill(0.0);
@@ -478,7 +479,7 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
 
 #[test]
 fn qat_norm_loss_updates_masters_with_diagnostics_and_lookahead() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let lr = 0.01;
     let factor = 0.25;
     for mode in [QatMode::Off, QatMode::Dense] {
@@ -623,7 +624,7 @@ fn qat_norm_loss_updates_masters_with_diagnostics_and_lookahead() -> TestResult 
 /// 入出力の位置ごとに異なる格子値と、出力数が 8 の倍数でない寸法・積の極値で確かめる。
 #[test]
 fn qat_dense_wide_matches_qat_dense() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let t = trainer(&ctx, 1536, true)?;
     let batch = 5_usize;
     let buckets = 3_usize;
@@ -702,7 +703,7 @@ fn qat_dense_wide_matches_qat_dense() -> TestResult {
 /// (bucket ごとに 16 行境界から始まり、端を -1 で埋める) は L1 の bucket sort と同じ形を host で作る。
 #[test]
 fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
-    let ctx = CudaContext::new(0)?;
+    let ctx = test_cuda_context()?;
     let t = trainer(&ctx, 128, true)?;
     let batch = 40_usize;
     let buckets = 4_usize;

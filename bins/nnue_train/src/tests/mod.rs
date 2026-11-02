@@ -9,6 +9,8 @@ mod cli_tests;
 mod ft_factorize_tests;
 #[cfg(all(test, feature = "oxide"))]
 mod gpu_cpu_equivalence_tests;
+#[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
+pub(crate) mod gpu_test_context;
 #[cfg(test)]
 mod native_bench_schema_tests;
 #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
