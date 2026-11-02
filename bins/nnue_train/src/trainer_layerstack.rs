@@ -18,6 +18,10 @@ struct FtFusedStep {
 #[cfg(all(test, feature = "native"))]
 type FtForwardTestState = (Option<Vec<f32>>, Vec<f32>);
 
+/// `(position order, ordered activation bits, unordered activation bits)` read back by tests.
+#[cfg(all(test, feature = "native"))]
+type FtForwardOrderTestState = (Vec<i32>, Vec<u32>, Vec<u32>);
+
 #[cfg(feature = "native")]
 const FT_FUSED_HALF_STATE: u32 = 1;
 #[cfg(feature = "native")]
@@ -142,6 +146,148 @@ impl GpuTrainer {
         Ok(())
     }
 
+    /// Builds `ws.ft_order`: the batch's positions grouped by stm king bucket in `[0, b)` and by
+    /// nstm king bucket in `[b, 2b)` (the latter stored as `b + position`). The order within a
+    /// bucket depends on atomic ranking, which only changes scheduling of the forward gather,
+    /// never its per-position result.
+    fn build_ft_forward_order(&self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let king_buckets = self.feature_set.king_buckets();
+        let king_stride = self.feature_set.piece_inputs()
+            * self
+                .feature_set
+                .effect_bucket_config()
+                .map_or(1, |config| config.nb);
+        let bins = 2 * king_buckets;
+        memset_zero(&self.stream, &self.ws.ft_order_counts)?;
+        memset_zero(&self.stream, &self.ws.ft_order_write_ctr)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。index 列は
+            // `b * max_active` 要素、key 列は `2 * b` 要素。
+            cuda_launch! {
+                kernel: ft_king_group_keys,
+                stream: self.stream, module: self.module, config: cfg_1d(2 * b),
+                args: [slice(self.ws.stm_idx_dev), slice(self.ws.nstm_idx_dev),
+                       slice(self.ws.nnz_dev), slice(self.ws.ft_order_keys),
+                       b as u32, self.ws.max_active as u32,
+                       king_stride as u32, king_buckets as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: 同上。key は `[0, 2 * king_buckets)` に収まり、histogram は
+            // `2 * king_buckets + 1` 要素 (末尾は範囲外 key 用で常に 0)。
+            cuda_launch! {
+                kernel: count_buckets,
+                stream: self.stream, module: self.module, config: cfg_1d(2 * b),
+                args: [slice(self.ws.ft_order_keys), slice(self.ws.ft_order_counts),
+                       (2 * b) as u32, bins as u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: 同上 (single-thread scan、offset は histogram と同じ長さ)。
+            cuda_launch! {
+                kernel: exclusive_scan_aligned,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.ft_order_counts), slice(self.ws.ft_order_offsets),
+                       (bins + 1) as u32, 1_u32]
+            }
+        }?;
+        unsafe {
+            // SAFETY: 同上。align 1 の offset なので書き込み先は `[0, 2 * b)` に収まる。
+            cuda_launch! {
+                kernel: scatter_bucket_perm,
+                stream: self.stream, module: self.module, config: cfg_1d(2 * b),
+                args: [slice(self.ws.ft_order_keys), slice(self.ws.ft_order_offsets),
+                       slice(self.ws.ft_order_write_ctr), slice(self.ws.ft_order),
+                       slice(self.ws.ft_order_sorted_keys), (2 * b) as u32, bins as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    /// FT forward for both perspectives in the king-grouped order of `ws.ft_order`, writing the
+    /// same activations as `sparse_ft_forward*` would.
+    fn launch_ft_forward_ordered(&mut self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        self.build_ft_forward_order(b)?;
+        let ft_out = self.ws.ft_out;
+        let (b_u32, ft_out_u32) = (b as u32, ft_out as u32);
+        let (ft_in, max_active) = (self.ws.ft_in as u32, self.ws.max_active as u32);
+        let config = cfg_1d(b * ft_out / 4);
+        for (perspective, order_base) in [(0, 0_u32), (1, b_u32)] {
+            let indices = if perspective == 0 {
+                &self.ws.stm_idx_dev
+            } else {
+                &self.ws.nstm_idx_dev
+            };
+            if self.ft_fp16_out {
+                let ft_w_h = self
+                    .ft_w_h
+                    .as_ref()
+                    .expect("ft_w_h is Some when ft_fp16 is enabled");
+                let output = if perspective == 0 {
+                    &self.ws.ft_stm_out_h
+                } else {
+                    &self.ws.ft_nstm_out_h
+                }
+                .as_ref()
+                .expect("FT f16 activations are allocated when ft_fp16_out is enabled");
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。`ft_order` の
+                    // `[order_base, order_base + b)` は `order_base + [0, b)` の並べ替え。
+                    cuda_launch! {
+                        kernel: sparse_ft_forward_fp16_out_ordered,
+                        stream: self.stream, module: self.module, config: config,
+                        args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                               slice(self.ws.ft_order), slice(output), order_base,
+                               b_u32, ft_out_u32, ft_in, max_active]
+                    }
+                }?;
+            } else {
+                let output = if perspective == 0 {
+                    &self.ws.ft_stm_out
+                } else {
+                    &self.ws.ft_nstm_out
+                };
+                if self.ft_fp16 {
+                    let ft_w_h = self
+                        .ft_w_h
+                        .as_ref()
+                        .expect("ft_w_h is Some when ft_fp16 is enabled");
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16_ordered,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    }?;
+                } else {
+                    // factorizer 有効時は畳み込み済み comb (`ft_w_fold32`)、無効時は master。
+                    let ft_w_fwd = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_ordered,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(ft_w_fwd), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    }?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// stm-side overwrite gather that skips rows outside `ws.ft_active_rows`.
     fn launch_ft_stm_gather_active(
         &self,
@@ -203,6 +349,106 @@ impl GpuTrainer {
     #[cfg(test)]
     pub(crate) fn set_ft_fused_optimizer_enabled_for_test(&mut self, enabled: bool) {
         self.ft_fused_optimizer_disabled = !enabled;
+    }
+
+    /// Runs the king-ordered FT forward and the unordered `sparse_ft_forward*` kernel on the
+    /// inputs of the last step, returning `(order, ordered bits, unordered bits)` with the stm
+    /// activations followed by the nstm ones.
+    #[cfg(test)]
+    pub(crate) fn ft_forward_orders_to_host_for_test(
+        &mut self,
+        b: usize,
+    ) -> Result<FtForwardOrderTestState, Box<dyn std::error::Error>> {
+        // Rows the ordered launch fails to write would otherwise still hold the last step's
+        // activations and compare equal.
+        memset_zero(&self.stream, &self.ws.ft_stm_out)?;
+        memset_zero(&self.stream, &self.ws.ft_nstm_out)?;
+        if let (Some(stm), Some(nstm)) = (&self.ws.ft_stm_out_h, &self.ws.ft_nstm_out_h) {
+            memset_zero(&self.stream, stm)?;
+            memset_zero(&self.stream, nstm)?;
+        }
+        self.launch_ft_forward_ordered(b)?;
+        let ft_out = self.ws.ft_out;
+        let n = b * ft_out;
+        let read_f32 =
+            |buffer: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                Ok(buffer.to_host_vec(&self.stream)?[..n]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect())
+            };
+        let read_f16 =
+            |buffer: &DeviceBuffer<f16>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                Ok(buffer.to_host_vec(&self.stream)?[..n]
+                    .iter()
+                    .map(|v| u32::from(v.to_bits()))
+                    .collect())
+            };
+        let mut ordered = Vec::with_capacity(2 * n);
+        let mut unordered = Vec::with_capacity(2 * n);
+        let (b_u32, ft_out_u32) = (b as u32, ft_out as u32);
+        let (ft_in, max_active) = (self.ws.ft_in as u32, self.ws.max_active as u32);
+        for perspective in 0..2 {
+            let indices = if perspective == 0 {
+                &self.ws.stm_idx_dev
+            } else {
+                &self.ws.nstm_idx_dev
+            };
+            if self.ft_fp16_out {
+                let output = if perspective == 0 {
+                    &self.ws.ft_stm_out_h
+                } else {
+                    &self.ws.ft_nstm_out_h
+                };
+                ordered.extend(read_f16(output.as_ref().expect("f16 activations"))?);
+                let scratch = DeviceBuffer::<f16>::zeroed(&self.stream, n)?;
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // 直後の読み出し (stream 同期) まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: sparse_ft_forward_fp16_out,
+                        stream: self.stream, module: self.module, config: cfg_1d(n / 4),
+                        args: [slice(self.ft_w_h.as_ref().expect("ft_w_h")), slice(indices),
+                               slice(self.ws.nnz_dev), slice(scratch),
+                               b_u32, ft_out_u32, ft_in, max_active]
+                    }
+                }?;
+                unordered.extend(read_f16(&scratch)?);
+            } else {
+                let output = if perspective == 0 {
+                    &self.ws.ft_stm_out
+                } else {
+                    &self.ws.ft_nstm_out
+                };
+                ordered.extend(read_f32(output)?);
+                let scratch = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+                if let Some(ft_w_h) = self.ft_w_h.as_ref().filter(|_| self.ft_fp16) {
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16,
+                            stream: self.stream, module: self.module, config: cfg_1d(n / 4),
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(scratch), b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    }?;
+                } else {
+                    let ft_w_fwd = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: sparse_ft_forward,
+                            stream: self.stream, module: self.module, config: cfg_1d(n / 4),
+                            args: [slice(ft_w_fwd), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(scratch), b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    }?;
+                }
+                unordered.extend(read_f32(&scratch)?);
+            }
+        }
+        let order = self.ws.ft_order.to_host_vec(&self.stream)?[..2 * b].to_vec();
+        Ok((order, ordered, unordered))
     }
 
     /// Per-column FT squared sums the last fused step accumulated for the current weights, or
@@ -969,6 +1215,20 @@ pub(crate) struct GpuWorkspace {
     #[cfg(feature = "native")]
     ft_active_rows: DeviceBuffer<u32>, // ft_in: 1 when either perspective uses the feature
 
+    // -- king-grouped position order for the FT forward (stm entries, then nstm + batch) --
+    #[cfg(feature = "native")]
+    ft_order_keys: DeviceBuffer<i32>, // 2 * batch
+    #[cfg(feature = "native")]
+    ft_order_sorted_keys: DeviceBuffer<i32>, // 2 * batch (scatter output, unused afterwards)
+    #[cfg(feature = "native")]
+    ft_order: DeviceBuffer<i32>, // 2 * batch
+    #[cfg(feature = "native")]
+    ft_order_counts: DeviceBuffer<u32>, // 2 * king_buckets + 1
+    #[cfg(feature = "native")]
+    ft_order_offsets: DeviceBuffer<u32>, // 2 * king_buckets + 1
+    #[cfg(feature = "native")]
+    ft_order_write_ctr: DeviceBuffer<u32>, // 2 * king_buckets + 1
+
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
     // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
     // 毎 step `mem::swap` し、直前 step が読んでいない back 側へ次 step 入力を copy
@@ -1101,6 +1361,27 @@ impl GpuWorkspace {
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, bwd_len(batch * max_active))?,
             #[cfg(feature = "native")]
             ft_active_rows: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
+            #[cfg(feature = "native")]
+            ft_order_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
+            #[cfg(feature = "native")]
+            ft_order_sorted_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
+            #[cfg(feature = "native")]
+            ft_order: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
+            #[cfg(feature = "native")]
+            ft_order_counts: DeviceBuffer::<u32>::zeroed(
+                stream,
+                2 * feature_set.king_buckets() + 1,
+            )?,
+            #[cfg(feature = "native")]
+            ft_order_offsets: DeviceBuffer::<u32>::zeroed(
+                stream,
+                2 * feature_set.king_buckets() + 1,
+            )?,
+            #[cfg(feature = "native")]
+            ft_order_write_ctr: DeviceBuffer::<u32>::zeroed(
+                stream,
+                2 * feature_set.king_buckets() + 1,
+            )?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
@@ -2955,7 +3236,11 @@ impl GpuTrainer {
         // factorizer 有効時は weight 入力が畳み込み済み comb (`ft_w_h` / `ft_w_fold32`、
         // base 形状) になるだけで、kernel・launch 次元 (`ws.ft_in` / `ws.max_active`
         // は base 値) とも無効時と同一。
+        // native backend は同じ 3 通りを玉 bucket 順に並べた `*_ordered` で起動する。
         debug_assert!(ft_out.is_multiple_of(4));
+        #[cfg(feature = "native")]
+        self.launch_ft_forward_ordered(b)?;
+        #[cfg(not(feature = "native"))]
         if self.ft_fp16_out {
             let ft_w_h = self
                 .ft_w_h

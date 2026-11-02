@@ -1002,6 +1002,182 @@ extern "C" __global__ void sparse_ft_forward_fp16_out(
     );
 }
 
+// Sort key that groups positions by king bucket for `sparse_ft_forward*_ordered`. Entry `i < batch`
+// is the stm key of position `i`, entry `batch + i` its nstm key offset by `king_buckets`, so one
+// counting sort over `2 * king_buckets` bins yields both orders back to back. Base features of one
+// king bucket occupy `king_stride` consecutive indices (`piece_inputs`, times the effect bucket
+// count when effect buckets expand the index), so the bucket is the smallest base feature divided
+// by `king_stride`; a position without one goes to the last bucket of its perspective.
+extern "C" __global__ void ft_king_group_keys(
+    const int* stm_indices,
+    unsigned long long,
+    const int* nstm_indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    int* keys,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int max_active,
+    unsigned int king_stride,
+    unsigned int king_buckets
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 2U * batch) {
+        return;
+    }
+    const unsigned int perspective = i >= batch ? 1U : 0U;
+    const unsigned int position = i - perspective * batch;
+    const int* indices = perspective == 0U ? stm_indices : nstm_indices;
+    const unsigned int base_columns = king_stride * king_buckets;
+    const unsigned int index_base = position * max_active;
+    const int count = nonzero_counts[position];
+    unsigned int smallest = base_columns;
+    for (int active = 0; active < count; ++active) {
+        const int column = indices[index_base + static_cast<unsigned int>(active)];
+        if (column >= 0 && static_cast<unsigned int>(column) < smallest) {
+            smallest = static_cast<unsigned int>(column);
+        }
+    }
+    const unsigned int group =
+        smallest < base_columns ? smallest / king_stride : king_buckets - 1U;
+    keys[i] = static_cast<int>(perspective * king_buckets + group);
+}
+
+__device__ __forceinline__ float ft_forward_load(float value) {
+    return value;
+}
+
+__device__ __forceinline__ float ft_forward_load(__half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ void ft_forward_store(float* destination, float value) {
+    *destination = value;
+}
+
+__device__ __forceinline__ void ft_forward_store(__half* destination, float value) {
+    *destination = __float2half_rn(value);
+}
+
+// `sparse_ft_forward*` with positions visited in `order[order_base + j] - order_base` order
+// instead of `j`. Each position's sum and output row are the same as the unordered kernels; only
+// which positions run concurrently changes. The base features of one king bucket form a
+// contiguous block of weight rows, so positions running together under this order draw their rows
+// from a few such blocks rather than from the whole table, which gives L2 a chance to reuse them.
+template <typename Weight, typename Output>
+__device__ __forceinline__ void native_sparse_ft_forward_ordered(
+    const Weight* weight,
+    const int* indices,
+    const int* nonzero_counts,
+    const int* order,
+    unsigned int order_base,
+    Output* output,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    const unsigned int rows_quarter = rows / 4;
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * rows_quarter;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index =
+        static_cast<unsigned int>(order[order_base + index / rows_quarter]) - order_base;
+    const unsigned int row = (index % rows_quarter) * 4;
+    float sums[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    const unsigned int index_base = batch_index * max_active;
+    const int row_nonzero_count = nonzero_counts[batch_index];
+    for (int active = 0; active < row_nonzero_count; ++active) {
+        const int column = indices[index_base + static_cast<unsigned int>(active)];
+        if (column >= 0 && static_cast<unsigned int>(column) < columns) {
+            const unsigned long long weight_base =
+                static_cast<unsigned long long>(column) * rows + row;
+#pragma unroll
+            for (unsigned int lane = 0; lane < 4; ++lane) {
+                sums[lane] += ft_forward_load(weight[weight_base + lane]);
+            }
+        }
+    }
+    const unsigned long long output_base =
+        static_cast<unsigned long long>(batch_index) * rows + row;
+#pragma unroll
+    for (unsigned int lane = 0; lane < 4; ++lane) {
+        ft_forward_store(output + output_base + lane, sums[lane]);
+    }
+}
+
+extern "C" __global__ void sparse_ft_forward_ordered(
+    const float* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* order,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int order_base,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    native_sparse_ft_forward_ordered(
+        weight, indices, nonzero_counts, order, order_base, output, batch, rows, columns,
+        max_active
+    );
+}
+
+extern "C" __global__ void sparse_ft_forward_fp16_ordered(
+    const __half* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* order,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int order_base,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    native_sparse_ft_forward_ordered(
+        weight, indices, nonzero_counts, order, order_base, output, batch, rows, columns,
+        max_active
+    );
+}
+
+extern "C" __global__ void sparse_ft_forward_fp16_out_ordered(
+    const __half* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* order,
+    unsigned long long,
+    __half* output,
+    unsigned long long,
+    unsigned int order_base,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    native_sparse_ft_forward_ordered(
+        weight, indices, nonzero_counts, order, order_base, output, batch, rows, columns,
+        max_active
+    );
+}
+
 template <bool Squared>
 __device__ __forceinline__ void native_simple_bias_act_fwd_fp16(
     const __half* ft_output,
