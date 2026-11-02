@@ -211,7 +211,7 @@ fn qat_activation_boundaries_and_main_ste() -> TestResult {
         assert_eq!(grad[i], 0.0, "clipped/zero derivative {i}");
     }
     assert_eq!(grad[15], 1.0);
-    let input_grad = t.ws.dcombined_from_l1.to_host_vec(&t.stream)?;
+    let input_grad = t.l1_input_gradient_for_test(16)?;
     assert_eq!(
         input_grad[0],
         1.0 / 64.0,

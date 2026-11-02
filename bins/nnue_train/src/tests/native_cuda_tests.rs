@@ -490,14 +490,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 87, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 86, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 103, "production kernel inventory changed");
+    assert_eq!(required.len(), 102, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3495,25 +3495,25 @@ fn ft_sparse_backward_gradient_matches_host_sum() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// tf32 経路の FT 活性勾配が、L1 入力勾配を bucket 並べ替えのまま逆写像で読んでも、元の行順に
-/// 戻してから読む従来経路と bit 単位で同じになること (FP32 / f16 の FT 活性の両方)。
+/// FT 活性勾配の kernel が L1 入力勾配をその場で計算しても、FP32 の L1 入力勾配を buffer に
+/// 書いてから読む経路と bit 単位で同じ勾配になること。tf32 でも本番は L1 入力勾配を f32 で
+/// 計算するので、参照は精度 flag によらず FP32 経路。
 #[cfg(feature = "native")]
 #[test]
-fn ft_post_grad_reads_sorted_l1_gradient_like_inverse_permute()
+fn ft_post_grad_from_l1_matches_materialized_l1_input_gradient()
 -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context()?;
     let standard = LayerStackTestOptions::standard();
-    let tf32_only = PrecisionFlags {
-        tf32: true,
-        ..PrecisionFlags::default()
-    };
     let all_optim = PrecisionFlags {
         tf32: true,
         ft_fp16: true,
         ft_fp16_out: true,
         fp16_opt_state: true,
     };
-    for (name, precision) in [("tf32", tf32_only), ("all-optim", all_optim)] {
+    for (name, precision) in [
+        ("fp32", PrecisionFlags::default()),
+        ("all-optim", all_optim),
+    ] {
         let options = LayerStackTestOptions {
             precision,
             num_buckets: 4,
@@ -3527,7 +3527,7 @@ fn ft_post_grad_reads_sorted_l1_gradient_like_inverse_permute()
             .collect();
         let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
         let (production, reference, nonzero) =
-            trainer.ft_post_grad_reference_bits_for_test(SMOKE_BATCH)?;
+            trainer.ft_post_grad_materialized_reference_bits_for_test(SMOKE_BATCH)?;
         assert!(nonzero > 0, "{name}: FT activation gradient is all zero");
         assert_eq!(
             production, reference,

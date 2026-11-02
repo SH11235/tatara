@@ -71,6 +71,22 @@ fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
     }
 }
 
+/// Block shape of `ft_post_grad_from_l1*`: each thread walks this many bucket-sorted rows of one
+/// column, reloading its L1 weights only when the bucket changes. At most `kFtPostL1MaxRows` in
+/// the CUDA source (the rows staged in shared memory).
+#[cfg(feature = "native")]
+const FT_POST_FROM_L1_ROWS_PER_BLOCK: usize = 64;
+#[cfg(feature = "native")]
+const FT_POST_FROM_L1_COLUMNS_PER_BLOCK: usize = 128;
+/// `kFtPostL1MaxOutputs` in the CUDA source.
+const FT_POST_FROM_L1_MAX_OUTPUTS: usize = 32;
+
+/// Whether the FT activation backward recomputes the L1 input gradient itself
+/// (`ft_post_grad_from_l1*`) instead of reading it from `dcombined_from_l1*`.
+fn l1_input_gradient_fused(l1_out: usize) -> bool {
+    cfg!(feature = "native") && l1_out <= FT_POST_FROM_L1_MAX_OUTPUTS
+}
+
 /// Launch shape for the `gather_and_sum_per_feature*` kernels: block `x` spans columns, block `y`
 /// spans features and the grid's `y` walks column slices. Blocks sweep every feature for one
 /// column slice before the next, so a slice narrow enough for the gradient rows of the positions
@@ -458,15 +474,28 @@ impl GpuTrainer {
         Ok(results)
     }
 
-    /// `ft_post_perspective_grad_fused{,_fp16}` for both perspectives with the L1 input gradient
-    /// read from `dcombined_from_l1_sorted` through `bucket_rank_dev`.
-    fn launch_ft_post_grad_sorted_l1(
+    /// FT activation backward for both perspectives with the L1 input gradient recomputed from
+    /// `dl1_total_sorted` and the L1 / L1-shared weights (`ft_post_grad_from_l1{,_fp16}`).
+    #[cfg(feature = "native")]
+    fn launch_ft_post_grad_from_l1(
         &mut self,
         b: usize,
         dft_scale: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ft_out = self.ws.ft_out;
-        let config = cfg_1d(b * ft_out / 2);
+        let l1_out = self.ws.l1_out;
+        let padded_b = padded_sort_batch(b, self.num_buckets);
+        let config = LaunchConfig {
+            grid_dim: (
+                (ft_out / 2).div_ceil(FT_POST_FROM_L1_COLUMNS_PER_BLOCK) as u32,
+                padded_b.div_ceil(FT_POST_FROM_L1_ROWS_PER_BLOCK) as u32,
+                1,
+            ),
+            block_dim: (FT_POST_FROM_L1_COLUMNS_PER_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let rows_per_block = FT_POST_FROM_L1_ROWS_PER_BLOCK as u32;
+        let num_buckets = self.num_buckets as u32;
         for (perspective, offset) in [(0, 0_u32), (1, (ft_out / 2) as u32)] {
             if self.ft_fp16_out {
                 let (output, gradient) = if perspective == 0 {
@@ -478,16 +507,17 @@ impl GpuTrainer {
                 let gradient = gradient.as_ref().expect("f16 FT activation gradients");
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                    // stream の完了を待つ同期点まで生存する device allocation。rank の各値は
-                    // `dcombined_from_l1_sorted` の実行 (padded_b 行以内)。
+                    // stream の完了を待つ同期点まで生存する device allocation。permutation と
+                    // sorted bucket は `padded_b` 要素で、非負の permutation 値は `b` 未満の行。
                     cuda_launch! {
-                        kernel: ft_post_perspective_grad_fused_fp16_sorted_l1,
+                        kernel: ft_post_grad_from_l1_fp16,
                         stream: self.stream, module: self.module, config: config,
-                        args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_rank_dev),
-                               slice(self.ws.dcombined_from_l1_shared), slice(output), slice(self.ft_b),
+                        args: [slice(self.ws.dl1_total_sorted), slice(self.ws.bucket_perm_dev),
+                               slice(self.ws.bucket_idx_sorted_dev), slice(self.l1_w),
+                               slice(self.l1_shared_weight), slice(output), slice(self.ft_b),
                                slice(gradient), slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
-                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE,
-                               dft_scale]
+                               padded_b as u32, ft_out as u32, l1_out as u32, num_buckets, offset,
+                               rows_per_block, FT_POST_SCALE, dft_scale]
                     }
                 }?;
             } else {
@@ -499,12 +529,14 @@ impl GpuTrainer {
                 unsafe {
                     // SAFETY: 同上。
                     cuda_launch! {
-                        kernel: ft_post_perspective_grad_fused_sorted_l1,
+                        kernel: ft_post_grad_from_l1,
                         stream: self.stream, module: self.module, config: config,
-                        args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_rank_dev),
-                               slice(self.ws.dcombined_from_l1_shared), slice(output), slice(self.ft_b),
+                        args: [slice(self.ws.dl1_total_sorted), slice(self.ws.bucket_perm_dev),
+                               slice(self.ws.bucket_idx_sorted_dev), slice(self.l1_w),
+                               slice(self.l1_shared_weight), slice(output), slice(self.ft_b),
                                slice(gradient), slice(self.ft_b_grad),
-                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE]
+                               padded_b as u32, ft_out as u32, l1_out as u32, num_buckets, offset,
+                               rows_per_block, FT_POST_SCALE]
                     }
                 }?;
             }
@@ -517,26 +549,71 @@ impl GpuTrainer {
         Ok(())
     }
 
-    /// Recomputes the last backward's FT activation gradients the unsorted way (inverse permute
-    /// of `dcombined_from_l1_sorted`, then `ft_post_perspective_grad_fused{,_fp16}`) into scratch
-    /// buffers, returning `(production bits, reference bits)` with stm before nstm.
+    /// The last backward's L1 (bucket) input gradient in original row order, `b * ft_out` values.
+    /// When `ft_post_grad_from_l1*` recomputed it in place, it is materialized here with
+    /// `dense_mm_bwd_input_bucket_tiled_sorted_scatter`.
     #[cfg(test)]
-    pub(crate) fn ft_post_grad_reference_bits_for_test(
-        &mut self,
+    pub(crate) fn l1_input_gradient_for_test(
+        &self,
         b: usize,
-    ) -> Result<BitsCompareTestState, Box<dyn std::error::Error>> {
-        let ft_out = self.ws.ft_out;
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        if !l1_input_gradient_fused(l1_out) {
+            return Ok(self.ws.dcombined_from_l1.to_host_vec(&self.stream)?[..b * ft_out].to_vec());
+        }
         let padded_b = padded_sort_batch(b, self.num_buckets);
-        let n = b * ft_out;
+        let gradient = DeviceBuffer::<f32>::zeroed(&self.stream, b * ft_out)?;
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: inverse_permute_rows_f32,
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
                 stream: self.stream, module: self.module,
-                config: cfg_1d(padded_b * ft_out),
-                args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_perm_dev),
-                       slice(self.ws.dcombined_from_l1), padded_b as u32, ft_out as u32]
+                config: LaunchConfig {
+                    grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.dl1_total_sorted), slice(self.l1_w),
+                       slice(self.ws.bucket_idx_sorted_dev), slice(self.ws.bucket_perm_dev),
+                       slice(gradient), padded_b as u32, ft_out as u32, l1_out as u32,
+                       self.num_buckets as u32]
+            }
+        }?;
+        Ok(gradient.to_host_vec(&self.stream)?)
+    }
+
+    /// Recomputes the last backward's FT activation gradients with the materialized FP32 L1 input
+    /// gradient (`dense_mm_bwd_input_bucket_tiled_sorted_scatter` + `dense_mm_bwd_input_tiled_wide`,
+    /// then the per-element `ft_post_perspective_grad_fused{,_fp16}`) into scratch buffers,
+    /// returning `(production bits, reference bits, nonzero production cells)` with stm before
+    /// nstm.
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn ft_post_grad_materialized_reference_bits_for_test(
+        &mut self,
+        b: usize,
+    ) -> Result<BitsCompareTestState, Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        let padded_b = padded_sort_batch(b, self.num_buckets);
+        let n = b * ft_out;
+        let from_l1 = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+        let from_shared = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+        self.launch_l1_shared_bwd_input_wide(b, &from_shared)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_bwd_input_bucket_tiled_sorted_scatter,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: ((ft_out / 16) as u32, (padded_b / 16) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.dl1_total_sorted), slice(self.l1_w),
+                       slice(self.ws.bucket_idx_sorted_dev), slice(self.ws.bucket_perm_dev),
+                       slice(from_l1), padded_b as u32, ft_out as u32, l1_out as u32,
+                       self.num_buckets as u32]
             }
         }?;
         let bias_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_out)?;
@@ -560,10 +637,9 @@ impl GpuTrainer {
                     cuda_launch! {
                         kernel: ft_post_perspective_grad_fused_fp16,
                         stream: self.stream, module: self.module, config: config,
-                        args: [slice(self.ws.dcombined_from_l1), slice(self.ws.dcombined_from_l1_shared),
-                               slice(output), slice(self.ft_b), slice(scratch), slice(bias_grad),
-                               slice(clamp), b as u32, ft_out as u32, offset, ft_out as u32,
-                               FT_POST_SCALE, dft_scale]
+                        args: [slice(from_l1), slice(from_shared), slice(output), slice(self.ft_b),
+                               slice(scratch), slice(bias_grad), slice(clamp), b as u32,
+                               ft_out as u32, offset, ft_out as u32, FT_POST_SCALE, dft_scale]
                     }
                 }?;
                 let bits =
@@ -587,9 +663,9 @@ impl GpuTrainer {
                     cuda_launch! {
                         kernel: ft_post_perspective_grad_fused,
                         stream: self.stream, module: self.module, config: config,
-                        args: [slice(self.ws.dcombined_from_l1), slice(self.ws.dcombined_from_l1_shared),
-                               slice(output), slice(self.ft_b), slice(scratch), slice(bias_grad),
-                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE]
+                        args: [slice(from_l1), slice(from_shared), slice(output), slice(self.ft_b),
+                               slice(scratch), slice(bias_grad), b as u32, ft_out as u32, offset,
+                               ft_out as u32, FT_POST_SCALE]
                     }
                 }?;
                 let bits =
@@ -1563,9 +1639,6 @@ pub(crate) struct GpuWorkspace {
     // -- king-grouped position order for the FT forward (stm entries, then nstm + batch) --
     #[cfg(feature = "native")]
     ft_order_keys: DeviceBuffer<i32>, // 2 * batch
-    /// Original row -> row in the L1 bucket-sorted layout (inverse of `bucket_perm_dev`).
-    #[cfg(feature = "native")]
-    bucket_rank_dev: DeviceBuffer<i32>, // batch
     #[cfg(feature = "native")]
     ft_order_sorted_keys: DeviceBuffer<i32>, // 2 * batch (scatter output, unused afterwards)
     #[cfg(feature = "native")]
@@ -1651,6 +1724,14 @@ impl GpuWorkspace {
         // `dcombined_from_l1_sorted` と同じ dead-allocation 回避手法)。forward と
         // loss kernel が触る buffer (`dy_net_output` 含む) は実長のまま。
         let bwd_len = |n: usize| if forward_only { 0 } else { n };
+        // `ft_post_grad_from_l1*` recomputes the L1 input gradient, so its buffers stay empty.
+        let l1_input_grad_len = |n: usize| {
+            if forward_only || l1_input_gradient_fused(l1_out) {
+                0
+            } else {
+                n
+            }
+        };
         let alloc_h = |on: bool| -> Result<Option<DeviceBuffer<f16>>, Box<dyn std::error::Error>> {
             if on {
                 Ok(Some(DeviceBuffer::<f16>::zeroed(stream, batch * ft_out)?))
@@ -1694,8 +1775,8 @@ impl GpuWorkspace {
             dl1_main_from_sqr: z(bwd_len(batch * l1_effective))?,
             dl1_main: z(bwd_len(batch * l1_effective))?,
             dl1_total: z(bwd_len(batch * l1_out))?,
-            dcombined_from_l1_shared: z(bwd_len(batch * ft_out))?,
-            dcombined_from_l1: z(bwd_len(batch * ft_out))?,
+            dcombined_from_l1_shared: z(l1_input_grad_len(batch * ft_out))?,
+            dcombined_from_l1: z(l1_input_grad_len(batch * ft_out))?,
             dft_stm_out: z(bwd_len(ft_act_f32_n))?,
             dft_nstm_out: z(bwd_len(ft_act_f32_n))?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
@@ -1711,8 +1792,6 @@ impl GpuWorkspace {
             ft_active_rows: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
             #[cfg(feature = "native")]
             ft_order_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
-            #[cfg(feature = "native")]
-            bucket_rank_dev: DeviceBuffer::<i32>::zeroed(stream, bwd_len(batch))?,
             #[cfg(feature = "native")]
             ft_order_sorted_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
             #[cfg(feature = "native")]
@@ -1760,8 +1839,10 @@ impl GpuWorkspace {
             dl1_total_sorted: z(bwd_len(padded_sort_batch(batch, num_buckets) * l1_out))?,
             // tf32 の per-bucket L1 input-bwd 経路のみが使う (bs65536/ft1536 で ~400MB)。
             // tf32 off では参照されないため 0-byte で確保し dead allocation を避ける。
-            dcombined_from_l1_sorted: if tf32 && !forward_only {
-                z(padded_sort_batch(batch, num_buckets) * ft_out)?
+            dcombined_from_l1_sorted: if tf32 {
+                z(l1_input_grad_len(
+                    padded_sort_batch(batch, num_buckets) * ft_out,
+                ))?
             } else {
                 z(0)?
             },
@@ -4858,7 +4939,9 @@ impl GpuTrainer {
         // (`dense_mm_bwd_input_tiled`、grid=batch/16 × in_dim/16)。out_dim は reduction 軸で
         // kernel 内のループで消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
-        if self.tf32 {
+        if l1_input_gradient_fused(self.ws.l1_out) {
+            // `ft_post_grad_from_l1*` recomputes this product per FT column.
+        } else if self.tf32 {
             // C[b, ft_out] = dl1_total[b, l1_out] @ l1_shared_weight[ft_out, l1_out]^T (reduce 軸 l1_out)。
             // SAFETY: dl1_total / l1_shared_weight / dcombined_from_l1_shared は cudaMalloc 由来、長さは arch
             // 上 invariant (`dl1_total.len() == b*l1_out`、`l1_shared_weight.len() == ft_out*l1_out`、
@@ -5033,10 +5116,11 @@ impl GpuTrainer {
         // `self.tf32` で per-bucket cuBLAS Sgemm (matmul のみ、beta=0) と手書き tiled kernel を
         // 分岐する。手書き kernel は sorted dx を別 buffer に出さず bucket_perm で original order
         // へ直接 scatter する融合版。cuBLAS 経路は sorted dx を dcombined_from_l1_sorted に出す。
-        // native backend は ft_post の勾配 kernel が `bucket_rank_dev` 経由でそのまま読み、
-        // cuda-oxide / oxide-parity は inverse_permute で original order へ戻してから読む。
+        // cuBLAS の sorted dx は inverse_permute で original order へ戻してから ft_post が読む。
         // padding 行 (perm=-1) はどちらも読まれず、real row は perm の単射ですべて covered。
-        if self.tf32 {
+        if l1_input_gradient_fused(self.ws.l1_out) {
+            // `ft_post_grad_from_l1*` recomputes this product per FT column.
+        } else if self.tf32 {
             let segs = bucket_segments;
             let dl1_base = self.ws.dl1_total_sorted.cu_deviceptr() as *const f32;
             let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
@@ -5063,22 +5147,6 @@ impl GpuTrainer {
                     )?;
                 }
             }
-            // native backend は sorted dx を元の行順へ戻さず、ft_post の勾配 kernel が
-            // `bucket_rank_dev` (置換の逆写像) 経由で直接読む。
-            #[cfg(feature = "native")]
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。permutation は
-                // `padded_b` 要素、rank は `b` 要素以上で、範囲外の行は kernel が捨てる。
-                cuda_launch! {
-                    kernel: invert_row_permutation,
-                    stream: self.stream, module: self.module,
-                    config: cfg_1d(padded_b),
-                    args: [slice(self.ws.bucket_perm_dev), slice(self.ws.bucket_rank_dev),
-                           padded_b as u32, b_u32]
-                }
-            }?;
-            #[cfg(not(feature = "native"))]
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -5165,14 +5233,11 @@ impl GpuTrainer {
         // `ft_fp16_out` 時は forward activation `ft_*_out` を f16 で読み、dft 出力も f16
         // で書く版 (`ft_post_perspective_grad_fused_fp16`)。`d_combined_*` / `ft_b` /
         // `ft_b_grad` は両 path とも f32。stm: d_combined_offset = 0、nstm: = ft_out/2。
-        // native の tf32 経路は L1 入力勾配を bucket 並べ替えのまま読む版を使う。
-        #[cfg(feature = "native")]
-        let l1_gradient_sorted = self.tf32;
-        #[cfg(not(feature = "native"))]
-        let l1_gradient_sorted = false;
-        if l1_gradient_sorted {
+        // native backend (L1 出力 32 以下) は L1 入力勾配を buffer に置かず、勾配 kernel が
+        // `dl1_total_sorted` と L1 重みからその場で計算する。
+        if l1_input_gradient_fused(self.ws.l1_out) {
             #[cfg(feature = "native")]
-            self.launch_ft_post_grad_sorted_l1(b, dft_scale)?;
+            self.launch_ft_post_grad_from_l1(b, dft_scale)?;
         } else if self.ft_fp16_out {
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
