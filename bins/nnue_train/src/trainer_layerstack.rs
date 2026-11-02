@@ -18,10 +18,10 @@ struct FtFusedStep {
 #[cfg(all(test, feature = "native"))]
 type FtForwardTestState = (Option<Vec<f32>>, Vec<f32>);
 
-/// `(production-shape gradient bits, one-column gradient bits, cells changed from the initial
-/// pattern)` read back by tests.
+/// `(bits of the production path, bits of the reference path, cells the production path
+/// changed or set nonzero)` read back by tests.
 #[cfg(all(test, feature = "native"))]
-type FtGatherShapeTestState = (Vec<u32>, Vec<u32>, usize);
+type BitsCompareTestState = (Vec<u32>, Vec<u32>, usize);
 
 /// `(position order, ordered activation bits, unordered activation bits)` read back by tests.
 #[cfg(all(test, feature = "native"))]
@@ -388,7 +388,7 @@ impl GpuTrainer {
     #[cfg(test)]
     pub(crate) fn ft_gather_fp16_shapes_for_test(
         &self,
-    ) -> Result<Vec<FtGatherShapeTestState>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<BitsCompareTestState>, Box<dyn std::error::Error>> {
         let (ft_in, ft_out) = (self.ws.ft_in, self.ws.ft_out);
         let dft = self
             .ws
@@ -456,6 +456,158 @@ impl GpuTrainer {
             results.push((prod, one, changed));
         }
         Ok(results)
+    }
+
+    /// `ft_post_perspective_grad_fused{,_fp16}` for both perspectives with the L1 input gradient
+    /// read from `dcombined_from_l1_sorted` through `bucket_rank_dev`.
+    fn launch_ft_post_grad_sorted_l1(
+        &mut self,
+        b: usize,
+        dft_scale: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ft_out = self.ws.ft_out;
+        let config = cfg_1d(b * ft_out / 2);
+        for (perspective, offset) in [(0, 0_u32), (1, (ft_out / 2) as u32)] {
+            if self.ft_fp16_out {
+                let (output, gradient) = if perspective == 0 {
+                    (&self.ws.ft_stm_out_h, &self.ws.dft_stm_out_h)
+                } else {
+                    (&self.ws.ft_nstm_out_h, &self.ws.dft_nstm_out_h)
+                };
+                let output = output.as_ref().expect("f16 FT activations");
+                let gradient = gradient.as_ref().expect("f16 FT activation gradients");
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。rank の各値は
+                    // `dcombined_from_l1_sorted` の実行 (padded_b 行以内)。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fused_fp16_sorted_l1,
+                        stream: self.stream, module: self.module, config: config,
+                        args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_rank_dev),
+                               slice(self.ws.dcombined_from_l1_shared), slice(output), slice(self.ft_b),
+                               slice(gradient), slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
+                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE,
+                               dft_scale]
+                    }
+                }?;
+            } else {
+                let (output, gradient) = if perspective == 0 {
+                    (&self.ws.ft_stm_out, &self.ws.dft_stm_out)
+                } else {
+                    (&self.ws.ft_nstm_out, &self.ws.dft_nstm_out)
+                };
+                unsafe {
+                    // SAFETY: 同上。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fused_sorted_l1,
+                        stream: self.stream, module: self.module, config: config,
+                        args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_rank_dev),
+                               slice(self.ws.dcombined_from_l1_shared), slice(output), slice(self.ft_b),
+                               slice(gradient), slice(self.ft_b_grad),
+                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE]
+                    }
+                }?;
+            }
+        }
+        if self.ft_fp16_out {
+            self.fp16_clamp_elems_written = self
+                .fp16_clamp_elems_written
+                .saturating_add(2_u64 * b as u64 * ft_out as u64);
+        }
+        Ok(())
+    }
+
+    /// Recomputes the last backward's FT activation gradients the unsorted way (inverse permute
+    /// of `dcombined_from_l1_sorted`, then `ft_post_perspective_grad_fused{,_fp16}`) into scratch
+    /// buffers, returning `(production bits, reference bits)` with stm before nstm.
+    #[cfg(test)]
+    pub(crate) fn ft_post_grad_reference_bits_for_test(
+        &mut self,
+        b: usize,
+    ) -> Result<BitsCompareTestState, Box<dyn std::error::Error>> {
+        let ft_out = self.ws.ft_out;
+        let padded_b = padded_sort_batch(b, self.num_buckets);
+        let n = b * ft_out;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: inverse_permute_rows_f32,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(padded_b * ft_out),
+                args: [slice(self.ws.dcombined_from_l1_sorted), slice(self.ws.bucket_perm_dev),
+                       slice(self.ws.dcombined_from_l1), padded_b as u32, ft_out as u32]
+            }
+        }?;
+        let bias_grad = DeviceBuffer::<f32>::zeroed(&self.stream, ft_out)?;
+        let clamp = DeviceBuffer::<u64>::zeroed(&self.stream, 1)?;
+        let dft_scale = FT_DFT_FP16_BASE_SCALE * (b as f32);
+        let config = cfg_1d(n / 2);
+        let mut production = Vec::with_capacity(2 * n);
+        let mut reference = Vec::with_capacity(2 * n);
+        for (perspective, offset) in [(0, 0_u32), (1, (ft_out / 2) as u32)] {
+            if self.ft_fp16_out {
+                let (output, gradient) = if perspective == 0 {
+                    (&self.ws.ft_stm_out_h, &self.ws.dft_stm_out_h)
+                } else {
+                    (&self.ws.ft_nstm_out_h, &self.ws.dft_nstm_out_h)
+                };
+                let output = output.as_ref().ok_or("f16 FT activations")?;
+                let gradient = gradient.as_ref().ok_or("f16 FT activation gradients")?;
+                let scratch = DeviceBuffer::<f16>::zeroed(&self.stream, n)?;
+                unsafe {
+                    // SAFETY: 同上。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fused_fp16,
+                        stream: self.stream, module: self.module, config: config,
+                        args: [slice(self.ws.dcombined_from_l1), slice(self.ws.dcombined_from_l1_shared),
+                               slice(output), slice(self.ft_b), slice(scratch), slice(bias_grad),
+                               slice(clamp), b as u32, ft_out as u32, offset, ft_out as u32,
+                               FT_POST_SCALE, dft_scale]
+                    }
+                }?;
+                let bits =
+                    |buffer: &DeviceBuffer<f16>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                        Ok(buffer.to_host_vec(&self.stream)?[..n]
+                            .iter()
+                            .map(|v| u32::from(v.to_bits()))
+                            .collect())
+                    };
+                production.extend(bits(gradient)?);
+                reference.extend(bits(&scratch)?);
+            } else {
+                let (output, gradient) = if perspective == 0 {
+                    (&self.ws.ft_stm_out, &self.ws.dft_stm_out)
+                } else {
+                    (&self.ws.ft_nstm_out, &self.ws.dft_nstm_out)
+                };
+                let scratch = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
+                unsafe {
+                    // SAFETY: 同上。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_grad_fused,
+                        stream: self.stream, module: self.module, config: config,
+                        args: [slice(self.ws.dcombined_from_l1), slice(self.ws.dcombined_from_l1_shared),
+                               slice(output), slice(self.ft_b), slice(scratch), slice(bias_grad),
+                               b as u32, ft_out as u32, offset, ft_out as u32, FT_POST_SCALE]
+                    }
+                }?;
+                let bits =
+                    |buffer: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                        Ok(buffer.to_host_vec(&self.stream)?[..n]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect())
+                    };
+                production.extend(bits(gradient)?);
+                reference.extend(bits(&scratch)?);
+            }
+        }
+        let changed = production
+            .iter()
+            .filter(|&&bits| bits & 0x7fff_ffff != 0)
+            .count();
+        Ok((production, reference, changed))
     }
 
     /// stm-side overwrite gather that skips rows outside `ws.ft_active_rows`.
@@ -1411,6 +1563,9 @@ pub(crate) struct GpuWorkspace {
     // -- king-grouped position order for the FT forward (stm entries, then nstm + batch) --
     #[cfg(feature = "native")]
     ft_order_keys: DeviceBuffer<i32>, // 2 * batch
+    /// Original row -> row in the L1 bucket-sorted layout (inverse of `bucket_perm_dev`).
+    #[cfg(feature = "native")]
+    bucket_rank_dev: DeviceBuffer<i32>, // batch
     #[cfg(feature = "native")]
     ft_order_sorted_keys: DeviceBuffer<i32>, // 2 * batch (scatter output, unused afterwards)
     #[cfg(feature = "native")]
@@ -1556,6 +1711,8 @@ impl GpuWorkspace {
             ft_active_rows: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
             #[cfg(feature = "native")]
             ft_order_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
+            #[cfg(feature = "native")]
+            bucket_rank_dev: DeviceBuffer::<i32>::zeroed(stream, bwd_len(batch))?,
             #[cfg(feature = "native")]
             ft_order_sorted_keys: DeviceBuffer::<i32>::zeroed(stream, 2 * batch)?,
             #[cfg(feature = "native")]
@@ -4875,10 +5032,10 @@ impl GpuTrainer {
         // L1 input backward: `dx[b][i] = Σ_o dl1_total_sorted[b][o] * w[bucket][o][i]`。
         // `self.tf32` で per-bucket cuBLAS Sgemm (matmul のみ、beta=0) と手書き tiled kernel を
         // 分岐する。手書き kernel は sorted dx を別 buffer に出さず bucket_perm で original order
-        // へ直接 scatter する融合版。cuBLAS 経路は sorted dx を dcombined_from_l1_sorted に出し、
-        // 既存 inverse_permute で original order へ戻す (融合 kernel が省いていた DRAM roundtrip が
-        // 1 本増える)。padding 行 (perm=-1) は inverse permute が skip、real row は perm の単射で
-        // すべて covered。
+        // へ直接 scatter する融合版。cuBLAS 経路は sorted dx を dcombined_from_l1_sorted に出す。
+        // native backend は ft_post の勾配 kernel が `bucket_rank_dev` 経由でそのまま読み、
+        // cuda-oxide / oxide-parity は inverse_permute で original order へ戻してから読む。
+        // padding 行 (perm=-1) はどちらも読まれず、real row は perm の単射ですべて covered。
         if self.tf32 {
             let segs = bucket_segments;
             let dl1_base = self.ws.dl1_total_sorted.cu_deviceptr() as *const f32;
@@ -4906,6 +5063,22 @@ impl GpuTrainer {
                     )?;
                 }
             }
+            // native backend は sorted dx を元の行順へ戻さず、ft_post の勾配 kernel が
+            // `bucket_rank_dev` (置換の逆写像) 経由で直接読む。
+            #[cfg(feature = "native")]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。permutation は
+                // `padded_b` 要素、rank は `b` 要素以上で、範囲外の行は kernel が捨てる。
+                cuda_launch! {
+                    kernel: invert_row_permutation,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(padded_b),
+                    args: [slice(self.ws.bucket_perm_dev), slice(self.ws.bucket_rank_dev),
+                           padded_b as u32, b_u32]
+                }
+            }?;
+            #[cfg(not(feature = "native"))]
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -4992,7 +5165,15 @@ impl GpuTrainer {
         // `ft_fp16_out` 時は forward activation `ft_*_out` を f16 で読み、dft 出力も f16
         // で書く版 (`ft_post_perspective_grad_fused_fp16`)。`d_combined_*` / `ft_b` /
         // `ft_b_grad` は両 path とも f32。stm: d_combined_offset = 0、nstm: = ft_out/2。
-        if self.ft_fp16_out {
+        // native の tf32 経路は L1 入力勾配を bucket 並べ替えのまま読む版を使う。
+        #[cfg(feature = "native")]
+        let l1_gradient_sorted = self.tf32;
+        #[cfg(not(feature = "native"))]
+        let l1_gradient_sorted = false;
+        if l1_gradient_sorted {
+            #[cfg(feature = "native")]
+            self.launch_ft_post_grad_sorted_l1(b, dft_scale)?;
+        } else if self.ft_fp16_out {
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。

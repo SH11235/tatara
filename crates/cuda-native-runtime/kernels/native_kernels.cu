@@ -3125,6 +3125,71 @@ extern "C" __global__ void psqt_diff_sparse_bwd(
     }
 }
 
+// Row `row` of `combined_gradient_a` is read from row `a_rows[row]` when `a_rows` is given (the
+// bucket-sorted L1 input gradient, read through the inverse permutation instead of being copied
+// back to original order first), from row `row` otherwise. `combined_gradient_b` is always in
+// original order.
+template <typename Activation>
+__device__ __forceinline__ void native_ft_post_perspective_grad_fused(
+    const float* combined_gradient_a,
+    const int* a_rows,
+    const float* combined_gradient_b,
+    const Activation* ft_output,
+    const float* bias,
+    Activation* ft_gradient,
+    float* bias_gradient,
+    unsigned long long* clamp_counter,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale,
+    float gradient_scale
+) {
+    const unsigned long long pair =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int half = ft_dimension / 2;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * half;
+    if (pair >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(pair / half);
+    const unsigned int column = static_cast<unsigned int>(pair % half);
+    const unsigned int a_row = a_rows != nullptr ? static_cast<unsigned int>(a_rows[row]) : row;
+    const unsigned long long a_index =
+        static_cast<unsigned long long>(a_row) * combined_stride + combined_offset + column;
+    const unsigned long long b_index =
+        static_cast<unsigned long long>(row) * combined_stride + combined_offset + column;
+    const float dy = combined_gradient_a[a_index] + combined_gradient_b[b_index];
+    const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
+    float xa;
+    float xb;
+    if constexpr (sizeof(Activation) == sizeof(float)) {
+        xa = ft_output[base + column] + bias[column];
+        xb = ft_output[base + half + column] + bias[half + column];
+    } else {
+        xa = __half2float(ft_output[base + column]) + bias[column];
+        xb = __half2float(ft_output[base + half + column]) + bias[half + column];
+    }
+    const float ya = native_clamp_unit(xa);
+    const float yb = native_clamp_unit(xb);
+    const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
+    const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
+    if constexpr (sizeof(Activation) == sizeof(float)) {
+        ft_gradient[base + column] = grad_a;
+        ft_gradient[base + half + column] = grad_b;
+    } else {
+        const float scaled_a = grad_a * gradient_scale;
+        const float scaled_b = grad_b * gradient_scale;
+        const float clamped_a = native_clamp_half(scaled_a, clamp_counter);
+        const float clamped_b = native_clamp_half(scaled_b, clamp_counter);
+        ft_gradient[base + column] = __float2half_rn(clamped_a);
+        ft_gradient[base + half + column] = __float2half_rn(clamped_b);
+    }
+    atomicAdd(bias_gradient + column, grad_a);
+    atomicAdd(bias_gradient + half + column, grad_b);
+}
+
 extern "C" __global__ void ft_post_perspective_grad_fused(
     const float* combined_gradient_a,
     unsigned long long,
@@ -3144,29 +3209,37 @@ extern "C" __global__ void ft_post_perspective_grad_fused(
     unsigned int combined_stride,
     float scale
 ) {
-    const unsigned long long pair =
-        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const unsigned int half = ft_dimension / 2;
-    const unsigned long long total = static_cast<unsigned long long>(batch) * half;
-    if (pair >= total) {
-        return;
-    }
-    const unsigned int row = static_cast<unsigned int>(pair / half);
-    const unsigned int column = static_cast<unsigned int>(pair % half);
-    const unsigned long long combined_index =
-        static_cast<unsigned long long>(row) * combined_stride + combined_offset + column;
-    const float dy = combined_gradient_a[combined_index] + combined_gradient_b[combined_index];
-    const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
-    const float xa = ft_output[base + column] + bias[column];
-    const float xb = ft_output[base + half + column] + bias[half + column];
-    const float ya = native_clamp_unit(xa);
-    const float yb = native_clamp_unit(xb);
-    const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
-    const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
-    ft_gradient[base + column] = grad_a;
-    ft_gradient[base + half + column] = grad_b;
-    atomicAdd(bias_gradient + column, grad_a);
-    atomicAdd(bias_gradient + half + column, grad_b);
+    native_ft_post_perspective_grad_fused(
+        combined_gradient_a, nullptr, combined_gradient_b, ft_output, bias, ft_gradient,
+        bias_gradient, nullptr, batch, ft_dimension, combined_offset, combined_stride, scale, 1.0F
+    );
+}
+
+extern "C" __global__ void ft_post_perspective_grad_fused_sorted_l1(
+    const float* combined_gradient_a,
+    unsigned long long,
+    const int* a_rows,
+    unsigned long long,
+    const float* combined_gradient_b,
+    unsigned long long,
+    const float* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale
+) {
+    native_ft_post_perspective_grad_fused(
+        combined_gradient_a, a_rows, combined_gradient_b, ft_output, bias, ft_gradient,
+        bias_gradient, nullptr, batch, ft_dimension, combined_offset, combined_stride, scale, 1.0F
+    );
 }
 
 extern "C" __global__ void ft_post_perspective_grad_fused_fp16(
@@ -3191,33 +3264,62 @@ extern "C" __global__ void ft_post_perspective_grad_fused_fp16(
     float scale,
     float gradient_scale
 ) {
-    const unsigned long long pair =
-        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const unsigned int half = ft_dimension / 2;
-    const unsigned long long total = static_cast<unsigned long long>(batch) * half;
-    if (pair >= total) {
+    native_ft_post_perspective_grad_fused(
+        combined_gradient_a, nullptr, combined_gradient_b, ft_output, bias, ft_gradient,
+        bias_gradient, clamp_counter, batch, ft_dimension, combined_offset, combined_stride, scale,
+        gradient_scale
+    );
+}
+
+extern "C" __global__ void ft_post_perspective_grad_fused_fp16_sorted_l1(
+    const float* combined_gradient_a,
+    unsigned long long,
+    const int* a_rows,
+    unsigned long long,
+    const float* combined_gradient_b,
+    unsigned long long,
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    __half* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned long long* clamp_counter,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale,
+    float gradient_scale
+) {
+    native_ft_post_perspective_grad_fused(
+        combined_gradient_a, a_rows, combined_gradient_b, ft_output, bias, ft_gradient,
+        bias_gradient, clamp_counter, batch, ft_dimension, combined_offset, combined_stride, scale,
+        gradient_scale
+    );
+}
+
+// `rank[permutation[j]] = j`: maps each original row to its row in the bucket-sorted layout.
+// Padding entries (-1) are skipped.
+extern "C" __global__ void invert_row_permutation(
+    const int* permutation,
+    unsigned long long,
+    int* rank,
+    unsigned long long,
+    unsigned int sorted_rows,
+    unsigned int rows
+) {
+    const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= sorted_rows) {
         return;
     }
-    const unsigned int row = static_cast<unsigned int>(pair / half);
-    const unsigned int column = static_cast<unsigned int>(pair % half);
-    const unsigned long long combined_index =
-        static_cast<unsigned long long>(row) * combined_stride + combined_offset + column;
-    const float dy = combined_gradient_a[combined_index] + combined_gradient_b[combined_index];
-    const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
-    const float xa = __half2float(ft_output[base + column]) + bias[column];
-    const float xb = __half2float(ft_output[base + half + column]) + bias[half + column];
-    const float ya = native_clamp_unit(xa);
-    const float yb = native_clamp_unit(xb);
-    const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
-    const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
-    const float scaled_a = grad_a * gradient_scale;
-    const float scaled_b = grad_b * gradient_scale;
-    const float clamped_a = native_clamp_half(scaled_a, clamp_counter);
-    const float clamped_b = native_clamp_half(scaled_b, clamp_counter);
-    ft_gradient[base + column] = __float2half_rn(clamped_a);
-    ft_gradient[base + half + column] = __float2half_rn(clamped_b);
-    atomicAdd(bias_gradient + column, grad_a);
-    atomicAdd(bias_gradient + half + column, grad_b);
+    const int row = permutation[j];
+    if (row >= 0 && static_cast<unsigned int>(row) < rows) {
+        rank[row] = static_cast<int>(j);
+    }
 }
 
 extern "C" __global__ void dense_mm_fwd_bucket(
