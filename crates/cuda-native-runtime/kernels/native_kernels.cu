@@ -1432,7 +1432,7 @@ __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     unsigned int ft_output,
     float inverse_gradient_scale
 ) {
-    const unsigned int feature = blockIdx.x;
+    const unsigned int feature = blockIdx.x * blockDim.y + threadIdx.y;
     const unsigned int row = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= n_features || row >= ft_output) {
         return;
@@ -2469,7 +2469,7 @@ __device__ void gather_feature_gradient(
     unsigned int ft_columns,
     bool add
 ) {
-    const unsigned int feature = blockIdx.x;
+    const unsigned int feature = blockIdx.x * blockDim.y + threadIdx.y;
     const unsigned int output = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= feature_count || output >= ft_columns) {
         return;

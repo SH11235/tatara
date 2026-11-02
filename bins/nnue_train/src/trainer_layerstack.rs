@@ -66,6 +66,30 @@ fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
     }
 }
 
+/// Launch shape for the `gather_and_sum_per_feature*` kernels: block `x` spans columns, block `y`
+/// spans features and the grid's `y` walks column slices. Blocks sweep every feature for one
+/// column slice before the next, so a slice narrow enough for the gradient rows of the positions
+/// in flight to stay in L2 cuts DRAM traffic; on the native backend that slice is 256 bytes of a
+/// row, with several features per block so the narrow block still fills the SM. The cuda-oxide
+/// kernels index features by `blockIdx.x` alone and keep one feature per 128-column block.
+fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> LaunchConfig {
+    let (columns, features) = if cfg!(feature = "native") {
+        if half_gradient { (128, 1) } else { (64, 4) }
+    } else {
+        (128, 1)
+    };
+    debug_assert!(ft_out.is_multiple_of(columns));
+    LaunchConfig {
+        grid_dim: (
+            ft_in.div_ceil(features) as u32,
+            (ft_out / columns) as u32,
+            1,
+        ),
+        block_dim: (columns as u32, features as u32, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 #[cfg(feature = "native")]
 impl GpuTrainer {
     /// Whether this step updates FT weights with `ft_fused_optimizer_step` instead of the
@@ -349,6 +373,25 @@ impl GpuTrainer {
     #[cfg(test)]
     pub(crate) fn set_ft_fused_optimizer_enabled_for_test(&mut self, enabled: bool) {
         self.ft_fused_optimizer_disabled = !enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_skip_optimizer_for_test(&mut self, skip: bool) {
+        self.skip_optimizer_for_test = skip;
+    }
+
+    /// FP32 FT activation gradients `(dft_stm, dft_nstm)` the last backward fed to the sparse
+    /// gather, `b * ft_out` each.
+    #[cfg(test)]
+    pub(crate) fn ft_output_grads_to_host_for_test(
+        &self,
+        b: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+        let n = b * self.ws.ft_out;
+        Ok((
+            self.ws.dft_stm_out.to_host_vec(&self.stream)?[..n].to_vec(),
+            self.ws.dft_nstm_out.to_host_vec(&self.stream)?[..n].to_vec(),
+        ))
     }
 
     /// Runs the king-ordered FT forward and the unordered `sparse_ft_forward*` kernel on the
@@ -1025,6 +1068,10 @@ pub(crate) struct GpuTrainer {
     /// tests can compare them against the fused kernel. Always `false` outside tests.
     #[cfg(feature = "native")]
     ft_fused_optimizer_disabled: bool,
+    /// Makes `step` return after the backward pass so tests can read the gradients the
+    /// optimizer kernels would consume and clear.
+    #[cfg(test)]
+    skip_optimizer_for_test: bool,
     /// The last backward wrote FT gradient rows only for features in `ws.ft_active_rows`; the
     /// other real rows hold stale values, so only the fused FT optimizer may consume the step.
     #[cfg(feature = "native")]
@@ -1982,6 +2029,8 @@ impl GpuTrainer {
             precision_diagnostic: None,
             #[cfg(feature = "native")]
             ft_fused_optimizer_disabled: false,
+            #[cfg(test)]
+            skip_optimizer_for_test: false,
             #[cfg(feature = "native")]
             ft_grad_active_rows_only: false,
             #[cfg(feature = "native")]
@@ -3142,6 +3191,13 @@ impl GpuTrainer {
         }
         if let Some(output) = result? {
             return Ok(output);
+        }
+        #[cfg(test)]
+        if self.skip_optimizer_for_test {
+            return Ok(StepOutput {
+                loss: 0.0,
+                net_output: Vec::new(),
+            });
         }
         self.optimizer_step(&mut context)
     }
@@ -5014,15 +5070,12 @@ impl GpuTrainer {
                 }
             }?;
             prof_tick!("phC_scat");
-            // D: gather_and_sum_per_feature。block grid = (ft_in, ft_out/128), block_dim=128.
+            // D: gather_and_sum_per_feature。1 thread = (feature, column) 1 cell
+            // (`ft_gather_launch_config`)。
             // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
             // overwrite kernel が全 cell (`active_rows_only` 時は active 行の全 cell) を
             // 書き切るため grad_w の host 事前 memset は不要。nstm 側が足す行は必ず active。
-            let d_config = LaunchConfig {
-                grid_dim: (ft_in as u32, (ft_out / 128) as u32, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            };
+            let d_config = ft_gather_launch_config(ft_in, ft_out, self.ft_fp16_out);
             // iter 0 = stm (dft_stm_out / overwrite)、iter 1 = nstm (dft_nstm_out / add)。
             // `ft_fp16_out` 時は dft が f16 なので f16 入力版の gather kernel を使う。
             if iter_idx == 0 {
