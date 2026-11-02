@@ -470,9 +470,24 @@ extern "C" __global__ void ft_fold_virtual_f16(
     combined[i] = __float2half_rn(value);
 }
 
-extern "C" __global__ void ft_reduce_virtual_grad(
+// Real-row FT gradient for the virtual-row reduction. Rows with `active_rows[row] == 0` were not
+// written by the masked backward gather and hold stale values, so they read as zero.
+__device__ __forceinline__ float ft_real_row_grad(
+    const float* gradient,
+    const unsigned int* active_rows,
+    unsigned long long row,
+    unsigned int ft_out,
+    unsigned int column
+) {
+    if (active_rows != nullptr && active_rows[row] == 0U) {
+        return 0.0F;
+    }
+    return gradient[row * ft_out + column];
+}
+
+__device__ __forceinline__ void ft_reduce_virtual_grad_impl(
     float* gradient,
-    unsigned long long,
+    const unsigned int* active_rows,
     const unsigned int* threat_pair_starts,
     unsigned long long threat_pair_starts_len,
     unsigned long long ft_bounds,
@@ -505,7 +520,7 @@ extern "C" __global__ void ft_reduce_virtual_grad(
         const unsigned long long end =
             static_cast<unsigned long long>(base_ft_in) + threat_pair_starts[pair + 1];
         for (unsigned long long feature = start; feature < end; ++feature) {
-            sum += gradient[feature * ft_out + column];
+            sum += ft_real_row_grad(gradient, active_rows, feature, ft_out, column);
         }
         gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
         return;
@@ -517,14 +532,15 @@ extern "C" __global__ void ft_reduce_virtual_grad(
         ? base_ft_in / piece_inputs
         : base_ft_in / (piece_inputs * nb);
     if (mode == 1) {
-        const unsigned long long king_stride =
-            static_cast<unsigned long long>(piece_inputs) * nb * ft_out;
+        const unsigned long long king_stride = static_cast<unsigned long long>(piece_inputs) * nb;
         for (unsigned int king_bucket = 0; king_bucket < king_buckets; ++king_bucket) {
             const unsigned long long base =
                 static_cast<unsigned long long>(king_bucket) * king_stride
-                + static_cast<unsigned long long>(piece) * nb * ft_out + column;
+                + static_cast<unsigned long long>(piece) * nb;
             for (unsigned int effect_bucket = 0; effect_bucket < nb; ++effect_bucket) {
-                sum += gradient[base + static_cast<unsigned long long>(effect_bucket) * ft_out];
+                sum += ft_real_row_grad(
+                    gradient, active_rows, base + effect_bucket, ft_out, column
+                );
             }
         }
         gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
@@ -532,11 +548,11 @@ extern "C" __global__ void ft_reduce_virtual_grad(
     }
 
     const unsigned long long row_stride = mode == 0
-        ? static_cast<unsigned long long>(piece_inputs) * ft_out
-        : static_cast<unsigned long long>(piece_inputs) * nb * ft_out;
+        ? static_cast<unsigned long long>(piece_inputs)
+        : static_cast<unsigned long long>(piece_inputs) * nb;
     const unsigned long long base = mode == 0
-        ? static_cast<unsigned long long>(piece) * ft_out + column
-        : (static_cast<unsigned long long>(piece) * nb + bucket) * ft_out + column;
+        ? static_cast<unsigned long long>(piece)
+        : static_cast<unsigned long long>(piece) * nb + bucket;
     float sum0 = 0.0F;
     float sum1 = 0.0F;
     float sum2 = 0.0F;
@@ -544,18 +560,56 @@ extern "C" __global__ void ft_reduce_virtual_grad(
     unsigned int king_bucket = 0;
     const unsigned int unroll_end = king_buckets > 3 ? king_buckets - 3 : 0;
     while (king_bucket < unroll_end) {
-        sum0 += gradient[base + static_cast<unsigned long long>(king_bucket) * row_stride];
-        sum1 += gradient[base + static_cast<unsigned long long>(king_bucket + 1) * row_stride];
-        sum2 += gradient[base + static_cast<unsigned long long>(king_bucket + 2) * row_stride];
-        sum3 += gradient[base + static_cast<unsigned long long>(king_bucket + 3) * row_stride];
+        const unsigned long long row = base + static_cast<unsigned long long>(king_bucket) * row_stride;
+        sum0 += ft_real_row_grad(gradient, active_rows, row, ft_out, column);
+        sum1 += ft_real_row_grad(gradient, active_rows, row + row_stride, ft_out, column);
+        sum2 += ft_real_row_grad(gradient, active_rows, row + 2 * row_stride, ft_out, column);
+        sum3 += ft_real_row_grad(gradient, active_rows, row + 3 * row_stride, ft_out, column);
         king_bucket += 4;
     }
     while (king_bucket < king_buckets) {
-        sum0 += gradient[base + static_cast<unsigned long long>(king_bucket) * row_stride];
+        sum0 += ft_real_row_grad(
+            gradient, active_rows, base + static_cast<unsigned long long>(king_bucket) * row_stride,
+            ft_out, column
+        );
         ++king_bucket;
     }
     sum = (sum0 + sum1) + (sum2 + sum3);
     gradient[(static_cast<unsigned long long>(ft_in) + virtual_row) * ft_out + column] = sum;
+}
+
+extern "C" __global__ void ft_reduce_virtual_grad(
+    float* gradient,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    ft_reduce_virtual_grad_impl(
+        gradient, nullptr, threat_pair_starts, threat_pair_starts_len, ft_bounds, ft_out,
+        piece_inputs, effect_bucket_factorize
+    );
+}
+
+extern "C" __global__ void ft_reduce_virtual_grad_active(
+    float* gradient,
+    unsigned long long,
+    const unsigned int* active_rows,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    ft_reduce_virtual_grad_impl(
+        gradient, active_rows, threat_pair_starts, threat_pair_starts_len, ft_bounds, ft_out,
+        piece_inputs, effect_bucket_factorize
+    );
 }
 
 extern "C" __global__ void loss_wrm(
@@ -1184,6 +1238,7 @@ __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     const unsigned int* positions,
     const unsigned int* offsets,
     float* weight_gradient,
+    const unsigned int* active_rows,
     unsigned int n_features,
     unsigned int ft_output,
     float inverse_gradient_scale
@@ -1191,6 +1246,9 @@ __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     const unsigned int feature = blockIdx.x;
     const unsigned int row = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= n_features || row >= ft_output) {
+        return;
+    }
+    if (active_rows != nullptr && active_rows[feature] == 0U) {
         return;
     }
     const unsigned int start = offsets[feature];
@@ -1249,7 +1307,28 @@ extern "C" __global__ void gather_and_sum_per_feature_overwrite_fp16(
     float inverse_gradient_scale
 ) {
     native_gather_and_sum_per_feature_fp16<false>(
-        output_gradient, positions, offsets, weight_gradient, n_features, ft_output,
+        output_gradient, positions, offsets, weight_gradient, nullptr, n_features, ft_output,
+        inverse_gradient_scale
+    );
+}
+
+extern "C" __global__ void gather_and_sum_per_feature_overwrite_fp16_active(
+    const __half* output_gradient,
+    unsigned long long,
+    const unsigned int* positions,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    const unsigned int* active_rows,
+    unsigned long long,
+    unsigned int n_features,
+    unsigned int ft_output,
+    float inverse_gradient_scale
+) {
+    native_gather_and_sum_per_feature_fp16<false>(
+        output_gradient, positions, offsets, weight_gradient, active_rows, n_features, ft_output,
         inverse_gradient_scale
     );
 }
@@ -1268,7 +1347,7 @@ extern "C" __global__ void gather_and_sum_per_feature_add_fp16(
     float inverse_gradient_scale
 ) {
     native_gather_and_sum_per_feature_fp16<true>(
-        output_gradient, positions, offsets, weight_gradient, n_features, ft_output,
+        output_gradient, positions, offsets, weight_gradient, nullptr, n_features, ft_output,
         inverse_gradient_scale
     );
 }
@@ -1535,8 +1614,14 @@ extern "C" __global__ void ranger_lookahead_lerp_fp16_mirror(
 // step. A factorizer comb reads virtual rows from `weights`, so the caller must finish the
 // virtual-row range before launching the real-row range with a comb output.
 //
+// With the active-row mask, rows below `active_row_count` whose `active_rows` entry is zero take
+// a zero gradient without reading `gradient`, and their gradient storage is left untouched: the
+// masked backward gather skips them, so they hold stale values. Rows at or above
+// `active_row_count` (factorizer virtual rows) always read the gradient.
+//
 // flags: bit 0 = FP16 moment storage, bit 1 = norm-loss, bit 2 = lookahead,
-// bits 4..5 = forward output (0 none, 1 FP16 mirror, 2 FP16 comb, 3 FP32 comb).
+// bit 3 = active-row mask, bits 4..5 = forward output (0 none, 1 FP16 mirror, 2 FP16 comb,
+// 3 FP32 comb).
 extern "C" __global__ void ft_fused_optimizer_step(
     float* weights,
     unsigned long long,
@@ -1550,6 +1635,8 @@ extern "C" __global__ void ft_fused_optimizer_step(
     unsigned long long,
     const float* norms,
     unsigned long long,
+    const unsigned int* active_rows,
+    unsigned long long active_row_count,
     void* forward_output,
     unsigned long long,
     const unsigned int* threat_pair_starts,
@@ -1592,7 +1679,10 @@ extern "C" __global__ void ft_fused_optimizer_step(
         w *= 1.0F - norm_learning_rate * correction;
     }
 
-    const float g = gradient[i];
+    const unsigned long long row = i / ft_out;
+    const bool gradient_live = (flags & 8U) == 0 || row >= active_row_count
+        || active_rows[row] != 0U;
+    const float g = gradient_live ? gradient[i] : 0.0F;
     const float rate = learning_rate * step_size;
     float p = w * (1.0F - decay * rate);
     float momentum;
@@ -1620,7 +1710,7 @@ extern "C" __global__ void ft_fused_optimizer_step(
         velocity_float[i] = velocity;
         // `radam_step` clears the gradient it consumed; the mirror variant
         // `radam_step_fp16_mirror` leaves it in place.
-        if (output_mode != 1U) {
+        if (output_mode != 1U && gradient_live) {
             gradient[i] = 0.0F;
         }
     }
@@ -1644,7 +1734,7 @@ extern "C" __global__ void ft_fused_optimizer_step(
         const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
         float folded = p;
         const unsigned long long partner = ft_fold_partner_index(
-            i / ft_out, column, threat_pair_starts, threat_pair_starts_len, base_ft_in, ft_in,
+            row, column, threat_pair_starts, threat_pair_starts_len, base_ft_in, ft_in,
             ft_out, piece_inputs, effect_bucket_factorize
         );
         if (partner != ~0ULL) {
@@ -2023,6 +2113,38 @@ extern "C" __global__ void build_feature_counts(
     }
 }
 
+// Sets `active_rows[feature] = 1` for every feature either perspective uses in the batch. The
+// caller zeroes `active_rows` first.
+extern "C" __global__ void mark_active_feature_rows(
+    const int* stm_indices,
+    unsigned long long,
+    const int* nstm_indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    unsigned int* active_rows,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int max_active,
+    unsigned int columns
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * max_active) {
+        return;
+    }
+    if (static_cast<int>(i % max_active) >= nonzero_counts[i / max_active]) {
+        return;
+    }
+    const int stm_feature = stm_indices[i];
+    if (stm_feature >= 0 && static_cast<unsigned int>(stm_feature) < columns) {
+        atomicOr(active_rows + stm_feature, 1U);
+    }
+    const int nstm_feature = nstm_indices[i];
+    if (nstm_feature >= 0 && static_cast<unsigned int>(nstm_feature) < columns) {
+        atomicOr(active_rows + nstm_feature, 1U);
+    }
+}
+
 extern "C" __global__ void prefix_sum_block_local(
     const unsigned int* counts,
     unsigned long long,
@@ -2139,6 +2261,7 @@ __device__ void gather_feature_gradient(
     const unsigned int* positions,
     const unsigned int* offsets,
     float* weight_gradient,
+    const unsigned int* active_rows,
     unsigned int feature_count,
     unsigned int ft_columns,
     bool add
@@ -2146,6 +2269,9 @@ __device__ void gather_feature_gradient(
     const unsigned int feature = blockIdx.x;
     const unsigned int output = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= feature_count || output >= ft_columns) {
+        return;
+    }
+    if (active_rows != nullptr && active_rows[feature] == 0U) {
         return;
     }
     const unsigned int start = offsets[feature];
@@ -2188,7 +2314,30 @@ extern "C" __global__ void gather_and_sum_per_feature_overwrite(
     unsigned int ft_columns
 ) {
     gather_feature_gradient(
-        output_gradient, positions, offsets, weight_gradient, feature_count, ft_columns, false
+        output_gradient, positions, offsets, weight_gradient, nullptr, feature_count, ft_columns,
+        false
+    );
+}
+
+// Overwrite gather that leaves rows with `active_rows[feature] == 0` untouched. Only valid when
+// every later reader of those rows treats them as zero (see `ft_fused_optimizer_step`).
+extern "C" __global__ void gather_and_sum_per_feature_overwrite_active(
+    const float* output_gradient,
+    unsigned long long,
+    const unsigned int* positions,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    const unsigned int* active_rows,
+    unsigned long long,
+    unsigned int feature_count,
+    unsigned int ft_columns
+) {
+    gather_feature_gradient(
+        output_gradient, positions, offsets, weight_gradient, active_rows, feature_count,
+        ft_columns, false
     );
 }
 
@@ -2205,7 +2354,8 @@ extern "C" __global__ void gather_and_sum_per_feature_add(
     unsigned int ft_columns
 ) {
     gather_feature_gradient(
-        output_gradient, positions, offsets, weight_gradient, feature_count, ft_columns, true
+        output_gradient, positions, offsets, weight_gradient, nullptr, feature_count, ft_columns,
+        true
     );
 }
 

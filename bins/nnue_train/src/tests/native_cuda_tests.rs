@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 73, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 77, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 89, "production kernel inventory changed");
+    assert_eq!(required.len(), 93, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3257,8 +3257,9 @@ fn assert_states_close(what: &str, actual: &[f32], expected: &[f32], relative: f
 
 /// `ft_fused_optimizer_step` と、norm-loss / RAdam / lookahead / fold を別々に launch する経路が
 /// 同じ学習状態 (master・moment・slow・device 上の mirror / comb・勾配 buffer) を作ることを、
-/// lookahead を跨ぐ step 数で確かめる。nstm 側 sparse backward の atomicAdd 順序で勾配が揺れる
-/// ため、bit 一致ではなく小さい相対 tolerance で比べる。
+/// lookahead を跨ぐ step 数で確かめる。2 種の batch を交互に流し、batch に出ない FT 行 (fused 経路は
+/// 勾配を書かず 0 として扱う) の集合を step ごとに変える。nstm 側 sparse backward の atomicAdd
+/// 順序で勾配が揺れるため、bit 一致ではなく小さい相対 tolerance で比べる。
 #[cfg(feature = "native")]
 #[test]
 fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::error::Error>> {
@@ -3349,15 +3350,27 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             "{name}: initial state differs"
         );
 
-        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
-        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
-            *bucket = (row % options.num_buckets) as i32;
-        }
-        batch.score.fill(70.0);
-        batch.wdl.fill(0.6);
-        for _ in 0..7 {
-            let _ = fused.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-            let _ = separate.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let ft_in = options.feature_set.ft_in() as i32;
+        let batches = [0, ft_in / 2].map(|shift| {
+            let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+            for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+                *bucket = (row % options.num_buckets) as i32;
+            }
+            for index in batch
+                .stm_indices
+                .iter_mut()
+                .chain(batch.nstm_indices.iter_mut())
+            {
+                *index = (*index + shift) % ft_in;
+            }
+            batch.score.fill(70.0);
+            batch.wdl.fill(0.6);
+            batch
+        });
+        for step in 0..7 {
+            let batch = batches[step % 2].as_ref();
+            let _ = fused.step(&batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let _ = separate.step(&batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
         }
         let (fused_steps, fused_groups) = fused.raw_checkpoint_state_to_host()?;
         let (separate_steps, separate_groups) = separate.raw_checkpoint_state_to_host()?;
