@@ -489,14 +489,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 77, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 78, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 93, "production kernel inventory changed");
+    assert_eq!(required.len(), 94, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3402,5 +3402,164 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             1.0e-4,
         );
     }
+    Ok(())
+}
+
+/// 融合 kernel が集めた列 2 乗和を host の f64 値と比べる。誤差は `norm_loss_reduce` と同じ分割
+/// (`cfg_norm_loss_reduce` の chunk ごとの f32 和) を host で再現した値の誤差以下であること。
+#[cfg(feature = "native")]
+#[test]
+fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let standard = LayerStackTestOptions::standard();
+    let all_optim = PrecisionFlags {
+        tf32: true,
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+    };
+    let configs = [
+        (
+            "plain-fp32",
+            standard.feature_set,
+            PrecisionFlags::default(),
+        ),
+        (
+            "hm-factorized-all-optim",
+            FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
+            all_optim,
+        ),
+        (
+            "threat-factorized-fp32",
+            standard
+                .feature_set
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_ft_factorize(),
+            PrecisionFlags::default(),
+        ),
+    ];
+    for (name, feature_set, precision) in configs {
+        let options = LayerStackTestOptions {
+            feature_set,
+            precision,
+            optimizer: OptimizerKind::Ranger,
+            norm_loss_factor: Some(1.0e-2),
+            ..standard
+        };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        assert!(trainer.ft_fused_norm_sums_to_host_for_test()?.is_none());
+        let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        let mut max_relative = 0.0_f64;
+        let mut max_reduce_relative = 0.0_f64;
+        for _ in 0..6 {
+            let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let sums = trainer
+                .ft_fused_norm_sums_to_host_for_test()?
+                .ok_or("fused step left no norm sums")?;
+            let (_, groups) = trainer.raw_checkpoint_state_to_host()?;
+            let (group, (weights, ..)) = &groups[0];
+            assert_eq!(*group, "ft_w");
+            let rows = weights.len() / options.ft_out;
+            let chunks = rows.div_ceil(1024).clamp(1, 64);
+            let mut expected = vec![0.0_f64; options.ft_out];
+            let mut reduce_chunks = vec![0.0_f32; options.ft_out * chunks];
+            for (index, &w) in weights.iter().enumerate() {
+                let (row, column) = (index / options.ft_out, index % options.ft_out);
+                expected[column] += f64::from(w) * f64::from(w);
+                reduce_chunks[column * chunks + row % chunks] += w * w;
+            }
+            for (column, (&got, &want)) in sums.iter().zip(&expected).enumerate() {
+                let relative = (got - want).abs() / want.max(f64::MIN_POSITIVE);
+                assert!(
+                    relative <= 1.0e-6,
+                    "{name}: column {column} squared sum {got} vs {want}"
+                );
+                max_relative = max_relative.max(relative);
+                let reduce: f32 = reduce_chunks[column * chunks..(column + 1) * chunks]
+                    .iter()
+                    .sum();
+                max_reduce_relative = max_reduce_relative
+                    .max((f64::from(reduce) - want).abs() / want.max(f64::MIN_POSITIVE));
+            }
+        }
+        eprintln!(
+            "{name}: max relative error of FT column squared sums: fused {max_relative:e}, \
+             reduce-order emulation {max_reduce_relative:e}"
+        );
+        assert!(
+            max_relative <= max_reduce_relative,
+            "{name}: fused squared sums are less precise than the reduce pass"
+        );
+    }
+    Ok(())
+}
+
+/// 重みの読み込み・従来経路の step・resume の後に古い列 2 乗和を使わないこと。古い norm の差が
+/// 重みに出るよう norm-loss 係数を大きくし、読み込む重みは 2 倍、resume は 2 倍前に戻す。
+#[cfg(feature = "native")]
+#[test]
+fn fused_ft_norms_follow_external_weight_writes() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions {
+        optimizer: OptimizerKind::Ranger,
+        norm_loss_factor: Some(1.0),
+        ..LayerStackTestOptions::standard()
+    };
+    let mut fused = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut separate = create_layerstack_trainer_with_options(&context, true, options)?;
+    separate.set_ft_fused_optimizer_enabled_for_test(false);
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    let step_both = |fused: &mut LayerStackGpuTrainer,
+                     separate: &mut LayerStackGpuTrainer|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let _ = fused.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let _ = separate.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        Ok(())
+    };
+    let assert_same_weights = |what: &str,
+                               fused: &LayerStackGpuTrainer,
+                               separate: &LayerStackGpuTrainer|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let (_, fused_groups) = fused.raw_checkpoint_state_to_host()?;
+        let (_, separate_groups) = separate.raw_checkpoint_state_to_host()?;
+        for ((group, a), (_, b)) in fused_groups.iter().zip(&separate_groups) {
+            assert_states_close(&format!("{what}: {group}.w"), &a.0, &b.0, 1.0e-5);
+        }
+        Ok(())
+    };
+    step_both(&mut fused, &mut separate)?;
+    step_both(&mut fused, &mut separate)?;
+    let checkpoint =
+        std::env::temp_dir().join(format!("tatara-fused-ft-norms-{}.ckpt", std::process::id()));
+    fused.save_raw_checkpoint(
+        &checkpoint,
+        1,
+        &nnue_train::trainer::CheckpointProducer::run_id_only("fused-ft-norms"),
+        None,
+    )?;
+
+    let mut weights = fused.to_layerstack_weights()?;
+    for w in &mut weights.ft_w {
+        *w *= 2.0;
+    }
+    fused.load_layerstack_weights(&weights)?;
+    separate.load_layerstack_weights(&weights)?;
+    assert!(fused.ft_fused_norm_sums_to_host_for_test()?.is_none());
+    step_both(&mut fused, &mut separate)?;
+    assert_same_weights("after weight load", &fused, &separate)?;
+
+    fused.set_ft_fused_optimizer_enabled_for_test(false);
+    step_both(&mut fused, &mut separate)?;
+    assert!(fused.ft_fused_norm_sums_to_host_for_test()?.is_none());
+    fused.set_ft_fused_optimizer_enabled_for_test(true);
+    step_both(&mut fused, &mut separate)?;
+    assert_same_weights("after separate step", &fused, &separate)?;
+
+    fused.load_raw_checkpoint(&checkpoint)?;
+    separate.load_raw_checkpoint(&checkpoint)?;
+    let _ = std::fs::remove_file(&checkpoint);
+    assert!(fused.ft_fused_norm_sums_to_host_for_test()?.is_none());
+    step_both(&mut fused, &mut separate)?;
+    assert_same_weights("after resume", &fused, &separate)?;
     Ok(())
 }

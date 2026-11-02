@@ -806,6 +806,19 @@ extern "C" __global__ void norm_loss_finalize(
     }
 }
 
+extern "C" __global__ void norm_loss_finalize_f64(
+    const double* sum_squared,
+    unsigned long long,
+    float* norms,
+    unsigned long long,
+    unsigned int n_groups
+) {
+    const unsigned int group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group < n_groups) {
+        norms[group] = static_cast<float>(sqrt(sum_squared[group]));
+    }
+}
+
 extern "C" __global__ void norm_loss_apply(
     float* weight,
     unsigned long long,
@@ -1614,6 +1627,13 @@ extern "C" __global__ void ranger_lookahead_lerp_fp16_mirror(
 // step. A factorizer comb reads virtual rows from `weights`, so the caller must finish the
 // virtual-row range before launching the real-row range with a comb output.
 //
+// The kernel is a grid-stride loop and the host sizes the grid so that the stride is a multiple
+// of `ft_out`: every thread stays on one column. With norm accumulation each thread adds the
+// squares of the weights it wrote to `column_sum_squared[column]` (zeroed by the caller), so the
+// next step's norms need no separate pass over the weights. The accumulator is `double` because
+// each column receives one atomic per thread; `float` atomics in that order lose about an order
+// of magnitude more precision than `norm_loss_reduce`.
+//
 // With the active-row mask, rows below `active_row_count` whose `active_rows` entry is zero take
 // a zero gradient without reading `gradient`, and their gradient storage is left untouched: the
 // masked backward gather skips them, so they hold stale values. Rows at or above
@@ -1621,7 +1641,7 @@ extern "C" __global__ void ranger_lookahead_lerp_fp16_mirror(
 //
 // flags: bit 0 = FP16 moment storage, bit 1 = norm-loss, bit 2 = lookahead,
 // bit 3 = active-row mask, bits 4..5 = forward output (0 none, 1 FP16 mirror, 2 FP16 comb,
-// 3 FP32 comb).
+// 3 FP32 comb), bit 6 = norm accumulation.
 extern "C" __global__ void ft_fused_optimizer_step(
     float* weights,
     unsigned long long,
@@ -1634,6 +1654,8 @@ extern "C" __global__ void ft_fused_optimizer_step(
     float* slow_weights,
     unsigned long long,
     const float* norms,
+    unsigned long long,
+    double* column_sum_squared,
     unsigned long long,
     const unsigned int* active_rows,
     unsigned long long active_row_count,
@@ -1664,87 +1686,92 @@ extern "C" __global__ void ft_fused_optimizer_step(
     float lookahead_alpha,
     unsigned int flags
 ) {
-    const unsigned long long i = element_begin
-        + static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= element_end) {
-        return;
-    }
     const bool half_state = (flags & 1U) != 0;
     const unsigned int output_mode = (flags >> 4) & 3U;
-    const unsigned int column = static_cast<unsigned int>(i % ft_out);
-
-    float w = weights[i];
-    if ((flags & 2U) != 0) {
-        const float correction = 2.0F * norm_factor * (1.0F - 1.0F / (norms[column] + norm_epsilon));
-        w *= 1.0F - norm_learning_rate * correction;
-    }
-
-    const unsigned long long row = i / ft_out;
-    const bool gradient_live = (flags & 8U) == 0 || row >= active_row_count
-        || active_rows[row] != 0U;
-    const float g = gradient_live ? gradient[i] : 0.0F;
-    const float rate = learning_rate * step_size;
-    float p = w * (1.0F - decay * rate);
-    float momentum;
-    float velocity;
-    if (half_state) {
-        __half* momentum_half = static_cast<__half*>(momentum_storage);
-        __half* velocity_half = static_cast<__half*>(velocity_storage);
-        const float previous_momentum = __half2float(momentum_half[i]) / momentum_scale;
-        const float previous_velocity = __half2float(velocity_half[i]) / velocity_scale;
-        momentum = beta1 * previous_momentum + (1.0F - beta1) * g;
-        velocity = beta2 * previous_velocity + (1.0F - beta2) * g * g;
-        float stored_momentum = momentum * momentum_scale;
-        stored_momentum = stored_momentum > 65504.0F
-            ? 65504.0F : (stored_momentum < -65504.0F ? -65504.0F : stored_momentum);
-        float stored_velocity = velocity * velocity_scale;
-        stored_velocity = stored_velocity > 65504.0F ? 65504.0F : stored_velocity;
-        momentum_half[i] = __float2half_rn(stored_momentum);
-        velocity_half[i] = __float2half_rn(stored_velocity);
-    } else {
-        float* momentum_float = static_cast<float*>(momentum_storage);
-        float* velocity_float = static_cast<float*>(velocity_storage);
-        momentum = beta1 * momentum_float[i] + (1.0F - beta1) * g;
-        velocity = beta2 * velocity_float[i] + (1.0F - beta2) * g * g;
-        momentum_float[i] = momentum;
-        velocity_float[i] = velocity;
-        // `radam_step` clears the gradient it consumed; the mirror variant
-        // `radam_step_fp16_mirror` leaves it in place.
-        if (output_mode != 1U && gradient_live) {
-            gradient[i] = 0.0F;
+    const bool accumulate_norms = (flags & 64U) != 0;
+    const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+    const unsigned long long first = element_begin
+        + static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int column = static_cast<unsigned int>(first % ft_out);
+    float thread_sum_squared = 0.0F;
+    for (unsigned long long i = first; i < element_end; i += stride) {
+        float w = weights[i];
+        if ((flags & 2U) != 0) {
+            const float correction = 2.0F * norm_factor * (1.0F - 1.0F / (norms[column] + norm_epsilon));
+            w *= 1.0F - norm_learning_rate * correction;
         }
-    }
-    float value = momentum;
-    if (use_variance_denom != 0) {
-        value /= sqrtf(velocity) + epsilon;
-    }
-    p -= rate * value;
-    p = p < min_weight ? min_weight : (p > max_weight ? max_weight : p);
 
-    if ((flags & 4U) != 0) {
-        p = lookahead_alpha * p + (1.0F - lookahead_alpha) * slow_weights[i];
-        slow_weights[i] = p;
-    }
-    weights[i] = p;
-
-    if (output_mode == 1U) {
-        static_cast<__half*>(forward_output)[i] = __float2half_rn(p);
-    } else if (output_mode >= 2U) {
-        const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
-        const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
-        float folded = p;
-        const unsigned long long partner = ft_fold_partner_index(
-            row, column, threat_pair_starts, threat_pair_starts_len, base_ft_in, ft_in,
-            ft_out, piece_inputs, effect_bucket_factorize
-        );
-        if (partner != ~0ULL) {
-            folded += weights[partner];
-        }
-        if (output_mode == 2U) {
-            static_cast<__half*>(forward_output)[i] = __float2half_rn(folded);
+        const unsigned long long row = i / ft_out;
+        const bool gradient_live = (flags & 8U) == 0 || row >= active_row_count
+            || active_rows[row] != 0U;
+        const float g = gradient_live ? gradient[i] : 0.0F;
+        const float rate = learning_rate * step_size;
+        float p = w * (1.0F - decay * rate);
+        float momentum;
+        float velocity;
+        if (half_state) {
+            __half* momentum_half = static_cast<__half*>(momentum_storage);
+            __half* velocity_half = static_cast<__half*>(velocity_storage);
+            const float previous_momentum = __half2float(momentum_half[i]) / momentum_scale;
+            const float previous_velocity = __half2float(velocity_half[i]) / velocity_scale;
+            momentum = beta1 * previous_momentum + (1.0F - beta1) * g;
+            velocity = beta2 * previous_velocity + (1.0F - beta2) * g * g;
+            float stored_momentum = momentum * momentum_scale;
+            stored_momentum = stored_momentum > 65504.0F
+                ? 65504.0F : (stored_momentum < -65504.0F ? -65504.0F : stored_momentum);
+            float stored_velocity = velocity * velocity_scale;
+            stored_velocity = stored_velocity > 65504.0F ? 65504.0F : stored_velocity;
+            momentum_half[i] = __float2half_rn(stored_momentum);
+            velocity_half[i] = __float2half_rn(stored_velocity);
         } else {
-            static_cast<float*>(forward_output)[i] = folded;
+            float* momentum_float = static_cast<float*>(momentum_storage);
+            float* velocity_float = static_cast<float*>(velocity_storage);
+            momentum = beta1 * momentum_float[i] + (1.0F - beta1) * g;
+            velocity = beta2 * velocity_float[i] + (1.0F - beta2) * g * g;
+            momentum_float[i] = momentum;
+            velocity_float[i] = velocity;
+            // `radam_step` clears the gradient it consumed; the mirror variant
+            // `radam_step_fp16_mirror` leaves it in place.
+            if (output_mode != 1U && gradient_live) {
+                gradient[i] = 0.0F;
+            }
         }
+        float value = momentum;
+        if (use_variance_denom != 0) {
+            value /= sqrtf(velocity) + epsilon;
+        }
+        p -= rate * value;
+        p = p < min_weight ? min_weight : (p > max_weight ? max_weight : p);
+
+        if ((flags & 4U) != 0) {
+            p = lookahead_alpha * p + (1.0F - lookahead_alpha) * slow_weights[i];
+            slow_weights[i] = p;
+        }
+        weights[i] = p;
+        thread_sum_squared += p * p;
+
+        if (output_mode == 1U) {
+            static_cast<__half*>(forward_output)[i] = __float2half_rn(p);
+        } else if (output_mode >= 2U) {
+            const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
+            const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
+            float folded = p;
+            const unsigned long long partner = ft_fold_partner_index(
+                row, column, threat_pair_starts, threat_pair_starts_len, base_ft_in, ft_in,
+                ft_out, piece_inputs, effect_bucket_factorize
+            );
+            if (partner != ~0ULL) {
+                folded += weights[partner];
+            }
+            if (output_mode == 2U) {
+                static_cast<__half*>(forward_output)[i] = __float2half_rn(folded);
+            } else {
+                static_cast<float*>(forward_output)[i] = folded;
+            }
+        }
+    }
+    if (accumulate_norms && thread_sum_squared != 0.0F) {
+        atomicAdd(column_sum_squared + column, static_cast<double>(thread_sum_squared));
     }
 }
 
