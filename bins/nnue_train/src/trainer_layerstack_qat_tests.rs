@@ -69,6 +69,76 @@ fn qat_trains_with_fp16_tf32_and_factorizer() -> TestResult {
     Ok(())
 }
 
+/// `qat_activation` が double 演算の定義 `floor(clamp(f64(x) * 127, 0, 127)) as f32 / 127` と
+/// bit 単位で同じ値を書くこと。格子点 `k / 127` の前後 1 ulp、範囲外、特殊値を含める。
+#[test]
+fn qat_activation_matches_double_definition() -> TestResult {
+    let ctx = CudaContext::new(0)?;
+    let t = trainer(&ctx, 128, false)?;
+    let mut values = vec![
+        0.0_f32,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::from_bits(1),
+        1.0,
+        -1.0,
+        1.5,
+        1000.0,
+        -1000.0,
+        f32::MAX,
+        f32::MIN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    for level in -2_i32..=130 {
+        let lattice = level as f32 / 127.0;
+        values.extend([
+            lattice,
+            f32::from_bits(lattice.to_bits().wrapping_sub(1)),
+            f32::from_bits(lattice.to_bits().wrapping_add(1)),
+            f32::from_bits(lattice.to_bits().wrapping_sub(2)),
+            f32::from_bits(lattice.to_bits().wrapping_add(2)),
+        ]);
+    }
+    let mut state = 0x2545_f491_u32;
+    for _ in 0..4096 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        values.push((state >> 8) as f32 / (1 << 23) as f32 * 1.25 - 0.1);
+    }
+    let expected: Vec<u32> = values
+        .iter()
+        .map(|&v| {
+            // CUDA `fmax(0.0, x)` は NaN と -0.0 に対して +0.0 を返す。
+            let scaled = f64::from(v) * 127.0;
+            let clamped = if scaled > 0.0 { scaled.min(127.0) } else { 0.0 };
+            (clamped.floor() as f32 / 127.0).to_bits()
+        })
+        .collect();
+    let buffer = DeviceBuffer::from_host(&t.stream, &values)?;
+    // SAFETY: `buffer` holds `values.len()` floats and lives until the read below.
+    unsafe {
+        cuda_launch! {
+            kernel: qat_activation, stream: t.stream, module: t.module,
+            config: cfg_1d(values.len()),
+            args: [slice(buffer), values.len() as u32]
+        }
+    }?;
+    let got = buffer.to_host_vec(&t.stream)?;
+    for ((&input, &want), out) in values.iter().zip(&expected).zip(got) {
+        assert_eq!(
+            out.to_bits(),
+            want,
+            "input {input:e} ({:#010x})",
+            input.to_bits()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn qat_activation_boundaries_and_main_ste() -> TestResult {
     let ctx = CudaContext::new(0)?;

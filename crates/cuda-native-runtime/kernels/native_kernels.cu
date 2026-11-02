@@ -110,12 +110,30 @@ extern "C" __global__ void qat_dense_wide(
     }
 }
 
+// `floor(clamp(x * 127, 0, 127)) / 127` evaluated in single precision without rounding the
+// product first. While `x * 127` is finite, `product` is its nearest float and `error`, from
+// `fmaf`, the exact remainder. Inside the unsaturated range, a `product` that is not an integer
+// floors like the exact value, because an integer between the two would have been the nearer
+// float, and an integer `product` exceeds the exact value only when `error` is negative. Outside
+// that range the correction may be lost to rounding or to an infinite / NaN `error`, but `level`
+// stays on the same side of the clamp, so the clamp gives the same endpoint. Clamping the floored
+// integer equals flooring the clamped value, and `fmaxf` returns +0 for NaN and for -0.
 extern "C" __global__ void qat_activation(
     float* x, unsigned long long,
     unsigned int n
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = static_cast<float>(floor(fmin(127.0, fmax(0.0, static_cast<double>(x[i]) * 127.0)))) / 127.0F;
+    if (i >= n) {
+        return;
+    }
+    const float value = x[i];
+    const float product = __fmul_rn(value, 127.0F);
+    const float error = fmaf(value, 127.0F, -product);
+    float level = floorf(product);
+    if (level == product && error < 0.0F) {
+        level -= 1.0F;
+    }
+    x[i] = fminf(127.0F, fmaxf(0.0F, level)) / 127.0F;
 }
 
 extern "C" __global__ void qat_l1_activation(
