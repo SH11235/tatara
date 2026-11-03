@@ -1198,9 +1198,10 @@ struct PsvWindow {
     next: usize,
 }
 
-/// Two-window producer/consumer reader. The producer fills the next raw PSV window while the
-/// decode workers consume the current one. `window_records` is per window, so resident raw PSV
-/// capacity is approximately `2 * window_records * 40` bytes.
+/// Two-window producer/consumer reader. The producer fills the next window of raw teacher
+/// records while the decode workers consume the current one. `window_records` is per window, and
+/// each record occupies `size_of::<TeacherRecord>()` bytes (41), so resident capacity is
+/// approximately `2 * window_records * 41` bytes.
 struct WindowedPsvReader {
     ready_rx: mpsc::Receiver<io::Result<PsvWindow>>,
     empty_tx: Option<mpsc::Sender<Vec<TeacherRecord>>>,
@@ -1404,7 +1405,7 @@ type BatchSlot = (Batch, Vec<i32>);
 ///   `Batch::push_decoded` (feature 抽出) と [`BucketMode::bucket_board`] の両方に
 ///   渡す。`pos.decode()` は 1 局面 1 回。
 /// - **並列パース**: worker は短い critical section (共有 reader を lock して
-///   `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
+///   `batch_size` 件の生 record を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
 ///   外で decode + 特徴抽出を並列に行う。windowed reader では窓境界で lock 保持の
 ///   まま次窓完成を待ち得る (`Drop` は共通 stop flag で先に入力を止める)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
@@ -1559,10 +1560,12 @@ impl BucketedPrefetchedLoader {
             num_buckets,
             monitor_active,
             reader,
+            path,
         ))
     }
 
-    /// Start decode workers for an already configured reader.
+    /// Start decode workers for an already configured reader. `data_path` is used only in
+    /// error messages.
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_reader(
         batch_size: usize,
@@ -1573,8 +1576,10 @@ impl BucketedPrefetchedLoader {
         num_buckets: usize,
         monitor_active: bool,
         reader: TrainingPsvReader,
+        data_path: &Path,
     ) -> Self {
         let num_workers = num_workers.max(1);
+        let data_path: Arc<Path> = Arc::from(data_path);
         let prefetch_depth = prefetch_depth_for(num_workers);
         // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
         // block しないようにする: result channel に最大 prefetch_depth、各 worker
@@ -1613,8 +1618,9 @@ impl BucketedPrefetchedLoader {
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
             let worker_stop = Arc::clone(&stop);
+            let data_path = Arc::clone(&data_path);
             let handle = thread::spawn(move || {
-                // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
+                // 各 worker 専有の生 record scratch (iteration をまたいで reuse)。
                 let mut scratch: Vec<TeacherRecord> = Vec::with_capacity(batch_size);
                 // batch-local な active-feature histogram (計装 on のときだけ確保)。
                 // batch 末に共有 `active_hist` へ一括加算 → 1 position ごとの lock を
@@ -1677,7 +1683,10 @@ impl BucketedPrefetchedLoader {
                             Ok(board) => board,
                             Err(e) => {
                                 // 壊れた HCPE record。下の max_active 超過と同じく学習を止める。
-                                failure = Some(e);
+                                failure = Some(io::Error::new(
+                                    e.kind(),
+                                    format!("corrupt record in {}: {e}", data_path.display()),
+                                ));
                                 break;
                             }
                         };

@@ -25,6 +25,19 @@ fn loader_contents(
     end_offset: u64,
     score_source: Option<ScoreSource<&Path>>,
 ) -> Vec<PositionRow> {
+    shuffled_loader_contents(path, batch_size, batches, end_offset, score_source, 0, None)
+}
+
+/// `shuffle_seed` が `Some` なら window を shuffle する。
+fn shuffled_loader_contents(
+    path: &Path,
+    batch_size: usize,
+    batches: usize,
+    end_offset: u64,
+    score_source: Option<ScoreSource<&Path>>,
+    buffer_mib: usize,
+    shuffle_seed: Option<u64>,
+) -> Vec<PositionRow> {
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
         path,
         batch_size,
@@ -38,9 +51,9 @@ fn loader_contents(
         end_offset,
         false,
         score_source,
-        0,
-        false,
-        0,
+        buffer_mib,
+        shuffle_seed.is_some(),
+        shuffle_seed.unwrap_or(0),
     )
     .unwrap();
     let mut out = Vec::new();
@@ -69,6 +82,18 @@ fn hcpe_training_stream_matches_psv_of_the_same_positions() {
     let hcpe = loader_contents(&fixture("sample.hcpe"), 25, 6, 100 * 38, None);
     assert_eq!(psv.len(), 150);
     assert_eq!(psv, hcpe);
+}
+
+#[test]
+fn hcpe_shuffle_window_matches_psv_with_the_same_seed() {
+    // 窓の局面数は形式によらず 40 byte 単位なので、同じ seed なら同じ並びになる。
+    let read =
+        |name: &str, end| shuffled_loader_contents(&fixture(name), 25, 8, end, None, 1, Some(7));
+    let psv = read("sample.psv", 100 * PSV_RECORD_BYTES);
+    let hcpe = read("sample.hcpe", 100 * 38);
+    assert_eq!(psv, hcpe);
+    let sequential = loader_contents(&fixture("sample.hcpe"), 25, 8, 100 * 38, None);
+    assert_ne!(hcpe, sequential, "the window must actually be shuffled");
 }
 
 #[test]
@@ -169,6 +194,10 @@ fn corrupt_hcpe_record_stops_the_loader() {
     drop(loader);
     let _ = std::fs::remove_file(&path);
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains(path.to_str().unwrap()),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]

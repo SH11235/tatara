@@ -87,6 +87,7 @@ fn spawn_controlled_reader(reader: TrainingPsvReader) -> BucketedPrefetchedLoade
         9,
         false,
         reader,
+        Path::new("teacher.psv"),
     )
 }
 

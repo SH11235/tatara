@@ -679,4 +679,41 @@ mod tests {
         assert_eq!(psv_batch.stm_indices, hcpe_batch.stm_indices);
         assert_eq!(psv_batch.nstm_indices, hcpe_batch.nstm_indices);
     }
+
+    #[test]
+    fn hcpe_tail_heldout_seeks_the_score_sidecar_by_record() {
+        let progress = ShogiProgressKPAbs;
+        let scores = std::env::temp_dir().join(format!(
+            "nnue-train-hcpe-tail-sidecar-{}.scores",
+            std::process::id()
+        ));
+        let replacement: Vec<u8> = (0..100_i16).flat_map(|i| (i * 3).to_le_bytes()).collect();
+        std::fs::write(&scores, &replacement).unwrap();
+        let load = |path: &Path, record_bytes: u64| {
+            HeldoutSet::load_from_range_with_score_sources(
+                path,
+                70 * record_bytes,
+                100 * record_bytes,
+                16,
+                None,
+                None,
+                16,
+                &progress,
+                test_spec(),
+                9,
+                Some(ScoreSource::Sidecar {
+                    scores: scores.as_path(),
+                    mask: None,
+                }),
+            )
+            .expect("load tail range with sidecar")
+        };
+        let psv = load(&sample_psv_path(), PSV_RECORD_BYTES);
+        let hcpe = load(&sample_psv_path().with_extension("hcpe"), 38);
+        let _ = std::fs::remove_file(&scores);
+        let expected: Vec<f32> = (70..86_i16).map(|i| f32::from(i * 3)).collect();
+        assert_eq!(hcpe.batches[0].0.score[..16], expected[..]);
+        assert_eq!(psv.batches[0].0.score, hcpe.batches[0].0.score);
+        assert_eq!(psv.batches[0].0.stm_indices, hcpe.batches[0].0.stm_indices);
+    }
 }
