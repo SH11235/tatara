@@ -1612,122 +1612,67 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
     }
 }
 
-/// Sorted layout 版 [`dense_mm_fwd_bucket_tiled_l1`]。caller が batch を bucket で
-/// sort 済かつ各 bucket の sorted 開始 offset が `TILE_B = 16` 境界に align 済
-/// (`exclusive_scan_aligned` 経由) を保証する前提。block 内全 TILE_B = 16 row は同一 bucket
-/// (uniform-by-construction、boundary block は存在しない)、per-K-tile の W_TILE shared-mem
-/// は 1 bucket 分 (16 oi × 16 k、shared は bank conflict 回避で row stride 17) のみ load する
-/// 分岐なし実装。sorted padding 行は
-/// `bucket_idx = -1` で kernel が y=0 を書き、後段の inverse permute が perm=-1 sentinel で
-/// skip して original 配列には戻らない。
-///
-/// `out_dim` は `TILE_OUT = 16` 幅の out-tile に分割し、各 out-tile を `blockIdx_y` で
-/// 受ける (grid_dim_y = `ceil(out_dim / 16)`)。1 block = 1 (batch-tile, out-tile)。
-/// `out_dim` が 16 の倍数でないとき末尾 out-tile は `oi_ok` guard で部分書き込み。
-///
-/// 数値同等性: per-row independent (k=0..15 加算順保持) で baseline と bit-exact、
-/// sort stability 不要。`in_dim % 16 == 0` / `batch % 16 == 0` / `num_buckets <= 9` /
-/// `grid_dim_y == ceil(out_dim/16)` は caller 契約。
+/// bucket で sort 済 (各 bucket の sorted 開始 offset が 16 行境界に align 済) の行について、
+/// per-bucket L1 層と L1 shared 層を合わせた
+/// `l1_total = (bias + x · w[bucket]) + ((x · shared_w) + shared_bias)` を
+/// `perm[sorted_row]` の元の行へ書く。block 内の 16 行は同じ bucket (先頭行の bucket) を使う。bucket の項は k 昇順の 1 本の累積で、無効な bucket の
+/// 行 (sorted bin の末尾) は bucket の項を 0 として shared の項だけを持つ。padding 行
+/// (`perm < 0`) は書かない。`shared_w` は `[in_dim][out_dim]` row-major。
+/// 起動形状は sorted kernel と同じ (grid = (batch/16, ceil(out_dim/16))、256 thread)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
-pub fn dense_mm_fwd_bucket_tiled_l1_sorted(
+pub fn dense_mm_fwd_l1_with_shared_sorted(
     x: &[f32],
     w: &[f32],
     bias: &[f32],
+    shared_w: &[f32],
+    shared_bias: &[f32],
     bucket_idx: &[i32],
-    mut y: DisjointSlice<f32>,
+    perm: &[i32],
+    y: &[f32],
     batch: u32,
     in_dim: u32,
     out_dim: u32,
     num_buckets: u32,
 ) {
-    static mut X_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
-    // W_TILE[oi_local][k] は row stride 17 で pad する。reduction の FMA read
-    // `W_TILE[tid_o * 17 + k]` は tid_o (output-index) が warp 内で変化するため、stride 16 だと
-    // 16 lane が 2 bank に集中して 8-way bank conflict になる。stride 17 で 16 bank に散る。
-    static mut W_TILE: SharedArray<f32, 272> = SharedArray::UNINIT; // 1 bucket × 16 oi × (16 k + 1 pad)
-
     let tid_local = thread::threadIdx_x() as usize;
-    let block_b = thread::blockIdx_x() as usize;
-    let out_tile = thread::blockIdx_y() as usize;
-    let tid_b = tid_local >> 4;
-    let tid_o = tid_local & 15;
-    let b_start = block_b << 4;
-    let global_bi = b_start + tid_b;
-    let global_oi = (out_tile << 4) + tid_o;
-
+    let b_start = (thread::blockIdx_x() as usize) << 4;
+    let row = b_start + (tid_local >> 4);
+    let oi = ((thread::blockIdx_y() as usize) << 4) + (tid_local & 15);
     let in_dim_u = in_dim as usize;
     let out_dim_u = out_dim as usize;
-    let batch_u = batch as usize;
-    let bi_ok = global_bi < batch_u;
-    let oi_ok = global_oi < out_dim_u;
-
-    // aligned sorted layout 前提で block は uniform-by-construction。b_start の bucket を
-    // 代表 = 全 row 共通 bucket。padding 行 / 終端 block は bucket = -1 で skip。
-    let block_buc = if b_start < batch_u {
-        bucket_idx[b_start]
-    } else {
-        -1_i32
-    };
-    let block_buc_ok = block_buc >= 0 && (block_buc as u32) < num_buckets;
-    let block_buc_u = if block_buc_ok { block_buc as usize } else { 0 };
-
-    let bias_init = if bi_ok && oi_ok && block_buc_ok {
-        bias[block_buc_u * out_dim_u + global_oi]
-    } else {
-        0.0_f32
-    };
-    let mut acc: f32 = bias_init;
-
-    let n_k_tiles = in_dim_u >> 4;
-    let mut k_tile: usize = 0;
-    while k_tile < n_k_tiles {
-        let k_start = k_tile << 4;
-        unsafe {
-            let bb = b_start + tid_b;
-            let kk = k_start + tid_o;
-            X_TILE[tid_local] = if bb < batch_u && kk < in_dim_u {
-                x[bb * in_dim_u + kk]
-            } else {
-                0.0_f32
-            };
-        }
-        unsafe {
-            let oi_local = tid_b;
-            let k_local = tid_o;
-            let kk = k_start + k_local;
-            let oi_global = (out_tile << 4) + oi_local;
-            let val = if block_buc_ok && oi_global < out_dim_u && kk < in_dim_u {
-                w[block_buc_u * out_dim_u * in_dim_u + oi_global * in_dim_u + kk]
-            } else {
-                0.0_f32
-            };
-            W_TILE[oi_local * 17 + k_local] = val;
-        }
-        thread::sync_threads();
-
-        if bi_ok && oi_ok && block_buc_ok {
-            let mut k: usize = 0;
-            while k < 16 {
-                unsafe {
-                    acc += X_TILE[(tid_b << 4) | k] * W_TILE[tid_o * 17 + k];
-                }
-                k += 1;
-            }
-        }
-        thread::sync_threads();
-        k_tile += 1;
+    if row >= batch as usize || oi >= out_dim_u {
+        return;
     }
-
-    if bi_ok && oi_ok {
-        // out-tile を grid に展開したため cell index は thread::index_1d() と一致しない。
-        // 各 thread は disjoint な (global_bi, global_oi) cell を担当するので raw ptr write。
-        // SAFETY: global_bi < batch、global_oi < out_dim ⇒ cell_idx < y.len() (= batch*out_dim)。
-        let cell_idx = global_bi * out_dim_u + global_oi;
-        let val = if block_buc_ok { acc } else { 0.0_f32 };
-        unsafe {
-            *y.as_mut_ptr().add(cell_idx) = val;
+    let dst_row = perm[row];
+    if dst_row < 0 {
+        return;
+    }
+    let block_buc = bucket_idx[b_start];
+    let x_base = row * in_dim_u;
+    let mut acc = 0.0_f32;
+    if block_buc >= 0 && (block_buc as u32) < num_buckets {
+        let g = block_buc as usize;
+        let w_base = (g * out_dim_u + oi) * in_dim_u;
+        acc = bias[g * out_dim_u + oi];
+        let mut k: usize = 0;
+        while k < in_dim_u {
+            acc += x[x_base + k] * w[w_base + k];
+            k += 1;
         }
+    }
+    let mut shared_acc = 0.0_f32;
+    let mut k: usize = 0;
+    while k < in_dim_u {
+        shared_acc += x[x_base + k] * shared_w[k * out_dim_u + oi];
+        k += 1;
+    }
+    let shared_term = shared_acc + shared_bias[oi];
+    // SAFETY: caller 契約で非 padding の `perm` は元の行 (< `y` の行数) への単射、`oi < out_dim`。
+    // 各 thread は disjoint な (dst_row, oi) cell を書く。
+    unsafe {
+        let dst = y.as_ptr().add((dst_row as usize) * out_dim_u + oi) as *mut f32;
+        *dst = acc + shared_term;
     }
 }
 

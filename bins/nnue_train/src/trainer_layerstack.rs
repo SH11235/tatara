@@ -583,37 +583,46 @@ impl GpuTrainer {
         Ok(gradient.to_host_vec(&self.stream)?)
     }
 
-    /// The last FP32 forward's per-bucket L1 output in original row order, and the same product
-    /// recomputed by the unsorted per-thread `dense_mm_fwd_bucket`, as `(production bits,
-    /// reference bits, nonzero production cells)`.
+    /// The last forward's `l1_total`, and a host recomputation that adds each term in ascending
+    /// input order with `f32::mul_add`: `(bias + x . w[bucket]) + ((x . shared_w) + shared bias)`,
+    /// with 0 for the bucket term of an invalid bucket. Returned as `(production bits, reference
+    /// bits, nonzero production cells)`.
     #[cfg(all(test, feature = "native"))]
-    pub(crate) fn l1_bucket_unsorted_reference_bits_for_test(
+    pub(crate) fn l1_total_sequential_reference_bits_for_test(
         &self,
         b: usize,
     ) -> Result<BitsCompareTestState, Box<dyn std::error::Error>> {
         let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
-        let reference = DeviceBuffer::<f32>::zeroed(&self.stream, b * l1_out)?;
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: dense_mm_fwd_bucket,
-                stream: self.stream, module: self.module,
-                config: cfg_1d(b * l1_out),
-                args: [slice(self.ws.combined), slice(self.l1_w), slice(self.l1_b),
-                       slice(self.ws.bucket_idx_dev), slice(reference), b as u32,
-                       ft_out as u32, l1_out as u32, self.num_buckets as u32]
+        let x = self.ws.combined.to_host_vec(&self.stream)?;
+        let w = self.l1_w.to_host_vec(&self.stream)?;
+        let bias = self.l1_b.to_host_vec(&self.stream)?;
+        let shared_w = self.l1_shared_weight.to_host_vec(&self.stream)?;
+        let shared_bias = self.l1_shared_bias.to_host_vec(&self.stream)?;
+        let buckets = self.ws.bucket_idx_dev.to_host_vec(&self.stream)?;
+        let production = self.ws.l1_total.to_host_vec(&self.stream)?[..b * l1_out].to_vec();
+        let mut reference = Vec::with_capacity(b * l1_out);
+        for row in 0..b {
+            let x = &x[row * ft_out..(row + 1) * ft_out];
+            let bucket = usize::try_from(buckets[row])
+                .ok()
+                .filter(|&g| g < self.num_buckets);
+            for o in 0..l1_out {
+                let bucket_term = bucket.map_or(0.0_f32, |g| {
+                    let w = &w[(g * l1_out + o) * ft_out..][..ft_out];
+                    x.iter()
+                        .zip(w)
+                        .fold(bias[g * l1_out + o], |acc, (&xi, &wi)| xi.mul_add(wi, acc))
+                });
+                let shared = x.iter().enumerate().fold(0.0_f32, |acc, (k, &xi)| {
+                    xi.mul_add(shared_w[k * l1_out + o], acc)
+                });
+                reference.push((bucket_term + (shared + shared_bias[o])).to_bits());
             }
-        }?;
-        let production = self.ws.l1_bucket.to_host_vec(&self.stream)?[..b * l1_out].to_vec();
+        }
         let nonzero = production.iter().filter(|&&v| v != 0.0).count();
         Ok((
             production.iter().map(|v| v.to_bits()).collect(),
-            reference
-                .to_host_vec(&self.stream)?
-                .iter()
-                .map(|v| v.to_bits())
-                .collect(),
+            reference,
             nonzero,
         ))
     }
@@ -3443,6 +3452,38 @@ impl GpuTrainer {
         Ok(result.loss)
     }
 
+    /// FP32 L1 forward of the per-bucket and shared layers into `l1_total` (original row order),
+    /// reading the bucket-sorted `combined_sorted` and permutation built by the same forward.
+    fn launch_l1_fwd_with_shared_sorted(
+        &self,
+        padded_b: usize,
+        n_out_tiles: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        debug_assert!(padded_b.is_multiple_of(16) && ft_out.is_multiple_of(16));
+        // SAFETY: `combined_sorted` holds `padded_b * ft_out` floats and the sorted bucket /
+        // permutation arrays `padded_b` entries; every non-padding permutation entry is a row
+        // below the real batch, which `l1_total` (`batch * l1_out`) covers. The weights match
+        // `l1_w` `[num_buckets, l1_out, ft_out]` and `l1_shared_weight` `[ft_out, l1_out]`.
+        unsafe {
+            cuda_launch! {
+                kernel: dense_mm_fwd_l1_with_shared_sorted,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: ((padded_b / 16) as u32, n_out_tiles as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(self.ws.combined_sorted), slice(self.l1_w), slice(self.l1_b),
+                       slice(self.l1_shared_weight), slice(self.l1_shared_bias),
+                       slice(self.ws.bucket_idx_sorted_dev), slice(self.ws.bucket_perm_dev),
+                       slice(self.ws.l1_total), padded_b as u32, ft_out as u32,
+                       l1_out as u32, self.num_buckets as u32]
+            }
+        }?;
+        Ok(())
+    }
+
     /// tf32 per-bucket cuBLAS 経路が使う、各 bucket の sorted 開始行と real row 数を host
     /// で求める。device の `count_buckets` + `exclusive_scan_aligned` (align 16) と同一手順で
     /// `batch.bucket_idx` (original order、有効値 `[0, num_buckets)`) を走査するため、結果は
@@ -3886,13 +3927,11 @@ impl GpuTrainer {
         prof_tick!("fwd_ftpost");
 
         // Forward L1 (per-bucket dense)。bucket sort で row を bucket_idx 昇順に並べ替え、
-        // 各 bucket の sorted 開始 offset を TILE_B=16 境界に align してから
-        // `dense_mm_fwd_bucket_tiled_l1_sorted` を 1-bucket-per-block で走らせ (per-K-tile の
-        // W_TILE shared-mem load は 1 bucket 分のみ)、inverse permute で `l1_bucket` を
-        // original order に戻す。出力次元 `l1_out` は 16 幅の out-tile (grid_y = n_out_tiles)
-        // で消化するため任意の値に対応する。
-        // 数値同等性: fwd_L1 は per-row independent (k 加算順保持) のため baseline と bit-exact、
-        // sort stability に依らない。
+        // 各 bucket の sorted 開始 offset を TILE_B=16 境界に align する。FP32 は
+        // `dense_mm_fwd_l1_with_shared_sorted` を 1-bucket-per-block で走らせ、L1 shared 層と
+        // 合わせた `l1_total` を元の行順へ直接書く。出力次元 `l1_out` は 16 幅の out-tile
+        // (grid_y = n_out_tiles) で消化するため任意の値に対応する。
+        // 数値同等性: per-row independent (k 加算順保持) のため sort stability に依らない。
         let padded_b = padded_sort_batch(b, self.num_buckets);
         debug_assert!(
             ft_out.is_multiple_of(16)
@@ -3981,67 +4020,47 @@ impl GpuTrainer {
         // kernel below, so the floating L1 / L1-shared products would only be overwritten.
         // Steps a) and b) still run: backward reads `combined_sorted` and the permutation.
         let qat_l1 = cfg!(feature = "native") && self.qat_mode != crate::qat::QatMode::Off;
-        if !qat_l1 {
-            // c) sorted fwd_L1 → l1_bucket_sorted。`self.tf32` で per-bucket cuBLAS Sgemm と
-            // 手書き tiled kernel を分岐する。手書き kernel は bias を fuse するが、cuBLAS は
-            // matmul のみなので step e) で bias を別 pass する。
-            if self.tf32 {
-                // cuBLAS 経路は有効 bucket segment のみ上書きするため、invalid bucket や segment 外の
-                // sorted 行には前 step の値が残る。手書き kernel 経路は同じ行を 0 で埋めるので、
-                // inverse-scatter (d) 後の l1_bucket を両経路で一致させるため出力を 0 初期化する。
-                memset_zero(&self.stream, &self.ws.l1_bucket_sorted)?;
-                // bucket g の real row `[row0, row0 + count)` は 16-align 済で combined_sorted 上に
-                // 連続する (segment は host で device と同一手順に算出、GPU 同期なし)。
-                let segs = bucket_segments;
-                let combined_base = self.ws.combined_sorted.cu_deviceptr() as *const f32;
-                let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
-                let out_base = self.ws.l1_bucket_sorted.cu_deviceptr() as *mut f32;
-                for (g, &(row0, m)) in segs.iter().enumerate().take(self.num_buckets) {
-                    if m == 0 {
-                        continue;
-                    }
-                    let row0 = row0 as usize;
-                    // C[m, l1_out] = combined_sorted[row0.., ft_out] @ l1_w[g][l1_out, ft_out]^T
-                    // (reduce 軸 ft_out)。w[g] は `[l1_out, ft_out]` row-major で offset
-                    // `g * l1_out * ft_out`。beta=0 overwrite。
-                    // SAFETY: 全 pointer は cudaMalloc 由来の base + element offset で、offset は
-                    // real row / weight slab の範囲内 (row0 + m <= padded_b、g < num_buckets)。
-                    // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行。
-                    unsafe {
-                        self.cublas.sgemm_x_yt_rowmajor(
-                            m as i32,      // rows in bucket g
-                            l1_out as i32, // n = out_dim
-                            ft_out as i32, // k = in_dim (reduce)
-                            combined_base.add(row0 * ft_out),
-                            l1w_base.add(g * l1_out * ft_out),
-                            out_base.add(row0 * l1_out),
-                        )?;
-                    }
+        // FP32 without the integer QAT L1 computes the per-bucket and shared L1 products and their
+        // sum in one kernel from `combined_sorted`, writing `l1_total` in the original row order.
+        // Backward reads only `l1_total`, so `l1_bucket` / `l1_shared_out` are not materialized.
+        let fused_l1 = !qat_l1 && !self.tf32;
+        if fused_l1 {
+            self.launch_l1_fwd_with_shared_sorted(padded_b, n_out_tiles)?;
+            prof_tick!("fwd_L1");
+        } else if !qat_l1 {
+            // c) TF32: sorted fwd_L1 → l1_bucket_sorted を per-bucket cuBLAS Sgemm で計算する。
+            // cuBLAS は matmul のみなので step e) で bias を別 pass する。
+            // cuBLAS は有効 bucket segment のみ上書きするため、invalid bucket や segment 外の
+            // sorted 行には前 step の値が残る。inverse-scatter (d) 後の l1_bucket で invalid
+            // bucket の行を 0 にするため出力を 0 初期化する。
+            memset_zero(&self.stream, &self.ws.l1_bucket_sorted)?;
+            // bucket g の real row `[row0, row0 + count)` は 16-align 済で combined_sorted 上に
+            // 連続する (segment は host で device と同一手順に算出、GPU 同期なし)。
+            let segs = bucket_segments;
+            let combined_base = self.ws.combined_sorted.cu_deviceptr() as *const f32;
+            let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
+            let out_base = self.ws.l1_bucket_sorted.cu_deviceptr() as *mut f32;
+            for (g, &(row0, m)) in segs.iter().enumerate().take(self.num_buckets) {
+                if m == 0 {
+                    continue;
                 }
-            } else {
-                // grid = (padded_b/16 batch-tile, n_out_tiles out-tile)、各 block uniform-bucket 保証。
+                let row0 = row0 as usize;
+                // C[m, l1_out] = combined_sorted[row0.., ft_out] @ l1_w[g][l1_out, ft_out]^T
+                // (reduce 軸 ft_out)。w[g] は `[l1_out, ft_out]` row-major で offset
+                // `g * l1_out * ft_out`。beta=0 overwrite。
+                // SAFETY: 全 pointer は cudaMalloc 由来の base + element offset で、offset は
+                // real row / weight slab の範囲内 (row0 + m <= padded_b、g < num_buckets)。
+                // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行。
                 unsafe {
-                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                    // stream の完了を待つ同期点まで生存する device allocation。
-                    cuda_launch! {
-                        kernel: dense_mm_fwd_bucket_tiled_l1_sorted,
-                        stream: self.stream,
-                        module: self.module,
-                        config: LaunchConfig {
-                            grid_dim: ((padded_b / 16) as u32, n_out_tiles as u32, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        args: [
-                            slice(self.ws.combined_sorted),
-                            slice(self.l1_w),
-                            slice(self.l1_b),
-                            slice(self.ws.bucket_idx_sorted_dev),
-                            slice_mut(self.ws.l1_bucket_sorted),
-                            padded_b as u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
-                        ]
-                    }
-                }?;
+                    self.cublas.sgemm_x_yt_rowmajor(
+                        m as i32,      // rows in bucket g
+                        l1_out as i32, // n = out_dim
+                        ft_out as i32, // k = in_dim (reduce)
+                        combined_base.add(row0 * ft_out),
+                        l1w_base.add(g * l1_out * ft_out),
+                        out_base.add(row0 * l1_out),
+                    )?;
+                }
             }
 
             // d) l1_bucket_sorted を perm で inverse-scatter → l1_bucket (original order)。
@@ -4062,27 +4081,24 @@ impl GpuTrainer {
                 }
             }?;
 
-            // e) tf32 経路のみ: original order の l1_bucket に per-bucket bias を足す
-            // (手書き kernel は fuse 済なので non-tf32 経路では不要)。bucket_idx_dev は
+            // e) original order の l1_bucket に per-bucket bias を足す。bucket_idx_dev は
             // original order の bucket、l1_b は `[num_buckets, l1_out]` row-major。
-            if self.tf32 {
-                unsafe {
-                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                    // stream の完了を待つ同期点まで生存する device allocation。
-                    cuda_launch! {
-                        kernel: bias_add_per_bucket_row,
-                        stream: self.stream,
-                        module: self.module,
-                        config: cfg_1d(b * l1_out),
-                        args: [
-                            slice(self.l1_b),
-                            slice(self.ws.bucket_idx_dev),
-                            slice_mut(self.ws.l1_bucket),
-                            b_u32, l1_out as u32, self.num_buckets as u32
-                        ]
-                    }
-                }?;
-            }
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_add_per_bucket_row,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.l1_b),
+                        slice(self.ws.bucket_idx_dev),
+                        slice_mut(self.ws.l1_bucket),
+                        b_u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
 
             prof_tick!("fwd_L1");
 

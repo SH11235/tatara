@@ -1420,13 +1420,14 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// 16-aligned bucket sort + sorted fwd_L1 + inverse permute の合成 pipeline が
-/// `dense_mm_fwd_bucket_cpu` と一致することを確認。fwd_L1 は per-row independent
-/// (k=0..15 加算順保持) で sort stability に依らない。一致は相対 tolerance で判定する:
+/// 16-aligned bucket sort + sorted fwd_L1 (bucket 層 + L1 shared 層、元の行順へ直接書く) の
+/// 合成 pipeline が `dense_mm_fwd_bucket_cpu` + shared 層の CPU 計算と一致することを確認。
+/// fwd_L1 は per-row independent で sort stability に依らない。無効な bucket の行は shared 層の
+/// 項だけを持つ。一致は相対 tolerance で判定する:
 /// 同一 PTX でも GPU 世代ごとに JIT 後 SASS の FMA 丸めが ~1 ULP 異なり、bit-exact 一致は
 /// 開発・検証した特定の GPU 世代でのみ成立するため。
 #[test]
-fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+fn bucket_sort_fwd_l1_with_shared_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // out_dim は 16 幅 out-tile (grid_y) で消化する。16 / 16 倍数 / 非倍数を網羅。
     for &(batch, in_dim, out_dim) in &[
@@ -1435,6 +1436,7 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         (48, 96, 24),
         (64, 32, 8),
         (32, 48, 17),
+        (48, 208, 16),
     ] {
         let nb = DEFAULT_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
@@ -1443,21 +1445,46 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             .map(|i| i as f32 * 0.0007 + 0.05)
             .collect();
         let bias: Vec<f32> = (0..nb * out_dim).map(|i| i as f32 * 0.02 - 1.0).collect();
+        let shared_w: Vec<f32> = (0..in_dim * out_dim)
+            .map(|i| i as f32 * -0.0005 + 0.03)
+            .collect();
+        let shared_bias: Vec<f32> = (0..out_dim).map(|i| i as f32 * 0.015 - 0.1).collect();
         let bucket_idx = bucket_idx_with_padding(batch, nb);
 
-        let mut y_cpu = vec![0.0_f32; batch * out_dim];
-        dense_mm_fwd_bucket_cpu(
-            &x,
-            &w,
-            &bias,
-            &bucket_idx,
-            &mut y_cpu,
-            batch,
-            in_dim,
-            out_dim,
-            nb,
-        );
+        // f64 reference and the per-cell sum of term magnitudes. An f32 sum of `n` terms in any
+        // order is within `n * eps * sum |term|` of the exact value; with cancellation that sum can
+        // be far larger than the result, so a bound relative to the result alone does not hold.
+        let mut y_ref = vec![0.0_f64; batch * out_dim];
+        let mut magnitude = vec![0.0_f64; batch * out_dim];
+        for row in 0..batch {
+            let bucket = usize::try_from(bucket_idx[row]).ok().filter(|&g| g < nb);
+            for o in 0..out_dim {
+                let (mut value, mut size) = (0.0_f64, 0.0_f64);
+                if let Some(g) = bucket {
+                    value = f64::from(bias[g * out_dim + o]);
+                    size = value.abs();
+                    for k in 0..in_dim {
+                        let term = f64::from(x[row * in_dim + k])
+                            * f64::from(w[(g * out_dim + o) * in_dim + k]);
+                        value += term;
+                        size += term.abs();
+                    }
+                }
+                value += f64::from(shared_bias[o]);
+                size += f64::from(shared_bias[o]).abs();
+                for k in 0..in_dim {
+                    let term =
+                        f64::from(x[row * in_dim + k]) * f64::from(shared_w[k * out_dim + o]);
+                    value += term;
+                    size += term.abs();
+                }
+                y_ref[row * out_dim + o] = value;
+                magnitude[row * out_dim + o] = size;
+            }
+        }
 
+        let shared_w_dev = DeviceBuffer::from_host(&stream, &shared_w)?;
+        let shared_bias_dev = DeviceBuffer::from_host(&stream, &shared_bias)?;
         let x_dev = DeviceBuffer::from_host(&stream, &x)?;
         let w_dev = DeviceBuffer::from_host(&stream, &w)?;
         let bias_dev = DeviceBuffer::from_host(&stream, &bias)?;
@@ -1469,7 +1496,6 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let perm_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
         let bidx_sorted_dev = DeviceBuffer::<i32>::zeroed(&stream, padded)?;
         let mut x_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * in_dim)?;
-        let mut y_sorted_dev = DeviceBuffer::<f32>::zeroed(&stream, padded * out_dim)?;
         let y_dev = DeviceBuffer::<f32>::zeroed(&stream, batch * out_dim)?;
 
         memset_minus_one_i32(&stream, &perm_dev)?;
@@ -1518,34 +1544,30 @@ fn bucket_sort_fwd_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: dense_mm_fwd_bucket_tiled_l1_sorted, stream: stream, module: module,
+                kernel: dense_mm_fwd_l1_with_shared_sorted, stream: stream, module: module,
                 config: LaunchConfig {
                     grid_dim: ((padded / 16) as u32, n_out_tiles as u32, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 },
-                args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(bidx_sorted_dev),
-                       slice_mut(y_sorted_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
-            }
-        }?;
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: inverse_permute_rows_f32, stream: stream, module: module,
-                config: cfg_1d(padded * out_dim),
-                args: [slice(y_sorted_dev), slice(perm_dev), slice(y_dev),
-                       padded as u32, out_dim as u32]
+                args: [slice(x_sorted_dev), slice(w_dev), slice(bias_dev), slice(shared_w_dev),
+                       slice(shared_bias_dev), slice(bidx_sorted_dev), slice(perm_dev),
+                       slice(y_dev), padded as u32, in_dim as u32, out_dim as u32, nb as u32]
             }
         }?;
         stream.synchronize()?;
 
-        assert_close_rel(
-            &format!("bucket_sort_fwd_l1 b={batch} in={in_dim}"),
-            &y_dev.to_host_vec(&stream)?,
-            &y_cpu,
-            TOL_FMA,
-        );
+        let y_gpu = y_dev.to_host_vec(&stream)?;
+        for (i, &got) in y_gpu.iter().enumerate() {
+            let diff = (f64::from(got) - y_ref[i]).abs();
+            let bound = (2 * in_dim + 2) as f64 * f64::from(f32::EPSILON) * magnitude[i];
+            assert!(
+                diff <= bound,
+                "bucket_sort_fwd_l1 b={batch} in={in_dim} out={out_dim}[{i}]: gpu={got} \
+                 ref={} diff={diff}",
+                y_ref[i]
+            );
+        }
     }
     Ok(())
 }
