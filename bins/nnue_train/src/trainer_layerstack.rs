@@ -583,6 +583,41 @@ impl GpuTrainer {
         Ok(gradient.to_host_vec(&self.stream)?)
     }
 
+    /// The last FP32 forward's per-bucket L1 output in original row order, and the same product
+    /// recomputed by the unsorted per-thread `dense_mm_fwd_bucket`, as `(production bits,
+    /// reference bits, nonzero production cells)`.
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn l1_bucket_unsorted_reference_bits_for_test(
+        &self,
+        b: usize,
+    ) -> Result<BitsCompareTestState, Box<dyn std::error::Error>> {
+        let (ft_out, l1_out) = (self.ws.ft_out, self.ws.l1_out);
+        let reference = DeviceBuffer::<f32>::zeroed(&self.stream, b * l1_out)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_mm_fwd_bucket,
+                stream: self.stream, module: self.module,
+                config: cfg_1d(b * l1_out),
+                args: [slice(self.ws.combined), slice(self.l1_w), slice(self.l1_b),
+                       slice(self.ws.bucket_idx_dev), slice(reference), b as u32,
+                       ft_out as u32, l1_out as u32, self.num_buckets as u32]
+            }
+        }?;
+        let production = self.ws.l1_bucket.to_host_vec(&self.stream)?[..b * l1_out].to_vec();
+        let nonzero = production.iter().filter(|&&v| v != 0.0).count();
+        Ok((
+            production.iter().map(|v| v.to_bits()).collect(),
+            reference
+                .to_host_vec(&self.stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            nonzero,
+        ))
+    }
+
     /// Recomputes the last backward's FT activation gradients with the materialized FP32 L1 input
     /// gradient (`dense_mm_bwd_input_bucket_tiled_sorted_scatter` + `dense_mm_bwd_input_tiled_wide`,
     /// then the per-element `ft_post_perspective_grad_fused{,_fp16}`) into scratch buffers,

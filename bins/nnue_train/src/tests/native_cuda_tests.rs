@@ -3537,6 +3537,53 @@ fn ft_post_grad_from_l1_matches_materialized_l1_input_gradient()
     Ok(())
 }
 
+/// FP32 の L1 forward (bucket 並べ替え済みの行・shared memory の tile) が、並べ替えない
+/// 1 thread 1 出力の kernel と bit 単位で同じ出力になること。無効な bucket の行と、
+/// 16 で割り切れない出力数 (out-tile の端) を含める。
+#[cfg(feature = "native")]
+#[test]
+fn l1_bucket_forward_sorted_matches_unsorted() -> Result<(), Box<dyn std::error::Error>> {
+    // HalfKP の FT 行は約 12.5 万で、ft_out 512 の trainer (重み・勾配・optimizer 状態) は約 1.5 GB。
+    let context = test_cuda_context_reserving_gib(2)?;
+    let standard = LayerStackTestOptions::standard();
+    // Several 16-row tiles per bucket, plus the padding rows at each bucket's end.
+    let batch_size = 256;
+    for (ft_out, l1_out) in [(128, 16), (512, 33)] {
+        let options = LayerStackTestOptions {
+            ft_out,
+            l1_out,
+            num_buckets: 4,
+            ..standard
+        };
+        let mut trainer =
+            create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
+        trainer.set_skip_optimizer_for_test(true);
+        // The L1 biases start at zero; nonzero values check that the accumulation starts there.
+        let mut net = trainer.to_layerstack_weights()?;
+        for (i, b) in net.l1_b.iter_mut().enumerate() {
+            *b = (i as f32 - 20.0) * 0.013;
+        }
+        trainer.load_layerstack_weights(&net)?;
+        trainer.sync_ft_forward_weights()?;
+        let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
+        batch.bucket_idx = (0..batch_size as i32)
+            .map(|r| [3, 0, 2, 0, 1, 4][r as usize % 6])
+            .collect();
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let (production, reference, nonzero) =
+            trainer.l1_bucket_unsorted_reference_bits_for_test(batch_size)?;
+        assert!(
+            nonzero > 0,
+            "ft_out {ft_out}, l1_out {l1_out}: L1 output is all zero"
+        );
+        assert_eq!(
+            production, reference,
+            "ft_out {ft_out}, l1_out {l1_out}: L1 output differs"
+        );
+    }
+    Ok(())
+}
+
 /// f16 勾配の sparse backward gather が、本番の起動形状 (1 thread 2 列) でも 1 thread 1 列でも
 /// bit 単位で同じ勾配を書くこと (overwrite / active overwrite / add の 3 種、書き込み先は
 /// 0 以外の値で初期化)。
