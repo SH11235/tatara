@@ -3477,21 +3477,31 @@ extern "C" __global__ void dense_mm_fwd_bucket(
     output[i] = accumulator;
 }
 
-// One block computes a 16-row x 16-output tile. Bucket segments start on 16-row boundaries, so the
-// whole tile uses the bucket of its first row and the X and W chunks are staged in shared memory
-// once per tile. Each thread still accumulates its single output over `k` in ascending order from
-// the bias, so the result is bit-identical to a plain per-thread dot product.
-// `xs` rows are padded by 4 floats so the two rows a warp reads land on different banks, and the
-// transposed `ws` rows by 1 float so the per-lane output index spreads the stores over banks.
-// Launch with 256 threads per block and `grid.y = ceil(output_dimension / 16)`.
-extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
+// Per-bucket and shared L1 layers over bucket-sorted rows, writing
+// `l1_total = (bucket bias + x . w[bucket]) + ((x . shared_w) + shared bias)` to row
+// `permutation[sorted_row]` of the original order. One block computes a 16-row x 16-output tile.
+// Bucket segments start on 16-row boundaries, so the whole tile uses the bucket of its first row
+// and the X, W and shared-W chunks are staged in shared memory once per tile. Each thread keeps
+// one ascending-`k` accumulation per term. Rows of invalid buckets (their own sorted bin) take 0
+// for the bucket term but still get the shared term; padding rows (`permutation < 0`) are skipped.
+// `shared_w` is `[input_dimension][output_dimension]` row-major. `xs` rows are padded by 4 floats
+// so the two rows a warp reads land on different banks, and the transposed `ws` rows by 1 float so
+// the per-lane output index spreads the stores over banks. Launch with 256 threads per block and
+// `grid.y = ceil(output_dimension / 16)`; `input_dimension % 16 == 0` keeps every float4 aligned.
+extern "C" __global__ void dense_mm_fwd_l1_with_shared_sorted(
     const float* input,
     unsigned long long,
     const float* weights,
     unsigned long long,
     const float* bias,
     unsigned long long,
+    const float* shared_weights,
+    unsigned long long,
+    const float* shared_bias,
+    unsigned long long,
     const int* bucket_idx,
+    unsigned long long,
+    const int* permutation,
     unsigned long long,
     float* output,
     unsigned long long,
@@ -3504,26 +3514,26 @@ extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
     constexpr unsigned int CHUNK = 64;
     __shared__ __align__(16) float xs[TILE][CHUNK + 4];
     __shared__ float ws[CHUNK][TILE + 1];
+    __shared__ float shared_ws[CHUNK][TILE + 1];
     const unsigned int local_row = threadIdx.x / TILE;
     const unsigned int local_output = threadIdx.x % TILE;
     const unsigned int tile_row = blockIdx.x * TILE;
+    if (tile_row >= batch) {
+        return;
+    }
     const unsigned int first_output = blockIdx.y * TILE;
     const unsigned int row = tile_row + local_row;
     const unsigned int output_index = first_output + local_output;
+    const int bucket = bucket_idx[tile_row];
+    const bool bucket_valid = bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets;
+    const unsigned long long weight_row0 = bucket_valid
+        ? static_cast<unsigned long long>(bucket) * output_dimension + first_output
+        : 0;
     const bool active = row < batch && output_index < output_dimension;
-    const int bucket = tile_row < batch ? bucket_idx[tile_row] : -1;
-    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
-        if (active) {
-            output[static_cast<unsigned long long>(row) * output_dimension + output_index] = 0.0F;
-        }
-        return;
-    }
-    const unsigned long long weight_row0 =
-        static_cast<unsigned long long>(bucket) * output_dimension + first_output;
-    float accumulator =
-        active ? bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index] : 0.0F;
-    // Each thread stages one float4 of X and one of W per chunk: row / output `threadIdx.x / 16`,
-    // columns `4 * (threadIdx.x % 16)`. `input_dimension % 16 == 0` keeps every float4 aligned.
+    float accumulator = active && bucket_valid
+        ? bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index]
+        : 0.0F;
+    float shared_accumulator = 0.0F;
     const unsigned int load_index = threadIdx.x / TILE;
     const unsigned int load_column = (threadIdx.x % TILE) * 4;
     for (unsigned int base = 0; base < input_dimension; base += CHUNK) {
@@ -3538,7 +3548,7 @@ extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
                     input + static_cast<unsigned long long>(x_row) * input_dimension + base + load_column
                 );
             }
-            if (first_output + load_index < output_dimension) {
+            if (bucket_valid && first_output + load_index < output_dimension) {
                 w4 = *reinterpret_cast<const float4*>(
                     weights + (weight_row0 + load_index) * input_dimension + base + load_column
                 );
@@ -3549,15 +3559,32 @@ extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
         ws[load_column + 1][load_index] = w4.y;
         ws[load_column + 2][load_index] = w4.z;
         ws[load_column + 3][load_index] = w4.w;
+        for (unsigned int e = threadIdx.x; e < CHUNK * TILE; e += blockDim.x) {
+            const unsigned int k = e / TILE;
+            const unsigned int o = e % TILE;
+            shared_ws[k][o] = k < width && first_output + o < output_dimension
+                ? shared_weights[static_cast<unsigned long long>(base + k) * output_dimension
+                                 + first_output + o]
+                : 0.0F;
+        }
         __syncthreads();
         for (unsigned int k = 0; k < width; ++k) {
-            accumulator += xs[local_row][k] * ws[k][local_output];
+            const float x = xs[local_row][k];
+            accumulator += x * ws[k][local_output];
+            shared_accumulator += x * shared_ws[k][local_output];
         }
         __syncthreads();
     }
-    if (active) {
-        output[static_cast<unsigned long long>(row) * output_dimension + output_index] = accumulator;
+    if (!active) {
+        return;
     }
+    const int destination = permutation[row];
+    if (destination < 0) {
+        return;
+    }
+    const float shared_term = shared_accumulator + shared_bias[output_index];
+    output[static_cast<unsigned long long>(destination) * output_dimension + output_index] =
+        accumulator + shared_term;
 }
 
 extern "C" __global__ void dense_mm_bwd_input_bucket(

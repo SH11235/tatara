@@ -3537,12 +3537,12 @@ fn ft_post_grad_from_l1_matches_materialized_l1_input_gradient()
     Ok(())
 }
 
-/// FP32 の L1 forward (bucket 並べ替え済みの行・shared memory の tile) が、並べ替えない
-/// 1 thread 1 出力の kernel と bit 単位で同じ出力になること。無効な bucket の行と、
-/// 16 で割り切れない出力数 (out-tile の端) を含める。
+/// FP32 の L1 forward が、bucket の項と shared の項をそれぞれ入力の昇順に足した値と bit 単位で
+/// 同じ `l1_total` を書くこと。無効な bucket の行と、16 で割り切れない出力数 (out-tile の端) を
+/// 含める。
 #[cfg(feature = "native")]
 #[test]
-fn l1_bucket_forward_sorted_matches_unsorted() -> Result<(), Box<dyn std::error::Error>> {
+fn l1_forward_sorted_matches_sequential_reference() -> Result<(), Box<dyn std::error::Error>> {
     // HalfKP の FT 行は約 12.5 万で、ft_out 512 の trainer (重み・勾配・optimizer 状態) は約 1.5 GB。
     let context = test_cuda_context_reserving_gib(2)?;
     let standard = LayerStackTestOptions::standard();
@@ -3558,28 +3558,27 @@ fn l1_bucket_forward_sorted_matches_unsorted() -> Result<(), Box<dyn std::error:
         let mut trainer =
             create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
         trainer.set_skip_optimizer_for_test(true);
-        // The L1 biases start at zero; nonzero values check that the accumulation starts there.
+        // The shared L1 bias starts at zero; give both biases nonzero values so that every term
+        // of the sum is exercised.
         let mut net = trainer.to_layerstack_weights()?;
         for (i, b) in net.l1_b.iter_mut().enumerate() {
             *b = (i as f32 - 20.0) * 0.013;
+        }
+        for (i, b) in net.l1_shared_bias.iter_mut().enumerate() {
+            *b = (i as f32 - 7.5) * 0.021;
         }
         trainer.load_layerstack_weights(&net)?;
         trainer.sync_ft_forward_weights()?;
         let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
         batch.bucket_idx = (0..batch_size as i32)
-            .map(|r| [3, 0, 2, 0, 1, 4][r as usize % 6])
+            .map(|r| [3, 0, 2, 0, 1, 4, -1][r as usize % 7])
             .collect();
         let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let name = format!("ft_out {ft_out}, l1_out {l1_out}");
         let (production, reference, nonzero) =
-            trainer.l1_bucket_unsorted_reference_bits_for_test(batch_size)?;
-        assert!(
-            nonzero > 0,
-            "ft_out {ft_out}, l1_out {l1_out}: L1 output is all zero"
-        );
-        assert_eq!(
-            production, reference,
-            "ft_out {ft_out}, l1_out {l1_out}: L1 output differs"
-        );
+            trainer.l1_total_sequential_reference_bits_for_test(batch_size)?;
+        assert!(nonzero > 0, "{name}: l1_total is all zero");
+        assert_eq!(production, reference, "{name}: l1_total differs");
     }
     Ok(())
 }

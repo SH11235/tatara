@@ -58,7 +58,7 @@ LayerStack アーキの FT 後処理と、bucket 別重み行列 (bucket 数は
 | `slice_extract_2d` / `slice_scatter_2d` | 2D buffer の行 slice 抽出 / 書き戻し |
 
 device 側の実体は tile / FP16 / sorted などの variant を持つ
-(`dense_mm_fwd_bucket_tiled_l1_sorted` など)。アーキ上の繋がりは
+(`dense_mm_fwd_l1_with_shared_sorted` など)。アーキ上の繋がりは
 `bins/nnue_train/src/kernels/mod.rs` の module doc を参照。
 
 ## Simple アーキ専用 kernels
