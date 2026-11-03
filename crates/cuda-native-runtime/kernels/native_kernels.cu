@@ -3477,6 +3477,13 @@ extern "C" __global__ void dense_mm_fwd_bucket(
     output[i] = accumulator;
 }
 
+// One block computes a 16-row x 16-output tile. Bucket segments start on 16-row boundaries, so the
+// whole tile uses the bucket of its first row and the X and W chunks are staged in shared memory
+// once per tile. Each thread still accumulates its single output over `k` in ascending order from
+// the bias, so the result is bit-identical to a plain per-thread dot product.
+// `xs` rows are padded by 4 floats so the two rows a warp reads land on different banks, and the
+// transposed `ws` rows by 1 float so the per-lane output index spreads the stores over banks.
+// Launch with 256 threads per block and `grid.y = ceil(output_dimension / 16)`.
 extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
     const float* input,
     unsigned long long,
@@ -3493,28 +3500,64 @@ extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
     unsigned int output_dimension,
     unsigned int num_buckets
 ) {
-    const unsigned int local_row = threadIdx.x >> 4;
-    const unsigned int local_output = threadIdx.x & 15U;
-    const unsigned int row = blockIdx.x * 16U + local_row;
-    const unsigned int output_index = blockIdx.y * 16U + local_output;
-    if (row >= batch || output_index >= output_dimension) {
-        return;
-    }
-    const int bucket = bucket_idx[blockIdx.x * 16U];
-    const unsigned long long output_offset =
-        static_cast<unsigned long long>(row) * output_dimension + output_index;
+    constexpr unsigned int TILE = 16;
+    constexpr unsigned int CHUNK = 64;
+    __shared__ __align__(16) float xs[TILE][CHUNK + 4];
+    __shared__ float ws[CHUNK][TILE + 1];
+    const unsigned int local_row = threadIdx.x / TILE;
+    const unsigned int local_output = threadIdx.x % TILE;
+    const unsigned int tile_row = blockIdx.x * TILE;
+    const unsigned int first_output = blockIdx.y * TILE;
+    const unsigned int row = tile_row + local_row;
+    const unsigned int output_index = first_output + local_output;
+    const bool active = row < batch && output_index < output_dimension;
+    const int bucket = tile_row < batch ? bucket_idx[tile_row] : -1;
     if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
-        output[output_offset] = 0.0F;
+        if (active) {
+            output[static_cast<unsigned long long>(row) * output_dimension + output_index] = 0.0F;
+        }
         return;
     }
-    const unsigned long long input_base = static_cast<unsigned long long>(row) * input_dimension;
-    const unsigned long long weight_base =
-        (static_cast<unsigned long long>(bucket) * output_dimension + output_index) * input_dimension;
-    float accumulator = bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index];
-    for (unsigned int input_index = 0; input_index < input_dimension; ++input_index) {
-        accumulator += input[input_base + input_index] * weights[weight_base + input_index];
+    const unsigned long long weight_row0 =
+        static_cast<unsigned long long>(bucket) * output_dimension + first_output;
+    float accumulator =
+        active ? bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index] : 0.0F;
+    // Each thread stages one float4 of X and one of W per chunk: row / output `threadIdx.x / 16`,
+    // columns `4 * (threadIdx.x % 16)`. `input_dimension % 16 == 0` keeps every float4 aligned.
+    const unsigned int load_index = threadIdx.x / TILE;
+    const unsigned int load_column = (threadIdx.x % TILE) * 4;
+    for (unsigned int base = 0; base < input_dimension; base += CHUNK) {
+        const unsigned int width =
+            input_dimension - base < CHUNK ? input_dimension - base : CHUNK;
+        float4 x4 = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        float4 w4 = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        if (load_column < width) {
+            const unsigned int x_row = tile_row + load_index;
+            if (x_row < batch) {
+                x4 = *reinterpret_cast<const float4*>(
+                    input + static_cast<unsigned long long>(x_row) * input_dimension + base + load_column
+                );
+            }
+            if (first_output + load_index < output_dimension) {
+                w4 = *reinterpret_cast<const float4*>(
+                    weights + (weight_row0 + load_index) * input_dimension + base + load_column
+                );
+            }
+        }
+        *reinterpret_cast<float4*>(&xs[load_index][load_column]) = x4;
+        ws[load_column + 0][load_index] = w4.x;
+        ws[load_column + 1][load_index] = w4.y;
+        ws[load_column + 2][load_index] = w4.z;
+        ws[load_column + 3][load_index] = w4.w;
+        __syncthreads();
+        for (unsigned int k = 0; k < width; ++k) {
+            accumulator += xs[local_row][k] * ws[k][local_output];
+        }
+        __syncthreads();
     }
-    output[output_offset] = accumulator;
+    if (active) {
+        output[static_cast<unsigned long long>(row) * output_dimension + output_index] = accumulator;
+    }
 }
 
 extern "C" __global__ void dense_mm_bwd_input_bucket(
