@@ -27,7 +27,7 @@ fn cancellation_during_filtered_scan_stops_before_next_record_or_wrap() {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(error.to_string().contains(path.to_str().unwrap()));
         assert_eq!(reader.record_index, 1);
-        assert_eq!(reader.loader.remaining_bytes, end - PSV_RECORD_BYTES);
+        assert_eq!(psv_remaining_bytes(&reader), end - PSV_RECORD_BYTES);
         assert_eq!(reader.barren_passes, 0);
     }
 }
@@ -72,7 +72,7 @@ fn cancellation_after_eof_does_not_reopen_or_report_barren_failure() {
         Ok(_) => panic!("EOF cancellation must precede reopen and barren failure"),
     };
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-    assert_eq!(reader.loader.remaining_bytes, 0);
+    assert_eq!(psv_remaining_bytes(&reader), 0);
     assert_eq!(reader.record_index, 1);
     assert_eq!(reader.barren_passes, MAX_BARREN_PASSES - 1);
 }
@@ -87,6 +87,7 @@ fn spawn_controlled_reader(reader: TrainingPsvReader) -> BucketedPrefetchedLoade
         9,
         false,
         reader,
+        Path::new("teacher.psv"),
     )
 }
 
@@ -212,5 +213,12 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
             .recv_timeout(Duration::from_secs(10))
             .expect("Drop must join all loader workers and the window producer");
         task.join().unwrap();
+    }
+}
+
+fn psv_remaining_bytes(reader: &PsvEpochReader) -> u64 {
+    match &reader.loader {
+        TeacherFileLoader::Psv(loader) => loader.remaining_bytes,
+        TeacherFileLoader::Hcpe(_) => panic!("expected a PSV loader"),
     }
 }

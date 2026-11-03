@@ -1175,8 +1175,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     "--eval-only --test-tail-positions requires --data (the file whose tail is the held-out set)",
                 )?;
                 let file_size = std::fs::metadata(data)?.len();
-                let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
-                    std::io::Error::other("--test-tail-positions * PSV record size overflows u64")
+                let record_bytes =
+                    nnue_train::dataloader::TeacherFormat::for_path(data)?.record_bytes();
+                let tail_bytes = n.checked_mul(record_bytes).ok_or_else(|| {
+                    std::io::Error::other("--test-tail-positions * record size overflows u64")
                 })?;
                 if tail_bytes >= file_size {
                     return Err("--test-tail-positions leaves no data to evaluate".into());
@@ -2037,11 +2039,14 @@ pub(crate) fn build_experiment_logger(
 /// 算出ロジックを使うための単一エントリポイント。`data` の metadata 読み
 /// 出しに失敗したときは `0`、`--test-tail-positions` が raw 件数以上の場合は
 /// raw record 数をそのまま返す (`trainer::run` 側で `validate` 経由 reject
-/// される前提の defensive fallback)。
+/// される前提の defensive fallback)。形式を決められない入力は PSV として数える
+/// (その入力は `trainer::run` が error にする)。
 #[cfg(feature = "gpu")]
 pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
+    let record_bytes = nnue_train::dataloader::TeacherFormat::for_path(data)
+        .map_or(PSV_RECORD_BYTES, |format| format.record_bytes());
     let total_records = std::fs::metadata(data)
-        .map(|m| m.len() / PSV_RECORD_BYTES)
+        .map(|m| m.len() / record_bytes)
         .unwrap_or(0);
     let train_records = match cli.test_tail_positions {
         Some(n) if n < total_records => total_records - n,

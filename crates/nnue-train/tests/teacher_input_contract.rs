@@ -107,21 +107,16 @@ fn sidecar_and_dual_labels_keep_feature_payload_with_windowed_training() {
 }
 
 #[test]
-fn aligned_hcpe_is_rejected_by_psv_readers_but_supported_as_heldout() {
+fn aligned_hcpe_is_read_as_hcpe_records_and_rejected_by_psv_only_readers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("teacher.HCPE");
-    fs::write(&path, HCPE.repeat(20)).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().len(), 760);
-    for window in [0, 1] {
-        let error = match training_loader(&path, window) {
-            Err(error) => error,
-            Ok(_) => panic!("HCPE must not be interpreted as 19 PSV records"),
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains(path.to_str().unwrap()));
+    // record ごとに score を変え、epoch の折り返し位置を score の並びで確かめる。
+    let mut bytes = HCPE.repeat(20);
+    for (index, record) in bytes.chunks_exact_mut(38).enumerate() {
+        record[32..34].copy_from_slice(&(index as i16).to_le_bytes());
     }
-    assert!(PsvFileLoader::new(&path).is_err());
-    assert!(PrefetchedLoader::spawn(&path, 4, FeatureSet::HalfKaHmMerged.spec(), 1).is_err());
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), 760);
     let heldout = HeldoutSet::load(
         &path,
         4,
@@ -132,9 +127,32 @@ fn aligned_hcpe_is_rejected_by_psv_readers_but_supported_as_heldout() {
         FeatureSet::HalfKaHmMerged.spec(),
         9,
     )
-    .expect("declared HCPE heldout remains supported");
+    .expect("HCPE heldout is supported");
     assert_eq!(heldout.n_positions(), 20);
     assert_eq!(heldout.n_batches(), 5);
+    let mut expected = Batch::with_capacity(4, FeatureSet::HalfKaHmMerged.spec());
+    let mut record = shogi_format::HuffmanCodedPosAndEval::default();
+    record.as_bytes_mut().copy_from_slice(&HCPE);
+    let board = record.decode().unwrap();
+    for _ in 0..4 {
+        assert!(expected.push_decoded(&board).unwrap());
+    }
+    let expected_scores: Vec<f32> = (0..24).map(|index| (index % 20) as f32).collect();
+    for window in [0, 1] {
+        // 20 HCPE records, not 19 PSV records: 6 batches of 4 wrap one epoch boundary.
+        let mut loader = training_loader(&path, window).expect("HCPE training input");
+        let mut scores = Vec::new();
+        for chunk in expected_scores.chunks(4) {
+            let (batch, buckets) = loader.next_batch().unwrap().unwrap();
+            expected.score[..4].copy_from_slice(chunk);
+            assert_eq!(payload(&batch), payload(&expected));
+            scores.extend_from_slice(&batch.score[..4]);
+            loader.recycle((batch, buckets));
+        }
+        assert_eq!(scores, expected_scores);
+    }
+    assert!(PsvFileLoader::new(&path).is_err());
+    assert!(PrefetchedLoader::spawn(&path, 4, FeatureSet::HalfKaHmMerged.spec(), 1).is_err());
 }
 
 fn payload(batch: &Batch) -> Vec<u8> {

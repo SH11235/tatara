@@ -1,6 +1,7 @@
-//! PSV file → feature-set sparse batch dataloader (+ prefetch wrapper)。
+//! PSV / HCPE file → feature-set sparse batch dataloader (+ prefetch wrapper)。
 //!
-//! trainer の data 供給路。`PackedSfenValue` を [`FeatureSetSpec`] の indexer で
+//! trainer の data 供給路。教師 record (`PackedSfenValue` または
+//! `HuffmanCodedPosAndEval`) を [`FeatureSetSpec`] の indexer で
 //! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `nnz` / `score` /
 //! `wdl` / `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
 //! 本 dataloader から `Batch` を pull する。どの feature set を使うかは生成時に
@@ -38,13 +39,93 @@ use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, S
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
 
-/// 拡張子が `.hcpe` (大文字小文字不問) の教師ファイルか判定する。PSV 専用入力の
-/// 拒否判定を CLI 層と loader 層で一致させるための共有述語。
+/// 拡張子が `.hcpe` (大文字小文字不問) の教師ファイルか判定する。PSV と HCPE は
+/// 形式を区別する header を持たず、40 と 38 の公倍数のサイズでは長さからも判別できない
+/// ため、形式の判定は拡張子だけで行う。CLI 層と loader 層で判定を一致させるための共有述語。
 pub fn is_hcpe_path(path: &Path) -> bool {
     path.extension().is_some_and(|ext| {
         ext.to_str()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("hcpe"))
     })
+}
+
+/// 教師ファイルの record 形式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeacherFormat {
+    /// `PackedSfenValue` (40 bytes)。
+    Psv,
+    /// `HuffmanCodedPosAndEval` (38 bytes)。
+    Hcpe,
+}
+
+impl TeacherFormat {
+    /// 拡張子から形式を決める ([`is_hcpe_path`] が真なら HCPE、それ以外は PSV)。
+    /// symlink は渡された名前と実体の名前の両方で判定し、食い違えば誤読を避けるため
+    /// error にする。実体を解決できない (file が無い等) ときは渡された名前で判定し、
+    /// file の不在は open 時の error に任せる。
+    pub fn for_path(path: &Path) -> io::Result<Self> {
+        let named = is_hcpe_path(path);
+        if let Ok(target) = path.canonicalize()
+            && is_hcpe_path(&target) != named
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "teacher file {} resolves to {}; the two names imply different formats \
+                     (PSV or HCPE), so the format is ambiguous",
+                    path.display(),
+                    target.display()
+                ),
+            ));
+        }
+        Ok(if named { Self::Hcpe } else { Self::Psv })
+    }
+
+    pub const fn record_bytes(self) -> u64 {
+        match self {
+            Self::Psv => PSV_RECORD_BYTES,
+            Self::Hcpe => HCPE_RECORD_BYTES as u64,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Psv => "PSV",
+            Self::Hcpe => "HCPE",
+        }
+    }
+}
+
+/// 学習 stream を流れる 1 局面分の教師 record。どちらの形式も手番側視点の score を
+/// bytes 32-33 に持つため、score の上書き・drop・clamp は形式によらず同じ意味になる。
+#[derive(Clone, Copy)]
+pub(crate) enum TeacherRecord {
+    Psv(PackedSfenValue),
+    Hcpe(HuffmanCodedPosAndEval),
+}
+
+impl TeacherRecord {
+    pub(crate) fn score(&self) -> i16 {
+        match self {
+            Self::Psv(psv) => psv.score(),
+            Self::Hcpe(hcpe) => hcpe.score(),
+        }
+    }
+
+    pub(crate) fn set_score(&mut self, score: i16) {
+        match self {
+            Self::Psv(psv) => psv.set_score(score),
+            Self::Hcpe(hcpe) => hcpe.set_score(score),
+        }
+    }
+
+    /// HCPE は Huffman 符号と駒数の検査に失敗すると `InvalidData` を返す。
+    pub(crate) fn decode(&self) -> io::Result<ShogiBoard> {
+        match self {
+            Self::Psv(psv) => Ok(psv.decode()),
+            Self::Hcpe(hcpe) => hcpe.decode(),
+        }
+    }
 }
 
 /// 40-byte PSV record 内の二つの score label から学習用 score を選ぶ方式。
@@ -125,7 +206,7 @@ impl DualLabelMode {
     }
 }
 
-/// Streaming reader for a score sidecar aligned to the records of one PSV file.
+/// Streaming reader for a score sidecar aligned to the records of one PSV or HCPE file.
 /// The optional bitmap uses LSB-first bits; a set bit preserves the PSV score.
 #[derive(Debug)]
 pub(crate) struct ScoreOverrideReader {
@@ -145,20 +226,23 @@ impl ScoreOverrideReader {
         mask_path: Option<&Path>,
         start_offset: u64,
     ) -> io::Result<Self> {
+        let format = TeacherFormat::for_path(data_path)?;
+        let record_bytes = format.record_bytes();
         let data_size = std::fs::metadata(data_path)?.len();
-        if !data_size.is_multiple_of(PSV_RECORD_BYTES) {
+        if !data_size.is_multiple_of(record_bytes) {
             return Err(io::Error::other(format!(
-                "data file {} size {data_size} is not a multiple of PSV record size ({PSV_RECORD_BYTES} bytes)",
-                data_path.display()
+                "data file {} size {data_size} is not a multiple of {} record size ({record_bytes} bytes)",
+                data_path.display(),
+                format.name(),
             )));
         }
-        if !start_offset.is_multiple_of(PSV_RECORD_BYTES) || start_offset > data_size {
+        if !start_offset.is_multiple_of(record_bytes) || start_offset > data_size {
             return Err(io::Error::other(format!(
                 "score override start offset {start_offset} is not an aligned offset in data file {}",
                 data_path.display()
             )));
         }
-        let records = data_size / PSV_RECORD_BYTES;
+        let records = data_size / record_bytes;
         let expected_score_size = records
             .checked_mul(2)
             .ok_or_else(|| io::Error::other("score override size calculation overflowed u64"))?;
@@ -206,7 +290,7 @@ impl ScoreOverrideReader {
             mask_byte_index: u64::MAX,
             mask_byte: 0,
         };
-        reader.seek_to(start_offset / PSV_RECORD_BYTES)?;
+        reader.seek_to(start_offset / record_bytes)?;
         Ok(reader)
     }
 
@@ -220,7 +304,16 @@ impl ScoreOverrideReader {
         Ok(())
     }
 
-    pub(crate) fn apply(&mut self, psv: &mut PackedSfenValue) -> io::Result<()> {
+    pub(crate) fn apply(&mut self, record: &mut TeacherRecord) -> io::Result<()> {
+        if let Some(score) = self.next_score()? {
+            record.set_score(score);
+        }
+        Ok(())
+    }
+
+    /// 次の record の置き換え score を読む。mask bit が立っていれば `None`
+    /// (元の score を温存)。
+    fn next_score(&mut self) -> io::Result<Option<i16>> {
         let mut score = [0_u8; 2];
         self.scores.read_exact(&mut score).map_err(|err| {
             io::Error::new(
@@ -254,22 +347,24 @@ impl ScoreOverrideReader {
             false
         };
         self.record_index += 1;
-        if !preserve {
-            psv.set_score(i16::from_le_bytes(score));
-        }
-        Ok(())
+        Ok((!preserve).then(|| i16::from_le_bytes(score)))
     }
 }
 
 /// Sequential reader for 38-byte Apery / dlshogi HCPE records.
+///
+/// 読み出し範囲は file 全体 ([`HcpeFileLoader::new`]) または byte range
+/// ([`HcpeFileLoader::new_range`]) で指定する。range の両端は 38 bytes の倍数で
+/// なければならない。
 pub struct HcpeFileLoader {
-    reader: BufReader<File>,
+    reader: BufReader<io::Take<File>>,
     remaining_records: u64,
 }
 
 impl HcpeFileLoader {
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let file = File::open(path)?;
         let file_size = file.metadata()?.len();
         let record_bytes = HCPE_RECORD_BYTES as u64;
         if !file_size.is_multiple_of(record_bytes) {
@@ -277,24 +372,88 @@ impl HcpeFileLoader {
                 io::ErrorKind::InvalidData,
                 format!(
                     "HCPE file size {file_size} is not a multiple of {HCPE_RECORD_BYTES} bytes for {}",
-                    path.as_ref().display()
+                    path.display()
                 ),
             ));
         }
+        Self::open_range(path, file, file_size, 0, file_size)
+    }
+
+    /// `path` の HCPE file を `[start, end)` の byte range で open する。両端は
+    /// 38 bytes の倍数、`start <= end <= file_size` でなければならない。
+    pub fn new_range<P: AsRef<Path>>(path: P, start: u64, end: u64) -> io::Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let file_size = file.metadata()?.len();
+        Self::open_range(path, file, file_size, start, end)
+    }
+
+    fn open_range(
+        path: &Path,
+        mut file: File,
+        file_size: u64,
+        start: u64,
+        end: u64,
+    ) -> io::Result<Self> {
+        let record_bytes = HCPE_RECORD_BYTES as u64;
+        if start > end || end > file_size {
+            return Err(io::Error::other(format!(
+                "HCPE range [{start}, {end}) is outside file size {file_size} for {}",
+                path.display()
+            )));
+        }
+        if !start.is_multiple_of(record_bytes) || !end.is_multiple_of(record_bytes) {
+            return Err(io::Error::other(format!(
+                "HCPE range [{start}, {end}) is not aligned to HCPE record size ({HCPE_RECORD_BYTES} bytes) for {}",
+                path.display()
+            )));
+        }
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))?;
+        }
         Ok(Self {
-            reader: BufReader::with_capacity(1024 * 1024, file),
-            remaining_records: file_size / record_bytes,
+            reader: BufReader::with_capacity(1024 * 1024, file.take(end - start)),
+            remaining_records: (end - start) / record_bytes,
         })
     }
 
-    pub fn next_board(&mut self) -> io::Result<Option<ShogiBoard>> {
+    /// 1 record を復号せずに読む。range 末尾で `Ok(None)`。
+    pub fn next_record(&mut self) -> io::Result<Option<HuffmanCodedPosAndEval>> {
         if self.remaining_records == 0 {
             return Ok(None);
         }
         let mut record = HuffmanCodedPosAndEval::default();
         self.reader.read_exact(record.as_bytes_mut())?;
         self.remaining_records -= 1;
-        record.decode().map(Some)
+        Ok(Some(record))
+    }
+
+    pub fn next_board(&mut self) -> io::Result<Option<ShogiBoard>> {
+        self.next_record()?
+            .map(|record| record.decode())
+            .transpose()
+    }
+}
+
+/// 拡張子で選んだ形式 ([`TeacherFormat`]) の教師 file を byte range で逐次読む。
+pub(crate) enum TeacherFileLoader {
+    Psv(PsvFileLoader),
+    Hcpe(HcpeFileLoader),
+}
+
+impl TeacherFileLoader {
+    pub(crate) fn new_range(path: &Path, start: u64, end: u64) -> io::Result<Self> {
+        Ok(match TeacherFormat::for_path(path)? {
+            TeacherFormat::Psv => Self::Psv(PsvFileLoader::new_range(path, start, end)?),
+            TeacherFormat::Hcpe => Self::Hcpe(HcpeFileLoader::new_range(path, start, end)?),
+        })
+    }
+
+    pub(crate) fn next_record(&mut self) -> io::Result<Option<TeacherRecord>> {
+        Ok(match self {
+            Self::Psv(loader) => loader.next_psv()?.map(TeacherRecord::Psv),
+            Self::Hcpe(loader) => loader.next_record()?.map(TeacherRecord::Hcpe),
+        })
     }
 }
 
@@ -789,22 +948,23 @@ impl PrefetchedLoader {
 /// これに達したら無限ループせず error を返す。
 pub const MAX_BARREN_PASSES: u32 = 5;
 
-/// `PsvFileLoader` を逐次読み、EOF で同 file を開き直して次 epoch とする stream
+/// 教師 file (PSV / HCPE) を逐次読み、EOF で同 file を開き直して次 epoch とする stream
 /// reader。`--score-drop-abs` の近似 skip (`|score| >= t` を捨てる) と空 file の
 /// 無限ループ防止 (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない**
 /// (decode-once 経路: bucket は呼び出し側 prefetch worker が `decode()` した
 /// `ShogiBoard` から選択された [`BucketMode`] で求める)。
 ///
-/// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
+/// `next()` は常に「使える record」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
 struct PsvEpochReader {
     path: PathBuf,
+    record_bytes: u64,
     /// 1 epoch の byte range `[start_offset, end_offset)`。wrap 時に
-    /// `PsvFileLoader::new_range(path, start, end)` で再 open する。`new()`
+    /// `TeacherFileLoader::new_range(path, start, end)` で再 open する。`new()`
     /// 経路では `(0, file_size)` で全体に等しい。
     start_offset: u64,
     end_offset: u64,
-    loader: PsvFileLoader,
+    loader: TeacherFileLoader,
     score_override: Option<ScoreOverrideReader>,
     dual_label_psv: Option<DualLabelMode>,
     record_index: u64,
@@ -825,8 +985,9 @@ struct PsvEpochReader {
 
 impl PsvEpochReader {
     /// `path` を `[start_offset, end_offset)` 範囲で epoch wrap させる reader。
-    /// wrap 時の再 open も同 range で行う。`PsvFileLoader::new_range` 同様の
-    /// 範囲・alignment 検証はここでは行わず、`new_range` 内で検証する。
+    /// wrap 時の再 open も同 range で行う。範囲・alignment 検証はここでは行わず、
+    /// `TeacherFileLoader::new_range` 内で検証する。dual-label は PSV の予約 field を
+    /// 使うため HCPE とは組み合わせられない。
     fn new_range(
         path: &Path,
         start_offset: u64,
@@ -835,7 +996,12 @@ impl PsvEpochReader {
         score_clamp_abs: Option<i16>,
         score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let format = TeacherFormat::for_path(path)?;
+        if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
+        {
+            return Err(dual_label_requires_psv(path));
+        }
+        let loader = TeacherFileLoader::new_range(path, start_offset, end_offset)?;
         let (score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
                 Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
@@ -844,14 +1010,16 @@ impl PsvEpochReader {
             Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
             None => (None, None),
         };
+        let record_bytes = format.record_bytes();
         Ok(Self {
             path: path.to_path_buf(),
+            record_bytes,
             start_offset,
             end_offset,
             loader,
             score_override,
             dual_label_psv,
-            record_index: start_offset / PSV_RECORD_BYTES,
+            record_index: start_offset / record_bytes,
             score_drop_abs,
             score_clamp_abs,
             pushed_this_epoch: 0,
@@ -864,32 +1032,35 @@ impl PsvEpochReader {
         })
     }
 
-    /// 現在の epoch にある次の使える PSV を返す。physical EOF では reader を次
+    /// 現在の epoch にある次の使える record を返す。physical EOF では reader を次
     /// epoch の先頭へ戻して `None` を返す。これにより window shuffle 側は epoch
     /// 境界を跨がず、末尾の partial window も独立して shuffle できる。
-    fn next_in_epoch(&mut self) -> io::Result<Option<PackedSfenValue>> {
+    fn next_in_epoch(&mut self) -> io::Result<Option<TeacherRecord>> {
         loop {
             self.check_cancelled()?;
-            match self.loader.next_psv()? {
-                Some(mut psv) => {
+            match self.loader.next_record()? {
+                Some(mut record) => {
                     let record_index = self.record_index;
                     self.record_index += 1;
                     #[cfg(test)]
                     if let Some(after_record) = &mut self.after_record {
                         after_record();
                     }
-                    // Sidecar indices are based on the complete PSV file. Applying the
-                    // replacement before filtering matches a materialized PSV variant.
+                    // Sidecar indices are based on the complete data file. Applying the
+                    // replacement before filtering matches a materialized variant.
                     if let Some(score_override) = &mut self.score_override {
-                        score_override.apply(&mut psv)?;
+                        score_override.apply(&mut record)?;
                     }
                     if let Some(mode) = self.dual_label_psv {
-                        mode.apply(&mut psv, record_index, &self.path)?;
+                        let TeacherRecord::Psv(psv) = &mut record else {
+                            return Err(dual_label_requires_psv(&self.path));
+                        };
+                        mode.apply(psv, record_index, &self.path)?;
                     }
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
                     if let Some(t) = self.score_drop_abs
-                        && i64::from(psv.score()).abs() >= i64::from(t)
+                        && i64::from(record.score()).abs() >= i64::from(t)
                     {
                         continue;
                     }
@@ -899,10 +1070,10 @@ impl PsvEpochReader {
                     // すり抜ける)。c >= 1 は TrainingConfig::validate が保証する
                     // ため `-c` は overflow しない。
                     if let Some(c) = self.score_clamp_abs {
-                        psv.set_score(psv.score().clamp(-c, c));
+                        record.set_score(record.score().clamp(-c, c));
                     }
                     self.pushed_this_epoch += 1;
-                    return Ok(Some(psv));
+                    return Ok(Some(record));
                 }
                 None => {
                     #[cfg(test)]
@@ -927,11 +1098,14 @@ impl PsvEpochReader {
                         self.barren_passes = 0;
                     }
                     self.pushed_this_epoch = 0;
-                    self.loader =
-                        PsvFileLoader::new_range(&self.path, self.start_offset, self.end_offset)?;
-                    self.record_index = self.start_offset / PSV_RECORD_BYTES;
+                    self.loader = TeacherFileLoader::new_range(
+                        &self.path,
+                        self.start_offset,
+                        self.end_offset,
+                    )?;
+                    self.record_index = self.start_offset / self.record_bytes;
                     if let Some(score_override) = &mut self.score_override {
-                        score_override.seek_to(self.start_offset / PSV_RECORD_BYTES)?;
+                        score_override.seek_to(self.record_index)?;
                     }
                     return Ok(None);
                 }
@@ -943,21 +1117,31 @@ impl PsvEpochReader {
         if self.stop.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                format!("PSV input cancelled: {}", self.path.display()),
+                format!("teacher input cancelled: {}", self.path.display()),
             ));
         }
         Ok(())
     }
 
-    /// 次の使える PSV を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
+    /// 次の使える record を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
     /// 全 drop で `MAX_BARREN_PASSES` 周しても 0 件なら `io::Error` を返す。
-    fn next(&mut self) -> io::Result<PackedSfenValue> {
+    fn next(&mut self) -> io::Result<TeacherRecord> {
         loop {
-            if let Some(psv) = self.next_in_epoch()? {
-                return Ok(psv);
+            if let Some(record) = self.next_in_epoch()? {
+                return Ok(record);
             }
         }
     }
+}
+
+pub(crate) fn dual_label_requires_psv(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "--dual-label-psv requires PSV input; HCPE has no second score label: {}",
+            path.display()
+        ),
+    )
 }
 
 const MIB_BYTES: usize = 1024 * 1024;
@@ -972,6 +1156,8 @@ pub(crate) fn shuffle_window_records(
     let bytes = buffer_mib
         .checked_mul(MIB_BYTES)
         .ok_or_else(|| io::Error::other("teacher shuffle buffer size overflow"))?;
+    // 窓の局面数は入力形式によらず 40 bytes 単位で数える (HCPE でも同じ MiB 指定が
+    // 同じ局面数になり、PSV では従来の shuffle 順を保つ)。
     let records = bytes / PSV_RECORD_BYTES as usize;
     let aligned = records / batch_size * batch_size;
     if aligned == 0 {
@@ -997,7 +1183,7 @@ impl SplitMix64 {
     }
 }
 
-fn shuffle_window(values: &mut [PackedSfenValue], seed: u64, epoch: u64, window: u64) {
+fn shuffle_window<T>(values: &mut [T], seed: u64, epoch: u64, window: u64) {
     let mut rng = SplitMix64(
         seed ^ epoch.wrapping_mul(0xd6e8_feb8_6659_fd93)
             ^ window.wrapping_mul(0xa5a3_56e4_e27f_886d),
@@ -1008,16 +1194,16 @@ fn shuffle_window(values: &mut [PackedSfenValue], seed: u64, epoch: u64, window:
 }
 
 struct PsvWindow {
-    records: Vec<PackedSfenValue>,
+    records: Vec<TeacherRecord>,
     next: usize,
 }
 
-/// Two-window producer/consumer reader. The producer fills the next raw PSV window while the
-/// decode workers consume the current one. `window_records` is per window, so resident raw PSV
-/// capacity is approximately `2 * window_records * 40` bytes.
+/// Two-window producer/consumer reader. The producer fills the next window of raw teacher
+/// records while the decode workers consume the current one. `window_records` is per window, so
+/// resident capacity is approximately `2 * window_records * size_of::<TeacherRecord>()` bytes.
 struct WindowedPsvReader {
     ready_rx: mpsc::Receiver<io::Result<PsvWindow>>,
-    empty_tx: Option<mpsc::Sender<Vec<PackedSfenValue>>>,
+    empty_tx: Option<mpsc::Sender<Vec<TeacherRecord>>>,
     current: Option<PsvWindow>,
     stop: Arc<AtomicBool>,
     producer: Option<thread::JoinHandle<()>>,
@@ -1029,7 +1215,7 @@ struct WindowedPsvReader {
 impl WindowedPsvReader {
     fn spawn(mut source: PsvEpochReader, window_records: usize, shuffle: bool, seed: u64) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (empty_tx, empty_rx) = mpsc::channel::<Vec<PackedSfenValue>>();
+        let (empty_tx, empty_rx) = mpsc::channel::<Vec<TeacherRecord>>();
         let stop = Arc::clone(&source.stop);
         let producer_stop = Arc::clone(&stop);
         let producer = thread::spawn(move || {
@@ -1073,7 +1259,7 @@ impl WindowedPsvReader {
                         return;
                     }
                     match source.next_in_epoch() {
-                        Ok(Some(psv)) => records.push(psv),
+                        Ok(Some(record)) => records.push(record),
                         Ok(None) => {
                             reached_epoch_end = true;
                             break;
@@ -1117,7 +1303,7 @@ impl WindowedPsvReader {
         }
     }
 
-    fn next(&mut self) -> io::Result<PackedSfenValue> {
+    fn next(&mut self) -> io::Result<TeacherRecord> {
         if let Some(msg) = &self.failure {
             return Err(io::Error::other(msg.clone()));
         }
@@ -1176,7 +1362,7 @@ enum TrainingPsvReader {
 }
 
 impl TrainingPsvReader {
-    fn next(&mut self) -> io::Result<PackedSfenValue> {
+    fn next(&mut self) -> io::Result<TeacherRecord> {
         match self {
             Self::Direct(reader) => reader.next(),
             Self::Windowed(reader) => reader.next(),
@@ -1218,7 +1404,7 @@ type BatchSlot = (Batch, Vec<i32>);
 ///   `Batch::push_decoded` (feature 抽出) と [`BucketMode::bucket_board`] の両方に
 ///   渡す。`pos.decode()` は 1 局面 1 回。
 /// - **並列パース**: worker は短い critical section (共有 reader を lock して
-///   `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
+///   `batch_size` 件の生 record を自前 scratch `Vec` に詰める; I/O は逐次・高速) の
 ///   外で decode + 特徴抽出を並列に行う。windowed reader では窓境界で lock 保持の
 ///   まま次窓完成を待ち得る (`Drop` は共通 stop flag で先に入力を止める)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
@@ -1281,9 +1467,10 @@ impl BucketedPrefetchedLoader {
     /// `train_end_offset` は training stream の上限 byte offset (`[0, train_end_offset)`
     /// が training に使われる)。file 全体を使うときは file size をそのまま渡す。
     /// 同 file 内に held-out tail を残す経路 (`--test-tail-positions`) で
-    /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
-    /// ようにするのが主用途。`train_end_offset` は [`PSV_RECORD_BYTES`] の倍数で
-    /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
+    /// `file_size - N * record_bytes` を渡し、training が tail に踏み込まない
+    /// ようにするのが主用途。`train_end_offset` は入力形式の record 長
+    /// ([`TeacherFormat::record_bytes`]) の倍数でなければならず、違反は loader の
+    /// open 時に error になる。
     /// `monitor_active` が `true` のとき、各 position の実 active feature 数を
     /// histogram (`feature_set.max_active() + 1` bins) に集計し [`Self::active_histogram_snapshot`]
     /// で参照できるようにする (`--monitor-active-features`)。`false` では histogram
@@ -1372,10 +1559,12 @@ impl BucketedPrefetchedLoader {
             num_buckets,
             monitor_active,
             reader,
+            path,
         ))
     }
 
-    /// Start decode workers for an already configured reader.
+    /// Start decode workers for an already configured reader. `data_path` is used only in
+    /// error messages.
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_reader(
         batch_size: usize,
@@ -1386,8 +1575,10 @@ impl BucketedPrefetchedLoader {
         num_buckets: usize,
         monitor_active: bool,
         reader: TrainingPsvReader,
+        data_path: &Path,
     ) -> Self {
         let num_workers = num_workers.max(1);
+        let data_path: Arc<Path> = Arc::from(data_path);
         let prefetch_depth = prefetch_depth_for(num_workers);
         // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
         // block しないようにする: result channel に最大 prefetch_depth、各 worker
@@ -1426,9 +1617,10 @@ impl BucketedPrefetchedLoader {
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
             let worker_stop = Arc::clone(&stop);
+            let data_path = Arc::clone(&data_path);
             let handle = thread::spawn(move || {
-                // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
-                let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
+                // 各 worker 専有の生 record scratch (iteration をまたいで reuse)。
+                let mut scratch: Vec<TeacherRecord> = Vec::with_capacity(batch_size);
                 // batch-local な active-feature histogram (計装 on のときだけ確保)。
                 // batch 末に共有 `active_hist` へ一括加算 → 1 position ごとの lock を
                 // 避ける。
@@ -1455,7 +1647,7 @@ impl BucketedPrefetchedLoader {
                         let mut failed: Option<io::Error> = None;
                         for _ in 0..batch_size {
                             match rdr.next() {
-                                Ok(psv) => scratch.push(psv),
+                                Ok(record) => scratch.push(record),
                                 Err(e) => {
                                     failed = Some(e);
                                     break;
@@ -1481,12 +1673,22 @@ impl BucketedPrefetchedLoader {
                     // のとき) position bucket の両方に使う。`compute_bucket=false`
                     // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
-                    let mut overflow: Option<io::Error> = None;
-                    for psv in &scratch {
+                    let mut failure: Option<io::Error> = None;
+                    for record in &scratch {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let board = psv.decode();
+                        let board = match record.decode() {
+                            Ok(board) => board,
+                            Err(e) => {
+                                // 壊れた HCPE record。下の max_active 超過と同じく学習を止める。
+                                failure = Some(io::Error::new(
+                                    e.kind(),
+                                    format!("corrupt record in {}: {e}", data_path.display()),
+                                ));
+                                break;
+                            }
+                        };
                         match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
@@ -1499,7 +1701,7 @@ impl BucketedPrefetchedLoader {
                                 // 積んで worker 終了。単一 worker error なので channel は
                                 // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
                                 // 明示エラーを返す (借りた slot は捨てる)。
-                                overflow = Some(e);
+                                failure = Some(e);
                                 break;
                             }
                         }
@@ -1507,7 +1709,7 @@ impl BucketedPrefetchedLoader {
                             buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
                         }
                     }
-                    if let Some(e) = overflow {
+                    if let Some(e) = failure {
                         let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
                         if slot.is_none() {
                             *slot = Some(e);
@@ -1656,6 +1858,10 @@ impl Drop for BucketedPrefetchedLoader {
 #[cfg(test)]
 #[path = "dataloader_cancellation_tests.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "dataloader_hcpe_tests.rs"]
+mod hcpe_tests;
 
 #[cfg(test)]
 mod tests {

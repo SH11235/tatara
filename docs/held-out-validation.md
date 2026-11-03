@@ -28,8 +28,9 @@ multiple).
 ## Which source to pick
 
 - **`--test-tail-positions <N>` (recommended)**: reserve the last N positions
-  of `--data` itself. Training reads `[0, file_end - N * 40)` and validation
-  reads `[file_end - N * 40, file_end)`; the two ranges are disjoint by
+  of `--data` itself. Training reads `[0, file_end - N * R)` and validation
+  reads `[file_end - N * R, file_end)`, where R is the record size (40 for
+  PSV, 38 for HCPE); the two ranges are disjoint by
   construction so contamination cannot occur. One file does both jobs, which
   removes the need to prepare a separate held-out PSV and to keep two files in
   sync. The only cost is that training loses N positions from its pool — for

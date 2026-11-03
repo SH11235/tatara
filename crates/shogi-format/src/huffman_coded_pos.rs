@@ -108,6 +108,11 @@ impl HuffmanCodedPosAndEval {
         i16::from_le_bytes([self.data[32], self.data[33]])
     }
 
+    /// Overwrite the side-to-move score (bytes 32-33, little-endian).
+    pub fn set_score(&mut self, score: i16) {
+        self.data[32..34].copy_from_slice(&score.to_le_bytes());
+    }
+
     pub fn game_result(&self) -> u8 {
         self.data[36]
     }
