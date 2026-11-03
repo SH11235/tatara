@@ -21,7 +21,7 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
     let feature_set = FeatureSet::from_canonical_name(&cli.feature_set)
         .ok_or_else(|| format!("unknown feature set: {}", cli.feature_set))?
         .spec();
-    // record 長の倍数検査は loader (PsvFileLoader::open_range) が行う。
+    // record 長の倍数検査は loader の open 時に入力形式ごとに行う。
     let file_size = std::fs::metadata(data)?.len();
     // `auto` は machine のメモリ量に依存し digest が machine 間で比較できなくなる
     // ため、digest では 0 (直接逐次読み) に解決する。明示値はそのまま使う。

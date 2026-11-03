@@ -189,12 +189,14 @@ impl TeacherShuffleBufferMib {
 ///
 /// Pick the NNUE architecture to train with the `layerstack` / `simple`
 /// subcommands. Shared options are global arguments and may be placed before or
-/// after the subcommand. Passing `--data <PSV>` runs the training loop;
+/// after the subcommand. Passing `--data <PSV|HCPE>` runs the training loop;
 /// omitting it runs a GPU smoke test that exercises the forward/backward path.
 #[derive(Parser, Debug)]
 #[command(name = "nnue-train", about = "Shogi NNUE trainer")]
 pub(crate) struct Cli {
-    /// Training data PSV file (`PackedSfenValue` x N, 40 bytes each). When omitted, runs a GPU smoke test.
+    /// Training data file: PSV (`PackedSfenValue`, 40 bytes per position), or HCPE
+    /// (`HuffmanCodedPosAndEval`, 38 bytes per position) when the extension is `.hcpe`.
+    /// When omitted, runs a GPU smoke test.
     #[arg(long, global = true)]
     pub(crate) data: Option<PathBuf>,
 
@@ -209,9 +211,10 @@ pub(crate) struct Cli {
     pub(crate) test_data: Option<PathBuf>,
 
     /// Reserve the last N positions of `--data` as a same-file held-out
-    /// validation set: training reads positions in `[0, file_end - N * 40)`
-    /// and validation reads `[file_end - N * 40, file_end)`. Useful when the
-    /// training PSV is too large to split into separate files. Mutually
+    /// validation set: training reads positions in `[0, file_end - N * R)`
+    /// and validation reads `[file_end - N * R, file_end)`, where R is the record
+    /// size (40 for PSV, 38 for HCPE). Useful when the training data is too large
+    /// to split into separate files. Mutually
     /// exclusive with `--test-data`. The first `--test-positions` of the
     /// reserved tail are evaluated at the end of each superbatch.
     #[arg(long, global = true, conflicts_with = "test_data")]
@@ -420,7 +423,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, requires = "data")]
     pub(crate) score_override: Option<PathBuf>,
 
-    /// Preserve the base PSV score where the corresponding LSB-first bitmap bit is set.
+    /// Preserve the base `--data` score where the corresponding LSB-first bitmap bit is set.
     #[arg(long, global = true, requires = "score_override")]
     pub(crate) score_override_mask: Option<PathBuf>,
 
@@ -908,15 +911,14 @@ impl Cli {
                 return Err("--precision-steps requires a training run with --data".into());
             }
         }
-        if self.score_source().is_some()
+        if self.dual_label_psv.is_some()
             && self
                 .data
                 .as_deref()
                 .is_some_and(nnue_train::dataloader::is_hcpe_path)
         {
             return Err(
-                "training --data requires PSV, not HCPE; --test-data supports HCPE heldout"
-                    .to_string(),
+                "--dual-label-psv requires PSV --data; HCPE has no second score label".to_string(),
             );
         }
         Ok(())

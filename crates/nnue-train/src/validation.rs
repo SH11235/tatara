@@ -29,8 +29,8 @@ use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
-    Batch, BucketMode, HcpeFileLoader, PSV_RECORD_BYTES, PsvFileLoader, ScoreOverrideReader,
-    ScoreSource,
+    Batch, BucketMode, ScoreOverrideReader, ScoreSource, TeacherFileLoader, TeacherFormat,
+    TeacherRecord, dual_label_requires_psv,
 };
 use crate::trainer::{LossKind, TrainerBackend};
 
@@ -84,22 +84,6 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
-        if crate::dataloader::is_hcpe_path(path) {
-            let loader = HcpeFileLoader::new(path)?;
-            return Self::load_boards(
-                loader,
-                |loader| loader.next_board(),
-                path,
-                batch_size,
-                score_drop_abs,
-                score_clamp_abs,
-                test_positions,
-                bucket_mode,
-                feature_set,
-                num_buckets,
-            );
-        }
-
         let file_size = std::fs::metadata(path)?.len();
         Self::load_from_range_with_score_sources(
             path,
@@ -116,12 +100,11 @@ impl HeldoutSet {
         )
     }
 
-    /// test PSV file の `[start_offset, end_offset)` byte range から固定の検証
-    /// 集合を読み込む。training PSV の末尾 N 局面を holdout 専用に分離する
+    /// test PSV / HCPE file の `[start_offset, end_offset)` byte range から固定の検証
+    /// 集合を読み込む。training data の末尾 N 局面を holdout 専用に分離する
     /// (`--test-tail-positions`) 経路で使う。挙動は [`HeldoutSet::load`] と同じく
     /// EOF (= range 末尾) で打ち切り、wrap はしない。range 検証 (alignment /
-    /// `end <= file_size` / `start <= end`) は [`PsvFileLoader::new_range`] に
-    /// 委譲する。
+    /// `end <= file_size` / `start <= end`) は入力形式の loader に委譲する。
     #[allow(clippy::too_many_arguments)]
     pub fn load_from_range(
         path: &Path,
@@ -150,7 +133,8 @@ impl HeldoutSet {
         )
     }
 
-    /// PSV range を sidecar または dual-label の明示的な score source で読む。
+    /// PSV / HCPE range を sidecar または dual-label の明示的な score source で読む。
+    /// dual-label は PSV だけが持つ field を使うため HCPE では error。
     #[allow(clippy::too_many_arguments)]
     pub fn load_from_range_with_score_sources(
         path: &Path,
@@ -165,7 +149,12 @@ impl HeldoutSet {
         num_buckets: usize,
         score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let format = TeacherFormat::for_path(path)?;
+        if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
+        {
+            return Err(dual_label_requires_psv(path));
+        }
+        let loader = TeacherFileLoader::new_range(path, start_offset, end_offset)?;
         let (mut score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
                 Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
@@ -174,21 +163,21 @@ impl HeldoutSet {
             Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
             None => (None, None),
         };
-        let mut record_index = start_offset / PSV_RECORD_BYTES;
+        let mut record_index = start_offset / format.record_bytes();
         Self::load_boards(
             loader,
             |loader| {
-                let Some(mut psv) = loader.next_psv()? else {
+                let Some(mut record) = loader.next_record()? else {
                     return Ok(None);
                 };
                 if let Some(score_override) = &mut score_override {
-                    score_override.apply(&mut psv)?;
+                    score_override.apply(&mut record)?;
                 }
-                if let Some(mode) = dual_label_psv {
-                    mode.apply(&mut psv, record_index, path)?;
+                if let (Some(mode), TeacherRecord::Psv(psv)) = (dual_label_psv, &mut record) {
+                    mode.apply(psv, record_index, path)?;
                 }
                 record_index += 1;
-                Ok(Some(psv.decode()))
+                record.decode().map(Some)
             },
             path,
             batch_size,
@@ -341,6 +330,7 @@ pub fn sign_agreement(net_output: &[f32], batch: &Batch) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataloader::{PSV_RECORD_BYTES, PsvFileLoader};
     use shogi_features::FeatureSet;
     use std::path::PathBuf;
 
@@ -657,5 +647,36 @@ mod tests {
             err.to_string().contains("fewer than batch_size"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn hcpe_tail_heldout_matches_psv_tail() {
+        let progress = ShogiProgressKPAbs;
+        let load = |path: &Path, record_bytes: u64| {
+            HeldoutSet::load_from_range(
+                path,
+                70 * record_bytes,
+                100 * record_bytes,
+                16,
+                None,
+                None,
+                16,
+                &progress,
+                test_spec(),
+                9,
+            )
+            .expect("load tail range")
+        };
+        let psv = load(&sample_psv_path(), PSV_RECORD_BYTES);
+        let hcpe = load(&sample_psv_path().with_extension("hcpe"), 38);
+        assert_eq!(hcpe.n_positions(), 16);
+        let (psv_batch, psv_buckets) = &psv.batches[0];
+        let (hcpe_batch, hcpe_buckets) = &hcpe.batches[0];
+        assert_eq!(psv_buckets, hcpe_buckets);
+        assert_eq!(psv_batch.score, hcpe_batch.score);
+        assert_eq!(psv_batch.wdl, hcpe_batch.wdl);
+        assert_eq!(psv_batch.nnz, hcpe_batch.nnz);
+        assert_eq!(psv_batch.stm_indices, hcpe_batch.stm_indices);
+        assert_eq!(psv_batch.nstm_indices, hcpe_batch.nstm_indices);
     }
 }

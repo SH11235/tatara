@@ -18,9 +18,15 @@
 
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
-| 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
+| 教師データ | PSV: `PackedSfenValue` × N (40 bytes 固定 / 局面)、または HCPE: `HuffmanCodedPosAndEval` × N (38 bytes 固定 / 局面、拡張子 `.hcpe`) | `--data` で渡す | 数百 GB |
 | progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progresskpabs` / `progresskpabsq16` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
+
+`--data` に渡すのはファイル 1 本。形式は拡張子で決まり、`.hcpe` (大文字小文字不問) は HCPE、
+それ以外は PSV として読む。symlink はリンク名と実体の名前が同じ形式を示す必要がある。
+可変長の hcpe3 は直接読めないので、[rshogi のツール群](https://github.com/SH11235/rshogi/tree/main/crates/tools) の
+`hcpe3_to_psv` で PSV に変換してから使う。複数のファイルや形式の混在した教師で学習するときは、
+PSV に変換 (HCPE は `hcpe_to_psv`) したうえで、事前に 1 本へ結合・シャッフルしておく。
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)
 
@@ -155,11 +161,13 @@ score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で
 窓内shuffleする。`--resume`時は教師streamをファイル先頭から開き直すため、
 checkpointは窓の途中位置やdataset epoch番号を復元しない。
 
-学習入力(`--data`)、`loader-digest`、PSVの再評価は40バイト固定長のPSVを使う。
-PSV readerは、総サイズが40の倍数でも`.hcpe`拡張子(大文字小文字不問)を拒否する。
-別の検証入力(`--test-data`)では引き続きHCPEを使える。
-レコードと局面の正当性を保証する生成処理で作ったPSV教師を使う。
-学習はその内容を信頼し、起動時の全件走査やdecode済み局面ごとの構造検証は行わない。
+学習入力(`--data`)、`--test-data`、`loader-digest`はPSVとHCPEを読める。
+再評価(`--rescore-input`)はPSV専用で、`.hcpe`という名前のファイルを拒否する。
+score sidecar(`--score-override`)はレコード数で対応づけるので、どちらの形式でも使える。
+`--dual-label-psv`はPSVにしかないfieldから2つ目のラベルを読むため、HCPEでは拒否する。
+レコードと局面の正当性を保証する生成処理で作った教師を使う。
+学習はその内容を信頼し、起動時の全件走査やdecode済みPSV局面ごとの構造検証は行わない。
+HCPEはHuffman符号や駒数が不正なレコードをdecodeした時点でエラーとなり、学習が止まる。
 dataset epochをまたぐ場合も含め、学習中は入力ファイルを変更しない。
 教師を再生成するときは別のファイルに出力する。
 PSVの再評価では、スコアを書き出す前の玉の配置・総駒数の構造検証を引き続き行う。

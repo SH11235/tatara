@@ -293,17 +293,23 @@ fn dual_label_psv_requires_data_and_conflicts_with_sidecars() {
 }
 
 #[test]
-fn inline_and_sidecar_score_sources_reject_hcpe_input() {
-    for args in [
-        vec!["--score-override", "scores.bin"],
-        vec!["--dual-label-psv", "all"],
-    ] {
-        let mut argv = vec!["nnue-train", "--data", "teacher.hcpe"];
-        argv.extend(args);
+fn hcpe_data_accepts_a_score_sidecar_but_not_dual_label() {
+    let parse = |extra: &[&str]| {
+        let mut argv = vec!["nnue-train", "--data", "teacher.HCPE"];
+        argv.extend_from_slice(extra);
         argv.push("simple");
-        let cli = Cli::try_parse_from(argv).unwrap();
-        assert!(cli.validate_score_sources().is_err());
-    }
+        Cli::try_parse_from(argv).unwrap()
+    };
+    assert!(parse(&[]).validate_score_sources().is_ok());
+    assert!(
+        parse(&["--score-override", "scores.bin"])
+            .validate_score_sources()
+            .is_ok()
+    );
+    let error = parse(&["--dual-label-psv", "all"])
+        .validate_score_sources()
+        .unwrap_err();
+    assert!(error.contains("--dual-label-psv requires PSV"), "{error}");
 }
 
 #[test]

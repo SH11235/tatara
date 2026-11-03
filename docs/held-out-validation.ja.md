@@ -25,8 +25,8 @@ source 選択とは別軸のパラメータで、選ばれた source の先頭�
 ## どちらの source を選ぶか
 
 - **`--test-tail-positions <N>` (推奨)**: `--data` 自身の末尾 N 局面を切り
-  分ける。training は `[0, file_end - N * 40)`、validation は
-  `[file_end - N * 40, file_end)` を読み、両者は byte range レベルで disjoint
+  分ける。training は `[0, file_end - N * R)`、validation は
+  `[file_end - N * R, file_end)` を読み (R は record 長で PSV は 40、HCPE は 38)、両者は byte range レベルで disjoint
   なので contamination は構造的に発生しない。教師ファイル 1 本で training と
   validation 両方をまかなえるので、別 file を用意して同期管理する手間が要らな
   い。唯一のコストは training pool が N 局面減ること。教師全件 ≫ N の典型ケース

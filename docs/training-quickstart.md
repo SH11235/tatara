@@ -21,9 +21,16 @@ examples:
 
 | File | Format | Purpose | Approx. size |
 |---|---|---|---:|
-| Training data PSV | `PackedSfenValue` × N (fixed 40 bytes / position) | Passed via `--data` | Hundreds of GB |
+| Training data | PSV: `PackedSfenValue` × N (fixed 40 bytes / position), or HCPE: `HuffmanCodedPosAndEval` × N (fixed 38 bytes / position, `.hcpe` extension) | Passed via `--data` | Hundreds of GB |
 | progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progresskpabs` / `progresskpabsq16` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
 | (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
+
+`--data` takes a single file. The format is chosen by the extension: `.hcpe` (case-insensitive)
+is read as HCPE, anything else as PSV. For a symlink, the link name and the target name must imply
+the same format. Variable-length hcpe3 files cannot be read directly; convert them to PSV first
+with `hcpe3_to_psv` from [rshogi's tools](https://github.com/SH11235/rshogi/tree/main/crates/tools). To train on several
+files or a mix of formats, convert them to PSV (`hcpe_to_psv` for HCPE), then merge and shuffle
+them into one file in advance.
 
 ## Example 1: Training a HalfKP NNUE (simple architecture)
 
@@ -130,7 +137,7 @@ The default (`--teacher-shuffle-buffer-mib 0`) reads the teacher sequentially wi
 assuming teachers are pre-shuffled on disk. Passing a positive value or `auto` enables windowing;
 `auto` sizes each window to 1/16 of the smaller of total RAM and the cgroup memory limit (including
 nested cgroup v2 limits), capped at 4096 MiB per window, so both windows together stay within 1/8
-of available memory. With windowing enabled, a producer thread reads PSV records sequentially into
+of available memory. With windowing enabled, a producer thread reads teacher records sequentially into
 windows of that size. While the CPU dataloader consumes one window, the producer prepares the next. A completed window is reordered
 with Fisher–Yates. A partial window at physical EOF is processed without mixing records from the
 next dataset epoch, and the next epoch uses a different seed that includes its epoch number. This
@@ -170,12 +177,14 @@ Score sidecars, `--score-drop-abs`, and `--score-clamp-abs` are applied in origi
 before records enter the shuffle window. On `--resume`, the teacher stream is reopened from the
 start; checkpoints do not restore a position within a window or the dataset epoch number.
 
-Training input (`--data`), `loader-digest`, and PSV rescoring require 40-byte PSV records.
-Files named `.hcpe` (case-insensitive) are rejected by PSV readers, even when their total
-length is also divisible by 40. Separate held-out input (`--test-data`) still supports HCPE.
-Use PSV data produced by a generator that guarantees valid records and positions. Training
+Training input (`--data`), `--test-data`, and `loader-digest` accept PSV and HCPE. Rescoring
+(`--rescore-input`) requires PSV and rejects files named `.hcpe`. A score sidecar
+(`--score-override`) is aligned by record count, so it works with either format. `--dual-label-psv`
+reads the second label from PSV-only fields and is rejected for HCPE.
+Use teacher data produced by a generator that guarantees valid records and positions. Training
 trusts that content: it does not scan the entire file at startup or structurally validate each
-decoded position. Keep the input file unchanged throughout training, including across dataset
+decoded PSV position. An HCPE record whose Huffman code or piece counts are invalid stops
+training with an error when it is decoded. Keep the input file unchanged throughout training, including across dataset
 epochs; write regenerated data to a different file.
 PSV rescoring retains its structural checks for king placement and total piece count before
 writing scores. These checks do not verify move legality or every possible format corruption.

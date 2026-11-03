@@ -63,7 +63,7 @@ use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
-    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PSV_RECORD_BYTES, ScoreSource,
+    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, ScoreSource, TeacherFormat,
 };
 use crate::experiment::{ExperimentLogger, format_utc_iso, now_epoch_secs};
 use crate::schedule::{LrScheduler, WdlScheduler};
@@ -478,8 +478,8 @@ pub struct TrainingConfig {
     pub test_positions: usize,
     /// `Some(n)` のとき `data_path` 末尾 `n` 局面を training stream から除外し
     /// held-out 専用に分離する (`--test-tail-positions`)。training は
-    /// `[0, file_size - n * PSV_RECORD_BYTES)`、validation は
-    /// `[file_size - n * PSV_RECORD_BYTES, file_size)` を読む。`test_data` と
+    /// `[0, file_size - n * record_bytes)`、validation は
+    /// `[file_size - n * record_bytes, file_size)` を読む。`test_data` と
     /// 同時指定は `validate()` で error。
     pub test_tail_positions: Option<u64>,
     /// dataloader worker で選択された bucket mode を計算して per-position
@@ -763,7 +763,8 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Resul
 /// superbatch training loop を実行し、`cfg.output_dir` 配下に checkpoint を書き出す。
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
-/// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
+/// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定) または拡張子 `.hcpe` の
+///   HCPE file (`HuffmanCodedPosAndEval` × N、38 bytes 固定)
 /// - `bucket_mode`: dataloader と held-out validation に共通の bucket 算出方式。
 ///   progresskpabs の重みは process-global なので呼び出し前に load 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
@@ -797,30 +798,31 @@ where
 {
     cfg.validate()?;
 
-    if crate::dataloader::is_hcpe_path(data_path) {
-        return Err(io::Error::other(
-            "training data requires PSV, not HCPE; held-out validation supports HCPE",
-        ));
+    let format = TeacherFormat::for_path(data_path)?;
+    if format == TeacherFormat::Hcpe && matches!(cfg.score_source, Some(ScoreSource::DualLabel(_)))
+    {
+        return Err(crate::dataloader::dual_label_requires_psv(data_path));
     }
+    let record_bytes = format.record_bytes();
 
-    // data file の byte サイズを取って PSV alignment を確認。
-    // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
+    // data file の byte サイズを取って record alignment を確認。
+    // `--test-tail-positions` の split 計算がここで record 境界に揃うか
     // 決まるため、tail 経路に入る前に確実に reject する。
     let file_size = std::fs::metadata(data_path)?.len();
-    if !file_size.is_multiple_of(PSV_RECORD_BYTES) {
+    if !file_size.is_multiple_of(record_bytes) {
         return Err(io::Error::other(format!(
-            "data file {} size {file_size} is not a multiple of PSV record size \
-             ({PSV_RECORD_BYTES} bytes); the file is corrupted or not a PackedSfenValue stream",
+            "data file {} size {file_size} is not a multiple of {} record size \
+             ({record_bytes} bytes); the file is corrupted or the extension does not match its format",
             data_path.display(),
+            format.name(),
         )));
     }
 
     let train_end_offset = match cfg.test_tail_positions {
         Some(n) => {
-            let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
+            let tail_bytes = n.checked_mul(record_bytes).ok_or_else(|| {
                 io::Error::other(format!(
-                    "test_tail_positions ({n}) * PSV record size ({PSV_RECORD_BYTES}) \
-                     overflows u64"
+                    "test_tail_positions ({n}) * record size ({record_bytes}) overflows u64"
                 ))
             })?;
             if tail_bytes >= file_size {
@@ -828,7 +830,7 @@ where
                     "test_tail_positions ({n}) leaves no training records \
                      (data file {} has {} records)",
                     data_path.display(),
-                    file_size / PSV_RECORD_BYTES,
+                    file_size / record_bytes,
                 )));
             }
             file_size - tail_bytes
@@ -1599,8 +1601,12 @@ mod tests {
         dir
     }
 
+    fn sample_hcpe_path() -> PathBuf {
+        sample_psv_path().with_extension("hcpe")
+    }
+
     #[test]
-    fn run_rejects_hcpe_training_data_without_a_score_source() {
+    fn run_trains_on_hcpe_data() {
         let progress = ShogiProgressKPAbs;
         let lr = StepLR {
             start: 1.0e-3,
@@ -1609,7 +1615,63 @@ mod tests {
         };
         let wdl = ConstantWDL { value: 0.0 };
         let cfg = base_cfg();
-        assert!(cfg.score_source.is_none());
+        let mut backend = MockBackend::new();
+        run(
+            &mut backend,
+            &sample_hcpe_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect("HCPE training data is accepted");
+        assert_eq!(backend.steps, 6);
+        assert_eq!(backend.max_batch_positions, cfg.batch_size);
+    }
+
+    #[test]
+    fn run_counts_hcpe_tail_positions_in_38_byte_records() {
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            test_tail_positions: Some(100),
+            test_positions: 8,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new();
+        let error = run(
+            &mut backend,
+            &sample_hcpe_path(),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .expect_err("a 100-position tail leaves no HCPE training records");
+        assert!(error.to_string().contains("has 100 records"), "{error}");
+        assert_eq!(backend.steps, 0);
+    }
+
+    #[test]
+    fn run_rejects_hcpe_with_dual_label_scores() {
+        let progress = ShogiProgressKPAbs;
+        let lr = StepLR {
+            start: 1.0e-3,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let cfg = TrainingConfig {
+            score_source: Some(ScoreSource::DualLabel(DualLabelMode::Gated)),
+            ..base_cfg()
+        };
         let mut backend = MockBackend::new();
         for name in ["teacher.hcpe", "teacher.HCPE"] {
             let error = run(
@@ -1621,8 +1683,13 @@ mod tests {
                 &cfg,
                 None,
             )
-            .expect_err("HCPE training data must be rejected");
-            assert!(error.to_string().contains("requires PSV, not HCPE"));
+            .expect_err("dual-label needs the PSV reserved fields");
+            assert!(
+                error
+                    .to_string()
+                    .contains("--dual-label-psv requires PSV input"),
+                "{error}"
+            );
         }
         assert_eq!(backend.steps, 0);
     }
