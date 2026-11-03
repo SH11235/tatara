@@ -1199,9 +1199,8 @@ struct PsvWindow {
 }
 
 /// Two-window producer/consumer reader. The producer fills the next window of raw teacher
-/// records while the decode workers consume the current one. `window_records` is per window, and
-/// each record occupies `size_of::<TeacherRecord>()` bytes (41), so resident capacity is
-/// approximately `2 * window_records * 41` bytes.
+/// records while the decode workers consume the current one. `window_records` is per window, so
+/// resident capacity is approximately `2 * window_records * size_of::<TeacherRecord>()` bytes.
 struct WindowedPsvReader {
     ready_rx: mpsc::Receiver<io::Result<PsvWindow>>,
     empty_tx: Option<mpsc::Sender<Vec<TeacherRecord>>>,
