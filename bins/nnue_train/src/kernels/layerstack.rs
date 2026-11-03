@@ -2378,6 +2378,64 @@ pub fn abs_pow2_scale_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, sc
     }
 }
 
+/// L1 出力の後段を `l1_total` (`batch × l1_out`) から 1 pass で計算する。1 thread =
+/// `l2_input` の 1 cell または `l1_skip` の 1 cell (行あたり `2 * effective + skip` thread)。
+/// `l1_main = l1_total[:, ..effective]`、`l1_skip = l1_total[:, effective..effective + skip]`、
+/// `l2_pre = [l1_main² * scale, l1_main]`、`l2_input = CReLU(l2_pre)`。式は slice / 2 乗 /
+/// concat / CReLU の各 kernel と同じなので、それらを順に走らせた結果と bit 単位で一致する。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_clamp)]
+#[kernel]
+pub fn l1_tail_fwd(
+    l1_total: &[f32],
+    l1_main: &[f32],
+    l1_skip: &[f32],
+    l2_pre: &[f32],
+    l2_input: &[f32],
+    batch: u32,
+    l1_out: u32,
+    effective: u32,
+    skip: u32,
+    scale: f32,
+) {
+    let i = thread::index_1d().get();
+    let effective = effective as usize;
+    let skip = skip as usize;
+    let l2_in = 2 * effective;
+    let width = l2_in + skip;
+    if i >= (batch as usize) * width {
+        return;
+    }
+    let row = i / width;
+    let column = i % width;
+    let source = row * (l1_out as usize);
+    // SAFETY: 各 thread は disjoint な cell を 1 つずつ書く。`row < batch`、列は各 buffer の
+    // 行幅 (`skip` / `effective` / `l2_in`) 未満で、caller は各 buffer に `batch` 行を確保する。
+    unsafe {
+        if column >= l2_in {
+            let j = column - l2_in;
+            *(l1_skip.as_ptr().add(row * skip + j) as *mut f32) = l1_total[source + effective + j];
+            return;
+        }
+        let square = column < effective;
+        let main_column = if square { column } else { column - effective };
+        let x = l1_total[source + main_column];
+        let pre = if square { x * x * scale } else { x };
+        if !square {
+            *(l1_main.as_ptr().add(row * effective + main_column) as *mut f32) = x;
+        }
+        let acted = if pre < 0.0_f32 {
+            0.0_f32
+        } else if pre > 1.0_f32 {
+            1.0_f32
+        } else {
+            pre
+        };
+        *(l2_pre.as_ptr().add(row * l2_in + column) as *mut f32) = pre;
+        *(l2_input.as_ptr().add(row * l2_in + column) as *mut f32) = acted;
+    }
+}
+
 /// Concat l1_sqr + l1_main forward — `out[b][..a_dim] = a[b]`, `out[b][a_dim..a_dim+b_dim] = b[b]`。
 ///
 /// 1 thread = 1 (batch, output_index) cell。`out_dim = a_dim + b_dim`。
@@ -2504,7 +2562,7 @@ pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) 
 }
 
 /// Extract a 2D slice — `dst[bi][oi] = src[bi*src_stride + src_offset + oi]`。
-/// 1 thread = 1 dst cell。l1_total (B×16) → l1_main (B×15) / l1_skip (B×1) 抽出に使用。
+/// 1 thread = 1 dst cell。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn slice_extract_2d(

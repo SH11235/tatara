@@ -2134,6 +2134,54 @@ extern "C" __global__ void radam_step(
     gradient[i] = 0.0F;
 }
 
+// L1 output tail in one pass over `l1_total` (`batch x l1_out`), one thread per cell of the
+// `l2_input` row plus `skip` cells: `l1_main = l1_total[:, :effective]`,
+// `l1_skip = l1_total[:, effective:effective + skip]`, `l2_pre = [l1_main^2 * scale, l1_main]` and
+// `l2_input = CReLU(l2_pre)`. The values are the same expressions as the separate slice, square,
+// concat and CReLU kernels, so the outputs are bit-identical to running those in sequence.
+extern "C" __global__ void l1_tail_fwd(
+    const float* l1_total,
+    unsigned long long,
+    float* l1_main,
+    unsigned long long,
+    float* l1_skip,
+    unsigned long long,
+    float* l2_pre,
+    unsigned long long,
+    float* l2_input,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int l1_out,
+    unsigned int effective,
+    unsigned int skip,
+    float scale
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int l2_in = 2 * effective;
+    const unsigned int width = l2_in + skip;
+    if (i >= static_cast<unsigned long long>(batch) * width) {
+        return;
+    }
+    const unsigned long long row = i / width;
+    const unsigned int column = static_cast<unsigned int>(i % width);
+    const float* source = l1_total + row * l1_out;
+    if (column >= l2_in) {
+        const unsigned int j = column - l2_in;
+        l1_skip[row * skip + j] = source[effective + j];
+        return;
+    }
+    const bool square = column < effective;
+    const unsigned int main_column = square ? column : column - effective;
+    const float x = source[main_column];
+    const float pre = square ? x * x * scale : x;
+    if (!square) {
+        l1_main[row * effective + main_column] = x;
+    }
+    l2_pre[row * l2_in + column] = pre;
+    l2_input[row * l2_in + column] = pre < 0.0F ? 0.0F : (pre > 1.0F ? 1.0F : pre);
+}
+
 extern "C" __global__ void crelu_fwd(
     const float* input,
     unsigned long long,

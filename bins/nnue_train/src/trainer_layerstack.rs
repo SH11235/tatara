@@ -22,6 +22,9 @@ type FtForwardTestState = (Option<Vec<f32>>, Vec<f32>);
 /// changed or set nonzero)` read back by tests.
 #[cfg(all(test, feature = "native"))]
 type BitsCompareTestState = (Vec<u32>, Vec<u32>, usize);
+/// `(output name, production bits, reference bits)`.
+#[cfg(all(test, feature = "native"))]
+type NamedBitsCompare = (&'static str, Vec<u32>, Vec<u32>);
 
 /// `(position order, ordered activation bits, unordered activation bits)` read back by tests.
 #[cfg(all(test, feature = "native"))]
@@ -581,6 +584,86 @@ impl GpuTrainer {
             }
         }?;
         Ok(gradient.to_host_vec(&self.stream)?)
+    }
+
+    /// Recomputes the last forward's L1 tail from `l1_total` with the separate slice, square,
+    /// concat and CReLU kernels, returning `(name, production bits, reference bits)` for
+    /// `l1_main`, `l1_skip`, `l2_pre` and `l2_input`.
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn l1_tail_reference_bits_for_test(
+        &self,
+        b: usize,
+    ) -> Result<Vec<NamedBitsCompare>, Box<dyn std::error::Error>> {
+        let l1_out = self.ws.l1_out;
+        let effective = self.ws.l1_effective();
+        let l2_in = self.ws.l2_in();
+        let main = DeviceBuffer::<f32>::zeroed(&self.stream, b * effective)?;
+        let skip = DeviceBuffer::<f32>::zeroed(&self.stream, b * L1_SKIP)?;
+        let sqr = DeviceBuffer::<f32>::zeroed(&self.stream, b * effective)?;
+        let pre = DeviceBuffer::<f32>::zeroed(&self.stream, b * l2_in)?;
+        let input = DeviceBuffer::<f32>::zeroed(&self.stream, b * l2_in)?;
+        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+        // stream の完了を待つ同期点まで生存する device allocation。
+        unsafe {
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(b * effective),
+                args: [slice(self.ws.l1_total), slice(main), b as u32, l1_out as u32, 0_u32,
+                       effective as u32]
+            }?;
+            cuda_launch! {
+                kernel: slice_extract_2d, stream: self.stream, module: self.module,
+                config: cfg_1d(b * L1_SKIP),
+                args: [slice(self.ws.l1_total), slice(skip), b as u32, l1_out as u32,
+                       effective as u32, L1_SKIP as u32]
+            }?;
+            cuda_launch! {
+                kernel: abs_pow2_scale_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(b * effective),
+                args: [slice(main), slice(sqr), L1_SQR_SCALE, (b * effective) as u32]
+            }?;
+            cuda_launch! {
+                kernel: concat_l1sqr_main_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(b * l2_in),
+                args: [slice(sqr), slice(main), slice(pre), b as u32, effective as u32,
+                       effective as u32]
+            }?;
+            cuda_launch! {
+                kernel: crelu_fwd, stream: self.stream, module: self.module,
+                config: cfg_1d(b * l2_in),
+                args: [slice(pre), slice(input), (b * l2_in) as u32]
+            }?;
+        }
+        let bits = |buffer: &DeviceBuffer<f32>,
+                    n: usize|
+         -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+            Ok(buffer.to_host_vec(&self.stream)?[..n]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        Ok(vec![
+            (
+                "l1_main",
+                bits(&self.ws.l1_main, b * effective)?,
+                bits(&main, b * effective)?,
+            ),
+            (
+                "l1_skip",
+                bits(&self.ws.l1_skip, b * L1_SKIP)?,
+                bits(&skip, b * L1_SKIP)?,
+            ),
+            (
+                "l2_pre",
+                bits(&self.ws.l2_pre, b * l2_in)?,
+                bits(&pre, b * l2_in)?,
+            ),
+            (
+                "l2_input",
+                bits(&self.ws.l2_input, b * l2_in)?,
+                bits(&input, b * l2_in)?,
+            ),
+        ])
     }
 
     /// The last forward's `l1_total`, and a host recomputation that adds each term in ascending
@@ -1638,7 +1721,6 @@ pub(crate) struct GpuWorkspace {
     l1_total: DeviceBuffer<f32>,      // b × l1_out
     l1_main: DeviceBuffer<f32>,       // b × l1_effective
     l1_skip: DeviceBuffer<f32>,       // b × L1_SKIP
-    l1_sqr: DeviceBuffer<f32>,        // b × l1_effective
     l2_pre: DeviceBuffer<f32>,        // b × l2_in
     l2_input: DeviceBuffer<f32>,      // b × l2_in
     l2_dense_out: DeviceBuffer<f32>,  // b × l2_out (L2 dense matmul output, pre-CReLU)
@@ -1802,7 +1884,6 @@ impl GpuWorkspace {
             l1_total: z(batch * l1_out)?,
             l1_main: z(batch * l1_effective)?,
             l1_skip: z(batch * L1_SKIP)?,
-            l1_sqr: z(batch * l1_effective)?,
             l2_pre: z(batch * l2_in)?,
             l2_input: z(batch * l2_in)?,
             l2_dense_out: z(batch * l2_out)?,
@@ -4161,87 +4242,23 @@ impl GpuTrainer {
         if qat_l1 {
             self.qat_dense_forward(1, b)?;
         }
-        // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
+        // -- Forward steps 7-10: l1_total → l1_main (B × l1_effective), l1_skip (B × L1_SKIP),
+        // l2_pre = concat(l1_main^2 * scale, l1_main) and l2_input = CReLU(l2_pre) (B × l2_in) --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
+            // stream の完了を待つ同期点まで生存する device allocation。各出力は `b` 行以上を持つ。
             cuda_launch! {
-                kernel: slice_extract_2d,
+                kernel: l1_tail_fwd,
                 stream: self.stream,
                 module: self.module,
-                config: cfg_1d(b * l1_effective),
+                config: cfg_1d(b * (l2_in + L1_SKIP)),
                 args: [
                     slice(self.ws.l1_total),
-                    slice_mut(self.ws.l1_main),
-                    b_u32, l1_out as u32, 0_u32, l1_effective as u32
-                ]
-            }
-        }?;
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: slice_extract_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * L1_SKIP),
-                args: [
-                    slice(self.ws.l1_total),
-                    slice_mut(self.ws.l1_skip),
-                    b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32
-                ]
-            }
-        }?;
-
-        // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × l1_effective) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: abs_pow2_scale_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
                     slice(self.ws.l1_main),
-                    slice_mut(self.ws.l1_sqr),
-                    L1_SQR_SCALE,
-                    (b * l1_effective) as u32
-                ]
-            }
-        }?;
-
-        // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × l2_in) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: concat_l1sqr_main_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_in),
-                args: [
-                    slice(self.ws.l1_sqr),
-                    slice(self.ws.l1_main),
-                    slice_mut(self.ws.l2_pre),
-                    b_u32, l1_effective as u32, l1_effective as u32
-                ]
-            }
-        }?;
-
-        // -- Forward step 10: l2_input = CReLU(l2_pre) (B × l2_in) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: crelu_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_in),
-                args: [
+                    slice(self.ws.l1_skip),
                     slice(self.ws.l2_pre),
-                    slice_mut(self.ws.l2_input),
-                    (b * l2_in) as u32
+                    slice(self.ws.l2_input),
+                    b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32, L1_SQR_SCALE
                 ]
             }
         }?;

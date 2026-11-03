@@ -490,14 +490,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 86, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 84, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 102, "production kernel inventory changed");
+    assert_eq!(required.len(), 100, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3579,6 +3579,48 @@ fn l1_forward_sorted_matches_sequential_reference() -> Result<(), Box<dyn std::e
             trainer.l1_total_sequential_reference_bits_for_test(batch_size)?;
         assert!(nonzero > 0, "{name}: l1_total is all zero");
         assert_eq!(production, reference, "{name}: l1_total differs");
+    }
+    Ok(())
+}
+
+/// L1 出力の後段 (slice / 2 乗 / concat / CReLU) を 1 本にまとめた kernel が、別々の kernel を
+/// 順に走らせた結果と bit 単位で同じ `l1_main` / `l1_skip` / `l2_pre` / `l2_input` を書くこと。
+/// CReLU の両端 (0 未満・1 超) に掛かる値が出るよう L1 の bias を広めに振る。
+#[cfg(feature = "native")]
+#[test]
+fn l1_tail_fused_matches_separate_kernels() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let standard = LayerStackTestOptions::standard();
+    let batch_size = 64;
+    for l1_out in [16, 33] {
+        let options = LayerStackTestOptions {
+            l1_out,
+            num_buckets: 4,
+            ..standard
+        };
+        let mut trainer =
+            create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
+        trainer.set_skip_optimizer_for_test(true);
+        let mut net = trainer.to_layerstack_weights()?;
+        for (i, b) in net.l1_b.iter_mut().enumerate() {
+            *b = ((i % 7) as f32 - 3.0) * 0.6;
+        }
+        trainer.load_layerstack_weights(&net)?;
+        trainer.sync_ft_forward_weights()?;
+        let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
+        batch.bucket_idx = (0..batch_size as i32).map(|r| r % 4).collect();
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        let outputs = trainer.l1_tail_reference_bits_for_test(batch_size)?;
+        let input = &outputs[3].1;
+        let clamped_low = input.iter().filter(|&&v| v == 0.0_f32.to_bits()).count();
+        let clamped_high = input.iter().filter(|&&v| v == 1.0_f32.to_bits()).count();
+        assert!(
+            clamped_low > 0 && clamped_high > 0 && clamped_low + clamped_high < input.len(),
+            "l1_out {l1_out}: CReLU ends not exercised ({clamped_low} at 0, {clamped_high} at 1)"
+        );
+        for (name, production, reference) in outputs {
+            assert_eq!(production, reference, "l1_out {l1_out}: {name} differs");
+        }
     }
     Ok(())
 }
