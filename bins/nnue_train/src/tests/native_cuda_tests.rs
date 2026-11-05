@@ -3845,6 +3845,7 @@ fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::
             standard.feature_set,
             PrecisionFlags::default(),
         ),
+        ("plain-all-optim-mirror", standard.feature_set, all_optim),
         (
             "hm-factorized-all-optim",
             FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
