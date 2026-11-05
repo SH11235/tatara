@@ -104,6 +104,7 @@ fn ft_post_clamp_unit(value: f32) -> f32 {
 }
 
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 pub fn ft_post_perspective_fwd_sorted(
     stm_ft_out: &[f32],
     nstm_ft_out: &[f32],
@@ -224,6 +225,7 @@ pub fn ft_post_perspective_fwd_fp16(
 }
 
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 pub fn ft_post_perspective_fwd_fp16_sorted(
     stm_ft_out: &[f16],
     nstm_ft_out: &[f16],
