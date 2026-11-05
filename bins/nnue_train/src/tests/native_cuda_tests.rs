@@ -370,17 +370,26 @@ fn strip_cuda_comments(source: &str) -> String {
     out
 }
 
-/// `native_kernels.cu` の行頭に `extern "C" __global__ void <name>(` がある export だけを
-/// 集める。コメントを潰してから行頭マッチするので、`//` / `/* ... */` (複数行含む) で
-/// コメント化された宣言は「存在する」と誤判定されない (穴を素通りさせないため)。
+/// `native_kernels.cu` の行頭に `extern "C" __global__ [__launch_bounds__(...)] void <name>(`
+/// がある export だけを集める。コメントを潰してから行頭マッチするので、`//` / `/* ... */`
+/// (複数行含む) でコメント化された宣言は「存在する」と誤判定されない (穴を素通りさせないため)。
 fn native_source_exports() -> std::collections::BTreeSet<String> {
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
-    let prefix = "extern \"C\" __global__ void ";
     strip_cuda_comments(native)
         .lines()
-        .filter_map(|line| line.strip_prefix(prefix).map(str::to_owned))
+        .filter_map(cuda_export_declaration)
         .filter_map(|declaration| declaration.split_once('(').map(|(name, _)| name.to_owned()))
         .collect()
+}
+
+/// `extern "C" __global__ ` の後に任意の `__launch_bounds__(...) ` を挟んだ `void ` 以降を返す。
+fn cuda_export_declaration(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("extern \"C\" __global__ ")?;
+    let rest = match rest.strip_prefix("__launch_bounds__(") {
+        Some(bounds) => bounds.split_once(") ")?.1,
+        None => rest,
+    };
+    rest.strip_prefix("void ")
 }
 
 fn assert_native_exports(required: &std::collections::BTreeSet<String>) {
