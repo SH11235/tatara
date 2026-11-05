@@ -4,7 +4,7 @@
 //! GPU 側 (`#[kernel] fn dense_mm_fwd` / `dense_mm_bwd_input` / `dense_mm_bwd_weight`
 //! / `bias_grad`) は `bins/nnue_train/src/kernels/` に定義 (cuda-oxide
 //! bin-entry 制約)。**L1 shared** layer
-//! (`combined (B×1536) → l1_shared_out (B×16)`) の forward / backward に使われる。
+//! (`combined_sorted (B×ft_out) → l1_shared_out (B×l1_out)`) の forward / backward に使われる。
 //!
 //! ## Layout 規約 (kernel と完全一致させる — テストの核心)
 //!

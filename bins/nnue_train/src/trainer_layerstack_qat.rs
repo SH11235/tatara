@@ -44,7 +44,7 @@ impl GpuTrainer {
                     cuda_launch! {
                         kernel: qat_activation, stream: self.stream, module: self.module,
                         config: cfg_1d(batch * self.ws.ft_out),
-                        args: [slice_mut(self.ws.combined), (batch * self.ws.ft_out) as u32]
+                        args: [slice_mut(self.ws.combined_sorted), (batch * self.ws.ft_out) as u32]
                     }
                 }?,
                 1 => {
@@ -168,18 +168,14 @@ impl GpuTrainer {
         layer: u32,
         batch: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if layer == 1 {
+            qat_dense_threads(batch, self.ws.ft_out, self.ws.l1_out)?;
+            return self.qat_dense_l1_sorted(batch, &self.ws.l1_total, &self.qat_raw[0]);
+        }
         // After qat_swap, qat_buffers holds the original masters (including nonzero shared bias).
         // Quantize those biases directly to integers: an f32 dequantize/requantize round trip
         // cannot preserve every i32 bias. The live quantized biases serve the floating kernels only.
         let (input, w, bias, output, inputs, outputs) = match layer {
-            1 => (
-                &self.ws.combined,
-                &self.l1_w,
-                &self.qat_buffers[1],
-                &self.ws.l1_total,
-                self.ws.ft_out,
-                self.ws.l1_out,
-            ),
             2 => (
                 &self.ws.l2_input,
                 &self.l2_w,
@@ -199,9 +195,6 @@ impl GpuTrainer {
             _ => unreachable!(),
         };
         let threads = qat_dense_threads(batch, inputs, outputs)?;
-        if layer == 1 {
-            return self.qat_dense_l1_sorted(batch, &self.ws.l1_total, &self.qat_raw[0]);
-        }
         // SAFETY: workspace and weight dimensions match the selected layer; batch buckets were validated.
         unsafe {
             if inputs >= QAT_DENSE_WIDE_INPUTS {

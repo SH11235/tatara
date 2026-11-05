@@ -721,7 +721,7 @@ impl CublasHandle {
     }
 
     /// row-major C[M, N] = A[M, K] @ B[K, N]、`alpha=1`, `beta=0` (overwrite)。
-    /// fwd_l1_shared 用: combined[B, ft_out] @ l1_shared_weight[ft_out, l1_out] → l1_shared_out[B, l1_out]。
+    /// fwd_l1_shared 用: combined_sorted[padded B, ft_out] @ l1_shared_weight[ft_out, l1_out] → l1_shared_out[padded B, l1_out]。
     ///
     /// col-major cuBLAS で row-major matmul を計算する転置 trick: 同 memory 表現
     /// を cublas は col-major と解釈するので、`A_rm[m, k]` は `A_cm[k, m]`、

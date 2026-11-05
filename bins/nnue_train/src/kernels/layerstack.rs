@@ -91,6 +91,62 @@ pub fn ft_post_perspective_fwd(
     }
 }
 
+// cuda-oxide cannot lower f32::clamp; comparisons also preserve NaN inputs.
+#[inline(always)]
+fn ft_post_clamp_unit(value: f32) -> f32 {
+    if value < 0.0 {
+        return 0.0;
+    }
+    if value > 1.0 {
+        return 1.0;
+    }
+    value
+}
+
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub fn ft_post_perspective_fwd_sorted(
+    stm_ft_out: &[f32],
+    nstm_ft_out: &[f32],
+    bias: &[f32],
+    inverse_permutation: &[i32],
+    combined: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (ft_dim as usize);
+    let ri = tid.get() % (ft_dim as usize);
+    let half = (ft_dim as usize) / 2;
+
+    let ft_base = bi * (ft_dim as usize);
+    let val = if ri < half {
+        let xa = stm_ft_out[ft_base + ri] + bias[ri];
+        let xb = stm_ft_out[ft_base + half + ri] + bias[half + ri];
+        let ya = ft_post_clamp_unit(xa);
+        let yb = ft_post_clamp_unit(xb);
+        ya * yb * scale
+    } else {
+        let pair_idx = ri - half;
+        let xa = nstm_ft_out[ft_base + pair_idx] + bias[pair_idx];
+        let xb = nstm_ft_out[ft_base + half + pair_idx] + bias[half + pair_idx];
+        let ya = ft_post_clamp_unit(xa);
+        let yb = ft_post_clamp_unit(xb);
+        ya * yb * scale
+    };
+
+    let dst = inverse_permutation[bi] as usize * ft_dim as usize + ri;
+    // SAFETY: the inverse permutation maps each real row to a unique in-bounds sorted row.
+    unsafe {
+        *(combined.as_ptr().add(dst) as *mut f32) = val;
+    }
+}
+
 /// [`ft_post_perspective_fwd`] の FP16 入力版。`stm_ft_out` / `nstm_ft_out` を `f16`
 /// で読み、`f32` に変換してから bias add 以降を計算する。math と `combined` 出力は
 /// `f32` のまま (`combined` は後続 dense L1 path が `f32` で読む)。
@@ -165,6 +221,50 @@ pub fn ft_post_perspective_fwd_fp16(
 
     if let Some(o) = combined.get_mut(tid) {
         *o = val;
+    }
+}
+
+#[kernel]
+#[allow(clippy::too_many_arguments)]
+pub fn ft_post_perspective_fwd_fp16_sorted(
+    stm_ft_out: &[f16],
+    nstm_ft_out: &[f16],
+    bias: &[f32],
+    inverse_permutation: &[i32],
+    combined: &[f32],
+    batch: u32,
+    ft_dim: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (ft_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (ft_dim as usize);
+    let ri = tid.get() % (ft_dim as usize);
+    let half = (ft_dim as usize) / 2;
+
+    let ft_base = bi * (ft_dim as usize);
+    let val = if ri < half {
+        let xa = stm_ft_out[ft_base + ri] as f32 + bias[ri];
+        let xb = stm_ft_out[ft_base + half + ri] as f32 + bias[half + ri];
+        let ya = ft_post_clamp_unit(xa);
+        let yb = ft_post_clamp_unit(xb);
+        ya * yb * scale
+    } else {
+        let pair_idx = ri - half;
+        let xa = nstm_ft_out[ft_base + pair_idx] as f32 + bias[pair_idx];
+        let xb = nstm_ft_out[ft_base + half + pair_idx] as f32 + bias[half + pair_idx];
+        let ya = ft_post_clamp_unit(xa);
+        let yb = ft_post_clamp_unit(xb);
+        ya * yb * scale
+    };
+
+    let dst = inverse_permutation[bi] as usize * ft_dim as usize + ri;
+    // SAFETY: the inverse permutation maps each real row to a unique in-bounds sorted row.
+    unsafe {
+        *(combined.as_ptr().add(dst) as *mut f32) = val;
     }
 }
 
@@ -1556,6 +1656,44 @@ pub fn scatter_bucket_perm(
     }
 }
 
+#[kernel]
+pub fn scatter_bucket_perm_inverse(
+    bucket_idx: &[i32],
+    offsets: &[u32],
+    write_ctr: &[u32],
+    perm: &[i32],
+    sorted_bucket: &[i32],
+    mut inverse_permutation: DisjointSlice<i32>,
+    batch: u32,
+) {
+    let num_buckets = offsets.len() as u32 - 1;
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let b = bucket_idx[tid.get()];
+    let bin = if b >= 0 && (b as u32) < num_buckets {
+        b as u32
+    } else {
+        num_buckets
+    };
+    let rank = unsafe {
+        let atom = &*(write_ctr.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
+        atom.fetch_add(1, AtomicOrdering::Relaxed)
+    };
+    let dst = (offsets[bin as usize] + rank) as usize;
+    // SAFETY: aligned offsets and atomic ranks select unique rows within padded_batch.
+    unsafe {
+        let perm_dst = perm.as_ptr().add(dst) as *mut i32;
+        *perm_dst = tid.get() as i32;
+        let sb_dst = sorted_bucket.as_ptr().add(dst) as *mut i32;
+        *sb_dst = b;
+    }
+    if let Some(out) = inverse_permutation.get_mut(tid) {
+        *out = dst as i32;
+    }
+}
+
 /// Row-permute (gather): `out[i, :] = in[perm[i], :]`。1 thread = 1 (row, col) cell、
 /// 1D launch (`batch * dim`)。perm[i] が範囲外 (`< 0 || >= batch`) は host 契約違反。
 #[kernel]
@@ -2698,5 +2836,21 @@ pub fn psqt_diff_sparse_bwd(
                 as *const DeviceAtomicF32)
         };
         cell.fetch_add(-half_g, AtomicOrdering::Relaxed);
+    }
+}
+
+#[kernel]
+pub fn clear_padding_rows_f32(perm: &[i32], output: &[f32], dim: u32) {
+    let row = thread::blockIdx_x() as usize;
+    if perm[row] >= 0 {
+        return;
+    }
+    let mut col = thread::threadIdx_x() as usize;
+    while col < dim as usize {
+        // SAFETY: each block owns one padding row and each lane owns disjoint columns.
+        unsafe {
+            *(output.as_ptr().add(row * dim as usize + col) as *mut f32) = 0.0;
+        }
+        col += thread::blockDim_x() as usize;
     }
 }
