@@ -17,11 +17,21 @@ fn every_source_export_resolves_from_embedded_fatbin() {
     let context = Context::new(0).unwrap();
     let module = context.load_module(NATIVE_KERNEL_FATBIN).unwrap();
     let source = include_str!("../kernels/native_kernels.cu");
-    let prefix = "extern \"C\" __global__ void ";
     let mut resolved = 0;
 
     for line in source.lines() {
-        let Some(declaration) = line.strip_prefix(prefix) else {
+        // `__launch_bounds__(...)` may sit between `__global__` and the return type.
+        let Some(rest) = line.strip_prefix("extern \"C\" __global__ ") else {
+            continue;
+        };
+        let rest = match rest.strip_prefix("__launch_bounds__(") {
+            Some(bounds) => match bounds.split_once(") ") {
+                Some((_, rest)) => rest,
+                None => continue,
+            },
+            None => rest,
+        };
+        let Some(declaration) = rest.strip_prefix("void ") else {
             continue;
         };
         let name = declaration

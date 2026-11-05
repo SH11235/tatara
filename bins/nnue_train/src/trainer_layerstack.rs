@@ -43,17 +43,25 @@ const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
 const FT_FUSED_OUT_COMB_F32: u32 = 3 << 4;
 #[cfg(feature = "native")]
 const FT_FUSED_ACCUMULATE_NORMS: u32 = 1 << 6;
-/// Elements each `ft_fused_optimizer_step` thread updates in its grid-stride loop. The norm
-/// accumulation costs one atomic per thread, while capping the grid at a few resident waves
-/// starves the update of memory parallelism; a handful of elements per thread keeps the grid
-/// large enough to stay bandwidth-bound.
+/// A few row visits per column keep enough blocks in flight for memory parallelism.
 #[cfg(feature = "native")]
 const FT_FUSED_ELEMENTS_PER_THREAD: usize = 4;
-
-/// Launch shape for `ft_fused_optimizer_step` over `n` elements: the block count is a multiple
-/// of `ft_out / gcd(ft_out, BLOCK_DIM)`, which makes the grid stride a multiple of `ft_out`.
+// Must match FT_FUSED_BLOCK_THREADS in the CUDA source to respect its launch bound.
 #[cfg(feature = "native")]
-fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
+const FT_FUSED_BLOCK_THREADS: u32 = BLOCK_DIM / 4;
+
+/// Rounding blocks to a multiple of `ft_out / gcd(ft_out, BLOCK_DIM)` makes the stride
+/// (blocks × BLOCK_DIM elements) a multiple of `ft_out`, keeping each lane on its column.
+#[cfg(feature = "native")]
+fn ft_fused_launch_config(
+    n: usize,
+    ft_out: usize,
+) -> Result<LaunchConfig, Box<dyn std::error::Error>> {
+    if ft_out == 0 || !ft_out.is_multiple_of(4) || !n.is_multiple_of(4) {
+        return Err(
+            "fused FT optimizer requires a positive width and range length divisible by 4".into(),
+        );
+    }
     let block = BLOCK_DIM as usize;
     let (mut a, mut b) = (ft_out, block);
     while b != 0 {
@@ -64,11 +72,11 @@ fn ft_fused_launch_config(n: usize, ft_out: usize) -> LaunchConfig {
         .div_ceil(block * FT_FUSED_ELEMENTS_PER_THREAD)
         .div_ceil(unit)
         * unit;
-    LaunchConfig {
+    Ok(LaunchConfig {
         grid_dim: (blocks as u32, 1, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
+        block_dim: (FT_FUSED_BLOCK_THREADS, 1, 1),
         shared_mem_bytes: 0,
-    }
+    })
 }
 
 /// Block shape of `ft_post_grad_from_l1*`: each thread walks this many bucket-sorted rows of one
@@ -1048,6 +1056,16 @@ impl GpuTrainer {
         let ft_factorize = self.feature_set.ft_factorize();
         let train_n = self.feature_set.train_ft_in() * ft_out;
         let real_n = self.feature_set.ft_in() * ft_out;
+        if ft_out == 0
+            || !ft_out.is_multiple_of(4)
+            || !real_n.is_multiple_of(4)
+            || !train_n.is_multiple_of(4)
+        {
+            return Err(
+                "fused FT optimizer requires a positive width and row boundaries divisible by 4"
+                    .into(),
+            );
+        }
         let (bounds, piece_inputs, fold_mode) = if ft_factorize {
             ft_factorize_host::fold_kernel_args(&self.feature_set)
         } else {
@@ -1093,17 +1111,26 @@ impl GpuTrainer {
             // the active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when
             // `out == 0`) receive a live buffer the kernel never touches.
             macro_rules! launch {
-                ($m:expr, $v:expr, $forward:expr) => {
+                ($m:expr, $v:expr, $forward:expr) => {{
+                    debug_assert!(self.ft_w.cu_deviceptr().is_multiple_of(16));
+                    debug_assert!(self.ft_w_grad.cu_deviceptr().is_multiple_of(16));
+                    debug_assert!(self.ft_w_slow.cu_deviceptr().is_multiple_of(16));
+                    let state_alignment = if flags & FT_FUSED_HALF_STATE != 0 { 8 } else { 16 };
+                    debug_assert!($m.cu_deviceptr().is_multiple_of(state_alignment));
+                    debug_assert!($v.cu_deviceptr().is_multiple_of(state_alignment));
+                    let output_alignment = if out == FT_FUSED_OUT_COMB_F32 { 16 } else { 8 };
+                    debug_assert!($forward.cu_deviceptr().is_multiple_of(output_alignment));
                     unsafe {
                         // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                         // stream の完了を待つ同期点まで生存する device allocation。`[begin, end)` は
                         // train 形状の `ft_w` / moment / grad / slow の範囲内で、forward output は
                         // `out != 0` のとき `end` 以上の長さを持つ (comb は real 行、mirror は train 行)。
-                        // norm 系 buffer は `ft_out` 要素。
+                        // norm 系 buffer は `ft_out` 要素。cudaMalloc base pointers と 4 要素境界で
+                        // float4 / 4 x f16 が整列し、ft_out % 4 == 0 で vector は行を跨がない。
                         cuda_launch! {
                             kernel: ft_fused_optimizer_step,
                             stream: self.stream, module: self.module,
-                            config: ft_fused_launch_config(end - begin, ft_out),
+                            config: ft_fused_launch_config(end - begin, ft_out)?,
                             args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
                                    slice(self.ft_norms), slice_mut(self.ft_norm_sums),
@@ -1117,7 +1144,7 @@ impl GpuTrainer {
                                    FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
                         }
                     }?
-                };
+                }};
             }
             macro_rules! with_forward {
                 ($m:expr, $v:expr) => {
