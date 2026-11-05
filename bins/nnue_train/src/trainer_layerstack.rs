@@ -4023,6 +4023,8 @@ impl GpuTrainer {
         // FP32 without the integer QAT L1 computes the per-bucket and shared L1 products and their
         // sum in one kernel from `combined_sorted`, writing `l1_total` in the original row order.
         // Backward reads only `l1_total`, so `l1_bucket` / `l1_shared_out` are not materialized.
+        // TF32 keeps the per-bucket cuBLAS path: even at L1 width 16 the tensor-core GEMMs were
+        // faster (RTX 3080 Ti) or equal (RTX 5090) to this FP32-FMA kernel despite its fewer launches.
         let fused_l1 = !qat_l1 && !self.tf32;
         if fused_l1 {
             self.launch_l1_fwd_with_shared_sorted(padded_b, n_out_tiles)?;
