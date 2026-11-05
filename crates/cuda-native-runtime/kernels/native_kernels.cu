@@ -1376,6 +1376,39 @@ extern "C" __global__ void ft_post_perspective_fwd_fp16(
     combined[index] = first * second * scale;
 }
 
+extern "C" __global__ void ft_post_perspective_fwd_fp16_sorted(
+    const __half* stm_output,
+    unsigned long long,
+    const __half* nstm_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float scale
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long count = static_cast<unsigned long long>(batch) * ft_dimension;
+    if (index >= count) {
+        return;
+    }
+    const unsigned int batch_index = index / ft_dimension;
+    const unsigned int row = index % ft_dimension;
+    const unsigned int half = ft_dimension / 2;
+    const __half* source = row < half ? stm_output : nstm_output;
+    const unsigned int pair = row < half ? row : row - half;
+    const unsigned long long base = static_cast<unsigned long long>(batch_index) * ft_dimension;
+    const float first = native_clamp_unit(__half2float(source[base + pair]) + bias[pair]);
+    const float second = native_clamp_unit(
+        __half2float(source[base + half + pair]) + bias[half + pair]
+    );
+    combined[static_cast<unsigned long long>(inverse_permutation[batch_index]) * ft_dimension + row] = first * second * scale;
+}
+
 template <bool Squared>
 __device__ __forceinline__ void native_simple_act_grad_to_fp16(
     const __half* ft_output,
@@ -2334,6 +2367,38 @@ extern "C" __global__ void ft_post_perspective_fwd(
     combined[i] = ya * yb * scale;
 }
 
+extern "C" __global__ void ft_post_perspective_fwd_sorted(
+    const float* stm_ft_output,
+    unsigned long long,
+    const float* nstm_ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    float scale
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * ft_columns) {
+        return;
+    }
+    const unsigned int row = i / ft_columns;
+    const unsigned int column = i % ft_columns;
+    const unsigned int half = ft_columns / 2;
+    const unsigned int pair = column < half ? column : column - half;
+    const float* ft_output = column < half ? stm_ft_output : nstm_ft_output;
+    const unsigned int base = row * ft_columns;
+    const float xa = ft_output[base + pair] + bias[pair];
+    const float xb = ft_output[base + half + pair] + bias[half + pair];
+    const float ya = xa < 0.0F ? 0.0F : (xa > 1.0F ? 1.0F : xa);
+    const float yb = xb < 0.0F ? 0.0F : (xb > 1.0F ? 1.0F : xb);
+    combined[static_cast<unsigned long long>(inverse_permutation[row]) * ft_columns + column] = ya * yb * scale;
+}
+
 extern "C" __global__ void ft_post_perspective_grad(
     const float* combined_gradient,
     unsigned long long,
@@ -2790,6 +2855,37 @@ extern "C" __global__ void scatter_bucket_perm(
     const unsigned int destination = offsets[bin] + rank;
     permutation[destination] = static_cast<int>(i);
     sorted_bucket[destination] = bucket;
+}
+
+extern "C" __global__ void scatter_bucket_perm_inverse(
+    const int* bucket_idx,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long offsets_len,
+    unsigned int* write_counters,
+    unsigned long long,
+    int* permutation,
+    unsigned long long,
+    int* sorted_bucket,
+    unsigned long long,
+    int* inverse_permutation,
+    unsigned long long,
+    unsigned int batch
+) {
+    const unsigned int num_buckets = static_cast<unsigned int>(offsets_len) - 1;
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch) {
+        return;
+    }
+    const int bucket = bucket_idx[i];
+    const unsigned int bin = bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets
+        ? static_cast<unsigned int>(bucket)
+        : num_buckets;
+    const unsigned int rank = atomicAdd(write_counters + bin, 1U);
+    const unsigned int destination = offsets[bin] + rank;
+    permutation[destination] = static_cast<int>(i);
+    sorted_bucket[destination] = bucket;
+    inverse_permutation[i] = static_cast<int>(destination);
 }
 
 extern "C" __global__ void permute_rows_f32(
@@ -3960,5 +4056,21 @@ extern "C" __global__ void bias_grad_bucket(
     if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
         atomicAdd(bias_gradient + static_cast<unsigned long long>(bucket) * output_dimension + output_index,
                   output_gradient[i]);
+    }
+}
+
+extern "C" __global__ void clear_padding_rows_f32(
+    const int* permutation,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int dimension
+) {
+    const unsigned int row = blockIdx.x;
+    if (permutation[row] >= 0) {
+        return;
+    }
+    for (unsigned int col = threadIdx.x; col < dimension; col += blockDim.x) {
+        output[static_cast<unsigned long long>(row) * dimension + col] = 0.0F;
     }
 }

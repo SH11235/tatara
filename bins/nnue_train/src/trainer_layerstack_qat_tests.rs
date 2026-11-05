@@ -331,7 +331,7 @@ fn qat_integer_forward_export_and_master_preservation() -> TestResult {
         t.configure_qat(Some(QatMode::Dense))?;
         let batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
         let actual = t.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
-        let x = t.ws.combined.to_host_vec(&t.stream)?;
+        let x = t.combined_original_order_for_test(16)?;
         let raw1 = t.qat_raw[0].to_host_vec(&t.stream)?;
         let raw2 = t.qat_raw[1].to_host_vec(&t.stream)?;
         for row in 0..16 {
@@ -437,7 +437,7 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
             assert!(t.forward(&data, &mut context)?.is_none());
             t.backward(&mut context)?;
             let dy = t.ws.dy_net_output.to_host_vec(&t.stream)?;
-            let x = t.ws.combined.to_host_vec(&t.stream)?;
+            let x = t.combined_original_order_for_test(16)?;
             let dw = t.l1_w_grad.to_host_vec(&t.stream)?;
             let shared = t.l1_shared_weight_grad.to_host_vec(&t.stream)?;
             for i in 0..128 {

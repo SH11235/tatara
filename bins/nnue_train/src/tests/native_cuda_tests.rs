@@ -490,14 +490,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 86, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 88, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 102, "production kernel inventory changed");
+    assert_eq!(required.len(), 106, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3579,6 +3579,47 @@ fn l1_forward_sorted_matches_sequential_reference() -> Result<(), Box<dyn std::e
             trainer.l1_total_sequential_reference_bits_for_test(batch_size)?;
         assert!(nonzero > 0, "{name}: l1_total is all zero");
         assert_eq!(production, reference, "{name}: l1_total differs");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn ft_post_sorted_matches_original_order() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let batch_size = 256;
+    for fp16 in [false, true] {
+        let options = LayerStackTestOptions {
+            ft_out: 512,
+            num_buckets: 4,
+            precision: PrecisionFlags {
+                ft_fp16: fp16,
+                ft_fp16_out: fp16,
+                ..PrecisionFlags::default()
+            },
+            ..LayerStackTestOptions::standard()
+        };
+        let mut trainer =
+            create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
+        trainer.set_skip_optimizer_for_test(true);
+        for (pattern, rows) in [(0, batch_size), (1, batch_size), (2, batch_size), (1, 16)] {
+            let mut batch = BatchData::smoke_dummy(rows, options.feature_set);
+            batch.bucket_idx = (0..rows)
+                .map(|r| match pattern {
+                    0 => (r % 4) as i32,
+                    1 => [3, 0, 2, 0, 1, 4, -1][r % 7],
+                    _ => 0,
+                })
+                .collect();
+            let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let (production, reference, nonzero) =
+                trainer.ft_post_sorted_reference_bits_for_test(rows)?;
+            assert!(
+                nonzero > 0,
+                "fp16={fp16}, pattern={pattern}: FT post is all zero"
+            );
+            assert_eq!(production, reference, "fp16={fp16}, pattern={pattern}");
+        }
     }
     Ok(())
 }
