@@ -6,6 +6,130 @@ use shogi_features::FeatureSet;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn ft_gradient_tiles_match_scatter_with_duplicates_and_partial_tiles() -> TestResult {
+    let ctx = test_cuda_context()?;
+    let width = 192;
+    let mut t = trainer(&ctx, width, false)?;
+    let features = t.ws.ft_in;
+    for (batch, duplicates) in [(1_usize, false), (16, false), (17, true), (33, true)] {
+        let nnz: Vec<i32> = (0..batch)
+            .map(|row| if batch != 16 && row % 7 == 0 { 0 } else { 40 })
+            .collect();
+        let order: Vec<i32> = (0..batch)
+            .rev()
+            .chain((0..batch).map(|row| batch + (row + 3) % batch))
+            .map(|row| row as i32)
+            .collect();
+        t.ws.nnz_dev = DeviceBuffer::from_host(&t.stream, &nnz)?;
+        t.ws.ft_order = DeviceBuffer::from_host(&t.stream, &order)?;
+        t.ws.feat_positions = DeviceBuffer::zeroed(&t.stream, batch * 40)?;
+        t.ws.ft_tile_masks = DeviceBuffer::zeroed(&t.stream, batch * 40)?;
+        let mut expected = vec![0.0_f64; features * width];
+        memset_zero(&t.stream, &t.ft_w_grad)?;
+        for perspective in 0..2 {
+            let indices: Vec<i32> = (0..batch * 40)
+                .map(|i| {
+                    if !duplicates {
+                        i as i32
+                    } else {
+                        match i % 40 {
+                            0 => -1,
+                            1 => features as i32,
+                            _ => ((i / 40 + i % 5 + perspective * 7) % 31) as i32,
+                        }
+                    }
+                })
+                .collect();
+            let gradient: Vec<f32> = (0..batch * width)
+                .map(|i| ((i * 13 + perspective * 5) % 97) as f32 / 128.0 - 0.375)
+                .collect();
+            for row in 0..batch {
+                for slot in 0..nnz[row] as usize {
+                    let feature = indices[row * 40 + slot];
+                    if feature < 0 || feature as usize >= features {
+                        continue;
+                    }
+                    for col in 0..width {
+                        expected[feature as usize * width + col] +=
+                            f64::from(gradient[row * width + col]);
+                    }
+                }
+            }
+            let indices = DeviceBuffer::from_host(&t.stream, &indices)?;
+            let gradient = DeviceBuffer::from_host(&t.stream, &gradient)?;
+            if perspective == 0 {
+                t.ws.stm_idx_dev = indices;
+                t.ws.dft_stm_out = gradient;
+            } else {
+                t.ws.nstm_idx_dev = indices;
+                t.ws.dft_nstm_out = gradient;
+            }
+            t.launch_ft_gradient_tiles(batch, perspective)?;
+        }
+        for (i, (got, want)) in t
+            .ft_w_grad
+            .to_host_vec(&t.stream)?
+            .into_iter()
+            .zip(expected)
+            .enumerate()
+        {
+            assert_eq!(f64::from(got), want, "batch={batch}, cell={i}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ft_gradient_tiles_preserve_fallbacks() {
+    let features = FeatureSet::HalfKaHmMerged.spec();
+    let capacity = features.ft_in() * 16 + 16;
+    let masks = if ft_gradient_tiles_eligible(features, capacity, 1536, false) {
+        capacity * 40
+    } else {
+        0
+    };
+    assert!(!ft_gradient_tiles_dispatch(
+        features, 65536, 1536, false, masks
+    ));
+    assert!(!ft_gradient_tiles_dispatch(
+        features,
+        65536,
+        1536,
+        false,
+        65536 * 40 - 1
+    ));
+    assert!(ft_gradient_tiles_dispatch(
+        features,
+        65536,
+        1536,
+        false,
+        65536 * 40
+    ));
+    assert!(ft_gradient_tiles_eligible(features, 65536, 1536, false));
+    assert!(ft_gradient_tiles_eligible(
+        features.with_ft_factorize(),
+        65537,
+        2304,
+        false
+    ));
+    assert!(!ft_gradient_tiles_eligible(features, 65535, 1536, false));
+    assert!(!ft_gradient_tiles_eligible(features, 65536, 128, false));
+    assert!(!ft_gradient_tiles_eligible(features, 65536, 1536, true));
+    assert!(!ft_gradient_tiles_eligible(
+        FeatureSet::HalfKp.spec(),
+        65536,
+        1536,
+        false
+    ));
+    assert!(!ft_gradient_tiles_eligible(
+        features,
+        features.ft_in() * 16 + 1,
+        1536,
+        false
+    ));
+}
+
+#[test]
 fn qat_dense_launch_rejects_thread_count_overflow() {
     // Wide layers launch one warp per row and group of eight outputs.
     assert_eq!(qat_dense_threads(65536, 1536, 16), Ok(4194304));
@@ -136,6 +260,96 @@ fn qat_activation_matches_double_definition() -> TestResult {
             "input {input:e} ({:#010x})",
             input.to_bits()
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn qat_ft_post_sorted_matches_separate_quantization() -> TestResult {
+    let ctx = test_cuda_context()?;
+    let (batch, width, padded) = (17_usize, 640_usize, 32_usize);
+    for half in [false, true] {
+        let mut t = GpuTrainer::new_forward_only(
+            &ctx,
+            batch,
+            width,
+            16,
+            32,
+            2,
+            BucketMode::ProgressKpAbs,
+            PrecisionFlags {
+                ft_fp16: half,
+                ft_fp16_out: half,
+                ..PrecisionFlags::default()
+            },
+            FeatureSet::HalfKaHmMerged.spec(),
+            OptimizerKind::RAdam,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            None,
+            &LayerStackInit::default_uniform(),
+        )?;
+        let values: Vec<f32> = (0..batch * width)
+            .map(|i| {
+                let v = ((i * 37) % 192) as f32 / 127.0 - 0.25;
+                match i % 5 {
+                    0 => v.next_up(),
+                    1 => v.next_down(),
+                    _ => v,
+                }
+            })
+            .collect();
+        let other: Vec<f32> = values.iter().rev().copied().collect();
+        let bias: Vec<f32> = (0..width).map(|i| (i % 17) as f32 / 256.0).collect();
+        let inverse: Vec<i32> = (0..batch).map(|i| ((i * 7) % batch + 3) as i32).collect();
+        t.ft_b = DeviceBuffer::from_host(&t.stream, &bias)?;
+        t.ws.bucket_inverse_perm_dev = DeviceBuffer::from_host(&t.stream, &inverse)?;
+        t.ws.combined_sorted = DeviceBuffer::zeroed(&t.stream, padded * width)?;
+        let reference = DeviceBuffer::<f32>::zeroed(&t.stream, padded * width)?;
+        if half {
+            let a: Vec<f16> = values.iter().map(|&v| v as f16).collect();
+            let b: Vec<f16> = other.iter().map(|&v| v as f16).collect();
+            t.ws.ft_stm_out_h = Some(DeviceBuffer::from_host(&t.stream, &a)?);
+            t.ws.ft_nstm_out_h = Some(DeviceBuffer::from_host(&t.stream, &b)?);
+            // SAFETY: inputs have batch * width elements; inverse maps distinct rows into padded.
+            unsafe {
+                cuda_launch! {
+                    kernel: ft_post_perspective_fwd_fp16_sorted, stream: t.stream, module: t.module,
+                    config: cfg_1d(batch * width),
+                    args: [slice(t.ws.ft_stm_out_h.as_ref().unwrap()),
+                           slice(t.ws.ft_nstm_out_h.as_ref().unwrap()), slice(t.ft_b),
+                           slice(t.ws.bucket_inverse_perm_dev), slice(reference),
+                           batch as u32, width as u32, FT_POST_SCALE]
+                }
+            }?;
+        } else {
+            t.ws.ft_stm_out = DeviceBuffer::from_host(&t.stream, &values)?;
+            t.ws.ft_nstm_out = DeviceBuffer::from_host(&t.stream, &other)?;
+            // SAFETY: inputs have batch * width elements; inverse maps distinct rows into padded.
+            unsafe {
+                cuda_launch! {
+                    kernel: ft_post_perspective_fwd_sorted, stream: t.stream, module: t.module,
+                    config: cfg_1d(batch * width),
+                    args: [slice(t.ws.ft_stm_out), slice(t.ws.ft_nstm_out), slice(t.ft_b),
+                           slice(t.ws.bucket_inverse_perm_dev), slice(reference),
+                           batch as u32, width as u32, FT_POST_SCALE]
+                }
+            }?;
+        }
+        // SAFETY: reference has padded * width floats and survives the stream read below.
+        unsafe {
+            cuda_launch! {
+                kernel: qat_activation, stream: t.stream, module: t.module,
+                config: cfg_1d(padded * width),
+                args: [slice(reference), (padded * width) as u32]
+            }
+        }?;
+        t.launch_ft_post_qat_sorted(batch)?;
+        let expected = reference.to_host_vec(&t.stream)?;
+        let actual = t.ws.combined_sorted.to_host_vec(&t.stream)?;
+        for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "half={half}, index={i}");
+        }
     }
     Ok(())
 }
@@ -707,9 +921,16 @@ fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
     let t = trainer(&ctx, 128, true)?;
     let batch = 40_usize;
     let buckets = 4_usize;
-    for (inputs, outputs) in [(128, 16), (640, 17), (1536, 33)] {
+    for (inputs, outputs) in [
+        (127, 1),
+        (128, 16),
+        (513, 17),
+        (640, 17),
+        (1536, 33),
+        (2304, 16),
+    ] {
         let x: Vec<f32> = (0..batch * inputs)
-            .map(|i| ((i * 37 + 5 + (i / inputs) * 11) % 128) as f32 / 127.0)
+            .map(|i| ((i * 37 + 5 + (i / inputs) * 13) % 128) as f32 / 127.0)
             .collect();
         let w: Vec<f32> = (0..buckets * outputs * inputs)
             .map(|i| (((i * 53 + 17) % 256) as i32 - 128) as f32 / 64.0)
