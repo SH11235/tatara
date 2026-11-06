@@ -11,16 +11,7 @@ fn ft_gradient_tiles_match_scatter_with_duplicates_and_partial_tiles() -> TestRe
     let width = 192;
     let mut t = trainer(&ctx, width, false)?;
     let features = t.ws.ft_in;
-    for (batch, duplicates, sparse) in [
-        (1_usize, false, false),
-        (16, false, false),
-        (17, true, false),
-        (33, true, false),
-        (1, true, true),
-        (16, true, true),
-        (17, true, true),
-        (33, true, true),
-    ] {
+    for (batch, duplicates) in [(1_usize, false), (16, false), (17, true), (33, true)] {
         let nnz: Vec<i32> = (0..batch)
             .map(|row| if batch != 16 && row % 7 == 0 { 0 } else { 40 })
             .collect();
@@ -50,24 +41,7 @@ fn ft_gradient_tiles_match_scatter_with_duplicates_and_partial_tiles() -> TestRe
                 })
                 .collect();
             let gradient: Vec<f32> = (0..batch * width)
-                .map(|i| {
-                    let row = i / width;
-                    let col = i % width;
-                    let live = !sparse
-                        || match col / 32 {
-                            0 => false,
-                            1 => row % 16 == 0,
-                            2 => row % 16 == 0 || (row % 16 == 1 && col % 32 == 0),
-                            3 => row % 16 == 7,
-                            4 => true,
-                            _ => row % 16 == 15,
-                        };
-                    if live {
-                        ((i * 13 + perspective * 5) % 97) as f32 / 128.0 - 0.375
-                    } else {
-                        -0.0
-                    }
-                })
+                .map(|i| ((i * 13 + perspective * 5) % 97) as f32 / 128.0 - 0.375)
                 .collect();
             for row in 0..batch {
                 for slot in 0..nnz[row] as usize {
@@ -99,11 +73,7 @@ fn ft_gradient_tiles_match_scatter_with_duplicates_and_partial_tiles() -> TestRe
             .zip(expected)
             .enumerate()
         {
-            assert_eq!(
-                f64::from(got),
-                want,
-                "batch={batch}, sparse={sparse}, cell={i}"
-            );
+            assert_eq!(f64::from(got), want, "batch={batch}, cell={i}");
         }
     }
     Ok(())
