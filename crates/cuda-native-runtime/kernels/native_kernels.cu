@@ -68,14 +68,35 @@ extern "C" __global__ void ft_gradient_tiles_sum(
 ) {
     __shared__ float tile_gradient[FT_GRAD_TILE][128];
     unsigned col = blockIdx.y * 128 + threadIdx.x;
+    unsigned nonzero_rows = 0;
     for (unsigned row = 0; row < FT_GRAD_TILE; ++row) {
         unsigned pos = blockIdx.x * FT_GRAD_TILE + row;
         tile_gradient[row][threadIdx.x] = pos < batch && col < width
             ? gradient[static_cast<unsigned long long>(order[order_base + pos] - order_base) * width + col] : 0.0F;
+        if (tile_gradient[row][threadIdx.x] != 0.0F) nonzero_rows |= 1U << row;
     }
     __syncthreads();
+    unsigned warp_nonzero = __popc(nonzero_rows);
+    for (unsigned offset = 16; offset != 0; offset >>= 1)
+        warp_nonzero += __shfl_xor_sync(0xffffffffU, warp_nonzero, offset);
     if (col >= width) return;
     unsigned offset = blockIdx.x * FT_GRAD_CAPACITY;
+    // A warp-uniform density gate avoids sparse-loop divergence for dense gradients.
+    if (warp_nonzero <= 32) {
+        if (nonzero_rows == 0) return;
+        for (unsigned i = 0; i < counts[blockIdx.x]; ++i) {
+            unsigned bits = masks[offset + i] & nonzero_rows;
+            if (bits == 0) continue;
+            float sum = 0.0F;
+            while (bits) {
+                unsigned row = __ffs(bits) - 1;
+                sum += tile_gradient[row][threadIdx.x];
+                bits &= bits - 1;
+            }
+            atomicAdd(result + static_cast<unsigned long long>(ids[offset + i]) * width + col, sum);
+        }
+        return;
+    }
     for (unsigned i = 0; i < counts[blockIdx.x]; ++i) {
         unsigned bits = masks[offset + i];
         float sum = 0.0F;
