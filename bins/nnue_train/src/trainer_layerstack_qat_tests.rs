@@ -130,6 +130,15 @@ fn ft_gradient_tiles_preserve_fallbacks() {
 }
 
 #[test]
+fn ft_gradient_tiles_device_selection() {
+    assert!(!ft_gradient_tiles_supported("NVIDIA GeForce RTX 5090"));
+    assert!(!ft_gradient_tiles_supported(" NVIDIA GeForce RTX 5090 "));
+    assert!(ft_gradient_tiles_supported("NVIDIA GeForce RTX 3080 Ti"));
+    assert!(ft_gradient_tiles_supported("NVIDIA GeForce RTX 5080"));
+    assert!(ft_gradient_tiles_supported("unknown"));
+}
+
+#[test]
 fn qat_dense_launch_rejects_thread_count_overflow() {
     // Wide layers launch one warp per row and group of eight outputs.
     assert_eq!(qat_dense_threads(65536, 1536, 16), Ok(4194304));
