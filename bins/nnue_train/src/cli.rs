@@ -1178,7 +1178,7 @@ pub(crate) struct LayerstackArgs {
     /// king squares x 1548 KP-abs piece inputs) for progresskpabs and
     /// progresskpabsq16. When omitted in those modes, every position falls in
     /// the middle bucket `floor(N / 2)` (zero weights → `sigmoid(0) = 0.5`;
-    /// bucket 4 for the default 9 buckets). Do not specify this option
+    /// bucket 4 for the default 8 buckets). Do not specify this option
     /// in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,

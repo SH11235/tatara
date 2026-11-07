@@ -97,6 +97,31 @@ pub const DEFAULT_L1_OUT: usize = 16;
 /// 既定 L2 出力次元。`--l2` 未指定時の値。L2 per-bucket dense 層の出力幅で、
 /// CReLU を経て L3 出力層の入力になる。
 pub const DEFAULT_L2_OUT: usize = 32;
+/// LayerStack `.bin` の header から保存されている bucket 数を読む。legacy `.bin`
+/// ([`LEGACY_NNUE_VERSION_BUCKETS9`]) は [`LEGACY_IMPLICIT_NUM_BUCKETS`] を返す。
+/// arch / hash / layer 形状は検証しないので、読んだ値は load 時に照合される。
+pub fn stored_num_buckets(bytes: &[u8]) -> io::Result<usize> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let u32_at = |at: usize| -> io::Result<u32> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("slice has 4 bytes")))
+            .ok_or_else(|| invalid(format!("NNUE header is truncated at byte {at}")))
+    };
+    let version = u32_at(0)?;
+    if version == LEGACY_NNUE_VERSION_BUCKETS9 {
+        return Ok(LEGACY_IMPLICIT_NUM_BUCKETS);
+    }
+    if version != NNUE_VERSION {
+        return Err(invalid(format!(
+            "unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x} or legacy \
+             {LEGACY_NNUE_VERSION_BUCKETS9:#x})"
+        )));
+    }
+    let arch_len = u32_at(8)? as usize;
+    Ok(u32_at(12 + arch_len)? as usize)
+}
+
 /// 既定 bucket 数。`--num-buckets` 未指定時の値。legacy `.bin` の暗黙 N は
 /// [`LEGACY_IMPLICIT_NUM_BUCKETS`] を使う。
 pub const DEFAULT_NUM_BUCKETS: usize = 8;
@@ -1837,6 +1862,7 @@ mod tests {
         );
         let mut buf = Vec::new();
         original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
+        assert_eq!(stored_num_buckets(&buf).unwrap(), DEFAULT_NUM_BUCKETS);
         let mut cursor = std::io::Cursor::new(&buf);
         let loaded = LayerStackWeights::load_quantised(
             &mut cursor,
@@ -1881,6 +1907,14 @@ mod tests {
         let mut legacy = current.clone();
         legacy[..4].copy_from_slice(&LEGACY_NNUE_VERSION_BUCKETS9.to_le_bytes());
         legacy.drain(field_at..field_at + 4);
+        assert_eq!(
+            stored_num_buckets(&current).unwrap(),
+            LEGACY_IMPLICIT_NUM_BUCKETS
+        );
+        assert_eq!(
+            stored_num_buckets(&legacy).unwrap(),
+            LEGACY_IMPLICIT_NUM_BUCKETS
+        );
 
         let load = |num_buckets| {
             LayerStackWeights::load_quantised(
@@ -2400,17 +2434,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// 外部 reference `.bin` の header から bucket 数を読む。legacy は field を持たない。
-    fn reference_num_buckets(bytes: &[u8]) -> usize {
-        let version = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        if version == LEGACY_NNUE_VERSION_BUCKETS9 {
-            return LEGACY_IMPLICIT_NUM_BUCKETS;
-        }
-        let arch_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let at = 12 + arch_len;
-        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
-    }
-
     #[test]
     fn load_external_reference_if_env_set() {
         // 外部 reference checkpoint を `RSHOGI_NNUE_LAYERSTACK_REF_BIN`
@@ -2420,7 +2443,7 @@ mod tests {
             eprintln!("skipping load_external_reference (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set)");
             return;
         };
-        let nb = reference_num_buckets(&std::fs::read(&path).expect("read reference bin"));
+        let nb = stored_num_buckets(&std::fs::read(&path).expect("read reference bin")).unwrap();
         let mut file = std::fs::File::open(&path).expect("open reference bin");
         let weights = LayerStackWeights::load_quantised(
             &mut file,
@@ -2506,7 +2529,7 @@ mod tests {
             v if v == LEGACY_NNUE_VERSION_BUCKETS9 => 4_i64,
             v => panic!("unknown NNUE_VERSION in reference: {v:#x}"),
         };
-        let nb = reference_num_buckets(&in_bytes);
+        let nb = stored_num_buckets(&in_bytes).unwrap();
         let out_path = std::env::temp_dir().join("layerstack_ref_resaved.bin");
         let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
         let weights = LayerStackWeights::load_quantised(

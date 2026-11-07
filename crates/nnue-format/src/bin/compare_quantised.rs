@@ -12,8 +12,6 @@
 //! exit code: 正常 0、引数不正 2、file I/O や parse 失敗 1。
 
 use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
 
 use nnue_format::LayerStackWeights;
 use shogi_features::FeatureSet;
@@ -22,18 +20,20 @@ use shogi_features::FeatureSet;
 ///
 /// 比較対象は production の `halfka-hm-merged` checkpoint を既定 FT 出力次元
 /// (`DEFAULT_FT_OUT`) / 既定 L1 出力次元 (`DEFAULT_L1_OUT`) / 既定 L2 出力次元
-/// (`DEFAULT_L2_OUT`) / 既定 bucket 数 (`DEFAULT_NUM_BUCKETS`) で想定し、その
-/// spec で load する (loader は arch / hash / layout がこの feature set と層次元 /
-/// bucket 数に一致するか検証する)。
+/// (`DEFAULT_L2_OUT`) で想定し、bucket 数は file の header に保存された値を使う
+/// (loader は arch / hash / layout がこの feature set と層次元 / bucket 数に一致
+/// するか検証する)。
 fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
-    let file = File::open(path).map_err(|e| format!("open `{path}`: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read `{path}`: {e}"))?;
+    let num_buckets = nnue_format::layerstack_weights::stored_num_buckets(&bytes)
+        .map_err(|e| format!("parse `{path}` header: {e}"))?;
     LayerStackWeights::load_quantised(
-        &mut BufReader::new(file),
+        &mut std::io::Cursor::new(&bytes),
         FeatureSet::HalfKaHmMerged.spec(),
         nnue_format::layerstack_weights::DEFAULT_FT_OUT,
         nnue_format::layerstack_weights::DEFAULT_L1_OUT,
         nnue_format::layerstack_weights::DEFAULT_L2_OUT,
-        nnue_format::layerstack_weights::DEFAULT_NUM_BUCKETS,
+        num_buckets,
     )
     .map_err(|e| format!("parse `{path}` as LayerStack quantised NNUE: {e}").into())
 }

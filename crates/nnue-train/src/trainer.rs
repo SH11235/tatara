@@ -412,7 +412,7 @@ pub enum OutputFormat {
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
-/// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 9、
+/// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 8、
 /// LayerStack `--num-buckets` 由来)。learning rate / WDL schedule は別に
 /// [`LrScheduler`] / [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
