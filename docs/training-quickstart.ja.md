@@ -12,7 +12,7 @@
 本ページは 2 つの構成を例に手順を示す:
 
 - **例 1: HalfKP NNUE**(`simple` アーキ)— 最小構成。bucket を使わず前準備が少ない
-- **例 2: LayerStack NNUE** — 局面進行度の 9 bucket を使う構成
+- **例 2: LayerStack NNUE** — 局面進行度の bucket(既定 8)を使う構成
 
 ## 必要な入力
 
@@ -88,10 +88,12 @@ target/release/nnue-train \
 KingRank9 を使う場合は末尾を次のように置き換える:
 
 ```bash
-  layerstack --bucket-mode kingrank9 --num-buckets 9
+  layerstack --bucket-mode kingrank9
 ```
 
-`layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
+`kingrank9` では `--num-buckets` を省くと 9 になる(9 以外はエラー)。
+
+`layerstack` は既定で `--feature-set halfka-hm-merged` / 8 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
 
 ## 主な option
 
@@ -116,7 +118,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
-| `--num-buckets` (`layerstack`) | 9 | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
+| `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
 
 ### 教師データの先読みとshuffle
 

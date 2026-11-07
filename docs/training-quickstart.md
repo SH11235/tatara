@@ -14,8 +14,8 @@ examples:
 
 - **Example 1: HalfKP NNUE** (`simple` architecture) — the minimal
   configuration. No buckets, so little preparation
-- **Example 2: LayerStack NNUE** — a configuration that uses the 9 game-progress
-  buckets
+- **Example 2: LayerStack NNUE** — a configuration that uses game-progress
+  buckets (8 by default)
 
 ## Required inputs
 
@@ -99,10 +99,13 @@ target/release/nnue-train \
 For KingRank9, replace the final line with:
 
 ```bash
-  layerstack --bucket-mode kingrank9 --num-buckets 9
+  layerstack --bucket-mode kingrank9
 ```
 
-`layerstack` defaults to `--feature-set halfka-hm-merged` / 9 buckets. The FT
+In `kingrank9` mode, omitting `--num-buckets` selects 9 (any other value is
+rejected).
+
+`layerstack` defaults to `--feature-set halfka-hm-merged` / 8 buckets. The FT
 output dimension can be changed with `--ft-out` (a multiple of 128, default
 1536).
 
@@ -129,7 +132,7 @@ change for real training are:
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` routes by the KP-absolute progress estimate. `progresskpabsq16` routes by the same estimate in integer Q16 arithmetic. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
-| `--num-buckets` (`layerstack`) | 9 | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9 |
+| `--num-buckets` (`layerstack`) | 8 (9 for `kingrank9`) | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9. Pass `--num-buckets 9` to `--resume` / `--init-from` a 9-bucket checkpoint or `.bin` |
 
 ### Teacher-data read-ahead and shuffle
 

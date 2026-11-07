@@ -40,7 +40,7 @@ reference CPU: `crates/gpu-kernels/src/sparse/`。
 ## LayerStack dense kernels
 
 LayerStack アーキの FT 後処理と、bucket 別重み行列 (bucket 数は
-`--num-buckets`、既定 9) を選択する per-bucket dense 層。reference CPU:
+`--num-buckets`、既定 8) を選択する per-bucket dense 層。reference CPU:
 `crates/gpu-kernels/src/layerstack/`。
 
 | Pattern | 用途 |

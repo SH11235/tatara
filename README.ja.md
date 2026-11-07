@@ -89,7 +89,7 @@ v9 以降の checkpoint では再指定不要。v8 以前から resume する場
 
 | アーキ | サブコマンド | 構造 |
 |---|---|---|
-| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(`--num-buckets`、既定 9。Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ `--l1`(既定 16)→ `--l2`(既定 32)|
+| **LayerStack** | `layerstack` | 局面の進行度で出力層を bucket 別に専用化(`--num-buckets`、既定 8。Stockfish の "LayerStacks" と同じ発想)。FT 出力 `--ft-out`(既定 1536)→ `--l1`(既定 16)→ `--l2`(既定 32)|
 | **Simple** | `simple` | bucket 分割のない素の NNUE(FT → 隠れ 2 層 → 単一出力)。層次元は `--arch <l1>x2-<l2>-<l3>` で指定(`l1` = FT 出力、`l2`/`l3` = 隠れ層、既定 `256x2-32-32`)、活性化 crelu / screlu / pairwise |
 
 ### 入力 feature set

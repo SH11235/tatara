@@ -506,10 +506,10 @@ mod tests {
             batch_size: 16,
             feature_set: FeatureSet::HalfKp.spec(),
             bucket_mode: BucketMode::ProgressKpAbs,
-            num_buckets: 9,
+            num_buckets: 8,
             net,
             weights_source: "init-from-bin",
-            arch: "LayerStack-128-16-32-9bucket".to_string(),
+            arch: "LayerStack-128-16-32-8bucket".to_string(),
             threat_profile: "off".to_string(),
             effect_bucket: "off".to_string(),
             ft_factorize: "off",
@@ -601,7 +601,7 @@ mod tests {
 
         // arch provenance: 生成条件を復元できる全構成 flag。
         for key in [
-            "arch=LayerStack-128-16-32-9bucket",
+            "arch=LayerStack-128-16-32-8bucket",
             "feature_set=",
             "threat_profile=off",
             "effect_bucket=off",
@@ -609,7 +609,7 @@ mod tests {
             "psqt=false",
             "stack_shared_delta=false",
             "bucket_mode=progresskpabs",
-            "num_buckets=9",
+            "num_buckets=8",
             "score_scale_bits=0x",
             "batch_size=16",
         ] {

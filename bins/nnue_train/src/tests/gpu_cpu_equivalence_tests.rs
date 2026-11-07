@@ -1318,7 +1318,7 @@ fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let batch = 13_usize; // > 9 + 2 → all buckets + both out-of-range kinds
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = DEFAULT_NUM_BUCKETS;
+    let nb = MAX_SUPPORTED_NUM_BUCKETS;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let w: Vec<f32> = (0..nb * out_dim * in_dim)
         .map(|i| i as f32 * 0.0007 + 0.05)
@@ -1368,7 +1368,7 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
     // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets <= 9
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
         let out_dim = 16_usize;
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
             .map(|i| i as f32 * 0.0007 + 0.05)
@@ -1438,7 +1438,7 @@ fn bucket_sort_fwd_l1_with_shared_matches_cpu() -> Result<(), Box<dyn std::error
         (32, 48, 17),
         (48, 208, 16),
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
@@ -1583,7 +1583,7 @@ fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Erro
         (64, 32, 8),
         (32, 48, 17),
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1713,7 +1713,7 @@ fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Err
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = DEFAULT_NUM_BUCKETS;
+    let nb = MAX_SUPPORTED_NUM_BUCKETS;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
         .collect();
@@ -1762,7 +1762,7 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = DEFAULT_NUM_BUCKETS;
+    let nb = MAX_SUPPORTED_NUM_BUCKETS;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
@@ -1817,7 +1817,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
         (1024, 14, 256),
         (32, 96, 30), // 非 16 倍数の out_dim
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1881,7 +1881,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         (32, 30), // 非 16 倍数の in_dim
     ] {
         let out_dim = 1_usize;
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1943,7 +1943,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::
     // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets == 9 を要求
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (32, 96)] {
         let out_dim = 16_usize;
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -2007,7 +2007,7 @@ fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Err
         (64, 32, 8),
         (32, 48, 17),
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
@@ -2120,7 +2120,7 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let batch = 13_usize;
     let out_dim = 32_usize;
-    let nb = DEFAULT_NUM_BUCKETS;
+    let nb = MAX_SUPPORTED_NUM_BUCKETS;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.017 - 0.9)
         .collect();
@@ -2170,7 +2170,7 @@ fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error
         (48, 8),  // l1_out < 16
         (64, 64), // l1_out > 32
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
+        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.017 - 0.9)
@@ -3002,7 +3002,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
 
 // =============================================================================
 // `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS = 9) を GPU/CPU で
-// exercise する parametrised test。既存テストは既定 N=9 で動かしているが、
+// exercise する parametrised test。既存テストは上限 N=9 で動かしているが、
 // kernel は `num_buckets` を runtime 引数で受けるため N ≤ 9 で同じ correctness
 // 不変条件 (`bucket_idx >= num_buckets` を silent skip、CPU と bit-equal) が
 // 成立する。本セクションでは `N ∈ {2, 4, 8, 9}` の主要 N で fwd / bwd_input /
@@ -5696,7 +5696,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, MAX_SUPPORTED_NUM_BUCKETS, 11_usize);
     let psqt_w = deterministic_floats(ft_in * nb, 33.0);
     let (stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
     let (nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
@@ -5750,7 +5750,7 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
 #[test]
 fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, DEFAULT_NUM_BUCKETS, 11_usize);
+    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, MAX_SUPPORTED_NUM_BUCKETS, 11_usize);
     let dnet = deterministic_floats(batch, 41.0);
     let (mut stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
     let (mut nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
@@ -5824,8 +5824,8 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
     // grid y 軸単位である 128 の最小値で、buffer 容量を test 向けに抑える。
     let feature_set = FeatureSet::HalfKp.spec();
     let ft_out = 128;
-    let psqt_init: Option<Vec<f32>> =
-        with_psqt.then(|| deterministic_floats(feature_set.ft_in() * DEFAULT_NUM_BUCKETS, 7.0));
+    let psqt_init: Option<Vec<f32>> = with_psqt
+        .then(|| deterministic_floats(feature_set.ft_in() * MAX_SUPPORTED_NUM_BUCKETS, 7.0));
     let new_trainer = || -> Result<GpuTrainer, Box<dyn std::error::Error>> {
         GpuTrainer::new(
             &ctx,
@@ -5833,7 +5833,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
             ft_out,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            DEFAULT_NUM_BUCKETS,
+            MAX_SUPPORTED_NUM_BUCKETS,
             nnue_train::dataloader::BucketMode::ProgressKpAbs,
             PrecisionFlags::default(),
             feature_set,
@@ -6589,7 +6589,7 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
             128,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            DEFAULT_NUM_BUCKETS,
+            MAX_SUPPORTED_NUM_BUCKETS,
             nnue_train::dataloader::BucketMode::ProgressKpAbs,
             PrecisionFlags::default(),
             feature_set,

@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::{
-    DEFAULT_L1_OUT, DEFAULT_L2_OUT, DEFAULT_NUM_BUCKETS, FV_SCALE, LEGACY_NNUE_VERSION_BUCKETS9,
-    NNUE_VERSION, QA, QB,
+    DEFAULT_L1_OUT, DEFAULT_L2_OUT, FV_SCALE, LEGACY_IMPLICIT_NUM_BUCKETS,
+    LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION, QA, QB,
 };
 use nnue_train::dataloader::BucketMode;
 use shogi_features::{
@@ -164,7 +164,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     }
     let arch = std::str::from_utf8(&bytes[arch_start..arch_end])?;
     let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
-        DEFAULT_NUM_BUCKETS
+        LEGACY_IMPLICIT_NUM_BUCKETS
     } else {
         if arch_end + 4 > bytes.len() {
             return Err("NNUE num_buckets field extends past end of file".into());
@@ -175,6 +175,9 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
                 .expect("slice has 4 bytes"),
         ) as usize
     };
+    if num_buckets == 0 {
+        return Err("NNUE num_buckets field is 0".into());
+    }
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
         effect_bucket_config: parse_effect_bucket_config(arch)?,
@@ -182,11 +185,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
         ft_out: parse_between(arch, "->", "x2]")?,
         l1_out: affine_outs.last().copied().unwrap_or(DEFAULT_L1_OUT),
         l2_out: affine_outs.get(1).copied().unwrap_or(DEFAULT_L2_OUT),
-        num_buckets: if num_buckets == 0 {
-            DEFAULT_NUM_BUCKETS
-        } else {
-            num_buckets
-        },
+        num_buckets,
     })
 }
 

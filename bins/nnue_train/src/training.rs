@@ -345,21 +345,21 @@ pub(crate) fn validate_bucket_mode(
     }
     match mode {
         BucketMode::ProgressKpAbs | BucketMode::ProgressKpAbsQ16 => {
-            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
+            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets()) {
                 return Err(format!(
                     "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for {} (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
                     mode.canonical_name(),
-                    args.num_buckets
+                    args.num_buckets()
                 )
                 .into());
             }
             Ok(mode)
         }
         BucketMode::KingRank9 => {
-            if args.num_buckets != KINGRANK9_NUM_BUCKETS {
+            if args.num_buckets() != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
                     "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
-                    args.num_buckets,
+                    args.num_buckets(),
                 )
                 .into());
             }
@@ -759,7 +759,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.ft_out,
             layerstack.l1,
             layerstack.l2,
-            layerstack.num_buckets,
+            layerstack.num_buckets(),
             layerstack.psqt,
         )?;
         crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
@@ -798,7 +798,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // domain、PSQT も同 scale で寄与する)、無効時は `scale` (= sigmoid 経路の cp → logit
     // 変換係数)。
     let psqt_init_vec: Option<Vec<f32>> = if layerstack.psqt {
-        let n = feature_set.ft_in() * layerstack.num_buckets;
+        let n = feature_set.ft_in() * layerstack.num_buckets();
         let vec = match layerstack.psqt_init {
             PsqtInit::Zeroed => vec![0.0_f32; n],
             PsqtInit::Material => {
@@ -822,7 +822,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 shogi_features::psqt_material_values(
                     &feature_set,
-                    layerstack.num_buckets,
+                    layerstack.num_buckets(),
                     out_scaling,
                 )
             }
@@ -884,7 +884,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.ft_out,
         layerstack.l1,
         layerstack.l2,
-        layerstack.num_buckets,
+        layerstack.num_buckets(),
         bucket_mode,
         PrecisionFlags {
             tf32,
@@ -963,7 +963,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 layerstack.ft_out,
                 layerstack.l1,
                 layerstack.l2,
-                layerstack.num_buckets,
+                layerstack.num_buckets(),
                 layerstack.psqt,
             )?
         } else {
@@ -974,7 +974,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 layerstack.ft_out,
                 layerstack.l1,
                 layerstack.l2,
-                layerstack.num_buckets,
+                layerstack.num_buckets(),
                 layerstack.psqt,
             )?
         };
@@ -1081,7 +1081,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         test_positions: cli.test_positions,
         test_tail_positions: cli.test_tail_positions,
         compute_bucket: true,
-        num_buckets: layerstack.num_buckets,
+        num_buckets: layerstack.num_buckets(),
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
         monitor_active_features: cli.monitor_active_features,
     };
@@ -1124,14 +1124,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             batch_size: cli.batch_size,
             feature_set,
             bucket_mode,
-            num_buckets: layerstack.num_buckets,
+            num_buckets: layerstack.num_buckets(),
             net: rescore_net_identity.ok_or("--rescore-input requires --init-from or --resume")?,
             weights_source,
             arch: layerstack_architecture(
                 layerstack.ft_out,
                 layerstack.l1,
                 layerstack.l2,
-                layerstack.num_buckets,
+                layerstack.num_buckets(),
             ),
             threat_profile: layerstack.threat_profile.clone(),
             effect_bucket: layerstack.effect_bucket_config.clone(),
@@ -1923,7 +1923,7 @@ pub(crate) fn build_experiment_logger(
             layerstack.ft_out,
             layerstack.l1,
             layerstack.l2,
-            layerstack.num_buckets,
+            layerstack.num_buckets(),
         ),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
@@ -1932,7 +1932,7 @@ pub(crate) fn build_experiment_logger(
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
-        num_buckets: Some(layerstack.num_buckets),
+        num_buckets: Some(layerstack.num_buckets()),
         optimizer: cli.optimizer.to_ascii_lowercase(),
         // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
         // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
