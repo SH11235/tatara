@@ -592,8 +592,13 @@ mod tests {
     #[test]
     fn real_yaneuraou_file_with_simple_version_is_rejected() {
         let spec = FeatureSet::HalfKaHmMerged.spec();
-        let net =
-            LayerStackWeights::zeroed(spec, 32, TEST_L1_OUT, TEST_L2_OUT, DEFAULT_NUM_BUCKETS);
+        let net = LayerStackWeights::zeroed(
+            spec,
+            32,
+            TEST_L1_OUT,
+            TEST_L2_OUT,
+            nnue_format::YANEURAOU_LAYER_STACKS,
+        );
         let mut input = Vec::new();
         save_yaneuraou(&mut input, &net).unwrap();
         assert_eq!(read_u32(&input, 0).unwrap(), SIMPLE_NNUE_VERSION);
