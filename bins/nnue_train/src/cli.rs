@@ -170,10 +170,22 @@ struct PathOptions {
 
 /// サブコマンドも含め、`PathBuf` を値に取る長いオプションの名前 (別名を含む) を集める。位置引数・
 /// 短いオプション・複数の値を取る `PathBuf` 引数は argv 上の位置を名前の直後の 1 要素として
-/// 追えないので、定義されていれば `None` を返す。
+/// 追えない。文字列やパスを値に取り `-` で始まる値も受け付ける引数があると、`--data` のような要素が
+/// その値なのかを走査で区別できない (数値の引数なら `--data` は解析に失敗するので区別できる)。
+/// どれかが定義されていれば `None` を返す。
 fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
-    let path_type = clap::builder::ValueParser::path_buf().type_id();
+    use clap::builder::ValueParser;
+    let path_type = ValueParser::path_buf().type_id();
+    let text_types = [
+        ValueParser::string().type_id(),
+        ValueParser::os_string().type_id(),
+        path_type,
+    ];
     for arg in command.get_arguments() {
+        let takes_text = text_types.contains(&arg.get_value_parser().type_id());
+        if arg.is_trailing_var_arg_set() || (arg.is_allow_hyphen_values_set() && takes_text) {
+            return None;
+        }
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }

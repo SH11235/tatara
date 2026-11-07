@@ -2604,6 +2604,25 @@ mod shared_cli_tests {
             collect(Command::new("t").subcommand(Command::new("sub").arg(path().short('d')))),
             None
         );
+        assert_eq!(
+            collect(
+                Command::new("t")
+                    .arg(path())
+                    .arg(Arg::new("label").long("label").allow_hyphen_values(true))
+            ),
+            None
+        );
+        assert_eq!(
+            collect(
+                Command::new("t").arg(path()).arg(
+                    Arg::new("scale")
+                        .long("scale")
+                        .allow_hyphen_values(true)
+                        .value_parser(value_parser!(i32))
+                )
+            ),
+            Some(vec!["data".to_string()])
+        );
     }
 
     #[test]
