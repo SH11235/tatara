@@ -53,9 +53,9 @@ struct Args {
     per_pack: bool,
 
     /// Number of progress buckets to survey (LayerStack `--num-buckets`).
-    /// Must be in `[1, 9]`; defaults to 9 to match the LayerStack trainer
+    /// Must be in `[1, 9]`; defaults to 8 to match the LayerStack trainer
     /// default. Position `p` maps to bucket `min(N-1, floor(p * N))`.
-    #[arg(long, default_value_t = 9)]
+    #[arg(long, default_value_t = 8)]
     num_buckets: usize,
 }
 

@@ -6,8 +6,7 @@
 //!
 //! 重み (`progress.bin`) は意図的にロードしないため、
 //! `weights()` は zero 配列、`progress()` は常に `sigmoid(0) = 0.5`、
-//! `bucket(pos, 9)` は `floor(0.5 * 9) = 4` になる (`num_buckets = 9` は
-//! LayerStack 既定)。
+//! `bucket(pos, 9)` は `floor(0.5 * 9) = 4` になる。
 
 use shogi_features::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
 use shogi_format::PackedSfenValue;

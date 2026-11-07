@@ -1178,7 +1178,7 @@ pub(crate) struct LayerstackArgs {
     /// king squares x 1548 KP-abs piece inputs) for progresskpabs and
     /// progresskpabsq16. When omitted in those modes, every position falls in
     /// the middle bucket `floor(N / 2)` (zero weights → `sigmoid(0) = 0.5`;
-    /// bucket 4 for the default 9 buckets). Do not specify this option
+    /// bucket 4 for the default 8 buckets). Do not specify this option
     /// in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
@@ -1222,18 +1222,17 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` (progresskpabsq16 uses the same split
-    /// in integer logit space) and N must be in `[2, 9]`. In
-    /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
-    /// in the per-bucket weight backward kernels. The default 9 keeps the
-    /// binning and weight-buffer shape identical to the standard layout and
-    /// resume-compatible with existing checkpoints. The historical 8-bucket
-    /// progress emission used `floor(p * 8)` on a 9-slot layout, leaving slot 8
-    /// unused; the unified design here means setting `--num-buckets 9` (the
-    /// default) actually emits index 8 — existing 9-bucket distributed nets
-    /// have an untrained slot 8 and may see a short-term eval shift on the
-    /// `p in [8/9, 1]` tail until continued training catches up.
-    #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
-    pub(crate) num_buckets: usize,
+    /// in integer logit space) and N must be in `[2, 9]`; the default is 8. In
+    /// kingrank9 mode the default is 9 and any other value is rejected. The
+    /// upper bound is the fixed 9-register accumulator in the per-bucket weight
+    /// backward kernels. Resuming or initializing from a 9-bucket checkpoint
+    /// in a progress mode needs `--num-buckets 9`; the bucket count is checked
+    /// against the checkpoint topology. Some older 9-bucket nets were trained
+    /// with `floor(p * 8)` on a 9-slot layout and have an untrained slot 8;
+    /// continuing them with `--num-buckets 9` routes the `p in [8/9, 1]` tail to
+    /// that slot, which may shift eval there until training catches up.
+    #[arg(long = "num-buckets", value_name = "N")]
+    num_buckets_arg: Option<usize>,
 
     /// Apply the existing L1 shared-delta parameterization to L2 and L3. The
     /// shared terms are initialized to zero and folded into each bucket on export, so
@@ -1336,6 +1335,24 @@ pub(crate) struct LayerstackArgs {
     /// `--threat-profile` and `--psqt`.
     #[arg(long = "effect-bucket", default_value = "off")]
     pub(crate) effect_bucket_config: String,
+}
+
+#[cfg(any(feature = "gpu", test))]
+impl LayerstackArgs {
+    /// `--num-buckets` if given, otherwise the bucket mode's default: kingrank9
+    /// has a fixed bucket layout, the progress modes use [`DEFAULT_NUM_BUCKETS`].
+    /// An unknown `--bucket-mode` falls back to the progress default; it is
+    /// rejected separately by bucket-mode validation.
+    pub(crate) fn num_buckets(&self) -> usize {
+        self.num_buckets_arg.unwrap_or_else(|| {
+            match nnue_train::dataloader::BucketMode::parse(&self.bucket_mode) {
+                Some((nnue_train::dataloader::BucketMode::KingRank9, _)) => {
+                    shogi_features::KINGRANK9_NUM_BUCKETS
+                }
+                _ => DEFAULT_NUM_BUCKETS,
+            }
+        })
+    }
 }
 
 /// PSQT shortcut の初期化方式。

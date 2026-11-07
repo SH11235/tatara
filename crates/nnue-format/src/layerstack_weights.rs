@@ -79,8 +79,12 @@ use shogi_features::{EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
 /// self-describing layout。
 pub const NNUE_VERSION: u32 = 0x7AF32F21;
 /// `num_buckets` field が無かった旧 layout の version。load 時は暗黙
-/// `num_buckets = 9` として処理する (bump 前の配布 net 互換)。save には使わない。
+/// `num_buckets = 9` ([`LEGACY_IMPLICIT_NUM_BUCKETS`]) として処理する (bump 前の
+/// 配布 net 互換)。save には使わない。
 pub const LEGACY_NNUE_VERSION_BUCKETS9: u32 = 0x7AF32F20;
+/// legacy `.bin` ([`LEGACY_NNUE_VERSION_BUCKETS9`]) の暗黙 bucket 数。header に
+/// `num_buckets` field が無いため、[`DEFAULT_NUM_BUCKETS`] とは独立に 9 で固定する。
+pub const LEGACY_IMPLICIT_NUM_BUCKETS: usize = 9;
 pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
 // FT 入力次元は feature set ごと、FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、
@@ -93,9 +97,38 @@ pub const DEFAULT_L1_OUT: usize = 16;
 /// 既定 L2 出力次元。`--l2` 未指定時の値。L2 per-bucket dense 層の出力幅で、
 /// CReLU を経て L3 出力層の入力になる。
 pub const DEFAULT_L2_OUT: usize = 32;
-/// 既定 bucket 数。`--num-buckets` 未指定時、および legacy `.bin`
-/// ([`LEGACY_NNUE_VERSION_BUCKETS9`]) の暗黙 N。
-pub const DEFAULT_NUM_BUCKETS: usize = 9;
+/// LayerStack `.bin` の header から保存されている bucket 数を読む。legacy `.bin`
+/// ([`LEGACY_NNUE_VERSION_BUCKETS9`]) は [`LEGACY_IMPLICIT_NUM_BUCKETS`] を返す。
+/// arch / hash / layer 形状は検証しないので、読んだ値は load 時に照合される。
+pub fn stored_num_buckets(bytes: &[u8]) -> io::Result<usize> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let u32_at = |at: usize| -> io::Result<u32> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("slice has 4 bytes")))
+            .ok_or_else(|| invalid(format!("NNUE header is truncated at byte {at}")))
+    };
+    let version = u32_at(0)?;
+    if version == LEGACY_NNUE_VERSION_BUCKETS9 {
+        return Ok(LEGACY_IMPLICIT_NUM_BUCKETS);
+    }
+    if version != NNUE_VERSION {
+        return Err(invalid(format!(
+            "unknown NNUE version: {version:#x} (expected {NNUE_VERSION:#x} or legacy \
+             {LEGACY_NNUE_VERSION_BUCKETS9:#x})"
+        )));
+    }
+    let arch_len = u32_at(8)? as usize;
+    let num_buckets = u32_at(12 + arch_len)? as usize;
+    if num_buckets == 0 {
+        return Err(invalid("NNUE num_buckets field is 0".to_string()));
+    }
+    Ok(num_buckets)
+}
+
+/// 既定 bucket 数。`--num-buckets` 未指定時の値。legacy `.bin` の暗黙 N は
+/// [`LEGACY_IMPLICIT_NUM_BUCKETS`] を使う。
+pub const DEFAULT_NUM_BUCKETS: usize = 8;
 
 pub const QA: i32 = 127;
 pub const QB: i32 = 64;
@@ -941,18 +974,17 @@ impl LayerStackWeights {
         // num_buckets field (current NNUE_VERSION のみ。legacy は暗黙 9 として扱う)。
         // legacy `.bin` を非 9 で load しようとした場合は明示 reject。
         let file_num_buckets = if file_is_legacy {
-            if num_buckets != DEFAULT_NUM_BUCKETS {
+            if num_buckets != LEGACY_IMPLICIT_NUM_BUCKETS {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "legacy NNUE version {LEGACY_NNUE_VERSION_BUCKETS9:#x} has implicit \
-                         num_buckets = {DEFAULT_NUM_BUCKETS}, but {num_buckets} was requested \
-                         (re-save the `.bin` with a current build to load it at non-default \
-                         bucket counts)"
+                         num_buckets = {LEGACY_IMPLICIT_NUM_BUCKETS}, but {num_buckets} was \
+                         requested (load it with num_buckets = {LEGACY_IMPLICIT_NUM_BUCKETS})"
                     ),
                 ));
             }
-            DEFAULT_NUM_BUCKETS
+            LEGACY_IMPLICIT_NUM_BUCKETS
         } else {
             reader.read_exact(&mut buf4)?;
             let v = u32::from_le_bytes(buf4) as usize;
@@ -1834,6 +1866,7 @@ mod tests {
         );
         let mut buf = Vec::new();
         original.save_quantised(&mut buf, Some(FV_SCALE)).unwrap();
+        assert_eq!(stored_num_buckets(&buf).unwrap(), DEFAULT_NUM_BUCKETS);
         let mut cursor = std::io::Cursor::new(&buf);
         let loaded = LayerStackWeights::load_quantised(
             &mut cursor,
@@ -1856,6 +1889,66 @@ mod tests {
         // 値も全 0
         assert!(loaded.ft_w.iter().all(|&x| x == 0.0));
         assert!(loaded.l1_w.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn legacy_bin_loads_with_implicit_nine_buckets_regardless_of_default() {
+        assert_ne!(DEFAULT_NUM_BUCKETS, LEGACY_IMPLICIT_NUM_BUCKETS);
+        let original = LayerStackWeights::zeroed(
+            test_spec(),
+            DEFAULT_FT_OUT,
+            DEFAULT_L1_OUT,
+            DEFAULT_L2_OUT,
+            LEGACY_IMPLICIT_NUM_BUCKETS,
+        );
+        let mut current = Vec::new();
+        original
+            .save_quantised(&mut current, Some(FV_SCALE))
+            .unwrap();
+        // legacy layout = version を差し替え、arch_str 直後の num_buckets field を除いたもの。
+        let arch_len = u32::from_le_bytes(current[8..12].try_into().unwrap()) as usize;
+        let field_at = 12 + arch_len;
+        let mut legacy = current.clone();
+        legacy[..4].copy_from_slice(&LEGACY_NNUE_VERSION_BUCKETS9.to_le_bytes());
+        legacy.drain(field_at..field_at + 4);
+        assert_eq!(
+            stored_num_buckets(&current).unwrap(),
+            LEGACY_IMPLICIT_NUM_BUCKETS
+        );
+        assert_eq!(
+            stored_num_buckets(&legacy).unwrap(),
+            LEGACY_IMPLICIT_NUM_BUCKETS
+        );
+        let mut zero = current.clone();
+        zero[field_at..field_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            stored_num_buckets(&zero).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            stored_num_buckets(&current[..field_at + 2])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let load = |num_buckets| {
+            LayerStackWeights::load_quantised(
+                &mut std::io::Cursor::new(&legacy),
+                test_spec(),
+                DEFAULT_FT_OUT,
+                DEFAULT_L1_OUT,
+                DEFAULT_L2_OUT,
+                num_buckets,
+            )
+        };
+        let loaded = load(LEGACY_IMPLICIT_NUM_BUCKETS).expect("legacy .bin loads with 9 buckets");
+        assert_eq!(loaded.num_buckets, LEGACY_IMPLICIT_NUM_BUCKETS);
+        assert_eq!(loaded.l3_b.len(), LEGACY_IMPLICIT_NUM_BUCKETS);
+
+        let err = load(DEFAULT_NUM_BUCKETS).expect_err("legacy .bin rejects non-9 bucket count");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("implicit"), "{err}");
     }
 
     fn threat_spec(profile: shogi_features::ThreatProfile) -> FeatureSetSpec {
@@ -2366,6 +2459,7 @@ mod tests {
             eprintln!("skipping load_external_reference (RSHOGI_NNUE_LAYERSTACK_REF_BIN not set)");
             return;
         };
+        let nb = stored_num_buckets(&std::fs::read(&path).expect("read reference bin")).unwrap();
         let mut file = std::fs::File::open(&path).expect("open reference bin");
         let weights = LayerStackWeights::load_quantised(
             &mut file,
@@ -2373,7 +2467,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            DEFAULT_NUM_BUCKETS,
+            nb,
         )
         .expect("parse reference bin");
 
@@ -2381,18 +2475,12 @@ mod tests {
         let l2_in = (DEFAULT_L1_OUT - 1) * 2;
         assert_eq!(weights.ft_w.len(), test_spec().ft_in() * DEFAULT_FT_OUT);
         assert_eq!(weights.ft_b.len(), DEFAULT_FT_OUT);
-        assert_eq!(
-            weights.l1_w.len(),
-            DEFAULT_NUM_BUCKETS * DEFAULT_L1_OUT * DEFAULT_FT_OUT
-        );
-        assert_eq!(weights.l1_b.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L1_OUT);
-        assert_eq!(
-            weights.l2_w.len(),
-            DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT * l2_in
-        );
-        assert_eq!(weights.l2_b.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT);
-        assert_eq!(weights.l3_w.len(), DEFAULT_NUM_BUCKETS * DEFAULT_L2_OUT);
-        assert_eq!(weights.l3_b.len(), DEFAULT_NUM_BUCKETS);
+        assert_eq!(weights.l1_w.len(), nb * DEFAULT_L1_OUT * DEFAULT_FT_OUT);
+        assert_eq!(weights.l1_b.len(), nb * DEFAULT_L1_OUT);
+        assert_eq!(weights.l2_w.len(), nb * DEFAULT_L2_OUT * l2_in);
+        assert_eq!(weights.l2_b.len(), nb * DEFAULT_L2_OUT);
+        assert_eq!(weights.l3_w.len(), nb * DEFAULT_L2_OUT);
+        assert_eq!(weights.l3_b.len(), nb);
 
         // 非自明 weight (training 済みなので非 0 が多い)
         let nz_ft = weights.ft_w.iter().filter(|&&x| x != 0.0).count();
@@ -2457,6 +2545,7 @@ mod tests {
             v if v == LEGACY_NNUE_VERSION_BUCKETS9 => 4_i64,
             v => panic!("unknown NNUE_VERSION in reference: {v:#x}"),
         };
+        let nb = stored_num_buckets(&in_bytes).unwrap();
         let out_path = std::env::temp_dir().join("layerstack_ref_resaved.bin");
         let mut reader = std::io::BufReader::new(std::fs::File::open(&in_path).unwrap());
         let weights = LayerStackWeights::load_quantised(
@@ -2465,7 +2554,7 @@ mod tests {
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            DEFAULT_NUM_BUCKETS,
+            nb,
         )
         .unwrap();
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());

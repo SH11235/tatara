@@ -425,6 +425,18 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
     println!("[smoke] CUDA context created, loading kernel module...");
     // smoke は production feature set (`halfka-hm-merged`) で動作確認する。
     let feature_set = FeatureSet::HalfKaHmMerged.spec();
+    // `RSHOGI_NNUE_LAYERSTACK_REF_BIN` に既存の量子化 checkpoint (`.bin`) path を
+    // 指定すると、その weight を注入して forward + backward + save を一通り走らせる。
+    // 未設定なら random-init での smoke のみ。trainer の bucket 数は reference の
+    // header に合わせる (既定と異なる bucket 数の reference も注入できるように)。
+    let layerstack_ref = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists());
+    let layerstack_ref_bytes = layerstack_ref.as_deref().map(std::fs::read).transpose()?;
+    let n_buckets = match &layerstack_ref_bytes {
+        Some(bytes) => nnue_format::layerstack_weights::stored_num_buckets(bytes)?,
+        None => DEFAULT_NUM_BUCKETS,
+    };
     // workspace を smoke の固定 batch 分で確保 (smoke は TF32 OFF 固定で動作確認、
     // training は CLI の `--tf32` を pass する)。
     let mut trainer = GpuTrainer::new(
@@ -433,7 +445,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_FT_OUT,
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
-        DEFAULT_NUM_BUCKETS,
+        n_buckets,
         nnue_train::dataloader::BucketMode::ProgressKpAbs,
         PrecisionFlags::default(),
         feature_set,
@@ -446,7 +458,6 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
     )?;
     // smoke は既定次元で走る。L2 入力次元は L1 出力から導出 (skip 1 dim を除いた ×2)。
     let l2_in = (DEFAULT_L1_OUT - L1_SKIP) * 2;
-    let n_buckets = DEFAULT_NUM_BUCKETS;
     println!(
         "[smoke] GpuTrainer ready: 10 weight groups, ~{:.1}M params total",
         (feature_set.ft_in() * DEFAULT_FT_OUT
@@ -465,23 +476,15 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
     trainer.assert_all_weights_finite()?;
     println!("[smoke] step 0: init weights all finite ✓");
 
-    // `RSHOGI_NNUE_LAYERSTACK_REF_BIN` に既存の量子化 checkpoint (`.bin`) path を
-    // 指定すると、その weight を注入して forward + backward + save を一通り走らせる。
-    // 未設定なら random-init での smoke のみ。
-    let layerstack_ref = std::env::var("RSHOGI_NNUE_LAYERSTACK_REF_BIN").ok();
-    if let Some(ref_path) = layerstack_ref
-        .as_deref()
-        .filter(|p| std::path::Path::new(p).exists())
-    {
+    if let (Some(ref_path), Some(ref_bytes)) = (layerstack_ref.as_deref(), &layerstack_ref_bytes) {
         println!("[smoke] loading reference checkpoint from {ref_path} ...");
-        let mut reader = std::io::BufReader::new(std::fs::File::open(ref_path)?);
         let weights = LayerStackWeights::load_quantised(
-            &mut reader,
+            &mut std::io::Cursor::new(ref_bytes),
             feature_set,
             DEFAULT_FT_OUT,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            DEFAULT_NUM_BUCKETS,
+            n_buckets,
         )?;
         trainer.load_layerstack_weights(&weights)?;
         trainer.assert_all_weights_finite()?;

@@ -34,12 +34,14 @@ pub(crate) const DEFAULT_L1_OUT: usize = 16;
 /// the per-bucket bias-gradient kernel.
 pub(crate) const DEFAULT_L2_OUT: usize = 32;
 
-/// Default LayerStack output bucket count, used when `--num-buckets` is not
-/// given. progress-kpabs assigns each position to `floor(p * num_buckets)`,
-/// so the default 9 keeps the binning + weight-buffer shape identical to the
-/// historical layout and resume-compatible with existing checkpoints. The
-/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
-pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
+/// Default LayerStack output bucket count for the progress bucket modes, used
+/// when `--num-buckets` is not given. progress-kpabs assigns each position to
+/// `min(N-1, floor(p * N))`. 8 is one of the bucket counts YaneuraOu's
+/// progress-bucket LayerStack accepts without patching. `kingrank9` ignores this
+/// default and uses its fixed 9 buckets. The trainer accepts
+/// `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
+#[cfg(any(feature = "gpu", test))]
+pub(crate) const DEFAULT_NUM_BUCKETS: usize = 8;
 
 /// Maximum supported bucket count without changing the per-bucket weight
 /// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels

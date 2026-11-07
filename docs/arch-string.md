@@ -14,7 +14,7 @@
 
 組み立ては `crates/nnue-format` の 2 箇所:
 
-- `layerstack_weights::build_arch_str` — N-bucket (`--num-buckets`、既定 9) LayerStack アーキ
+- `layerstack_weights::build_arch_str` — N-bucket (`--num-buckets`、既定 8) LayerStack アーキ
 - `simple_weights::build_arch_str` — bucket 無し Simple 4 層アーキ
 
 ## 全体構造

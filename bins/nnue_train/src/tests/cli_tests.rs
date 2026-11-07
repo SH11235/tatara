@@ -1238,6 +1238,10 @@ fn kingrank9_bucket_mode_validation() {
     let err = validate_bucket_mode(&wrong_count).unwrap_err().to_string();
     assert!(err.contains("must be 9"), "{err}");
 
+    let implicit = layerstack_args(&["--bucket-mode", "kingrank9"]);
+    assert_eq!(implicit.num_buckets(), 9);
+    assert!(validate_bucket_mode(&implicit).is_ok());
+
     let progress_coeff = layerstack_args(&[
         "--bucket-mode",
         "kingrank9",
@@ -1254,6 +1258,19 @@ fn kingrank9_bucket_mode_validation() {
     assert!(err.contains("unknown"), "{err}");
     assert!(err.contains("progresskpabs"), "{err}");
     assert!(err.contains("kingrank9"), "{err}");
+}
+
+#[test]
+fn num_buckets_defaults_to_eight_for_progress_modes_and_honours_explicit_value() {
+    assert_eq!(layerstack_args(&[]).num_buckets(), 8);
+    for mode in ["progresskpabs", "progresskpabsq16"] {
+        let args = layerstack_args(&["--bucket-mode", mode]);
+        assert_eq!(args.num_buckets(), 8, "{mode}");
+        assert!(validate_bucket_mode(&args).is_ok(), "{mode}");
+    }
+    let nine = layerstack_args(&["--num-buckets", "9"]);
+    assert_eq!(nine.num_buckets(), 9);
+    assert!(validate_bucket_mode(&nine).is_ok());
 }
 
 #[test]
