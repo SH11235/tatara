@@ -2019,6 +2019,7 @@ pub(crate) fn build_experiment_logger(
     );
 
     let command_args = std::env::args().collect::<Vec<_>>();
+    let command_path_args = crate::cli::path_arg_indices(&command_args);
     let json_path = cli.output.join("experiments").join(format!("{id}.json"));
     let doc = ExperimentDoc::new(
         id,
@@ -2026,6 +2027,7 @@ pub(crate) fn build_experiment_logger(
         start_secs,
         crate::build_identity::experiment_commit(),
         command_args,
+        command_path_args,
         lineage,
         params,
         data_info,
@@ -2201,6 +2203,7 @@ pub(crate) fn build_experiment_logger_simple(
     );
 
     let command_args = std::env::args().collect::<Vec<_>>();
+    let command_path_args = crate::cli::path_arg_indices(&command_args);
     let json_path = cli
         .output
         .join("experiments")
@@ -2211,6 +2214,7 @@ pub(crate) fn build_experiment_logger_simple(
         start_secs,
         crate::build_identity::experiment_commit(),
         command_args,
+        command_path_args,
         lineage,
         params,
         data_info,
@@ -2580,6 +2584,33 @@ pub(crate) fn run_simple_training(
 #[cfg(test)]
 mod shared_cli_tests {
     use super::*;
+
+    #[test]
+    fn path_arg_indices_marks_values_of_path_arguments() {
+        let argv: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "/srv/teachers/private alice",
+            "--test-data=floodgate.psv",
+            "--lr",
+            "0.001",
+            "layerstack",
+            "--progress-coeff",
+            "progress.bin",
+            "--fv-scale",
+            "37",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(crate::cli::path_arg_indices(&argv), Some(vec![2, 3, 8]));
+
+        let invalid: Vec<String> = ["nnue-train", "--no-such-option"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert_eq!(crate::cli::path_arg_indices(&invalid), None);
+    }
 
     #[test]
     fn layerstack_fv_scale_follows_loss_and_override() {

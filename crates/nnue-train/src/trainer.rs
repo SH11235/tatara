@@ -1925,6 +1925,7 @@ mod tests {
                 "sample.psv".to_string(),
             ],
             None,
+            None,
             experiment_params(),
             DataInfo {
                 name: "sample.psv".to_string(),

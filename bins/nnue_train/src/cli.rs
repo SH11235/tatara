@@ -73,6 +73,55 @@ const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
+/// `argv` のうち、ファイルパスを値に取る引数 (`PathBuf` の引数) の値を含む位置を返す。
+/// `--data x`・`--data=x` のどちらの書き方でも、値を含む要素の位置を返す。experiment.json の
+/// `command_path_args` に書き、nnue-lab が公開時にその引数を伏せるのに使う。
+/// `argv` を解釈できなければ位置を決められないので `None` を返す。
+pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let matches = command.clone().try_get_matches_from(argv).ok()?;
+    let mut values = Vec::new();
+    collect_path_values(&command, &matches, &mut values);
+    let mut indices: Vec<usize> = argv
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, arg)| {
+            values.iter().any(|value| {
+                arg.as_str() == value
+                    || arg.strip_suffix(value.as_str()).is_some_and(|head| {
+                        head.ends_with('=') || (head.starts_with('-') && !head.starts_with("--"))
+                    })
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_unstable();
+    Some(indices)
+}
+
+fn collect_path_values(
+    command: &clap::Command,
+    matches: &clap::ArgMatches,
+    values: &mut Vec<String>,
+) {
+    let path_type = clap::builder::ValueParser::path_buf().type_id();
+    for arg in command.get_arguments() {
+        if arg.get_value_parser().type_id() != path_type {
+            continue;
+        }
+        if let Ok(Some(raw)) = matches.try_get_raw(arg.get_id().as_str()) {
+            values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
+        }
+    }
+    if let Some((name, sub_matches)) = matches.subcommand() {
+        if let Some(sub) = command.find_subcommand(name) {
+            collect_path_values(sub, sub_matches, values);
+        }
+    }
+}
+
 /// メモリ量に対する 1 窓の MiB。下限 floor は置かず、2 窓合計が常に総量の 1/8 に
 /// 収まるようにする。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
 #[cfg(any(feature = "gpu", test))]
