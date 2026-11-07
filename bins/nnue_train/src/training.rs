@@ -2601,14 +2601,6 @@ mod shared_cli_tests {
         assert_eq!(collect(Command::new("t").arg(path().short('d'))), None);
         assert_eq!(collect(Command::new("t").arg(path().num_args(1..))), None);
         assert_eq!(
-            collect(
-                Command::new("t")
-                    .arg(path())
-                    .arg(Arg::new("label").long("label").allow_hyphen_values(true))
-            ),
-            None
-        );
-        assert_eq!(
             collect(Command::new("t").subcommand(Command::new("sub").arg(path().short('d')))),
             None
         );
@@ -2646,7 +2638,20 @@ mod shared_cli_tests {
         .iter()
         .map(|arg| arg.to_string())
         .collect();
-        assert_eq!(crate::cli::path_arg_indices(&repeated), Some(vec![2, 5]));
+        // global 引数を 2 回指定すると clap は最後の値しか持たず、位置の値と食い違うので書かない。
+        assert_eq!(crate::cli::path_arg_indices(&repeated), None);
+
+        let same_value: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "x.psv",
+            "--net-id=x.psv",
+            "layerstack",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(crate::cli::path_arg_indices(&same_value), Some(vec![2]));
 
         let invalid: Vec<String> = ["nnue-train", "--no-such-option"]
             .iter()

@@ -77,13 +77,15 @@ const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 /// `--data x` なら `x` の位置、`--data=x` ならその要素の位置を返す。同じ引数を何度
 /// 指定しても、どの指定も拾えるよう値ではなくオプション名で探す。experiment.json の
 /// `command_path_args` に書き、nnue-lab が公開時にその引数を伏せるのに使う。
+/// 名前で探した位置の値が、clap が `PathBuf` 引数として解釈した値と一致することも確かめる
+/// (`-` で始まる値を受け付ける引数があると、`--data` のような要素が別のオプションの値のことがある)。
 /// `argv` を解釈できないとき、`--` があるとき、この関数が追えない形の `PathBuf` 引数 (位置引数・
-/// 短いオプション・複数の値を取るもの) が定義されているときは、位置を確実に決められないので
-/// `None` を返す。
+/// 短いオプション・複数の値を取るもの) が定義されているとき、位置の値と clap の解釈が食い違う
+/// (同じ global 引数を複数回指定したときも含む) ときは、位置を確実に決められないので `None` を返す。
 pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     use clap::CommandFactory;
     let command = Cli::command();
-    command.clone().try_get_matches_from(argv).ok()?;
+    let matches = command.clone().try_get_matches_from(argv).ok()?;
     let mut options = PathOptions::default();
     collect_path_options(&command, &mut options)?;
     let mut indices = Vec::new();
@@ -105,7 +107,45 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
             }
         }
     }
-    Some(indices)
+    if previous_takes_path {
+        return None;
+    }
+    let marked: std::collections::BTreeSet<&str> = indices
+        .iter()
+        .map(|&index| {
+            let arg = argv[index].as_str();
+            match arg.strip_prefix("--").and_then(|long| long.split_once('=')) {
+                Some((_, value)) => value,
+                None => arg,
+            }
+        })
+        .collect();
+    let mut parsed = Vec::new();
+    collect_path_values(&command, &matches, &mut parsed);
+    let parsed: std::collections::BTreeSet<&str> = parsed.iter().map(String::as_str).collect();
+    (marked == parsed).then_some(indices)
+}
+
+/// clap が `PathBuf` 引数として解釈した値を、サブコマンドも含めて集める。
+fn collect_path_values(
+    command: &clap::Command,
+    matches: &clap::ArgMatches,
+    values: &mut Vec<String>,
+) {
+    let path_type = clap::builder::ValueParser::path_buf().type_id();
+    for arg in command.get_arguments() {
+        if arg.get_value_parser().type_id() != path_type {
+            continue;
+        }
+        if let Ok(Some(raw)) = matches.try_get_raw(arg.get_id().as_str()) {
+            values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
+        }
+    }
+    if let Some((name, sub_matches)) = matches.subcommand()
+        && let Some(sub) = command.find_subcommand(name)
+    {
+        collect_path_values(sub, sub_matches, values);
+    }
 }
 
 /// テスト用: `command` から集めた `PathBuf` の長いオプション名を並べて返す。
@@ -125,14 +165,10 @@ struct PathOptions {
 
 /// サブコマンドも含め、`PathBuf` を値に取る長いオプションの名前 (別名を含む) を集める。位置引数・
 /// 短いオプション・複数の値を取る `PathBuf` 引数は argv 上の位置を名前の直後の 1 要素として
-/// 追えない。また `-` で始まる値を受け付ける引数があると、`--data` のような要素が別のオプションの
-/// 値なのかを走査で区別できない。どちらかが定義されていれば `None` を返す。
+/// 追えないので、定義されていれば `None` を返す。
 fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
     let path_type = clap::builder::ValueParser::path_buf().type_id();
     for arg in command.get_arguments() {
-        if arg.is_allow_hyphen_values_set() || arg.is_trailing_var_arg_set() {
-            return None;
-        }
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }
