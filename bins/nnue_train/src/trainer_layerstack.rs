@@ -1,4 +1,9 @@
 use std::path::Path;
+
+#[cfg(feature = "native")]
+fn ft_gradient_tiles_supported(device_name: &str) -> bool {
+    device_name.trim() != "NVIDIA GeForce RTX 5090"
+}
 #[path = "trainer_layerstack_qat.rs"]
 mod qat_impl;
 
@@ -1498,6 +1503,8 @@ impl<'a> StepContext<'a> {
 // ===========================================================================
 
 pub(crate) struct GpuTrainer {
+    #[cfg(feature = "native")]
+    ft_gradient_tiles_supported: bool,
     pub(crate) qat_mode: crate::qat::QatMode,
     #[cfg(feature = "native")]
     qat_buffers: Vec<DeviceBuffer<f32>>,
@@ -2386,6 +2393,8 @@ impl GpuTrainer {
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
+        #[cfg(feature = "native")]
+        let ft_gradient_tiles_supported = ft_gradient_tiles_supported(&ctx.device_name()?);
 
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
@@ -2534,6 +2543,8 @@ impl GpuTrainer {
             stream: stream.clone(),
             module,
             device_occupancy,
+            #[cfg(feature = "native")]
+            ft_gradient_tiles_supported,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
             ft_w_m: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
@@ -5637,13 +5648,14 @@ impl GpuTrainer {
             }
         }
         #[cfg(feature = "native")]
-        let tiled = ft_gradient_tiles_dispatch(
-            self.feature_set,
-            b,
-            ft_out,
-            self.ft_fp16_out,
-            self.ws.ft_tile_masks.len(),
-        );
+        let tiled = self.ft_gradient_tiles_supported
+            && ft_gradient_tiles_dispatch(
+                self.feature_set,
+                b,
+                ft_out,
+                self.ft_fp16_out,
+                self.ws.ft_tile_masks.len(),
+            );
         #[cfg(feature = "native")]
         if tiled {
             memset_zero(&self.stream, &self.ft_w_grad)?;
