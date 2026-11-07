@@ -74,52 +74,84 @@ const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
 /// `argv` のうち、ファイルパスを値に取る引数 (`PathBuf` の引数) の値を含む位置を返す。
-/// `--data x`・`--data=x` のどちらの書き方でも、値を含む要素の位置を返す。experiment.json の
+/// `--data x` なら `x` の位置、`--data=x` や `-dx` ならその要素の位置を返す。同じ引数を何度
+/// 指定しても、どの指定も拾えるよう値ではなくオプション名で探す。experiment.json の
 /// `command_path_args` に書き、nnue-lab が公開時にその引数を伏せるのに使う。
-/// `argv` を解釈できなければ位置を決められないので `None` を返す。
+/// `argv` を解釈できないとき、位置引数で `PathBuf` を取るサブコマンドがあるとき、`--` 以降に
+/// 引数があるときは、位置を確実に決められないので `None` を返す。
 pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     use clap::CommandFactory;
     let command = Cli::command();
-    let matches = command.clone().try_get_matches_from(argv).ok()?;
-    let mut values = Vec::new();
-    collect_path_values(&command, &matches, &mut values);
-    let mut indices: Vec<usize> = argv
-        .iter()
-        .enumerate()
-        .skip(1)
-        .filter(|(_, arg)| {
-            values.iter().any(|value| {
-                arg.as_str() == value
-                    || arg.strip_suffix(value.as_str()).is_some_and(|head| {
-                        head.ends_with('=') || (head.starts_with('-') && !head.starts_with("--"))
-                    })
-            })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    indices.sort_unstable();
+    command.clone().try_get_matches_from(argv).ok()?;
+    let mut options = PathOptions::default();
+    collect_path_options(&command, &mut options)?;
+    let mut indices = Vec::new();
+    let mut previous_takes_path = false;
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        if previous_takes_path {
+            indices.push(index);
+            previous_takes_path = false;
+            continue;
+        }
+        if arg == "--" {
+            return None;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) if options.long.contains(name) => indices.push(index),
+                None if options.long.contains(long) => previous_takes_path = true,
+                _ => {}
+            }
+        } else if let Some(short) = arg.strip_prefix('-').and_then(|rest| rest.chars().next())
+            && options.short.contains(&short)
+        {
+            if arg.chars().count() > 2 {
+                indices.push(index);
+            } else {
+                previous_takes_path = true;
+            }
+        }
+    }
     Some(indices)
 }
 
-fn collect_path_values(
-    command: &clap::Command,
-    matches: &clap::ArgMatches,
-    values: &mut Vec<String>,
-) {
+#[derive(Default)]
+struct PathOptions {
+    long: std::collections::HashSet<String>,
+    short: std::collections::HashSet<char>,
+}
+
+/// サブコマンドも含め、`PathBuf` を値に取るオプションの名前 (別名を含む) を集める。位置引数で
+/// `PathBuf` を取るものがあれば `None` を返す。
+fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
     let path_type = clap::builder::ValueParser::path_buf().type_id();
     for arg in command.get_arguments() {
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }
-        if let Ok(Some(raw)) = matches.try_get_raw(arg.get_id().as_str()) {
-            values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
+        if arg.is_positional() {
+            return None;
         }
+        if let Some(long) = arg.get_long() {
+            options.long.insert(long.to_string());
+        }
+        options.long.extend(
+            arg.get_all_aliases()
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string),
+        );
+        if let Some(short) = arg.get_short() {
+            options.short.insert(short);
+        }
+        options
+            .short
+            .extend(arg.get_all_short_aliases().unwrap_or_default());
     }
-    if let Some((name, sub_matches)) = matches.subcommand()
-        && let Some(sub) = command.find_subcommand(name)
-    {
-        collect_path_values(sub, sub_matches, values);
+    for sub in command.get_subcommands() {
+        collect_path_options(sub, options)?;
     }
+    Some(())
 }
 
 /// メモリ量に対する 1 窓の MiB。下限 floor は置かず、2 窓合計が常に総量の 1/8 に

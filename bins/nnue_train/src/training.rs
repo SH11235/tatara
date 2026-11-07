@@ -2605,6 +2605,20 @@ mod shared_cli_tests {
         .collect();
         assert_eq!(crate::cli::path_arg_indices(&argv), Some(vec![2, 3, 8]));
 
+        let repeated: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "/private/a.psv",
+            "layerstack",
+            "--data",
+            "/private/b.psv",
+            "--net-id=/private/b.psv",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(crate::cli::path_arg_indices(&repeated), Some(vec![2, 5]));
+
         let invalid: Vec<String> = ["nnue-train", "--no-such-option"]
             .iter()
             .map(|arg| arg.to_string())
