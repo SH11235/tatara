@@ -108,17 +108,31 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     Some(indices)
 }
 
+/// テスト用: `command` から集めた `PathBuf` の長いオプション名を並べて返す。
+#[cfg(test)]
+pub(crate) fn collect_path_options_for_test(command: &clap::Command) -> Option<Vec<String>> {
+    let mut options = PathOptions::default();
+    collect_path_options(command, &mut options)?;
+    let mut names: Vec<String> = options.long.into_iter().collect();
+    names.sort();
+    Some(names)
+}
+
 #[derive(Default)]
 struct PathOptions {
     long: std::collections::HashSet<String>,
 }
 
 /// サブコマンドも含め、`PathBuf` を値に取る長いオプションの名前 (別名を含む) を集める。位置引数・
-/// 短いオプション・複数の値を取るものは argv 上の位置を名前の直後の 1 要素として追えないので、
-/// 定義されていれば `None` を返す。
+/// 短いオプション・複数の値を取る `PathBuf` 引数は argv 上の位置を名前の直後の 1 要素として
+/// 追えない。また `-` で始まる値を受け付ける引数があると、`--data` のような要素が別のオプションの
+/// 値なのかを走査で区別できない。どちらかが定義されていれば `None` を返す。
 fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
     let path_type = clap::builder::ValueParser::path_buf().type_id();
     for arg in command.get_arguments() {
+        if arg.is_allow_hyphen_values_set() || arg.is_trailing_var_arg_set() {
+            return None;
+        }
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }

@@ -2586,6 +2586,35 @@ mod shared_cli_tests {
     use super::*;
 
     #[test]
+    fn path_options_refuse_argument_shapes_whose_positions_cannot_be_tracked() {
+        use clap::{Arg, Command, value_parser};
+        let path = || {
+            Arg::new("data")
+                .long("data")
+                .value_parser(value_parser!(std::path::PathBuf))
+        };
+        let collect = |command: Command| crate::cli::collect_path_options_for_test(&command);
+        assert_eq!(
+            collect(Command::new("t").arg(path())),
+            Some(vec!["data".to_string()])
+        );
+        assert_eq!(collect(Command::new("t").arg(path().short('d'))), None);
+        assert_eq!(collect(Command::new("t").arg(path().num_args(1..))), None);
+        assert_eq!(
+            collect(
+                Command::new("t")
+                    .arg(path())
+                    .arg(Arg::new("label").long("label").allow_hyphen_values(true))
+            ),
+            None
+        );
+        assert_eq!(
+            collect(Command::new("t").subcommand(Command::new("sub").arg(path().short('d')))),
+            None
+        );
+    }
+
+    #[test]
     fn path_arg_indices_marks_values_of_path_arguments() {
         let argv: Vec<String> = [
             "nnue-train",
