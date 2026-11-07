@@ -74,11 +74,12 @@ const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
 /// `argv` のうち、ファイルパスを値に取る引数 (`PathBuf` の引数) の値を含む位置を返す。
-/// `--data x` なら `x` の位置、`--data=x` や `-dx` ならその要素の位置を返す。同じ引数を何度
+/// `--data x` なら `x` の位置、`--data=x` ならその要素の位置を返す。同じ引数を何度
 /// 指定しても、どの指定も拾えるよう値ではなくオプション名で探す。experiment.json の
 /// `command_path_args` に書き、nnue-lab が公開時にその引数を伏せるのに使う。
-/// `argv` を解釈できないとき、位置引数で `PathBuf` を取るサブコマンドがあるとき、`--` 以降に
-/// 引数があるときは、位置を確実に決められないので `None` を返す。
+/// `argv` を解釈できないとき、`--` があるとき、この関数が追えない形の `PathBuf` 引数 (位置引数・
+/// 短いオプション・複数の値を取るもの) が定義されているときは、位置を確実に決められないので
+/// `None` を返す。
 pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     use clap::CommandFactory;
     let command = Cli::command();
@@ -102,14 +103,6 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
                 None if options.long.contains(long) => previous_takes_path = true,
                 _ => {}
             }
-        } else if let Some(short) = arg.strip_prefix('-').and_then(|rest| rest.chars().next())
-            && options.short.contains(&short)
-        {
-            if arg.chars().count() > 2 {
-                indices.push(index);
-            } else {
-                previous_takes_path = true;
-            }
         }
     }
     Some(indices)
@@ -118,18 +111,25 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
 #[derive(Default)]
 struct PathOptions {
     long: std::collections::HashSet<String>,
-    short: std::collections::HashSet<char>,
 }
 
-/// サブコマンドも含め、`PathBuf` を値に取るオプションの名前 (別名を含む) を集める。位置引数で
-/// `PathBuf` を取るものがあれば `None` を返す。
+/// サブコマンドも含め、`PathBuf` を値に取る長いオプションの名前 (別名を含む) を集める。位置引数・
+/// 短いオプション・複数の値を取るものは argv 上の位置を名前の直後の 1 要素として追えないので、
+/// 定義されていれば `None` を返す。
 fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
     let path_type = clap::builder::ValueParser::path_buf().type_id();
     for arg in command.get_arguments() {
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }
-        if arg.is_positional() {
+        let multiple_values = arg
+            .get_num_args()
+            .is_some_and(|range| range.max_values() > 1);
+        if arg.is_positional()
+            || arg.get_short().is_some()
+            || !arg.get_all_short_aliases().unwrap_or_default().is_empty()
+            || multiple_values
+        {
             return None;
         }
         if let Some(long) = arg.get_long() {
@@ -141,12 +141,6 @@ fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> O
                 .into_iter()
                 .map(str::to_string),
         );
-        if let Some(short) = arg.get_short() {
-            options.short.insert(short);
-        }
-        options
-            .short
-            .extend(arg.get_all_short_aliases().unwrap_or_default());
     }
     for sub in command.get_subcommands() {
         collect_path_options(sub, options)?;
