@@ -1,6 +1,39 @@
 use std::path::Path;
+
+#[cfg(feature = "native")]
+fn ft_gradient_tiles_supported(device_name: &str) -> bool {
+    device_name.trim() != "NVIDIA GeForce RTX 5090"
+}
 #[path = "trainer_layerstack_qat.rs"]
 mod qat_impl;
+
+#[cfg(feature = "native")]
+fn ft_gradient_tiles_eligible(
+    features: FeatureSetSpec,
+    batch: usize,
+    width: usize,
+    half_gradient: bool,
+) -> bool {
+    !half_gradient
+        && batch >= 65536
+        && batch.div_ceil(16) <= features.ft_in()
+        && width >= 1536
+        && features.feature_set() == shogi_features::FeatureSet::HalfKaHmMerged
+        && features.threat_profile().is_none()
+        && features.effect_bucket_config().is_none()
+        && features.max_active() == 40
+}
+
+#[cfg(feature = "native")]
+fn ft_gradient_tiles_dispatch(
+    features: FeatureSetSpec,
+    batch: usize,
+    width: usize,
+    half_gradient: bool,
+    mask_elements: usize,
+) -> bool {
+    ft_gradient_tiles_eligible(features, batch, width, half_gradient) && batch <= mask_elements / 40
+}
 
 /// Per-step scalars of the FT RAdam update consumed by the fused FT optimizer kernel.
 #[cfg(feature = "native")]
@@ -196,6 +229,54 @@ impl GpuTrainer {
                 args: [slice(self.ws.stm_idx_dev), slice(self.ws.nstm_idx_dev),
                        slice(self.ws.nnz_dev), slice(self.ws.ft_active_rows),
                        b as u32, max_active as u32, self.ws.ft_in as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    fn launch_ft_gradient_tiles(
+        &self,
+        b: usize,
+        perspective: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (indices, gradient) = if perspective == 0 {
+            (&self.ws.stm_idx_dev, &self.ws.dft_stm_out)
+        } else {
+            (&self.ws.nstm_idx_dev, &self.ws.dft_nstm_out)
+        };
+        let order_base = (perspective * b) as u32;
+        let tiles = b.div_ceil(16) as u32;
+        // SAFETY: each tile emits at most its positions * 40 entries into batch * 40
+        // scratch, and ceil(b / 16) <= ft_in bounds counts. ft_order holds both
+        // permutations, with nstm positions offset by b.
+        unsafe {
+            cuda_launch! {
+                kernel: ft_gradient_tiles_pack,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (tiles, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(indices), slice(self.ws.nnz_dev), slice(self.ws.ft_order),
+                       slice(self.ws.feat_positions), slice(self.ws.ft_tile_masks),
+                       slice(self.ws.feat_counts), b as u32, order_base, self.ws.ft_in as u32]
+            }
+        }?;
+        // SAFETY: the pack launch bounds IDs by ft_in and masks by 16 positions;
+        // each gradient has b * ft_out elements, and all buffers outlive the stream.
+        unsafe {
+            cuda_launch! {
+                kernel: ft_gradient_tiles_sum,
+                stream: self.stream, module: self.module,
+                config: LaunchConfig {
+                    grid_dim: (tiles, self.ws.ft_out.div_ceil(128) as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                args: [slice(gradient), slice(self.ws.ft_order), slice(self.ws.feat_positions),
+                       slice(self.ws.ft_tile_masks), slice(self.ws.feat_counts),
+                       slice(self.ft_w_grad), b as u32, self.ws.ft_out as u32, order_base]
             }
         }?;
         Ok(())
@@ -1422,6 +1503,8 @@ impl<'a> StepContext<'a> {
 // ===========================================================================
 
 pub(crate) struct GpuTrainer {
+    #[cfg(feature = "native")]
+    ft_gradient_tiles_supported: bool,
     pub(crate) qat_mode: crate::qat::QatMode,
     #[cfg(feature = "native")]
     qat_buffers: Vec<DeviceBuffer<f32>>,
@@ -1778,6 +1861,8 @@ pub(crate) struct GpuWorkspace {
 
     // -- inverse-index sparse_ft_backward scratch (sized by feature set) --
     feat_counts: DeviceBuffer<u32>, // ft_in: per-feature histogram (atomic build)
+    #[cfg(feature = "native")]
+    ft_tile_masks: DeviceBuffer<u32>,
     feat_offsets: DeviceBuffer<u32>, // ft_in + 1: exclusive prefix sum (multi-block scan)
     feat_block_sums: DeviceBuffer<u32>, // ceil(ft_in/1024): scan level 1 per-block total
     feat_block_offsets: DeviceBuffer<u32>, // ceil(ft_in/1024)+1: scan level 2 (block totals)
@@ -1930,6 +2015,15 @@ impl GpuWorkspace {
             dft_stm_out: z(bwd_len(ft_act_f32_n))?,
             dft_nstm_out: z(bwd_len(ft_act_f32_n))?,
             feat_counts: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in))?,
+            #[cfg(feature = "native")]
+            ft_tile_masks: DeviceBuffer::<u32>::zeroed(
+                stream,
+                if ft_gradient_tiles_eligible(feature_set, batch, ft_out, ft_fp16_out) {
+                    bwd_len(batch * max_active)
+                } else {
+                    0
+                },
+            )?,
             feat_offsets: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in + 1))?,
             feat_block_sums: DeviceBuffer::<u32>::zeroed(stream, bwd_len(ft_in.div_ceil(1024)))?,
             feat_block_offsets: DeviceBuffer::<u32>::zeroed(
@@ -2299,6 +2393,8 @@ impl GpuTrainer {
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
+        #[cfg(feature = "native")]
+        let ft_gradient_tiles_supported = ft_gradient_tiles_supported(&ctx.device_name()?);
 
         // 各 weight group の element 数 (FT 入力次元は feature set 依存、FT 出力次元は
         // `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket 数は
@@ -2447,6 +2543,8 @@ impl GpuTrainer {
             stream: stream.clone(),
             module,
             device_occupancy,
+            #[cfg(feature = "native")]
+            ft_gradient_tiles_supported,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
             ft_w_m: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
@@ -3564,6 +3662,54 @@ impl GpuTrainer {
         Ok(result.loss)
     }
 
+    #[cfg(feature = "native")]
+    fn launch_ft_post_qat_sorted(&self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let (b_u32, ft_out) = (b as u32, self.ws.ft_out);
+        if self.ft_fp16_out {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ft_post_perspective_fwd_fp16_qat_sorted,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * ft_out),
+                    args: [
+                        slice(self.ws.ft_stm_out_h.as_ref()
+                            .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                        slice(self.ws.ft_nstm_out_h.as_ref()
+                            .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                        slice(self.ft_b),
+                        slice(self.ws.bucket_inverse_perm_dev),
+                        slice_mut(self.ws.combined_sorted),
+                        b_u32, ft_out as u32, FT_POST_SCALE
+                    ]
+                }
+            }?;
+        } else {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ft_post_perspective_fwd_qat_sorted,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * ft_out),
+                    args: [
+                        slice(self.ws.ft_stm_out),
+                        slice(self.ws.ft_nstm_out),
+                        slice(self.ft_b),
+                        slice(self.ws.bucket_inverse_perm_dev),
+                        slice_mut(self.ws.combined_sorted),
+                        b_u32, ft_out as u32, FT_POST_SCALE
+                    ]
+                }
+            }?;
+        }
+
+        Ok(())
+    }
+
     /// FP32 L1 forward of the per-bucket and shared layers into `l1_total` (original row order),
     /// reading the bucket-sorted `combined_sorted` and permutation built by the same forward.
     fn launch_l1_fwd_with_shared_sorted(
@@ -4079,51 +4225,53 @@ impl GpuTrainer {
             }
         }?;
 
-        if self.ft_fp16_out {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: ft_post_perspective_fwd_fp16_sorted,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(b * ft_out),
-                    args: [
-                        slice(self.ws.ft_stm_out_h.as_ref()
-                            .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
-                        slice(self.ws.ft_nstm_out_h.as_ref()
-                            .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
-                        slice(self.ft_b),
-                        slice(self.ws.bucket_inverse_perm_dev),
-                        slice_mut(self.ws.combined_sorted),
-                        b_u32, ft_out as u32, FT_POST_SCALE
-                    ]
-                }
-            }?;
-        } else {
-            unsafe {
-                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-                // stream の完了を待つ同期点まで生存する device allocation。
-                cuda_launch! {
-                    kernel: ft_post_perspective_fwd_sorted,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(b * ft_out),
-                    args: [
-                        slice(self.ws.ft_stm_out),
-                        slice(self.ws.ft_nstm_out),
-                        slice(self.ft_b),
-                        slice(self.ws.bucket_inverse_perm_dev),
-                        slice_mut(self.ws.combined_sorted),
-                        b_u32, ft_out as u32, FT_POST_SCALE
-                    ]
-                }
-            }?;
-        }
-
+        let fused_qat = cfg!(feature = "native") && self.qat_mode != crate::qat::QatMode::Off;
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
-            self.qat_activations(0, padded_b)?;
+        if fused_qat {
+            self.launch_ft_post_qat_sorted(b)?;
+        }
+        if !fused_qat {
+            if self.ft_fp16_out {
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_fwd_fp16_sorted,
+                        stream: self.stream,
+                        module: self.module,
+                        config: cfg_1d(b * ft_out),
+                        args: [
+                            slice(self.ws.ft_stm_out_h.as_ref()
+                                .expect("ft_stm_out_h is Some when ft_fp16_out is enabled")),
+                            slice(self.ws.ft_nstm_out_h.as_ref()
+                                .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled")),
+                            slice(self.ft_b),
+                            slice(self.ws.bucket_inverse_perm_dev),
+                            slice_mut(self.ws.combined_sorted),
+                            b_u32, ft_out as u32, FT_POST_SCALE
+                        ]
+                    }
+                }?;
+            } else {
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: ft_post_perspective_fwd_sorted,
+                        stream: self.stream,
+                        module: self.module,
+                        config: cfg_1d(b * ft_out),
+                        args: [
+                            slice(self.ws.ft_stm_out),
+                            slice(self.ws.ft_nstm_out),
+                            slice(self.ft_b),
+                            slice(self.ws.bucket_inverse_perm_dev),
+                            slice_mut(self.ws.combined_sorted),
+                            b_u32, ft_out as u32, FT_POST_SCALE
+                        ]
+                    }
+                }?;
+            }
         }
         prof_tick!("fwd_ftpost");
 
@@ -5499,10 +5647,28 @@ impl GpuTrainer {
                 self.mark_ft_active_rows(b)?;
             }
         }
+        #[cfg(feature = "native")]
+        let tiled = self.ft_gradient_tiles_supported
+            && ft_gradient_tiles_dispatch(
+                self.feature_set,
+                b,
+                ft_out,
+                self.ft_fp16_out,
+                self.ws.ft_tile_masks.len(),
+            );
+        #[cfg(feature = "native")]
+        if tiled {
+            memset_zero(&self.stream, &self.ft_w_grad)?;
+        }
         for (iter_idx, idx_dev) in [&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev]
             .into_iter()
             .enumerate()
         {
+            #[cfg(feature = "native")]
+            if tiled {
+                self.launch_ft_gradient_tiles(b, iter_idx)?;
+                continue;
+            }
             // A: feat_counts ← 0
             memset_zero(&self.stream, &self.ws.feat_counts)?;
             memset_zero(&self.stream, &self.ws.feat_write_ctr)?;

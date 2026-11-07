@@ -1,6 +1,94 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+constexpr unsigned FT_GRAD_TILE = 16;
+constexpr unsigned FT_GRAD_ACTIVE = 40;
+constexpr unsigned FT_GRAD_CAPACITY = FT_GRAD_TILE * FT_GRAD_ACTIVE;
+constexpr unsigned FT_GRAD_HASH = 1024;
+static_assert(FT_GRAD_HASH > FT_GRAD_CAPACITY);
+static_assert((FT_GRAD_HASH & (FT_GRAD_HASH - 1)) == 0);
+
+extern "C" __global__ void ft_gradient_tiles_pack(
+    const int* indices, unsigned long long, const int* nnz, unsigned long long,
+    const int* order, unsigned long long,
+    unsigned* ids, unsigned long long, unsigned* masks, unsigned long long,
+    unsigned* counts, unsigned long long, unsigned batch, unsigned order_base, unsigned features
+) {
+    __shared__ int keys[FT_GRAD_HASH];
+    __shared__ unsigned rows[FT_GRAD_HASH];
+    __shared__ unsigned count;
+    for (unsigned i = threadIdx.x; i < FT_GRAD_HASH; i += blockDim.x) {
+        keys[i] = -1;
+        rows[i] = 0;
+    }
+    if (threadIdx.x == 0) count = 0;
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < FT_GRAD_CAPACITY; i += blockDim.x) {
+        unsigned local = i / FT_GRAD_ACTIVE;
+        unsigned pos = blockIdx.x * FT_GRAD_TILE + local;
+        if (pos >= batch) continue;
+        unsigned row = order[order_base + pos] - order_base;
+        unsigned slot = i % FT_GRAD_ACTIVE;
+        if (slot >= static_cast<unsigned>(nnz[row])) continue;
+        int feature = indices[row * FT_GRAD_ACTIVE + slot];
+        if (feature < 0 || static_cast<unsigned>(feature) >= features) continue;
+        unsigned hash = (static_cast<unsigned>(feature) * 2654435761U) & (FT_GRAD_HASH - 1);
+        while (true) {
+            int previous = atomicCAS(keys + hash, -1, feature);
+            if (previous == -1 || previous == feature) {
+                // Extra occurrences need separate entries; a row mask alone loses multiplicity.
+                const unsigned bit = 1U << local;
+                if (atomicOr(rows + hash, bit) & bit) {
+                    unsigned at = atomicAdd(&count, 1U);
+                    ids[blockIdx.x * FT_GRAD_CAPACITY + at] = feature;
+                    masks[blockIdx.x * FT_GRAD_CAPACITY + at] = bit;
+                }
+                break;
+            }
+            hash = (hash + 1) & (FT_GRAD_HASH - 1);
+        }
+    }
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < FT_GRAD_HASH; i += blockDim.x) {
+        if (keys[i] >= 0) {
+            unsigned at = atomicAdd(&count, 1U);
+            ids[blockIdx.x * FT_GRAD_CAPACITY + at] = keys[i];
+            masks[blockIdx.x * FT_GRAD_CAPACITY + at] = rows[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) counts[blockIdx.x] = count;
+}
+
+extern "C" __global__ void ft_gradient_tiles_sum(
+    const float* gradient, unsigned long long, const int* order, unsigned long long,
+    const unsigned* ids, unsigned long long, const unsigned* masks, unsigned long long,
+    const unsigned* counts, unsigned long long,
+    float* result, unsigned long long, unsigned batch, unsigned width, unsigned order_base
+) {
+    __shared__ float tile_gradient[FT_GRAD_TILE][128];
+    unsigned col = blockIdx.y * 128 + threadIdx.x;
+    for (unsigned row = 0; row < FT_GRAD_TILE; ++row) {
+        unsigned pos = blockIdx.x * FT_GRAD_TILE + row;
+        tile_gradient[row][threadIdx.x] = pos < batch && col < width
+            ? gradient[static_cast<unsigned long long>(order[order_base + pos] - order_base) * width + col] : 0.0F;
+    }
+    __syncthreads();
+    if (col >= width) return;
+    unsigned offset = blockIdx.x * FT_GRAD_CAPACITY;
+    for (unsigned i = 0; i < counts[blockIdx.x]; ++i) {
+        unsigned bits = masks[offset + i];
+        float sum = 0.0F;
+        while (bits) {
+            unsigned row = __ffs(bits) - 1;
+            sum += tile_gradient[row][threadIdx.x];
+            bits &= bits - 1;
+        }
+        atomicAdd(result + static_cast<unsigned long long>(ids[offset + i]) * width + col, sum);
+    }
+}
+
+
 // Quantize the effective L1 sum once; shared storage is input-major.
 extern "C" __global__ void qat_weight(
     const float* w, unsigned long long n,
@@ -110,10 +198,25 @@ extern "C" __global__ void qat_dense_wide(
     }
 }
 
+__device__ __forceinline__ int dot_signed_bytes(int a, int b, int sum) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, sum);
+#else
+#pragma unroll
+    for (unsigned int byte = 0; byte < 4; ++byte) {
+        const int x = static_cast<signed char>(static_cast<unsigned int>(a) >> (8 * byte));
+        const int w = static_cast<signed char>(static_cast<unsigned int>(b) >> (8 * byte));
+        sum += x * w;
+    }
+    return sum;
+#endif
+}
+
 // `qat_dense_wide` over bucket-sorted rows, writing to `permutation[sorted_row]`. A 16-row tile
 // shares one bucket because bucket segments start on 16-row boundaries, so its quantized weights
 // are staged in shared memory once per tile. The partial sums are integers, so combining the 16
-// lanes of a row in any order reproduces `qat_dense_wide` exactly.
+// lanes of a row in any order reproduces `qat_dense_wide` exactly. Packed values require
+// activations on [0,127]/127 and weights on [-128,127]/64.
 extern "C" __global__ void qat_dense_wide_sorted(
     const float* x_sorted, unsigned long long,
     const float* w, unsigned long long,
@@ -128,7 +231,8 @@ extern "C" __global__ void qat_dense_wide_sorted(
     constexpr unsigned int ROWS = 16;
     constexpr unsigned int GROUP = 16;
     constexpr unsigned int CHUNK = 512;
-    __shared__ int weight_tile[GROUP][CHUNK];
+    constexpr unsigned int PACKED = CHUNK / 4;
+    __shared__ int weight_tile[GROUP][PACKED];
     const unsigned int tile_row = blockIdx.x * ROWS;
     const int bucket = bucket_sorted[tile_row];
     if (bucket < 0) {
@@ -144,21 +248,33 @@ extern "C" __global__ void qat_dense_wide_sorted(
     int sums[GROUP] = {};
     for (unsigned int base = 0; base < inputs; base += CHUNK) {
         const unsigned int width = inputs - base < CHUNK ? inputs - base : CHUNK;
-        for (unsigned int k = threadIdx.x; k < GROUP * CHUNK; k += blockDim.x) {
-            const unsigned int o = k / CHUNK;
-            const unsigned int j = k % CHUNK;
-            weight_tile[o][j] = o < count && j < width
-                ? __float2int_rn(
-                      w[static_cast<unsigned long long>(neuron_base + o) * inputs + base + j] * 64.0F
-                  )
-                : 0;
+        for (unsigned int k = threadIdx.x; k < GROUP * PACKED; k += blockDim.x) {
+            const unsigned int o = k / PACKED;
+            const unsigned int j = (k % PACKED) * 4;
+            unsigned int packed = 0;
+#pragma unroll
+            for (unsigned int byte = 0; byte < 4; ++byte) {
+                const int q = o < count && j + byte < width
+                    ? __float2int_rn(w[static_cast<unsigned long long>(neuron_base + o)
+                                      * inputs + base + j + byte] * 64.0F)
+                    : 0;
+                packed |= (static_cast<unsigned int>(q) & 0xffU) << (byte * 8);
+            }
+            weight_tile[o][j / 4] = static_cast<int>(packed);
         }
         __syncthreads();
-        for (unsigned int j = lane; j < width; j += GROUP) {
-            const int q = __float2int_rn(x_sorted[row_base + base + j] * 127.0F);
+        for (unsigned int j = lane * 4; j < width; j += GROUP * 4) {
+            unsigned int packed = 0;
+#pragma unroll
+            for (unsigned int byte = 0; byte < 4; ++byte) {
+                const int q = j + byte < width
+                    ? __float2int_rn(x_sorted[row_base + base + j + byte] * 127.0F)
+                    : 0;
+                packed |= (static_cast<unsigned int>(q) & 0xffU) << (byte * 8);
+            }
 #pragma unroll
             for (unsigned int o = 0; o < GROUP; ++o) {
-                sums[o] += q * weight_tile[o][j];
+                sums[o] = dot_signed_bytes(static_cast<int>(packed), weight_tile[o][j / 4], sums[o]);
             }
         }
         __syncthreads();
@@ -197,22 +313,24 @@ extern "C" __global__ void qat_dense_wide_sorted(
 // that range the correction may be lost to rounding or to an infinite / NaN `error`, but `level`
 // stays on the same side of the clamp, so the clamp gives the same endpoint. Clamping the floored
 // integer equals flooring the clamped value, and `fmaxf` returns +0 for NaN and for -0.
-extern "C" __global__ void qat_activation(
-    float* x, unsigned long long,
-    unsigned int n
-) {
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
-        return;
-    }
-    const float value = x[i];
+__device__ __forceinline__ float quantize_activation(float value) {
     const float product = __fmul_rn(value, 127.0F);
     const float error = fmaf(value, 127.0F, -product);
     float level = floorf(product);
     if (level == product && error < 0.0F) {
         level -= 1.0F;
     }
-    x[i] = fminf(127.0F, fmaxf(0.0F, level)) / 127.0F;
+    return fminf(127.0F, fmaxf(0.0F, level)) / 127.0F;
+}
+
+extern "C" __global__ void qat_activation(
+    float* x, unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = quantize_activation(x[i]);
+    }
 }
 
 extern "C" __global__ void qat_l1_activation(
@@ -1376,17 +1494,13 @@ extern "C" __global__ void ft_post_perspective_fwd_fp16(
     combined[index] = first * second * scale;
 }
 
-extern "C" __global__ void ft_post_perspective_fwd_fp16_sorted(
+template <bool Quantize>
+__device__ __forceinline__ void ft_post_perspective_fwd_fp16_sorted_impl(
     const __half* stm_output,
-    unsigned long long,
     const __half* nstm_output,
-    unsigned long long,
     const float* bias,
-    unsigned long long,
     const int* inverse_permutation,
-    unsigned long long,
     float* combined,
-    unsigned long long,
     unsigned int batch,
     unsigned int ft_dimension,
     float scale
@@ -1406,7 +1520,43 @@ extern "C" __global__ void ft_post_perspective_fwd_fp16_sorted(
     const float second = native_clamp_unit(
         __half2float(source[base + half + pair]) + bias[half + pair]
     );
-    combined[static_cast<unsigned long long>(inverse_permutation[batch_index]) * ft_dimension + row] = first * second * scale;
+    combined[static_cast<unsigned long long>(inverse_permutation[batch_index]) * ft_dimension + row] = Quantize ? quantize_activation(first * second * scale) : first * second * scale;
+}
+
+extern "C" __global__ void ft_post_perspective_fwd_fp16_sorted(
+    const __half* stm_output,
+    unsigned long long,
+    const __half* nstm_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float scale
+) {
+    ft_post_perspective_fwd_fp16_sorted_impl<false>(stm_output, nstm_output, bias, inverse_permutation, combined, batch, ft_dimension, scale);
+}
+
+extern "C" __global__ void ft_post_perspective_fwd_fp16_qat_sorted(
+    const __half* stm_output,
+    unsigned long long,
+    const __half* nstm_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    float scale
+) {
+    ft_post_perspective_fwd_fp16_sorted_impl<true>(stm_output, nstm_output, bias, inverse_permutation, combined, batch, ft_dimension, scale);
 }
 
 template <bool Squared>
@@ -2414,17 +2564,13 @@ extern "C" __global__ void ft_post_perspective_fwd(
     combined[i] = ya * yb * scale;
 }
 
-extern "C" __global__ void ft_post_perspective_fwd_sorted(
+template <bool Quantize>
+__device__ __forceinline__ void ft_post_perspective_fwd_sorted_impl(
     const float* stm_ft_output,
-    unsigned long long,
     const float* nstm_ft_output,
-    unsigned long long,
     const float* bias,
-    unsigned long long,
     const int* inverse_permutation,
-    unsigned long long,
     float* combined,
-    unsigned long long,
     unsigned int batch,
     unsigned int ft_columns,
     float scale
@@ -2443,7 +2589,43 @@ extern "C" __global__ void ft_post_perspective_fwd_sorted(
     const float xb = ft_output[base + half + pair] + bias[half + pair];
     const float ya = xa < 0.0F ? 0.0F : (xa > 1.0F ? 1.0F : xa);
     const float yb = xb < 0.0F ? 0.0F : (xb > 1.0F ? 1.0F : xb);
-    combined[static_cast<unsigned long long>(inverse_permutation[row]) * ft_columns + column] = ya * yb * scale;
+    combined[static_cast<unsigned long long>(inverse_permutation[row]) * ft_columns + column] = Quantize ? quantize_activation(ya * yb * scale) : ya * yb * scale;
+}
+
+extern "C" __global__ void ft_post_perspective_fwd_sorted(
+    const float* stm_ft_output,
+    unsigned long long,
+    const float* nstm_ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    float scale
+) {
+    ft_post_perspective_fwd_sorted_impl<false>(stm_ft_output, nstm_ft_output, bias, inverse_permutation, combined, batch, ft_columns, scale);
+}
+
+extern "C" __global__ void ft_post_perspective_fwd_qat_sorted(
+    const float* stm_ft_output,
+    unsigned long long,
+    const float* nstm_ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* inverse_permutation,
+    unsigned long long,
+    float* combined,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_columns,
+    float scale
+) {
+    ft_post_perspective_fwd_sorted_impl<true>(stm_ft_output, nstm_ft_output, bias, inverse_permutation, combined, batch, ft_columns, scale);
 }
 
 extern "C" __global__ void ft_post_perspective_grad(
