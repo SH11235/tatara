@@ -126,7 +126,7 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     (marked == parsed).then_some(indices)
 }
 
-/// clap が `PathBuf` 引数として解釈した値を、サブコマンドも含めて集める。
+/// clap が argv から `PathBuf` 引数として解釈した値を、サブコマンドも含めて集める。
 fn collect_path_values(
     command: &clap::Command,
     matches: &clap::ArgMatches,
@@ -137,7 +137,12 @@ fn collect_path_values(
         if arg.get_value_parser().type_id() != path_type {
             continue;
         }
-        if let Ok(Some(raw)) = matches.try_get_raw(arg.get_id().as_str()) {
+        // 既定値や環境変数から入った値は argv に現れないので数えない。
+        let id = arg.get_id().as_str();
+        if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+            continue;
+        }
+        if let Ok(Some(raw)) = matches.try_get_raw(id) {
             values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
         }
     }
