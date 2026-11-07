@@ -15,13 +15,13 @@
 //! - **L0 (FT)**: sparse_ft_forward — weight (ft_in × ft_out), bias (ft_out, 共有)
 //! - **per-perspective post**: bias add → CReLU → pairwise_mul (ft_out→ft_out/2) → ×127/128
 //! - **combined**: stm.concat(nstm) → ft_out
-//! - **L1 (per-bucket)**: weight (9×16, ft_out) + bias (9×16) → select(bucket) → 16
+//! - **L1 (per-bucket)**: weight (8×16, ft_out) + bias (8×16) → select(bucket) → 16
 //! - **L1 shared**: weight (ft_out, 16) + bias (16) → 16
 //! - **l1_out_t**: L1_select + L1 shared → 16; slice → l1_main (15) + l1_skip (1)
 //! - **l1_sqr**: l1_main^2 * 127/128 → 15
 //! - **l2_input**: CReLU(concat(l1_sqr, l1_main)) → 30
-//! - **L2 (per-bucket)**: weight (9×32, 30) + bias (9×32) → select(bucket) → CReLU → 32
-//! - **L3 (per-bucket)**: weight (9×32) + bias (9) → select(bucket) → 1
+//! - **L2 (per-bucket)**: weight (8×32, 30) + bias (8×32) → select(bucket) → CReLU → 32
+//! - **L3 (per-bucket)**: weight (8×32) + bias (8) → select(bucket) → 1
 //! - **net_output**: l3_out + l1_skip → 1 scalar
 //!
 //! ## kernel 一覧

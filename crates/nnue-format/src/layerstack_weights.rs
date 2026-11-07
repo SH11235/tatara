@@ -119,7 +119,11 @@ pub fn stored_num_buckets(bytes: &[u8]) -> io::Result<usize> {
         )));
     }
     let arch_len = u32_at(8)? as usize;
-    Ok(u32_at(12 + arch_len)? as usize)
+    let num_buckets = u32_at(12 + arch_len)? as usize;
+    if num_buckets == 0 {
+        return Err(invalid("NNUE num_buckets field is 0".to_string()));
+    }
+    Ok(num_buckets)
 }
 
 /// 既定 bucket 数。`--num-buckets` 未指定時の値。legacy `.bin` の暗黙 N は
@@ -1914,6 +1918,18 @@ mod tests {
         assert_eq!(
             stored_num_buckets(&legacy).unwrap(),
             LEGACY_IMPLICIT_NUM_BUCKETS
+        );
+        let mut zero = current.clone();
+        zero[field_at..field_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            stored_num_buckets(&zero).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            stored_num_buckets(&current[..field_at + 2])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
 
         let load = |num_buckets| {

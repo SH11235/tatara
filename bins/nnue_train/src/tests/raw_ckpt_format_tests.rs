@@ -342,13 +342,14 @@ fn v4_layerstack_header(superbatch: u64, step_count: u64, num_groups: u64) -> Ve
     b
 }
 
-/// 既定 FT / L1 / L2 出力次元 + 既定 bucket 数の LayerStack topology
-/// (test helper、`'static` 借用用)。
+/// 既定 FT / L1 / L2 出力次元 + 9 bucket の LayerStack topology (test helper、
+/// `'static` 借用用)。9 は kingrank9 を含む全 bucket mode で有効な bucket 数なので、
+/// bucket mode だけが異なる checkpoint を同じ topology で比較できる。
 const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(
     DEFAULT_FT_OUT,
     DEFAULT_L1_OUT,
     DEFAULT_L2_OUT,
-    DEFAULT_NUM_BUCKETS,
+    shogi_features::KINGRANK9_NUM_BUCKETS,
 );
 
 fn layerstack_arch() -> RawCkptArch<'static> {

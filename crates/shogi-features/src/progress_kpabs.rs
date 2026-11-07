@@ -183,9 +183,9 @@ impl ShogiProgressKPAbs {
     }
 
     /// N-bucket 割当 (`0..=num_buckets-1`)。`num_buckets ∈ [1, MAX_NUM_BUCKETS]`
-    /// を assert する (返り値が `u8` のため上限 256)。`num_buckets = 9` で
-    /// `floor(p * 9).clamp(0, 8)` を返し、index 8 まで emit する (LayerStack
-    /// 既定)。`num_buckets = N` での split 境界は `i / N` (`i = 0..N`) で等間隔。
+    /// を assert する (返り値が `u8` のため上限 256)。`num_buckets = N` で
+    /// `floor(p * N).clamp(0, N - 1)` を返し、split 境界は `i / N` (`i = 0..N`) で
+    /// 等間隔 (例: `N = 9` なら index 8 まで emit する)。
     pub fn bucket(&self, pos: &PackedSfenValue, num_buckets: usize) -> u8 {
         self.bucket_board(&pos.decode(), num_buckets)
     }
