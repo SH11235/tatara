@@ -82,6 +82,7 @@ const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 /// `argv` を解釈できないとき、`--` があるとき、この関数が追えない形の `PathBuf` 引数 (位置引数・
 /// 短いオプション・複数の値を取るもの) が定義されているとき、位置の値と clap の解釈が食い違う
 /// (同じ global 引数を複数回指定したときも含む) ときは、位置を確実に決められないので `None` を返す。
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
     use clap::CommandFactory;
     let command = Cli::command();
@@ -127,6 +128,7 @@ pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
 }
 
 /// clap が argv から `PathBuf` 引数として解釈した値を、サブコマンドも含めて集める。
+#[cfg(any(feature = "gpu", test))]
 fn collect_path_values(
     command: &clap::Command,
     matches: &clap::ArgMatches,
@@ -163,6 +165,7 @@ pub(crate) fn collect_path_options_for_test(command: &clap::Command) -> Option<V
     Some(names)
 }
 
+#[cfg(any(feature = "gpu", test))]
 #[derive(Default)]
 struct PathOptions {
     long: std::collections::HashSet<String>,
@@ -173,6 +176,7 @@ struct PathOptions {
 /// 追えない。文字列やパスを値に取り `-` で始まる値も受け付ける引数があると、`--data` のような要素が
 /// その値なのかを走査で区別できない (数値の引数なら `--data` は解析に失敗するので区別できる)。
 /// どれかが定義されていれば `None` を返す。
+#[cfg(any(feature = "gpu", test))]
 fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
     use clap::builder::ValueParser;
     let path_type = ValueParser::path_buf().type_id();
