@@ -18,7 +18,8 @@ selected for the run using the same selector as kernel loading. An `oxide-parity
 build can select native CUDA kernels at runtime without changing its build identity.
 
 The recipe repository and runtime working directory are not inferred from the
-trainer commit. `command` retains the invocation; record recipe provenance in the
+trainer commit. `command` retains the invocation (`command_args` keeps the same arguments as an
+array, so their boundaries survive); record recipe provenance in the
 run recipe separately. A historical experiment without `trainer_build` has no
 verified embedded build provenance: its `commit` may describe the launch directory.
 Do not rewrite that field by assuming the current executable ran the old experiment.

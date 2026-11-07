@@ -1919,7 +1919,11 @@ mod tests {
             id.to_string(),
             1_747_000_000,
             None,
-            "nnue-train --data sample.psv".to_string(),
+            vec![
+                "nnue-train".to_string(),
+                "--data".to_string(),
+                "sample.psv".to_string(),
+            ],
             None,
             experiment_params(),
             DataInfo {

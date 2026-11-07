@@ -2018,14 +2018,14 @@ pub(crate) fn build_experiment_logger(
         &data_info,
     );
 
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let command_args = std::env::args().collect::<Vec<_>>();
     let json_path = cli.output.join("experiments").join(format!("{id}.json"));
     let doc = ExperimentDoc::new(
         id,
         name,
         start_secs,
         crate::build_identity::experiment_commit(),
-        command,
+        command_args,
         lineage,
         params,
         data_info,
@@ -2200,7 +2200,7 @@ pub(crate) fn build_experiment_logger_simple(
         &data_info,
     );
 
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let command_args = std::env::args().collect::<Vec<_>>();
     let json_path = cli
         .output
         .join("experiments")
@@ -2210,7 +2210,7 @@ pub(crate) fn build_experiment_logger_simple(
         name,
         start_secs,
         crate::build_identity::experiment_commit(),
-        command,
+        command_args,
         lineage,
         params,
         data_info,
