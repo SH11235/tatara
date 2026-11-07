@@ -115,10 +115,10 @@ fn collect_path_values(
             values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
         }
     }
-    if let Some((name, sub_matches)) = matches.subcommand() {
-        if let Some(sub) = command.find_subcommand(name) {
-            collect_path_values(sub, sub_matches, values);
-        }
+    if let Some((name, sub_matches)) = matches.subcommand()
+        && let Some(sub) = command.find_subcommand(name)
+    {
+        collect_path_values(sub, sub_matches, values);
     }
 }
 
