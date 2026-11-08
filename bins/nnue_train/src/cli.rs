@@ -73,6 +73,152 @@ const AUTO_TEACHER_BUFFER_MAX_MIB: usize = 4096;
 #[cfg(any(feature = "gpu", test))]
 const AUTO_TEACHER_BUFFER_MEMORY_DIVISOR: u64 = 16;
 
+/// `argv` のうち、ファイルパスを値に取る引数 (`PathBuf` の引数) の値を含む位置を返す。
+/// `--data x` なら `x` の位置、`--data=x` ならその要素の位置を返す。同じ引数を何度
+/// 指定しても、どの指定も拾えるよう値ではなくオプション名で探す。experiment.json の
+/// `command_path_args` に書き、nnue-lab が公開時にその引数を伏せるのに使う。
+/// 名前で探した位置の値が、clap が `PathBuf` 引数として解釈した値と一致することも確かめる
+/// (`-` で始まる値を受け付ける引数があると、`--data` のような要素が別のオプションの値のことがある)。
+/// `argv` を解釈できないとき、`--` があるとき、この関数が追えない形の `PathBuf` 引数 (位置引数・
+/// 短いオプション・複数の値を取るもの) が定義されているとき、位置の値と clap の解釈が食い違う
+/// (同じ global 引数を複数回指定したときも含む) ときは、位置を確実に決められないので `None` を返す。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn path_arg_indices(argv: &[String]) -> Option<Vec<usize>> {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let matches = command.clone().try_get_matches_from(argv).ok()?;
+    let mut options = PathOptions::default();
+    collect_path_options(&command, &mut options)?;
+    let mut indices = Vec::new();
+    let mut previous_takes_path = false;
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        if previous_takes_path {
+            indices.push(index);
+            previous_takes_path = false;
+            continue;
+        }
+        if arg == "--" {
+            return None;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) if options.long.contains(name) => indices.push(index),
+                None if options.long.contains(long) => previous_takes_path = true,
+                _ => {}
+            }
+        }
+    }
+    if previous_takes_path {
+        return None;
+    }
+    let marked: std::collections::BTreeSet<&str> = indices
+        .iter()
+        .map(|&index| {
+            let arg = argv[index].as_str();
+            match arg.strip_prefix("--").and_then(|long| long.split_once('=')) {
+                Some((_, value)) => value,
+                None => arg,
+            }
+        })
+        .collect();
+    let mut parsed = Vec::new();
+    collect_path_values(&command, &matches, &mut parsed);
+    let parsed: std::collections::BTreeSet<&str> = parsed.iter().map(String::as_str).collect();
+    (marked == parsed).then_some(indices)
+}
+
+/// clap が argv から `PathBuf` 引数として解釈した値を、サブコマンドも含めて集める。
+#[cfg(any(feature = "gpu", test))]
+fn collect_path_values(
+    command: &clap::Command,
+    matches: &clap::ArgMatches,
+    values: &mut Vec<String>,
+) {
+    let path_type = clap::builder::ValueParser::path_buf().type_id();
+    for arg in command.get_arguments() {
+        if arg.get_value_parser().type_id() != path_type {
+            continue;
+        }
+        // 既定値や環境変数から入った値は argv に現れないので数えない。
+        let id = arg.get_id().as_str();
+        if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+            continue;
+        }
+        if let Ok(Some(raw)) = matches.try_get_raw(id) {
+            values.extend(raw.map(|value| value.to_string_lossy().into_owned()));
+        }
+    }
+    if let Some((name, sub_matches)) = matches.subcommand()
+        && let Some(sub) = command.find_subcommand(name)
+    {
+        collect_path_values(sub, sub_matches, values);
+    }
+}
+
+/// テスト用: `command` から集めた `PathBuf` の長いオプション名を並べて返す。
+#[cfg(test)]
+pub(crate) fn collect_path_options_for_test(command: &clap::Command) -> Option<Vec<String>> {
+    let mut options = PathOptions::default();
+    collect_path_options(command, &mut options)?;
+    let mut names: Vec<String> = options.long.into_iter().collect();
+    names.sort();
+    Some(names)
+}
+
+#[cfg(any(feature = "gpu", test))]
+#[derive(Default)]
+struct PathOptions {
+    long: std::collections::HashSet<String>,
+}
+
+/// サブコマンドも含め、`PathBuf` を値に取る長いオプションの名前 (別名を含む) を集める。位置引数・
+/// 短いオプション・複数の値を取る `PathBuf` 引数は argv 上の位置を名前の直後の 1 要素として
+/// 追えない。文字列やパスを値に取り `-` で始まる値も受け付ける引数があると、`--data` のような要素が
+/// その値なのかを走査で区別できない (数値の引数なら `--data` は解析に失敗するので区別できる)。
+/// どれかが定義されていれば `None` を返す。
+#[cfg(any(feature = "gpu", test))]
+fn collect_path_options(command: &clap::Command, options: &mut PathOptions) -> Option<()> {
+    use clap::builder::ValueParser;
+    let path_type = ValueParser::path_buf().type_id();
+    let text_types = [
+        ValueParser::string().type_id(),
+        ValueParser::os_string().type_id(),
+        path_type,
+    ];
+    for arg in command.get_arguments() {
+        let takes_text = text_types.contains(&arg.get_value_parser().type_id());
+        if arg.is_trailing_var_arg_set() || (arg.is_allow_hyphen_values_set() && takes_text) {
+            return None;
+        }
+        if arg.get_value_parser().type_id() != path_type {
+            continue;
+        }
+        let multiple_values = arg
+            .get_num_args()
+            .is_some_and(|range| range.max_values() > 1);
+        if arg.is_positional()
+            || arg.get_short().is_some()
+            || !arg.get_all_short_aliases().unwrap_or_default().is_empty()
+            || multiple_values
+        {
+            return None;
+        }
+        if let Some(long) = arg.get_long() {
+            options.long.insert(long.to_string());
+        }
+        options.long.extend(
+            arg.get_all_aliases()
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    for sub in command.get_subcommands() {
+        collect_path_options(sub, options)?;
+    }
+    Some(())
+}
+
 /// メモリ量に対する 1 窓の MiB。下限 floor は置かず、2 窓合計が常に総量の 1/8 に
 /// 収まるようにする。極小メモリでは 0 (= 直接逐次読み) へ縮退する。
 #[cfg(any(feature = "gpu", test))]

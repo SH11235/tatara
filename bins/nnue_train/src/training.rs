@@ -2018,14 +2018,16 @@ pub(crate) fn build_experiment_logger(
         &data_info,
     );
 
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let command_args = std::env::args().collect::<Vec<_>>();
+    let command_path_args = crate::cli::path_arg_indices(&command_args);
     let json_path = cli.output.join("experiments").join(format!("{id}.json"));
     let doc = ExperimentDoc::new(
         id,
         name,
         start_secs,
         crate::build_identity::experiment_commit(),
-        command,
+        command_args,
+        command_path_args,
         lineage,
         params,
         data_info,
@@ -2200,7 +2202,8 @@ pub(crate) fn build_experiment_logger_simple(
         &data_info,
     );
 
-    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let command_args = std::env::args().collect::<Vec<_>>();
+    let command_path_args = crate::cli::path_arg_indices(&command_args);
     let json_path = cli
         .output
         .join("experiments")
@@ -2210,7 +2213,8 @@ pub(crate) fn build_experiment_logger_simple(
         name,
         start_secs,
         crate::build_identity::experiment_commit(),
-        command,
+        command_args,
+        command_path_args,
         lineage,
         params,
         data_info,
@@ -2580,6 +2584,100 @@ pub(crate) fn run_simple_training(
 #[cfg(test)]
 mod shared_cli_tests {
     use super::*;
+
+    #[test]
+    fn path_options_refuse_argument_shapes_whose_positions_cannot_be_tracked() {
+        use clap::{Arg, Command, value_parser};
+        let path = || {
+            Arg::new("data")
+                .long("data")
+                .value_parser(value_parser!(std::path::PathBuf))
+        };
+        let collect = |command: Command| crate::cli::collect_path_options_for_test(&command);
+        assert_eq!(
+            collect(Command::new("t").arg(path())),
+            Some(vec!["data".to_string()])
+        );
+        assert_eq!(collect(Command::new("t").arg(path().short('d'))), None);
+        assert_eq!(collect(Command::new("t").arg(path().num_args(1..))), None);
+        assert_eq!(
+            collect(Command::new("t").subcommand(Command::new("sub").arg(path().short('d')))),
+            None
+        );
+        assert_eq!(
+            collect(
+                Command::new("t")
+                    .arg(path())
+                    .arg(Arg::new("label").long("label").allow_hyphen_values(true))
+            ),
+            None
+        );
+        assert_eq!(
+            collect(
+                Command::new("t").arg(path()).arg(
+                    Arg::new("scale")
+                        .long("scale")
+                        .allow_hyphen_values(true)
+                        .value_parser(value_parser!(i32))
+                )
+            ),
+            Some(vec!["data".to_string()])
+        );
+    }
+
+    #[test]
+    fn path_arg_indices_marks_values_of_path_arguments() {
+        let argv: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "/srv/teachers/private alice",
+            "--test-data=floodgate.psv",
+            "--lr",
+            "0.001",
+            "layerstack",
+            "--progress-coeff",
+            "progress.bin",
+            "--fv-scale",
+            "37",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(crate::cli::path_arg_indices(&argv), Some(vec![2, 3, 8]));
+
+        let repeated: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "/private/a.psv",
+            "layerstack",
+            "--data",
+            "/private/b.psv",
+            "--net-id=/private/b.psv",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        // global 引数を 2 回指定すると clap は最後の値しか持たず、位置の値と食い違うので書かない。
+        assert_eq!(crate::cli::path_arg_indices(&repeated), None);
+
+        let same_value: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "x.psv",
+            "--net-id=x.psv",
+            "layerstack",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(crate::cli::path_arg_indices(&same_value), Some(vec![2]));
+
+        let invalid: Vec<String> = ["nnue-train", "--no-such-option"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert_eq!(crate::cli::path_arg_indices(&invalid), None);
+    }
 
     #[test]
     fn layerstack_fv_scale_follows_loss_and_override() {

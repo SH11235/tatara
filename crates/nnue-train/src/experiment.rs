@@ -410,7 +410,16 @@ pub struct ExperimentDoc {
     /// tatara の source revision。取得できなければ省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// 起動時の引数を空白でつないだもの。引数の区切りは復元できないので、区切りが要るときは
+    /// `command_args` を使う。
     pub command: String,
+    /// 起動時の引数 (argv) をそのまま並べたもの。
+    pub command_args: Vec<String>,
+    /// `command_args` のうち、ファイルパスを値に取る引数 (`PathBuf` の引数) の値を含む位置。
+    /// nnue-lab は公開時にこの位置の引数を伏せてコマンドを見せる。引数を解釈できず位置を
+    /// 決められなかったときは省略し、nnue-lab はコマンドを丸ごと隠す。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_path_args: Option<Vec<usize>>,
     /// resume した run のみ持つ。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
@@ -442,7 +451,8 @@ impl ExperimentDoc {
         name: String,
         start_epoch_secs: u64,
         commit: Option<String>,
-        command: String,
+        command_args: Vec<String>,
+        command_path_args: Option<Vec<usize>>,
         lineage: Option<Lineage>,
         params: Params,
         data: DataInfo,
@@ -458,7 +468,9 @@ impl ExperimentDoc {
             date,
             status: STATUS_RUNNING.to_string(),
             commit,
-            command,
+            command: command_args.join(" "),
+            command_args,
+            command_path_args,
             lineage,
             params,
             data,
@@ -720,7 +732,8 @@ mod tests {
             "exp".to_string(),
             1_747_000_000,
             None,
-            "nnue-train".to_string(),
+            vec!["nnue-train".to_string()],
+            None,
             None,
             sample_params(),
             sample_data(),
@@ -903,12 +916,46 @@ mod tests {
             "rshogi".to_string(),
             1_747_000_000,
             Some("7beb263".to_string()),
-            "nnue-train --data teacher.psv".to_string(),
+            vec![
+                "nnue-train".to_string(),
+                "--data".to_string(),
+                "teacher.psv".to_string(),
+            ],
+            None,
             None,
             sample_params(),
             sample_data(),
             Some(nnue_format::layerstack_weights::FV_SCALE),
         )
+    }
+
+    #[test]
+    fn command_keeps_argv_alongside_the_joined_string() {
+        let argv = vec![
+            "nnue-train".to_string(),
+            "--data".to_string(),
+            "/srv/teachers/private alice".to_string(),
+        ];
+        let doc = ExperimentDoc::new(
+            "net-20260517t041530z".to_string(),
+            "net".to_string(),
+            1_747_000_000,
+            None,
+            argv.clone(),
+            Some(vec![2]),
+            None,
+            sample_params(),
+            sample_data(),
+            None,
+        );
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["command_args"], serde_json::json!(argv));
+        assert_eq!(json["command"], argv.join(" "));
+        assert_eq!(json["command_path_args"], serde_json::json!([2]));
+
+        let unknown = sample_doc();
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json.get("command_path_args").is_none());
     }
 
     #[test]
@@ -1063,7 +1110,8 @@ mod tests {
             "net".to_string(),
             1_747_000_000,
             None,
-            "nnue-train".to_string(),
+            vec!["nnue-train".to_string()],
+            None,
             None,
             params,
             sample_data(),
@@ -1090,7 +1138,8 @@ mod tests {
             "net".to_string(),
             1_747_000_000,
             None,
-            "nnue-train".to_string(),
+            vec!["nnue-train".to_string()],
+            None,
             None,
             params,
             sample_data(),
@@ -1111,7 +1160,8 @@ mod tests {
             "net".to_string(),
             1_747_000_000,
             None,
-            "nnue-train".to_string(),
+            vec!["nnue-train".to_string()],
+            None,
             None,
             params,
             sample_data(),
