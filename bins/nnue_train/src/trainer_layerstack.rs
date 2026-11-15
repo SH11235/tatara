@@ -1511,6 +1511,8 @@ pub(crate) struct GpuTrainer {
     #[cfg(feature = "native")]
     qat_raw: Vec<DeviceBuffer<i32>>,
     pub(crate) wdl_ignore_draws: bool,
+    pub(crate) crelu_ste_l1: f32,
+    pub(crate) crelu_ste_l2: f32,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
     device_occupancy: DeviceOccupancy,
@@ -2540,6 +2542,8 @@ impl GpuTrainer {
             #[cfg(feature = "native")]
             qat_raw: Vec::new(),
             wdl_ignore_draws: false,
+            crelu_ste_l1: 0.0,
+            crelu_ste_l2: 0.0,
             stream: stream.clone(),
             module,
             device_occupancy,
@@ -4971,12 +4975,12 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L3");
 
-        // -- Backward 12 reverse: crelu_grad on l2_dense_out --
+        // -- Backward 12 reverse: crelu_grad_ste on l2_dense_out --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: crelu_grad,
+                kernel: crelu_grad_ste,
                 stream: self.stream,
                 module: self.module,
                 config: cfg_1d(b * l2_out),
@@ -4984,6 +4988,7 @@ impl GpuTrainer {
                     slice(self.ws.l2_dense_out),
                     slice(self.ws.dl2_acted),
                     slice_mut(self.ws.dl2_out),
+                    self.crelu_ste_l2,
                     (b * l2_out) as u32
                 ]
             }
@@ -5116,12 +5121,12 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L2");
 
-        // -- Backward 10 reverse: crelu_grad on l2_pre --
+        // -- Backward 10 reverse: crelu_grad_ste on l2_pre --
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: crelu_grad,
+                kernel: crelu_grad_ste,
                 stream: self.stream,
                 module: self.module,
                 config: cfg_1d(b * l2_in),
@@ -5129,6 +5134,7 @@ impl GpuTrainer {
                     slice(self.ws.l2_pre),
                     slice(self.ws.dl2_input),
                     slice_mut(self.ws.dl2_pre),
+                    self.crelu_ste_l1,
                     (b * l2_in) as u32
                 ]
             }

@@ -1845,6 +1845,8 @@ mod tests {
             ft_in: 73_305,
             ft_factorize: None,
             stack_shared_delta: None,
+            crelu_ste_l1: None,
+            crelu_ste_l2: None,
             l0: 1536,
             l1: 16,
             l2: 32,

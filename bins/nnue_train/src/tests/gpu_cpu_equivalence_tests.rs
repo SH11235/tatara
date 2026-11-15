@@ -29,7 +29,7 @@ use gpu_kernels::layerstack::psqt::{psqt_diff_sparse_bwd_cpu, psqt_diff_sparse_f
 use gpu_kernels::layerstack::{
     abs_pow2_scale::{abs_pow2_scale_fwd_cpu, abs_pow2_scale_grad_cpu},
     concat_l1sqr_main::{concat_l1sqr_main_fwd_cpu, concat_l1sqr_main_grad_cpu},
-    crelu::{crelu_fwd_cpu, crelu_grad_cpu},
+    crelu::{crelu_fwd_cpu, crelu_grad_cpu, crelu_grad_ste_cpu},
     dense_mm::{bias_grad_cpu, dense_mm_bwd_input_cpu, dense_mm_bwd_weight_cpu, dense_mm_fwd_cpu},
     dense_mm_bucket::{
         bias_grad_bucket_cpu, dense_mm_bwd_input_bucket_cpu, dense_mm_bwd_weight_bucket_cpu,
@@ -219,6 +219,42 @@ fn crelu_grad_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     }?;
     stream.synchronize()?;
     assert_close("crelu_grad", &dx_dev.to_host_vec(&stream)?, &dx_cpu, 0.0);
+    Ok(())
+}
+
+#[test]
+fn crelu_grad_ste_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    let mut x = deterministic_floats(257, 2.0);
+    x.extend([0.0_f32, 1.0, 0.0, 1.0, f32::NAN]);
+    let n = x.len();
+    let dy: Vec<f32> = (0..n)
+        .map(|i| (0.3_f32 + 0.11_f32 * i as f32) * if i % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    let x_dev = DeviceBuffer::from_host(&stream, &x)?;
+    let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
+    let mut plain = vec![0.0_f32; n];
+    crelu_grad_cpu(&x, &dy, &mut plain, n);
+    for alpha in [0.0_f32, 0.25, 1.0] {
+        let mut dx_cpu = vec![0.0_f32; n];
+        crelu_grad_ste_cpu(&x, &dy, &mut dx_cpu, alpha, n);
+        let recovered = (0..n).filter(|&i| dx_cpu[i] != plain[i]).count();
+        assert_eq!(recovered > 0, alpha > 0.0);
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+        unsafe {
+            cuda_launch! {
+                kernel: crelu_grad_ste, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice(x_dev), slice(dy_dev), slice_mut(dx_dev), alpha, n as u32]
+            }
+        }?;
+        stream.synchronize()?;
+        let got = dx_dev.to_host_vec(&stream)?;
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            dx_cpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "crelu_grad_ste alpha {alpha}"
+        );
+    }
     Ok(())
 }
 
