@@ -115,15 +115,60 @@ impl MomentBuf {
         scale: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if fp16 {
-            let h: Vec<f16> = data
-                .iter()
-                .map(|&x| (x * scale).clamp(-65504.0, 65504.0) as f16)
-                .collect();
-            Ok(MomentBuf::F16(DeviceBuffer::from_host(stream, &h)?))
+            Ok(MomentBuf::F16(DeviceBuffer::from_host(
+                stream,
+                &moment_to_f16(data, scale),
+            )?))
         } else {
             Ok(MomentBuf::F32(DeviceBuffer::from_host(stream, data)?))
         }
     }
+
+    pub(crate) fn copy_from_host_f32(
+        &mut self,
+        stream: &CudaStream,
+        data: &[f32],
+        fp16: bool,
+        scale: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            MomentBuf::F32(b) if !fp16 && b.len() == data.len() => {
+                b.copy_from_host(stream, data)?;
+            }
+            MomentBuf::F16(b) if fp16 && b.len() == data.len() => {
+                b.copy_from_host(stream, &moment_to_f16(data, scale))?;
+            }
+            _ => *self = Self::from_host_f32(stream, data, fp16, scale)?,
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cu_deviceptr(&self) -> u64 {
+        match self {
+            MomentBuf::F32(b) => b.cu_deviceptr(),
+            MomentBuf::F16(b) => b.cu_deviceptr(),
+        }
+    }
+}
+
+fn moment_to_f16(data: &[f32], scale: f32) -> Vec<f16> {
+    data.iter()
+        .map(|&x| (x * scale).clamp(-65504.0, 65504.0) as f16)
+        .collect()
+}
+
+pub(crate) fn upload_into(
+    stream: &CudaStream,
+    dst: &mut DeviceBuffer<f32>,
+    src: &[f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if dst.len() == src.len() {
+        dst.copy_from_host(stream, src)?;
+    } else {
+        *dst = DeviceBuffer::from_host(stream, src)?;
+    }
+    Ok(())
 }
 
 /// [`GpuTrainer::step_impl`] の出力。
