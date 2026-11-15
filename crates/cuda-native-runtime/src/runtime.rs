@@ -520,6 +520,7 @@ impl<T: DeviceElement> DeviceBuffer<T> {
             .checked_mul(size_of::<T>())
             .expect("CUDA allocation byte size overflowed");
         let mut host = ptr::null_mut();
+        // SAFETY: host points to writable output storage and bytes is non-zero.
         unsafe {
             check(cuMemHostAlloc(
                 &mut host,
@@ -534,7 +535,9 @@ impl<T: DeviceElement> DeviceBuffer<T> {
             marker: PhantomData,
             host: host as usize,
         };
+        // SAFETY: cuMemHostAlloc succeeded, so host is a live allocation of bytes bytes.
         unsafe { ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
+        // SAFETY: host was allocated with DEVICEMAP in the current context.
         unsafe { check(cuMemHostGetDevicePointer_v2(&mut buffer.raw, host, 0))? };
         Ok(buffer)
     }
@@ -747,7 +750,7 @@ impl<T: DeviceElement> Drop for DeviceBuffer<T> {
         if self.raw == 0 && self.host == 0 {
             return;
         }
-        // SAFETY: the retained context owns raw and stays alive through this call.
+        // SAFETY: the retained context owns raw or host and stays alive through this call.
         unsafe {
             let _ = cuCtxSetCurrent(self.context.raw);
             if self.host == 0 {
