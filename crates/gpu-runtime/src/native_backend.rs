@@ -198,6 +198,15 @@ impl<T: native::DeviceElement> DeviceBuffer<T> {
         Ok(Self { inner })
     }
 
+    pub fn zeroed_mapped(stream: &CudaStream, len: usize) -> Result<Self> {
+        let inner = native::DeviceBuffer::zeroed_mapped(&stream.context.inner, len)?;
+        Ok(Self { inner })
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.inner.is_mapped()
+    }
+
     pub fn copy_from_host(&mut self, stream: &CudaStream, values: &[T]) -> Result<()> {
         stream.synchronize()?;
         self.inner.copy_from(values)?;

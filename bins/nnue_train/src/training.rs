@@ -891,6 +891,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             ft_fp16,
             ft_fp16_out,
             fp16_opt_state,
+            ft_state_host: layerstack.ft_state_host,
         },
         feature_set,
         shared.optimizer,
@@ -2422,6 +2423,7 @@ pub(crate) fn run_simple_training(
             ft_fp16,
             ft_fp16_out,
             fp16_opt_state,
+            ft_state_host: false,
         },
         &init_spec,
     )

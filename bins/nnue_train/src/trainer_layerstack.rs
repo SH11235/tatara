@@ -1384,6 +1384,39 @@ use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
+fn ft_moment(
+    stream: &CudaStream,
+    n: usize,
+    fp16: bool,
+    host: bool,
+) -> Result<MomentBuf, Box<dyn std::error::Error>> {
+    if !host {
+        return MomentBuf::zeroed(stream, n, fp16);
+    }
+    #[cfg(feature = "native")]
+    return MomentBuf::zeroed_mapped(stream, n, fp16);
+    #[cfg(not(feature = "native"))]
+    {
+        Err("--ft-state-host requires the native backend".into())
+    }
+}
+
+fn ft_slow(
+    stream: &CudaStream,
+    n: usize,
+    host: bool,
+) -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
+    if !host {
+        return Ok(DeviceBuffer::<f32>::zeroed(stream, n)?);
+    }
+    #[cfg(feature = "native")]
+    return Ok(DeviceBuffer::<f32>::zeroed_mapped(stream, n)?);
+    #[cfg(not(feature = "native"))]
+    {
+        Err("--ft-state-host requires the native backend".into())
+    }
+}
+
 struct StepContext<'a> {
     lr: f32,
     wdl_lambda: f32,
@@ -1638,6 +1671,7 @@ pub(crate) struct GpuTrainer {
     /// (`--fp16-opt-state`)。`ft_w_m` / `ft_w_v` が [`MomentBuf::F16`] になり、optimizer
     /// step は [`radam_step_f16state`] 系を使う。false で従来の `f32` path。
     fp16_opt_state: bool,
+    ft_state_host: bool,
     /// true なら L1 forward (per-bucket dense) と L1 shared input backward を手書き tiled
     /// kernel ではなく `self.cublas` の TF32 Sgemm で計算する (`--tf32`)。false では
     /// 手書き kernel の純 FP32 path と bit-identical。`self.cublas` の math mode も同
@@ -2547,9 +2581,19 @@ impl GpuTrainer {
             ft_gradient_tiles_supported,
             // FT
             ft_w: DeviceBuffer::from_host(&stream, &ft_w_init)?,
-            ft_w_m: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
-            ft_w_v: MomentBuf::zeroed(&stream, opt_len(ft_w_n), precision.fp16_opt_state)?,
-            ft_w_slow: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_w_n))?,
+            ft_w_m: ft_moment(
+                &stream,
+                opt_len(ft_w_n),
+                precision.fp16_opt_state,
+                precision.ft_state_host,
+            )?,
+            ft_w_v: ft_moment(
+                &stream,
+                opt_len(ft_w_n),
+                precision.fp16_opt_state,
+                precision.ft_state_host,
+            )?,
+            ft_w_slow: ft_slow(&stream, opt_len(ft_w_n), precision.ft_state_host)?,
             ft_w_grad: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_w_n))?,
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
             // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
@@ -2654,6 +2698,7 @@ impl GpuTrainer {
             ft_fp16: precision.ft_fp16,
             ft_fp16_out: precision.ft_fp16_out,
             fp16_opt_state: precision.fp16_opt_state,
+            ft_state_host: precision.ft_state_host,
             tf32: precision.tf32,
             feature_set,
             optim_groups,
@@ -2955,9 +3000,25 @@ impl GpuTrainer {
             let l2_b_n = self.num_buckets * l2_out;
             let l3_w_n = self.num_buckets * l2_out;
             let l3_b_n = self.num_buckets;
-            self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
-            self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
-            self.ft_w_slow = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+            self.ft_w_m = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_v = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_slow = if self.ft_state_host {
+                let mut slow = ft_slow(&self.stream, w.ft_w.len(), true)?;
+                slow.copy_from_host(&self.stream, &w.ft_w)?;
+                slow
+            } else {
+                DeviceBuffer::from_host(&self.stream, &w.ft_w)?
+            };
             self.ft_w_grad = zeros_f32(ft_w_n)?;
             self.ft_b_m = zeros_f32(ft_b_n)?;
             self.ft_b_v = zeros_f32(ft_b_n)?;
@@ -3245,6 +3306,11 @@ impl GpuTrainer {
             self.ws.l1_bucket_sorted.to_host_vec(&self.stream)?,
             self.ws.bucket_idx_sorted_dev.to_host_vec(&self.stream)?,
         ))
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn ft_state_mapped(&self) -> bool {
+        self.ft_w_m.is_mapped() && self.ft_w_v.is_mapped() && self.ft_w_slow.is_mapped()
     }
 
     #[cfg(all(test, any(feature = "oxide-parity", feature = "native")))]
