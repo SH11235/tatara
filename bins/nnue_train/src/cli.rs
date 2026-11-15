@@ -342,9 +342,10 @@ impl TeacherShuffleBufferMib {
 pub(crate) struct Cli {
     /// Training data file: PSV (`PackedSfenValue`, 40 bytes per position), or HCPE
     /// (`HuffmanCodedPosAndEval`, 38 bytes per position) when the extension is `.hcpe`.
-    /// When omitted, runs a GPU smoke test.
+    /// Repeat the flag to train on several files of one format, read in the given
+    /// order as one data set. When omitted, runs a GPU smoke test.
     #[arg(long, global = true)]
-    pub(crate) data: Option<PathBuf>,
+    pub(crate) data: Vec<PathBuf>,
 
     /// PSV or HCPE file for held-out validation. Pass positions that are never used for
     /// a gradient update, separate from the training `--data`. When set, a
@@ -1048,7 +1049,7 @@ impl Cli {
                         .into(),
                 );
             }
-            if self.data.is_none()
+            if self.data.is_empty()
                 || self.eval_only
                 || self.threat_norm_dump
                 || self.rescore_input.is_some()
@@ -1060,8 +1061,8 @@ impl Cli {
         if self.dual_label_psv.is_some()
             && self
                 .data
-                .as_deref()
-                .is_some_and(nnue_train::dataloader::is_hcpe_path)
+                .iter()
+                .any(|path| nnue_train::dataloader::is_hcpe_path(path))
         {
             return Err(
                 "--dual-label-psv requires PSV --data; HCPE has no second score label".to_string(),

@@ -783,7 +783,7 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Resul
 /// (training では問題ない)。
 pub fn run<B, L, W, M>(
     backend: &mut B,
-    data_path: &Path,
+    data_paths: &[impl AsRef<Path>],
     bucket_mode: &M,
     lr_scheduler: &L,
     wdl_scheduler: &W,
@@ -798,7 +798,8 @@ where
 {
     cfg.validate()?;
 
-    let format = TeacherFormat::for_path(data_path)?;
+    let data_path = &crate::dataloader::teacher_data_label(data_paths);
+    let format = crate::dataloader::teacher_format(data_paths)?;
     if format == TeacherFormat::Hcpe && matches!(cfg.score_source, Some(ScoreSource::DualLabel(_)))
     {
         return Err(crate::dataloader::dual_label_requires_psv(data_path));
@@ -808,7 +809,7 @@ where
     // data file の byte サイズを取って record alignment を確認。
     // `--test-tail-positions` の split 計算がここで record 境界に揃うか
     // 決まるため、tail 経路に入る前に確実に reject する。
-    let file_size = std::fs::metadata(data_path)?.len();
+    let file_size = crate::dataloader::teacher_data_bytes(data_paths)?;
     if !file_size.is_multiple_of(record_bytes) {
         return Err(io::Error::other(format!(
             "data file {} size {file_size} is not a multiple of {} record size \
@@ -839,7 +840,7 @@ where
     };
 
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
-        data_path,
+        data_paths,
         cfg.batch_size,
         cfg.score_drop_abs,
         cfg.score_clamp_abs,
@@ -910,7 +911,7 @@ where
         }
         (None, Some(_)) => {
             let set = crate::validation::HeldoutSet::load_from_range_with_score_sources(
-                data_path,
+                data_paths,
                 train_end_offset,
                 file_size,
                 cfg.batch_size,
@@ -1618,7 +1619,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_hcpe_path(),
+            &[sample_hcpe_path()],
             &progress,
             &lr,
             &wdl,
@@ -1647,7 +1648,7 @@ mod tests {
         let mut backend = MockBackend::new();
         let error = run(
             &mut backend,
-            &sample_hcpe_path(),
+            &[sample_hcpe_path()],
             &progress,
             &lr,
             &wdl,
@@ -1676,7 +1677,7 @@ mod tests {
         for name in ["teacher.hcpe", "teacher.HCPE"] {
             let error = run(
                 &mut backend,
-                Path::new(name),
+                &[Path::new(name)],
                 &progress,
                 &lr,
                 &wdl,
@@ -1710,7 +1711,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -1791,7 +1792,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -1965,7 +1966,7 @@ mod tests {
                     }
                     let error = run(
                         &mut backend,
-                        &sample_psv_path(),
+                        &[sample_psv_path()],
                         &ShogiProgressKPAbs,
                         &StepLR {
                             start: 1e-3,
@@ -2022,7 +2023,7 @@ mod tests {
         };
         let error = run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &ShogiProgressKPAbs,
             &StepLR {
                 start: 1e-3,
@@ -2068,7 +2069,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2124,7 +2125,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2234,7 +2235,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2280,7 +2281,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2332,7 +2333,7 @@ mod tests {
 
             run(
                 &mut backend,
-                &sample_psv_path(),
+                &[sample_psv_path()],
                 &progress,
                 &lr,
                 &wdl,
@@ -2371,7 +2372,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2413,7 +2414,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2460,7 +2461,7 @@ mod tests {
         let mut baseline = MockBackend::new();
         run(
             &mut baseline,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2476,7 +2477,7 @@ mod tests {
         let mut controlled = MockBackend::new();
         run(
             &mut controlled,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2520,7 +2521,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2564,7 +2565,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2604,7 +2605,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2633,7 +2634,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2665,7 +2666,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2886,7 +2887,7 @@ mod tests {
         std::fs::write(&tmp, b"").expect("write empty psv");
 
         let mut backend = MockBackend::new();
-        let result = run(&mut backend, &tmp, &progress, &lr, &wdl, &cfg, None);
+        let result = run(&mut backend, &[&tmp], &progress, &lr, &wdl, &cfg, None);
         let _ = std::fs::remove_file(&tmp);
 
         let err = result.expect_err("empty data file should error, not hang");

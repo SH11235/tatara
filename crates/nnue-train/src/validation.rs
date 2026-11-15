@@ -30,7 +30,7 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
     Batch, BucketMode, ScoreOverrideReader, ScoreSource, TeacherFileLoader, TeacherFormat,
-    TeacherRecord, dual_label_requires_psv,
+    TeacherRecord, dual_label_requires_psv, teacher_data_label, teacher_format,
 };
 use crate::trainer::{LossKind, TrainerBackend};
 
@@ -86,7 +86,7 @@ impl HeldoutSet {
     ) -> io::Result<Self> {
         let file_size = std::fs::metadata(path)?.len();
         Self::load_from_range_with_score_sources(
-            path,
+            &[path],
             0,
             file_size,
             batch_size,
@@ -119,7 +119,7 @@ impl HeldoutSet {
         num_buckets: usize,
     ) -> io::Result<Self> {
         Self::load_from_range_with_score_sources(
-            path,
+            &[path],
             start_offset,
             end_offset,
             batch_size,
@@ -137,7 +137,7 @@ impl HeldoutSet {
     /// dual-label は PSV だけが持つ field を使うため HCPE では error。
     #[allow(clippy::too_many_arguments)]
     pub fn load_from_range_with_score_sources(
-        path: &Path,
+        paths: &[impl AsRef<Path>],
         start_offset: u64,
         end_offset: u64,
         batch_size: usize,
@@ -149,15 +149,16 @@ impl HeldoutSet {
         num_buckets: usize,
         score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        let format = TeacherFormat::for_path(path)?;
+        let path = &teacher_data_label(paths);
+        let format = teacher_format(paths)?;
         if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
         {
             return Err(dual_label_requires_psv(path));
         }
-        let loader = TeacherFileLoader::new_range(path, start_offset, end_offset)?;
+        let loader = TeacherFileLoader::new_range(paths, start_offset, end_offset)?;
         let (mut score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
-                Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
+                Some(ScoreOverrideReader::new(paths, scores, mask, start_offset)?),
                 None,
             ),
             Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
@@ -555,7 +556,7 @@ mod tests {
             record[39] = u8::from(index == 8 || index == 15);
         });
         let set = HeldoutSet::load_from_range_with_score_sources(
-            &path,
+            &[&path],
             8 * PSV_RECORD_BYTES,
             16 * PSV_RECORD_BYTES,
             8,
@@ -691,7 +692,7 @@ mod tests {
         std::fs::write(&scores, &replacement).unwrap();
         let load = |path: &Path, record_bytes: u64| {
             HeldoutSet::load_from_range_with_score_sources(
-                path,
+                &[path],
                 70 * record_bytes,
                 100 * record_bytes,
                 16,

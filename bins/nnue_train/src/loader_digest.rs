@@ -11,7 +11,10 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
     if cli.test_data.is_some() {
         return Err("loader-digest does not support --test-data".into());
     }
-    let data = cli.data.as_deref().ok_or("loader-digest requires --data")?;
+    if cli.data.is_empty() {
+        return Err("loader-digest requires --data".into());
+    }
+    let data = cli.data.as_slice();
     if cli.batch_size == 0 {
         return Err("--batch-size must be >= 1".into());
     }
@@ -22,7 +25,7 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         .ok_or_else(|| format!("unknown feature set: {}", cli.feature_set))?
         .spec();
     // record 長の倍数検査は loader の open 時に入力形式ごとに行う。
-    let file_size = std::fs::metadata(data)?.len();
+    let file_size = nnue_train::dataloader::teacher_data_bytes(data)?;
     // `auto` は machine のメモリ量に依存し digest が machine 間で比較できなくなる
     // ため、digest では 0 (直接逐次読み) に解決する。明示値はそのまま使う。
     let teacher_shuffle_buffer_mib = match cli.teacher_shuffle_buffer_mib {

@@ -1380,7 +1380,7 @@ fn shared_args_are_global_around_subcommand() {
     ])
     .expect("global args after subcommand");
     assert!(cli.ft_fp16);
-    assert_eq!(cli.data.as_deref(), Some(std::path::Path::new("x.psv")));
+    assert_eq!(cli.data, [std::path::PathBuf::from("x.psv")]);
     assert_eq!(cli.batch_size, 4096);
 }
 

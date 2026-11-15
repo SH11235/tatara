@@ -39,7 +39,7 @@ fn shuffled_loader_contents(
     shuffle_seed: Option<u64>,
 ) -> Vec<PositionRow> {
     let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
-        path,
+        &[path],
         batch_size,
         None,
         None,
@@ -150,7 +150,7 @@ fn hcpe_score_sidecar_is_aligned_by_record_count() {
 #[test]
 fn hcpe_rejects_dual_label_scores() {
     let Err(error) = PsvEpochReader::new_range(
-        &fixture("sample.hcpe"),
+        &[fixture("sample.hcpe")],
         0,
         100 * 38,
         None,

@@ -1,5 +1,5 @@
 #[cfg(feature = "gpu")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "gpu")]
 use gpu_runtime::CudaContext;
@@ -290,7 +290,7 @@ pub(crate) fn validate_rescore_cli(
                 .into(),
         );
     }
-    if cli.data.is_some() || cli.test_data.is_some() || cli.test_tail_positions.is_some() {
+    if !cli.data.is_empty() || cli.test_data.is_some() || cli.test_tail_positions.is_some() {
         return Err(
             "--rescore-input cannot be combined with --data / --test-data / \
              --test-tail-positions (rescore reads every record of --rescore-input in order, \
@@ -515,7 +515,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // --data は通常学習と --eval-only --test-tail-positions では必須だが、
     // --threat-norm-dump と --eval-only --test-data は学習データを読まないので任意。
     // 必須経路では参照点で明示 error にする (None のまま誤って学習に進ませない)。
-    let data = cli.data.as_ref();
+    let data = (!cli.data.is_empty()).then_some(cli.data.as_slice());
 
     if (cli.threat_ablate.is_some() || cli.threat_norm_dump) && cli.init_from.is_none() {
         return Err(
@@ -1174,9 +1174,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 let data = data.ok_or(
                     "--eval-only --test-tail-positions requires --data (the file whose tail is the held-out set)",
                 )?;
-                let file_size = std::fs::metadata(data)?.len();
-                let record_bytes =
-                    nnue_train::dataloader::TeacherFormat::for_path(data)?.record_bytes();
+                let file_size = nnue_train::dataloader::teacher_data_bytes(data)?;
+                let record_bytes = nnue_train::dataloader::teacher_format(data)?.record_bytes();
                 let tail_bytes = n.checked_mul(record_bytes).ok_or_else(|| {
                     std::io::Error::other("--test-tail-positions * record size overflows u64")
                 })?;
@@ -1878,7 +1877,7 @@ pub(crate) fn build_experiment_logger(
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
     resume_producer: Option<crate::ckpt::ResumeProducer>,
-    data: &Path,
+    data: &[PathBuf],
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
     lr_schedule: String,
@@ -2044,18 +2043,22 @@ pub(crate) fn build_experiment_logger(
 /// される前提の defensive fallback)。形式を決められない入力は PSV として数える
 /// (その入力は `trainer::run` が error にする)。
 #[cfg(feature = "gpu")]
-pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
-    let record_bytes = nnue_train::dataloader::TeacherFormat::for_path(data)
+pub(crate) fn build_data_info(cli: &Cli, data: &[PathBuf]) -> DataInfo {
+    let record_bytes = nnue_train::dataloader::teacher_format(data)
         .map_or(PSV_RECORD_BYTES, |format| format.record_bytes());
-    let total_records = std::fs::metadata(data)
-        .map(|m| m.len() / record_bytes)
+    let total_records = nnue_train::dataloader::teacher_data_bytes(data)
+        .map(|bytes| bytes / record_bytes)
         .unwrap_or(0);
     let train_records = match cli.test_tail_positions {
         Some(n) if n < total_records => total_records - n,
         _ => total_records,
     };
     DataInfo {
-        name: file_basename(data),
+        name: data
+            .iter()
+            .map(|path| file_basename(path))
+            .collect::<Vec<_>>()
+            .join(" + "),
         positions: train_records,
         total_positions: 0,
         dataset_passes: 0.0,
@@ -2076,7 +2079,7 @@ pub(crate) fn build_experiment_logger_simple(
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
     resume_producer: Option<crate::ckpt::ResumeProducer>,
-    data: &Path,
+    data: &[PathBuf],
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
     ft_fp16: bool,
@@ -2287,10 +2290,8 @@ pub(crate) fn run_simple_training(
     // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
     reject_simple_unsupported_flags(cli)?;
     require_simple_win_rate_model(cli)?;
-    let data = cli
-        .data
-        .as_ref()
-        .expect("run_simple_training called with --data");
+    let data = cli.data.as_slice();
+    assert!(!data.is_empty(), "run_simple_training called with --data");
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
@@ -2972,7 +2973,7 @@ mod tests {
             1,
             None,
             None,
-            &data,
+            std::slice::from_ref(&data),
             256,
             false,
             "step".to_string(),
@@ -3031,7 +3032,7 @@ mod tests {
             0,
             None,
             None,
-            &data,
+            std::slice::from_ref(&data),
             256,
             true,
             false,

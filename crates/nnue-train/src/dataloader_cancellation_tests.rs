@@ -17,7 +17,8 @@ fn cancellation_during_filtered_scan_stops_before_next_record_or_wrap() {
         let path = dir.path().join("filtered.psv");
         std::fs::write(&path, sample_record(30000).as_bytes().repeat(records)).unwrap();
         let end = records as u64 * PSV_RECORD_BYTES;
-        let mut reader = PsvEpochReader::new_range(&path, 0, end, Some(1000), None, None).unwrap();
+        let mut reader =
+            PsvEpochReader::new_range(&[&path], 0, end, Some(1000), None, None).unwrap();
         let stop = Arc::clone(&reader.stop);
         reader.after_record = Some(Box::new(move || stop.store(true, Ordering::Relaxed)));
         let error = match reader.next_in_epoch() {
@@ -39,7 +40,7 @@ fn direct_and_windowed_readers_share_cancellation_with_epoch_scan() {
         let path = dir.path().join("filtered.psv");
         std::fs::write(&path, sample_record(30000).as_bytes().repeat(3)).unwrap();
         let mut source =
-            PsvEpochReader::new_range(&path, 0, 3 * PSV_RECORD_BYTES, Some(1000), None, None)
+            PsvEpochReader::new_range(&[&path], 0, 3 * PSV_RECORD_BYTES, Some(1000), None, None)
                 .unwrap();
         let stop = Arc::clone(&source.stop);
         source.after_record = Some(Box::new(move || stop.store(true, Ordering::Relaxed)));
@@ -63,7 +64,7 @@ fn cancellation_after_eof_does_not_reopen_or_report_barren_failure() {
     let path = dir.path().join("filtered.psv");
     std::fs::write(&path, sample_record(30000).as_bytes()).unwrap();
     let mut reader =
-        PsvEpochReader::new_range(&path, 0, PSV_RECORD_BYTES, Some(1000), None, None).unwrap();
+        PsvEpochReader::new_range(&[&path], 0, PSV_RECORD_BYTES, Some(1000), None, None).unwrap();
     reader.barren_passes = MAX_BARREN_PASSES - 1;
     let stop = Arc::clone(&reader.stop);
     reader.after_eof = Some(Box::new(move || stop.store(true, Ordering::Relaxed)));
@@ -98,7 +99,7 @@ fn drop_during_filtered_scan_joins_workers_without_recording_an_error() {
         let path = dir.path().join("filtered.psv");
         std::fs::write(&path, sample_record(30000).as_bytes().repeat(3)).unwrap();
         let mut source =
-            PsvEpochReader::new_range(&path, 0, 3 * PSV_RECORD_BYTES, Some(1000), None, None)
+            PsvEpochReader::new_range(&[&path], 0, 3 * PSV_RECORD_BYTES, Some(1000), None, None)
                 .unwrap();
         let source_stop = Arc::clone(&source.stop);
         let scanned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -155,7 +156,7 @@ fn cancellation_after_record_read_does_not_publish_a_batch() {
     let path = dir.path().join("teacher.psv");
     std::fs::write(&path, sample_record(0).as_bytes()).unwrap();
     let mut source =
-        PsvEpochReader::new_range(&path, 0, PSV_RECORD_BYTES, None, None, None).unwrap();
+        PsvEpochReader::new_range(&[&path], 0, PSV_RECORD_BYTES, None, None, None).unwrap();
     let stop = Arc::clone(&source.stop);
     source.after_record = Some(Box::new(move || stop.store(true, Ordering::Relaxed)));
     let mut loader = spawn_controlled_reader(TrainingPsvReader::Direct(Box::new(source)));
@@ -179,7 +180,7 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
         let (completed_tx, completed_rx) = mpsc::channel();
         let task = thread::spawn(move || {
             let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
-                &path,
+                &[&path],
                 2,
                 Some(1000),
                 None,
@@ -217,8 +218,8 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
 }
 
 fn psv_remaining_bytes(reader: &PsvEpochReader) -> u64 {
-    match &reader.loader {
-        TeacherFileLoader::Psv(loader) => loader.remaining_bytes,
-        TeacherFileLoader::Hcpe(_) => panic!("expected a PSV loader"),
+    match &reader.loader.current {
+        TeacherFileRange::Psv(loader) => loader.remaining_bytes,
+        TeacherFileRange::Hcpe(_) => panic!("expected a PSV loader"),
     }
 }
