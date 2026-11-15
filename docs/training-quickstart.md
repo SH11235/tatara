@@ -25,12 +25,12 @@ examples:
 | progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progresskpabs` / `progresskpabsq16` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
 | (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
 
-`--data` takes a single file. The format is chosen by the extension: `.hcpe` (case-insensitive)
+`--data` takes one file; repeat it to read several files of one format in the given order as one
+data set. The format is chosen by the extension: `.hcpe` (case-insensitive)
 is read as HCPE, anything else as PSV. For a symlink, the link name and the target name must imply
 the same format. Variable-length hcpe3 files cannot be read directly; convert them to PSV first
-with `hcpe3_to_psv` from [rshogi's tools](https://github.com/SH11235/rshogi/tree/main/crates/tools). To train on several
-files or a mix of formats, convert them to PSV (`hcpe_to_psv` for HCPE), then merge and shuffle
-them into one file in advance.
+with `hcpe3_to_psv` from [rshogi's tools](https://github.com/SH11235/rshogi/tree/main/crates/tools). To train on a mix of
+formats, convert them to PSV first (`hcpe_to_psv` for HCPE). Shuffle the data in advance.
 
 ## Example 1: Training a HalfKP NNUE (simple architecture)
 

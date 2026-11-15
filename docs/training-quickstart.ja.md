@@ -22,11 +22,11 @@
 | progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progresskpabs` / `progresskpabsq16` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
 
-`--data` に渡すのはファイル 1 本。形式は拡張子で決まり、`.hcpe` (大文字小文字不問) は HCPE、
+`--data` を繰り返すと、同じ形式の複数ファイルを指定順に 1 つの教師として読む。形式は拡張子で決まり、`.hcpe` (大文字小文字不問) は HCPE、
 それ以外は PSV として読む。symlink はリンク名と実体の名前が同じ形式を示す必要がある。
 可変長の hcpe3 は直接読めないので、[rshogi のツール群](https://github.com/SH11235/rshogi/tree/main/crates/tools) の
-`hcpe3_to_psv` で PSV に変換してから使う。複数のファイルや形式の混在した教師で学習するときは、
-PSV に変換 (HCPE は `hcpe_to_psv`) したうえで、事前に 1 本へ結合・シャッフルしておく。
+`hcpe3_to_psv` で PSV に変換してから使う。形式の混在した教師で学習するときは、
+PSV に変換 (HCPE は `hcpe_to_psv`) しておく。教師は事前にシャッフルしておく。
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)
 
