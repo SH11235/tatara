@@ -1038,6 +1038,20 @@ impl Cli {
         }
     }
 
+    pub(crate) fn validate_data_args(&self, argv: &[String]) -> Result<(), String> {
+        let given = argv
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_str() != "--")
+            .filter(|arg| arg.as_str() == "--data" || arg.starts_with("--data="))
+            .count();
+        if given == self.data.len() {
+            Ok(())
+        } else {
+            Err("--data must be given on one side of the subcommand".into())
+        }
+    }
+
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
         if !self.precision_steps.is_empty() {
             if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {

@@ -1859,3 +1859,44 @@ fn cycle_wdl_flags_parse_and_build() {
     let invalid = simple_cli(&["--validation-wdl", "1.5"]);
     assert!(build_wdl_scheduler(&invalid).is_err());
 }
+
+#[test]
+fn data_split_around_subcommand_is_rejected() {
+    let check = |argv: &[&str]| {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+        cli.validate_data_args(&argv)
+    };
+    assert!(
+        check(&[
+            "nnue-train",
+            "--data",
+            "a.psv",
+            "--data=b.psv",
+            "layerstack"
+        ])
+        .is_ok()
+    );
+    assert!(
+        check(&[
+            "nnue-train",
+            "layerstack",
+            "--data",
+            "a.psv",
+            "--data",
+            "b.psv"
+        ])
+        .is_ok()
+    );
+    assert!(
+        check(&[
+            "nnue-train",
+            "--data",
+            "a.psv",
+            "layerstack",
+            "--data",
+            "b.psv"
+        ])
+        .is_err()
+    );
+}
