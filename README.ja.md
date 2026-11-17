@@ -134,6 +134,8 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 
 ## ドキュメント
 
+- [Threat の部分幅](docs/partial-threat-width.md) — 駒の FT 幅を維持して Threat の重みだけ狭める設定と export 形式。
+
 - [Setup guide](docs/setup.ja.md) — OS 別の案内、native CUDA / cuda-oxide の build
   セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.ja.md) — アーキ別の学習例 + 主要

@@ -4303,3 +4303,157 @@ extern "C" __global__ void clear_padding_rows_f32(
         output[static_cast<unsigned long long>(row) * dimension + col] = 0.0F;
     }
 }
+
+extern "C" __global__ void partial_ft_forward(
+    const float* weight, unsigned long long, const int* indices, unsigned long long,
+    const int* nnz, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    float* out, unsigned long long, const unsigned* shape, unsigned long long, unsigned batch) {
+    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
+    unsigned active = shape[4], piece = shape[5], factorize = shape[6], half_weight = shape[7];
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= batch * rows) return;
+    unsigned b = k / rows, col = k % rows;
+    unsigned real_n = base * rows + threats * width;
+    float sum = 0.0F;
+    for (int n = 0; n < nnz[b]; ++n) {
+        int fi = indices[b * active + n];
+        if (fi < 0 || static_cast<unsigned>(fi) >= base + threats) continue;
+        unsigned f = fi, offset = f * rows + col;
+        unsigned virtual_offset = real_n + (f % piece) * rows + col;
+        if (f >= base) {
+            unsigned c = col % (rows / 2);
+            if (c >= width / 2) continue;
+            unsigned pc = c + (col >= rows / 2 ? width / 2 : 0);
+            offset = base * rows + (f - base) * width + pc;
+            if (factorize) {
+                unsigned pair = 0;
+                while (pair + 1 < pair_len && f - base >= pairs[pair + 1]) ++pair;
+                virtual_offset = real_n + piece * rows + pair * width + pc;
+            }
+        }
+        float value = weight[offset];
+        if (factorize) value += weight[virtual_offset];
+        if (half_weight) value = __half2float(__float2half_rn(value));
+        sum += value;
+    }
+    out[k] = sum;
+}
+extern "C" __global__ void partial_ft_forward_fp16_out(
+    const float* weight, unsigned long long, const int* indices, unsigned long long,
+    const int* nnz, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    __half* out, unsigned long long, const unsigned* shape, unsigned long long, unsigned batch) {
+    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
+    unsigned active = shape[4], piece = shape[5], factorize = shape[6], half_weight = shape[7];
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= batch * rows) return;
+    unsigned b = k / rows, col = k % rows;
+    unsigned real_n = base * rows + threats * width;
+    float sum = 0.0F;
+    for (int n = 0; n < nnz[b]; ++n) {
+        int fi = indices[b * active + n];
+        if (fi < 0 || static_cast<unsigned>(fi) >= base + threats) continue;
+        unsigned f = fi, offset = f * rows + col;
+        unsigned virtual_offset = real_n + (f % piece) * rows + col;
+        if (f >= base) {
+            unsigned c = col % (rows / 2);
+            if (c >= width / 2) continue;
+            unsigned pc = c + (col >= rows / 2 ? width / 2 : 0);
+            offset = base * rows + (f - base) * width + pc;
+            if (factorize) {
+                unsigned pair = 0;
+                while (pair + 1 < pair_len && f - base >= pairs[pair + 1]) ++pair;
+                virtual_offset = real_n + piece * rows + pair * width + pc;
+            }
+        }
+        float value = weight[offset];
+        if (factorize) value += weight[virtual_offset];
+        if (half_weight) value = __half2float(__float2half_rn(value));
+        sum += value;
+    }
+    out[k] = __float2half_rn(sum);
+}
+extern "C" __global__ void partial_ft_gather(
+    const float* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale) {
+    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x, base_n = base * rows;
+    if (k >= base_n + threats * width) return;
+    unsigned f, col;
+    if (k < base_n) { f = k / rows; col = k % rows; } else {
+        f = base + (k - base_n) / width;
+        unsigned c = (k - base_n) % width;
+        col = c < width / 2 ? c : rows / 2 + c - width / 2;
+    }
+    float sum = 0.0F;
+    for (unsigned p = offsets[f]; p < offsets[f + 1]; ++p)
+        sum += gradient[positions[p] * rows + col] * scale;
+    if (add) result[k] += sum; else result[k] = sum;
+}
+extern "C" __global__ void partial_ft_gather_fp16(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale) {
+    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x, base_n = base * rows;
+    if (k >= base_n + threats * width) return;
+    unsigned f, col;
+    if (k < base_n) { f = k / rows; col = k % rows; } else {
+        f = base + (k - base_n) / width;
+        unsigned c = (k - base_n) % width;
+        col = c < width / 2 ? c : rows / 2 + c - width / 2;
+    }
+    float sum = 0.0F;
+    for (unsigned p = offsets[f]; p < offsets[f + 1]; ++p)
+        sum += __half2float(gradient[positions[p] * rows + col]) * scale;
+    if (add) result[k] += sum; else result[k] = sum;
+}
+extern "C" __global__ void partial_ft_reduce(
+    const float* grad, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, unsigned long long) {
+    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3], piece = shape[5];
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x, piece_n = piece * rows;
+    if (k >= piece_n + (pair_len - 1) * width) return;
+    float sum = 0.0F;
+    if (k < piece_n) {
+        unsigned p = k / rows, c = k % rows;
+        for (unsigned f = p; f < base; f += piece) sum += grad[f * rows + c];
+    } else {
+        unsigned pair = (k - piece_n) / width, c = (k - piece_n) % width;
+        for (unsigned f = pairs[pair]; f < pairs[pair + 1]; ++f) sum += grad[base * rows + f * width + c];
+    }
+    const_cast<float*>(grad)[base * rows + threats * width + k] = sum;
+}
+
+extern "C" __global__ void partial_ft_norm(
+    const float* weight, unsigned long long, const unsigned* shape, unsigned long long,
+    float* norms, unsigned long long) {
+    unsigned col = blockIdx.x * blockDim.x + threadIdx.x, rows = shape[0];
+    if (col >= rows) return;
+    unsigned base = shape[1], threats = shape[2], width = shape[3];
+    unsigned real_n = base * rows + threats * width;
+    double sum = 0.0;
+    for (unsigned f = 0; f < base; ++f) { double v = weight[f * rows + col]; sum += v * v; }
+    if (shape[6]) for (unsigned p = 0; p < shape[5]; ++p) { double v = weight[real_n + p * rows + col]; sum += v * v; }
+    unsigned c = col % (rows / 2);
+    if (c < width / 2) {
+        unsigned pc = c + (col >= rows / 2 ? width / 2 : 0);
+        for (unsigned f = 0; f < threats; ++f) { double v = weight[base * rows + f * width + pc]; sum += v * v; }
+        for (unsigned p = 0; p < shape[8]; ++p) { double v = weight[real_n + shape[5] * rows + p * width + pc]; sum += v * v; }
+    }
+    norms[col] = static_cast<float>(sqrt(sum));
+}
+extern "C" __global__ void partial_ft_norm_apply(
+    float* weight, unsigned long long n, const unsigned* shape, unsigned long long,
+    const float* norms, unsigned long long, float factor, float lr) {
+    unsigned k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    unsigned rows = shape[0], base_n = shape[1] * rows, width = shape[3];
+    unsigned real_n = base_n + shape[2] * width, col;
+    if (k < base_n) col = k % rows;
+    else if (k < real_n) { unsigned c = (k - base_n) % width; col = c < width / 2 ? c : rows / 2 + c - width / 2; }
+    else if (k < real_n + shape[5] * rows) col = (k - real_n) % rows;
+    else { unsigned c = (k - real_n - shape[5] * rows) % width; col = c < width / 2 ? c : rows / 2 + c - width / 2; }
+    float correction = 2.0F * factor * (1.0F - 1.0F / (norms[col] + 1.0e-8F));
+    weight[k] *= 1.0F - lr * correction;
+}

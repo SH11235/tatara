@@ -117,6 +117,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_width: None,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
@@ -131,6 +132,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_width: None,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
@@ -145,6 +147,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_width: None,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
@@ -159,6 +162,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_width: None,
                 effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
@@ -173,6 +177,7 @@ impl FeatureSet {
                 ft_factorize: false,
                 ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                threat_width: None,
                 effect_bucket_config: None,
             },
         }
@@ -288,6 +293,7 @@ pub struct FeatureSetSpec {
     /// factorizer とは併用可 (fold/reduce/coalesce が threat pair ごとの仮想行を
     /// 追加で配線する)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
+    threat_width: Option<usize>,
     /// effect bucket で base index 全体を書き換える config。`None` で base と
     /// bit-identical。threat とは同時に使わない。
     effect_bucket_config: Option<EffectBucketConfig>,
@@ -341,6 +347,60 @@ impl FeatureSetSpec {
         match self.threat_profile {
             Some(p) => crate::threat::threat_dimensions_of(p),
             None => 0,
+        }
+    }
+
+    /// Threat row width; absence uses the full feature-transform width.
+    pub const fn threat_width(&self, ft_out: usize) -> usize {
+        match self.threat_width {
+            Some(width) => width,
+            None => ft_out,
+        }
+    }
+
+    /// Set a compact Threat row width. The caller validates it against FT output width.
+    pub fn with_threat_width(self, width: usize) -> Self {
+        assert!(
+            self.threat_profile.is_some(),
+            "Threat width requires a Threat profile"
+        );
+        assert!(
+            width > 0 && width.is_multiple_of(2),
+            "Threat width must be positive and even"
+        );
+        Self {
+            threat_width: Some(width),
+            ..self
+        }
+    }
+
+    /// Number of real FT weight elements, with compact Threat rows.
+    pub const fn ft_weight_len(&self, ft_out: usize) -> usize {
+        (self.ft_in() - self.threat_dims()) * ft_out
+            + self.threat_dims() * self.threat_width(ft_out)
+    }
+
+    /// Number of trainable FT elements, including factorizer rows.
+    pub const fn train_ft_weight_len(&self, ft_out: usize) -> usize {
+        if !self.ft_factorize {
+            return self.ft_weight_len(ft_out);
+        }
+        let pairs = self.threat_factorize_pair_count();
+        self.ft_weight_len(ft_out)
+            + (self.ft_factorize_virtual_rows() - pairs) * ft_out
+            + pairs * self.threat_width(ft_out)
+    }
+
+    /// Offset and width of a real feature row in the packed FT matrix.
+    pub const fn ft_row_layout(&self, feature: usize, ft_out: usize) -> (usize, usize) {
+        let base = self.ft_in() - self.threat_dims();
+        if feature < base {
+            (feature * ft_out, ft_out)
+        } else {
+            (
+                base * ft_out + (feature - base) * self.threat_width(ft_out),
+                self.threat_width(ft_out),
+            )
         }
     }
 

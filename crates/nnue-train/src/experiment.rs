@@ -178,6 +178,8 @@ pub struct Params {
     /// 入力 feature 総次元 `ft_in` (feature set ごとに異なる)。export 形状の
     /// base 値で、FT factorizer の仮想行は含めない。
     pub ft_in: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threat_width: Option<usize>,
     /// FT factorizer (学習時仮想特徴) を有効にした run なら `Some(true)`。
     /// 無効の run では省略 (factorizer 以前の run の JSON と同形)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -934,6 +936,7 @@ mod tests {
             trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
             feature_set: "halfka-hm-merged".to_string(),
+            threat_width: None,
             ft_in: 73_305,
             ft_factorize: None,
             stack_shared_delta: None,

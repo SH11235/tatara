@@ -147,6 +147,8 @@ For building the kernels and running the smoke test, see
 
 ## Documentation
 
+- [Partial Threat width](docs/partial-threat-width.md): train and export compact Threat rows mapped to both pairwise FT halves.
+
 - [Dense QAT continuation](docs/dense-qat.md): compare ordinary and quantization-aware tails from the same raw checkpoint.
 
 - [Setup guide](docs/setup.md) — per-OS guidance, native CUDA / cuda-oxide build

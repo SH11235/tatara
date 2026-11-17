@@ -4202,3 +4202,103 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
     std::fs::remove_file(checkpoint)?;
     Ok(())
 }
+
+#[test]
+fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    for factorize in [false, true] {
+        for half in [false, true] {
+            let mut spec = FeatureSet::HalfKp
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32);
+            if factorize {
+                spec = spec.with_ft_factorize();
+            }
+            let options = LayerStackTestOptions {
+                feature_set: spec,
+                precision: PrecisionFlags {
+                    ft_fp16: half,
+                    ft_fp16_out: half,
+                    fp16_opt_state: half,
+                    ..PrecisionFlags::default()
+                },
+                norm_loss_factor: Some(0.1),
+                ..LayerStackTestOptions::standard()
+            };
+            let mut original = create_layerstack_trainer_with_options(&context, true, options)?;
+            let batch = BatchData::smoke_dummy(SMOKE_BATCH, spec);
+            let _ = original.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let checkpoint = std::env::temp_dir().join(format!(
+                "tatara-partial-{}-{factorize}-{half}.ckpt",
+                std::process::id()
+            ));
+            original.save_raw_checkpoint(
+                &checkpoint,
+                1,
+                &nnue_train::trainer::CheckpointProducer::run_id_only("partial"),
+                None,
+            )?;
+            let mut resumed = create_layerstack_trainer_with_options(&context, true, options)?;
+            resumed.load_raw_checkpoint(&checkpoint, false)?;
+            std::fs::remove_file(&checkpoint)?;
+            assert_eq!(
+                original.raw_checkpoint_state_to_host()?,
+                resumed.raw_checkpoint_state_to_host()?
+            );
+            nnue_train::trainer::TrainerBackend::flush_pending_loss(&mut original)?;
+            for _ in 0..5 {
+                let a = original.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                let b = resumed.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                assert!((a - b).abs() < 1.0e-6);
+            }
+            let (_, a) = original.raw_checkpoint_state_to_host()?;
+            let (_, b) = resumed.raw_checkpoint_state_to_host()?;
+            for ((name, a), (_, b)) in a.iter().zip(&b) {
+                assert_states_close(&format!("{name}.weight"), &a.0, &b.0, 1.0e-5);
+                assert_states_close(&format!("{name}.moment"), &a.1, &b.1, 1.0e-5);
+                assert_states_close(&format!("{name}.variance"), &a.2, &b.2, 1.0e-5);
+                assert_states_close(&format!("{name}.slow"), &a.3, &b.3, 1.0e-5);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_full_threat_width_preserves_training() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let options = LayerStackTestOptions {
+        feature_set: FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide),
+        ..LayerStackTestOptions::standard()
+    };
+    let mut implicit = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut explicit = create_layerstack_trainer_with_options(
+        &context,
+        true,
+        LayerStackTestOptions {
+            feature_set: options.feature_set.with_threat_width(options.ft_out),
+            ..options
+        },
+    )?;
+    assert_eq!(
+        implicit.raw_checkpoint_state_to_host()?,
+        explicit.raw_checkpoint_state_to_host()?
+    );
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    let a = implicit.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let explicit_batch = BatchData::smoke_dummy(
+        SMOKE_BATCH,
+        options.feature_set.with_threat_width(options.ft_out),
+    );
+    let b = explicit.step(&explicit_batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    assert!((a - b).abs() < 1.0e-9);
+    let (_, a) = implicit.raw_checkpoint_state_to_host()?;
+    let (_, b) = explicit.raw_checkpoint_state_to_host()?;
+    for ((name, a), (_, b)) in a.iter().zip(&b) {
+        assert_states_close(name, &a.0, &b.0, 1.0e-6);
+    }
+    Ok(())
+}

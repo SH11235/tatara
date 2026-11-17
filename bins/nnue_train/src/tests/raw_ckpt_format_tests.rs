@@ -211,7 +211,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 12);
+    assert_eq!(RAW_CKPT_VERSION, 14);
 }
 
 #[test]
@@ -1065,4 +1065,43 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
     assert_eq!(legacy.producer_net_id, None);
     assert_eq!(legacy.producer_recipe_fingerprint, None);
     assert_eq!(legacy.superbatch, 420);
+}
+
+#[test]
+fn partial_threat_checkpoint_identity_and_full_width_bytes() {
+    let full = layerstack_arch_threat_factorized();
+    let explicit = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(DEFAULT_FT_OUT),
+        ..full
+    };
+    let partial = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(512),
+        ..full
+    };
+    let meta = RawCkptMeta {
+        optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
+        qat_dense: false,
+        run_id: "run",
+        superbatch: 1,
+        step_count: 5,
+        lr_horizon: None,
+        fv_scale: None,
+        net_id: "",
+        recipe_fingerprint: None,
+    };
+    let write = |arch, meta| {
+        let mut bytes = Vec::new();
+        write_raw_ckpt_header(&mut bytes, arch, meta, 10).unwrap();
+        bytes
+    };
+    let a = write(&full, &meta);
+    let b = write(&explicit, &meta);
+    let c = write(&partial, &meta);
+    assert_eq!(a, b);
+    assert_eq!(c[4..8], 13_u32.to_le_bytes());
+    let header = read_raw_ckpt_header(&mut Cursor::new(&c), &partial).unwrap();
+    assert_eq!(header.step_count, 5);
+    assert!(!header.sgd);
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&c), &full).is_err());
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&a), &partial).is_err());
 }

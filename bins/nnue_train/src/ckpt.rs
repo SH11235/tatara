@@ -17,10 +17,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 12):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 14):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (11 or 12)             (4 bytes)
+//   version      u32 (11..=14)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -28,6 +28,7 @@ use crate::trainer_common::MomentBuf;
 //   max_active   u64                 (学習側の 1 perspective あたり active feature 数)
 //   ft_factorize u8                  (v6+、FT factorizer 有効 flag)
 //   feature_hash u32                 (v7+、feature mapping identity)
+//   threat_width u64               (v13+, packed Threat row width)
 //   run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
 //   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
@@ -56,7 +57,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=12 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=14 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -123,18 +124,24 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   `--resume` compares them with the resuming run to record whether it
 ///   continues the producer's training or forks a new experiment from it.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=12. Version 1 is interpreted as
+/// - `12`: the version 11 layout with SGD momentum state.
+/// - `13`: compact Threat with Ranger or RAdam state. A u64 Threat row width
+///   follows the feature hash.
+/// - `14`: the compact Threat layout with SGD momentum state.
+///
+/// `load_raw_checkpoint` accepts versions 1..=14. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 12 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 14 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
-/// Version 12 uses the same layout as version 11 and identifies SGD momentum state.
-pub(crate) const RAW_CKPT_VERSION: u32 = 12;
+pub(crate) const RAW_CKPT_VERSION: u32 = 14;
 const ADAM_CHECKPOINT_VERSION: u32 = 11;
 const SGD_CHECKPOINT_VERSION: u32 = 12;
+const PARTIAL_THREAT_CKPT_VERSION: u32 = 13;
+const PARTIAL_THREAT_SGD_CKPT_VERSION: u32 = 14;
 
 /// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
 /// `lineage.parent_id` と、resume した run が続きか派生かの判定に使う。
@@ -406,10 +413,13 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     num_groups: u64,
 ) -> std::io::Result<()> {
     w.write_all(&RAW_CKPT_MAGIC)?;
-    let version = if meta.optimizer == OptimizerKind::Sgd {
-        SGD_CHECKPOINT_VERSION
-    } else {
-        ADAM_CHECKPOINT_VERSION
+    let threat_width = arch.feature_set.threat_width(arch.ft_out as usize) as u64;
+    let partial = threat_width != arch.ft_out;
+    let version = match (partial, meta.optimizer == OptimizerKind::Sgd) {
+        (false, false) => ADAM_CHECKPOINT_VERSION,
+        (false, true) => SGD_CHECKPOINT_VERSION,
+        (true, false) => PARTIAL_THREAT_CKPT_VERSION,
+        (true, true) => PARTIAL_THREAT_SGD_CKPT_VERSION,
     };
     w.write_all(&version.to_le_bytes())?;
     // feature set header (v2+): canonical 名 + 次元 3 値。
@@ -423,6 +433,9 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(&[arch.feature_set.ft_factorize() as u8])?;
     // feature mapping hash (v7+)。
     w.write_all(&arch.feature_set.feature_hash().to_le_bytes())?;
+    if partial {
+        w.write_all(&threat_width.to_le_bytes())?;
+    }
     // producer run id (v3+)。
     w.write_all(&(meta.run_id.len() as u32).to_le_bytes())?;
     w.write_all(meta.run_id.as_bytes())?;
@@ -460,7 +473,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=12 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=14 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
@@ -485,7 +498,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     if version == 0 || version > RAW_CKPT_VERSION {
         return Err(invalid_data(format!(
             "raw checkpoint version {version} is not supported \
-             (this build reads 1..={RAW_CKPT_VERSION})"
+             (this build reads 1..=14)"
         )));
     }
     let mut buf8 = [0u8; 8];
@@ -527,6 +540,16 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             None
         };
 
+        let width = if version >= PARTIAL_THREAT_CKPT_VERSION {
+            let mut width_bytes = [0; 8];
+            read_exact_or_invalid(r, &mut width_bytes, "Threat width")?;
+            u64::from_le_bytes(width_bytes)
+        } else {
+            expected.ft_out
+        };
+        if width != expected.feature_set.threat_width(expected.ft_out as usize) as u64 {
+            return Err(invalid_data("raw checkpoint Threat width mismatch".into()));
+        }
         let want = expected.feature_set;
         if fs_name != want_name {
             return Err(invalid_data(format!(
@@ -797,7 +820,10 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     let num_groups = u64::from_le_bytes(buf8);
 
     Ok(RawCkptHeader {
-        sgd: version == SGD_CHECKPOINT_VERSION,
+        sgd: matches!(
+            version,
+            SGD_CHECKPOINT_VERSION | PARTIAL_THREAT_SGD_CKPT_VERSION
+        ),
         qat_dense,
         superbatch,
         step_count,

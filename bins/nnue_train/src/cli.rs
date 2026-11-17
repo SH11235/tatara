@@ -1707,6 +1707,10 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
 
+    /// Threat accumulator width (positive even number, at most --ft-out). Defaults to --ft-out.
+    #[arg(long)]
+    pub(crate) threat_width: Option<usize>,
+
     /// effect bucket feature config. One of: off (default),
     /// 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed,
     /// 3x3-kingbucketed. effect bucket rewrites every base feature row as

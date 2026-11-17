@@ -126,6 +126,12 @@ fn load_layerstack(
             return Err("arch string contains both EffectBucket and Threat tokens".into());
         }
         spec = spec.with_threat_profile(threat_profile);
+        if let Some(width) = meta.threat_width {
+            if width == 0 || !width.is_multiple_of(2) || width > meta.ft_out {
+                return Err("invalid ThreatWidth".into());
+            }
+            spec = spec.with_threat_width(width);
+        }
     }
     let mut cursor = Cursor::new(&bytes);
     let weights = LayerStackWeights::load_quantised(
@@ -142,6 +148,7 @@ fn load_layerstack(
 struct ArchMeta {
     effect_bucket_config: Option<EffectBucketConfig>,
     threat_profile: Option<ThreatProfile>,
+    threat_width: Option<usize>,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -180,6 +187,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     }
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
+        threat_width: parse_token_usize(arch, "ThreatWidth=")?,
         effect_bucket_config: parse_effect_bucket_config(arch)?,
         threat_profile: parse_threat_profile(arch)?,
         ft_out: parse_between(arch, "->", "x2]")?,
@@ -372,9 +380,14 @@ fn sparse_ft_forward_raw(
         if idx < 0 || idx as usize >= ft_in {
             continue;
         }
-        let base = idx as usize * ft_out;
-        for (row, out_cell) in out.iter_mut().enumerate().take(ft_out) {
-            *out_cell += quant_i32(weights.ft_w[base + row], QA);
+        let (base, width) = weights.feature_set.ft_row_layout(idx as usize, ft_out);
+        for col in 0..width {
+            let row = if col < width / 2 {
+                col
+            } else {
+                ft_out / 2 + col - width / 2
+            };
+            out[row] += quant_i32(weights.ft_w[base + col], QA);
         }
     }
 }
@@ -714,5 +727,29 @@ mod tests {
         assert!(err.contains("requires a 9-bucket net"), "{err}");
         let err = validate_mode_args(BucketMode::KingRank9, Some(coeff), 9).unwrap_err();
         assert!(err.contains("not used"), "{err}");
+    }
+    #[test]
+    fn compact_threat_accumulates_into_pairwise_bands() {
+        let spec = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide)
+            .with_threat_width(4);
+        let mut net = LayerStackWeights::zeroed(spec, 8, 2, 2, 2);
+        let base = spec.base_ft_in() * 8;
+        net.ft_w[base..base + 4].copy_from_slice(&[
+            1.0 / 127.0,
+            2.0 / 127.0,
+            -3.0 / 127.0,
+            4.0 / 127.0,
+        ]);
+        let mut output = [0; 8];
+        sparse_ft_forward_raw(
+            &net,
+            &[spec.base_ft_in() as i32, spec.base_ft_in() as i32],
+            &mut output,
+            8,
+            spec.ft_in(),
+        );
+        assert_eq!(output, [2, 4, 0, 0, -6, 8, 0, 0]);
     }
 }
