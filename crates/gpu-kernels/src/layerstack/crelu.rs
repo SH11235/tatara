@@ -52,6 +52,21 @@ pub fn crelu_grad_cpu(x: &[f32], dy: &[f32], dx: &mut [f32], n: usize) {
     }
 }
 
+pub fn crelu_grad_ste_cpu(x: &[f32], dy: &[f32], dx: &mut [f32], alpha: f32, n: usize) {
+    for i in 0..n {
+        let (xi, gi) = (x[i], dy[i]);
+        dx[i] = if xi > 0.0_f32 && xi < 1.0_f32 {
+            gi
+        } else if alpha > 0.0_f32
+            && ((xi >= 1.0_f32 && gi > 0.0_f32) || (xi <= 0.0_f32 && gi < 0.0_f32))
+        {
+            alpha * gi
+        } else {
+            0.0_f32
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +114,25 @@ mod tests {
         let mut dx: Vec<f32> = vec![];
         crelu_grad_cpu(&[], &[], &mut dx, 0);
         assert!(dx.is_empty());
+    }
+
+    #[test]
+    fn ste_grad_recovers_only_toward_unit_interval() {
+        let x = [-0.5_f32, 0.5, 1.5, -0.5, 1.5, 0.0, 1.0, f32::NAN];
+        let dy = [-1.0_f32, 2.0, 3.0, 1.0, -3.0, -1.0, 1.0, 1.0];
+        let mut dx = [9.0_f32; 8];
+        crelu_grad_ste_cpu(&x, &dy, &mut dx, 0.25, 8);
+        assert_eq!(dx, [-0.25, 2.0, 0.75, 0.0, 0.0, -0.25, 0.25, 0.0]);
+    }
+
+    #[test]
+    fn ste_grad_with_zero_alpha_matches_plain_grad_bitwise() {
+        let x = [-0.5_f32, 0.5, 1.5, -0.5, 1.5, 0.0, 1.0, f32::NAN];
+        let dy = [-1.0_f32, 2.0, 3.0, 1.0, -3.0, -1.0, 1.0, 1.0];
+        let mut ste = [9.0_f32; 8];
+        let mut plain = [9.0_f32; 8];
+        crelu_grad_ste_cpu(&x, &dy, &mut ste, 0.0, 8);
+        crelu_grad_cpu(&x, &dy, &mut plain, 8);
+        assert_eq!(ste.map(f32::to_bits), plain.map(f32::to_bits));
     }
 }

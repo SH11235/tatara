@@ -175,6 +175,10 @@ pub struct Params {
     /// has a shared term in the base architecture and is therefore not represented here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stack_shared_delta: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crelu_ste_l1: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crelu_ste_l2: Option<f32>,
     /// FT 出力次元 (per-perspective)。入力次元ではない点に注意。
     pub l0: usize,
     pub l1: usize,
@@ -835,6 +839,8 @@ mod tests {
             ft_in: 73_305,
             ft_factorize: None,
             stack_shared_delta: None,
+            crelu_ste_l1: None,
+            crelu_ste_l2: None,
             l0: 1536,
             l1: 16,
             l2: 32,

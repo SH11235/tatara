@@ -2464,6 +2464,28 @@ pub fn crelu_grad(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, n: u32) {
     }
 }
 
+#[kernel]
+pub fn crelu_grad_ste(x: &[f32], dy: &[f32], mut dx: DisjointSlice<f32>, alpha: f32, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let xi = x[i.get()];
+    let gi = dy[i.get()];
+    let g = if xi > 0.0_f32 && xi < 1.0_f32 {
+        gi
+    } else if alpha > 0.0_f32
+        && ((xi >= 1.0_f32 && gi > 0.0_f32) || (xi <= 0.0_f32 && gi < 0.0_f32))
+    {
+        alpha * gi
+    } else {
+        0.0_f32
+    };
+    if let Some(out) = dx.get_mut(i) {
+        *out = g;
+    }
+}
+
 /// SCReLU forward — `y[i] = clip(x[i], 0, 1)²`。1 thread = 1 element。
 ///
 /// `screlu_grad` と対の forward。Simple アーキの dense 層活性化

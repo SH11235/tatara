@@ -17,6 +17,16 @@ fn parse_positive_f32(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
+fn parse_ste_alpha(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| "ALPHA must be a number in (0, 1]".to_string())?;
+    if !(parsed > 0.0 && parsed <= 1.0) {
+        return Err("ALPHA must be a number in (0, 1]".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_positive_i32(value: &str) -> Result<i32, String> {
     let parsed = value
         .parse::<i32>()
@@ -1365,6 +1375,20 @@ pub(crate) struct LayerstackArgs {
     /// argument, so non-default widths are not penalized.
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
+
+    /// Recovery straight-through gradient for the CReLU after the L1 layer
+    /// (the L2 input). Where the forward pass clamps the pre-activation to 0
+    /// or 1, the backward pass returns ALPHA times the incoming gradient when
+    /// the descent step moves the value back into (0, 1), and 0 otherwise.
+    /// Forward and export are unchanged. ALPHA must be in (0, 1]; unset keeps
+    /// the plain CReLU gradient.
+    #[arg(long, value_name = "ALPHA", value_parser = parse_ste_alpha)]
+    pub(crate) crelu_ste_l1: Option<f32>,
+
+    /// Same as `--crelu-ste-l1`, for the CReLU after the L2 layer (the L3
+    /// input).
+    #[arg(long, value_name = "ALPHA", value_parser = parse_ste_alpha)]
+    pub(crate) crelu_ste_l2: Option<f32>,
 
     /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` (progresskpabsq16 uses the same split

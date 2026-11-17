@@ -2394,6 +2394,25 @@ extern "C" __global__ void crelu_grad(
     }
 }
 
+extern "C" __global__ void crelu_grad_ste(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    float alpha,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float x = input[i];
+        const float g = output_gradient[i];
+        const bool recovers = (x >= 1.0F && g > 0.0F) || (x <= 0.0F && g < 0.0F);
+        input_gradient[i] = x > 0.0F && x < 1.0F ? g : (alpha > 0.0F && recovers ? alpha * g : 0.0F);
+    }
+}
+
 extern "C" __global__ void screlu_fwd(
     const float* input,
     unsigned long long,

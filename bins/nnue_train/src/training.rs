@@ -927,6 +927,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             cli.precision_seed,
         )?;
     }
+    trainer.crelu_ste_l1 = layerstack.crelu_ste_l1.unwrap_or(0.0);
+    trainer.crelu_ste_l2 = layerstack.crelu_ste_l2.unwrap_or(0.0);
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }
@@ -1929,6 +1931,8 @@ pub(crate) fn build_experiment_logger(
         ft_in: feature_set.ft_in(),
         ft_factorize: feature_set.ft_factorize().then_some(true),
         stack_shared_delta: layerstack.stack_shared_delta.then_some(true),
+        crelu_ste_l1: layerstack.crelu_ste_l1,
+        crelu_ste_l2: layerstack.crelu_ste_l2,
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
@@ -2122,6 +2126,8 @@ pub(crate) fn build_experiment_logger_simple(
         ft_in: id.ft_in(),
         ft_factorize: id.feature_set.ft_factorize().then_some(true),
         stack_shared_delta: None,
+        crelu_ste_l1: None,
+        crelu_ste_l2: None,
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,
