@@ -549,10 +549,10 @@ impl ExperimentLogger {
         &self.path
     }
 
-    pub fn record_control(&mut self, sb: usize, stop: Option<usize>, pause: bool) {
-        self.doc
-            .control_history
-            .push(serde_json::json!({"superbatch": sb, "stop_superbatch": stop, "pause": pause}));
+    pub fn record_control(&mut self, sb: usize, target: Option<usize>, pause: bool) {
+        self.doc.control_history.push(
+            serde_json::json!({"superbatch": sb, "target_superbatches": target, "pause": pause}),
+        );
     }
 
     pub fn record_stop(&mut self, sb: usize, pause: bool) {

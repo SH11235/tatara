@@ -395,6 +395,8 @@ pub(crate) struct Cli {
     pub(crate) test_positions: usize,
 
     /// Output directory for checkpoints (writes `{net_id}-{superbatch}.bin`).
+    /// Training also reads control.json here unless --control-file overrides it;
+    /// a missing control.json is silently ignored.
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
 
@@ -426,9 +428,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, global = true)]
     pub(crate) superbatches: usize,
 
-    /// JSON control file, reloaded at superbatch boundaries: stop_superbatch and pause.
-    /// stop_superbatch changes only the stopping point; the LR horizon stays unchanged.
-    /// pause saves a resumable checkpoint and exits with code 75. Clear pause before resume.
+    /// Override the training control file (default: control.json under --output).
+    /// target_superbatches is read at each superbatch start and clamped to the current
+    /// superbatch and original --superbatches; values below the resume start are ignored.
+    /// Applied targets are appended to control_history.jsonl and recorded in experiment.json.
+    /// LR and WDL schedules retain the original horizon. Missing files are silently ignored.
+    /// pause is read at startup and superbatch ends.
+    /// A false-to-true pause change saves a resumable checkpoint and exits with code 75.
+    /// Startup pause=true is ignored; set false then true to request another pause.
+    /// Paths without training output, such as smoke tests, have no default control file.
     #[arg(long, global = true)]
     pub(crate) control_file: Option<PathBuf>,
 

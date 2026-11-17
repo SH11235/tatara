@@ -402,39 +402,6 @@ the curve is reproduced on resume independently of `--superbatches`; see
 [Horizon and resuming](training-schedule.md#horizon-and-resuming) for the
 precedence rules.
 
-### Pausing and resuming the input stream
-
-Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` files form
-one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
-record; the sidecar also restores the mixing selection counter and shuffle window position.
-Version 1 sidecars are accepted for input without mixing or sampling.
-Resume rejects changes to any teacher's absolute path/size, sampling probabilities/seeds,
-mixing rates/seed, batch size, batches per superbatch, training range, score processing, or shuffle settings. There is no mismatch
-override. Content changes of the same size are not detected, so keep teacher files immutable.
-Old checkpoints without a sidecar warn once and restart input from the beginning.
-Overriding `--start-superbatch` is rejected for checkpoints with input positions.
-
-Pass `--control-file /path/to/control.json` when starting training. This replaces the automatic
-output-directory `control.json` polling described below. The trainer reads this
-JSON at the end of every superbatch. Write a temporary file and rename it to avoid partial JSON:
-
-```json
-{"stop_superbatch": 800, "pause": false}
-```
-
-A run started with `--superbatches 1200` completes normally at 800 while keeping the LR and
-WDL curves based on 1200 superbatches. A target at or below the current superbatch stops
-after the current superbatch. The final `.bin`, `.ckpt`, and `.loader.json` are saved regardless
-of `--save-rate`. Omitting `stop_superbatch` restores the original stopping point; a target
-above the original ending cannot extend training.
-
-`{"pause": true}` saves the same files after the current superbatch and exits with code **75**.
-`experiment.json` marks the run interrupted, records accepted changes in `control_history`,
-and records the actual ending superbatch and pause flag in `stopped`. Clear `pause` before
-resuming with the original arguments plus `--resume <saved.ckpt>`. Missing, unreadable, or
-malformed files warn only once and retain the last valid settings. SIGINT and SIGTERM are
-not converted into pause requests; use the control file for a checkpointed stop.
-
 ### Stopping at a superbatch boundary
 
 To shorten a running job without interrupting a superbatch, write `control.json`
@@ -460,6 +427,44 @@ Before resuming in the same output directory, remove `control.json` or replace
 it with the new target. A target below the resumed run's starting superbatch is
 treated as stale state from the previous run, ignored with a warning, and not
 recorded in `control_history.jsonl`.
+
+The default path is `control.json` under `--output`. Set
+`--control-file /path/to/control.json` to read only that path instead of the default.
+The selected path is logged once at startup. The trainer never rewrites the file.
+Write a temporary file and rename it to avoid partial JSON.
+Applied targets are also recorded in `experiment.json` as `results.target_superbatches`.
+
+Add `"pause": true` to the same file to pause at the end of the superbatch where
+the trainer reads a change from false (or absent) to true after startup.
+It saves weights and optimizer state in `.ckpt`, input positions in `.loader.json`,
+and inference weights in `.bin`, regardless of `--save-rate`, then exits with code **75**.
+Pause is polled at superbatch ends and its application is appended to `control_history.jsonl`.
+
+```json
+{"target_superbatches": 1000, "pause": true}
+```
+
+Startup `pause=true` is ignored with a warning. Leaving it true does not pause.
+To pause again, set it false, let the trainer read it at a superbatch boundary,
+then set it true. `experiment.json` marks paused runs interrupted, records applied
+pauses in `control_history`, and records the ending superbatch and pause flag in `stopped`.
+SIGINT and SIGTERM are not converted into pause requests; use the control file for a
+checkpointed stop.
+
+### Pausing and resuming the input stream
+
+Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` files form
+one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
+record; the sidecar also restores the mixing selection counter and shuffle window position.
+Version 1 sidecars are accepted for input without mixing or sampling.
+Resume rejects changes to any teacher's absolute path/size, sampling probabilities/seeds,
+mixing rates/seed, batch size, batches per superbatch, training range, score processing, or shuffle settings. There is no mismatch
+override. Content changes of the same size are not detected, so keep teacher files immutable.
+Old checkpoints without a sidecar warn once and restart input from the beginning.
+Overriding `--start-superbatch` is rejected for checkpoints with input positions.
+
+Restart with the same arguments plus `--resume <last.ckpt>`, keeping its matching
+`.loader.json`. Startup pause is ignored, so leaving it true also allows resuming.
 
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state

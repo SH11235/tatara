@@ -12,13 +12,14 @@
 //! effective_end = end_superbatch
 //! sb = start_superbatch
 //! while sb <= effective_end:
-//!     poll output_dir/control.json and update effective_end
+//!     poll target_superbatches and update effective_end
 //!     for batch_idx in 0..batches_per_superbatch:
 //!         lr  = lr_scheduler.lr(batch_idx, sb)
 //!         wdl = wdl_scheduler.blend(batch_idx, sb, end_superbatch)
 //!         fill Batch + per-position bucket from the PSV stream
 //!           (EOF → 同 file を開き直す = 次 epoch)
 //!         loss += backend.train_step(batch, buckets, lr, wdl, loss_kind)
+//!     poll pause and update effective_end
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == effective_end:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
@@ -767,7 +768,7 @@ fn apply_control(
     Some(target)
 }
 
-fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Result<()> {
+fn append_control_history(path: &Path, entry: &impl Serialize) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
     file.write_all(b"\n")
@@ -788,6 +789,8 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Resul
 ///
 /// 各 superbatch の開始時に `cfg.output_dir/control.json` を読み、
 /// `target_superbatches` があれば元の終了点を超えない範囲で実効終了点を更新する。
+/// `cfg.control_file` があればそのパスだけを読む。
+/// 起動後の `pause` の false → true は superbatch 終了時に保存して停止する。
 /// LR / WDL schedule の horizon は `cfg.end_superbatch` のまま変えない。
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
@@ -1041,30 +1044,39 @@ where
     let mut prev_fp16_clamp_count: u64 = 0;
     let mut prev_fp16_clamp_elems: u64 = 0;
 
-    let control_path = cfg.output_dir.join("control.json");
+    let control_path = cfg
+        .control_file
+        .clone()
+        .unwrap_or_else(|| cfg.output_dir.join("control.json"));
+    println!("[control] file: {}", control_path.display());
+    let mut live_control = LiveControl::default();
+    live_control.poll(&control_path);
+    if live_control.value.pause {
+        eprintln!(
+            "[control] warning: ignoring startup pause=true; set pause to false, then true to pause training"
+        );
+    }
+    live_control.pause_requested = false;
     let control_history_path = cfg.output_dir.join("control_history.jsonl");
     let mut control = ControlState {
         effective_target: cfg.end_superbatch,
         ignored_stale_target: None,
     };
-    let mut live_control = LiveControl::default();
     let mut sb = cfg.start_superbatch;
     loop {
-        if cfg.control_file.is_none()
-            && let Some(target) = apply_control(
-                &control_path,
-                &control_history_path,
-                &mut control,
-                sb,
-                cfg.start_superbatch,
-                cfg.end_superbatch,
-            )
-            && let Some(log) = experiment.as_mut()
+        if let Some(target) = apply_control(
+            &control_path,
+            &control_history_path,
+            &mut control,
+            sb,
+            cfg.start_superbatch,
+            cfg.end_superbatch,
+        ) && let Some(log) = experiment.as_mut()
         {
             log.set_target_superbatches(target);
             write_experiment_log(log);
         }
-
+        let mut effective_target = control.effective_target;
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
@@ -1131,7 +1143,7 @@ where
                     "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
                     progress_terminator,
                     sb,
-                    control.effective_target,
+                    effective_target,
                     pct,
                     done,
                     cfg.batches_per_superbatch,
@@ -1174,9 +1186,28 @@ where
                 run_start.elapsed().as_secs_f64(),
             ));
         }
+        live_control.poll(&control_path);
+        if live_control.pause_requested {
+            effective_target = sb;
+            let entry = serde_json::json!({
+                "type": "control",
+                "timestamp": format_utc_iso(now_epoch_secs()),
+                "superbatch": sb,
+                "pause": true,
+            });
+            if let Err(e) = append_control_history(&control_history_path, &entry) {
+                eprintln!(
+                    "[control] warning: failed to append {}: {e}; training will continue",
+                    control_history_path.display()
+                );
+            }
+            if let Some(log) = experiment.as_mut() {
+                log.record_control(sb, None, true);
+            }
+        }
+
         let pos_per_sec = sb_positions as f64 / sb_secs;
-        let remaining_positions =
-            positions_per_sb.saturating_mul((control.effective_target - sb) as u64);
+        let remaining_positions = positions_per_sb.saturating_mul((effective_target - sb) as u64);
         let eta_secs = if pos_per_sec > 0.0 {
             remaining_positions as f64 / pos_per_sec
         } else {
@@ -1220,7 +1251,7 @@ where
         println!(
             "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}{}",
             sb,
-            control.effective_target,
+            effective_target,
             mean_loss,
             pos_per_sec,
             lr_now,
@@ -1298,29 +1329,7 @@ where
             );
         }
 
-        if let Some(path) = &cfg.control_file {
-            if live_control.poll(path)
-                && let Some(log) = experiment.as_mut()
-            {
-                log.record_control(
-                    sb,
-                    live_control.value.stop_superbatch,
-                    live_control.value.pause,
-                );
-            }
-            if let Some(stop) = live_control.value.stop_superbatch {
-                control.effective_target = stop.max(sb).min(cfg.end_superbatch);
-            } else {
-                control.effective_target = cfg.end_superbatch;
-            }
-            if let Some(log) = experiment.as_mut() {
-                log.set_target_superbatches(control.effective_target);
-            }
-        }
-        if live_control.value.pause {
-            control.effective_target = sb;
-        }
-        let saved = sb.is_multiple_of(cfg.save_rate) || sb >= control.effective_target;
+        let saved = sb.is_multiple_of(cfg.save_rate) || sb == effective_target;
         if saved {
             std::fs::create_dir_all(&cfg.output_dir)?;
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
@@ -1391,7 +1400,7 @@ where
             write_experiment_log(log);
         }
 
-        if sb == control.effective_target {
+        if sb == effective_target {
             break;
         }
         sb += 1;
@@ -1422,15 +1431,15 @@ where
     );
 
     if let Some(log) = experiment.as_mut() {
-        log.record_stop(sb, live_control.value.pause);
-        if live_control.value.pause {
+        log.record_stop(sb, live_control.pause_requested);
+        if live_control.pause_requested {
             log.mark_interrupted();
         } else {
             log.mark_finished(run_start.elapsed().as_secs_f64());
         }
         write_experiment_log(log);
     }
-    if live_control.value.pause {
+    if live_control.pause_requested {
         return Err(io::Error::other(TrainingPaused));
     }
     Ok(())
@@ -1447,9 +1456,7 @@ impl std::fmt::Display for TrainingPaused {
 impl std::error::Error for TrainingPaused {}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LiveControlFile {
-    stop_superbatch: Option<usize>,
     #[serde(default)]
     pause: bool,
 }
@@ -1457,6 +1464,7 @@ struct LiveControlFile {
 #[derive(Default)]
 struct LiveControl {
     value: LiveControlFile,
+    pause_requested: bool,
     warned: bool,
 }
 impl LiveControl {
@@ -1469,13 +1477,11 @@ impl LiveControl {
                 if value == self.value {
                     return false;
                 }
-                println!(
-                    "[control] applied: stop_superbatch={:?} pause={}",
-                    value.stop_superbatch, value.pause
-                );
+                self.pause_requested |= !self.value.pause && value.pause;
                 self.value = value;
                 true
             }
+            Err(e) if e.kind() == ErrorKind::NotFound => false,
             Err(e) => {
                 if !self.warned {
                     eprintln!(
@@ -1636,7 +1642,7 @@ mod tests {
         seen_features: Vec<Vec<i32>>,
         write_checkpoints: bool,
         bucketless: bool,
-        control_update: Option<(usize, PathBuf, String)>,
+        control_updates: Vec<(usize, PathBuf, String)>,
         /// `validate_step` の呼び出し回数 (held-out validation の検証用)。
         validate_steps: usize,
         /// `read_fp16_clamp_count` の呼び出し回数。`--monitor-fp16-clamps` が
@@ -1667,7 +1673,7 @@ mod tests {
                 seen_features: Vec::new(),
                 write_checkpoints: false,
                 bucketless: false,
-                control_update: None,
+                control_updates: vec![],
                 validate_steps: 0,
                 clamp_reads: 0,
                 clamp_count_sim: 0,
@@ -1711,10 +1717,10 @@ mod tests {
                 "bucket in 0..9: {bucket_idx:?}"
             );
             self.steps += 1;
-            if let Some((step, path, text)) = &self.control_update
-                && *step == self.steps
-            {
-                std::fs::write(path, text)?;
+            for (step, path, text) in &self.control_updates {
+                if *step == self.steps {
+                    std::fs::write(path, text)?;
+                }
             }
             self.last_buckets = bucket_idx.to_vec();
             self.max_batch_positions = self.max_batch_positions.max(batch.n_positions);
@@ -3568,12 +3574,17 @@ mod tests {
                     )
                     .unwrap();
                     let control = output.path().join("live.json");
-                    std::fs::write(&control, r#"{"pause":true}"#).unwrap();
+                    std::fs::write(&control, "{}").unwrap();
                     let paused_cfg = TrainingConfig {
                         control_file: Some(control.clone()),
                         ..cfg.clone()
                     };
                     let mut paused = MockBackend::new().with_file_writes();
+                    paused.control_updates = vec![(
+                        cfg.batches_per_superbatch,
+                        control.clone(),
+                        r#"{"pause":true}"#.into(),
+                    )];
                     paused.bucketless = !cfg.compute_bucket;
                     let result = run(
                         &mut paused,
@@ -3635,23 +3646,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_control_stop_preserves_horizon_and_records_pause() {
-        for pause in [false, true] {
+    fn explicit_control_file_overrides_default() {
+        for explicit in [None, Some(r#"{"target_superbatches":2}"#)] {
             let output = tempfile::tempdir().unwrap();
-            let control = output.path().join("live.json");
             std::fs::write(
-                &control,
-                format!(r#"{{"stop_superbatch":0,"pause":{pause}}}"#),
+                output.path().join("control.json"),
+                r#"{"target_superbatches":1,"pause":true}"#,
             )
             .unwrap();
+            let path = output.path().join("override.json");
+            if let Some(text) = explicit {
+                std::fs::write(&path, text).unwrap();
+            }
             let cfg = TrainingConfig {
                 output_dir: output.path().to_path_buf(),
-                control_file: Some(control),
+                control_file: Some(path),
                 ..base_cfg()
             };
             let mut backend = MockBackend::new().with_file_writes();
-            let mut logger = experiment_logger(output.path().join("experiment.json"), "live-stop");
-            let result = run(
+            run(
                 &mut backend,
                 &[sample_psv_path()],
                 &ShogiProgressKPAbs,
@@ -3662,32 +3675,51 @@ mod tests {
                 },
                 &ConstantWDL { value: 0.0 },
                 &cfg,
-                Some(&mut logger),
-            );
-            assert_eq!(result.is_err(), pause);
-            assert_eq!(backend.steps, cfg.batches_per_superbatch);
-            let doc: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(logger.path()).unwrap()).unwrap();
-            assert_eq!(doc["stopped"]["superbatch"], 1);
-            assert_eq!(doc["stopped"]["paused"], pause);
-            assert_eq!(doc["control_history"][0]["stop_superbatch"], 0);
-            assert!(output.path().join("test-1.loader.json").exists());
+                None,
+            )
+            .unwrap();
+            let end = if explicit.is_some() {
+                2
+            } else {
+                cfg.end_superbatch
+            };
+            assert_eq!(backend.steps, end * cfg.batches_per_superbatch);
         }
     }
 
     #[test]
-    fn control_changes_during_superbatch_are_applied_at_its_end() {
-        for text in [r#"{"stop_superbatch":0}"#, r#"{"pause":true}"#] {
+    fn default_control_pause_requires_a_rising_edge_after_startup() {
+        for (initial, updates, paused_at) in [
+            (None, vec![], None),
+            (Some(r#"{"pause":true}"#), vec![], None),
+            (Some("{}"), vec![(1, r#"{"pause":true}"#)], Some(1)),
+            (
+                Some(r#"{"pause":false}"#),
+                vec![(1, r#"{"pause":true}"#)],
+                Some(1),
+            ),
+            (
+                Some(r#"{"pause":true}"#),
+                vec![(1, r#"{"pause":false}"#), (2, r#"{"pause":true}"#)],
+                Some(2),
+            ),
+        ] {
             let output = tempfile::tempdir().unwrap();
-            let path = output.path().join("live.json");
-            std::fs::write(&path, "{}").unwrap();
+            let path = output.path().join("control.json");
+            if let Some(text) = initial {
+                std::fs::write(&path, text).unwrap();
+            }
             let cfg = TrainingConfig {
                 output_dir: output.path().to_path_buf(),
-                control_file: Some(path.clone()),
+                save_rate: 10,
                 ..base_cfg()
             };
             let mut backend = MockBackend::new().with_file_writes();
-            backend.control_update = Some((cfg.batches_per_superbatch, path, text.into()));
+            let final_text = updates.last().map(|(_, text)| *text).or(initial);
+            backend.control_updates = updates
+                .into_iter()
+                .map(|(sb, text)| (sb * cfg.batches_per_superbatch, path.clone(), text.into()))
+                .collect();
             let result = run(
                 &mut backend,
                 &[sample_psv_path()],
@@ -3701,28 +3733,41 @@ mod tests {
                 &cfg,
                 None,
             );
-            assert_eq!(result.is_err(), text.contains("pause"));
-            assert_eq!(backend.steps, cfg.batches_per_superbatch);
-            assert!(output.path().join("test-1.ckpt").exists());
-            assert!(output.path().join("test-1.loader.json").exists());
+            if paused_at.is_some() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .get_ref()
+                        .unwrap()
+                        .is::<TrainingPaused>()
+                );
+            } else {
+                result.unwrap();
+            }
+            let history = output.path().join("control_history.jsonl");
+            if let Some(sb) = paused_at {
+                let text = std::fs::read_to_string(history).unwrap();
+                let entries: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["pause"], true);
+                assert_eq!(entries[0]["superbatch"], sb);
+            } else {
+                assert!(!history.exists());
+            }
+            let end = paused_at.unwrap_or(cfg.end_superbatch);
+            assert_eq!(backend.steps, end * cfg.batches_per_superbatch);
+            assert!(output.path().join(format!("test-{end}.ckpt")).exists());
+            assert!(
+                output
+                    .path()
+                    .join(format!("test-{end}.loader.json"))
+                    .exists()
+            );
+            assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), final_text);
         }
-    }
-
-    #[test]
-    fn explicit_control_retains_last_valid_values_on_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.json");
-        let mut control = LiveControl::default();
-        assert!(!control.poll(&path));
-        std::fs::write(&path, r#"{"stop_superbatch":2}"#).unwrap();
-        assert!(control.poll(&path));
-        std::fs::write(&path, "broken").unwrap();
-        assert!(!control.poll(&path));
-        assert!(!control.poll(&path));
-        assert_eq!(control.value.stop_superbatch, Some(2));
-        std::fs::write(&path, r#"{"pause":true}"#).unwrap();
-        assert!(control.poll(&path));
-        assert!(control.value.pause);
     }
 
     #[test]

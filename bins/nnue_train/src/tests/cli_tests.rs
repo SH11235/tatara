@@ -87,6 +87,15 @@ fn simple_cli(argv: &[&str]) -> Cli {
 }
 
 #[test]
+fn control_file_defaults_and_override_parse() {
+    assert_eq!(simple_cli(&[]).control_file, None);
+    assert_eq!(
+        simple_cli(&["--control-file", "live.json"]).control_file,
+        Some(std::path::PathBuf::from("live.json"))
+    );
+}
+
+#[test]
 fn cli_definition_is_valid() {
     // clap derive の構成 (global 引数 + 必須サブコマンド) が破綻していないこと。
     Cli::command().debug_assert();

@@ -363,37 +363,6 @@ horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存
 時に `--superbatches` に依らず curve が再現される。優先順位の詳細は
 [Horizon と resume](training-schedule.ja.md#horizon-と-resume) を参照。
 
-### 読み位置を含む一時停止・再開
-
-`.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
-連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
-通し番号、shuffle 窓内の位置も保存・復元する。version 1 の sidecar は混合・間引きなしの
-入力として読める。再開時に全教師の絶対パスとサイズ、間引き確率・seed、混合割合・seed、
-batch size・sb 当たり batch 数・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
-オプションはない。同じサイズの内容変更は検出しないため、教師を変更しないこと。
-sidecar がない古い checkpoint は警告を一行出し、従来どおり教師の先頭から読む。
-`--start-superbatch` による番号の変更は、読み位置付き checkpoint では受け付けない。
-
-`--control-file` 指定時は、後述する output directory 直下の旧制御ファイルの自動読込に代わり、
-指定したファイルだけを読む。起動時に `--control-file /path/to/control.json` を指定すると、各 superbatch の終了時に
-次の JSON を読む。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
-
-```json
-{"stop_superbatch": 800, "pause": false}
-```
-
-`--superbatches 1200` なら、LR / WDL の曲線は 1200 sb を想定したまま 800 sb で
-通常完了する。現在の sb 以下を指定した場合は現在の sb を終えて停止する。
-最終 `.bin`・`.ckpt`・`.loader.json` は `--save-rate` に関係なく保存する。
-`stop_superbatch` の省略は元の終了点を意味する。元の終了点を超える指定は延長しない。
-
-`{"pause": true}` は現在の sb を終えて同じ一式を保存し、終了コード **75** で終了する。
-`experiment.json` は interrupted を立て、制御の変更を `control_history`、実際の終了 sb と
-pause の有無を `stopped` に残す。`pause` を false にするか項目を削除してから、
-元の引数に `--resume <保存した.ckpt>` を加えて再開する。ファイル不在・読込失敗・
-壊れた JSON は警告を一回だけ出し、最後に読めた設定で学習を続ける。
-SIGINT / SIGTERM は一時停止の要求には変換しない。保存して止めるには制御ファイルを使う。
-
 ### superbatch 境界で停止する
 
 実行中の学習を superbatch の途中で中断せず短縮するには、output directory 直下に
@@ -416,6 +385,42 @@ schedule は元の horizon を維持し、進捗と ETA だけが短縮後の ta
 同じ output directory で resume する前に、`control.json` を削除するか新しい target
 へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った
 stale な値として warning とともに無視され、`control_history.jsonl` にも記録されない。
+
+既定のファイルは `--output` directory 直下の `control.json`。
+`--control-file /path/to/control.json` を指定すると、そのパスだけを読み、既定の
+ファイルは読まない。読むパスは起動時にログへ一行出す。学習器はファイルを
+書き換えない。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
+適用した target は `experiment.json` の `results.target_superbatches` にも記録する。
+
+同じ制御ファイルに `"pause": true` を追加すると、起動後に false (または項目なし)
+から true への変化を読んだ superbatch の終わりで、一時停止する。
+重み・optimizer の `.ckpt` と読み位置の `.loader.json`、推論用 `.bin` を
+`--save-rate` に関係なく保存し、終了コード **75** で終える。pause は各 superbatch
+終了時に読み、適用を `control_history.jsonl` に追記する。
+
+```json
+{"target_superbatches": 1000, "pause": true}
+```
+
+起動時の `pause=true` は警告して無視する。そのまま true を置いても停止しない。
+再び止めるには一度 false にし、superbatch 境界で学習器が読んでから true にする。
+`experiment.json` は一時停止時に interrupted を立て、pause の適用を `control_history`、
+実際の終了 sb と pause の有無を `stopped` に残す。
+SIGINT / SIGTERM は pause に変換しない。保存して止めるには制御ファイルを使う。
+
+### 読み位置を含む一時停止・再開
+
+`.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
+連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
+通し番号、shuffle 窓内の位置も保存・復元する。version 1 の sidecar は混合・間引きなしの
+入力として読める。再開時に全教師の絶対パスとサイズ、間引き確率・seed、混合割合・seed、
+batch size・sb 当たり batch 数・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
+オプションはない。同じサイズの内容変更は検出しないため、教師を変更しないこと。
+sidecar がない古い checkpoint は警告を一行出し、従来どおり教師の先頭から読む。
+`--start-superbatch` による番号の変更は、読み位置付き checkpoint では受け付けない。
+
+同名の `.loader.json` を保管したまま、同じ引数に `--resume <最後の.ckpt>` を
+加えて再開する。起動時の pause は無視されるため、true のままでも再開できる。
 
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
