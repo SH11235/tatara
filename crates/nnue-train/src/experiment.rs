@@ -230,6 +230,8 @@ pub struct Params {
     pub validation_wdl: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wdl_ignore_draws: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tree_sample_eval_only: bool,
     pub scale: f32,
     pub weight_decay: f32,
     /// optimizer の param-group (ft / dense / bias) ごとの有効 weight_decay と
@@ -949,6 +951,7 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
+            tree_sample_eval_only: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -1220,6 +1223,24 @@ mod tests {
         // linear WDL taper を使わない run では start/end は省略 (constant lambda は `wdl`)。
         assert!(v["params"].get("start_wdl").is_none());
         assert!(v["params"].get("end_wdl").is_none());
+    }
+
+    #[test]
+    fn tree_sample_flag_is_serialized_and_fingerprinted() {
+        let mut params = sample_params();
+        let original = recipe_fingerprint(&params, "samples");
+        assert!(
+            serde_json::to_value(&params)
+                .unwrap()
+                .get("tree_sample_eval_only")
+                .is_none()
+        );
+        params.tree_sample_eval_only = true;
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["tree_sample_eval_only"],
+            true
+        );
+        assert_ne!(original, recipe_fingerprint(&params, "samples"));
     }
 
     #[test]

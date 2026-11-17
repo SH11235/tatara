@@ -2113,3 +2113,27 @@ fn resume_input_defaults_to_restore_and_requires_resume() {
         Cli::try_parse_from(["nnue-train", "--resume-input", "restart", "layerstack"]).is_err()
     );
 }
+
+#[test]
+fn tree_sample_eval_only_requires_psv_data() {
+    assert!(Cli::try_parse_from(["nnue-train", "--tree-sample-eval-only", "simple"]).is_err());
+    let cli = simple_cli(&["--data", "samples.psv", "--tree-sample-eval-only"]);
+    assert!(cli.tree_sample_eval_only);
+    assert!(cli.validate_score_sources().is_ok());
+    let mixed = simple_cli(&[
+        "--data",
+        "main.psv",
+        "--mix-data",
+        "tree.psv",
+        "--mix-rate",
+        "0.03",
+        "--tree-sample-eval-only",
+    ]);
+    assert!(mixed.tree_sample_eval_only);
+    assert!(mixed.validate_score_sources().is_ok());
+    assert!(
+        simple_cli(&["--data", "samples.hcpe", "--tree-sample-eval-only"])
+            .validate_score_sources()
+            .is_err()
+    );
+}

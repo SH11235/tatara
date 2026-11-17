@@ -324,7 +324,7 @@ fn bucket_assembly_preserves_sparse_rows_and_replays_partial_chunks() {
                         num_buckets: 9,
                         train_end_offset: 4000,
                         monitor_active: false,
-                        score_source: None,
+                        labels: LabelOptions::default(),
                         teacher_shuffle_buffer_mib: 0,
                         teacher_shuffle: false,
                         teacher_shuffle_seed: 0,

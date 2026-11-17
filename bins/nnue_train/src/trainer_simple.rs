@@ -115,7 +115,7 @@ pub(crate) struct SimpleGpuWorkspace {
     nnz_dev: DeviceBuffer<i32>,
     /// target score (`b`、centipawn)。
     score_dev: DeviceBuffer<f32>,
-    /// target wdl (`b`、0.0/0.5/1.0)。
+    /// target wdl (`b`、-1 = score only、0.0/0.5/1.0)。
     wdl_dev: DeviceBuffer<f32>,
     /// 同上、back 側物理 buffer。次 step の H2D 先 (`step` 冒頭で `mem::swap` で active
     /// へ昇格)。直前 step の compute が読んでいる active と物理分離されるため、H2D は

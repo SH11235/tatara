@@ -415,7 +415,7 @@ extern "C" __global__ void native_loss_wrm_default(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+        const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
         const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
 
         const float score_net = output[i] * nnue2score;
@@ -865,7 +865,7 @@ extern "C" __global__ void loss_wrm(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+        const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
         const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
         const float score_net = output[i] * nnue2score;
         const float q = 1.0F / (1.0F + expf(-((score_net - input_offset) / input_scaling)));
@@ -935,7 +935,7 @@ extern "C" __global__ void loss_wdl(
     }
     const float prediction = 1.0F / (1.0F + expf(-(output[i] * scale)));
     const float score_target = 1.0F / (1.0F + expf(-(score[i] * scale)));
-    const float lam = ignore_draws != 0 && wdl[i] == 0.5F ? 0.0F : lambda;
+    const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
     const float target = lam * wdl[i] + (1.0F - lam) * score_target;
     const float error = prediction - target;
     output_gradient[i] = 2.0F * error * prediction * (1.0F - prediction)

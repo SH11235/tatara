@@ -637,6 +637,12 @@ pub(crate) struct Cli {
     )]
     pub(crate) dual_label_psv: Option<DualLabelPsvArg>,
 
+    /// Train positions whose PSV padding bit 1 is set on the score term only
+    /// (WDL weight 0). Requires PSV training data; records with padding bits other than
+    /// bit 0 and bit 1 are rejected, and marked positions must not appear in held-out data.
+    #[arg(long, global = true, requires = "data")]
+    pub(crate) tree_sample_eval_only: bool,
+
     /// Inject weights from a quantised NNUE binary before training starts
     /// (pretrained start). The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and
@@ -1213,6 +1219,16 @@ impl Cli {
             {
                 return Err("--precision-steps requires a training run with --data".into());
             }
+        }
+        if self.tree_sample_eval_only
+            && self
+                .data
+                .iter()
+                .any(|path| nnue_train::dataloader::is_hcpe_path(path))
+        {
+            return Err(
+                "--tree-sample-eval-only requires PSV --data; HCPE has no padding mark".into(),
+            );
         }
         if self.dual_label_psv.is_some()
             && self

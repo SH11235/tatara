@@ -132,6 +132,12 @@ so their target is derived from the teacher score. `--validation-wdl <value>`
 fixes lambda for held-out validation and eval-only runs; without it, validation
 uses the training schedule.
 
+`--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
+on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
+`--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.
+Records with padding bits other than bit 0 and bit 1 are rejected. Marked positions
+are rejected in external `--test-data` and `--test-tail-positions`.
+
 ## Where the values are recorded
 
 The effective schedules are written to the run's `experiment.json` under
@@ -146,5 +152,5 @@ on one scale (see "Reading the
 metrics" in [Held-out validation](held-out-validation.md)).
 Cycle runs also record `wdl_cycle_delta`, `wdl_cycle_warmup_pct`, and
 `wdl_schedule_superbatch` (the latter only when explicitly set).
-`validation_wdl` is recorded only when specified, and `wdl_ignore_draws` only
-when true.
+`validation_wdl` is recorded only when specified; `wdl_ignore_draws` and
+`tree_sample_eval_only` are recorded only when true.

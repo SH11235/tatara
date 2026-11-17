@@ -274,6 +274,13 @@ epochs; write regenerated data to a different file.
 PSV rescoring retains its structural checks for king placement and total piece count before
 writing scores. These checks do not verify move legality or every possible format corruption.
 
+`--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
+on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
+`--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.
+Records with padding bits other than bit 0 and bit 1 are rejected. Marked positions
+are rejected in external `--test-data` and `--test-tail-positions`.
+This flag also applies to teachers supplied with `--mix-data`.
+
 Dropping the training loader cancels both direct and windowed readers at record boundaries,
 including while high-score records are skipped and before the next dataset epoch is opened.
 Cancellation during normal shutdown is not an experiment failure. A read already blocked

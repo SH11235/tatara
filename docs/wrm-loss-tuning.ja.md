@@ -58,6 +58,12 @@ v9 以降の raw checkpoint はこの値を保存するため再指定不要。v
 係数。既定 0 では target = `target_wrm` のみ、1 で純 WDL になる。
 `--wdl-ignore-draws` を指定すると、WDL ラベルが `0.5` の局面は教師 score の target を使う。
 
+`--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
+WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
+`--data` が必要。bit 0 の dual-label gate は独立して働く。マーク付き局面は
+外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。padding の
+bit 0・bit 1 以外が立つ record もエラーにする。
+
 ## loss の一般化 (pow_exp / asymmetry / weight boost)
 
 既定の WRM loss は素の二乗誤差 `mean((qf - target)^2)`。さらに 4 つの引数で誤差項を

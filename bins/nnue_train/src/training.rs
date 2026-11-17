@@ -1082,6 +1082,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         score_source: cli.score_source().map(ScoreSource::to_path_buf),
         mix_sources: cli.mix_sources(),
         mix_seed: cli.mix_seed,
+        tree_sample_eval_only: cli.tree_sample_eval_only,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
@@ -1154,7 +1155,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     if cli.eval_only {
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
-        // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
+        // eval-only はそこへ到達せず held-out loader を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
         // cfg.validate() 丸ごとは呼べない: eval-only では resume 由来の
         // start_superbatch が --superbatches を超えていても正当なため。
@@ -1166,16 +1167,24 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             .validation_wdl
             .unwrap_or_else(|| wdl_scheduler.blend(0, cfg.end_superbatch, cfg.end_superbatch));
         let set = match (&cfg.test_data, cfg.test_tail_positions) {
-            (Some(test_path), None) => nnue_train::validation::HeldoutSet::load(
-                test_path,
-                cfg.batch_size,
-                cfg.score_drop_abs,
-                cfg.score_clamp_abs,
-                cfg.test_positions,
-                &bucket_mode,
-                cfg.feature_set,
-                cfg.num_buckets,
-            )?,
+            (Some(test_path), None) => {
+                nnue_train::validation::HeldoutSet::load_from_range_with_score_sources(
+                    &[test_path],
+                    0,
+                    std::fs::metadata(test_path)?.len(),
+                    cfg.batch_size,
+                    cfg.score_drop_abs,
+                    cfg.score_clamp_abs,
+                    cfg.test_positions,
+                    &bucket_mode,
+                    cfg.feature_set,
+                    cfg.num_buckets,
+                    nnue_train::dataloader::LabelOptions {
+                        score_source: None,
+                        tree_sample_eval_only: cfg.tree_sample_eval_only,
+                    },
+                )?
+            }
             (None, Some(n)) => {
                 if n == 0 {
                     return Err("--test-tail-positions must be >= 1".into());
@@ -1202,7 +1211,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     &bucket_mode,
                     cfg.feature_set,
                     cfg.num_buckets,
-                    cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                    nnue_train::dataloader::LabelOptions {
+                        score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                        tree_sample_eval_only: cfg.tree_sample_eval_only,
+                    },
                 )?
             }
             _ => {
@@ -1965,6 +1977,7 @@ pub(crate) fn build_experiment_logger(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
+        tree_sample_eval_only: cli.tree_sample_eval_only,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
@@ -2170,6 +2183,7 @@ pub(crate) fn build_experiment_logger_simple(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
+        tree_sample_eval_only: cli.tree_sample_eval_only,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
@@ -2564,6 +2578,7 @@ pub(crate) fn run_simple_training(
         score_source: cli.score_source().map(ScoreSource::to_path_buf),
         mix_sources: cli.mix_sources(),
         mix_seed: cli.mix_seed,
+        tree_sample_eval_only: cli.tree_sample_eval_only,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,

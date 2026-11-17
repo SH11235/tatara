@@ -10,7 +10,7 @@
 //! ## 設計のポイント
 //!
 //! - **WDL blend は GPU 側 (`loss_wdl` / `loss_wrm` kernel) で fuse する**ため、
-//!   本 dataloader は `score` (raw cp) と `wdl` (game result `{0, 0.5, 1}`) を
+//!   本 dataloader は `score` (raw cp) と `wdl` (game result `{-1 = score only, 0, 0.5, 1}`) を
 //!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
 //! - sparse index は feature set の最大 active 数 (`FeatureSetSpec::max_active`)
 //!   で固定容量を持つ。有効 slot は position ごとの `nnz` で決まり、下流 kernel は
@@ -199,6 +199,81 @@ impl ScoreSource<&Path> {
     }
 }
 
+/// Label interpretation shared by training and held-out readers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LabelOptions<'a> {
+    pub score_source: Option<ScoreSource<&'a Path>>,
+    pub tree_sample_eval_only: bool,
+}
+
+impl<'a> From<Option<ScoreSource<&'a Path>>> for LabelOptions<'a> {
+    fn from(score_source: Option<ScoreSource<&'a Path>>) -> Self {
+        Self {
+            score_source,
+            tree_sample_eval_only: false,
+        }
+    }
+}
+
+pub const EVAL_ONLY_GAME_RESULT: i8 = i8::MIN;
+pub use gpu_kernels::pointwise::EVAL_ONLY_WDL;
+const TREE_SAMPLE_PADDING_BIT: u8 = 2;
+
+impl LabelOptions<'_> {
+    pub(crate) fn validate_format(self, format: TeacherFormat, path: &Path) -> io::Result<()> {
+        if format == TeacherFormat::Hcpe {
+            if self.tree_sample_eval_only {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--tree-sample-eval-only requires PSV input; HCPE has no padding mark: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if matches!(self.score_source, Some(ScoreSource::DualLabel(_))) {
+                return Err(dual_label_requires_psv(path));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_tree_sample(
+        self,
+        psv: &mut PackedSfenValue,
+        record_index: u64,
+        path: &Path,
+        heldout: bool,
+    ) -> io::Result<()> {
+        if !self.tree_sample_eval_only {
+            return Ok(());
+        }
+        let padding = psv.as_bytes_mut()[39];
+        if padding & !3 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PSV record {record_index} in {} has non-zero reserved padding bits: 0x{padding:02x}",
+                    path.display()
+                ),
+            ));
+        }
+        if padding & TREE_SAMPLE_PADDING_BIT != 0 {
+            if heldout {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "held-out PSV record {record_index} in {} is marked as a tree sample and has no WDL label",
+                        path.display()
+                    ),
+                ));
+            }
+            psv.as_bytes_mut()[38] = EVAL_ONLY_GAME_RESULT as u8;
+        }
+        Ok(())
+    }
+}
+
 impl DualLabelMode {
     pub const fn canonical_name(self) -> &'static str {
         match self {
@@ -214,11 +289,21 @@ impl DualLabelMode {
         record_index: u64,
         path: &Path,
     ) -> io::Result<()> {
+        self.apply_with_tree_samples(psv, record_index, path, false)
+    }
+
+    fn apply_with_tree_samples(
+        self,
+        psv: &mut PackedSfenValue,
+        record_index: u64,
+        path: &Path,
+        tree_sample_eval_only: bool,
+    ) -> io::Result<()> {
         let (dl_score, gate) = {
             let bytes = psv.as_bytes_mut();
             (i16::from_le_bytes([bytes[34], bytes[35]]), bytes[39])
         };
-        if gate & !1 != 0 {
+        if gate & !(if tree_sample_eval_only { 3 } else { 1 }) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -682,7 +767,7 @@ impl From<ShogiProgressKPAbs> for BucketMode {
 ///   実長超の slot の内容は未規定 (`reset` は clear せず、下流 kernel は `nnz` 打ち切りで
 ///   読まない)。`with_capacity` は初期値として `-1` を入れるが依存してはならない
 /// - `score`: raw cp (`PackedSfenValue::score` の i16 を f32 cast)
-/// - `wdl`: game result を `{0.0, 0.5, 1.0}` に正規化 (Loss → 0.0, Draw → 0.5,
+/// - `wdl`: game result を `{-1.0 = score only, 0.0, 0.5, 1.0}` に正規化 (Loss → 0.0, Draw → 0.5,
 ///   Win → 1.0)
 /// - `per_pos_norm`: batch averaging 用 weight (default 1.0、trainer 側で
 ///   override 可能)
@@ -828,6 +913,7 @@ impl Batch {
         // (`>0 → 1.0`, `<0 → 0.0`, `==0 → 0.5`)。`as u8 / 2.0` で直訳すると
         // Win=1 が誤って 0.5 に潰れるので必ず本 match を使うこと。
         self.wdl[bi] = match board.result {
+            EVAL_ONLY_GAME_RESULT => EVAL_ONLY_WDL,
             r if r > 0 => 1.0,
             r if r < 0 => 0.0,
             _ => 0.5,
@@ -1238,6 +1324,7 @@ struct PsvEpochReader {
     loader: TeacherFileLoader,
     score_override: Option<ScoreOverrideReader>,
     dual_label_psv: Option<DualLabelMode>,
+    tree_sample_eval_only: bool,
     record_index: u64,
     epoch: u64,
     teacher: u16,
@@ -1264,20 +1351,19 @@ impl PsvEpochReader {
     /// wrap 時の再 open も同 range で行う。範囲・alignment 検証はここでは行わず、
     /// `TeacherFileLoader::new_range` 内で検証する。dual-label は PSV の予約 field を
     /// 使うため HCPE とは組み合わせられない。
-    fn new_range(
+    fn new_range<'a>(
         paths: &[impl AsRef<Path>],
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
-        score_source: Option<ScoreSource<&Path>>,
+        options: impl Into<LabelOptions<'a>>,
     ) -> io::Result<Self> {
         let path = teacher_data_label(paths);
         let format = teacher_format(paths)?;
-        if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
-        {
-            return Err(dual_label_requires_psv(&path));
-        }
+        let options = options.into();
+        options.validate_format(format, &path)?;
+        let score_source = options.score_source;
         let loader = TeacherFileLoader::new_range(paths, start_offset, end_offset)?;
         let (score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
@@ -1300,6 +1386,7 @@ impl PsvEpochReader {
             loader,
             score_override,
             dual_label_psv,
+            tree_sample_eval_only: options.tree_sample_eval_only,
             record_index: start_offset / record_bytes,
             epoch: 0,
             teacher: 0,
@@ -1369,11 +1456,28 @@ impl PsvEpochReader {
                     if let Some(score_override) = &mut self.score_override {
                         score_override.apply(&mut record)?;
                     }
+                    if let TeacherRecord::Psv(psv) = &mut record {
+                        LabelOptions {
+                            score_source: None,
+                            tree_sample_eval_only: self.tree_sample_eval_only,
+                        }
+                        .apply_tree_sample(
+                            psv,
+                            record_index,
+                            &self.path,
+                            false,
+                        )?;
+                    }
                     if let Some(mode) = self.dual_label_psv {
                         let TeacherRecord::Psv(psv) = &mut record else {
                             return Err(dual_label_requires_psv(&self.path));
                         };
-                        mode.apply(psv, record_index, &self.path)?;
+                        mode.apply_with_tree_samples(
+                            psv,
+                            record_index,
+                            &self.path,
+                            self.tree_sample_eval_only,
+                        )?;
                     }
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
@@ -1625,7 +1729,10 @@ impl MixedTeacherReader {
                 teacher_data_bytes(&[&mix.path])?,
                 main.score_drop_abs,
                 main.score_clamp_abs,
-                None,
+                LabelOptions {
+                    score_source: None,
+                    tree_sample_eval_only: main.tree_sample_eval_only,
+                },
             )?;
             reader.stop = Arc::clone(&main.stop);
             reader.teacher = u16::try_from(sources.len())
@@ -2112,7 +2219,7 @@ pub struct BucketedLoaderOptions<'a> {
     pub num_buckets: usize,
     pub train_end_offset: u64,
     pub monitor_active: bool,
-    pub score_source: Option<ScoreSource<&'a Path>>,
+    pub labels: LabelOptions<'a>,
     pub teacher_shuffle_buffer_mib: usize,
     pub teacher_shuffle: bool,
     pub teacher_shuffle_seed: u64,
@@ -2178,7 +2285,7 @@ impl BucketedPrefetchedLoader {
 
     /// Spawns a loader with explicit score sources and stateless training sampling.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_score_sources(
+    pub fn spawn_with_score_sources<'a>(
         paths: &[impl AsRef<Path>],
         batch_size: usize,
         score_drop_abs: Option<i32>,
@@ -2190,7 +2297,7 @@ impl BucketedPrefetchedLoader {
         num_buckets: usize,
         train_end_offset: u64,
         monitor_active: bool,
-        score_source: Option<ScoreSource<&Path>>,
+        options: impl Into<LabelOptions<'a>>,
         teacher_shuffle_buffer_mib: usize,
         teacher_shuffle: bool,
         teacher_shuffle_seed: u64,
@@ -2210,7 +2317,7 @@ impl BucketedPrefetchedLoader {
                 num_buckets,
                 train_end_offset,
                 monitor_active,
-                score_source,
+                labels: options.into(),
                 teacher_shuffle_buffer_mib,
                 teacher_shuffle,
                 teacher_shuffle_seed,
@@ -2251,7 +2358,7 @@ impl BucketedPrefetchedLoader {
             num_buckets,
             train_end_offset,
             monitor_active,
-            score_source,
+            labels,
             teacher_shuffle_buffer_mib,
             teacher_shuffle,
             teacher_shuffle_seed,
@@ -2272,7 +2379,7 @@ impl BucketedPrefetchedLoader {
             train_end_offset,
             score_drop_abs,
             score_clamp_abs,
-            score_source,
+            labels,
         )?;
         source.configure_sampling(sampling);
         if let Some(position) = resume {
@@ -3152,6 +3259,107 @@ mod tests {
         }
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn tree_sample_batches_preserve_unmarked_labels_and_select_independent_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.psv");
+        let sample = std::fs::read(sample_psv_path()).unwrap();
+        for marked in [false, true] {
+            let mut bytes = sample[..4 * PSV_RECORD_BYTES as usize].to_vec();
+            for (i, record) in bytes.chunks_exact_mut(40).enumerate() {
+                record[32..34].copy_from_slice(&(100 + i as i16).to_le_bytes());
+                record[34..36].copy_from_slice(&(200 + i as i16).to_le_bytes());
+                record[38] = match i {
+                    0 => (-1_i8) as u8,
+                    1 => 1,
+                    _ => 0,
+                };
+                record[39] = (i % 2) as u8 | if marked && i >= 2 { 2 } else { 0 };
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let read = |enabled: bool, dual: bool| {
+                let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+                    &[&path],
+                    4,
+                    None,
+                    None,
+                    1,
+                    BucketMode::KingRank9,
+                    test_spec(),
+                    true,
+                    9,
+                    160,
+                    false,
+                    LabelOptions {
+                        score_source: dual.then_some(ScoreSource::DualLabel(DualLabelMode::Gated)),
+                        tree_sample_eval_only: enabled,
+                    },
+                    1,
+                    false,
+                    0,
+                    Default::default(),
+                )
+                .unwrap();
+                loader.next_batch().unwrap().unwrap().0
+            };
+            let plain = read(false, false);
+            let enabled = read(true, false);
+            assert_eq!(
+                plain.score.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                enabled
+                    .score
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            for i in 0..4 {
+                assert_eq!(plain.wdl[i], [0.0, 1.0, 0.5, 0.5][i]);
+                assert_eq!(
+                    enabled.wdl[i].to_bits(),
+                    if marked && i >= 2 {
+                        EVAL_ONLY_WDL
+                    } else {
+                        plain.wdl[i]
+                    }
+                    .to_bits()
+                );
+            }
+            let dual = read(true, true);
+            assert_eq!(dual.score, [200.0, 101.0, 202.0, 103.0]);
+            assert_eq!(dual.wdl, enabled.wdl);
+            if !marked {
+                let disabled = read(false, true);
+                assert_eq!(disabled.score, dual.score);
+                assert_eq!(disabled.wdl, dual.wdl);
+            }
+        }
+    }
+
+    #[test]
+    fn tree_sample_rejects_reserved_bits_and_hcpe() {
+        let path = synthetic_dual_file("tree-reserved", &[1, 2], &[11, 12], &[0, 4]);
+        let options = LabelOptions {
+            score_source: None,
+            tree_sample_eval_only: true,
+        };
+        let mut reader = PsvEpochReader::new_range(&[&path], 0, 80, None, None, options).unwrap();
+        reader.next().unwrap();
+        let err = reader.next().err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("record 1"));
+        assert!(err.to_string().contains(&path.display().to_string()));
+        std::fs::remove_file(path).unwrap();
+        let err =
+            PsvEpochReader::new_range(&[Path::new("samples.hcpe")], 0, 38, None, None, options)
+                .err()
+                .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("--tree-sample-eval-only requires PSV")
+        );
     }
 
     #[test]

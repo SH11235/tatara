@@ -200,6 +200,9 @@ impl LoaderState {
         for value in [&mut saved_settings, &mut expected_settings] {
             if let Some(object) = value.as_object_mut() {
                 object.remove("batches_per_superbatch");
+                object
+                    .entry("tree_sample_eval_only")
+                    .or_insert(serde_json::Value::Bool(false));
             }
         }
         match (saved_settings.as_object(), expected_settings.as_object()) {
@@ -246,6 +249,41 @@ fn describe_files(files: &[TeacherFileIdentity]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_sample_label_setting_must_match_and_defaults_to_disabled() {
+        let files = vec![TeacherFileIdentity {
+            path: "teacher.psv".into(),
+            bytes: 40,
+        }];
+        for saved in [
+            serde_json::json!({}),
+            serde_json::json!({"tree_sample_eval_only": false}),
+            serde_json::json!({"tree_sample_eval_only": true}),
+        ] {
+            let state = LoaderState {
+                version: 1,
+                superbatch: 1,
+                teachers: vec![TeacherState {
+                    id: "primary".into(),
+                    files: files.clone(),
+                    position: TeacherPosition::default(),
+                }],
+                settings: saved.clone(),
+            };
+            for enabled in [false, true] {
+                let current = serde_json::json!({"tree_sample_eval_only": enabled});
+                let result = state.validate(&files, &current, 1);
+                assert_eq!(
+                    result.is_ok(),
+                    saved["tree_sample_eval_only"].as_bool().unwrap_or(false) == enabled
+                );
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("tree_sample_eval_only"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn mismatch_lists_each_changed_setting_and_teacher() {

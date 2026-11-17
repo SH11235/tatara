@@ -12,7 +12,7 @@
 //! per position i:
 //!     p   = sigmoid(out[i] * scale)            # NNUE eval を確率に
 //!     ys  = sigmoid(score[i] * scale)          # 教師 cp score を確率に
-//!     lam = (ignore_draws && wdl[i] == 0.5) ? 0 : lambda   # result 欠損行は score のみ
+//!     lam = ((ignore_draws && wdl[i] == 0.5) || wdl[i] < 0) ? 0 : lambda   # result 欠損行は score のみ
 //!     y   = lam * wdl[i] + (1 - lam) * ys      # WDL blend
 //!     err = p - y
 //!     loss_acc += err^2                        # un-normalized sum
@@ -22,13 +22,13 @@
 //! - `out`, `score` は同じ cp scale を共有する前提 (`scale = 1/scale_param`)
 //! - `lambda = 1.0` で純 WDL ターゲット、`lambda = 0.0` で純 score sigmoid
 //!   (WdlScheduler が batch / superbatch 単位で動的に決める想定)
-//! - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss=0, draw=0.5, win=1)
+//! - `wdl[i] ∈ {-1.0, 0.0, 0.5, 1.0}` (-1 = score only) (loss=0, draw=0.5, win=1)
 //! - `per_pos_norm[i]` は `1 / (n_games * game_len)`、loss_acc 側には乗らず
 //!   grad だけに乗る convention
 //!
 //! ## 実装メモ
 //!
-//! - WDL blend を kernel 内に畳み込み、`score` (raw cp) と `wdl` ({0, 0.5, 1})
+//! - WDL blend を kernel 内に畳み込み、`score` (raw cp) と `wdl` ({-1 = score only, 0, 0.5, 1})
 //!   を 2 buffer で渡す。batch 1 度しか転送しないため pre-compute する場合と
 //!   比較して total memory traffic は同等以下
 //! - chain rule で sigmoid(out * scale) の `out` 微分には `* scale` が乗る
@@ -39,8 +39,7 @@
 //! - `out[i] = NaN` → `p = sigmoid(NaN) = NaN`、`err = NaN`、`loss = NaN`、
 //!   `dl_dout = NaN` (NaN を伝搬)
 //! - `score[i] = NaN` も同様に NaN 伝搬
-//! - `wdl[i]` が `{0, 0.5, 1}` invariant を破った場合は target が `[0, 1]` を
-//!   超えるが kernel 側で潰さない (host invariant 違反の検出は loader 側で行う)
+//! - 負の `wdl[i]` は score-only として扱う。正の範囲外値や NaN は clamp しない。
 //! - SCReLU と異なり本 kernel は NaN を握り潰さず伝搬するため、学習中の NaN は
 //!   loss 経路で気付ける
 
@@ -56,7 +55,7 @@
 ///   反転するため別 loss になる (NNUE の `1/scale_param` 用法では常に正、host
 ///   側で保証する前提)
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 score sigmoid)
-/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
+/// - `wdl[i] ∈ {-1.0, 0.0, 0.5, 1.0}` (-1 = score only) (loss / draw / win)
 ///
 /// 引数 10 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
 /// を allow する。
@@ -76,7 +75,7 @@ pub fn loss_wdl_cpu(
     for i in 0..n {
         let p = sigmoid_f32(out[i] * scale);
         let ys = sigmoid_f32(score[i] * scale);
-        let lam = if ignore_draws && wdl[i] == 0.5 {
+        let lam = if (ignore_draws && wdl[i] == 0.5) || wdl[i] < 0.0 {
             0.0
         } else {
             lambda
@@ -353,6 +352,36 @@ mod tests {
             (loss, grad[0])
         };
         assert_eq!(run(0, 0.8, true), run(0, 0.0, false));
+        assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
+        assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
+    }
+    #[test]
+    fn eval_only_rows_ignore_lambda() {
+        let out = [0.4_f32, -0.7, 0.2];
+        let score = [200.0_f32, -300.0, 100.0];
+        let wdl = [super::super::EVAL_ONLY_WDL, 0.0, 1.0];
+        let run = |i: usize, lambda: f32, ignore_draws: bool| {
+            let mut grad = [0.0_f32];
+            let mut loss = 0.0_f64;
+            loss_wdl_cpu(
+                &out[i..=i],
+                &score[i..=i],
+                &wdl[i..=i],
+                &[1.0],
+                &mut grad,
+                &mut loss,
+                lambda,
+                1.0,
+                ignore_draws,
+                1,
+            );
+            (loss, grad[0])
+        };
+        for lambda in [0.0, 0.3, 0.8, 1.0] {
+            for ignore_draws in [false, true] {
+                assert_eq!(run(0, lambda, ignore_draws), run(0, 0.0, false));
+            }
+        }
         assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
         assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
     }

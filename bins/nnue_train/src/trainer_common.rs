@@ -217,7 +217,7 @@ pub(crate) struct BatchData<'a> {
     pub(crate) nnz: &'a [i32], // (n_pos)、両 perspective 共通の実 active 数
     pub(crate) bucket_idx: &'a [i32], // (n_pos)、progress-kpabs が emit する 0..num_buckets-1
     pub(crate) score: &'a [f32], // (n_pos)、target eval cp の元
-    pub(crate) wdl: &'a [f32], // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    pub(crate) wdl: &'a [f32], // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win) / 負 (score のみ)
     pub(crate) per_pos_norm: f32, // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)
 }
 
