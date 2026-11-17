@@ -116,7 +116,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍 |
 | `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途。`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある |
-| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
+| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓の permutation が再現し、複数 worker でも学習には入力順で batch を渡す |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
@@ -174,8 +174,9 @@ held-out の局面をあらかじめ除いておくこと。
 状態を持たない。shuffle 窓が有効な場合は、混合後の流れで窓を満たしてから shuffle する。
 混合時の窓は個々の教師の epoch 境界をまたぐ。また局面ごとの出典情報を保持するため、
 混合なしの「窓サイズの約 2 倍」という見積もりより追加メモリが増える。
-同じ入力と seed なら `--threads 1` で
-同じ局面列になるが、複数の decode worker ではバッチの到着順が変わり得る。
+複数の decode worker でも、学習には読み取り順に batch を渡す。
+bucket 間引き時は、棄却分を読み直して batch が埋まるまで worker が読み位置を保持するため、
+decode の並列性が制限される。
 
 混合と `--score-override` / `--dual-label-psv` の併用はエラーになる。勝敗の無い局面は
 result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば評価値だけで学習できる。
@@ -229,8 +230,9 @@ target/release/nnue-train ... \
 ```
 
 score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で適用してから
-窓内shuffleする。`--resume`時は教師streamをファイル先頭から開き直すため、
-checkpointは窓の途中位置やdataset epoch番号を復元しない。
+窓内shuffleする。`--resume` は checkpoint に隣接する `.loader.json` から
+教師の epoch・読み位置・shuffle 窓内の消費数を復元する。未学習の先読み分は含めない。
+単一 worker では中断しない場合と同じ局面列になり、並列 decode でも入力範囲は連続する。
 
 学習入力(`--data`)、`--test-data`、`loader-digest`はPSVとHCPEを読める。
 再評価(`--rescore-input`)はPSV専用で、`.hcpe`という名前のファイルを拒否する。
@@ -361,6 +363,37 @@ horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存
 時に `--superbatches` に依らず curve が再現される。優先順位の詳細は
 [Horizon と resume](training-schedule.ja.md#horizon-と-resume) を参照。
 
+### 読み位置を含む一時停止・再開
+
+`.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
+連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
+通し番号、shuffle 窓内の位置も保存・復元する。version 1 の sidecar は混合・間引きなしの
+入力として読める。再開時に全教師の絶対パスとサイズ、間引き確率・seed、混合割合・seed、
+batch size・sb 当たり batch 数・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
+オプションはない。同じサイズの内容変更は検出しないため、教師を変更しないこと。
+sidecar がない古い checkpoint は警告を一行出し、従来どおり教師の先頭から読む。
+`--start-superbatch` による番号の変更は、読み位置付き checkpoint では受け付けない。
+
+`--control-file` 指定時は、後述する output directory 直下の旧制御ファイルの自動読込に代わり、
+指定したファイルだけを読む。起動時に `--control-file /path/to/control.json` を指定すると、各 superbatch の終了時に
+次の JSON を読む。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
+
+```json
+{"stop_superbatch": 800, "pause": false}
+```
+
+`--superbatches 1200` なら、LR / WDL の曲線は 1200 sb を想定したまま 800 sb で
+通常完了する。現在の sb 以下を指定した場合は現在の sb を終えて停止する。
+最終 `.bin`・`.ckpt`・`.loader.json` は `--save-rate` に関係なく保存する。
+`stop_superbatch` の省略は元の終了点を意味する。元の終了点を超える指定は延長しない。
+
+`{"pause": true}` は現在の sb を終えて同じ一式を保存し、終了コード **75** で終了する。
+`experiment.json` は interrupted を立て、制御の変更を `control_history`、実際の終了 sb と
+pause の有無を `stopped` に残す。`pause` を false にするか項目を削除してから、
+元の引数に `--resume <保存した.ckpt>` を加えて再開する。ファイル不在・読込失敗・
+壊れた JSON は警告を一回だけ出し、最後に読めた設定で学習を続ける。
+SIGINT / SIGTERM は一時停止の要求には変換しない。保存して止めるには制御ファイルを使う。
+
 ### superbatch 境界で停止する
 
 実行中の学習を superbatch の途中で中断せず短縮するには、output directory 直下に
@@ -396,6 +429,7 @@ stale な値として warning とともに無視され、`control_history.jsonl`
 | ファイル | 形式 | 用途 |
 |---|---|---|
 | `<run-name>-<sb>.bin` | 量子化 NNUE binary | **推論エンジンに投入する artifact** (binary layout は `crates/nnue-format` 参照) |
+| `<run-name>-<sb>.loader.json` | 教師の識別情報・読み位置 | `.ckpt` と一緒に保管する (`--keep-checkpoints` で一緒に淘汰) |
 | `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
 `<run-name>-<最終 sb>.bin` が最終 net。これは [rshogi](https://github.com/SH11235/rshogi)

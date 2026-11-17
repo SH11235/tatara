@@ -442,6 +442,10 @@ pub struct ExperimentDoc {
     pub history: Vec<HistoryEntry>,
     /// run が書き出した checkpoint ファイル名の生成記録 (informational)。
     pub checkpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub control_history: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<serde_json::Value>,
 }
 
 /// status 文字列。`nnue-lab` の enum が `running` / `completed` のみ受け付ける
@@ -501,6 +505,8 @@ impl ExperimentDoc {
             },
             history: Vec::new(),
             checkpoints: Vec::new(),
+            control_history: Vec::new(),
+            stopped: None,
         }
     }
 }
@@ -541,6 +547,16 @@ impl ExperimentLogger {
     /// 書き込み先 path。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn record_control(&mut self, sb: usize, stop: Option<usize>, pause: bool) {
+        self.doc
+            .control_history
+            .push(serde_json::json!({"superbatch": sb, "stop_superbatch": stop, "pause": pause}));
+    }
+
+    pub fn record_stop(&mut self, sb: usize, pause: bool) {
+        self.doc.stopped = Some(serde_json::json!({"superbatch": sb, "paused": pause}));
     }
 
     /// `control.json` で適用された実効終了 superbatch を記録する。

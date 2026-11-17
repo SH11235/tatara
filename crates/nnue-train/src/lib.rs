@@ -44,4 +44,5 @@ pub mod schedule;
 pub mod trainer;
 pub mod validation;
 
+pub mod loader_state;
 pub mod sampling;

@@ -426,6 +426,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 10, global = true)]
     pub(crate) superbatches: usize,
 
+    /// JSON control file, reloaded at superbatch boundaries: stop_superbatch and pause.
+    /// stop_superbatch changes only the stopping point; the LR horizon stays unchanged.
+    /// pause saves a resumable checkpoint and exits with code 75. Clear pause before resume.
+    #[arg(long, global = true)]
+    pub(crate) control_file: Option<PathBuf>,
+
     /// Number of batches per superbatch.
     #[arg(long, default_value_t = 6104, global = true)]
     pub(crate) batches_per_superbatch: usize,
@@ -682,7 +688,11 @@ pub(crate) struct Cli {
     /// from the superbatch recorded in the checkpoint + 1. A v5+ checkpoint also
     /// stores the LR-schedule horizon; on resume the saved horizon is restored
     /// so the LR curve is reproduced independently of --superbatches (see
-    /// --lr-final-superbatch for the full precedence).
+    /// --lr-final-superbatch for the full precedence). An adjacent .loader.json
+    /// restores every teacher's input position, mixing selection counter, and shuffle
+    /// window. Missing metadata warns and restarts input. All teacher paths/sizes,
+    /// sampling probabilities, mixing rates/seeds, and other input settings
+    /// must match. Keep the sidecar together with the checkpoint.
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 
@@ -840,11 +850,10 @@ pub(crate) struct Cli {
     /// matches the Ranger21 reference.
     #[arg(long, default_value_t = 1e-4, global = true)]
     pub(crate) norm_loss_factor: f32,
-    /// Number of dataloader prefetch workers. Each worker does PSV parsing +
-    /// HalfKA_hm sparse extraction + progresskpabs bucket computation in a
-    /// single `decode()` call and supplies positions ahead of time. `1` preserves
-    /// the reader's deterministic order; `>= 2` parses in parallel (batch delivery
-    /// order within an epoch is non-deterministic, which is fine for training).
+    /// Number of dataloader prefetch workers for decoding, feature extraction,
+    /// and bucket computation. Training receives batches in input order regardless
+    /// of worker completion order. With bucket sampling, input stays locked until
+    /// a batch is full so rejected positions cannot shift the saved resume boundary.
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
     /// Raw PSV shuffle window size in MiB, per window. The default 0 reads the teacher

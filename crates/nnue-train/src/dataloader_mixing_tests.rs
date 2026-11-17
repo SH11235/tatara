@@ -424,3 +424,89 @@ fn mixed_sampling_preserves_teacher_identity_rates_and_bucket_sets_across_worker
         }
     }
 }
+
+#[test]
+fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = teacher(dir.path(), "primary.psv", &(1..=2000).collect::<Vec<_>>());
+    let sources = [
+        MixSource {
+            path: teacher(
+                dir.path(),
+                "extra.psv",
+                &(10001..=12000).collect::<Vec<_>>(),
+            ),
+            rate: 0.25,
+        },
+        MixSource {
+            path: teacher(
+                dir.path(),
+                "another.psv",
+                &(20001..=22000).collect::<Vec<_>>(),
+            ),
+            rate: 0.35,
+        },
+    ];
+    let open = |workers, position: Option<&TeacherPosition>| {
+        BucketedPrefetchedLoader::spawn_mixed_resumable(
+            &[&primary],
+            BucketedLoaderOptions {
+                sampling: crate::sampling::Sampling {
+                    keep_rate: 0.8,
+                    bucket_keep_rates: Some(vec![0.7; 9]),
+                    skip_seed: 19,
+                    ..Default::default()
+                },
+                batch_size: 128,
+                score_drop_abs: None,
+                score_clamp_abs: None,
+                num_workers: workers,
+                bucket_mode: BucketMode::KingRank9,
+                feature_set: FeatureSet::HalfKaHmMerged.spec(),
+                compute_bucket: true,
+                num_buckets: 9,
+                train_end_offset: 2000 * PSV_RECORD_BYTES,
+                monitor_active: false,
+                score_source: None,
+                teacher_shuffle_buffer_mib: 1,
+                teacher_shuffle: true,
+                teacher_shuffle_seed: 31,
+            },
+            &sources,
+            79,
+            position,
+        )
+        .unwrap()
+    };
+    let collect = |loader: &mut BucketedPrefetchedLoader, batches| {
+        let mut scores = Vec::new();
+        for _ in 0..batches {
+            let slot = loader.next_batch().unwrap().unwrap();
+            scores.extend(slot.0.score[..slot.0.n_positions].iter().map(|&s| s as i16));
+            loader.recycle(slot);
+        }
+        scores
+    };
+    let mut reference = open(1, None);
+    let expected = collect(&mut reference, 350);
+    drop(reference);
+    for workers in [1, 4] {
+        let mut first = open(workers, None);
+        let mut actual = collect(&mut first, 151);
+        let position: TeacherPosition =
+            serde_json::from_slice(&serde_json::to_vec(first.position()).unwrap()).unwrap();
+        assert_eq!(position.mixes.len(), 2);
+        assert!(position.window_index.unwrap() > 0);
+        assert!(position.epoch > 0);
+        drop(first);
+        let mut resumed = open(workers, Some(&position));
+        actual.extend(collect(&mut resumed, 199));
+        if workers == 1 {
+            assert_eq!(actual, expected);
+        }
+        actual.sort_unstable();
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_eq!(actual, sorted);
+    }
+}

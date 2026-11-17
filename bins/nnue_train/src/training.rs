@@ -1058,6 +1058,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
+        control_file: cli.control_file.clone(),
+        resume_checkpoint: cli.resume.clone(),
         net_id: cli.net_id.clone(),
         feature_set,
         output_dir: cli.output.clone(),
@@ -2535,6 +2537,8 @@ pub(crate) fn run_simple_training(
     let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
+        control_file: cli.control_file.clone(),
+        resume_checkpoint: cli.resume.clone(),
         net_id: cli.net_id.clone(),
         feature_set,
         output_dir: cli.output.clone(),
