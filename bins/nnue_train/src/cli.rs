@@ -703,6 +703,8 @@ pub(crate) struct Cli {
     /// sampling probabilities, mixing rates/seeds, and other input settings
     /// must match; absolute teacher paths may change. Bucket sampling also checks
     /// bucket mode/count and the progress coefficient file size and SHA-256.
+    /// Shuffle windows require the same actual record count per window.
+    /// The sidecar format is version 1; unknown versions are rejected.
     /// Delete .loader.json to restart teacher input without restoring positions.
     /// With --start-superbatch, input restarts with a warning.
     /// Keep the sidecar together with the checkpoint.
@@ -866,8 +868,9 @@ pub(crate) struct Cli {
     pub(crate) norm_loss_factor: f32,
     /// Number of dataloader prefetch workers for decoding, feature extraction,
     /// and bucket computation. Training receives batches in input order regardless
-    /// of worker completion order. With bucket sampling, input stays locked until
-    /// a batch is full so rejected positions cannot shift the saved resume boundary.
+    /// of worker completion order. With bucket sampling, workers read numbered raw
+    /// chunks under the input lock, then decode and filter outside the lock.
+    /// Accepted positions are assembled in chunk order into full batches.
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
     /// Teacher shuffle window memory in MiB, per window, including record metadata. The default 0 reads the teacher

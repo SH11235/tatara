@@ -1209,12 +1209,9 @@ pub struct TeacherPosition {
     pub next_record: u64,
     pub window_index: Option<u64>,
     pub window_offset: usize,
-    #[serde(default)]
     pub mixes: Vec<TeacherPosition>,
-    #[serde(default)]
     pub ordinal: u64,
     /// Accepted positions already delivered from the raw chunk starting at this cursor.
-    #[serde(default)]
     pub bucket_skip: usize,
 }
 

@@ -880,6 +880,9 @@ where
         "score_clamp_abs": cfg.score_clamp_abs,
         "score_source": score_settings,
         "shuffle_buffer_mib": cfg.teacher_shuffle_buffer_mib,
+        "window_records": crate::dataloader::shuffle_window_records(
+            cfg.teacher_shuffle_buffer_mib, cfg.batch_size
+        )?,
         "shuffle": cfg.teacher_shuffle,
         "seed": cfg.teacher_shuffle_seed,
         "sampling": cfg.sampling,
@@ -1387,7 +1390,7 @@ where
                 });
             }
             crate::loader_state::LoaderState {
-                version: 3,
+                version: 1,
                 superbatch: sb,
                 teachers,
                 settings: settings.clone(),
@@ -3632,7 +3635,15 @@ mod tests {
                     let state = crate::loader_state::LoaderState::load(&checkpoint)
                         .unwrap()
                         .unwrap();
+                    assert_eq!(state.version, 1);
                     assert_eq!(state.superbatch, 1);
+                    assert_eq!(
+                        state.settings["window_records"],
+                        serde_json::json!(
+                            crate::dataloader::shuffle_window_records(buffer, cfg.batch_size)
+                                .unwrap()
+                        )
+                    );
                     assert_eq!(state.teachers.len(), if combined { 3 } else { 1 });
                     if combined {
                         assert!(
@@ -3647,6 +3658,29 @@ mod tests {
                         resume_checkpoint: Some(checkpoint),
                         ..paused_cfg
                     };
+                    if buffer > 0 {
+                        let mut mismatched = state.clone();
+                        mismatched.settings["window_records"] = serde_json::json!(
+                            state.settings["window_records"].as_u64().unwrap() + 1
+                        );
+                        mismatched
+                            .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
+                            .unwrap();
+                        let error = run(
+                            &mut MockBackend::new(),
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &resumed_cfg,
+                            None,
+                        )
+                        .unwrap_err();
+                        assert!(error.to_string().contains("loader state does not match"));
+                        state
+                            .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
+                            .unwrap();
+                    }
                     let mut resumed = MockBackend::new();
                     resumed.bucketless = !cfg.compute_bucket;
                     run(

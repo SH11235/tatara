@@ -59,9 +59,16 @@ impl LoaderState {
 
     pub fn load(checkpoint: &Path) -> io::Result<Option<Self>> {
         match std::fs::read(checkpoint.with_extension("loader.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(io::Error::other),
+            Ok(bytes) => {
+                let state: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if state.version != 1 {
+                    return Err(io::Error::other(format!(
+                        "unsupported loader state version: {}",
+                        state.version
+                    )));
+                }
+                Ok(Some(state))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 eprintln!(
                     "[train] warning: checkpoint has no loader state; restarting teacher input from the beginning"
@@ -98,34 +105,13 @@ impl LoaderState {
         superbatch: usize,
     ) -> io::Result<&TeacherPosition> {
         let mut saved_settings = self.settings.clone();
-        if self.version == 1
-            && settings.get("sampling").is_some()
-            && let Some(object) = saved_settings.as_object_mut()
-        {
-            object.entry("sampling").or_insert(
-                serde_json::to_value(crate::sampling::Sampling::default())
-                    .map_err(io::Error::other)?,
-            );
-            object.entry("mix_rates").or_insert(serde_json::json!([]));
-            object.entry("mix_seed").or_insert(serde_json::json!(0));
-        }
         let mut expected_settings = settings.clone();
-        if mixes.is_empty() && expected_settings.get("mix_seed").is_some() {
-            expected_settings["mix_seed"] = serde_json::json!(0);
-        }
         for value in [&mut saved_settings, &mut expected_settings] {
             if let Some(object) = value.as_object_mut() {
                 object.remove("batches_per_superbatch");
-                if object
-                    .get("bucket_inputs")
-                    .is_some_and(serde_json::Value::is_null)
-                {
-                    object.remove("bucket_inputs");
-                }
             }
         }
-        if !matches!(self.version, 1..=3)
-            || (self.version == 1 && !mixes.is_empty())
+        if self.version != 1
             || self.superbatch != superbatch
             || self.teachers.len() != mixes.len() + 1
             || self.teachers[0].id != "primary"
@@ -161,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_replay_metadata_round_trips_and_legacy_cursors_default_to_zero() {
+    fn chunk_replay_metadata_round_trips() {
         let files = vec![TeacherFileIdentity {
             path: "teacher.psv".into(),
             bytes: 4000,
@@ -173,7 +159,7 @@ mod tests {
             ..Default::default()
         };
         let state = LoaderState {
-            version: 3,
+            version: 1,
             superbatch: 2,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -182,19 +168,9 @@ mod tests {
             }],
             settings: settings.clone(),
         };
-        let mut json = serde_json::to_value(state).unwrap();
-        let decoded: LoaderState = serde_json::from_value(json.clone()).unwrap();
+        let json = serde_json::to_value(state).unwrap();
+        let decoded: LoaderState = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.validate(&files, &settings, 2).unwrap(), &position);
-        json["version"] = serde_json::json!(2);
-        json["teachers"][0]["position"]
-            .as_object_mut()
-            .unwrap()
-            .remove("bucket_skip");
-        let legacy: LoaderState = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            legacy.validate(&files, &settings, 2).unwrap().bucket_skip,
-            0
-        );
     }
 
     #[test]
@@ -244,8 +220,12 @@ mod tests {
                 .validate(&LoaderState::identities(&[&teacher]).unwrap(), &settings, 3)
                 .is_err()
         );
-        loaded.version = 99;
-        assert!(loaded.validate(&files, &settings, 3).is_err());
+        for version in [0, 2, 3, 99] {
+            loaded.version = version;
+            assert!(loaded.validate(&files, &settings, 3).is_err());
+            loaded.save(&checkpoint).unwrap();
+            assert!(LoaderState::load(&checkpoint).is_err());
+        }
     }
 
     #[test]
@@ -268,7 +248,7 @@ mod tests {
         };
         let settings = serde_json::json!({"mix_rates": [0.2], "mix_seed": 9});
         let state = LoaderState {
-            version: 2,
+            version: 1,
             superbatch: 7,
             settings: settings.clone(),
             teachers: vec![
@@ -319,25 +299,13 @@ mod tests {
     }
 
     #[test]
-    fn version_one_defaults_to_unmixed_unsampled_input() {
-        let state: LoaderState = serde_json::from_value(serde_json::json!({
-            "version": 1, "superbatch": 2, "settings": {"seed": 3},
-            "teachers": [{"id": "primary", "files": [], "position": {"epoch": 1, "next_record": 4, "window_index": null, "window_offset": 0}}]
-        })).unwrap();
-        let mut settings = serde_json::json!({"seed": 3, "sampling": crate::sampling::Sampling::default(), "mix_rates": [], "mix_seed": 0});
-        assert_eq!(state.validate(&[], &settings, 2).unwrap().next_record, 4);
-        settings["sampling"]["keep_rate"] = serde_json::json!(0.5);
-        assert!(state.validate(&[], &settings, 2).is_err());
-    }
-
-    #[test]
     fn relocated_teachers_and_superbatch_batch_count_preserve_positions() {
         let files = vec![TeacherFileIdentity {
             path: "/old/data.psv".into(),
             bytes: 80,
         }];
         let state = LoaderState {
-            version: 2,
+            version: 1,
             superbatch: 1,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -377,7 +345,7 @@ mod tests {
             "progress_coeff": artifact_identity(&coeff).unwrap(),
         }});
         let state = LoaderState {
-            version: 2,
+            version: 1,
             superbatch: 1,
             teachers: vec![TeacherState {
                 id: "primary".into(),

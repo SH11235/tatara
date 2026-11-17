@@ -188,9 +188,10 @@ are read in full and must exclude held-out positions themselves.
 Teacher selection hashes `--mix-seed` with the mixed-stream position number; it does
 not maintain random-generator state. A shuffle window, when enabled, is filled from
 the mixed stream and shuffled afterward. Mixed windows cross individual teacher epoch
-boundaries. Mixed windows also retain a source identifier per position, so their
-resident memory is larger than the approximately twice-the-window-size estimate for
-unmixed input. Training receives batches in reader order even with multiple decode
+boundaries. The record count per window is calculated from the actual in-memory
+record size, including source metadata, and rounded down to a multiple of the batch
+size. Each window stays within the specified MiB budget, including when mixing;
+the two windows together use at most twice that budget. Training receives batches in reader order even with multiple decode
 workers. With bucket sampling, workers read numbered raw chunks under the input lock,
 then decode, extract features and filter outside the lock. Accepted positions are assembled
 in chunk order into full batches; leftovers carry into the next batch. Assembly copies
@@ -463,10 +464,12 @@ checkpointed stop.
 Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` files form
 one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
 record; the sidecar also restores the mixing selection counter and shuffle window position.
-Version 3 sidecars also store the number of accepted positions already delivered from
+Version 1 sidecars store the number of accepted positions already delivered from
 a partially consumed chunk. Resume rereads that chunk and skips those accepted positions;
-prefetch cannot advance the saved boundary. Version 2 sidecars remain readable;
-version 1 sidecars are accepted for input without mixing or sampling.
+prefetch cannot advance the saved boundary. Unknown sidecar versions are rejected.
+When windows are enabled, the sidecar stores the actual record count per window
+(`window_records`); resume rejects a mismatch with the count calculated from the
+current settings because it changes the meaning of positions within a window.
 Resume rejects changes to any teacher's basename/size, sampling probabilities/seeds,
 mixing rates/seed, batch size, training range, score processing, or shuffle settings. There is no mismatch
 override. Absolute teacher paths are recorded for reference and may change. When bucket
