@@ -1380,7 +1380,7 @@ fn shared_args_are_global_around_subcommand() {
     ])
     .expect("global args after subcommand");
     assert!(cli.ft_fp16);
-    assert_eq!(cli.data.as_deref(), Some(std::path::Path::new("x.psv")));
+    assert_eq!(cli.data, [std::path::PathBuf::from("x.psv")]);
     assert_eq!(cli.batch_size, 4096);
 }
 
@@ -1858,4 +1858,45 @@ fn cycle_wdl_flags_parse_and_build() {
     assert!(build_wdl_scheduler(&invalid).is_err());
     let invalid = simple_cli(&["--validation-wdl", "1.5"]);
     assert!(build_wdl_scheduler(&invalid).is_err());
+}
+
+#[test]
+fn data_split_around_subcommand_is_rejected() {
+    let check = |argv: &[&str]| {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+        cli.validate_data_args(&argv)
+    };
+    assert!(
+        check(&[
+            "nnue-train",
+            "--data",
+            "a.psv",
+            "--data=b.psv",
+            "layerstack"
+        ])
+        .is_ok()
+    );
+    assert!(
+        check(&[
+            "nnue-train",
+            "layerstack",
+            "--data",
+            "a.psv",
+            "--data",
+            "b.psv"
+        ])
+        .is_ok()
+    );
+    assert!(
+        check(&[
+            "nnue-train",
+            "--data",
+            "a.psv",
+            "layerstack",
+            "--data",
+            "b.psv"
+        ])
+        .is_err()
+    );
 }

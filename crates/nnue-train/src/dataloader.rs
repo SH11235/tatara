@@ -221,14 +221,15 @@ pub(crate) struct ScoreOverrideReader {
 
 impl ScoreOverrideReader {
     pub(crate) fn new(
-        data_path: &Path,
+        data_paths: &[impl AsRef<Path>],
         score_path: &Path,
         mask_path: Option<&Path>,
         start_offset: u64,
     ) -> io::Result<Self> {
-        let format = TeacherFormat::for_path(data_path)?;
+        let data_path = &teacher_data_label(data_paths);
+        let format = teacher_format(data_paths)?;
         let record_bytes = format.record_bytes();
-        let data_size = std::fs::metadata(data_path)?.len();
+        let data_size = teacher_data_bytes(data_paths)?;
         if !data_size.is_multiple_of(record_bytes) {
             return Err(io::Error::other(format!(
                 "data file {} size {data_size} is not a multiple of {} record size ({record_bytes} bytes)",
@@ -436,24 +437,123 @@ impl HcpeFileLoader {
 }
 
 /// 拡張子で選んだ形式 ([`TeacherFormat`]) の教師 file を byte range で逐次読む。
-pub(crate) enum TeacherFileLoader {
+pub(crate) struct TeacherFileLoader {
+    current: TeacherFileRange,
+    rest: std::vec::IntoIter<(PathBuf, u64, u64)>,
+}
+
+enum TeacherFileRange {
     Psv(PsvFileLoader),
     Hcpe(HcpeFileLoader),
 }
 
+impl TeacherFileRange {
+    fn open((path, start, end): (PathBuf, u64, u64)) -> io::Result<Self> {
+        Ok(match TeacherFormat::for_path(&path)? {
+            TeacherFormat::Psv => Self::Psv(PsvFileLoader::new_range(&path, start, end)?),
+            TeacherFormat::Hcpe => Self::Hcpe(HcpeFileLoader::new_range(&path, start, end)?),
+        })
+    }
+}
+
 impl TeacherFileLoader {
-    pub(crate) fn new_range(path: &Path, start: u64, end: u64) -> io::Result<Self> {
-        Ok(match TeacherFormat::for_path(path)? {
-            TeacherFormat::Psv => Self::Psv(PsvFileLoader::new_range(path, start, end)?),
-            TeacherFormat::Hcpe => Self::Hcpe(HcpeFileLoader::new_range(path, start, end)?),
+    pub(crate) fn new_range(paths: &[impl AsRef<Path>], start: u64, end: u64) -> io::Result<Self> {
+        let ranges = if let [path] = paths {
+            vec![(path.as_ref().to_path_buf(), start, end)]
+        } else {
+            let sizes = teacher_file_sizes(paths)?;
+            let total: u64 = sizes.iter().sum();
+            if start > end || end > total {
+                return Err(io::Error::other(format!(
+                    "teacher range [{start}, {end}) is outside the {total} bytes of {}",
+                    teacher_data_label(paths).display()
+                )));
+            }
+            let mut ranges = Vec::with_capacity(paths.len());
+            let mut offset = 0;
+            for (path, size) in paths.iter().zip(sizes) {
+                let local = |at: u64| at.clamp(offset, offset + size) - offset;
+                ranges.push((path.as_ref().to_path_buf(), local(start), local(end)));
+                offset += size;
+            }
+            ranges
+        };
+        let mut rest = ranges.into_iter();
+        let first = rest
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no teacher file given"))?;
+        Ok(Self {
+            current: TeacherFileRange::open(first)?,
+            rest,
         })
     }
 
     pub(crate) fn next_record(&mut self) -> io::Result<Option<TeacherRecord>> {
-        Ok(match self {
-            Self::Psv(loader) => loader.next_psv()?.map(TeacherRecord::Psv),
-            Self::Hcpe(loader) => loader.next_record()?.map(TeacherRecord::Hcpe),
-        })
+        loop {
+            let record = match &mut self.current {
+                TeacherFileRange::Psv(loader) => loader.next_psv()?.map(TeacherRecord::Psv),
+                TeacherFileRange::Hcpe(loader) => loader.next_record()?.map(TeacherRecord::Hcpe),
+            };
+            if record.is_some() {
+                return Ok(record);
+            }
+            let Some(next) = self.rest.next() else {
+                return Ok(None);
+            };
+            self.current = TeacherFileRange::open(next)?;
+        }
+    }
+}
+
+pub fn teacher_format(paths: &[impl AsRef<Path>]) -> io::Result<TeacherFormat> {
+    let mut seen = None;
+    for path in paths {
+        let format = TeacherFormat::for_path(path.as_ref())?;
+        if seen.is_some_and(|seen| seen != format) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "teacher files mix PSV and HCPE: {}",
+                    teacher_data_label(paths).display()
+                ),
+            ));
+        }
+        seen = Some(format);
+    }
+    seen.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no teacher file given"))
+}
+
+fn teacher_file_sizes(paths: &[impl AsRef<Path>]) -> io::Result<Vec<u64>> {
+    let record_bytes = teacher_format(paths)?.record_bytes();
+    let mut sizes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let size = std::fs::metadata(path.as_ref())?.len();
+        if paths.len() > 1 && !size.is_multiple_of(record_bytes) {
+            return Err(io::Error::other(format!(
+                "teacher file {} size {size} is not a multiple of the record size \
+                 ({record_bytes} bytes), so it cannot be joined with other teacher files",
+                path.as_ref().display()
+            )));
+        }
+        sizes.push(size);
+    }
+    Ok(sizes)
+}
+
+pub fn teacher_data_bytes(paths: &[impl AsRef<Path>]) -> io::Result<u64> {
+    Ok(teacher_file_sizes(paths)?.iter().sum())
+}
+
+pub fn teacher_data_label(paths: &[impl AsRef<Path>]) -> PathBuf {
+    match paths {
+        [path] => path.as_ref().to_path_buf(),
+        _ => PathBuf::from(
+            paths
+                .iter()
+                .map(|path| path.as_ref().display().to_string())
+                .collect::<Vec<_>>()
+                .join(" + "),
+        ),
     }
 }
 
@@ -958,6 +1058,7 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 /// wrap するので「終わり」は無い)。
 struct PsvEpochReader {
     path: PathBuf,
+    paths: Vec<PathBuf>,
     record_bytes: u64,
     /// 1 epoch の byte range `[start_offset, end_offset)`。wrap 時に
     /// `TeacherFileLoader::new_range(path, start, end)` で再 open する。`new()`
@@ -989,22 +1090,23 @@ impl PsvEpochReader {
     /// `TeacherFileLoader::new_range` 内で検証する。dual-label は PSV の予約 field を
     /// 使うため HCPE とは組み合わせられない。
     fn new_range(
-        path: &Path,
+        paths: &[impl AsRef<Path>],
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
         score_source: Option<ScoreSource<&Path>>,
     ) -> io::Result<Self> {
-        let format = TeacherFormat::for_path(path)?;
+        let path = teacher_data_label(paths);
+        let format = teacher_format(paths)?;
         if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
         {
-            return Err(dual_label_requires_psv(path));
+            return Err(dual_label_requires_psv(&path));
         }
-        let loader = TeacherFileLoader::new_range(path, start_offset, end_offset)?;
+        let loader = TeacherFileLoader::new_range(paths, start_offset, end_offset)?;
         let (score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
-                Some(ScoreOverrideReader::new(path, scores, mask, start_offset)?),
+                Some(ScoreOverrideReader::new(paths, scores, mask, start_offset)?),
                 None,
             ),
             Some(ScoreSource::DualLabel(mode)) => (None, Some(mode)),
@@ -1012,7 +1114,11 @@ impl PsvEpochReader {
         };
         let record_bytes = format.record_bytes();
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
+            paths: paths
+                .iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
             record_bytes,
             start_offset,
             end_offset,
@@ -1099,7 +1205,7 @@ impl PsvEpochReader {
                     }
                     self.pushed_this_epoch = 0;
                     self.loader = TeacherFileLoader::new_range(
-                        &self.path,
+                        &self.paths,
                         self.start_offset,
                         self.end_offset,
                     )?;
@@ -1490,7 +1596,7 @@ impl BucketedPrefetchedLoader {
         monitor_active: bool,
     ) -> io::Result<Self> {
         Self::spawn_with_score_sources(
-            path,
+            &[path],
             batch_size,
             score_drop_abs,
             score_clamp_abs,
@@ -1511,7 +1617,7 @@ impl BucketedPrefetchedLoader {
     /// Spawns a loader with one explicit score source selection.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_score_sources(
-        path: &Path,
+        paths: &[impl AsRef<Path>],
         batch_size: usize,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
@@ -1534,7 +1640,7 @@ impl BucketedPrefetchedLoader {
         assert!(batch_size >= 1, "batch_size must be >= 1");
         let bucket_mode = bucket_mode.into();
         let source = PsvEpochReader::new_range(
-            path,
+            paths,
             0,
             train_end_offset,
             score_drop_abs,
@@ -1559,7 +1665,7 @@ impl BucketedPrefetchedLoader {
             num_buckets,
             monitor_active,
             reader,
-            path,
+            &teacher_data_label(paths),
         ))
     }
 
@@ -1953,6 +2059,46 @@ mod tests {
             .join("shogi-format/tests/data/sample.psv")
     }
 
+    #[test]
+    fn teacher_files_are_read_as_one_range_in_the_given_order() {
+        let bytes = std::fs::read(sample_psv_path()).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("nnue-train-multi-data-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<PathBuf> = [&bytes[..1480], &bytes[1480..1480], &bytes[1480..]]
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let path = dir.join(format!("{i}.psv"));
+                std::fs::write(&path, part).unwrap();
+                path
+            })
+            .collect();
+        let read_all = |mut loader: TeacherFileLoader| {
+            let mut records = Vec::new();
+            while let Some(TeacherRecord::Psv(psv)) = loader.next_record().unwrap() {
+                records.push(*psv.as_bytes());
+            }
+            records
+        };
+        assert_eq!(teacher_data_bytes(&paths).unwrap(), 4000);
+        for (start, end) in [(0, 4000), (400, 3600), (1440, 1520), (2000, 2000)] {
+            assert_eq!(
+                read_all(TeacherFileLoader::new_range(&paths, start, end).unwrap()),
+                read_all(TeacherFileLoader::new_range(&[sample_psv_path()], start, end).unwrap()),
+                "range [{start}, {end})"
+            );
+        }
+        assert!(TeacherFileLoader::new_range(&paths, 0, 4040).is_err());
+        assert!(TeacherFileLoader::new_range(&paths, 20, 4000).is_err());
+        let hcpe = dir.join("3.hcpe");
+        std::fs::write(&hcpe, []).unwrap();
+        assert!(teacher_format(&[&paths[2], &hcpe]).is_err());
+        std::fs::write(&paths[0], &bytes[..1490]).unwrap();
+        assert!(teacher_data_bytes(&paths).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn synthetic_override_files(
         name: &str,
         base_scores: &[i16],
@@ -2000,7 +2146,7 @@ mod tests {
         score_override: Option<&Path>,
     ) -> WindowedPsvReader {
         let source = PsvEpochReader::new_range(
-            data,
+            &[data],
             0,
             records as u64 * PSV_RECORD_BYTES,
             None,
@@ -2071,7 +2217,7 @@ mod tests {
         let dl = [101, 102, 103, 104, 105];
         let path = synthetic_dual_file("window", &base, &dl, &[0; 5]);
         let source = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             0,
             base.len() as u64 * PSV_RECORD_BYTES,
             None,
@@ -2129,7 +2275,7 @@ mod tests {
         let dl = [101, -202, 303];
         let path = synthetic_dual_file("all-wrap", &base, &dl, &[1, 0, 1]);
         let mut reader = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             0,
             3 * PSV_RECORD_BYTES,
             None,
@@ -2152,7 +2298,7 @@ mod tests {
             .collect();
         let path = synthetic_dual_file("gated-boundaries", &base, &dl, &gates);
         let mut reader = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             0,
             17 * PSV_RECORD_BYTES,
             None,
@@ -2177,7 +2323,7 @@ mod tests {
     fn dual_label_rejects_reserved_padding_bits_with_index_and_path() {
         let path = synthetic_dual_file("reserved-bits", &[1, 2, 3], &[11, 12, 13], &[0, 2, 0]);
         let mut reader = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             0,
             3 * PSV_RECORD_BYTES,
             None,
@@ -2205,7 +2351,7 @@ mod tests {
         let dl = [100, 101, 102, 103, 104];
         let path = synthetic_dual_file("range", &base, &dl, &[0; 5]);
         let mut reader = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             2 * PSV_RECORD_BYTES,
             5 * PSV_RECORD_BYTES,
             None,
@@ -2224,7 +2370,7 @@ mod tests {
         let path =
             synthetic_dual_file("drop-clamp-order", &[10, 20, 30], &[500, 50, -250], &[0; 3]);
         let mut reader = PsvEpochReader::new_range(
-            &path,
+            &[&path],
             0,
             3 * PSV_RECORD_BYTES,
             Some(400),
@@ -2244,7 +2390,7 @@ mod tests {
         let replacement = [101, -202, 303];
         let (data, scores, _) = synthetic_override_files("all-wrap", &base, &replacement, None);
         let mut reader = PsvEpochReader::new_range(
-            &data,
+            &[&data],
             0,
             3 * PSV_RECORD_BYTES,
             None,
@@ -2271,7 +2417,7 @@ mod tests {
         let (data, scores, mask_path) =
             synthetic_override_files("mask-boundary", &base, &replacement, Some(&mask));
         let mut reader = PsvEpochReader::new_range(
-            &data,
+            &[&data],
             0,
             17 * PSV_RECORD_BYTES,
             None,
@@ -2301,7 +2447,7 @@ mod tests {
         let replacement = [100, 101, 102, 103, 104];
         let (data, scores, _) = synthetic_override_files("range", &base, &replacement, None);
         let mut reader = PsvEpochReader::new_range(
-            &data,
+            &[&data],
             2 * PSV_RECORD_BYTES,
             5 * PSV_RECORD_BYTES,
             None,
@@ -2326,7 +2472,7 @@ mod tests {
         let (data, scores, mask_path) =
             synthetic_override_files("mask-range-wrap", &base, &replacement, Some(&mask));
         let mut reader = PsvEpochReader::new_range(
-            &data,
+            &[&data],
             3 * PSV_RECORD_BYTES,
             11 * PSV_RECORD_BYTES,
             None,
@@ -2359,7 +2505,7 @@ mod tests {
         }
         std::fs::write(&materialized, bytes).unwrap();
         let mut overridden = PsvEpochReader::new_range(
-            &data,
+            &[&data],
             0,
             3 * PSV_RECORD_BYTES,
             Some(400),
@@ -2371,7 +2517,7 @@ mod tests {
         )
         .unwrap();
         let mut concrete = PsvEpochReader::new_range(
-            &materialized,
+            &[&materialized],
             0,
             3 * PSV_RECORD_BYTES,
             Some(400),
@@ -2400,7 +2546,7 @@ mod tests {
             let bad = scores.with_extension(format!("scores-{delta}"));
             let size = (replacement.len() as i64 * 2 + delta) as usize;
             std::fs::write(&bad, vec![0_u8; size]).unwrap();
-            let err = ScoreOverrideReader::new(&data, &bad, None, 0).unwrap_err();
+            let err = ScoreOverrideReader::new(&[&data], &bad, None, 0).unwrap_err();
             let _ = std::fs::remove_file(&bad);
             assert!(err.to_string().contains("expected 18 bytes"));
         }
@@ -2408,7 +2554,7 @@ mod tests {
             let bad = scores.with_extension(format!("mask-{delta}"));
             let size = (2_i64 + delta) as usize;
             std::fs::write(&bad, vec![0_u8; size]).unwrap();
-            let err = ScoreOverrideReader::new(&data, &scores, Some(&bad), 0).unwrap_err();
+            let err = ScoreOverrideReader::new(&[&data], &scores, Some(&bad), 0).unwrap_err();
             let _ = std::fs::remove_file(&bad);
             assert!(err.to_string().contains("expected 2 bytes"));
         }
@@ -2425,7 +2571,7 @@ mod tests {
             synthetic_override_files("unused-mask-bits", &base, &replacement, Some(&mask));
 
         let err = match PsvEpochReader::new_range(
-            &data,
+            &[&data],
             0,
             9 * PSV_RECORD_BYTES,
             None,
@@ -2973,7 +3119,7 @@ mod tests {
 
         let end = base_bytes.len() as u64;
         let mut sidecar = BucketedPrefetchedLoader::spawn_with_score_sources(
-            &base_path,
+            &[&base_path],
             16,
             None,
             None,
@@ -2994,7 +3140,7 @@ mod tests {
         )
         .unwrap();
         let mut inline = BucketedPrefetchedLoader::spawn_with_score_sources(
-            &dual_path,
+            &[&dual_path],
             16,
             None,
             None,
@@ -3177,7 +3323,7 @@ mod tests {
 
         let end = full_range_end(&path);
         let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
-            &path,
+            &[&path],
             8,
             None,
             None,
@@ -3325,7 +3471,7 @@ mod tests {
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
         let mut reader =
-            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None, None).unwrap();
+            PsvEpochReader::new_range(&[sample_psv_path()], 2800, 4000, None, None, None).unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
@@ -3352,7 +3498,7 @@ mod tests {
         std::fs::write(&tmp, &bytes).expect("write synthetic psv");
 
         let mut reader =
-            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100), None)
+            PsvEpochReader::new_range(&[&tmp], 0, bytes.len() as u64, Some(32000), Some(100), None)
                 .unwrap();
         let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
         std::fs::remove_file(&tmp).ok();

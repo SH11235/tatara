@@ -99,7 +99,7 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::ArchCommand::LayerStack(_) | cli::ArchCommand::Simple(_) => {
             #[cfg(feature = "gpu")]
             {
-                if cli.data.is_some()
+                if !cli.data.is_empty()
                     || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some())
                     || cli.eval_only
                     || cli.rescore_input.is_some()
@@ -121,8 +121,12 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let result = cli
         .validate_score_sources()
+        .and_then(|()| cli.validate_data_args(&argv))
         .map_err(Into::into)
         .and_then(|()| dispatch(&cli));
     match result {

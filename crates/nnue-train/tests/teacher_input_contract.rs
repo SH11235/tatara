@@ -26,7 +26,7 @@ fn training_loader_with_source(
     score_source: Option<ScoreSource<&Path>>,
 ) -> io::Result<BucketedPrefetchedLoader> {
     BucketedPrefetchedLoader::spawn_with_score_sources(
-        path,
+        &[path],
         4,
         None,
         None,
@@ -90,7 +90,7 @@ fn sidecar_and_dual_labels_keep_feature_payload_with_windowed_training() {
         }
     }
     let heldout = HeldoutSet::load_from_range_with_score_sources(
-        &dual_path,
+        &[&dual_path],
         40,
         160,
         1,
