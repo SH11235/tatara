@@ -1624,6 +1624,7 @@ fn precision_diagnostic_training_on_off_equivalence() -> Result<(), Box<dyn std:
                     ft_fp16: true,
                     ft_fp16_out: true,
                     fp16_opt_state: half,
+                    ft_state_host: false,
                 };
                 options.norm_loss_factor = Some(1.0e-4);
                 let mut control =
@@ -1695,6 +1696,109 @@ fn precision_diagnostic_training_on_off_equivalence() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn ft_state_host_training_matches_device_state() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    for (ft_fp16, half) in [(false, false), (true, false), (true, true)] {
+        let mut options = LayerStackTestOptions::standard();
+        options.precision.ft_fp16 = ft_fp16;
+        options.precision.fp16_opt_state = half;
+        let mut control = create_layerstack_trainer_with_options(&context, true, options)?;
+        options.precision.ft_state_host = true;
+        let mut host = create_layerstack_trainer_with_options(&context, true, options)?;
+        assert!(!control.ft_state_mapped());
+        assert!(host.ft_state_mapped());
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (row % 2) as i32;
+        }
+        batch.score.fill(120.0);
+        for step in 1..=3 {
+            let a = control.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let b = host.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            assert!(
+                (a - b).abs() <= 1.0e-9 + NATIVE_PARITY_TOLERANCE * a.abs().max(b.abs()),
+                "ft_fp16={ft_fp16}, half={half}, step={step}"
+            );
+        }
+        let a = control.raw_checkpoint_state_to_host()?;
+        let b = host.raw_checkpoint_state_to_host()?;
+        assert_eq!(a.0, b.0);
+        for ((name, a), (_, b)) in a.1.iter().zip(&b.1) {
+            for (field, (a, b)) in [&a.0, &a.1, &a.2, &a.3]
+                .into_iter()
+                .zip([&b.0, &b.1, &b.2, &b.3])
+                .enumerate()
+            {
+                assert_eq!(a.len(), b.len());
+                let abs_tolerance = match field {
+                    1 => NATIVE_FIRST_MOMENT_ABS_TOLERANCE,
+                    2 => NATIVE_SECOND_MOMENT_ABS_TOLERANCE,
+                    _ => NATIVE_WEIGHT_ABS_TOLERANCE,
+                };
+                assert!(
+                    a.iter().zip(b).all(|(a, b)| (a - b).abs()
+                        <= abs_tolerance + NATIVE_PARITY_TOLERANCE as f32 * a.abs().max(b.abs())),
+                    "{name} field={field}, ft_fp16={ft_fp16}, half={half}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn ft_state_host_raw_checkpoint_resumes_bit_identically() -> Result<(), Box<dyn std::error::Error>>
+{
+    let context = test_cuda_context()?;
+    let mut options = LayerStackTestOptions::standard();
+    options.precision.ft_state_host = true;
+    let mut source = create_layerstack_trainer_with_options(&context, true, options)?;
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for _ in 0..2 {
+        let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    }
+    let expected = source.raw_checkpoint_state_to_host()?;
+    let path = std::env::temp_dir().join(format!(
+        "tatara-ft-state-host-resume-{}.ckpt",
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        source.save_raw_checkpoint(
+            &path,
+            2,
+            &nnue_train::trainer::CheckpointProducer::run_id_only("ft-state-host"),
+            None,
+        )?;
+        for ft_state_host in [false, true] {
+            options.precision.ft_state_host = ft_state_host;
+            let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+            trainer.load_raw_checkpoint(&path)?;
+            assert_eq!(trainer.ft_state_mapped(), ft_state_host);
+            let loaded = trainer.raw_checkpoint_state_to_host()?;
+            assert_eq!(loaded.0, expected.0);
+            for ((name, a), (_, b)) in expected.1.iter().zip(&loaded.1) {
+                for (a, b) in [&a.0, &a.1, &a.2, &a.3]
+                    .into_iter()
+                    .zip([&b.0, &b.1, &b.2, &b.3])
+                {
+                    assert!(
+                        a.iter()
+                            .map(|x| x.to_bits())
+                            .eq(b.iter().map(|x| x.to_bits())),
+                        "{name}, ft_state_host={ft_state_host}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
 #[test]
 #[cfg(feature = "oxide-parity")]
 fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
@@ -1733,6 +1837,7 @@ fn large_batch_multistep_all_optim_layerstack_native_matches_cuda_oxide()
                 ft_fp16: true,
                 ft_fp16_out: true,
                 fp16_opt_state: true,
+                ft_state_host: false,
             },
             ..LayerStackTestOptions::standard()
         },
@@ -3281,6 +3386,7 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
         ft_fp16: true,
         ft_fp16_out: true,
         fp16_opt_state: true,
+        ft_state_host: false,
     };
     let fp16_weights_only = PrecisionFlags {
         ft_fp16: true,
@@ -3518,6 +3624,7 @@ fn ft_post_grad_from_l1_matches_materialized_l1_input_gradient()
         ft_fp16: true,
         ft_fp16_out: true,
         fp16_opt_state: true,
+        ft_state_host: false,
     };
     for (name, precision) in [
         ("fp32", PrecisionFlags::default()),
@@ -3646,6 +3753,7 @@ fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std:
         ft_fp16: true,
         ft_fp16_out: true,
         fp16_opt_state: true,
+        ft_state_host: false,
     };
     // ft_out 256 で列 slice が複数になる。factorizer の仮想行は gather の起動形状に関係しない。
     for (name, feature_set, ft_out) in [("halfka-hm", FeatureSet::HalfKaHmMerged.spec(), 256)] {
@@ -3743,6 +3851,7 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
                 ft_fp16: true,
                 ft_fp16_out: true,
                 fp16_opt_state: true,
+                ft_state_host: false,
             },
         ),
     ];
@@ -3847,6 +3956,7 @@ fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::
         ft_fp16: true,
         ft_fp16_out: true,
         fp16_opt_state: true,
+        ft_state_host: false,
     };
     let configs = [
         (

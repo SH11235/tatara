@@ -58,6 +58,7 @@ pub(crate) struct PrecisionFlags {
     pub(crate) ft_fp16_out: bool,
     /// FT weight の optimizer moment を scale 付き FP16 で保持する。
     pub(crate) fp16_opt_state: bool,
+    pub(crate) ft_state_host: bool,
 }
 
 /// `ft_w` の optimizer moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
@@ -80,6 +81,31 @@ impl MomentBuf {
             Ok(MomentBuf::F16(DeviceBuffer::<f16>::zeroed(stream, n)?))
         } else {
             Ok(MomentBuf::F32(DeviceBuffer::<f32>::zeroed(stream, n)?))
+        }
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn zeroed_mapped(
+        stream: &CudaStream,
+        n: usize,
+        fp16: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if fp16 {
+            Ok(MomentBuf::F16(DeviceBuffer::<f16>::zeroed_mapped(
+                stream, n,
+            )?))
+        } else {
+            Ok(MomentBuf::F32(DeviceBuffer::<f32>::zeroed_mapped(
+                stream, n,
+            )?))
+        }
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn is_mapped(&self) -> bool {
+        match self {
+            MomentBuf::F32(b) => b.is_mapped(),
+            MomentBuf::F16(b) => b.is_mapped(),
         }
     }
 

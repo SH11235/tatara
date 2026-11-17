@@ -359,6 +359,7 @@ fn selected_precisions(selection: NativeBenchPrecisionArg) -> Vec<PrecisionSpec>
             ft_fp16: true,
             ft_fp16_out: true,
             fp16_opt_state: true,
+            ft_state_host: false,
         },
     };
     match selection {

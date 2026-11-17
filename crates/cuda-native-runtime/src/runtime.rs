@@ -13,6 +13,7 @@ type CuEvent = *mut c_void;
 
 const CUDA_SUCCESS: CuResult = 0;
 const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
+const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
 const CU_STREAM_NON_BLOCKING: u32 = 1;
 
 #[cfg_attr(target_os = "windows", link(name = "cuda"))]
@@ -39,6 +40,11 @@ unsafe extern "C" {
     fn cuMemFree_v2(device_ptr: CuDevicePtr) -> CuResult;
     fn cuMemHostAlloc(host_ptr: *mut *mut c_void, bytes: usize, flags: u32) -> CuResult;
     fn cuMemFreeHost(host_ptr: *mut c_void) -> CuResult;
+    fn cuMemHostGetDevicePointer_v2(
+        device_ptr: *mut CuDevicePtr,
+        host_ptr: *mut c_void,
+        flags: u32,
+    ) -> CuResult;
     fn cuMemcpyHtoD_v2(dst: CuDevicePtr, src: *const c_void, bytes: usize) -> CuResult;
     fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CuDevicePtr, bytes: usize) -> CuResult;
     fn cuMemcpyHtoDAsync_v2(
@@ -463,6 +469,7 @@ pub struct DeviceBuffer<T: DeviceElement> {
     len: usize,
     context: Arc<ContextInner>,
     marker: PhantomData<T>,
+    host: usize,
 }
 
 impl<T: DeviceElement> DeviceBuffer<T> {
@@ -473,6 +480,7 @@ impl<T: DeviceElement> DeviceBuffer<T> {
                 len: 0,
                 context: Arc::clone(&context.inner),
                 marker: PhantomData,
+                host: 0,
             });
         }
         context.set_current()?;
@@ -487,6 +495,7 @@ impl<T: DeviceElement> DeviceBuffer<T> {
             len,
             context: Arc::clone(&context.inner),
             marker: PhantomData,
+            host: 0,
         })
     }
 
@@ -500,6 +509,41 @@ impl<T: DeviceElement> DeviceBuffer<T> {
         unsafe { check(cuMemsetD8_v2(buffer.raw, 0, len * size_of::<T>()))? };
         synchronize_default_stream()?;
         Ok(buffer)
+    }
+
+    pub fn zeroed_mapped(context: &Context, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Self::allocate(context, 0);
+        }
+        context.set_current()?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .expect("CUDA allocation byte size overflowed");
+        let mut host = ptr::null_mut();
+        // SAFETY: host points to writable output storage and bytes is non-zero.
+        unsafe {
+            check(cuMemHostAlloc(
+                &mut host,
+                bytes,
+                CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP,
+            ))?
+        };
+        let mut buffer = Self {
+            raw: 0,
+            len,
+            context: Arc::clone(&context.inner),
+            marker: PhantomData,
+            host: host as usize,
+        };
+        // SAFETY: cuMemHostAlloc succeeded, so host is a live allocation of bytes bytes.
+        unsafe { ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
+        // SAFETY: host was allocated with DEVICEMAP in the current context.
+        unsafe { check(cuMemHostGetDevicePointer_v2(&mut buffer.raw, host, 0))? };
+        Ok(buffer)
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.host != 0
     }
 
     /// Returns after the upload is complete, including for non-blocking consumers.
@@ -703,13 +747,17 @@ impl<T: DeviceElement> DeviceBuffer<T> {
 
 impl<T: DeviceElement> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        if self.raw == 0 {
+        if self.raw == 0 && self.host == 0 {
             return;
         }
-        // SAFETY: the retained context owns raw and stays alive through this call.
+        // SAFETY: the retained context owns raw or host and stays alive through this call.
         unsafe {
             let _ = cuCtxSetCurrent(self.context.raw);
-            let _ = cuMemFree_v2(self.raw);
+            if self.host == 0 {
+                let _ = cuMemFree_v2(self.raw);
+            } else {
+                let _ = cuMemFreeHost(self.host as *mut c_void);
+            }
         }
     }
 }
