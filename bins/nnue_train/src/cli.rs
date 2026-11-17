@@ -434,8 +434,9 @@ pub(crate) struct Cli {
     /// Applied targets are appended to control_history.jsonl and recorded in experiment.json.
     /// LR and WDL schedules retain the original horizon. Missing files are silently ignored.
     /// pause is read at startup and superbatch ends.
-    /// A false-to-true pause change saves a resumable checkpoint and exits with code 75.
-    /// Startup pause=true is ignored; set false then true to request another pause.
+    /// A control-file rewrite after startup with pause=true saves a resumable checkpoint
+    /// and exits with code 75, unless training completes at that boundary.
+    /// Startup pause=true is ignored; rewrite the file with pause=true to request a pause.
     /// Paths without training output, such as smoke tests, have no default control file.
     #[arg(long, global = true)]
     pub(crate) control_file: Option<PathBuf>,
@@ -698,9 +699,13 @@ pub(crate) struct Cli {
     /// so the LR curve is reproduced independently of --superbatches (see
     /// --lr-final-superbatch for the full precedence). An adjacent .loader.json
     /// restores every teacher's input position, mixing selection counter, and shuffle
-    /// window. Missing metadata warns and restarts input. All teacher paths/sizes,
+    /// window. Missing metadata warns and restarts input. All teacher basenames/sizes,
     /// sampling probabilities, mixing rates/seeds, and other input settings
-    /// must match. Keep the sidecar together with the checkpoint.
+    /// must match; absolute teacher paths may change. Bucket sampling also checks
+    /// bucket mode/count and the progress coefficient file size and SHA-256.
+    /// Delete .loader.json to restart teacher input without restoring positions.
+    /// With --start-superbatch, input restarts with a warning.
+    /// Keep the sidecar together with the checkpoint.
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 
@@ -723,7 +728,8 @@ pub(crate) struct Cli {
     /// Superbatch number to start training from (1-indexed, inclusive). When
     /// omitted: with `--resume`, the checkpoint's superbatch + 1; otherwise 1.
     /// An error if outside `1 <= N <= --superbatches` (may be set explicitly to
-    /// redo past superbatches on resume).
+    /// redo past superbatches on resume). With --resume, warns and restarts teacher
+    /// input from the beginning instead of restoring input positions.
     #[arg(long, global = true)]
     pub(crate) start_superbatch: Option<usize>,
 
@@ -864,12 +870,12 @@ pub(crate) struct Cli {
     /// a batch is full so rejected positions cannot shift the saved resume boundary.
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
-    /// Raw PSV shuffle window size in MiB, per window. The default 0 reads the teacher
+    /// Teacher shuffle window memory in MiB, per window, including record metadata. The default 0 reads the teacher
     /// sequentially without windows (teachers are expected to be pre-shuffled on disk).
     /// A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle;
     /// `auto` sizes the window to 1/16 of total RAM (or the cgroup limit, including nested
-    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so raw teacher-data
-    /// memory is approximately twice the resolved value.
+    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so window
+    /// memory (including record metadata) is approximately twice the resolved value.
     #[arg(long, default_value = "0", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.

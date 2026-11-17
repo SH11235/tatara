@@ -201,6 +201,51 @@ fn corrupt_hcpe_record_stops_the_loader() {
     );
 }
 
+#[test]
+fn corrupt_middle_hcpe_record_wakes_ordered_multi_worker_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-middle.hcpe");
+    let mut bytes = std::fs::read(fixture("sample.hcpe")).unwrap();
+    bytes[30 * 38..30 * 38 + 32].fill(0xff);
+    std::fs::write(&path, &bytes).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let task = thread::spawn(move || {
+        let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+            &[&path],
+            10,
+            None,
+            None,
+            4,
+            BucketMode::KingRank9,
+            FeatureSet::HalfKaHmMerged.spec(),
+            true,
+            9,
+            bytes.len() as u64,
+            false,
+            None,
+            0,
+            false,
+            0,
+            Default::default(),
+        )
+        .unwrap();
+        let error = loop {
+            match loader.next_batch() {
+                Ok(Some(slot)) => loader.recycle(slot),
+                Err(error) => break error,
+                Ok(None) => panic!("corrupt stream must fail"),
+            }
+        };
+        drop(loader);
+        tx.send(error).unwrap();
+    });
+    let error = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("missing sequence must not leave ordered delivery blocked");
+    task.join().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_whose_name_and_target_disagree_on_the_format_is_rejected() {

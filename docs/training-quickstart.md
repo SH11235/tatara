@@ -128,7 +128,7 @@ change for real training are:
 | `--mix-data PATH` / `--mix-rate R` | none | Repeat in matching order to sample additional teachers; each finite rate is positive and their sum is less than 1. The remainder comes from the concatenated `--data` stream. All teachers must use the same format |
 | `--mix-seed` | 0 | Stateless teacher-selection seed, independent of the shuffle seed |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
-| `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value |
+| `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional window memory (including record metadata) is approximately twice the effective value |
 | `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering. Takes effect only when `--teacher-shuffle-buffer-mib > 0` |
 | `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation; training delivers decoded batches in input order even with multiple workers |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
@@ -204,8 +204,8 @@ actually passed to training, excluding unread prefetched positions. Source 0 is 
 main teacher; sources 1 onward follow `--mix-data` order. `experiment.json` records
 ordered teacher basenames and rates in `params.mix_data`, and the seed in
 `params.mix_seed`; these fields participate in the recipe fingerprint. With no mixing,
-the input sequence and recipe fingerprint remain unchanged. Existing checkpoint
-resume does not restore teacher reading positions; reproducing an interrupted mixed
+the input sequence and recipe fingerprint remain unchanged. Old checkpoints without `.loader.json`
+do not restore teacher reading positions; reproducing an interrupted mixed
 stream also requires its output ordinal and each teacher's epoch and next record index.
 
 ### Teacher-data read-ahead and shuffle
@@ -222,11 +222,12 @@ avoids repeating exactly the same order when training makes multiple passes over
 pre-shuffled PSV.
 
 As a guide, machines limited to 8/16/32/64 GiB or more resolve to 512 MiB/1 GiB/2 GiB/4 GiB per
-window. The startup `N MiB x2 (auto)` message and `experiment.json` record the resolved value.
+window. Capacity is rounded down to whole batches using the in-memory record size,
+including identity metadata, for both PSV and HCPE. The startup `N MiB x2 (auto)` message and `experiment.json` record the resolved value.
 The calculation does not use currently available memory, so other processes and page-cache state
 do not change the result for a fixed memory limit.
 
-Additional raw memory is approximately twice the effective value; an explicit
+Additional window memory (including record metadata) is approximately twice the effective value; an explicit
 `--teacher-shuffle-buffer-mib 4096` adds about 8 GiB. A larger window can absorb longer
 HDD stalls, but it also increases the delay before the first batch, CPU time spent shuffling, and
 random memory traffic. When windowing is enabled, a small explicit value such as 256 keeps the
@@ -234,7 +235,7 @@ first-batch delay, memory, and shuffle cost low. `--threads` controls decode wor
 producer's window shuffle.
 
 ```bash
-# 1 GiB per window (up to about 2 GiB of additional raw PSV), with a fixed base seed
+# 1 GiB per window (up to about 2 GiB of additional window memory), with a fixed base seed
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
   layerstack ...
@@ -435,7 +436,8 @@ Write a temporary file and rename it to avoid partial JSON.
 Applied targets are also recorded in `experiment.json` as `results.target_superbatches`.
 
 Add `"pause": true` to the same file to pause at the end of the superbatch where
-the trainer reads a change from false (or absent) to true after startup.
+the trainer reads `pause=true` in a file rewritten after startup (changed modification
+time or contents).
 It saves weights and optimizer state in `.ckpt`, input positions in `.loader.json`,
 and inference weights in `.bin`, regardless of `--save-rate`, then exits with code **75**.
 Pause is polled at superbatch ends and its application is appended to `control_history.jsonl`.
@@ -445,8 +447,9 @@ Pause is polled at superbatch ends and its application is appended to `control_h
 ```
 
 Startup `pause=true` is ignored with a warning. Leaving it true does not pause.
-To pause again, set it false, let the trainer read it at a superbatch boundary,
-then set it true. `experiment.json` marks paused runs interrupted, records applied
+To pause again, rewrite the file with `pause=true`; intermediate false values do not
+need to be observed. A pause received at the final superbatch is ignored with a log
+message, and training completes normally with exit code 0. `experiment.json` marks paused runs interrupted, records applied
 pauses in `control_history`, and records the ending superbatch and pause flag in `stopped`.
 SIGINT and SIGTERM are not converted into pause requests; use the control file for a
 checkpointed stop.
@@ -457,11 +460,15 @@ Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` f
 one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
 record; the sidecar also restores the mixing selection counter and shuffle window position.
 Version 1 sidecars are accepted for input without mixing or sampling.
-Resume rejects changes to any teacher's absolute path/size, sampling probabilities/seeds,
-mixing rates/seed, batch size, batches per superbatch, training range, score processing, or shuffle settings. There is no mismatch
-override. Content changes of the same size are not detected, so keep teacher files immutable.
+Resume rejects changes to any teacher's basename/size, sampling probabilities/seeds,
+mixing rates/seed, batch size, training range, score processing, or shuffle settings. There is no mismatch
+override. Absolute teacher paths are recorded for reference and may change. When bucket
+keep rates are enabled, bucket mode/count and progress coefficient file size/SHA-256
+must also match. Delete `.loader.json` to use legacy resume from the beginning of
+the teachers without restoring input positions. Content changes of the same size are not detected, so keep teacher files immutable.
 Old checkpoints without a sidecar warn once and restart input from the beginning.
-Overriding `--start-superbatch` is rejected for checkpoints with input positions.
+Passing `--start-superbatch` with `--resume` warns and restarts teacher input from
+the beginning, without restoring loader positions. Batches per superbatch may change.
 
 Restart with the same arguments plus `--resume <last.ckpt>`, keeping its matching
 `.loader.json`. Startup pause is ignored, so leaving it true also allows resuming.

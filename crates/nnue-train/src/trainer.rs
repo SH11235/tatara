@@ -418,6 +418,8 @@ pub enum OutputFormat {
 pub struct TrainingConfig {
     pub control_file: Option<PathBuf>,
     pub resume_checkpoint: Option<PathBuf>,
+    pub resume_superbatch_override: bool,
+    pub progress_coeff: Option<PathBuf>,
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
     pub net_id: String,
     /// 入力 feature set spec。dataloader の sparse index 化に使う
@@ -463,7 +465,7 @@ pub struct TrainingConfig {
     pub mix_sources: Vec<crate::dataloader::MixSource>,
     /// Stateless teacher-selection seed, combined with the output record ordinal.
     pub mix_seed: u64,
-    /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
+    /// Teacher window memory in MiB, including record metadata, per window. Two windows are used so the producer can fill
     /// one while decode workers consume the other. `0` restores direct sequential reading.
     pub teacher_shuffle_buffer_mib: usize,
     /// Shuffle records within each raw PSV window. Callers pass the effective value
@@ -790,7 +792,7 @@ fn append_control_history(path: &Path, entry: &impl Serialize) -> io::Result<()>
 /// 各 superbatch の開始時に `cfg.output_dir/control.json` を読み、
 /// `target_superbatches` があれば元の終了点を超えない範囲で実効終了点を更新する。
 /// `cfg.control_file` があればそのパスだけを読む。
-/// 起動後の `pause` の false → true は superbatch 終了時に保存して停止する。
+/// 起動後に書き換えた制御ファイルの `pause=true` は superbatch 終了時に保存して停止する。
 /// LR / WDL schedule の horizon は `cfg.end_superbatch` のまま変えない。
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
@@ -874,7 +876,6 @@ where
         "train_end_offset": train_end_offset,
         "record_bytes": record_bytes,
         "batch_size": cfg.batch_size,
-        "batches_per_superbatch": cfg.batches_per_superbatch,
         "score_drop_abs": cfg.score_drop_abs,
         "score_clamp_abs": cfg.score_clamp_abs,
         "score_source": score_settings,
@@ -882,12 +883,26 @@ where
         "shuffle": cfg.teacher_shuffle,
         "seed": cfg.teacher_shuffle_seed,
         "sampling": cfg.sampling,
+        "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
+            serde_json::json!({
+                "mode": Into::<BucketMode>::into(*bucket_mode).canonical_name(),
+                "count": cfg.num_buckets,
+                "progress_coeff": cfg.progress_coeff.as_deref()
+                    .map(crate::loader_state::artifact_identity).transpose()?,
+            })
+        } else { serde_json::Value::Null },
         "mix_rates": cfg.mix_sources.iter().map(|s| s.rate).collect::<Vec<_>>(),
         "mix_seed": if cfg.mix_sources.is_empty() { 0 } else { cfg.mix_seed },
     });
+    if cfg.resume_checkpoint.is_some() && cfg.resume_superbatch_override {
+        eprintln!(
+            "[train] warning: --start-superbatch overrides resume; restarting teacher input from the beginning without restoring loader positions"
+        );
+    }
     let resume_state = cfg
         .resume_checkpoint
         .as_deref()
+        .filter(|_| !cfg.resume_superbatch_override)
         .map(crate::loader_state::LoaderState::load)
         .transpose()?
         .flatten();
@@ -1053,7 +1068,7 @@ where
     live_control.poll(&control_path);
     if live_control.value.pause {
         eprintln!(
-            "[control] warning: ignoring startup pause=true; set pause to false, then true to pause training"
+            "[control] warning: ignoring startup pause=true; rewrite the control file with pause=true to pause training"
         );
     }
     live_control.pause_requested = false;
@@ -1187,6 +1202,10 @@ where
             ));
         }
         live_control.poll(&control_path);
+        if live_control.pause_requested && sb >= effective_target {
+            println!("[control] ignoring pause request because training has completed");
+            live_control.pause_requested = false;
+        }
         if live_control.pause_requested {
             effective_target = sb;
             let entry = serde_json::json!({
@@ -1466,18 +1485,23 @@ struct LiveControl {
     value: LiveControlFile,
     pause_requested: bool,
     warned: bool,
+    revision: Option<(Option<std::time::SystemTime>, Vec<u8>)>,
 }
 impl LiveControl {
     fn poll(&mut self, path: &Path) -> bool {
         let parsed = std::fs::read(path).and_then(|bytes| {
-            serde_json::from_slice::<LiveControlFile>(&bytes).map_err(io::Error::other)
+            let value =
+                serde_json::from_slice::<LiveControlFile>(&bytes).map_err(io::Error::other)?;
+            let modified = std::fs::metadata(path)?.modified().ok();
+            Ok((value, (modified, bytes)))
         });
         match parsed {
-            Ok(value) => {
-                if value == self.value {
+            Ok((value, revision)) => {
+                if self.revision.as_ref() == Some(&revision) {
                     return false;
                 }
-                self.pause_requested |= !self.value.pause && value.pause;
+                self.pause_requested |= value.pause;
+                self.revision = Some(revision);
                 self.value = value;
                 true
             }
@@ -1820,6 +1844,8 @@ mod tests {
         TrainingConfig {
             control_file: None,
             resume_checkpoint: None,
+            resume_superbatch_override: false,
+            progress_coeff: None,
             net_id: "test".to_string(),
             feature_set: shogi_features::FeatureSet::HalfKaHmMerged.spec(),
             output_dir: unique_output_path("unused"),
@@ -3646,6 +3672,95 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_true_pause_is_detected_even_if_false_was_not_polled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.json");
+        std::fs::write(&path, r#"{"pause":true}"#).unwrap();
+        let mut control = LiveControl::default();
+        control.poll(&path);
+        control.pause_requested = false;
+        let initial = control.revision.as_ref().unwrap().0.unwrap();
+        std::fs::write(&path, r#"{"pause":false}"#).unwrap();
+        std::fs::write(&path, r#"{"pause":true}"#).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(initial + std::time::Duration::from_secs(1))
+            .unwrap();
+        control.poll(&path);
+        assert!(control.pause_requested);
+    }
+
+    #[test]
+    fn final_superbatch_pause_completes_experiment_normally() {
+        let output = tempfile::tempdir().unwrap();
+        let path = output.path().join("control.json");
+        let experiment_path = output.path().join("experiment.json");
+        let mut logger = experiment_logger(experiment_path.clone(), "final-pause");
+        let cfg = TrainingConfig {
+            output_dir: output.path().to_path_buf(),
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new().with_file_writes();
+        backend.control_updates = vec![(
+            cfg.end_superbatch * cfg.batches_per_superbatch,
+            path,
+            r#"{"pause":true}"#.into(),
+        )];
+        run(
+            &mut backend,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &StepLR {
+                start: 0.001,
+                gamma: 0.9,
+                step: 1,
+            },
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            Some(&mut logger),
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(experiment_path).unwrap()).unwrap();
+        assert_eq!(doc["status"], "completed");
+        assert_eq!(doc["results"]["interrupted"], false);
+        assert_eq!(doc["stopped"]["paused"], false);
+    }
+
+    #[test]
+    fn explicit_resume_superbatch_restarts_input_without_loading_sidecar() {
+        let output = tempfile::tempdir().unwrap();
+        let checkpoint = output.path().join("test-1.ckpt");
+        std::fs::write(checkpoint.with_extension("loader.json"), b"invalid").unwrap();
+        let cfg = TrainingConfig {
+            output_dir: output.path().to_path_buf(),
+            resume_checkpoint: Some(checkpoint),
+            resume_superbatch_override: true,
+            start_superbatch: 2,
+            end_superbatch: 2,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new().with_file_writes();
+        run(
+            &mut backend,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &StepLR {
+                start: 0.001,
+                gamma: 0.9,
+                step: 1,
+            },
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            None,
+        )
+        .unwrap();
+        assert_eq!(backend.steps, cfg.batches_per_superbatch);
+    }
+
+    #[test]
     fn explicit_control_file_overrides_default() {
         for explicit in [None, Some(r#"{"target_superbatches":2}"#)] {
             let output = tempfile::tempdir().unwrap();
@@ -3688,11 +3803,17 @@ mod tests {
     }
 
     #[test]
-    fn default_control_pause_requires_a_rising_edge_after_startup() {
+    fn default_control_pause_requires_a_rewrite_after_startup() {
         for (initial, updates, paused_at) in [
             (None, vec![], None),
             (Some(r#"{"pause":true}"#), vec![], None),
             (Some("{}"), vec![(1, r#"{"pause":true}"#)], Some(1)),
+            (
+                Some(r#"{"pause":true}"#),
+                vec![(1, r#"{ "pause": true }"#)],
+                Some(1),
+            ),
+            (Some("{}"), vec![(3, r#"{"pause":true}"#)], None),
             (
                 Some(r#"{"pause":false}"#),
                 vec![(1, r#"{"pause":true}"#)],

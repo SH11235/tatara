@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::dataloader::TeacherPosition;
 
+pub fn artifact_identity(path: &Path) -> io::Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(serde_json::json!({"bytes": bytes.len(), "sha256": hex}))
+}
+
+fn same_files(saved: &[TeacherFileIdentity], current: &[TeacherFileIdentity]) -> bool {
+    saved.len() == current.len()
+        && saved
+            .iter()
+            .zip(current)
+            .all(|(a, b)| a.bytes == b.bytes && a.path.file_name() == b.path.file_name())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeacherFileIdentity {
     pub path: PathBuf,
@@ -97,12 +113,23 @@ impl LoaderState {
         if mixes.is_empty() && expected_settings.get("mix_seed").is_some() {
             expected_settings["mix_seed"] = serde_json::json!(0);
         }
+        for value in [&mut saved_settings, &mut expected_settings] {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("batches_per_superbatch");
+                if object
+                    .get("bucket_inputs")
+                    .is_some_and(serde_json::Value::is_null)
+                {
+                    object.remove("bucket_inputs");
+                }
+            }
+        }
         if !matches!(self.version, 1 | 2)
             || (self.version == 1 && !mixes.is_empty())
             || self.superbatch != superbatch
             || self.teachers.len() != mixes.len() + 1
             || self.teachers[0].id != "primary"
-            || self.teachers[0].files != files
+            || !same_files(&self.teachers[0].files, files)
             || saved_settings != expected_settings
             || self
                 .teachers
@@ -111,7 +138,7 @@ impl LoaderState {
                 .zip(mixes)
                 .enumerate()
                 .any(|(i, (teacher, files))| {
-                    teacher.id != format!("mix-{}", i + 1) || &teacher.files != files
+                    teacher.id != format!("mix-{}", i + 1) || !same_files(&teacher.files, files)
                 })
             || self.teachers[0].position.mixes.len() != mixes.len()
             || self
@@ -122,7 +149,7 @@ impl LoaderState {
                 .any(|(teacher, cursor)| &teacher.position != cursor)
         {
             return Err(io::Error::other(
-                "loader state does not match checkpoint, teacher paths/sizes, or input settings",
+                "loader state does not match checkpoint, teacher basenames/sizes, or input settings; deleting .loader.json resumes from the beginning of the teachers without restoring input positions (legacy resume)",
             ));
         }
         Ok(&self.teachers[0].position)
@@ -264,6 +291,79 @@ mod tests {
         assert_eq!(state.validate(&[], &settings, 2).unwrap().next_record, 4);
         settings["sampling"]["keep_rate"] = serde_json::json!(0.5);
         assert!(state.validate(&[], &settings, 2).is_err());
+    }
+
+    #[test]
+    fn relocated_teachers_and_superbatch_batch_count_preserve_positions() {
+        let files = vec![TeacherFileIdentity {
+            path: "/old/data.psv".into(),
+            bytes: 80,
+        }];
+        let state = LoaderState {
+            version: 2,
+            superbatch: 1,
+            teachers: vec![TeacherState {
+                id: "primary".into(),
+                files: files.clone(),
+                position: TeacherPosition::default(),
+            }],
+            settings: serde_json::json!({"batches_per_superbatch": 5}),
+        };
+        let relocated = vec![TeacherFileIdentity {
+            path: "/new/data.psv".into(),
+            bytes: 80,
+        }];
+        state
+            .validate(
+                &relocated,
+                &serde_json::json!({"batches_per_superbatch": 9}),
+                1,
+            )
+            .unwrap();
+        let resized = vec![TeacherFileIdentity {
+            path: "/new/data.psv".into(),
+            bytes: 120,
+        }];
+        let error = state
+            .validate(&resized, &serde_json::json!({}), 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("deleting .loader.json"));
+    }
+
+    #[test]
+    fn bucket_inputs_check_mode_count_and_coefficient_size_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let coeff = dir.path().join("progress.bin");
+        std::fs::write(&coeff, b"abcd").unwrap();
+        let settings = serde_json::json!({"bucket_inputs": {
+            "mode": "progresskpabs", "count": 8,
+            "progress_coeff": artifact_identity(&coeff).unwrap(),
+        }});
+        let state = LoaderState {
+            version: 2,
+            superbatch: 1,
+            teachers: vec![TeacherState {
+                id: "primary".into(),
+                files: vec![],
+                position: TeacherPosition::default(),
+            }],
+            settings: settings.clone(),
+        };
+        state.validate(&[], &settings, 1).unwrap();
+        for (key, value) in [
+            ("mode", serde_json::json!("progresskpabsq16")),
+            ("count", serde_json::json!(9)),
+        ] {
+            let mut changed = settings.clone();
+            changed["bucket_inputs"][key] = value;
+            assert!(state.validate(&[], &changed, 1).is_err());
+        }
+        for bytes in [b"abce".as_slice(), b"abcde".as_slice()] {
+            std::fs::write(&coeff, bytes).unwrap();
+            let mut changed = settings.clone();
+            changed["bucket_inputs"]["progress_coeff"] = artifact_identity(&coeff).unwrap();
+            assert!(state.validate(&[], &changed, 1).is_err());
+        }
     }
 
     #[test]

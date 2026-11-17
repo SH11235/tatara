@@ -1090,10 +1090,9 @@ struct SamplingCounts {
 #[derive(Clone, Copy)]
 struct IdentifiedRecord {
     record: TeacherRecord,
-    teacher: u64,
+    teacher: u16,
     epoch: u64,
     record_index: u64,
-    probability: f64,
 }
 
 impl std::ops::Deref for IdentifiedRecord {
@@ -1171,10 +1170,15 @@ impl BucketSampling {
         let rate = self.sampling.bucket_keep_rates.as_ref().unwrap()[bucket];
         // reader と同じ乱数を合成確率と比較し、二段判定でも採用率の積を保つ。
         let kept = self.sampling.accepts(
-            record.teacher,
+            u64::from(record.teacher),
             record.epoch,
             record.record_index,
-            record.probability * rate,
+            self.sampling.keep_rate
+                * match &record.record {
+                    TeacherRecord::Psv(psv) => self.sampling.ply_rate(psv.game_ply()),
+                    TeacherRecord::Hcpe(_) => 1.0,
+                }
+                * rate,
         );
         if kept {
             #[cfg(test)]
@@ -1236,7 +1240,7 @@ struct PsvEpochReader {
     dual_label_psv: Option<DualLabelMode>,
     record_index: u64,
     epoch: u64,
-    teacher: u64,
+    teacher: u16,
     sampling: crate::sampling::Sampling,
     bucket_sampling: Option<Arc<BucketSampling>>,
     sampling_counts: Arc<SamplingCounts>,
@@ -1390,10 +1394,12 @@ impl PsvEpochReader {
                     if let TeacherRecord::Psv(psv) = &record {
                         probability *= self.sampling.ply_rate(psv.game_ply());
                     }
-                    if !self
-                        .sampling
-                        .accepts(self.teacher, self.epoch, record_index, probability)
-                    {
+                    if !self.sampling.accepts(
+                        u64::from(self.teacher),
+                        self.epoch,
+                        record_index,
+                        probability,
+                    ) {
                         continue;
                     }
                     if let Some(sampling) = &self.bucket_sampling {
@@ -1407,7 +1413,6 @@ impl PsvEpochReader {
                         teacher: self.teacher,
                         epoch: self.epoch,
                         record_index,
-                        probability,
                     }));
                 }
                 None => {
@@ -1495,14 +1500,12 @@ pub(crate) fn shuffle_window_records(
     let bytes = buffer_mib
         .checked_mul(MIB_BYTES)
         .ok_or_else(|| io::Error::other("teacher shuffle buffer size overflow"))?;
-    // 窓の局面数は入力形式によらず 40 bytes 単位で数える (HCPE でも同じ MiB 指定が
-    // 同じ局面数になり、PSV では従来の shuffle 順を保つ)。
-    let records = bytes / PSV_RECORD_BYTES as usize;
+    let records = bytes / std::mem::size_of::<SourcedRecord>();
     let aligned = records / batch_size * batch_size;
     if aligned == 0 {
         return Err(io::Error::other(format!(
             "teacher shuffle buffer ({buffer_mib} MiB) is smaller than one raw batch ({} bytes)",
-            batch_size * PSV_RECORD_BYTES as usize
+            batch_size * std::mem::size_of::<SourcedRecord>()
         )));
     }
     Ok(Some(aligned))
@@ -1569,12 +1572,17 @@ impl EpochSource for PsvEpochReader {
 #[derive(Clone, Copy)]
 struct SourcedRecord {
     record: IdentifiedRecord,
-    source: usize,
+}
+
+impl SourcedRecord {
+    fn source(&self) -> usize {
+        usize::from(self.record.teacher)
+    }
 }
 
 impl From<IdentifiedRecord> for SourcedRecord {
     fn from(record: IdentifiedRecord) -> Self {
-        Self { record, source: 0 }
+        Self { record }
     }
 }
 
@@ -1620,7 +1628,8 @@ impl MixedTeacherReader {
                 None,
             )?;
             reader.stop = Arc::clone(&main.stop);
-            reader.teacher = sources.len() as u64;
+            reader.teacher = u16::try_from(sources.len())
+                .map_err(|_| io::Error::other("too many mixed teachers (maximum 65535)"))?;
             reader.configure_sampling(main.sampling.clone());
             sources.push(reader);
             total += mix.rate;
@@ -1648,7 +1657,7 @@ impl MixedTeacherReader {
             .map_or(0, |i| i + 1);
         let record = self.sources[source].next()?;
         self.ordinal = self.ordinal.wrapping_add(1);
-        Ok(SourcedRecord { record, source })
+        Ok(SourcedRecord { record })
     }
 }
 
@@ -1701,8 +1710,7 @@ struct WindowedPsvReader<R = IdentifiedRecord> {
     stop: Arc<AtomicBool>,
     producer: Option<thread::JoinHandle<()>>,
     bucket_samplings: Vec<Option<Arc<BucketSampling>>>,
-    /// producer の失敗 message。err_slot は first-write-wins なので、後続 caller にも
-    /// 汎用 "stopped" でなく同じ詳細 message を返して race による握り潰しを防ぐ。
+    /// 後続 caller にも producer の詳細な失敗理由を返す。
     failure: Option<String>,
 }
 
@@ -1867,7 +1875,7 @@ impl<R: Copy + Send + Into<SourcedRecord> + 'static> WindowedPsvReader<R> {
         // Regenerated prefix candidates must leave the epoch's pending count before new reads.
         for record in &window.records[..window.next] {
             let record: SourcedRecord = (*record).into();
-            if let Some(sampling) = &self.bucket_samplings[record.source] {
+            if let Some(sampling) = &self.bucket_samplings[record.source()] {
                 let board = record.record.decode()?;
                 sampling.finish(
                     &record.record,
@@ -1958,12 +1966,8 @@ impl TrainingPsvReader {
 
     fn next(&mut self) -> io::Result<SourcedRecord> {
         match self {
-            Self::Direct(reader) => reader
-                .next()
-                .map(|record| SourcedRecord { record, source: 0 }),
-            Self::Windowed(reader) => reader
-                .next()
-                .map(|record| SourcedRecord { record, source: 0 }),
+            Self::Direct(reader) => reader.next().map(|record| SourcedRecord { record }),
+            Self::Windowed(reader) => reader.next().map(|record| SourcedRecord { record }),
             Self::Mixed(reader) => reader.next(),
             Self::MixedWindowed(reader, _) => reader.next(),
         }
@@ -2046,17 +2050,15 @@ type BatchSlot = (Batch, Vec<i32>);
 /// - **読み位置**: resume 用の loader は reader の batch 順に返す。bucket 間引き時は
 ///   採用候補の decode と取り直しの間 reader を保持し、次 batch の先読みによる
 ///   保存境界の追い越しを防ぐ。
-/// - **error 伝搬**: worker が reader から `io::Error` (主に barren-exhaustion)
-///   を受けたら shared error slot に格納して exit。main の
-///   [`Self::next_batch`] は全 worker が exit して result channel が閉じたら
-///   error slot を見て伝搬する。
+/// - **error 伝搬**: reader・decode・特徴抽出の失敗は result channel で通知し、
+///   未着の batch 番号を待っている main もエラーで停止する。
 /// - **終了**: main が `BucketedPrefetchedLoader` を drop すると [`Drop`] impl が
 ///   まず result/pool 両 channel endpoint を落として全 worker を unblock させ、
 ///   その後 worker thread を join する (close-then-join、詳細は `Drop` の doc)。
 pub struct BucketedPrefetchedLoader {
     /// 完成 batch (Batch + per-position bucket) を worker → main で渡す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
-    result_rx: Option<mpsc::Receiver<(u64, TeacherPosition, BatchSlot)>>,
+    result_rx: Option<mpsc::Receiver<io::Result<(u64, TeacherPosition, BatchSlot)>>>,
     pending: BTreeMap<u64, (TeacherPosition, BatchSlot)>,
     next_sequence: u64,
     ordered: bool,
@@ -2066,8 +2068,6 @@ pub struct BucketedPrefetchedLoader {
     /// 消費済み batch buffer を main → worker で返す (ring buffer)。
     /// `Drop` で `.take()` して先に落とすため `Option`。
     pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
-    /// worker が reader から受けた io::Error を main に伝えるための slot。
-    err_slot: Arc<Mutex<Option<io::Error>>>,
     /// `--monitor-active-features` 時のみ `Some`。全 worker が共有する実 active
     /// feature 数の histogram (長さ `feature_set.max_active() + 1`、bin `k` =
     /// 実 active 数がちょうど `k` だった position 数の累積)。worker は自身の
@@ -2360,7 +2360,6 @@ impl BucketedPrefetchedLoader {
         let stop = reader.stop_flag();
         let teacher_count = reader.teacher_count();
         let reader = Arc::new(Mutex::new((reader, 0u64)));
-        let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
             Some(Arc::new(Mutex::new(vec![
                 0u64;
@@ -2371,7 +2370,7 @@ impl BucketedPrefetchedLoader {
         };
 
         let (result_tx, result_rx) =
-            mpsc::sync_channel::<(u64, TeacherPosition, BatchSlot)>(prefetch_depth);
+            mpsc::sync_channel::<io::Result<(u64, TeacherPosition, BatchSlot)>>(prefetch_depth);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
@@ -2387,7 +2386,6 @@ impl BucketedPrefetchedLoader {
         let mut handles = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let reader = Arc::clone(&reader);
-            let err_slot = Arc::clone(&err_slot);
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
@@ -2450,12 +2448,7 @@ impl BucketedPrefetchedLoader {
                             if worker_stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            // reader が exhausted: error を slot に置いて worker 終了
-                            // (借りた slot は捨てる; main は next_batch の err_slot 確認で気付く)。
-                            let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
+                            let _ = result_tx.send(Err(e));
                             return;
                         }
                     }
@@ -2498,7 +2491,7 @@ impl BucketedPrefetchedLoader {
                         };
                         let bucket =
                             compute_bucket.then(|| bucket_mode.bucket_board(&board, num_buckets));
-                        if let Some(sampling) = &bucket_samplings[record.source] {
+                        if let Some(sampling) = &bucket_samplings[record.source()] {
                             match sampling.finish(
                                 &record.record,
                                 usize::from(bucket.expect("bucket sampling requires buckets")),
@@ -2519,26 +2512,19 @@ impl BucketedPrefetchedLoader {
                                 );
                             }
                             Err(e) => {
-                                // max_active 超過: reader error と同じく err_slot に
-                                // 積んで worker 終了。単一 worker error なので channel は
-                                // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
-                                // 明示エラーを返す (借りた slot は捨てる)。
                                 failure = Some(e);
                                 break;
                             }
                         }
                         if teacher_count != 0 {
-                            batch.teacher_counts[record.source] += 1;
+                            batch.teacher_counts[record.source()] += 1;
                         }
                         if let Some(bucket) = bucket {
                             buckets.push(i32::from(bucket));
                         }
                     }
                     if let Some(e) = failure {
-                        let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
+                        let _ = result_tx.send(Err(e));
                         return;
                     }
                     if let Some(guard) = retained.take() {
@@ -2563,7 +2549,7 @@ impl BucketedPrefetchedLoader {
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
                     if result_tx
-                        .send((sequence, position, (batch, buckets)))
+                        .send(Ok((sequence, position, (batch, buckets))))
                         .is_err()
                     {
                         break;
@@ -2585,7 +2571,6 @@ impl BucketedPrefetchedLoader {
             sampling_counts: Vec::new(),
             bucket_samplings,
             pool_tx: Some(pool_tx),
-            err_slot,
             active_hist,
             handles,
             stop,
@@ -2646,18 +2631,6 @@ impl BucketedPrefetchedLoader {
     ///
     /// 消費後は [`Self::recycle`] で `(batch, buckets)` を返すこと (ring buffer)。
     pub fn next_batch(&mut self) -> io::Result<Option<BatchSlot>> {
-        // 単一 worker でのみ起きる error (max_active 超過等) は、全 worker の exit
-        // = result channel close を待たずに surface する必要がある。生存 worker は
-        // epoch wrap で batch を供給し続け channel が閉じないため、recv 前に
-        // err_slot を確認する (確認漏れ時も channel close 経路が backstop)。
-        if let Some(e) = self
-            .err_slot
-            .lock()
-            .expect("err_slot mutex poisoned")
-            .take()
-        {
-            return Err(e);
-        }
         loop {
             if let Some((position, slot)) = self.pending.remove(&self.next_sequence) {
                 self.next_sequence += 1;
@@ -2670,26 +2643,15 @@ impl BucketedPrefetchedLoader {
                 .expect("result_rx present until Drop")
                 .recv()
             {
-                Ok((sequence, position, slot)) => {
+                Ok(Ok((sequence, position, slot))) => {
                     if !self.ordered {
                         self.position = position;
                         return Ok(Some(slot));
                     }
                     self.pending.insert(sequence, (position, slot));
                 }
-                Err(_) => {
-                    // 全 worker exit → result channel close。残った error を確認。
-                    if let Some(e) = self
-                        .err_slot
-                        .lock()
-                        .expect("err_slot mutex poisoned")
-                        .take()
-                    {
-                        return Err(e);
-                    } else {
-                        return Ok(None);
-                    }
-                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(None),
             }
         }
     }
@@ -2944,8 +2906,8 @@ mod tests {
         assert_eq!(shuffle_window_records(0, 65_536).unwrap(), None);
         let records = shuffle_window_records(4096, 65_536).unwrap().unwrap();
         assert_eq!(records % 65_536, 0);
-        assert!(records * PSV_RECORD_BYTES as usize <= 4096 * MIB_BYTES);
-        assert!((records + 65_536) * PSV_RECORD_BYTES as usize > 4096 * MIB_BYTES);
+        assert!(records * std::mem::size_of::<SourcedRecord>() <= 4096 * MIB_BYTES);
+        assert!((records + 65_536) * std::mem::size_of::<SourcedRecord>() > 4096 * MIB_BYTES);
         assert!(shuffle_window_records(1, 65_536).is_err());
     }
 

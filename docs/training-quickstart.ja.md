@@ -114,7 +114,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--mix-data PATH` / `--mix-rate R` | なし | 対応する順序で繰り返し、別の教師を指定比率で混ぜる。各 R は有限の正数で、合計は 1 未満。残りは `--data` を指定順につないだ主の教師から取る。全教師の形式は同一であること |
 | `--mix-seed` | 0 | 教師の選択に使う状態を持たない乱数の seed。shuffle の seed とは独立 |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
-| `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍 |
+| `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うため識別情報込みの窓の追加メモリは概ね実効値の2倍 |
 | `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途。`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある |
 | `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓の permutation が再現し、複数 worker でも学習には入力順で batch を渡す |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
@@ -187,7 +187,7 @@ result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば
 出す。未消費の先読み分は含めない。source 0 が主の教師、1 以降が `--mix-data` の指定順。
 `experiment.json` の `params.mix_data` に指定順の教師 basename と比率、`params.mix_seed`
 に seed を保存し、recipe fingerprint に含める。混合の指定がなければ既存の局面列と
-fingerprint は変わらない。既存の checkpoint resume は教師の読み位置を復元しない。
+fingerprint は変わらない。`.loader.json` のない古い checkpoint の resume は教師の読み位置を復元しない。
 中断した混合列の再現には、混合後の通し番号と各教師の epoch・次 record 番号の復元も必要になる。
 
 ### 教師データの先読みとshuffle
@@ -203,17 +203,18 @@ epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも�
 順序を繰り返さずに済む。
 
 `auto`の目安は、RAM 8/16/32/64 GiB以上に対して1窓512 MiB/1 GiB/2 GiB/4 GiB。
+窓の局面数は PSV・HCPE とも識別情報込みの要素サイズで割り、batch 単位で切り下げる。
 起動ログの`N MiB x2 (auto)`と`experiment.json`には解決後の実効値を記録する。
 空きメモリ量は使わないため、同じメモリ上限なら他プロセスやpage cacheの状態で値は変わらない。
 
-追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
+識別情報込みの窓の追加メモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
 大きな窓はHDDの長いstallを
 吸収しやすい一方、初回batchまでの読込時間、窓shuffleのCPU時間、random memory
 trafficも増やす。窓を使う場合、256などの小さい明示値は初回読込・メモリ・shuffleコストを抑える。
 `--threads`はdecode worker数であり、producerの窓shuffle自体は並列化しない。
 
 ```bash
-# 1 GiB/窓 (raw PSVは最大約2 GiB追加)、base seedを固定
+# 1 GiB/窓 (窓のメモリは最大約2 GiB追加)、base seedを固定
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
   layerstack ...
@@ -392,8 +393,8 @@ stale な値として warning とともに無視され、`control_history.jsonl`
 書き換えない。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
 適用した target は `experiment.json` の `results.target_superbatches` にも記録する。
 
-同じ制御ファイルに `"pause": true` を追加すると、起動後に false (または項目なし)
-から true への変化を読んだ superbatch の終わりで、一時停止する。
+同じ制御ファイルを起動後に書き換え、更新時刻または内容が変わったファイルから
+`"pause": true` を読んだ superbatch の終わりで、一時停止する。
 重み・optimizer の `.ckpt` と読み位置の `.loader.json`、推論用 `.bin` を
 `--save-rate` に関係なく保存し、終了コード **75** で終える。pause は各 superbatch
 終了時に読み、適用を `control_history.jsonl` に追記する。
@@ -403,7 +404,9 @@ stale な値として warning とともに無視され、`control_history.jsonl`
 ```
 
 起動時の `pause=true` は警告して無視する。そのまま true を置いても停止しない。
-再び止めるには一度 false にし、superbatch 境界で学習器が読んでから true にする。
+再び止めるには `pause=true` でファイルを書き換える。途中の false を学習器が読む必要はない。
+最後の superbatch で pause を受けた場合は、無視した旨を一行出して通常完了する
+(終了コード 0、experiment.json は completed)。
 `experiment.json` は一時停止時に interrupted を立て、pause の適用を `control_history`、
 実際の終了 sb と pause の有無を `stopped` に残す。
 SIGINT / SIGTERM は pause に変換しない。保存して止めるには制御ファイルを使う。
@@ -413,11 +416,14 @@ SIGINT / SIGTERM は pause に変換しない。保存して止めるには制�
 `.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
 連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
 通し番号、shuffle 窓内の位置も保存・復元する。version 1 の sidecar は混合・間引きなしの
-入力として読める。再開時に全教師の絶対パスとサイズ、間引き確率・seed、混合割合・seed、
-batch size・sb 当たり batch 数・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
-オプションはない。同じサイズの内容変更は検出しないため、教師を変更しないこと。
+入力として読める。再開時に全教師の basename とサイズ、間引き確率・seed、混合割合・seed、
+batch size・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
+オプションはない。絶対パスは記録のみで照合せず、教師の移動を許容する。bucket 間引き時は
+bucket mode・bucket 数・進行度係数ファイルのサイズと SHA-256 も照合する。
+`.loader.json` を消すと、読み位置を復元せずに教師の先頭から読み直す (従来の resume)。同じサイズの内容変更は検出しないため、教師を変更しないこと。
 sidecar がない古い checkpoint は警告を一行出し、従来どおり教師の先頭から読む。
-`--start-superbatch` による番号の変更は、読み位置付き checkpoint では受け付けない。
+`--resume` と `--start-superbatch` の併用時は警告し、読み位置を復元せず教師の先頭から読む。
+sb 当たり batch 数は変更できる。
 
 同名の `.loader.json` を保管したまま、同じ引数に `--resume <最後の.ckpt>` を
 加えて再開する。起動時の pause は無視されるため、true のままでも再開できる。

@@ -89,15 +89,15 @@ fn mixing_matches_rates_and_seed_and_wraps_each_teacher_independently() {
         let next = a.next().unwrap();
         let again = b.next().unwrap();
         assert_eq!(
-            (next.source, next.record.score()),
-            (again.source, again.record.score())
+            (next.source(), next.record.score()),
+            (again.source(), again.record.score())
         );
         assert_eq!(
             next.record.score(),
-            scores[next.source][counts[next.source] % scores[next.source].len()]
+            scores[next.source()][counts[next.source()] % scores[next.source()].len()]
         );
-        counts[next.source] += 1;
-        different |= next.source != c.next().unwrap().source;
+        counts[next.source()] += 1;
+        different |= next.source() != c.next().unwrap().source();
     }
     assert!(different);
     for (count, expected) in counts.into_iter().zip([0.77, 0.03, 0.2]) {
@@ -149,9 +149,9 @@ fn mixed_teachers_apply_drop_before_clamp() {
         let next = reader.next().unwrap();
         assert_eq!(
             next.record.score(),
-            [vec![1, 100], vec![-100, -1]][next.source][counts[next.source] % 2]
+            [vec![1, 100], vec![-100, -1]][next.source()][counts[next.source()] % 2]
         );
-        counts[next.source] += 1;
+        counts[next.source()] += 1;
     }
     assert!(counts.into_iter().all(|n| n > 0));
 }
@@ -172,13 +172,13 @@ fn window_shuffle_follows_mixing_and_preserves_provenance() {
         let expected = (0..17)
             .map(|_| {
                 let r = sequential.next().unwrap();
-                (r.source, r.record.score())
+                (r.source(), r.record.score())
             })
             .collect::<Vec<_>>();
         let actual = (0..17)
             .map(|_| {
                 let r = windowed.next().unwrap();
-                (r.source, r.record.score())
+                (r.source(), r.record.score())
             })
             .collect::<Vec<_>>();
         differs |= expected != actual;
@@ -300,7 +300,7 @@ fn matching_hcpe_and_psv_mixtures_decode_identically() {
                 let mut batch = Batch::with_capacity(1, FeatureSet::HalfKaHmMerged.spec());
                 batch.push_decoded(&board).unwrap();
                 (
-                    r.source,
+                    r.source(),
                     batch.score,
                     batch.wdl,
                     batch.stm_indices,
@@ -339,17 +339,21 @@ fn mixed_sampling_preserves_teacher_identity_rates_and_bucket_sets_across_worker
         let r = a.next().unwrap();
         let again = b.next().unwrap();
         assert_eq!(
-            (r.source, r.record.epoch, r.record.record_index),
-            (again.source, again.record.epoch, again.record.record_index)
+            (r.source(), r.record.epoch, r.record.record_index),
+            (
+                again.source(),
+                again.record.epoch,
+                again.record.record_index
+            )
         );
-        assert_eq!(r.record.teacher, r.source as u64);
+        assert_eq!(r.record.teacher, r.source() as u16);
         assert!(sampling.accepts(
-            r.record.teacher,
+            u64::from(r.record.teacher),
             r.record.epoch,
             r.record.record_index,
             0.65 * 0.8
         ));
-        counts[r.source] += 1;
+        counts[r.source()] += 1;
     }
     assert!((counts[1] as f64 / 10_000.0 - 0.3).abs() < 0.02);
     let mut expected = vec![Vec::new(); 2];
