@@ -29,8 +29,8 @@ use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
 use crate::dataloader::{
-    Batch, BucketMode, ScoreOverrideReader, ScoreSource, TeacherFileLoader, TeacherFormat,
-    TeacherRecord, dual_label_requires_psv, teacher_data_label, teacher_format,
+    Batch, BucketMode, LabelOptions, ScoreOverrideReader, ScoreSource, TeacherFileLoader,
+    TeacherFormat, TeacherRecord, teacher_data_label, teacher_format,
 };
 use crate::trainer::{LossKind, TrainerBackend};
 
@@ -136,7 +136,7 @@ impl HeldoutSet {
     /// PSV / HCPE range を sidecar または dual-label の明示的な score source で読む。
     /// dual-label は PSV だけが持つ field を使うため HCPE では error。
     #[allow(clippy::too_many_arguments)]
-    pub fn load_from_range_with_score_sources(
+    pub fn load_from_range_with_score_sources<'a>(
         paths: &[impl AsRef<Path>],
         start_offset: u64,
         end_offset: u64,
@@ -147,14 +147,17 @@ impl HeldoutSet {
         bucket_mode: &(impl Copy + Into<BucketMode>),
         feature_set: FeatureSetSpec,
         num_buckets: usize,
-        score_source: Option<ScoreSource<&Path>>,
+        options: impl Into<LabelOptions<'a>>,
     ) -> io::Result<Self> {
         let path = &teacher_data_label(paths);
         let format = teacher_format(paths)?;
-        if format == TeacherFormat::Hcpe && matches!(score_source, Some(ScoreSource::DualLabel(_)))
-        {
-            return Err(dual_label_requires_psv(path));
+        let mut options = options.into();
+        // HCPE には padding の印が無いので、印の付いた held-out は起こり得ない。
+        if format == TeacherFormat::Hcpe {
+            options.tree_sample_eval_only = false;
         }
+        options.validate_format(format, path)?;
+        let score_source = options.score_source;
         let loader = TeacherFileLoader::new_range(paths, start_offset, end_offset)?;
         let (mut score_override, dual_label_psv) = match score_source {
             Some(ScoreSource::Sidecar { scores, mask }) => (
@@ -171,6 +174,9 @@ impl HeldoutSet {
                 let Some(mut record) = loader.next_record()? else {
                     return Ok(None);
                 };
+                if let TeacherRecord::Psv(psv) = &mut record {
+                    options.apply_tree_sample(psv, record_index, path, true)?;
+                }
                 if let Some(score_override) = &mut score_override {
                     score_override.apply(&mut record)?;
                 }
@@ -306,7 +312,7 @@ impl HeldoutSet {
 ///
 /// - `net_output[i] > 0` を「手番側が有利と予測」、`batch.wdl[i] > 0.5` を「実際に
 ///   手番側が勝った」と解釈し、両者の bool が一致したら correct。
-/// - 引き分け (`wdl == 0.5`) は符号が無いので分母 (`n_counted`) からも除外する。
+/// - 引き分け (`wdl == 0.5`) と score-only (`wdl < 0`) は分母から除外する。
 ///
 /// `net_output` は `batch` の position 順に並ぶ per-position scalar。長さが
 /// `batch.n_positions` 未満なら短い方までを見る (防御的)。
@@ -315,7 +321,7 @@ pub fn sign_agreement(net_output: &[f32], batch: &Batch) -> (u64, u64) {
     let mut n_correct = 0_u64;
     let mut n_counted = 0_u64;
     for (&out, &wdl) in net_output[..n].iter().zip(&batch.wdl[..n]) {
-        if wdl == 0.5 {
+        if wdl == 0.5 || wdl < 0.0 {
             continue; // 引き分けは符号が定義できないため除外
         }
         let predicted_win = out > 0.0;
@@ -544,6 +550,77 @@ mod tests {
         .expect("load tail range");
         assert_eq!(set.n_batches(), 1, "EOF で 2 batch 目は埋まらない");
         assert_eq!(set.n_positions(), 16);
+    }
+
+    #[test]
+    fn tree_sample_heldout_rejects_marks_before_filtering() {
+        let path = sample_psv_variant("tree-heldout", 16, |index, record| {
+            record[39] = if index == 8 { 2 } else { 0 };
+            record[32..34].copy_from_slice(&300_i16.to_le_bytes());
+        });
+        for start in [0, 8 * PSV_RECORD_BYTES] {
+            let err = HeldoutSet::load_from_range_with_score_sources(
+                &[&path],
+                start,
+                16 * PSV_RECORD_BYTES,
+                8,
+                Some(200),
+                None,
+                16,
+                &BucketMode::KingRank9,
+                test_spec(),
+                9,
+                LabelOptions {
+                    score_source: None,
+                    tree_sample_eval_only: true,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("held-out PSV record 8"));
+            assert!(err.to_string().contains(&path.display().to_string()));
+        }
+        HeldoutSet::load(
+            &path,
+            8,
+            None,
+            None,
+            16,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tree_sample_flag_accepts_hcpe_heldout() {
+        let hcpe = sample_psv_path().with_file_name("sample.hcpe");
+        let set = HeldoutSet::load_from_range_with_score_sources(
+            &[&hcpe],
+            0,
+            16 * 38,
+            8,
+            None,
+            None,
+            16,
+            &BucketMode::KingRank9,
+            test_spec(),
+            9,
+            LabelOptions {
+                score_source: None,
+                tree_sample_eval_only: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(set.n_positions(), 16);
+    }
+
+    #[test]
+    fn sign_agreement_excludes_eval_only_rows() {
+        let batch = batch_with_wdl(&[crate::dataloader::EVAL_ONLY_WDL, 1.0, 0.0]);
+        assert_eq!(sign_agreement(&[1.0, 1.0, -1.0], &batch), (2, 2));
     }
 
     #[test]

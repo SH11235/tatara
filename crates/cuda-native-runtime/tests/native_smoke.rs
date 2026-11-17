@@ -331,7 +331,15 @@ fn pinned_async_copies_can_be_ordered_across_streams() {
 fn wrm_default_matches_cpu_reference() {
     let output = [-0.9_f32, -0.1, 0.0, 0.2, 1.1, 2.0, -3.0];
     let score = [-1200.0_f32, -100.0, 0.0, 300.0, 900.0, 32000.0, -32000.0];
-    let wdl = [0.0_f32, 0.0, 0.5, 1.0, 1.0, 1.0, 0.0];
+    let wdl = [
+        0.0_f32,
+        gpu_kernels::pointwise::EVAL_ONLY_WDL,
+        0.5,
+        1.0,
+        1.0,
+        1.0,
+        0.0,
+    ];
     let n = output.len();
     let per_pos_norm = 1.0_f32 / n as f32;
     let mut expected_gradient = vec![0.0_f32; n];

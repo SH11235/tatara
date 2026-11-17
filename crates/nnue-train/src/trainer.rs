@@ -61,9 +61,7 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{
-    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, ScoreSource, TeacherFormat,
-};
+use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, ScoreSource};
 use crate::experiment::{ExperimentLogger, format_utc_iso, now_epoch_secs};
 use crate::schedule::{LrScheduler, WdlScheduler};
 
@@ -463,6 +461,7 @@ pub struct TrainingConfig {
     pub score_clamp_abs: Option<i16>,
     /// PSV の base score を差し替える sidecar または record 内 dual-label。
     pub score_source: Option<ScoreSource<PathBuf>>,
+    pub tree_sample_eval_only: bool,
     /// Independently cycling teachers sampled before window shuffle.
     pub mix_sources: Vec<crate::dataloader::MixSource>,
     /// Stateless teacher-selection seed, combined with the output record ordinal.
@@ -819,10 +818,11 @@ where
 
     let data_path = &crate::dataloader::teacher_data_label(data_paths);
     let format = crate::dataloader::teacher_format(data_paths)?;
-    if format == TeacherFormat::Hcpe && matches!(cfg.score_source, Some(ScoreSource::DualLabel(_)))
-    {
-        return Err(crate::dataloader::dual_label_requires_psv(data_path));
+    crate::dataloader::LabelOptions {
+        score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+        tree_sample_eval_only: cfg.tree_sample_eval_only,
     }
+    .validate_format(format, data_path)?;
     let record_bytes = format.record_bytes();
 
     // data file の byte サイズを取って record alignment を確認。
@@ -881,6 +881,7 @@ where
         "score_drop_abs": cfg.score_drop_abs,
         "score_clamp_abs": cfg.score_clamp_abs,
         "score_source": score_settings,
+        "tree_sample_eval_only": cfg.tree_sample_eval_only,
         "shuffle_buffer_mib": cfg.teacher_shuffle_buffer_mib,
         "window_records": crate::dataloader::shuffle_window_records(
             cfg.teacher_shuffle_buffer_mib, cfg.batch_size
@@ -942,7 +943,10 @@ where
             num_buckets: cfg.num_buckets,
             train_end_offset,
             monitor_active: cfg.monitor_active_features,
-            score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+            labels: crate::dataloader::LabelOptions {
+                score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                tree_sample_eval_only: cfg.tree_sample_eval_only,
+            },
             teacher_shuffle_buffer_mib: cfg.teacher_shuffle_buffer_mib,
             teacher_shuffle: cfg.teacher_shuffle,
             teacher_shuffle_seed: cfg.teacher_shuffle_seed,
@@ -985,8 +989,10 @@ where
     // 指定は reject 済みなので exhaustive な 4-arm match で意図を明示。
     let heldout = match (&cfg.test_data, cfg.test_tail_positions) {
         (Some(test_path), None) => {
-            let set = crate::validation::HeldoutSet::load(
-                test_path,
+            let set = crate::validation::HeldoutSet::load_from_range_with_score_sources(
+                &[test_path],
+                0,
+                std::fs::metadata(test_path)?.len(),
                 cfg.batch_size,
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
@@ -994,6 +1000,10 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
+                crate::dataloader::LabelOptions {
+                    score_source: None,
+                    tree_sample_eval_only: cfg.tree_sample_eval_only,
+                },
             )?;
             println!(
                 "[train] held-out validation (external file): data={} | {} batches x bs {} ({} positions)",
@@ -1016,7 +1026,10 @@ where
                 bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
-                cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                crate::dataloader::LabelOptions {
+                    score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+                    tree_sample_eval_only: cfg.tree_sample_eval_only,
+                },
             )?;
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
@@ -1877,6 +1890,7 @@ mod tests {
             score_source: None,
             mix_sources: Vec::new(),
             mix_seed: 0,
+            tree_sample_eval_only: false,
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
@@ -1913,6 +1927,44 @@ mod tests {
 
     fn sample_hcpe_path() -> PathBuf {
         sample_psv_path().with_extension("hcpe")
+    }
+
+    #[test]
+    fn tree_sample_flag_reaches_external_and_tail_heldout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.psv");
+        let mut bytes = std::fs::read(sample_psv_path()).unwrap()[..16 * 40].to_vec();
+        for (i, record) in bytes.chunks_exact_mut(40).enumerate() {
+            record[39] = if i == 8 { 2 } else { 0 };
+        }
+        std::fs::write(&path, bytes).unwrap();
+        for tail in [false, true] {
+            let cfg = TrainingConfig {
+                tree_sample_eval_only: true,
+                test_data: (!tail).then_some(path.clone()),
+                test_tail_positions: tail.then_some(8),
+                test_positions: 16,
+                ..base_cfg()
+            };
+            let mut backend = MockBackend::new();
+            let error = run(
+                &mut backend,
+                &[&path],
+                &BucketMode::KingRank9,
+                &StepLR {
+                    start: 1.0e-3,
+                    gamma: 0.9,
+                    step: 1,
+                },
+                &ConstantWDL { value: 0.5 },
+                &cfg,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("held-out PSV record 8"));
+            assert_eq!(backend.steps, 0);
+        }
     }
 
     #[test]
@@ -2179,6 +2231,7 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
+            tree_sample_eval_only: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -3645,6 +3698,10 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     assert_eq!(state.version, 1);
+                    assert_eq!(
+                        state.settings["tree_sample_eval_only"],
+                        serde_json::json!(cfg.tree_sample_eval_only)
+                    );
                     assert_eq!(state.superbatch, 1);
                     assert_eq!(
                         state.settings["window_records"],

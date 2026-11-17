@@ -215,7 +215,7 @@ fn batches_count_only_delivered_records_and_unmixed_order_is_unchanged() {
                 num_buckets: 1,
                 train_end_offset: 3 * PSV_RECORD_BYTES,
                 monitor_active: false,
-                score_source: None,
+                labels: LabelOptions::default(),
                 teacher_shuffle_buffer_mib: usize::from(shuffle),
                 teacher_shuffle: shuffle,
                 teacher_shuffle_seed: 99,
@@ -248,7 +248,7 @@ fn batches_count_only_delivered_records_and_unmixed_order_is_unchanged() {
             num_buckets: 1,
             train_end_offset: 3 * PSV_RECORD_BYTES,
             monitor_active: false,
-            score_source: None,
+            labels: LabelOptions::default(),
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
@@ -471,7 +471,7 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
                 num_buckets: 9,
                 train_end_offset: 2000 * PSV_RECORD_BYTES,
                 monitor_active: false,
-                score_source: None,
+                labels: LabelOptions::default(),
                 teacher_shuffle_buffer_mib: window_mib,
                 teacher_shuffle: true,
                 teacher_shuffle_seed: 31,
@@ -516,4 +516,102 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
             }
         }
     }
+}
+
+#[test]
+fn mixed_tree_samples_use_eval_only_labels_only_when_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[100]);
+    let extra = teacher(dir.path(), "tree.psv", &[200, 201]);
+    for (path, marked) in [(&main, false), (&extra, true)] {
+        let mut bytes = std::fs::read(path).unwrap();
+        for (i, record) in bytes
+            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+            .enumerate()
+        {
+            record[38] = 1;
+            record[39] = if marked && i == 0 { 2 } else { 0 };
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+    for enabled in [false, true] {
+        for shuffle in [false, true] {
+            let mut loader = BucketedPrefetchedLoader::spawn_with_mixing(
+                &[&main],
+                BucketedLoaderOptions {
+                    sampling: Default::default(),
+                    batch_size: 1024,
+                    score_drop_abs: None,
+                    score_clamp_abs: None,
+                    num_workers: 2,
+                    bucket_mode: BucketMode::KingRank9,
+                    feature_set: FeatureSet::HalfKaHmMerged.spec(),
+                    compute_bucket: false,
+                    num_buckets: 1,
+                    train_end_offset: PSV_RECORD_BYTES,
+                    monitor_active: false,
+                    labels: LabelOptions {
+                        score_source: None,
+                        tree_sample_eval_only: enabled,
+                    },
+                    teacher_shuffle_buffer_mib: usize::from(shuffle),
+                    teacher_shuffle: shuffle,
+                    teacher_shuffle_seed: 99,
+                },
+                &[MixSource {
+                    path: extra.clone(),
+                    rate: 0.03,
+                }],
+                55,
+            )
+            .unwrap();
+            let (batch, _) = loader.next_batch().unwrap().unwrap();
+            let mut counts = [0; 3];
+            for (&score, &wdl) in batch.score.iter().zip(&batch.wdl) {
+                let source = match score as i16 {
+                    100 => 0,
+                    200 => 1,
+                    201 => 2,
+                    other => panic!("unexpected score: {other}"),
+                };
+                counts[source] += 1;
+                assert_eq!(
+                    wdl,
+                    if enabled && source == 1 {
+                        EVAL_ONLY_WDL
+                    } else {
+                        1.0
+                    }
+                );
+            }
+            assert!(counts.into_iter().all(|count| count > 0));
+        }
+    }
+}
+
+#[test]
+fn mixed_tree_samples_reject_reserved_padding_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[100]);
+    let extra = teacher(dir.path(), "invalid.psv", &[200]);
+    let mut bytes = std::fs::read(&extra).unwrap();
+    bytes[39] = 6;
+    std::fs::write(&extra, bytes).unwrap();
+    let mut main = main_reader(&main, None, None);
+    main.tree_sample_eval_only = true;
+    let mut reader = MixedTeacherReader::new(
+        main,
+        &[MixSource {
+            path: extra.clone(),
+            rate: 0.03,
+        }],
+        55,
+    )
+    .unwrap();
+    let error = (0..1024)
+        .find_map(|_| reader.next().err())
+        .expect("mixed teacher must be read");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("reserved padding bits"));
+    assert!(error.to_string().contains(extra.to_str().unwrap()));
 }

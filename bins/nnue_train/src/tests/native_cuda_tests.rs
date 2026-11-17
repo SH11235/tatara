@@ -2980,13 +2980,14 @@ fn assert_native_matches_cuda_oxide_with_training_options_and_steps(
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
+    batch.wdl[0] = nnue_train::dataloader::EVAL_ONLY_WDL;
 
     for _ in 0..steps {
-        let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
-        let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+        let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.6, loss)?;
+        let _ = native.step(&batch.as_ref(), 1.0e-3, 0.6, loss)?;
     }
-    let oxide_loss = oxide.forward(&batch.as_ref(), 0.0, loss)?;
-    let native_loss = native.forward(&batch.as_ref(), 0.0, loss)?;
+    let oxide_loss = oxide.forward(&batch.as_ref(), 0.6, loss)?;
+    let native_loss = native.forward(&batch.as_ref(), 0.6, loss)?;
     assert_trainers_close(id, oxide_loss, native_loss, &oxide, &native)
 }
 

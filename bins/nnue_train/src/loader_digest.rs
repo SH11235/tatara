@@ -56,7 +56,10 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         1,
         file_size,
         false,
-        cli.score_source(),
+        nnue_train::dataloader::LabelOptions {
+            score_source: cli.score_source(),
+            tree_sample_eval_only: cli.tree_sample_eval_only,
+        },
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         cli.teacher_shuffle_seed,

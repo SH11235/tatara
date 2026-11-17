@@ -250,6 +250,13 @@ dataset epochをまたぐ場合も含め、学習中は入力ファイルを変�
 PSVの再評価では、スコアを書き出す前の玉の配置・総駒数の構造検証を引き続き行う。
 この検証は、指し手の合法性やあらゆる形式破損を検証するものではない。
 
+`--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
+WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
+`--data` が必要。bit 0 の dual-label gate は独立して働く。マーク付き局面は
+外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。padding の
+bit 0・bit 1 以外が立つ record もエラーにする。
+このフラグは `--mix-data` で指定した教師にも適用する。
+
 学習loaderをdropすると、direct・windowed双方をレコード境界で取り消す。
 高スコアのレコードを読み飛ばしている間や、次のdataset epochを開き直す前も停止を確認する。
 通常終了時の取消はexperimentの失敗として扱わない。OS内で既にblockしているreadは取り消せず、

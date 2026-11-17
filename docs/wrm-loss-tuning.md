@@ -66,6 +66,12 @@ it is pure WDL.
 
 With `--wdl-ignore-draws`, positions whose WDL label is `0.5` use the teacher-score target.
 
+`--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
+on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
+`--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.
+Records with padding bits other than bit 0 and bit 1 are rejected. Marked positions
+are rejected in external `--test-data` and `--test-tail-positions`.
+
 ## Generalized loss form (pow_exp / asymmetry / weight boost)
 
 By default the WRM loss is the plain squared error `mean((qf - target)^2)`. Four

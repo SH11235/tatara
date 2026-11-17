@@ -121,6 +121,12 @@ score の target を使う。他のラベルには選択した schedule を使�
 `--validation-wdl <value>` を指定すると held-out validation と eval-only の lambda を
 固定でき、省略時は training schedule を使う。
 
+`--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
+WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
+`--data` が必要。bit 0 の dual-label gate は独立して働く。マーク付き局面は
+外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。padding の
+bit 0・bit 1 以外が立つ record もエラーにする。
+
 ## 値の記録先
 
 実効スケジュールは run の `experiment.json` の `params` に記録される。`lr_schedule`
@@ -135,4 +141,4 @@ scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` �
 の「指標の読み方」を参照）。
 cycle run では `wdl_cycle_delta` と `wdl_cycle_warmup_pct` も記録され、
 `wdl_schedule_superbatch` は明示した場合のみ記録される。`validation_wdl` は
-指定時のみ、`wdl_ignore_draws` は true の場合のみ記録される。
+指定時のみ、`wdl_ignore_draws` と `tree_sample_eval_only` は true の場合のみ記録される。

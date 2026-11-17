@@ -16,7 +16,8 @@
 //!     pt   = (score[i]  - target_offset) / target_scaling
 //!     pmt  = (-score[i] - target_offset) / target_scaling
 //!     target_wrm = 0.5 * (1 + sigmoid(pt) - sigmoid(pmt))
-//!     target = lambda * wdl[i] + (1 - lambda) * target_wrm
+//!     lam  = ((ignore_draws && wdl[i] == 0.5) || wdl[i] < 0) ? 0 : lambda
+//!     target = lam * wdl[i] + (1 - lam) * target_wrm
 //!     # --- prediction (scorenet = out * nnue2score) ---
 //!     scorenet = out[i] * nnue2score
 //!     q   = sigmoid((scorenet  - in_offset) / in_scaling)
@@ -56,7 +57,7 @@
 //! ## 実装メモ
 //!
 //! WRM target + WDL blend を kernel 内に畳み込み、`score` (raw cp) と `wdl`
-//! ({0, 0.5, 1}) を 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
+//! ({-1 = score only, 0, 0.5, 1}) を 2 buffer で渡す (`loss_wdl` と同じ trade-off)。
 //!
 //! ## NaN / Inf 挙動
 //!
@@ -82,7 +83,7 @@
 ///   `--wrm-nnue2score` / `--wrm-in-scaling` / `--wrm-target-scaling` は正値、
 ///   host 側で保証)、`in_offset` / `target_offset` は任意の有限値
 /// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
-/// - `wdl[i] ∈ {0.0, 0.5, 1.0}` (loss / draw / win)
+/// - `wdl[i] ∈ {-1.0, 0.0, 0.5, 1.0}` (-1 = score only) (loss / draw / win)
 /// - extended では `pow_exp` / `weight_boost_w2` は weight base ≥ 0 への powf として
 ///   評価する (base = `(pf-0.5)^2 * pf*(1-pf)` は pf∈[0,1] で常に ≥ 0)
 ///
@@ -140,7 +141,7 @@ pub fn loss_wrm_cpu(
         let pt = (s - target_offset) / target_scaling;
         let pmt = (-s - target_offset) / target_scaling;
         let target_wrm = 0.5_f32 * (1.0_f32 + sigmoid_f32(pt) - sigmoid_f32(pmt));
-        let lam = if ignore_draws && wdl[i] == 0.5 {
+        let lam = if (ignore_draws && wdl[i] == 0.5) || wdl[i] < 0.0 {
             0.0
         } else {
             lambda
@@ -1032,5 +1033,46 @@ mod tests {
         assert_eq!(run(0, 0.8, true), run(0, 0.0, false));
         assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
         assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
+    }
+    #[test]
+    fn eval_only_rows_ignore_lambda() {
+        for extended in [false, true] {
+            let out = [0.4_f32, -0.7, 0.2];
+            let score = [200.0_f32, -300.0, 100.0];
+            let wdl = [super::super::EVAL_ONLY_WDL, 0.0, 1.0];
+            let run = |i: usize, lambda: f32, ignore_draws: bool| {
+                let mut grad = [0.0_f32];
+                let mut loss = 0.0_f64;
+                loss_wrm_cpu(
+                    &out[i..=i],
+                    &score[i..=i],
+                    &wdl[i..=i],
+                    &[1.0],
+                    &mut grad,
+                    &mut loss,
+                    lambda,
+                    600.0,
+                    340.0,
+                    270.0,
+                    270.0,
+                    380.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                    0.5,
+                    extended,
+                    ignore_draws,
+                    1,
+                );
+                (loss, grad[0])
+            };
+            for lambda in [0.0, 0.3, 0.8, 1.0] {
+                for ignore_draws in [false, true] {
+                    assert_eq!(run(0, lambda, ignore_draws), run(0, 0.0, false));
+                }
+            }
+            assert_eq!(run(1, 0.8, true), run(1, 0.8, false));
+            assert_eq!(run(2, 0.8, true), run(2, 0.8, false));
+        }
     }
 }
