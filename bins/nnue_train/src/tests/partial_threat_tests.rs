@@ -13,7 +13,7 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
     let indices = [0_i32, 2, 4, -1, 1, 3, 2, 2];
     let nnz = [3_i32, 4];
     let pairs = [0_u32, 1, 3];
-    for width in [512, 1536] {
+    for width in [2, 12, 512, 1536] {
         for factor in [false, true] {
             for half in [false, true] {
                 let real_n = 2 * rows + 3 * width;
@@ -69,12 +69,26 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                         }
                     }
                 }
+                let comb = DeviceBuffer::<f32>::zeroed(&stream, real_n)?;
+                // SAFETY: the packed cache covers only real rows; partners are in w's virtual block.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_fold, stream: stream, module: module, config: cfg_1d(real_n),
+                        args: [slice(w), slice(pair_dev), slice(shape_dev), slice(comb)]
+                    }
+                }?;
                 let out = DeviceBuffer::<f32>::zeroed(&stream, 2 * rows)?;
+                let lanes = if cfg!(feature = "native") && width.is_multiple_of(8) {
+                    4
+                } else {
+                    1
+                };
+                let order = DeviceBuffer::from_host(&stream, &[1_i32, 0])?;
                 // SAFETY: all allocations follow the synthetic shape, with one writer per output cell.
                 unsafe {
                     cuda_launch! {
-                        kernel: partial_ft_forward, stream: stream, module: module, config: cfg_1d(2 * rows),
-                        args: [slice(w), slice(idx), slice(nnz_dev), slice(pair_dev), slice(out), slice(shape_dev), 2_u32]
+                        kernel: partial_ft_forward, stream: stream, module: module, config: cfg_1d(2 * rows / lanes),
+                        args: [slice(comb), slice(idx), slice(nnz_dev), slice(out), slice(shape_dev), 2_u64, slice(order)]
                     }
                 }?;
                 assert_eq!(out.to_host_vec(&stream)?, expected);
@@ -83,8 +97,8 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                     // SAFETY: same shape as the FP32-output launch.
                     unsafe {
                         cuda_launch! {
-                            kernel: partial_ft_forward_fp16_out, stream: stream, module: module, config: cfg_1d(2 * rows),
-                            args: [slice(w), slice(idx), slice(nnz_dev), slice(pair_dev), slice(out_h), slice(shape_dev), 2_u32]
+                            kernel: partial_ft_forward_fp16_out, stream: stream, module: module, config: cfg_1d(2 * rows / lanes),
+                            args: [slice(comb), slice(idx), slice(nnz_dev), slice(out_h), slice(shape_dev), 2_u64, slice(order)]
                         }
                     }?;
                     let expected_half: Vec<f16> = expected.iter().map(|&v| v as f16).collect();
@@ -204,11 +218,19 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                     }
                 }
                 let norms = DeviceBuffer::<f32>::zeroed(&stream, rows)?;
+                let sums = DeviceBuffer::<f64>::zeroed(&stream, rows * 256)?;
                 // SAFETY: norms has one cell per output column and weight follows shape.
                 unsafe {
                     cuda_launch! {
-                        kernel: partial_ft_norm, stream: stream, module: module, config: cfg_1d(rows),
-                        args: [slice(w), slice(shape_dev), slice(norms)]
+                        kernel: partial_ft_norm, stream: stream, module: module, config: cfg_1d(rows * 256),
+                        args: [slice(w), slice(shape_dev), slice(sums)]
+                    }
+                }?;
+                // SAFETY: sums contains 256 partitions per column and norms has rows cells.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_norm_finalize, stream: stream, module: module, config: cfg_1d(rows),
+                        args: [slice(sums), slice(norms), rows as u32]
                     }
                 }?;
                 let actual_norms = norms.to_host_vec(&stream)?;
@@ -240,6 +262,85 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                         assert!((updated[k] - weight[k] * multiplier).abs() < 1.0e-6);
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn partial_threat_partitioned_norm_matches_serial_f64() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = test_cuda_context()?;
+    let stream = gpu_runtime::create_compute_stream(&ctx)?;
+    let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
+    let rows = 32;
+    let base = 513;
+    let threats = 519;
+    let piece = 3;
+    for width in [2, 12, 32] {
+        for factor in [false, true] {
+            let virtual_piece = if factor { piece } else { 0 };
+            let virtual_pairs = if factor { 2 } else { 0 };
+            let real_n = base * rows + threats * width;
+            let n = real_n + virtual_piece * rows + virtual_pairs * width;
+            let weight: Vec<f32> = (0..n)
+                .map(|i| ((i * 7 % 101) as f32 - 50.0) / 113.0)
+                .collect();
+            let shape = [
+                rows as u32,
+                base as u32,
+                threats as u32,
+                width as u32,
+                4,
+                piece as u32,
+                factor as u32,
+                0,
+                virtual_pairs as u32,
+            ];
+            let w = DeviceBuffer::from_host(&stream, &weight)?;
+            let shape_dev = DeviceBuffer::from_host(&stream, &shape)?;
+            let sums = DeviceBuffer::<f64>::zeroed(&stream, rows * 256)?;
+            let norms = DeviceBuffer::<f32>::zeroed(&stream, rows)?;
+            // SAFETY: all allocations match the packed shape and each output has a unique writer.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_norm, stream: stream, module: module,
+                    config: cfg_1d(rows * 256),
+                    args: [slice(w), slice(shape_dev), slice(sums)]
+                }
+            }?;
+            // SAFETY: every norm reads exactly 256 initialized partial sums.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_norm_finalize, stream: stream, module: module,
+                    config: cfg_1d(rows), args: [slice(sums), slice(norms), rows as u32]
+                }
+            }?;
+            let actual = norms.to_host_vec(&stream)?;
+            for (col, &norm) in actual.iter().enumerate() {
+                let mut sum = 0.0_f64;
+                for f in 0..base {
+                    sum += f64::from(weight[f * rows + col]).powi(2);
+                }
+                for p in 0..virtual_piece {
+                    sum += f64::from(weight[real_n + p * rows + col]).powi(2);
+                }
+                let c = col % (rows / 2);
+                if c < width / 2 {
+                    let pc = c + if col >= rows / 2 { width / 2 } else { 0 };
+                    for f in 0..threats {
+                        sum += f64::from(weight[base * rows + f * width + pc]).powi(2);
+                    }
+                    for p in 0..virtual_pairs {
+                        sum += f64::from(weight[real_n + virtual_piece * rows + p * width + pc])
+                            .powi(2);
+                    }
+                }
+                let expected = sum.sqrt() as f32;
+                assert!(
+                    (norm - expected).abs() <= 1.0e-6 * expected,
+                    "{width}/{factor}/{col}: {norm} vs {expected}"
+                );
             }
         }
     }

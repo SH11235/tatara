@@ -499,14 +499,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 92, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 101, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 110, "production kernel inventory changed");
+    assert_eq!(required.len(), 119, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3446,6 +3446,47 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             ranger,
             norm,
         ),
+        (
+            "partial-factorized-fp32",
+            threat_factorized.with_threat_width(32),
+            fp32,
+            ranger,
+            norm,
+        ),
+        (
+            "partial-factorized-all-optim",
+            threat_factorized.with_threat_width(32),
+            all_optim,
+            ranger,
+            norm,
+        ),
+        (
+            "partial-factorized-unaligned-base",
+            threat_factorized.with_threat_width(56),
+            fp32,
+            ranger,
+            norm,
+        ),
+        (
+            "partial-no-factorizer",
+            standard
+                .feature_set
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32),
+            fp32,
+            ranger,
+            norm,
+        ),
+        (
+            "partial-no-factorizer-half",
+            standard
+                .feature_set
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32),
+            all_optim,
+            ranger,
+            norm,
+        ),
         ("plain-fp16-mirror", plain, fp16_weights_only, ranger, norm),
         ("plain-all-optim-mirror", plain, all_optim, ranger, norm),
         ("plain-fp32-radam", plain, fp32, OptimizerKind::RAdam, None),
@@ -3461,6 +3502,10 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
         let mut fused = create_layerstack_trainer_with_options(&context, true, options)?;
         let mut separate = create_layerstack_trainer_with_options(&context, true, options)?;
         separate.set_ft_fused_optimizer_enabled_for_test(false);
+        if feature_set.threat_width(options.ft_out) != options.ft_out && !precision.ft_fp16 {
+            fused.configure_qat(Some(crate::qat::QatMode::Dense))?;
+            separate.configure_qat(Some(crate::qat::QatMode::Dense))?;
+        }
         assert_eq!(
             fused.raw_checkpoint_state_to_host()?,
             separate.raw_checkpoint_state_to_host()?,
@@ -4208,6 +4253,7 @@ fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::erro
     let context = test_cuda_context()?;
     for factorize in [false, true] {
         for half in [false, true] {
+            let case = format!("factorize={factorize}, half={half}");
             let mut spec = FeatureSet::HalfKp
                 .spec()
                 .with_threat_profile(ThreatProfile::CrossSide)
@@ -4227,6 +4273,7 @@ fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::erro
                 ..LayerStackTestOptions::standard()
             };
             let mut original = create_layerstack_trainer_with_options(&context, true, options)?;
+            original.set_ft_fused_optimizer_enabled_for_test(false);
             let batch = BatchData::smoke_dummy(SMOKE_BATCH, spec);
             let _ = original.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let checkpoint = std::env::temp_dir().join(format!(
@@ -4240,25 +4287,34 @@ fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::erro
                 None,
             )?;
             let mut resumed = create_layerstack_trainer_with_options(&context, true, options)?;
+            // Resume equivalence requires the same floating-point optimizer path on both sides.
+            resumed.set_ft_fused_optimizer_enabled_for_test(false);
             resumed.load_raw_checkpoint(&checkpoint, false)?;
+            resumed.sync_ft_forward_weights()?;
             std::fs::remove_file(&checkpoint)?;
             assert_eq!(
                 original.raw_checkpoint_state_to_host()?,
-                resumed.raw_checkpoint_state_to_host()?
+                resumed.raw_checkpoint_state_to_host()?,
+                "{case}: state immediately after resume"
             );
             nnue_train::trainer::TrainerBackend::flush_pending_loss(&mut original)?;
-            for _ in 0..5 {
+            for step in 2..=6 {
                 let a = original.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
                 let b = resumed.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
-                assert!((a - b).abs() < 1.0e-6);
+                assert!(
+                    (a - b).abs() < 1.0e-6,
+                    "{case}: step {step} loss {a} vs {b}"
+                );
             }
-            let (_, a) = original.raw_checkpoint_state_to_host()?;
-            let (_, b) = resumed.raw_checkpoint_state_to_host()?;
+            let (original_step, a) = original.raw_checkpoint_state_to_host()?;
+            let (resumed_step, b) = resumed.raw_checkpoint_state_to_host()?;
+            assert_eq!(original_step, 6, "{case}: original step count");
+            assert_eq!(resumed_step, 6, "{case}: resumed step count");
             for ((name, a), (_, b)) in a.iter().zip(&b) {
-                assert_states_close(&format!("{name}.weight"), &a.0, &b.0, 1.0e-5);
-                assert_states_close(&format!("{name}.moment"), &a.1, &b.1, 1.0e-5);
-                assert_states_close(&format!("{name}.variance"), &a.2, &b.2, 1.0e-5);
-                assert_states_close(&format!("{name}.slow"), &a.3, &b.3, 1.0e-5);
+                assert_states_close(&format!("{case}: {name}.weight"), &a.0, &b.0, 1.0e-5);
+                assert_states_close(&format!("{case}: {name}.moment"), &a.1, &b.1, 1.0e-5);
+                assert_states_close(&format!("{case}: {name}.variance"), &a.2, &b.2, 1.0e-5);
+                assert_states_close(&format!("{case}: {name}.slow"), &a.3, &b.3, 1.0e-5);
             }
         }
     }

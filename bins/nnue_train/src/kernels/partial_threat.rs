@@ -1,70 +1,99 @@
 use cuda_device::{DisjointSlice, kernel, thread};
 
 #[kernel]
+pub fn partial_ft_fold(weight: &[f32], pairs: &[u32], shape: &[u32], mut comb: DisjointSlice<f32>) {
+    let i = thread::index_1d();
+    let k = i.get();
+    if k >= comb.len() {
+        return;
+    }
+    let r = shape[0] as usize;
+    let base_n = shape[1] as usize * r;
+    let w = shape[3] as usize;
+    let real_n = base_n + shape[2] as usize * w;
+    let mut value = weight[k];
+    if shape[6] != 0 {
+        let partner;
+        if k < base_n {
+            partner = real_n + (k / r % shape[5] as usize) * r + k % r;
+        } else {
+            let f = (k - base_n) / w;
+            let mut pair = 0_usize;
+            let mut end = pairs.len() - 1;
+            while pair + 1 < end {
+                let mid = (pair + end) / 2;
+                if f >= pairs[mid] as usize {
+                    pair = mid;
+                } else {
+                    end = mid;
+                }
+            }
+            partner = real_n + shape[5] as usize * r + pair * w + (k - base_n) % w;
+        }
+        value += weight[partner];
+    }
+    if shape[7] != 0 {
+        value = (value as f16) as f32;
+    }
+    if let Some(cell) = comb.get_mut(i) {
+        *cell = value;
+    }
+}
+
+#[kernel]
 pub fn partial_ft_forward(
     weight: &[f32],
     indices: &[i32],
     nnz: &[i32],
-    pairs: &[u32],
     mut out: DisjointSlice<f32>,
     shape: &[u32],
-    batch: u32,
+    batch_order: u64,
+    order: &[i32],
 ) {
+    let batch = batch_order as u32;
+    let order_base = (batch_order >> 32) as u32;
     let rows = shape[0];
     let base = shape[1];
     let threats = shape[2];
     let width = shape[3];
     let active = shape[4];
-    let piece = shape[5];
-    let factorize = shape[6];
-    let half_weight = shape[7];
     let i = thread::index_1d();
     let k = i.get();
     let r = rows as usize;
     if k >= batch as usize * r {
         return;
     }
-    let b = k / r;
+    let position = k / r;
+    let b = if order_base == u32::MAX {
+        position
+    } else {
+        order[order_base as usize + position] as usize - order_base as usize
+    };
     let col = k % r;
     let w = width as usize;
     let base = base as usize;
     let threats = threats as usize;
-    let real_n = base * r + threats * w;
     let mut sum = 0.0_f32;
     for n in 0..nnz[b] as usize {
         let f = indices[b * active as usize + n];
         if f >= 0 && (f as usize) < base + threats {
             let f = f as usize;
             let mut offset = f * r + col;
-            let mut virtual_offset = real_n + (f % piece as usize) * r + col;
             let mut enabled = true;
             if f >= base {
                 let c = col % (r / 2);
                 enabled = c < w / 2;
                 let packed_col = c + if col >= r / 2 { w / 2 } else { 0 };
                 offset = base * r + (f - base) * w + packed_col;
-                if factorize != 0 && enabled {
-                    let mut pair = 0_usize;
-                    while pair + 1 < pairs.len() && (f - base) >= pairs[pair + 1] as usize {
-                        pair += 1;
-                    }
-                    virtual_offset = real_n + piece as usize * r + pair * w + packed_col;
-                }
             }
             if enabled {
-                let mut value = weight[offset];
-                if factorize != 0 {
-                    value += weight[virtual_offset];
-                }
-                if half_weight != 0 {
-                    value = (value as f16) as f32;
-                }
-                sum += value;
+                sum += weight[offset];
             }
         }
     }
-    if let Some(cell) = out.get_mut(i) {
-        *cell = sum;
+    // SAFETY: order is a permutation, so each thread owns one distinct output cell.
+    unsafe {
+        *(out.as_mut_ptr().add(b * r + col)) = sum;
     }
 }
 
@@ -73,66 +102,55 @@ pub fn partial_ft_forward_fp16_out(
     weight: &[f32],
     indices: &[i32],
     nnz: &[i32],
-    pairs: &[u32],
     mut out: DisjointSlice<f16>,
     shape: &[u32],
-    batch: u32,
+    batch_order: u64,
+    order: &[i32],
 ) {
+    let batch = batch_order as u32;
+    let order_base = (batch_order >> 32) as u32;
     let rows = shape[0];
     let base = shape[1];
     let threats = shape[2];
     let width = shape[3];
     let active = shape[4];
-    let piece = shape[5];
-    let factorize = shape[6];
-    let half_weight = shape[7];
     let i = thread::index_1d();
     let k = i.get();
     let r = rows as usize;
     if k >= batch as usize * r {
         return;
     }
-    let b = k / r;
+    let position = k / r;
+    let b = if order_base == u32::MAX {
+        position
+    } else {
+        order[order_base as usize + position] as usize - order_base as usize
+    };
     let col = k % r;
     let w = width as usize;
     let base = base as usize;
     let threats = threats as usize;
-    let real_n = base * r + threats * w;
     let mut sum = 0.0_f32;
     for n in 0..nnz[b] as usize {
         let f = indices[b * active as usize + n];
         if f >= 0 && (f as usize) < base + threats {
             let f = f as usize;
             let mut offset = f * r + col;
-            let mut virtual_offset = real_n + (f % piece as usize) * r + col;
             let mut enabled = true;
             if f >= base {
                 let c = col % (r / 2);
                 enabled = c < w / 2;
                 let packed_col = c + if col >= r / 2 { w / 2 } else { 0 };
                 offset = base * r + (f - base) * w + packed_col;
-                if factorize != 0 && enabled {
-                    let mut pair = 0_usize;
-                    while pair + 1 < pairs.len() && (f - base) >= pairs[pair + 1] as usize {
-                        pair += 1;
-                    }
-                    virtual_offset = real_n + piece as usize * r + pair * w + packed_col;
-                }
             }
             if enabled {
-                let mut value = weight[offset];
-                if factorize != 0 {
-                    value += weight[virtual_offset];
-                }
-                if half_weight != 0 {
-                    value = (value as f16) as f32;
-                }
-                sum += value;
+                sum += weight[offset];
             }
         }
     }
-    if let Some(cell) = out.get_mut(i) {
-        *cell = sum as f16;
+    // SAFETY: order is a permutation, so each thread owns one distinct output cell.
+    unsafe {
+        *(out.as_mut_ptr().add(b * r + col)) = sum as f16;
     }
 }
 
@@ -264,40 +282,62 @@ pub fn partial_ft_reduce(grad: &[f32], pairs: &[u32], shape: &[u32]) {
     }
 }
 
+// Split each column across 256 row partitions so the FT reduction can use all SMs.
 #[kernel]
-pub fn partial_ft_norm(weight: &[f32], shape: &[u32], mut norms: DisjointSlice<f32>) {
+pub fn partial_ft_norm(weight: &[f32], shape: &[u32], mut sums: DisjointSlice<f64>) {
     let i = thread::index_1d();
-    let col = i.get();
+    let k = i.get();
     let r = shape[0] as usize;
-    if col >= r {
+    if k >= r * 256 {
         return;
     }
+    let col = k % r;
+    let partition = k / r;
     let base = shape[1] as usize;
     let threats = shape[2] as usize;
     let w = shape[3] as usize;
+    let piece = if shape[6] != 0 { shape[5] as usize } else { 0 };
+    let pairs = shape[8] as usize;
     let real_n = base * r + threats * w;
-    let mut sum = 0.0_f64;
-    for f in 0..base {
-        let v = weight[f * r + col] as f64;
-        sum += v * v;
-    }
-    if shape[6] != 0 {
-        for p in 0..shape[5] as usize {
-            let v = weight[real_n + p * r + col] as f64;
-            sum += v * v;
-        }
-    }
     let c = col % (r / 2);
-    if c < w / 2 {
-        let pc = c + if col >= r / 2 { w / 2 } else { 0 };
-        for f in 0..threats {
-            let v = weight[base * r + f * w + pc] as f64;
-            sum += v * v;
+    let pc = c + if col >= r / 2 { w / 2 } else { 0 };
+    let mut sum = 0.0_f64;
+    let mut row = partition;
+    while row < base + piece + threats + pairs {
+        let offset;
+        if row < base {
+            offset = row * r + col;
+        } else if row < base + piece {
+            offset = real_n + (row - base) * r + col;
+        } else if c < w / 2 {
+            if row < base + piece + threats {
+                offset = base * r + (row - base - piece) * w + pc;
+            } else {
+                offset = real_n + piece * r + (row - base - piece - threats) * w + pc;
+            }
+        } else {
+            row += 256;
+            continue;
         }
-        for p in 0..shape[8] as usize {
-            let v = weight[real_n + shape[5] as usize * r + p * w + pc] as f64;
-            sum += v * v;
-        }
+        let v = weight[offset] as f64;
+        sum += v * v;
+        row += 256;
+    }
+    if let Some(cell) = sums.get_mut(i) {
+        *cell = sum;
+    }
+}
+
+#[kernel]
+pub fn partial_ft_norm_finalize(sums: &[f64], mut norms: DisjointSlice<f32>, rows: u32) {
+    let i = thread::index_1d();
+    let col = i.get();
+    if col >= rows as usize {
+        return;
+    }
+    let mut sum = 0.0_f64;
+    for partition in 0..256 {
+        sum += sums[partition * rows as usize + col];
     }
     if let Some(cell) = norms.get_mut(i) {
         *cell = sum.sqrt() as f32;
