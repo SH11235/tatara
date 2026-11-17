@@ -451,7 +451,7 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
             rate: 0.35,
         },
     ];
-    let open = |workers, position: Option<&TeacherPosition>| {
+    let open = |workers, window_mib, position: Option<&TeacherPosition>| {
         BucketedPrefetchedLoader::spawn_mixed_resumable(
             &[&primary],
             BucketedLoaderOptions {
@@ -472,7 +472,7 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
                 train_end_offset: 2000 * PSV_RECORD_BYTES,
                 monitor_active: false,
                 score_source: None,
-                teacher_shuffle_buffer_mib: 1,
+                teacher_shuffle_buffer_mib: window_mib,
                 teacher_shuffle: true,
                 teacher_shuffle_seed: 31,
             },
@@ -491,26 +491,29 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
         }
         scores
     };
-    let mut reference = open(1, None);
-    let expected = collect(&mut reference, 350);
-    drop(reference);
-    for workers in [1, 4] {
-        let mut first = open(workers, None);
-        let mut actual = collect(&mut first, 151);
-        let position: TeacherPosition =
-            serde_json::from_slice(&serde_json::to_vec(first.position()).unwrap()).unwrap();
-        assert_eq!(position.mixes.len(), 2);
-        assert!(position.window_index.unwrap() > 0);
-        assert!(position.epoch > 0);
-        drop(first);
-        let mut resumed = open(workers, Some(&position));
-        actual.extend(collect(&mut resumed, 199));
-        if workers == 1 {
-            assert_eq!(actual, expected);
+    for window_mib in [0, 1] {
+        let mut reference = open(1, window_mib, None);
+        let expected = collect(&mut reference, 350);
+        drop(reference);
+        for workers in [1, 4] {
+            for cut in [1, 151] {
+                let mut first = open(workers, window_mib, None);
+                let mut actual = collect(&mut first, cut);
+                let position: TeacherPosition =
+                    serde_json::from_slice(&serde_json::to_vec(first.position()).unwrap()).unwrap();
+                assert_eq!(position.mixes.len(), 2);
+                assert!(position.bucket_skip > 0);
+                if cut == 151 {
+                    if window_mib != 0 {
+                        assert!(position.window_index.unwrap() > 0);
+                    }
+                    assert!(position.epoch > 0);
+                }
+                drop(first);
+                let mut resumed = open(workers, window_mib, Some(&position));
+                actual.extend(collect(&mut resumed, 350 - cut));
+                assert_eq!(actual, expected);
+            }
         }
-        actual.sort_unstable();
-        let mut sorted = expected.clone();
-        sorted.sort_unstable();
-        assert_eq!(actual, sorted);
     }
 }

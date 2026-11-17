@@ -156,7 +156,7 @@ All applicable probabilities are multiplied; score filtering also applies.
 Sampling hashes the seed, teacher ID (0 for concatenated `--data`, 1 onward for
 `--mix-data` in argument order), zero-based epoch and physical record index. Multiple `--data` files form one stream
 in argument order. Decisions are independent of shuffle windows and decode worker
-scheduling, including `--threads >= 2`; batch delivery order can still vary.
+scheduling, including `--threads >= 2`.
 Bucket sampling runs in the parallel decode workers and reuses the decoded board
 for feature extraction. Rejected records are replaced to keep batches full.
 After five consecutive empty passes the loader returns an error.
@@ -191,8 +191,12 @@ the mixed stream and shuffled afterward. Mixed windows cross individual teacher 
 boundaries. Mixed windows also retain a source identifier per position, so their
 resident memory is larger than the approximately twice-the-window-size estimate for
 unmixed input. Training receives batches in reader order even with multiple decode
-workers. With bucket sampling, each worker holds the input cursor until its batch is
-full, including replacement reads for rejected positions; this limits parallel decoding.
+workers. With bucket sampling, workers read numbered raw chunks under the input lock,
+then decode, extract features and filter outside the lock. Accepted positions are assembled
+in chunk order into full batches; leftovers carry into the next batch. Assembly copies
+fixed-size sparse indices and labels, without decoding again. Lower keep rates still
+require decoding more candidates per delivered position. Without bucket sampling,
+each raw chunk remains one batch.
 
 Mixing conflicts with `--score-override` and `--dual-label-psv`. For positions without
 a game result, encode result 0 (draw) and use `--wdl-ignore-draws` to train on the score
@@ -459,7 +463,10 @@ checkpointed stop.
 Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` files form
 one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
 record; the sidecar also restores the mixing selection counter and shuffle window position.
-Version 1 sidecars are accepted for input without mixing or sampling.
+Version 3 sidecars also store the number of accepted positions already delivered from
+a partially consumed chunk. Resume rereads that chunk and skips those accepted positions;
+prefetch cannot advance the saved boundary. Version 2 sidecars remain readable;
+version 1 sidecars are accepted for input without mixing or sampling.
 Resume rejects changes to any teacher's basename/size, sampling probabilities/seeds,
 mixing rates/seed, batch size, training range, score processing, or shuffle settings. There is no mismatch
 override. Absolute teacher paths are recorded for reference and may change. When bucket

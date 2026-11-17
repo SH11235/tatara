@@ -124,7 +124,7 @@ impl LoaderState {
                 }
             }
         }
-        if !matches!(self.version, 1 | 2)
+        if !matches!(self.version, 1..=3)
             || (self.version == 1 && !mixes.is_empty())
             || self.superbatch != superbatch
             || self.teachers.len() != mixes.len() + 1
@@ -159,6 +159,43 @@ impl LoaderState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_replay_metadata_round_trips_and_legacy_cursors_default_to_zero() {
+        let files = vec![TeacherFileIdentity {
+            path: "teacher.psv".into(),
+            bytes: 4000,
+        }];
+        let settings = serde_json::json!({"batch_size": 7});
+        let position = TeacherPosition {
+            next_record: 42,
+            bucket_skip: 3,
+            ..Default::default()
+        };
+        let state = LoaderState {
+            version: 3,
+            superbatch: 2,
+            teachers: vec![TeacherState {
+                id: "primary".into(),
+                files: files.clone(),
+                position: position.clone(),
+            }],
+            settings: settings.clone(),
+        };
+        let mut json = serde_json::to_value(state).unwrap();
+        let decoded: LoaderState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.validate(&files, &settings, 2).unwrap(), &position);
+        json["version"] = serde_json::json!(2);
+        json["teachers"][0]["position"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bucket_skip");
+        let legacy: LoaderState = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            legacy.validate(&files, &settings, 2).unwrap().bucket_skip,
+            0
+        );
+    }
 
     #[test]
     fn sidecar_round_trip_checks_teacher_identity_and_version() {

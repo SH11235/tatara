@@ -142,8 +142,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 採否は seed・教師 ID・0 始まりの epoch・物理 record 番号のハッシュで決めます。
 複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱い、
 `--mix-data` の教師 ID は指定順に 1, 2, ... とします。間引きは全教師に適用します。
-shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません
-（batch の到着順は変わることがあります）。
+shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません。
 bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤面を使います。
 捨てた分は次の record で補い、batch の件数を保ちます。
 5 周連続で採用がゼロなら error になります。
@@ -175,8 +174,11 @@ held-out の局面をあらかじめ除いておくこと。
 混合時の窓は個々の教師の epoch 境界をまたぐ。また局面ごとの出典情報を保持するため、
 混合なしの「窓サイズの約 2 倍」という見積もりより追加メモリが増える。
 複数の decode worker でも、学習には読み取り順に batch を渡す。
-bucket 間引き時は、棄却分を読み直して batch が埋まるまで worker が読み位置を保持するため、
-decode の並列性が制限される。
+bucket 間引き時は、生 record の塊と通し番号を lock 内で取得し、decode・特徴抽出・
+間引きは lock の外で並列に行う。採用局面を塊の番号順に固定サイズの batch へ詰め、
+端数は次の batch に回す。詰め直しでは固定長の sparse index とラベルだけをコピーし、
+decode は繰り返さない。採用率を下げるほど、学習に渡す局面あたりの decode 件数は増える。
+bucket 指定なしでは、従来どおり生 record の塊一つを一つの batch として渡す。
 
 混合と `--score-override` / `--dual-label-psv` の併用はエラーになる。勝敗の無い局面は
 result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば評価値だけで学習できる。
@@ -415,8 +417,10 @@ SIGINT / SIGTERM は pause に変換しない。保存して止めるには制�
 
 `.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
 連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
-通し番号、shuffle 窓内の位置も保存・復元する。version 1 の sidecar は混合・間引きなしの
-入力として読める。再開時に全教師の basename とサイズ、間引き確率・seed、混合割合・seed、
+通し番号、shuffle 窓内の位置も保存・復元する。version 3 では、一部だけ使った塊の
+開始位置と、その塊から既に渡した採用局面数も保存する。再開時は塊を読み直して既使用分を
+飛ばすため、先読みが保存位置を追い越さない。version 2 も読み込める。
+version 1 の sidecar は混合・間引きなしの入力として読める。再開時に全教師の basename とサイズ、間引き確率・seed、混合割合・seed、
 batch size・教師範囲・score 処理・shuffle 設定が一致しなければエラーになる。強制続行の
 オプションはない。絶対パスは記録のみで照合せず、教師の移動を許容する。bucket 間引き時は
 bucket mode・bucket 数・進行度係数ファイルのサイズと SHA-256 も照合する。

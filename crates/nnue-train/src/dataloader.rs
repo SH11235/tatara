@@ -1213,6 +1213,9 @@ pub struct TeacherPosition {
     pub mixes: Vec<TeacherPosition>,
     #[serde(default)]
     pub ordinal: u64,
+    /// Accepted positions already delivered from the raw chunk starting at this cursor.
+    #[serde(default)]
+    pub bucket_skip: usize,
 }
 
 /// 教師 file (PSV / HCPE) を逐次読み、EOF で同 file を開き直して次 epoch とする stream
@@ -1854,6 +1857,7 @@ impl<R: Copy + Send + Into<SourcedRecord> + 'static> WindowedPsvReader<R> {
         if window.position
             != (TeacherPosition {
                 window_offset: 0,
+                bucket_skip: 0,
                 ..position.clone()
             })
             || position.window_offset > window.records.len()
@@ -2027,6 +2031,23 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 /// 回す。`buffers` は `reset()` 再利用、`buckets` は `clear()` 再利用。
 type BatchSlot = (Batch, Vec<i32>);
 
+struct DecodedChunk {
+    before: TeacherPosition,
+    after: TeacherPosition,
+    sources: Vec<usize>,
+    slot: BatchSlot,
+}
+
+struct BucketAssembly {
+    chunk: Option<DecodedChunk>,
+    offset: usize,
+    resume_skip: usize,
+    outputs: Mutex<Vec<BatchSlot>>,
+    batch_size: usize,
+    feature_set: FeatureSetSpec,
+    teacher_count: usize,
+}
+
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
 /// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
 /// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
@@ -2042,30 +2063,28 @@ type BatchSlot = (Batch, Vec<i32>);
 ///   外で decode + 特徴抽出を並列に行う。windowed reader では窓境界で lock 保持の
 ///   まま次窓完成を待ち得る (`Drop` は共通 stop flag で先に入力を止める)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
-/// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
-///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
-///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
-///   が再借用して `reset()` / `clear()` で reuse。毎 batch の `Vec` 新規 alloc
-///   (~21MB) は発生しない。
-/// - **読み位置**: resume 用の loader は reader の batch 順に返す。bucket 間引き時は
-///   採用候補の decode と取り直しの間 reader を保持し、次 batch の先読みによる
-///   保存境界の追い越しを防ぐ。
+/// - **buffer reuse**: worker の塊は `prefetch_depth + num_workers + 1` 個の
+///   pool から借り、消費後に返す。bucket 間引き時は組み立て用 batch を別の pool で
+///   再利用し、[`BucketedPrefetchedLoader::recycle`] は消費済み出力をそこへ返す。
+/// - **読み位置**: bucket 間引き時は生 record の塊を番号順に詰め直し、
+///   一部だけ使った塊の開始位置と既使用の採用局面数から再開する。
 /// - **error 伝搬**: reader・decode・特徴抽出の失敗は result channel で通知し、
 ///   未着の batch 番号を待っている main もエラーで停止する。
 /// - **終了**: main が `BucketedPrefetchedLoader` を drop すると [`Drop`] impl が
 ///   まず result/pool 両 channel endpoint を落として全 worker を unblock させ、
 ///   その後 worker thread を join する (close-then-join、詳細は `Drop` の doc)。
 pub struct BucketedPrefetchedLoader {
-    /// 完成 batch (Batch + per-position bucket) を worker → main で渡す。
+    /// decode 済みの塊と再開位置を worker → main で渡す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
-    result_rx: Option<mpsc::Receiver<io::Result<(u64, TeacherPosition, BatchSlot)>>>,
-    pending: BTreeMap<u64, (TeacherPosition, BatchSlot)>,
+    result_rx: Option<mpsc::Receiver<io::Result<(u64, DecodedChunk)>>>,
+    pending: BTreeMap<u64, DecodedChunk>,
+    assembly: Option<BucketAssembly>,
     next_sequence: u64,
     ordered: bool,
     position: TeacherPosition,
     sampling_counts: Vec<Arc<SamplingCounts>>,
     bucket_samplings: Vec<Option<Arc<BucketSampling>>>,
-    /// 消費済み batch buffer を main → worker で返す (ring buffer)。
+    /// 消費済みの塊の buffer を main → worker で返す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
     pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
     /// `--monitor-active-features` 時のみ `Some`。全 worker が共有する実 active
@@ -2212,7 +2231,7 @@ impl BucketedPrefetchedLoader {
         mix_seed: u64,
     ) -> io::Result<Self> {
         let mut loader = Self::spawn_mixed_resumable(paths, options, mixes, mix_seed, None)?;
-        loader.ordered = false;
+        loader.ordered = loader.assembly.is_some();
         Ok(loader)
     }
 
@@ -2332,6 +2351,9 @@ impl BucketedPrefetchedLoader {
         );
         loader.sampling_counts = counts;
         loader.position = resume.cloned().unwrap_or_default();
+        if let Some(assembly) = &mut loader.assembly {
+            assembly.resume_skip = resume.map_or(0, |p| p.bucket_skip);
+        }
         Ok(loader)
     }
 
@@ -2357,6 +2379,7 @@ impl BucketedPrefetchedLoader {
         // が最大 1、main が最大 1。
         let n_slots = prefetch_depth + num_workers + 1;
         let bucket_samplings = reader.bucket_samplings();
+        let bucket_filter = bucket_samplings.iter().any(Option::is_some);
         let stop = reader.stop_flag();
         let teacher_count = reader.teacher_count();
         let reader = Arc::new(Mutex::new((reader, 0u64)));
@@ -2370,7 +2393,7 @@ impl BucketedPrefetchedLoader {
         };
 
         let (result_tx, result_rx) =
-            mpsc::sync_channel::<io::Result<(u64, TeacherPosition, BatchSlot)>>(prefetch_depth);
+            mpsc::sync_channel::<io::Result<(u64, DecodedChunk)>>(prefetch_depth);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
@@ -2416,21 +2439,40 @@ impl BucketedPrefetchedLoader {
 
                     // 短い critical section: 共有 reader から batch_size 件を
                     // scratch に詰める (I/O のみ、decode はしない)。
-                    let (sequence, mut position);
-                    let mut retained = None;
+                    let (sequence, mut before, position);
                     {
                         let mut guard = reader.lock().expect("reader mutex poisoned");
                         let (rdr, counter) = &mut *guard;
                         sequence = *counter;
                         *counter += 1;
                         scratch.clear();
+                        before = if bucket_filter {
+                            rdr.position()
+                        } else {
+                            TeacherPosition::default()
+                        };
                         let mut failed = rdr.replay_sampling(bucket_mode, num_buckets).err();
                         for _ in 0..batch_size {
                             if failed.is_some() {
                                 break;
                             }
                             match rdr.next() {
-                                Ok(record) => scratch.push(record),
+                                Ok(record) => {
+                                    if bucket_filter
+                                        && scratch.is_empty()
+                                        && before.window_index.is_none()
+                                    {
+                                        // The first window exposes its physical cursor after its first read.
+                                        let current = rdr.position();
+                                        if current.window_index.is_some() {
+                                            before = TeacherPosition {
+                                                window_offset: current.window_offset - 1,
+                                                ..current
+                                            };
+                                        }
+                                    }
+                                    scratch.push(record);
+                                }
                                 Err(e) => {
                                     failed = Some(e);
                                     break;
@@ -2438,17 +2480,15 @@ impl BucketedPrefetchedLoader {
                             }
                         }
                         position = rdr.position();
-                        // Bucket rejection must finish before another batch advances the cursor.
-                        if bucket_samplings.iter().any(Option::is_some) {
-                            retained = Some(guard);
-                        } else {
-                            drop(guard);
-                        }
+                        drop(guard);
                         if let Some(e) = failed {
                             if worker_stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let _ = result_tx.send(Err(e));
+                            let _ = result_tx.send(Err(io::Error::new(
+                                e.kind(),
+                                format!("decode chunk {sequence}: {e}"),
+                            )));
                             return;
                         }
                     }
@@ -2458,23 +2498,8 @@ impl BucketedPrefetchedLoader {
                     // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
                     let mut failure: Option<io::Error> = None;
-                    let mut records = scratch.iter().copied();
-                    while batch.n_positions < batch_size {
-                        let record = match records.next() {
-                            Some(record) => record,
-                            None => match retained
-                                .as_mut()
-                                .expect("bucket refill owns reader")
-                                .0
-                                .next()
-                            {
-                                Ok(record) => record,
-                                Err(e) => {
-                                    failure = Some(e);
-                                    break;
-                                }
-                            },
-                        };
+                    let mut sources = Vec::new();
+                    for record in scratch.iter().copied() {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
@@ -2518,20 +2543,23 @@ impl BucketedPrefetchedLoader {
                         }
                         if teacher_count != 0 {
                             batch.teacher_counts[record.source()] += 1;
+                            if bucket_filter {
+                                sources.push(record.source());
+                            }
                         }
                         if let Some(bucket) = bucket {
                             buckets.push(i32::from(bucket));
                         }
                     }
                     if let Some(e) = failure {
-                        let _ = result_tx.send(Err(e));
+                        let _ = result_tx.send(Err(io::Error::new(
+                            e.kind(),
+                            format!("decode chunk {sequence}: {e}"),
+                        )));
                         return;
                     }
-                    if let Some(guard) = retained.take() {
-                        position = guard.0.position();
-                    }
-                    debug_assert_eq!(batch.n_positions, batch_size);
-                    debug_assert!(!compute_bucket || buckets.len() == batch_size);
+                    debug_assert!(bucket_filter || batch.n_positions == batch_size);
+                    debug_assert!(!compute_bucket || buckets.len() == batch.n_positions);
 
                     // batch-local histogram を共有 accumulator に flush して 0 に戻す
                     // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
@@ -2549,7 +2577,15 @@ impl BucketedPrefetchedLoader {
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
                     if result_tx
-                        .send(Ok((sequence, position, (batch, buckets))))
+                        .send(Ok((
+                            sequence,
+                            DecodedChunk {
+                                before,
+                                after: position,
+                                sources,
+                                slot: (batch, buckets),
+                            },
+                        )))
                         .is_err()
                     {
                         break;
@@ -2565,6 +2601,15 @@ impl BucketedPrefetchedLoader {
         Self {
             result_rx: Some(result_rx),
             pending: BTreeMap::new(),
+            assembly: bucket_filter.then(|| BucketAssembly {
+                chunk: None,
+                offset: 0,
+                resume_skip: 0,
+                outputs: Mutex::new(Vec::new()),
+                batch_size,
+                feature_set,
+                teacher_count,
+            }),
             next_sequence: 0,
             ordered: true,
             position: TeacherPosition::default(),
@@ -2623,6 +2668,36 @@ impl BucketedPrefetchedLoader {
             .map(|h| h.lock().expect("active_hist mutex poisoned").clone())
     }
 
+    fn next_chunk(&mut self) -> io::Result<Option<DecodedChunk>> {
+        loop {
+            if let Some(chunk) = self.pending.remove(&self.next_sequence) {
+                self.next_sequence += 1;
+                return Ok(Some(chunk));
+            }
+            match self
+                .result_rx
+                .as_ref()
+                .expect("result_rx present until Drop")
+                .recv()
+            {
+                Ok(Ok((sequence, chunk))) => {
+                    if !self.ordered {
+                        return Ok(Some(chunk));
+                    }
+                    self.pending.insert(sequence, chunk);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) if !self.pending.is_empty() => {
+                    return Err(io::Error::other(format!(
+                        "decode workers stopped before chunk {}",
+                        self.next_sequence
+                    )));
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
     /// 次の `(Batch, per-position bucket)` を取得。返り値:
     /// - `Ok(Some((batch, buckets)))`: 正常 batch (`batch.n_positions == batch_size`)
     /// - `Err(e)`: worker が reader から io::Error (barren-exhaustion 等) を受けた
@@ -2631,29 +2706,90 @@ impl BucketedPrefetchedLoader {
     ///
     /// 消費後は [`Self::recycle`] で `(batch, buckets)` を返すこと (ring buffer)。
     pub fn next_batch(&mut self) -> io::Result<Option<BatchSlot>> {
-        loop {
-            if let Some((position, slot)) = self.pending.remove(&self.next_sequence) {
-                self.next_sequence += 1;
-                self.position = position;
-                return Ok(Some(slot));
-            }
-            match self
-                .result_rx
-                .as_ref()
-                .expect("result_rx present until Drop")
-                .recv()
-            {
-                Ok(Ok((sequence, position, slot))) => {
-                    if !self.ordered {
-                        self.position = position;
-                        return Ok(Some(slot));
-                    }
-                    self.pending.insert(sequence, (position, slot));
+        let Some(mut assembly) = self.assembly.take() else {
+            return self.next_chunk().map(|chunk| {
+                chunk.map(|chunk| {
+                    self.position = chunk.after;
+                    chunk.slot
+                })
+            });
+        };
+        let result = self.assemble_batch(&mut assembly);
+        self.assembly = Some(assembly);
+        result
+    }
+
+    fn assemble_batch(&mut self, assembly: &mut BucketAssembly) -> io::Result<Option<BatchSlot>> {
+        let mut output = assembly
+            .outputs
+            .lock()
+            .expect("output pool poisoned")
+            .pop()
+            .unwrap_or_else(|| {
+                (
+                    Batch::with_capacity(assembly.batch_size, assembly.feature_set),
+                    Vec::with_capacity(assembly.batch_size),
+                )
+            });
+        output.0.reset();
+        output.0.teacher_counts.resize(assembly.teacher_count, 0);
+        output.1.clear();
+        let mut position = self.position.clone();
+        while output.0.n_positions < assembly.batch_size {
+            if assembly.chunk.is_none() {
+                let Some(chunk) = self.next_chunk()? else {
+                    return Ok(None);
+                };
+                assembly.offset = assembly.resume_skip;
+                assembly.resume_skip = 0;
+                if assembly.offset > chunk.slot.0.n_positions {
+                    return Err(io::Error::other("loader bucket skip exceeds decoded chunk"));
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Ok(None),
+                assembly.chunk = Some(chunk);
+            }
+            let chunk = assembly.chunk.as_ref().expect("assembly chunk");
+            let start = assembly.offset;
+            let count =
+                (chunk.slot.0.n_positions - start).min(assembly.batch_size - output.0.n_positions);
+            let dst = output.0.n_positions;
+            let src = &chunk.slot.0;
+            let max_active = src.max_active;
+            output.0.stm_indices[dst * max_active..(dst + count) * max_active].copy_from_slice(
+                &src.stm_indices[start * max_active..(start + count) * max_active],
+            );
+            output.0.nstm_indices[dst * max_active..(dst + count) * max_active].copy_from_slice(
+                &src.nstm_indices[start * max_active..(start + count) * max_active],
+            );
+            output.0.nnz[dst..dst + count].copy_from_slice(&src.nnz[start..start + count]);
+            output.0.score[dst..dst + count].copy_from_slice(&src.score[start..start + count]);
+            output.0.wdl[dst..dst + count].copy_from_slice(&src.wdl[start..start + count]);
+            output.0.per_pos_norm[dst..dst + count]
+                .copy_from_slice(&src.per_pos_norm[start..start + count]);
+            output
+                .1
+                .extend_from_slice(&chunk.slot.1[start..start + count]);
+            if assembly.teacher_count != 0 {
+                for &source in &chunk.sources[start..start + count] {
+                    output.0.teacher_counts[source] += 1;
+                }
+            }
+            output.0.n_positions += count;
+            assembly.offset += count;
+            if assembly.offset == src.n_positions {
+                let chunk = assembly.chunk.take().expect("exhausted chunk");
+                position = chunk.after;
+                if let Some(tx) = &self.pool_tx {
+                    let _ = tx.send(chunk.slot);
+                }
+            } else {
+                position = TeacherPosition {
+                    bucket_skip: assembly.offset,
+                    ..chunk.before.clone()
+                };
             }
         }
+        self.position = position;
+        Ok(Some(output))
     }
 
     /// Position after the last batch delivered to the training loop, excluding prefetch.
@@ -2665,6 +2801,14 @@ impl BucketedPrefetchedLoader {
     /// pool channel は ring の全 slot 容量を持つので block しない。worker が
     /// 既に全員終了していたら send は失敗するが無視してよい (loader drop 経路)。
     pub fn recycle(&self, slot: BatchSlot) {
+        if let Some(assembly) = &self.assembly {
+            assembly
+                .outputs
+                .lock()
+                .expect("output pool poisoned")
+                .push(slot);
+            return;
+        }
         if let Some(tx) = self.pool_tx.as_ref() {
             let _ = tx.send(slot);
         }

@@ -597,7 +597,7 @@ pub(crate) struct Cli {
     /// Training PSV ply probabilities, e.g. "0:0.025,22:0.05,32:1"; linear between points, constant outside.
     #[arg(long, global = true)]
     pub(crate) ply_keep_curve: Option<nnue_train::sampling::PlyKeepCurve>,
-    /// Training keep probabilities per LayerStack bucket; applied by parallel decode workers, with per-bucket counts.
+    /// Training keep probabilities per LayerStack bucket; parallel decode with ordered, full-batch assembly and per-bucket counts.
     #[arg(long, value_delimiter = ',', global = true)]
     pub(crate) bucket_keep_rates: Option<Vec<f64>>,
     /// Stateless training sampling seed (default: 0), combined with teacher ID, epoch and physical record index.

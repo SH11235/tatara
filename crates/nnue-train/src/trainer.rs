@@ -1387,7 +1387,7 @@ where
                 });
             }
             crate::loader_state::LoaderState {
-                version: 2,
+                version: 3,
                 superbatch: sb,
                 teachers,
                 settings: settings.clone(),
