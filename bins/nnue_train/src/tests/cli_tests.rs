@@ -1937,6 +1937,98 @@ fn sampling_cli_parses_defaults_curve_and_bucket_rates() {
 }
 
 #[test]
+fn mixing_cli_pairs_and_rates_are_validated() {
+    let parse = |tail: &[&str]| {
+        let mut args = vec!["nnue-train", "--data", "main.psv", "layerstack"];
+        args.extend_from_slice(tail);
+        Cli::try_parse_from(args)
+    };
+    let cli = parse(&[
+        "--mix-data",
+        "tree.psv",
+        "--mix-rate",
+        "0.03",
+        "--mix-data",
+        "other.psv",
+        "--mix-rate",
+        "0.2",
+        "--mix-seed",
+        "42",
+    ])
+    .unwrap();
+    cli.validate_score_sources().unwrap();
+    assert_eq!(cli.mix_sources().len(), 2);
+    assert_eq!(cli.mix_sources()[0].rate, 0.03);
+    assert_eq!(cli.mix_sources()[1].path, PathBuf::from("other.psv"));
+    assert_eq!(cli.mix_seed, 42);
+    for rate in ["0", "-0.1", "1", "NaN", "inf"] {
+        let args = ["--mix-data", "tree.psv", "--mix-rate", rate];
+        assert!(parse(&args).map_or(true, |cli| cli.validate_score_sources().is_err()));
+    }
+    for tail in [
+        vec!["--mix-data", "tree.psv"],
+        vec!["--mix-rate", "0.03"],
+        vec![
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.7",
+            "--mix-data",
+            "other.psv",
+            "--mix-rate",
+            "0.3",
+        ],
+        vec![
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.1",
+            "--mix-data",
+            "other.psv",
+        ],
+        vec!["--mix-data", "tree.hcpe", "--mix-rate", "0.03"],
+    ] {
+        assert!(
+            parse(&tail).map_or(true, |cli| cli.validate_score_sources().is_err()),
+            "{tail:?}"
+        );
+    }
+    for conflict in ["--score-override", "--dual-label-psv", "--eval-only"] {
+        let mut tail = vec!["--mix-data", "tree.psv", "--mix-rate", "0.03", conflict];
+        if conflict == "--score-override" {
+            tail.push("scores.i16");
+        }
+        if conflict == "--dual-label-psv" {
+            tail.push("all");
+        }
+        assert!(parse(&tail).is_err());
+    }
+    assert!(
+        Cli::try_parse_from([
+            "nnue-train",
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.03",
+            "layerstack"
+        ])
+        .unwrap()
+        .validate_score_sources()
+        .is_err()
+    );
+    let argv: Vec<String> = ["nnue-train", "--mix-seed", "42", "layerstack"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    assert!(
+        Cli::try_parse_from(&argv)
+            .unwrap()
+            .validate_data_args(&argv)
+            .is_err()
+    );
+}
+
+#[test]
 fn sampling_cli_rejects_hcpe_ply_and_wrong_bucket_counts() {
     for option in [vec!["--min-ply", "18"], vec!["--ply-keep-curve", "0:0.5"]] {
         let mut args = vec!["nnue-train", "--data", "teacher.hcpe"];
@@ -1962,4 +2054,42 @@ fn sampling_cli_rejects_hcpe_ply_and_wrong_bucket_counts() {
     ])
     .unwrap();
     assert!(cli.validate_score_sources().is_err());
+}
+
+#[test]
+fn mixing_cli_rejects_flags_split_across_subcommand() {
+    for flag in ["--mix-data", "--mix-rate"] {
+        let values = if flag == "--mix-data" {
+            ["tree.psv", "other.psv"]
+        } else {
+            ["0.03", "0.2"]
+        };
+        let other = if flag == "--mix-data" {
+            "--mix-rate"
+        } else {
+            "--mix-data"
+        };
+        let other_value = if flag == "--mix-data" {
+            "0.03"
+        } else {
+            "tree.psv"
+        };
+        let argv: Vec<String> = [
+            "nnue-train",
+            "--data",
+            "main.psv",
+            other,
+            other_value,
+            flag,
+            values[0],
+            "layerstack",
+            flag,
+            values[1],
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let cli = Cli::try_parse_from(&argv).unwrap();
+        assert!(cli.validate_data_args(&argv).is_err());
+    }
 }

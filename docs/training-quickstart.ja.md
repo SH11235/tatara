@@ -111,6 +111,8 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99) / `radam` (lookahead なしの rectified Adam, beta1=0.9) / `adamw` (bias correction なしの Adam, beta1=0.9) から選ぶ。raw `.ckpt` からの `--resume` 時は元 run と同じ値を渡す |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
+| `--mix-data PATH` / `--mix-rate R` | なし | 対応する順序で繰り返し、別の教師を指定比率で混ぜる。各 R は有限の正数で、合計は 1 未満。残りは `--data` を指定順につないだ主の教師から取る。全教師の形式は同一であること |
+| `--mix-seed` | 0 | 教師の選択に使う状態を持たない乱数の seed。shuffle の seed とは独立 |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍 |
 | `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途。`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある |
@@ -138,17 +140,54 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 折れ線の点の間は直線補間し、端の外側は端の確率を使います。
 各確率を掛け合わせ、score のフィルタも通った局面だけを使います。
 採否は seed・教師 ID・0 始まりの epoch・物理 record 番号のハッシュで決めます。
-複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱います。
+複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱い、
+`--mix-data` の教師 ID は指定順に 1, 2, ... とします。間引きは全教師に適用します。
 shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません
 （batch の到着順は変わることがあります）。
 bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤面を使います。
 捨てた分は次の record で補い、batch の件数を保ちます。
 5 周連続で採用がゼロなら error になります。
-間引きのオプションを一つでも指定したときだけ、各 superbatch に累積 `read` / `kept` を出します。
+間引きのオプションを一つでも指定したときだけ、各 superbatch に教師ごとと全体の累積 `read` / `kept` を出します。
 bucket 指定時は bucket ごとの読んだ数（reader のフィルタ通過後）と採った数も出します。
 先読み済みの局面も含みます。設定は `experiment.json` の `params.sampling` に保存し、
 recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）の場合だけ省略し、
 既存の recipe fingerprint を維持します。
+
+### 別の教師を割合を決めて混ぜる
+
+```bash
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+```
+
+この例では、学習に流れる局面の約 3% を `tree.psv`、約 97% を `main.psv` から取る。
+複数の教師を混ぜる場合は `--mix-data` / `--mix-rate` を対応する順序で繰り返す。
+同じオプションの繰り返しはサブコマンドの片側にまとめる。比率は score と reader 側の間引きを
+通過した局面の期待値であり、バッチごとの固定割当ではない。
+bucket で棄却されると worker は教師の選択からやり直すため、教師ごとの棄却率が違うと実際の割合は指定からずれ、`[teacher-mix]` ログで確認できる。
+各教師は独立に末尾から
+先頭へ戻り、全教師に同じ `--score-drop-abs` / `--score-clamp-abs` をかける。
+空の教師や全件が除外される教師は、その教師が選ばれた時点でエラーになる。
+`--test-tail-positions` が確保する末尾は主の教師だけが対象。混ぜる教師は全件を読むため、
+held-out の局面をあらかじめ除いておくこと。
+
+教師の選択は `--mix-seed` と混合後の局面の通し番号のハッシュで決め、乱数生成器の
+状態を持たない。shuffle 窓が有効な場合は、混合後の流れで窓を満たしてから shuffle する。
+混合時の窓は個々の教師の epoch 境界をまたぐ。また局面ごとの出典情報を保持するため、
+混合なしの「窓サイズの約 2 倍」という見積もりより追加メモリが増える。
+同じ入力と seed なら `--threads 1` で
+同じ局面列になるが、複数の decode worker ではバッチの到着順が変わり得る。
+
+混合と `--score-override` / `--dual-label-psv` の併用はエラーになる。勝敗の無い局面は
+result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば評価値だけで学習できる。
+この指定は主の教師を含む全教師の実際の引き分けにも効き、勝敗の付いた局面には効かない。
+`--wdl 0` なら全局面を評価値だけで学習する。
+
+各 superbatch の `[teacher-mix]` ログに、実際に学習へ渡したバッチの出典別件数と比率を
+出す。未消費の先読み分は含めない。source 0 が主の教師、1 以降が `--mix-data` の指定順。
+`experiment.json` の `params.mix_data` に指定順の教師 basename と比率、`params.mix_seed`
+に seed を保存し、recipe fingerprint に含める。混合の指定がなければ既存の局面列と
+fingerprint は変わらない。既存の checkpoint resume は教師の読み位置を復元しない。
+中断した混合列の再現には、混合後の通し番号と各教師の epoch・次 record 番号の復元も必要になる。
 
 ### 教師データの先読みとshuffle
 

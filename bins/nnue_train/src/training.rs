@@ -1075,6 +1075,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs,
         score_source: cli.score_source().map(ScoreSource::to_path_buf),
+        mix_sources: cli.mix_sources(),
+        mix_seed: cli.mix_seed,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
@@ -1987,6 +1989,15 @@ pub(crate) fn build_experiment_logger(
         score_drop_abs: cli.score_drop_abs,
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
+        mix_data: cli
+            .mix_sources()
+            .iter()
+            .map(|source| nnue_train::experiment::MixDataParam {
+                name: file_basename(&source.path),
+                rate: source.rate,
+            })
+            .collect(),
+        mix_seed: (!cli.mix_data.is_empty()).then_some(cli.mix_seed),
         score_override: cli.score_override.as_deref().map(file_basename),
         score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
         teacher_shuffle_buffer_mib,
@@ -2180,6 +2191,15 @@ pub(crate) fn build_experiment_logger_simple(
         score_drop_abs: cli.score_drop_abs,
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
+        mix_data: cli
+            .mix_sources()
+            .iter()
+            .map(|source| nnue_train::experiment::MixDataParam {
+                name: file_basename(&source.path),
+                rate: source.rate,
+            })
+            .collect(),
+        mix_seed: (!cli.mix_data.is_empty()).then_some(cli.mix_seed),
         score_override: cli.score_override.as_deref().map(file_basename),
         score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
         teacher_shuffle_buffer_mib,
@@ -2532,6 +2552,8 @@ pub(crate) fn run_simple_training(
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs,
         score_source: cli.score_source().map(ScoreSource::to_path_buf),
+        mix_sources: cli.mix_sources(),
+        mix_seed: cli.mix_seed,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         teacher_shuffle_seed: cli.teacher_shuffle_seed,

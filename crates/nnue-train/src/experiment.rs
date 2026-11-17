@@ -148,6 +148,13 @@ pub fn recipe_fingerprint(params: &Params, data_name: &str) -> u64 {
     hash
 }
 
+/// Additional teacher basename and its expected fraction of training positions.
+#[derive(Debug, Clone, Serialize)]
+pub struct MixDataParam {
+    pub name: String,
+    pub rate: f64,
+}
+
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
 /// 本リポ固有の knob (`loss_kind` / `ft_fp16` 等) を flat に並べる。flat 配置は
 /// `nnue-lab` のパラメータ差分表が run 間で比較できるようにするため。
@@ -280,6 +287,10 @@ pub struct Params {
     /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mix_data: Vec<MixDataParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mix_seed: Option<u64>,
     /// `--score-override` の入力ファイル basename。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_override: Option<String>,
@@ -835,6 +846,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mixing_recipe_records_ordered_names_rates_and_seed() {
+        let base = sample_params();
+        let value = serde_json::to_value(&base).unwrap();
+        assert!(value.get("mix_data").is_none());
+        assert!(value.get("mix_seed").is_none());
+        let mut mixed = base.clone();
+        mixed.mix_data = vec![MixDataParam {
+            name: "tree.psv".into(),
+            rate: 0.03,
+        }];
+        mixed.mix_seed = Some(0);
+        let hash = recipe_fingerprint(&mixed, "main.psv");
+        assert_ne!(hash, recipe_fingerprint(&base, "main.psv"));
+        let value = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(value["mix_data"][0]["name"], "tree.psv");
+        assert_eq!(value["mix_data"][0]["rate"], 0.03);
+        for changed in 0..3 {
+            let mut params = mixed.clone();
+            match changed {
+                0 => params.mix_data[0].name = "other.psv".into(),
+                1 => params.mix_data[0].rate = 0.04,
+                _ => params.mix_seed = Some(1),
+            }
+            assert_ne!(hash, recipe_fingerprint(&params, "main.psv"));
+        }
+    }
+
     /// 指紋は checkpoint に保存して版をまたいで比較するので、計算方法が変わったら検出する。
     #[test]
     fn recipe_fingerprint_is_stable() {
@@ -918,6 +957,8 @@ mod tests {
             score_drop_abs: None,
             sampling: Default::default(),
             score_clamp_abs: None,
+            mix_data: Vec::new(),
+            mix_seed: None,
             score_override: None,
             score_override_mask: None,
             dual_label_psv: None,

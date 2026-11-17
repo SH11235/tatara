@@ -347,6 +347,25 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) data: Vec<PathBuf>,
 
+    /// Additional teacher file, sampled independently of the concatenated --data stream.
+    /// Repeat with --mix-rate in matching order. Must use the same format as --data.
+    /// Score filtering and clamping apply to every teacher; shuffle follows mixing.
+    #[arg(long, global = true,
+        conflicts_with_all = ["score_override", "dual_label_psv", "eval_only", "rescore_input"])]
+    pub(crate) mix_data: Vec<PathBuf>,
+
+    /// Expected fraction of training positions from the corresponding --mix-data file.
+    /// Each rate must be finite and positive; their sum must be less than 1.
+    /// The remaining fraction comes from --data. Pair repeated values in matching order.
+    /// Rates apply after reader sampling; worker-side bucket rejection can change observed fractions.
+    #[arg(long, global = true)]
+    pub(crate) mix_rate: Vec<f64>,
+
+    /// Seed hashed with the mixed-stream position number to select each teacher.
+    /// Teacher selection has no mutable random-generator state.
+    #[arg(long, global = true, default_value_t = 0)]
+    pub(crate) mix_seed: u64,
+
     /// PSV or HCPE file for held-out validation. Pass positions that are never used for
     /// a gradient update, separate from the training `--data`. When set, a
     /// forward-only validation pass runs at the end of each superbatch and
@@ -1055,17 +1074,42 @@ impl Cli {
     }
 
     pub(crate) fn validate_data_args(&self, argv: &[String]) -> Result<(), String> {
-        let given = argv
-            .iter()
-            .skip(1)
-            .take_while(|arg| arg.as_str() != "--")
-            .filter(|arg| arg.as_str() == "--data" || arg.starts_with("--data="))
-            .count();
-        if given == self.data.len() {
-            Ok(())
-        } else {
-            Err("--data must be given on one side of the subcommand".into())
+        for (flag, parsed_count) in [
+            ("--data", self.data.len()),
+            ("--mix-data", self.mix_data.len()),
+            ("--mix-rate", self.mix_rate.len()),
+        ] {
+            let given = argv
+                .iter()
+                .skip(1)
+                .take_while(|arg| arg.as_str() != "--")
+                .filter(|arg| arg.as_str() == flag || arg.starts_with(&format!("{flag}=")))
+                .count();
+            if given != parsed_count {
+                return Err(format!(
+                    "{flag} must be given on one side of the subcommand"
+                ));
+            }
         }
+        if self.mix_data.is_empty()
+            && argv
+                .iter()
+                .any(|arg| arg == "--mix-seed" || arg.starts_with("--mix-seed="))
+        {
+            return Err("--mix-seed requires --mix-data".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mix_sources(&self) -> Vec<nnue_train::dataloader::MixSource> {
+        self.mix_data
+            .iter()
+            .zip(&self.mix_rate)
+            .map(|(path, rate)| nnue_train::dataloader::MixSource {
+                path: path.clone(),
+                rate: *rate,
+            })
+            .collect()
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
@@ -1080,6 +1124,41 @@ impl Cli {
         self.sampling()
             .validate(has_ply, compute_bucket, num_buckets)
             .map_err(|error| error.to_string())?;
+        if self.mix_data.len() != self.mix_rate.len() {
+            return Err(
+                "--mix-data and --mix-rate must be repeated the same number of times".into(),
+            );
+        }
+        if !self.mix_data.is_empty() {
+            if self.data.is_empty() {
+                return Err("--mix-data requires --data".into());
+            }
+            if self.score_source().is_some() || self.eval_only || self.rescore_input.is_some() {
+                return Err("--mix-data cannot be combined with score overrides, dual-label input, evaluation-only or rescoring".into());
+            }
+            if !matches!(
+                self.arch,
+                ArchCommand::LayerStack(_) | ArchCommand::Simple(_)
+            ) || self.threat_norm_dump
+                || self.threat_ablate.is_some()
+            {
+                return Err("--mix-data requires a training run (simple or layerstack)".into());
+            }
+            nnue_train::dataloader::validate_mix_sources(&self.mix_sources())
+                .map_err(|error| error.to_string())?;
+            let format = nnue_train::dataloader::TeacherFormat::for_path(&self.data[0])
+                .map_err(|error| error.to_string())?;
+            for path in &self.mix_data {
+                if nnue_train::dataloader::TeacherFormat::for_path(path)
+                    .map_err(|error| error.to_string())?
+                    != format
+                {
+                    return Err(
+                        "--mix-data must use the same format as --data (PSV or HCPE)".into(),
+                    );
+                }
+            }
+        }
         if !self.precision_steps.is_empty() {
             if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {
                 return Err("--precision-steps requires native CUDA and LayerStack (cuda-oxide is unsupported)".into());

@@ -458,6 +458,10 @@ pub struct TrainingConfig {
     pub score_clamp_abs: Option<i16>,
     /// PSV の base score を差し替える sidecar または record 内 dual-label。
     pub score_source: Option<ScoreSource<PathBuf>>,
+    /// Independently cycling teachers sampled before window shuffle.
+    pub mix_sources: Vec<crate::dataloader::MixSource>,
+    /// Stateless teacher-selection seed, combined with the output record ordinal.
+    pub mix_seed: u64,
     /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
     /// one while decode workers consume the other. `0` restores direct sequential reading.
     pub teacher_shuffle_buffer_mib: usize,
@@ -541,6 +545,12 @@ impl TrainingConfig {
         self.loss.validate()?;
         self.sampling
             .validate(true, self.compute_bucket, self.num_buckets)?;
+        crate::dataloader::validate_mix_sources(&self.mix_sources)?;
+        if !self.mix_sources.is_empty() && self.score_source.is_some() {
+            return Err(io::Error::other(
+                "teacher mixing cannot be combined with score overrides or dual-label input",
+            ));
+        }
         crate::dataloader::shuffle_window_records(
             self.teacher_shuffle_buffer_mib,
             self.batch_size,
@@ -842,23 +852,27 @@ where
         None => file_size,
     };
 
-    let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+    let mut loader = BucketedPrefetchedLoader::spawn_with_mixing(
         data_paths,
-        cfg.batch_size,
-        cfg.score_drop_abs,
-        cfg.score_clamp_abs,
-        cfg.threads,
-        (*bucket_mode).into(),
-        cfg.feature_set,
-        cfg.compute_bucket,
-        cfg.num_buckets,
-        train_end_offset,
-        cfg.monitor_active_features,
-        cfg.score_source.as_ref().map(ScoreSource::as_deref),
-        cfg.teacher_shuffle_buffer_mib,
-        cfg.teacher_shuffle,
-        cfg.teacher_shuffle_seed,
-        cfg.sampling.clone(),
+        crate::dataloader::BucketedLoaderOptions {
+            sampling: cfg.sampling.clone(),
+            batch_size: cfg.batch_size,
+            score_drop_abs: cfg.score_drop_abs,
+            score_clamp_abs: cfg.score_clamp_abs,
+            num_workers: cfg.threads,
+            bucket_mode: (*bucket_mode).into(),
+            feature_set: cfg.feature_set,
+            compute_bucket: cfg.compute_bucket,
+            num_buckets: cfg.num_buckets,
+            train_end_offset,
+            monitor_active: cfg.monitor_active_features,
+            score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+            teacher_shuffle_buffer_mib: cfg.teacher_shuffle_buffer_mib,
+            teacher_shuffle: cfg.teacher_shuffle,
+            teacher_shuffle_seed: cfg.teacher_shuffle_seed,
+        },
+        &cfg.mix_sources,
+        cfg.mix_seed,
     )?;
 
     let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
@@ -1003,6 +1017,11 @@ where
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
+        let mut teacher_counts = if cfg.mix_sources.is_empty() {
+            Vec::new()
+        } else {
+            vec![0u64; cfg.mix_sources.len() + 1]
+        };
         let mut sb_printed_progress = false;
 
         for batch_idx in 0..cfg.batches_per_superbatch {
@@ -1015,6 +1034,9 @@ where
                 )
             })?;
             let n_pos = batch.n_positions;
+            for (total, count) in teacher_counts.iter_mut().zip(&batch.teacher_counts) {
+                *total += count;
+            }
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
             // 直前 batch を recycle: その H2D は今 `train_step` 呼出内の event sync で
@@ -1157,6 +1179,23 @@ where
             val_str,
         );
 
+        for (source, count) in teacher_counts.iter().enumerate() {
+            let name = if source == 0 {
+                "main".to_string()
+            } else {
+                cfg.mix_sources[source - 1]
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            println!(
+                "[teacher-mix] sb={sb} source={source} name={name:?} positions={count} fraction={:.8}",
+                *count as f64 / sb_positions as f64
+            );
+        }
+
         if cfg.monitor_fp16_clamps {
             // dft FP16 書き込みで `±65504` cap が当たった要素数 (累積) と処理要素数
             // (累積) を device から読み、当 sb の delta + ratio を出す。`--ft-fp16-out`
@@ -1179,6 +1218,12 @@ where
         }
 
         if cfg.sampling.log_enabled || !cfg.sampling.is_default() {
+            for (teacher, (read, kept)) in loader.sampling_teacher_counts().into_iter().enumerate()
+            {
+                eprintln!(
+                    "[sampling] sb={sb} teacher={teacher} read={read} kept={kept} (includes prefetch)"
+                );
+            }
             let (read, kept) = loader.sampling_counts();
             eprintln!("[sampling] sb={sb} cumulative read={read} kept={kept} (includes prefetch)");
             if let Some(counts) = loader.sampling_bucket_counts() {
@@ -1584,6 +1629,8 @@ mod tests {
             sampling: Default::default(),
             score_clamp_abs: None,
             score_source: None,
+            mix_sources: Vec::new(),
+            mix_seed: 0,
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
@@ -1910,6 +1957,8 @@ mod tests {
             score_drop_abs: None,
             sampling: Default::default(),
             score_clamp_abs: None,
+            mix_data: Vec::new(),
+            mix_seed: None,
             score_override: None,
             score_override_mask: None,
             dual_label_psv: None,

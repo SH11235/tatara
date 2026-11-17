@@ -97,7 +97,7 @@ fn bucket_loader(sampling: Sampling, workers: usize, shuffle: bool) -> BucketedP
         input,
         &fixture("sample.psv"),
     );
-    loader.sampling_counts = Some(counts);
+    loader.sampling_counts = vec![counts];
     loader
 }
 
@@ -174,7 +174,7 @@ fn sampling_bucket_rates_follow_record_identity_across_workers_and_shuffle() {
     for workers in [1, 4] {
         for shuffle in [false, true] {
             let mut loader = bucket_loader(sampling.clone(), workers, shuffle);
-            let state = loader.bucket_sampling.as_ref().unwrap().clone();
+            let state = loader.bucket_samplings[0].as_ref().unwrap().clone();
             let mut completed = false;
             for _ in 0..1000 {
                 let (batch, buckets) = loader.next_batch().unwrap().unwrap();

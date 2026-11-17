@@ -125,6 +125,8 @@ change for real training are:
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99), `radam` (rectified Adam without lookahead, beta1=0.9), or `adamw` (Adam without bias correction, beta1=0.9). When resuming from a raw `.ckpt`, pass the same value as the original run |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
+| `--mix-data PATH` / `--mix-rate R` | none | Repeat in matching order to sample additional teachers; each finite rate is positive and their sum is less than 1. The remainder comes from the concatenated `--data` stream. All teachers must use the same format |
+| `--mix-seed` | 0 | Stateless teacher-selection seed, independent of the shuffle seed |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value |
 | `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering. Takes effect only when `--teacher-shuffle-buffer-mib > 0` |
@@ -151,19 +153,59 @@ For example, `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
 "0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1"` combines random and early-ply skipping.
 Curve values are linearly interpolated, with constant values outside the endpoints.
 All applicable probabilities are multiplied; score filtering also applies.
-Sampling hashes the seed, teacher ID (0 for the single concatenated training stream),
-zero-based epoch and physical record index. Multiple `--data` files form one stream
+Sampling hashes the seed, teacher ID (0 for concatenated `--data`, 1 onward for
+`--mix-data` in argument order), zero-based epoch and physical record index. Multiple `--data` files form one stream
 in argument order. Decisions are independent of shuffle windows and decode worker
 scheduling, including `--threads >= 2`; batch delivery order can still vary.
 Bucket sampling runs in the parallel decode workers and reuses the decoded board
 for feature extraction. Rejected records are replaced to keep batches full.
 After five consecutive empty passes the loader returns an error.
 When any sampling option is specified, each superbatch logs cumulative `read` and
-`kept` counts, including prefetched records. Bucket sampling also logs per-bucket
-reads (candidates surviving reader filters) and survivors;
+`kept` counts for each teacher and the total, including prefetched records.
+Bucket sampling also logs per-bucket reads (candidates surviving reader filters) and survivors;
 `kept` counts survivors of all training filters. The effective sampling configuration
 is stored in `experiment.json` under `params.sampling` and participates in the recipe fingerprint.
 The all-default configuration is omitted to preserve existing recipe fingerprints (including its implicit seed 0).
+
+### Mixing teachers
+
+```bash
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+```
+
+This samples approximately 3% of training positions from `tree.psv` and 97% from
+`main.psv`. Add more `--mix-data` / `--mix-rate` pairs in matching order; keep each
+repeated option on one side of the subcommand. Rates describe the expected fraction
+after score and reader sampling filters, rather than a fixed quota per batch.
+Worker-side bucket rejection retries teacher selection, so different rejection rates
+across teachers can shift the observed fractions shown in `[teacher-mix]` logs.
+Every teacher cycles independently and uses the same sampling, `--score-drop-abs`
+and `--score-clamp-abs` settings.
+An empty teacher or one with no surviving positions is an error when sampled.
+`--test-tail-positions` reserves a tail from the main teacher only; additional teachers
+are read in full and must exclude held-out positions themselves.
+
+Teacher selection hashes `--mix-seed` with the mixed-stream position number; it does
+not maintain random-generator state. A shuffle window, when enabled, is filled from
+the mixed stream and shuffled afterward. Mixed windows cross individual teacher epoch
+boundaries. Mixed windows also retain a source identifier per position, so their
+resident memory is larger than the approximately twice-the-window-size estimate for
+unmixed input. With `--threads 1`, the same inputs and seeds reproduce the delivered
+sequence; multiple decode workers can change batch delivery order.
+
+Mixing conflicts with `--score-override` and `--dual-label-psv`. For positions without
+a game result, encode result 0 (draw) and use `--wdl-ignore-draws` to train on the score
+only. This also affects genuine draws in every teacher, including the main teacher;
+it does not ignore decisive game results. `--wdl 0` trains every position on score only.
+
+Each superbatch logs `[teacher-mix]` counts and observed fractions for the batches
+actually passed to training, excluding unread prefetched positions. Source 0 is the
+main teacher; sources 1 onward follow `--mix-data` order. `experiment.json` records
+ordered teacher basenames and rates in `params.mix_data`, and the seed in
+`params.mix_seed`; these fields participate in the recipe fingerprint. With no mixing,
+the input sequence and recipe fingerprint remain unchanged. Existing checkpoint
+resume does not restore teacher reading positions; reproducing an interrupted mixed
+stream also requires its output ordinal and each teacher's epoch and next record index.
 
 ### Teacher-data read-ahead and shuffle
 
