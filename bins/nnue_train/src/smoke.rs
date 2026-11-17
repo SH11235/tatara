@@ -377,6 +377,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
                 ft_fp16_out: true,
                 fp16_opt_state: false,
                 tf32: false,
+                ft_state_host: false,
             },
             &SimpleInit::default_uniform(),
         )?;

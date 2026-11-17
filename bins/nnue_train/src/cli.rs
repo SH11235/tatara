@@ -1432,6 +1432,14 @@ pub(crate) struct LayerstackArgs {
     #[arg(long)]
     pub(crate) ft_fp16_out: bool,
 
+    /// Keep the FT optimizer state (first and second moments and the Ranger
+    /// slow weight) in host-mapped pinned memory instead of device memory.
+    /// The optimizer kernels access it over PCIe, so an FT whose state does not
+    /// fit in device memory can still be trained, at a lower step rate.
+    /// Numerics are unchanged. Native backend only.
+    #[arg(long)]
+    pub(crate) ft_state_host: bool,
+
     /// Enable the PSQT (Piece-Square Table) shortcut layer.
     ///
     /// PSQT is a per-feature × per-bucket scalar prior layered in parallel with

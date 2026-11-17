@@ -1074,6 +1074,7 @@ fn simple_trainer_ft_out_gt_1024_steps() -> Result<(), Box<dyn std::error::Error
                     ft_fp16_out,
                     fp16_opt_state: false,
                     tf32: false,
+                    ft_state_host: false,
                 },
                 &init,
             )?;
@@ -5987,6 +5988,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 ft_fp16_out: false,
                 fp16_opt_state: false,
                 tf32: false,
+                ft_state_host: false,
             },
         ),
         (
@@ -5996,6 +5998,7 @@ fn simple_trainer_ft_factorize_end_to_end() -> Result<(), Box<dyn std::error::Er
                 ft_fp16_out: true,
                 fp16_opt_state: true,
                 tf32: true,
+                ft_state_host: false,
             },
         ),
     ];
