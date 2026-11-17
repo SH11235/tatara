@@ -40,7 +40,6 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// progress-bucket LayerStack accepts without patching. `kingrank9` ignores this
 /// default and uses its fixed 9 buckets. The trainer accepts
 /// `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
-#[cfg(any(feature = "gpu", test))]
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 8;
 
 /// Maximum supported bucket count without changing the per-bucket weight

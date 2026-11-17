@@ -111,14 +111,87 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99) / `radam` (lookahead なしの rectified Adam, beta1=0.9) / `adamw` (bias correction なしの Adam, beta1=0.9) から選ぶ。raw `.ckpt` からの `--resume` 時は元 run と同じ値を渡す |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
+| `--mix-data PATH` / `--mix-rate R` | なし | 対応する順序で繰り返し、別の教師を指定比率で混ぜる。各 R は有限の正数で、合計は 1 未満。残りは `--data` を指定順につないだ主の教師から取る。全教師の形式は同一であること |
+| `--mix-seed` | 0 | 教師の選択に使う状態を持たない乱数の seed。shuffle の seed とは独立 |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
-| `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うためraw PSVの追加メモリは概ね実効値の2倍 |
+| `--teacher-shuffle-buffer-mib` | 0 | 教師データの先読み・shuffle窓サイズ (MiB、1窓あたり)。既定の`0`は窓を使わない直接逐次読み (教師はディスク上でshuffle済みである前提)。正の値で二重バッファ先読み + epochごとの窓内shuffleを有効化。`auto`は総RAMまたはcgroup上限 (nested cgroup v2の上限を含む) の小さい方の1/16を、上限4096 MiB/窓で使う。2窓を使うため識別情報込みの窓の追加メモリは概ね実効値の2倍 |
 | `--no-teacher-shuffle` | OFF | 二重バッファの逐次先読みを維持したまま窓内shuffleだけを無効化する。I/O先読みとshuffleの影響を分けて比較する用途。`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある |
-| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓のpermutationは再現するが、`--threads >= 2`ではworkerの完了順によりbatch delivery順は完全には固定されない |
+| `--teacher-shuffle-seed` | 0 | dataset epoch・窓番号と組み合わせる窓内shuffleのbase seed (`--teacher-shuffle-buffer-mib > 0` のときだけ効果がある)。同じ値なら窓の permutation が再現し、複数 worker でも学習には入力順で batch を渡す |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
 | `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
+
+### 学習局面の間引き
+
+間引きは明示指定時だけ学習データに適用します。`--test-data` と
+`--test-tail-positions` の検証局面には適用しません。既定では元の局面列を維持します。
+
+| オプション | 既定 | 意味 |
+|------------|------|------|
+| `--keep-rate R` | 1 | 採る確率。有限値で `0 < R <= 1` |
+| `--min-ply N` | なし | PSV の `game_ply <= N` を捨てる。HCPE では指定不可 |
+| `--ply-keep-curve POINTS` | なし | `手数:確率` をカンマで区切る。手数は非負・昇順、確率は `[0,1]`。HCPE では指定不可 |
+| `--bucket-keep-rates r0,r1,...` | なし | LayerStack の bucket 順に `[0,1]` の確率を指定。個数は bucket 数と一致させる。simple arch では指定不可 |
+| `--skip-seed N` | 0 | 状態を持たない採否判定の固定 seed |
+
+例: `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
+"0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1"`。
+折れ線の点の間は直線補間し、端の外側は端の確率を使います。
+各確率を掛け合わせ、score のフィルタも通った局面だけを使います。
+採否は seed・教師 ID・0 始まりの epoch・物理 record 番号のハッシュで決めます。
+複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱い、
+`--mix-data` の教師 ID は指定順に 1, 2, ... とします。間引きは全教師に適用します。
+shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません。
+bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤面を使います。
+捨てた分は次の record で補い、batch の件数を保ちます。
+5 周連続で採用がゼロなら error になります。
+間引きのオプションを一つでも指定したときだけ、各 superbatch に教師ごとと全体の累積 `read` / `kept` を出します。
+bucket 指定時は bucket ごとの読んだ数（reader のフィルタ通過後）と採った数も出します。
+先読み済みの局面も含みます。設定は `experiment.json` の `params.sampling` に保存し、
+recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）の場合だけ省略し、
+既存の recipe fingerprint を維持します。
+
+### 別の教師を割合を決めて混ぜる
+
+```bash
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+```
+
+この例では、学習に流れる局面の約 3% を `tree.psv`、約 97% を `main.psv` から取る。
+複数の教師を混ぜる場合は `--mix-data` / `--mix-rate` を対応する順序で繰り返す。
+同じオプションの繰り返しはサブコマンドの片側にまとめる。比率は score と reader 側の間引きを
+通過した局面の期待値であり、バッチごとの固定割当ではない。
+bucket で棄却されると worker は教師の選択からやり直すため、教師ごとの棄却率が違うと実際の割合は指定からずれ、`[teacher-mix]` ログで確認できる。
+各教師は独立に末尾から
+先頭へ戻り、全教師に同じ `--score-drop-abs` / `--score-clamp-abs` をかける。
+空の教師や全件が除外される教師は、その教師が選ばれた時点でエラーになる。
+`--test-tail-positions` が確保する末尾は主の教師だけが対象。混ぜる教師は全件を読むため、
+held-out の局面をあらかじめ除いておくこと。
+
+教師の選択は `--mix-seed` と混合後の局面の通し番号のハッシュで決め、乱数生成器の
+状態を持たない。shuffle 窓が有効な場合は、混合後の流れで窓を満たしてから shuffle する。
+混合時の窓は個々の教師の epoch 境界をまたぐ。窓の局面数は出典情報を含む要素の
+実メモリサイズから計算し、batch size の倍数へ切り下げる。混合時も各窓は指定 MiB 以内に
+収まり、二つの窓を合わせたメモリは指定値の 2 倍以下になる。
+複数の decode worker でも、学習には読み取り順に batch を渡す。
+bucket 間引き時は、生 record の塊と通し番号を lock 内で取得し、decode・特徴抽出・
+間引きは lock の外で並列に行う。採用局面を塊の番号順に固定サイズの batch へ詰め、
+端数は次の batch に回す。詰め直しでは固定長の sparse index とラベルだけをコピーし、
+decode は繰り返さない。採用率を下げるほど、学習に渡す局面あたりの decode 件数は増える。
+bucket 指定なしでは、従来どおり生 record の塊一つを一つの batch として渡す。
+
+混合と `--score-override` / `--dual-label-psv` の併用はエラーになる。勝敗の無い局面は
+result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば評価値だけで学習できる。
+この指定は主の教師を含む全教師の実際の引き分けにも効き、勝敗の付いた局面には効かない。
+`--wdl 0` なら全局面を評価値だけで学習する。
+
+各 superbatch の `[teacher-mix]` ログに、実際に学習へ渡したバッチの出典別件数と比率を
+出す。未消費の先読み分は含めない。source 0 が主の教師、1 以降が `--mix-data` の指定順。
+`experiment.json` の `params.mix_data` に指定順の教師 basename と比率、`params.mix_seed`
+に seed を保存し、recipe fingerprint に含める。混合の指定がなければ既存の局面列と
+fingerprint は変わらない。`.loader.json` のない古い checkpoint の resume は教師の読み位置を復元しない。
+中断した混合列の再現には、混合後の通し番号と各教師の epoch・次 record 番号の復元も必要になる。
 
 ### 教師データの先読みとshuffle
 
@@ -133,17 +206,18 @@ epoch番号を含む別のseedを使う。元のPSVが事前shuffle済みでも�
 順序を繰り返さずに済む。
 
 `auto`の目安は、RAM 8/16/32/64 GiB以上に対して1窓512 MiB/1 GiB/2 GiB/4 GiB。
+窓の局面数は PSV・HCPE とも識別情報込みの要素サイズで割り、batch 単位で切り下げる。
 起動ログの`N MiB x2 (auto)`と`experiment.json`には解決後の実効値を記録する。
 空きメモリ量は使わないため、同じメモリ上限なら他プロセスやpage cacheの状態で値は変わらない。
 
-追加rawメモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
+識別情報込みの窓の追加メモリは概ね実効値の2倍。`--teacher-shuffle-buffer-mib 4096`なら約8 GiB増える。
 大きな窓はHDDの長いstallを
 吸収しやすい一方、初回batchまでの読込時間、窓shuffleのCPU時間、random memory
 trafficも増やす。窓を使う場合、256などの小さい明示値は初回読込・メモリ・shuffleコストを抑える。
 `--threads`はdecode worker数であり、producerの窓shuffle自体は並列化しない。
 
 ```bash
-# 1 GiB/窓 (raw PSVは最大約2 GiB追加)、base seedを固定
+# 1 GiB/窓 (窓のメモリは最大約2 GiB追加)、base seedを固定
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
   layerstack ...
@@ -160,8 +234,9 @@ target/release/nnue-train ... \
 ```
 
 score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で適用してから
-窓内shuffleする。`--resume`時は教師streamをファイル先頭から開き直すため、
-checkpointは窓の途中位置やdataset epoch番号を復元しない。
+窓内shuffleする。`--resume` は checkpoint に隣接する `.loader.json` から
+教師の epoch・読み位置・shuffle 窓内の消費数を復元する。未学習の先読み分は含めない。
+単一 worker では中断しない場合と同じ局面列になり、並列 decode でも入力範囲は連続する。
 
 学習入力(`--data`)、`--test-data`、`loader-digest`はPSVとHCPEを読める。
 再評価(`--rescore-input`)はPSV専用で、`.hcpe`という名前のファイルを拒否する。
@@ -315,6 +390,53 @@ schedule は元の horizon を維持し、進捗と ETA だけが短縮後の ta
 へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った
 stale な値として warning とともに無視され、`control_history.jsonl` にも記録されない。
 
+既定のファイルは `--output` directory 直下の `control.json`。
+`--control-file /path/to/control.json` を指定すると、そのパスだけを読み、既定の
+ファイルは読まない。読むパスは起動時にログへ一行出す。学習器はファイルを
+書き換えない。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
+適用した target は `experiment.json` の `results.target_superbatches` にも記録する。
+
+同じ制御ファイルを起動後に書き換え、更新時刻または内容が変わったファイルから
+`"pause": true` を読んだ superbatch の終わりで、一時停止する。
+重み・optimizer の `.ckpt` と読み位置の `.loader.json`、推論用 `.bin` を
+`--save-rate` に関係なく保存し、終了コード **75** で終える。pause は各 superbatch
+終了時に読み、適用を `control_history.jsonl` に追記する。
+
+```json
+{"target_superbatches": 1000, "pause": true}
+```
+
+起動時の `pause=true` は警告して無視する。そのまま true を置いても停止しない。
+再び止めるには `pause=true` でファイルを書き換える。途中の false を学習器が読む必要はない。
+最後の superbatch で pause を受けた場合は、無視した旨を一行出して通常完了する
+(終了コード 0、experiment.json は completed)。
+`experiment.json` は一時停止時に interrupted を立て、pause の適用を `control_history`、
+実際の終了 sb と pause の有無を `stopped` に残す。
+SIGINT / SIGTERM は pause に変換しない。保存して止めるには制御ファイルを使う。
+
+### 読み位置を含む一時停止・再開
+
+`.ckpt` と同名の `.loader.json` を一緒に保管する。複数の `--data` は指定順に
+連結した一つの教師として扱う。各 `--mix-data` 教師の epoch と次の record、混合の
+通し番号、shuffle 窓内の位置も保存・復元する。形式は version 1 とし、一部だけ使った塊の
+開始位置と、その塊から既に渡した採用局面数も保存する。再開時は塊を読み直して既使用分を
+飛ばすため、先読みが保存位置を追い越さない。未知の version はエラーになる。
+窓を使う場合は実際の局面数 (`window_records`) も保存し、再開時に現在の設定から計算した値と
+一致しなければエラーになる。窓内の位置の意味が変わるためである。
+再開時に全教師の basename とサイズ、間引き確率・seed、混合割合・seed、
+batch size・教師範囲・score 処理・shuffle 設定が一致しなければ、違う項目を並べて起動時に
+エラーで止まる。絶対パスは記録のみで照合せず、教師の移動を許容する。bucket 間引き時は
+bucket mode・bucket 数・進行度係数ファイルのサイズと SHA-256 も照合する。
+教師や上記の設定を変えて再開するときは `--resume-input restart` を付ける。重みと optimizer
+state は復元し、教師は先頭から読み直す。同じサイズの内容変更は検出しないため、読み位置を戻す
+再開では教師を変更しないこと。
+sidecar がない古い checkpoint は警告を一行出し、従来どおり教師の先頭から読む。
+`--resume` と `--start-superbatch` の併用時は警告し、読み位置を復元せず教師の先頭から読む。
+sb 当たり batch 数は変更できる。
+
+同名の `.loader.json` を保管したまま、同じ引数に `--resume <最後の.ckpt>` を
+加えて再開する。起動時の pause は無視されるため、true のままでも再開できる。
+
 > **`--resume` と `--init-from` の違い**: `--init-from` は量子化 `.bin` から
 > weight だけ注入し optimizer state を **reset** する (fine-tuning / continued
 > training)、`--resume` は raw `.ckpt` から weight + optimizer 両方復元する
@@ -327,6 +449,7 @@ stale な値として warning とともに無視され、`control_history.jsonl`
 | ファイル | 形式 | 用途 |
 |---|---|---|
 | `<run-name>-<sb>.bin` | 量子化 NNUE binary | **推論エンジンに投入する artifact** (binary layout は `crates/nnue-format` 参照) |
+| `<run-name>-<sb>.loader.json` | 教師の識別情報・読み位置 | `.ckpt` と一緒に保管する (`--keep-checkpoints` で一緒に淘汰) |
 | `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | `--resume` 用、推論には使わない (`--keep-checkpoints` で淘汰) |
 
 `<run-name>-<最終 sb>.bin` が最終 net。これは [rshogi](https://github.com/SH11235/rshogi)

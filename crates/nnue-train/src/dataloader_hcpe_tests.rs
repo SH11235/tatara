@@ -54,6 +54,7 @@ fn shuffled_loader_contents(
         buffer_mib,
         shuffle_seed.is_some(),
         shuffle_seed.unwrap_or(0),
+        Default::default(),
     )
     .unwrap();
     let mut out = Vec::new();
@@ -198,6 +199,59 @@ fn corrupt_hcpe_record_stops_the_loader() {
         error.to_string().contains(path.to_str().unwrap()),
         "{error}"
     );
+}
+
+#[test]
+fn corrupt_middle_hcpe_record_wakes_ordered_multi_worker_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-middle.hcpe");
+    let mut bytes = std::fs::read(fixture("sample.hcpe")).unwrap();
+    bytes[30 * 38..30 * 38 + 32].fill(0xff);
+    std::fs::write(&path, &bytes).unwrap();
+    for bucket_keep_rates in [None, Some(vec![0.5; 9])] {
+        let path = path.clone();
+        let bytes = bytes.clone();
+        let (tx, rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+                &[&path],
+                10,
+                None,
+                None,
+                4,
+                BucketMode::KingRank9,
+                FeatureSet::HalfKaHmMerged.spec(),
+                true,
+                9,
+                bytes.len() as u64,
+                false,
+                None,
+                0,
+                false,
+                0,
+                crate::sampling::Sampling {
+                    bucket_keep_rates,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let error = loop {
+                match loader.next_batch() {
+                    Ok(Some(slot)) => loader.recycle(slot),
+                    Err(error) => break error,
+                    Ok(None) => panic!("corrupt stream must fail"),
+                }
+            };
+            drop(loader);
+            tx.send(error).unwrap();
+        });
+        let error = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("missing sequence must not leave ordered delivery blocked");
+        task.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("decode chunk 3:"), "{error}");
+    }
 }
 
 #[cfg(unix)]

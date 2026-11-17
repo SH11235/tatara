@@ -148,6 +148,13 @@ pub fn recipe_fingerprint(params: &Params, data_name: &str) -> u64 {
     hash
 }
 
+/// Additional teacher basename and its expected fraction of training positions.
+#[derive(Debug, Clone, Serialize)]
+pub struct MixDataParam {
+    pub name: String,
+    pub rate: f64,
+}
+
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
 /// 本リポ固有の knob (`loss_kind` / `ft_fp16` 等) を flat に並べる。flat 配置は
 /// `nnue-lab` のパラメータ差分表が run 間で比較できるようにするため。
@@ -275,9 +282,15 @@ pub struct Params {
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
+    #[serde(default, skip_serializing_if = "crate::sampling::Sampling::is_default")]
+    pub sampling: crate::sampling::Sampling,
     /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mix_data: Vec<MixDataParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mix_seed: Option<u64>,
     /// `--score-override` の入力ファイル basename。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_override: Option<String>,
@@ -429,6 +442,10 @@ pub struct ExperimentDoc {
     pub history: Vec<HistoryEntry>,
     /// run が書き出した checkpoint ファイル名の生成記録 (informational)。
     pub checkpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub control_history: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<serde_json::Value>,
 }
 
 /// status 文字列。`nnue-lab` の enum が `running` / `completed` のみ受け付ける
@@ -488,6 +505,8 @@ impl ExperimentDoc {
             },
             history: Vec::new(),
             checkpoints: Vec::new(),
+            control_history: Vec::new(),
+            stopped: None,
         }
     }
 }
@@ -528,6 +547,16 @@ impl ExperimentLogger {
     /// 書き込み先 path。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn record_control(&mut self, sb: usize, target: Option<usize>, pause: bool) {
+        self.doc.control_history.push(
+            serde_json::json!({"superbatch": sb, "target_superbatches": target, "pause": pause}),
+        );
+    }
+
+    pub fn record_stop(&mut self, sb: usize, pause: bool) {
+        self.doc.stopped = Some(serde_json::json!({"superbatch": sb, "paused": pause}));
     }
 
     /// `control.json` で適用された実効終了 superbatch を記録する。
@@ -749,6 +778,39 @@ mod tests {
     }
 
     #[test]
+    fn sampling_options_change_recipe_fingerprint() {
+        let base = sample_params();
+        let original = recipe_fingerprint(&base, "teacher.psv");
+        let variants = [
+            crate::sampling::Sampling {
+                keep_rate: 0.25,
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                min_ply: Some(18),
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                ply_keep_curve: vec![(0.0, 0.5)],
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                bucket_keep_rates: Some(vec![1.0; 9]),
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                skip_seed: 42,
+                ..Default::default()
+            },
+        ];
+        for sampling in variants {
+            let mut params = base.clone();
+            params.sampling = sampling;
+            assert_ne!(recipe_fingerprint(&params, "teacher.psv"), original);
+        }
+    }
+
+    #[test]
     fn recipe_fingerprint_ignores_resume_and_environment_settings() {
         let base = sample_params();
         let fingerprint = recipe_fingerprint(&base, "teacher.psv");
@@ -798,6 +860,34 @@ mod tests {
             recipe_fingerprint(&longer, "teacher.psv"),
             recipe_fingerprint(&taper, "teacher.psv")
         );
+    }
+
+    #[test]
+    fn mixing_recipe_records_ordered_names_rates_and_seed() {
+        let base = sample_params();
+        let value = serde_json::to_value(&base).unwrap();
+        assert!(value.get("mix_data").is_none());
+        assert!(value.get("mix_seed").is_none());
+        let mut mixed = base.clone();
+        mixed.mix_data = vec![MixDataParam {
+            name: "tree.psv".into(),
+            rate: 0.03,
+        }];
+        mixed.mix_seed = Some(0);
+        let hash = recipe_fingerprint(&mixed, "main.psv");
+        assert_ne!(hash, recipe_fingerprint(&base, "main.psv"));
+        let value = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(value["mix_data"][0]["name"], "tree.psv");
+        assert_eq!(value["mix_data"][0]["rate"], 0.03);
+        for changed in 0..3 {
+            let mut params = mixed.clone();
+            match changed {
+                0 => params.mix_data[0].name = "other.psv".into(),
+                1 => params.mix_data[0].rate = 0.04,
+                _ => params.mix_seed = Some(1),
+            }
+            assert_ne!(hash, recipe_fingerprint(&params, "main.psv"));
+        }
     }
 
     /// 指紋は checkpoint に保存して版をまたいで比較するので、計算方法が変わったら検出する。
@@ -881,7 +971,10 @@ mod tests {
             wrm_weight_boost_w1: Some(0.0),
             wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
+            mix_data: Vec::new(),
+            mix_seed: None,
             score_override: None,
             score_override_mask: None,
             dual_label_psv: None,

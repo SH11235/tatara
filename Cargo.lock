@@ -800,6 +800,7 @@ dependencies = [
  "nnue-format",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "shogi-features",
  "shogi-format",
  "tempfile",

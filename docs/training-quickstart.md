@@ -125,14 +125,93 @@ change for real training are:
 | `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99), `radam` (rectified Adam without lookahead, beta1=0.9), or `adamw` (Adam without bias correction, beta1=0.9). When resuming from a raw `.ckpt`, pass the same value as the original run |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
 | `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
+| `--mix-data PATH` / `--mix-rate R` | none | Repeat in matching order to sample additional teachers; each finite rate is positive and their sum is less than 1. The remainder comes from the concatenated `--data` stream. All teachers must use the same format |
+| `--mix-seed` | 0 | Stateless teacher-selection seed, independent of the shuffle seed |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
-| `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional raw-PSV memory is approximately twice the effective value |
+| `--teacher-shuffle-buffer-mib` | 0 | Teacher-data read-ahead and shuffle window size in MiB, per window. The default 0 reads the teacher sequentially without windows (teachers are expected to be pre-shuffled on disk). A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle; `auto` uses 1/16 of the smaller of total RAM and the cgroup limit (including nested cgroup v2 limits), capped at 4096 MiB per window. Two windows are used, so additional window memory (including record metadata) is approximately twice the effective value |
 | `--no-teacher-shuffle` | OFF | Disables only the within-window shuffle while retaining double-buffered sequential read-ahead. Use it to separate the effects of I/O read-ahead and reordering. Takes effect only when `--teacher-shuffle-buffer-mib > 0` |
-| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation, but with `--threads >= 2`, worker completion can still change the final batch-delivery order |
+| `--teacher-shuffle-seed` | 0 | Base seed combined with the dataset epoch and window index (takes effect only when `--teacher-shuffle-buffer-mib > 0`). The same value reproduces each window permutation; training delivers decoded batches in input order even with multiple workers |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` routes by the KP-absolute progress estimate. `progresskpabsq16` routes by the same estimate in integer Q16 arithmetic. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
 | `--num-buckets` (`layerstack`) | 8 (9 for `kingrank9`) | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9. Pass `--num-buckets 9` to `--resume` / `--init-from` a 9-bucket checkpoint or `.bin` |
+
+### Training position sampling
+
+Sampling is opt-in and applies only to training records; `--test-data` and
+`--test-tail-positions` are unaffected. Defaults preserve the original position stream.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--keep-rate R` | 1 | Keep probability, finite and in `(0, 1]` |
+| `--min-ply N` | none | Discard PSV records with `game_ply <= N`; invalid for HCPE |
+| `--ply-keep-curve POINTS` | none | Comma-separated `ply:probability` points, strictly increasing nonnegative plies and probabilities in `[0,1]`; invalid for HCPE |
+| `--bucket-keep-rates r0,r1,...` | none | Probabilities in `[0,1]`, one per LayerStack bucket; invalid for simple architectures |
+| `--skip-seed N` | 0 | Fixed seed for stateless position sampling |
+
+For example, `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
+"0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1"` combines random and early-ply skipping.
+Curve values are linearly interpolated, with constant values outside the endpoints.
+All applicable probabilities are multiplied; score filtering also applies.
+Sampling hashes the seed, teacher ID (0 for concatenated `--data`, 1 onward for
+`--mix-data` in argument order), zero-based epoch and physical record index. Multiple `--data` files form one stream
+in argument order. Decisions are independent of shuffle windows and decode worker
+scheduling, including `--threads >= 2`.
+Bucket sampling runs in the parallel decode workers and reuses the decoded board
+for feature extraction. Rejected records are replaced to keep batches full.
+After five consecutive empty passes the loader returns an error.
+When any sampling option is specified, each superbatch logs cumulative `read` and
+`kept` counts for each teacher and the total, including prefetched records.
+Bucket sampling also logs per-bucket reads (candidates surviving reader filters) and survivors;
+`kept` counts survivors of all training filters. The effective sampling configuration
+is stored in `experiment.json` under `params.sampling` and participates in the recipe fingerprint.
+The all-default configuration is omitted to preserve existing recipe fingerprints (including its implicit seed 0).
+
+### Mixing teachers
+
+```bash
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+```
+
+This samples approximately 3% of training positions from `tree.psv` and 97% from
+`main.psv`. Add more `--mix-data` / `--mix-rate` pairs in matching order; keep each
+repeated option on one side of the subcommand. Rates describe the expected fraction
+after score and reader sampling filters, rather than a fixed quota per batch.
+Worker-side bucket rejection retries teacher selection, so different rejection rates
+across teachers can shift the observed fractions shown in `[teacher-mix]` logs.
+Every teacher cycles independently and uses the same sampling, `--score-drop-abs`
+and `--score-clamp-abs` settings.
+An empty teacher or one with no surviving positions is an error when sampled.
+`--test-tail-positions` reserves a tail from the main teacher only; additional teachers
+are read in full and must exclude held-out positions themselves.
+
+Teacher selection hashes `--mix-seed` with the mixed-stream position number; it does
+not maintain random-generator state. A shuffle window, when enabled, is filled from
+the mixed stream and shuffled afterward. Mixed windows cross individual teacher epoch
+boundaries. The record count per window is calculated from the actual in-memory
+record size, including source metadata, and rounded down to a multiple of the batch
+size. Each window stays within the specified MiB budget, including when mixing;
+the two windows together use at most twice that budget. Training receives batches in reader order even with multiple decode
+workers. With bucket sampling, workers read numbered raw chunks under the input lock,
+then decode, extract features and filter outside the lock. Accepted positions are assembled
+in chunk order into full batches; leftovers carry into the next batch. Assembly copies
+fixed-size sparse indices and labels, without decoding again. Lower keep rates still
+require decoding more candidates per delivered position. Without bucket sampling,
+each raw chunk remains one batch.
+
+Mixing conflicts with `--score-override` and `--dual-label-psv`. For positions without
+a game result, encode result 0 (draw) and use `--wdl-ignore-draws` to train on the score
+only. This also affects genuine draws in every teacher, including the main teacher;
+it does not ignore decisive game results. `--wdl 0` trains every position on score only.
+
+Each superbatch logs `[teacher-mix]` counts and observed fractions for the batches
+actually passed to training, excluding unread prefetched positions. Source 0 is the
+main teacher; sources 1 onward follow `--mix-data` order. `experiment.json` records
+ordered teacher basenames and rates in `params.mix_data`, and the seed in
+`params.mix_seed`; these fields participate in the recipe fingerprint. With no mixing,
+the input sequence and recipe fingerprint remain unchanged. Old checkpoints without `.loader.json`
+do not restore teacher reading positions; reproducing an interrupted mixed
+stream also requires its output ordinal and each teacher's epoch and next record index.
 
 ### Teacher-data read-ahead and shuffle
 
@@ -148,11 +227,12 @@ avoids repeating exactly the same order when training makes multiple passes over
 pre-shuffled PSV.
 
 As a guide, machines limited to 8/16/32/64 GiB or more resolve to 512 MiB/1 GiB/2 GiB/4 GiB per
-window. The startup `N MiB x2 (auto)` message and `experiment.json` record the resolved value.
+window. Capacity is rounded down to whole batches using the in-memory record size,
+including identity metadata, for both PSV and HCPE. The startup `N MiB x2 (auto)` message and `experiment.json` record the resolved value.
 The calculation does not use currently available memory, so other processes and page-cache state
 do not change the result for a fixed memory limit.
 
-Additional raw memory is approximately twice the effective value; an explicit
+Additional window memory (including record metadata) is approximately twice the effective value; an explicit
 `--teacher-shuffle-buffer-mib 4096` adds about 8 GiB. A larger window can absorb longer
 HDD stalls, but it also increases the delay before the first batch, CPU time spent shuffling, and
 random memory traffic. When windowing is enabled, a small explicit value such as 256 keeps the
@@ -160,7 +240,7 @@ first-batch delay, memory, and shuffle cost low. `--threads` controls decode wor
 producer's window shuffle.
 
 ```bash
-# 1 GiB per window (up to about 2 GiB of additional raw PSV), with a fixed base seed
+# 1 GiB per window (up to about 2 GiB of additional window memory), with a fixed base seed
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
   layerstack ...
@@ -177,8 +257,10 @@ target/release/nnue-train ... \
 ```
 
 Score sidecars, `--score-drop-abs`, and `--score-clamp-abs` are applied in original file order
-before records enter the shuffle window. On `--resume`, the teacher stream is reopened from the
-start; checkpoints do not restore a position within a window or the dataset epoch number.
+before records enter the shuffle window. On `--resume`, the adjacent `.loader.json` restores
+its epoch, input position, and consumption within the shuffle window. Prefetched but unused
+records are excluded. One worker reproduces the uninterrupted position sequence; parallel
+decode also consumes a contiguous input range.
 
 Training input (`--data`), `--test-data`, and `loader-digest` accept PSV and HCPE. Rescoring
 (`--rescore-input`) requires PSV and rejects files named `.hcpe`. A score sidecar
@@ -352,6 +434,57 @@ it with the new target. A target below the resumed run's starting superbatch is
 treated as stale state from the previous run, ignored with a warning, and not
 recorded in `control_history.jsonl`.
 
+The default path is `control.json` under `--output`. Set
+`--control-file /path/to/control.json` to read only that path instead of the default.
+The selected path is logged once at startup. The trainer never rewrites the file.
+Write a temporary file and rename it to avoid partial JSON.
+Applied targets are also recorded in `experiment.json` as `results.target_superbatches`.
+
+Add `"pause": true` to the same file to pause at the end of the superbatch where
+the trainer reads `pause=true` in a file rewritten after startup (changed modification
+time or contents).
+It saves weights and optimizer state in `.ckpt`, input positions in `.loader.json`,
+and inference weights in `.bin`, regardless of `--save-rate`, then exits with code **75**.
+Pause is polled at superbatch ends and its application is appended to `control_history.jsonl`.
+
+```json
+{"target_superbatches": 1000, "pause": true}
+```
+
+Startup `pause=true` is ignored with a warning. Leaving it true does not pause.
+To pause again, rewrite the file with `pause=true`; intermediate false values do not
+need to be observed. A pause received at the final superbatch is ignored with a log
+message, and training completes normally with exit code 0. `experiment.json` marks paused runs interrupted, records applied
+pauses in `control_history`, and records the ending superbatch and pause flag in `stopped`.
+SIGINT and SIGTERM are not converted into pause requests; use the control file for a
+checkpointed stop.
+
+### Pausing and resuming the input stream
+
+Keep each `.ckpt` together with its matching `.loader.json`. Multiple `--data` files form
+one teacher in command-line order. Each `--mix-data` teacher retains its own epoch and next
+record; the sidecar also restores the mixing selection counter and shuffle window position.
+Version 1 sidecars store the number of accepted positions already delivered from
+a partially consumed chunk. Resume rereads that chunk and skips those accepted positions;
+prefetch cannot advance the saved boundary. Unknown sidecar versions are rejected.
+When windows are enabled, the sidecar stores the actual record count per window
+(`window_records`); resume rejects a mismatch with the count calculated from the
+current settings because it changes the meaning of positions within a window.
+Resume rejects changes to any teacher's basename/size, sampling probabilities/seeds,
+mixing rates/seed, batch size, training range, score processing, or shuffle settings: it
+stops at startup and lists the differing items. Absolute teacher paths are recorded for
+reference and may change. When bucket keep rates are enabled, bucket mode/count and
+progress coefficient file size/SHA-256 must also match. To resume with changed teachers
+or settings, add `--resume-input restart`: weights and optimizer state are restored and
+the teachers are read from the beginning. Content changes of the same size are not
+detected, so keep teacher files immutable when restoring input positions.
+Old checkpoints without a sidecar warn once and restart input from the beginning.
+Passing `--start-superbatch` with `--resume` warns and restarts teacher input from
+the beginning, without restoring loader positions. Batches per superbatch may change.
+
+Restart with the same arguments plus `--resume <last.ckpt>`, keeping its matching
+`.loader.json`. Startup pause is ignored, so leaving it true also allows resuming.
+
 > **Difference between `--resume` and `--init-from`**: `--init-from` injects
 > only the weights from a quantised `.bin` and **resets** the optimizer state
 > (fine-tuning / continued training); `--resume` restores both weights and
@@ -364,6 +497,7 @@ After training, what appears under `checkpoints/<run-name>/`:
 | File | Format | Purpose |
 |---|---|---|
 | `<run-name>-<sb>.bin` | quantised NNUE binary | **The artifact to feed to the inference engine** (for the binary layout, see `crates/nnue-format`) |
+| `<run-name>-<sb>.loader.json` | Teacher identity and input position | Keep with `.ckpt`; pruned together by `--keep-checkpoints` |
 | `<run-name>-<sb>.ckpt` | raw f32 + optimizer state | For `--resume`; not used for inference (pruned by `--keep-checkpoints`) |
 
 `<run-name>-<final sb>.bin` is the final net. It is loaded by the

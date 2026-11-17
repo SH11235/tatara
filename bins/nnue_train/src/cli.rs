@@ -347,6 +347,25 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) data: Vec<PathBuf>,
 
+    /// Additional teacher file, sampled independently of the concatenated --data stream.
+    /// Repeat with --mix-rate in matching order. Must use the same format as --data.
+    /// Score filtering and clamping apply to every teacher; shuffle follows mixing.
+    #[arg(long, global = true,
+        conflicts_with_all = ["score_override", "dual_label_psv", "eval_only", "rescore_input"])]
+    pub(crate) mix_data: Vec<PathBuf>,
+
+    /// Expected fraction of training positions from the corresponding --mix-data file.
+    /// Each rate must be finite and positive; their sum must be less than 1.
+    /// The remaining fraction comes from --data. Pair repeated values in matching order.
+    /// Rates apply after reader sampling; worker-side bucket rejection can change observed fractions.
+    #[arg(long, global = true)]
+    pub(crate) mix_rate: Vec<f64>,
+
+    /// Seed hashed with the mixed-stream position number to select each teacher.
+    /// Teacher selection has no mutable random-generator state.
+    #[arg(long, global = true, default_value_t = 0)]
+    pub(crate) mix_seed: u64,
+
     /// PSV or HCPE file for held-out validation. Pass positions that are never used for
     /// a gradient update, separate from the training `--data`. When set, a
     /// forward-only validation pass runs at the end of each superbatch and
@@ -376,6 +395,8 @@ pub(crate) struct Cli {
     pub(crate) test_positions: usize,
 
     /// Output directory for checkpoints (writes `{net_id}-{superbatch}.bin`).
+    /// Training also reads control.json here unless --control-file overrides it;
+    /// a missing control.json is silently ignored.
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
 
@@ -406,6 +427,19 @@ pub(crate) struct Cli {
     /// 10 is for smoke testing; use a much larger value for real training.
     #[arg(long, default_value_t = 10, global = true)]
     pub(crate) superbatches: usize,
+
+    /// Override the training control file (default: control.json under --output).
+    /// target_superbatches is read at each superbatch start and clamped to the current
+    /// superbatch and original --superbatches; values below the resume start are ignored.
+    /// Applied targets are appended to control_history.jsonl and recorded in experiment.json.
+    /// LR and WDL schedules retain the original horizon. Missing files are silently ignored.
+    /// pause is read at startup and superbatch ends.
+    /// A control-file rewrite after startup with pause=true saves a resumable checkpoint
+    /// and exits with code 75, unless training completes at that boundary.
+    /// Startup pause=true is ignored; rewrite the file with pause=true to request a pause.
+    /// Paths without training output, such as smoke tests, have no default control file.
+    #[arg(long, global = true)]
+    pub(crate) control_file: Option<PathBuf>,
 
     /// Number of batches per superbatch.
     #[arg(long, default_value_t = 6104, global = true)]
@@ -554,6 +588,22 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 20, global = true)]
     pub(crate) save_rate: usize,
 
+    /// Keep each training position with this probability (0 < R <= 1; default: 1).
+    #[arg(long, global = true)]
+    pub(crate) keep_rate: Option<f64>,
+    /// Discard training PSV records whose game ply is at most this value. HCPE is unsupported.
+    #[arg(long, global = true)]
+    pub(crate) min_ply: Option<u16>,
+    /// Training PSV ply probabilities, e.g. "0:0.025,22:0.05,32:1"; linear between points, constant outside.
+    #[arg(long, global = true)]
+    pub(crate) ply_keep_curve: Option<nnue_train::sampling::PlyKeepCurve>,
+    /// Training keep probabilities per LayerStack bucket; parallel decode with ordered, full-batch assembly and per-bucket counts.
+    #[arg(long, value_delimiter = ',', global = true)]
+    pub(crate) bucket_keep_rates: Option<Vec<f64>>,
+    /// Stateless training sampling seed (default: 0), combined with teacher ID, epoch and physical record index.
+    #[arg(long, global = true)]
+    pub(crate) skip_seed: Option<u64>,
+
     /// Exclude positions with `|score| >= score_drop_abs` from the loss.
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
@@ -647,7 +697,17 @@ pub(crate) struct Cli {
     /// from the superbatch recorded in the checkpoint + 1. A v5+ checkpoint also
     /// stores the LR-schedule horizon; on resume the saved horizon is restored
     /// so the LR curve is reproduced independently of --superbatches (see
-    /// --lr-final-superbatch for the full precedence).
+    /// --lr-final-superbatch for the full precedence). An adjacent .loader.json
+    /// restores every teacher's input position, mixing selection counter, and shuffle
+    /// window. Missing metadata warns and restarts input. All teacher basenames/sizes,
+    /// sampling probabilities, mixing rates/seeds, and other input settings
+    /// must match; absolute teacher paths may change. Bucket sampling also checks
+    /// bucket mode/count and the progress coefficient file size and SHA-256.
+    /// Shuffle windows require the same actual record count per window.
+    /// The sidecar format is version 1; unknown versions are rejected.
+    /// Delete .loader.json to restart teacher input without restoring positions.
+    /// With --start-superbatch, input restarts with a warning.
+    /// Keep the sidecar together with the checkpoint.
     #[arg(long, global = true)]
     pub(crate) resume: Option<PathBuf>,
 
@@ -667,10 +727,21 @@ pub(crate) struct Cli {
     #[arg(long, global = true, requires = "resume")]
     pub(crate) lineage_kind: Option<LineageKindArg>,
 
+    /// How `--resume` treats the teacher input positions saved in the `.loader.json`
+    /// next to the checkpoint. `restore` continues reading the teachers where the
+    /// checkpoint stopped and fails at startup, listing the differences, when the
+    /// teachers or input settings (batch size, shuffle, skipping, mixing, ...) differ
+    /// from the saved ones. `restart` keeps the weights and optimizer state but reads
+    /// the teachers from the beginning; use it when resuming with changed teachers or
+    /// input settings.
+    #[arg(long, global = true, value_enum, default_value_t = ResumeInputArg::Restore, requires = "resume")]
+    pub(crate) resume_input: ResumeInputArg,
+
     /// Superbatch number to start training from (1-indexed, inclusive). When
     /// omitted: with `--resume`, the checkpoint's superbatch + 1; otherwise 1.
     /// An error if outside `1 <= N <= --superbatches` (may be set explicitly to
-    /// redo past superbatches on resume).
+    /// redo past superbatches on resume). With --resume, warns and restarts teacher
+    /// input from the beginning instead of restoring input positions.
     #[arg(long, global = true)]
     pub(crate) start_superbatch: Option<usize>,
 
@@ -805,19 +876,19 @@ pub(crate) struct Cli {
     /// matches the Ranger21 reference.
     #[arg(long, default_value_t = 1e-4, global = true)]
     pub(crate) norm_loss_factor: f32,
-    /// Number of dataloader prefetch workers. Each worker does PSV parsing +
-    /// HalfKA_hm sparse extraction + progresskpabs bucket computation in a
-    /// single `decode()` call and supplies positions ahead of time. `1` preserves
-    /// the reader's deterministic order; `>= 2` parses in parallel (batch delivery
-    /// order within an epoch is non-deterministic, which is fine for training).
+    /// Number of dataloader prefetch workers for decoding, feature extraction,
+    /// and bucket computation. Training receives batches in input order regardless
+    /// of worker completion order. With bucket sampling, workers read numbered raw
+    /// chunks under the input lock, then decode and filter outside the lock.
+    /// Accepted positions are assembled in chunk order into full batches.
     #[arg(long, default_value_t = 16, global = true)]
     pub(crate) threads: usize,
-    /// Raw PSV shuffle window size in MiB, per window. The default 0 reads the teacher
+    /// Teacher shuffle window memory in MiB, per window, including record metadata. The default 0 reads the teacher
     /// sequentially without windows (teachers are expected to be pre-shuffled on disk).
     /// A positive value enables double-buffered read-ahead plus per-epoch in-window shuffle;
     /// `auto` sizes the window to 1/16 of total RAM (or the cgroup limit, including nested
-    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so raw teacher-data
-    /// memory is approximately twice the resolved value.
+    /// cgroup v2 limits), capped at 4096 MiB. Two windows are kept, so window
+    /// memory (including record metadata) is approximately twice the resolved value.
     #[arg(long, default_value = "0", global = true)]
     pub(crate) teacher_shuffle_buffer_mib: TeacherShuffleBufferMib,
     /// Keep double-buffered sequential I/O but do not shuffle records within each window.
@@ -1039,20 +1110,91 @@ impl Cli {
     }
 
     pub(crate) fn validate_data_args(&self, argv: &[String]) -> Result<(), String> {
-        let given = argv
-            .iter()
-            .skip(1)
-            .take_while(|arg| arg.as_str() != "--")
-            .filter(|arg| arg.as_str() == "--data" || arg.starts_with("--data="))
-            .count();
-        if given == self.data.len() {
-            Ok(())
-        } else {
-            Err("--data must be given on one side of the subcommand".into())
+        for (flag, parsed_count) in [
+            ("--data", self.data.len()),
+            ("--mix-data", self.mix_data.len()),
+            ("--mix-rate", self.mix_rate.len()),
+        ] {
+            let given = argv
+                .iter()
+                .skip(1)
+                .take_while(|arg| arg.as_str() != "--")
+                .filter(|arg| arg.as_str() == flag || arg.starts_with(&format!("{flag}=")))
+                .count();
+            if given != parsed_count {
+                return Err(format!(
+                    "{flag} must be given on one side of the subcommand"
+                ));
+            }
         }
+        if self.mix_data.is_empty()
+            && argv
+                .iter()
+                .any(|arg| arg == "--mix-seed" || arg.starts_with("--mix-seed="))
+        {
+            return Err("--mix-seed requires --mix-data".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mix_sources(&self) -> Vec<nnue_train::dataloader::MixSource> {
+        self.mix_data
+            .iter()
+            .zip(&self.mix_rate)
+            .map(|(path, rate)| nnue_train::dataloader::MixSource {
+                path: path.clone(),
+                rate: *rate,
+            })
+            .collect()
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
+        let (compute_bucket, num_buckets) = match &self.arch {
+            ArchCommand::LayerStack(args) => (true, args.num_buckets()),
+            _ => (false, 1),
+        };
+        let has_ply = !self
+            .data
+            .iter()
+            .any(|path| nnue_train::dataloader::is_hcpe_path(path));
+        self.sampling()
+            .validate(has_ply, compute_bucket, num_buckets)
+            .map_err(|error| error.to_string())?;
+        if self.mix_data.len() != self.mix_rate.len() {
+            return Err(
+                "--mix-data and --mix-rate must be repeated the same number of times".into(),
+            );
+        }
+        if !self.mix_data.is_empty() {
+            if self.data.is_empty() {
+                return Err("--mix-data requires --data".into());
+            }
+            if self.score_source().is_some() || self.eval_only || self.rescore_input.is_some() {
+                return Err("--mix-data cannot be combined with score overrides, dual-label input, evaluation-only or rescoring".into());
+            }
+            if !matches!(
+                self.arch,
+                ArchCommand::LayerStack(_) | ArchCommand::Simple(_)
+            ) || self.threat_norm_dump
+                || self.threat_ablate.is_some()
+            {
+                return Err("--mix-data requires a training run (simple or layerstack)".into());
+            }
+            nnue_train::dataloader::validate_mix_sources(&self.mix_sources())
+                .map_err(|error| error.to_string())?;
+            let format = nnue_train::dataloader::TeacherFormat::for_path(&self.data[0])
+                .map_err(|error| error.to_string())?;
+            for path in &self.mix_data {
+                if nnue_train::dataloader::TeacherFormat::for_path(path)
+                    .map_err(|error| error.to_string())?
+                    != format
+                {
+                    return Err(
+                        "--mix-data must use the same format as --data (PSV or HCPE)".into(),
+                    );
+                }
+            }
+        }
         if !self.precision_steps.is_empty() {
             if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {
                 return Err("--precision-steps requires native CUDA and LayerStack (cuda-oxide is unsupported)".into());
@@ -1083,6 +1225,21 @@ impl Cli {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ResumeInputArg {
+    Restore,
+    Restart,
+}
+
+impl From<ResumeInputArg> for nnue_train::loader_state::ResumeInput {
+    fn from(value: ResumeInputArg) -> Self {
+        match value {
+            ResumeInputArg::Restore => Self::Restore,
+            ResumeInputArg::Restart => Self::Restart,
+        }
     }
 }
 
@@ -1506,7 +1663,6 @@ pub(crate) struct LayerstackArgs {
     pub(crate) effect_bucket_config: String,
 }
 
-#[cfg(any(feature = "gpu", test))]
 impl LayerstackArgs {
     /// `--num-buckets` if given, otherwise the bucket mode's default: kingrank9
     /// has a fixed bucket layout, the progress modes use [`DEFAULT_NUM_BUCKETS`].
@@ -1603,4 +1759,25 @@ pub(crate) struct SimpleArgs {
     /// `--tf32` (an opt-in flag with a playing-strength risk).
     #[arg(long)]
     pub(crate) tf32: bool,
+}
+
+impl Cli {
+    pub(crate) fn sampling(&self) -> nnue_train::sampling::Sampling {
+        nnue_train::sampling::Sampling {
+            log_enabled: self.keep_rate.is_some()
+                || self.min_ply.is_some()
+                || self.ply_keep_curve.is_some()
+                || self.bucket_keep_rates.is_some()
+                || self.skip_seed.is_some(),
+            keep_rate: self.keep_rate.unwrap_or(1.0),
+            min_ply: self.min_ply,
+            ply_keep_curve: self
+                .ply_keep_curve
+                .as_ref()
+                .map(|curve| curve.0.clone())
+                .unwrap_or_default(),
+            bucket_keep_rates: self.bucket_keep_rates.clone(),
+            skip_seed: self.skip_seed.unwrap_or(0),
+        }
+    }
 }

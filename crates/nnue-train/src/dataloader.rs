@@ -22,10 +22,11 @@
 //!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
 //!   同時計算) を提供する
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -94,6 +95,33 @@ impl TeacherFormat {
             Self::Hcpe => "HCPE",
         }
     }
+}
+
+/// An independently wrapping teacher and its expected fraction of training positions.
+#[derive(Clone, Debug)]
+pub struct MixSource {
+    pub path: PathBuf,
+    pub rate: f64,
+}
+
+pub fn validate_mix_sources(sources: &[MixSource]) -> io::Result<()> {
+    let mut total = 0.0;
+    for source in sources {
+        if !source.rate.is_finite() || source.rate <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--mix-rate must be finite and greater than zero",
+            ));
+        }
+        total += source.rate;
+    }
+    if total >= 1.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the sum of --mix-rate values must be less than one",
+        ));
+    }
+    Ok(())
 }
 
 /// 学習 stream を流れる 1 局面分の教師 record。どちらの形式も手番側視点の score を
@@ -677,6 +705,9 @@ pub struct Batch {
     pub wdl: Vec<f32>,
     pub per_pos_norm: Vec<f32>,
     pub n_positions: usize,
+    /// Counts of delivered positions from the main teacher followed by each mixed teacher.
+    /// Empty when teacher mixing is disabled.
+    pub teacher_counts: Vec<u64>,
 }
 
 impl Batch {
@@ -695,10 +726,11 @@ impl Batch {
             wdl: vec![0.0; batch_size],
             per_pos_norm: vec![1.0; batch_size],
             n_positions: 0,
+            teacher_counts: Vec::new(),
         }
     }
 
-    /// 既存 `Batch` を再利用 (alloc 削減)。`n_positions` を 0 に戻すだけの O(1) 操作。
+    /// 既存 `Batch` を再利用し、局面数と教師ごとの件数を 0 に戻す。
     /// `PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の ring-buffer return
     /// path (消費済み `Batch` を pool channel 経由で worker に返して `reset()` で再利用)
     /// の両方で使われる。
@@ -712,6 +744,7 @@ impl Batch {
     /// 観測されない。`per_pos_norm` Vec は下流が scalar `1/n_pos` を再計算するため未使用。
     pub fn reset(&mut self) {
         self.n_positions = 0;
+        self.teacher_counts.fill(0);
     }
 
     /// 1 position を batch に追加。`Ok(true)` 成功、`Ok(false)` は batch 満杯、
@@ -1048,6 +1081,140 @@ impl PrefetchedLoader {
 /// これに達したら無限ループせず error を返す。
 pub const MAX_BARREN_PASSES: u32 = 5;
 
+#[derive(Default)]
+struct SamplingCounts {
+    read: AtomicU64,
+    kept: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct IdentifiedRecord {
+    record: TeacherRecord,
+    teacher: u16,
+    epoch: u64,
+    record_index: u64,
+}
+
+impl std::ops::Deref for IdentifiedRecord {
+    type Target = TeacherRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+#[derive(Default)]
+struct EpochSampling {
+    pending: u64,
+    kept: u64,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct BucketProgress {
+    epochs: BTreeMap<u64, EpochSampling>,
+    barren: u32,
+    failed: bool,
+}
+
+impl BucketProgress {
+    fn check(&mut self) -> io::Result<()> {
+        // 完了順は worker に依存するため、全候補の判定が済んだ epoch を順に確定する。
+        while self
+            .epochs
+            .first_key_value()
+            .is_some_and(|(_, e)| e.closed && e.pending == 0)
+        {
+            let (_, epoch) = self.epochs.pop_first().unwrap();
+            self.barren = if epoch.kept == 0 { self.barren + 1 } else { 0 };
+            if self.barren >= MAX_BARREN_PASSES {
+                self.failed = true;
+                break;
+            }
+        }
+        if self.failed {
+            Err(io::Error::other(format!(
+                "training filters yielded no usable positions over {MAX_BARREN_PASSES} full passes"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BucketSampling {
+    sampling: crate::sampling::Sampling,
+    counts: Arc<SamplingCounts>,
+    buckets: Vec<SamplingCounts>,
+    progress: Mutex<BucketProgress>,
+    #[cfg(test)]
+    accepted: Mutex<Vec<(u64, u64)>>,
+}
+
+impl BucketSampling {
+    fn register(&self, epoch: u64) {
+        self.progress
+            .lock()
+            .expect("sampling mutex poisoned")
+            .epochs
+            .entry(epoch)
+            .or_default()
+            .pending += 1;
+    }
+    fn close(&self, epoch: u64) -> io::Result<()> {
+        let mut progress = self.progress.lock().expect("sampling mutex poisoned");
+        progress.epochs.entry(epoch).or_default().closed = true;
+        progress.check()
+    }
+    fn finish(&self, record: &IdentifiedRecord, bucket: usize) -> io::Result<bool> {
+        self.buckets[bucket].read.fetch_add(1, Ordering::Relaxed);
+        let rate = self.sampling.bucket_keep_rates.as_ref().unwrap()[bucket];
+        // reader と同じ乱数を合成確率と比較し、二段判定でも採用率の積を保つ。
+        let kept = self.sampling.accepts(
+            u64::from(record.teacher),
+            record.epoch,
+            record.record_index,
+            self.sampling.keep_rate
+                * match &record.record {
+                    TeacherRecord::Psv(psv) => self.sampling.ply_rate(psv.game_ply()),
+                    TeacherRecord::Hcpe(_) => 1.0,
+                }
+                * rate,
+        );
+        if kept {
+            #[cfg(test)]
+            self.accepted
+                .lock()
+                .unwrap()
+                .push((record.epoch, record.record_index));
+            self.buckets[bucket].kept.fetch_add(1, Ordering::Relaxed);
+            self.counts.kept.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut progress = self.progress.lock().expect("sampling mutex poisoned");
+        let epoch = progress
+            .epochs
+            .get_mut(&record.epoch)
+            .expect("registered epoch");
+        epoch.pending -= 1;
+        epoch.kept += u64::from(kept);
+        progress.check()?;
+        Ok(kept)
+    }
+}
+
+/// Next input position in one concatenated teacher stream. A shuffled window is
+/// reconstructed from its first physical record before skipping `window_offset` outputs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TeacherPosition {
+    pub epoch: u64,
+    pub next_record: u64,
+    pub window_index: Option<u64>,
+    pub window_offset: usize,
+    pub mixes: Vec<TeacherPosition>,
+    pub ordinal: u64,
+    /// Accepted positions already delivered from the raw chunk starting at this cursor.
+    pub bucket_skip: usize,
+}
+
 /// 教師 file (PSV / HCPE) を逐次読み、EOF で同 file を開き直して次 epoch とする stream
 /// reader。`--score-drop-abs` の近似 skip (`|score| >= t` を捨てる) と空 file の
 /// 無限ループ防止 (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない**
@@ -1056,6 +1223,9 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 ///
 /// `next()` は常に「使える record」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
+/// keep-rate / ply の間引きは decode 前に行い、bucket 判定用の識別情報は
+/// shuffle を通して worker へ渡す。bucket の採否は返却後に worker が判定し、
+/// bucket による全 drop も worker の完了時に検出する。
 struct PsvEpochReader {
     path: PathBuf,
     paths: Vec<PathBuf>,
@@ -1069,6 +1239,11 @@ struct PsvEpochReader {
     score_override: Option<ScoreOverrideReader>,
     dual_label_psv: Option<DualLabelMode>,
     record_index: u64,
+    epoch: u64,
+    teacher: u16,
+    sampling: crate::sampling::Sampling,
+    bucket_sampling: Option<Arc<BucketSampling>>,
+    sampling_counts: Arc<SamplingCounts>,
     score_drop_abs: Option<i32>,
     score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
@@ -1126,6 +1301,11 @@ impl PsvEpochReader {
             score_override,
             dual_label_psv,
             record_index: start_offset / record_bytes,
+            epoch: 0,
+            teacher: 0,
+            sampling: Default::default(),
+            bucket_sampling: None,
+            sampling_counts: Arc::new(SamplingCounts::default()),
             score_drop_abs,
             score_clamp_abs,
             pushed_this_epoch: 0,
@@ -1138,16 +1318,48 @@ impl PsvEpochReader {
         })
     }
 
+    fn restore(&mut self, position: &TeacherPosition) -> io::Result<()> {
+        let offset = position
+            .next_record
+            .checked_mul(self.record_bytes)
+            .filter(|offset| *offset >= self.start_offset && *offset <= self.end_offset)
+            .ok_or_else(|| io::Error::other("loader position exceeds training range"))?;
+        self.loader = TeacherFileLoader::new_range(&self.paths, offset, self.end_offset)?;
+        self.record_index = position.next_record;
+        self.epoch = position.epoch;
+        if let Some(scores) = &mut self.score_override {
+            scores.seek_to(position.next_record)?;
+        }
+        Ok(())
+    }
+
+    fn configure_sampling(&mut self, sampling: crate::sampling::Sampling) {
+        self.bucket_sampling = sampling.bucket_keep_rates.as_ref().map(|rates| {
+            Arc::new(BucketSampling {
+                sampling: sampling.clone(),
+                counts: Arc::clone(&self.sampling_counts),
+                buckets: (0..rates.len())
+                    .map(|_| SamplingCounts::default())
+                    .collect(),
+                progress: Mutex::new(BucketProgress::default()),
+                #[cfg(test)]
+                accepted: Mutex::new(Vec::new()),
+            })
+        });
+        self.sampling = sampling;
+    }
+
     /// 現在の epoch にある次の使える record を返す。physical EOF では reader を次
     /// epoch の先頭へ戻して `None` を返す。これにより window shuffle 側は epoch
     /// 境界を跨がず、末尾の partial window も独立して shuffle できる。
-    fn next_in_epoch(&mut self) -> io::Result<Option<TeacherRecord>> {
+    fn next_in_epoch(&mut self) -> io::Result<Option<IdentifiedRecord>> {
         loop {
             self.check_cancelled()?;
             match self.loader.next_record()? {
                 Some(mut record) => {
                     let record_index = self.record_index;
                     self.record_index += 1;
+                    self.sampling_counts.read.fetch_add(1, Ordering::Relaxed);
                     #[cfg(test)]
                     if let Some(after_record) = &mut self.after_record {
                         after_record();
@@ -1178,8 +1390,30 @@ impl PsvEpochReader {
                     if let Some(c) = self.score_clamp_abs {
                         record.set_score(record.score().clamp(-c, c));
                     }
+                    let mut probability = self.sampling.keep_rate;
+                    if let TeacherRecord::Psv(psv) = &record {
+                        probability *= self.sampling.ply_rate(psv.game_ply());
+                    }
+                    if !self.sampling.accepts(
+                        u64::from(self.teacher),
+                        self.epoch,
+                        record_index,
+                        probability,
+                    ) {
+                        continue;
+                    }
+                    if let Some(sampling) = &self.bucket_sampling {
+                        sampling.register(self.epoch);
+                    } else {
+                        self.sampling_counts.kept.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.pushed_this_epoch += 1;
-                    return Ok(Some(record));
+                    return Ok(Some(IdentifiedRecord {
+                        record,
+                        teacher: self.teacher,
+                        epoch: self.epoch,
+                        record_index,
+                    }));
                 }
                 None => {
                     #[cfg(test)]
@@ -1187,13 +1421,16 @@ impl PsvEpochReader {
                         after_eof();
                     }
                     self.check_cancelled()?;
+                    if let Some(sampling) = &self.bucket_sampling {
+                        sampling.close(self.epoch)?;
+                    }
                     if self.pushed_this_epoch == 0 {
                         self.barren_passes += 1;
                         if self.barren_passes >= MAX_BARREN_PASSES {
                             return Err(io::Error::other(format!(
                                 "data file {} range [{}, {}) yielded no usable positions over {} \
                                  full passes (empty range, or all positions filtered out by \
-                                 score-drop-abs)",
+                                 training filters)",
                                 self.path.display(),
                                 self.start_offset,
                                 self.end_offset,
@@ -1209,6 +1446,7 @@ impl PsvEpochReader {
                         self.start_offset,
                         self.end_offset,
                     )?;
+                    self.epoch = self.epoch.wrapping_add(1);
                     self.record_index = self.start_offset / self.record_bytes;
                     if let Some(score_override) = &mut self.score_override {
                         score_override.seek_to(self.record_index)?;
@@ -1231,7 +1469,7 @@ impl PsvEpochReader {
 
     /// 次の使える record を返す。EOF なら file を開き直す (= 次 epoch)。空 file /
     /// 全 drop で `MAX_BARREN_PASSES` 周しても 0 件なら `io::Error` を返す。
-    fn next(&mut self) -> io::Result<TeacherRecord> {
+    fn next(&mut self) -> io::Result<IdentifiedRecord> {
         loop {
             if let Some(record) = self.next_in_epoch()? {
                 return Ok(record);
@@ -1262,20 +1500,18 @@ pub(crate) fn shuffle_window_records(
     let bytes = buffer_mib
         .checked_mul(MIB_BYTES)
         .ok_or_else(|| io::Error::other("teacher shuffle buffer size overflow"))?;
-    // 窓の局面数は入力形式によらず 40 bytes 単位で数える (HCPE でも同じ MiB 指定が
-    // 同じ局面数になり、PSV では従来の shuffle 順を保つ)。
-    let records = bytes / PSV_RECORD_BYTES as usize;
+    let records = bytes / std::mem::size_of::<SourcedRecord>();
     let aligned = records / batch_size * batch_size;
     if aligned == 0 {
         return Err(io::Error::other(format!(
             "teacher shuffle buffer ({buffer_mib} MiB) is smaller than one raw batch ({} bytes)",
-            batch_size * PSV_RECORD_BYTES as usize
+            batch_size * std::mem::size_of::<SourcedRecord>()
         )));
     }
     Ok(Some(aligned))
 }
 
-/// Small deterministic PRNG used only for Fisher-Yates indices. Keeping this local avoids
+/// Small deterministic PRNG used for Fisher-Yates indices and teacher selection. Keeping this local avoids
 /// coupling training-data order to the version or algorithm of an external RNG crate.
 struct SplitMix64(u64);
 
@@ -1299,36 +1535,213 @@ fn shuffle_window<T>(values: &mut [T], seed: u64, epoch: u64, window: u64) {
     }
 }
 
-struct PsvWindow {
-    records: Vec<TeacherRecord>,
+trait EpochSource: Send + 'static {
+    type Record: Copy + Send;
+    fn next_in_epoch(&mut self) -> io::Result<Option<Self::Record>>;
+    fn position(&self) -> TeacherPosition;
+    fn shuffle_epoch(&self) -> u64 {
+        self.position().epoch
+    }
+    fn stop_flag(&self) -> Arc<AtomicBool>;
+    fn bucket_samplings(&self) -> Vec<Option<Arc<BucketSampling>>>;
+}
+
+impl EpochSource for PsvEpochReader {
+    fn position(&self) -> TeacherPosition {
+        TeacherPosition {
+            epoch: self.epoch,
+            next_record: self.record_index,
+            ..Default::default()
+        }
+    }
+    type Record = IdentifiedRecord;
+
+    fn next_in_epoch(&mut self) -> io::Result<Option<Self::Record>> {
+        PsvEpochReader::next_in_epoch(self)
+    }
+
+    fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    fn bucket_samplings(&self) -> Vec<Option<Arc<BucketSampling>>> {
+        vec![self.bucket_sampling.clone()]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourcedRecord {
+    record: IdentifiedRecord,
+}
+
+impl SourcedRecord {
+    fn source(&self) -> usize {
+        usize::from(self.record.teacher)
+    }
+}
+
+impl From<IdentifiedRecord> for SourcedRecord {
+    fn from(record: IdentifiedRecord) -> Self {
+        Self { record }
+    }
+}
+
+struct MixedTeacherReader {
+    sources: Vec<PsvEpochReader>,
+    cumulative_rates: Vec<f64>,
+    seed: u64,
+    /// Next position in the combined stream, independent of each teacher's physical cursor.
+    ordinal: u64,
+}
+
+impl MixedTeacherReader {
+    fn new(main: PsvEpochReader, mixes: &[MixSource], seed: u64) -> io::Result<Self> {
+        validate_mix_sources(mixes)?;
+        if main.score_override.is_some() || main.dual_label_psv.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "teacher mixing cannot be combined with --score-override or --dual-label-psv",
+            ));
+        }
+        let format = teacher_format(&main.paths)?;
+        let mut sources = vec![main];
+        let mut cumulative_rates = Vec::with_capacity(mixes.len());
+        let mut total = 0.0;
+        for mix in mixes {
+            if TeacherFormat::for_path(&mix.path)? != format {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "mixed teacher {} must use the main teacher's {} format",
+                        mix.path.display(),
+                        format.name()
+                    ),
+                ));
+            }
+            let main = &sources[0];
+            let mut reader = PsvEpochReader::new_range(
+                &[&mix.path],
+                0,
+                teacher_data_bytes(&[&mix.path])?,
+                main.score_drop_abs,
+                main.score_clamp_abs,
+                None,
+            )?;
+            reader.stop = Arc::clone(&main.stop);
+            reader.teacher = u16::try_from(sources.len())
+                .map_err(|_| io::Error::other("too many mixed teachers (maximum 65535)"))?;
+            reader.configure_sampling(main.sampling.clone());
+            sources.push(reader);
+            total += mix.rate;
+            cumulative_rates.push(total);
+        }
+        Ok(Self {
+            sources,
+            cumulative_rates,
+            seed,
+            ordinal: 0,
+        })
+    }
+
+    fn next(&mut self) -> io::Result<SourcedRecord> {
+        // A domain-separated counter hash makes selection reproducible without RNG state.
+        let hash = SplitMix64(
+            self.seed ^ 0x6d69_782d_7465_6163 ^ self.ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        )
+        .next();
+        let draw = (hash >> 11) as f64 * (1.0 / ((1u64 << 53) as f64));
+        let source = self
+            .cumulative_rates
+            .iter()
+            .position(|&rate| draw < rate)
+            .map_or(0, |i| i + 1);
+        let record = self.sources[source].next()?;
+        self.ordinal = self.ordinal.wrapping_add(1);
+        Ok(SourcedRecord { record })
+    }
+}
+
+impl EpochSource for MixedTeacherReader {
+    fn shuffle_epoch(&self) -> u64 {
+        0
+    }
+    fn position(&self) -> TeacherPosition {
+        TeacherPosition {
+            mixes: self.sources[1..]
+                .iter()
+                .map(EpochSource::position)
+                .collect(),
+            ordinal: self.ordinal,
+            ..self.sources[0].position()
+        }
+    }
+    type Record = SourcedRecord;
+
+    fn next_in_epoch(&mut self) -> io::Result<Option<Self::Record>> {
+        self.next().map(Some)
+    }
+
+    fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.sources[0].stop)
+    }
+
+    fn bucket_samplings(&self) -> Vec<Option<Arc<BucketSampling>>> {
+        self.sources
+            .iter()
+            .map(|s| s.bucket_sampling.clone())
+            .collect()
+    }
+}
+
+struct PsvWindow<R> {
+    position: TeacherPosition,
+    records: Vec<R>,
     next: usize,
 }
 
 /// Two-window producer/consumer reader. The producer fills the next window of raw teacher
 /// records while the decode workers consume the current one. `window_records` is per window, so
-/// resident capacity is approximately `2 * window_records * size_of::<TeacherRecord>()` bytes.
-struct WindowedPsvReader {
-    ready_rx: mpsc::Receiver<io::Result<PsvWindow>>,
-    empty_tx: Option<mpsc::Sender<Vec<TeacherRecord>>>,
-    current: Option<PsvWindow>,
+/// resident capacity is approximately `2 * window_records * size_of::<R>()` bytes.
+struct WindowedPsvReader<R = IdentifiedRecord> {
+    ready_rx: mpsc::Receiver<io::Result<PsvWindow<R>>>,
+    empty_tx: Option<mpsc::Sender<Vec<R>>>,
+    current: Option<PsvWindow<R>>,
+    replay_pending: bool,
     stop: Arc<AtomicBool>,
     producer: Option<thread::JoinHandle<()>>,
-    /// producer の失敗 message。err_slot は first-write-wins なので、後続 caller にも
-    /// 汎用 "stopped" でなく同じ詳細 message を返して race による握り潰しを防ぐ。
+    bucket_samplings: Vec<Option<Arc<BucketSampling>>>,
+    /// 後続 caller にも producer の詳細な失敗理由を返す。
     failure: Option<String>,
 }
 
-impl WindowedPsvReader {
-    fn spawn(mut source: PsvEpochReader, window_records: usize, shuffle: bool, seed: u64) -> Self {
+impl<R: Copy + Send + Into<SourcedRecord> + 'static> WindowedPsvReader<R> {
+    #[cfg(test)]
+    fn spawn(
+        source: impl EpochSource<Record = R>,
+        window_records: usize,
+        shuffle: bool,
+        seed: u64,
+    ) -> Self {
+        Self::spawn_at(source, window_records, shuffle, seed, 0)
+    }
+
+    fn spawn_at(
+        mut source: impl EpochSource<Record = R>,
+        window_records: usize,
+        shuffle: bool,
+        seed: u64,
+        first_window: u64,
+    ) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (empty_tx, empty_rx) = mpsc::channel::<Vec<TeacherRecord>>();
-        let stop = Arc::clone(&source.stop);
+        let (empty_tx, empty_rx) = mpsc::channel::<Vec<R>>();
+        let bucket_samplings = source.bucket_samplings();
+        let stop = source.stop_flag();
         let producer_stop = Arc::clone(&stop);
         let producer = thread::spawn(move || {
             let mut allocated = 0usize;
             let mut spare = None;
-            let mut epoch = 0u64;
-            let mut window = 0u64;
+            let mut epoch = source.shuffle_epoch();
+            let mut window = first_window;
             loop {
                 if producer_stop.load(Ordering::Relaxed) {
                     break;
@@ -1359,6 +1772,11 @@ impl WindowedPsvReader {
                     }
                 };
                 records.clear();
+                let position = TeacherPosition {
+                    window_index: Some(window),
+                    window_offset: 0,
+                    ..source.position()
+                };
                 let mut reached_epoch_end = false;
                 while records.len() < window_records {
                     if producer_stop.load(Ordering::Relaxed) {
@@ -1389,7 +1807,14 @@ impl WindowedPsvReader {
                 if shuffle {
                     shuffle_window(&mut records, seed, epoch, window);
                 }
-                if ready_tx.send(Ok(PsvWindow { records, next: 0 })).is_err() {
+                if ready_tx
+                    .send(Ok(PsvWindow {
+                        position,
+                        records,
+                        next: 0,
+                    }))
+                    .is_err()
+                {
                     return;
                 }
                 window = window.wrapping_add(1);
@@ -1401,15 +1826,68 @@ impl WindowedPsvReader {
         });
         Self {
             ready_rx,
+            bucket_samplings,
             empty_tx: Some(empty_tx),
             current: None,
+            replay_pending: false,
             stop,
             producer: Some(producer),
             failure: None,
         }
     }
 
-    fn next(&mut self) -> io::Result<TeacherRecord> {
+    fn position(&self) -> TeacherPosition {
+        self.current
+            .as_ref()
+            .map(|w| TeacherPosition {
+                window_offset: w.next,
+                ..w.position.clone()
+            })
+            .unwrap_or_default()
+    }
+
+    fn restore_window(&mut self, position: &TeacherPosition) -> io::Result<()> {
+        let mut window = self
+            .ready_rx
+            .recv()
+            .map_err(|_| io::Error::other("teacher window producer stopped during resume"))??;
+        if window.position
+            != (TeacherPosition {
+                window_offset: 0,
+                bucket_skip: 0,
+                ..position.clone()
+            })
+            || position.window_offset > window.records.len()
+        {
+            return Err(io::Error::other("invalid teacher window position"));
+        }
+        window.next = position.window_offset;
+        self.current = Some(window);
+        self.replay_pending = true;
+        Ok(())
+    }
+
+    fn replay_sampling(&mut self, bucket_mode: BucketMode, num_buckets: usize) -> io::Result<()> {
+        if !self.replay_pending {
+            return Ok(());
+        }
+        self.replay_pending = false;
+        let window = self.current.as_ref().expect("restored window");
+        // Regenerated prefix candidates must leave the epoch's pending count before new reads.
+        for record in &window.records[..window.next] {
+            let record: SourcedRecord = (*record).into();
+            if let Some(sampling) = &self.bucket_samplings[record.source()] {
+                let board = record.record.decode()?;
+                sampling.finish(
+                    &record.record,
+                    usize::from(bucket_mode.bucket_board(&board, num_buckets)),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> io::Result<R> {
         if let Some(msg) = &self.failure {
             return Err(io::Error::other(msg.clone()));
         }
@@ -1452,7 +1930,7 @@ impl WindowedPsvReader {
     }
 }
 
-impl Drop for WindowedPsvReader {
+impl<R> Drop for WindowedPsvReader<R> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.empty_tx.take();
@@ -1465,13 +1943,62 @@ impl Drop for WindowedPsvReader {
 enum TrainingPsvReader {
     Direct(Box<PsvEpochReader>),
     Windowed(WindowedPsvReader),
+    Mixed(Box<MixedTeacherReader>),
+    MixedWindowed(WindowedPsvReader<SourcedRecord>, usize),
 }
 
 impl TrainingPsvReader {
-    fn next(&mut self) -> io::Result<TeacherRecord> {
+    fn replay_sampling(&mut self, bucket_mode: BucketMode, num_buckets: usize) -> io::Result<()> {
         match self {
-            Self::Direct(reader) => reader.next(),
-            Self::Windowed(reader) => reader.next(),
+            Self::Windowed(reader) => reader.replay_sampling(bucket_mode, num_buckets),
+            Self::MixedWindowed(reader, _) => reader.replay_sampling(bucket_mode, num_buckets),
+            _ => Ok(()),
+        }
+    }
+
+    fn bucket_samplings(&self) -> Vec<Option<Arc<BucketSampling>>> {
+        match self {
+            Self::Direct(reader) => reader.bucket_samplings(),
+            Self::Windowed(reader) => reader.bucket_samplings.clone(),
+            Self::Mixed(reader) => reader.bucket_samplings(),
+            Self::MixedWindowed(reader, _) => reader.bucket_samplings.clone(),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<SourcedRecord> {
+        match self {
+            Self::Direct(reader) => reader.next().map(|record| SourcedRecord { record }),
+            Self::Windowed(reader) => reader.next().map(|record| SourcedRecord { record }),
+            Self::Mixed(reader) => reader.next(),
+            Self::MixedWindowed(reader, _) => reader.next(),
+        }
+    }
+
+    fn teacher_count(&self) -> usize {
+        match self {
+            Self::Direct(_) | Self::Windowed(_) => 0,
+            Self::Mixed(reader) => reader.sources.len(),
+            Self::MixedWindowed(_, count) => *count,
+        }
+    }
+
+    fn position(&self) -> TeacherPosition {
+        match self {
+            Self::Direct(r) => TeacherPosition {
+                epoch: r.epoch,
+                next_record: r.record_index,
+                ..TeacherPosition::default()
+            },
+            Self::Mixed(r) => r.position(),
+            Self::MixedWindowed(r, _) => r.position(),
+            Self::Windowed(r) => r
+                .current
+                .as_ref()
+                .map(|w| TeacherPosition {
+                    window_offset: w.next,
+                    ..w.position.clone()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -1480,6 +2007,8 @@ impl TrainingPsvReader {
         match self {
             Self::Direct(reader) => Arc::clone(&reader.stop),
             Self::Windowed(reader) => Arc::clone(&reader.stop),
+            Self::Mixed(reader) => reader.stop_flag(),
+            Self::MixedWindowed(reader, _) => Arc::clone(&reader.stop),
         }
     }
 }
@@ -1499,6 +2028,23 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 /// 回す。`buffers` は `reset()` 再利用、`buckets` は `clear()` 再利用。
 type BatchSlot = (Batch, Vec<i32>);
 
+struct DecodedChunk {
+    before: TeacherPosition,
+    after: TeacherPosition,
+    sources: Vec<usize>,
+    slot: BatchSlot,
+}
+
+struct BucketAssembly {
+    chunk: Option<DecodedChunk>,
+    offset: usize,
+    resume_skip: usize,
+    outputs: Mutex<Vec<BatchSlot>>,
+    batch_size: usize,
+    feature_set: FeatureSetSpec,
+    teacher_count: usize,
+}
+
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
 /// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
 /// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
@@ -1514,34 +2060,30 @@ type BatchSlot = (Batch, Vec<i32>);
 ///   外で decode + 特徴抽出を並列に行う。windowed reader では窓境界で lock 保持の
 ///   まま次窓完成を待ち得る (`Drop` は共通 stop flag で先に入力を止める)。`FeatureSetSpec` は
 ///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
-/// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
-///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
-///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
-///   が再借用して `reset()` / `clear()` で reuse。毎 batch の `Vec` 新規 alloc
-///   (~21MB) は発生しない。
-/// - **epoch 意味論**: 共有 reader が EOF で file を開き直す (= 次 epoch)、
-///   `score-drop-abs` skip、`MAX_BARREN_PASSES` ガードは [`PsvEpochReader`] が
-///   担う。ただし **1 epoch 内の position の順序は worker 数 ≥ 2 では非決定的**
-///   (各 worker が `batch_size` 件ずつ排他的に読むため batch 境界の切れ目が
-///   変わる)。training では問題ない (適用される lr/wdl は loop の `batch_idx` で
-///   決まりデータ内容に依らない) が、決定論的順序が要る場合は
-///   `num_workers = 1` を使うこと。
-/// - **error 伝搬**: worker が reader から `io::Error` (主に barren-exhaustion)
-///   を受けたら shared error slot に格納して exit。main の
-///   [`Self::next_batch`] は全 worker が exit して result channel が閉じたら
-///   error slot を見て伝搬する。
+/// - **buffer reuse**: worker の塊は `prefetch_depth + num_workers + 1` 個の
+///   pool から借り、消費後に返す。bucket 間引き時は組み立て用 batch を別の pool で
+///   再利用し、[`BucketedPrefetchedLoader::recycle`] は消費済み出力をそこへ返す。
+/// - **読み位置**: bucket 間引き時は生 record の塊を番号順に詰め直し、
+///   一部だけ使った塊の開始位置と既使用の採用局面数から再開する。
+/// - **error 伝搬**: reader・decode・特徴抽出の失敗は result channel で通知し、
+///   未着の batch 番号を待っている main もエラーで停止する。
 /// - **終了**: main が `BucketedPrefetchedLoader` を drop すると [`Drop`] impl が
 ///   まず result/pool 両 channel endpoint を落として全 worker を unblock させ、
 ///   その後 worker thread を join する (close-then-join、詳細は `Drop` の doc)。
 pub struct BucketedPrefetchedLoader {
-    /// 完成 batch (Batch + per-position bucket) を worker → main で渡す。
+    /// decode 済みの塊と再開位置を worker → main で渡す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
-    result_rx: Option<mpsc::Receiver<BatchSlot>>,
-    /// 消費済み batch buffer を main → worker で返す (ring buffer)。
+    result_rx: Option<mpsc::Receiver<io::Result<(u64, DecodedChunk)>>>,
+    pending: BTreeMap<u64, DecodedChunk>,
+    assembly: Option<BucketAssembly>,
+    next_sequence: u64,
+    ordered: bool,
+    position: TeacherPosition,
+    sampling_counts: Vec<Arc<SamplingCounts>>,
+    bucket_samplings: Vec<Option<Arc<BucketSampling>>>,
+    /// 消費済みの塊の buffer を main → worker で返す。
     /// `Drop` で `.take()` して先に落とすため `Option`。
     pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
-    /// worker が reader から受けた io::Error を main に伝えるための slot。
-    err_slot: Arc<Mutex<Option<io::Error>>>,
     /// `--monitor-active-features` 時のみ `Some`。全 worker が共有する実 active
     /// feature 数の histogram (長さ `feature_set.max_active() + 1`、bin `k` =
     /// 実 active 数がちょうど `k` だった position 数の累積)。worker は自身の
@@ -1555,6 +2097,25 @@ pub struct BucketedPrefetchedLoader {
     /// テスト用: Drop の stop 設定と scan の再開を channel で同期する。
     #[cfg(test)]
     after_stop: Option<Box<dyn FnMut() + Send>>,
+}
+
+/// Input and decode settings for a bucketed training loader.
+pub struct BucketedLoaderOptions<'a> {
+    pub sampling: crate::sampling::Sampling,
+    pub batch_size: usize,
+    pub score_drop_abs: Option<i32>,
+    pub score_clamp_abs: Option<i16>,
+    pub num_workers: usize,
+    pub bucket_mode: BucketMode,
+    pub feature_set: FeatureSetSpec,
+    pub compute_bucket: bool,
+    pub num_buckets: usize,
+    pub train_end_offset: u64,
+    pub monitor_active: bool,
+    pub score_source: Option<ScoreSource<&'a Path>>,
+    pub teacher_shuffle_buffer_mib: usize,
+    pub teacher_shuffle: bool,
+    pub teacher_shuffle_seed: u64,
 }
 
 impl BucketedPrefetchedLoader {
@@ -1611,10 +2172,11 @@ impl BucketedPrefetchedLoader {
             0,
             false,
             0,
+            Default::default(),
         )
     }
 
-    /// Spawns a loader with one explicit score source selection.
+    /// Spawns a loader with explicit score sources and stateless training sampling.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_score_sources(
         paths: &[impl AsRef<Path>],
@@ -1632,14 +2194,79 @@ impl BucketedPrefetchedLoader {
         teacher_shuffle_buffer_mib: usize,
         teacher_shuffle: bool,
         teacher_shuffle_seed: u64,
+        sampling: crate::sampling::Sampling,
     ) -> io::Result<Self> {
+        Self::spawn_with_mixing(
+            paths,
+            BucketedLoaderOptions {
+                sampling,
+                batch_size,
+                score_drop_abs,
+                score_clamp_abs,
+                num_workers,
+                bucket_mode: bucket_mode.into(),
+                feature_set,
+                compute_bucket,
+                num_buckets,
+                train_end_offset,
+                monitor_active,
+                score_source,
+                teacher_shuffle_buffer_mib,
+                teacher_shuffle,
+                teacher_shuffle_seed,
+            },
+            &[],
+            0,
+        )
+    }
+
+    /// Spawns a loader that mixes independent teachers before optional window shuffling.
+    pub fn spawn_with_mixing(
+        paths: &[impl AsRef<Path>],
+        options: BucketedLoaderOptions<'_>,
+        mixes: &[MixSource],
+        mix_seed: u64,
+    ) -> io::Result<Self> {
+        let mut loader = Self::spawn_mixed_resumable(paths, options, mixes, mix_seed, None)?;
+        loader.ordered = loader.assembly.is_some();
+        Ok(loader)
+    }
+
+    pub fn spawn_mixed_resumable(
+        paths: &[impl AsRef<Path>],
+        options: BucketedLoaderOptions<'_>,
+        mixes: &[MixSource],
+        mix_seed: u64,
+        resume: Option<&TeacherPosition>,
+    ) -> io::Result<Self> {
+        let BucketedLoaderOptions {
+            sampling,
+            batch_size,
+            score_drop_abs,
+            score_clamp_abs,
+            num_workers,
+            bucket_mode,
+            feature_set,
+            compute_bucket,
+            num_buckets,
+            train_end_offset,
+            monitor_active,
+            score_source,
+            teacher_shuffle_buffer_mib,
+            teacher_shuffle,
+            teacher_shuffle_seed,
+        } = options;
         assert!(
             num_buckets >= 1,
             "BucketedPrefetchedLoader requires num_buckets >= 1"
         );
         assert!(batch_size >= 1, "batch_size must be >= 1");
-        let bucket_mode = bucket_mode.into();
-        let source = PsvEpochReader::new_range(
+        sampling.validate(
+            teacher_format(paths)? == TeacherFormat::Psv,
+            compute_bucket,
+            num_buckets,
+        )?;
+        let mut source = PsvEpochReader::new_range(
             paths,
             0,
             train_end_offset,
@@ -1647,16 +2274,68 @@ impl BucketedPrefetchedLoader {
             score_clamp_abs,
             score_source,
         )?;
-        let reader = match shuffle_window_records(teacher_shuffle_buffer_mib, batch_size)? {
-            Some(window_records) => TrainingPsvReader::Windowed(WindowedPsvReader::spawn(
-                source,
-                window_records,
-                teacher_shuffle,
-                teacher_shuffle_seed,
-            )),
-            None => TrainingPsvReader::Direct(Box::new(source)),
+        source.configure_sampling(sampling);
+        if let Some(position) = resume {
+            if position.mixes.len() != mixes.len() {
+                return Err(io::Error::other("loader mixed teacher count differs"));
+            }
+            if teacher_shuffle_buffer_mib == 0
+                && (position.window_index.is_some() || position.window_offset != 0)
+            {
+                return Err(io::Error::other(
+                    "window position cannot resume a direct input stream",
+                ));
+            }
+            source.restore(position)?;
+        }
+        let mut counts = vec![Arc::clone(&source.sampling_counts)];
+        let window_records = shuffle_window_records(teacher_shuffle_buffer_mib, batch_size)?;
+        let mut reader = if mixes.is_empty() {
+            match window_records {
+                Some(window_records) => TrainingPsvReader::Windowed(WindowedPsvReader::spawn_at(
+                    source,
+                    window_records,
+                    teacher_shuffle,
+                    teacher_shuffle_seed,
+                    resume.and_then(|p| p.window_index).unwrap_or(0),
+                )),
+                None => TrainingPsvReader::Direct(Box::new(source)),
+            }
+        } else {
+            let mut mixed = MixedTeacherReader::new(source, mixes, mix_seed)?;
+            if let Some(position) = resume {
+                mixed.ordinal = position.ordinal;
+                for (reader, cursor) in mixed.sources[1..].iter_mut().zip(&position.mixes) {
+                    reader.restore(cursor)?;
+                }
+            }
+            counts = mixed
+                .sources
+                .iter()
+                .map(|s| Arc::clone(&s.sampling_counts))
+                .collect();
+            match window_records {
+                Some(window_records) => TrainingPsvReader::MixedWindowed(
+                    WindowedPsvReader::spawn_at(
+                        mixed,
+                        window_records,
+                        teacher_shuffle,
+                        teacher_shuffle_seed,
+                        resume.and_then(|p| p.window_index).unwrap_or(0),
+                    ),
+                    mixes.len() + 1,
+                ),
+                None => TrainingPsvReader::Mixed(Box::new(mixed)),
+            }
         };
-        Ok(Self::spawn_with_reader(
+        if let Some(position) = resume {
+            match &mut reader {
+                TrainingPsvReader::Windowed(r) => r.restore_window(position)?,
+                TrainingPsvReader::MixedWindowed(r, _) => r.restore_window(position)?,
+                _ => {}
+            }
+        }
+        let mut loader = Self::spawn_with_reader(
             batch_size,
             num_workers,
             bucket_mode,
@@ -1666,7 +2345,13 @@ impl BucketedPrefetchedLoader {
             monitor_active,
             reader,
             &teacher_data_label(paths),
-        ))
+        );
+        loader.sampling_counts = counts;
+        loader.position = resume.cloned().unwrap_or_default();
+        if let Some(assembly) = &mut loader.assembly {
+            assembly.resume_skip = resume.map_or(0, |p| p.bucket_skip);
+        }
+        Ok(loader)
     }
 
     /// Start decode workers for an already configured reader. `data_path` is used only in
@@ -1690,9 +2375,11 @@ impl BucketedPrefetchedLoader {
         // block しないようにする: result channel に最大 prefetch_depth、各 worker
         // が最大 1、main が最大 1。
         let n_slots = prefetch_depth + num_workers + 1;
+        let bucket_samplings = reader.bucket_samplings();
+        let bucket_filter = bucket_samplings.iter().any(Option::is_some);
         let stop = reader.stop_flag();
-        let reader = Arc::new(Mutex::new(reader));
-        let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+        let teacher_count = reader.teacher_count();
+        let reader = Arc::new(Mutex::new((reader, 0u64)));
         let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
             Some(Arc::new(Mutex::new(vec![
                 0u64;
@@ -1702,7 +2389,8 @@ impl BucketedPrefetchedLoader {
             None
         };
 
-        let (result_tx, result_rx) = mpsc::sync_channel::<BatchSlot>(prefetch_depth);
+        let (result_tx, result_rx) =
+            mpsc::sync_channel::<io::Result<(u64, DecodedChunk)>>(prefetch_depth);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
         for _ in 0..n_slots {
             let slot = (
@@ -1718,15 +2406,15 @@ impl BucketedPrefetchedLoader {
         let mut handles = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let reader = Arc::clone(&reader);
-            let err_slot = Arc::clone(&err_slot);
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
             let active_hist = active_hist.clone();
+            let bucket_samplings = bucket_samplings.clone();
             let worker_stop = Arc::clone(&stop);
             let data_path = Arc::clone(&data_path);
             let handle = thread::spawn(move || {
                 // 各 worker 専有の生 record scratch (iteration をまたいで reuse)。
-                let mut scratch: Vec<TeacherRecord> = Vec::with_capacity(batch_size);
+                let mut scratch: Vec<SourcedRecord> = Vec::with_capacity(batch_size);
                 // batch-local な active-feature histogram (計装 on のときだけ確保)。
                 // batch 末に共有 `active_hist` へ一括加算 → 1 position ごとの lock を
                 // 避ける。
@@ -1743,34 +2431,61 @@ impl BucketedPrefetchedLoader {
                         }
                     };
                     batch.reset();
+                    batch.teacher_counts.resize(teacher_count, 0);
                     buckets.clear();
 
                     // 短い critical section: 共有 reader から batch_size 件を
                     // scratch に詰める (I/O のみ、decode はしない)。
+                    let (sequence, mut before, position);
                     {
-                        let mut rdr = reader.lock().expect("reader mutex poisoned");
+                        let mut guard = reader.lock().expect("reader mutex poisoned");
+                        let (rdr, counter) = &mut *guard;
+                        sequence = *counter;
+                        *counter += 1;
                         scratch.clear();
-                        let mut failed: Option<io::Error> = None;
+                        before = if bucket_filter {
+                            rdr.position()
+                        } else {
+                            TeacherPosition::default()
+                        };
+                        let mut failed = rdr.replay_sampling(bucket_mode, num_buckets).err();
                         for _ in 0..batch_size {
+                            if failed.is_some() {
+                                break;
+                            }
                             match rdr.next() {
-                                Ok(record) => scratch.push(record),
+                                Ok(record) => {
+                                    if bucket_filter
+                                        && scratch.is_empty()
+                                        && before.window_index.is_none()
+                                    {
+                                        // The first window exposes its physical cursor after its first read.
+                                        let current = rdr.position();
+                                        if current.window_index.is_some() {
+                                            before = TeacherPosition {
+                                                window_offset: current.window_offset - 1,
+                                                ..current
+                                            };
+                                        }
+                                    }
+                                    scratch.push(record);
+                                }
                                 Err(e) => {
                                     failed = Some(e);
                                     break;
                                 }
                             }
                         }
-                        drop(rdr);
+                        position = rdr.position();
+                        drop(guard);
                         if let Some(e) = failed {
                             if worker_stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            // reader が exhausted: error を slot に置いて worker 終了
-                            // (借りた slot は捨てる; main は next_batch の err_slot 確認で気付く)。
-                            let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
+                            let _ = result_tx.send(Err(io::Error::new(
+                                e.kind(),
+                                format!("decode chunk {sequence}: {e}"),
+                            )));
                             return;
                         }
                     }
@@ -1780,11 +2495,12 @@ impl BucketedPrefetchedLoader {
                     // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
                     let mut failure: Option<io::Error> = None;
-                    for record in &scratch {
+                    let mut sources = Vec::new();
+                    for record in scratch.iter().copied() {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let board = match record.decode() {
+                        let board = match record.record.decode() {
                             Ok(board) => board,
                             Err(e) => {
                                 // 壊れた HCPE record。下の max_active 超過と同じく学習を止める。
@@ -1795,6 +2511,21 @@ impl BucketedPrefetchedLoader {
                                 break;
                             }
                         };
+                        let bucket =
+                            compute_bucket.then(|| bucket_mode.bucket_board(&board, num_buckets));
+                        if let Some(sampling) = &bucket_samplings[record.source()] {
+                            match sampling.finish(
+                                &record.record,
+                                usize::from(bucket.expect("bucket sampling requires buckets")),
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    failure = Some(e);
+                                    break;
+                                }
+                            }
+                        }
                         match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
@@ -1803,27 +2534,29 @@ impl BucketedPrefetchedLoader {
                                 );
                             }
                             Err(e) => {
-                                // max_active 超過: reader error と同じく err_slot に
-                                // 積んで worker 終了。単一 worker error なので channel は
-                                // 閉じないが、next_batch が recv 前の err_slot 確認で検出し
-                                // 明示エラーを返す (借りた slot は捨てる)。
                                 failure = Some(e);
                                 break;
                             }
                         }
-                        if compute_bucket {
-                            buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
+                        if teacher_count != 0 {
+                            batch.teacher_counts[record.source()] += 1;
+                            if bucket_filter {
+                                sources.push(record.source());
+                            }
+                        }
+                        if let Some(bucket) = bucket {
+                            buckets.push(i32::from(bucket));
                         }
                     }
                     if let Some(e) = failure {
-                        let mut slot = err_slot.lock().expect("err_slot mutex poisoned");
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
+                        let _ = result_tx.send(Err(io::Error::new(
+                            e.kind(),
+                            format!("decode chunk {sequence}: {e}"),
+                        )));
                         return;
                     }
-                    debug_assert_eq!(batch.n_positions, batch_size);
-                    debug_assert!(!compute_bucket || buckets.len() == batch_size);
+                    debug_assert!(bucket_filter || batch.n_positions == batch_size);
+                    debug_assert!(!compute_bucket || buckets.len() == batch.n_positions);
 
                     // batch-local histogram を共有 accumulator に flush して 0 に戻す
                     // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
@@ -1840,7 +2573,18 @@ impl BucketedPrefetchedLoader {
                     }
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
-                    if result_tx.send((batch, buckets)).is_err() {
+                    if result_tx
+                        .send(Ok((
+                            sequence,
+                            DecodedChunk {
+                                before,
+                                after: position,
+                                sources,
+                                slot: (batch, buckets),
+                            },
+                        )))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1853,14 +2597,61 @@ impl BucketedPrefetchedLoader {
 
         Self {
             result_rx: Some(result_rx),
+            pending: BTreeMap::new(),
+            assembly: bucket_filter.then(|| BucketAssembly {
+                chunk: None,
+                offset: 0,
+                resume_skip: 0,
+                outputs: Mutex::new(Vec::new()),
+                batch_size,
+                feature_set,
+                teacher_count,
+            }),
+            next_sequence: 0,
+            ordered: true,
+            position: TeacherPosition::default(),
+            sampling_counts: Vec::new(),
+            bucket_samplings,
             pool_tx: Some(pool_tx),
-            err_slot,
             active_hist,
             handles,
             stop,
             #[cfg(test)]
             after_stop: None,
         }
+    }
+
+    /// Cumulative physical reads and survivors, including prefetched records.
+    pub fn sampling_counts(&self) -> (u64, u64) {
+        self.sampling_teacher_counts()
+            .into_iter()
+            .fold((0, 0), |(r, k), (read, kept)| (r + read, k + kept))
+    }
+
+    /// Cumulative physical reads and survivors for each teacher in argument order.
+    pub fn sampling_teacher_counts(&self) -> Vec<(u64, u64)> {
+        self.sampling_counts
+            .iter()
+            .map(|counts| {
+                (
+                    counts.read.load(Ordering::Relaxed),
+                    counts.kept.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// Bucket reads count decoded candidates after reader filters; counts include prefetch.
+    pub fn sampling_bucket_counts(&self) -> Option<Vec<(u64, u64)>> {
+        let first = self.bucket_samplings.first()?.as_ref()?;
+        let mut counts = vec![(0, 0); first.buckets.len()];
+        for sampling in self.bucket_samplings.iter().flatten() {
+            for (total, bucket) in counts.iter_mut().zip(&sampling.buckets) {
+                total.0 += bucket.read.load(Ordering::Relaxed);
+                total.1 += bucket.kept.load(Ordering::Relaxed);
+            }
+        }
+        Some(counts)
     }
 
     /// `--monitor-active-features` の histogram の現時点 snapshot を返す
@@ -1874,6 +2665,36 @@ impl BucketedPrefetchedLoader {
             .map(|h| h.lock().expect("active_hist mutex poisoned").clone())
     }
 
+    fn next_chunk(&mut self) -> io::Result<Option<DecodedChunk>> {
+        loop {
+            if let Some(chunk) = self.pending.remove(&self.next_sequence) {
+                self.next_sequence += 1;
+                return Ok(Some(chunk));
+            }
+            match self
+                .result_rx
+                .as_ref()
+                .expect("result_rx present until Drop")
+                .recv()
+            {
+                Ok(Ok((sequence, chunk))) => {
+                    if !self.ordered {
+                        return Ok(Some(chunk));
+                    }
+                    self.pending.insert(sequence, chunk);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) if !self.pending.is_empty() => {
+                    return Err(io::Error::other(format!(
+                        "decode workers stopped before chunk {}",
+                        self.next_sequence
+                    )));
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
     /// 次の `(Batch, per-position bucket)` を取得。返り値:
     /// - `Ok(Some((batch, buckets)))`: 正常 batch (`batch.n_positions == batch_size`)
     /// - `Err(e)`: worker が reader から io::Error (barren-exhaustion 等) を受けた
@@ -1882,45 +2703,109 @@ impl BucketedPrefetchedLoader {
     ///
     /// 消費後は [`Self::recycle`] で `(batch, buckets)` を返すこと (ring buffer)。
     pub fn next_batch(&mut self) -> io::Result<Option<BatchSlot>> {
-        // 単一 worker でのみ起きる error (max_active 超過等) は、全 worker の exit
-        // = result channel close を待たずに surface する必要がある。生存 worker は
-        // epoch wrap で batch を供給し続け channel が閉じないため、recv 前に
-        // err_slot を確認する (確認漏れ時も channel close 経路が backstop)。
-        if let Some(e) = self
-            .err_slot
+        let Some(mut assembly) = self.assembly.take() else {
+            return self.next_chunk().map(|chunk| {
+                chunk.map(|chunk| {
+                    self.position = chunk.after;
+                    chunk.slot
+                })
+            });
+        };
+        let result = self.assemble_batch(&mut assembly);
+        self.assembly = Some(assembly);
+        result
+    }
+
+    fn assemble_batch(&mut self, assembly: &mut BucketAssembly) -> io::Result<Option<BatchSlot>> {
+        let mut output = assembly
+            .outputs
             .lock()
-            .expect("err_slot mutex poisoned")
-            .take()
-        {
-            return Err(e);
-        }
-        match self
-            .result_rx
-            .as_ref()
-            .expect("result_rx present until Drop")
-            .recv()
-        {
-            Ok(slot) => Ok(Some(slot)),
-            Err(_) => {
-                // 全 worker exit → result channel close。残った error を確認。
-                if let Some(e) = self
-                    .err_slot
-                    .lock()
-                    .expect("err_slot mutex poisoned")
-                    .take()
-                {
-                    Err(e)
-                } else {
-                    Ok(None)
+            .expect("output pool poisoned")
+            .pop()
+            .unwrap_or_else(|| {
+                (
+                    Batch::with_capacity(assembly.batch_size, assembly.feature_set),
+                    Vec::with_capacity(assembly.batch_size),
+                )
+            });
+        output.0.reset();
+        output.0.teacher_counts.resize(assembly.teacher_count, 0);
+        output.1.clear();
+        let mut position = self.position.clone();
+        while output.0.n_positions < assembly.batch_size {
+            if assembly.chunk.is_none() {
+                let Some(chunk) = self.next_chunk()? else {
+                    return Ok(None);
+                };
+                assembly.offset = assembly.resume_skip;
+                assembly.resume_skip = 0;
+                if assembly.offset > chunk.slot.0.n_positions {
+                    return Err(io::Error::other("loader bucket skip exceeds decoded chunk"));
+                }
+                assembly.chunk = Some(chunk);
+            }
+            let chunk = assembly.chunk.as_ref().expect("assembly chunk");
+            let start = assembly.offset;
+            let count =
+                (chunk.slot.0.n_positions - start).min(assembly.batch_size - output.0.n_positions);
+            let dst = output.0.n_positions;
+            let src = &chunk.slot.0;
+            let max_active = src.max_active;
+            output.0.stm_indices[dst * max_active..(dst + count) * max_active].copy_from_slice(
+                &src.stm_indices[start * max_active..(start + count) * max_active],
+            );
+            output.0.nstm_indices[dst * max_active..(dst + count) * max_active].copy_from_slice(
+                &src.nstm_indices[start * max_active..(start + count) * max_active],
+            );
+            output.0.nnz[dst..dst + count].copy_from_slice(&src.nnz[start..start + count]);
+            output.0.score[dst..dst + count].copy_from_slice(&src.score[start..start + count]);
+            output.0.wdl[dst..dst + count].copy_from_slice(&src.wdl[start..start + count]);
+            output.0.per_pos_norm[dst..dst + count]
+                .copy_from_slice(&src.per_pos_norm[start..start + count]);
+            output
+                .1
+                .extend_from_slice(&chunk.slot.1[start..start + count]);
+            if assembly.teacher_count != 0 {
+                for &source in &chunk.sources[start..start + count] {
+                    output.0.teacher_counts[source] += 1;
                 }
             }
+            output.0.n_positions += count;
+            assembly.offset += count;
+            if assembly.offset == src.n_positions {
+                let chunk = assembly.chunk.take().expect("exhausted chunk");
+                position = chunk.after;
+                if let Some(tx) = &self.pool_tx {
+                    let _ = tx.send(chunk.slot);
+                }
+            } else {
+                position = TeacherPosition {
+                    bucket_skip: assembly.offset,
+                    ..chunk.before.clone()
+                };
+            }
         }
+        self.position = position;
+        Ok(Some(output))
+    }
+
+    /// Position after the last batch delivered to the training loop, excluding prefetch.
+    pub fn position(&self) -> &TeacherPosition {
+        &self.position
     }
 
     /// 消費済み `(Batch, buckets)` を pool に返す (worker が再利用する)。
     /// pool channel は ring の全 slot 容量を持つので block しない。worker が
     /// 既に全員終了していたら send は失敗するが無視してよい (loader drop 経路)。
     pub fn recycle(&self, slot: BatchSlot) {
+        if let Some(assembly) = &self.assembly {
+            assembly
+                .outputs
+                .lock()
+                .expect("output pool poisoned")
+                .push(slot);
+            return;
+        }
         if let Some(tx) = self.pool_tx.as_ref() {
             let _ = tx.send(slot);
         }
@@ -2162,8 +3047,8 @@ mod tests {
         assert_eq!(shuffle_window_records(0, 65_536).unwrap(), None);
         let records = shuffle_window_records(4096, 65_536).unwrap().unwrap();
         assert_eq!(records % 65_536, 0);
-        assert!(records * PSV_RECORD_BYTES as usize <= 4096 * MIB_BYTES);
-        assert!((records + 65_536) * PSV_RECORD_BYTES as usize > 4096 * MIB_BYTES);
+        assert!(records * std::mem::size_of::<SourcedRecord>() <= 4096 * MIB_BYTES);
+        assert!((records + 65_536) * std::mem::size_of::<SourcedRecord>() > 4096 * MIB_BYTES);
         assert!(shuffle_window_records(1, 65_536).is_err());
     }
 
@@ -3137,6 +4022,7 @@ mod tests {
             0,
             false,
             0,
+            Default::default(),
         )
         .unwrap();
         let mut inline = BucketedPrefetchedLoader::spawn_with_score_sources(
@@ -3155,6 +4041,7 @@ mod tests {
             0,
             false,
             0,
+            Default::default(),
         )
         .unwrap();
 
@@ -3338,6 +4225,7 @@ mod tests {
             0,
             false,
             0,
+            Default::default(),
         )
         .expect("spawn multi-worker dual-label loader");
         let mut error = None;
@@ -3537,3 +4425,11 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 }
+
+#[cfg(test)]
+#[path = "dataloader_sampling_tests.rs"]
+mod sampling_tests;
+
+#[cfg(test)]
+#[path = "dataloader_mixing_tests.rs"]
+mod mixing_tests;

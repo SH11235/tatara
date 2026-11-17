@@ -41,6 +41,7 @@ fn training_loader_with_source(
         buffer_mib,
         false,
         0,
+        Default::default(),
     )
 }
 

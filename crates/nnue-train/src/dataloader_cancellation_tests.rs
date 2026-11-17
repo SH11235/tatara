@@ -122,7 +122,7 @@ fn drop_during_filtered_scan_joins_workers_without_recording_an_error() {
         };
         let mut loader = spawn_controlled_reader(reader);
         let stop = Arc::clone(&loader.stop);
-        let error_slot = Arc::clone(&loader.err_slot);
+        let result_rx = loader.result_rx.take().unwrap();
         let (stopped_tx, stopped_rx) = mpsc::channel();
         loader.after_stop = Some(Box::new(move || stopped_tx.send(()).unwrap()));
         ready_rx
@@ -144,7 +144,7 @@ fn drop_during_filtered_scan_joins_workers_without_recording_an_error() {
         task.join().unwrap();
         assert_eq!(scanned.load(Ordering::Relaxed), 1);
         assert!(
-            error_slot.lock().unwrap().is_none(),
+            result_rx.try_iter().all(|result| result.is_ok()),
             "worker must not record a cancelled filtered scan as an input failure"
         );
     }
@@ -164,7 +164,6 @@ fn cancellation_after_record_read_does_not_publish_a_batch() {
         loader.next_batch().unwrap().is_none(),
         "cancelled worker must not publish a batch"
     );
-    assert!(loader.err_slot.lock().unwrap().is_none());
 }
 
 #[test]
@@ -195,17 +194,18 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
                 buffer_mib,
                 false,
                 0,
+                Default::default(),
             )
             .unwrap();
             let slot = loader.next_batch().unwrap().expect("first batch");
             assert_eq!(slot.0.n_positions, 2);
             drop(slot);
             let stop = Arc::clone(&loader.stop);
-            let error_slot = Arc::clone(&loader.err_slot);
+            let result_rx = loader.result_rx.take().unwrap();
             drop(loader);
             assert!(stop.load(Ordering::Relaxed));
             assert!(
-                error_slot.lock().unwrap().is_none(),
+                result_rx.try_iter().all(|result| result.is_ok()),
                 "Drop cancellation is not an input failure"
             );
             completed_tx.send(()).unwrap();

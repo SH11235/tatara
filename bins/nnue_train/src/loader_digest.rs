@@ -60,6 +60,7 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
         cli.teacher_shuffle_seed,
+        cli.sampling(),
     )?;
 
     let mut hasher = Sha256::new();

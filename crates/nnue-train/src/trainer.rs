@@ -12,13 +12,14 @@
 //! effective_end = end_superbatch
 //! sb = start_superbatch
 //! while sb <= effective_end:
-//!     poll output_dir/control.json and update effective_end
+//!     poll target_superbatches and update effective_end
 //!     for batch_idx in 0..batches_per_superbatch:
 //!         lr  = lr_scheduler.lr(batch_idx, sb)
 //!         wdl = wdl_scheduler.blend(batch_idx, sb, end_superbatch)
 //!         fill Batch + per-position bucket from the PSV stream
 //!           (EOF → 同 file を開き直す = 次 epoch)
 //!         loss += backend.train_step(batch, buckets, lr, wdl, loss_kind)
+//!     poll pause and update effective_end
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == effective_end:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
@@ -47,10 +48,8 @@
 //!
 //! ## 決定論性
 //!
-//! `cfg.threads >= 2` のとき [`BucketedPrefetchedLoader`] は 1 epoch 内の
-//! position 順序が非決定的になる (loader doc 参照)。lr / wdl は `batch_idx`
-//! 駆動で順序非依存なので training には影響しない。決定論的順序が必要なら
-//! `cfg.threads = 1` を指定する。
+//! Decode は並列でも batch を入力順に渡す。保存する読み位置は最後に学習へ渡した
+//! batch の直後であり、decode worker や shuffle producer の先読み位置を含めない。
 
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, IsTerminal, Write};
@@ -417,6 +416,12 @@ pub enum OutputFormat {
 /// [`LrScheduler`] / [`WdlScheduler`] を渡す。
 #[derive(Clone, Debug)]
 pub struct TrainingConfig {
+    pub control_file: Option<PathBuf>,
+    pub resume_checkpoint: Option<PathBuf>,
+    pub resume_superbatch_override: bool,
+    /// `--resume` で `.loader.json` の読み位置を戻すか、教師の先頭から読み直すか。
+    pub resume_input: crate::loader_state::ResumeInput,
+    pub progress_coeff: Option<PathBuf>,
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
     pub net_id: String,
     /// 入力 feature set spec。dataloader の sparse index 化に使う
@@ -450,6 +455,7 @@ pub struct TrainingConfig {
     pub validation_wdl: Option<f32>,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
+    pub sampling: crate::sampling::Sampling,
     /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
     /// させる (`--score-clamp-abs`)。教師の encode 変種 (clip 上限の違い等) を
     /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
@@ -457,7 +463,11 @@ pub struct TrainingConfig {
     pub score_clamp_abs: Option<i16>,
     /// PSV の base score を差し替える sidecar または record 内 dual-label。
     pub score_source: Option<ScoreSource<PathBuf>>,
-    /// Raw PSV window size in MiB, per window. Two windows are used so the producer can fill
+    /// Independently cycling teachers sampled before window shuffle.
+    pub mix_sources: Vec<crate::dataloader::MixSource>,
+    /// Stateless teacher-selection seed, combined with the output record ordinal.
+    pub mix_seed: u64,
+    /// Teacher window memory in MiB, including record metadata, per window. Two windows are used so the producer can fill
     /// one while decode workers consume the other. `0` restores direct sequential reading.
     pub teacher_shuffle_buffer_mib: usize,
     /// Shuffle records within each raw PSV window. Callers pass the effective value
@@ -538,6 +548,14 @@ impl TrainingConfig {
             ));
         }
         self.loss.validate()?;
+        self.sampling
+            .validate(true, self.compute_bucket, self.num_buckets)?;
+        crate::dataloader::validate_mix_sources(&self.mix_sources)?;
+        if !self.mix_sources.is_empty() && self.score_source.is_some() {
+            return Err(io::Error::other(
+                "teacher mixing cannot be combined with score overrides or dual-label input",
+            ));
+        }
         crate::dataloader::shuffle_window_records(
             self.teacher_shuffle_buffer_mib,
             self.batch_size,
@@ -754,7 +772,7 @@ fn apply_control(
     Some(target)
 }
 
-fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Result<()> {
+fn append_control_history(path: &Path, entry: &impl Serialize) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
     file.write_all(b"\n")
@@ -775,12 +793,13 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> io::Resul
 ///
 /// 各 superbatch の開始時に `cfg.output_dir/control.json` を読み、
 /// `target_superbatches` があれば元の終了点を超えない範囲で実効終了点を更新する。
+/// `cfg.control_file` があればそのパスだけを読む。
+/// 起動後に書き換えた制御ファイルの `pause=true` は superbatch 終了時に保存して停止する。
 /// LR / WDL schedule の horizon は `cfg.end_superbatch` のまま変えない。
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
-/// worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる点に注意
-/// (training では問題ない)。
+/// decode worker 数にかかわらず batch は入力順に学習へ渡す。
 pub fn run<B, L, W, M>(
     backend: &mut B,
     data_paths: &[impl AsRef<Path>],
@@ -839,22 +858,98 @@ where
         None => file_size,
     };
 
-    let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+    let identities = crate::loader_state::LoaderState::identities(data_paths)?;
+    let mix_identities = cfg
+        .mix_sources
+        .iter()
+        .map(|source| crate::loader_state::LoaderState::identities(&[&source.path]))
+        .collect::<io::Result<Vec<_>>>()?;
+    let score_settings = match &cfg.score_source {
+        None => serde_json::Value::Null,
+        Some(ScoreSource::DualLabel(mode)) => {
+            serde_json::json!({"dual_label": mode.canonical_name()})
+        }
+        Some(ScoreSource::Sidecar { scores, mask }) => serde_json::json!({
+            "scores": crate::loader_state::LoaderState::identities(&[scores])?,
+            "mask": mask.as_ref().map(|path| crate::loader_state::LoaderState::identities(&[path])).transpose()?,
+        }),
+    };
+    let settings = serde_json::json!({
+        "train_end_offset": train_end_offset,
+        "record_bytes": record_bytes,
+        "batch_size": cfg.batch_size,
+        "score_drop_abs": cfg.score_drop_abs,
+        "score_clamp_abs": cfg.score_clamp_abs,
+        "score_source": score_settings,
+        "shuffle_buffer_mib": cfg.teacher_shuffle_buffer_mib,
+        "window_records": crate::dataloader::shuffle_window_records(
+            cfg.teacher_shuffle_buffer_mib, cfg.batch_size
+        )?,
+        "shuffle": cfg.teacher_shuffle,
+        "seed": cfg.teacher_shuffle_seed,
+        "sampling": cfg.sampling,
+        "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
+            serde_json::json!({
+                "mode": Into::<BucketMode>::into(*bucket_mode).canonical_name(),
+                "count": cfg.num_buckets,
+                "progress_coeff": cfg.progress_coeff.as_deref()
+                    .map(crate::loader_state::artifact_identity).transpose()?,
+            })
+        } else { serde_json::Value::Null },
+        "mix_rates": cfg.mix_sources.iter().map(|s| s.rate).collect::<Vec<_>>(),
+        "mix_seed": if cfg.mix_sources.is_empty() { 0 } else { cfg.mix_seed },
+    });
+    if cfg.resume_checkpoint.is_some() && cfg.resume_superbatch_override {
+        eprintln!(
+            "[train] warning: --start-superbatch overrides resume; restarting teacher input from the beginning without restoring loader positions"
+        );
+    }
+    let restart_input = cfg.resume_input == crate::loader_state::ResumeInput::Restart;
+    if cfg.resume_checkpoint.is_some() && restart_input && !cfg.resume_superbatch_override {
+        eprintln!(
+            "[train] --resume-input restart: restarting teacher input from the beginning without restoring loader positions"
+        );
+    }
+    let resume_state = cfg
+        .resume_checkpoint
+        .as_deref()
+        .filter(|_| !cfg.resume_superbatch_override && !restart_input)
+        .map(crate::loader_state::LoaderState::load)
+        .transpose()?
+        .flatten();
+    let resume_position = resume_state
+        .as_ref()
+        .map(|state| {
+            state.validate_mixed(
+                &identities,
+                &mix_identities,
+                &settings,
+                cfg.start_superbatch - 1,
+            )
+        })
+        .transpose()?;
+    let mut loader = BucketedPrefetchedLoader::spawn_mixed_resumable(
         data_paths,
-        cfg.batch_size,
-        cfg.score_drop_abs,
-        cfg.score_clamp_abs,
-        cfg.threads,
-        (*bucket_mode).into(),
-        cfg.feature_set,
-        cfg.compute_bucket,
-        cfg.num_buckets,
-        train_end_offset,
-        cfg.monitor_active_features,
-        cfg.score_source.as_ref().map(ScoreSource::as_deref),
-        cfg.teacher_shuffle_buffer_mib,
-        cfg.teacher_shuffle,
-        cfg.teacher_shuffle_seed,
+        crate::dataloader::BucketedLoaderOptions {
+            sampling: cfg.sampling.clone(),
+            batch_size: cfg.batch_size,
+            score_drop_abs: cfg.score_drop_abs,
+            score_clamp_abs: cfg.score_clamp_abs,
+            num_workers: cfg.threads,
+            bucket_mode: (*bucket_mode).into(),
+            feature_set: cfg.feature_set,
+            compute_bucket: cfg.compute_bucket,
+            num_buckets: cfg.num_buckets,
+            train_end_offset,
+            monitor_active: cfg.monitor_active_features,
+            score_source: cfg.score_source.as_ref().map(ScoreSource::as_deref),
+            teacher_shuffle_buffer_mib: cfg.teacher_shuffle_buffer_mib,
+            teacher_shuffle: cfg.teacher_shuffle,
+            teacher_shuffle_seed: cfg.teacher_shuffle_seed,
+        },
+        &cfg.mix_sources,
+        cfg.mix_seed,
+        resume_position,
     )?;
 
     let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
@@ -975,7 +1070,19 @@ where
     let mut prev_fp16_clamp_count: u64 = 0;
     let mut prev_fp16_clamp_elems: u64 = 0;
 
-    let control_path = cfg.output_dir.join("control.json");
+    let control_path = cfg
+        .control_file
+        .clone()
+        .unwrap_or_else(|| cfg.output_dir.join("control.json"));
+    println!("[control] file: {}", control_path.display());
+    let mut live_control = LiveControl::default();
+    live_control.poll(&control_path);
+    if live_control.value.pause {
+        eprintln!(
+            "[control] warning: ignoring startup pause=true; rewrite the control file with pause=true to pause training"
+        );
+    }
+    live_control.pause_requested = false;
     let control_history_path = cfg.output_dir.join("control_history.jsonl");
     let mut control = ControlState {
         effective_target: cfg.end_superbatch,
@@ -995,10 +1102,15 @@ where
             log.set_target_superbatches(target);
             write_experiment_log(log);
         }
-
+        let mut effective_target = control.effective_target;
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
+        let mut teacher_counts = if cfg.mix_sources.is_empty() {
+            Vec::new()
+        } else {
+            vec![0u64; cfg.mix_sources.len() + 1]
+        };
         let mut sb_printed_progress = false;
 
         for batch_idx in 0..cfg.batches_per_superbatch {
@@ -1011,6 +1123,9 @@ where
                 )
             })?;
             let n_pos = batch.n_positions;
+            for (total, count) in teacher_counts.iter_mut().zip(&batch.teacher_counts) {
+                *total += count;
+            }
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
             // 直前 batch を recycle: その H2D は今 `train_step` 呼出内の event sync で
@@ -1054,7 +1169,7 @@ where
                     "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
                     progress_terminator,
                     sb,
-                    control.effective_target,
+                    effective_target,
                     pct,
                     done,
                     cfg.batches_per_superbatch,
@@ -1097,9 +1212,32 @@ where
                 run_start.elapsed().as_secs_f64(),
             ));
         }
+        live_control.poll(&control_path);
+        if live_control.pause_requested && sb >= effective_target {
+            println!("[control] ignoring pause request because training has completed");
+            live_control.pause_requested = false;
+        }
+        if live_control.pause_requested {
+            effective_target = sb;
+            let entry = serde_json::json!({
+                "type": "control",
+                "timestamp": format_utc_iso(now_epoch_secs()),
+                "superbatch": sb,
+                "pause": true,
+            });
+            if let Err(e) = append_control_history(&control_history_path, &entry) {
+                eprintln!(
+                    "[control] warning: failed to append {}: {e}; training will continue",
+                    control_history_path.display()
+                );
+            }
+            if let Some(log) = experiment.as_mut() {
+                log.record_control(sb, None, true);
+            }
+        }
+
         let pos_per_sec = sb_positions as f64 / sb_secs;
-        let remaining_positions =
-            positions_per_sb.saturating_mul((control.effective_target - sb) as u64);
+        let remaining_positions = positions_per_sb.saturating_mul((effective_target - sb) as u64);
         let eta_secs = if pos_per_sec > 0.0 {
             remaining_positions as f64 / pos_per_sec
         } else {
@@ -1143,7 +1281,7 @@ where
         println!(
             "[train] superbatch {}/{} | loss {:.6} | {:.0} pos/s | lr {:.4e} | wdl {:.3} | sb {:.1}s | ETA {}{}",
             sb,
-            control.effective_target,
+            effective_target,
             mean_loss,
             pos_per_sec,
             lr_now,
@@ -1152,6 +1290,23 @@ where
             format_hms(eta_secs),
             val_str,
         );
+
+        for (source, count) in teacher_counts.iter().enumerate() {
+            let name = if source == 0 {
+                "main".to_string()
+            } else {
+                cfg.mix_sources[source - 1]
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            println!(
+                "[teacher-mix] sb={sb} source={source} name={name:?} positions={count} fraction={:.8}",
+                *count as f64 / sb_positions as f64
+            );
+        }
 
         if cfg.monitor_fp16_clamps {
             // dft FP16 書き込みで `±65504` cap が当たった要素数 (累積) と処理要素数
@@ -1174,6 +1329,23 @@ where
             );
         }
 
+        if cfg.sampling.log_enabled || !cfg.sampling.is_default() {
+            for (teacher, (read, kept)) in loader.sampling_teacher_counts().into_iter().enumerate()
+            {
+                eprintln!(
+                    "[sampling] sb={sb} teacher={teacher} read={read} kept={kept} (includes prefetch)"
+                );
+            }
+            let (read, kept) = loader.sampling_counts();
+            eprintln!("[sampling] sb={sb} cumulative read={read} kept={kept} (includes prefetch)");
+            if let Some(counts) = loader.sampling_bucket_counts() {
+                for (bucket, (read, kept)) in counts.into_iter().enumerate() {
+                    eprintln!(
+                        "[sampling] sb={sb} bucket={bucket} read={read} kept={kept} (after reader filters, includes prefetch)"
+                    );
+                }
+            }
+        }
         if cfg.monitor_active_features
             && let Some(hist) = loader.active_histogram_snapshot()
             && let Some(stats) = ActiveHistStats::from_histogram(&hist)
@@ -1187,8 +1359,9 @@ where
             );
         }
 
-        let saved = sb.is_multiple_of(cfg.save_rate) || sb == control.effective_target;
+        let saved = sb.is_multiple_of(cfg.save_rate) || sb == effective_target;
         if saved {
+            std::fs::create_dir_all(&cfg.output_dir)?;
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
             println!("[train] checkpoint saved: {}", path.display());
@@ -1208,6 +1381,29 @@ where
                     .map(ExperimentLogger::recipe_fingerprint),
             };
             backend.save_resume_checkpoint(&raw_path, sb, &producer, lr_scheduler.horizon())?;
+            let mut teachers = vec![crate::loader_state::TeacherState {
+                id: "primary".into(),
+                files: identities.clone(),
+                position: loader.position().clone(),
+            }];
+            for (i, (files, position)) in mix_identities
+                .iter()
+                .zip(&loader.position().mixes)
+                .enumerate()
+            {
+                teachers.push(crate::loader_state::TeacherState {
+                    id: format!("mix-{}", i + 1),
+                    files: files.clone(),
+                    position: position.clone(),
+                });
+            }
+            crate::loader_state::LoaderState {
+                version: 1,
+                superbatch: sb,
+                teachers,
+                settings: settings.clone(),
+            }
+            .save(&raw_path)?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
 
             if let Some(keep) = cfg.keep_raw_checkpoints {
@@ -1234,7 +1430,7 @@ where
             write_experiment_log(log);
         }
 
-        if sb == control.effective_target {
+        if sb == effective_target {
             break;
         }
         sb += 1;
@@ -1265,10 +1461,74 @@ where
     );
 
     if let Some(log) = experiment.as_mut() {
-        log.mark_finished(run_start.elapsed().as_secs_f64());
+        log.record_stop(sb, live_control.pause_requested);
+        if live_control.pause_requested {
+            log.mark_interrupted();
+        } else {
+            log.mark_finished(run_start.elapsed().as_secs_f64());
+        }
         write_experiment_log(log);
     }
+    if live_control.pause_requested {
+        return Err(io::Error::other(TrainingPaused));
+    }
     Ok(())
+}
+
+/// Successful pause after a durable superbatch checkpoint.
+#[derive(Debug)]
+pub struct TrainingPaused;
+impl std::fmt::Display for TrainingPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("training paused at superbatch boundary (exit code 75)")
+    }
+}
+impl std::error::Error for TrainingPaused {}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveControlFile {
+    #[serde(default)]
+    pause: bool,
+}
+
+#[derive(Default)]
+struct LiveControl {
+    value: LiveControlFile,
+    pause_requested: bool,
+    warned: bool,
+    revision: Option<(Option<std::time::SystemTime>, Vec<u8>)>,
+}
+impl LiveControl {
+    fn poll(&mut self, path: &Path) -> bool {
+        let parsed = std::fs::read(path).and_then(|bytes| {
+            let value =
+                serde_json::from_slice::<LiveControlFile>(&bytes).map_err(io::Error::other)?;
+            let modified = std::fs::metadata(path)?.modified().ok();
+            Ok((value, (modified, bytes)))
+        });
+        match parsed {
+            Ok((value, revision)) => {
+                if self.revision.as_ref() == Some(&revision) {
+                    return false;
+                }
+                self.pause_requested |= value.pause;
+                self.revision = Some(revision);
+                self.value = value;
+                true
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => false,
+            Err(e) => {
+                if !self.warned {
+                    eprintln!(
+                        "[control] warning: {}: {e}; keeping previous values",
+                        path.display()
+                    );
+                    self.warned = true;
+                }
+                false
+            }
+        }
+    }
 }
 
 fn record_training_failure(
@@ -1343,10 +1603,21 @@ fn prune_old_raw_checkpoints(output_dir: &Path, net_id: &str, keep: usize) {
     found.sort_by_key(|(sb, _)| std::cmp::Reverse(*sb));
     for (sb, path) in found.into_iter().skip(keep) {
         match std::fs::remove_file(&path) {
-            Ok(()) => println!(
-                "[train] pruned old raw checkpoint: {} (sb {sb})",
-                path.display()
-            ),
+            Ok(()) => {
+                let sidecar = path.with_extension("loader.json");
+                if let Err(e) = std::fs::remove_file(&sidecar)
+                    && e.kind() != ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "[train] warning: failed to prune {}: {e}",
+                        sidecar.display()
+                    );
+                }
+                println!(
+                    "[train] pruned old raw checkpoint: {} (sb {sb})",
+                    path.display()
+                );
+            }
             Err(e) => eprintln!(
                 "[train] warning: failed to prune {} (sb {sb}): {e}",
                 path.display()
@@ -1402,7 +1673,11 @@ mod tests {
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
         seen_wdl: Vec<f32>,
+        seen_scores: Vec<f32>,
+        seen_features: Vec<Vec<i32>>,
         write_checkpoints: bool,
+        bucketless: bool,
+        control_updates: Vec<(usize, PathBuf, String)>,
         /// `validate_step` の呼び出し回数 (held-out validation の検証用)。
         validate_steps: usize,
         /// `read_fp16_clamp_count` の呼び出し回数。`--monitor-fp16-clamps` が
@@ -1429,7 +1704,11 @@ mod tests {
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
                 seen_wdl: Vec::new(),
+                seen_scores: Vec::new(),
+                seen_features: Vec::new(),
                 write_checkpoints: false,
+                bucketless: false,
+                control_updates: vec![],
                 validate_steps: 0,
                 clamp_reads: 0,
                 clamp_count_sim: 0,
@@ -1454,8 +1733,12 @@ mod tests {
         ) -> io::Result<f64> {
             assert_eq!(
                 bucket_idx.len(),
-                batch.n_positions,
-                "one bucket per position"
+                if self.bucketless {
+                    0
+                } else {
+                    batch.n_positions
+                },
+                "one bucket per position in bucketed training"
             );
             assert!(batch.n_positions <= batch.batch_size);
             assert!(lr > 0.0, "lr should be positive");
@@ -1469,8 +1752,22 @@ mod tests {
                 "bucket in 0..9: {bucket_idx:?}"
             );
             self.steps += 1;
+            for (step, path, text) in &self.control_updates {
+                if *step == self.steps {
+                    std::fs::write(path, text)?;
+                }
+            }
             self.last_buckets = bucket_idx.to_vec();
             self.max_batch_positions = self.max_batch_positions.max(batch.n_positions);
+            self.seen_scores
+                .extend_from_slice(&batch.score[..batch.n_positions]);
+            for i in 0..batch.n_positions {
+                let start = i * batch.max_active;
+                let end = start + batch.nnz[i] as usize;
+                let mut features = batch.stm_indices[start..end].to_vec();
+                features.extend_from_slice(&batch.nstm_indices[start..end]);
+                self.seen_features.push(features);
+            }
             self.seen_lr.push(lr);
             self.seen_wdl.push(wdl_lambda);
             self.clamp_count_sim += 7;
@@ -1498,8 +1795,12 @@ mod tests {
         ) -> io::Result<ValidationStepOutput> {
             assert_eq!(
                 bucket_idx.len(),
-                batch.n_positions,
-                "one bucket per position"
+                if self.bucketless {
+                    0
+                } else {
+                    batch.n_positions
+                },
+                "one bucket per position in bucketed training"
             );
             assert!(wdl_lambda.is_finite());
             assert!(
@@ -1552,6 +1853,11 @@ mod tests {
 
     fn base_cfg() -> TrainingConfig {
         TrainingConfig {
+            control_file: None,
+            resume_checkpoint: None,
+            resume_superbatch_override: false,
+            resume_input: Default::default(),
+            progress_coeff: None,
             net_id: "test".to_string(),
             feature_set: shogi_features::FeatureSet::HalfKaHmMerged.spec(),
             output_dir: unique_output_path("unused"),
@@ -1566,8 +1872,11 @@ mod tests {
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             validation_wdl: None,
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
             score_source: None,
+            mix_sources: Vec::new(),
+            mix_seed: 0,
             teacher_shuffle_buffer_mib: 0,
             teacher_shuffle: false,
             teacher_shuffle_seed: 0,
@@ -1892,7 +2201,10 @@ mod tests {
             wrm_weight_boost_w1: None,
             wrm_weight_boost_w2: None,
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
+            mix_data: Vec::new(),
+            mix_seed: None,
             score_override: None,
             score_override_mask: None,
             dual_label_psv: None,
@@ -2784,6 +3096,7 @@ mod tests {
         // 既存 .ckpt と .bin を散らかしておく (`.bin` は prune 対象外であることを確認)。
         for sb in 1..=4usize {
             std::fs::write(dir.join(format!("net-{sb}.ckpt")), b"x").unwrap();
+            std::fs::write(dir.join(format!("net-{sb}.loader.json")), b"{}").unwrap();
             std::fs::write(dir.join(format!("net-{sb}.bin")), b"x").unwrap();
         }
         // 別 net_id の .ckpt は触られないこと。
@@ -2804,6 +3117,9 @@ mod tests {
         );
         assert!(dir.join("net-3.ckpt").exists(), "net-3.ckpt should be kept");
         assert!(dir.join("net-4.ckpt").exists(), "net-4.ckpt should be kept");
+        for sb in 1..=4usize {
+            assert_eq!(dir.join(format!("net-{sb}.loader.json")).exists(), sb >= 3);
+        }
         // .bin は全部残る。
         for sb in 1..=4usize {
             assert!(
@@ -3215,6 +3531,425 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn pause_resume_matches_uninterrupted_teacher_sequence() {
+        assert_pause_resume_sequence(false);
+    }
+
+    #[test]
+    fn pause_resume_sampling_mixing_and_window_shuffle_matches_continuation() {
+        assert_pause_resume_sequence(true);
+    }
+
+    fn assert_pause_resume_sequence(combined: bool) {
+        for threads in [1, 4] {
+            for (buffer, shuffle) in [(0, false), (1, true)] {
+                for data in [sample_psv_path(), sample_hcpe_path()] {
+                    let output = tempfile::tempdir().unwrap();
+                    let paths = if threads == 4 {
+                        vec![data.clone(), data.clone()]
+                    } else {
+                        vec![data.clone()]
+                    };
+                    let cfg = TrainingConfig {
+                        output_dir: output.path().to_path_buf(),
+                        batch_size: 17,
+                        batches_per_superbatch: 7,
+                        end_superbatch: 5,
+                        teacher_shuffle_buffer_mib: buffer,
+                        teacher_shuffle: shuffle,
+                        teacher_shuffle_seed: 91,
+                        mix_sources: if combined {
+                            vec![
+                                crate::dataloader::MixSource {
+                                    path: data.clone(),
+                                    rate: 0.2,
+                                },
+                                crate::dataloader::MixSource {
+                                    path: data.clone(),
+                                    rate: 0.3,
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        },
+                        mix_seed: 73,
+                        sampling: if combined {
+                            crate::sampling::Sampling {
+                                keep_rate: 0.8,
+                                bucket_keep_rates: (data.extension().unwrap() == "psv")
+                                    .then(|| vec![0.6; 9]),
+                                skip_seed: 17,
+                                ..Default::default()
+                            }
+                        } else {
+                            Default::default()
+                        },
+                        score_drop_abs: if shuffle { Some(400) } else { None },
+                        score_clamp_abs: if shuffle { Some(100) } else { None },
+                        compute_bucket: data.extension().unwrap() == "psv",
+                        threads,
+                        ..base_cfg()
+                    };
+                    let lr = StepLR {
+                        start: 0.001,
+                        gamma: 0.9,
+                        step: 1,
+                    };
+                    let wdl = ConstantWDL { value: 0.0 };
+                    let mut baseline = MockBackend::new();
+                    baseline.bucketless = !cfg.compute_bucket;
+                    run(
+                        &mut baseline,
+                        &paths,
+                        &ShogiProgressKPAbs,
+                        &lr,
+                        &wdl,
+                        &cfg,
+                        None,
+                    )
+                    .unwrap();
+                    let control = output.path().join("live.json");
+                    std::fs::write(&control, "{}").unwrap();
+                    let paused_cfg = TrainingConfig {
+                        control_file: Some(control.clone()),
+                        ..cfg.clone()
+                    };
+                    let mut paused = MockBackend::new().with_file_writes();
+                    paused.control_updates = vec![(
+                        cfg.batches_per_superbatch,
+                        control.clone(),
+                        r#"{"pause":true}"#.into(),
+                    )];
+                    paused.bucketless = !cfg.compute_bucket;
+                    let result = run(
+                        &mut paused,
+                        &paths,
+                        &ShogiProgressKPAbs,
+                        &lr,
+                        &wdl,
+                        &paused_cfg,
+                        None,
+                    );
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .get_ref()
+                            .unwrap()
+                            .is::<TrainingPaused>()
+                    );
+                    let checkpoint = output.path().join("test-1.ckpt");
+                    let state = crate::loader_state::LoaderState::load(&checkpoint)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(state.version, 1);
+                    assert_eq!(state.superbatch, 1);
+                    assert_eq!(
+                        state.settings["window_records"],
+                        serde_json::json!(
+                            crate::dataloader::shuffle_window_records(buffer, cfg.batch_size)
+                                .unwrap()
+                        )
+                    );
+                    assert_eq!(state.teachers.len(), if combined { 3 } else { 1 });
+                    if combined {
+                        assert!(
+                            state.teachers[0].position.ordinal > 0
+                                || state.teachers[0].position.window_offset > 0
+                        );
+                        assert_eq!(state.teachers[0].position.mixes.len(), 2);
+                    }
+                    std::fs::write(&control, "{}").unwrap();
+                    let resumed_cfg = TrainingConfig {
+                        start_superbatch: 2,
+                        resume_checkpoint: Some(checkpoint),
+                        ..paused_cfg
+                    };
+                    if buffer > 0 {
+                        let mut mismatched = state.clone();
+                        mismatched.settings["window_records"] = serde_json::json!(
+                            state.settings["window_records"].as_u64().unwrap() + 1
+                        );
+                        mismatched
+                            .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
+                            .unwrap();
+                        let error = run(
+                            &mut MockBackend::new(),
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &resumed_cfg,
+                            None,
+                        )
+                        .unwrap_err();
+                        assert!(error.to_string().contains("loader state does not match"));
+                        assert!(error.to_string().contains("--resume-input restart"));
+                        let restart_cfg = TrainingConfig {
+                            resume_input: crate::loader_state::ResumeInput::Restart,
+                            output_dir: resumed_cfg.output_dir.join("restart"),
+                            ..resumed_cfg.clone()
+                        };
+                        let mut restarted = MockBackend::new();
+                        restarted.bucketless = !cfg.compute_bucket;
+                        run(
+                            &mut restarted,
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &restart_cfg,
+                            None,
+                        )
+                        .unwrap();
+                        state
+                            .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
+                            .unwrap();
+                    }
+                    let mut resumed = MockBackend::new();
+                    resumed.bucketless = !cfg.compute_bucket;
+                    run(
+                        &mut resumed,
+                        &paths,
+                        &ShogiProgressKPAbs,
+                        &lr,
+                        &wdl,
+                        &resumed_cfg,
+                        None,
+                    )
+                    .unwrap();
+                    paused.seen_features.extend(resumed.seen_features);
+                    assert_eq!(paused.seen_features, baseline.seen_features);
+                    paused.seen_scores.extend(resumed.seen_scores);
+                    assert_eq!(
+                        paused.seen_scores, baseline.seen_scores,
+                        "threads={threads} window={buffer} data={data:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rewritten_true_pause_is_detected_even_if_false_was_not_polled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.json");
+        std::fs::write(&path, r#"{"pause":true}"#).unwrap();
+        let mut control = LiveControl::default();
+        control.poll(&path);
+        control.pause_requested = false;
+        let initial = control.revision.as_ref().unwrap().0.unwrap();
+        std::fs::write(&path, r#"{"pause":false}"#).unwrap();
+        std::fs::write(&path, r#"{"pause":true}"#).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(initial + std::time::Duration::from_secs(1))
+            .unwrap();
+        control.poll(&path);
+        assert!(control.pause_requested);
+    }
+
+    #[test]
+    fn final_superbatch_pause_completes_experiment_normally() {
+        let output = tempfile::tempdir().unwrap();
+        let path = output.path().join("control.json");
+        let experiment_path = output.path().join("experiment.json");
+        let mut logger = experiment_logger(experiment_path.clone(), "final-pause");
+        let cfg = TrainingConfig {
+            output_dir: output.path().to_path_buf(),
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new().with_file_writes();
+        backend.control_updates = vec![(
+            cfg.end_superbatch * cfg.batches_per_superbatch,
+            path,
+            r#"{"pause":true}"#.into(),
+        )];
+        run(
+            &mut backend,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &StepLR {
+                start: 0.001,
+                gamma: 0.9,
+                step: 1,
+            },
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            Some(&mut logger),
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(experiment_path).unwrap()).unwrap();
+        assert_eq!(doc["status"], "completed");
+        assert_eq!(doc["results"]["interrupted"], false);
+        assert_eq!(doc["stopped"]["paused"], false);
+    }
+
+    #[test]
+    fn explicit_resume_superbatch_restarts_input_without_loading_sidecar() {
+        let output = tempfile::tempdir().unwrap();
+        let checkpoint = output.path().join("test-1.ckpt");
+        std::fs::write(checkpoint.with_extension("loader.json"), b"invalid").unwrap();
+        let cfg = TrainingConfig {
+            output_dir: output.path().to_path_buf(),
+            resume_checkpoint: Some(checkpoint),
+            resume_superbatch_override: true,
+            start_superbatch: 2,
+            end_superbatch: 2,
+            ..base_cfg()
+        };
+        let mut backend = MockBackend::new().with_file_writes();
+        run(
+            &mut backend,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &StepLR {
+                start: 0.001,
+                gamma: 0.9,
+                step: 1,
+            },
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            None,
+        )
+        .unwrap();
+        assert_eq!(backend.steps, cfg.batches_per_superbatch);
+    }
+
+    #[test]
+    fn explicit_control_file_overrides_default() {
+        for explicit in [None, Some(r#"{"target_superbatches":2}"#)] {
+            let output = tempfile::tempdir().unwrap();
+            std::fs::write(
+                output.path().join("control.json"),
+                r#"{"target_superbatches":1,"pause":true}"#,
+            )
+            .unwrap();
+            let path = output.path().join("override.json");
+            if let Some(text) = explicit {
+                std::fs::write(&path, text).unwrap();
+            }
+            let cfg = TrainingConfig {
+                output_dir: output.path().to_path_buf(),
+                control_file: Some(path),
+                ..base_cfg()
+            };
+            let mut backend = MockBackend::new().with_file_writes();
+            run(
+                &mut backend,
+                &[sample_psv_path()],
+                &ShogiProgressKPAbs,
+                &StepLR {
+                    start: 0.001,
+                    gamma: 0.9,
+                    step: 1,
+                },
+                &ConstantWDL { value: 0.0 },
+                &cfg,
+                None,
+            )
+            .unwrap();
+            let end = if explicit.is_some() {
+                2
+            } else {
+                cfg.end_superbatch
+            };
+            assert_eq!(backend.steps, end * cfg.batches_per_superbatch);
+        }
+    }
+
+    #[test]
+    fn default_control_pause_requires_a_rewrite_after_startup() {
+        for (initial, updates, paused_at) in [
+            (None, vec![], None),
+            (Some(r#"{"pause":true}"#), vec![], None),
+            (Some("{}"), vec![(1, r#"{"pause":true}"#)], Some(1)),
+            (
+                Some(r#"{"pause":true}"#),
+                vec![(1, r#"{ "pause": true }"#)],
+                Some(1),
+            ),
+            (Some("{}"), vec![(3, r#"{"pause":true}"#)], None),
+            (
+                Some(r#"{"pause":false}"#),
+                vec![(1, r#"{"pause":true}"#)],
+                Some(1),
+            ),
+            (
+                Some(r#"{"pause":true}"#),
+                vec![(1, r#"{"pause":false}"#), (2, r#"{"pause":true}"#)],
+                Some(2),
+            ),
+        ] {
+            let output = tempfile::tempdir().unwrap();
+            let path = output.path().join("control.json");
+            if let Some(text) = initial {
+                std::fs::write(&path, text).unwrap();
+            }
+            let cfg = TrainingConfig {
+                output_dir: output.path().to_path_buf(),
+                save_rate: 10,
+                ..base_cfg()
+            };
+            let mut backend = MockBackend::new().with_file_writes();
+            let final_text = updates.last().map(|(_, text)| *text).or(initial);
+            backend.control_updates = updates
+                .into_iter()
+                .map(|(sb, text)| (sb * cfg.batches_per_superbatch, path.clone(), text.into()))
+                .collect();
+            let result = run(
+                &mut backend,
+                &[sample_psv_path()],
+                &ShogiProgressKPAbs,
+                &StepLR {
+                    start: 0.001,
+                    gamma: 0.9,
+                    step: 1,
+                },
+                &ConstantWDL { value: 0.0 },
+                &cfg,
+                None,
+            );
+            if paused_at.is_some() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .get_ref()
+                        .unwrap()
+                        .is::<TrainingPaused>()
+                );
+            } else {
+                result.unwrap();
+            }
+            let history = output.path().join("control_history.jsonl");
+            if let Some(sb) = paused_at {
+                let text = std::fs::read_to_string(history).unwrap();
+                let entries: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["pause"], true);
+                assert_eq!(entries[0]["superbatch"], sb);
+            } else {
+                assert!(!history.exists());
+            }
+            let end = paused_at.unwrap_or(cfg.end_superbatch);
+            assert_eq!(backend.steps, end * cfg.batches_per_superbatch);
+            assert!(output.path().join(format!("test-{end}.ckpt")).exists());
+            assert!(
+                output
+                    .path()
+                    .join(format!("test-{end}.loader.json"))
+                    .exists()
+            );
+            assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), final_text);
+        }
     }
 
     #[test]

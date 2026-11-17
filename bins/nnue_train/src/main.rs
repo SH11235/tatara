@@ -132,8 +132,16 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::ExitCode::from(1)
+            let paused = e
+                .downcast_ref::<std::io::Error>()
+                .and_then(|e| e.get_ref())
+                .is_some_and(|e| e.is::<nnue_train::trainer::TrainingPaused>());
+            if paused {
+                eprintln!("[train] {e}");
+            } else {
+                eprintln!("error: {e}");
+            }
+            std::process::ExitCode::from(if paused { 75 } else { 1 })
         }
     }
 }
