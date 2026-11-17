@@ -54,6 +54,7 @@ fn shuffled_loader_contents(
         buffer_mib,
         shuffle_seed.is_some(),
         shuffle_seed.unwrap_or(0),
+        Default::default(),
     )
     .unwrap();
     let mut out = Vec::new();

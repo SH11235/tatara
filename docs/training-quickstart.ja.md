@@ -120,6 +120,36 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
 | `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
 
+### 学習局面の間引き
+
+間引きは明示指定時だけ学習データに適用します。`--test-data` と
+`--test-tail-positions` の検証局面には適用しません。既定では元の局面列を維持します。
+
+| オプション | 既定 | 意味 |
+|------------|------|------|
+| `--keep-rate R` | 1 | 採る確率。有限値で `0 < R <= 1` |
+| `--min-ply N` | なし | PSV の `game_ply <= N` を捨てる。HCPE では指定不可 |
+| `--ply-keep-curve POINTS` | なし | `手数:確率` をカンマで区切る。手数は非負・昇順、確率は `[0,1]`。HCPE では指定不可 |
+| `--bucket-keep-rates r0,r1,...` | なし | LayerStack の bucket 順に `[0,1]` の確率を指定。個数は bucket 数と一致させる。simple arch では指定不可 |
+| `--skip-seed N` | 0 | 状態を持たない採否判定の固定 seed |
+
+例: `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
+"0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1"`。
+折れ線の点の間は直線補間し、端の外側は端の確率を使います。
+各確率を掛け合わせ、score のフィルタも通った局面だけを使います。
+採否は seed・教師 ID・0 始まりの epoch・物理 record 番号のハッシュで決めます。
+複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱います。
+shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません
+（batch の到着順は変わることがあります）。
+bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤面を使います。
+捨てた分は次の record で補い、batch の件数を保ちます。
+5 周連続で採用がゼロなら error になります。
+間引きのオプションを一つでも指定したときだけ、各 superbatch に累積 `read` / `kept` を出します。
+bucket 指定時は bucket ごとの読んだ数（reader のフィルタ通過後）と採った数も出します。
+先読み済みの局面も含みます。設定は `experiment.json` の `params.sampling` に保存し、
+recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）の場合だけ省略し、
+既存の recipe fingerprint を維持します。
+
 ### 教師データの先読みとshuffle
 
 既定 (`--teacher-shuffle-buffer-mib 0`) は窓を使わない直接逐次読みで、教師はディスク上で

@@ -450,6 +450,7 @@ pub struct TrainingConfig {
     pub validation_wdl: Option<f32>,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
+    pub sampling: crate::sampling::Sampling,
     /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
     /// させる (`--score-clamp-abs`)。教師の encode 変種 (clip 上限の違い等) を
     /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
@@ -538,6 +539,8 @@ impl TrainingConfig {
             ));
         }
         self.loss.validate()?;
+        self.sampling
+            .validate(true, self.compute_bucket, self.num_buckets)?;
         crate::dataloader::shuffle_window_records(
             self.teacher_shuffle_buffer_mib,
             self.batch_size,
@@ -855,6 +858,7 @@ where
         cfg.teacher_shuffle_buffer_mib,
         cfg.teacher_shuffle,
         cfg.teacher_shuffle_seed,
+        cfg.sampling.clone(),
     )?;
 
     let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
@@ -1174,6 +1178,17 @@ where
             );
         }
 
+        if cfg.sampling.log_enabled || !cfg.sampling.is_default() {
+            let (read, kept) = loader.sampling_counts();
+            eprintln!("[sampling] sb={sb} cumulative read={read} kept={kept} (includes prefetch)");
+            if let Some(counts) = loader.sampling_bucket_counts() {
+                for (bucket, (read, kept)) in counts.into_iter().enumerate() {
+                    eprintln!(
+                        "[sampling] sb={sb} bucket={bucket} read={read} kept={kept} (after reader filters, includes prefetch)"
+                    );
+                }
+            }
+        }
         if cfg.monitor_active_features
             && let Some(hist) = loader.active_histogram_snapshot()
             && let Some(stats) = ActiveHistStats::from_histogram(&hist)
@@ -1566,6 +1581,7 @@ mod tests {
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             validation_wdl: None,
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
             score_source: None,
             teacher_shuffle_buffer_mib: 0,
@@ -1892,6 +1908,7 @@ mod tests {
             wrm_weight_boost_w1: None,
             wrm_weight_boost_w2: None,
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
             score_override: None,
             score_override_mask: None,

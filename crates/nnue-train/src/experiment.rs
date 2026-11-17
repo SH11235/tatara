@@ -275,6 +275,8 @@ pub struct Params {
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
+    #[serde(default, skip_serializing_if = "crate::sampling::Sampling::is_default")]
+    pub sampling: crate::sampling::Sampling,
     /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i32>,
@@ -749,6 +751,39 @@ mod tests {
     }
 
     #[test]
+    fn sampling_options_change_recipe_fingerprint() {
+        let base = sample_params();
+        let original = recipe_fingerprint(&base, "teacher.psv");
+        let variants = [
+            crate::sampling::Sampling {
+                keep_rate: 0.25,
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                min_ply: Some(18),
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                ply_keep_curve: vec![(0.0, 0.5)],
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                bucket_keep_rates: Some(vec![1.0; 9]),
+                ..Default::default()
+            },
+            crate::sampling::Sampling {
+                skip_seed: 42,
+                ..Default::default()
+            },
+        ];
+        for sampling in variants {
+            let mut params = base.clone();
+            params.sampling = sampling;
+            assert_ne!(recipe_fingerprint(&params, "teacher.psv"), original);
+        }
+    }
+
+    #[test]
     fn recipe_fingerprint_ignores_resume_and_environment_settings() {
         let base = sample_params();
         let fingerprint = recipe_fingerprint(&base, "teacher.psv");
@@ -881,6 +916,7 @@ mod tests {
             wrm_weight_boost_w1: Some(0.0),
             wrm_weight_boost_w2: Some(0.5),
             score_drop_abs: None,
+            sampling: Default::default(),
             score_clamp_abs: None,
             score_override: None,
             score_override_mask: None,

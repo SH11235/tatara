@@ -1900,3 +1900,66 @@ fn data_split_around_subcommand_is_rejected() {
         .is_err()
     );
 }
+
+#[test]
+fn sampling_cli_parses_defaults_curve_and_bucket_rates() {
+    assert_eq!(
+        simple_cli(&[]).sampling(),
+        nnue_train::sampling::Sampling::default()
+    );
+    for args in [vec!["--keep-rate", "1"], vec!["--skip-seed", "0"]] {
+        let sampling = simple_cli(&args).sampling();
+        assert!(sampling.log_enabled);
+        assert!(sampling.is_default());
+    }
+    let cli = simple_cli(&[
+        "--keep-rate",
+        "0.25",
+        "--min-ply",
+        "18",
+        "--ply-keep-curve",
+        "0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1",
+        "--bucket-keep-rates",
+        "0,0.5,1",
+        "--skip-seed",
+        "42",
+    ]);
+    let sampling = cli.sampling();
+    assert_eq!(sampling.keep_rate, 0.25);
+    assert_eq!(sampling.min_ply, Some(18));
+    assert_eq!(sampling.ply_keep_curve.len(), 5);
+    assert_eq!(sampling.bucket_keep_rates, Some(vec![0.0, 0.5, 1.0]));
+    assert_eq!(sampling.skip_seed, 42);
+    assert!(sampling.validate(true, false, 3).is_err());
+    assert!(
+        Cli::try_parse_from(["nnue-train", "--ply-keep-curve", "22:1,0:0", "layerstack"]).is_err()
+    );
+}
+
+#[test]
+fn sampling_cli_rejects_hcpe_ply_and_wrong_bucket_counts() {
+    for option in [vec!["--min-ply", "18"], vec!["--ply-keep-curve", "0:0.5"]] {
+        let mut args = vec!["nnue-train", "--data", "teacher.hcpe"];
+        args.extend(option);
+        args.push("layerstack");
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.validate_score_sources().unwrap_err().contains("HCPE"));
+    }
+    let simple = simple_cli(&["--bucket-keep-rates", "1"]);
+    assert!(
+        simple
+            .validate_score_sources()
+            .unwrap_err()
+            .contains("LayerStack")
+    );
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--bucket-keep-rates",
+        "1,1",
+        "layerstack",
+        "--bucket-mode",
+        "kingrank9",
+    ])
+    .unwrap();
+    assert!(cli.validate_score_sources().is_err());
+}

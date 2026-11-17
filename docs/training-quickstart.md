@@ -134,6 +134,37 @@ change for real training are:
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` routes by the KP-absolute progress estimate. `progresskpabsq16` routes by the same estimate in integer Q16 arithmetic. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
 | `--num-buckets` (`layerstack`) | 8 (9 for `kingrank9`) | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9. Pass `--num-buckets 9` to `--resume` / `--init-from` a 9-bucket checkpoint or `.bin` |
 
+### Training position sampling
+
+Sampling is opt-in and applies only to training records; `--test-data` and
+`--test-tail-positions` are unaffected. Defaults preserve the original position stream.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--keep-rate R` | 1 | Keep probability, finite and in `(0, 1]` |
+| `--min-ply N` | none | Discard PSV records with `game_ply <= N`; invalid for HCPE |
+| `--ply-keep-curve POINTS` | none | Comma-separated `ply:probability` points, strictly increasing nonnegative plies and probabilities in `[0,1]`; invalid for HCPE |
+| `--bucket-keep-rates r0,r1,...` | none | Probabilities in `[0,1]`, one per LayerStack bucket; invalid for simple architectures |
+| `--skip-seed N` | 0 | Fixed seed for stateless position sampling |
+
+For example, `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
+"0:0.025,22:0.05,25.5:0.2,29.5:0.8,32:1"` combines random and early-ply skipping.
+Curve values are linearly interpolated, with constant values outside the endpoints.
+All applicable probabilities are multiplied; score filtering also applies.
+Sampling hashes the seed, teacher ID (0 for the single concatenated training stream),
+zero-based epoch and physical record index. Multiple `--data` files form one stream
+in argument order. Decisions are independent of shuffle windows and decode worker
+scheduling, including `--threads >= 2`; batch delivery order can still vary.
+Bucket sampling runs in the parallel decode workers and reuses the decoded board
+for feature extraction. Rejected records are replaced to keep batches full.
+After five consecutive empty passes the loader returns an error.
+When any sampling option is specified, each superbatch logs cumulative `read` and
+`kept` counts, including prefetched records. Bucket sampling also logs per-bucket
+reads (candidates surviving reader filters) and survivors;
+`kept` counts survivors of all training filters. The effective sampling configuration
+is stored in `experiment.json` under `params.sampling` and participates in the recipe fingerprint.
+The all-default configuration is omitted to preserve existing recipe fingerprints (including its implicit seed 0).
+
 ### Teacher-data read-ahead and shuffle
 
 The default (`--teacher-shuffle-buffer-mib 0`) reads the teacher sequentially without windows,

@@ -554,6 +554,22 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 20, global = true)]
     pub(crate) save_rate: usize,
 
+    /// Keep each training position with this probability (0 < R <= 1; default: 1).
+    #[arg(long, global = true)]
+    pub(crate) keep_rate: Option<f64>,
+    /// Discard training PSV records whose game ply is at most this value. HCPE is unsupported.
+    #[arg(long, global = true)]
+    pub(crate) min_ply: Option<u16>,
+    /// Training PSV ply probabilities, e.g. "0:0.025,22:0.05,32:1"; linear between points, constant outside.
+    #[arg(long, global = true)]
+    pub(crate) ply_keep_curve: Option<nnue_train::sampling::PlyKeepCurve>,
+    /// Training keep probabilities per LayerStack bucket; applied by parallel decode workers, with per-bucket counts.
+    #[arg(long, value_delimiter = ',', global = true)]
+    pub(crate) bucket_keep_rates: Option<Vec<f64>>,
+    /// Stateless training sampling seed (default: 0), combined with teacher ID, epoch and physical record index.
+    #[arg(long, global = true)]
+    pub(crate) skip_seed: Option<u64>,
+
     /// Exclude positions with `|score| >= score_drop_abs` from the loss.
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
@@ -1053,6 +1069,17 @@ impl Cli {
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
+        let (compute_bucket, num_buckets) = match &self.arch {
+            ArchCommand::LayerStack(args) => (true, args.num_buckets()),
+            _ => (false, 1),
+        };
+        let has_ply = !self
+            .data
+            .iter()
+            .any(|path| nnue_train::dataloader::is_hcpe_path(path));
+        self.sampling()
+            .validate(has_ply, compute_bucket, num_buckets)
+            .map_err(|error| error.to_string())?;
         if !self.precision_steps.is_empty() {
             if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {
                 return Err("--precision-steps requires native CUDA and LayerStack (cuda-oxide is unsupported)".into());
@@ -1506,7 +1533,6 @@ pub(crate) struct LayerstackArgs {
     pub(crate) effect_bucket_config: String,
 }
 
-#[cfg(any(feature = "gpu", test))]
 impl LayerstackArgs {
     /// `--num-buckets` if given, otherwise the bucket mode's default: kingrank9
     /// has a fixed bucket layout, the progress modes use [`DEFAULT_NUM_BUCKETS`].
@@ -1603,4 +1629,25 @@ pub(crate) struct SimpleArgs {
     /// `--tf32` (an opt-in flag with a playing-strength risk).
     #[arg(long)]
     pub(crate) tf32: bool,
+}
+
+impl Cli {
+    pub(crate) fn sampling(&self) -> nnue_train::sampling::Sampling {
+        nnue_train::sampling::Sampling {
+            log_enabled: self.keep_rate.is_some()
+                || self.min_ply.is_some()
+                || self.ply_keep_curve.is_some()
+                || self.bucket_keep_rates.is_some()
+                || self.skip_seed.is_some(),
+            keep_rate: self.keep_rate.unwrap_or(1.0),
+            min_ply: self.min_ply,
+            ply_keep_curve: self
+                .ply_keep_curve
+                .as_ref()
+                .map(|curve| curve.0.clone())
+                .unwrap_or_default(),
+            bucket_keep_rates: self.bucket_keep_rates.clone(),
+            skip_seed: self.skip_seed.unwrap_or(0),
+        }
+    }
 }

@@ -195,6 +195,7 @@ fn partial_consumption_drop_joins_direct_and_windowed_workers() {
                 buffer_mib,
                 false,
                 0,
+                Default::default(),
             )
             .unwrap();
             let slot = loader.next_batch().unwrap().expect("first batch");
