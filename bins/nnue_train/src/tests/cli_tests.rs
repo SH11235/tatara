@@ -2102,3 +2102,14 @@ fn mixing_cli_rejects_flags_split_across_subcommand() {
         assert!(cli.validate_data_args(&argv).is_err());
     }
 }
+
+#[test]
+fn resume_input_defaults_to_restore_and_requires_resume() {
+    let restore = simple_cli(&["--resume", "net-3.ckpt"]);
+    assert_eq!(restore.resume_input, ResumeInputArg::Restore);
+    let restart = simple_cli(&["--resume", "net-3.ckpt", "--resume-input", "restart"]);
+    assert_eq!(restart.resume_input, ResumeInputArg::Restart);
+    assert!(
+        Cli::try_parse_from(["nnue-train", "--resume-input", "restart", "layerstack"]).is_err()
+    );
+}

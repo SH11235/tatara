@@ -471,11 +471,13 @@ When windows are enabled, the sidecar stores the actual record count per window
 (`window_records`); resume rejects a mismatch with the count calculated from the
 current settings because it changes the meaning of positions within a window.
 Resume rejects changes to any teacher's basename/size, sampling probabilities/seeds,
-mixing rates/seed, batch size, training range, score processing, or shuffle settings. There is no mismatch
-override. Absolute teacher paths are recorded for reference and may change. When bucket
-keep rates are enabled, bucket mode/count and progress coefficient file size/SHA-256
-must also match. Delete `.loader.json` to use legacy resume from the beginning of
-the teachers without restoring input positions. Content changes of the same size are not detected, so keep teacher files immutable.
+mixing rates/seed, batch size, training range, score processing, or shuffle settings: it
+stops at startup and lists the differing items. Absolute teacher paths are recorded for
+reference and may change. When bucket keep rates are enabled, bucket mode/count and
+progress coefficient file size/SHA-256 must also match. To resume with changed teachers
+or settings, add `--resume-input restart`: weights and optimizer state are restored and
+the teachers are read from the beginning. Content changes of the same size are not
+detected, so keep teacher files immutable when restoring input positions.
 Old checkpoints without a sidecar warn once and restart input from the beginning.
 Passing `--start-superbatch` with `--resume` warns and restarts teacher input from
 the beginning, without restoring loader positions. Batches per superbatch may change.

@@ -419,6 +419,8 @@ pub struct TrainingConfig {
     pub control_file: Option<PathBuf>,
     pub resume_checkpoint: Option<PathBuf>,
     pub resume_superbatch_override: bool,
+    /// `--resume` で `.loader.json` の読み位置を戻すか、教師の先頭から読み直すか。
+    pub resume_input: crate::loader_state::ResumeInput,
     pub progress_coeff: Option<PathBuf>,
     /// network id — checkpoint file 名にのみ使う (`{net_id}-{sb}.bin`)。
     pub net_id: String,
@@ -902,10 +904,16 @@ where
             "[train] warning: --start-superbatch overrides resume; restarting teacher input from the beginning without restoring loader positions"
         );
     }
+    let restart_input = cfg.resume_input == crate::loader_state::ResumeInput::Restart;
+    if cfg.resume_checkpoint.is_some() && restart_input && !cfg.resume_superbatch_override {
+        eprintln!(
+            "[train] --resume-input restart: restarting teacher input from the beginning without restoring loader positions"
+        );
+    }
     let resume_state = cfg
         .resume_checkpoint
         .as_deref()
-        .filter(|_| !cfg.resume_superbatch_override)
+        .filter(|_| !cfg.resume_superbatch_override && !restart_input)
         .map(crate::loader_state::LoaderState::load)
         .transpose()?
         .flatten();
@@ -1848,6 +1856,7 @@ mod tests {
             control_file: None,
             resume_checkpoint: None,
             resume_superbatch_override: false,
+            resume_input: Default::default(),
             progress_coeff: None,
             net_id: "test".to_string(),
             feature_set: shogi_features::FeatureSet::HalfKaHmMerged.spec(),
@@ -3677,6 +3686,24 @@ mod tests {
                         )
                         .unwrap_err();
                         assert!(error.to_string().contains("loader state does not match"));
+                        assert!(error.to_string().contains("--resume-input restart"));
+                        let restart_cfg = TrainingConfig {
+                            resume_input: crate::loader_state::ResumeInput::Restart,
+                            output_dir: resumed_cfg.output_dir.join("restart"),
+                            ..resumed_cfg.clone()
+                        };
+                        let mut restarted = MockBackend::new();
+                        restarted.bucketless = !cfg.compute_bucket;
+                        run(
+                            &mut restarted,
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &restart_cfg,
+                            None,
+                        )
+                        .unwrap();
                         state
                             .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
                             .unwrap();

@@ -727,6 +727,16 @@ pub(crate) struct Cli {
     #[arg(long, global = true, requires = "resume")]
     pub(crate) lineage_kind: Option<LineageKindArg>,
 
+    /// How `--resume` treats the teacher input positions saved in the `.loader.json`
+    /// next to the checkpoint. `restore` continues reading the teachers where the
+    /// checkpoint stopped and fails at startup, listing the differences, when the
+    /// teachers or input settings (batch size, shuffle, skipping, mixing, ...) differ
+    /// from the saved ones. `restart` keeps the weights and optimizer state but reads
+    /// the teachers from the beginning; use it when resuming with changed teachers or
+    /// input settings.
+    #[arg(long, global = true, value_enum, default_value_t = ResumeInputArg::Restore, requires = "resume")]
+    pub(crate) resume_input: ResumeInputArg,
+
     /// Superbatch number to start training from (1-indexed, inclusive). When
     /// omitted: with `--resume`, the checkpoint's superbatch + 1; otherwise 1.
     /// An error if outside `1 <= N <= --superbatches` (may be set explicitly to
@@ -1215,6 +1225,21 @@ impl Cli {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ResumeInputArg {
+    Restore,
+    Restart,
+}
+
+impl From<ResumeInputArg> for nnue_train::loader_state::ResumeInput {
+    fn from(value: ResumeInputArg) -> Self {
+        match value {
+            ResumeInputArg::Restore => Self::Restore,
+            ResumeInputArg::Restart => Self::Restart,
+        }
     }
 }
 

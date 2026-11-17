@@ -14,6 +14,16 @@ pub fn artifact_identity(path: &Path) -> io::Result<serde_json::Value> {
     Ok(serde_json::json!({"bytes": bytes.len(), "sha256": hex}))
 }
 
+/// How `--resume` treats the teacher input positions saved next to the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResumeInput {
+    /// Continue from the saved positions; a mismatch with this run is an error.
+    #[default]
+    Restore,
+    /// Ignore the saved positions and read the teachers from the beginning.
+    Restart,
+}
+
 fn same_files(saved: &[TeacherFileIdentity], current: &[TeacherFileIdentity]) -> bool {
     saved.len() == current.len()
         && saved
@@ -104,6 +114,87 @@ impl LoaderState {
         settings: &serde_json::Value,
         superbatch: usize,
     ) -> io::Result<&TeacherPosition> {
+        let mismatches = self.mismatches(files, mixes, settings, superbatch);
+        if !mismatches.is_empty() {
+            return Err(io::Error::other(format!(
+                "loader state does not match this run, so teacher input positions cannot be restored:\n  {}\n\
+                 Add --resume-input restart to resume the weights and optimizer state and read the teachers from the beginning.",
+                mismatches.join("\n  ")
+            )));
+        }
+        Ok(&self.teachers[0].position)
+    }
+
+    /// Human-readable differences between the saved state and this run, empty when the
+    /// saved input positions can be restored.
+    pub fn mismatches(
+        &self,
+        files: &[TeacherFileIdentity],
+        mixes: &[Vec<TeacherFileIdentity>],
+        settings: &serde_json::Value,
+        superbatch: usize,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.version != 1 {
+            out.push(format!(
+                "loader state version: saved {}, supported 1",
+                self.version
+            ));
+        }
+        if self.superbatch != superbatch {
+            out.push(format!(
+                "superbatch: saved {}, resuming after {superbatch}",
+                self.superbatch
+            ));
+        }
+        let saved_files: Vec<&[TeacherFileIdentity]> =
+            self.teachers.iter().map(|t| t.files.as_slice()).collect();
+        let current_files: Vec<&[TeacherFileIdentity]> = std::iter::once(files)
+            .chain(mixes.iter().map(Vec::as_slice))
+            .collect();
+        for (i, current) in current_files.iter().enumerate() {
+            let label = if i == 0 {
+                "--data".to_string()
+            } else {
+                format!("--mix-data #{i}")
+            };
+            match saved_files.get(i) {
+                None => out.push(format!("{label}: not in the saved state")),
+                Some(saved) if !same_files(saved, current) => out.push(format!(
+                    "{label}: saved [{}], now [{}]",
+                    describe_files(saved),
+                    describe_files(current)
+                )),
+                Some(_) => {}
+            }
+        }
+        if saved_files.len() > current_files.len() {
+            out.push(format!(
+                "teacher count: saved {} (--data + --mix-data), now {}",
+                saved_files.len(),
+                current_files.len()
+            ));
+        }
+        let ids_ok = self.teachers.first().is_some_and(|t| t.id == "primary")
+            && self
+                .teachers
+                .iter()
+                .skip(1)
+                .enumerate()
+                .all(|(i, t)| t.id == format!("mix-{}", i + 1));
+        let cursors_ok = self
+            .teachers
+            .first()
+            .is_some_and(|t| t.position.mixes.len() + 1 == self.teachers.len())
+            && self
+                .teachers
+                .iter()
+                .skip(1)
+                .zip(&self.teachers[0].position.mixes)
+                .all(|(teacher, cursor)| &teacher.position == cursor);
+        if !ids_ok || !cursors_ok {
+            out.push("loader state is internally inconsistent".to_string());
+        }
         let mut saved_settings = self.settings.clone();
         let mut expected_settings = settings.clone();
         for value in [&mut saved_settings, &mut expected_settings] {
@@ -111,40 +202,84 @@ impl LoaderState {
                 object.remove("batches_per_superbatch");
             }
         }
-        if self.version != 1
-            || self.superbatch != superbatch
-            || self.teachers.len() != mixes.len() + 1
-            || self.teachers[0].id != "primary"
-            || !same_files(&self.teachers[0].files, files)
-            || saved_settings != expected_settings
-            || self
-                .teachers
-                .iter()
-                .skip(1)
-                .zip(mixes)
-                .enumerate()
-                .any(|(i, (teacher, files))| {
-                    teacher.id != format!("mix-{}", i + 1) || !same_files(&teacher.files, files)
-                })
-            || self.teachers[0].position.mixes.len() != mixes.len()
-            || self
-                .teachers
-                .iter()
-                .skip(1)
-                .zip(&self.teachers[0].position.mixes)
-                .any(|(teacher, cursor)| &teacher.position != cursor)
-        {
-            return Err(io::Error::other(
-                "loader state does not match checkpoint, teacher basenames/sizes, or input settings; deleting .loader.json resumes from the beginning of the teachers without restoring input positions (legacy resume)",
-            ));
+        match (saved_settings.as_object(), expected_settings.as_object()) {
+            (Some(saved), Some(now)) => {
+                let mut keys: Vec<&String> = saved.keys().chain(now.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let (a, b) = (saved.get(key), now.get(key));
+                    if a != b {
+                        out.push(format!(
+                            "{key}: saved {}, now {}",
+                            a.map_or("(absent)".to_string(), |v| v.to_string()),
+                            b.map_or("(absent)".to_string(), |v| v.to_string())
+                        ));
+                    }
+                }
+            }
+            _ if saved_settings != expected_settings => {
+                out.push(format!(
+                    "input settings: saved {saved_settings}, now {expected_settings}"
+                ));
+            }
+            _ => {}
         }
-        Ok(&self.teachers[0].position)
+        out
     }
+}
+
+fn describe_files(files: &[TeacherFileIdentity]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            let name = f.path.file_name().map_or_else(
+                || f.path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            format!("{name} ({} bytes)", f.bytes)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mismatch_lists_each_changed_setting_and_teacher() {
+        let saved_files = vec![TeacherFileIdentity {
+            path: "a.psv".into(),
+            bytes: 400,
+        }];
+        let state = LoaderState {
+            version: 1,
+            superbatch: 4,
+            teachers: vec![TeacherState {
+                id: "primary".into(),
+                files: saved_files,
+                position: TeacherPosition::default(),
+            }],
+            settings: serde_json::json!({"batch_size": 16384, "seed": 0, "batches_per_superbatch": 10}),
+        };
+        let now_files = vec![TeacherFileIdentity {
+            path: "b.psv".into(),
+            bytes: 800,
+        }];
+        let now = serde_json::json!({"batch_size": 32768, "seed": 0, "batches_per_superbatch": 20});
+        let diffs = state.mismatches(&now_files, &[], &now, 4);
+        assert_eq!(
+            diffs,
+            vec![
+                "--data: saved [a.psv (400 bytes)], now [b.psv (800 bytes)]".to_string(),
+                "batch_size: saved 16384, now 32768".to_string(),
+            ]
+        );
+        let message = state.validate(&now_files, &now, 4).unwrap_err().to_string();
+        assert!(message.contains("batch_size: saved 16384, now 32768"));
+        assert!(message.contains("--resume-input restart"));
+    }
 
     #[test]
     fn chunk_replay_metadata_round_trips() {
@@ -332,7 +467,7 @@ mod tests {
         let error = state
             .validate(&resized, &serde_json::json!({}), 1)
             .unwrap_err();
-        assert!(error.to_string().contains("deleting .loader.json"));
+        assert!(error.to_string().contains("--resume-input restart"));
     }
 
     #[test]
