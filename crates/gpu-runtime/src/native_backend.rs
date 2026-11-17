@@ -198,6 +198,12 @@ impl<T: native::DeviceElement> DeviceBuffer<T> {
         Ok(Self { inner })
     }
 
+    pub fn copy_from_host(&mut self, stream: &CudaStream, values: &[T]) -> Result<()> {
+        stream.synchronize()?;
+        self.inner.copy_from(values)?;
+        Ok(())
+    }
+
     pub fn cu_deviceptr(&self) -> u64 {
         self.inner.device_ptr()
     }

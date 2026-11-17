@@ -5866,8 +5866,31 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
         Some(42),
     )?;
 
+    let device_ptrs = |trainer: &GpuTrainer| -> Vec<u64> {
+        trainer
+            .raw_ckpt_group_sources()
+            .iter()
+            .flat_map(|g| match &g.bufs {
+                crate::ckpt::RawCkptGroupBufs::Uniform { w, m, v, slow } => [
+                    w.cu_deviceptr(),
+                    m.cu_deviceptr(),
+                    v.cu_deviceptr(),
+                    slow.cu_deviceptr(),
+                ],
+                crate::ckpt::RawCkptGroupBufs::FtMoment { w, m, v, slow } => [
+                    w.cu_deviceptr(),
+                    m.cu_deviceptr(),
+                    v.cu_deviceptr(),
+                    slow.cu_deviceptr(),
+                ],
+            })
+            .collect()
+    };
+
     let mut loader = new_trainer()?;
+    let ptrs_before_load = device_ptrs(&loader);
     let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
+    assert_eq!(device_ptrs(&loader), ptrs_before_load);
     assert_eq!(superbatch, 3);
     assert_eq!(producer.run_id.as_deref(), Some("roundtrip-test"));
     assert_eq!(lr_horizon, Some(42));

@@ -3373,27 +3373,35 @@ impl GpuTrainer {
         // state は 0-byte のまま維持する (file 側は全 group を読了・検証済み)。
         let forward_only = self.forward_only;
         let (ftw_w, ftw_m, ftw_v, ftw_slow) = &loaded[0];
-        self.ft_w = DeviceBuffer::from_host(&self.stream, ftw_w)?;
+        upload_into(&self.stream, &mut self.ft_w, ftw_w)?;
         #[cfg(feature = "native")]
         {
             self.ft_norm_sums_current = false;
         }
         if !forward_only {
-            self.ft_w_m =
-                MomentBuf::from_host_f32(&self.stream, ftw_m, self.fp16_opt_state, FT_OPT_M_SCALE)?;
-            self.ft_w_v =
-                MomentBuf::from_host_f32(&self.stream, ftw_v, self.fp16_opt_state, FT_OPT_V_SCALE)?;
-            self.ft_w_slow = DeviceBuffer::from_host(&self.stream, ftw_slow)?;
+            self.ft_w_m.copy_from_host_f32(
+                &self.stream,
+                ftw_m,
+                self.fp16_opt_state,
+                FT_OPT_M_SCALE,
+            )?;
+            self.ft_w_v.copy_from_host_f32(
+                &self.stream,
+                ftw_v,
+                self.fp16_opt_state,
+                FT_OPT_V_SCALE,
+            )?;
+            upload_into(&self.stream, &mut self.ft_w_slow, ftw_slow)?;
         }
 
         macro_rules! up {
             ($idx:expr, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                 let (w, m, v, s) = &loaded[$idx];
-                self.$w = DeviceBuffer::from_host(&self.stream, w)?;
+                upload_into(&self.stream, &mut self.$w, w)?;
                 if !forward_only {
-                    self.$m = DeviceBuffer::from_host(&self.stream, m)?;
-                    self.$v = DeviceBuffer::from_host(&self.stream, v)?;
-                    self.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                    upload_into(&self.stream, &mut self.$m, m)?;
+                    upload_into(&self.stream, &mut self.$v, v)?;
+                    upload_into(&self.stream, &mut self.$slow, s)?;
                 }
             }};
         }
@@ -3423,11 +3431,11 @@ impl GpuTrainer {
             macro_rules! up_shared {
                 ($idx:expr, $layer:ident, $w:ident, $m:ident, $v:ident, $slow:ident) => {{
                     let (w, m, v, s) = &loaded[$idx];
-                    f.$layer.$w = DeviceBuffer::from_host(&self.stream, w)?;
+                    upload_into(&self.stream, &mut f.$layer.$w, w)?;
                     if !forward_only {
-                        f.$layer.$m = DeviceBuffer::from_host(&self.stream, m)?;
-                        f.$layer.$v = DeviceBuffer::from_host(&self.stream, v)?;
-                        f.$layer.$slow = DeviceBuffer::from_host(&self.stream, s)?;
+                        upload_into(&self.stream, &mut f.$layer.$m, m)?;
+                        upload_into(&self.stream, &mut f.$layer.$v, v)?;
+                        upload_into(&self.stream, &mut f.$layer.$slow, s)?;
                     }
                 }};
             }
@@ -3442,11 +3450,11 @@ impl GpuTrainer {
         // PSQT (任意): 末尾 group (save 側と対称)。
         if let Some(psqt) = self.psqt.as_mut() {
             let (w_host, m_host, v_host, slow_host) = &loaded[psqt_idx];
-            psqt.w = DeviceBuffer::from_host(&self.stream, w_host)?;
+            upload_into(&self.stream, &mut psqt.w, w_host)?;
             if !forward_only {
-                psqt.w_m = DeviceBuffer::from_host(&self.stream, m_host)?;
-                psqt.w_v = DeviceBuffer::from_host(&self.stream, v_host)?;
-                psqt.w_slow = DeviceBuffer::from_host(&self.stream, slow_host)?;
+                upload_into(&self.stream, &mut psqt.w_m, m_host)?;
+                upload_into(&self.stream, &mut psqt.w_v, v_host)?;
+                upload_into(&self.stream, &mut psqt.w_slow, slow_host)?;
             }
         }
 
