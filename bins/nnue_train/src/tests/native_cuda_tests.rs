@@ -4703,6 +4703,41 @@ fn ft_only_import_preserves_fresh_output_layers() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn ft_only_import_rejects_incompatible_psqt_routing() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let mut trainer = create_layerstack_trainer_with_options(
+        &context,
+        true,
+        LayerStackTestOptions {
+            num_buckets: 3,
+            bucket_mode: BucketMode::Spec("ownking:2/3".parse().unwrap()),
+            psqt: true,
+            ..LayerStackTestOptions::standard()
+        },
+    )?;
+    let before = trainer.to_layerstack_weights()?;
+    let mut source = before.clone();
+    source.ft_w[0] += 1.0;
+    source.psqt_w.as_mut().unwrap()[0] += 1.0;
+    source.bucket_spec = Some("oppking:2/3".parse().unwrap());
+    assert!(trainer.load_ft_weights(&source).is_err());
+    source.bucket_spec = None;
+    assert!(trainer.load_ft_weights(&source).is_err());
+    source.bucket_spec = before.bucket_spec;
+    source.num_buckets = 4;
+    assert!(trainer.load_ft_weights(&source).is_err());
+    let after = trainer.to_layerstack_weights()?;
+    assert_eq!(before.ft_w, after.ft_w);
+    assert_eq!(before.psqt_w, after.psqt_w);
+    source.num_buckets = before.num_buckets;
+    trainer.load_ft_weights(&source)?;
+    let after = trainer.to_layerstack_weights()?;
+    assert_eq!(source.ft_w, after.ft_w);
+    assert_eq!(source.psqt_w, after.psqt_w);
+    Ok(())
+}
+
+#[test]
 fn ft_only_import_matches_fresh_dense_weights_at_first_lookahead()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::arch::RANGER_K;

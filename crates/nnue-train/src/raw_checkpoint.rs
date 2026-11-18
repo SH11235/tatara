@@ -77,7 +77,7 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `14`: the compact Threat layout with SGD momentum state.
 /// - `15`: the compact Threat layout with RAdam optimizer state.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=15. Version 1 is interpreted as
+/// The trainer resume format accepts versions 1..=15. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
 /// interpreted as `layerstack`. Versions above 15 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent

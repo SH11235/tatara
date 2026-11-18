@@ -3059,6 +3059,18 @@ impl GpuTrainer {
         if self.feature_set.ft_factorize() {
             return Err("FT-only import requires FT factorization to be disabled".into());
         }
+        // Without a bucket spec, the source weights carry no routing identity for PSQT.
+        if source.psqt_w.is_some()
+            && (source.num_buckets != self.num_buckets
+                || !matches!(
+                    (self.bucket_mode, source.bucket_spec),
+                    (BucketMode::Spec(target), Some(source)) if target == source
+                ))
+        {
+            return Err(
+                "FT-only import with PSQT requires matching bucket mode, count and spec".into(),
+            );
+        }
         self.load_feature_transform_weights(source)
     }
 

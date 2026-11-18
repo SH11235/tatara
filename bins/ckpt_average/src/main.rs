@@ -78,13 +78,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|p| raw_ckpt::read_ckpt_info(p).map_err(|e| format!("{}: {e}", p.display())))
         .collect::<Result<Vec<_>, _>>()?;
-    for (path, info) in paths.iter().zip(&infos) {
-        raw_ckpt::layerstack_layout(&info.identity)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    let first_key = infos[0].identity.compat_key();
+    let load_layout = |path: &Path, info: &raw_ckpt::CkptInfo| {
+        raw_ckpt::layerstack_layout(&info.identity).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let layout = load_layout(paths[0], &infos[0])?;
+    let first_key = infos[0].identity.compat_key(&layout);
     for (path, info) in paths.iter().zip(&infos).skip(1) {
-        let key = info.identity.compat_key();
+        let key = info.identity.compat_key(&load_layout(path, info)?);
         if key != first_key {
             return Err(format!(
                 "{} does not match the first checkpoint's architecture ({key:?} vs {first_key:?})",
@@ -96,7 +96,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.mode == Mode::Ema && infos.windows(2).any(|w| w[0].superbatch >= w[1].superbatch) {
         return Err("--mode ema needs checkpoints in strictly increasing superbatch order".into());
     }
-    let layout = raw_ckpt::layerstack_layout(&infos[0].identity)?;
 
     println!(
         "architecture: {} ft_out={} l1={} l2={} buckets={} bucket_mode={} ft_factorize={} qat_dense={}",
@@ -119,20 +118,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let groups = raw_ckpt::weighted_average(&paths, &infos, &coefficients)?;
+    let groups = raw_ckpt::weighted_average(&layout, &paths, &infos, &coefficients)?;
     let weights = raw_ckpt::to_layerstack_weights(&layout, groups);
     write_new(&args.output, |w| weights.save_quantised(w, args.fv_scale))?;
     println!("output: {}", args.output.display());
 
     if let Some(reference) = &args.reference {
         let load = |p: &Path| -> io::Result<LayerStackWeights> {
-            LayerStackWeights::load_quantised(
+            LayerStackWeights::load_quantised_with_psqt(
                 &mut io::BufReader::new(fs::File::open(p)?),
                 layout.export_spec(),
                 layout.ft_out,
                 layout.l1_out,
                 layout.l2_out,
                 layout.num_buckets,
+                layout.with_psqt,
             )
         };
         let ours = load(&args.output)?;
@@ -175,12 +175,18 @@ fn compare_quantised(a: &LayerStackWeights, b: &LayerStackWeights) -> Vec<String
         ("l3_b", &a.l3_b, &b.l3_b),
     ];
     tensors
-        .iter()
+        .into_iter()
+        .chain(
+            a.psqt_w
+                .as_deref()
+                .zip(b.psqt_w.as_deref())
+                .map(|(x, y)| ("psqt_w", x, y)),
+        )
         .map(|(name, x, y)| {
-            let changed = x.iter().zip(*y).filter(|(p, q)| p != q).count();
+            let changed = x.iter().zip(y).filter(|(p, q)| p != q).count();
             let max_diff = x
                 .iter()
-                .zip(*y)
+                .zip(y)
                 .map(|(p, q)| (p - q).abs())
                 .fold(0f32, f32::max);
             format!(
