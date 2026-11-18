@@ -163,8 +163,9 @@ for feature extraction. Rejected records are replaced to keep batches full.
 After five consecutive empty passes the loader returns an error.
 When any sampling option is specified, each superbatch logs cumulative `read` and
 `kept` counts for each teacher and the total, including prefetched records.
-Bucket sampling also logs per-bucket reads (candidates surviving reader filters) and survivors;
-`kept` counts survivors of all training filters. The effective sampling configuration
+Bucket sampling also logs per-bucket reads (decoded candidates surviving reader filters)
+and survivors. Candidates that bypass the bucket filter count as both read and kept.
+The effective sampling configuration
 is stored in `experiment.json` under `params.sampling` and participates in the recipe fingerprint.
 The all-default configuration is omitted to preserve existing recipe fingerprints (including its implicit seed 0).
 
@@ -178,15 +179,26 @@ This samples approximately 3% of training positions from `tree.psv` and 97% from
 `main.psv`. Add more `--mix-data` / `--mix-rate` pairs in matching order; keep each
 repeated option on one side of the subcommand. Rates describe the expected fraction
 after score and reader sampling filters, rather than a fixed quota per batch.
-Worker-side bucket rejection retries teacher selection, so different rejection rates
-across teachers can shift the observed fractions shown in `[teacher-mix]` logs.
-Each teacher cycles independently and uses the same sampling settings. To
-set score limits for the additional teachers, repeat `--mix-score-drop-abs N` or
-`--mix-score-clamp-abs N` once per `--mix-data` file in the same order. Omitting
-either option inherits the corresponding main threshold. Each teacher selects its
+Worker-side bucket rejection retries teacher selection. Each teacher's delivered share
+is proportional to its selection rate multiplied by the fraction of its reader
+candidates accepted at the bucket stage. Marked tree samples and records from
+teachers with a numeric `--mix-keep-rate` pass this stage with probability 1, so
+bucket rejection on the main teacher can raise the delivered share of these teachers
+above their configured rates. Use the delivered counts in the `[teacher-mix]` log
+to tune `--mix-rate`.
+Each teacher cycles independently. To set score limits for the additional teachers,
+repeat `--mix-score-drop-abs N` or
+`--mix-score-clamp-abs N` once per `--mix-data` file in the same order. Use
+`inherit` in a teacher's position to use the corresponding main threshold, or
+omit the option to inherit it for all teachers. Each teacher selects its
 score, drops records at or above its absolute drop threshold, then clamps the scores
 of the surviving records. If both limits are set for a teacher, the clamp must be
 below the drop threshold.
+Repeat `--mix-keep-rate F` once per additional teacher in the same order
+to use F (from 0 to 1) as the sole sampling probability for its unmarked
+positions. Use `inherit` to apply the main teacher's sampling filters to that
+teacher, or omit the option to inherit them for all teachers.
+Explicit rates are recorded as `keep_rate` in `experiment.json` under `params.mix_data`.
 An empty teacher or one with no surviving positions is an error when sampled.
 `--test-tail-positions` reserves a tail from the main teacher only; additional teachers
 are read in full and must exclude held-out positions themselves.
@@ -290,6 +302,10 @@ on the score term only (WDL weight 0), regardless of the WDL schedule. It requir
 padding bits 0 and 1 with this flag, and bit 0 retains its dual-label gate meaning.
 Additional teachers also permit bits 0 and 1 but never read bit 0 as a gate. Marked positions are rejected in external
 `--test-data` and `--test-tail-positions`.
+With this flag, `--tree-sample-accept F` keeps marked positions from any teacher
+with probability F (from 0 to 1, default 1). Marked positions bypass
+`--keep-rate`, `--min-ply`, `--ply-keep-curve`, `--bucket-keep-rates`, and
+`--mix-keep-rate`.
 
 Dropping the training loader cancels both direct and windowed readers at record boundaries,
 including while high-score records are skipped and before the next dataset epoch is opened.

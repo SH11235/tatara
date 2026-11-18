@@ -2058,7 +2058,7 @@ fn mixing_cli_pairs_and_rates_are_validated() {
 }
 
 #[test]
-fn mixing_cli_pairs_score_limits_in_teacher_order() {
+fn mixing_cli_pairs_teacher_overrides_in_order() {
     let parse = |tail: &[&str]| {
         let mut args = vec![
             "nnue-train",
@@ -2086,6 +2086,10 @@ fn mixing_cli_pairs_score_limits_in_teacher_order() {
         "2000",
         "--mix-score-clamp-abs",
         "200",
+        "--mix-keep-rate",
+        "0",
+        "--mix-keep-rate",
+        "0.35",
     ])
     .unwrap();
     cli.validate_score_sources().unwrap();
@@ -2098,10 +2102,55 @@ fn mixing_cli_pairs_score_limits_in_teacher_order() {
         (sources[1].score_drop_abs, sources[1].score_clamp_abs),
         (Some(2000), Some(200))
     );
-    for flag in ["--mix-score-drop-abs", "--mix-score-clamp-abs"] {
+    assert_eq!(sources[0].keep_rate, Some(0.0));
+    assert_eq!(sources[1].keep_rate, Some(0.35));
+    let mixed = parse(&[
+        "--mix-score-drop-abs",
+        "inherit",
+        "--mix-score-drop-abs",
+        "2000",
+        "--mix-score-clamp-abs",
+        "100",
+        "--mix-score-clamp-abs",
+        "inherit",
+        "--mix-keep-rate=inherit",
+        "--mix-keep-rate",
+        "1",
+    ])
+    .unwrap();
+    mixed.validate_score_sources().unwrap();
+    let sources = mixed.mix_sources();
+    assert_eq!(
+        (
+            sources[0].score_drop_abs,
+            sources[0].score_clamp_abs,
+            sources[0].keep_rate
+        ),
+        (None, Some(100), None)
+    );
+    assert_eq!(
+        (
+            sources[1].score_drop_abs,
+            sources[1].score_clamp_abs,
+            sources[1].keep_rate
+        ),
+        (Some(2000), None, Some(1.0))
+    );
+    assert!(
+        parse(&[])
+            .unwrap()
+            .mix_sources()
+            .iter()
+            .all(|source| source.keep_rate.is_none())
+    );
+    for flag in [
+        "--mix-score-drop-abs",
+        "--mix-score-clamp-abs",
+        "--mix-keep-rate",
+    ] {
         for tail in [
-            vec![flag, "100"],
-            vec![flag, "100", flag, "200", flag, "300"],
+            vec![flag, "inherit"],
+            vec![flag, "inherit", flag, "inherit", flag, "inherit"],
         ] {
             let error = parse(&tail).unwrap().validate_score_sources().unwrap_err();
             assert!(error.contains(&format!("{flag} must be given once per --mix-data file")));
@@ -2111,14 +2160,28 @@ fn mixing_cli_pairs_score_limits_in_teacher_order() {
             "--data",
             "main.psv",
             flag,
-            "100",
+            "inherit",
             "layerstack",
         ])
         .unwrap();
         assert!(orphan.validate_score_sources().unwrap_err().contains(flag));
-        assert!(parse(&[flag, "0"]).is_err());
+        if flag != "--mix-keep-rate" {
+            assert!(parse(&[flag, "0"]).is_err());
+        }
     }
+    assert!(parse(&["--mix-score-drop-abs", "2147483648"]).is_err());
     assert!(parse(&["--mix-score-clamp-abs", "32768"]).is_err());
+    for invalid in ["-0.01", "1.01", "NaN", "inf"] {
+        let error = parse(&[
+            &format!("--mix-keep-rate={invalid}"),
+            "--mix-keep-rate",
+            "inherit",
+        ])
+        .unwrap()
+        .validate_score_sources()
+        .unwrap_err();
+        assert!(error.contains("--mix-keep-rate must be finite and in [0, 1]"));
+    }
 }
 
 #[test]
@@ -2161,13 +2224,19 @@ fn mixing_cli_rejects_flags_split_across_subcommand() {
         ("--mix-rate", ["0.03", "0.2"], "--mix-data", "tree.psv"),
         (
             "--mix-score-drop-abs",
-            ["1000", "2000"],
+            ["1000", "inherit"],
             "--mix-data",
             "tree.psv",
         ),
         (
             "--mix-score-clamp-abs",
-            ["100", "200"],
+            ["inherit", "200"],
+            "--mix-data",
+            "tree.psv",
+        ),
+        (
+            "--mix-keep-rate",
+            ["0.5", "inherit"],
             "--mix-data",
             "tree.psv",
         ),
@@ -2225,4 +2294,49 @@ fn tree_sample_eval_only_requires_psv_data() {
             .validate_score_sources()
             .is_err()
     );
+}
+
+#[test]
+fn tree_sample_accept_cli_requires_eval_only_and_validates_probability() {
+    let error = Cli::try_parse_from([
+        "nnue-train",
+        "--data",
+        "samples.psv",
+        "simple",
+        "--tree-sample-accept",
+        "1",
+    ])
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(error.to_string().contains("--tree-sample-eval-only"));
+
+    let default = simple_cli(&["--data", "samples.psv", "--tree-sample-eval-only"]);
+    assert_eq!(default.sampling().tree_sample_accept, 1.0);
+    for (rate, valid) in [
+        ("0", true),
+        ("1", true),
+        ("0.25", true),
+        ("NaN", false),
+        ("inf", false),
+        ("1.01", false),
+    ] {
+        let cli = simple_cli(&[
+            "--data",
+            "samples.psv",
+            "--tree-sample-eval-only",
+            "--tree-sample-accept",
+            rate,
+        ]);
+        assert_eq!(cli.validate_score_sources().is_ok(), valid);
+        if valid {
+            assert_eq!(
+                cli.sampling().tree_sample_accept,
+                rate.parse::<f64>().unwrap()
+            );
+        }
+    }
 }

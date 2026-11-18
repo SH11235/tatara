@@ -157,6 +157,8 @@ pub struct MixDataParam {
     pub score_drop_abs: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_rate: Option<f64>,
 }
 
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
@@ -880,6 +882,7 @@ mod tests {
             rate: 0.03,
             score_drop_abs: None,
             score_clamp_abs: None,
+            keep_rate: None,
         }];
         mixed.mix_seed = Some(0);
         let hash = recipe_fingerprint(&mixed, "main.psv");
@@ -889,6 +892,27 @@ mod tests {
             value["mix_data"],
             serde_json::json!([{"name": "tree.psv", "rate": 0.03}])
         );
+        assert_eq!(recipe_fingerprint(&base, "main.psv"), 0x4bf0_04b9_8bee_10a0);
+        assert_eq!(hash, 0x08f6_75e6_1952_e498);
+        let mut marked = mixed.clone();
+        marked.tree_sample_eval_only = true;
+        let marked_hash = recipe_fingerprint(&marked, "main.psv");
+        assert_eq!(marked_hash, 0xd781_420e_46d2_e7a1);
+        marked.sampling.tree_sample_accept = 0.25;
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap()["sampling"]["tree_sample_accept"],
+            0.25
+        );
+        assert_ne!(recipe_fingerprint(&marked, "main.psv"), marked_hash);
+
+        let mut overridden = mixed.clone();
+        overridden.mix_data[0].keep_rate = Some(1.0);
+        assert_eq!(
+            serde_json::to_value(&overridden).unwrap()["mix_data"][0]["keep_rate"],
+            1.0
+        );
+        assert_ne!(recipe_fingerprint(&overridden, "main.psv"), hash);
+
         for changed in 0..5 {
             let mut params = mixed.clone();
             match changed {

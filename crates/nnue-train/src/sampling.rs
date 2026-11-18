@@ -10,6 +10,8 @@ pub struct Sampling {
     #[serde(skip)]
     pub log_enabled: bool,
     pub keep_rate: f64,
+    #[serde(skip_serializing_if = "is_one")]
+    pub tree_sample_accept: f64,
     pub min_ply: Option<u16>,
     pub ply_keep_curve: Vec<(f64, f64)>,
     pub bucket_keep_rates: Option<Vec<f64>>,
@@ -21,6 +23,7 @@ impl Default for Sampling {
         Self {
             log_enabled: false,
             keep_rate: 1.0,
+            tree_sample_accept: 1.0,
             min_ply: None,
             ply_keep_curve: Vec::new(),
             bucket_keep_rates: None,
@@ -45,6 +48,9 @@ impl Sampling {
         let error = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if !valid_rate(self.keep_rate) || self.keep_rate == 0.0 {
             return Err(error("--keep-rate must be finite and in (0, 1]"));
+        }
+        if !valid_rate(self.tree_sample_accept) {
+            return Err(error("--tree-sample-accept must be finite and in [0, 1]"));
         }
         if !has_ply && (self.min_ply.is_some() || !self.ply_keep_curve.is_empty()) {
             return Err(error(
@@ -111,7 +117,11 @@ impl Sampling {
     }
 }
 
-fn valid_rate(rate: f64) -> bool {
+fn is_one(rate: &f64) -> bool {
+    *rate == 1.0
+}
+
+pub(crate) fn valid_rate(rate: f64) -> bool {
     rate.is_finite() && (0.0..=1.0).contains(&rate)
 }
 
@@ -167,6 +177,25 @@ mod tests {
                 record,
                 sampling.keep_rate * sampling.ply_rate(record as u16)
             ));
+        }
+    }
+
+    #[test]
+    fn sampling_default_serialization_preserves_loader_settings_bytes() {
+        let legacy = r#"{"keep_rate":1.0,"min_ply":null,"ply_keep_curve":[],"bucket_keep_rates":null,"skip_seed":0}"#;
+        let sampling: Sampling = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sampling.tree_sample_accept, 1.0);
+        assert_eq!(serde_json::to_string(&sampling).unwrap(), legacy);
+    }
+
+    #[test]
+    fn sampling_validates_tree_sample_accept() {
+        for rate in [0.0, 0.25, 1.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let sampling = Sampling {
+                tree_sample_accept: rate,
+                ..Sampling::default()
+            };
+            assert_eq!(sampling.validate(true, false, 1).is_ok(), valid_rate(rate));
         }
     }
 

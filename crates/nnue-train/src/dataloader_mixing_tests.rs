@@ -478,11 +478,186 @@ fn mixed_sampling_preserves_teacher_identity_rates_and_bucket_sets_across_worker
     }
 }
 
+fn mark_tree_samples(path: &Path, stride: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    for (i, record) in bytes
+        .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+        .enumerate()
+    {
+        record[39] = if i.is_multiple_of(stride) { 2 } else { 0 };
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn marked_sampling_uses_its_own_probability_before_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = teacher(dir.path(), "tree.psv", &(1..=4000).collect::<Vec<_>>());
+    mark_tree_samples(&path, 2);
+    for (rate, expected_range) in [(0.0, 0..=0), (0.25, 430..=570), (1.0, 2000..=2000)] {
+        let sampling = crate::sampling::Sampling {
+            tree_sample_accept: rate,
+            keep_rate: 0.01,
+            min_ply: Some(u16::MAX),
+            ply_keep_curve: vec![(0.0, 0.0)],
+            bucket_keep_rates: Some(vec![0.0; 9]),
+            skip_seed: 42,
+            ..Default::default()
+        };
+        let mut reader = main_reader(&path, None, None);
+        reader.tree_sample_eval_only = true;
+        reader.configure_sampling(sampling.clone());
+        let buckets = reader.bucket_sampling.clone().unwrap();
+        let mut actual = Vec::new();
+        while let Some(record) = reader.next_in_epoch().unwrap() {
+            assert!(record.tree_sample);
+            assert!(buckets.finish(&record, 0).unwrap());
+            actual.push(record.record_index);
+        }
+        let expected = (0..4000)
+            .step_by(2)
+            .filter(|&record| sampling.accepts(0, 0, record, rate))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(expected_range.contains(&actual.len()));
+        assert_eq!(reader.sampling_counts.read.load(Ordering::Relaxed), 4000);
+        assert_eq!(
+            reader.sampling_counts.kept.load(Ordering::Relaxed),
+            actual.len() as u64
+        );
+        assert_eq!(
+            buckets.buckets[0].read.load(Ordering::Relaxed),
+            actual.len() as u64
+        );
+        assert_eq!(
+            buckets.buckets[0].kept.load(Ordering::Relaxed),
+            actual.len() as u64
+        );
+    }
+}
+
+#[test]
+fn mix_keep_rate_bypasses_game_sampling_only_for_its_teacher() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[10, 11]);
+    let inherited = teacher(dir.path(), "inherited.psv", &[20, 21]);
+    let overridden = teacher(dir.path(), "overridden.psv", &[30, 31]);
+    for path in [&main, &inherited, &overridden] {
+        mark_tree_samples(path, 2);
+    }
+    let mixes = [
+        MixSource::new(inherited, 0.20),
+        MixSource {
+            keep_rate: Some(0.5),
+            ..MixSource::new(overridden, 0.30)
+        },
+    ];
+    let sampling = crate::sampling::Sampling {
+        tree_sample_accept: 0.25,
+        min_ply: Some(u16::MAX),
+        ply_keep_curve: vec![(0.0, 0.0)],
+        bucket_keep_rates: Some(vec![0.0; 9]),
+        skip_seed: 42,
+        ..Default::default()
+    };
+    // Each epoch provides enough independent draws to avoid barren-pass errors.
+    for path in [&main, &mixes[0].path, &mixes[1].path] {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, bytes.repeat(64)).unwrap();
+    }
+    let mut reader = main_reader(&main, None, None);
+    reader.tree_sample_eval_only = true;
+    reader.configure_sampling(sampling.clone());
+    let mut mixed = MixedTeacherReader::new(reader, &mixes, 123).unwrap();
+    let buckets = mixed.bucket_samplings();
+    assert!(buckets[2].is_none());
+    let mut counts = [0; 3];
+    let mut mix_unmarked = 0;
+    for _ in 0..4000 {
+        let next = mixed.next().unwrap();
+        let source = next.source();
+        let record = next.record;
+        counts[source] += 1;
+        if record.tree_sample {
+            assert!(sampling.accepts(source as u64, record.epoch, record.record_index, 0.25));
+        } else {
+            assert_eq!(source, 2);
+            assert!(sampling.accepts(2, record.epoch, record.record_index, 0.5));
+            mix_unmarked += 1;
+        }
+        if let Some(bucket) = &buckets[source] {
+            assert!(bucket.finish(&record, 0).unwrap());
+        }
+    }
+    for (count, expected) in counts.into_iter().zip([0.5, 0.2, 0.3]) {
+        assert!((f64::from(count) / 4000.0 - expected).abs() < 0.025);
+    }
+    assert!(mix_unmarked > counts[2] / 2);
+}
+
+#[test]
+fn delivered_teacher_mix_is_weighted_by_bucket_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[10; 512]);
+    let marked = teacher(dir.path(), "marked.psv", &[20; 512]);
+    let overridden = teacher(dir.path(), "overridden.psv", &[30; 512]);
+    mark_tree_samples(&marked, 1);
+    let rates = [0.5, 0.25, 0.25];
+    let bucket_acceptance = [0.25, 1.0, 1.0];
+    let mixes = [
+        MixSource::new(marked, rates[1]),
+        MixSource {
+            keep_rate: Some(0.5),
+            ..MixSource::new(overridden, rates[2])
+        },
+    ];
+    let mut reader = main_reader(&main, None, None);
+    reader.tree_sample_eval_only = true;
+    reader.configure_sampling(crate::sampling::Sampling {
+        bucket_keep_rates: Some(vec![bucket_acceptance[0]; 9]),
+        skip_seed: 42,
+        ..Default::default()
+    });
+    let mixed = MixedTeacherReader::new(reader, &mixes, 123).unwrap();
+    let mut loader = BucketedPrefetchedLoader::spawn_with_reader(
+        64,
+        4,
+        BucketMode::KingRank9,
+        FeatureSet::HalfKaHmMerged.spec(),
+        true,
+        9,
+        false,
+        TrainingPsvReader::Mixed(Box::new(mixed)),
+        &main,
+    );
+    let mut delivered = [0; 3];
+    for _ in 0..128 {
+        let slot = loader.next_batch().unwrap().unwrap();
+        assert_eq!(slot.0.teacher_counts.iter().sum::<u64>(), 64);
+        for (total, count) in delivered.iter_mut().zip(&slot.0.teacher_counts) {
+            *total += count;
+        }
+        loader.recycle(slot);
+    }
+    let total = delivered.iter().sum::<u64>();
+    let weights = std::array::from_fn::<_, 3, _>(|i| rates[i] * bucket_acceptance[i]);
+    let total_weight = weights.iter().sum::<f64>();
+    for (count, weight) in delivered.into_iter().zip(weights) {
+        let actual = count as f64 / total as f64;
+        let expected = weight / total_weight;
+        assert!((actual - expected).abs() < 0.025, "{actual} vs {expected}");
+    }
+    let buckets = loader.sampling_bucket_counts().unwrap();
+    let (read, kept) = buckets.into_iter().find(|&(read, _)| read != 0).unwrap();
+    assert!(kept >= total, "bucket kept={kept}, delivered={total}");
+    assert!(read > kept, "bucket read={read}, kept={kept}");
+}
+
 #[test]
 fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
     let dir = tempfile::tempdir().unwrap();
     let primary = teacher(dir.path(), "primary.psv", &(1..=2000).collect::<Vec<_>>());
-    let sources = [
+    let mut sources = [
         MixSource::new(
             teacher(
                 dir.path(),
@@ -500,12 +675,17 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
             0.35,
         ),
     ];
+    sources[0].keep_rate = Some(0.6);
+    for path in [&primary, &sources[0].path, &sources[1].path] {
+        mark_tree_samples(path, 4);
+    }
     let open = |workers, window_mib, position: Option<&TeacherPosition>| {
         BucketedPrefetchedLoader::spawn_mixed_resumable(
             &[&primary],
             BucketedLoaderOptions {
                 sampling: crate::sampling::Sampling {
                     keep_rate: 0.8,
+                    tree_sample_accept: 0.35,
                     bucket_keep_rates: Some(vec![0.7; 9]),
                     skip_seed: 19,
                     ..Default::default()
@@ -520,7 +700,10 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
                 num_buckets: 9,
                 train_end_offset: 2000 * PSV_RECORD_BYTES,
                 monitor_active: false,
-                labels: LabelOptions::default(),
+                labels: LabelOptions {
+                    tree_sample_eval_only: true,
+                    ..Default::default()
+                },
                 teacher_shuffle_buffer_mib: window_mib,
                 teacher_shuffle: true,
                 teacher_shuffle_seed: 31,

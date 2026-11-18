@@ -2087,6 +2087,7 @@ pub(crate) fn build_experiment_logger(
                 rate: source.rate,
                 score_drop_abs: source.score_drop_abs,
                 score_clamp_abs: source.score_clamp_abs,
+                keep_rate: source.keep_rate,
             })
             .collect(),
         mix_seed: (!cli.mix_data.is_empty()).then_some(cli.mix_seed),
@@ -2294,6 +2295,7 @@ pub(crate) fn build_experiment_logger_simple(
                 rate: source.rate,
                 score_drop_abs: source.score_drop_abs,
                 score_clamp_abs: source.score_clamp_abs,
+                keep_rate: source.keep_rate,
             })
             .collect(),
         mix_seed: (!cli.mix_data.is_empty()).then_some(cli.mix_seed),
