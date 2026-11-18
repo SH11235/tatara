@@ -123,9 +123,9 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   `--resume` compares them with the resuming run to record whether it
 ///   continues the producer's training or forks a new experiment from it.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=11. Version 1 is interpreted as
+/// `load_raw_checkpoint` accepts versions 1..=12. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 11 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 12 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
@@ -183,12 +183,17 @@ impl RawCkptHeader {
         let Some(run_id) = self.producer_run_id.as_deref() else {
             return Ok(());
         };
-        if Path::new(run_id).file_name().and_then(|name| name.to_str()) != Some(run_id) {
+        let run_path = Path::new(run_id);
+        if !run_path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
             return Err(invalid_data(
                 "invalid checkpoint producer run id".to_string(),
             ));
         }
-        let Some(directory) = checkpoint.canonicalize()?.parent().map(Path::to_path_buf) else {
+        let checkpoint = checkpoint.canonicalize()?;
+        let Some(directory) = checkpoint.ancestors().nth(run_path.components().count()) else {
             return Ok(());
         };
         let metadata = directory.join("experiments").join(format!("{run_id}.json"));

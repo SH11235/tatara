@@ -816,7 +816,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0.5, global = true)]
     pub(crate) loss_weight_boost_w2: f32,
     /// Optimizer: ranger (RAdam with Lookahead), radam, adamw, or sgd (classical
-    /// momentum 0.9). A raw checkpoint resume uses the original optimizer.
+    /// momentum 0.9). A raw checkpoint training resume uses the original optimizer.
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
 
@@ -826,7 +826,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         global = true,
-        requires_all = ["resume", "lr"],
+        requires_all = ["resume", "lr", "data"],
         conflicts_with_all = ["start_superbatch", "resume_input", "lineage_kind", "eval_only", "rescore_input"]
     )]
     pub(crate) transfer_radam_momentum: bool,

@@ -494,10 +494,10 @@ fn validate_shared_cli(
 }
 
 #[cfg(feature = "gpu")]
-fn check_sgd_transfer_destination(
+fn lock_sgd_transfer_destination(
     output: &Path,
     net_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<std::fs::File, Box<dyn std::error::Error>> {
     let namespace = output.join(format!("{net_id}-"));
     let prefix = namespace
         .file_name()
@@ -505,6 +505,20 @@ fn check_sgd_transfer_destination(
         .ok_or("invalid --net-id")?
         .to_lowercase();
     let directory = namespace.parent().ok_or("invalid --output")?;
+    std::fs::create_dir_all(directory)?;
+    let lock_path = directory.join(format!(".{prefix}sgd-transfer.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.try_lock().map_err(|error| {
+        format!(
+            "cannot lock SGD transfer destination {}: {error}",
+            lock_path.display()
+        )
+    })?;
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_lowercase();
@@ -521,7 +535,7 @@ fn check_sgd_transfer_destination(
             ).into());
         }
     }
-    Ok(())
+    Ok(lock)
 }
 
 #[cfg(feature = "gpu")]
@@ -732,9 +746,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
     std::fs::create_dir_all(&cli.output)?;
-    if cli.transfer_radam_momentum {
-        check_sgd_transfer_destination(&cli.output, &cli.net_id)?;
-    }
+    let _transfer_lock = cli
+        .transfer_radam_momentum
+        .then(|| lock_sgd_transfer_destination(&cli.output, &cli.net_id))
+        .transpose()?;
 
     // progress 系 mode のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
@@ -2473,9 +2488,10 @@ pub(crate) fn run_simple_training(
     let init_spec = build_simple_init_spec(cli)?;
 
     std::fs::create_dir_all(&cli.output)?;
-    if cli.transfer_radam_momentum {
-        check_sgd_transfer_destination(&cli.output, &cli.net_id)?;
-    }
+    let _transfer_lock = cli
+        .transfer_radam_momentum
+        .then(|| lock_sgd_transfer_destination(&cli.output, &cli.net_id))
+        .transpose()?;
 
     // Simple は bucket-aware progress を持たない: dataloader に渡す
     // `ShogiProgressKPAbs` は zero-weight default (全 position が bucket 4)、
@@ -2957,12 +2973,14 @@ mod shared_cli_tests {
     }
 
     #[test]
-    fn radam_momentum_transfer_requires_checkpoint_and_explicit_learning_rate() {
+    fn radam_momentum_transfer_requires_checkpoint_rate_and_data() {
         let with_checkpoint = [
             "nnue-trainer",
             "layerstack",
             "--resume",
             "state.ckpt",
+            "--data",
+            "teacher.psv",
             "--optimizer",
             "sgd",
             "--transfer-radam-momentum",
@@ -2973,9 +2991,28 @@ mod shared_cli_tests {
                 .to_string()
                 .contains("--lr")
         );
+        let without_data = [
+            "nnue-trainer",
+            "layerstack",
+            "--resume",
+            "state.ckpt",
+            "--optimizer",
+            "sgd",
+            "--transfer-radam-momentum",
+            "--lr",
+            "0.01",
+        ];
+        assert!(
+            Cli::try_parse_from(without_data)
+                .unwrap_err()
+                .to_string()
+                .contains("--data")
+        );
         let valid = parse(&[
             "--resume",
             "state.ckpt",
+            "--data",
+            "teacher.psv",
             "--optimizer",
             "sgd",
             "--transfer-radam-momentum",
@@ -2989,6 +3026,8 @@ mod shared_cli_tests {
             &[
                 "--resume",
                 "state.ckpt",
+                "--data",
+                "teacher.psv",
                 "--transfer-radam-momentum",
                 "--lr",
                 "0.01",
@@ -3005,10 +3044,12 @@ mod shared_cli_tests {
             std::env::temp_dir().join(format!("tatara-sgd-destination-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Source-1.CKPT"), b"source").unwrap();
-        assert!(check_sgd_transfer_destination(&dir, "source").is_err());
-        assert!(check_sgd_transfer_destination(&dir, "new-net").is_ok());
-        std::fs::remove_file(dir.join("Source-1.CKPT")).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        assert!(lock_sgd_transfer_destination(&dir, "source").is_err());
+        let lock = lock_sgd_transfer_destination(&dir, "team/New-Net").unwrap();
+        assert!(lock_sgd_transfer_destination(&dir, "team/new-net").is_err());
+        drop(lock);
+        assert!(lock_sgd_transfer_destination(&dir, "team/new-net").is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

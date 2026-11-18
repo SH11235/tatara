@@ -67,7 +67,7 @@
 /// 入力前提:
 /// - `step >= 1` (1-indexed。`step = 0` で `beta^0 = 1` となり `bc1 = 0`、
 ///   `step_size = 1/0 = +inf` になるので呼び出し側で避ける)
-/// - `0 < beta1 < 1`, `0 < beta2 <= 1`
+/// - `0 < beta1 < 1`, `0 < beta2 < 1`
 /// - `n_sma_threshold > 0` (論文 default `5.0`)
 ///
 /// 戻り値: `(step_size, denom)` (denom は 0 or 1 の i32、kernel 引数として

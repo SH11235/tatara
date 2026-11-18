@@ -3428,12 +3428,15 @@ impl GpuTrainer {
             &expected_groups,
         )?;
 
-        header.prepare_optimizer_state(
-            path,
-            &mut loaded,
-            self.optimizer,
-            transfer_radam_momentum,
-        )?;
+        let forward_only = self.forward_only;
+        if !forward_only {
+            header.prepare_optimizer_state(
+                path,
+                &mut loaded,
+                self.optimizer,
+                transfer_radam_momentum,
+            )?;
+        }
 
         self.qat_mode = if header.qat_dense {
             crate::qat::QatMode::Dense
@@ -3446,7 +3449,6 @@ impl GpuTrainer {
         // 載せ直す (checkpoint は真値 f32、mode 非依存)。forward-only trainer は
         // optimizer state (`m` / `v` / `slow`) を持たないため weight のみ載せ、
         // state は 0-byte のまま維持する (file 側は全 group を読了・検証済み)。
-        let forward_only = self.forward_only;
         let (ftw_w, ftw_m, ftw_v, ftw_slow) = &loaded[0];
         upload_into(&self.stream, &mut self.ft_w, ftw_w)?;
         #[cfg(feature = "native")]

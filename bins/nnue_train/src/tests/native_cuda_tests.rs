@@ -4182,6 +4182,22 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
     let (saved_sb, _, horizon) = separate.load_raw_checkpoint(&checkpoint, false)?;
     assert_eq!((saved_sb, horizon), (1, Some(12)));
     assert_eq!(separate.raw_checkpoint_state_to_host()?, (1, fused_groups));
+    drop(separate);
+
+    let mut eval = create_layerstack_trainer_forward_only(
+        &context,
+        true,
+        LayerStackTestOptions {
+            optimizer: OptimizerKind::Ranger,
+            ..options
+        },
+    )?;
+    eval.load_raw_checkpoint(&checkpoint, false)?;
+    eval.sync_ft_forward_weights()?;
+    let trained = fused.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    let forward_only = eval.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+    assert_eq!(forward_only.loss.to_bits(), trained.loss.to_bits());
+
     std::fs::remove_file(parent_checkpoint)?;
     std::fs::remove_file(checkpoint)?;
     Ok(())
