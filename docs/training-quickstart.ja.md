@@ -261,7 +261,7 @@ PSVの再評価では、スコアを書き出す前の玉の配置・総駒数�
 `--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
 WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
 `--data` が必要で、フラグは全教師に適用する。主の教師では padding の bit 0 と bit 1 を許可し、
-bit 0 は dual-label の gate としても働く。追加教師では bit 1 だけを許可する。マーク付き局面は
+bit 0 は dual-label の gate としても働く。追加教師でも bit 0 と bit 1 を許可するが、bit 0 は gate として読まない。マーク付き局面は
 外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。
 
 学習loaderをdropすると、direct・windowed双方をレコード境界で取り消す。

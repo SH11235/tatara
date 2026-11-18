@@ -580,7 +580,12 @@ fn mixed_tree_samples_use_eval_only_labels_when_marked() {
                 .enumerate()
             {
                 record[38] = 1;
-                record[39] = if marked && i == 0 { 2 } else { 0 };
+                // Bit 0 has no dual-label meaning on a mixed teacher and must be ignored.
+                record[39] = match (*path == extra, marked && i == 0) {
+                    (true, true) => 3,
+                    (true, false) => 1,
+                    (false, _) => 0,
+                };
             }
             std::fs::write(path, bytes).unwrap();
         }
@@ -642,7 +647,7 @@ fn mixed_tree_samples_reject_reserved_padding_bits() {
     let extra = teacher(dir.path(), "invalid.psv", &[200]);
     let sources = [MixSource::new(extra.clone(), 0.4)];
     let mut bytes = std::fs::read(&extra).unwrap();
-    for (padding, enabled) in [(1, true), (3, true), (6, true)] {
+    for (padding, enabled) in [(4, true), (6, true)] {
         bytes[39] = padding;
         std::fs::write(&extra, &bytes).unwrap();
         let mut main = main_reader(&main, None, None);
@@ -655,12 +660,13 @@ fn mixed_tree_samples_reject_reserved_padding_bits() {
         assert!(error.to_string().contains("reserved padding bits"));
         assert!(error.to_string().contains(extra.to_str().unwrap()));
     }
-    // Without the flag the padding of a mixed teacher is not interpreted.
-    for padding in [1, 2, 7] {
+    // Bits 0 and 1 are accepted with the flag; without it the padding is not interpreted.
+    for (padding, enabled) in [(1, true), (3, true), (1, false), (2, false), (7, false)] {
         bytes[39] = padding;
         std::fs::write(&extra, &bytes).unwrap();
-        let mut reader =
-            MixedTeacherReader::new(main_reader(&main, None, None), &sources, 0).unwrap();
+        let mut main = main_reader(&main, None, None);
+        main.tree_sample_eval_only = enabled;
+        let mut reader = MixedTeacherReader::new(main, &sources, 0).unwrap();
         for _ in 0..100 {
             reader.next().unwrap();
         }

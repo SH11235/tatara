@@ -287,7 +287,7 @@ writing scores. These checks do not verify move legality or every possible forma
 on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
 `--data` in PSV format and applies to all teachers. The main teacher permits
 padding bits 0 and 1 with this flag, and bit 0 retains its dual-label gate meaning.
-Additional teachers permit only bit 1. Marked positions are rejected in external
+Additional teachers also permit bits 0 and 1 but never read bit 0 as a gate. Marked positions are rejected in external
 `--test-data` and `--test-tail-positions`.
 
 Dropping the training loader cancels both direct and windowed readers at record boundaries,

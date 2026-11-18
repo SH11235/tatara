@@ -288,23 +288,11 @@ impl LabelOptions<'_> {
         path: &Path,
         heldout: bool,
     ) -> io::Result<()> {
-        self.apply_tree_sample_with_padding(psv, record_index, path, heldout, None)
-    }
-
-    fn apply_tree_sample_with_padding(
-        self,
-        psv: &mut PackedSfenValue,
-        record_index: u64,
-        path: &Path,
-        heldout: bool,
-        allowed_padding: Option<u8>,
-    ) -> io::Result<()> {
-        let Some(allowed_padding) = allowed_padding.or(self.tree_sample_eval_only.then_some(3))
-        else {
+        if !self.tree_sample_eval_only {
             return Ok(());
-        };
+        }
         let padding = psv.as_bytes_mut()[39];
-        if padding & !allowed_padding != 0 {
+        if padding & !3 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1512,19 +1500,15 @@ impl PsvEpochReader {
                         score_override.apply(&mut record)?;
                     }
                     if let TeacherRecord::Psv(psv) = &mut record {
-                        // Mixed teachers have no dual-label gate, so only the tree-sample bit is meaningful.
-                        let allowed_padding = (self.teacher != 0 && self.tree_sample_eval_only)
-                            .then_some(TREE_SAMPLE_PADDING_BIT);
                         LabelOptions {
                             score_source: None,
                             tree_sample_eval_only: self.tree_sample_eval_only,
                         }
-                        .apply_tree_sample_with_padding(
+                        .apply_tree_sample(
                             psv,
                             record_index,
                             &self.path,
                             false,
-                            allowed_padding,
                         )?;
                     }
                     if let Some(mode) = self.dual_label_psv {
