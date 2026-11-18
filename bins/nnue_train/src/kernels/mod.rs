@@ -79,3 +79,6 @@ mod simple;
 pub(crate) use common::*;
 pub(crate) use layerstack::*;
 pub(crate) use simple::*;
+
+mod partial_threat;
+pub(crate) use partial_threat::*;

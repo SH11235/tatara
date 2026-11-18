@@ -648,6 +648,21 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             unreachable!("effect bucket and threat are rejected before spec construction")
         }
     };
+    let feature_set = if let Some(width) = layerstack.threat_width {
+        if threat_profile.is_none()
+            || width == 0
+            || !width.is_multiple_of(2)
+            || width > layerstack.ft_out
+        {
+            return Err(
+                "--threat-width requires Threat features and a positive even width <= --ft-out"
+                    .into(),
+            );
+        }
+        feature_set.with_threat_width(width)
+    } else {
+        feature_set
+    };
     let feature_set = if cli.ft_factorize_enabled() {
         if cli.init_from.is_some() {
             println!(
@@ -2019,6 +2034,8 @@ pub(crate) fn build_experiment_logger(
         ),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
+        threat_width: (feature_set.threat_width(layerstack.ft_out) != layerstack.ft_out)
+            .then_some(feature_set.threat_width(layerstack.ft_out)),
         ft_factorize: feature_set.ft_factorize().then_some(true),
         stack_shared_delta: layerstack.stack_shared_delta.then_some(true),
         l0: layerstack.ft_out,
@@ -2231,6 +2248,7 @@ pub(crate) fn build_experiment_logger_simple(
         architecture,
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
+        threat_width: None,
         ft_factorize: id.feature_set.ft_factorize().then_some(true),
         stack_shared_delta: None,
         l0: id.ft_out,

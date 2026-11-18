@@ -1,5 +1,4 @@
 use std::io::Write;
-#[cfg(feature = "gpu")]
 use std::path::Path;
 
 #[cfg(feature = "gpu")]
@@ -17,10 +16,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 12):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 15):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (11 or 12)             (4 bytes)
+//   version      u32 (11..=15)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -28,6 +27,7 @@ use crate::trainer_common::MomentBuf;
 //   max_active   u64                 (学習側の 1 perspective あたり active feature 数)
 //   ft_factorize u8                  (v6+、FT factorizer 有効 flag)
 //   feature_hash u32                 (v7+、feature mapping identity)
+//   threat_width u64               (v13+, packed Threat row width)
 //   run_id_len   u32                 (4 bytes、producer run id の長さ、0 可)
 //   run_id       UTF-8 [run_id_len]   (この checkpoint を書いた run の experiment.json `id`)
 //   arch_len     u32                 (4 bytes、arch kind canonical 名の長さ)
@@ -56,7 +56,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=12 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=15 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -123,18 +123,26 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   `--resume` compares them with the resuming run to record whether it
 ///   continues the producer's training or forks a new experiment from it.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=12. Version 1 is interpreted as
+/// - `12`: the version 11 layout with SGD momentum state.
+/// - `13`: compact Threat with the version 11 optimizer state. A u64 Threat
+///   row width follows the feature hash.
+/// - `14`: the compact Threat layout with SGD momentum state.
+/// - `15`: the compact Threat layout with RAdam optimizer state.
+///
+/// `load_raw_checkpoint` accepts versions 1..=15. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 12 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 15 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
-/// Version 12 uses the same layout as version 11 and identifies SGD momentum state.
-pub(crate) const RAW_CKPT_VERSION: u32 = 12;
+pub(crate) const RAW_CKPT_VERSION: u32 = 15;
 const ADAM_CHECKPOINT_VERSION: u32 = 11;
 const SGD_CHECKPOINT_VERSION: u32 = 12;
+const PARTIAL_THREAT_CKPT_VERSION: u32 = 13;
+const PARTIAL_THREAT_SGD_CKPT_VERSION: u32 = 14;
+const PARTIAL_THREAT_RADAM_CKPT_VERSION: u32 = 15;
 
 /// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
 /// `lineage.parent_id` と、resume した run が続きか派生かの判定に使う。
@@ -146,7 +154,6 @@ pub(crate) struct ResumeProducer {
     pub(crate) recipe_fingerprint: Option<u64>,
 }
 
-#[cfg(feature = "gpu")]
 impl RawCkptHeader {
     pub(crate) fn prepare_optimizer_state(
         &mut self,
@@ -162,7 +169,9 @@ impl RawCkptHeader {
                         .to_string(),
                 ));
             }
-            self.check_radam_producer(path)?;
+            if self.version != PARTIAL_THREAT_RADAM_CKPT_VERSION {
+                self.check_radam_producer(path)?;
+            }
             // Both optimizers store the same gradient EMA with beta1 = 0.9.
             for (_, _, variance, slow) in groups {
                 variance.fill(0.0);
@@ -170,6 +179,13 @@ impl RawCkptHeader {
             }
             self.step_count = 0;
             self.lr_horizon = None;
+        } else if self.version == PARTIAL_THREAT_RADAM_CKPT_VERSION
+            && optimizer != OptimizerKind::RAdam
+        {
+            return Err(invalid_data(
+                "Version 15 compact checkpoints require --optimizer radam for resume; to start SGD, use --optimizer sgd with --transfer-radam-momentum"
+                    .to_string(),
+            ));
         } else if self.sgd != (optimizer == OptimizerKind::Sgd) {
             return Err(invalid_data(
                 "SGD checkpoints require --optimizer sgd; to start SGD from a RAdam checkpoint, use --transfer-radam-momentum"
@@ -180,8 +196,18 @@ impl RawCkptHeader {
     }
 
     fn check_radam_producer(&self, checkpoint: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let missing_metadata = || {
+            if self.version == PARTIAL_THREAT_CKPT_VERSION {
+                Err(invalid_data(
+                    "--transfer-radam-momentum requires producer metadata identifying RAdam for a version 13 compact checkpoint"
+                        .to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
         let Some(run_id) = self.producer_run_id.as_deref() else {
-            return Ok(());
+            return missing_metadata();
         };
         let run_path = Path::new(run_id);
         if !run_path
@@ -194,12 +220,14 @@ impl RawCkptHeader {
         }
         let checkpoint = checkpoint.canonicalize()?;
         let Some(directory) = checkpoint.ancestors().nth(run_path.components().count()) else {
-            return Ok(());
+            return missing_metadata();
         };
         let metadata = directory.join("experiments").join(format!("{run_id}.json"));
         let file = match std::fs::File::open(&metadata) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return missing_metadata();
+            }
             Err(error) => return Err(error.into()),
         };
         let experiment: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(file))?;
@@ -214,6 +242,7 @@ impl RawCkptHeader {
         Ok(())
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn producer(&self) -> ResumeProducer {
         ResumeProducer {
             run_id: self.producer_run_id.clone(),
@@ -228,7 +257,6 @@ impl RawCkptHeader {
 pub(crate) const MAX_RUN_ID_BYTES: usize = 256;
 
 /// raw checkpoint 1 group 分の host buffer (`w`, `m`, `v`, `slow` の f32 Vec、`grad` は含めない)。
-#[cfg(feature = "gpu")]
 pub(crate) type RawCkptGroup = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// LayerStack の `load_raw_checkpoint` の戻り値: `(完了 superbatch, producer の識別情報,
@@ -377,6 +405,7 @@ pub(crate) struct RawCkptMeta<'a> {
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
 #[derive(Debug)]
 pub(crate) struct RawCkptHeader {
+    version: u32,
     pub(crate) sgd: bool,
     pub(crate) qat_dense: bool,
     /// この checkpoint が表す完了 superbatch 番号。
@@ -406,10 +435,14 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     num_groups: u64,
 ) -> std::io::Result<()> {
     w.write_all(&RAW_CKPT_MAGIC)?;
-    let version = if meta.optimizer == OptimizerKind::Sgd {
-        SGD_CHECKPOINT_VERSION
-    } else {
-        ADAM_CHECKPOINT_VERSION
+    let threat_width = arch.feature_set.threat_width(arch.ft_out as usize) as u64;
+    let partial = threat_width != arch.ft_out;
+    let version = match (partial, meta.optimizer) {
+        (false, OptimizerKind::Sgd) => SGD_CHECKPOINT_VERSION,
+        (false, _) => ADAM_CHECKPOINT_VERSION,
+        (true, OptimizerKind::Sgd) => PARTIAL_THREAT_SGD_CKPT_VERSION,
+        (true, OptimizerKind::RAdam) => PARTIAL_THREAT_RADAM_CKPT_VERSION,
+        (true, _) => PARTIAL_THREAT_CKPT_VERSION,
     };
     w.write_all(&version.to_le_bytes())?;
     // feature set header (v2+): canonical 名 + 次元 3 値。
@@ -423,6 +456,9 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     w.write_all(&[arch.feature_set.ft_factorize() as u8])?;
     // feature mapping hash (v7+)。
     w.write_all(&arch.feature_set.feature_hash().to_le_bytes())?;
+    if partial {
+        w.write_all(&threat_width.to_le_bytes())?;
+    }
     // producer run id (v3+)。
     w.write_all(&(meta.run_id.len() as u32).to_le_bytes())?;
     w.write_all(meta.run_id.as_bytes())?;
@@ -460,7 +496,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=12 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=15 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
@@ -485,7 +521,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     if version == 0 || version > RAW_CKPT_VERSION {
         return Err(invalid_data(format!(
             "raw checkpoint version {version} is not supported \
-             (this build reads 1..={RAW_CKPT_VERSION})"
+             (this build reads 1..=15)"
         )));
     }
     let mut buf8 = [0u8; 8];
@@ -527,6 +563,16 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             None
         };
 
+        let width = if version >= PARTIAL_THREAT_CKPT_VERSION {
+            let mut width_bytes = [0; 8];
+            read_exact_or_invalid(r, &mut width_bytes, "Threat width")?;
+            u64::from_le_bytes(width_bytes)
+        } else {
+            expected.ft_out
+        };
+        if width != expected.feature_set.threat_width(expected.ft_out as usize) as u64 {
+            return Err(invalid_data("raw checkpoint Threat width mismatch".into()));
+        }
         let want = expected.feature_set;
         if fs_name != want_name {
             return Err(invalid_data(format!(
@@ -577,7 +623,13 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         // ないため値で受理する。
         let legacy_factorized_max_active =
             want.ft_factorize() && ckpt_max_active == 2 * want.max_active() as u64;
-        if ckpt_max_active != want.max_active() as u64 && !legacy_factorized_max_active {
+        // Threat's sparse input capacity can grow without changing any checkpoint tensors.
+        let legacy_threat_max_active = want.threat_profile().is_some()
+            && ckpt_max_active == (want.feature_set().spec().max_active() + 128) as u64;
+        if ckpt_max_active != want.max_active() as u64
+            && !legacy_factorized_max_active
+            && !legacy_threat_max_active
+        {
             return Err(invalid_data(format!(
                 "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
                 want.max_active()
@@ -797,7 +849,11 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     let num_groups = u64::from_le_bytes(buf8);
 
     Ok(RawCkptHeader {
-        sgd: version == SGD_CHECKPOINT_VERSION,
+        version,
+        sgd: matches!(
+            version,
+            SGD_CHECKPOINT_VERSION | PARTIAL_THREAT_SGD_CKPT_VERSION
+        ),
         qat_dense,
         superbatch,
         step_count,
@@ -881,7 +937,6 @@ pub(crate) fn save_raw_checkpoint_file(
 /// reject する。全 group を読み切ってから返すので、caller は読み途中の失敗で
 /// device 側が中途半端な state になる心配なく upload できる (trailing garbage は
 /// 許容、足りないのは `read_exact` が弾く)。
-#[cfg(feature = "gpu")]
 pub(crate) fn load_raw_checkpoint_file(
     path: &Path,
     expected_arch: &RawCkptArch,
@@ -906,7 +961,6 @@ pub(crate) fn load_raw_checkpoint_file(
 
 /// 1 group 分 (len + w/m/v/slow の f32 × len) を読む。file 記載 `len` と
 /// `expected_len` の不一致 / `u64 → usize` overflow は `InvalidData` で reject。
-#[cfg(feature = "gpu")]
 fn read_raw_ckpt_group<R: std::io::Read>(
     r: &mut R,
     name: &str,

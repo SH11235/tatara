@@ -2202,6 +2202,7 @@ mod tests {
     /// experiment.json テスト用の最小 `Params` (sigmoid loss、held-out 既定 None)。
     fn experiment_params() -> crate::experiment::Params {
         crate::experiment::Params {
+            threat_width: None,
             qat: "off".into(),
             trainer_build: None,
             trainer_backend: None,

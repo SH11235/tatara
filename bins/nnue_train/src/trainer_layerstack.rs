@@ -166,7 +166,12 @@ impl GpuTrainer {
             .precision_diagnostic
             .as_ref()
             .is_some_and(|d| d.steps.contains(&step));
-        !diagnostic_step && self.psqt.is_none() && !self.ft_fused_optimizer_disabled
+        let width = self.feature_set.threat_width(self.ws.ft_out);
+        !diagnostic_step
+            && (!self.partial_threat()
+                || (width.is_multiple_of(8) && self.ws.ft_out.is_multiple_of(4)))
+            && self.psqt.is_none()
+            && !self.ft_fused_optimizer_disabled
     }
 
     /// Leaves the per-column FT norms for this fused step in `ft_norms` and zeroes
@@ -185,6 +190,8 @@ impl GpuTrainer {
                     args: [slice(self.ft_norm_sums), slice_mut(self.ft_norms), ft_out as u32]
                 }
             }?;
+        } else if self.partial_threat() {
+            self.launch_partial_ft_norms(&self.ft_norms)?;
         } else {
             let rows = self.feature_set.train_ft_in();
             memset_zero(&self.stream, &self.ft_norms)?;
@@ -349,6 +356,9 @@ impl GpuTrainer {
     /// FT forward for both perspectives in the king-grouped order of `ws.ft_order`, writing the
     /// same activations as `sparse_ft_forward*` would.
     fn launch_ft_forward_ordered(&mut self, b: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if self.partial_threat() {
+            return self.launch_partial_ft_forward(b);
+        }
         self.build_ft_forward_order(b)?;
         let ft_out = self.ws.ft_out;
         let (b_u32, ft_out_u32) = (b as u32, ft_out as u32);
@@ -998,7 +1008,11 @@ impl GpuTrainer {
             memset_zero(&self.stream, stm)?;
             memset_zero(&self.stream, nstm)?;
         }
-        self.launch_ft_forward_ordered(b)?;
+        if self.partial_threat() {
+            self.launch_partial_ft_forward(b)?;
+        } else {
+            self.launch_ft_forward_ordered(b)?;
+        }
         let ft_out = self.ws.ft_out;
         let n = b * ft_out;
         let read_f32 =
@@ -1135,8 +1149,8 @@ impl GpuTrainer {
         step: FtFusedStep,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ft_factorize = self.feature_set.ft_factorize();
-        let train_n = self.feature_set.train_ft_in() * ft_out;
-        let real_n = self.feature_set.ft_in() * ft_out;
+        let train_n = self.feature_set.train_ft_weight_len(ft_out);
+        let real_n = self.feature_set.ft_weight_len(ft_out);
         if ft_out == 0
             || !ft_out.is_multiple_of(4)
             || !real_n.is_multiple_of(4)
@@ -1177,13 +1191,43 @@ impl GpuTrainer {
         } else {
             0
         };
-        // (begin, end, forward output flags) per launch.
-        let ranges: [(usize, usize, u32); 2] = if ft_factorize {
-            [(real_n, train_n, 0), (0, real_n, output_flags)]
+        let width = self.feature_set.threat_width(ft_out);
+        let base_n = self.feature_set.base_ft_in() * ft_out;
+        let piece_end = real_n + self.feature_set.piece_inputs() * ft_out;
+        // Each launch uses a uniform packed row width; virtual rows precede the real updates.
+        let ranges = if self.partial_threat() {
+            [
+                (
+                    real_n,
+                    if ft_factorize { piece_end } else { real_n },
+                    0,
+                    ft_out,
+                ),
+                (
+                    if ft_factorize { piece_end } else { train_n },
+                    train_n,
+                    0,
+                    width,
+                ),
+                (0, base_n, 0, ft_out),
+                (base_n, real_n, 0, width),
+            ]
+        } else if ft_factorize {
+            [
+                (real_n, train_n, 0, ft_out),
+                (0, real_n, output_flags, ft_out),
+                (0, 0, 0, ft_out),
+                (0, 0, 0, ft_out),
+            ]
         } else {
-            [(0, train_n, output_flags), (0, 0, 0)]
+            [
+                (0, train_n, output_flags, ft_out),
+                (0, 0, 0, ft_out),
+                (0, 0, 0, ft_out),
+                (0, 0, 0, ft_out),
+            ]
         };
-        for (begin, end, out) in ranges {
+        for (begin, end, out, row_width) in ranges {
             if begin == end {
                 continue;
             }
@@ -1211,13 +1255,13 @@ impl GpuTrainer {
                         cuda_launch! {
                             kernel: ft_fused_optimizer_step,
                             stream: self.stream, module: self.module,
-                            config: ft_fused_launch_config(end - begin, ft_out)?,
+                            config: ft_fused_launch_config(end - begin, row_width)?,
                             args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
                                    slice(self.ft_norms), slice_mut(self.ft_norm_sums),
                                    slice(self.ws.ft_active_rows),
                                    slice_mut($forward),
-                                   slice(self.threat_pair_starts), bounds, ft_out as u32,
+                                   slice(self.threat_pair_starts), bounds, row_width as u32, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
                                    norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
                                    step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
@@ -1258,6 +1302,9 @@ impl GpuTrainer {
         count: usize,
         seed: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.partial_threat() {
+            return Err("FT precision diagnostics require full Threat width".into());
+        }
         self.precision_diagnostic = Some(crate::precision_diagnostics::Diagnostic::new(
             &self.stream,
             self.ft_w.len(),
@@ -1383,6 +1430,25 @@ use shogi_features::FeatureSetSpec;
 use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
+
+fn cfg_partial_ft_1d(elements: usize) -> LaunchConfig {
+    let mut config = cfg_1d(1);
+    config.grid_dim.0 = u32::try_from(elements.max(1).div_ceil(config.block_dim.0 as usize))
+        .expect("compact FT requires too many CUDA blocks");
+    config
+}
+
+fn validate_unfused_ft_optimizer_len(elements: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if u32::try_from(elements).is_err() {
+        return Err(format!(
+            "The unfused FT optimizer supports at most {} weights, but this configuration has \
+             {elements}. Reduce --ft-out or --threat-width, or use the native fused FT optimizer.",
+            u32::MAX
+        )
+        .into());
+    }
+    Ok(())
+}
 
 fn ft_moment(
     stream: &CudaStream,
@@ -1566,6 +1632,8 @@ pub(crate) struct GpuTrainer {
     /// 代わりに読む。それ以外の構成では `None` (FP32 forward は `ft_w` を直接読む)。
     ft_w_fold32: Option<DeviceBuffer<f32>>,
     threat_pair_starts: DeviceBuffer<u32>,
+    partial_ft_shape: DeviceBuffer<u32>,
+    partial_norm_sums: DeviceBuffer<f64>,
     empty_threat_pair_starts: DeviceBuffer<u32>,
     ft_b: DeviceBuffer<f32>,
     ft_b_m: DeviceBuffer<f32>,
@@ -2424,6 +2492,15 @@ impl GpuTrainer {
         if precision.ft_fp16_out && !precision.ft_fp16 {
             return Err("--ft-fp16-out requires --ft-fp16".into());
         }
+        let width = feature_set.threat_width(ft_out);
+        if width == 0 || !width.is_multiple_of(2) || width > ft_out {
+            return Err("Threat width must be positive, even and <= FT output width".into());
+        }
+        let ft_w_n = feature_set.train_ft_weight_len(ft_out);
+        #[cfg(not(feature = "native"))]
+        if !forward_only {
+            validate_unfused_ft_optimizer_len(ft_w_n)?;
+        }
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
@@ -2440,9 +2517,9 @@ impl GpuTrainer {
         // (threat 行を跨がないため両者は別物)。
         let base_ft_in = feature_set.ft_in();
         let train_ft_in = feature_set.train_ft_in();
+
         let l1_effective = l1_out - L1_SKIP;
         let l2_in = l1_effective * 2;
-        let ft_w_n = train_ft_in * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = num_buckets * l1_out * ft_out;
         let l1_b_n = num_buckets * l1_out;
@@ -2470,7 +2547,7 @@ impl GpuTrainer {
         // 実 row の半値幅がずれる、(c) RNG 消費数が変わり実 row の乱数列が OFF と
         // 不一致になる。bias に仮想部は無いが fan_in は同じ理由で base を使う。
         let mut ft_w_init = init::sample(
-            WeightShape::flat(base_ft_in * ft_out, base_ft_in),
+            WeightShape::flat(feature_set.ft_weight_len(ft_out), base_ft_in),
             &init_spec.ft_w,
         );
         ft_w_init.resize(ft_w_n, 0.0);
@@ -2598,9 +2675,9 @@ impl GpuTrainer {
             // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb
             // (base 形状)、無効時の `ft_w_h` は master の cast mirror (train 形状
             // = base と同値)。いずれも `sync_ft_forward_weights` が初期同期する。
-            ft_w_h: if precision.ft_fp16 {
+            ft_w_h: if precision.ft_fp16 && feature_set.threat_width(ft_out) == ft_out {
                 let n = if feature_set.ft_factorize() {
-                    base_ft_in * ft_out
+                    feature_set.ft_weight_len(ft_out)
                 } else {
                     ft_w_n
                 };
@@ -2608,12 +2685,44 @@ impl GpuTrainer {
             } else {
                 None
             },
-            ft_w_fold32: if feature_set.ft_factorize() && !precision.ft_fp16 {
-                Some(DeviceBuffer::<f32>::zeroed(&stream, base_ft_in * ft_out)?)
+            ft_w_fold32: if (feature_set.ft_factorize() && !precision.ft_fp16)
+                || (feature_set.threat_width(ft_out) != ft_out
+                    && (feature_set.ft_factorize() || precision.ft_fp16))
+            {
+                Some(DeviceBuffer::<f32>::zeroed(
+                    &stream,
+                    feature_set.ft_weight_len(ft_out),
+                )?)
             } else {
                 None
             },
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
+            partial_ft_shape: DeviceBuffer::from_host(
+                &stream,
+                &[
+                    ft_out as u32,
+                    feature_set.base_ft_in() as u32,
+                    feature_set.threat_dims() as u32,
+                    feature_set.threat_width(ft_out) as u32,
+                    feature_set.max_active() as u32,
+                    feature_set.piece_inputs() as u32,
+                    feature_set.ft_factorize() as u32,
+                    precision.ft_fp16 as u32,
+                    if feature_set.ft_factorize() {
+                        feature_set.threat_factorize_pair_count() as u32
+                    } else {
+                        0
+                    },
+                ],
+            )?,
+            partial_norm_sums: DeviceBuffer::<f64>::zeroed(
+                &stream,
+                if feature_set.threat_width(ft_out) != ft_out {
+                    ft_out * 256
+                } else {
+                    1
+                },
+            )?,
             empty_threat_pair_starts: DeviceBuffer::from_host(&stream, &[0_u32])?,
             ft_b: DeviceBuffer::from_host(&stream, &ft_b_init)?,
             ft_b_m: DeviceBuffer::<f32>::zeroed(&stream, opt_len(ft_b_n))?,
@@ -2990,7 +3099,7 @@ impl GpuTrainer {
             let l1_out = self.ws.l1_out;
             let l2_out = self.ws.l2_out;
             let l2_in = self.ws.l2_in();
-            let ft_w_n = self.feature_set.ft_in() * ft_out;
+            let ft_w_n = self.feature_set.ft_weight_len(ft_out);
             let ft_b_n = ft_out;
             let l1_w_n = self.num_buckets * l1_out * ft_out;
             let l1_b_n = self.num_buckets * l1_out;
@@ -3136,7 +3245,14 @@ impl GpuTrainer {
             feature_set: if self.feature_set.ft_factorize() {
                 let base = self.feature_set.feature_set().spec();
                 if let Some(profile) = self.feature_set.threat_profile() {
-                    base.with_threat_profile(profile)
+                    {
+                        let spec = base.with_threat_profile(profile);
+                        if self.partial_threat() {
+                            spec.with_threat_width(self.feature_set.threat_width(self.ws.ft_out))
+                        } else {
+                            spec
+                        }
+                    }
                 } else if let Some(config) = self.feature_set.effect_bucket_config() {
                     base.with_effect_bucket_config(config)
                 } else {
@@ -3212,7 +3328,7 @@ impl GpuTrainer {
         let l1_out = self.ws.l1_out;
         let l2_out = self.ws.l2_out;
         let l2_in = self.ws.l2_in();
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_w_n = self.feature_set.train_ft_weight_len(ft_out);
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
@@ -3598,12 +3714,159 @@ impl GpuTrainer {
     /// factorizer 有効時の comb は毎 step 末の
     /// [`launch_ft_fold`](Self::launch_ft_fold) が維持する。どちらにも該当しない
     /// 構成 (FP32 + factorizer 無効) は forward が master を直接読むため no-op。
+    fn partial_threat(&self) -> bool {
+        self.feature_set.threat_width(self.ws.ft_out) != self.ws.ft_out
+    }
+
+    fn launch_partial_ft_forward(&self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let rows = self.ws.ft_out;
+        let forward = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
+        #[cfg(feature = "native")]
+        self.build_ft_forward_order(batch)?;
+        let lanes = if cfg!(feature = "native")
+            && rows.is_multiple_of(8)
+            && self.feature_set.threat_width(rows).is_multiple_of(8)
+        {
+            4
+        } else {
+            1
+        };
+        for perspective in 0..2 {
+            let indices = if perspective == 0 {
+                &self.ws.stm_idx_dev
+            } else {
+                &self.ws.nstm_idx_dev
+            };
+            #[cfg(feature = "native")]
+            let (order, order_base) = (&self.ws.ft_order, (perspective * batch) as u32);
+            #[cfg(not(feature = "native"))]
+            let (order, order_base) = (indices, u32::MAX);
+            let batch_order = batch as u64 | ((order_base as u64) << 32);
+            if self.ft_fp16_out {
+                let output = if perspective == 0 {
+                    self.ws.ft_stm_out_h.as_ref()
+                } else {
+                    self.ws.ft_nstm_out_h.as_ref()
+                }
+                .expect("FP16 output allocated");
+                // SAFETY: packed weight and index lengths are validated at construction; each thread owns one output cell.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_forward_fp16_out, stream: self.stream, module: self.module,
+                        config: cfg_partial_ft_1d(batch * rows / lanes),
+                        args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                               slice(self.partial_ft_shape), batch_order, slice(order)]
+                    }
+                }?;
+            } else {
+                let output = if perspective == 0 {
+                    &self.ws.ft_stm_out
+                } else {
+                    &self.ws.ft_nstm_out
+                };
+                // SAFETY: same bounds and ownership as the FP16-output variant.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_forward, stream: self.stream, module: self.module,
+                        config: cfg_partial_ft_1d(batch * rows / lanes),
+                        args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                               slice(self.partial_ft_shape), batch_order, slice(order)]
+                    }
+                }?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_partial_ft_fold(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(comb) = self.ft_w_fold32.as_ref() {
+            // SAFETY: the cache has the real packed length; virtual partners lie in the master.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_fold, stream: self.stream, module: self.module,
+                    config: cfg_partial_ft_1d(comb.len()),
+                    args: [slice(self.ft_w), slice(self.threat_pair_starts),
+                           slice(self.partial_ft_shape), slice(comb)]
+                }
+            }?;
+        }
+        Ok(())
+    }
+
+    fn launch_partial_ft_norms(
+        &self,
+        norms: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rows = self.ws.ft_out;
+        // SAFETY: 256 disjoint partial sums per column cover all packed real and virtual rows.
+        unsafe {
+            cuda_launch! {
+                kernel: partial_ft_norm, stream: self.stream, module: self.module,
+                config: cfg_partial_ft_1d(rows * 256),
+                args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.partial_norm_sums)]
+            }
+        }?;
+        // SAFETY: the reduction reads all partitions and writes one norm per FT column.
+        unsafe {
+            cuda_launch! {
+                kernel: partial_ft_norm_finalize, stream: self.stream, module: self.module,
+                config: cfg_1d(rows),
+                args: [slice(self.partial_norm_sums), slice(norms), rows as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    fn launch_partial_ft_gather(
+        &self,
+        perspective: usize,
+        scale: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let spec = self.feature_set;
+        let rows = self.ws.ft_out;
+        let config = cfg_partial_ft_1d(spec.ft_weight_len(rows));
+        if self.ft_fp16_out {
+            let gradient = if perspective == 0 {
+                self.ws.dft_stm_out_h.as_ref()
+            } else {
+                self.ws.dft_nstm_out_h.as_ref()
+            }
+            .expect("FP16 gradients allocated");
+            // SAFETY: inverse-index offsets address valid batch rows; one thread owns each compact parameter.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_gather_fp16, stream: self.stream, module: self.module, config: config,
+                    args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets), slice(self.ft_w_grad),
+                           slice(self.partial_ft_shape), perspective as u32, scale]
+                }
+            }?;
+        } else {
+            let gradient = if perspective == 0 {
+                &self.ws.dft_stm_out
+            } else {
+                &self.ws.dft_nstm_out
+            };
+            // SAFETY: same bounds and ownership as the FP16-gradient variant.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_gather, stream: self.stream, module: self.module, config: config,
+                    args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets), slice(self.ft_w_grad),
+                           slice(self.partial_ft_shape), perspective as u32, 1.0_f32]
+                }
+            }?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.partial_threat() {
+            return self.launch_partial_ft_fold();
+        }
         if self.feature_set.ft_factorize() {
             return self.launch_ft_fold();
         }
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-            let ft_w_n = self.feature_set.train_ft_in() * self.ws.ft_out;
+            let ft_w_n = self.feature_set.train_ft_weight_len(self.ws.ft_out);
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -3627,6 +3890,9 @@ impl GpuTrainer {
     /// (constructor が「factorize ⇒ comb buffer がちょうど 1 つ」を確立済みで、
     /// buffer 欠落は配線バグなので silent skip せず fail-fast にする)。
     fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.partial_threat() {
+            return self.launch_partial_ft_fold();
+        }
         // release でも検査する: 非 factorize で誤呼び出しされると ft_fp16 構成
         // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
         // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
@@ -4101,7 +4367,9 @@ impl GpuTrainer {
         #[cfg(feature = "native")]
         self.launch_ft_forward_ordered(b)?;
         #[cfg(not(feature = "native"))]
-        if self.ft_fp16_out {
+        if self.partial_threat() {
+            self.launch_partial_ft_forward(b)?;
+        } else if self.ft_fp16_out {
             let ft_w_h = self
                 .ft_w_h
                 .as_ref()
@@ -5722,7 +5990,8 @@ impl GpuTrainer {
         // written here nor read there (they take a zero gradient); every other consumer needs
         // the full overwrite.
         #[cfg(feature = "native")]
-        let active_rows_only = self.ft_fused_optimizer_applies(self.step_count + 1);
+        let active_rows_only =
+            self.ft_fused_optimizer_applies(self.step_count + 1) && !self.partial_threat();
         #[cfg(not(feature = "native"))]
         let active_rows_only = false;
         #[cfg(feature = "native")]
@@ -5865,7 +6134,9 @@ impl GpuTrainer {
             let d_config = ft_gather_launch_config(ft_in, ft_out, self.ft_fp16_out);
             // iter 0 = stm (dft_stm_out / overwrite)、iter 1 = nstm (dft_nstm_out / add)。
             // `ft_fp16_out` 時は dft が f16 なので f16 入力版の gather kernel を使う。
-            if iter_idx == 0 {
+            if self.partial_threat() {
+                self.launch_partial_ft_gather(iter_idx, dft_inv_scale)?;
+            } else if iter_idx == 0 {
                 if active_rows_only {
                     #[cfg(feature = "native")]
                     self.launch_ft_stm_gather_active(d_config, dft_inv_scale)?;
@@ -5953,7 +6224,19 @@ impl GpuTrainer {
         // 同じ pair に属する threat 実行の勾配和で埋める。stm / nstm 両方の gather が
         // 実 block を確定させた後に 1 launch で仮想 block を埋める。
         if self.feature_set.ft_factorize() {
-            if active_rows_only {
+            if self.partial_threat() {
+                let n = self.feature_set.train_ft_weight_len(ft_out)
+                    - self.feature_set.ft_weight_len(ft_out);
+                // SAFETY: threads write disjoint virtual cells and read only real gradient cells.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_reduce, stream: self.stream, module: self.module,
+                        config: cfg_partial_ft_1d(n),
+                        args: [slice_mut(self.ft_w_grad), slice(self.threat_pair_starts),
+                               slice(self.partial_ft_shape)]
+                    }
+                }?;
+            } else if active_rows_only {
                 #[cfg(feature = "native")]
                 self.launch_ft_reduce_active(ft_out)?;
             } else {
@@ -5995,7 +6278,7 @@ impl GpuTrainer {
             ..
         } = *context;
         let prof_t0 = &mut *context.prof_t0;
-        let ft_w_n = self.feature_set.train_ft_in() * ft_out;
+        let ft_w_n = self.feature_set.train_ft_weight_len(ft_out);
         let ft_b_n = ft_out;
         let l1_w_n = self.num_buckets * l1_out * ft_out;
         let l1_b_n = self.num_buckets * l1_out;
@@ -6021,17 +6304,17 @@ impl GpuTrainer {
             };
         }
 
-        // The step counter advances before regularization so the fused FT path can be decided
-        // against the precision-diagnostic schedule, which is keyed by the post-increment count.
-        self.step_count += 1;
+        // Precision diagnostics are keyed by the step count after the increment.
         #[cfg(feature = "native")]
-        let ft_fused = self.ft_fused_optimizer_applies(self.step_count);
+        let ft_fused = self.ft_fused_optimizer_applies(self.step_count + 1);
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
         #[cfg(feature = "native")]
         if !ft_fused {
+            validate_unfused_ft_optimizer_len(ft_w_n)?;
             self.ft_norm_sums_current = false;
         }
+        self.step_count += 1;
         #[cfg(feature = "native")]
         if self.ft_grad_active_rows_only && !ft_fused {
             return Err(
@@ -6103,7 +6386,16 @@ impl GpuTrainer {
             // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
             // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
             // prior と整合する方向の intended 仕様)。
-            if !ft_fused {
+            if self.partial_threat() && !ft_fused {
+                self.launch_partial_ft_norms(&self.norm_scratch)?;
+                // SAFETY: each thread updates one parameter using its mapped FT-column norm.
+                unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_norm_apply, stream: self.stream, module: self.module, config: cfg_partial_ft_1d(ft_w_n),
+                        args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.norm_scratch), nl_factor, lr]
+                    }
+                }?;
+            } else if !ft_fused {
                 norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
             }
             norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
@@ -6542,7 +6834,9 @@ impl GpuTrainer {
         }
         // factorizer: master (`ft_w`) の本 step の全更新 (norm loss / radam /
         // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
-        if ft_factorize && !ft_fused {
+        if self.partial_threat() {
+            self.launch_partial_ft_fold()?;
+        } else if ft_factorize && !ft_fused {
             self.launch_ft_fold()?;
         }
         self.sync_stack_forward_weights()?;
@@ -6593,6 +6887,25 @@ trainer_backend_impl! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn unfused_ft_optimizer_rejects_element_counts_above_u32() {
+        use shogi_features::{FeatureSet, ThreatProfile};
+
+        let limit = u32::MAX as usize;
+        assert!(validate_unfused_ft_optimizer_len(limit).is_ok());
+        assert!(validate_unfused_ft_optimizer_len(limit + 1).is_err());
+
+        let features = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::Full)
+            .with_threat_width(8192);
+        let elements = features.train_ft_weight_len(32768);
+        assert_eq!(elements, 5_884_084_224);
+        let error = validate_unfused_ft_optimizer_len(elements).unwrap_err();
+        assert!(error.to_string().contains("5884084224"));
+    }
 
     /// radam_step / ranger_lookahead_lerp pass が回す一様 weight group の launch 順・
     /// param-group・clamp 範囲を gold 値で固定する test。順序や kind / clamp がずれると

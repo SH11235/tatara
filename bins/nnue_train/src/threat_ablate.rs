@@ -73,8 +73,8 @@ pub fn apply(
             idx.swap(i, j);
         }
         for &fi in &idx[..n] {
-            let s = (base_ft_in + fi) * ft_out;
-            weights.ft_w[s..s + ft_out].fill(0.0);
+            let (s, row_width) = weights.feature_set.ft_row_layout(base_ft_in + fi, ft_out);
+            weights.ft_w[s..s + row_width].fill(0.0);
         }
         return Ok(AblationStats {
             zeroed_dims: n,
@@ -108,8 +108,14 @@ pub fn apply(
     let mut zeroed_pairs = 0usize;
     for_each_threat_pair_range(profile, |a_s, ac, ds, dc, fbase, width| {
         if pred(a_s, ac, ds, dc) {
-            let s = (base_ft_in + fbase) * ft_out;
-            let e = (base_ft_in + fbase + width) * ft_out;
+            let s = weights
+                .feature_set
+                .ft_row_layout(base_ft_in + fbase, ft_out)
+                .0;
+            let e = weights
+                .feature_set
+                .ft_row_layout(base_ft_in + fbase + width, ft_out)
+                .0;
             weights.ft_w[s..e].fill(0.0);
             zeroed_dims += width;
             zeroed_pairs += 1;
@@ -133,8 +139,8 @@ pub fn norm_dump(weights: &LayerStackWeights, ft_out: usize) {
     let threat_dims = weights.feature_set.threat_dims();
 
     let row_sumsq = |fi: usize| -> f64 {
-        let s = (base_ft_in + fi) * ft_out;
-        weights.ft_w[s..s + ft_out]
+        let (s, row_width) = weights.feature_set.ft_row_layout(base_ft_in + fi, ft_out);
+        weights.ft_w[s..s + row_width]
             .iter()
             .map(|&w| f64::from(w) * f64::from(w))
             .sum()

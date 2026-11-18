@@ -7,6 +7,7 @@ use shogi_features::{EffectBucketConfig, FeatureSet};
 use crate::{arch::*, ckpt::*};
 
 use std::io::Cursor;
+use std::path::Path;
 
 struct LimitedIo<T> {
     inner: T,
@@ -211,7 +212,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 12);
+    assert_eq!(RAW_CKPT_VERSION, 15);
 }
 
 #[test]
@@ -1065,4 +1066,227 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
     assert_eq!(legacy.producer_net_id, None);
     assert_eq!(legacy.producer_recipe_fingerprint, None);
     assert_eq!(legacy.superbatch, 420);
+}
+
+#[test]
+fn partial_threat_checkpoint_identity_and_full_width_bytes() {
+    let full = layerstack_arch_threat_factorized();
+    let explicit = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(DEFAULT_FT_OUT),
+        ..full
+    };
+    let partial = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(512),
+        ..full
+    };
+    use nnue_train::optimizer::OptimizerKind;
+
+    let meta = RawCkptMeta {
+        optimizer: OptimizerKind::Ranger,
+        qat_dense: false,
+        run_id: "run",
+        superbatch: 1,
+        step_count: 5,
+        lr_horizon: None,
+        fv_scale: None,
+        net_id: "",
+        recipe_fingerprint: None,
+    };
+    let write = |arch, optimizer| {
+        let mut bytes = Vec::new();
+        crate::ckpt::write_raw_ckpt_header(
+            &mut bytes,
+            arch,
+            &RawCkptMeta { optimizer, ..meta },
+            10,
+        )
+        .unwrap();
+        bytes
+    };
+    for (optimizer, version) in [
+        (OptimizerKind::Ranger, 13_u32),
+        (OptimizerKind::RAdam, 15),
+        (OptimizerKind::AdamW, 13),
+        (OptimizerKind::Sgd, 14),
+    ] {
+        let full_bytes = write(&full, optimizer);
+        assert_eq!(full_bytes, write(&explicit, optimizer));
+        let packed_bytes = write(&partial, optimizer);
+        assert_eq!(packed_bytes[4..8], version.to_le_bytes());
+        let mut header = read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &partial).unwrap();
+        assert_eq!(header.step_count, 5);
+        assert_eq!(header.sgd, optimizer == OptimizerKind::Sgd);
+        for requested in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+            OptimizerKind::Sgd,
+        ] {
+            let result =
+                header.prepare_optimizer_state(Path::new("unused.ckpt"), &mut [], requested, false);
+            let required_flag = match version {
+                13 if requested == OptimizerKind::Sgd => Some("--transfer-radam-momentum"),
+                14 if requested != OptimizerKind::Sgd => Some("--optimizer sgd"),
+                15 if requested != OptimizerKind::RAdam => Some("--optimizer radam"),
+                _ => None,
+            };
+            if let Some(flag) = required_flag {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(flag),
+                    "v{version} with {requested:?}: {error}"
+                );
+            } else {
+                assert!(result.is_ok(), "v{version} with {requested:?}: {result:?}");
+            }
+            assert_eq!(header.step_count, 5);
+        }
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &full).is_err());
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&full_bytes), &partial).is_err());
+    }
+}
+
+#[test]
+fn compact_v13_transfer_checks_producer_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::optimizer::OptimizerKind;
+
+    let full = layerstack_arch_threat_factorized();
+    let arch = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(512),
+        ..full
+    };
+    let mut bytes = Vec::new();
+    write_raw_ckpt_header(&mut bytes, &arch, "run", 6, 12, Some(20), 0)?;
+    assert_eq!(bytes[4..8], 13_u32.to_le_bytes());
+
+    let root = std::env::temp_dir().join(format!("tatara-compact-v13-{}", std::process::id()));
+    let path = root.join("source.ckpt");
+    std::fs::create_dir_all(root.join("experiments"))?;
+    std::fs::write(&path, &bytes)?;
+    let (mut header, mut groups) = load_raw_checkpoint_file(&path, &arch, &[])?;
+    let transfer = |header: &mut RawCkptHeader, groups: &mut [RawCkptGroup]| {
+        header.prepare_optimizer_state(&path, groups, OptimizerKind::Sgd, true)
+    };
+    let missing = transfer(&mut header, &mut groups).unwrap_err();
+    assert!(missing.to_string().contains("requires producer metadata"));
+    let metadata = root.join("experiments/run.json");
+    std::fs::write(&metadata, r#"{"id":"run","params":{"optimizer":"ranger"}}"#)?;
+    assert!(transfer(&mut header, &mut groups).is_err());
+    assert_eq!((header.step_count, header.lr_horizon), (12, Some(20)));
+    std::fs::write(&metadata, r#"{"id":"run","params":{"optimizer":"radam"}}"#)?;
+    transfer(&mut header, &mut groups)?;
+    assert_eq!((header.step_count, header.lr_horizon), (0, None));
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn raw_ckpt_accepts_legacy_threat_input_capacity() {
+    let arch = layerstack_arch_threat_factorized();
+    let mut bytes = Vec::new();
+    write_raw_ckpt_header(&mut bytes, &arch, "run", 1, 5, None, 10).unwrap();
+    let max_active_offset = 12 + arch.feature_set.canonical_name().len() + 16;
+    let legacy_max_active = (arch.feature_set.feature_set().spec().max_active() + 128) as u64;
+    let field = max_active_offset..max_active_offset + 8;
+    bytes[field.clone()].copy_from_slice(&legacy_max_active.to_le_bytes());
+    read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).unwrap();
+    bytes[field].copy_from_slice(&(legacy_max_active - 1).to_le_bytes());
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).is_err());
+}
+
+#[test]
+fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::optimizer::OptimizerKind;
+    use std::io::Write;
+
+    let topology = layerstack_topology(8, 16, 32, 2);
+    let full = layerstack_arch_threat_factorized();
+    let arch = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(4),
+        ft_out: 8,
+        topology: &topology,
+        ..full
+    };
+    let len = arch.feature_set.train_ft_weight_len(8);
+    let path = std::env::temp_dir().join(format!("tatara-packed-ft-{}.ckpt", std::process::id()));
+    let mut groups = vec![(
+        vec![0.25; len],
+        vec![0.5; len],
+        vec![0.0; len],
+        vec![0.0; len],
+    )];
+    for optimizer in [
+        OptimizerKind::Sgd,
+        OptimizerKind::Ranger,
+        OptimizerKind::AdamW,
+        OptimizerKind::RAdam,
+    ] {
+        if optimizer != OptimizerKind::Sgd {
+            groups[0].2.fill(0.125);
+        }
+        if optimizer == OptimizerKind::Ranger {
+            groups[0].3.fill(0.75);
+        } else {
+            groups[0].3.fill(0.0);
+        }
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        crate::ckpt::write_raw_ckpt_header(
+            &mut writer,
+            &arch,
+            &RawCkptMeta {
+                optimizer,
+                qat_dense: false,
+                run_id: "",
+                superbatch: 6,
+                step_count: 12,
+                lr_horizon: Some(20),
+                fv_scale: None,
+                net_id: "",
+                recipe_fingerprint: None,
+            },
+            1,
+        )?;
+        writer.write_all(&(len as u64).to_le_bytes())?;
+        let (w, m, v, slow) = &groups[0];
+        for tensor in [w, m, v, slow] {
+            write_f32_slice(&mut writer, tensor)?;
+        }
+        writer.flush()?;
+
+        let (mut header, mut loaded) = load_raw_checkpoint_file(&path, &arch, &[("ft_w", len)])?;
+        header.prepare_optimizer_state(&path, &mut loaded, optimizer, false)?;
+        assert_eq!(loaded, groups, "{optimizer:?}");
+        assert_eq!(
+            (header.superbatch, header.step_count, header.lr_horizon),
+            (6, 12, Some(20))
+        );
+        if optimizer == OptimizerKind::RAdam {
+            assert!(
+                header
+                    .prepare_optimizer_state(&path, &mut loaded, OptimizerKind::Sgd, false)
+                    .is_err()
+            );
+            header.prepare_optimizer_state(&path, &mut loaded, OptimizerKind::Sgd, true)?;
+            assert_eq!(
+                (header.superbatch, header.step_count, header.lr_horizon),
+                (6, 0, None)
+            );
+            let (loaded_w, loaded_m, loaded_v, loaded_slow) = &loaded[0];
+            assert_eq!(loaded_w, w);
+            assert_eq!(loaded_m, m);
+            assert!(loaded_v.iter().chain(loaded_slow).all(|&x| x == 0.0));
+        } else {
+            let error = header
+                .prepare_optimizer_state(&path, &mut loaded, OptimizerKind::Sgd, true)
+                .unwrap_err();
+            if optimizer != OptimizerKind::Sgd {
+                assert!(error.to_string().contains("requires producer metadata"));
+            }
+            assert_eq!(loaded, groups);
+            assert_eq!((header.step_count, header.lr_horizon), (12, Some(20)));
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
 }
