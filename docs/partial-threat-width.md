@@ -31,7 +31,7 @@ The payload keeps the existing order: compressed FT biases, compressed piece FT 
 
 ## Checkpoints
 
-Full-width raw checkpoints use version 11 for Ranger, RAdam, or AdamW and version 12 for SGD. Partial-width raw checkpoints use version 13 for Ranger, RAdam, or AdamW and version 14 for SGD. Both partial-width versions add one u64 Threat width immediately after the feature hash and before the producer run id. Other header fields and parameter-group serialization retain their existing order. Resume validates the width and rejects changes of width. Restarting from a quantized file likewise requires the matching profile and `--threat-width`.
+Full-width raw checkpoints use version 11 for Ranger, RAdam, or AdamW and version 12 for SGD. Partial-width raw checkpoints use version 13 for Ranger and AdamW, version 14 for SGD, and version 15 for RAdam. Transferring momentum from a version 13 checkpoint to SGD requires producer metadata identifying RAdam. All partial-width versions add one u64 Threat width immediately after the feature hash and before the producer run id. Other header fields and parameter-group serialization retain their existing order. Resume validates the width and rejects changes of width. Restarting from a quantized file likewise requires the matching profile and `--threat-width`.
 
 ## Throughput comparison
 

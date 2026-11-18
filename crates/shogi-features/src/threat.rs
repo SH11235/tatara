@@ -32,11 +32,8 @@ use crate::threat_symmetric::{RawThreatEdge, is_canonical_dead};
 /// ThreatClass の数 (King 除外、9 family)。
 pub const NUM_THREAT_CLASSES: usize = 9;
 
-/// Threat 特徴量の per-position active 数の上限。行幅 `base(40) + THREAT_MAX_ACTIVE`
-/// を決める。Full profile の total active の実測 max は、DLSuisho 803M + aoba 103M 局面で
-/// 145、DL水匠のスコアで作り直した教師 (dl-teacher-rebuild x1、522 億局面) で 173 (threat 133)。
-/// 192 は後者に margin 59 を持たせた値。超過しても dataloader は silent truncation せず
-/// hard-error で停止する (この定数を上げて再ビルドを促す) ため破損は起きない。
+/// 1 局面あたりの Threat 特徴量に確保する容量。
+/// 特徴量が入力行の容量を超えると、データローダーはエラーを返す。
 pub const THREAT_MAX_ACTIVE: usize = 192;
 
 /// profile から threat 次元数を返す。`ThreatIndexer::new(profile)` の

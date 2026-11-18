@@ -126,7 +126,7 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                 }
                 let positions_dev = DeviceBuffer::from_host(&stream, &positions)?;
                 let offsets_dev = DeviceBuffer::from_host(&stream, &offsets)?;
-                let result = DeviceBuffer::<f32>::zeroed(&stream, n)?;
+                let mut result = DeviceBuffer::<f32>::zeroed(&stream, n)?;
                 for add in 0..2_u32 {
                     if half {
                         // SAFETY: inverse-index lists contain valid batch rows and cover every real parameter.
@@ -171,7 +171,7 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                     unsafe {
                         cuda_launch! {
                             kernel: partial_ft_reduce, stream: stream, module: module, config: cfg_1d(n - real_n),
-                            args: [slice(result), slice(pair_dev), slice(shape_dev)]
+                            args: [slice_mut(result), slice(pair_dev), slice(shape_dev)]
                         }
                     }?;
                     let real_copy = expected_grad[..real_n].to_vec();

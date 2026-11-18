@@ -245,40 +245,42 @@ pub fn partial_ft_gather_fp16(
 }
 
 #[kernel]
-pub fn partial_ft_reduce(grad: &[f32], pairs: &[u32], shape: &[u32]) {
-    let rows = shape[0];
-    let base = shape[1];
-    let threats = shape[2];
-    let width = shape[3];
-    let piece = shape[5];
-    let i = thread::index_1d();
-    let k = i.get();
-    let r = rows as usize;
-    let w = width as usize;
-    let piece_n = piece as usize * r;
+pub fn partial_ft_reduce(mut grad: DisjointSlice<f32>, pairs: &[u32], shape: &[u32]) {
+    let r = shape[0] as usize;
+    let base = shape[1] as usize;
+    let threats = shape[2] as usize;
+    let w = shape[3] as usize;
+    let piece = shape[5] as usize;
+    let k = thread::index_1d().get();
+    let base_n = base * r;
+    let real_n = base_n + threats * w;
+    let piece_n = piece * r;
     let virtual_n = piece_n + (pairs.len() - 1) * w;
     if k >= virtual_n {
         return;
     }
+    let ptr = grad.as_mut_ptr();
+    // SAFETY: the prefix contains all real gradients and is read-only during this launch.
+    let real_grad = unsafe { core::slice::from_raw_parts(ptr, real_n) };
     let mut sum = 0.0_f32;
     if k < piece_n {
         let p = k / r;
         let c = k % r;
         let mut f = p;
-        while f < base as usize {
-            sum += grad[f * r + c];
-            f += piece as usize;
+        while f < base {
+            sum += real_grad[f * r + c];
+            f += piece;
         }
     } else {
         let pair = (k - piece_n) / w;
         let c = (k - piece_n) % w;
         for f in pairs[pair]..pairs[pair + 1] {
-            sum += grad[base as usize * r + f as usize * w + c];
+            sum += real_grad[base_n + f as usize * w + c];
         }
     }
-    // SAFETY: each thread owns one virtual element; reads only access the real block.
+    // SAFETY: the suffix contains virtual_n elements and each thread owns one element.
     unsafe {
-        *(grad.as_ptr() as *mut f32).add(base as usize * r + threats as usize * w + k) = sum;
+        *ptr.add(real_n + k) = sum;
     }
 }
 

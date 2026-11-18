@@ -1431,6 +1431,13 @@ use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
+fn cfg_partial_ft_1d(elements: usize) -> LaunchConfig {
+    let mut config = cfg_1d(1);
+    config.grid_dim.0 = u32::try_from(elements.max(1).div_ceil(config.block_dim.0 as usize))
+        .expect("compact FT requires too many CUDA blocks");
+    config
+}
+
 fn ft_moment(
     stream: &CudaStream,
     n: usize,
@@ -3730,7 +3737,7 @@ impl GpuTrainer {
                 unsafe {
                     cuda_launch! {
                         kernel: partial_ft_forward_fp16_out, stream: self.stream, module: self.module,
-                        config: cfg_1d(batch * rows / lanes),
+                        config: cfg_partial_ft_1d(batch * rows / lanes),
                         args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
                                slice(self.partial_ft_shape), batch_order, slice(order)]
                     }
@@ -3745,7 +3752,7 @@ impl GpuTrainer {
                 unsafe {
                     cuda_launch! {
                         kernel: partial_ft_forward, stream: self.stream, module: self.module,
-                        config: cfg_1d(batch * rows / lanes),
+                        config: cfg_partial_ft_1d(batch * rows / lanes),
                         args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
                                slice(self.partial_ft_shape), batch_order, slice(order)]
                     }
@@ -3761,7 +3768,7 @@ impl GpuTrainer {
             unsafe {
                 cuda_launch! {
                     kernel: partial_ft_fold, stream: self.stream, module: self.module,
-                    config: cfg_1d(comb.len()),
+                    config: cfg_partial_ft_1d(comb.len()),
                     args: [slice(self.ft_w), slice(self.threat_pair_starts),
                            slice(self.partial_ft_shape), slice(comb)]
                 }
@@ -3779,7 +3786,7 @@ impl GpuTrainer {
         unsafe {
             cuda_launch! {
                 kernel: partial_ft_norm, stream: self.stream, module: self.module,
-                config: cfg_1d(rows * 256),
+                config: cfg_partial_ft_1d(rows * 256),
                 args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.partial_norm_sums)]
             }
         }?;
@@ -3801,7 +3808,7 @@ impl GpuTrainer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let spec = self.feature_set;
         let rows = self.ws.ft_out;
-        let config = cfg_1d(spec.ft_weight_len(rows));
+        let config = cfg_partial_ft_1d(spec.ft_weight_len(rows));
         if self.ft_fp16_out {
             let gradient = if perspective == 0 {
                 self.ws.dft_stm_out_h.as_ref()
@@ -6208,8 +6215,8 @@ impl GpuTrainer {
                 unsafe {
                     cuda_launch! {
                         kernel: partial_ft_reduce, stream: self.stream, module: self.module,
-                        config: cfg_1d(n),
-                        args: [slice(self.ft_w_grad), slice(self.threat_pair_starts),
+                        config: cfg_partial_ft_1d(n),
+                        args: [slice_mut(self.ft_w_grad), slice(self.threat_pair_starts),
                                slice(self.partial_ft_shape)]
                     }
                 }?;
@@ -6368,7 +6375,7 @@ impl GpuTrainer {
                 // SAFETY: each thread updates one parameter using its mapped FT-column norm.
                 unsafe {
                     cuda_launch! {
-                        kernel: partial_ft_norm_apply, stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
+                        kernel: partial_ft_norm_apply, stream: self.stream, module: self.module, config: cfg_partial_ft_1d(ft_w_n),
                         args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.norm_scratch), nl_factor, lr]
                     }
                 }?;
