@@ -2002,16 +2002,36 @@ fn mixing_cli_pairs_and_rates_are_validated() {
             "{tail:?}"
         );
     }
-    for conflict in ["--score-override", "--dual-label-psv", "--eval-only"] {
-        let mut tail = vec!["--mix-data", "tree.psv", "--mix-rate", "0.03", conflict];
-        if conflict == "--score-override" {
-            tail.push("scores.i16");
-        }
-        if conflict == "--dual-label-psv" {
-            tail.push("all");
-        }
-        assert!(parse(&tail).is_err());
+    for score_source in [
+        ["--score-override", "scores.i16"],
+        ["--dual-label-psv", "all"],
+    ] {
+        let mut args = vec![
+            "nnue-train",
+            "--data",
+            "main.psv",
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.03",
+        ];
+        args.extend(score_source);
+        args.push("layerstack");
+        Cli::try_parse_from(args)
+            .unwrap()
+            .validate_score_sources()
+            .unwrap();
     }
+    assert!(
+        parse(&[
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.03",
+            "--eval-only"
+        ])
+        .is_err()
+    );
     assert!(
         Cli::try_parse_from([
             "nnue-train",
@@ -2035,6 +2055,70 @@ fn mixing_cli_pairs_and_rates_are_validated() {
             .validate_data_args(&argv)
             .is_err()
     );
+}
+
+#[test]
+fn mixing_cli_pairs_score_limits_in_teacher_order() {
+    let parse = |tail: &[&str]| {
+        let mut args = vec![
+            "nnue-train",
+            "--data",
+            "main.psv",
+            "layerstack",
+            "--mix-data",
+            "tree.psv",
+            "--mix-rate",
+            "0.03",
+            "--mix-data",
+            "other.psv",
+            "--mix-rate",
+            "0.2",
+        ];
+        args.extend_from_slice(tail);
+        Cli::try_parse_from(args)
+    };
+    let cli = parse(&[
+        "--mix-score-clamp-abs",
+        "100",
+        "--mix-score-drop-abs",
+        "1000",
+        "--mix-score-drop-abs",
+        "2000",
+        "--mix-score-clamp-abs",
+        "200",
+    ])
+    .unwrap();
+    cli.validate_score_sources().unwrap();
+    let sources = cli.mix_sources();
+    assert_eq!(
+        (sources[0].score_drop_abs, sources[0].score_clamp_abs),
+        (Some(1000), Some(100))
+    );
+    assert_eq!(
+        (sources[1].score_drop_abs, sources[1].score_clamp_abs),
+        (Some(2000), Some(200))
+    );
+    for flag in ["--mix-score-drop-abs", "--mix-score-clamp-abs"] {
+        for tail in [
+            vec![flag, "100"],
+            vec![flag, "100", flag, "200", flag, "300"],
+        ] {
+            let error = parse(&tail).unwrap().validate_score_sources().unwrap_err();
+            assert!(error.contains(&format!("{flag} must be given once per --mix-data file")));
+        }
+        let orphan = Cli::try_parse_from([
+            "nnue-train",
+            "--data",
+            "main.psv",
+            flag,
+            "100",
+            "layerstack",
+        ])
+        .unwrap();
+        assert!(orphan.validate_score_sources().unwrap_err().contains(flag));
+        assert!(parse(&[flag, "0"]).is_err());
+    }
+    assert!(parse(&["--mix-score-clamp-abs", "32768"]).is_err());
 }
 
 #[test]
@@ -2067,22 +2151,27 @@ fn sampling_cli_rejects_hcpe_ply_and_wrong_bucket_counts() {
 
 #[test]
 fn mixing_cli_rejects_flags_split_across_subcommand() {
-    for flag in ["--mix-data", "--mix-rate"] {
-        let values = if flag == "--mix-data" {
-            ["tree.psv", "other.psv"]
-        } else {
-            ["0.03", "0.2"]
-        };
-        let other = if flag == "--mix-data" {
-            "--mix-rate"
-        } else {
-            "--mix-data"
-        };
-        let other_value = if flag == "--mix-data" {
-            "0.03"
-        } else {
-            "tree.psv"
-        };
+    for (flag, values, other, other_value) in [
+        (
+            "--mix-data",
+            ["tree.psv", "other.psv"],
+            "--mix-rate",
+            "0.03",
+        ),
+        ("--mix-rate", ["0.03", "0.2"], "--mix-data", "tree.psv"),
+        (
+            "--mix-score-drop-abs",
+            ["1000", "2000"],
+            "--mix-data",
+            "tree.psv",
+        ),
+        (
+            "--mix-score-clamp-abs",
+            ["100", "200"],
+            "--mix-data",
+            "tree.psv",
+        ),
+    ] {
         let argv: Vec<String> = [
             "nnue-train",
             "--data",

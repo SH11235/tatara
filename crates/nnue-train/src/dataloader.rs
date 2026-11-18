@@ -102,6 +102,19 @@ impl TeacherFormat {
 pub struct MixSource {
     pub path: PathBuf,
     pub rate: f64,
+    pub score_drop_abs: Option<i32>,
+    pub score_clamp_abs: Option<i16>,
+}
+
+impl MixSource {
+    pub fn new(path: PathBuf, rate: f64) -> Self {
+        Self {
+            path,
+            rate,
+            score_drop_abs: None,
+            score_clamp_abs: None,
+        }
+    }
 }
 
 pub fn validate_mix_sources(sources: &[MixSource]) -> io::Result<()> {
@@ -120,6 +133,36 @@ pub fn validate_mix_sources(sources: &[MixSource]) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "the sum of --mix-rate values must be less than one",
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_score_limits(
+    score_drop_abs: Option<i32>,
+    score_clamp_abs: Option<i16>,
+) -> io::Result<()> {
+    if let Some(t) = score_drop_abs
+        && t < 1
+    {
+        return Err(io::Error::other(format!(
+            "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
+        )));
+    }
+    if let Some(c) = score_clamp_abs
+        && c < 1
+    {
+        return Err(io::Error::other(format!(
+            "score_clamp_abs must be >= 1 (got {c}); a non-positive bound would saturate \
+             every score to it"
+        )));
+    }
+    if let (Some(t), Some(c)) = (score_drop_abs, score_clamp_abs)
+        && i64::from(c) >= i64::from(t)
+    {
+        return Err(io::Error::other(format!(
+            "score_clamp_abs ({c}) must be < score_drop_abs ({t}); every position surviving \
+             the drop filter already has |score| < {t}, so the clamp would never fire"
+        )));
     }
     Ok(())
 }
@@ -1701,12 +1744,6 @@ struct MixedTeacherReader {
 impl MixedTeacherReader {
     fn new(main: PsvEpochReader, mixes: &[MixSource], seed: u64) -> io::Result<Self> {
         validate_mix_sources(mixes)?;
-        if main.score_override.is_some() || main.dual_label_psv.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "teacher mixing cannot be combined with --score-override or --dual-label-psv",
-            ));
-        }
         let format = teacher_format(&main.paths)?;
         let mut sources = vec![main];
         let mut cumulative_rates = Vec::with_capacity(mixes.len());
@@ -1723,12 +1760,22 @@ impl MixedTeacherReader {
                 ));
             }
             let main = &sources[0];
+            let score_drop_abs = mix.score_drop_abs.or(main.score_drop_abs);
+            let score_clamp_abs = mix.score_clamp_abs.or(main.score_clamp_abs);
+            if mix.score_drop_abs.is_some() || mix.score_clamp_abs.is_some() {
+                validate_score_limits(score_drop_abs, score_clamp_abs).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("mixed teacher {}: {error}", mix.path.display()),
+                    )
+                })?;
+            }
             let mut reader = PsvEpochReader::new_range(
                 &[&mix.path],
                 0,
                 teacher_data_bytes(&[&mix.path])?,
-                main.score_drop_abs,
-                main.score_clamp_abs,
+                score_drop_abs,
+                score_clamp_abs,
                 LabelOptions {
                     score_source: None,
                     tree_sample_eval_only: main.tree_sample_eval_only,

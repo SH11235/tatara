@@ -349,9 +349,9 @@ pub(crate) struct Cli {
 
     /// Additional teacher file, sampled independently of the concatenated --data stream.
     /// Repeat with --mix-rate in matching order. Must use the same format as --data.
-    /// Score filtering and clamping apply to every teacher; shuffle follows mixing.
+    /// Uses the stored score. Score overrides and dual-label selection apply to --data only.
     #[arg(long, global = true,
-        conflicts_with_all = ["score_override", "dual_label_psv", "eval_only", "rescore_input"])]
+        conflicts_with_all = ["eval_only", "rescore_input"])]
     pub(crate) mix_data: Vec<PathBuf>,
 
     /// Expected fraction of training positions from the corresponding --mix-data file.
@@ -360,6 +360,17 @@ pub(crate) struct Cli {
     /// Rates apply after reader sampling; worker-side bucket rejection can change observed fractions.
     #[arg(long, global = true)]
     pub(crate) mix_rate: Vec<f64>,
+
+    /// Drop records with absolute score at or above N. Repeat once per --mix-data file,
+    /// in matching order. Omit to inherit --score-drop-abs.
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(i32).range(1..))]
+    pub(crate) mix_score_drop_abs: Vec<i32>,
+
+    /// Clamp scores to [-N, N] after dropping records. Repeat once per --mix-data file,
+    /// in matching order. Omit to inherit --score-clamp-abs.
+    /// If both limits are set for a teacher, the clamp must be below the drop threshold.
+    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(i16).range(1..))]
+    pub(crate) mix_score_clamp_abs: Vec<i16>,
 
     /// Seed hashed with the mixed-stream position number to select each teacher.
     /// Teacher selection has no mutable random-generator state.
@@ -616,7 +627,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(i16).range(1..))]
     pub(crate) score_clamp_abs: Option<i16>,
 
-    /// Read little-endian i16 teacher scores from this record-aligned sidecar.
+    /// Read little-endian i16 scores from a sidecar aligned to the --data records.
     #[arg(long, global = true, requires = "data")]
     pub(crate) score_override: Option<PathBuf>,
 
@@ -1120,6 +1131,8 @@ impl Cli {
             ("--data", self.data.len()),
             ("--mix-data", self.mix_data.len()),
             ("--mix-rate", self.mix_rate.len()),
+            ("--mix-score-drop-abs", self.mix_score_drop_abs.len()),
+            ("--mix-score-clamp-abs", self.mix_score_clamp_abs.len()),
         ] {
             let given = argv
                 .iter()
@@ -1147,9 +1160,12 @@ impl Cli {
         self.mix_data
             .iter()
             .zip(&self.mix_rate)
-            .map(|(path, rate)| nnue_train::dataloader::MixSource {
+            .enumerate()
+            .map(|(i, (path, rate))| nnue_train::dataloader::MixSource {
                 path: path.clone(),
                 rate: *rate,
+                score_drop_abs: self.mix_score_drop_abs.get(i).copied(),
+                score_clamp_abs: self.mix_score_clamp_abs.get(i).copied(),
             })
             .collect()
     }
@@ -1171,12 +1187,25 @@ impl Cli {
                 "--mix-data and --mix-rate must be repeated the same number of times".into(),
             );
         }
+        for (flag, count) in [
+            ("--mix-score-drop-abs", self.mix_score_drop_abs.len()),
+            ("--mix-score-clamp-abs", self.mix_score_clamp_abs.len()),
+        ] {
+            if count != 0 && count != self.mix_data.len() {
+                return Err(format!(
+                    "{flag} must be given once per --mix-data file (expected {}, got {count})",
+                    self.mix_data.len()
+                ));
+            }
+        }
         if !self.mix_data.is_empty() {
             if self.data.is_empty() {
                 return Err("--mix-data requires --data".into());
             }
-            if self.score_source().is_some() || self.eval_only || self.rescore_input.is_some() {
-                return Err("--mix-data cannot be combined with score overrides, dual-label input, evaluation-only or rescoring".into());
+            if self.eval_only || self.rescore_input.is_some() {
+                return Err(
+                    "--mix-data cannot be combined with evaluation-only or rescoring".into(),
+                );
             }
             if !matches!(
                 self.arch,

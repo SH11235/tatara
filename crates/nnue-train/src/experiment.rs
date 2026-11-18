@@ -153,6 +153,10 @@ pub fn recipe_fingerprint(params: &Params, data_name: &str) -> u64 {
 pub struct MixDataParam {
     pub name: String,
     pub rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_drop_abs: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_clamp_abs: Option<i16>,
 }
 
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
@@ -874,19 +878,25 @@ mod tests {
         mixed.mix_data = vec![MixDataParam {
             name: "tree.psv".into(),
             rate: 0.03,
+            score_drop_abs: None,
+            score_clamp_abs: None,
         }];
         mixed.mix_seed = Some(0);
         let hash = recipe_fingerprint(&mixed, "main.psv");
         assert_ne!(hash, recipe_fingerprint(&base, "main.psv"));
         let value = serde_json::to_value(&mixed).unwrap();
-        assert_eq!(value["mix_data"][0]["name"], "tree.psv");
-        assert_eq!(value["mix_data"][0]["rate"], 0.03);
-        for changed in 0..3 {
+        assert_eq!(
+            value["mix_data"],
+            serde_json::json!([{"name": "tree.psv", "rate": 0.03}])
+        );
+        for changed in 0..5 {
             let mut params = mixed.clone();
             match changed {
                 0 => params.mix_data[0].name = "other.psv".into(),
                 1 => params.mix_data[0].rate = 0.04,
-                _ => params.mix_seed = Some(1),
+                2 => params.mix_seed = Some(1),
+                3 => params.mix_data[0].score_drop_abs = Some(1000),
+                _ => params.mix_data[0].score_clamp_abs = Some(100),
             }
             assert_ne!(hash, recipe_fingerprint(&params, "main.psv"));
         }

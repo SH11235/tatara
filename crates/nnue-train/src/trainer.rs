@@ -550,38 +550,11 @@ impl TrainingConfig {
         self.sampling
             .validate(true, self.compute_bucket, self.num_buckets)?;
         crate::dataloader::validate_mix_sources(&self.mix_sources)?;
-        if !self.mix_sources.is_empty() && self.score_source.is_some() {
-            return Err(io::Error::other(
-                "teacher mixing cannot be combined with score overrides or dual-label input",
-            ));
-        }
         crate::dataloader::shuffle_window_records(
             self.teacher_shuffle_buffer_mib,
             self.batch_size,
         )?;
-        if let Some(t) = self.score_drop_abs
-            && t < 1
-        {
-            return Err(io::Error::other(format!(
-                "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
-            )));
-        }
-        if let Some(c) = self.score_clamp_abs
-            && c < 1
-        {
-            return Err(io::Error::other(format!(
-                "score_clamp_abs must be >= 1 (got {c}); a non-positive bound would saturate \
-                 every score to it"
-            )));
-        }
-        if let (Some(t), Some(c)) = (self.score_drop_abs, self.score_clamp_abs)
-            && i64::from(c) >= i64::from(t)
-        {
-            return Err(io::Error::other(format!(
-                "score_clamp_abs ({c}) must be < score_drop_abs ({t}); every position surviving \
-                 the drop filter already has |score| < {t}, so the clamp would never fire"
-            )));
-        }
+        crate::dataloader::validate_score_limits(self.score_drop_abs, self.score_clamp_abs)?;
         if self.test_data.is_some() && self.test_positions == 0 {
             return Err(io::Error::other(
                 "test_positions must be >= 1 when test_data is set",
@@ -874,7 +847,7 @@ where
             "mask": mask.as_ref().map(|path| crate::loader_state::LoaderState::identities(&[path])).transpose()?,
         }),
     };
-    let settings = serde_json::json!({
+    let mut settings = serde_json::json!({
         "train_end_offset": train_end_offset,
         "record_bytes": record_bytes,
         "batch_size": cfg.batch_size,
@@ -900,6 +873,22 @@ where
         "mix_rates": cfg.mix_sources.iter().map(|s| s.rate).collect::<Vec<_>>(),
         "mix_seed": if cfg.mix_sources.is_empty() { 0 } else { cfg.mix_seed },
     });
+    let mix_drop = cfg
+        .mix_sources
+        .iter()
+        .map(|s| s.score_drop_abs)
+        .collect::<Vec<_>>();
+    let mix_clamp = cfg
+        .mix_sources
+        .iter()
+        .map(|s| s.score_clamp_abs)
+        .collect::<Vec<_>>();
+    if mix_drop.iter().any(Option::is_some) {
+        settings["mix_score_drop_abs"] = serde_json::json!(mix_drop);
+    }
+    if mix_clamp.iter().any(Option::is_some) {
+        settings["mix_score_clamp_abs"] = serde_json::json!(mix_clamp);
+    }
     if cfg.resume_checkpoint.is_some() && cfg.resume_superbatch_override {
         eprintln!(
             "[train] warning: --start-superbatch overrides resume; restarting teacher input from the beginning without restoring loader positions"
@@ -3617,13 +3606,10 @@ mod tests {
                         mix_sources: if combined {
                             vec![
                                 crate::dataloader::MixSource {
-                                    path: data.clone(),
-                                    rate: 0.2,
+                                    score_drop_abs: Some(1000),
+                                    ..crate::dataloader::MixSource::new(data.clone(), 0.2)
                                 },
-                                crate::dataloader::MixSource {
-                                    path: data.clone(),
-                                    rate: 0.3,
-                                },
+                                crate::dataloader::MixSource::new(data.clone(), 0.3),
                             ]
                         } else {
                             vec![]
@@ -3724,6 +3710,29 @@ mod tests {
                         resume_checkpoint: Some(checkpoint),
                         ..paused_cfg
                     };
+                    if combined {
+                        assert_eq!(
+                            state.settings["mix_score_drop_abs"],
+                            serde_json::json!([1000, null])
+                        );
+                        let mut changed = resumed_cfg.clone();
+                        changed.mix_sources[0].score_drop_abs = Some(1001);
+                        let error = run(
+                            &mut MockBackend::new(),
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &changed,
+                            None,
+                        )
+                        .unwrap_err();
+                        assert!(error.to_string().contains("loader state does not match"));
+                        assert!(error.to_string().contains("mix_score_drop_abs"));
+                    } else {
+                        assert!(state.settings.get("mix_score_drop_abs").is_none());
+                    }
+                    assert!(state.settings.get("mix_score_clamp_abs").is_none());
                     if buffer > 0 {
                         let mut mismatched = state.clone();
                         mismatched.settings["window_records"] = serde_json::json!(
