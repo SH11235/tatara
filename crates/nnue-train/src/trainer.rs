@@ -861,7 +861,7 @@ where
         )?,
         "shuffle": cfg.teacher_shuffle,
         "seed": cfg.teacher_shuffle_seed,
-        "sampling": cfg.sampling,
+        "sampling": cfg.sampling.settings(cfg.tree_sample_eval_only),
         "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
             serde_json::json!({
                 "mode": Into::<BucketMode>::into(*bucket_mode).canonical_name(),
@@ -873,11 +873,6 @@ where
         "mix_rates": cfg.mix_sources.iter().map(|s| s.rate).collect::<Vec<_>>(),
         "mix_seed": if cfg.mix_sources.is_empty() { 0 } else { cfg.mix_seed },
     });
-    // Marked records bypass game sampling, so resume must verify their effective rate.
-    if cfg.tree_sample_eval_only {
-        settings["sampling"]["tree_sample_accept"] =
-            serde_json::json!(cfg.sampling.tree_sample_accept);
-    }
     let mix_drop = cfg
         .mix_sources
         .iter()
@@ -2239,7 +2234,6 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
-            tree_sample_eval_only: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -3596,15 +3590,20 @@ mod tests {
 
     #[test]
     fn pause_resume_matches_uninterrupted_teacher_sequence() {
-        assert_pause_resume_sequence(false);
+        assert_pause_resume_sequence(false, false);
     }
 
     #[test]
     fn pause_resume_sampling_mixing_and_window_shuffle_matches_continuation() {
-        assert_pause_resume_sequence(true);
+        assert_pause_resume_sequence(true, true);
     }
 
-    fn assert_pause_resume_sequence(combined: bool) {
+    #[test]
+    fn pause_resume_filter_free_tree_sampling_accepts_legacy_loader_settings() {
+        assert_pause_resume_sequence(false, true);
+    }
+
+    fn assert_pause_resume_sequence(combined: bool, tree_sample_eval_only: bool) {
         for threads in [1, 4] {
             for (buffer, shuffle) in [(0, false), (1, true)] {
                 for data in [sample_psv_path(), sample_hcpe_path()] {
@@ -3616,7 +3615,7 @@ mod tests {
                     };
                     let psv = data.extension().unwrap() == "psv";
                     let cfg = TrainingConfig {
-                        tree_sample_eval_only: combined && psv,
+                        tree_sample_eval_only: tree_sample_eval_only && psv,
                         output_dir: output.path().to_path_buf(),
                         batch_size: 17,
                         batches_per_superbatch: 7,
@@ -3768,7 +3767,7 @@ mod tests {
                         assert!(state.settings.get("mix_score_drop_abs").is_none());
                         assert!(state.settings.get("mix_keep_rate").is_none());
                     }
-                    if !cfg.tree_sample_eval_only {
+                    if !(combined && cfg.tree_sample_eval_only) {
                         assert!(
                             state.settings["sampling"]
                                 .get("tree_sample_accept")
@@ -3778,7 +3777,7 @@ mod tests {
                     assert!(state.settings.get("mix_score_clamp_abs").is_none());
                     if buffer > 0 {
                         let mut mismatched = state.clone();
-                        let missing_or_changed_key = if cfg.tree_sample_eval_only {
+                        let missing_or_changed_key = if combined && cfg.tree_sample_eval_only {
                             mismatched.settings["sampling"]
                                 .as_object_mut()
                                 .unwrap()

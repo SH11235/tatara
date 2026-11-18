@@ -13,7 +13,7 @@ use nnue_train::dataloader::BucketMode;
 use nnue_train::dataloader::{DualLabelMode, ScoreSource};
 #[cfg(feature = "gpu")]
 use nnue_train::experiment::{
-    DataInfo, ExperimentDoc, ExperimentLogger, Lineage, LineageKind, Params,
+    DataInfo, ExperimentDoc, ExperimentLogger, Lineage, LineageKind, Params, SamplingParams,
 };
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
@@ -2049,7 +2049,6 @@ pub(crate) fn build_experiment_logger(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
-        tree_sample_eval_only: cli.tree_sample_eval_only,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
@@ -2077,7 +2076,7 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        sampling: cli.sampling(),
+        sampling: SamplingParams::new(cli.tree_sample_eval_only, cli.sampling()),
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         mix_data: cli
             .mix_sources()
@@ -2260,7 +2259,6 @@ pub(crate) fn build_experiment_logger_simple(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
-        tree_sample_eval_only: cli.tree_sample_eval_only,
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
@@ -2285,7 +2283,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        sampling: cli.sampling(),
+        sampling: SamplingParams::new(cli.tree_sample_eval_only, cli.sampling()),
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         mix_data: cli
             .mix_sources()

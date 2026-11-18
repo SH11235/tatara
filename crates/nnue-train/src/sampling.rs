@@ -39,6 +39,26 @@ impl Sampling {
         effective == Self::default()
     }
 
+    pub(crate) fn settings(&self, tree_sample_eval_only: bool) -> serde_json::Value {
+        let mut settings = serde_json::json!(self);
+        let fields = settings
+            .as_object_mut()
+            .expect("sampling settings are an object");
+        // At rate 1, bypassing game-record sampling only matters when a filter is configured.
+        if tree_sample_eval_only
+            && (self.tree_sample_accept != 1.0
+                || self.keep_rate != 1.0
+                || self.min_ply.is_some()
+                || !self.ply_keep_curve.is_empty()
+                || self.bucket_keep_rates.is_some())
+        {
+            fields.insert("tree_sample_accept".into(), self.tree_sample_accept.into());
+        } else {
+            fields.remove("tree_sample_accept");
+        }
+        settings
+    }
+
     pub fn validate(
         &self,
         has_ply: bool,
@@ -186,6 +206,48 @@ mod tests {
         let sampling: Sampling = serde_json::from_str(legacy).unwrap();
         assert_eq!(sampling.tree_sample_accept, 1.0);
         assert_eq!(serde_json::to_string(&sampling).unwrap(), legacy);
+    }
+
+    #[test]
+    fn sampling_settings_record_tree_accept_for_each_game_filter() {
+        let unfiltered = Sampling {
+            log_enabled: true,
+            skip_seed: 42,
+            ..Sampling::default()
+        };
+        assert!(
+            unfiltered
+                .settings(true)
+                .get("tree_sample_accept")
+                .is_none()
+        );
+        for sampling in [
+            Sampling {
+                keep_rate: 0.5,
+                ..Sampling::default()
+            },
+            Sampling {
+                min_ply: Some(0),
+                ..Sampling::default()
+            },
+            Sampling {
+                ply_keep_curve: vec![(0.0, 0.5)],
+                ..Sampling::default()
+            },
+            Sampling {
+                bucket_keep_rates: Some(vec![0.5; 9]),
+                ..Sampling::default()
+            },
+        ] {
+            assert_eq!(sampling.settings(true)["tree_sample_accept"], 1.0);
+            assert!(sampling.settings(false).get("tree_sample_accept").is_none());
+        }
+        let custom = Sampling {
+            tree_sample_accept: 0.25,
+            ..Sampling::default()
+        };
+        assert_eq!(custom.settings(true)["tree_sample_accept"], 0.25);
+        assert!(custom.settings(false).get("tree_sample_accept").is_none());
     }
 
     #[test]
