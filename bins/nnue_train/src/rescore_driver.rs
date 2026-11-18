@@ -245,7 +245,7 @@ impl Fingerprint {
             ("ft_factorize", cfg.ft_factorize.to_string()),
             ("psqt", cfg.psqt.to_string()),
             ("stack_shared_delta", cfg.stack_shared_delta.to_string()),
-            ("bucket_mode", cfg.bucket_mode.canonical_name().to_string()),
+            ("bucket_mode", cfg.bucket_mode.identity()),
             ("num_buckets", cfg.num_buckets.to_string()),
         ];
         if let Some(coeff) = &cfg.progress_coeff {

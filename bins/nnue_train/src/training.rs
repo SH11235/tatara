@@ -339,15 +339,37 @@ pub(crate) fn validate_rescore_cli(
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
 ) -> Result<BucketMode, Box<dyn std::error::Error>> {
+    if args.bucket_mode == "spec" {
+        if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets()) {
+            return Err(format!(
+                "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for spec (got {})",
+                args.num_buckets()
+            )
+            .into());
+        }
+        let spec = args
+            .bucket_spec
+            .ok_or("--bucket-mode spec requires --bucket-spec")?;
+        if args.progress_coeff.is_some() {
+            return Err("--progress-coeff is not used with --bucket-mode spec".into());
+        }
+        if args.num_buckets() != spec.num_buckets() {
+            return Err("--num-buckets does not match --bucket-spec".into());
+        }
+        return Ok(BucketMode::Spec(spec));
+    }
+    if args.bucket_spec.is_some() {
+        return Err("--bucket-spec requires --bucket-mode spec".into());
+    }
     let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
     match mode {
         BucketMode::ProgressKpAbs | BucketMode::ProgressKpAbsQ16 => {
-            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets()) {
+            if !(1..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets()) {
                 return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for {} (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    "--num-buckets must be in [1, {MAX_LAYERSTACK_BUCKETS}] for {} (got {})",
                     mode.canonical_name(),
                     args.num_buckets()
                 )
@@ -355,6 +377,7 @@ pub(crate) fn validate_bucket_mode(
             }
             Ok(mode)
         }
+        BucketMode::Spec(_) => unreachable!("spec handled above"),
         BucketMode::KingRank9 => {
             if args.num_buckets() != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
@@ -380,10 +403,7 @@ pub(crate) fn validate_output_format(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
     {
-        return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress routing cannot be exported to YaneuraOu SFNN"
-                .into(),
-        );
+        return Err("--output-format yaneuraou requires LayerStack --bucket-mode kingrank9".into());
     }
     Ok(())
 }
@@ -540,6 +560,9 @@ fn lock_sgd_transfer_destination(
 
 #[cfg(feature = "gpu")]
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(cli.arch, ArchCommand::Simple(_)) && (cli.freeze_ft || cli.init_ft_only) {
+        return Err("--freeze-ft and --init-ft-only require layerstack".into());
+    }
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
@@ -995,6 +1018,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             cli.precision_seed,
         )?;
     }
+    trainer.set_freeze_ft(cli.freeze_ft);
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }
@@ -1014,7 +1038,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // rescore は fingerprint に「ロードに使った byte 列そのもの」の sha256 を
         // 書くため、file を一括で読んでから同じ buffer で parse する。学習経路は
         // 従来どおり streaming (数百 MB を余分に保持しない)。
-        let mut weights = if cli.rescore_input.is_some() {
+        let mut weights = if cli.init_ft_only {
+            load_ft_source(init, feature_set, layerstack.ft_out, layerstack.psqt)?
+        } else if cli.rescore_input.is_some() {
             // hash とロードの対象を同じ実体にするため、canonical path に解決して
             // から読む (symlink 差し替えで両者が乖離しないように)。
             let canonical = init.canonicalize().map_err(|e| {
@@ -1056,7 +1082,11 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 weights.feature_set.threat_dims(),
             );
         }
-        trainer.load_layerstack_weights(&weights)?;
+        if cli.init_ft_only {
+            trainer.load_ft_weights(&weights)?;
+        } else {
+            trainer.load_layerstack_weights(&weights)?;
+        }
         (None, None, None)
     } else if let Some(ckpt) = &cli.resume {
         // rescore は .ckpt (数 GB 級) を stream hash → 直後にロード → stat 等値の
@@ -1853,7 +1883,7 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
     if cli.transfer_radam_momentum {
         return Some("RAdam checkpoint with momentum transfer".to_string());
     }
-    if cli.init_from.is_some() || cli.resume.is_some() {
+    if (cli.init_from.is_some() && !cli.init_ft_only) || cli.resume.is_some() {
         return None;
     }
     let overridden: Vec<&str> = [
@@ -2045,7 +2075,7 @@ pub(crate) fn build_experiment_logger(
         optimizer: cli.optimizer.to_ascii_lowercase(),
         // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
         // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
-        bucket_mode: Some(bucket_mode.canonical_name().to_string()),
+        bucket_mode: Some(bucket_mode.identity()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
         lr: finite_or_zero(cli.lr),
@@ -2114,6 +2144,8 @@ pub(crate) fn build_experiment_logger(
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
+        freeze_ft: cli.freeze_ft,
+        init_ft_only: cli.init_ft_only,
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
         // 指定時のみ Some を記録する (未指定 run の experiment.json では省略)。
@@ -2322,6 +2354,8 @@ pub(crate) fn build_experiment_logger_simple(
         teacher_shuffle_seed: cli.teacher_shuffle_seed,
         dual_label_psv: dual_label_param(cli),
         init_from: cli.init_from.as_deref().map(file_basename),
+        freeze_ft: cli.freeze_ft,
+        init_ft_only: cli.init_ft_only,
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
         test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
@@ -3436,5 +3470,73 @@ mod tests {
         assert!(Cli::try_parse_from(argv).is_err());
         let cli = parse(&["--resume", "net-a-420.ckpt", "--lineage-kind", "fork"]);
         assert_eq!(cli.lineage_kind, Some(crate::cli::LineageKindArg::Fork));
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn load_ft_source(
+    path: &std::path::Path,
+    feature_set: shogi_features::FeatureSetSpec,
+    ft_out: usize,
+    psqt: bool,
+) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
+    use nnue_format::layerstack_weights::{read_layerstack_arch, stored_num_buckets};
+    use std::io::{Read, Seek};
+    let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
+    let arch = read_layerstack_arch(&mut file)?;
+    let affine_dims: Vec<usize> = arch
+        .split("AffineTransform[")
+        .skip(1)
+        .map(|s| s.split("<-").next().unwrap().parse::<usize>())
+        .collect::<Result<_, _>>()?;
+    if affine_dims.len() != 3 {
+        return Err("invalid LayerStack affine dimensions".into());
+    }
+    file.rewind()?;
+    let mut header = vec![0; 16 + arch.len()];
+    file.read_exact(&mut header)?;
+    let buckets = stored_num_buckets(&header)?;
+    file.rewind()?;
+    Ok(LayerStackWeights::load_quantised_with_psqt(
+        &mut file,
+        feature_set,
+        ft_out,
+        affine_dims[2],
+        affine_dims[1],
+        buckets,
+        psqt,
+    )?)
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod ft_source_tests {
+    use super::*;
+
+    #[test]
+    fn ft_source_reads_its_own_output_dimensions_and_bucket_count() {
+        let spec = shogi_features::FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
+            .with_threat_width(2);
+        let mut source = LayerStackWeights::zeroed(spec, 4, 6, 8, 3);
+        source.bucket_spec = Some("ownking:2/3".parse().unwrap());
+        source
+            .ft_w
+            .fill(16.0 / nnue_format::layerstack_weights::QA as f32);
+        source
+            .ft_b
+            .fill(32.0 / nnue_format::layerstack_weights::QA as f32);
+        let path =
+            std::env::temp_dir().join(format!("tatara-ft-source-{}.bin", std::process::id()));
+        source
+            .save_quantised(&mut std::fs::File::create(&path).unwrap(), None)
+            .unwrap();
+        let loaded = load_ft_source(&path, spec, 4, false).unwrap();
+        assert!(loaded.ft_w == source.ft_w);
+        assert_eq!(loaded.ft_b, source.ft_b);
+        assert_eq!(loaded.num_buckets, 3);
+        assert_eq!(loaded.bucket_spec, source.bucket_spec);
+        assert!(load_ft_source(&path, spec.with_threat_width(4), 4, false).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -1299,10 +1299,9 @@ fn bias_grad_l1_shared_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// -- dense_mm_bucket fwd / bwd_input / bwd_weight / bias_grad (9 buckets, -1 padding) --
+// -- Dense per-bucket kernels and padding --
 
-/// batch を num_buckets(=9) より大きくして全 bucket を踏み、`-1` (out-of-range)
-/// と `>= num_buckets` の position も入れる。
+/// A batch of at least `num_buckets + 2` rows includes every bucket and both invalid IDs.
 fn bucket_idx_with_padding(batch: usize, num_buckets: usize) -> Vec<i32> {
     (0..batch)
         .map(|i| match i % (num_buckets + 2) {
@@ -1316,10 +1315,10 @@ fn bucket_idx_with_padding(batch: usize, num_buckets: usize) -> Vec<i32> {
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let batch = 13_usize; // > 9 + 2 → all buckets + both out-of-range kinds
+    let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = MAX_SUPPORTED_NUM_BUCKETS;
+    let nb = 9;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let w: Vec<f32> = (0..nb * out_dim * in_dim)
         .map(|i| i as f32 * 0.0007 + 0.05)
@@ -1366,10 +1365,9 @@ fn dense_mm_fwd_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets <= 9
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (48, 96), (64, 32)] {
         let out_dim = 16_usize;
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
+        let nb = 9;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
             .map(|i| i as f32 * 0.0007 + 0.05)
@@ -1714,7 +1712,7 @@ fn dense_mm_bwd_input_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Err
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = MAX_SUPPORTED_NUM_BUCKETS;
+    let nb = 9;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
         .collect();
@@ -1763,7 +1761,7 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
     let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
-    let nb = MAX_SUPPORTED_NUM_BUCKETS;
+    let nb = 9;
     let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.013 - 0.4)
@@ -1805,25 +1803,83 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn bucket_weight_test_ids(batch: usize, num_buckets: usize) -> Vec<i32> {
+    let mut ids = bucket_idx_with_padding(batch, num_buckets);
+    for (row, bucket) in ids.iter_mut().enumerate() {
+        if num_buckets > 2 && *bucket == 1 {
+            *bucket = -1;
+        } else if (0..num_buckets as i32).contains(bucket) && row % 3 == 0 {
+            *bucket = 0;
+        }
+    }
+    ids
+}
+
+struct BucketWeightTestLayout {
+    permutation: DeviceBuffer<i32>,
+    offsets: DeviceBuffer<u32>,
+    counts: DeviceBuffer<u32>,
+    chunks: u32,
+    row_shift: u32,
+}
+
+impl BucketWeightTestLayout {
+    fn upload(
+        stream: &CudaStream,
+        bucket_idx: &[i32],
+        num_buckets: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let row_shift = 5;
+        let padded_batch = padded_sort_batch(bucket_idx.len(), num_buckets);
+        let mut permutation = Vec::with_capacity(padded_batch);
+        let mut offsets = Vec::with_capacity(num_buckets + 1);
+        let mut counts = Vec::with_capacity(num_buckets + 1);
+        for bucket in 0..num_buckets {
+            let start = permutation.len();
+            offsets.push(start as u32);
+            permutation.extend(
+                bucket_idx
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter_map(|(row, &id)| (id == bucket as i32).then_some(row as i32)),
+            );
+            counts.push((permutation.len() - start) as u32);
+            permutation.resize(permutation.len().next_multiple_of(16), -1);
+        }
+        offsets.push(permutation.len() as u32);
+        counts.push(0);
+        permutation.resize(padded_batch, -1);
+        Ok(Self {
+            permutation: DeviceBuffer::from_host(stream, &permutation)?,
+            offsets: DeviceBuffer::from_host(stream, &offsets)?,
+            counts: DeviceBuffer::from_host(stream, &counts)?,
+            chunks: ((padded_batch as u32) >> row_shift) + num_buckets as u32,
+            row_shift,
+        })
+    }
+}
+
 #[test]
-fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+fn dense_mm_bwd_weight_bucket_grid_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // L2 weight backward: out_dim は L2 出力次元 (`--l2`、可変)、in_dim = l2_in
     // (= 2*(l1_out-1)、`--l1` 依存)。既定 out_dim 32 と非既定 {16, 64, 256} を
     // 各種 in_dim・非 16 倍数 out_dim と組み合わせて検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 30_usize, 32_usize), // 既定形状
-        (64, 46, 16),
-        (256, 62, 64),
-        (1024, 14, 256),
-        (32, 96, 30), // 非 16 倍数の out_dim
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 30_usize, 32_usize, 9), // 既定形状
+        (65, 46, 16, 1),
+        (129, 62, 64, 2),
+        (1024, 14, 256, 8),
+        (32, 96, 30, 9), // 非 16 倍数の out_dim
+        (259, 30, 64, 16),
+        (513, 46, 17, 32),
     ] {
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
             .collect();
-        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let bucket_idx = bucket_weight_test_ids(batch, nb);
         let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
         dense_mm_bwd_weight_bucket_cpu(
             &x,
@@ -1838,12 +1894,11 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
 
         let x_dev = DeviceBuffer::from_host(&stream, &x)?;
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
-        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
-        let num_splits = 8_usize;
         let cell_blocks = (out_dim * in_dim).div_ceil(256);
+        let layout = BucketWeightTestLayout::upload(&stream, &bucket_idx, nb)?;
         let config = LaunchConfig {
-            grid_dim: (cell_blocks as u32, num_splits as u32, 1),
+            grid_dim: (cell_blocks as u32, layout.chunks, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1851,15 +1906,16 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: dense_mm_bwd_weight_bucket_tiled_l2, stream: stream, module: module,
+                kernel: dense_mm_bwd_weight_bucket_grid_l2, stream: stream, module: module,
                 config: config,
-                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+                args: [slice(x_dev), slice(dy_dev), slice(layout.permutation),
+                       slice(layout.offsets), slice(layout.counts), slice(dw_dev),
+                       layout.row_shift, in_dim as u32, out_dim as u32, nb as u32]
             }
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l2 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_grid_l2 b={batch} nb={nb}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
@@ -1869,25 +1925,26 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
-    // tiled L3 (out_dim=1, num_buckets=9; in_dim は L2 出力次元 l2_out、可変)。
-    // host は block_dim を in_dim に一致させる。既定 in_dim 32 と非既定
+fn dense_mm_bwd_weight_bucket_grid_l3_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    // L3 (out_dim=1; in_dim は L2 出力次元 l2_out、可変)。
+    // block_dim は in_dim の倍数。既定 in_dim 32 と非既定
     // {16, 64, 256}・非 16 倍数の 30 を検証する。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim) in &[
-        (16_usize, 32_usize), // 既定形状
-        (64, 16),
-        (256, 64),
-        (1024, 256),
-        (32, 30), // 非 16 倍数の in_dim
+    for &(batch, in_dim, nb) in &[
+        (16_usize, 32_usize, 9), // 既定形状
+        (65, 16, 1),
+        (129, 64, 2),
+        (1024, 256, 8),
+        (32, 30, 9), // 非 16 倍数の in_dim
+        (259, 64, 16),
+        (513, 30, 32),
     ] {
         let out_dim = 1_usize;
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
             .collect();
-        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let bucket_idx = bucket_weight_test_ids(batch, nb);
         let mut dw_cpu = vec![0.0_f32; nb * out_dim * in_dim];
         dense_mm_bwd_weight_bucket_cpu(
             &x,
@@ -1902,9 +1959,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
 
         let x_dev = DeviceBuffer::from_host(&stream, &x)?;
         let dy_dev = DeviceBuffer::from_host(&stream, &dy)?;
-        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
         let dw_dev = DeviceBuffer::<f32>::zeroed(&stream, nb * out_dim * in_dim)?;
-        let num_splits = 8_usize; // 小 grid。kernel は grid-stride で全 batch を覆う。
         // 列あたり R lane (= block_dim / in_dim) で batch reduction を並列化 (production と同じ
         // 算出)。R = in_dim を掛けて 256 を超えない最大 2 冪、block_dim = R*in_dim。
         let mut lanes = 1_usize;
@@ -1912,8 +1967,9 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
             lanes *= 2;
         }
         let block_dim = (lanes * in_dim) as u32;
+        let layout = BucketWeightTestLayout::upload(&stream, &bucket_idx, nb)?;
         let config = LaunchConfig {
-            grid_dim: (num_splits as u32, 1, 1),
+            grid_dim: (layout.chunks, 1, 1),
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1921,15 +1977,16 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
             cuda_launch! {
-                kernel: dense_mm_bwd_weight_bucket_tiled_l3, stream: stream, module: module,
+                kernel: dense_mm_bwd_weight_bucket_grid_l3, stream: stream, module: module,
                 config: config,
-                args: [slice(x_dev), slice(dy_dev), slice(bidx_dev), slice(dw_dev),
-                       batch as u32, in_dim as u32, out_dim as u32, nb as u32]
+                args: [slice(x_dev), slice(dy_dev), slice(layout.permutation),
+                       slice(layout.offsets), slice(layout.counts), slice(dw_dev),
+                       layout.row_shift, in_dim as u32, nb as u32]
             }
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l3 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_grid_l3 b={batch} nb={nb}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
@@ -1941,10 +1998,9 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
 #[test]
 fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    // tiled (L1): in_dim % 16 == 0、out_dim == 16、batch % 16 == 0、num_buckets == 9 を要求
     for &(batch, in_dim) in &[(16_usize, 16_usize), (32, 64), (32, 96)] {
         let out_dim = 16_usize;
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
+        let nb = 9;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -2121,7 +2177,7 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     let batch = 13_usize;
     let out_dim = 32_usize;
-    let nb = MAX_SUPPORTED_NUM_BUCKETS;
+    let nb = 9;
     let dy: Vec<f32> = (0..batch * out_dim)
         .map(|i| i as f32 * 0.017 - 0.9)
         .collect();
@@ -2161,17 +2217,16 @@ fn bias_grad_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // out_dim は L1 bias (= l1_out) と L2 bias (= l2_out) の双方を網羅する (ともに可変)。
-    for &(batch, out_dim) in &[
-        (16_usize, 16_usize), // L1 bias 既定形状
-        (32, 16),
-        (64, 16),
-        (16, 32), // L2 bias 形状
-        (48, 32),
-        (32, 24), // 非 16 倍数の l1_out
-        (48, 8),  // l1_out < 16
-        (64, 64), // l1_out > 32
+    for &(batch, out_dim, nb) in &[
+        (16_usize, 16_usize, 9),
+        (32, 16, 9),
+        (64, 16, 9),
+        (16, 32, 9),
+        (48, 32, 16),
+        (32, 24, 9),
+        (48, 8, 16),
+        (64, 64, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.017 - 0.9)
@@ -3001,27 +3056,16 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
     Ok(())
 }
 
-// =============================================================================
-// `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS = 9) を GPU/CPU で
-// exercise する parametrised test。既存テストは上限 N=9 で動かしているが、
-// kernel は `num_buckets` を runtime 引数で受けるため N ≤ 9 で同じ correctness
-// 不変条件 (`bucket_idx >= num_buckets` を silent skip、CPU と bit-equal) が
-// 成立する。本セクションでは `N ∈ {2, 4, 8, 9}` の主要 N で fwd / bwd_input /
-// bwd_weight / bias_grad を回し、host plumbing 経由で kernel が runtime N を
-// 正しく受け取れていることを確認する。
-// =============================================================================
-
-/// `--num-buckets` で実験的に使う想定の N 値。
-const NUM_BUCKETS_PARAM_VALUES: [usize; 4] = [2, 4, 8, 9];
+const NUM_BUCKETS_PARAM_VALUES: [usize; 6] = [2, 4, 8, 9, 16, MAX_SUPPORTED_NUM_BUCKETS];
 
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_ctx, module, stream) = open_module()?;
-    let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
     for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let batch = nb + 3;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
             .map(|i| i as f32 * 0.0007 + 0.05)
@@ -3072,10 +3116,10 @@ fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn 
 fn dense_mm_bwd_input_bucket_matches_cpu_for_each_num_buckets()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
     for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let batch = nb + 3;
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
             .collect();
@@ -3124,10 +3168,10 @@ fn dense_mm_bwd_input_bucket_matches_cpu_for_each_num_buckets()
 fn dense_mm_bwd_weight_bucket_matches_cpu_for_each_num_buckets()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let batch = 13_usize;
     let in_dim = 30_usize;
     let out_dim = 32_usize;
     for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let batch = nb + 3;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -3160,7 +3204,7 @@ fn dense_mm_bwd_weight_bucket_matches_cpu_for_each_num_buckets()
             }
         }?;
         stream.synchronize()?;
-        assert_close(
+        assert_close_rel(
             &format!("dense_mm_bwd_weight_bucket nb={nb}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
@@ -3173,9 +3217,9 @@ fn dense_mm_bwd_weight_bucket_matches_cpu_for_each_num_buckets()
 #[test]
 fn bias_grad_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let batch = 13_usize;
     let out_dim = 32_usize;
     for &nb in &NUM_BUCKETS_PARAM_VALUES {
+        let batch = nb + 3;
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.017 - 0.9)
             .collect();
@@ -5712,52 +5756,53 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, MAX_SUPPORTED_NUM_BUCKETS, 11_usize);
-    let psqt_w = deterministic_floats(ft_in * nb, 33.0);
-    let (stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
-    let (nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
-    // 全 9 bucket + `-1` / `>= nb` の invalid bucket (skip) を踏む。
-    let bucket_idx = bucket_idx_with_padding(batch, nb);
-    let net0 = deterministic_floats(batch, 37.0);
+    for nb in [9, 16, MAX_SUPPORTED_NUM_BUCKETS] {
+        let (batch, max_active, ft_in) = (nb + 3, 4_usize, 11_usize);
+        let psqt_w = deterministic_floats(ft_in * nb, 33.0);
+        let (stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
+        let (nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        let net0 = deterministic_floats(batch, 37.0);
 
-    let mut net_cpu = net0.clone();
-    psqt_diff_sparse_fwd_inplace_cpu(
-        &psqt_w,
-        &stm_indices,
-        &nstm_indices,
-        &nnz,
-        &bucket_idx,
-        &mut net_cpu,
-        batch,
-        max_active,
-        nb,
-        ft_in,
-    );
+        let mut net_cpu = net0.clone();
+        psqt_diff_sparse_fwd_inplace_cpu(
+            &psqt_w,
+            &stm_indices,
+            &nstm_indices,
+            &nnz,
+            &bucket_idx,
+            &mut net_cpu,
+            batch,
+            max_active,
+            nb,
+            ft_in,
+        );
 
-    let w_dev = DeviceBuffer::from_host(&stream, &psqt_w)?;
-    let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
-    let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
-    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
-    let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
-    let mut net_dev = DeviceBuffer::from_host(&stream, &net0)?;
-    unsafe {
-        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-        // stream の完了を待つ同期点まで生存する device allocation。
-        cuda_launch! {
-            kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
-            config: cfg_1d(batch),
-            args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
-                   slice(bidx_dev), slice_mut(net_dev), batch as u32, max_active as u32,
-                   nb as u32, ft_in as u32]
-        }
-    }?;
-    stream.synchronize()?;
-    assert_close(
-        "psqt_diff_sparse_fwd_inplace",
-        &net_dev.to_host_vec(&stream)?,
-        &net_cpu,
-        TOL,
-    );
+        let w_dev = DeviceBuffer::from_host(&stream, &psqt_w)?;
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+        let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let mut net_dev = DeviceBuffer::from_host(&stream, &net0)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: psqt_diff_sparse_fwd_inplace, stream: stream, module: module,
+                config: cfg_1d(batch),
+                args: [slice(w_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
+                       slice(bidx_dev), slice_mut(net_dev), batch as u32, max_active as u32,
+                       nb as u32, ft_in as u32]
+            }
+        }?;
+        stream.synchronize()?;
+        assert_close(
+            "psqt_diff_sparse_fwd_inplace",
+            &net_dev.to_host_vec(&stream)?,
+            &net_cpu,
+            TOL,
+        );
+    }
     Ok(())
 }
 
@@ -5766,58 +5811,60 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
 #[test]
 fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    let (batch, max_active, nb, ft_in) = (12_usize, 4_usize, MAX_SUPPORTED_NUM_BUCKETS, 11_usize);
-    let dnet = deterministic_floats(batch, 41.0);
-    let (mut stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
-    let (mut nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
-    let bucket_idx = bucket_idx_with_padding(batch, nb);
-    // 実長超 slot を範囲内 index で汚す (全幅走査すると勾配が変わる)。
-    for bi in 0..batch {
-        for ni in nnz[bi] as usize..max_active {
-            stm_indices[bi * max_active + ni] = ((bi + ni + 1) % ft_in) as i32;
-            nstm_indices[bi * max_active + ni] = ((bi + ni + 2) % ft_in) as i32;
+    for nb in [9, 16, MAX_SUPPORTED_NUM_BUCKETS] {
+        let (batch, max_active, ft_in) = (nb + 3, 4_usize, 11_usize);
+        let dnet = deterministic_floats(batch, 41.0);
+        let (mut stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
+        let (mut nstm_indices, _) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 4);
+        let bucket_idx = bucket_idx_with_padding(batch, nb);
+        // 実長超 slot を範囲内 index で汚す (全幅走査すると勾配が変わる)。
+        for bi in 0..batch {
+            for ni in nnz[bi] as usize..max_active {
+                stm_indices[bi * max_active + ni] = ((bi + ni + 1) % ft_in) as i32;
+                nstm_indices[bi * max_active + ni] = ((bi + ni + 2) % ft_in) as i32;
+            }
         }
+
+        let mut grad_cpu = vec![0.0_f32; ft_in * nb];
+        psqt_diff_sparse_bwd_cpu(
+            &dnet,
+            &stm_indices,
+            &nstm_indices,
+            &nnz,
+            &bucket_idx,
+            &mut grad_cpu,
+            batch,
+            max_active,
+            nb,
+            ft_in,
+        );
+
+        let dnet_dev = DeviceBuffer::from_host(&stream, &dnet)?;
+        let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
+        let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
+        let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
+        let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
+        let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * nb)?;
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
+                config: cfg_1d(batch * max_active),
+                args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
+                       slice(bidx_dev), slice(grad_dev), batch as u32, max_active as u32,
+                       nb as u32, ft_in as u32]
+            }
+        }?;
+        stream.synchronize()?;
+        // ±0.5*dnet の atomic scatter は加算順非決定 → relative tolerance。
+        assert_close_rel(
+            "psqt_diff_sparse_bwd (実長超のゴミを無視)",
+            &grad_dev.to_host_vec(&stream)?,
+            &grad_cpu,
+            TOL,
+        );
     }
-
-    let mut grad_cpu = vec![0.0_f32; ft_in * nb];
-    psqt_diff_sparse_bwd_cpu(
-        &dnet,
-        &stm_indices,
-        &nstm_indices,
-        &nnz,
-        &bucket_idx,
-        &mut grad_cpu,
-        batch,
-        max_active,
-        nb,
-        ft_in,
-    );
-
-    let dnet_dev = DeviceBuffer::from_host(&stream, &dnet)?;
-    let stm_dev = DeviceBuffer::from_host(&stream, &stm_indices)?;
-    let nstm_dev = DeviceBuffer::from_host(&stream, &nstm_indices)?;
-    let nnz_dev = DeviceBuffer::from_host(&stream, &nnz)?;
-    let bidx_dev = DeviceBuffer::from_host(&stream, &bucket_idx)?;
-    let grad_dev = DeviceBuffer::<f32>::zeroed(&stream, ft_in * nb)?;
-    unsafe {
-        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-        // stream の完了を待つ同期点まで生存する device allocation。
-        cuda_launch! {
-            kernel: psqt_diff_sparse_bwd, stream: stream, module: module,
-            config: cfg_1d(batch * max_active),
-            args: [slice(dnet_dev), slice(stm_dev), slice(nstm_dev), slice(nnz_dev),
-                   slice(bidx_dev), slice(grad_dev), batch as u32, max_active as u32,
-                   nb as u32, ft_in as u32]
-        }
-    }?;
-    stream.synchronize()?;
-    // ±0.5*dnet の atomic scatter は加算順非決定 → relative tolerance。
-    assert_close_rel(
-        "psqt_diff_sparse_bwd (実長超のゴミを無視)",
-        &grad_dev.to_host_vec(&stream)?,
-        &grad_cpu,
-        TOL,
-    );
     Ok(())
 }
 
@@ -6630,7 +6677,7 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
             128,
             DEFAULT_L1_OUT,
             DEFAULT_L2_OUT,
-            MAX_SUPPORTED_NUM_BUCKETS,
+            9,
             nnue_train::dataloader::BucketMode::ProgressKpAbs,
             PrecisionFlags::default(),
             feature_set,

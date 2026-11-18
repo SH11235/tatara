@@ -370,12 +370,6 @@ extern "C" __global__ void qat_output(
     out[i] = static_cast<float>(static_cast<double>(raw) / 8128.0);
 }
 
-// LayerStack bucket 数の上限。per-bucket accumulator を register array で持つ kernel が
-// この値で配列を確保する。各アクセスは `min(num_buckets, kMaxSupportedNumBuckets)` で
-// clamp するので範囲外 index (UB) にはならないが、host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS`
-// がこの値を超えると上位 bucket の勾配が黙って落ちる。両定数の一致を
-// `native_bucket_capacity_matches_host` test で固定する。
-constexpr unsigned int kMaxSupportedNumBuckets = 9;
 
 extern "C" __global__ void native_vec_add(
     const float* lhs,
@@ -4136,16 +4130,54 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l1_sorted(
     atomicAdd(weight_gradient + index, accumulator);
 }
 
-extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l2(
+struct BucketGradientChunk {
+    unsigned int bucket;
+    unsigned int first;
+    unsigned int end;
+};
+
+// Rounding offsets down and adding the bucket index reserves enough chunks
+// for every segment, including those that cross a chunk boundary.
+static __device__ __forceinline__ BucketGradientChunk bucket_gradient_chunk(
+    const unsigned int* offsets,
+    const unsigned int* counts,
+    unsigned int chunk,
+    unsigned int row_shift,
+    unsigned int num_buckets
+) {
+    unsigned int bucket = 0;
+    unsigned int limit = num_buckets;
+    while (bucket + 1U < limit) {
+        const unsigned int mid = bucket + (limit - bucket) / 2U;
+        const unsigned int mid_chunk = (offsets[mid] >> row_shift) + mid;
+        if (mid_chunk <= chunk) {
+            bucket = mid;
+        } else {
+            limit = mid;
+        }
+    }
+
+    const unsigned int start = offsets[bucket];
+    const unsigned int first_chunk = (start >> row_shift) + bucket;
+    const unsigned int first_row = start + ((chunk - first_chunk) << row_shift);
+    const unsigned int end_row = min(start + counts[bucket], first_row + (1U << row_shift));
+    return {bucket, first_row, end_row};
+}
+
+extern "C" __global__ void dense_mm_bwd_weight_bucket_grid_l2(
     const float* input,
     unsigned long long,
     const float* output_gradient,
     unsigned long long,
-    const int* bucket_idx,
+    const int* permutation,
+    unsigned long long,
+    const unsigned int* bucket_offsets,
+    unsigned long long,
+    const unsigned int* bucket_counts,
     unsigned long long,
     float* weight_gradient,
     unsigned long long,
-    unsigned int batch,
+    unsigned int row_shift,
     unsigned int input_dimension,
     unsigned int output_dimension,
     unsigned int num_buckets
@@ -4155,60 +4187,71 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l2(
     if (cell >= cells_per_bucket) {
         return;
     }
-    const unsigned int output_index = cell / input_dimension;
+    const auto chunk =
+        bucket_gradient_chunk(bucket_offsets, bucket_counts, blockIdx.y, row_shift, num_buckets);
+    if (chunk.first >= chunk.end) {
+        return;
+    }
+
     const unsigned int input_index = cell % input_dimension;
-    const unsigned int rows_per_split = (batch + gridDim.y - 1U) / gridDim.y;
-    const unsigned int first_row = blockIdx.y * rows_per_split;
-    const unsigned int last_row = min(first_row + rows_per_split, batch);
-    float accumulators[kMaxSupportedNumBuckets] = {};
-    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
-    for (unsigned int row = first_row; row < last_row; ++row) {
-        const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
-            accumulators[bucket] +=
-                input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
-                output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
-        }
+    const unsigned int output_index = cell / input_dimension;
+    float accumulator = 0.0F;
+    for (unsigned int sorted_row = chunk.first; sorted_row < chunk.end; ++sorted_row) {
+        const auto row = static_cast<unsigned long long>(permutation[sorted_row]);
+        accumulator += input[row * input_dimension + input_index] *
+                       output_gradient[row * output_dimension + output_index];
     }
-    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
-        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * cells_per_bucket + cell,
-                  accumulators[bucket]);
-    }
+
+    atomicAdd(weight_gradient + static_cast<unsigned long long>(chunk.bucket) * cells_per_bucket + cell,
+              accumulator);
 }
 
-extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l3(
+extern "C" __global__ void dense_mm_bwd_weight_bucket_grid_l3(
     const float* input,
     unsigned long long,
     const float* output_gradient,
     unsigned long long,
-    const int* bucket_idx,
+    const int* permutation,
+    unsigned long long,
+    const unsigned int* bucket_offsets,
+    unsigned long long,
+    const unsigned int* bucket_counts,
     unsigned long long,
     float* weight_gradient,
     unsigned long long,
-    unsigned int batch,
+    unsigned int row_shift,
     unsigned int input_dimension,
-    unsigned int output_dimension,
     unsigned int num_buckets
 ) {
+    __shared__ float partial[256];
+    const auto chunk =
+        bucket_gradient_chunk(bucket_offsets, bucket_counts, blockIdx.x, row_shift, num_buckets);
+    if (chunk.first >= chunk.end) {
+        return;
+    }
+
     const unsigned int input_index = threadIdx.x % input_dimension;
     const unsigned int lane = threadIdx.x / input_dimension;
-    const unsigned int lanes_per_column = blockDim.x / input_dimension;
-    const unsigned int stride = gridDim.x * lanes_per_column;
-    unsigned int row = blockIdx.x * lanes_per_column + lane;
-    float accumulators[kMaxSupportedNumBuckets] = {};
-    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
-    while (row < batch) {
-        const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
-            accumulators[bucket] +=
-                input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
-                output_gradient[static_cast<unsigned long long>(row) * output_dimension];
-        }
-        row += stride;
+    const unsigned int lanes = blockDim.x / input_dimension;
+    float accumulator = 0.0F;
+    for (unsigned int sorted_row = chunk.first + lane; sorted_row < chunk.end; sorted_row += lanes) {
+        const auto row = static_cast<unsigned long long>(permutation[sorted_row]);
+        accumulator += input[row * input_dimension + input_index] * output_gradient[row];
     }
-    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
-        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * input_dimension + input_index,
-                  accumulators[bucket]);
+
+    partial[threadIdx.x] = accumulator;
+    __syncthreads();
+    for (unsigned int offset = lanes / 2; offset > 0; offset /= 2) {
+        if (lane < offset) {
+            partial[threadIdx.x] += partial[threadIdx.x + offset * input_dimension];
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        atomicAdd(weight_gradient + static_cast<unsigned long long>(chunk.bucket) * input_dimension +
+                      input_index,
+                  partial[threadIdx.x]);
     }
 }
 

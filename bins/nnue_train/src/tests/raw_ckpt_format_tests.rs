@@ -1079,6 +1079,10 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         feature_set: full.feature_set.with_threat_width(512),
         ..full
     };
+    let with_spec = RawCkptArch {
+        bucket_mode: Some("spec:ownking:2/3+oppking:2/3"),
+        ..partial
+    };
     use nnue_train::optimizer::OptimizerKind;
 
     let meta = RawCkptMeta {
@@ -1113,6 +1117,10 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         assert_eq!(full_bytes, write(&explicit, optimizer));
         let packed_bytes = write(&partial, optimizer);
         assert_eq!(packed_bytes[4..8], version.to_le_bytes());
+        let spec_bytes = write(&with_spec, optimizer);
+        assert_eq!(spec_bytes[4..8], version.to_le_bytes());
+        read_raw_ckpt_header(&mut Cursor::new(&spec_bytes), &with_spec).unwrap();
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&spec_bytes), &partial).is_err());
         let mut header = read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &partial).unwrap();
         assert_eq!(header.step_count, 5);
         assert_eq!(header.sgd, optimizer == OptimizerKind::Sgd);
@@ -1289,4 +1297,14 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
     }
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+#[test]
+fn raw_ckpt_spec_identity_roundtrip_and_mismatch() {
+    let arch = layerstack_arch_with_mode("spec:handmajor3+ownking:2/3");
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "bucket-spec-roundtrip", 2, 20, None, 10).unwrap();
+    read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+    let other = layerstack_arch_with_mode("spec:handmajor3+oppking:2/3");
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &other).is_err());
 }

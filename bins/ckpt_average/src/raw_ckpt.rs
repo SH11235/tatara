@@ -235,6 +235,7 @@ pub(crate) struct LayerStackLayout {
     pub(crate) l1_out: usize,
     pub(crate) l2_out: usize,
     pub(crate) num_buckets: usize,
+    bucket_spec: Option<shogi_features::BucketSpec>,
 }
 
 impl LayerStackLayout {
@@ -316,7 +317,18 @@ pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayou
         l1_out: l1_out as usize,
         l2_out: l2_out as usize,
         num_buckets: num_buckets as usize,
+        bucket_spec: id
+            .bucket_mode
+            .strip_prefix("spec:")
+            .map(|s| s.parse().map_err(invalid))
+            .transpose()?,
     };
+    if layout
+        .bucket_spec
+        .is_some_and(|s| s.num_buckets() != layout.num_buckets)
+    {
+        return Err(invalid("bucket spec does not match checkpoint topology"));
+    }
     for ((name, want), &got) in LAYERSTACK_GROUP_NAMES
         .iter()
         .zip(layout.group_lens())
@@ -417,6 +429,7 @@ pub(crate) fn to_layerstack_weights(
     LayerStackWeights {
         feature_set: layout.export_spec(),
         num_buckets: layout.num_buckets,
+        bucket_spec: layout.bucket_spec,
         ft_w: coalesce_ft_factorized(&layout.train_spec, layout.ft_out, &ft_w),
         ft_b,
         l1_w,
@@ -453,6 +466,7 @@ pub(crate) mod tests {
             l1_out: L1,
             l2_out: L2,
             num_buckets: NB,
+            bucket_spec: None,
         }
     }
 
@@ -494,6 +508,7 @@ pub(crate) mod tests {
             l1_out: topology[1] as usize,
             l2_out: topology[2] as usize,
             num_buckets: topology[3] as usize,
+            bucket_spec: None,
         };
         let mut out = Vec::new();
         out.extend(MAGIC);
@@ -698,5 +713,27 @@ pub(crate) mod tests {
         assert!((weighted - ema).abs() < 1e-12);
         assert!((c.iter().sum::<f64>() - 1.0).abs() < 1e-12);
         assert!((uniform_coefficients(3).iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+    #[test]
+    fn spec_routing_survives_checkpoint_averaging_export() {
+        let path = temp_path("spec-routing.ckpt");
+        write_ckpt(
+            &path,
+            1,
+            [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64],
+            pattern(1.0),
+        );
+        let mut id = read_ckpt_info(&path).unwrap().identity;
+        id.bucket_mode = "spec:ownking:2".into();
+        let layout = layerstack_layout(&id).unwrap();
+        let groups = layout
+            .group_lens()
+            .into_iter()
+            .map(|n| vec![0.0; n])
+            .collect();
+        let weights = to_layerstack_weights(&layout, groups);
+        assert_eq!(weights.bucket_spec.unwrap().to_string(), "ownking:2");
+        id.bucket_mode = "spec:handmajor3".into();
+        assert!(layerstack_layout(&id).is_err());
     }
 }

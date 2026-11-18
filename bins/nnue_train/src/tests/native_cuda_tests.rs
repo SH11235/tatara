@@ -563,28 +563,6 @@ fn cuda_launch_stays_within_known_production_roots() {
     );
 }
 
-/// `native_kernels.cu` の per-bucket accumulator 容量 (`kMaxSupportedNumBuckets`) が host 側の
-/// `MAX_SUPPORTED_NUM_BUCKETS` と一致することを固定する。host が上回ると kernel が
-/// `min(num_buckets, kMaxSupportedNumBuckets)` で clamp し、上位 bucket の勾配が黙って落ちる。
-#[test]
-fn native_bucket_capacity_matches_host() {
-    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
-    let marker = "constexpr unsigned int kMaxSupportedNumBuckets = ";
-    let value = native
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix(marker))
-        .and_then(|rest| rest.split(';').next())
-        .map(str::trim)
-        .expect("native_kernels.cu must define kMaxSupportedNumBuckets")
-        .parse::<usize>()
-        .expect("kMaxSupportedNumBuckets must be an integer");
-    assert_eq!(
-        value,
-        crate::arch::MAX_SUPPORTED_NUM_BUCKETS,
-        "native kMaxSupportedNumBuckets must match host MAX_SUPPORTED_NUM_BUCKETS"
-    );
-}
-
 #[derive(Clone, Copy)]
 struct LayerStackTestOptions {
     feature_set: shogi_features::FeatureSetSpec,
@@ -1812,6 +1790,55 @@ fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
 
 #[test]
 #[cfg(feature = "oxide-parity")]
+fn skewed_bucket_layerstack_native_matches_cuda_oxide() -> Result<(), Box<dyn std::error::Error>> {
+    for num_buckets in [1, 2, 8, 9, 16, shogi_features::MAX_LAYERSTACK_BUCKETS] {
+        let options = LayerStackTestOptions {
+            num_buckets,
+            ..LayerStackTestOptions::standard()
+        };
+        let mut batch = BatchData::smoke_dummy(96, options.feature_set);
+        // Populate the first and last buckets unevenly, leaving interior buckets empty.
+        for bucket in batch.bucket_idx.iter_mut().step_by(16) {
+            *bucket = (num_buckets - 1) as i32;
+        }
+        batch.score.fill(200.0);
+        batch.wdl.fill(0.8);
+        assert_layerstack_batch_native_matches_cuda_oxide(
+            options,
+            SMOKE_LOSS_WRM,
+            1,
+            &batch.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "oxide-parity")]
+fn wide_bucket_spec_layerstack_native_matches_cuda_oxide() -> Result<(), Box<dyn std::error::Error>>
+{
+    for routing in [
+        "ownking:2/3/7+oppking:2/3/7",
+        "handmajor4+ownking:2/3/4/5/6/7/8",
+    ] {
+        let spec: shogi_features::BucketSpec = routing.parse()?;
+        assert_layerstack_native_matches_cuda_oxide_with_batch(
+            LayerStackTestOptions {
+                num_buckets: spec.num_buckets(),
+                bucket_mode: BucketMode::Spec(spec),
+                psqt: true,
+                ..LayerStackTestOptions::standard()
+            },
+            SMOKE_LOSS_WRM,
+            1,
+            96,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "oxide-parity")]
 fn large_batch_multistep_layerstack_native_matches_cuda_oxide()
 -> Result<(), Box<dyn std::error::Error>> {
     assert_layerstack_native_matches_cuda_oxide_with_batch(
@@ -2003,6 +2030,14 @@ fn layerstack_configuration_matrix() -> Vec<(&'static str, LayerStackTestOptions
             SMOKE_LOSS_WRM,
         ),
         (
+            "progress-32-buckets",
+            LayerStackTestOptions {
+                num_buckets: 32,
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
             "minimum-hidden",
             LayerStackTestOptions {
                 l1_out: 2,
@@ -2102,26 +2137,38 @@ fn assert_layerstack_native_matches_cuda_oxide_with_batch(
     steps: usize,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = test_cuda_context()?;
-    let mut oxide = create_layerstack_trainer_with_batch(&context, false, options, batch_size)?;
-    let mut native = create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
     let mut batch = BatchData::smoke_dummy(batch_size, options.feature_set);
     for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
         *bucket = (row % options.num_buckets) as i32;
     }
     batch.score.fill(200.0);
     batch.wdl.fill(0.8);
+    assert_layerstack_batch_native_matches_cuda_oxide(options, loss, steps, &batch.as_ref())
+}
+
+#[cfg(feature = "oxide-parity")]
+fn assert_layerstack_batch_native_matches_cuda_oxide(
+    options: LayerStackTestOptions,
+    loss: LossKind,
+    steps: usize,
+    batch: &BatchData,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let batch_size = batch.n_pos;
+    let context = test_cuda_context()?;
+    let mut oxide = create_layerstack_trainer_with_batch(&context, false, options, batch_size)?;
+    let mut native = create_layerstack_trainer_with_batch(&context, true, options, batch_size)?;
 
     for _ in 0..steps {
-        let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
-        let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+        let _ = oxide.step(batch, 1.0e-3, 0.0, loss)?;
+        let _ = native.step(batch, 1.0e-3, 0.0, loss)?;
     }
-    let oxide_loss = oxide.validate(&batch.as_ref(), 0.0, loss)?.loss;
-    let native_loss = native.validate(&batch.as_ref(), 0.0, loss)?.loss;
+    let oxide_loss = oxide.validate(batch, 0.0, loss)?.loss;
+    let native_loss = native.validate(batch, 0.0, loss)?.loss;
     let loss_difference = (oxide_loss - native_loss).abs();
     assert!(
         loss_difference <= NATIVE_PARITY_TOLERANCE * (1.0 + oxide_loss.abs()),
-        "LayerStack loss differs: oxide={oxide_loss}, native={native_loss}, diff={loss_difference}"
+        "LayerStack loss differs: buckets={}, oxide={oxide_loss}, native={native_loss}, diff={loss_difference}",
+        options.num_buckets
     );
     let oxide_state = oxide.raw_checkpoint_state_to_host()?;
     let native_state = native.raw_checkpoint_state_to_host()?;
@@ -3587,6 +3634,95 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn skewed_bucket_weight_gradients_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
+    assert_skewed_bucket_weight_gradients_match_cpu(&[2, 8])
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_bucket_capacity_matches_host() -> Result<(), Box<dyn std::error::Error>> {
+    assert_skewed_bucket_weight_gradients_match_cpu(&[crate::arch::MAX_SUPPORTED_NUM_BUCKETS])
+}
+
+#[cfg(feature = "native")]
+fn assert_skewed_bucket_weight_gradients_match_cpu(
+    bucket_counts: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gpu_kernels::layerstack::dense_mm_bucket::dense_mm_bwd_weight_bucket_cpu;
+
+    const ROWS: usize = 48;
+    let context = test_cuda_context()?;
+    for &num_buckets in bucket_counts {
+        for tf32 in [false, true] {
+            let options = LayerStackTestOptions {
+                num_buckets,
+                precision: PrecisionFlags {
+                    tf32,
+                    ..PrecisionFlags::default()
+                },
+                ..LayerStackTestOptions::standard()
+            };
+            let mut trainer = create_layerstack_trainer_with_batch(&context, true, options, ROWS)?;
+            trainer.set_skip_optimizer_for_test(true);
+
+            let last_bucket = num_buckets - 1;
+            let mut batch = BatchData::smoke_dummy(ROWS, options.feature_set);
+            // 先頭 bucket の 1 行で alignment gap を作り、末尾の 47 行は 3 block にまたがる。
+            batch.bucket_idx.fill(last_bucket as i32);
+            batch.bucket_idx[ROWS / 2] = 0;
+            batch.score.fill(200.0);
+            batch.wdl.fill(0.8);
+            trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+
+            for (layer, data) in ["L2", "L3"]
+                .into_iter()
+                .zip(trainer.l2_l3_weight_grads_to_host_for_test()?)
+            {
+                // 各精度で実際に kernel に渡された行順と値を使い、bucket ごとの和を検証する。
+                let in_dim = data.input.len() / ROWS;
+                let out_dim = data.output_grad.len() / ROWS;
+                let cells = in_dim * out_dim;
+                let mut expected = vec![0.0; num_buckets * cells];
+                dense_mm_bwd_weight_bucket_cpu(
+                    &data.input,
+                    &data.output_grad,
+                    &batch.bucket_idx,
+                    &mut expected,
+                    ROWS,
+                    in_dim,
+                    out_dim,
+                    num_buckets,
+                );
+                assert_eq!(data.weight_grad.len(), expected.len());
+                for (bucket, (actual, expected)) in data
+                    .weight_grad
+                    .chunks_exact(cells)
+                    .zip(expected.chunks_exact(cells))
+                    .enumerate()
+                {
+                    let label =
+                        format!("{layer}, buckets={num_buckets}, tf32={tf32}, bucket={bucket}");
+                    if bucket == 0 || bucket == last_bucket {
+                        assert!(
+                            expected.iter().any(|&g| g != 0.0),
+                            "{label}: zero reference gradient"
+                        );
+                        assert_states_close(&label, actual, expected, 1.0e-5);
+                    } else {
+                        assert!(
+                            actual.iter().all(|&g| g == 0.0),
+                            "{label}: nonzero empty-bucket gradient"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// FP32 の sparse FT backward (inverse-index gather) が書く `ft_w_grad` が、host で
 /// `dft_stm` / `dft_nstm` を各局面の active feature 行へ足し込んだ値と一致すること。
 /// `ft_in` が 1 block あたりの feature 数で割り切れない構成も含める。
@@ -4427,5 +4563,165 @@ fn explicit_full_threat_width_preserves_training() -> Result<(), Box<dyn std::er
     for ((name, a), (_, b)) in a.iter().zip(&b) {
         assert_states_close(name, &a.0, &b.0, 1.0e-6);
     }
+    Ok(())
+}
+
+#[test]
+fn freeze_ft_keeps_weights_through_norm_decay_and_lookahead()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let standard = LayerStackTestOptions::standard();
+    for options in [
+        standard,
+        LayerStackTestOptions {
+            precision: PrecisionFlags {
+                ft_fp16: true,
+                ft_fp16_out: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            ..standard
+        },
+        LayerStackTestOptions {
+            feature_set: FeatureSet::HalfKp.spec().with_ft_factorize(),
+            ..standard
+        },
+        LayerStackTestOptions {
+            feature_set: FeatureSet::HalfKaHmMerged
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide),
+            ..standard
+        },
+        LayerStackTestOptions {
+            feature_set: FeatureSet::HalfKp
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32),
+            ..standard
+        },
+        LayerStackTestOptions {
+            feature_set: FeatureSet::HalfKp
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(30),
+            optimizer: OptimizerKind::Sgd,
+            ..standard
+        },
+        LayerStackTestOptions {
+            feature_set: FeatureSet::HalfKp
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32),
+            optimizer: OptimizerKind::RAdam,
+            ..standard
+        },
+        LayerStackTestOptions {
+            psqt: true,
+            ..standard
+        },
+    ] {
+        let psqt = options
+            .psqt
+            .then(|| vec![0.125; options.feature_set.ft_in() * options.num_buckets]);
+        let mut init = LayerStackInit::default_uniform();
+        init.ft_b = nnue_train::init::LayerInit::uniform_abs(0.1, 42);
+        let mut trainer = LayerStackGpuTrainer::new(
+            &context,
+            SMOKE_BATCH,
+            options.ft_out,
+            options.l1_out,
+            options.l2_out,
+            options.num_buckets,
+            options.bucket_mode,
+            options.precision,
+            options.feature_set,
+            options.optimizer,
+            OptimGroupConfig::resolve(0.1, None, None, None, None, None, None),
+            Some(0.01),
+            psqt.as_deref(),
+            &init,
+        )?;
+        trainer.set_freeze_ft(true);
+        trainer.sync_ft_forward_weights()?;
+        let before = trainer.to_layerstack_weights()?;
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        for (i, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (i % options.num_buckets) as i32;
+        }
+        batch.score.fill(150.0);
+        batch.wdl.fill(0.7);
+        for _ in 0..8 {
+            trainer.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
+        }
+        let after = trainer.to_layerstack_weights()?;
+        assert_eq!(before.ft_w, after.ft_w, "FT weights");
+        assert_eq!(before.ft_b, after.ft_b, "FT bias");
+        assert_eq!(before.psqt_w, after.psqt_w, "PSQT");
+        assert_ne!(before.l3_b, after.l3_b, "output layer must train");
+    }
+    Ok(())
+}
+
+#[test]
+fn ft_only_import_preserves_fresh_output_layers() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let mut trainer = create_layerstack_trainer_with_options(
+        &context,
+        true,
+        LayerStackTestOptions {
+            num_buckets: 9,
+            bucket_mode: BucketMode::Spec("handmajor3+ownking:2/3".parse().unwrap()),
+            feature_set: FeatureSet::HalfKp
+                .spec()
+                .with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(32),
+            ..LayerStackTestOptions::standard()
+        },
+    )?;
+    let before = trainer.to_layerstack_weights()?;
+    let mut source = nnue_format::LayerStackWeights::zeroed(before.feature_set, 128, 32, 16, 3);
+    source.ft_w.fill(0.125);
+    source.ft_b.fill(0.25);
+    let mut other_width = source.clone();
+    other_width.feature_set = before.feature_set.with_threat_width(64);
+    assert!(trainer.load_ft_weights(&other_width).is_err());
+    trainer.load_ft_weights(&source)?;
+    trainer.sync_ft_forward_weights()?;
+    let after = trainer.to_layerstack_weights()?;
+    assert_eq!(source.ft_w, after.ft_w);
+    assert_eq!(source.ft_b, after.ft_b);
+    assert_eq!(before.l1_w, after.l1_w);
+    assert_eq!(before.l1_b, after.l1_b);
+    assert_eq!(before.l1_shared_weight, after.l1_shared_weight);
+    assert_eq!(before.l1_shared_bias, after.l1_shared_bias);
+    assert_eq!(before.l2_w, after.l2_w);
+    assert_eq!(before.l2_b, after.l2_b);
+    assert_eq!(before.l3_w, after.l3_w);
+    assert_eq!(before.l3_b, after.l3_b);
+    assert_eq!(before.bucket_spec, after.bucket_spec);
+    Ok(())
+}
+
+#[test]
+fn ft_only_import_rejects_incompatible_psqt_routing() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let mut trainer = create_layerstack_trainer_with_options(
+        &context,
+        true,
+        LayerStackTestOptions {
+            num_buckets: 3,
+            bucket_mode: BucketMode::Spec("ownking:2/3".parse().unwrap()),
+            psqt: true,
+            ..LayerStackTestOptions::standard()
+        },
+    )?;
+    let before = trainer.to_layerstack_weights()?;
+    let mut source = before.clone();
+    source.bucket_spec = Some("oppking:2/3".parse().unwrap());
+    assert!(trainer.load_ft_weights(&source).is_err());
+    source.bucket_spec = before.bucket_spec;
+    source.num_buckets = 4;
+    assert!(trainer.load_ft_weights(&source).is_err());
+    assert_eq!(before.ft_w, trainer.to_layerstack_weights()?.ft_w);
     Ok(())
 }

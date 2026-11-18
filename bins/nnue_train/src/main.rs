@@ -120,12 +120,13 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let argv: Vec<String> = std::env::args_os()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let result = cli
-        .validate_score_sources()
+        .resolve_bucket_metadata()
+        .and_then(|()| cli.validate_score_sources())
         .and_then(|()| cli.validate_data_args(&argv))
         .map_err(Into::into)
         .and_then(|()| dispatch(&cli));

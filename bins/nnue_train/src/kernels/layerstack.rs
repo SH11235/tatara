@@ -1220,7 +1220,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
 ///
 /// 数値同等性: 加算順序が sort 済 batch 順 + split-K 集約順になるため fp32 associativity で
 /// baseline と bit-exact ではないが、reduction tolerance (相対誤差 < `TOL`) 内で一致。
-/// `in_dim % 16 == 0` / `num_buckets <= 9` / `padded_batch % 16 == 0` /
+/// `in_dim % 16 == 0` / `padded_batch % 16 == 0` /
 /// `bucket_offsets` が aligned exclusive scan 出力 / `blockIdx_x` 範囲は caller 契約。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
@@ -1588,7 +1588,7 @@ pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets
 /// 各 bucket の sorted layout 開始 offset を round up し、bucket 境界を block size
 /// (`TILE_B = 16`) に揃える。bucket 末端と次 bucket 開始の間は padding 行 (caller 側で
 /// invalid bucket marker `-1` で埋める) になり、kernel は uniform block 前提で走れる。
-/// n ≤ NUM_BUCKETS + 1 = 10 想定で 1 thread sequential。
+/// 最大 32 bucket と無効行用の 1 bin を 1 thread で走査する。
 #[kernel]
 pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u32) {
     if thread::index_1d().get() != 0 {
@@ -1874,7 +1874,7 @@ pub fn dense_mm_bwd_input_bucket(
 ///
 /// w_tile は [o][i] の row stride 16。reduction read `w_tile[o*16 + tid_i]` は i (in-index) が
 /// warp 内 stride 1 = fast index なので bank conflict 無し (pad 不要)。`in_dim % 16 == 0` /
-/// `batch % 16 == 0` / `num_buckets <= 9` が caller 契約。out_dim は 16 幅の K-tile に分割するため
+/// `batch % 16 == 0` が caller 契約。out_dim は 16 幅の K-tile に分割するため
 /// 任意 (末尾 tile は 0 padding)。padding 行 (`perm[bs] < 0`) は write を skip するので original
 /// buffer には触れない (perm は real row の bijection で全 real row をちょうど 1 回ずつ覆う)。
 ///
@@ -2010,7 +2010,7 @@ pub fn dense_mm_bwd_weight_bucket(
     let rem = tid.get() % per_bucket;
     let oi = rem / (in_dim as usize);
     let ii = rem % (in_dim as usize);
-    // num_buckets は小さい (= 9) ので buc_u as i32 は wrap しない。負の bucket_idx は match しない。
+    // 負の bucket_idx は match しない。
     let target_buc = buc_u as i32;
     let mut sum = 0.0_f32;
     let mut b: u32 = 0;
@@ -2026,292 +2026,136 @@ pub fn dense_mm_bwd_weight_bucket(
     }
 }
 
-/// L3 weight backward (specialized: `out_dim=1`, `num_buckets<=9`; `in_dim` は L2 の
-/// 出力次元で runtime arg)。`grad_w[buc][0][ii] = Σ_{b: bucket[b]==buc} x[b][ii] * dy[b][0]`。
-///
-/// 列 `ii` を専有する thread を `R = block_dim / in_dim` 本持ち (`r = tid / in_dim`、`ii =
-/// tid % in_dim`)、R 本が grid-stride で別々の batch row を 9 bucket register に集計してから、
-/// block 内で r 軸を shared-mem tree reduction (各 bucket plane ごと) で 1 本に畳み、列あたり
-/// block で 1 回だけ global atomicAdd する。列あたり R thread に分けるのは、`block_dim = in_dim`
-/// (列あたり 1 thread = 1 warp/block) だと batch reduction が直列かつ block が 1 warp しか持たず
-/// SM の warp slot をほぼ埋められないため、warp/block と batch 並列度を稼ぐ。
-///
-/// 汎用の [`dense_mm_bwd_weight_bucket`] は L3 形状では (in_dim * num_buckets) cells 分の
-/// threads しか使えず並列度が極小になるため、本 specialized kernel を使う。
-///
-/// host 契約: grad_w は呼出前に 0 reset (accumulate semantics)。`out_dim == 1`、
-/// `num_buckets <= 9`、`block_dim == R * in_dim` で `R` は 2 冪 (tree reduction が R を完全に
-/// 畳める前提)、`block_dim <= 256` (`PARTIAL` 固定容量 = 9 plane × 256)。
-///
-/// 数値: register 累積 → tree reduction → block 跨ぎ atomic は和の項を batch 走査順とは別順序で
-/// 足すため FP32 非結合性で最下位 bit が動き得る (global atomic 集約は項順非決定)。和の値は同一で、
-/// 全部分和が 2^24 未満の整数値入力なら各 f32 加算が exact で順序非依存になる。単体テストは fractional
-/// 入力で CPU 参照と相対 tolerance 一致を確認する。
-#[allow(clippy::too_many_arguments)]
-#[kernel]
-pub fn dense_mm_bwd_weight_bucket_tiled_l3(
-    x: &[f32],
-    dy: &[f32],
-    bucket_idx: &[i32],
-    grad_w: &[f32],
-    batch: u32,
-    in_dim: u32,
-    out_dim: u32,
+// Rounding offsets down and adding the bucket index reserves enough chunks
+// for every segment, including those that cross a chunk boundary.
+#[inline(always)]
+fn bucket_gradient_chunk(
+    offsets: &[u32],
+    counts: &[u32],
+    chunk: u32,
+    row_shift: u32,
     num_buckets: u32,
-) {
-    use core::ptr::addr_of_mut;
-    // 9 bucket plane × block_dim(<=256)。9 KB、GA102 (48 KB/block 上限) で occupancy へ影響軽微。
-    static mut PARTIAL: SharedArray<f32, 2304> = SharedArray::UNINIT;
-    let tid = thread::threadIdx_x() as usize;
-    let block_dim = thread::blockDim_x() as usize;
-    let in_dim_u = in_dim as usize;
-    let out_dim_u = out_dim as usize;
-    let batch_u = batch as usize;
-    let ii = tid % in_dim_u; // 担当列
-    let r = tid / in_dim_u; // 列内の batch-lane (0..R)
-    let rows_per_iter = block_dim / in_dim_u; // R: host が block_dim % in_dim == 0 を保証
-
-    // grid-stride: block bx の lane r は row {bx*R + r, + gridDim*R, ...} を担当。
-    let grid = thread::gridDim_x() as usize;
-    let stride = grid * rows_per_iter;
-    let mut row = thread::blockIdx_x() as usize * rows_per_iter + r;
-
-    let mut a0 = 0.0_f32;
-    let mut a1 = 0.0_f32;
-    let mut a2 = 0.0_f32;
-    let mut a3 = 0.0_f32;
-    let mut a4 = 0.0_f32;
-    let mut a5 = 0.0_f32;
-    let mut a6 = 0.0_f32;
-    let mut a7 = 0.0_f32;
-    let mut a8 = 0.0_f32;
-
-    while row < batch_u {
-        let buc = bucket_idx[row];
-        let xv = x[row * in_dim_u + ii];
-        // out_dim=1 想定 (oi=0 のみ)。dy[row][0] を読む。
-        let mul = xv * dy[row * out_dim_u];
-        if buc == 0 {
-            a0 += mul;
-        } else if buc == 1 {
-            a1 += mul;
-        } else if buc == 2 {
-            a2 += mul;
-        } else if buc == 3 {
-            a3 += mul;
-        } else if buc == 4 {
-            a4 += mul;
-        } else if buc == 5 {
-            a5 += mul;
-        } else if buc == 6 {
-            a6 += mul;
-        } else if buc == 7 {
-            a7 += mul;
-        } else if buc == 8 {
-            a8 += mul;
-        }
-        row += stride;
-    }
-
-    // 各 bucket plane を PARTIAL[buc * block_dim + tid] に置く。
-    let pp: *mut f32 = addr_of_mut!(PARTIAL) as *mut f32;
-    unsafe {
-        pp.add(tid).write(a0);
-        pp.add(block_dim + tid).write(a1);
-        pp.add(2 * block_dim + tid).write(a2);
-        pp.add(3 * block_dim + tid).write(a3);
-        pp.add(4 * block_dim + tid).write(a4);
-        pp.add(5 * block_dim + tid).write(a5);
-        pp.add(6 * block_dim + tid).write(a6);
-        pp.add(7 * block_dim + tid).write(a7);
-        pp.add(8 * block_dim + tid).write(a8);
-    }
-    thread::sync_threads();
-
-    // r 軸 tree reduction: partner は同 ii の `r + s` lane (`tid + s * in_dim`)。R が 2 冪なので
-    // s=R/2..1 で R 本の部分和が r==0 に集まる。各 step で 9 plane すべてを畳む。
-    let mut s = rows_per_iter / 2;
-    while s >= 1 {
-        if r < s {
-            let off = s * in_dim_u;
-            unsafe {
-                let mut p = 0;
-                while p < 9 {
-                    let base = p * block_dim + tid;
-                    let v = pp.add(base).read() + pp.add(base + off).read();
-                    pp.add(base).write(v);
-                    p += 1;
-                }
-            }
-        }
-        thread::sync_threads();
-        s /= 2;
-    }
-
-    // r==0 (tid < in_dim) が列 ii の block 総和を持つ。列あたり block で 1 atomic/bucket。
-    // layout は buc * (out_dim * in_dim) + oi * in_dim + ii、oi=0 なので buc * in_dim + ii。
-    if r == 0 {
-        let num_buc_u = num_buckets as usize;
-        let raw = grad_w.as_ptr();
-        let mut p = 0;
-        while p < num_buc_u {
-            // SAFETY: r==0 ⇒ p*block_dim+tid は plane p の lane0 slot (tid==ii<in_dim)。grad_w
-            // index buc*in_dim+ii < num_buckets*in_dim == grad_w.len() (host 契約、out_dim=1)。
-            // `f32`/`DeviceAtomicF32` 同 align、atomic add 同士のみ serialize。
-            unsafe {
-                let v = pp.add(p * block_dim + tid).read();
-                let c = &*(raw.add(p * in_dim_u + ii) as *const DeviceAtomicF32);
-                c.fetch_add(v, AtomicOrdering::Relaxed);
-            }
-            p += 1;
+) -> (usize, usize, usize) {
+    let mut bucket = 0;
+    let mut limit = num_buckets;
+    while bucket + 1 < limit {
+        let mid = bucket + (limit - bucket) / 2;
+        let mid_chunk = (offsets[mid as usize] >> row_shift) + mid;
+        if mid_chunk <= chunk {
+            bucket = mid;
+        } else {
+            limit = mid;
         }
     }
+
+    let start = offsets[bucket as usize];
+    let first_chunk = (start >> row_shift) + bucket;
+    let first_row = start + ((chunk - first_chunk) << row_shift);
+    let end_row = (start + counts[bucket as usize]).min(first_row + (1 << row_shift));
+    (bucket as usize, first_row as usize, end_row as usize)
 }
 
-/// L2 weight backward (`out_dim` は L2 出力次元 `l2_out` (`--l2` 依存)、`in_dim = l2_in`
-/// は `--l1` 依存、`num_buckets <= 9`)。
-///
-/// split-K + per-bucket register accumulator (1 thread = 1 (oi, ii) cell × 9 bucket acc)
-/// で並列度を確保する。weight cell 空間 (per-bucket `out_dim * in_dim`) を `blockIdx_x`、
-/// batch split-K を `blockIdx_y` に分け、`block_dim` は cell 数と独立な固定値で launch
-/// する (`block_dim = out_dim * in_dim` だと `l2_in` 次第で 1024 thread を超えるため)。
-/// 汎用の [`dense_mm_bwd_weight_bucket`] は batch を bucket ごとに再 scan する分遅い。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
-pub fn dense_mm_bwd_weight_bucket_tiled_l2(
+pub fn dense_mm_bwd_weight_bucket_grid_l2(
     x: &[f32],
     dy: &[f32],
-    bucket_idx: &[i32],
+    permutation: &[i32],
+    offsets: &[u32],
+    counts: &[u32],
     grad_w: &[f32],
-    batch: u32,
+    row_shift: u32,
     in_dim: u32,
     out_dim: u32,
     num_buckets: u32,
 ) {
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_cell = thread::blockIdx_x() as usize;
-    let block_dim_u = thread::blockDim_x() as usize;
-    let block_split = thread::blockIdx_y() as usize;
-    let num_splits = thread::gridDim_y() as usize;
-    let in_dim_u = in_dim as usize;
-    let out_dim_u = out_dim as usize;
-    let batch_u = batch as usize;
-    // weight cell 空間 (per-bucket out_dim*in_dim) を blockIdx_x で分割し、1 thread =
-    // 1 (oi, ii) cell。範囲外 thread は早期 return。
-    let per_bucket = out_dim_u * in_dim_u;
-    let cell_in_bucket = block_cell * block_dim_u + tid_local;
-    if cell_in_bucket >= per_bucket {
+    let in_dim = in_dim as usize;
+    let out_dim = out_dim as usize;
+    let cells_per_bucket = in_dim * out_dim;
+    let cell = thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+        + thread::threadIdx_x() as usize;
+    if cell >= cells_per_bucket {
         return;
     }
-    let oi = cell_in_bucket / in_dim_u;
-    let ii = cell_in_bucket % in_dim_u;
-
-    let positions_per_block = batch_u.div_ceil(num_splits);
-    let b_start = block_split * positions_per_block;
-    if b_start >= batch_u {
+    let (bucket, mut sorted_row, end) = bucket_gradient_chunk(
+        offsets,
+        counts,
+        thread::blockIdx_y(),
+        row_shift,
+        num_buckets,
+    );
+    if sorted_row >= end {
         return;
     }
-    let b_end_candidate = b_start + positions_per_block;
-    let b_end = if b_end_candidate < batch_u {
-        b_end_candidate
-    } else {
-        batch_u
-    };
 
-    let mut a0 = 0.0_f32;
-    let mut a1 = 0.0_f32;
-    let mut a2 = 0.0_f32;
-    let mut a3 = 0.0_f32;
-    let mut a4 = 0.0_f32;
-    let mut a5 = 0.0_f32;
-    let mut a6 = 0.0_f32;
-    let mut a7 = 0.0_f32;
-    let mut a8 = 0.0_f32;
-
-    let mut bb = b_start;
-    while bb < b_end {
-        let buc = bucket_idx[bb];
-        let xv = x[bb * in_dim_u + ii];
-        let dyv = dy[bb * out_dim_u + oi];
-        let mul = xv * dyv;
-        if buc == 0 {
-            a0 += mul;
-        } else if buc == 1 {
-            a1 += mul;
-        } else if buc == 2 {
-            a2 += mul;
-        } else if buc == 3 {
-            a3 += mul;
-        } else if buc == 4 {
-            a4 += mul;
-        } else if buc == 5 {
-            a5 += mul;
-        } else if buc == 6 {
-            a6 += mul;
-        } else if buc == 7 {
-            a7 += mul;
-        } else if buc == 8 {
-            a8 += mul;
-        }
-        bb += 1;
+    let ii = cell % in_dim;
+    let oi = cell / in_dim;
+    let mut acc = 0.0_f32;
+    while sorted_row < end {
+        let row = permutation[sorted_row] as usize;
+        acc += x[row * in_dim + ii] * dy[row * out_dim + oi];
+        sorted_row += 1;
     }
 
-    // grad_w layout: buc * (out_dim * in_dim) + oi * in_dim + ii (= per_bucket + cell_in_bucket)。
-    let num_buc_u = num_buckets as usize;
-    let raw = grad_w.as_ptr();
-    if num_buc_u >= 1 {
-        unsafe {
-            let c = &*(raw.add(cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a0, AtomicOrdering::Relaxed);
-        }
+    let index = bucket * cells_per_bucket + cell;
+    let target = unsafe { &*(grad_w.as_ptr().add(index) as *const DeviceAtomicF32) };
+    target.fetch_add(acc, AtomicOrdering::Relaxed);
+}
+
+/// One lane group per input column. The power-of-two group reduces across rows.
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_mm_bwd_weight_bucket_grid_l3(
+    x: &[f32],
+    dy: &[f32],
+    permutation: &[i32],
+    offsets: &[u32],
+    counts: &[u32],
+    grad_w: &[f32],
+    row_shift: u32,
+    in_dim: u32,
+    num_buckets: u32,
+) {
+    static mut PARTIAL: SharedArray<f32, 256> = SharedArray::UNINIT;
+    let (bucket, first, end) = bucket_gradient_chunk(
+        offsets,
+        counts,
+        thread::blockIdx_x(),
+        row_shift,
+        num_buckets,
+    );
+    if first >= end {
+        return;
     }
-    if num_buc_u >= 2 {
-        unsafe {
-            let c = &*(raw.add(per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a1, AtomicOrdering::Relaxed);
-        }
+
+    let tid = thread::threadIdx_x() as usize;
+    let in_dim = in_dim as usize;
+    let ii = tid % in_dim;
+    let lane = tid / in_dim;
+    let lanes = thread::blockDim_x() as usize / in_dim;
+    let mut sorted_row = first + lane;
+    let mut acc = 0.0_f32;
+    while sorted_row < end {
+        let row = permutation[sorted_row] as usize;
+        acc += x[row * in_dim + ii] * dy[row];
+        sorted_row += lanes;
     }
-    if num_buc_u >= 3 {
-        unsafe {
-            let c = &*(raw.add(2 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a2, AtomicOrdering::Relaxed);
+
+    unsafe { PARTIAL[tid] = acc };
+    thread::sync_threads();
+    let mut offset = lanes / 2;
+    while offset > 0 {
+        if lane < offset {
+            unsafe { PARTIAL[tid] += PARTIAL[tid + offset * in_dim] };
         }
+        thread::sync_threads();
+        offset /= 2;
     }
-    if num_buc_u >= 4 {
-        unsafe {
-            let c = &*(raw.add(3 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a3, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 5 {
-        unsafe {
-            let c = &*(raw.add(4 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a4, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 6 {
-        unsafe {
-            let c = &*(raw.add(5 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a5, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 7 {
-        unsafe {
-            let c = &*(raw.add(6 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a6, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 8 {
-        unsafe {
-            let c = &*(raw.add(7 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a7, AtomicOrdering::Relaxed);
-        }
-    }
-    if num_buc_u >= 9 {
-        unsafe {
-            let c = &*(raw.add(8 * per_bucket + cell_in_bucket) as *const DeviceAtomicF32);
-            c.fetch_add(a8, AtomicOrdering::Relaxed);
-        }
+
+    if lane == 0 {
+        let index = bucket * in_dim + ii;
+        let target = unsafe { &*(grad_w.as_ptr().add(index) as *const DeviceAtomicF32) };
+        target.fetch_add(unsafe { PARTIAL[tid] }, AtomicOrdering::Relaxed);
     }
 }
 
@@ -2328,7 +2172,7 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l2(
 ///
 /// 数値同等性: 加算順が sort 済 batch 順 + per-block reduce 順になるため fp32
 /// associativity で baseline と bit-exact ではないが、reduction tolerance 内で一致。
-/// `block_dim == 256` / `padded_batch % 16 == 0` / `num_buckets <= 9` / `out_dim <= 256`
+/// `block_dim == 256` / `padded_batch % 16 == 0` / `out_dim <= 256`
 /// (PARTIAL 固定容量) / `grid_dim_x == padded_batch / 16` は caller 契約。
 #[kernel]
 pub fn bias_grad_bucket_shared_sorted(
@@ -2776,9 +2620,8 @@ pub fn psqt_diff_sparse_fwd_inplace(
 /// `±0.5 * dnet[b]` を atomic-add する。**accumulate semantics** (host が呼出前に
 /// `psqt_w_grad` を 0 初期化する責務)。
 ///
-/// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。num_buckets
-/// 上限 9 が小さく contention は限定的 (例: N=9, batch=65536 / nnz=40 / stm+nstm
-/// 両 add で 5.2M atomic-add / 660K cells ≒ 平均 8 thread/cell)。
+/// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。
+/// 勾配の列数は `num_buckets` (1〜32) で、同じ feature と bucket の組に atomic add が集中する。
 ///
 /// `nnz_arr[bi]` は position bi の実 active 数で、`ni >= nnz_arr[bi]` の padding slot
 /// は index / bucket / dnet を DRAM から読む前に捨てる (dataloader が padding slot を

@@ -100,6 +100,7 @@ const NON_RECIPE_PARAMS: &[&str] = &[
     "superbatches",
     "start_superbatch",
     "init_from",
+    "init_ft_only",
     "init_preset",
     "trainer_build",
     "trainer_backend",
@@ -331,6 +332,10 @@ pub struct Params {
     /// `--init-from` の入力ファイル basename (pretrained start)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_from: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub freeze_ft: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_ft_only: bool,
     /// 重み初期化の override 要約 (`--init-{ft,l1,l1-shared,l2,l3}` で差し替えた層名)。
     /// override の無い既定の run では省略する。field 名は experiment.json schema
     /// 互換のため従来どおり `init_preset`。
@@ -1042,6 +1047,8 @@ mod tests {
             score_override_mask: None,
             dual_label_psv: None,
             init_from: None,
+            freeze_ft: false,
+            init_ft_only: false,
             init_preset: None,
             test_data: None,
             test_positions: None,

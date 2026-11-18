@@ -715,8 +715,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             // mode として照合する。未知の mode 名は正規化せずそのまま比較に回し、
             // 下の不一致エラーで surface させる。
             (!bucket_mode.is_empty()).then(|| {
-                BucketMode::parse(&bucket_mode)
-                    .map_or(bucket_mode, |(mode, _)| mode.canonical_name().to_string())
+                BucketMode::parse(&bucket_mode).map_or(bucket_mode, |(mode, _)| mode.identity())
             })
         } else if ckpt_arch == ArchKind::LayerStack {
             // bucket-mode header を持たない version の LayerStack は、当時唯一の

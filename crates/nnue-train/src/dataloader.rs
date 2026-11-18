@@ -744,6 +744,7 @@ pub enum BucketMode {
     ProgressKpAbsQ16,
     /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
     KingRank9,
+    Spec(shogi_features::BucketSpec),
 }
 
 impl BucketMode {
@@ -759,6 +760,7 @@ impl BucketMode {
             Self::ProgressKpAbs => "progresskpabs",
             Self::ProgressKpAbsQ16 => "progresskpabsq16",
             Self::KingRank9 => "kingrank9",
+            Self::Spec(_) => "spec",
         }
     }
 
@@ -777,7 +779,17 @@ impl BucketMode {
             "progresskpabsq16" => Some((Self::ProgressKpAbsQ16, false)),
             Self::LEGACY_PROGRESS_KPABS_NAME => Some((Self::ProgressKpAbs, true)),
             "kingrank9" => Some((Self::KingRank9, false)),
-            _ => None,
+            _ => name
+                .strip_prefix("spec:")
+                .and_then(|s| s.parse().ok())
+                .map(|s| (Self::Spec(s), false)),
+        }
+    }
+
+    pub fn identity(self) -> String {
+        match self {
+            Self::Spec(spec) => format!("spec:{spec}"),
+            _ => self.canonical_name().to_string(),
         }
     }
 
@@ -785,6 +797,9 @@ impl BucketMode {
     /// 同一のエラー文・非推奨警告文を出すための単一パース点。alias 綴りのときは
     /// 呼び出し元がそのまま表示する警告文を `Some` で返す。
     pub fn parse_cli(name: &str) -> Result<(Self, Option<String>), String> {
+        if name.starts_with("spec:") {
+            return Err("use --bucket-mode spec with --bucket-spec <spec>".into());
+        }
         match Self::parse(name) {
             Some((mode, true)) => {
                 let warning = format!(
@@ -809,6 +824,7 @@ impl BucketMode {
             Self::ProgressKpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
             Self::ProgressKpAbsQ16 => ShogiProgressKPAbs.bucket_q16_board(board, num_buckets),
             Self::KingRank9 => kingrank9_bucket_board(board),
+            Self::Spec(spec) => spec.bucket_board(board),
         }
     }
 }

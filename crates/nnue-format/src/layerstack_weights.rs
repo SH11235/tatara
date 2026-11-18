@@ -69,7 +69,40 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::{EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
+use shogi_features::{BucketSpec, EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
+
+pub fn bucket_spec_from_arch(arch: &str) -> io::Result<Option<BucketSpec>> {
+    let value = parse_single_arch_token(arch, "ls_bucket=")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "duplicate ls_bucket token"))?;
+    value
+        .map(|s| {
+            s.parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        })
+        .transpose()
+}
+
+pub fn read_layerstack_arch<R: Read>(reader: &mut R) -> io::Result<String> {
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header)?;
+    let version = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown LayerStack NNUE version",
+        ));
+    }
+    let len = u32::from_le_bytes(header[8..].try_into().unwrap()) as usize;
+    if !(1..=16384).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid architecture length",
+        ));
+    }
+    let mut bytes = vec![0; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
 // =============================================================================
 // constants (LayerStack architecture)
@@ -556,6 +589,7 @@ pub struct LayerStackWeights {
     /// buffer の bucket 軸長と、save / load 時の `.bin` `num_buckets` field を
     /// 駆動する。
     pub num_buckets: usize,
+    pub bucket_spec: Option<BucketSpec>,
     pub ft_w: Vec<f32>,
     pub ft_b: Vec<f32>,
     pub l1_w: Vec<f32>,
@@ -646,6 +680,15 @@ impl LayerStackWeights {
         if width != ft_out {
             arch_str.push_str(&format!(",ThreatWidth={width}"));
         }
+        if let Some(spec) = self.bucket_spec {
+            if spec.num_buckets() != self.num_buckets {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bucket spec count does not match weights",
+                ));
+            }
+            arch_str.push_str(&format!(",ls_bucket={spec}"));
+        }
         let arch_bytes = arch_str.as_bytes();
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
         writer.write_all(arch_bytes)?;
@@ -676,6 +719,7 @@ impl LayerStackWeights {
         Self {
             feature_set,
             num_buckets,
+            bucket_spec: None,
             ft_w: vec![0.0; feature_set.ft_weight_len(ft_out)],
             ft_b: vec![0.0; ft_out],
             l1_w: vec![0.0; num_buckets * l1_out * ft_out],
@@ -1011,6 +1055,7 @@ impl LayerStackWeights {
                 "Threat width mismatch",
             ));
         }
+        let bucket_spec = bucket_spec_from_arch(&arch_str)?;
 
         // num_buckets field (current NNUE_VERSION のみ。legacy は暗黙 9 として扱う)。
         // legacy `.bin` を非 9 で load しようとした場合は明示 reject。
@@ -1038,6 +1083,12 @@ impl LayerStackWeights {
             v
         };
 
+        if bucket_spec.is_some_and(|s| s.num_buckets() != file_num_buckets) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ls_bucket count does not match stored bucket count",
+            ));
+        }
         // HandCount は未対応 (reject のまま)。Threat は `expected` の profile と
         // arch_str の `Threat={profile},` token が一致するか検証する: token 有無 /
         // profile 名のどちらが食い違っても InvalidData で弾く (profile compaction で
@@ -1387,6 +1438,7 @@ impl LayerStackWeights {
         Ok(Self {
             feature_set: expected,
             num_buckets,
+            bucket_spec,
             ft_w,
             ft_b,
             l1_w,
@@ -3199,5 +3251,85 @@ mod partial_threat_tests {
             spec.ft_row_layout(spec.base_ft_in() + 1, rows),
             (spec.base_ft_in() * rows + 32, 32)
         );
+    }
+}
+
+#[cfg(test)]
+mod bucket_spec_tests {
+    use super::*;
+    use shogi_features::FeatureSet;
+
+    #[test]
+    fn wide_bucket_spec_roundtrips_with_psqt() {
+        let features = FeatureSet::HalfKp.spec();
+        for (spec, count) in [
+            ("ownking:2/3/7+oppking:2/3/7", 16),
+            ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+        ] {
+            let mut original = LayerStackWeights::zeroed_with_psqt(features, 4, 4, 4, count);
+            original.bucket_spec = Some(spec.parse().unwrap());
+            *original.psqt_w.as_mut().unwrap().last_mut().unwrap() = 0.25;
+            original.l3_b[count - 1] = -0.25;
+
+            let mut bytes = Vec::new();
+            original.save_quantised(&mut bytes, None).unwrap();
+            assert_eq!(stored_num_buckets(&bytes).unwrap(), count);
+            let loaded = LayerStackWeights::load_quantised_with_psqt(
+                &mut &bytes[..],
+                features,
+                4,
+                4,
+                4,
+                count,
+                true,
+            )
+            .unwrap();
+            assert_eq!(loaded.bucket_spec, original.bucket_spec);
+            assert_eq!(loaded.psqt_w, original.psqt_w);
+            assert_eq!(loaded.l3_b, original.l3_b);
+        }
+    }
+
+    #[test]
+    fn bucket_arch_token_roundtrip_and_validation() {
+        let mut w = LayerStackWeights::zeroed(FeatureSet::HalfKp.spec(), 4, 4, 4, 9);
+        w.bucket_spec = Some("handmajor3+ownking:2/3".parse().unwrap());
+        let mut bytes = Vec::new();
+        w.save_quantised(&mut bytes, Some(24)).unwrap();
+        let arch = read_layerstack_arch(&mut &bytes[..]).unwrap();
+        assert!(arch.ends_with(",fv_scale=24,ls_bucket=handmajor3+ownking:2/3"));
+        assert_eq!(bucket_spec_from_arch(&arch).unwrap(), w.bucket_spec);
+        let loaded =
+            LayerStackWeights::load_quantised(&mut &bytes[..], w.feature_set, 4, 4, 4, 9).unwrap();
+        assert_eq!(loaded.bucket_spec, w.bucket_spec);
+        let mut saved = Vec::new();
+        loaded.save_quantised(&mut saved, Some(24)).unwrap();
+        assert_eq!(bytes, saved);
+        assert!(bucket_spec_from_arch("ls_bucket=handmajor3,ls_bucket=handmajor4").is_err());
+        assert!(bucket_spec_from_arch("ls_bucket=ownking:0").is_err());
+        w.num_buckets = 3;
+        assert!(w.save_quantised(&mut Vec::new(), None).is_err());
+    }
+
+    #[test]
+    fn compact_threat_roundtrip_keeps_bucket_spec_last() {
+        let features = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
+            .with_threat_width(2);
+        let mut weights = LayerStackWeights::zeroed(features, 4, 4, 4, 3);
+        weights.bucket_spec = Some("ownking:2/3".parse().unwrap());
+        *weights.ft_w.last_mut().unwrap() = 1.0;
+        let mut bytes = Vec::new();
+        weights.save_quantised(&mut bytes, Some(24)).unwrap();
+        let arch = read_layerstack_arch(&mut &bytes[..]).unwrap();
+        assert!(arch.ends_with(",fv_scale=24,ThreatWidth=2,ls_bucket=ownking:2/3"));
+        let loaded =
+            LayerStackWeights::load_quantised(&mut &bytes[..], features, 4, 4, 4, 3).unwrap();
+        assert_eq!(loaded.ft_w, weights.ft_w);
+        assert_eq!(loaded.bucket_spec, weights.bucket_spec);
+        let mut saved = Vec::new();
+        loaded.save_quantised(&mut saved, Some(24)).unwrap();
+        assert_eq!(bytes, saved);
     }
 }

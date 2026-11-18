@@ -1276,6 +1276,9 @@ fn num_buckets_defaults_to_eight_for_progress_modes_and_honours_explicit_value()
         let args = layerstack_args(&["--bucket-mode", mode]);
         assert_eq!(args.num_buckets(), 8, "{mode}");
         assert!(validate_bucket_mode(&args).is_ok(), "{mode}");
+        let single = layerstack_args(&["--bucket-mode", mode, "--num-buckets", "1"]);
+        assert_eq!(single.num_buckets(), 1, "{mode}");
+        assert!(validate_bucket_mode(&single).is_ok(), "{mode}");
     }
     let nine = layerstack_args(&["--num-buckets", "9"]);
     assert_eq!(nine.num_buckets(), 9);
@@ -1309,7 +1312,7 @@ fn progresskpabsq16_bucket_mode_shares_progress_bucket_range() {
         Ok(nnue_train::dataloader::BucketMode::ProgressKpAbsQ16)
     ));
 
-    let too_few = layerstack_args(&["--bucket-mode", "progresskpabsq16", "--num-buckets", "1"]);
+    let too_few = layerstack_args(&["--bucket-mode", "progresskpabsq16", "--num-buckets", "0"]);
     let err = validate_bucket_mode(&too_few).unwrap_err().to_string();
     assert!(err.contains("for progresskpabsq16"), "{err}");
 }
@@ -2339,4 +2342,139 @@ fn tree_sample_accept_cli_requires_eval_only_and_validates_probability() {
             );
         }
     }
+}
+
+#[test]
+fn bucket_spec_cli_validation() {
+    for (spec, count) in [
+        ("handmajor3+ownking:2/3", 9),
+        ("handmajor4", 4),
+        ("ownking:2/3+oppking:2/3", 9),
+        ("ownking:2/3/7+oppking:2/3/7", 16),
+        ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+    ] {
+        let cli = Cli::try_parse_from([
+            "nnue-train",
+            "layerstack",
+            "--bucket-mode",
+            "spec",
+            "--bucket-spec",
+            spec,
+        ])
+        .unwrap();
+        let ArchCommand::LayerStack(args) = cli.arch else {
+            panic!()
+        };
+        assert_eq!(args.num_buckets(), count);
+        assert!(matches!(
+            validate_bucket_mode(&args).unwrap(),
+            nnue_train::dataloader::BucketMode::Spec(_)
+        ));
+    }
+    for extra in [
+        vec!["--num-buckets", "8"],
+        vec!["--progress-coeff", "progress.bin"],
+    ] {
+        let mut argv = vec![
+            "nnue-train",
+            "layerstack",
+            "--bucket-mode",
+            "spec",
+            "--bucket-spec",
+            "handmajor3+ownking:2/3",
+        ];
+        argv.extend(extra);
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let ArchCommand::LayerStack(args) = cli.arch else {
+            panic!()
+        };
+        assert!(validate_bucket_mode(&args).is_err());
+    }
+    assert!(Cli::try_parse_from(["nnue-train", "layerstack", "--bucket-mode", "spec"]).is_err());
+    let too_many = Cli::try_parse_from([
+        "nnue-train",
+        "layerstack",
+        "--bucket-mode",
+        "spec",
+        "--bucket-spec",
+        "handmajor4+ownking:2/3/4/5/6/7/8/9",
+    ])
+    .expect_err("36 buckets exceed the spec limit")
+    .to_string();
+    assert!(
+        too_many.contains("bucket spec needs 36 buckets; maximum is 32"),
+        "{too_many}"
+    );
+    for (options, range) in [
+        (vec!["--num-buckets", "33"], "[1, 32]"),
+        (
+            vec![
+                "--bucket-mode",
+                "spec",
+                "--bucket-spec",
+                "ownking:2/3/7+oppking:2/3/7",
+                "--num-buckets",
+                "33",
+            ],
+            "[2, 32]",
+        ),
+    ] {
+        let err = validate_bucket_mode(&layerstack_args(&options))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("must be in {range}")), "{err}");
+        assert!(err.contains("got 33"), "{err}");
+    }
+    assert!(Cli::try_parse_from(["nnue-train", "--init-ft-only", "layerstack"]).is_err());
+}
+
+#[test]
+fn bucket_spec_eval_inherits_bin_metadata() {
+    let path = std::env::temp_dir().join(format!("tatara-bucket-spec-{}.bin", std::process::id()));
+    let mut weights = nnue_format::LayerStackWeights::zeroed(
+        shogi_features::FeatureSet::HalfKp.spec(),
+        4,
+        4,
+        4,
+        16,
+    );
+    let spec = "ownking:2/3/7+oppking:2/3/7";
+    weights.bucket_spec = Some(spec.parse().unwrap());
+    weights
+        .save_quantised(&mut std::fs::File::create(&path).unwrap(), None)
+        .unwrap();
+    let mut cli = Cli::try_parse_from([
+        "nnue-train",
+        "--eval-only",
+        "--init-from",
+        path.to_str().unwrap(),
+        "layerstack",
+    ])
+    .unwrap();
+    cli.resolve_bucket_metadata().unwrap();
+    let ArchCommand::LayerStack(args) = &cli.arch else {
+        panic!()
+    };
+    assert_eq!(args.num_buckets(), 16);
+    assert_eq!(args.bucket_spec.unwrap().to_string(), spec);
+    assert!(matches!(
+        validate_bucket_mode(args).unwrap(),
+        nnue_train::dataloader::BucketMode::Spec(_)
+    ));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn bucket_spec_embedded_identity_is_not_a_cli_mode() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "layerstack",
+        "--bucket-mode",
+        "spec:handmajor3",
+    ])
+    .unwrap();
+    let ArchCommand::LayerStack(args) = cli.arch else {
+        panic!()
+    };
+    assert!(validate_bucket_mode(&args).is_err());
 }

@@ -695,6 +695,16 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) init_from: Option<PathBuf>,
 
+    /// Read only FT (including Threat and PSQT) from --init-from; initialize output
+    /// layers with --init-l1/--init-l2/--init-l3. LayerStack only.
+    #[arg(long, global = true, requires = "init_from", conflicts_with_all = ["resume", "eval_only", "rescore_input"])]
+    pub(crate) init_ft_only: bool,
+
+    /// Keep FT weights, bias, Threat and PSQT fixed, skipping their backward and
+    /// optimizer updates. LayerStack only.
+    #[arg(long, global = true)]
+    pub(crate) freeze_ft: bool,
+
     /// Load weights (via --init-from / --resume), evaluate held-out test_loss /
     /// test_accuracy once, and exit without training. Requires held-out data
     /// (--test-tail-positions or --test-data).
@@ -1598,11 +1608,19 @@ pub(crate) struct LayerstackArgs {
     /// inference. The two modes pick different buckets only for positions very
     /// close to a bucket boundary, where the per-coefficient rounding to 1/65536
     /// decides the side.
+    /// `spec` uses --bucket-spec without --progress-coeff; the bucket count is inferred.
     /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets. The
     /// deprecated spelling `progress8kpabs` is accepted as an alias of
     /// `progresskpabs` (the digit is not the bucket count; see `--num-buckets`).
     #[arg(long, default_value = "progresskpabs")]
     pub(crate) bucket_mode: String,
+
+    /// Position bucket axes, e.g. handmajor3+ownking:2/3 or ownking:2/3+oppking:2/3.
+    /// One or two axes; left axis is most significant. At most 32 buckets.
+    /// King-rank cuts are increasing integers in [1, 9], measured from each king's home rank.
+    /// handmajor3 merges neither/both sides holding a rook or bishop; handmajor4 separates them.
+    #[arg(long, required_if_eq("bucket_mode", "spec"))]
+    pub(crate) bucket_spec: Option<shogi_features::BucketSpec>,
 
     /// Output dimension of the FT (feature transformer) per perspective. Must be
     /// a positive multiple of 128. The default value keeps the network
@@ -1630,10 +1648,9 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` (progresskpabsq16 uses the same split
-    /// in integer logit space) and N must be in `[2, 9]`; the default is 8. In
-    /// kingrank9 mode the default is 9 and any other value is rejected. The
-    /// upper bound is the fixed 9-register accumulator in the per-bucket weight
-    /// backward kernels. Resuming or initializing from a 9-bucket checkpoint
+    /// in integer logit space) and N must be in `[1, 32]`; the default is 8. In
+    /// kingrank9 mode the default is 9 and any other value is rejected.
+    /// Resuming or initializing from a 9-bucket checkpoint
     /// in a progress mode needs `--num-buckets 9`; the bucket count is checked
     /// against the checkpoint topology. Some older 9-bucket nets were trained
     /// with `floor(p * 8)` on a 9-slot layout and have an untrained slot 8;
@@ -1764,6 +1781,11 @@ impl LayerstackArgs {
     /// rejected separately by bucket-mode validation.
     pub(crate) fn num_buckets(&self) -> usize {
         self.num_buckets_arg.unwrap_or_else(|| {
+            if self.bucket_mode == "spec"
+                && let Some(spec) = self.bucket_spec
+            {
+                return spec.num_buckets();
+            }
             match nnue_train::dataloader::BucketMode::parse(&self.bucket_mode) {
                 Some((nnue_train::dataloader::BucketMode::KingRank9, _)) => {
                     shogi_features::KINGRANK9_NUM_BUCKETS
@@ -1875,5 +1897,37 @@ impl Cli {
             bucket_keep_rates: self.bucket_keep_rates.clone(),
             skip_seed: self.skip_seed.unwrap_or(0),
         }
+    }
+}
+
+impl Cli {
+    pub(crate) fn resolve_bucket_metadata(&mut self) -> Result<(), String> {
+        let ArchCommand::LayerStack(args) = &mut self.arch else {
+            return Ok(());
+        };
+        if let Some(path) = &self.init_from
+            && !self.init_ft_only
+        {
+            let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let arch = nnue_format::layerstack_weights::read_layerstack_arch(&mut file)
+                .map_err(|e| e.to_string())?;
+            if let Some(spec) = nnue_format::layerstack_weights::bucket_spec_from_arch(&arch)
+                .map_err(|e| e.to_string())?
+            {
+                if args.bucket_spec.is_some_and(|s| s != spec)
+                    || !matches!(args.bucket_mode.as_str(), "spec" | "progresskpabs")
+                {
+                    return Err("bucket arguments conflict with the net's ls_bucket token".into());
+                }
+                args.bucket_mode = "spec".into();
+                args.bucket_spec = Some(spec);
+            } else if args.bucket_mode == "spec" {
+                return Err(
+                    "net has no ls_bucket token; use --init-ft-only to change its bucket routing"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
     }
 }

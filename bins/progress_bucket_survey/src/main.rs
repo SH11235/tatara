@@ -53,7 +53,7 @@ struct Args {
     per_pack: bool,
 
     /// Number of progress buckets to survey (LayerStack `--num-buckets`).
-    /// Must be in `[1, 9]`; defaults to 8 to match the LayerStack trainer
+    /// Must be in `[1, 32]`; defaults to 8 to match the LayerStack trainer
     /// default. Position `p` maps to bucket `min(N-1, floor(p * N))`.
     #[arg(long, default_value_t = 8)]
     num_buckets: usize,
@@ -133,8 +133,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.stride == 0 {
         return Err("--stride must be >= 1".into());
     }
-    if !(1..=9).contains(&args.num_buckets) {
-        return Err(format!("--num-buckets must be in [1, 9] (got {})", args.num_buckets).into());
+    if !(1..=shogi_features::MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
+        return Err(format!(
+            "--num-buckets must be in [1, {}] (got {})",
+            shogi_features::MAX_LAYERSTACK_BUCKETS,
+            args.num_buckets
+        )
+        .into());
     }
     let data_paths: Vec<PathBuf> = args
         .data

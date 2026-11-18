@@ -26,7 +26,7 @@ struct Args {
 
     /// Bucket assignment used when the net was trained: progresskpabs,
     /// progresskpabsq16 or kingrank9. The deprecated spelling progress8kpabs is
-    /// accepted as an alias of progresskpabs.
+    /// accepted as an alias of progresskpabs. Nets with ls_bucket metadata use it automatically.
     #[arg(long, default_value = "progresskpabs")]
     bucket_mode: String,
 
@@ -64,6 +64,15 @@ fn validate_mode_args(
                 )
             })
             .map(Some),
+        BucketMode::Spec(spec) => {
+            if spec.num_buckets() != stored_num_buckets {
+                return Err("bucket spec does not match stored bucket count".into());
+            }
+            if progress_coeff.is_some() {
+                return Err("--progress-coeff is not used with spec routing".into());
+            }
+            Ok(None)
+        }
         BucketMode::KingRank9 => {
             if stored_num_buckets != KINGRANK9_NUM_BUCKETS {
                 return Err(format!(
@@ -83,7 +92,14 @@ fn validate_mode_args(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (weights, spec) = load_layerstack(&args.nnue_file)?;
-    let (mode, warning) = BucketMode::parse_cli(&args.bucket_mode)?;
+    let (mode, warning) = if let Some(spec) = weights.bucket_spec {
+        if !matches!(args.bucket_mode.as_str(), "progresskpabs" | "spec") {
+            return Err("--bucket-mode conflicts with net ls_bucket metadata".into());
+        }
+        (BucketMode::Spec(spec), None)
+    } else {
+        BucketMode::parse_cli(&args.bucket_mode)?
+    };
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
@@ -677,6 +693,42 @@ fn remove_hand(board: &mut ShogiBoard, color: Color, pt: PieceType) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_wide_spec_nets_evaluate_the_highest_bucket() {
+        let feature_set = FeatureSet::HalfKaHmMerged.spec();
+        for (routing, count) in [
+            ("ownking:2/3/7+oppking:2/3/7", 16),
+            ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+        ] {
+            let mut weights = LayerStackWeights::zeroed(feature_set, 4, 4, 4, count);
+            weights.bucket_spec = Some(routing.parse().unwrap());
+            weights.l3_b[count - 1] = 0.25;
+
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes, None).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "tatara-eval-sfen-{count}-{}.bin",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = load_layerstack(&path);
+            std::fs::remove_file(path).unwrap();
+            let (weights, features) = loaded.unwrap();
+            let mode = BucketMode::Spec(weights.bucket_spec.unwrap());
+            assert_eq!(
+                validate_mode_args(mode, None, weights.num_buckets),
+                Ok(None)
+            );
+            let board = parse_position("sfen 9/4K4/9/9/9/9/9/4k4/9 b Rr 1").unwrap();
+            let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
+            assert_eq!(bucket, count - 1);
+            assert_eq!(
+                forward_one_raw(&weights, features, &board, bucket).unwrap(),
+                QA * QB / 4
+            );
+        }
+    }
 
     #[test]
     fn bucket_mode_arg_shares_trainer_parse() {

@@ -63,8 +63,8 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキには 3 つの bucket mode がある。既定の `progresskpabs` は
-局面進行度を 2–9 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
+`layerstack` の既定の bucket mode `progresskpabs` は
+局面進行度を 1–32 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
 学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
 `progresskpabsq16` は同じ `progress.bin` と bucket 数を使い、係数を整数
@@ -95,6 +95,23 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 
 `layerstack` は既定で `--feature-set halfka-hm-merged` / 8 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
 
+`--bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'` は局面の属性で
+出力を 16 bucket に分ける。1〜2 軸を `+` で結び、左の軸を上位桁とする。
+`ownking` / `oppking` は各玉の自陣最下段を 1 とした段で、cut 以下ではなく
+**cut 以上**の値を次の帯に入れる。`ownking:2/3` は 1、2、3〜9 の 3 帯。
+`handmajor3` は双方に手駒の飛角が無い／双方にある=0、手番側だけ=1、相手だけ=2。
+`handmajor4` は双方にある場合を 3 に分ける。bucket 数は軸の帯数の積 (最大 32) で、
+`--num-buckets` を指定する場合は一致が必要。`--progress-coeff` は併用できない。
+
+`--init-from <net.bin> --init-ft-only --freeze-ft` で FT (Threat・PSQT を含む) を
+読み込んで固定し、出力層を `--init-l1` / `--init-l1-shared` / `--init-l2` / `--init-l3`
+で初期化して学習できる。入力特徴と FT 幅は元の net に合わせる。
+PSQT は bucket 列を持つため、PSQT 付き net の FT だけを読む場合は bucket 数と spec を変えられない。
+対照には同じ初期化・固定オプションで進行度 mode と係数を指定する。
+保存した `.bin` の `ls_bucket=` token は `--eval-only --init-from <net.bin>` で自動的に読まれる。
+spec routing は対応する reader が必要。
+
+
 ## 主な option
 
 `nnue-train` の CLI 既定値は動作確認 (smoke) 向けに小さい。本番学習で主に
@@ -121,7 +138,7 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
-| `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
+| `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[1, 32]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
 
 ### 学習局面の間引き
 
