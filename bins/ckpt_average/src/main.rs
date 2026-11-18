@@ -40,7 +40,7 @@ struct Args {
     /// omit it when that run exported without one.
     #[arg(long, value_name = "N", value_parser = parse_positive_i32)]
     fv_scale: Option<i32>,
-    /// Quantised .bin with the same architecture to compare the output against.
+    /// Quantised .bin with the same architecture and bucket spec to compare the output against.
     #[arg(long, value_name = "BIN")]
     reference: Option<PathBuf>,
 }
@@ -136,7 +136,20 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         let ours = load(&args.output)?;
-        let theirs = load(reference)?;
+        let theirs =
+            load(reference).map_err(|e| format!("reference {}: {e}", reference.display()))?;
+        if ours.bucket_spec != theirs.bucket_spec {
+            let show = |spec: Option<_>| {
+                spec.map_or_else(|| "none".to_string(), |s| format!("ls_bucket={s}"))
+            };
+            return Err(format!(
+                "reference {} bucket spec mismatch: expected {}, found {}",
+                reference.display(),
+                show(ours.bucket_spec),
+                show(theirs.bucket_spec)
+            )
+            .into());
+        }
         for line in compare_quantised(&ours, &theirs) {
             println!("vs reference: {line}");
         }
@@ -201,7 +214,10 @@ fn compare_quantised(a: &LayerStackWeights, b: &LayerStackWeights) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raw_ckpt::tests::{FT_OUT, L1, L2, NB, layout, pattern, temp_path, write_ckpt};
+    use raw_ckpt::tests::{
+        FT_OUT, L1, L2, NB, layout, pattern, temp_path, train_spec, write_ckpt,
+        write_ckpt_versioned,
+    };
 
     const TOPO: [u64; 4] = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
 
@@ -297,8 +313,17 @@ mod tests {
     fn reference_comparison_counts_changed_elements() {
         let a = temp_path("ref-a.ckpt");
         let b = temp_path("ref-b.ckpt");
-        write_ckpt(&a, 20, TOPO, pattern(1.0));
-        write_ckpt(&b, 40, TOPO, pattern(1.0));
+        for (path, superbatch) in [(&a, 20), (&b, 40)] {
+            write_ckpt_versioned(
+                path,
+                11,
+                train_spec(),
+                superbatch,
+                TOPO,
+                "spec:ownking:2",
+                pattern(1.0),
+            );
+        }
         let first = temp_path("ref-first.bin");
         let avg = temp_path("ref-avg.bin");
         for p in [&first, &avg] {
@@ -323,6 +348,44 @@ mod tests {
                 .enumerate()
                 .all(|(i, l)| i == 6 || l.contains("changed 0/"))
         );
+    }
+
+    #[test]
+    fn reference_comparison_accepts_nets_without_bucket_spec() {
+        let a = temp_path("ref-plain-a.ckpt");
+        let b = temp_path("ref-plain-b.ckpt");
+        write_ckpt(&a, 20, TOPO, pattern(1.0));
+        write_ckpt(&b, 40, TOPO, pattern(1.0));
+        let first = temp_path("ref-plain-first.bin");
+        let avg = temp_path("ref-plain-avg.bin");
+        for p in [&first, &avg] {
+            let _ = fs::remove_file(p);
+        }
+        run(&args(vec![a.clone()], first.clone())).unwrap();
+        let mut both = args(vec![a, b], avg);
+        both.reference = Some(first);
+        run(&both).unwrap();
+    }
+
+    #[test]
+    fn reference_comparison_rejects_different_bucket_routing() {
+        let topology = [FT_OUT as u64, L1 as u64, L2 as u64, 3];
+        let checkpoint = temp_path("reference-ownking.ckpt");
+        let other = temp_path("reference-oppking.ckpt");
+        let reference = temp_path("reference-oppking.bin");
+        for (path, mode) in [
+            (&checkpoint, "spec:ownking:2/3"),
+            (&other, "spec:oppking:2/3"),
+        ] {
+            write_ckpt_versioned(path, 11, train_spec(), 20, topology, mode, pattern(1.0));
+        }
+        run(&args(vec![other], reference.clone())).unwrap();
+        let mut comparison = args(vec![checkpoint], temp_path("reference-ownking.bin"));
+        comparison.reference = Some(reference);
+        let error = run(&comparison).unwrap_err().to_string();
+        assert!(error.contains("bucket spec mismatch"), "{error}");
+        assert!(error.contains("expected ls_bucket=ownking:2/3"), "{error}");
+        assert!(error.contains("found ls_bucket=oppking:2/3"), "{error}");
     }
 
     fn raw_ckpt_group_len(g: usize) -> usize {

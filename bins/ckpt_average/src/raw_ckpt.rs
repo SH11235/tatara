@@ -588,7 +588,15 @@ pub(crate) mod tests {
         topology: [u64; 4],
         weight: impl Fn(usize, usize) -> f32,
     ) {
-        write_ckpt_versioned(path, 11, train_spec(), superbatch, topology, weight);
+        write_ckpt_versioned(
+            path,
+            11,
+            train_spec(),
+            superbatch,
+            topology,
+            "progresskpabs",
+            weight,
+        );
     }
 
     /// trainer の raw checkpoint writer が `version` で書く header の LayerStack checkpoint を
@@ -600,6 +608,7 @@ pub(crate) mod tests {
         spec: FeatureSetSpec,
         superbatch: u64,
         topology: [u64; 4],
+        bucket_mode: &str,
         weight: impl Fn(usize, usize) -> f32,
     ) {
         let lay = LayerStackLayout {
@@ -608,7 +617,7 @@ pub(crate) mod tests {
             l1_out: topology[1] as usize,
             l2_out: topology[2] as usize,
             num_buckets: topology[3] as usize,
-            bucket_mode: BucketMode::ProgressKpAbs,
+            bucket_mode: BucketMode::parse(bucket_mode).unwrap().0,
             with_psqt: false,
             shared_delta: false,
         };
@@ -628,7 +637,7 @@ pub(crate) mod tests {
         put_name(&mut out, "test-run");
         put_name(&mut out, "layerstack");
         if version >= 8 {
-            put_name(&mut out, "progresskpabs");
+            put_name(&mut out, bucket_mode);
         }
         out.extend(4u64.to_le_bytes());
         for d in topology {
@@ -760,8 +769,24 @@ pub(crate) mod tests {
         let older = temp_path("compat-v8.ckpt");
         let no_mode = temp_path("compat-v7.ckpt");
         write_ckpt(&current, 40, topo, pattern(1.0));
-        write_ckpt_versioned(&older, 8, train_spec(), 20, topo, pattern(1.0));
-        write_ckpt_versioned(&no_mode, 7, train_spec(), 20, topo, pattern(1.0));
+        write_ckpt_versioned(
+            &older,
+            8,
+            train_spec(),
+            20,
+            topo,
+            "progresskpabs",
+            pattern(1.0),
+        );
+        write_ckpt_versioned(
+            &no_mode,
+            7,
+            train_spec(),
+            20,
+            topo,
+            "progresskpabs",
+            pattern(1.0),
+        );
         let v11 = read_ckpt_info(&current).unwrap().identity;
         let v8 = read_ckpt_info(&older).unwrap().identity;
         let v7 = read_ckpt_info(&no_mode).unwrap().identity;
@@ -784,7 +809,15 @@ pub(crate) mod tests {
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
         for version in [MIN_VERSION - 1, MAX_VERSION + 1] {
             let path = temp_path(&format!("version-{version}.ckpt"));
-            write_ckpt_versioned(&path, version, train_spec(), 20, topo, pattern(1.0));
+            write_ckpt_versioned(
+                &path,
+                version,
+                train_spec(),
+                20,
+                topo,
+                "progresskpabs",
+                pattern(1.0),
+            );
             let err = read_ckpt_info(&path).unwrap_err();
             assert!(err.to_string().contains("not supported"), "{err}");
         }
@@ -795,7 +828,7 @@ pub(crate) mod tests {
         let spec = FeatureSet::HalfKaHmMerged.spec();
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
         let path = temp_path("plain.ckpt");
-        write_ckpt_versioned(&path, 11, spec, 20, topo, pattern(1.0));
+        write_ckpt_versioned(&path, 11, spec, 20, topo, "progresskpabs", pattern(1.0));
         let info = read_ckpt_info(&path).unwrap();
         assert!(!info.identity.ft_factorize);
         let lay = layerstack_layout(&info.identity).unwrap();

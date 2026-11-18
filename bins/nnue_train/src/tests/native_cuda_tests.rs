@@ -4703,36 +4703,74 @@ fn ft_only_import_preserves_fresh_output_layers() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn ft_only_import_rejects_incompatible_psqt_routing() -> Result<(), Box<dyn std::error::Error>> {
+fn ft_only_import_rejects_invalid_weights_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context_reserving_gib(2)?;
-    let mut trainer = create_layerstack_trainer_with_options(
-        &context,
-        true,
-        LayerStackTestOptions {
-            num_buckets: 3,
-            bucket_mode: BucketMode::Spec("ownking:2/3".parse().unwrap()),
-            psqt: true,
-            ..LayerStackTestOptions::standard()
-        },
-    )?;
+    let options = LayerStackTestOptions {
+        num_buckets: 3,
+        bucket_mode: BucketMode::Spec("ownking:2/3".parse().unwrap()),
+        psqt: true,
+        ..LayerStackTestOptions::standard()
+    };
+    let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    batch.bucket_idx.fill(0);
+    batch.score.fill(150.0);
+    batch.wdl.fill(0.7);
+    trainer.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
     let before = trainer.to_layerstack_weights()?;
+    let state = trainer.raw_checkpoint_state_to_host()?;
+    let reject = |trainer: &mut LayerStackGpuTrainer,
+                  source: &nnue_format::LayerStackWeights,
+                  message: &str| {
+        let error = trainer.load_ft_weights(source).unwrap_err().to_string();
+        assert!(error.contains(message), "{error}");
+        let after = trainer.raw_checkpoint_state_to_host().unwrap();
+        assert_eq!(state.0, after.0, "{message}: optimizer step");
+        for ((name, before), (_, after)) in state.1.iter().zip(&after.1) {
+            assert!(
+                before == after,
+                "{message}: {name} weights or optimizer state changed"
+            );
+        }
+    };
     let mut source = before.clone();
     source.ft_w[0] += 1.0;
+    source.ft_b[0] += 1.0;
     source.psqt_w.as_mut().unwrap()[0] += 1.0;
-    source.bucket_spec = Some("oppking:2/3".parse().unwrap());
-    assert!(trainer.load_ft_weights(&source).is_err());
-    source.bucket_spec = None;
-    assert!(trainer.load_ft_weights(&source).is_err());
-    source.bucket_spec = before.bucket_spec;
-    source.num_buckets = 4;
-    assert!(trainer.load_ft_weights(&source).is_err());
-    let after = trainer.to_layerstack_weights()?;
-    assert_eq!(before.ft_w, after.ft_w);
-    assert_eq!(before.psqt_w, after.psqt_w);
+    for (spec, count) in [
+        (Some("oppking:2/3".parse().unwrap()), before.num_buckets),
+        (None, before.num_buckets),
+        (before.bucket_spec, 4),
+    ] {
+        source.bucket_spec = spec;
+        source.num_buckets = count;
+        reject(
+            &mut trainer,
+            &source,
+            "matching bucket mode, count and spec",
+        );
+    }
     source.num_buckets = before.num_buckets;
+
+    let mut psqt = source.psqt_w.take().unwrap();
+    reject(&mut trainer, &source, "weights have no psqt_w");
+    let last = psqt.pop().unwrap();
+    source.psqt_w = Some(psqt);
+    reject(&mut trainer, &source, "psqt_w length");
+    source.psqt_w.as_mut().unwrap().push(last);
+
+    let last = source.ft_w.pop().unwrap();
+    reject(&mut trainer, &source, "packed dimensions");
+    source.ft_w.push(last);
+    let last = source.ft_b.pop().unwrap();
+    reject(&mut trainer, &source, "packed dimensions");
+    source.ft_b.push(last);
+
     trainer.load_ft_weights(&source)?;
     let after = trainer.to_layerstack_weights()?;
     assert_eq!(source.ft_w, after.ft_w);
+    assert_eq!(source.ft_b, after.ft_b);
     assert_eq!(source.psqt_w, after.psqt_w);
     Ok(())
 }

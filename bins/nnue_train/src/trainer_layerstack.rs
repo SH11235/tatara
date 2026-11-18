@@ -3195,6 +3195,28 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let psqt_len = self.feature_set.ft_in() * self.num_buckets;
+        match (self.psqt.is_some(), w.psqt_w.as_ref()) {
+            (true, Some(weights)) if weights.len() != psqt_len => {
+                return Err(invalid_data(format!(
+                    "weight psqt_w length {} != expected {psqt_len}",
+                    weights.len()
+                )));
+            }
+            (true, None) => {
+                return Err(invalid_data(
+                    "trainer has PSQT enabled but weights have no psqt_w (use a PSQT-trained .bin)"
+                        .to_string(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(invalid_data(
+                    "weights carry psqt_w but trainer has PSQT disabled (rerun with --psqt)"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
         self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
         #[cfg(feature = "native")]
@@ -3229,39 +3251,14 @@ impl GpuTrainer {
             self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
             self.ft_b_grad = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
         }
-        // PSQT (任意): trainer 側で psqt が enabled なら weight 側も `Some` を要求。
-        // load 側で `Some` でも trainer が `None` の組合せ (誤って PSQT 無し trainer に
-        // PSQT 含む weights を入れる) も同じく reject する。
-        match (self.psqt.as_mut(), w.psqt_w.as_ref()) {
-            (Some(psqt), Some(w_psqt)) => {
-                let n = self.feature_set.ft_in() * self.num_buckets;
-                if w_psqt.len() != n {
-                    return Err(invalid_data(format!(
-                        "weight psqt_w length {} != expected {n}",
-                        w_psqt.len()
-                    )));
-                }
-                psqt.w = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                if !self.forward_only {
-                    psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                    psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                    psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                    psqt.w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                }
+        if let Some((psqt, weights)) = self.psqt.as_mut().zip(w.psqt_w.as_ref()) {
+            psqt.w = DeviceBuffer::from_host(&self.stream, weights)?;
+            if !self.forward_only {
+                psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
+                psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
+                psqt.w_slow = DeviceBuffer::from_host(&self.stream, weights)?;
+                psqt.w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
             }
-            (Some(_), None) => {
-                return Err(invalid_data(
-                    "trainer has PSQT enabled but weights have no psqt_w (use a PSQT-trained .bin)"
-                        .to_string(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(invalid_data(
-                    "weights carry psqt_w but trainer has PSQT disabled (rerun with --psqt)"
-                        .to_string(),
-                ));
-            }
-            (None, None) => {}
         }
         Ok(())
     }
