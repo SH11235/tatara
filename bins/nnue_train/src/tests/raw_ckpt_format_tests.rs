@@ -1078,8 +1078,10 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         feature_set: full.feature_set.with_threat_width(512),
         ..full
     };
+    use nnue_train::optimizer::OptimizerKind;
+
     let meta = RawCkptMeta {
-        optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
+        optimizer: OptimizerKind::Ranger,
         qat_dense: false,
         run_id: "run",
         superbatch: 1,
@@ -1089,19 +1091,134 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         net_id: "",
         recipe_fingerprint: None,
     };
-    let write = |arch, meta| {
+    let write = |arch, optimizer| {
         let mut bytes = Vec::new();
-        write_raw_ckpt_header(&mut bytes, arch, meta, 10).unwrap();
+        crate::ckpt::write_raw_ckpt_header(
+            &mut bytes,
+            arch,
+            &RawCkptMeta { optimizer, ..meta },
+            10,
+        )
+        .unwrap();
         bytes
     };
-    let a = write(&full, &meta);
-    let b = write(&explicit, &meta);
-    let c = write(&partial, &meta);
-    assert_eq!(a, b);
-    assert_eq!(c[4..8], 13_u32.to_le_bytes());
-    let header = read_raw_ckpt_header(&mut Cursor::new(&c), &partial).unwrap();
-    assert_eq!(header.step_count, 5);
-    assert!(!header.sgd);
-    assert!(read_raw_ckpt_header(&mut Cursor::new(&c), &full).is_err());
-    assert!(read_raw_ckpt_header(&mut Cursor::new(&a), &partial).is_err());
+    for (optimizer, version) in [
+        (OptimizerKind::Ranger, 13_u32),
+        (OptimizerKind::RAdam, 13),
+        (OptimizerKind::AdamW, 13),
+        (OptimizerKind::Sgd, 14),
+    ] {
+        let full_bytes = write(&full, optimizer);
+        assert_eq!(full_bytes, write(&explicit, optimizer));
+        let packed_bytes = write(&partial, optimizer);
+        assert_eq!(packed_bytes[4..8], version.to_le_bytes());
+        let header = read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &partial).unwrap();
+        assert_eq!(header.step_count, 5);
+        assert_eq!(header.sgd, optimizer == OptimizerKind::Sgd);
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &full).is_err());
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&full_bytes), &partial).is_err());
+    }
+}
+
+#[test]
+fn raw_ckpt_accepts_legacy_threat_input_capacity() {
+    let arch = layerstack_arch_threat_factorized();
+    let mut bytes = Vec::new();
+    write_raw_ckpt_header(&mut bytes, &arch, "run", 1, 5, None, 10).unwrap();
+    let max_active_offset = 12 + arch.feature_set.canonical_name().len() + 16;
+    let legacy_max_active = (arch.feature_set.feature_set().spec().max_active() + 128) as u64;
+    let field = max_active_offset..max_active_offset + 8;
+    bytes[field.clone()].copy_from_slice(&legacy_max_active.to_le_bytes());
+    read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).unwrap();
+    bytes[field].copy_from_slice(&(legacy_max_active - 1).to_le_bytes());
+    assert!(read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).is_err());
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::optimizer::OptimizerKind;
+    use std::io::Write;
+
+    let topology = layerstack_topology(8, 16, 32, 2);
+    let full = layerstack_arch_threat_factorized();
+    let arch = RawCkptArch {
+        feature_set: full.feature_set.with_threat_width(4),
+        ft_out: 8,
+        topology: &topology,
+        ..full
+    };
+    let len = arch.feature_set.train_ft_weight_len(8);
+    let path = std::env::temp_dir().join(format!("tatara-packed-ft-{}.ckpt", std::process::id()));
+    let mut groups = vec![(
+        vec![0.25; len],
+        vec![0.5; len],
+        vec![0.0; len],
+        vec![0.0; len],
+    )];
+    for optimizer in [
+        OptimizerKind::Sgd,
+        OptimizerKind::Ranger,
+        OptimizerKind::AdamW,
+        OptimizerKind::RAdam,
+    ] {
+        if optimizer != OptimizerKind::Sgd {
+            groups[0].2.fill(0.125);
+        }
+        if optimizer == OptimizerKind::Ranger {
+            groups[0].3.fill(0.75);
+        } else {
+            groups[0].3.fill(0.0);
+        }
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        crate::ckpt::write_raw_ckpt_header(
+            &mut writer,
+            &arch,
+            &RawCkptMeta {
+                optimizer,
+                qat_dense: false,
+                run_id: "",
+                superbatch: 6,
+                step_count: 12,
+                lr_horizon: Some(20),
+                fv_scale: None,
+                net_id: "",
+                recipe_fingerprint: None,
+            },
+            1,
+        )?;
+        writer.write_all(&(len as u64).to_le_bytes())?;
+        let (w, m, v, slow) = &groups[0];
+        for tensor in [w, m, v, slow] {
+            write_f32_slice(&mut writer, tensor)?;
+        }
+        writer.flush()?;
+
+        let (mut header, mut loaded) = load_raw_checkpoint_file(&path, &arch, &[("ft_w", len)])?;
+        header.prepare_optimizer_state(&path, &mut loaded, optimizer, false)?;
+        assert_eq!(loaded, groups, "{optimizer:?}");
+        assert_eq!(
+            (header.superbatch, header.step_count, header.lr_horizon),
+            (6, 12, Some(20))
+        );
+        if optimizer == OptimizerKind::RAdam {
+            assert!(
+                header
+                    .prepare_optimizer_state(&path, &mut loaded, OptimizerKind::Sgd, false)
+                    .is_err()
+            );
+            header.prepare_optimizer_state(&path, &mut loaded, OptimizerKind::Sgd, true)?;
+            assert_eq!(
+                (header.superbatch, header.step_count, header.lr_horizon),
+                (6, 0, None)
+            );
+            let (loaded_w, loaded_m, loaded_v, loaded_slow) = &loaded[0];
+            assert_eq!(loaded_w, w);
+            assert_eq!(loaded_m, m);
+            assert!(loaded_v.iter().chain(loaded_slow).all(|&x| x == 0.0));
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
 }

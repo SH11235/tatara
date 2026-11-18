@@ -125,8 +125,8 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   continues the producer's training or forks a new experiment from it.
 ///
 /// - `12`: the version 11 layout with SGD momentum state.
-/// - `13`: compact Threat with Ranger or RAdam state. A u64 Threat row width
-///   follows the feature hash.
+/// - `13`: compact Threat with the version 11 optimizer state. A u64 Threat
+///   row width follows the feature hash.
 /// - `14`: the compact Threat layout with SGD momentum state.
 ///
 /// `load_raw_checkpoint` accepts versions 1..=14. Version 1 is interpreted as
@@ -600,7 +600,13 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         // ないため値で受理する。
         let legacy_factorized_max_active =
             want.ft_factorize() && ckpt_max_active == 2 * want.max_active() as u64;
-        if ckpt_max_active != want.max_active() as u64 && !legacy_factorized_max_active {
+        // Threat's sparse input capacity can grow without changing any checkpoint tensors.
+        let legacy_threat_max_active = want.threat_profile().is_some()
+            && ckpt_max_active == (want.feature_set().spec().max_active() + 128) as u64;
+        if ckpt_max_active != want.max_active() as u64
+            && !legacy_factorized_max_active
+            && !legacy_threat_max_active
+        {
             return Err(invalid_data(format!(
                 "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
                 want.max_active()

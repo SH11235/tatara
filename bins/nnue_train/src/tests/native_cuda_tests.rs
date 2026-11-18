@@ -511,7 +511,7 @@ fn every_production_cuda_launch_is_exported() {
 }
 
 /// `production_cuda_launch_symbols` は nnue_train crate の `src` だけを走査する。native path
-/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて 79 本の
+/// を持ち得る production launch が別 crate / 別 binary に移ると、この走査から外れて
 /// inventory tripwire も発火しなくなる。workspace 全体を走査し、`cuda_launch!` を含む
 /// production source が既知の許可 path 配下だけにあることを固定する。
 #[test]
@@ -3490,6 +3490,20 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
         ("plain-fp16-mirror", plain, fp16_weights_only, ranger, norm),
         ("plain-all-optim-mirror", plain, all_optim, ranger, norm),
         ("plain-fp32-radam", plain, fp32, OptimizerKind::RAdam, None),
+        (
+            "partial-factorized-radam",
+            threat_factorized.with_threat_width(32),
+            fp32,
+            OptimizerKind::RAdam,
+            norm,
+        ),
+        (
+            "partial-factorized-sgd",
+            threat_factorized.with_threat_width(32),
+            fp32,
+            OptimizerKind::Sgd,
+            norm,
+        ),
     ];
     for (name, feature_set, precision, optimizer, norm_loss_factor) in configs {
         let options = LayerStackTestOptions {
@@ -3533,6 +3547,12 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             let batch = batches[step % 2].as_ref();
             let _ = fused.step(&batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
             let _ = separate.step(&batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        }
+        if norm_loss_factor.is_some() {
+            assert!(
+                fused.ft_fused_norm_sums_to_host_for_test()?.is_some(),
+                "{name}: expected fused FT update"
+            );
         }
         let (fused_steps, fused_groups) = fused.raw_checkpoint_state_to_host()?;
         let (separate_steps, separate_groups) = separate.raw_checkpoint_state_to_host()?;
@@ -4156,8 +4176,34 @@ fn fused_ft_norms_follow_external_weight_writes() -> Result<(), Box<dyn std::err
 fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
 -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context()?;
+    check_sgd_momentum_transfer(
+        &context,
+        FeatureSet::HalfKp.spec().with_ft_factorize(),
+        "full",
+    )
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn partial_threat_transfers_radam_momentum_and_resumes_sgd()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let spec = FeatureSet::HalfKp
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide)
+        .with_threat_width(32)
+        .with_ft_factorize();
+    check_sgd_momentum_transfer(&context, spec, "partial")
+}
+
+#[cfg(feature = "native")]
+fn check_sgd_momentum_transfer(
+    context: &std::sync::Arc<CudaContext>,
+    feature_set: shogi_features::FeatureSetSpec,
+    layout: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let options = LayerStackTestOptions {
-        feature_set: FeatureSet::HalfKp.spec().with_ft_factorize(),
+        feature_set,
         precision: PrecisionFlags {
             ft_fp16: true,
             ft_fp16_out: true,
@@ -4170,17 +4216,38 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
     };
     let dir = std::env::temp_dir();
     let pid = std::process::id();
-    let parent_checkpoint = dir.join(format!("tatara-sgd-parent-{pid}.ckpt"));
-    let checkpoint = dir.join(format!("tatara-sgd-resume-{pid}.ckpt"));
+    let parent_checkpoint = dir.join(format!("tatara-sgd-parent-{layout}-{pid}.ckpt"));
+    let checkpoint = dir.join(format!("tatara-sgd-resume-{layout}-{pid}.ckpt"));
     let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
     batch.score.fill(200.0);
+    let partial = feature_set.threat_width(options.ft_out) != options.ft_out;
+    if partial {
+        for row in batch.stm_indices.chunks_exact_mut(feature_set.max_active()) {
+            row[0] = feature_set.base_ft_in() as i32;
+        }
+    }
     let producer = nnue_train::trainer::CheckpointProducer::run_id_only("sgd-test");
-    let mut radam = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut radam = create_layerstack_trainer_with_options(context, true, options)?;
     radam.configure_qat(Some(crate::qat::QatMode::Dense))?;
     radam.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     radam.save_raw_checkpoint(&parent_checkpoint, 6, &producer, Some(100))?;
-    let (_, parent_groups) = radam.raw_checkpoint_state_to_host()?;
+    let (parent_step, parent_groups) = radam.raw_checkpoint_state_to_host()?;
     drop(radam);
+    if partial {
+        let mut resumed = create_layerstack_trainer_with_options(context, true, options)?;
+        let (sb, _, horizon) = resumed.load_raw_checkpoint(&parent_checkpoint, false)?;
+        assert_eq!((sb, horizon), (6, Some(100)));
+        let (step, groups) = resumed.raw_checkpoint_state_to_host()?;
+        assert_eq!(step, parent_step);
+        assert_eq!(groups, parent_groups);
+        let (_, (_, momentum, _, _)) = &parent_groups[0];
+        let (offset, width) = feature_set.ft_row_layout(feature_set.base_ft_in(), options.ft_out);
+        assert!(
+            momentum[offset..offset + width]
+                .iter()
+                .any(|&value| value != 0.0)
+        );
+    }
     assert!(
         parent_groups
             .iter()
@@ -4191,7 +4258,7 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
         optimizer: OptimizerKind::Sgd,
         ..options
     };
-    let mut fused = create_layerstack_trainer_with_options(&context, true, sgd_options)?;
+    let mut fused = create_layerstack_trainer_with_options(context, true, sgd_options)?;
     assert!(
         fused
             .load_raw_checkpoint(&parent_checkpoint, false)
@@ -4209,9 +4276,11 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
         assert!(v.iter().chain(slow).all(|&x| x == 0.0));
     }
 
-    let mut separate = create_layerstack_trainer_with_options(&context, true, sgd_options)?;
+    let mut separate = create_layerstack_trainer_with_options(context, true, sgd_options)?;
     separate.set_ft_fused_optimizer_enabled_for_test(false);
     separate.load_raw_checkpoint(&parent_checkpoint, true)?;
+    fused.sync_ft_forward_weights()?;
+    separate.sync_ft_forward_weights()?;
     fused.step(&batch.as_ref(), 5.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     separate.step(&batch.as_ref(), 5.0e-3, 0.0, SMOKE_LOSS_WRM)?;
     let (_, fused_groups) = fused.raw_checkpoint_state_to_host()?;
@@ -4230,7 +4299,7 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
     drop(separate);
 
     let mut eval = create_layerstack_trainer_forward_only(
-        &context,
+        context,
         true,
         LayerStackTestOptions {
             optimizer: OptimizerKind::Ranger,
@@ -4248,6 +4317,7 @@ fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
     Ok(())
 }
 
+#[cfg(feature = "native")]
 #[test]
 fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context()?;
@@ -4321,6 +4391,7 @@ fn partial_threat_checkpoint_resumes_optimizer() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+#[cfg(feature = "native")]
 #[test]
 fn explicit_full_threat_width_preserves_training() -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context()?;
