@@ -211,7 +211,51 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 11);
+    assert_eq!(RAW_CKPT_VERSION, 12);
+}
+
+#[test]
+fn raw_ckpt_marks_sgd_without_changing_adam_layout() {
+    use nnue_train::optimizer::OptimizerKind;
+
+    let arch = layerstack_arch();
+    let meta = RawCkptMeta {
+        optimizer: OptimizerKind::RAdam,
+        qat_dense: false,
+        run_id: "",
+        superbatch: 1,
+        step_count: 1,
+        lr_horizon: None,
+        fv_scale: None,
+        net_id: "",
+        recipe_fingerprint: None,
+    };
+    let write = |optimizer| {
+        let mut bytes = Vec::new();
+        crate::ckpt::write_raw_ckpt_header(
+            &mut bytes,
+            &arch,
+            &RawCkptMeta { optimizer, ..meta },
+            10,
+        )
+        .unwrap();
+        bytes
+    };
+    let adam = write(OptimizerKind::RAdam);
+    let sgd = write(OptimizerKind::Sgd);
+    assert_eq!(adam[4..8], 11_u32.to_le_bytes());
+    assert_eq!(sgd[4..8], 12_u32.to_le_bytes());
+    assert_eq!(adam[8..], sgd[8..]);
+    assert!(
+        !read_raw_ckpt_header(&mut Cursor::new(adam), &arch)
+            .unwrap()
+            .sgd
+    );
+    assert!(
+        read_raw_ckpt_header(&mut Cursor::new(sgd), &arch)
+            .unwrap()
+            .sgd
+    );
 }
 
 #[test]
@@ -222,6 +266,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
         &mut bytes,
         &arch,
         &RawCkptMeta {
+            optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: true,
             run_id: "qat",
             superbatch: 1201,
@@ -257,6 +302,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
         &mut bytes,
         &simple,
         &RawCkptMeta {
+            optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: true,
             run_id: "invalid-simple-qat",
             superbatch: 1,
@@ -393,6 +439,7 @@ fn write_raw_ckpt_header<W: std::io::Write>(
         w,
         arch,
         &RawCkptMeta {
+            optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: false,
             run_id,
             superbatch: superbatch.try_into().expect("test superbatch fits usize"),
@@ -415,6 +462,7 @@ fn write_raw_ckpt_header_with_fv_scale(
         buf,
         arch,
         &RawCkptMeta {
+            optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: false,
             run_id: "fv-scale-test",
             superbatch: 9,
@@ -984,6 +1032,7 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
             &mut bytes,
             &arch,
             &RawCkptMeta {
+                optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
                 qat_dense: false,
                 run_id: "run-a",
                 superbatch: 420,

@@ -640,7 +640,7 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
         None,
     )?;
     for mode in [QatMode::Off, QatMode::Dense] {
-        t.load_raw_checkpoint(&path)?;
+        t.load_raw_checkpoint(&path, false)?;
         t.configure_qat(Some(mode))?;
         if mode == QatMode::Dense {
             let mut now = std::time::Instant::now();
@@ -693,7 +693,7 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
         None,
     )?;
     t.configure_qat(Some(QatMode::Off))?;
-    t.load_raw_checkpoint(&path)?;
+    t.load_raw_checkpoint(&path, false)?;
     t.configure_qat(None)?;
     assert_eq!(t.qat_mode, QatMode::Dense);
     t.configure_qat(Some(QatMode::Off))?;

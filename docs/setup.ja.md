@@ -140,7 +140,7 @@ WSL backend比較mode、統計、結果の扱いは[Native CUDA benchmark](nativ
 SCReLU / Pairwise と任意のhidden dimensionに対応する。LayerStackは可変層次元とbucket
 mode、PSQT、feature factorizer、threat / effect featureに対応する。両architectureとも
 FP32 / FP16 option/state (TF32 ON / OFF)、Sigmoid / WRM (拡張設定を含む)、norm loss、
-Ranger / RAdam / AdamWを利用でき、各trainerが起動し得る全kernelを収録する。
+Ranger / RAdam / AdamW / momentum 付き SGD を利用でき、各trainerが起動し得る全kernelを収録する。
 
 ## Windows (WSL2) の準備
 

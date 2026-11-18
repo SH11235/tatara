@@ -16,7 +16,7 @@ use shogi_features::{FeatureSet, FeatureSetSpec};
 const MAGIC: [u8; 4] = *b"RNRC";
 /// arch kind と topology を header に持つ最初の version。
 const MIN_VERSION: u32 = 4;
-const MAX_VERSION: u32 = 11;
+const MAX_VERSION: u32 = 12;
 const MAX_NAME_BYTES: usize = 256;
 /// 各 group の本体は `len u64` に続く `w`, `m`, `v`, `slow` の 4 本の f32 tensor。
 const TENSORS_PER_GROUP: u64 = 4;

@@ -850,7 +850,7 @@ fn forward_only_resumes_raw_checkpoint_for_validate() -> Result<(), Box<dyn std:
 
     let mut forward_only =
         create_layerstack_trainer_forward_only(&context, true, LayerStackTestOptions::standard())?;
-    let (superbatch, _, _) = forward_only.load_raw_checkpoint(&path)?;
+    let (superbatch, _, _) = forward_only.load_raw_checkpoint(&path, false)?;
     forward_only.sync_ft_forward_weights()?;
     assert_eq!(superbatch, 1);
 
@@ -1105,7 +1105,7 @@ fn forward_only_matches_with_ft_factorizer_variants_via_ckpt_resume()
         )?;
 
         let mut forward_only = create_layerstack_trainer_forward_only(&context, true, options)?;
-        forward_only.load_raw_checkpoint(&path)?;
+        forward_only.load_raw_checkpoint(&path, false)?;
         forward_only.sync_ft_forward_weights()?;
 
         let control_out = control.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
@@ -1775,7 +1775,7 @@ fn ft_state_host_raw_checkpoint_resumes_bit_identically() -> Result<(), Box<dyn 
         for ft_state_host in [false, true] {
             options.precision.ft_state_host = ft_state_host;
             let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
-            trainer.load_raw_checkpoint(&path)?;
+            trainer.load_raw_checkpoint(&path, false)?;
             assert_eq!(trainer.ft_state_mapped(), ft_state_host);
             let loaded = trainer.raw_checkpoint_state_to_host()?;
             assert_eq!(loaded.0, expected.0);
@@ -2338,7 +2338,7 @@ fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
                 native.enable_stack_shared_delta()?;
             }
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
-                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
+                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path, false)?;
                 assert_eq!(superbatch, 17);
                 assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
@@ -3106,7 +3106,7 @@ fn checkpoint_resume_simple_native_matches_cuda_oxide_in_both_directions()
             )?;
             for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
                 let (superbatch, producer, horizon, fv_scale) =
-                    trainer.load_raw_checkpoint(&path)?;
+                    trainer.load_raw_checkpoint(&path, false)?;
                 assert_eq!(superbatch, 17);
                 assert_eq!(producer.run_id.as_deref(), Some(source_name));
                 assert_eq!(horizon, Some(42));
@@ -4097,11 +4097,92 @@ fn fused_ft_norms_follow_external_weight_writes() -> Result<(), Box<dyn std::err
     step_both(&mut fused, &mut separate)?;
     assert_same_weights("after separate step", &fused, &separate)?;
 
-    fused.load_raw_checkpoint(&checkpoint)?;
-    separate.load_raw_checkpoint(&checkpoint)?;
+    fused.load_raw_checkpoint(&checkpoint, false)?;
+    separate.load_raw_checkpoint(&checkpoint, false)?;
     let _ = std::fs::remove_file(&checkpoint);
     assert!(fused.ft_fused_norm_sums_to_host_for_test()?.is_none());
     step_both(&mut fused, &mut separate)?;
     assert_same_weights("after resume", &fused, &separate)?;
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn sgd_transfers_radam_momentum_and_resumes_its_own_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context()?;
+    let options = LayerStackTestOptions {
+        feature_set: FeatureSet::HalfKp.spec().with_ft_factorize(),
+        precision: PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            tf32: true,
+            ..PrecisionFlags::default()
+        },
+        optimizer: OptimizerKind::RAdam,
+        ..LayerStackTestOptions::standard()
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let parent_checkpoint = dir.join(format!("tatara-sgd-parent-{pid}.ckpt"));
+    let checkpoint = dir.join(format!("tatara-sgd-resume-{pid}.ckpt"));
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    batch.score.fill(200.0);
+    let producer = nnue_train::trainer::CheckpointProducer::run_id_only("sgd-test");
+    let mut radam = create_layerstack_trainer_with_options(&context, true, options)?;
+    radam.configure_qat(Some(crate::qat::QatMode::Dense))?;
+    radam.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    radam.save_raw_checkpoint(&parent_checkpoint, 6, &producer, Some(100))?;
+    let (_, parent_groups) = radam.raw_checkpoint_state_to_host()?;
+    drop(radam);
+    assert!(
+        parent_groups
+            .iter()
+            .any(|(_, (_, m, _, _))| m.iter().any(|&x| x != 0.0))
+    );
+
+    let sgd_options = LayerStackTestOptions {
+        optimizer: OptimizerKind::Sgd,
+        ..options
+    };
+    let mut fused = create_layerstack_trainer_with_options(&context, true, sgd_options)?;
+    assert!(
+        fused
+            .load_raw_checkpoint(&parent_checkpoint, false)
+            .is_err()
+    );
+    let (source_sb, _, horizon) = fused.load_raw_checkpoint(&parent_checkpoint, true)?;
+    assert_eq!((source_sb, horizon), (6, None));
+    let (step, initial_groups) = fused.raw_checkpoint_state_to_host()?;
+    assert_eq!(step, 0);
+    for ((name, (w, m, v, slow)), (_, (parent_w, parent_m, _, _))) in
+        initial_groups.iter().zip(&parent_groups)
+    {
+        assert_eq!(w, parent_w, "{name} weights");
+        assert_eq!(m, parent_m, "{name} momentum");
+        assert!(v.iter().chain(slow).all(|&x| x == 0.0));
+    }
+
+    let mut separate = create_layerstack_trainer_with_options(&context, true, sgd_options)?;
+    separate.set_ft_fused_optimizer_enabled_for_test(false);
+    separate.load_raw_checkpoint(&parent_checkpoint, true)?;
+    fused.step(&batch.as_ref(), 5.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    separate.step(&batch.as_ref(), 5.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let (_, fused_groups) = fused.raw_checkpoint_state_to_host()?;
+    let (_, separate_groups) = separate.raw_checkpoint_state_to_host()?;
+    for ((name, (fw, fm, fv, _)), (_, (sw, sm, sv, _))) in fused_groups.iter().zip(&separate_groups)
+    {
+        assert_states_close(name, fw, sw, 1e-5);
+        assert_states_close(name, fm, sm, 1e-3);
+        assert!(fv.iter().chain(sv).all(|&x| x == 0.0));
+    }
+    fused.save_raw_checkpoint(&checkpoint, 1, &producer, Some(12))?;
+    assert!(separate.load_raw_checkpoint(&checkpoint, true).is_err());
+    let (saved_sb, _, horizon) = separate.load_raw_checkpoint(&checkpoint, false)?;
+    assert_eq!((saved_sb, horizon), (1, Some(12)));
+    assert_eq!(separate.raw_checkpoint_state_to_host()?, (1, fused_groups));
+    std::fs::remove_file(parent_checkpoint)?;
+    std::fs::remove_file(checkpoint)?;
     Ok(())
 }

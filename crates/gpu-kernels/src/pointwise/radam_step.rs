@@ -67,7 +67,7 @@
 /// 入力前提:
 /// - `step >= 1` (1-indexed。`step = 0` で `beta^0 = 1` となり `bc1 = 0`、
 ///   `step_size = 1/0 = +inf` になるので呼び出し側で避ける)
-/// - `0 < beta1 < 1`, `0 < beta2 < 1`
+/// - `0 < beta1 < 1`, `0 < beta2 <= 1`
 /// - `n_sma_threshold > 0` (論文 default `5.0`)
 ///
 /// 戻り値: `(step_size, denom)` (denom は 0 or 1 の i32、kernel 引数として
@@ -105,10 +105,10 @@ pub fn radam_compute_step_size_denom(
 ///
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == n`
-/// - `lr ≥ 0`, `decay ≥ 0`, `0 < beta1 < 1`, `0 < beta2 < 1`, `eps > 0`
+/// - `lr ≥ 0`, `decay ≥ 0`, `0 < beta1 < 1`, `0 < beta2 <= 1`, `eps > 0`
 /// - `min_w ≤ max_w` (host 側不変条件)
-/// - `step_size > 0`, `denom ∈ {0, 1}` (host pre-compute による、
-///   `radam_compute_step_size_denom` の戻り値をそのまま渡す前提)
+/// - `step_size > 0`, `denom ∈ {0, 1}`
+/// - `beta2 = 1` with `denom = 0` leaves the unused second moment unchanged for SGD.
 ///
 /// 引数 14 個は RAdam の host pre-compute 引数を畳み込んだ形。
 /// `clippy::too_many_arguments` を allow する。

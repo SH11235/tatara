@@ -35,7 +35,7 @@ fn ft_gradient_tiles_dispatch(
     ft_gradient_tiles_eligible(features, batch, width, half_gradient) && batch <= mask_elements / 40
 }
 
-/// Per-step scalars of the FT RAdam update consumed by the fused FT optimizer kernel.
+/// Per-step scalars for the fused FT optimizer kernel.
 #[cfg(feature = "native")]
 #[derive(Clone, Copy)]
 struct FtFusedStep {
@@ -1220,7 +1220,7 @@ impl GpuTrainer {
                                    slice(self.threat_pair_starts), bounds, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
                                    norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
-                                   step.weight_decay, step.beta1, BETA2, EPS,
+                                   step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
                                    W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE,
                                    FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
                         }
@@ -1316,7 +1316,7 @@ impl GpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(self.ft_w.len()),
                         args: [slice(self.ft_w), slice($m), slice($v), slice(self.ft_w_grad),
                             slice(mirror), slice(d.device_indices), slice(d.records),
-                            lr, step_size, denom, decay, beta1, BETA2, EPS,
+                            lr, step_size, denom, decay, beta1, self.optimizer.kernel_beta2(BETA2), EPS,
                             W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE, FT_OPT_V_SCALE,
                             self.ft_w.len() as u32, d.indices.len() as u32,
                             i32::from(self.fp16_opt_state),
@@ -3371,6 +3371,7 @@ impl GpuTrainer {
                 topology,
             },
             &RawCkptMeta {
+                optimizer: self.optimizer,
                 qat_dense: self.qat_mode == crate::qat::QatMode::Dense,
                 run_id: producer.run_id,
                 net_id: producer.net_id,
@@ -3403,6 +3404,7 @@ impl GpuTrainer {
     pub(crate) fn load_raw_checkpoint(
         &mut self,
         path: &Path,
+        transfer_radam_momentum: bool,
     ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
         let ft_out = self.ws.ft_out;
         let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
@@ -3414,7 +3416,7 @@ impl GpuTrainer {
             .iter()
             .map(|g| (g.name, g.len))
             .collect();
-        let (header, loaded) = load_raw_checkpoint_file(
+        let (mut header, mut loaded) = load_raw_checkpoint_file(
             path,
             &RawCkptArch {
                 feature_set: self.feature_set,
@@ -3424,6 +3426,13 @@ impl GpuTrainer {
                 topology,
             },
             &expected_groups,
+        )?;
+
+        header.prepare_optimizer_state(
+            path,
+            &mut loaded,
+            self.optimizer,
+            transfer_radam_momentum,
         )?;
 
         self.qat_mode = if header.qat_dense {
@@ -6123,19 +6132,18 @@ impl GpuTrainer {
         }
 
         // ===== OPTIMIZER STEP =====
-        // 3 種 (ranger / radam / adamw) とも element 更新は同じ radam_step kernel。
-        // 種別は per-step scalar (step_size, denom) と beta1、lookahead lerp の
-        // 有無だけで表現する ([`OptimizerKind`])。
         let lookahead_now =
             self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K);
         let (step_size, denom) =
             self.optimizer
                 .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
         let beta1 = self.optimizer.beta1();
+        let beta2 = self.optimizer.kernel_beta2(BETA2);
         // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
         // `&mut self.*` を保持するので、loop 内で `self.optim_groups` を参照すると
         // borrow が衝突する。先に局所へ退避して resolve に使う。
         let optim_groups = self.optim_groups;
+        let optimizer = self.optimizer;
 
         // 10 weight groups × radam_step。FT weight (`ft_w`) の radam は 2 つの opt-in
         // flag で 4 通りに分岐する:
@@ -6152,6 +6160,7 @@ impl GpuTrainer {
         // のみ更新し step 末の fold が comb を再生成する (`launch_ft_fold`)。
         let ft_factorize = self.feature_set.ft_factorize();
         let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
+        let ft_wd = optimizer.kernel_weight_decay(ft_wd);
         #[cfg(feature = "native")]
         let diagnosed = self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
         #[cfg(not(feature = "native"))]
@@ -6183,7 +6192,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                        FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                             }
                         }?;
@@ -6196,7 +6205,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
-                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                        FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                             }
                         }?;
@@ -6213,7 +6222,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                       ft_wd, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                             }
                         }?;
                     } else {
@@ -6224,7 +6233,7 @@ impl GpuTrainer {
                                 kernel: radam_step,
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                                       slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, BETA2,
+                                       slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, beta2,
                                        EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                             }
                         }?;
@@ -6383,6 +6392,7 @@ impl GpuTrainer {
             // を resolve する。全 group 既定 (override 無し) なら decay = 大域値・
             // lr = scheduled_lr で単一 weight_decay 経路と bit-identical。
             let (wd, lr_g) = optim_groups.effective(g.kind, lr);
+            let wd = optimizer.kernel_weight_decay(wd);
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -6391,7 +6401,7 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module, config: cfg_1d(g.n),
                     args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
                            slice_mut(*g.grad), lr_g, step_size, denom, wd,
-                           beta1, BETA2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
+                           beta1, beta2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
                 }
             }?;
         }
@@ -6408,8 +6418,8 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d($n),
                             args: [
                                 slice_mut(layer.$field), slice_mut(layer.$m), slice_mut(layer.$v),
-                                slice_mut(layer.$grad), $lr, step_size, denom, $wd,
-                                beta1, BETA2, EPS, $min, $max, ($n) as u32
+                                slice_mut(layer.$grad), $lr, step_size, denom, optimizer.kernel_weight_decay($wd),
+                                beta1, beta2, EPS, $min, $max, ($n) as u32
                             ]
                         }
                     }?;

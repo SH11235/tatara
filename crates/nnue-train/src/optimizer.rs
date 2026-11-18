@@ -20,6 +20,7 @@ pub use gpu_kernels::pointwise::radam_step::radam_compute_step_size_denom;
 /// | ranger | RAdam rectified schedule            | 0.99  | あり      |
 /// | radam  | RAdam rectified schedule            | 0.9   | なし      |
 /// | adamw  | 常に (1, 1) = bias correction なし  | 0.9   | なし      |
+/// | sgd    | classical momentum, no variance scaling | 0.9 | なし |
 ///
 /// `adamw` は bullet (`trainer/src/optimiser/adam.rs`) の AdamW と同じく
 /// bias correction を持たない `p -= lr * m / (sqrt(v) + eps)` 形。beta1 の
@@ -33,6 +34,8 @@ pub enum OptimizerKind {
     RAdam,
     /// decoupled weight decay + weight clamp 付き Adam。bias correction なし。
     AdamW,
+    /// SGD with classical momentum.
+    Sgd,
 }
 
 impl OptimizerKind {
@@ -44,6 +47,8 @@ impl OptimizerKind {
             Some(Self::RAdam)
         } else if s.eq_ignore_ascii_case("adamw") {
             Some(Self::AdamW)
+        } else if s.eq_ignore_ascii_case("sgd") {
+            Some(Self::Sgd)
         } else {
             None
         }
@@ -55,6 +60,7 @@ impl OptimizerKind {
             Self::Ranger => "ranger",
             Self::RAdam => "radam",
             Self::AdamW => "adamw",
+            Self::Sgd => "sgd",
         }
     }
 
@@ -62,7 +68,23 @@ impl OptimizerKind {
     pub fn beta1(self) -> f32 {
         match self {
             Self::Ranger => RangerParams::DEFAULT.beta1,
-            Self::RAdam | Self::AdamW => 0.9,
+            Self::RAdam | Self::AdamW | Self::Sgd => 0.9,
+        }
+    }
+
+    /// Keep the unused second moment at zero for SGD.
+    pub fn kernel_beta2(self, beta2: f32) -> f32 {
+        match self {
+            Self::Sgd => 1.0,
+            _ => beta2,
+        }
+    }
+
+    /// The kernel applies decay at the scaled step rate, so undo SGD's gradient scaling.
+    pub fn kernel_weight_decay(self, decay: f32) -> f32 {
+        match self {
+            Self::Sgd => decay * (1.0 - self.beta1()),
+            _ => decay,
         }
     }
 
@@ -83,6 +105,8 @@ impl OptimizerKind {
                 radam_compute_step_size_denom(step, self.beta1(), beta2, n_sma_threshold)
             }
             Self::AdamW => (1.0, 1),
+            // The stored mean is (1 - beta1) times the classical momentum buffer.
+            Self::Sgd => ((1.0 - self.beta1()).recip(), 0),
         }
     }
 }
@@ -163,7 +187,7 @@ mod tests {
         assert_eq!(OptimizerKind::parse("RAdam"), Some(OptimizerKind::RAdam));
         assert_eq!(OptimizerKind::parse("adamw"), Some(OptimizerKind::AdamW));
         assert_eq!(OptimizerKind::parse("AdamW"), Some(OptimizerKind::AdamW));
-        assert_eq!(OptimizerKind::parse("sgd"), None);
+        assert_eq!(OptimizerKind::parse("SGD"), Some(OptimizerKind::Sgd));
         assert_eq!(OptimizerKind::parse(""), None);
     }
 
@@ -239,6 +263,45 @@ mod tests {
             "got {} exp {expected}",
             weights[0]
         );
+    }
+
+    #[test]
+    fn sgd_kernel_scalars_match_classical_momentum_from_a_radam_mean() {
+        use gpu_kernels::pointwise::radam_step::radam_step_cpu;
+
+        let sgd = OptimizerKind::Sgd;
+        let momentum = 0.9;
+        let lr = 0.02;
+        let decay = 0.03;
+        let mut w = [0.5];
+        let mut m = [0.03];
+        let mut v = [0.0];
+        let mut expected_weight = w[0];
+        let mut expected_buffer = m[0] / (1.0 - momentum);
+        for (step, gradient) in [0.12, -0.2, 0.0, 0.08].into_iter().enumerate() {
+            let (step_size, denom) = sgd.step_size_denom(step as u64 + 1, 0.999, 5.0);
+            radam_step_cpu(
+                &mut w,
+                &mut m,
+                &mut v,
+                &mut [gradient],
+                lr,
+                step_size,
+                denom,
+                sgd.kernel_weight_decay(decay),
+                sgd.beta1(),
+                sgd.kernel_beta2(0.999),
+                1e-8,
+                -1.0,
+                1.0,
+                1,
+            );
+            expected_buffer = momentum * expected_buffer + gradient;
+            expected_weight = expected_weight * (1.0 - lr * decay) - lr * expected_buffer;
+            assert!((w[0] - expected_weight).abs() < 1e-7);
+            assert!((m[0] / (1.0 - momentum) - expected_buffer).abs() < 1e-6);
+            assert_eq!(v, [0.0]);
+        }
     }
 
     /// ranger / radam は各自の beta1 で rectified schedule を計算する。

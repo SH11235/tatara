@@ -144,7 +144,7 @@ The current scope is Simple (including HalfKaHmMerged) and LayerStack. Simple su
 CReLU / SCReLU / Pairwise and arbitrary hidden dimensions. LayerStack supports its
 configurable dimensions and bucket modes, PSQT, feature factorization, threat and effect
 features, FP32 and FP16 options or state with TF32 on or off, Sigmoid or WRM (including
-extended settings), norm loss, and Ranger / RAdam / AdamW. The embedded fat binary
+extended settings), norm loss, and Ranger / RAdam / AdamW / SGD with momentum. The embedded fat binary
 contains every kernel that either trainer can launch.
 
 ## Preparing Windows (WSL2)

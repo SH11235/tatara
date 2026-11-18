@@ -429,10 +429,13 @@ fn validate_shared_cli(
 
     let optimizer = OptimizerKind::parse(&cli.optimizer).ok_or_else(|| {
         format!(
-            "--optimizer '{}' is not a known optimizer (expected one of: ranger, radam, adamw)",
+            "--optimizer '{}' is not a known optimizer (expected one of: ranger, radam, adamw, sgd)",
             cli.optimizer
         )
     })?;
+    if cli.transfer_radam_momentum && optimizer != OptimizerKind::Sgd {
+        return Err("--transfer-radam-momentum requires --optimizer sgd".into());
+    }
     // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
     if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
         return Err(
@@ -488,6 +491,37 @@ fn validate_shared_cli(
             tf32: tf32_raw || cli.all_optim,
         },
     })
+}
+
+#[cfg(feature = "gpu")]
+fn check_sgd_transfer_destination(
+    output: &Path,
+    net_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let namespace = output.join(format!("{net_id}-"));
+    let prefix = namespace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid --net-id")?
+        .to_lowercase();
+    let directory = namespace.parent().ok_or("invalid --output")?;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let Some((sb, extension)) = name
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.split_once('.'))
+        else {
+            continue;
+        };
+        if matches!(extension, "bin" | "ckpt" | "loader.json") && sb.parse::<usize>().is_ok() {
+            return Err(format!(
+                "--transfer-radam-momentum starts at superbatch 1 and would reuse checkpoint names in {}; select a different --output or --net-id",
+                directory.display()
+            ).into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]
@@ -698,6 +732,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
     std::fs::create_dir_all(&cli.output)?;
+    if cli.transfer_radam_momentum {
+        check_sgd_transfer_destination(&cli.output, &cli.net_id)?;
+    }
 
     // progress 系 mode のみ process-global coefficient を使う。KingRank9 は玉位置から
     // 直接求めるため file I/O も progress model 初期化も行わない。
@@ -1007,15 +1044,23 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         } else {
             ckpt.clone()
         };
-        let (sb, producer, lr_horizon) = trainer.load_raw_checkpoint(&ckpt)?;
+        let (sb, producer, lr_horizon) =
+            trainer.load_raw_checkpoint(&ckpt, cli.transfer_radam_momentum)?;
         if let Some(identity) = &rescore_net_identity {
             identity.verify_unchanged("--resume checkpoint")?;
         }
-        println!(
-            "[train] resuming from {} at superbatch {}",
-            ckpt.display(),
-            sb + 1
-        );
+        if cli.transfer_radam_momentum {
+            println!(
+                "[train] starting SGD from RAdam weights and momentum in {} (source superbatch {sb})",
+                ckpt.display(),
+            );
+        } else {
+            println!(
+                "[train] resuming from {} at superbatch {}",
+                ckpt.display(),
+                sb + 1
+            );
+        }
         if producer.run_id.is_none() {
             println!(
                 "[train] note: {} predates producer run id embedding; \
@@ -1038,7 +1083,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
-    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
+    let start_superbatch = shared.start_superbatch(
+        cli,
+        resumed_superbatch.filter(|_| !cli.transfer_radam_momentum),
+    )?;
     // 学習しない経路には train-range 制約を課さない。これを課すと最終
     // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価 /
     // リスコアできない。
@@ -1059,7 +1107,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
-        resume_checkpoint: cli.resume.clone(),
+        resume_checkpoint: cli.resume.clone().filter(|_| !cli.transfer_radam_momentum),
         resume_superbatch_override: cli.start_superbatch.is_some(),
         resume_input: cli.resume_input.into(),
         progress_coeff: layerstack.progress_coeff.clone(),
@@ -1772,6 +1820,9 @@ pub(crate) fn file_basename(path: &Path) -> String {
 /// あれば差し替えた層名を記す。
 #[cfg(feature = "gpu")]
 pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
+    if cli.transfer_radam_momentum {
+        return Some("RAdam checkpoint with momentum transfer".to_string());
+    }
     if cli.init_from.is_some() || cli.resume.is_some() {
         return None;
     }
@@ -1854,7 +1905,11 @@ pub(crate) fn build_lineage(
         resumed_from_checkpoint: file_basename(ckpt),
         resumed_from_superbatch,
         kind: resolve_lineage_kind(
-            cli.lineage_kind.map(Into::into),
+            if cli.transfer_radam_momentum {
+                Some(LineageKind::Fork)
+            } else {
+                cli.lineage_kind.map(Into::into)
+            },
             producer,
             &cli.net_id,
             recipe,
@@ -1915,7 +1970,9 @@ pub(crate) fn build_experiment_logger(
         std::process::id()
     );
     let name = cli.experiment_name.clone().unwrap_or_else(|| {
-        if cli.resume.is_some() {
+        if cli.transfer_radam_momentum {
+            format!("{} (RAdam to SGD)", cli.net_id)
+        } else if cli.resume.is_some() {
             format!("{} (resume @sb{start_superbatch})", cli.net_id)
         } else {
             cli.net_id.clone()
@@ -2131,7 +2188,9 @@ pub(crate) fn build_experiment_logger_simple(
         std::process::id()
     );
     let name = cli.experiment_name.clone().unwrap_or_else(|| {
-        if cli.resume.is_some() {
+        if cli.transfer_radam_momentum {
+            format!("{} (RAdam to SGD)", cli.net_id)
+        } else if cli.resume.is_some() {
             format!("{} (resume @sb{start_superbatch})", cli.net_id)
         } else {
             cli.net_id.clone()
@@ -2414,6 +2473,9 @@ pub(crate) fn run_simple_training(
     let init_spec = build_simple_init_spec(cli)?;
 
     std::fs::create_dir_all(&cli.output)?;
+    if cli.transfer_radam_momentum {
+        check_sgd_transfer_destination(&cli.output, &cli.net_id)?;
+    }
 
     // Simple は bucket-aware progress を持たない: dataloader に渡す
     // `ShogiProgressKPAbs` は zero-weight default (全 position が bucket 4)、
@@ -2502,12 +2564,20 @@ pub(crate) fn run_simple_training(
         trainer.load_simple_weights(&weights)?;
         (None, None, None, None)
     } else if let Some(ckpt) = &cli.resume {
-        let (sb, producer, lr_horizon, fv_scale) = trainer.load_raw_checkpoint(ckpt)?;
-        println!(
-            "[train] resuming from {} at superbatch {}",
-            ckpt.display(),
-            sb + 1
-        );
+        let (sb, producer, lr_horizon, fv_scale) =
+            trainer.load_raw_checkpoint(ckpt, cli.transfer_radam_momentum)?;
+        if cli.transfer_radam_momentum {
+            println!(
+                "[train] starting SGD from RAdam weights and momentum in {} (source superbatch {sb})",
+                ckpt.display(),
+            );
+        } else {
+            println!(
+                "[train] resuming from {} at superbatch {}",
+                ckpt.display(),
+                sb + 1
+            );
+        }
         (Some(sb), Some(producer), lr_horizon, fv_scale)
     } else {
         (None, None, None, None)
@@ -2542,7 +2612,10 @@ pub(crate) fn run_simple_training(
     // かつ `--ft-fp16` 未指定なら no-op。
     trainer.sync_ft_forward_weights()?;
 
-    let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
+    let start_superbatch = shared.start_superbatch(
+        cli,
+        resumed_superbatch.filter(|_| !cli.transfer_radam_momentum),
+    )?;
     if start_superbatch > cli.superbatches {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train)",
@@ -2555,7 +2628,7 @@ pub(crate) fn run_simple_training(
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
-        resume_checkpoint: cli.resume.clone(),
+        resume_checkpoint: cli.resume.clone().filter(|_| !cli.transfer_radam_momentum),
         resume_superbatch_override: cli.start_superbatch.is_some(),
         resume_input: cli.resume_input.into(),
         progress_coeff: None,
@@ -2881,6 +2954,61 @@ mod shared_cli_tests {
                 .expect("valid shared CLI");
             assert_eq!(shared.optimizer, expected, "--optimizer {arg}");
         }
+    }
+
+    #[test]
+    fn radam_momentum_transfer_requires_checkpoint_and_explicit_learning_rate() {
+        let with_checkpoint = [
+            "nnue-trainer",
+            "layerstack",
+            "--resume",
+            "state.ckpt",
+            "--optimizer",
+            "sgd",
+            "--transfer-radam-momentum",
+        ];
+        assert!(
+            Cli::try_parse_from(with_checkpoint)
+                .unwrap_err()
+                .to_string()
+                .contains("--lr")
+        );
+        let valid = parse(&[
+            "--resume",
+            "state.ckpt",
+            "--optimizer",
+            "sgd",
+            "--transfer-radam-momentum",
+            "--lr",
+            "0.01",
+        ]);
+        let shared = validate_shared_cli(&valid, false, false).expect("valid SGD transfer");
+        assert_eq!(shared.optimizer, OptimizerKind::Sgd);
+        assert_eq!(shared.start_superbatch(&valid, None).unwrap(), 1);
+        let wrong_optimizer = shared_cli_error(
+            &[
+                "--resume",
+                "state.ckpt",
+                "--transfer-radam-momentum",
+                "--lr",
+                "0.01",
+            ],
+            false,
+        );
+        assert!(wrong_optimizer.contains("requires --optimizer sgd"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn sgd_transfer_refuses_to_reuse_checkpoint_names() {
+        let dir =
+            std::env::temp_dir().join(format!("tatara-sgd-destination-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Source-1.CKPT"), b"source").unwrap();
+        assert!(check_sgd_transfer_destination(&dir, "source").is_err());
+        assert!(check_sgd_transfer_destination(&dir, "new-net").is_ok());
+        std::fs::remove_file(dir.join("Source-1.CKPT")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
