@@ -37,7 +37,8 @@ cargo run --release -p nnue-trainer -- \
 組合せだけを受理し、`progresskpabs`、`progresskpabsq16`、Simple、PSQT、Threat、EffectBucket は明示的に
 エラーにする。学習 config から bucket routing mode を判定できるため、この経路では
 `--assume-kingrank9` は不要。`progresskpabs` で学習した net は tatara `.bin` で出力し、
-`net_to_yo --assume-progresskpabs` で変換する。
+`net_to_yo --assume-progresskpabs` で変換する。YaneuraOu 形式への変換は KingRank9
+の 9 bucket または `progresskpabs` の 1〜9 bucket に対応し、10 bucket 以上の net は拒否する。
 
 ## `net_from_yo` — YaneuraOu → tatara
 
@@ -77,8 +78,9 @@ dense weight の 32 境界 padding 列は復元時に除去する。`net_to_yo` 
 progress kp abs の評価ファイルを YaneuraOu で使うときは、学習に使った進行度係数
 (`progress.bin`、[進行度係数の用意](progress-bin.md)) を `nn.bin` と同じ directory に置き、
 `YANEURAOU_ENGINE_SFNN_<key>_<ft>_<h1>_<h2>_progress<N>` で build する。YaneuraOu の
-アーキ生成器が受理する progress bucket 数は 2 / 3 / 4 / 8 / 16 / 32 で、tatara の 2〜9 との
-共通部分 (2 / 3 / 4 / 8) 以外は YaneuraOu 側に対応 build が無い。N=1 は suffix なしの
+アーキ生成器が受理する progress bucket 数は 2 / 3 / 4 / 8 / 16 / 32。tatara は
+1〜32 bucket で学習でき、`net_to_yo` が対応する 1〜9 bucket の範囲でアーキ生成器と
+共通する progress build は 2 / 3 / 4 / 8。N=1 は suffix なしの
 `YANEURAOU_ENGINE_SFNN_<key>_<ft>_<h1>_<h2>` (単一 LayerStack) で使え、`progress.bin` は要らない。
 進行度の計算方法 (f32 か、係数と閾値を 65536 倍した整数か) は YaneuraOu の build によって
 異なり、整数で計算する build では bucket 境界ちょうど付近の局面で tatara の f32 計算と

@@ -71,8 +71,8 @@ options" below.
 
 ## Example 2: Training a LayerStack NNUE
 
-The `layerstack` architecture supports three bucket modes. The default
-`progresskpabs` mode uses 2–9 game-progress buckets; prepare `progress.bin`
+The default LayerStack bucket mode is `progresskpabs`. It
+uses 1–32 game-progress buckets. Prepare `progress.bin`
 with `progress-kpabs-train` and inspect it with `progress-bucket-survey`, as
 described in [Game-progress buckets: preparing `progress.bin`](progress-bin.md).
 `progresskpabsq16` uses the same `progress.bin` and bucket count but sums the
@@ -109,6 +109,25 @@ rejected).
 output dimension can be changed with `--ft-out` (a multiple of 128, default
 1536).
 
+Use `--bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'` to route by
+both kings' ranks into 16 buckets. Join one or two axes with `+`. The left
+axis is most significant. `ownking` / `oppking` measure ranks from each king's home rank (1).
+`ownking:2/3` gives bands 1, 2, and 3–9: each cut less than or equal to the
+rank advances the band. `handmajor3` gives 0 when neither or both sides hold a
+rook or bishop, 1 when only the side to move does, and 2 when only its opponent
+does. `handmajor4` separates both sides holding a major piece into value 3.
+The bucket count is the product of axis sizes (at most 32). An explicit
+`--num-buckets` must match; `--progress-coeff` is rejected.
+
+Use `--init-from <net.bin> --init-ft-only --freeze-ft` to load and fix the FT
+(including Threat and PSQT) while initializing the output layers with
+`--init-l1` / `--init-l1-shared` / `--init-l2` / `--init-l3`. Match the source
+feature set and FT width. PSQT has bucket columns, so importing it requires
+the same bucket count and spec. For the control, use the same initialization and freeze
+options with a progress mode and its coefficients. Saved `.bin` files carry an
+`ls_bucket=` token; `--eval-only --init-from <net.bin>` inherits that routing.
+Other consumers need a reader that supports spec routing.
+
 ## Key options
 
 `nnue-train`'s CLI defaults are small, for smoke testing. The ones you mainly
@@ -135,7 +154,7 @@ change for real training are:
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` routes by the KP-absolute progress estimate. `progresskpabsq16` routes by the same estimate in integer Q16 arithmetic. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
-| `--num-buckets` (`layerstack`) | 8 (9 for `kingrank9`) | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9. Pass `--num-buckets 9` to `--resume` / `--init-from` a 9-bucket checkpoint or `.bin` |
+| `--num-buckets` (`layerstack`) | 8 (9 for `kingrank9`) | In `progresskpabs` / `progresskpabsq16` mode, an integer in `[1, 32]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9. Pass `--num-buckets 9` to `--resume` / `--init-from` a 9-bucket checkpoint or `.bin` |
 
 ### Training position sampling
 

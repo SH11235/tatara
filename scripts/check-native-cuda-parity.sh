@@ -7,54 +7,61 @@ cd "$(dirname "$0")/.."
 
 hybrid_log=$(mktemp /tmp/tatara-native-hybrid.XXXXXX)
 portable_log=$(mktemp /tmp/tatara-native-portable.XXXXXX)
+test_log=$(mktemp /tmp/tatara-native-test.XXXXXX)
 portable_cli_dir=$(mktemp -d /tmp/tatara-native-cli.XXXXXX)
 portable_layerstack_cli_dir=$(mktemp -d /tmp/tatara-native-layerstack-cli.XXXXXX)
-trap 'rm -f -- "$hybrid_log" "$portable_log"; rm -r -- "$portable_cli_dir" "$portable_layerstack_cli_dir"' EXIT
+trap 'rm -f -- "$hybrid_log" "$portable_log" "$test_log"; rm -r -- "$portable_cli_dir" "$portable_layerstack_cli_dir"' EXIT
+
+run_tests() {
+    cargo test "$@" 2>&1 | tee "$test_log" || return
+    if ! grep -qE '^test result: ok\. [1-9][0-9]* passed;' "$test_log"; then
+        printf 'No tests passed for cargo test %s\n' "$*" >&2
+        return 1
+    fi
+}
 
 echo "== native CUDA artifact and edge-case tests =="
-cargo test -p cuda-native-runtime --features native-cuda --release -- \
+run_tests -p cuda-native-runtime --features native-cuda --release -- \
     --nocapture --test-threads=1
 
 echo "== native CUDA production launch inventory =="
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     native_inventory_parser -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     every_production_cuda_launch_is_exported -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     cuda_launch_stays_within_known_production_roots -- --nocapture
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
-    native_bucket_capacity_matches_host -- --nocapture
 
 echo "== native CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     simple_native_ -- --nocapture --test-threads=1
 
 echo "== LayerStack CUDA C++ kernels vs cuda-oxide =="
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     layerstack_native_ -- --nocapture --test-threads=1
 
 echo "== cuda-oxide host fingerprint =="
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$hybrid_log"
-cargo test -p nnue-trainer --no-default-features --features oxide-parity --release \
+run_tests -p nnue-trainer --no-default-features --features oxide-parity --release \
     standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee -a "$hybrid_log"
 
 echo "== portable host fingerprint =="
-cargo test -p nnue-trainer --no-default-features --features native --release \
+run_tests -p nnue-trainer --no-default-features --features native --release \
     standard_simple_crelu_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee "$portable_log"
-cargo test -p nnue-trainer --no-default-features --features native --release \
+run_tests -p nnue-trainer --no-default-features --features native --release \
     standard_layerstack_runs_one_native_training_step -- --nocapture --test-threads=1 \
     2>&1 | tee -a "$portable_log"
 
 echo "== portable host Simple configuration matrix =="
-cargo test -p nnue-trainer --no-default-features --features native --release \
+run_tests -p nnue-trainer --no-default-features --features native --release \
     complete_simple_native_configuration_matrix_runs_one_step -- --nocapture --test-threads=1
 
 echo "== portable host LayerStack configuration matrices =="
-cargo test -p nnue-trainer --no-default-features --features native --release \
+run_tests -p nnue-trainer --no-default-features --features native --release \
     complete_layerstack_native_ -- --nocapture --test-threads=1
 
 echo "== portable host CLI smoke =="

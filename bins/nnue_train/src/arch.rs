@@ -39,18 +39,11 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// `min(N-1, floor(p * N))`. 8 is one of the bucket counts YaneuraOu's
 /// progress-bucket LayerStack accepts without patching. `kingrank9` ignores this
 /// default and uses its fixed 9 buckets. The trainer accepts
-/// `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
+/// `[1, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 8;
 
-/// Maximum supported bucket count without changing the per-bucket weight
-/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
-/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
-/// restructure (register fan-out → `blockIdx.z` grid axis).
-/// kernel の容量仕様だが、CLI validation (test 含む) が非 GPU build でも参照するため
-/// gpu module の外に置く。参照元と同じ cfg で非 GPU の bin 単体 build では消える。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
+pub(crate) use shogi_features::MAX_LAYERSTACK_BUCKETS as MAX_SUPPORTED_NUM_BUCKETS;
 
 #[cfg(feature = "gpu")]
 mod gpu {

@@ -15,7 +15,7 @@ const YO_NETWORK_HASH: u32 = 0x6333_718a;
 /// YaneuraOu SFNN が要求する KingRank9 LayerStack 数。
 pub const YANEURAOU_LAYER_STACKS: usize = 9;
 
-/// progress kp abs routing で受理する LayerStack 数の上限 (tatara `progresskpabs` と同じ範囲)。
+/// progress kp abs routing で受理する LayerStack 数の上限。
 pub const MAX_PROGRESS_KPABS_BUCKETS: usize = 9;
 
 /// YaneuraOu SFNN の LayerStack 選択規則。Network 構造名の末尾 token に対応し、
@@ -152,6 +152,9 @@ fn architecture(
     weights: &LayerStackWeights,
     routing: YaneuraOuRouting,
 ) -> io::Result<Architecture> {
+    if weights.bucket_spec.is_some() {
+        return invalid_input("spec bucket routing is not representable in YaneuraOu SFNN");
+    }
     let feature_set = FeatureSet::ALL
         .into_iter()
         .find(|feature_set| feature_set.spec() == weights.feature_set)
@@ -554,5 +557,21 @@ mod tests {
         assert!(output[11..40].iter().all(|&byte| byte == 0));
         assert_eq!(&output[40..43], &[255, 254, 253]);
         assert!(output[43..72].iter().all(|&byte| byte == 0));
+    }
+}
+
+#[cfg(test)]
+mod spec_routing_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_spec_routing_without_writing_output() {
+        let mut weights = LayerStackWeights::zeroed(FeatureSet::HalfKp.spec(), 128, 16, 32, 9);
+        weights.bucket_spec = Some("ownking:2/3+oppking:2/3".parse().unwrap());
+        for routing in [YaneuraOuRouting::KingRank9, YaneuraOuRouting::ProgressKpAbs] {
+            let mut bytes = Vec::new();
+            assert!(save_yaneuraou_with_routing(&mut bytes, &weights, routing).is_err());
+            assert!(bytes.is_empty());
+        }
     }
 }

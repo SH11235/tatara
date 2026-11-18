@@ -7,6 +7,8 @@
 //! - `progress_kpabs`: KP-absolute 特徴 (`81 * FE_OLD_END` 次元) と
 //!   logistic regression による `0..=1` progress / N-bucket 割当 (caller が N を指定)。
 
+pub mod bucket_spec;
+pub use bucket_spec::{BucketSpec, MAX_LAYERSTACK_BUCKETS};
 pub mod effect_bucket;
 pub mod feature_set;
 pub mod halfka_hm;

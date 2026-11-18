@@ -11,27 +11,19 @@ use std::path::Path;
 
 use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::coalesce_ft_factorized;
-use shogi_features::{FeatureSet, FeatureSetSpec};
-
-const MAGIC: [u8; 4] = *b"RNRC";
+use nnue_train::dataloader::BucketMode;
+use nnue_train::raw_checkpoint::{
+    PARTIAL_THREAT_CKPT_VERSION, PARTIAL_THREAT_RADAM_CKPT_VERSION, RAW_CKPT_MAGIC,
+};
+use shogi_features::{
+    BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
+};
 /// arch kind と topology を header に持つ最初の version。
 const MIN_VERSION: u32 = 4;
-const MAX_VERSION: u32 = 12;
+const MAX_VERSION: u32 = PARTIAL_THREAT_RADAM_CKPT_VERSION;
 const MAX_NAME_BYTES: usize = 256;
 /// 各 group の本体は `len u64` に続く `w`, `m`, `v`, `slow` の 4 本の f32 tensor。
 const TENSORS_PER_GROUP: u64 = 4;
-const LAYERSTACK_GROUP_NAMES: [&str; 10] = [
-    "ft_w",
-    "ft_b",
-    "l1_w",
-    "l1_b",
-    "l1_shared_weight",
-    "l1_shared_bias",
-    "l2_w",
-    "l2_b",
-    "l3_w",
-    "l3_b",
-];
 const READ_CHUNK_F32: usize = 1 << 20;
 
 /// 平均を取る checkpoint 同士で一致していなければならない header 項目。
@@ -43,6 +35,7 @@ pub(crate) struct CkptIdentity {
     pub(crate) max_active: u64,
     pub(crate) ft_factorize: bool,
     pub(crate) feature_hash: Option<u32>,
+    pub(crate) threat_width: Option<u64>,
     pub(crate) arch_kind: String,
     pub(crate) bucket_mode: String,
     pub(crate) topology: Vec<u64>,
@@ -50,34 +43,25 @@ pub(crate) struct CkptIdentity {
     pub(crate) group_lens: Vec<u64>,
 }
 
-/// 平均してよいかの判定に使う構成。version の違いで表記が変わる項目は trainer の reader と
-/// 同じ規則で正規化し、`max_active` / feature hash は各 checkpoint を
-/// [`layerstack_layout`] で個別に検証するので比較から外す。
+/// The weight layout and routing must agree across checkpoints, including
+/// checkpoints that use different versions or optimizer states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompatKey {
-    feature_set_name: String,
-    ft_factorize: bool,
+    train_spec: FeatureSetSpec,
     bucket_mode: String,
     topology: Vec<u64>,
     qat_dense: bool,
-    group_lens: Vec<u64>,
+    shared_delta: bool,
 }
 
 impl CkptIdentity {
-    pub(crate) fn compat_key(&self) -> CompatKey {
-        // v7 以前の LayerStack checkpoint は bucket mode を持たず、trainer は唯一の mode
-        // "progresskpabs" として読む。"progress8kpabs" は同じ mode の旧名。
-        let bucket_mode = match self.bucket_mode.as_str() {
-            "" | "progress8kpabs" => "progresskpabs".to_string(),
-            other => other.to_string(),
-        };
+    pub(crate) fn compat_key(&self, layout: &LayerStackLayout) -> CompatKey {
         CompatKey {
-            feature_set_name: self.feature_set_name.clone(),
-            ft_factorize: self.ft_factorize,
-            bucket_mode,
+            train_spec: layout.train_spec,
+            bucket_mode: layout.bucket_mode.identity(),
             topology: self.topology.clone(),
             qat_dense: self.qat_dense,
-            group_lens: self.group_lens.clone(),
+            shared_delta: layout.shared_delta,
         }
     }
 }
@@ -132,7 +116,7 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut r = BufReader::new(file);
-    if read_array::<4>(&mut r, "magic")? != MAGIC {
+    if read_array::<4>(&mut r, "magic")? != RAW_CKPT_MAGIC {
         return Err(invalid("not a raw training checkpoint (magic mismatch)"));
     }
     let version = read_u32(&mut r, "version")?;
@@ -148,6 +132,11 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     let ft_factorize = version >= 6 && read_array::<1>(&mut r, "ft_factorize flag")?[0] != 0;
     let feature_hash = if version >= 7 {
         Some(read_u32(&mut r, "feature hash")?)
+    } else {
+        None
+    };
+    let threat_width = if version >= PARTIAL_THREAT_CKPT_VERSION {
+        Some(read_u64(&mut r, "Threat width")?)
     } else {
         None
     };
@@ -215,6 +204,7 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
             max_active,
             ft_factorize,
             feature_hash,
+            threat_width,
             arch_kind,
             bucket_mode,
             topology,
@@ -235,38 +225,127 @@ pub(crate) struct LayerStackLayout {
     pub(crate) l1_out: usize,
     pub(crate) l2_out: usize,
     pub(crate) num_buckets: usize,
+    bucket_mode: BucketMode,
+    pub(crate) with_psqt: bool,
+    shared_delta: bool,
 }
 
 impl LayerStackLayout {
-    fn group_lens(&self) -> [usize; 10] {
+    fn bucket_spec(&self) -> Option<BucketSpec> {
+        match self.bucket_mode {
+            BucketMode::Spec(spec) => Some(spec),
+            _ => None,
+        }
+    }
+
+    fn group_lens(&self) -> io::Result<Vec<(&'static str, usize)>> {
         let (ft_out, l1, l2, nb) = (self.ft_out, self.l1_out, self.l2_out, self.num_buckets);
-        let l2_in = (l1 - 1) * 2;
-        [
-            self.train_spec.train_ft_in() * ft_out,
-            ft_out,
-            nb * l1 * ft_out,
-            nb * l1,
-            ft_out * l1,
-            l1,
-            nb * l2 * l2_in,
-            nb * l2,
-            nb * l2,
-            nb,
-        ]
+        let product = |a: usize, b: usize| {
+            a.checked_mul(b)
+                .ok_or_else(|| invalid("checkpoint tensor dimensions overflow"))
+        };
+        let l2_in = product(l1 - 1, 2)?;
+        let l1_w = product(ft_out, l1)?;
+        let l2_w = product(l2_in, l2)?;
+        // Full-width rows bound the packed FT size, including virtual rows.
+        let train_ft_in = self.train_spec.train_ft_in();
+        product(train_ft_in, ft_out)?;
+        let mut groups = vec![
+            ("ft_w", self.train_spec.train_ft_weight_len(ft_out)),
+            ("ft_b", ft_out),
+            ("l1_w", product(nb, l1_w)?),
+            ("l1_b", product(nb, l1)?),
+            ("l1_shared_weight", l1_w),
+            ("l1_shared_bias", l1),
+            ("l2_w", product(nb, l2_w)?),
+            ("l2_b", product(nb, l2)?),
+            ("l3_w", product(nb, l2)?),
+            ("l3_b", nb),
+        ];
+        if self.shared_delta {
+            groups.extend([
+                ("l2_shared_weight", l2_w),
+                ("l2_shared_bias", l2),
+                ("l3_shared_weight", l2),
+                ("l3_shared_bias", 1),
+            ]);
+        }
+        if self.with_psqt {
+            groups.push(("psqt_w", product(train_ft_in, nb)?));
+        }
+        Ok(groups)
     }
 
     /// export される `.bin` の feature set (factorizer の仮想行は畳み込まれて消える)。
     pub(crate) fn export_spec(&self) -> FeatureSetSpec {
-        if self.train_spec.ft_factorize() {
-            self.train_spec.feature_set().spec()
-        } else {
-            self.train_spec
-        }
+        self.train_spec.without_ft_factorize()
     }
 }
 
-/// header から LayerStack の層構成を復元し、group 長を照合する。threat / effect bucket /
-/// PSQT / L2-L3 shared-delta の checkpoint は header だけでは spec を復元できないため拒否する。
+fn training_feature_spec(id: &CkptIdentity, ft_out: usize) -> io::Result<FeatureSetSpec> {
+    let base = FeatureSet::from_canonical_name(&id.feature_set_name)
+        .ok_or_else(|| invalid(format!("unknown feature set '{}'", id.feature_set_name)))?
+        .spec();
+    let width = if let Some(width) = id.threat_width {
+        if width == 0 || !width.is_multiple_of(2) || width >= ft_out as u64 {
+            return Err(invalid(format!(
+                "compact Threat width {width} must be positive, even and less than FT width {ft_out}"
+            )));
+        }
+        Some(width as usize)
+    } else {
+        None
+    };
+    let threats = ThreatProfile::ALL.map(|profile| {
+        let spec = base.with_threat_profile(profile);
+        width.map_or(spec, |width| spec.with_threat_width(width))
+    });
+    let effect_buckets = [
+        EffectBucketConfig::KINGFIXED_2X2,
+        EffectBucketConfig::KINGBUCKETED_2X2,
+        EffectBucketConfig::KINGFIXED_3X3,
+        EffectBucketConfig::KINGBUCKETED_3X3,
+    ]
+    .map(|config| base.with_effect_bucket_config(config));
+    std::iter::once(base)
+        .chain(threats)
+        .chain(effect_buckets)
+        .filter(|spec| match id.feature_hash {
+            Some(hash) => spec.feature_hash() == hash,
+            None => *spec == base,
+        })
+        .filter(|spec| width.is_none() || spec.threat_profile().is_some())
+        .find_map(|spec| {
+            let shared = if id.ft_factorize {
+                spec.with_ft_factorize()
+            } else {
+                spec
+            };
+            let modes = if id.ft_factorize && spec.effect_bucket_config().is_some() {
+                // The training row count distinguishes the two effect-bucket factorizer modes.
+                [
+                    Some(shared),
+                    Some(spec.with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket)),
+                ]
+            } else {
+                [Some(shared), None]
+            };
+            modes.into_iter().flatten().find(|spec| {
+                let max_active = spec.max_active() as u64;
+                id.train_ft_in == spec.train_ft_in() as u64
+                    && (id.max_active == max_active
+                        || (id.ft_factorize && id.max_active == 2 * max_active))
+            })
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "feature hash or training dimensions do not match a '{}' feature layout",
+                id.feature_set_name
+            ))
+        })
+}
+
+/// Restore the LayerStack layout from the header and validate the weight group lengths.
 pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayout> {
     if id.arch_kind != "layerstack" {
         return Err(invalid(format!(
@@ -274,54 +353,70 @@ pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayou
             id.arch_kind
         )));
     }
-    let &[ft_out, l1_out, l2_out, num_buckets] = id.topology.as_slice() else {
-        return Err(invalid(
-            "only LayerStack checkpoints without PSQT are supported (topology must have 4 dims)",
-        ));
+    let &[ft_out, l1_out, l2_out, num_buckets, ref psqt_dims @ ..] = id.topology.as_slice() else {
+        return Err(invalid("invalid LayerStack topology"));
     };
-    if id.group_lens.len() != LAYERSTACK_GROUP_NAMES.len() {
-        return Err(invalid(format!(
-            "expected {} weight groups, found {} (PSQT and L2/L3 shared-delta are not supported)",
-            LAYERSTACK_GROUP_NAMES.len(),
-            id.group_lens.len()
-        )));
-    }
-    if l1_out < 2 || num_buckets == 0 || ft_out != id.ft_out {
+    let with_psqt = match psqt_dims {
+        [] => false,
+        &[psqt_buckets] if psqt_buckets == num_buckets => true,
+        _ => return Err(invalid("invalid LayerStack PSQT topology or bucket count")),
+    };
+    if ft_out == 0
+        || !ft_out.is_multiple_of(2)
+        || l1_out < 2
+        || l2_out == 0
+        || num_buckets == 0
+        || ft_out != id.ft_out
+    {
         return Err(invalid("checkpoint topology is inconsistent"));
     }
-    let base = FeatureSet::from_canonical_name(&id.feature_set_name)
-        .ok_or_else(|| invalid(format!("unknown feature set '{}'", id.feature_set_name)))?
-        .spec();
-    let train_spec = if id.ft_factorize {
-        base.with_ft_factorize()
-    } else {
-        base
+    let dimension = |value| {
+        usize::try_from(value).map_err(|_| invalid("checkpoint dimension exceeds host limits"))
     };
-    let max_active_ok = id.max_active == train_spec.max_active() as u64
-        || (id.ft_factorize && id.max_active == 2 * train_spec.max_active() as u64);
-    if id.train_ft_in != train_spec.train_ft_in() as u64
-        || id
-            .feature_hash
-            .is_some_and(|h| h != train_spec.feature_hash())
-        || !max_active_ok
-    {
-        return Err(invalid(format!(
-            "feature set '{}' with threat or effect-bucket features is not supported",
-            id.feature_set_name
-        )));
+    let bucket_mode = if id.bucket_mode.is_empty() {
+        BucketMode::ProgressKpAbs
+    } else {
+        BucketMode::parse(&id.bucket_mode)
+            .ok_or_else(|| invalid(format!("unknown bucket mode '{}'", id.bucket_mode)))?
+            .0
+    };
+    let ft_out = dimension(ft_out)?;
+    let train_spec = training_feature_spec(id, ft_out)?;
+    if with_psqt && train_spec.threat_profile().is_some() {
+        return Err(invalid(
+            "LayerStack checkpoints with PSQT and Threat features are unsupported",
+        ));
     }
+    // Shared-delta has no topology field. Its four groups precede the optional PSQT group.
+    let shared_delta = match id.group_lens.len().checked_sub(usize::from(with_psqt)) {
+        Some(10) => false,
+        Some(14) => true,
+        _ => {
+            return Err(invalid(format!(
+                "found {} weight groups; expected {} or {} for LayerStack with this topology",
+                id.group_lens.len(),
+                10 + usize::from(with_psqt),
+                14 + usize::from(with_psqt)
+            )));
+        }
+    };
     let layout = LayerStackLayout {
         train_spec,
-        ft_out: ft_out as usize,
-        l1_out: l1_out as usize,
-        l2_out: l2_out as usize,
-        num_buckets: num_buckets as usize,
+        ft_out,
+        l1_out: dimension(l1_out)?,
+        l2_out: dimension(l2_out)?,
+        num_buckets: dimension(num_buckets)?,
+        bucket_mode,
+        with_psqt,
+        shared_delta,
     };
-    for ((name, want), &got) in LAYERSTACK_GROUP_NAMES
-        .iter()
-        .zip(layout.group_lens())
-        .zip(&id.group_lens)
+    if layout
+        .bucket_spec()
+        .is_some_and(|s| s.num_buckets() != layout.num_buckets)
     {
+        return Err(invalid("bucket spec does not match checkpoint topology"));
+    }
+    for ((name, want), &got) in layout.group_lens()?.into_iter().zip(&id.group_lens) {
         if want as u64 != got {
             return Err(invalid(format!(
                 "group {name} has {got} elements, expected {want}"
@@ -353,6 +448,7 @@ pub(crate) fn ema_coefficients(n: usize, decay: f64) -> Vec<f64> {
 
 /// 各 checkpoint の `w` を `coefficients` で加重和する。group ごとに f64 で累積する。
 pub(crate) fn weighted_average(
+    layout: &LayerStackLayout,
     paths: &[&Path],
     infos: &[CkptInfo],
     coefficients: &[f64],
@@ -363,11 +459,10 @@ pub(crate) fn weighted_average(
         .iter()
         .map(|p| File::open(p).map(|f| BufReader::with_capacity(8 << 20, f)))
         .collect::<io::Result<Vec<_>>>()?;
-    let group_lens = &infos[0].identity.group_lens;
+    let group_lens = layout.group_lens()?;
     let mut out = Vec::with_capacity(group_lens.len());
     let mut bytes = vec![0u8; READ_CHUNK_F32 * 4];
-    for (g, &len) in group_lens.iter().enumerate() {
-        let len = len as usize;
+    for (g, (name, len)) in group_lens.into_iter().enumerate() {
         let mut acc = vec![0f64; len];
         for ((file, info), &c) in files.iter_mut().zip(infos).zip(coefficients) {
             file.seek(SeekFrom::Start(info.w_offsets[g]))?;
@@ -379,8 +474,7 @@ pub(crate) fn weighted_average(
                     let x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                     if !x.is_finite() {
                         return Err(invalid(format!(
-                            "non-finite weight in group {} at superbatch {}",
-                            LAYERSTACK_GROUP_NAMES.get(g).unwrap_or(&"?"),
+                            "non-finite weight in group {name} at superbatch {}",
                             info.superbatch
                         )));
                     }
@@ -400,6 +494,7 @@ pub(crate) fn to_layerstack_weights(
     layout: &LayerStackLayout,
     groups: Vec<Vec<f32>>,
 ) -> LayerStackWeights {
+    let mut groups = groups.into_iter();
     let [
         ft_w,
         ft_b,
@@ -407,16 +502,26 @@ pub(crate) fn to_layerstack_weights(
         l1_b,
         l1_shared_weight,
         l1_shared_bias,
-        l2_w,
-        l2_b,
-        l3_w,
-        l3_b,
-    ]: [Vec<f32>; 10] = groups
-        .try_into()
-        .expect("LayerStack checkpoints have 10 weight groups");
+        mut l2_w,
+        mut l2_b,
+        mut l3_w,
+        mut l3_b,
+    ] = std::array::from_fn(|_| groups.next().expect("validated LayerStack weight group"));
+    if layout.shared_delta {
+        for bucketed in [&mut l2_w, &mut l2_b, &mut l3_w, &mut l3_b] {
+            let shared = groups.next().expect("validated shared-delta weight group");
+            for (value, shared_value) in bucketed.iter_mut().zip(shared.iter().cycle()) {
+                *value += shared_value;
+            }
+        }
+    }
+    let psqt_w = groups
+        .next()
+        .map(|psqt| coalesce_ft_factorized(&layout.train_spec, layout.num_buckets, &psqt));
     LayerStackWeights {
         feature_set: layout.export_spec(),
         num_buckets: layout.num_buckets,
+        bucket_spec: layout.bucket_spec(),
         ft_w: coalesce_ft_factorized(&layout.train_spec, layout.ft_out, &ft_w),
         ft_b,
         l1_w,
@@ -427,7 +532,7 @@ pub(crate) fn to_layerstack_weights(
         l2_b,
         l3_w,
         l3_b,
-        psqt_w: None,
+        psqt_w,
     }
 }
 
@@ -436,6 +541,12 @@ pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    use nnue_format::ArchKind;
+    use nnue_train::{
+        optimizer::OptimizerKind,
+        raw_checkpoint::{RawCkptArch, RawCkptMeta, write_raw_ckpt_group, write_raw_ckpt_header},
+    };
 
     pub(crate) const FT_OUT: usize = 4;
     pub(crate) const L1: usize = 4;
@@ -453,6 +564,9 @@ pub(crate) mod tests {
             l1_out: L1,
             l2_out: L2,
             num_buckets: NB,
+            bucket_mode: BucketMode::ProgressKpAbs,
+            with_psqt: false,
+            shared_delta: false,
         }
     }
 
@@ -474,7 +588,15 @@ pub(crate) mod tests {
         topology: [u64; 4],
         weight: impl Fn(usize, usize) -> f32,
     ) {
-        write_ckpt_versioned(path, 11, train_spec(), superbatch, topology, weight);
+        write_ckpt_versioned(
+            path,
+            11,
+            train_spec(),
+            superbatch,
+            topology,
+            "progresskpabs",
+            weight,
+        );
     }
 
     /// trainer の raw checkpoint writer が `version` で書く header の LayerStack checkpoint を
@@ -486,6 +608,7 @@ pub(crate) mod tests {
         spec: FeatureSetSpec,
         superbatch: u64,
         topology: [u64; 4],
+        bucket_mode: &str,
         weight: impl Fn(usize, usize) -> f32,
     ) {
         let lay = LayerStackLayout {
@@ -494,9 +617,12 @@ pub(crate) mod tests {
             l1_out: topology[1] as usize,
             l2_out: topology[2] as usize,
             num_buckets: topology[3] as usize,
+            bucket_mode: BucketMode::parse(bucket_mode).unwrap().0,
+            with_psqt: false,
+            shared_delta: false,
         };
         let mut out = Vec::new();
-        out.extend(MAGIC);
+        out.extend(RAW_CKPT_MAGIC);
         out.extend(version.to_le_bytes());
         put_name(&mut out, spec.canonical_name());
         out.extend((spec.train_ft_in() as u64).to_le_bytes());
@@ -511,7 +637,7 @@ pub(crate) mod tests {
         put_name(&mut out, "test-run");
         put_name(&mut out, "layerstack");
         if version >= 8 {
-            put_name(&mut out, "progresskpabs");
+            put_name(&mut out, bucket_mode);
         }
         out.extend(4u64.to_le_bytes());
         for d in topology {
@@ -533,7 +659,7 @@ pub(crate) mod tests {
             out.extend(0u64.to_le_bytes());
         }
         out.extend(10u64.to_le_bytes());
-        for (g, len) in lay.group_lens().into_iter().enumerate() {
+        for (g, (_, len)) in lay.group_lens().unwrap().into_iter().enumerate() {
             out.extend((len as u64).to_le_bytes());
             for i in 0..len {
                 out.extend(weight(g, i).to_le_bytes());
@@ -583,7 +709,9 @@ pub(crate) mod tests {
         write_ckpt(&a, 20, topo, pattern(1.0));
         write_ckpt(&b, 40, topo, pattern(3.0));
         let infos = [read_ckpt_info(&a).unwrap(), read_ckpt_info(&b).unwrap()];
-        let groups = weighted_average(&[a.as_path(), b.as_path()], &infos, &[0.25, 0.75]).unwrap();
+        let lay = layerstack_layout(&infos[0].identity).unwrap();
+        let groups =
+            weighted_average(&lay, &[a.as_path(), b.as_path()], &infos, &[0.25, 0.75]).unwrap();
         let expected = pattern(2.5);
         for (g, values) in groups.iter().enumerate() {
             assert_eq!(values.len() as u64, infos[0].identity.group_lens[g]);
@@ -630,6 +758,10 @@ pub(crate) mod tests {
         assert!(layerstack_layout(&id).is_err());
     }
 
+    fn compat_key(id: &CkptIdentity) -> CompatKey {
+        id.compat_key(&layerstack_layout(id).unwrap())
+    }
+
     #[test]
     fn older_versions_share_the_compat_key_of_current_checkpoints() {
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
@@ -637,23 +769,39 @@ pub(crate) mod tests {
         let older = temp_path("compat-v8.ckpt");
         let no_mode = temp_path("compat-v7.ckpt");
         write_ckpt(&current, 40, topo, pattern(1.0));
-        write_ckpt_versioned(&older, 8, train_spec(), 20, topo, pattern(1.0));
-        write_ckpt_versioned(&no_mode, 7, train_spec(), 20, topo, pattern(1.0));
+        write_ckpt_versioned(
+            &older,
+            8,
+            train_spec(),
+            20,
+            topo,
+            "progresskpabs",
+            pattern(1.0),
+        );
+        write_ckpt_versioned(
+            &no_mode,
+            7,
+            train_spec(),
+            20,
+            topo,
+            "progresskpabs",
+            pattern(1.0),
+        );
         let v11 = read_ckpt_info(&current).unwrap().identity;
         let v8 = read_ckpt_info(&older).unwrap().identity;
         let v7 = read_ckpt_info(&no_mode).unwrap().identity;
         assert!(layerstack_layout(&v7).is_ok());
-        assert_eq!(v7.compat_key(), v8.compat_key());
+        assert_eq!(compat_key(&v7), compat_key(&v8));
         // QAT mode is recorded from v10 on, so a v8 checkpoint reads as QAT off.
         let mut v11_without_qat = v11.clone();
         v11_without_qat.qat_dense = false;
-        assert_eq!(v8.compat_key(), v11_without_qat.compat_key());
+        assert_eq!(compat_key(&v8), compat_key(&v11_without_qat));
         let mut alias = v11.clone();
         alias.bucket_mode = "progress8kpabs".to_string();
-        assert_eq!(alias.compat_key(), v11.compat_key());
+        assert_eq!(compat_key(&alias), compat_key(&v11));
         let mut other_mode = v11.clone();
-        other_mode.bucket_mode = "progressq16".to_string();
-        assert_ne!(other_mode.compat_key(), v11.compat_key());
+        other_mode.bucket_mode = "progresskpabsq16".to_string();
+        assert_ne!(compat_key(&other_mode), compat_key(&v11));
     }
 
     #[test]
@@ -661,7 +809,15 @@ pub(crate) mod tests {
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
         for version in [MIN_VERSION - 1, MAX_VERSION + 1] {
             let path = temp_path(&format!("version-{version}.ckpt"));
-            write_ckpt_versioned(&path, version, train_spec(), 20, topo, pattern(1.0));
+            write_ckpt_versioned(
+                &path,
+                version,
+                train_spec(),
+                20,
+                topo,
+                "progresskpabs",
+                pattern(1.0),
+            );
             let err = read_ckpt_info(&path).unwrap_err();
             assert!(err.to_string().contains("not supported"), "{err}");
         }
@@ -672,12 +828,12 @@ pub(crate) mod tests {
         let spec = FeatureSet::HalfKaHmMerged.spec();
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
         let path = temp_path("plain.ckpt");
-        write_ckpt_versioned(&path, 11, spec, 20, topo, pattern(1.0));
+        write_ckpt_versioned(&path, 11, spec, 20, topo, "progresskpabs", pattern(1.0));
         let info = read_ckpt_info(&path).unwrap();
         assert!(!info.identity.ft_factorize);
         let lay = layerstack_layout(&info.identity).unwrap();
         assert_eq!(lay.export_spec(), spec);
-        let groups = weighted_average(&[path.as_path()], &[info], &[1.0]).unwrap();
+        let groups = weighted_average(&lay, &[path.as_path()], &[info], &[1.0]).unwrap();
         let weights = to_layerstack_weights(&lay, groups);
         assert_eq!(weights.ft_w.len(), spec.train_ft_in() * FT_OUT);
         for (i, &v) in weights.ft_w.iter().enumerate() {
@@ -698,5 +854,268 @@ pub(crate) mod tests {
         assert!((weighted - ema).abs() < 1e-12);
         assert!((c.iter().sum::<f64>() - 1.0).abs() < 1e-12);
         assert!((uniform_coefficients(3).iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+    fn write_training_checkpoint(
+        path: &Path,
+        spec: FeatureSetSpec,
+        optimizer: OptimizerKind,
+        scale: f32,
+        shared_delta: bool,
+        psqt: bool,
+    ) {
+        use nnue_format::layerstack_weights::{QA, QB};
+
+        let dims = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64, NB as u64];
+        let topology = &dims[..if psqt { 5 } else { 4 }];
+        let net = LayerStackWeights::zeroed(spec.without_ft_factorize(), FT_OUT, L1, L2, NB);
+        let mut lengths = vec![
+            spec.train_ft_weight_len(FT_OUT),
+            net.ft_b.len(),
+            net.l1_w.len(),
+            net.l1_b.len(),
+            net.l1_shared_weight.len(),
+            net.l1_shared_bias.len(),
+            net.l2_w.len(),
+            net.l2_b.len(),
+            net.l3_w.len(),
+            net.l3_b.len(),
+        ];
+        if shared_delta {
+            lengths.extend([
+                net.l2_w.len() / NB,
+                net.l2_b.len() / NB,
+                net.l3_w.len() / NB,
+                1,
+            ]);
+        }
+        if psqt {
+            lengths.push(spec.train_ft_in() * NB);
+        }
+        let arch = RawCkptArch {
+            feature_set: spec,
+            arch_kind: ArchKind::LayerStack,
+            bucket_mode: Some("spec:ownking:2"),
+            ft_out: topology[0],
+            topology,
+        };
+        let meta = RawCkptMeta {
+            optimizer,
+            qat_dense: false,
+            run_id: "run",
+            superbatch: scale as usize,
+            step_count: 100,
+            lr_horizon: None,
+            fv_scale: None,
+            net_id: "net",
+            recipe_fingerprint: None,
+        };
+        let mut file = std::io::BufWriter::new(File::create(path).unwrap());
+        write_raw_ckpt_header(&mut file, &arch, &meta, lengths.len() as u64).unwrap();
+        for (group, &len) in lengths.iter().enumerate() {
+            let mut weights = vec![0.0; len];
+            if psqt && group == lengths.len() - 1 {
+                weights[NB - 1] = scale / (QA * QB) as f32;
+                if spec.ft_factorize() {
+                    weights[spec.ft_in() * NB + NB - 1] = scale / (QA * QB) as f32;
+                }
+            } else {
+                match group {
+                    0 => {
+                        weights[spec.ft_weight_len(FT_OUT) - 1] = scale / QA as f32;
+                        if spec.ft_factorize() {
+                            weights[spec.ft_weight_len(FT_OUT)] = scale / QA as f32;
+                        }
+                    }
+                    1 => weights[0] = scale / QA as f32,
+                    6 | 8 | 10 | 12 => weights[0] = (scale + group as f32) / QB as f32,
+                    7 | 9 | 11 | 13 => weights[0] = (scale + group as f32) / (QA * QB) as f32,
+                    _ => {}
+                }
+            }
+            let state = vec![f32::NAN; len];
+            write_raw_ckpt_group(&mut file, [&weights, &state, &state, &state]).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    #[test]
+    fn trainer_checkpoints_average_and_reload() {
+        use OptimizerKind::{RAdam, Ranger, Sgd};
+        use nnue_format::layerstack_weights::{QA, QB};
+
+        let plain = FeatureSet::HalfKaHmMerged.spec();
+        let threat = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide);
+        let compact = threat.with_threat_width(2).with_ft_factorize();
+        let effect = plain.with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+        for (name, spec, version, optimizer, shared_delta, psqt) in [
+            ("plain", plain, 11, Ranger, false, false),
+            (
+                "threat-ranger",
+                threat.with_ft_factorize(),
+                11,
+                Ranger,
+                false,
+                false,
+            ),
+            ("threat-sgd", threat, 12, Sgd, false, false),
+            ("compact-ranger", compact, 13, Ranger, false, false),
+            ("compact-sgd", compact, 14, Sgd, false, false),
+            ("compact-radam", compact, 15, RAdam, false, false),
+            ("compact-shared", compact, 15, RAdam, true, false),
+            ("psqt", plain.with_ft_factorize(), 11, Ranger, false, true),
+            (
+                "psqt-shared",
+                plain.with_ft_factorize(),
+                11,
+                Ranger,
+                true,
+                true,
+            ),
+            (
+                "effect-pooled",
+                effect.with_ft_factorize(),
+                11,
+                Ranger,
+                false,
+                false,
+            ),
+            (
+                "effect-per-bucket",
+                effect.with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket),
+                11,
+                Ranger,
+                false,
+                false,
+            ),
+        ] {
+            let paths = [1, 3].map(|scale| {
+                let path = temp_path(&format!("{name}-{scale}.ckpt"));
+                write_training_checkpoint(&path, spec, optimizer, scale as f32, shared_delta, psqt);
+                let info = read_ckpt_info(&path).unwrap();
+                assert_eq!(info.version, version, "{name}");
+                assert_eq!(
+                    info.identity.group_lens.len(),
+                    10 + usize::from(psqt) + 4 * usize::from(shared_delta),
+                    "{name}"
+                );
+                assert_eq!(
+                    layerstack_layout(&info.identity).unwrap().train_spec,
+                    spec,
+                    "{name}"
+                );
+                path
+            });
+
+            let output = temp_path(&format!("{name}-average.bin"));
+            let args = crate::Args {
+                checkpoints: paths.to_vec(),
+                output: output.clone(),
+                mode: crate::Mode::Uniform,
+                ema_decay: None,
+                fv_scale: None,
+                reference: None,
+            };
+            crate::run(&args).unwrap();
+            let weights = LayerStackWeights::load_quantised_with_psqt(
+                &mut BufReader::new(File::open(&output).unwrap()),
+                spec.without_ft_factorize(),
+                FT_OUT,
+                L1,
+                L2,
+                NB,
+                psqt,
+            )
+            .unwrap();
+            assert_eq!(weights.bucket_spec.unwrap().to_string(), "ownking:2");
+            let expected = 2.0 / QA as f32;
+            assert_eq!(weights.ft_w.last(), Some(&expected), "{name}");
+            assert_eq!(weights.ft_b[0], expected, "{name}");
+            assert_eq!(
+                weights.ft_w[0],
+                if spec.ft_factorize() { expected } else { 0.0 },
+                "{name}"
+            );
+            for (group, tensor, width, divisor) in [
+                (6, &weights.l2_w, (L1 - 1) * 2 * L2, QB),
+                (7, &weights.l2_b, L2, QA * QB),
+                (8, &weights.l3_w, L2, QB),
+                (9, &weights.l3_b, 1, QA * QB),
+            ] {
+                let shared = if shared_delta { 2 + group + 4 } else { 0 };
+                assert_eq!(
+                    tensor[0],
+                    (2 + group + shared) as f32 / divisor as f32,
+                    "{name} group {group}"
+                );
+                assert_eq!(
+                    tensor[width],
+                    shared as f32 / divisor as f32,
+                    "{name} group {group}"
+                );
+            }
+            if psqt {
+                let psqt = weights.psqt_w.unwrap();
+                assert_eq!(psqt[0], 0.0, "{name}");
+                assert_eq!(psqt[NB - 1], 4.0 / (QA * QB) as f32, "{name}");
+            }
+            for path in paths.into_iter().chain([output]) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_layouts_and_distinguishes_bucket_routing() {
+        let compact = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide)
+            .with_threat_width(2);
+        let path = temp_path("layout-validation.ckpt");
+        write_training_checkpoint(&path, compact, OptimizerKind::RAdam, 1.0, true, false);
+        let id = read_ckpt_info(&path).unwrap().identity;
+        let mut other = id.clone();
+        other.bucket_mode = "spec:oppking:2".into();
+        assert_ne!(compat_key(&other), compat_key(&id));
+        other.bucket_mode = "spec:handmajor3".into();
+        assert!(
+            layerstack_layout(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("bucket spec")
+        );
+        other = id.clone();
+        other.threat_width = Some(FT_OUT as u64);
+        assert!(
+            layerstack_layout(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("compact Threat width")
+        );
+        other = id.clone();
+        other.group_lens[10] += 1;
+        assert!(
+            layerstack_layout(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("group l2_shared_weight")
+        );
+        other.group_lens.pop();
+        assert!(
+            layerstack_layout(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("expected 10 or 14")
+        );
+        write_training_checkpoint(&path, compact, OptimizerKind::RAdam, 1.0, false, true);
+        let invalid = read_ckpt_info(&path).unwrap().identity;
+        assert!(
+            layerstack_layout(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("with PSQT and Threat")
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

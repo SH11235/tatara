@@ -579,9 +579,7 @@ impl TrainingConfig {
             }
         }
         if self.num_buckets == 0 {
-            return Err(io::Error::other(
-                "num_buckets must be >= 1 (LayerStack uses `--num-buckets` in [2, 9])",
-            ));
+            return Err(io::Error::other("num_buckets must be >= 1"));
         }
         Ok(())
     }
@@ -864,7 +862,7 @@ where
         "sampling": cfg.sampling.settings(cfg.tree_sample_eval_only),
         "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
             serde_json::json!({
-                "mode": Into::<BucketMode>::into(*bucket_mode).canonical_name(),
+                "mode": Into::<BucketMode>::into(*bucket_mode).identity(),
                 "count": cfg.num_buckets,
                 "progress_coeff": cfg.progress_coeff.as_deref()
                     .map(crate::loader_state::artifact_identity).transpose()?,
@@ -2265,6 +2263,8 @@ mod tests {
             score_override_mask: None,
             dual_label_psv: None,
             init_from: None,
+            freeze_ft: false,
+            init_ft_only: false,
             init_preset: None,
             test_data: None,
             test_positions: None,

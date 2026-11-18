@@ -146,7 +146,7 @@ fn detect_arch<R: Read>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result
 /// `Features=<name>(Friend)[<in>-><ft>x2],...,Network=AffineTransform[1<-<l2_out>](...
 /// SqrClippedReLU[<l2_in>](AffineTransform[<l1_out>-<ft*2>]...`。
 fn parse_arch_str(arch_str: &str) -> io::Result<DetectedArch> {
-    for unsupported in ["PSQT=", "Threat=", "EffectBucket="] {
+    for unsupported in ["PSQT=", "Threat=", "EffectBucket=", "ls_bucket="] {
         if arch_str.contains(unsupported) {
             let token = unsupported.trim_end_matches('=');
             return invalid_input(format!(

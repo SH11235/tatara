@@ -52,8 +52,7 @@
 //!
 //! - `l1_skip = 1`、`l1_effective = l1_out - 1`、`l2_in = l1_effective * 2`
 //!   (l1_sqr.concat(l1_main)) — いずれも `l1_out` から導出する派生次元
-//! - `num_buckets` (`--num-buckets`、既定 8、上限 9 は per-bucket weight bwd
-//!   kernel の固定 9-register accumulator 由来)
+//! - `num_buckets` (`--num-buckets`、進行度モードでは 1〜32、既定 8)
 //! - `FT_POST_SCALE = L1_SQR_SCALE = 127.0/128.0` (`qa = 127` 由来)
 
 pub mod abs_pow2_scale;

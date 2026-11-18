@@ -167,7 +167,8 @@ impl GpuTrainer {
             .as_ref()
             .is_some_and(|d| d.steps.contains(&step));
         let width = self.feature_set.threat_width(self.ws.ft_out);
-        !diagnostic_step
+        !self.freeze_ft
+            && !diagnostic_step
             && (!self.partial_threat()
                 || (width.is_multiple_of(8) && self.ws.ft_out.is_multiple_of(4)))
             && self.psqt.is_none()
@@ -1522,6 +1523,13 @@ pub(crate) struct StepOptions<'a> {
 pub(crate) type LayerStackRawCheckpointState =
     (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
+#[cfg(all(test, feature = "native"))]
+pub(crate) struct DenseWeightGradTestData {
+    pub(crate) input: Vec<f32>,
+    pub(crate) output_grad: Vec<f32>,
+    pub(crate) weight_grad: Vec<f32>,
+}
+
 struct SharedDenseLayerState {
     w: DeviceBuffer<f32>,
     w_m: DeviceBuffer<f32>,
@@ -1589,13 +1597,17 @@ impl<'a> StepContext<'a> {
             // とき `n_out_tiles == 1` で out-tile 軸は長さ 1 に縮退する。
             n_out_tiles: l1_out.div_ceil(16),
             padded_b: padded_sort_batch(b, trainer.num_buckets),
-            bucket_segments: trainer.l1_bucket_segments(batch),
+            bucket_segments: if trainer.tf32 {
+                trainer.l1_bucket_segments(batch)
+            } else {
+                [(0, 0); MAX_SUPPORTED_NUM_BUCKETS]
+            },
         })
     }
 }
 
 // ===========================================================================
-// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out + progresskpabs 9 buckets)
+// GpuTrainer (LayerStack: FT ft_out → L1 l1_out → L2 l2_out)
 //
 // 10 weight groups × {w, m, v, slow, grad} = 50 device buffers + loss_acc + step_count。
 // Forward は 15 kernel launch、backward は ~16 kernel launch、optimizer は 10×{radam+lerp}。
@@ -1771,6 +1783,7 @@ pub(crate) struct GpuTrainer {
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
     bucket_mode: BucketMode,
+    freeze_ft: bool,
     optimizer: OptimizerKind,
     step_count: u64,
     #[cfg(feature = "native")]
@@ -2484,8 +2497,8 @@ impl GpuTrainer {
         forward_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
-            (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
-            "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
+            (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
+            "GpuTrainer requires num_buckets in [1, {MAX_SUPPORTED_NUM_BUCKETS}]"
         );
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
@@ -2815,6 +2828,7 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             bucket_mode,
+            freeze_ft: false,
             optimizer,
             step_count: 0,
             #[cfg(feature = "native")]
@@ -3023,6 +3037,43 @@ impl GpuTrainer {
         Ok(())
     }
 
+    pub(crate) fn set_freeze_ft(&mut self, freeze: bool) {
+        self.freeze_ft = freeze;
+        #[cfg(feature = "native")]
+        if freeze {
+            self.ft_grad_active_rows_only = false;
+        }
+    }
+
+    pub(crate) fn load_ft_weights(
+        &mut self,
+        source: &LayerStackWeights,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ft_out = self.ws.ft_out;
+        if source.feature_set != self.feature_set
+            || source.ft_b.len() != ft_out
+            || source.ft_w.len() != self.feature_set.ft_weight_len(ft_out)
+        {
+            return Err("FT source feature set or packed dimensions do not match trainer".into());
+        }
+        if self.feature_set.ft_factorize() {
+            return Err("FT-only import requires FT factorization to be disabled".into());
+        }
+        // Without a bucket spec, the source weights carry no routing identity for PSQT.
+        if source.psqt_w.is_some()
+            && (source.num_buckets != self.num_buckets
+                || !matches!(
+                    (self.bucket_mode, source.bucket_spec),
+                    (BucketMode::Spec(target), Some(source)) if target == source
+                ))
+        {
+            return Err(
+                "FT-only import with PSQT requires matching bucket mode, count and spec".into(),
+            );
+        }
+        self.load_feature_transform_weights(source)
+    }
+
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
     ///
     /// Optimizer state reset:
@@ -3047,7 +3098,6 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let forward_only = self.forward_only;
         // 本経路は companion buffer (`ft_w_m`/`v`/`grad`/`slow`) を base 長で
         // 再確保するため、factorize 有効 trainer (train 長の `ft_w`) には適用
         // できない (spec 等値性でも弾かれるが、長さ不変条件をここで閉じる)。
@@ -3071,12 +3121,7 @@ impl GpuTrainer {
                 self.feature_set.ft_factorize()
             )));
         }
-        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
-        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
-        #[cfg(feature = "native")]
-        {
-            self.ft_norm_sums_current = false;
-        }
+        self.load_feature_transform_weights(w)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
         self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
         self.l1_shared_weight = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
@@ -3099,8 +3144,6 @@ impl GpuTrainer {
             let l1_out = self.ws.l1_out;
             let l2_out = self.ws.l2_out;
             let l2_in = self.ws.l2_in();
-            let ft_w_n = self.feature_set.ft_weight_len(ft_out);
-            let ft_b_n = ft_out;
             let l1_w_n = self.num_buckets * l1_out * ft_out;
             let l1_b_n = self.num_buckets * l1_out;
             let l1_shared_weight_n = ft_out * l1_out;
@@ -3109,30 +3152,6 @@ impl GpuTrainer {
             let l2_b_n = self.num_buckets * l2_out;
             let l3_w_n = self.num_buckets * l2_out;
             let l3_b_n = self.num_buckets;
-            self.ft_w_m = ft_moment(
-                &self.stream,
-                ft_w_n,
-                self.fp16_opt_state,
-                self.ft_state_host,
-            )?;
-            self.ft_w_v = ft_moment(
-                &self.stream,
-                ft_w_n,
-                self.fp16_opt_state,
-                self.ft_state_host,
-            )?;
-            self.ft_w_slow = if self.ft_state_host {
-                let mut slow = ft_slow(&self.stream, w.ft_w.len(), true)?;
-                slow.copy_from_host(&self.stream, &w.ft_w)?;
-                slow
-            } else {
-                DeviceBuffer::from_host(&self.stream, &w.ft_w)?
-            };
-            self.ft_w_grad = zeros_f32(ft_w_n)?;
-            self.ft_b_m = zeros_f32(ft_b_n)?;
-            self.ft_b_v = zeros_f32(ft_b_n)?;
-            self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
-            self.ft_b_grad = zeros_f32(ft_b_n)?;
             self.l1_w_m = zeros_f32(l1_w_n)?;
             self.l1_w_v = zeros_f32(l1_w_n)?;
             self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -3167,42 +3186,80 @@ impl GpuTrainer {
             self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
             self.l3_b_grad = zeros_f32(l3_b_n)?;
         }
-        // PSQT (任意): trainer 側で psqt が enabled なら weight 側も `Some` を要求。
-        // load 側で `Some` でも trainer が `None` の組合せ (誤って PSQT 無し trainer に
-        // PSQT 含む weights を入れる) も同じく reject する。
-        match (self.psqt.as_mut(), w.psqt_w.as_ref()) {
-            (Some(psqt), Some(w_psqt)) => {
-                let n = self.feature_set.ft_in() * self.num_buckets;
-                if w_psqt.len() != n {
-                    return Err(invalid_data(format!(
-                        "weight psqt_w length {} != expected {n}",
-                        w_psqt.len()
-                    )));
-                }
-                psqt.w = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                if !forward_only {
-                    psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                    psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                    psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                    psqt.w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
-                }
+        self.step_count = 0;
+        self.sync_stack_forward_weights()?;
+        Ok(())
+    }
+
+    fn load_feature_transform_weights(
+        &mut self,
+        w: &LayerStackWeights,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let psqt_len = self.feature_set.ft_in() * self.num_buckets;
+        match (self.psqt.is_some(), w.psqt_w.as_ref()) {
+            (true, Some(weights)) if weights.len() != psqt_len => {
+                return Err(invalid_data(format!(
+                    "weight psqt_w length {} != expected {psqt_len}",
+                    weights.len()
+                )));
             }
-            (Some(_), None) => {
+            (true, None) => {
                 return Err(invalid_data(
                     "trainer has PSQT enabled but weights have no psqt_w (use a PSQT-trained .bin)"
                         .to_string(),
                 ));
             }
-            (None, Some(_)) => {
+            (false, Some(_)) => {
                 return Err(invalid_data(
                     "weights carry psqt_w but trainer has PSQT disabled (rerun with --psqt)"
                         .to_string(),
                 ));
             }
-            (None, None) => {}
+            _ => {}
         }
-        self.step_count = 0;
-        self.sync_stack_forward_weights()?;
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        #[cfg(feature = "native")]
+        {
+            self.ft_norm_sums_current = false;
+        }
+        if !self.forward_only {
+            let ft_b_n = self.ws.ft_out;
+            let ft_w_n = self.feature_set.ft_weight_len(ft_b_n);
+            self.ft_w_m = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_v = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_slow = if self.ft_state_host {
+                let mut slow = ft_slow(&self.stream, w.ft_w.len(), true)?;
+                slow.copy_from_host(&self.stream, &w.ft_w)?;
+                slow
+            } else {
+                DeviceBuffer::from_host(&self.stream, &w.ft_w)?
+            };
+            self.ft_w_grad = DeviceBuffer::zeroed(&self.stream, ft_w_n)?;
+            self.ft_b_m = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+            self.ft_b_v = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+            self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+            self.ft_b_grad = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+        }
+        if let Some((psqt, weights)) = self.psqt.as_mut().zip(w.psqt_w.as_ref()) {
+            psqt.w = DeviceBuffer::from_host(&self.stream, weights)?;
+            if !self.forward_only {
+                psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
+                psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
+                psqt.w_slow = DeviceBuffer::from_host(&self.stream, weights)?;
+                psqt.w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, psqt_len)?;
+            }
+        }
         Ok(())
     }
 
@@ -3211,6 +3268,24 @@ impl GpuTrainer {
     #[cfg(test)]
     pub(crate) fn l3_b_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.l3_b_m.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    #[cfg(all(test, feature = "native"))]
+    pub(crate) fn l2_l3_weight_grads_to_host_for_test(
+        &self,
+    ) -> Result<[DenseWeightGradTestData; 2], Box<dyn std::error::Error>> {
+        Ok([
+            DenseWeightGradTestData {
+                input: self.ws.l2_input.to_host_vec(&self.stream)?,
+                output_grad: self.ws.dl2_out.to_host_vec(&self.stream)?,
+                weight_grad: self.l2_w_grad.to_host_vec(&self.stream)?,
+            },
+            DenseWeightGradTestData {
+                input: self.ws.l2_acted.to_host_vec(&self.stream)?,
+                output_grad: self.ws.dy_net_output.to_host_vec(&self.stream)?,
+                weight_grad: self.l3_w_grad.to_host_vec(&self.stream)?,
+            },
+        ])
     }
 
     /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
@@ -3262,6 +3337,10 @@ impl GpuTrainer {
                 self.feature_set
             },
             num_buckets: self.num_buckets,
+            bucket_spec: match self.bucket_mode {
+                BucketMode::Spec(s) => Some(s),
+                _ => None,
+            },
             ft_w: {
                 // factorizer 有効時はpiece-input 仮想行を実行へ畳み込み、base 形状で返す
                 // (`save_quantised` の飽和検査・量子化は畳み込み後の値に掛かる)。
@@ -3482,7 +3561,7 @@ impl GpuTrainer {
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&self.bucket_mode.identity()),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -3537,7 +3616,7 @@ impl GpuTrainer {
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&self.bucket_mode.identity()),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -4093,6 +4172,17 @@ impl GpuTrainer {
         Ok(())
     }
 
+    fn bucket_weight_grad_chunks(&self, batch: u32, padded_batch: usize, block: u32) -> (u32, u32) {
+        // Round the chunk size down so power-of-two alignment preserves the target parallelism.
+        let row_shift = batch
+            .div_ceil(self.device_occupancy.fill_blocks(block))
+            .max(16)
+            .ilog2();
+        // The end offset is bounded by padded_batch, including alignment gaps.
+        let chunks = ((padded_batch as u32) >> row_shift) + self.num_buckets as u32;
+        (chunks, row_shift)
+    }
+
     /// tf32 per-bucket cuBLAS 経路が使う、各 bucket の sorted 開始行と real row 数を host
     /// で求める。device の `count_buckets` + `exclusive_scan_aligned` (align 16) と同一手順で
     /// `batch.bucket_idx` (original order、有効値 `[0, num_buckets)`) を走査するため、結果は
@@ -4505,7 +4595,8 @@ impl GpuTrainer {
         // histogram + 16-aligned scan + scatter。aligned offset で各 bucket が 16-row
         // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
         // bucket=-1 で initialise (sorted kernel 側で skip)、perm も -1 sentinel (inverse
-        // permute が skip)。
+        // permute が skip)。L2/L3 の weight backward は同じ stream 上で perm と
+        // offset を再利用し、count で各 bucket の実データ行だけを読む。
         memset_zero(&self.stream, &self.ws.bucket_counts_dev)?;
         memset_zero(&self.stream, &self.ws.bucket_write_ctr_dev)?;
         memset_minus_one_i32(&self.stream, &self.ws.bucket_perm_dev)?;
@@ -5160,7 +5251,7 @@ impl GpuTrainer {
         memset_zero(&self.stream, &self.l3_w_grad)?;
         memset_zero(&self.stream, &self.l3_b_grad)?;
         memset_zero(&self.stream, &self.ws.dl1_total)?;
-        if let Some(psqt) = self.psqt.as_ref() {
+        if let Some(psqt) = self.psqt.as_ref().filter(|_| !self.freeze_ft) {
             memset_zero(&self.stream, &psqt.w_grad)?;
         }
         prof_tick!("bwd_reset");
@@ -5170,7 +5261,7 @@ impl GpuTrainer {
         // 1 thread = (b, ni) で psqt_w_grad に atomic add する (memset 済の前提)。
         // 同 dnet を後続 bwd_L3 もそのまま読むので、本 kernel は dnet を destructive
         // に変更しない (read-only access)。
-        if let Some(psqt) = self.psqt.as_ref() {
+        if let Some(psqt) = self.psqt.as_ref().filter(|_| !self.freeze_ft) {
             let max_active = self.ws.max_active;
             let ft_in_u = self.ws.ft_in as u32;
             unsafe {
@@ -5245,38 +5336,33 @@ impl GpuTrainer {
                 ]
             }
         }?;
-        // L3 weight bwd: in_dim=l2_out, out_dim=1, num_buckets<=9。
-        // 列 (= l2_out) あたり R lane で batch reduction を並列化する
-        // `dense_mm_bwd_weight_bucket_tiled_l3`。`buc >= num_buckets` は flush も accumulate も
-        // されない silent skip で動く。R = l2_out を掛けて 256 を超えない最大 2 冪 (kernel の
-        // PARTIAL = 9 plane × 256 上限、tree reduction が畳めるよう 2 冪)。block_dim = R*l2_out
-        // で 1 列あたり R thread (= 複数 warp/block) にして warp/block と batch 並列度を上げ、grid は
-        // grid-stride で全 SM を埋める数にする (kernel は任意 grid で正しく、grid は occupancy/
-        // atomic 数の調整のみ)。`--l2 <= 256` を CLI が保証するので block_dim は 256 上限内。
-        debug_assert!(self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS);
+        // Each column uses a power of two row lanes for the shared-memory reduction.
         let mut l3_lanes = 1_usize;
         while l3_lanes * 2 * l2_out <= 256 {
             l3_lanes *= 2;
         }
         let l3_block = (l3_lanes * l2_out) as u32;
+        let (chunks, row_shift) = self.bucket_weight_grad_chunks(b_u32, padded_b, l3_block);
         unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
+            // SAFETY: The forward sort initialized all permutation entries within each
+            // real segment. The input and gradient buffers stay live on this stream.
             cuda_launch! {
-                kernel: dense_mm_bwd_weight_bucket_tiled_l3,
+                kernel: dense_mm_bwd_weight_bucket_grid_l3,
                 stream: self.stream,
                 module: self.module,
                 config: LaunchConfig {
-                    grid_dim: (self.device_occupancy.fill_blocks(l3_block), 1, 1),
+                    grid_dim: (chunks, 1, 1),
                     block_dim: (l3_block, 1, 1),
                     shared_mem_bytes: 0,
                 },
                 args: [
                     slice(self.ws.l2_acted),
                     slice(self.ws.dy_net_output),
-                    slice(self.ws.bucket_idx_dev),
+                    slice(self.ws.bucket_perm_dev),
+                    slice(self.ws.bucket_offsets_dev),
+                    slice(self.ws.bucket_counts_dev),
                     slice(self.l3_w_grad),
-                    b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    row_shift, l2_out as u32, self.num_buckets as u32
                 ]
             }
         }?;
@@ -5364,24 +5450,18 @@ impl GpuTrainer {
                 ]
             }
         }?;
-        // L2 weight backward: split-K + 9 bucket register accumulator。weight cell 空間
-        // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
-        // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
-        // 超えるため)。grid_y (= batch split 数) は per-thread の直列 batch reduction を短くし
-        // SM を埋めるため大きめに取る (weight cell 数が少ない形状では split が少ないと走る warp が
-        // SM slot に足りず latency-bound になる)。kernel は任意の grid_y で正しく、grid_y は
-        // occupancy/atomic 数の調整のみ。
+        let (chunks, row_shift) = self.bucket_weight_grad_chunks(b_u32, padded_b, 256);
         unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
+            // SAFETY: The forward sort initialized all permutation entries within each
+            // real segment. The input and gradient buffers stay live on this stream.
             cuda_launch! {
-                kernel: dense_mm_bwd_weight_bucket_tiled_l2,
+                kernel: dense_mm_bwd_weight_bucket_grid_l2,
                 stream: self.stream,
                 module: self.module,
                 config: LaunchConfig {
                     grid_dim: (
                         (l2_out * l2_in).div_ceil(256) as u32,
-                        self.device_occupancy.fill_blocks(256),
+                        chunks,
                         1,
                     ),
                     block_dim: (256, 1, 1),
@@ -5390,9 +5470,11 @@ impl GpuTrainer {
                 args: [
                     slice(self.ws.l2_input),
                     slice(self.ws.dl2_out),
-                    slice(self.ws.bucket_idx_dev),
+                    slice(self.ws.bucket_perm_dev),
+                    slice(self.ws.bucket_offsets_dev),
+                    slice(self.ws.bucket_counts_dev),
                     slice(self.l2_w_grad),
-                    b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                    row_shift, l2_in as u32, l2_out as u32, self.num_buckets as u32
                 ]
             }
         }?;
@@ -5588,7 +5670,7 @@ impl GpuTrainer {
         // (`dense_mm_bwd_input_tiled`、grid=batch/16 × in_dim/16)。out_dim は reduction 軸で
         // kernel 内のループで消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
-        if l1_input_gradient_fused(self.ws.l1_out) {
+        if self.freeze_ft || l1_input_gradient_fused(self.ws.l1_out) {
             // `ft_post_grad_from_l1*` recomputes this product per FT column.
         } else if self.tf32 {
             // C[b, ft_out] = dl1_total[b, l1_out] @ l1_shared_weight[ft_out, l1_out]^T (reduce 軸 l1_out)。
@@ -5758,7 +5840,7 @@ impl GpuTrainer {
         // へ直接 scatter する融合版。cuBLAS 経路は sorted dx を dcombined_from_l1_sorted に出す。
         // cuBLAS の sorted dx は inverse_permute で original order へ戻してから ft_post が読む。
         // padding 行 (perm=-1) はどちらも読まれず、real row は perm の単射ですべて covered。
-        if l1_input_gradient_fused(self.ws.l1_out) {
+        if self.freeze_ft || l1_input_gradient_fused(self.ws.l1_out) {
             // `ft_post_grad_from_l1*` recomputes this product per FT column.
         } else if self.tf32 {
             let segs = bucket_segments;
@@ -5860,6 +5942,9 @@ impl GpuTrainer {
         }?;
 
         prof_tick!("bwd_L1");
+        if self.freeze_ft {
+            return Ok(());
+        }
 
         // dft (FT activation gradient) FP16 化の loss scaling 係数。dft ∝ 1/batch なので
         // batch 比例にして batch 非依存に f16 域へ載せる ([`FT_DFT_FP16_BASE_SCALE`])。
@@ -6310,7 +6395,7 @@ impl GpuTrainer {
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
         #[cfg(feature = "native")]
-        if !ft_fused {
+        if !self.freeze_ft && !ft_fused {
             validate_unfused_ft_optimizer_len(ft_w_n)?;
             self.ft_norm_sums_current = false;
         }
@@ -6386,17 +6471,19 @@ impl GpuTrainer {
             // (pitch=in, stride=1)。FT の group 行数は train 値 — factorizer の
             // 仮想行も同じ正則化 group に含める (king 非依存成分が仮想行へ寄る
             // prior と整合する方向の intended 仕様)。
-            if self.partial_threat() && !ft_fused {
-                self.launch_partial_ft_norms(&self.norm_scratch)?;
-                // SAFETY: each thread updates one parameter using its mapped FT-column norm.
-                unsafe {
-                    cuda_launch! {
-                        kernel: partial_ft_norm_apply, stream: self.stream, module: self.module, config: cfg_partial_ft_1d(ft_w_n),
-                        args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.norm_scratch), nl_factor, lr]
-                    }
-                }?;
-            } else if !ft_fused {
-                norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+            if !self.freeze_ft && !ft_fused {
+                if self.partial_threat() {
+                    self.launch_partial_ft_norms(&self.norm_scratch)?;
+                    // SAFETY: each thread updates one parameter using its mapped FT-column norm.
+                    unsafe {
+                        cuda_launch! {
+                            kernel: partial_ft_norm_apply, stream: self.stream, module: self.module, config: cfg_partial_ft_1d(ft_w_n),
+                            args: [slice(self.ft_w), slice(self.partial_ft_shape), slice(self.norm_scratch), nl_factor, lr]
+                        }
+                    }?;
+                } else {
+                    norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+                }
             }
             norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
@@ -6407,11 +6494,13 @@ impl GpuTrainer {
             // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —
             // factorizer 有効時はpiece-input 仮想行も同じ group に含める。
             let psqt_num_buckets = self.num_buckets;
-            if let Some(psqt) = self.psqt.as_mut() {
+            if let Some(psqt) = self.psqt.as_mut().filter(|_| !self.freeze_ft) {
                 norm_loss_group!(psqt.w, psqt_num_buckets, 1, psqt_num_buckets, ft_w_rows);
             }
             // bias: per-tensor scalar (テンソル全体で 1 norm、bucket 軸も畳む)。
-            norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
+            if !self.freeze_ft {
+                norm_loss_group!(self.ft_b, 1, 0, 1, ft_b_n);
+            }
             norm_loss_group!(self.l1_b, 1, 0, 1, l1_b_n);
             norm_loss_group!(self.l1_shared_bias, 1, 0, 1, l1_shared_bias_n);
             norm_loss_group!(self.l2_b, 1, 0, 1, l2_b_n);
@@ -6456,7 +6545,8 @@ impl GpuTrainer {
         let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
         let ft_wd = optimizer.kernel_weight_decay(ft_wd);
         #[cfg(feature = "native")]
-        let diagnosed = self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
+        let diagnosed =
+            !self.freeze_ft && self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
         #[cfg(not(feature = "native"))]
         let diagnosed = false;
         if ft_fused {
@@ -6473,7 +6563,7 @@ impl GpuTrainer {
                     lookahead: lookahead_now,
                 },
             )?;
-        } else if !diagnosed {
+        } else if !self.freeze_ft && !diagnosed {
             match (&mut self.ft_w_m, &mut self.ft_w_v) {
                 (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                     let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
@@ -6681,7 +6771,11 @@ impl GpuTrainer {
                 .eq(uniform_optim_group_layout(psqt_enabled)),
             "uniform optim group が uniform_optim_group_layout と不一致 (順序 / kind / clamp のドリフト)"
         );
-        for g in uniform_groups.iter_mut().chain(psqt_group.iter_mut()) {
+        for g in uniform_groups
+            .iter_mut()
+            .chain(psqt_group.iter_mut())
+            .filter(|g| !self.freeze_ft || !matches!(g.label, "ft_b" | "psqt_w"))
+        {
             // group の param-group から weight_decay と lr (= scheduled_lr × lr_mult)
             // を resolve する。全 group 既定 (override 無し) なら decay = 大域値・
             // lr = scheduled_lr で単一 weight_decay 経路と bit-identical。
@@ -6775,7 +6869,7 @@ impl GpuTrainer {
         // 有効時は radam と同じ理由で mirror variant を使わず、step 末の fold に委ねる)。
         if lookahead_now {
             // The fused FT kernel has already applied the lookahead to `ft_w`.
-            if ft_fused {
+            if self.freeze_ft || ft_fused {
             } else if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
@@ -6799,7 +6893,11 @@ impl GpuTrainer {
                 }?;
             }
             // 一様 group の lerp も radam と同じ group 集合を回す (FT は上で個別に launch)。
-            for g in uniform_groups.iter_mut().chain(psqt_group.iter_mut()) {
+            for g in uniform_groups
+                .iter_mut()
+                .chain(psqt_group.iter_mut())
+                .filter(|g| !self.freeze_ft || !matches!(g.label, "ft_b" | "psqt_w"))
+            {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。
@@ -6834,10 +6932,12 @@ impl GpuTrainer {
         }
         // factorizer: master (`ft_w`) の本 step の全更新 (norm loss / radam /
         // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
-        if self.partial_threat() {
-            self.launch_partial_ft_fold()?;
-        } else if ft_factorize && !ft_fused {
-            self.launch_ft_fold()?;
+        if !self.freeze_ft {
+            if self.partial_threat() {
+                self.launch_partial_ft_fold()?;
+            } else if ft_factorize && !ft_fused {
+                self.launch_ft_fold()?;
+            }
         }
         self.sync_stack_forward_weights()?;
         #[cfg(feature = "native")]
