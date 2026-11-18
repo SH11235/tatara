@@ -104,6 +104,7 @@ pub struct MixSource {
     pub rate: f64,
     pub score_drop_abs: Option<i32>,
     pub score_clamp_abs: Option<i16>,
+    pub keep_rate: Option<f64>,
 }
 
 impl MixSource {
@@ -113,6 +114,7 @@ impl MixSource {
             rate,
             score_drop_abs: None,
             score_clamp_abs: None,
+            keep_rate: None,
         }
     }
 }
@@ -124,6 +126,15 @@ pub fn validate_mix_sources(sources: &[MixSource]) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "--mix-rate must be finite and greater than zero",
+            ));
+        }
+        if source
+            .keep_rate
+            .is_some_and(|rate| !crate::sampling::valid_rate(rate))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--mix-keep-rate must be finite and in [0, 1]",
             ));
         }
         total += source.rate;
@@ -176,6 +187,14 @@ pub(crate) enum TeacherRecord {
 }
 
 impl TeacherRecord {
+    fn sampling_probability(&self, sampling: &crate::sampling::Sampling) -> f64 {
+        sampling.keep_rate
+            * match self {
+                Self::Psv(psv) => sampling.ply_rate(psv.game_ply()),
+                Self::Hcpe(_) => 1.0,
+            }
+    }
+
     pub(crate) fn score(&self) -> i16 {
         match self {
             Self::Psv(psv) => psv.score(),
@@ -287,9 +306,9 @@ impl LabelOptions<'_> {
         record_index: u64,
         path: &Path,
         heldout: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if !self.tree_sample_eval_only {
-            return Ok(());
+            return Ok(false);
         }
         let padding = psv.as_bytes_mut()[39];
         if padding & !3 != 0 {
@@ -301,7 +320,8 @@ impl LabelOptions<'_> {
                 ),
             ));
         }
-        if padding & TREE_SAMPLE_PADDING_BIT != 0 {
+        let marked = padding & TREE_SAMPLE_PADDING_BIT != 0;
+        if marked {
             if heldout {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -313,7 +333,7 @@ impl LabelOptions<'_> {
             }
             psv.as_bytes_mut()[38] = EVAL_ONLY_GAME_RESULT as u8;
         }
-        Ok(())
+        Ok(marked)
     }
 }
 
@@ -1220,6 +1240,7 @@ struct SamplingCounts {
 struct IdentifiedRecord {
     record: TeacherRecord,
     teacher: u16,
+    tree_sample: bool,
     epoch: u64,
     record_index: u64,
 }
@@ -1280,6 +1301,24 @@ struct BucketSampling {
 }
 
 impl BucketSampling {
+    fn finish_candidate(
+        samplings: &[Option<Arc<Self>>],
+        record: &SourcedRecord,
+        bucket: u8,
+    ) -> io::Result<bool> {
+        let bucket = usize::from(bucket);
+        if let Some(sampling) = &samplings[record.source()] {
+            return sampling.finish(&record.record, bucket);
+        }
+        // The bucket log aggregates all teachers, including those without bucket filters.
+        if let Some(main) = &samplings[0] {
+            let counts = &main.buckets[bucket];
+            counts.read.fetch_add(1, Ordering::Relaxed);
+            counts.kept.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
     fn register(&self, epoch: u64) {
         self.progress
             .lock()
@@ -1296,19 +1335,15 @@ impl BucketSampling {
     }
     fn finish(&self, record: &IdentifiedRecord, bucket: usize) -> io::Result<bool> {
         self.buckets[bucket].read.fetch_add(1, Ordering::Relaxed);
-        let rate = self.sampling.bucket_keep_rates.as_ref().unwrap()[bucket];
-        // reader と同じ乱数を合成確率と比較し、二段判定でも採用率の積を保つ。
-        let kept = self.sampling.accepts(
-            u64::from(record.teacher),
-            record.epoch,
-            record.record_index,
-            self.sampling.keep_rate
-                * match &record.record {
-                    TeacherRecord::Psv(psv) => self.sampling.ply_rate(psv.game_ply()),
-                    TeacherRecord::Hcpe(_) => 1.0,
-                }
-                * rate,
-        );
+        // Reuse the reader's draw for the combined probability.
+        let kept = record.tree_sample
+            || self.sampling.accepts(
+                u64::from(record.teacher),
+                record.epoch,
+                record.record_index,
+                record.record.sampling_probability(&self.sampling)
+                    * self.sampling.bucket_keep_rates.as_ref().unwrap()[bucket],
+            );
         if kept {
             #[cfg(test)]
             self.accepted
@@ -1499,7 +1534,7 @@ impl PsvEpochReader {
                     if let Some(score_override) = &mut self.score_override {
                         score_override.apply(&mut record)?;
                     }
-                    if let TeacherRecord::Psv(psv) = &mut record {
+                    let tree_sample = if let TeacherRecord::Psv(psv) = &mut record {
                         LabelOptions {
                             score_source: None,
                             tree_sample_eval_only: self.tree_sample_eval_only,
@@ -1509,8 +1544,10 @@ impl PsvEpochReader {
                             record_index,
                             &self.path,
                             false,
-                        )?;
-                    }
+                        )?
+                    } else {
+                        false
+                    };
                     if let Some(mode) = self.dual_label_psv {
                         let TeacherRecord::Psv(psv) = &mut record else {
                             return Err(dual_label_requires_psv(&self.path));
@@ -1537,10 +1574,11 @@ impl PsvEpochReader {
                     if let Some(c) = self.score_clamp_abs {
                         record.set_score(record.score().clamp(-c, c));
                     }
-                    let mut probability = self.sampling.keep_rate;
-                    if let TeacherRecord::Psv(psv) = &record {
-                        probability *= self.sampling.ply_rate(psv.game_ply());
-                    }
+                    let probability = if tree_sample {
+                        self.sampling.tree_sample_accept
+                    } else {
+                        record.sampling_probability(&self.sampling)
+                    };
                     if !self.sampling.accepts(
                         u64::from(self.teacher),
                         self.epoch,
@@ -1558,6 +1596,7 @@ impl PsvEpochReader {
                     return Ok(Some(IdentifiedRecord {
                         record,
                         teacher: self.teacher,
+                        tree_sample,
                         epoch: self.epoch,
                         record_index,
                     }));
@@ -1784,7 +1823,19 @@ impl MixedTeacherReader {
             reader.stop = Arc::clone(&main.stop);
             reader.teacher = u16::try_from(sources.len())
                 .map_err(|_| io::Error::other("too many mixed teachers (maximum 65535)"))?;
-            reader.configure_sampling(main.sampling.clone());
+            let sampling = match mix.keep_rate {
+                Some(keep_rate) => crate::sampling::Sampling {
+                    keep_rate,
+                    min_ply: None,
+                    ply_keep_curve: Vec::new(),
+                    bucket_keep_rates: None,
+                    skip_seed: main.sampling.skip_seed,
+                    tree_sample_accept: main.sampling.tree_sample_accept,
+                    log_enabled: main.sampling.log_enabled,
+                },
+                None => main.sampling.clone(),
+            };
+            reader.configure_sampling(sampling);
             sources.push(reader);
             total += mix.rate;
             cumulative_rates.push(total);
@@ -2026,17 +2077,19 @@ impl<R: Copy + Send + Into<SourcedRecord> + 'static> WindowedPsvReader<R> {
             return Ok(());
         }
         self.replay_pending = false;
+        if self.bucket_samplings[0].is_none() {
+            return Ok(());
+        }
         let window = self.current.as_ref().expect("restored window");
         // Regenerated prefix candidates must leave the epoch's pending count before new reads.
         for record in &window.records[..window.next] {
             let record: SourcedRecord = (*record).into();
-            if let Some(sampling) = &self.bucket_samplings[record.source()] {
-                let board = record.record.decode()?;
-                sampling.finish(
-                    &record.record,
-                    usize::from(bucket_mode.bucket_board(&board, num_buckets)),
-                )?;
-            }
+            let board = record.record.decode()?;
+            BucketSampling::finish_candidate(
+                &self.bucket_samplings,
+                &record,
+                bucket_mode.bucket_board(&board, num_buckets),
+            )?;
         }
         Ok(())
     }
@@ -2667,10 +2720,11 @@ impl BucketedPrefetchedLoader {
                         };
                         let bucket =
                             compute_bucket.then(|| bucket_mode.bucket_board(&board, num_buckets));
-                        if let Some(sampling) = &bucket_samplings[record.source()] {
-                            match sampling.finish(
-                                &record.record,
-                                usize::from(bucket.expect("bucket sampling requires buckets")),
+                        if bucket_filter {
+                            match BucketSampling::finish_candidate(
+                                &bucket_samplings,
+                                &record,
+                                bucket.expect("bucket sampling requires buckets"),
                             ) {
                                 Ok(true) => {}
                                 Ok(false) => continue,

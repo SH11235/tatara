@@ -10,6 +10,8 @@ pub struct Sampling {
     #[serde(skip)]
     pub log_enabled: bool,
     pub keep_rate: f64,
+    #[serde(skip_serializing_if = "is_one")]
+    pub tree_sample_accept: f64,
     pub min_ply: Option<u16>,
     pub ply_keep_curve: Vec<(f64, f64)>,
     pub bucket_keep_rates: Option<Vec<f64>>,
@@ -21,6 +23,7 @@ impl Default for Sampling {
         Self {
             log_enabled: false,
             keep_rate: 1.0,
+            tree_sample_accept: 1.0,
             min_ply: None,
             ply_keep_curve: Vec::new(),
             bucket_keep_rates: None,
@@ -36,6 +39,26 @@ impl Sampling {
         effective == Self::default()
     }
 
+    pub(crate) fn settings(&self, tree_sample_eval_only: bool) -> serde_json::Value {
+        let mut settings = serde_json::json!(self);
+        let fields = settings
+            .as_object_mut()
+            .expect("sampling settings are an object");
+        // At rate 1, bypassing game-record sampling only matters when a filter is configured.
+        if tree_sample_eval_only
+            && (self.tree_sample_accept != 1.0
+                || self.keep_rate != 1.0
+                || self.min_ply.is_some()
+                || !self.ply_keep_curve.is_empty()
+                || self.bucket_keep_rates.is_some())
+        {
+            fields.insert("tree_sample_accept".into(), self.tree_sample_accept.into());
+        } else {
+            fields.remove("tree_sample_accept");
+        }
+        settings
+    }
+
     pub fn validate(
         &self,
         has_ply: bool,
@@ -45,6 +68,9 @@ impl Sampling {
         let error = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if !valid_rate(self.keep_rate) || self.keep_rate == 0.0 {
             return Err(error("--keep-rate must be finite and in (0, 1]"));
+        }
+        if !valid_rate(self.tree_sample_accept) {
+            return Err(error("--tree-sample-accept must be finite and in [0, 1]"));
         }
         if !has_ply && (self.min_ply.is_some() || !self.ply_keep_curve.is_empty()) {
             return Err(error(
@@ -111,7 +137,11 @@ impl Sampling {
     }
 }
 
-fn valid_rate(rate: f64) -> bool {
+fn is_one(rate: &f64) -> bool {
+    *rate == 1.0
+}
+
+pub(crate) fn valid_rate(rate: f64) -> bool {
     rate.is_finite() && (0.0..=1.0).contains(&rate)
 }
 
@@ -167,6 +197,67 @@ mod tests {
                 record,
                 sampling.keep_rate * sampling.ply_rate(record as u16)
             ));
+        }
+    }
+
+    #[test]
+    fn sampling_default_serialization_preserves_loader_settings_bytes() {
+        let legacy = r#"{"keep_rate":1.0,"min_ply":null,"ply_keep_curve":[],"bucket_keep_rates":null,"skip_seed":0}"#;
+        let sampling: Sampling = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sampling.tree_sample_accept, 1.0);
+        assert_eq!(serde_json::to_string(&sampling).unwrap(), legacy);
+    }
+
+    #[test]
+    fn sampling_settings_record_tree_accept_for_each_game_filter() {
+        let unfiltered = Sampling {
+            log_enabled: true,
+            skip_seed: 42,
+            ..Sampling::default()
+        };
+        assert!(
+            unfiltered
+                .settings(true)
+                .get("tree_sample_accept")
+                .is_none()
+        );
+        for sampling in [
+            Sampling {
+                keep_rate: 0.5,
+                ..Sampling::default()
+            },
+            Sampling {
+                min_ply: Some(0),
+                ..Sampling::default()
+            },
+            Sampling {
+                ply_keep_curve: vec![(0.0, 0.5)],
+                ..Sampling::default()
+            },
+            Sampling {
+                bucket_keep_rates: Some(vec![0.5; 9]),
+                ..Sampling::default()
+            },
+        ] {
+            assert_eq!(sampling.settings(true)["tree_sample_accept"], 1.0);
+            assert!(sampling.settings(false).get("tree_sample_accept").is_none());
+        }
+        let custom = Sampling {
+            tree_sample_accept: 0.25,
+            ..Sampling::default()
+        };
+        assert_eq!(custom.settings(true)["tree_sample_accept"], 0.25);
+        assert!(custom.settings(false).get("tree_sample_accept").is_none());
+    }
+
+    #[test]
+    fn sampling_validates_tree_sample_accept() {
+        for rate in [0.0, 0.25, 1.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let sampling = Sampling {
+                tree_sample_accept: rate,
+                ..Sampling::default()
+            };
+            assert_eq!(sampling.validate(true, false, 1).is_ok(), valid_rate(rate));
         }
     }
 

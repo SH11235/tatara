@@ -63,6 +63,10 @@ WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習す
 `--data` が必要。bit 0 の dual-label gate は独立して働く。マーク付き局面は
 外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。padding の
 bit 0・bit 1 以外が立つ record もエラーにする。
+`--tree-sample-accept F` はこのフラグと併用し、全教師のマーク付き局面を
+確率 F（0 以上 1 以下、既定値 1）で採用する。マーク付き局面には
+`--keep-rate`、`--min-ply`、`--ply-keep-curve`、`--bucket-keep-rates`、
+`--mix-keep-rate` を適用しない。
 
 ## loss の一般化 (pow_exp / asymmetry / weight boost)
 

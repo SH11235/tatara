@@ -861,7 +861,7 @@ where
         )?,
         "shuffle": cfg.teacher_shuffle,
         "seed": cfg.teacher_shuffle_seed,
-        "sampling": cfg.sampling,
+        "sampling": cfg.sampling.settings(cfg.tree_sample_eval_only),
         "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
             serde_json::json!({
                 "mode": Into::<BucketMode>::into(*bucket_mode).canonical_name(),
@@ -883,6 +883,14 @@ where
         .iter()
         .map(|s| s.score_clamp_abs)
         .collect::<Vec<_>>();
+    let mix_keep = cfg
+        .mix_sources
+        .iter()
+        .map(|s| s.keep_rate)
+        .collect::<Vec<_>>();
+    if mix_keep.iter().any(Option::is_some) {
+        settings["mix_keep_rate"] = serde_json::json!(mix_keep);
+    }
     if mix_drop.iter().any(Option::is_some) {
         settings["mix_score_drop_abs"] = serde_json::json!(mix_drop);
     }
@@ -1331,7 +1339,13 @@ where
             );
         }
 
-        if cfg.sampling.log_enabled || !cfg.sampling.is_default() {
+        if cfg.sampling.log_enabled
+            || !cfg.sampling.is_default()
+            || cfg
+                .mix_sources
+                .iter()
+                .any(|source| source.keep_rate.is_some())
+        {
             for (teacher, (read, kept)) in loader.sampling_teacher_counts().into_iter().enumerate()
             {
                 eprintln!(
@@ -2220,7 +2234,6 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
-            tree_sample_eval_only: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -3577,15 +3590,20 @@ mod tests {
 
     #[test]
     fn pause_resume_matches_uninterrupted_teacher_sequence() {
-        assert_pause_resume_sequence(false);
+        assert_pause_resume_sequence(false, false);
     }
 
     #[test]
     fn pause_resume_sampling_mixing_and_window_shuffle_matches_continuation() {
-        assert_pause_resume_sequence(true);
+        assert_pause_resume_sequence(true, true);
     }
 
-    fn assert_pause_resume_sequence(combined: bool) {
+    #[test]
+    fn pause_resume_filter_free_tree_sampling_accepts_legacy_loader_settings() {
+        assert_pause_resume_sequence(false, true);
+    }
+
+    fn assert_pause_resume_sequence(combined: bool, tree_sample_eval_only: bool) {
         for threads in [1, 4] {
             for (buffer, shuffle) in [(0, false), (1, true)] {
                 for data in [sample_psv_path(), sample_hcpe_path()] {
@@ -3595,7 +3613,9 @@ mod tests {
                     } else {
                         vec![data.clone()]
                     };
+                    let psv = data.extension().unwrap() == "psv";
                     let cfg = TrainingConfig {
+                        tree_sample_eval_only: tree_sample_eval_only && psv,
                         output_dir: output.path().to_path_buf(),
                         batch_size: 17,
                         batches_per_superbatch: 7,
@@ -3607,6 +3627,7 @@ mod tests {
                             vec![
                                 crate::dataloader::MixSource {
                                     score_drop_abs: Some(1000),
+                                    keep_rate: Some(0.75),
                                     ..crate::dataloader::MixSource::new(data.clone(), 0.2)
                                 },
                                 crate::dataloader::MixSource::new(data.clone(), 0.3),
@@ -3618,8 +3639,8 @@ mod tests {
                         sampling: if combined {
                             crate::sampling::Sampling {
                                 keep_rate: 0.8,
-                                bucket_keep_rates: (data.extension().unwrap() == "psv")
-                                    .then(|| vec![0.6; 9]),
+                                bucket_keep_rates: psv.then(|| vec![0.6; 9]),
+                                min_ply: psv.then_some(20),
                                 skip_seed: 17,
                                 ..Default::default()
                             }
@@ -3715,8 +3736,17 @@ mod tests {
                             state.settings["mix_score_drop_abs"],
                             serde_json::json!([1000, null])
                         );
+                        assert_eq!(
+                            state.settings["mix_keep_rate"],
+                            serde_json::json!([0.75, null])
+                        );
                         let mut changed = resumed_cfg.clone();
                         changed.mix_sources[0].score_drop_abs = Some(1001);
+                        changed.mix_sources[0].keep_rate = Some(0.8);
+                        if cfg.tree_sample_eval_only {
+                            assert_eq!(state.settings["sampling"]["tree_sample_accept"], 1.0);
+                            changed.sampling.tree_sample_accept = 0.25;
+                        }
                         let error = run(
                             &mut MockBackend::new(),
                             &paths,
@@ -3729,15 +3759,37 @@ mod tests {
                         .unwrap_err();
                         assert!(error.to_string().contains("loader state does not match"));
                         assert!(error.to_string().contains("mix_score_drop_abs"));
+                        assert!(error.to_string().contains("mix_keep_rate"));
+                        if cfg.tree_sample_eval_only {
+                            assert!(error.to_string().contains("tree_sample_accept"));
+                        }
                     } else {
                         assert!(state.settings.get("mix_score_drop_abs").is_none());
+                        assert!(state.settings.get("mix_keep_rate").is_none());
+                    }
+                    if !(combined && cfg.tree_sample_eval_only) {
+                        assert!(
+                            state.settings["sampling"]
+                                .get("tree_sample_accept")
+                                .is_none()
+                        );
                     }
                     assert!(state.settings.get("mix_score_clamp_abs").is_none());
                     if buffer > 0 {
                         let mut mismatched = state.clone();
-                        mismatched.settings["window_records"] = serde_json::json!(
-                            state.settings["window_records"].as_u64().unwrap() + 1
-                        );
+                        let missing_or_changed_key = if combined && cfg.tree_sample_eval_only {
+                            mismatched.settings["sampling"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("tree_sample_accept");
+                            assert!(state.teachers[0].position.window_offset > 0);
+                            "tree_sample_accept"
+                        } else {
+                            mismatched.settings["window_records"] = serde_json::json!(
+                                state.settings["window_records"].as_u64().unwrap() + 1
+                            );
+                            "window_records"
+                        };
                         mismatched
                             .save(resumed_cfg.resume_checkpoint.as_ref().unwrap())
                             .unwrap();
@@ -3752,6 +3804,7 @@ mod tests {
                         )
                         .unwrap_err();
                         assert!(error.to_string().contains("loader state does not match"));
+                        assert!(error.to_string().contains(missing_or_changed_key));
                         assert!(error.to_string().contains("--resume-input restart"));
                         let restart_cfg = TrainingConfig {
                             resume_input: crate::loader_state::ResumeInput::Restart,

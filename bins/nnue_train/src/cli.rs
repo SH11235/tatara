@@ -27,6 +27,24 @@ fn parse_positive_i32(value: &str) -> Result<i32, String> {
     Ok(parsed)
 }
 
+fn parse_mix_override<T: FromStr>(value: &str) -> Result<Option<T>, T::Err> {
+    if value == "inherit" {
+        return Ok(None);
+    }
+    value.parse().map(Some)
+}
+
+fn parse_mix_score_limit<T: FromStr + PartialOrd + From<u8>>(
+    value: &str,
+) -> Result<Option<T>, String> {
+    let limit = parse_mix_override::<T>(value)
+        .map_err(|_| "expected a positive integer in range or inherit".to_string())?;
+    if limit.as_ref().is_some_and(|limit| *limit <= T::from(0)) {
+        return Err("expected a positive integer or inherit".into());
+    }
+    Ok(limit)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TeacherShuffleBufferMib {
     Auto,
@@ -362,15 +380,21 @@ pub(crate) struct Cli {
     pub(crate) mix_rate: Vec<f64>,
 
     /// Drop records with absolute score at or above N. Repeat once per --mix-data file,
-    /// in matching order. Omit to inherit --score-drop-abs.
-    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(i32).range(1..))]
-    pub(crate) mix_score_drop_abs: Vec<i32>,
+    /// in matching order. Use inherit or omit the option to inherit --score-drop-abs.
+    #[arg(long, global = true, value_name = "N|inherit", value_parser = parse_mix_score_limit::<i32>)]
+    pub(crate) mix_score_drop_abs: Vec<Option<i32>>,
 
     /// Clamp scores to [-N, N] after dropping records. Repeat once per --mix-data file,
-    /// in matching order. Omit to inherit --score-clamp-abs.
+    /// in matching order. Use inherit or omit the option to inherit --score-clamp-abs.
     /// If both limits are set for a teacher, the clamp must be below the drop threshold.
-    #[arg(long, global = true, value_name = "N", value_parser = clap::value_parser!(i16).range(1..))]
-    pub(crate) mix_score_clamp_abs: Vec<i16>,
+    #[arg(long, global = true, value_name = "N|inherit", value_parser = parse_mix_score_limit::<i16>)]
+    pub(crate) mix_score_clamp_abs: Vec<Option<i16>>,
+
+    /// Keep unmarked records from each --mix-data file with probability F in [0, 1].
+    /// Repeat once per file in matching order. Use inherit or omit the option
+    /// to inherit the main sampling filters.
+    #[arg(long, global = true, value_name = "F|inherit", value_parser = parse_mix_override::<f64>)]
+    pub(crate) mix_keep_rate: Vec<Option<f64>>,
 
     /// Seed hashed with the mixed-stream position number to select each teacher.
     /// Teacher selection has no mutable random-generator state.
@@ -653,6 +677,16 @@ pub(crate) struct Cli {
     /// bit 0 and bit 1 are rejected, and marked positions must not appear in held-out data.
     #[arg(long, global = true, requires = "data")]
     pub(crate) tree_sample_eval_only: bool,
+
+    /// Keep marked tree samples with probability F in [0, 1] (default: 1).
+    /// Marked samples bypass the game-record sampling filters.
+    #[arg(
+        long,
+        global = true,
+        value_name = "F",
+        requires = "tree_sample_eval_only"
+    )]
+    pub(crate) tree_sample_accept: Option<f64>,
 
     /// Inject weights from a quantised NNUE binary before training starts
     /// (pretrained start). The optimizer state (m/v/slow/step) is
@@ -1141,6 +1175,7 @@ impl Cli {
             ("--mix-rate", self.mix_rate.len()),
             ("--mix-score-drop-abs", self.mix_score_drop_abs.len()),
             ("--mix-score-clamp-abs", self.mix_score_clamp_abs.len()),
+            ("--mix-keep-rate", self.mix_keep_rate.len()),
         ] {
             let given = argv
                 .iter()
@@ -1172,8 +1207,9 @@ impl Cli {
             .map(|(i, (path, rate))| nnue_train::dataloader::MixSource {
                 path: path.clone(),
                 rate: *rate,
-                score_drop_abs: self.mix_score_drop_abs.get(i).copied(),
-                score_clamp_abs: self.mix_score_clamp_abs.get(i).copied(),
+                score_drop_abs: self.mix_score_drop_abs.get(i).copied().flatten(),
+                score_clamp_abs: self.mix_score_clamp_abs.get(i).copied().flatten(),
+                keep_rate: self.mix_keep_rate.get(i).copied().flatten(),
             })
             .collect()
     }
@@ -1198,6 +1234,7 @@ impl Cli {
         for (flag, count) in [
             ("--mix-score-drop-abs", self.mix_score_drop_abs.len()),
             ("--mix-score-clamp-abs", self.mix_score_clamp_abs.len()),
+            ("--mix-keep-rate", self.mix_keep_rate.len()),
         ] {
             if count != 0 && count != self.mix_data.len() {
                 return Err(format!(
@@ -1821,8 +1858,10 @@ impl Cli {
                 || self.min_ply.is_some()
                 || self.ply_keep_curve.is_some()
                 || self.bucket_keep_rates.is_some()
-                || self.skip_seed.is_some(),
+                || self.skip_seed.is_some()
+                || self.tree_sample_accept.is_some(),
             keep_rate: self.keep_rate.unwrap_or(1.0),
+            tree_sample_accept: self.tree_sample_accept.unwrap_or(1.0),
             min_ply: self.min_ply,
             ply_keep_curve: self
                 .ply_keep_curve

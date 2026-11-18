@@ -157,6 +157,28 @@ pub struct MixDataParam {
     pub score_drop_abs: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SamplingParams {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tree_sample_eval_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampling: Option<serde_json::Value>,
+}
+
+impl SamplingParams {
+    pub fn new(tree_sample_eval_only: bool, mut sampling: crate::sampling::Sampling) -> Self {
+        if !tree_sample_eval_only {
+            sampling.tree_sample_accept = 1.0;
+        }
+        Self {
+            tree_sample_eval_only,
+            sampling: (!sampling.is_default()).then(|| sampling.settings(tree_sample_eval_only)),
+        }
+    }
 }
 
 /// 学習パラメータ。`nnue-lab` が index する key (`architecture` / `lr` 等) と、
@@ -234,8 +256,6 @@ pub struct Params {
     pub validation_wdl: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wdl_ignore_draws: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub tree_sample_eval_only: bool,
     pub scale: f32,
     pub weight_decay: f32,
     /// optimizer の param-group (ft / dense / bias) ごとの有効 weight_decay と
@@ -288,8 +308,8 @@ pub struct Params {
     /// `|score| >= score_drop_abs` の局面を loss から除外する閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_drop_abs: Option<i32>,
-    #[serde(default, skip_serializing_if = "crate::sampling::Sampling::is_default")]
-    pub sampling: crate::sampling::Sampling,
+    #[serde(flatten)]
+    pub sampling: SamplingParams,
     /// drop を生き残った局面の score を `[-c, c]` に飽和させる閾値。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_clamp_abs: Option<i32>,
@@ -811,7 +831,7 @@ mod tests {
         ];
         for sampling in variants {
             let mut params = base.clone();
-            params.sampling = sampling;
+            params.sampling = SamplingParams::new(false, sampling);
             assert_ne!(recipe_fingerprint(&params, "teacher.psv"), original);
         }
     }
@@ -880,6 +900,7 @@ mod tests {
             rate: 0.03,
             score_drop_abs: None,
             score_clamp_abs: None,
+            keep_rate: None,
         }];
         mixed.mix_seed = Some(0);
         let hash = recipe_fingerprint(&mixed, "main.psv");
@@ -889,6 +910,33 @@ mod tests {
             value["mix_data"],
             serde_json::json!([{"name": "tree.psv", "rate": 0.03}])
         );
+        assert_eq!(recipe_fingerprint(&base, "main.psv"), 0x4bf0_04b9_8bee_10a0);
+        assert_eq!(hash, 0x08f6_75e6_1952_e498);
+        let mut marked = mixed.clone();
+        marked.sampling = SamplingParams::new(true, Default::default());
+        let marked_hash = recipe_fingerprint(&marked, "main.psv");
+        assert_eq!(marked_hash, 0xd781_420e_46d2_e7a1);
+        marked.sampling = SamplingParams::new(
+            true,
+            crate::sampling::Sampling {
+                tree_sample_accept: 0.25,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap()["sampling"]["tree_sample_accept"],
+            0.25
+        );
+        assert_ne!(recipe_fingerprint(&marked, "main.psv"), marked_hash);
+
+        let mut overridden = mixed.clone();
+        overridden.mix_data[0].keep_rate = Some(1.0);
+        assert_eq!(
+            serde_json::to_value(&overridden).unwrap()["mix_data"][0]["keep_rate"],
+            1.0
+        );
+        assert_ne!(recipe_fingerprint(&overridden, "main.psv"), hash);
+
         for changed in 0..5 {
             let mut params = mixed.clone();
             match changed {
@@ -961,7 +1009,6 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
-            tree_sample_eval_only: false,
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -1245,12 +1292,41 @@ mod tests {
                 .get("tree_sample_eval_only")
                 .is_none()
         );
-        params.tree_sample_eval_only = true;
+        params.sampling = SamplingParams::new(true, Default::default());
         assert_eq!(
             serde_json::to_value(&params).unwrap()["tree_sample_eval_only"],
             true
         );
         assert_ne!(original, recipe_fingerprint(&params, "samples"));
+    }
+
+    #[test]
+    fn filtered_tree_sample_accept_is_serialized_and_changes_recipe_fingerprint() {
+        let mut params = sample_params();
+        let sampling = crate::sampling::Sampling {
+            keep_rate: 0.5,
+            ..Default::default()
+        };
+        params.sampling = SamplingParams::new(false, sampling.clone());
+        assert_eq!(
+            recipe_fingerprint(&params, "teacher.psv"),
+            0xd708_cd9a_08df_7e83
+        );
+        assert!(
+            serde_json::to_value(&params).unwrap()["sampling"]
+                .get("tree_sample_accept")
+                .is_none()
+        );
+
+        params.sampling = SamplingParams::new(true, sampling);
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["sampling"]["tree_sample_accept"],
+            1.0
+        );
+        assert_ne!(
+            recipe_fingerprint(&params, "teacher.psv"),
+            0x64fa_6b52_5f2f_869c
+        );
     }
 
     #[test]

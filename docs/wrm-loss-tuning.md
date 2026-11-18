@@ -71,6 +71,10 @@ on the score term only (WDL weight 0), regardless of the WDL schedule. It requir
 `--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.
 Records with padding bits other than bit 0 and bit 1 are rejected. Marked positions
 are rejected in external `--test-data` and `--test-tail-positions`.
+With this flag, `--tree-sample-accept F` keeps marked positions from any teacher
+with probability F (from 0 to 1, default 1). Marked positions bypass
+`--keep-rate`, `--min-ply`, `--ply-keep-curve`, `--bucket-keep-rates`, and
+`--mix-keep-rate`.
 
 ## Generalized loss form (pow_exp / asymmetry / weight boost)
 

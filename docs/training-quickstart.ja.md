@@ -148,7 +148,8 @@ bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤�
 捨てた分は次の record で補い、batch の件数を保ちます。
 5 周連続で採用がゼロなら error になります。
 間引きのオプションを一つでも指定したときだけ、各 superbatch に教師ごとと全体の累積 `read` / `kept` を出します。
-bucket 指定時は bucket ごとの読んだ数（reader のフィルタ通過後）と採った数も出します。
+bucket 間引きを指定すると、bucket ごとに reader のフィルタを通過して decode した局面数と、
+採用した局面数も出します。bucket のフィルタを通さない局面も、両方の数に含めます。
 先読み済みの局面も含みます。設定は `experiment.json` の `params.sampling` に保存し、
 recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）の場合だけ省略し、
 既存の recipe fingerprint を維持します。
@@ -163,13 +164,23 @@ nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 lay
 複数の教師を混ぜる場合は `--mix-data` / `--mix-rate` を対応する順序で繰り返す。
 同じオプションの繰り返しはサブコマンドの片側にまとめる。比率は score と reader 側の間引きを
 通過した局面の期待値であり、バッチごとの固定割当ではない。
-bucket で棄却されると worker は教師の選択からやり直すため、教師ごとの棄却率が違うと実際の割合は指定からずれ、`[teacher-mix]` ログで確認できる。
+bucket で棄却されると worker は教師の選択からやり直す。学習バッチに入る割合は、教師ごとの
+選択率に、reader 通過後の局面が bucket の段階で採用される割合を掛けた値に比例する。
+マーク付きの局面と、`--mix-keep-rate` に数値を指定した教師の局面は、この段階で必ず
+採用される。主の教師の局面が bucket で多く棄却されると、これらの局面を含む追加教師の
+割合は指定値より大きくなりうる。`[teacher-mix]` ログの採用件数を見て `--mix-rate` を調整する。
 各教師は独立に末尾から先頭へ戻る。追加教師ごとにスコアの閾値を指定するには、
 `--mix-score-drop-abs N` や
 `--mix-score-clamp-abs N` を `--mix-data` と同じ順序で、ファイルごとに 1 回ずつ指定する。
-省略したオプションの閾値は主の教師から引き継ぐ。各教師で使用するスコアを確定してから、
+個別の教師で主の教師の閾値を使うには `inherit` を指定する。オプションを省略すると
+全教師がその閾値を引き継ぐ。各教師で使用するスコアを確定してから、
 絶対値が drop の閾値以上の局面を除外し、残った局面のスコアを clamp する。両方の閾値が
 ある教師では、clamp の閾値を drop の閾値より小さくする。
+`--mix-keep-rate F`（0 以上 1 以下）も `--mix-data` と同じ順序でファイルごとに
+1 回ずつ指定する。指定した教師では、マークのない局面に対する間引きを確率 F のみにする。
+`inherit` を指定した教師は主の教師の間引き設定を引き継ぐ。オプションを省略すると
+全教師がその設定を引き継ぐ。数値を指定した場合は `experiment.json` の
+`params.mix_data` に `keep_rate` として記録する。
 空の教師や全件が除外される教師は、その教師が選ばれた時点でエラーになる。
 `--test-tail-positions` が確保する末尾は主の教師だけが対象。混ぜる教師は全件を読むため、
 held-out の局面をあらかじめ除いておくこと。
@@ -264,6 +275,10 @@ WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習す
 `--data` が必要で、フラグは全教師に適用する。主の教師では padding の bit 0 と bit 1 を許可し、
 bit 0 は dual-label の gate としても働く。追加教師でも bit 0 と bit 1 を許可するが、bit 0 は gate として読まない。マーク付き局面は
 外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。
+`--tree-sample-accept F` はこのフラグと併用し、全教師のマーク付き局面を
+確率 F（0 以上 1 以下、既定値 1）で採用する。マーク付き局面には
+`--keep-rate`、`--min-ply`、`--ply-keep-curve`、`--bucket-keep-rates`、
+`--mix-keep-rate` を適用しない。
 
 学習loaderをdropすると、direct・windowed双方をレコード境界で取り消す。
 高スコアのレコードを読み飛ばしている間や、次のdataset epochを開き直す前も停止を確認する。
