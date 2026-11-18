@@ -108,7 +108,8 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 | `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
 | `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp / --wrm-nnue2score` で収束する。`layerstack` では任意 (未指定なら plain sigmoid-MSE)。`simple` トレーナは必須で、`simple --fv-scale` 省略時は weight 読み込みの有無にかかわらず `--scale = --wrm-nnue2score` も必須。上の例は両方を 290 とし、`FV_SCALE=28` になる。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
 | `--fv-scale` (`simple`) | なし | export するアーキ文字列に書く正の整数の評価値スケール。明示値が常に最優先。省略時は v9 以降の `--resume` checkpoint、`--init-from` の入力 net、`round(127 × QB / --scale)` の導出値の順に解決し、weight 読み込みの有無にかかわらず `--scale = --wrm-nnue2score` が必須。v9 以降は再指定不要。v8 以前では override を再指定しないと導出値へ戻る |
-| `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99) / `radam` (lookahead なしの rectified Adam, beta1=0.9) / `adamw` (bias correction なしの Adam, beta1=0.9) から選ぶ。raw `.ckpt` からの `--resume` 時は元 run と同じ値を渡す |
+| `--optimizer` | ranger | `ranger`、`radam`、`adamw`、`sgd`（momentum 0.9）から選ぶ。raw `.ckpt` からの通常再開は元と同じ optimizer を指定する。 |
+| `--transfer-radam-momentum` | off | `--optimizer sgd --resume <RAdam の .ckpt> --lr <SGD の初期学習率>` と併用する。量子化前の重みと勾配の一次モーメントを引き継ぎ、SGD の更新回数・学習率スケジュール・教師の読み位置を最初から始める。元の run が `--optimizer radam` だったことを確認し、新しい出力先または net ID を指定する。 |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
 | `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--mix-data PATH` / `--mix-rate R` | なし | 対応する順序で繰り返し、別の教師を指定比率で混ぜる。各 R は有限の正数で、合計は 1 未満。残りは `--data` を指定順につないだ主の教師から取る。全教師の形式は同一であること |

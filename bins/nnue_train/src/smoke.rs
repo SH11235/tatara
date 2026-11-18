@@ -241,7 +241,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon, checkpoint_fv_scale) =
-        trainer_r.load_raw_checkpoint(&raw_path)?;
+        trainer_r.load_raw_checkpoint(&raw_path, false)?;
     trainer_r.sync_ft_forward_weights()?;
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());

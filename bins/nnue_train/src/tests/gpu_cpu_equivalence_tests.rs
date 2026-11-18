@@ -5905,7 +5905,7 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
 
     let mut loader = new_trainer()?;
     let ptrs_before_load = device_ptrs(&loader);
-    let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path)?;
+    let (superbatch, producer, lr_horizon) = loader.load_raw_checkpoint(&path, false)?;
     assert_eq!(device_ptrs(&loader), ptrs_before_load);
     assert_eq!(superbatch, 3);
     assert_eq!(producer.run_id.as_deref(), Some("roundtrip-test"));
@@ -6183,12 +6183,12 @@ fn simple_ft_factorize_resume_rejects_on_off_mismatch() -> Result<(), Box<dyn st
 
     // factorize checkpoint を非 factorize trainer に load → reject。
     assert!(
-        mk(base_id)?.load_raw_checkpoint(&fac_path).is_err(),
+        mk(base_id)?.load_raw_checkpoint(&fac_path, false).is_err(),
         "loading a factorized checkpoint into a non-factorized trainer must be rejected"
     );
     // 非 factorize checkpoint を factorize trainer に load → reject。
     assert!(
-        mk(fac_id)?.load_raw_checkpoint(&base_path).is_err(),
+        mk(fac_id)?.load_raw_checkpoint(&base_path, false).is_err(),
         "loading a non-factorized checkpoint into a factorized trainer must be rejected"
     );
 

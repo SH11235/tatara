@@ -105,10 +105,10 @@ pub fn radam_compute_step_size_denom(
 ///
 /// 入力前提:
 /// - `weights.len() == m.len() == v.len() == grad.len() == n`
-/// - `lr ≥ 0`, `decay ≥ 0`, `0 < beta1 < 1`, `0 < beta2 < 1`, `eps > 0`
+/// - `lr ≥ 0`, `decay ≥ 0`, `0 < beta1 < 1`, `0 < beta2 <= 1`, `eps > 0`
 /// - `min_w ≤ max_w` (host 側不変条件)
-/// - `step_size > 0`, `denom ∈ {0, 1}` (host pre-compute による、
-///   `radam_compute_step_size_denom` の戻り値をそのまま渡す前提)
+/// - `step_size > 0`, `denom ∈ {0, 1}`
+/// - `beta2 = 1` with `denom = 0` leaves the unused second moment unchanged for SGD.
 ///
 /// 引数 14 個は RAdam の host pre-compute 引数を畳み込んだ形。
 /// `clippy::too_many_arguments` を allow する。

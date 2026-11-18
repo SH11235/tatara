@@ -6,6 +6,7 @@ use std::path::Path;
 use gpu_runtime::{CudaStream, DeviceBuffer};
 use nnue_format::ArchKind;
 use nnue_train::dataloader::BucketMode;
+use nnue_train::optimizer::OptimizerKind;
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
 #[cfg(feature = "gpu")]
@@ -16,10 +17,10 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 11):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 12):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (11)             (4 bytes)
+//   version      u32 (11 or 12)             (4 bytes)
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -55,7 +56,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=11 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=12 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// raw checkpoint format magic (`b"RNRC"` = "RShogi Nnue Resume Checkpoint")。
@@ -122,15 +123,18 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   `--resume` compares them with the resuming run to record whether it
 ///   continues the producer's training or forks a new experiment from it.
 ///
-/// `load_raw_checkpoint` accepts versions 1..=11. Version 1 is interpreted as
+/// `load_raw_checkpoint` accepts versions 1..=12. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 11 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 12 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
-pub(crate) const RAW_CKPT_VERSION: u32 = 11;
+/// Version 12 uses the same layout as version 11 and identifies SGD momentum state.
+pub(crate) const RAW_CKPT_VERSION: u32 = 12;
+const ADAM_CHECKPOINT_VERSION: u32 = 11;
+const SGD_CHECKPOINT_VERSION: u32 = 12;
 
 /// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
 /// `lineage.parent_id` と、resume した run が続きか派生かの判定に使う。
@@ -144,6 +148,72 @@ pub(crate) struct ResumeProducer {
 
 #[cfg(feature = "gpu")]
 impl RawCkptHeader {
+    pub(crate) fn prepare_optimizer_state(
+        &mut self,
+        path: &Path,
+        groups: &mut [RawCkptGroup],
+        optimizer: OptimizerKind,
+        transfer_radam_momentum: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if transfer_radam_momentum {
+            if self.sgd || optimizer != OptimizerKind::Sgd {
+                return Err(invalid_data(
+                    "--transfer-radam-momentum requires a RAdam checkpoint and --optimizer sgd"
+                        .to_string(),
+                ));
+            }
+            self.check_radam_producer(path)?;
+            // Both optimizers store the same gradient EMA with beta1 = 0.9.
+            for (_, _, variance, slow) in groups {
+                variance.fill(0.0);
+                slow.fill(0.0);
+            }
+            self.step_count = 0;
+            self.lr_horizon = None;
+        } else if self.sgd != (optimizer == OptimizerKind::Sgd) {
+            return Err(invalid_data(
+                "SGD checkpoints require --optimizer sgd; to start SGD from a RAdam checkpoint, use --transfer-radam-momentum"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_radam_producer(&self, checkpoint: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(run_id) = self.producer_run_id.as_deref() else {
+            return Ok(());
+        };
+        let run_path = Path::new(run_id);
+        if !run_path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(invalid_data(
+                "invalid checkpoint producer run id".to_string(),
+            ));
+        }
+        let checkpoint = checkpoint.canonicalize()?;
+        let Some(directory) = checkpoint.ancestors().nth(run_path.components().count()) else {
+            return Ok(());
+        };
+        let metadata = directory.join("experiments").join(format!("{run_id}.json"));
+        let file = match std::fs::File::open(&metadata) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let experiment: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(file))?;
+        if experiment["id"].as_str() != Some(run_id)
+            || experiment["params"]["optimizer"].as_str() != Some("radam")
+        {
+            return Err(invalid_data(format!(
+                "RAdam source checkpoint optimizer could not be verified from {}",
+                metadata.display()
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn producer(&self) -> ResumeProducer {
         ResumeProducer {
             run_id: self.producer_run_id.clone(),
@@ -285,6 +355,7 @@ pub(crate) struct RawCkptArch<'a> {
 /// [`save_raw_checkpoint_file`] が [`RawCkptArch`] と並べて受け取る。
 #[derive(Clone, Copy)]
 pub(crate) struct RawCkptMeta<'a> {
+    pub(crate) optimizer: OptimizerKind,
     pub(crate) qat_dense: bool,
     /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
     /// `lineage.parent_id` に使う)。空文字列は「未記録」。
@@ -306,6 +377,7 @@ pub(crate) struct RawCkptMeta<'a> {
 /// `read_raw_ckpt_header` が返す raw checkpoint header の解析結果。
 #[derive(Debug)]
 pub(crate) struct RawCkptHeader {
+    pub(crate) sgd: bool,
     pub(crate) qat_dense: bool,
     /// この checkpoint が表す完了 superbatch 番号。
     pub(crate) superbatch: usize,
@@ -327,7 +399,6 @@ pub(crate) struct RawCkptHeader {
 }
 
 /// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
-/// 常に最新 [`RAW_CKPT_VERSION`] で書き出す。
 pub(crate) fn write_raw_ckpt_header<W: Write>(
     w: &mut W,
     arch: &RawCkptArch,
@@ -335,7 +406,12 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
     num_groups: u64,
 ) -> std::io::Result<()> {
     w.write_all(&RAW_CKPT_MAGIC)?;
-    w.write_all(&RAW_CKPT_VERSION.to_le_bytes())?;
+    let version = if meta.optimizer == OptimizerKind::Sgd {
+        SGD_CHECKPOINT_VERSION
+    } else {
+        ADAM_CHECKPOINT_VERSION
+    };
+    w.write_all(&version.to_le_bytes())?;
     // feature set header (v2+): canonical 名 + 次元 3 値。
     let fs_name = arch.feature_set.canonical_name();
     w.write_all(&(fs_name.len() as u32).to_le_bytes())?;
@@ -384,7 +460,7 @@ pub(crate) fn write_raw_ckpt_header<W: Write>(
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=10 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=12 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
@@ -721,6 +797,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     let num_groups = u64::from_le_bytes(buf8);
 
     Ok(RawCkptHeader {
+        sgd: version == SGD_CHECKPOINT_VERSION,
         qat_dense,
         superbatch,
         step_count,

@@ -826,14 +826,22 @@ pub(crate) struct Cli {
     /// Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 0.5, global = true)]
     pub(crate) loss_weight_boost_w2: f32,
-    /// Optimizer: "ranger" (RAdam + lookahead, beta1=0.99), "radam" (rectified
-    /// Adam without lookahead, beta1=0.9), or "adamw" (Adam without bias
-    /// correction, decoupled weight decay, beta1=0.9). All three share
-    /// beta2=0.999 and the per-layer weight clamp. When resuming from a raw
-    /// checkpoint, pass the same optimizer as the original run (the checkpoint
-    /// stores moment buffers but not the optimizer name).
+    /// Optimizer: ranger (RAdam with Lookahead), radam, adamw, or sgd (classical
+    /// momentum 0.9). A raw checkpoint training resume uses the original optimizer.
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
+
+    /// Start SGD from the raw RAdam checkpoint passed to --resume. Keeps the
+    /// weights and gradient momentum and starts new learning-rate and input
+    /// schedules. The caller must confirm the source run used --optimizer radam.
+    #[arg(
+        long,
+        global = true,
+        requires_all = ["resume", "lr", "data"],
+        conflicts_with_all = ["start_superbatch", "resume_input", "lineage_kind", "eval_only", "rescore_input"]
+    )]
+    pub(crate) transfer_radam_momentum: bool,
+
     /// Weight decay coefficient for the optimizer (AdamW-style decoupled
     /// weight decay). The default 0.0 means no decay. A non-zero value slightly
     /// decays the weights of every weight group toward 0 on each step.
