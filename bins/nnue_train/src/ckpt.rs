@@ -179,6 +179,13 @@ impl RawCkptHeader {
             }
             self.step_count = 0;
             self.lr_horizon = None;
+        } else if self.version == PARTIAL_THREAT_RADAM_CKPT_VERSION
+            && optimizer != OptimizerKind::RAdam
+        {
+            return Err(invalid_data(
+                "Version 15 compact checkpoints require --optimizer radam for resume; to start SGD, use --optimizer sgd with --transfer-radam-momentum"
+                    .to_string(),
+            ));
         } else if self.sgd != (optimizer == OptimizerKind::Sgd) {
             return Err(invalid_data(
                 "SGD checkpoints require --optimizer sgd; to start SGD from a RAdam checkpoint, use --transfer-radam-momentum"

@@ -7,6 +7,7 @@ use shogi_features::{EffectBucketConfig, FeatureSet};
 use crate::{arch::*, ckpt::*};
 
 use std::io::Cursor;
+use std::path::Path;
 
 struct LimitedIo<T> {
     inner: T,
@@ -1112,9 +1113,34 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         assert_eq!(full_bytes, write(&explicit, optimizer));
         let packed_bytes = write(&partial, optimizer);
         assert_eq!(packed_bytes[4..8], version.to_le_bytes());
-        let header = read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &partial).unwrap();
+        let mut header = read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &partial).unwrap();
         assert_eq!(header.step_count, 5);
         assert_eq!(header.sgd, optimizer == OptimizerKind::Sgd);
+        for requested in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+            OptimizerKind::Sgd,
+        ] {
+            let result =
+                header.prepare_optimizer_state(Path::new("unused.ckpt"), &mut [], requested, false);
+            let required_flag = match version {
+                13 if requested == OptimizerKind::Sgd => Some("--transfer-radam-momentum"),
+                14 if requested != OptimizerKind::Sgd => Some("--optimizer sgd"),
+                15 if requested != OptimizerKind::RAdam => Some("--optimizer radam"),
+                _ => None,
+            };
+            if let Some(flag) = required_flag {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(flag),
+                    "v{version} with {requested:?}: {error}"
+                );
+            } else {
+                assert!(result.is_ok(), "v{version} with {requested:?}: {result:?}");
+            }
+            assert_eq!(header.step_count, 5);
+        }
         assert!(read_raw_ckpt_header(&mut Cursor::new(&packed_bytes), &full).is_err());
         assert!(read_raw_ckpt_header(&mut Cursor::new(&full_bytes), &partial).is_err());
     }

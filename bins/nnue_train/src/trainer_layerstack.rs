@@ -1438,6 +1438,18 @@ fn cfg_partial_ft_1d(elements: usize) -> LaunchConfig {
     config
 }
 
+fn validate_unfused_ft_optimizer_len(elements: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if u32::try_from(elements).is_err() {
+        return Err(format!(
+            "The unfused FT optimizer supports at most {} weights, but this configuration has \
+             {elements}. Reduce --ft-out or --threat-width, or use the native fused FT optimizer.",
+            u32::MAX
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn ft_moment(
     stream: &CudaStream,
     n: usize,
@@ -2484,6 +2496,11 @@ impl GpuTrainer {
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
+        let ft_w_n = feature_set.train_ft_weight_len(ft_out);
+        #[cfg(not(feature = "native"))]
+        if !forward_only {
+            validate_unfused_ft_optimizer_len(ft_w_n)?;
+        }
         let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let device_occupancy = DeviceOccupancy::query(ctx)?;
@@ -2503,7 +2520,6 @@ impl GpuTrainer {
 
         let l1_effective = l1_out - L1_SKIP;
         let l2_in = l1_effective * 2;
-        let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         let ft_b_n = ft_out;
         let l1_w_n = num_buckets * l1_out * ft_out;
         let l1_b_n = num_buckets * l1_out;
@@ -6288,17 +6304,17 @@ impl GpuTrainer {
             };
         }
 
-        // The step counter advances before regularization so the fused FT path can be decided
-        // against the precision-diagnostic schedule, which is keyed by the post-increment count.
-        self.step_count += 1;
+        // Precision diagnostics are keyed by the step count after the increment.
         #[cfg(feature = "native")]
-        let ft_fused = self.ft_fused_optimizer_applies(self.step_count);
+        let ft_fused = self.ft_fused_optimizer_applies(self.step_count + 1);
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
         #[cfg(feature = "native")]
         if !ft_fused {
+            validate_unfused_ft_optimizer_len(ft_w_n)?;
             self.ft_norm_sums_current = false;
         }
+        self.step_count += 1;
         #[cfg(feature = "native")]
         if self.ft_grad_active_rows_only && !ft_fused {
             return Err(
@@ -6871,6 +6887,25 @@ trainer_backend_impl! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn unfused_ft_optimizer_rejects_element_counts_above_u32() {
+        use shogi_features::{FeatureSet, ThreatProfile};
+
+        let limit = u32::MAX as usize;
+        assert!(validate_unfused_ft_optimizer_len(limit).is_ok());
+        assert!(validate_unfused_ft_optimizer_len(limit + 1).is_err());
+
+        let features = FeatureSet::HalfKp
+            .spec()
+            .with_threat_profile(ThreatProfile::Full)
+            .with_threat_width(8192);
+        let elements = features.train_ft_weight_len(32768);
+        assert_eq!(elements, 5_884_084_224);
+        let error = validate_unfused_ft_optimizer_len(elements).unwrap_err();
+        assert!(error.to_string().contains("5884084224"));
+    }
 
     /// radam_step / ranger_lookahead_lerp pass が回す一様 weight group の launch 順・
     /// param-group・clamp 範囲を gold 値で固定する test。順序や kind / clamp がずれると
