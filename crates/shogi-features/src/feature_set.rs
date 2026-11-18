@@ -458,6 +458,15 @@ impl FeatureSetSpec {
         }
     }
 
+    /// Drop the training-only FT factorizer while preserving the real feature layout.
+    pub const fn without_ft_factorize(self) -> Self {
+        Self {
+            ft_factorize: false,
+            ft_factorize_mode: FtFactorizeMode::Base,
+            ..self
+        }
+    }
+
     /// Threat profile を連結した spec を返す (modifier 適用の唯一の経路)。
     ///
     /// `ft_factorize` とは違い base 次元を拡張する: `ft_in` / `max_active` /

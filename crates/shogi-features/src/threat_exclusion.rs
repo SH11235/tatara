@@ -42,6 +42,15 @@ pub enum ThreatProfile {
 }
 
 impl ThreatProfile {
+    pub const ALL: [Self; 6] = [
+        Self::Full,
+        Self::SameClass,
+        Self::SameClassMajorPawn,
+        Self::StepAttacker,
+        Self::FullSymDedup,
+        Self::CrossSide,
+    ];
+
     /// CLI 文字列から変換。未知の文字列は None。
     pub fn from_cli(s: &str) -> Option<Self> {
         match s {

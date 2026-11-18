@@ -17,6 +17,7 @@ workspace = true
 # `bins/nnue_train/src/kernels/` 側に置く必要があり、本 crate は kernel launch を
 # 持たず host 側ロジックのみに留める (GPU 非依存の test を CI に通すため
 # `gpu-runtime` も非依存)。`gpu-kernels` は CPU reference 実装の流用のみ。
+nnue-format = { workspace = true }
 shogi-format = { workspace = true }
 shogi-features = { workspace = true }
 gpu-kernels = { workspace = true }
@@ -25,9 +26,3 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27"
 sha2 = "0.11"
-
-[dev-dependencies]
-# `ExperimentDoc::new` が呼び出し側の `fv_scale` を素通しで記録することを、実 export 値
-# (`nnue_format::{layerstack_weights::FV_SCALE, simple_weights::simple_fv_scale}`) を
-# 使ったテストで担保する。
-nnue-format = { workspace = true }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "gpu")]
 use gpu_runtime::CudaContext;
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 use nnue_format::LayerStackWeights;
 #[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
@@ -710,7 +710,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
     validate_output_format(cli.output_format, bucket_mode)?;
-    // 学習は progress 係数未指定を全 bucket 4 に縮退させるが、リスコアで同じ縮退を
+    let midpoint_bucket = layerstack.num_buckets() / 2;
+    // 学習は progress 係数未指定を中央 bucket に縮退させるが、リスコアで同じ縮退を
     // 許すと全行が誤 routing のラベルになる。rescore 経路のみ明示エラーにする。
     if cli.rescore_input.is_some()
         && bucket_mode.uses_progress_coeff()
@@ -718,7 +719,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     {
         return Err(format!(
             "--rescore-input with --bucket-mode {} requires --progress-coeff \
-             (without it every position would silently fall into bucket 4)",
+             (without it every position would silently fall into bucket {midpoint_bucket})",
             bucket_mode.canonical_name()
         )
         .into());
@@ -829,7 +830,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             None => eprintln!(
-                "[train] note: --progress-coeff not given; all positions map to bucket 4 (sigmoid(0) = 0.5)"
+                "[train] note: --progress-coeff not given; all positions map to bucket {midpoint_bucket} (sigmoid(0) = 0.5)"
             ),
         }
     }
@@ -1039,7 +1040,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 書くため、file を一括で読んでから同じ buffer で parse する。学習経路は
         // 従来どおり streaming (数百 MB を余分に保持しない)。
         let mut weights = if cli.init_ft_only {
-            load_ft_source(init, feature_set, layerstack.ft_out, layerstack.psqt)?
+            load_ft_source(
+                init,
+                feature_set,
+                layerstack.ft_out,
+                layerstack
+                    .psqt
+                    .then_some((bucket_mode, layerstack.num_buckets())),
+            )?
         } else if cli.rescore_input.is_some() {
             // hash とロードの対象を同じ実体にするため、canonical path に解決して
             // から読む (symlink 差し替えで両者が乖離しないように)。
@@ -3473,12 +3481,12 @@ mod tests {
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 fn load_ft_source(
     path: &std::path::Path,
     feature_set: shogi_features::FeatureSetSpec,
     ft_out: usize,
-    psqt: bool,
+    psqt_routing: Option<(BucketMode, usize)>,
 ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
     use nnue_format::layerstack_weights::{read_layerstack_arch, stored_num_buckets};
     use std::io::{Read, Seek};
@@ -3497,18 +3505,31 @@ fn load_ft_source(
     file.read_exact(&mut header)?;
     let buckets = stored_num_buckets(&header)?;
     file.rewind()?;
-    Ok(LayerStackWeights::load_quantised_with_psqt(
+    let weights = LayerStackWeights::load_quantised_with_psqt(
         &mut file,
         feature_set,
         ft_out,
         affine_dims[2],
         affine_dims[1],
         buckets,
-        psqt,
-    )?)
+        psqt_routing.is_some(),
+    )?;
+    if let Some((target_mode, target_buckets)) = psqt_routing {
+        let source_spec = weights.bucket_spec.ok_or(
+            "--init-ft-only with --psqt requires ls_bucket= in the source net to verify PSQT routing",
+        )?;
+        if !matches!(target_mode, BucketMode::Spec(spec) if spec == source_spec)
+            || target_buckets != weights.num_buckets
+        {
+            return Err(
+                "--init-ft-only with --psqt requires matching bucket mode, count and spec".into(),
+            );
+        }
+    }
+    Ok(weights)
 }
 
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(test)]
 mod ft_source_tests {
     use super::*;
 
@@ -3531,12 +3552,54 @@ mod ft_source_tests {
         source
             .save_quantised(&mut std::fs::File::create(&path).unwrap(), None)
             .unwrap();
-        let loaded = load_ft_source(&path, spec, 4, false).unwrap();
+        let loaded = load_ft_source(&path, spec, 4, None).unwrap();
         assert!(loaded.ft_w == source.ft_w);
         assert_eq!(loaded.ft_b, source.ft_b);
         assert_eq!(loaded.num_buckets, 3);
         assert_eq!(loaded.bucket_spec, source.bucket_spec);
-        assert!(load_ft_source(&path, spec.with_threat_width(4), 4, false).is_err());
+        assert!(load_ft_source(&path, spec.with_threat_width(4), 4, None).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ft_source_with_psqt_requires_verifiable_matching_routing() {
+        let features = FeatureSet::HalfKp.spec();
+        let mut source = LayerStackWeights::zeroed_with_psqt(features, 4, 4, 4, 9);
+        let path = std::env::temp_dir().join(format!("tatara-ft-psqt-{}.bin", std::process::id()));
+        let write_source = |source: &LayerStackWeights| {
+            source
+                .save_quantised(&mut std::fs::File::create(&path).unwrap(), None)
+                .unwrap();
+        };
+        write_source(&source);
+        let err = load_ft_source(&path, features, 4, Some((BucketMode::ProgressKpAbs, 9)))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("requires ls_bucket="), "{err}");
+
+        let spec = "handmajor3+ownking:2/3".parse().unwrap();
+        source.bucket_spec = Some(spec);
+        write_source(&source);
+        for target in [
+            (BucketMode::KingRank9, 9),
+            (
+                BucketMode::Spec("handmajor3+oppking:2/3".parse().unwrap()),
+                9,
+            ),
+            (BucketMode::Spec(spec), 8),
+        ] {
+            let err = load_ft_source(&path, features, 4, Some(target))
+                .err()
+                .unwrap();
+            assert!(
+                err.to_string()
+                    .contains("matching bucket mode, count and spec"),
+                "{err}"
+            );
+        }
+        let loaded = load_ft_source(&path, features, 4, Some((BucketMode::Spec(spec), 9))).unwrap();
+        assert_eq!(loaded.bucket_spec, source.bucket_spec);
+        assert_eq!(loaded.psqt_w, source.psqt_w);
         std::fs::remove_file(path).unwrap();
     }
 }

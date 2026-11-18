@@ -68,6 +68,37 @@ fn precision_cli_scope_and_bounds() {
         );
     }
 }
+#[test]
+fn precision_steps_conflict_with_freeze_ft() {
+    for args in [
+        [
+            "nnue-train",
+            "layerstack",
+            "--precision-steps",
+            "1",
+            "--freeze-ft",
+        ],
+        [
+            "nnue-train",
+            "--freeze-ft",
+            "layerstack",
+            "--precision-steps",
+            "1",
+        ],
+        [
+            "nnue-train",
+            "--precision-steps",
+            "1",
+            "layerstack",
+            "--freeze-ft",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let err = cli.validate_score_sources().unwrap_err();
+        assert_eq!(err, "--freeze-ft cannot be combined with --precision-steps");
+    }
+}
+
 use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;

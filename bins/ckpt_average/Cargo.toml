@@ -19,3 +19,4 @@ path = "src/main.rs"
 clap = { workspace = true }
 nnue-format = { workspace = true }
 shogi-features = { workspace = true }
+nnue-train = { workspace = true }

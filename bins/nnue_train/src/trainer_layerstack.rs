@@ -3056,20 +3056,10 @@ impl GpuTrainer {
         {
             return Err("FT source feature set or packed dimensions do not match trainer".into());
         }
-        let target_spec = match self.bucket_mode {
-            BucketMode::Spec(s) => Some(s),
-            _ => None,
-        };
-        if source.psqt_w.is_some()
-            && (source.num_buckets != self.num_buckets || source.bucket_spec != target_spec)
-        {
-            return Err("PSQT columns depend on output buckets; FT-only import with PSQT requires the same bucket count and spec".into());
+        if self.feature_set.ft_factorize() {
+            return Err("FT-only import requires FT factorization to be disabled".into());
         }
-        let mut weights = self.to_layerstack_weights()?;
-        weights.ft_w.clone_from(&source.ft_w);
-        weights.ft_b.clone_from(&source.ft_b);
-        weights.psqt_w.clone_from(&source.psqt_w);
-        self.load_layerstack_weights(&weights)
+        self.load_feature_transform_weights(source)
     }
 
     /// `LayerStackWeights` から weight buffer を device に upload (pretrained 注入、`--init-from`)。
@@ -3096,7 +3086,6 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let forward_only = self.forward_only;
         // 本経路は companion buffer (`ft_w_m`/`v`/`grad`/`slow`) を base 長で
         // 再確保するため、factorize 有効 trainer (train 長の `ft_w`) には適用
         // できない (spec 等値性でも弾かれるが、長さ不変条件をここで閉じる)。
@@ -3120,12 +3109,7 @@ impl GpuTrainer {
                 self.feature_set.ft_factorize()
             )));
         }
-        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
-        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
-        #[cfg(feature = "native")]
-        {
-            self.ft_norm_sums_current = false;
-        }
+        self.load_feature_transform_weights(w)?;
         self.l1_w = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
         self.l1_b = DeviceBuffer::from_host(&self.stream, &w.l1_b)?;
         self.l1_shared_weight = DeviceBuffer::from_host(&self.stream, &w.l1_shared_weight)?;
@@ -3148,8 +3132,6 @@ impl GpuTrainer {
             let l1_out = self.ws.l1_out;
             let l2_out = self.ws.l2_out;
             let l2_in = self.ws.l2_in();
-            let ft_w_n = self.feature_set.ft_weight_len(ft_out);
-            let ft_b_n = ft_out;
             let l1_w_n = self.num_buckets * l1_out * ft_out;
             let l1_b_n = self.num_buckets * l1_out;
             let l1_shared_weight_n = ft_out * l1_out;
@@ -3158,30 +3140,6 @@ impl GpuTrainer {
             let l2_b_n = self.num_buckets * l2_out;
             let l3_w_n = self.num_buckets * l2_out;
             let l3_b_n = self.num_buckets;
-            self.ft_w_m = ft_moment(
-                &self.stream,
-                ft_w_n,
-                self.fp16_opt_state,
-                self.ft_state_host,
-            )?;
-            self.ft_w_v = ft_moment(
-                &self.stream,
-                ft_w_n,
-                self.fp16_opt_state,
-                self.ft_state_host,
-            )?;
-            self.ft_w_slow = if self.ft_state_host {
-                let mut slow = ft_slow(&self.stream, w.ft_w.len(), true)?;
-                slow.copy_from_host(&self.stream, &w.ft_w)?;
-                slow
-            } else {
-                DeviceBuffer::from_host(&self.stream, &w.ft_w)?
-            };
-            self.ft_w_grad = zeros_f32(ft_w_n)?;
-            self.ft_b_m = zeros_f32(ft_b_n)?;
-            self.ft_b_v = zeros_f32(ft_b_n)?;
-            self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
-            self.ft_b_grad = zeros_f32(ft_b_n)?;
             self.l1_w_m = zeros_f32(l1_w_n)?;
             self.l1_w_v = zeros_f32(l1_w_n)?;
             self.l1_w_slow = DeviceBuffer::from_host(&self.stream, &w.l1_w)?;
@@ -3216,6 +3174,49 @@ impl GpuTrainer {
             self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
             self.l3_b_grad = zeros_f32(l3_b_n)?;
         }
+        self.step_count = 0;
+        self.sync_stack_forward_weights()?;
+        Ok(())
+    }
+
+    fn load_feature_transform_weights(
+        &mut self,
+        w: &LayerStackWeights,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.ft_w = DeviceBuffer::from_host(&self.stream, &w.ft_w)?;
+        self.ft_b = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+        #[cfg(feature = "native")]
+        {
+            self.ft_norm_sums_current = false;
+        }
+        if !self.forward_only {
+            let ft_b_n = self.ws.ft_out;
+            let ft_w_n = self.feature_set.ft_weight_len(ft_b_n);
+            self.ft_w_m = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_v = ft_moment(
+                &self.stream,
+                ft_w_n,
+                self.fp16_opt_state,
+                self.ft_state_host,
+            )?;
+            self.ft_w_slow = if self.ft_state_host {
+                let mut slow = ft_slow(&self.stream, w.ft_w.len(), true)?;
+                slow.copy_from_host(&self.stream, &w.ft_w)?;
+                slow
+            } else {
+                DeviceBuffer::from_host(&self.stream, &w.ft_w)?
+            };
+            self.ft_w_grad = DeviceBuffer::zeroed(&self.stream, ft_w_n)?;
+            self.ft_b_m = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+            self.ft_b_v = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+            self.ft_b_slow = DeviceBuffer::from_host(&self.stream, &w.ft_b)?;
+            self.ft_b_grad = DeviceBuffer::zeroed(&self.stream, ft_b_n)?;
+        }
         // PSQT (任意): trainer 側で psqt が enabled なら weight 側も `Some` を要求。
         // load 側で `Some` でも trainer が `None` の組合せ (誤って PSQT 無し trainer に
         // PSQT 含む weights を入れる) も同じく reject する。
@@ -3229,7 +3230,7 @@ impl GpuTrainer {
                     )));
                 }
                 psqt.w = DeviceBuffer::from_host(&self.stream, w_psqt)?;
-                if !forward_only {
+                if !self.forward_only {
                     psqt.w_m = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
                     psqt.w_v = DeviceBuffer::<f32>::zeroed(&self.stream, n)?;
                     psqt.w_slow = DeviceBuffer::from_host(&self.stream, w_psqt)?;
@@ -3250,8 +3251,6 @@ impl GpuTrainer {
             }
             (None, None) => {}
         }
-        self.step_count = 0;
-        self.sync_stack_forward_weights()?;
         Ok(())
     }
 

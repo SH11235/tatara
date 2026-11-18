@@ -4703,25 +4703,43 @@ fn ft_only_import_preserves_fresh_output_layers() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn ft_only_import_rejects_incompatible_psqt_routing() -> Result<(), Box<dyn std::error::Error>> {
+fn ft_only_import_matches_fresh_dense_weights_at_first_lookahead()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::arch::RANGER_K;
+
     let context = test_cuda_context_reserving_gib(2)?;
-    let mut trainer = create_layerstack_trainer_with_options(
-        &context,
-        true,
-        LayerStackTestOptions {
-            num_buckets: 3,
-            bucket_mode: BucketMode::Spec("ownking:2/3".parse().unwrap()),
-            psqt: true,
-            ..LayerStackTestOptions::standard()
-        },
-    )?;
-    let before = trainer.to_layerstack_weights()?;
-    let mut source = before.clone();
-    source.bucket_spec = Some("oppking:2/3".parse().unwrap());
-    assert!(trainer.load_ft_weights(&source).is_err());
-    source.bucket_spec = before.bucket_spec;
-    source.num_buckets = 4;
-    assert!(trainer.load_ft_weights(&source).is_err());
-    assert_eq!(before.ft_w, trainer.to_layerstack_weights()?.ft_w);
+    let options = LayerStackTestOptions::standard();
+    let mut fresh = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut imported = create_layerstack_trainer_with_options(&context, true, options)?;
+    let source = fresh.to_layerstack_weights()?;
+    imported.load_ft_weights(&source)?;
+    for trainer in [&mut fresh, &mut imported] {
+        trainer.set_freeze_ft(true);
+        trainer.sync_ft_forward_weights()?;
+    }
+    let batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for _ in 1..RANGER_K {
+        for trainer in [&mut fresh, &mut imported] {
+            trainer.step(&batch.as_ref(), 0.0, 0.5, SMOKE_LOSS_WRM)?;
+        }
+    }
+    let before = fresh.to_layerstack_weights()?;
+    assert_eq!(before.l3_w, imported.to_layerstack_weights()?.l3_w);
+    assert!(before.l3_w.iter().any(|&weight| weight != 0.0));
+
+    for trainer in [&mut fresh, &mut imported] {
+        trainer.step(&batch.as_ref(), 0.0, 0.5, SMOKE_LOSS_WRM)?;
+    }
+    let fresh = fresh.to_layerstack_weights()?;
+    let imported = imported.to_layerstack_weights()?;
+    assert_ne!(fresh.l3_w, before.l3_w);
+    assert_eq!(fresh.l1_w, imported.l1_w);
+    assert_eq!(fresh.l1_b, imported.l1_b);
+    assert_eq!(fresh.l1_shared_weight, imported.l1_shared_weight);
+    assert_eq!(fresh.l1_shared_bias, imported.l1_shared_bias);
+    assert_eq!(fresh.l2_w, imported.l2_w);
+    assert_eq!(fresh.l2_b, imported.l2_b);
+    assert_eq!(fresh.l3_w, imported.l3_w);
+    assert_eq!(fresh.l3_b, imported.l3_b);
     Ok(())
 }

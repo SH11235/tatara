@@ -395,27 +395,41 @@ fn validate_simple(
 }
 
 fn rewrite_arch(arch: &str, rewrite: Rewrite) -> Result<String, Box<dyn std::error::Error>> {
-    let fv_tokens = arch
-        .split(',')
-        .enumerate()
-        .filter(|(_, token)| token.starts_with("fv_scale="))
-        .collect::<Vec<_>>();
-    if fv_tokens.len() > 1 {
-        return Err("architecture string contains multiple fv_scale tokens".into());
-    }
-    if let Some((index, token)) = fv_tokens.first()
-        && (*index + 1 != arch.split(',').count() || token["fv_scale=".len()..].is_empty())
-    {
-        return Err("fv_scale is not a canonical trailing architecture token".into());
+    let mut tokens = arch.split(',').collect::<Vec<_>>();
+    let mut scale_index = None;
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(value) = token.strip_prefix("fv_scale=") {
+            if scale_index.replace(index).is_some() {
+                return Err("architecture string contains multiple fv_scale tokens".into());
+            }
+            if value.is_empty() {
+                return Err("architecture string contains an empty fv_scale token".into());
+            }
+        }
     }
 
-    let base = match fv_tokens.first() {
-        Some((_, token)) => &arch[..arch.len() - token.len() - 1],
-        None => arch,
-    };
     match rewrite {
-        Rewrite::Set(value) => Ok(format!("{base},fv_scale={value}")),
-        Rewrite::Remove => Ok(base.to_string()),
+        Rewrite::Set(value) => {
+            let token = format!("fv_scale={value}");
+            if let Some(index) = scale_index {
+                tokens[index] = &token;
+            } else {
+                let index = tokens
+                    .iter()
+                    .position(|token| {
+                        token.starts_with("ThreatWidth=") || token.starts_with("ls_bucket=")
+                    })
+                    .unwrap_or(tokens.len());
+                tokens.insert(index, &token);
+            }
+            Ok(tokens.join(","))
+        }
+        Rewrite::Remove => {
+            if let Some(index) = scale_index {
+                tokens.remove(index);
+            }
+            Ok(tokens.join(","))
+        }
     }
 }
 
@@ -484,6 +498,47 @@ mod tests {
         let restored = rewrite_fv_scale(&removed, Rewrite::Set(28)).unwrap();
         assert_eq!(restored, with_scale);
         load_real_file(&restored, spec);
+    }
+
+    #[test]
+    fn spec_exports_round_trip_set_and_remove_with_optional_compact_threat() {
+        let plain = FeatureSet::HalfKp.spec();
+        for spec in [
+            plain,
+            plain
+                .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
+                .with_threat_width(2),
+        ] {
+            let mut net = LayerStackWeights::zeroed(spec, TEST_FT_OUT, TEST_L1_OUT, TEST_L2_OUT, 3);
+            net.bucket_spec = Some("ownking:2/3".parse().unwrap());
+            let save = |scale| {
+                let mut bytes = Vec::new();
+                net.save_quantised(&mut bytes, scale).unwrap();
+                bytes
+            };
+            let original = save(Some(24));
+            let set = rewrite_fv_scale(&original, Rewrite::Set(37)).unwrap();
+            assert_eq!(set, save(Some(37)));
+            let removed = rewrite_fv_scale(&original, Rewrite::Remove).unwrap();
+            assert_eq!(removed, save(None));
+            let restored = rewrite_fv_scale(&removed, Rewrite::Set(24)).unwrap();
+            assert_eq!(restored, original);
+            for (bytes, scale) in [(&set, Some(37)), (&removed, None), (&restored, Some(24))] {
+                let loaded = LayerStackWeights::load_quantised(
+                    &mut &bytes[..],
+                    spec,
+                    TEST_FT_OUT,
+                    TEST_L1_OUT,
+                    TEST_L2_OUT,
+                    3,
+                )
+                .unwrap();
+                assert_eq!(loaded.bucket_spec, net.bucket_spec);
+                let mut exported = Vec::new();
+                loaded.save_quantised(&mut exported, scale).unwrap();
+                assert_eq!(exported, save(scale));
+            }
+        }
     }
 
     #[test]

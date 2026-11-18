@@ -39,6 +39,7 @@ pub mod dataloader;
 pub mod experiment;
 pub mod init;
 pub mod optimizer;
+pub mod raw_checkpoint;
 pub mod rescore;
 pub mod schedule;
 pub mod trainer;

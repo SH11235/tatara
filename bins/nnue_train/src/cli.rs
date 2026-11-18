@@ -696,7 +696,8 @@ pub(crate) struct Cli {
     pub(crate) init_from: Option<PathBuf>,
 
     /// Read only FT (including Threat and PSQT) from --init-from; initialize output
-    /// layers with --init-l1/--init-l2/--init-l3. LayerStack only.
+    /// layers with --init-l1/--init-l2/--init-l3. PSQT requires matching bucket
+    /// routing recorded in the source net. LayerStack only.
     #[arg(long, global = true, requires = "init_from", conflicts_with_all = ["resume", "eval_only", "rescore_input"])]
     pub(crate) init_ft_only: bool,
 
@@ -1286,6 +1287,9 @@ impl Cli {
             }
         }
         if !self.precision_steps.is_empty() {
+            if self.freeze_ft {
+                return Err("--freeze-ft cannot be combined with --precision-steps".into());
+            }
             if !cfg!(feature = "native") || !matches!(self.arch, ArchCommand::LayerStack(_)) {
                 return Err("--precision-steps requires native CUDA and LayerStack (cuda-oxide is unsupported)".into());
             }
