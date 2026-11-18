@@ -179,8 +179,13 @@ repeated option on one side of the subcommand. Rates describe the expected fract
 after score and reader sampling filters, rather than a fixed quota per batch.
 Worker-side bucket rejection retries teacher selection, so different rejection rates
 across teachers can shift the observed fractions shown in `[teacher-mix]` logs.
-Every teacher cycles independently and uses the same sampling, `--score-drop-abs`
-and `--score-clamp-abs` settings.
+Each teacher cycles independently and uses the same sampling settings. To
+set score limits for the additional teachers, repeat `--mix-score-drop-abs N` or
+`--mix-score-clamp-abs N` once per `--mix-data` file in the same order. Omitting
+either option inherits the corresponding main threshold. Each teacher selects its
+score, drops records at or above its absolute drop threshold, then clamps the scores
+of the surviving records. If both limits are set for a teacher, the clamp must be
+below the drop threshold.
 An empty teacher or one with no surviving positions is an error when sampled.
 `--test-tail-positions` reserves a tail from the main teacher only; additional teachers
 are read in full and must exclude held-out positions themselves.
@@ -199,16 +204,20 @@ fixed-size sparse indices and labels, without decoding again. Lower keep rates s
 require decoding more candidates per delivered position. Without bucket sampling,
 each raw chunk remains one batch.
 
-Mixing conflicts with `--score-override` and `--dual-label-psv`. For positions without
-a game result, encode result 0 (draw) and use `--wdl-ignore-draws` to train on the score
-only. This also affects genuine draws in every teacher, including the main teacher;
+`--dual-label-psv` and `--score-override` (including its optional mask) apply
+only to the concatenated `--data` stream. Put `--data` and its score-source
+options on the same side of the subcommand. Additional teachers use their ordinary
+stored score and never treat padding as a dual-label gate.
+
+For positions without a game result, encode result 0 (draw) and use
+`--wdl-ignore-draws` to train on the score only. This also affects genuine draws in every teacher, including the main teacher;
 it does not ignore decisive game results. `--wdl 0` trains every position on score only.
 
 Each superbatch logs `[teacher-mix]` counts and observed fractions for the batches
 actually passed to training, excluding unread prefetched positions. Source 0 is the
 main teacher; sources 1 onward follow `--mix-data` order. `experiment.json` records
-ordered teacher basenames and rates in `params.mix_data`, and the seed in
-`params.mix_seed`; these fields participate in the recipe fingerprint. With no mixing,
+ordered teacher basenames, rates and any per-teacher score limits in `params.mix_data`.
+The seed is stored in `params.mix_seed`. These fields participate in the recipe fingerprint. With no mixing,
 the input sequence and recipe fingerprint remain unchanged. Old checkpoints without `.loader.json`
 do not restore teacher reading positions; reproducing an interrupted mixed
 stream also requires its output ordinal and each teacher's epoch and next record index.
@@ -276,10 +285,10 @@ writing scores. These checks do not verify move legality or every possible forma
 
 `--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
 on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
-`--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.
-Records with padding bits other than bit 0 and bit 1 are rejected. Marked positions
-are rejected in external `--test-data` and `--test-tail-positions`.
-This flag also applies to teachers supplied with `--mix-data`.
+`--data` in PSV format and applies to all teachers. The main teacher permits
+padding bits 0 and 1 with this flag, and bit 0 retains its dual-label gate meaning.
+Additional teachers permit only bit 1. Marked positions are rejected in external
+`--test-data` and `--test-tail-positions`.
 
 Dropping the training loader cancels both direct and windowed readers at record boundaries,
 including while high-score records are skipped and before the next dataset epoch is opened.

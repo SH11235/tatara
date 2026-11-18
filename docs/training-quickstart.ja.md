@@ -163,8 +163,12 @@ nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 lay
 同じオプションの繰り返しはサブコマンドの片側にまとめる。比率は score と reader 側の間引きを
 通過した局面の期待値であり、バッチごとの固定割当ではない。
 bucket で棄却されると worker は教師の選択からやり直すため、教師ごとの棄却率が違うと実際の割合は指定からずれ、`[teacher-mix]` ログで確認できる。
-各教師は独立に末尾から
-先頭へ戻り、全教師に同じ `--score-drop-abs` / `--score-clamp-abs` をかける。
+各教師は独立に末尾から先頭へ戻る。追加教師ごとにスコアの閾値を指定するには、
+`--mix-score-drop-abs N` や
+`--mix-score-clamp-abs N` を `--mix-data` と同じ順序で、ファイルごとに 1 回ずつ指定する。
+省略したオプションの閾値は主の教師から引き継ぐ。各教師で使用するスコアを確定してから、
+絶対値が drop の閾値以上の局面を除外し、残った局面のスコアを clamp する。両方の閾値が
+ある教師では、clamp の閾値を drop の閾値より小さくする。
 空の教師や全件が除外される教師は、その教師が選ばれた時点でエラーになる。
 `--test-tail-positions` が確保する末尾は主の教師だけが対象。混ぜる教師は全件を読むため、
 held-out の局面をあらかじめ除いておくこと。
@@ -181,15 +185,19 @@ bucket 間引き時は、生 record の塊と通し番号を lock 内で取得�
 decode は繰り返さない。採用率を下げるほど、学習に渡す局面あたりの decode 件数は増える。
 bucket 指定なしでは、従来どおり生 record の塊一つを一つの batch として渡す。
 
-混合と `--score-override` / `--dual-label-psv` の併用はエラーになる。勝敗の無い局面は
-result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば評価値だけで学習できる。
+`--dual-label-psv` と `--score-override` (任意のマスクを含む) は、連結した
+`--data` にだけ適用する。`--data` とスコアの取得元を指定するオプションは、サブコマンドの
+同じ側に置く。追加教師は通常のスコア欄の値を使い、padding を dual-label の gate として読まない。
+
+勝敗の無い局面は result を 0 (draw) として記録し、`--wdl-ignore-draws` を指定すれば
+評価値だけで学習できる。
 この指定は主の教師を含む全教師の実際の引き分けにも効き、勝敗の付いた局面には効かない。
 `--wdl 0` なら全局面を評価値だけで学習する。
 
 各 superbatch の `[teacher-mix]` ログに、実際に学習へ渡したバッチの出典別件数と比率を
 出す。未消費の先読み分は含めない。source 0 が主の教師、1 以降が `--mix-data` の指定順。
-`experiment.json` の `params.mix_data` に指定順の教師 basename と比率、`params.mix_seed`
-に seed を保存し、recipe fingerprint に含める。混合の指定がなければ既存の局面列と
+`experiment.json` の `params.mix_data` に指定順の教師 basename、比率、明示したスコア閾値を保存する。
+seed は `params.mix_seed` に保存する。これらの項目は recipe fingerprint に含める。混合の指定がなければ既存の局面列と
 fingerprint は変わらない。`.loader.json` のない古い checkpoint の resume は教師の読み位置を復元しない。
 中断した混合列の再現には、混合後の通し番号と各教師の epoch・次 record 番号の復元も必要になる。
 
@@ -252,10 +260,9 @@ PSVの再評価では、スコアを書き出す前の玉の配置・総駒数�
 
 `--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
 WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
-`--data` が必要。bit 0 の dual-label gate は独立して働く。マーク付き局面は
-外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。padding の
-bit 0・bit 1 以外が立つ record もエラーにする。
-このフラグは `--mix-data` で指定した教師にも適用する。
+`--data` が必要で、フラグは全教師に適用する。主の教師では padding の bit 0 と bit 1 を許可し、
+bit 0 は dual-label の gate としても働く。追加教師では bit 1 だけを許可する。マーク付き局面は
+外部の `--test-data` と `--test-tail-positions` のどちらでも拒否する。
 
 学習loaderをdropすると、direct・windowed双方をレコード境界で取り消す。
 高スコアのレコードを読み飛ばしている間や、次のdataset epochを開き直す前も停止を確認する。

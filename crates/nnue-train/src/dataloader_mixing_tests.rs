@@ -46,21 +46,12 @@ fn rate_validation_rejects_invalid_values_and_totals() {
     ] {
         let sources = rates
             .into_iter()
-            .map(|rate| MixSource {
-                path: "unused.psv".into(),
-                rate,
-            })
+            .map(|rate| MixSource::new("unused.psv".into(), rate))
             .collect::<Vec<_>>();
         assert!(validate_mix_sources(&sources).is_err());
     }
     assert!(validate_mix_sources(&[]).is_ok());
-    assert!(
-        validate_mix_sources(&[MixSource {
-            path: "unused.psv".into(),
-            rate: 0.03
-        }])
-        .is_ok()
-    );
+    assert!(validate_mix_sources(&[MixSource::new("unused.psv".into(), 0.03)]).is_ok());
 }
 
 #[test]
@@ -69,16 +60,7 @@ fn mixing_matches_rates_and_seed_and_wraps_each_teacher_independently() {
     let main = teacher(dir.path(), "main.psv", &[1, 2, 3]);
     let first = teacher(dir.path(), "first.psv", &[11, 12]);
     let second = teacher(dir.path(), "second.psv", &[21, 22, 23, 24, 25]);
-    let sources = [
-        MixSource {
-            path: first,
-            rate: 0.03,
-        },
-        MixSource {
-            path: second,
-            rate: 0.2,
-        },
-    ];
+    let sources = [MixSource::new(first, 0.03), MixSource::new(second, 0.2)];
     let mut a = mixed(&main, &sources, 123);
     let mut b = mixed(&main, &sources, 123);
     let mut c = mixed(&main, &sources, 124);
@@ -111,49 +93,131 @@ fn mixing_matches_rates_and_seed_and_wraps_each_teacher_independently() {
 }
 
 #[test]
-fn mixing_rejects_formats_and_score_sources() {
+fn mixing_rejects_mismatched_formats() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[1]);
     let hcpe = dir.path().join("other.hcpe");
     std::fs::write(&hcpe, [0u8; HCPE_RECORD_BYTES]).unwrap();
-    let sources = [MixSource {
-        path: hcpe,
-        rate: 0.03,
-    }];
+    let sources = [MixSource::new(hcpe, 0.03)];
     let error = MixedTeacherReader::new(main_reader(&main, None, None), &sources, 0)
         .err()
         .unwrap();
     assert!(error.to_string().contains("format"));
-    let mut source = main_reader(&main, None, None);
-    source.dual_label_psv = Some(DualLabelMode::All);
-    let sources = [MixSource {
-        path: main.clone(),
-        rate: 0.03,
-    }];
-    assert!(MixedTeacherReader::new(source, &sources, 0).is_err());
+}
+
+fn assert_mixed_scores(reader: &mut MixedTeacherReader, scores: [&[i16]; 2]) {
+    let mut counts = [0; 2];
+    for _ in 0..100 {
+        let next = reader.next().unwrap();
+        let source = next.source();
+        assert_eq!(
+            next.record.score(),
+            scores[source][counts[source] % scores[source].len()]
+        );
+        counts[source] += 1;
+    }
+    assert!(counts.into_iter().all(|n| n > 2));
 }
 
 #[test]
-fn mixed_teachers_apply_drop_before_clamp() {
+fn mixed_dual_labels_apply_only_to_the_main_teacher() {
     let dir = tempfile::tempdir().unwrap();
-    let main = teacher(dir.path(), "main.psv", &[1, 1000, 150]);
-    let extra = teacher(dir.path(), "extra.psv", &[1000, -150, -1]);
-    let sources = [MixSource {
-        path: extra,
-        rate: 0.4,
-    }];
-    let mut reader =
-        MixedTeacherReader::new(main_reader(&main, Some(1000), Some(100)), &sources, 0).unwrap();
-    let mut counts = [0usize; 2];
-    for _ in 0..100 {
-        let next = reader.next().unwrap();
-        assert_eq!(
-            next.record.score(),
-            [vec![1, 100], vec![-100, -1]][next.source()][counts[next.source()] % 2]
-        );
-        counts[next.source()] += 1;
+    let main = teacher(dir.path(), "main.psv", &[10, 20]);
+    let extra = teacher(dir.path(), "extra.psv", &[100, 200, 300]);
+    let mut bytes = std::fs::read(&main).unwrap();
+    for (record, (score, padding)) in bytes
+        .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+        .zip([(30_i16, 2), (40, 3)])
+    {
+        record[34..36].copy_from_slice(&score.to_le_bytes());
+        record[39] = padding;
     }
-    assert!(counts.into_iter().all(|n| n > 0));
+    std::fs::write(&main, bytes).unwrap();
+    let sources = [MixSource::new(extra, 0.4)];
+    for (mode, expected) in [
+        (DualLabelMode::All, [30, 40]),
+        (DualLabelMode::Gated, [30, 20]),
+    ] {
+        let main = PsvEpochReader::new_range(
+            &[&main],
+            0,
+            2 * PSV_RECORD_BYTES,
+            None,
+            None,
+            LabelOptions {
+                score_source: Some(ScoreSource::DualLabel(mode)),
+                tree_sample_eval_only: true,
+            },
+        )
+        .unwrap();
+        let mut reader = MixedTeacherReader::new(main, &sources, 0).unwrap();
+        assert_mixed_scores(&mut reader, [&expected, &[100, 200, 300]]);
+        let TeacherRecord::Psv(psv) = reader.sources[0].next().unwrap().record else {
+            panic!("expected a PSV record");
+        };
+        assert_eq!(psv.game_result(), EVAL_ONLY_GAME_RESULT);
+    }
+}
+
+#[test]
+fn mixed_score_sidecar_and_mask_apply_only_to_concatenated_main_teacher() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[10]);
+    let continuation = teacher(dir.path(), "main-part2.psv", &[20, 30]);
+    let extra = teacher(dir.path(), "extra.psv", &[100, 200]);
+    let scores = dir.path().join("scores.i16");
+    let mask = dir.path().join("scores.mask");
+    std::fs::write(&scores, [40_i16, 50, 60].map(i16::to_le_bytes).concat()).unwrap();
+    std::fs::write(&mask, [0b010]).unwrap();
+    let main = PsvEpochReader::new_range(
+        &[&main, &continuation],
+        0,
+        3 * PSV_RECORD_BYTES,
+        None,
+        None,
+        Some(ScoreSource::Sidecar {
+            scores: scores.as_path(),
+            mask: Some(mask.as_path()),
+        }),
+    )
+    .unwrap();
+    let sources = [MixSource::new(extra, 0.4)];
+    let mut reader = MixedTeacherReader::new(main, &sources, 0).unwrap();
+    assert_mixed_scores(&mut reader, [&[40, 20, 60], &[100, 200]]);
+}
+
+#[test]
+fn mixed_teachers_apply_drop_before_clamp_with_overrides_or_inheritance() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = teacher(dir.path(), "main.psv", &[1000, 500, 150, 1]);
+    let extra = teacher(dir.path(), "extra.psv", &[-1000, -500, -150, -1]);
+    for (drop, clamp, expected) in [
+        (None, None, &[-300, -150, -1][..]),
+        (Some(500), None, &[-150, -1]),
+        (None, Some(100), &[-100, -100, -1]),
+        (Some(500), Some(100), &[-100, -1]),
+    ] {
+        let sources = [MixSource {
+            score_drop_abs: drop,
+            score_clamp_abs: clamp,
+            ..MixSource::new(extra.clone(), 0.4)
+        }];
+        let mut reader =
+            MixedTeacherReader::new(main_reader(&main, Some(1000), Some(300)), &sources, 0)
+                .unwrap();
+        assert_mixed_scores(&mut reader, [&[300, 150, 1], expected]);
+    }
+
+    let sources = [MixSource {
+        score_drop_abs: Some(300),
+        ..MixSource::new(extra, 0.4)
+    }];
+    let error = MixedTeacherReader::new(main_reader(&main, Some(1000), Some(300)), &sources, 0)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("extra.psv"));
+    assert!(error.to_string().contains("must be < score_drop_abs"));
 }
 
 #[test]
@@ -161,10 +225,7 @@ fn window_shuffle_follows_mixing_and_preserves_provenance() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[1, 2, 3]);
     let extra = teacher(dir.path(), "extra.psv", &[11, 12]);
-    let sources = [MixSource {
-        path: extra,
-        rate: 0.4,
-    }];
+    let sources = [MixSource::new(extra, 0.4)];
     let mut sequential = mixed(&main, &sources, 55);
     let mut windowed = WindowedPsvReader::spawn(mixed(&main, &sources, 55), 17, true, 99);
     let mut differs = false;
@@ -196,10 +257,7 @@ fn batches_count_only_delivered_records_and_unmixed_order_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[1, 2, 3]);
     let extra = teacher(dir.path(), "extra.psv", &[11, 12]);
-    let sources = [MixSource {
-        path: extra,
-        rate: 0.4,
-    }];
+    let sources = [MixSource::new(extra, 0.4)];
     for shuffle in [false, true] {
         let mut loader = BucketedPrefetchedLoader::spawn_with_mixing(
             &[&main],
@@ -267,10 +325,7 @@ fn cancelling_mixed_filtered_scan_stops_every_teacher() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[1]);
     let extra = teacher(dir.path(), "extra.psv", &[999]);
-    let sources = [MixSource {
-        path: extra,
-        rate: 0.99,
-    }];
+    let sources = [MixSource::new(extra, 0.99)];
     let mut reader =
         MixedTeacherReader::new(main_reader(&main, Some(100), None), &sources, 0).unwrap();
     let stop = reader.stop_flag();
@@ -286,10 +341,7 @@ fn matching_hcpe_and_psv_mixtures_decode_identically() {
         let path = fixture.join(format!("sample.{extension}"));
         let mut source = MixedTeacherReader::new(
             main_reader(&path, None, None),
-            &[MixSource {
-                path: path.clone(),
-                rate: 0.3,
-            }],
+            &[MixSource::new(path.clone(), 0.3)],
             72,
         )
         .unwrap();
@@ -323,10 +375,7 @@ fn mixed_sampling_preserves_teacher_identity_rates_and_bucket_sets_across_worker
         skip_seed: 42,
         ..Default::default()
     };
-    let mixes = [MixSource {
-        path: fixture.clone(),
-        rate: 0.3,
-    }];
+    let mixes = [MixSource::new(fixture.clone(), 0.3)];
     let make = || {
         let mut main = PsvEpochReader::new_range(&[&fixture], 0, 4000, None, None, None).unwrap();
         main.configure_sampling(sampling.clone());
@@ -434,22 +483,22 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
     let dir = tempfile::tempdir().unwrap();
     let primary = teacher(dir.path(), "primary.psv", &(1..=2000).collect::<Vec<_>>());
     let sources = [
-        MixSource {
-            path: teacher(
+        MixSource::new(
+            teacher(
                 dir.path(),
                 "extra.psv",
                 &(10001..=12000).collect::<Vec<_>>(),
             ),
-            rate: 0.25,
-        },
-        MixSource {
-            path: teacher(
+            0.25,
+        ),
+        MixSource::new(
+            teacher(
                 dir.path(),
                 "another.psv",
                 &(20001..=22000).collect::<Vec<_>>(),
             ),
-            rate: 0.35,
-        },
+            0.35,
+        ),
     ];
     let open = |workers, window_mib, position: Option<&TeacherPosition>| {
         BucketedPrefetchedLoader::spawn_mixed_resumable(
@@ -519,22 +568,22 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
 }
 
 #[test]
-fn mixed_tree_samples_use_eval_only_labels_only_when_enabled() {
+fn mixed_tree_samples_use_eval_only_labels_when_marked() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[100]);
     let extra = teacher(dir.path(), "tree.psv", &[200, 201]);
-    for (path, marked) in [(&main, false), (&extra, true)] {
-        let mut bytes = std::fs::read(path).unwrap();
-        for (i, record) in bytes
-            .chunks_exact_mut(PSV_RECORD_BYTES as usize)
-            .enumerate()
-        {
-            record[38] = 1;
-            record[39] = if marked && i == 0 { 2 } else { 0 };
-        }
-        std::fs::write(path, bytes).unwrap();
-    }
     for enabled in [false, true] {
+        for (path, marked) in [(&main, false), (&extra, enabled)] {
+            let mut bytes = std::fs::read(path).unwrap();
+            for (i, record) in bytes
+                .chunks_exact_mut(PSV_RECORD_BYTES as usize)
+                .enumerate()
+            {
+                record[38] = 1;
+                record[39] = if marked && i == 0 { 2 } else { 0 };
+            }
+            std::fs::write(path, bytes).unwrap();
+        }
         for shuffle in [false, true] {
             let mut loader = BucketedPrefetchedLoader::spawn_with_mixing(
                 &[&main],
@@ -558,10 +607,7 @@ fn mixed_tree_samples_use_eval_only_labels_only_when_enabled() {
                     teacher_shuffle: shuffle,
                     teacher_shuffle_seed: 99,
                 },
-                &[MixSource {
-                    path: extra.clone(),
-                    rate: 0.03,
-                }],
+                &[MixSource::new(extra.clone(), 0.03)],
                 55,
             )
             .unwrap();
@@ -594,24 +640,29 @@ fn mixed_tree_samples_reject_reserved_padding_bits() {
     let dir = tempfile::tempdir().unwrap();
     let main = teacher(dir.path(), "main.psv", &[100]);
     let extra = teacher(dir.path(), "invalid.psv", &[200]);
+    let sources = [MixSource::new(extra.clone(), 0.4)];
     let mut bytes = std::fs::read(&extra).unwrap();
-    bytes[39] = 6;
-    std::fs::write(&extra, bytes).unwrap();
-    let mut main = main_reader(&main, None, None);
-    main.tree_sample_eval_only = true;
-    let mut reader = MixedTeacherReader::new(
-        main,
-        &[MixSource {
-            path: extra.clone(),
-            rate: 0.03,
-        }],
-        55,
-    )
-    .unwrap();
-    let error = (0..1024)
-        .find_map(|_| reader.next().err())
-        .expect("mixed teacher must be read");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("reserved padding bits"));
-    assert!(error.to_string().contains(extra.to_str().unwrap()));
+    for (padding, enabled) in [(1, true), (3, true), (6, true)] {
+        bytes[39] = padding;
+        std::fs::write(&extra, &bytes).unwrap();
+        let mut main = main_reader(&main, None, None);
+        main.tree_sample_eval_only = enabled;
+        let mut reader = MixedTeacherReader::new(main, &sources, 0).unwrap();
+        let error = (0..100)
+            .find_map(|_| reader.next().err())
+            .expect("mixed teacher must be read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("reserved padding bits"));
+        assert!(error.to_string().contains(extra.to_str().unwrap()));
+    }
+    // Without the flag the padding of a mixed teacher is not interpreted.
+    for padding in [1, 2, 7] {
+        bytes[39] = padding;
+        std::fs::write(&extra, &bytes).unwrap();
+        let mut reader =
+            MixedTeacherReader::new(main_reader(&main, None, None), &sources, 0).unwrap();
+        for _ in 0..100 {
+            reader.next().unwrap();
+        }
+    }
 }
