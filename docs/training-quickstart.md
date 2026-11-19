@@ -138,14 +138,29 @@ during accumulation. The file uses the standard LayerStack format.
 The forward pass rounds the sum of the real weight and any shared factor
 weight. The optimizer updates both at full precision. This works with the
 default factorizer, any supported `--ft-out`, and either progress or spec
-buckets. Threat weights keep their separate int8 representation. For fresh
-training, the default piece FT initialization uses a minimum spread so
-rounding leaves some nonzero weights on the first pass. An explicit
-`--init-ft` controls the initialization as usual.
+buckets. Threat weights keep their separate int8 representation.
 
-Use the same setting when resuming a raw checkpoint. A warm start via
-`--init-from` trains with the FT factorizer disabled. The option projects
-the loaded piece weights onto the even grid from the first forward pass.
+Training stops at startup if fewer than 1% of the piece FT weights remain
+nonzero after rounding. This guards against piece FT gradients that are zero
+or too weak for learning to recover. If all projected piece weights are
+zero, they contribute nothing to the FT output, which can stall learning.
+The FT bias can still allow some gradient through the pairwise product.
+For fresh training, omit `--init-ft` to use the default
+uniform half-width of at least `1.25/127`. If you set a uniform initializer
+explicitly, use a half-width greater than `1/127` and leave enough weights
+above the rounding boundary to pass the check.
+
+Use the same i8x2 setting when resuming a raw checkpoint with `--resume`.
+If the checkpoint fails the 1% check, its piece FT weights mostly round to
+zero. This suggests the run started with an initializer that left the piece
+FT effectively at zero. Restart from scratch, either omitting the narrow
+`--init-ft` setting or using a wider initializer.
+
+A warm start via `--init-from` trains with the FT factorizer disabled and
+projects the loaded piece weights onto the even grid from the first forward
+pass. If the source network fails the 1% check, its piece FT weights mostly
+round to zero on the i8x2 grid. Retrain its FT before using the network as an
+i8x2 warm start.
 If you also pass `--freeze-ft`, the source piece weights must already
 satisfy the export range and parity.
 

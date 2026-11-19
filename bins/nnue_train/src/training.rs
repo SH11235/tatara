@@ -16,7 +16,9 @@ use nnue_train::experiment::{
     DataInfo, ExperimentDoc, ExperimentLogger, Lineage, LineageKind, Params, SamplingParams,
 };
 #[cfg(feature = "gpu")]
-use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
+use nnue_train::init::SimpleInit;
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::init::{LayerStackInit, WeightLayer};
 #[cfg(any(feature = "gpu", test))]
 use nnue_train::optimizer::OptimizerKind;
 #[cfg(feature = "gpu")]
@@ -42,6 +44,69 @@ use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simpl
 #[cfg(any(feature = "gpu", test))]
 // kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
 const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
+
+#[cfg(any(feature = "gpu", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PieceFtSource {
+    Fresh,
+    InitFrom,
+    Resume,
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn initial_piece_ft_i8x2_source(cli: &Cli, enabled: bool) -> Option<PieceFtSource> {
+    if !enabled || training_range_exempt(cli) {
+        return None;
+    }
+    Some(if cli.init_from.is_some() {
+        PieceFtSource::InitFrom
+    } else if cli.resume.is_some() {
+        PieceFtSource::Resume
+    } else {
+        PieceFtSource::Fresh
+    })
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn validate_initial_piece_ft_i8x2(
+    source: PieceFtSource,
+    custom_initializer: bool,
+    features: &FeatureSetSpec,
+    ft_out: usize,
+    ft_weights: &[f32],
+) -> Result<(), String> {
+    let (nonzero, total) =
+        nnue_format::layerstack_weights::count_nonzero_piece_ft_i8x2(features, ft_out, ft_weights);
+    let required = total.div_ceil(100);
+    if nonzero >= required {
+        return Ok(());
+    }
+
+    let advice = match source {
+        PieceFtSource::InitFrom => {
+            "The source network's piece FT weights mostly round to zero on the i8x2 grid. \
+             It cannot be used as an i8x2 warm start without retraining its FT."
+        }
+        PieceFtSource::Resume => {
+            "The checkpoint's piece FT weights mostly round to zero on the i8x2 grid. \
+             This suggests the run started with an initialization that left the piece FT \
+             effectively at zero. Restart from scratch, either omitting the narrow --init-ft \
+             setting or using a wider initializer."
+        }
+        PieceFtSource::Fresh if custom_initializer => {
+            "Omit --init-ft to use the i8x2 default initialization (uniform half-width at least \
+             1.25/127), or widen the initializer so its half-width exceeds 1/127."
+        }
+        PieceFtSource::Fresh => "Use a wider initializer so its half-width exceeds 1/127.",
+    };
+    Err(format!(
+        "--ft-weight-i8x2 needs at least {required} of {total} projected piece FT weights \
+         to be nonzero (at least 1%). Only {nonzero} are nonzero. The threshold guards against \
+         piece FT gradients that are zero or too weak for learning to recover. All-zero \
+         projected weights contribute nothing to the FT output and can stall learning. \
+         {advice}",
+    ))
+}
 
 /// experiment.json へ記録する dual-label mode の canonical 名。両 logger で共有する。
 #[cfg(feature = "gpu")]
@@ -1021,6 +1086,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     trainer.set_freeze_ft(cli.freeze_ft);
     trainer.set_ft_weight_i8x2(layerstack.ft_weight_i8x2)?;
+    let initial_piece_ft_source = initial_piece_ft_i8x2_source(cli, layerstack.ft_weight_i8x2);
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }
@@ -1091,6 +1157,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 weights.feature_set.threat_dims(),
             );
         }
+        if let Some(source @ PieceFtSource::InitFrom) = initial_piece_ft_source {
+            validate_initial_piece_ft_i8x2(
+                source,
+                cli.init_ft.is_some(),
+                &weights.feature_set,
+                layerstack.ft_out,
+                &weights.ft_w,
+            )?;
+        }
         if cli.freeze_ft && layerstack.ft_weight_i8x2 {
             weights.validate_piece_ft_i8x2().map_err(|err| {
                 format!(
@@ -1148,6 +1223,17 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         (None, None, None)
     };
+
+    if let Some(source @ (PieceFtSource::Fresh | PieceFtSource::Resume)) = initial_piece_ft_source {
+        let ft_weights = trainer.read_ft_weights()?;
+        validate_initial_piece_ft_i8x2(
+            source,
+            cli.init_ft.is_some(),
+            &feature_set,
+            layerstack.ft_out,
+            &ft_weights,
+        )?;
+    }
 
     trainer.configure_qat(layerstack.qat)?;
     if trainer.qat_mode != crate::qat::QatMode::Off && cli.rescore_input.is_some() {
@@ -1924,7 +2010,7 @@ pub(crate) fn init_summary_for_log(cli: &Cli) -> Option<String> {
 }
 
 /// LayerStack の weight 初期化 spec を CLI から組み立てる (既定値 + per-layer override)。
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     let mut spec = LayerStackInit::default_uniform();
     if let Some(ov) = cli.init_ft {
@@ -2814,6 +2900,113 @@ pub(crate) fn run_simple_training(
 #[cfg(test)]
 mod shared_cli_tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn i8x2_startup_on_halfka_hm_merged_rejects_fanin_and_accepts_default() {
+        let parse = |init: &[&str]| {
+            Cli::try_parse_from(
+                ["nnue-train", "--data", "teacher.psv", "--ft-fp16"]
+                    .into_iter()
+                    .chain(init.iter().copied())
+                    .chain(["layerstack", "--ft-weight-i8x2", "--ft-out", "128"]),
+            )
+            .unwrap()
+        };
+        let check_startup = |cli: Cli| {
+            cli.validate_ft_weight_i8x2().unwrap();
+            let shared = validate_shared_cli(&cli, false, false).unwrap();
+            assert_eq!(shared.feature_set, FeatureSet::HalfKaHmMerged.spec());
+            assert!(cli.ft_factorize_enabled());
+            let features = shared.feature_set.with_ft_factorize();
+            let ArchCommand::LayerStack(ref args) = cli.arch else {
+                unreachable!();
+            };
+            let weights =
+                build_layerstack_init_spec(&cli).sample_packed_ft_weights(&features, args.ft_out);
+            let source = initial_piece_ft_i8x2_source(&cli, args.ft_weight_i8x2).unwrap();
+            validate_initial_piece_ft_i8x2(
+                source,
+                cli.init_ft.is_some(),
+                &features,
+                args.ft_out,
+                &weights,
+            )
+        };
+        let err = check_startup(parse(&["--init-ft", "uniform:fanin"])).unwrap_err();
+        assert!(err.contains("needs at least 93831 of 9383040"), "{err}");
+        assert!(err.contains("Only 0 are nonzero"), "{err}");
+        assert!(err.contains("gradients that are zero or too weak"), "{err}");
+        assert!(err.contains("Omit --init-ft"), "{err}");
+        assert!(err.contains("1.25/127"), "{err}");
+        assert!(err.contains("half-width exceeds 1/127"), "{err}");
+        check_startup(parse(&[])).unwrap();
+    }
+
+    #[test]
+    fn i8x2_startup_selects_guard_from_training_mode_and_option() {
+        for (args, enabled, expected) in [
+            (&[][..], true, Some(PieceFtSource::Fresh)),
+            (
+                &["--init-from", "net.bin"],
+                true,
+                Some(PieceFtSource::InitFrom),
+            ),
+            (
+                &["--resume", "state.ckpt"],
+                true,
+                Some(PieceFtSource::Resume),
+            ),
+            (&["--eval-only", "--init-from", "net.bin"], true, None),
+            (
+                &["--rescore-input", "teacher.psv", "--resume", "state.ckpt"],
+                true,
+                None,
+            ),
+            (&[], false, None),
+        ] {
+            assert_eq!(
+                initial_piece_ft_i8x2_source(&parse(args), enabled),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn i8x2_startup_uses_exact_threshold_and_source_specific_advice() {
+        let features = FeatureSet::HalfKaHmMerged.spec();
+        let ft_out = 64;
+        let total = features.ft_weight_len(ft_out);
+        assert_ne!(total % 100, 0);
+        let required = total / 100 + 1;
+        let mut weights = vec![0.0; total];
+        weights[..required].fill(1.0 / nnue_format::layerstack_weights::QA as f32);
+        validate_initial_piece_ft_i8x2(PieceFtSource::InitFrom, false, &features, ft_out, &weights)
+            .unwrap();
+
+        weights[required - 1] = 0.0;
+        let check_rejection = |source, advice| {
+            let err = validate_initial_piece_ft_i8x2(source, false, &features, ft_out, &weights)
+                .unwrap_err();
+            assert!(
+                err.contains(&format!("needs at least {required} of {total}")),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("Only {} are nonzero", required - 1)),
+                "{err}"
+            );
+            assert!(err.ends_with(advice), "{err}");
+        };
+        check_rejection(
+            PieceFtSource::InitFrom,
+            "It cannot be used as an i8x2 warm start without retraining its FT.",
+        );
+        check_rejection(
+            PieceFtSource::Resume,
+            "Restart from scratch, either omitting the narrow --init-ft setting or using a wider initializer.",
+        );
+    }
 
     #[test]
     fn path_options_refuse_argument_shapes_whose_positions_cannot_be_tracked() {
@@ -2995,8 +3188,6 @@ mod shared_cli_tests {
         assert!(message.contains("lower --scale (currently 20000)"));
         assert!(message.contains("set a positive --fv-scale explicitly"));
     }
-    use clap::Parser;
-
     fn parse(extra: &[&str]) -> Cli {
         let mut argv = vec!["nnue-trainer"];
         argv.extend_from_slice(extra);
