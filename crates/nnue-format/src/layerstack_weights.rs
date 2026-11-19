@@ -514,6 +514,57 @@ pub fn network_hash(feature_hash: u32, ft_out: usize, l2_out: usize) -> u32 {
     compute_fc_hash(ft_out, l2_out) ^ ft_hash(feature_hash, ft_out)
 }
 
+fn piece_ft_rows(feature_set: &FeatureSetSpec) -> usize {
+    feature_set.ft_in() - feature_set.threat_dims()
+}
+
+fn piece_ft_factor_rows<'a>(
+    feature_set: &FeatureSetSpec,
+    ft_out: usize,
+    virtual_weights: &'a [f32],
+) -> impl Iterator<Item = &'a [f32]> + use<'a> {
+    let piece_inputs = feature_set.piece_inputs();
+    let nb = feature_set.effect_bucket_config().map_or(1, |cfg| cfg.nb);
+    let mode = feature_set.ft_factorize_mode();
+    (0..piece_ft_rows(feature_set)).map(move |feat| {
+        let row = match mode {
+            FtFactorizeMode::Base => feat % piece_inputs,
+            FtFactorizeMode::PoolEffectBuckets => (feat / nb) % piece_inputs,
+            FtFactorizeMode::PerEffectBucket => feat % (piece_inputs * nb),
+        };
+        &virtual_weights[row * ft_out..(row + 1) * ft_out]
+    })
+}
+
+/// Count the nonzero i8x2 projections in the packed training FT, excluding Threat rows.
+pub fn count_nonzero_piece_ft_i8x2(
+    feature_set: &FeatureSetSpec,
+    ft_out: usize,
+    ft_w_train: &[f32],
+) -> (usize, usize) {
+    let total = piece_ft_rows(feature_set) * ft_out;
+    let piece_weights = &ft_w_train[..total];
+    let nonzero = if feature_set.ft_factorize() {
+        let virtual_weights = &ft_w_train[feature_set.ft_weight_len(ft_out)..];
+        piece_weights
+            .chunks_exact(ft_out)
+            .zip(piece_ft_factor_rows(feature_set, ft_out, virtual_weights))
+            .map(|(real, factor)| {
+                real.iter()
+                    .zip(factor)
+                    .filter(|&(&r, &f)| piece_ft_i8x2_value(r + f).abs() > 0.0)
+                    .count()
+            })
+            .sum()
+    } else {
+        piece_weights
+            .iter()
+            .filter(|&&w| piece_ft_i8x2_value(w).abs() > 0.0)
+            .count()
+    };
+    (nonzero, total)
+}
+
 /// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
@@ -539,9 +590,6 @@ pub fn coalesce_ft_factorized(
         return ft_w_train.to_vec();
     }
     let base_ft_in = feature_set.base_ft_in();
-    let ft_in = feature_set.ft_in(); // base + threat (= 仮想行の手前まで)
-    let piece_inputs = feature_set.piece_inputs();
-    let nb = feature_set.effect_bucket_config().map_or(1, |cfg| cfg.nb);
     assert_eq!(
         ft_w_train.len(),
         feature_set.train_ft_weight_len(ft_out),
@@ -553,26 +601,12 @@ pub fn coalesce_ft_factorized(
     let mut out = ft_w_train[..virtual_base].to_vec();
     let base_virtual_rows =
         feature_set.ft_factorize_virtual_rows() - feature_set.threat_factorize_pair_count();
-    let fold_ft_in = if feature_set.effect_bucket_config().is_some() {
-        ft_in
-    } else {
-        base_ft_in
-    };
-    for feat in 0..fold_ft_in {
-        let p = match feature_set.ft_factorize_mode() {
-            FtFactorizeMode::Base => feat % piece_inputs,
-            FtFactorizeMode::PoolEffectBuckets | FtFactorizeMode::PerEffectBucket => {
-                (feat / nb) % piece_inputs
-            }
-        };
-        let vrow = match feature_set.ft_factorize_mode() {
-            FtFactorizeMode::PerEffectBucket => p * nb + feat % nb,
-            FtFactorizeMode::Base | FtFactorizeMode::PoolEffectBuckets => p,
-        };
-        let dst = feat * ft_out;
-        let src = virtual_base + vrow * ft_out;
-        for o in 0..ft_out {
-            out[dst + o] += ft_w_train[src + o];
+    for (feat, factor) in
+        piece_ft_factor_rows(feature_set, ft_out, &ft_w_train[virtual_base..]).enumerate()
+    {
+        let real = &mut out[feat * ft_out..(feat + 1) * ft_out];
+        for (weight, &shared) in real.iter_mut().zip(factor) {
+            *weight += shared;
         }
     }
     let threat_pair_starts = feature_set.threat_factorize_pair_starts();
@@ -778,13 +812,7 @@ impl LayerStackWeights {
     }
 
     fn piece_ft_weight_count(&self) -> usize {
-        // Threat weights use a separate raw i8 block at scale QA.
-        let rows = if self.feature_set.threat_profile().is_some() {
-            self.feature_set.base_ft_in()
-        } else {
-            self.feature_set.ft_in()
-        };
-        rows * self.ft_b.len()
+        piece_ft_rows(&self.feature_set) * self.ft_b.len()
     }
 
     /// Project the coalesced piece weights onto the grid used by the i8x2 forward pass.
@@ -3392,6 +3420,35 @@ mod bucket_spec_tests {
 #[cfg(test)]
 mod piece_ft_i8x2_tests {
     use super::*;
+
+    #[test]
+    fn ft_i8x2_counts_coalesced_piece_weights_only() {
+        let spec = shogi_features::FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
+            .with_threat_width(2)
+            .with_ft_factorize();
+        let ft_out = 4;
+        let piece_end = spec.base_ft_in() * ft_out;
+        let factor_start = spec.ft_weight_len(ft_out);
+        let mut weights = vec![0.0; spec.train_ft_weight_len(ft_out)];
+        let tie = 1.0 / QA as f32;
+        weights[0] = tie * 0.5;
+        weights[1] = -tie;
+        weights[2] = -tie;
+        weights[piece_end..factor_start].fill(tie);
+        weights[factor_start] = tie * 0.5;
+        weights[factor_start + 1] = tie;
+        assert_eq!(
+            count_nonzero_piece_ft_i8x2(&spec, ft_out, &weights),
+            (2 + spec.king_buckets() - 1, piece_end)
+        );
+        let coalesced = coalesce_ft_factorized(&spec, ft_out, &weights);
+        assert_eq!(
+            count_nonzero_piece_ft_i8x2(&spec.feature_set().spec(), ft_out, &coalesced),
+            count_nonzero_piece_ft_i8x2(&spec, ft_out, &weights)
+        );
+    }
 
     #[test]
     fn ft_i8x2_rounds_ties_away_and_bounds_all_finite_inputs() {

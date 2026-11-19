@@ -287,6 +287,21 @@ impl LayerStackInit {
         weights
     }
 
+    /// Sample the real FT rows and zero-initialize any factorizer rows.
+    pub fn sample_packed_ft_weights(
+        &self,
+        features: &shogi_features::FeatureSetSpec,
+        ft_out: usize,
+    ) -> Vec<f32> {
+        let ft_in = features.ft_in();
+        let mut weights = self.sample_ft_weights(
+            WeightShape::flat(features.ft_weight_len(ft_out), ft_in),
+            (ft_in - features.threat_dims()) * ft_out,
+        );
+        weights.resize(features.train_ft_weight_len(ft_out), 0.0);
+        weights
+    }
+
     /// CLI override (重み側のみ) を該当 group に適用する。`per_bucket_repeat` と
     /// `seed` は既定値を保ち、`dist` / `scale` だけ差し替える。
     pub fn apply_weight_override(&mut self, layer: WeightLayer, ov: LayerInitOverride) {

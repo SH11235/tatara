@@ -2585,11 +2585,7 @@ impl GpuTrainer {
         // noise が入り step-0 の forward が OFF 構成と一致しない、(b) fan_in が変わり
         // 実 row の半値幅がずれる、(c) RNG 消費数が変わり実 row の乱数列が OFF と
         // 不一致になる。bias に仮想部は無いが fan_in は同じ理由で base を使う。
-        let mut ft_w_init = init_spec.sample_ft_weights(
-            WeightShape::flat(feature_set.ft_weight_len(ft_out), base_ft_in),
-            (base_ft_in - feature_set.threat_dims()) * ft_out,
-        );
-        ft_w_init.resize(ft_w_n, 0.0);
+        let ft_w_init = init_spec.sample_packed_ft_weights(&feature_set, ft_out);
         let ft_b_init = init::sample(WeightShape::flat(ft_b_n, base_ft_in), &init_spec.ft_b);
         let l1_w_init = init::sample(
             WeightShape::bucketed(l1_w_n, num_buckets, ft_out),
@@ -3315,6 +3311,10 @@ impl GpuTrainer {
         ])
     }
 
+    pub(crate) fn read_ft_weights(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        Ok(self.ft_w.to_host_vec(&self.stream)?)
+    }
+
     /// device buffer を host に download し `LayerStackWeights` を返す (save_quantised 前)。
     pub(crate) fn to_layerstack_weights(
         &self,
@@ -3371,7 +3371,7 @@ impl GpuTrainer {
             ft_w: {
                 // factorizer 有効時はpiece-input 仮想行を実行へ畳み込み、base 形状で返す
                 // (`save_quantised` の飽和検査・量子化は畳み込み後の値に掛かる)。
-                let ft_w = self.ft_w.to_host_vec(&self.stream)?;
+                let ft_w = self.read_ft_weights()?;
                 if self.feature_set.ft_factorize() {
                     nnue_format::layerstack_weights::coalesce_ft_factorized(
                         &self.feature_set,

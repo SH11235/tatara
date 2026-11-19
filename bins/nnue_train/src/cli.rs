@@ -1673,6 +1673,8 @@ pub(crate) struct LayerstackArgs {
 
     /// Round piece FT weights during training so exported piece FT weights are even and within
     /// [-254, 254]. Threat weights use a separate raw int8 block.
+    /// Training requires at least 1% of piece FT weights to remain nonzero after rounding at
+    /// startup to guard against piece FT gradients that are zero or too weak to recover.
     /// Requires --ft-fp16 or --all-optim. Pass the same setting when resuming a raw checkpoint.
     #[arg(long)]
     pub(crate) ft_weight_i8x2: bool,
