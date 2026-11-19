@@ -1020,6 +1020,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )?;
     }
     trainer.set_freeze_ft(cli.freeze_ft);
+    trainer.set_ft_weight_i8x2(layerstack.ft_weight_i8x2)?;
     if layerstack.stack_shared_delta {
         trainer.enable_stack_shared_delta()?;
     }
@@ -1090,6 +1091,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 weights.feature_set.threat_dims(),
             );
         }
+        if cli.freeze_ft && layerstack.ft_weight_i8x2 {
+            weights.validate_piece_ft_i8x2().map_err(|err| {
+                format!(
+                    "--freeze-ft with --ft-weight-i8x2 requires compatible source FT weights: {err}"
+                )
+            })?;
+        }
         if cli.init_ft_only {
             trainer.load_ft_weights(&weights)?;
         } else {
@@ -1146,9 +1154,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         return Err("--rescore-input does not support dense QAT; use --qat off".into());
     }
     println!(
-        "[train] QAT={} (FT weight/accumulator and final score division excluded)",
+        "[train] dense QAT={} (dense weights/biases and activations)",
         trainer.qat_mode.name()
     );
+    if layerstack.ft_weight_i8x2 {
+        println!("[train] piece FT i8x2 enabled (even weights within [-254, 254] at export)");
+    }
 
     // start_superbatch の決定 + 範囲チェック (1 <= start <= --superbatches)。
     let start_superbatch = shared.start_superbatch(
@@ -1918,6 +1929,11 @@ pub(crate) fn build_layerstack_init_spec(cli: &Cli) -> LayerStackInit {
     let mut spec = LayerStackInit::default_uniform();
     if let Some(ov) = cli.init_ft {
         spec.apply_weight_override(WeightLayer::Ft, ov);
+    } else if matches!(&cli.arch, ArchCommand::LayerStack(args) if args.ft_weight_i8x2)
+        && cli.init_from.is_none()
+        && cli.resume.is_none()
+    {
+        spec.enable_piece_ft_i8x2_init();
     }
     if let Some(ov) = cli.init_l1 {
         spec.apply_weight_override(WeightLayer::L1, ov);
@@ -2064,6 +2080,7 @@ pub(crate) fn build_experiment_logger(
     );
     let params = Params {
         qat: qat.name().into(),
+        ft_weight_i8x2: layerstack.ft_weight_i8x2,
         trainer_build: Some(crate::build_identity::trainer_build()),
         trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture: layerstack_architecture(
@@ -2286,6 +2303,7 @@ pub(crate) fn build_experiment_logger_simple(
     let is_wrm = cli.win_rate_model;
     let params = Params {
         qat: "off".into(),
+        ft_weight_i8x2: false,
         trainer_build: Some(crate::build_identity::trainer_build()),
         trainer_backend: Some(crate::build_identity::runtime_backend().into()),
         architecture,

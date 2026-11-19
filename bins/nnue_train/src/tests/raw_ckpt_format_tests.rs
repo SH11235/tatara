@@ -223,6 +223,7 @@ fn raw_ckpt_marks_sgd_without_changing_adam_layout() {
     let meta = RawCkptMeta {
         optimizer: OptimizerKind::RAdam,
         qat_dense: false,
+        ft_weight_i8x2: false,
         run_id: "",
         superbatch: 1,
         step_count: 1,
@@ -269,6 +270,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
         &RawCkptMeta {
             optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: true,
+            ft_weight_i8x2: false,
             run_id: "qat",
             superbatch: 1201,
             step_count: 10,
@@ -288,7 +290,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
     );
     let offset = bytes.len() - 12;
     let mut invalid = bytes.clone();
-    invalid[offset..offset + 4].copy_from_slice(&2_u32.to_le_bytes());
+    invalid[offset..offset + 4].copy_from_slice(&4_u32.to_le_bytes());
     assert!(read_raw_ckpt_header(&mut Cursor::new(&invalid), &arch).is_err());
     bytes.drain(offset..offset + 4);
     bytes[4..8].copy_from_slice(&9_u32.to_le_bytes());
@@ -305,6 +307,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
         &RawCkptMeta {
             optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: true,
+            ft_weight_i8x2: false,
             run_id: "invalid-simple-qat",
             superbatch: 1,
             step_count: 1,
@@ -317,7 +320,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
     )
     .unwrap();
     let error = read_raw_ckpt_header(&mut Cursor::new(&bytes), &simple).unwrap_err();
-    assert!(error.to_string().contains("unsupported QAT mode 1"));
+    assert!(error.to_string().contains("unsupported QAT flags 1"));
 }
 
 #[test]
@@ -442,6 +445,7 @@ fn write_raw_ckpt_header<W: std::io::Write>(
         &RawCkptMeta {
             optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: false,
+            ft_weight_i8x2: false,
             run_id,
             superbatch: superbatch.try_into().expect("test superbatch fits usize"),
             step_count,
@@ -465,6 +469,7 @@ fn write_raw_ckpt_header_with_fv_scale(
         &RawCkptMeta {
             optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
             qat_dense: false,
+            ft_weight_i8x2: false,
             run_id: "fv-scale-test",
             superbatch: 9,
             step_count: 90,
@@ -1035,6 +1040,7 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
             &RawCkptMeta {
                 optimizer: nnue_train::optimizer::OptimizerKind::Ranger,
                 qat_dense: false,
+                ft_weight_i8x2: false,
                 run_id: "run-a",
                 superbatch: 420,
                 step_count: 1,
@@ -1088,6 +1094,7 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
     let meta = RawCkptMeta {
         optimizer: OptimizerKind::Ranger,
         qat_dense: false,
+        ft_weight_i8x2: false,
         run_id: "run",
         superbatch: 1,
         step_count: 5,
@@ -1245,6 +1252,7 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
             &RawCkptMeta {
                 optimizer,
                 qat_dense: false,
+                ft_weight_i8x2: false,
                 run_id: "",
                 superbatch: 6,
                 step_count: 12,
@@ -1307,4 +1315,44 @@ fn raw_ckpt_spec_identity_roundtrip_and_mismatch() {
     read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
     let other = layerstack_arch_with_mode("spec:handmajor3+oppking:2/3");
     assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &other).is_err());
+}
+
+#[test]
+fn ft_i8x2_raw_checkpoint_records_mode_and_requires_matching_resume() {
+    let arch = layerstack_arch();
+    for optimizer in [
+        nnue_train::optimizer::OptimizerKind::Ranger,
+        nnue_train::optimizer::OptimizerKind::RAdam,
+        nnue_train::optimizer::OptimizerKind::Sgd,
+    ] {
+        for qat_dense in [false, true] {
+            for ft_weight_i8x2 in [false, true] {
+                let mut bytes = Vec::new();
+                crate::ckpt::write_raw_ckpt_header(
+                    &mut bytes,
+                    &arch,
+                    &RawCkptMeta {
+                        optimizer,
+                        qat_dense,
+                        ft_weight_i8x2,
+                        run_id: "",
+                        superbatch: 1,
+                        step_count: 1,
+                        lr_horizon: None,
+                        fv_scale: None,
+                        net_id: "",
+                        recipe_fingerprint: None,
+                    },
+                    10,
+                )
+                .unwrap();
+                let header = read_raw_ckpt_header(&mut Cursor::new(bytes), &arch).unwrap();
+                assert_eq!(header.qat_dense, qat_dense);
+                assert_eq!(header.ft_weight_i8x2, ft_weight_i8x2);
+                assert!(header.validate_ft_weight_i8x2(ft_weight_i8x2).is_ok());
+                let err = header.validate_ft_weight_i8x2(!ft_weight_i8x2).unwrap_err();
+                assert!(err.to_string().contains("--ft-weight-i8x2"));
+            }
+        }
+    }
 }

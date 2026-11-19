@@ -2904,6 +2904,7 @@ impl SimpleGpuTrainer {
             &RawCkptMeta {
                 optimizer: self.optimizer,
                 qat_dense: false,
+                ft_weight_i8x2: false,
                 run_id: producer.run_id,
                 net_id: producer.net_id,
                 recipe_fingerprint: producer.recipe_fingerprint,

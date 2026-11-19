@@ -4,6 +4,9 @@ use std::path::Path;
 fn ft_gradient_tiles_supported(device_name: &str) -> bool {
     device_name.trim() != "NVIDIA GeForce RTX 5090"
 }
+#[cfg(test)]
+#[path = "trainer_layerstack_i8x2_tests.rs"]
+mod piece_ft_i8x2_tests;
 #[path = "trainer_layerstack_qat.rs"]
 mod qat_impl;
 
@@ -1164,6 +1167,12 @@ impl GpuTrainer {
         }
         let (bounds, piece_inputs, fold_mode) = if ft_factorize {
             ft_factorize_host::fold_kernel_args(&self.feature_set)
+        } else if self.ft_weight_i8x2 {
+            (
+                ft_factorize_host::ft_bounds(self.piece_ft_rows(), self.feature_set.ft_in()),
+                0,
+                0,
+            )
         } else {
             (0, 0, 0)
         };
@@ -1233,9 +1242,29 @@ impl GpuTrainer {
                 continue;
             }
             let launch_flags = flags | out;
+            let quantize_forward = self.ft_weight_i8x2 && out != 0;
             // Unused pointer slots (`slow` without lookahead, the norm buffers without norm-loss,
             // the active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when
             // `out == 0`) receive a live buffer the kernel never touches.
+            macro_rules! launch_with_args {
+                ($($args:tt)*) => {
+                    if quantize_forward {
+                        cuda_launch! {
+                            kernel: ft_fused_optimizer_step_i8x2,
+                            stream: self.stream, module: self.module,
+                            config: ft_fused_launch_config(end - begin, row_width)?,
+                            args: [$($args)*]
+                        }
+                    } else {
+                        cuda_launch! {
+                            kernel: ft_fused_optimizer_step,
+                            stream: self.stream, module: self.module,
+                            config: ft_fused_launch_config(end - begin, row_width)?,
+                            args: [$($args)*]
+                        }
+                    }
+                };
+            }
             macro_rules! launch {
                 ($m:expr, $v:expr, $forward:expr) => {{
                     debug_assert!(self.ft_w.cu_deviceptr().is_multiple_of(16));
@@ -1253,11 +1282,7 @@ impl GpuTrainer {
                         // `out != 0` のとき `end` 以上の長さを持つ (comb は real 行、mirror は train 行)。
                         // norm 系 buffer は `ft_out` 要素。cudaMalloc base pointers と 4 要素境界で
                         // float4 / 4 x f16 が整列し、ft_out % 4 == 0 で vector は行を跨がない。
-                        cuda_launch! {
-                            kernel: ft_fused_optimizer_step,
-                            stream: self.stream, module: self.module,
-                            config: ft_fused_launch_config(end - begin, row_width)?,
-                            args: [slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
+                        launch_with_args![slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
                                    slice(self.ft_norms), slice_mut(self.ft_norm_sums),
                                    slice(self.ws.ft_active_rows),
@@ -1268,7 +1293,6 @@ impl GpuTrainer {
                                    step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
                                    W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE,
                                    FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
-                        }
                     }?
                 }};
             }
@@ -1368,7 +1392,7 @@ impl GpuTrainer {
                             W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE, FT_OPT_V_SCALE,
                             self.ft_w.len() as u32, d.indices.len() as u32,
                             i32::from(self.fp16_opt_state),
-                            i32::from(self.ft_w_h.is_some() && !self.feature_set.ft_factorize())]
+                            i32::from(self.ft_w_h.is_some() && !self.feature_set.ft_factorize() && !self.ft_weight_i8x2)]
                     }
                 }
             }};
@@ -1618,6 +1642,7 @@ pub(crate) struct GpuTrainer {
     #[cfg(feature = "native")]
     ft_gradient_tiles_supported: bool,
     pub(crate) qat_mode: crate::qat::QatMode,
+    ft_weight_i8x2: bool,
     #[cfg(feature = "native")]
     qat_buffers: Vec<DeviceBuffer<f32>>,
     #[cfg(feature = "native")]
@@ -2560,9 +2585,9 @@ impl GpuTrainer {
         // noise が入り step-0 の forward が OFF 構成と一致しない、(b) fan_in が変わり
         // 実 row の半値幅がずれる、(c) RNG 消費数が変わり実 row の乱数列が OFF と
         // 不一致になる。bias に仮想部は無いが fan_in は同じ理由で base を使う。
-        let mut ft_w_init = init::sample(
+        let mut ft_w_init = init_spec.sample_ft_weights(
             WeightShape::flat(feature_set.ft_weight_len(ft_out), base_ft_in),
-            &init_spec.ft_w,
+            (base_ft_in - feature_set.threat_dims()) * ft_out,
         );
         ft_w_init.resize(ft_w_n, 0.0);
         let ft_b_init = init::sample(WeightShape::flat(ft_b_n, base_ft_in), &init_spec.ft_b);
@@ -2660,6 +2685,7 @@ impl GpuTrainer {
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
             qat_mode: crate::qat::QatMode::Off,
+            ft_weight_i8x2: false,
             #[cfg(feature = "native")]
             qat_buffers: Vec::new(),
             #[cfg(feature = "native")]
@@ -3311,7 +3337,7 @@ impl GpuTrainer {
             }
             None => None,
         };
-        Ok(LayerStackWeights {
+        let mut weights = LayerStackWeights {
             // factorizer 有効時は ft_w を畳み込んで返すため export spec から
             // factorizer modifier を外す (consumer が train 次元を観測しない不変
             // 条件)。ただし **threat profile は保持する**: threat real 行は coalesce
@@ -3378,7 +3404,11 @@ impl GpuTrainer {
                 None => self.l3_b.to_host_vec(&self.stream)?,
             },
             psqt_w,
-        })
+        };
+        if self.ft_weight_i8x2 {
+            weights.quantize_piece_ft_i8x2()?;
+        }
+        Ok(weights)
     }
 
     /// raw checkpoint format の全 weight group を format の group 順 (= ft_w, ft_b,
@@ -3569,6 +3599,7 @@ impl GpuTrainer {
             &RawCkptMeta {
                 optimizer: self.optimizer,
                 qat_dense: self.qat_mode == crate::qat::QatMode::Dense,
+                ft_weight_i8x2: self.ft_weight_i8x2,
                 run_id: producer.run_id,
                 net_id: producer.net_id,
                 recipe_fingerprint: producer.recipe_fingerprint,
@@ -3623,6 +3654,8 @@ impl GpuTrainer {
             },
             &expected_groups,
         )?;
+
+        header.validate_ft_weight_i8x2(self.ft_weight_i8x2)?;
 
         let forward_only = self.forward_only;
         if !forward_only {
@@ -3862,11 +3895,20 @@ impl GpuTrainer {
         if let Some(comb) = self.ft_w_fold32.as_ref() {
             // SAFETY: the cache has the real packed length; virtual partners lie in the master.
             unsafe {
-                cuda_launch! {
-                    kernel: partial_ft_fold, stream: self.stream, module: self.module,
-                    config: cfg_partial_ft_1d(comb.len()),
-                    args: [slice(self.ft_w), slice(self.threat_pair_starts),
-                           slice(self.partial_ft_shape), slice(comb)]
+                if self.ft_weight_i8x2 {
+                    cuda_launch! {
+                        kernel: partial_ft_fold_i8x2, stream: self.stream, module: self.module,
+                        config: cfg_partial_ft_1d(comb.len()),
+                        args: [slice(self.ft_w), slice(self.threat_pair_starts),
+                               slice(self.partial_ft_shape), slice(comb)]
+                    }
+                } else {
+                    cuda_launch! {
+                        kernel: partial_ft_fold, stream: self.stream, module: self.module,
+                        config: cfg_partial_ft_1d(comb.len()),
+                        args: [slice(self.ft_w), slice(self.threat_pair_starts),
+                               slice(self.partial_ft_shape), slice(comb)]
+                    }
                 }
             }?;
         }
@@ -3938,12 +3980,53 @@ impl GpuTrainer {
         Ok(())
     }
 
+    fn piece_ft_rows(&self) -> usize {
+        // The Threat block is already stored as raw i8 at scale QA.
+        self.feature_set.ft_in() - self.feature_set.threat_dims()
+    }
+
+    fn launch_ft_i8x2_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let ft_out = self.ws.ft_out;
+        let (bounds, piece_inputs, fold_mode) = if self.feature_set.ft_factorize() {
+            ft_factorize_host::fold_kernel_args(&self.feature_set)
+        } else {
+            (
+                ft_factorize_host::ft_bounds(self.piece_ft_rows(), self.feature_set.ft_in()),
+                0,
+                0,
+            )
+        };
+        let mut comb = self.ft_w_h.as_mut().expect("full-width FP16 FT cache");
+        // SAFETY: each thread writes one real element. Fold partners, when enabled,
+        // are in the virtual block of the master allocation and use the same row width.
+        unsafe {
+            cuda_launch! {
+                kernel: ft_fold_i8x2_f16, stream: self.stream, module: self.module,
+                config: cfg_partial_ft_1d(comb.len()),
+                args: [slice(self.ft_w), slice_mut(comb), slice(self.threat_pair_starts),
+                       bounds, ft_out as u32, piece_inputs, fold_mode]
+            }
+        }?;
+        Ok(())
+    }
+
+    pub(crate) fn set_ft_weight_i8x2(&mut self, enabled: bool) -> Result<(), &'static str> {
+        if enabled && !self.ft_fp16 {
+            return Err("--ft-weight-i8x2 requires --ft-fp16 or --all-optim");
+        }
+        self.ft_weight_i8x2 = enabled;
+        Ok(())
+    }
+
     pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.partial_threat() {
             return self.launch_partial_ft_fold();
         }
         if self.feature_set.ft_factorize() {
             return self.launch_ft_fold();
+        }
+        if self.ft_weight_i8x2 {
+            return self.launch_ft_i8x2_fold();
         }
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
             let ft_w_n = self.feature_set.train_ft_weight_len(self.ws.ft_out);
@@ -3980,28 +4063,31 @@ impl GpuTrainer {
         // FT comb の再生成は LayerStack / Simple 共通の [`ft_factorize_host::launch_ft_fold`]
         // に委ねる (base 行に piece-input 仮想行、threat 行に pair 仮想行を畳み base 形状の
         // comb を上書き)。`--ft-fp16` 系列は f16 comb、既定 FP32 経路は f32 comb。
-        let comb = if self.ft_fp16 {
-            FoldComb::F16(
-                self.ft_w_h
-                    .as_mut()
-                    .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled"),
-            )
+        if self.ft_weight_i8x2 {
+            self.launch_ft_i8x2_fold()?;
         } else {
-            FoldComb::F32(
-                self.ft_w_fold32
-                    .as_mut()
-                    .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16"),
-            )
-        };
-        ft_factorize_host::launch_ft_fold(
-            &self.stream,
-            &self.module,
-            &self.feature_set,
-            self.ws.ft_out,
-            &self.ft_w,
-            comb,
-            &self.threat_pair_starts,
-        )?;
+            let comb =
+                if self.ft_fp16 {
+                    FoldComb::F16(self.ft_w_h.as_mut().expect(
+                        "ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled",
+                    ))
+                } else {
+                    FoldComb::F32(
+                        self.ft_w_fold32.as_mut().expect(
+                            "ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16",
+                        ),
+                    )
+                };
+            ft_factorize_host::launch_ft_fold(
+                &self.stream,
+                &self.module,
+                &self.feature_set,
+                self.ws.ft_out,
+                &self.ft_w,
+                comb,
+                &self.threat_pair_starts,
+            )?;
+        }
         // PSQT shortcut も factorizer 有効時は同じpiece-input 仮想行を持つ。FT と同じ
         // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
         // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat / effect
@@ -6570,7 +6656,11 @@ impl GpuTrainer {
             match (&mut self.ft_w_m, &mut self.ft_w_v) {
                 (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                     let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                    if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                    if let Some(mut ft_w_h) = self
+                        .ft_w_h
+                        .as_mut()
+                        .filter(|_| !ft_factorize && !self.ft_weight_i8x2)
+                    {
                         unsafe {
                             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                             // stream の完了を待つ同期点まで生存する device allocation。
@@ -6600,7 +6690,11 @@ impl GpuTrainer {
                 }
                 (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
                     let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                    if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                    if let Some(mut ft_w_h) = self
+                        .ft_w_h
+                        .as_mut()
+                        .filter(|_| !ft_factorize && !self.ft_weight_i8x2)
+                    {
                         unsafe {
                             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                             // stream の完了を待つ同期点まで生存する device allocation。
@@ -6873,7 +6967,11 @@ impl GpuTrainer {
         if lookahead_now {
             // The fused FT kernel has already applied the lookahead to `ft_w`.
             if self.freeze_ft || ft_fused {
-            } else if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+            } else if let Some(mut ft_w_h) = self
+                .ft_w_h
+                .as_mut()
+                .filter(|_| !ft_factorize && !self.ft_weight_i8x2)
+            {
                 unsafe {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。
@@ -6938,8 +7036,8 @@ impl GpuTrainer {
         if !self.freeze_ft {
             if self.partial_threat() {
                 self.launch_partial_ft_fold()?;
-            } else if ft_factorize && !ft_fused {
-                self.launch_ft_fold()?;
+            } else if !ft_fused && (ft_factorize || self.ft_weight_i8x2) {
+                self.sync_ft_forward_weights()?;
             }
         }
         self.sync_stack_forward_weights()?;

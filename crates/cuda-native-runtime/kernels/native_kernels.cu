@@ -679,6 +679,13 @@ extern "C" __global__ void ft_fold_virtual(
     combined[i] = value;
 }
 
+// Match export's FP32 scaling and clamp, then round ties away from zero.
+__device__ __forceinline__ float piece_ft_i8x2(float value) {
+    const float half = __fmul_rn(value, 127.0F * 0.5F);
+    const float bounded = half < -127.0F ? -127.0F : (half > 127.0F ? 127.0F : half);
+    return __fmul_rn(roundf(bounded), 2.0F / 127.0F);
+}
+
 extern "C" __global__ void ft_fold_virtual_f16(
     const float* weights,
     unsigned long long,
@@ -709,6 +716,43 @@ extern "C" __global__ void ft_fold_virtual_f16(
     );
     if (partner != ~0ULL) {
         value += weights[partner];
+    }
+    combined[i] = __float2half_rn(value);
+}
+
+extern "C" __global__ void ft_fold_i8x2_f16(
+    const float* weights,
+    unsigned long long,
+    __half* combined,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize
+) {
+    const unsigned int base_ft_in = static_cast<unsigned int>(ft_bounds);
+    const unsigned int ft_in = static_cast<unsigned int>(ft_bounds >> 32);
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long n = static_cast<unsigned long long>(ft_in) * ft_out;
+    if (i >= n) {
+        return;
+    }
+
+    const unsigned long long feature = i / ft_out;
+    const unsigned int column = static_cast<unsigned int>(i - feature * ft_out);
+    float value = weights[i];
+    const unsigned long long partner = piece_inputs != 0 ? ft_fold_partner_index(
+        feature, column, threat_pair_starts, threat_pair_starts_len, base_ft_in, ft_in, ft_out,
+        piece_inputs, effect_bucket_factorize
+    ) : ~0ULL;
+    if (partner != ~0ULL) {
+        value = __fadd_rn(value, weights[partner]);
+    }
+    if (feature < base_ft_in) {
+        value = piece_ft_i8x2(value);
     }
     combined[i] = __float2half_rn(value);
 }
@@ -2349,6 +2393,180 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
             }
         }
         if (output_mode == 1U || output_mode == 2U) {
+            ft_optimizer_store4(static_cast<__half*>(forward_output) + i, w4);
+        } else if (output_mode == 3U) {
+            ft_optimizer_store4(static_cast<float*>(forward_output) + i, w4);
+        }
+    }
+    #pragma unroll
+    for (unsigned int lane = 0; lane < 4; ++lane) {
+        if (accumulate_norms && thread_sum_squared[lane] != 0.0F) {
+            atomicAdd(column_sum_squared + norm_column + lane,
+                static_cast<double>(thread_sum_squared[lane]));
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fused_optimizer_step_i8x2(
+    float* weights,
+    unsigned long long,
+    void* momentum_storage,
+    unsigned long long,
+    void* velocity_storage,
+    unsigned long long,
+    float* gradient,
+    unsigned long long,
+    float* slow_weights,
+    unsigned long long,
+    const float* norms,
+    unsigned long long,
+    double* column_sum_squared,
+    unsigned long long,
+    const unsigned int* active_rows,
+    unsigned long long active_row_count,
+    void* forward_output,
+    unsigned long long,
+    const unsigned int* threat_pair_starts,
+    unsigned long long threat_pair_starts_len,
+    unsigned long long ft_bounds,
+    unsigned int ft_out,
+    unsigned int norm_width,
+    unsigned int piece_inputs,
+    unsigned int effect_bucket_factorize,
+    unsigned long long element_begin,
+    unsigned long long element_end,
+    float norm_learning_rate,
+    float norm_factor,
+    float norm_epsilon,
+    float learning_rate,
+    float step_size,
+    int use_variance_denom,
+    float decay,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float min_weight,
+    float max_weight,
+    float momentum_scale,
+    float velocity_scale,
+    float lookahead_alpha,
+    unsigned int flags
+) {
+    const bool half_state = (flags & 1U) != 0;
+    const unsigned int output_mode = (flags >> 4) & 3U;
+    const bool accumulate_norms = (flags & 64U) != 0;
+    const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x * 4U;
+    const unsigned long long first = element_begin
+        + (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 4U;
+    const unsigned int column = static_cast<unsigned int>((first - element_begin) % ft_out);
+    const unsigned int norm_column = column < ft_out / 2U
+        ? column : norm_width / 2U + column - ft_out / 2U;
+    unsigned long long row = first / ft_out;
+    const unsigned long long row_stride = stride / ft_out;
+    float thread_sum_squared[4] = {};
+    for (unsigned long long i = first; i < element_end; i += stride, row += row_stride) {
+        const bool gradient_live = (flags & 8U) == 0 || row >= active_row_count
+            || active_rows[row] != 0U;
+        float w4[4], g4[4] = {}, m4[4], v4[4], slow4[4];
+        ft_forward_load4(weights + i, w4);
+        if (gradient_live) {
+            ft_forward_load4(gradient + i, g4);
+        }
+        if (half_state) {
+            ft_forward_load4(static_cast<const __half*>(momentum_storage) + i, m4);
+            ft_forward_load4(static_cast<const __half*>(velocity_storage) + i, v4);
+        } else {
+            ft_forward_load4(static_cast<const float*>(momentum_storage) + i, m4);
+            ft_forward_load4(static_cast<const float*>(velocity_storage) + i, v4);
+        }
+        if ((flags & 4U) != 0) {
+            ft_forward_load4(slow_weights + i, slow4);
+        }
+        #pragma unroll
+        for (unsigned int lane = 0; lane < 4; ++lane) {
+            float w = w4[lane];
+            if ((flags & 2U) != 0) {
+                const float correction = 2.0F * norm_factor * (1.0F - 1.0F / (norms[norm_column + lane] + norm_epsilon));
+                w *= 1.0F - norm_learning_rate * correction;
+            }
+
+            const float g = g4[lane];
+            const float rate = learning_rate * step_size;
+            float p = w * (1.0F - decay * rate);
+            float momentum;
+            float velocity;
+            if (half_state) {
+                const float previous_momentum = m4[lane] / momentum_scale;
+                const float previous_velocity = v4[lane] / velocity_scale;
+                momentum = beta1 * previous_momentum + (1.0F - beta1) * g;
+                velocity = beta2 * previous_velocity + (1.0F - beta2) * g * g;
+                float stored_momentum = momentum * momentum_scale;
+                stored_momentum = stored_momentum > 65504.0F
+                    ? 65504.0F : (stored_momentum < -65504.0F ? -65504.0F : stored_momentum);
+                float stored_velocity = velocity * velocity_scale;
+                stored_velocity = stored_velocity > 65504.0F ? 65504.0F : stored_velocity;
+                m4[lane] = stored_momentum;
+                v4[lane] = stored_velocity;
+            } else {
+                momentum = beta1 * m4[lane] + (1.0F - beta1) * g;
+                velocity = beta2 * v4[lane] + (1.0F - beta2) * g * g;
+                m4[lane] = momentum;
+                v4[lane] = velocity;
+            }
+            float value = momentum;
+            if (use_variance_denom != 0) {
+                value /= sqrtf(velocity) + epsilon;
+            }
+            p -= rate * value;
+            p = p < min_weight ? min_weight : (p > max_weight ? max_weight : p);
+
+            if ((flags & 4U) != 0) {
+                p = lookahead_alpha * p + (1.0F - lookahead_alpha) * slow4[lane];
+                slow4[lane] = p;
+            }
+            w4[lane] = p;
+            thread_sum_squared[lane] += p * p;
+        }
+        ft_optimizer_store4(weights + i, w4);
+        if (half_state) {
+            ft_optimizer_store4(static_cast<__half*>(momentum_storage) + i, m4);
+            ft_optimizer_store4(static_cast<__half*>(velocity_storage) + i, v4);
+        } else {
+            ft_optimizer_store4(static_cast<float*>(momentum_storage) + i, m4);
+            ft_optimizer_store4(static_cast<float*>(velocity_storage) + i, v4);
+            // The separate FP32 mirror update retains gradients; other FP32 updates clear them.
+            if (output_mode != 1U && gradient_live) {
+                const float zero[4] = {};
+                ft_optimizer_store4(gradient + i, zero);
+            }
+        }
+        if ((flags & 4U) != 0) {
+            ft_optimizer_store4(slow_weights + i, slow4);
+        }
+        const unsigned long long partner = output_mode >= 2U ? ft_fold_partner_index(
+            row, column, threat_pair_starts, threat_pair_starts_len,
+            static_cast<unsigned int>(ft_bounds), static_cast<unsigned int>(ft_bounds >> 32),
+            ft_out, piece_inputs, effect_bucket_factorize
+        ) : ~0ULL;
+        float partner4[4] = {};
+        if (partner != ~0ULL) {
+            ft_forward_load4(weights + partner, partner4);
+        }
+        // Export projects the sum of the updated FP32 master values. Keep the real
+        // weights unprojected until the fold with the already-updated virtual rows.
+        #pragma unroll
+        for (unsigned int lane = 0; lane < 4; ++lane) {
+            if (partner != ~0ULL) {
+                w4[lane] = __fadd_rn(w4[lane], partner4[lane]);
+            }
+        }
+        if (output_mode == 1U || output_mode == 2U) {
+            if (row < static_cast<unsigned int>(ft_bounds)) {
+                #pragma unroll
+                for (unsigned int lane = 0; lane < 4; ++lane) {
+                    w4[lane] = piece_ft_i8x2(w4[lane]);
+                }
+            }
             ft_optimizer_store4(static_cast<__half*>(forward_output) + i, w4);
         } else if (output_mode == 3U) {
             ft_optimizer_store4(static_cast<float*>(forward_output) + i, w4);
@@ -4419,6 +4637,33 @@ extern "C" __global__ void partial_ft_fold(
         }
         value += weight[partner];
     }
+    if (shape[7]) value = __half2float(__float2half_rn(value));
+    comb[k] = value;
+}
+
+extern "C" __global__ void partial_ft_fold_i8x2(
+    const float* weight, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, unsigned long long, float* comb, unsigned long long n) {
+    unsigned long long k = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    unsigned rows = shape[0], width = shape[3];
+    unsigned long long base_n = partial_ft_row_offset(shape[1], rows);
+    unsigned long long real_n = base_n + partial_ft_row_offset(shape[2], width);
+    float value = weight[k];
+    if (shape[6]) {
+        unsigned long long partner;
+        if (k < base_n) partner = real_n + (k / rows % shape[5]) * rows + k % rows;
+        else {
+            unsigned long long f = (k - base_n) / width, pair = 0, end = pair_len - 1;
+            while (pair + 1 < end) {
+                unsigned long long mid = (pair + end) / 2;
+                if (f >= pairs[mid]) pair = mid; else end = mid;
+            }
+            partner = real_n + partial_ft_row_offset(shape[5], rows) + pair * width + (k - base_n) % width;
+        }
+        value = __fadd_rn(value, weight[partner]);
+    }
+    if (k < base_n) value = piece_ft_i8x2(value);
     if (shape[7]) value = __half2float(__float2half_rn(value));
     comb[k] = value;
 }

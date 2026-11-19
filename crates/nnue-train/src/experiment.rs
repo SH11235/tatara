@@ -188,6 +188,8 @@ impl SamplingParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct Params {
     pub qat: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ft_weight_i8x2: bool,
     /// Build provenance, independent of recipe and runtime working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trainer_build: Option<TrainerBuild>,
@@ -879,6 +881,19 @@ mod tests {
     }
 
     #[test]
+    fn ft_i8x2_experiment_metadata_records_only_enabled_mode() {
+        let mut params = sample_params();
+        let off = serde_json::to_value(&params).unwrap();
+        assert!(off.get("ft_weight_i8x2").is_none());
+        let off_fingerprint = recipe_fingerprint(&params, "teacher.psv");
+
+        params.ft_weight_i8x2 = true;
+        let on = serde_json::to_value(&params).unwrap();
+        assert_eq!(on["ft_weight_i8x2"], true);
+        assert_ne!(recipe_fingerprint(&params, "teacher.psv"), off_fingerprint);
+    }
+
+    #[test]
     fn recipe_fingerprint_counts_the_superbatch_count_as_the_wdl_horizon() {
         let mut taper = sample_params();
         taper.start_wdl = Some(0.0);
@@ -987,6 +1002,7 @@ mod tests {
     fn sample_params() -> Params {
         Params {
             qat: "off".into(),
+            ft_weight_i8x2: false,
             trainer_build: None,
             trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),

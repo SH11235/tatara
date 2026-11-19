@@ -2277,6 +2277,7 @@ mod tests {
         crate::experiment::Params {
             threat_width: None,
             qat: "off".into(),
+            ft_weight_i8x2: false,
             trainer_build: None,
             trainer_backend: None,
             architecture: "LayerStack-1536-16-32-9bucket".to_string(),
