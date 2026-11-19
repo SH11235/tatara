@@ -378,7 +378,7 @@ fn mixed_sampling_preserves_teacher_identity_rates_and_bucket_sets_across_worker
     let mixes = [MixSource::new(fixture.clone(), 0.3)];
     let make = || {
         let mut main = PsvEpochReader::new_range(&[&fixture], 0, 4000, None, None, None).unwrap();
-        main.configure_sampling(sampling.clone());
+        main.configure_sampling(sampling.clone(), None);
         MixedTeacherReader::new(main, &mixes, 123).unwrap()
     };
     let mut a = make();
@@ -506,7 +506,7 @@ fn marked_sampling_uses_its_own_probability_before_buckets() {
         };
         let mut reader = main_reader(&path, None, None);
         reader.tree_sample_eval_only = true;
-        reader.configure_sampling(sampling.clone());
+        reader.configure_sampling(sampling.clone(), None);
         let buckets = reader.bucket_sampling.clone().unwrap();
         let mut actual = Vec::new();
         while let Some(record) = reader.next_in_epoch().unwrap() {
@@ -567,7 +567,7 @@ fn mix_keep_rate_bypasses_game_sampling_only_for_its_teacher() {
     }
     let mut reader = main_reader(&main, None, None);
     reader.tree_sample_eval_only = true;
-    reader.configure_sampling(sampling.clone());
+    reader.configure_sampling(sampling.clone(), None);
     let mut mixed = MixedTeacherReader::new(reader, &mixes, 123).unwrap();
     let buckets = mixed.bucket_samplings();
     assert!(buckets[2].is_none());
@@ -613,11 +613,14 @@ fn delivered_teacher_mix_is_weighted_by_bucket_acceptance() {
     ];
     let mut reader = main_reader(&main, None, None);
     reader.tree_sample_eval_only = true;
-    reader.configure_sampling(crate::sampling::Sampling {
-        bucket_keep_rates: Some(vec![bucket_acceptance[0]; 9]),
-        skip_seed: 42,
-        ..Default::default()
-    });
+    reader.configure_sampling(
+        crate::sampling::Sampling {
+            bucket_keep_rates: Some(vec![bucket_acceptance[0]; 9]),
+            skip_seed: 42,
+            ..Default::default()
+        },
+        None,
+    );
     let mixed = MixedTeacherReader::new(reader, &mixes, 123).unwrap();
     let mut loader = BucketedPrefetchedLoader::spawn_with_reader(
         64,

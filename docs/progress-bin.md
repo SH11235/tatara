@@ -58,21 +58,27 @@ final `progress.bin` by the strength of the LayerStack NNUE trained with it.
 
 ## Checking the bucket distribution
 
-`progress-bucket-survey` reports how a `progress.bin` assigns positions to the
-progress buckets. A roughly even spread is healthy; if one bucket dominates, the
-LayerStack output buckets are trained on very uneven amounts of data.
+Use `progress-bucket-survey` to measure the share of PSV records assigned to
+each bucket. Give `--progress` and optionally `--num-buckets` (default 8), or
+give `--bucket-spec`. To cross-tabulate two definitions, add
+`--compare-bucket-spec` or `--compare-progress` with optional
+`--compare-num-buckets`.
 
 ```bash
 cargo build --release -p progress-bucket-survey
 target/release/progress-bucket-survey \
-  --data <path/to/consecutive-psv.bin> \
-  --progress output/progress/<run-name>.e5.bin \
-  --samples 200000
+  --data teacher.psv --progress progress.bin --num-buckets 8 \
+  --compare-bucket-spec 'ownking:2/3/7+oppking:2/3/7' --samples 200000
 ```
 
-It prints a per-bucket count and percentage plus the top bucket's share. Only
-one `progress.bin` can be loaded per run, so to compare epochs run it once per
-`<run-name>.e<N>.bin` and compare the outputs.
+The default samples up to 32 evenly spaced windows per file. A quota of one
+position selects the middle of the eligible range. Use `--chunks 1` to read
+from the specified offset. Repeat `--data` for multiple teachers and add
+`--per-pack` for separate tables. The combined sample
+is allocated by file size. Cross-tab cells are percentages of all sampled
+positions. Add `--tsv` for counts and fractions, with `all` marking marginal
+and grand totals. The `scope` column identifies per-pack rows as `pack`
+and combined rows as `aggregate`.
 
 Once you have a `progress.bin` you are happy with, pass it to `nnue-train` via
 `--progress-coeff` when training a `layerstack` net (see

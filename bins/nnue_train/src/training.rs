@@ -1450,8 +1450,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // ここに到達 = 通常学習 (eval-only / norm-dump は上で return 済)。学習には --data が要る。
     let data = data.ok_or("training requires --data")?;
 
+    let keep_bucket = cfg.sampling.prepare_keep_bucket()?;
+    let sampling_params = SamplingParams::with_prepared_keep_bucket(
+        cfg.tree_sample_eval_only,
+        cfg.sampling.clone(),
+        keep_bucket.as_ref(),
+    );
     let mut experiment = build_experiment_logger(
         cli,
+        sampling_params,
         layerstack,
         trainer.qat_mode,
         bucket_mode,
@@ -1467,10 +1474,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
-    let result = nnue_train::trainer::run(
+    let result = nnue_train::trainer::run_with_prepared_keep_bucket(
         &mut trainer,
         data,
-        &bucket_mode,
+        (&bucket_mode, keep_bucket),
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,
@@ -2118,6 +2125,7 @@ pub(crate) fn resolve_lineage_kind(
 #[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger(
     cli: &Cli,
+    sampling: SamplingParams,
     layerstack: &LayerstackArgs,
     qat: crate::qat::QatMode,
     bucket_mode: BucketMode,
@@ -2237,7 +2245,7 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        sampling: SamplingParams::new(cli.tree_sample_eval_only, cli.sampling()),
+        sampling,
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         mix_data: cli
             .mix_sources()
@@ -2344,6 +2352,7 @@ pub(crate) fn build_data_info(cli: &Cli, data: &[PathBuf]) -> DataInfo {
 #[cfg(feature = "gpu")]
 pub(crate) fn build_experiment_logger_simple(
     cli: &Cli,
+    sampling: SamplingParams,
     id: SimpleId,
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
@@ -2449,7 +2458,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
-        sampling: SamplingParams::new(cli.tree_sample_eval_only, cli.sampling()),
+        sampling,
         score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         mix_data: cli
             .mix_sources()
@@ -2857,8 +2866,15 @@ pub(crate) fn run_simple_training(
         monitor_active_features: cli.monitor_active_features,
     };
 
+    let keep_bucket = cfg.sampling.prepare_keep_bucket()?;
+    let sampling_params = SamplingParams::with_prepared_keep_bucket(
+        cfg.tree_sample_eval_only,
+        cfg.sampling.clone(),
+        keep_bucket.as_ref(),
+    );
     let mut experiment = build_experiment_logger_simple(
         cli,
+        sampling_params,
         id,
         start_superbatch,
         resumed_superbatch,
@@ -2875,10 +2891,10 @@ pub(crate) fn run_simple_training(
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
-    let result = nnue_train::trainer::run(
+    let result = nnue_train::trainer::run_with_prepared_keep_bucket(
         &mut trainer,
         data,
-        &progress,
+        (&progress, keep_bucket),
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,
@@ -3466,6 +3482,7 @@ mod tests {
 
         let logger = build_experiment_logger(
             &cli,
+            SamplingParams::default(),
             layerstack,
             crate::qat::QatMode::Dense,
             bucket_mode,
@@ -3522,6 +3539,7 @@ mod tests {
 
         let logger = build_experiment_logger_simple(
             &cli,
+            SamplingParams::default(),
             SimpleId {
                 feature_set: FeatureSet::HalfKp.spec(),
                 activation: SimpleActivation::CReLU,

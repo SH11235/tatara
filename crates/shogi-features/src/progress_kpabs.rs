@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use shogi_format::bona_piece::FE_OLD_END;
+use shogi_format::bona_piece::{FE_OLD_END, PIECE_BASE};
 use shogi_format::types::HAND_PIECE_TYPES;
 use shogi_format::{BonaPiece, Color, PackedSfenValue, ShogiBoard};
 
@@ -73,23 +73,28 @@ impl ShogiProgressKPAbs {
     /// ための入口 (`for_each_active_index` は `pos.decode()` 経由で本メソッドを
     /// 呼ぶのと等価)。
     pub fn for_each_active_index_board(board: &ShogiBoard, mut f: impl FnMut(usize)) {
+        Self::fold_active_indices(board, (), |(), index| f(index));
+    }
+
+    fn fold_active_indices<T: Copy>(
+        board: &ShogiBoard,
+        mut acc: T,
+        mut f: impl FnMut(T, usize) -> T,
+    ) -> T {
         if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
-            return;
+            return acc;
         }
 
-        let sq_bk = board.black_king_sq.index();
-        let sq_wk = board.white_king_sq.inverse().index();
+        let black_row = board.black_king_sq.index() * FE_OLD_END;
+        let white_row = board.white_king_sq.inverse().index() * FE_OLD_END;
 
         board.for_each_board_piece(|piece, sq| {
-            let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
-            if bp_b != BonaPiece::ZERO {
-                f(sq_bk * FE_OLD_END + bp_b.value() as usize);
-            }
-
-            let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
-            if bp_w != BonaPiece::ZERO {
-                f(sq_wk * FE_OLD_END + bp_w.value() as usize);
-            }
+            // The board iterator emits only non-king pieces with valid squares.
+            let bases = PIECE_BASE[piece.piece_type as usize];
+            let color = piece.color as usize;
+            let square = sq.index();
+            acc = f(acc, black_row + usize::from(bases[1 - color]) + square);
+            acc = f(acc, white_row + usize::from(bases[color]) + (80 - square));
         });
 
         for owner in [Color::Black, Color::White] {
@@ -103,16 +108,17 @@ impl ShogiProgressKPAbs {
                 for c in 1..=count {
                     let bp_b = BonaPiece::from_hand_piece(Color::Black, owner, pt, c);
                     if bp_b != BonaPiece::ZERO {
-                        f(sq_bk * FE_OLD_END + bp_b.value() as usize);
+                        acc = f(acc, black_row + bp_b.value() as usize);
                     }
 
                     let bp_w = BonaPiece::from_hand_piece(Color::White, owner, pt, c);
                     if bp_w != BonaPiece::ZERO {
-                        f(sq_wk * FE_OLD_END + bp_w.value() as usize);
+                        acc = f(acc, white_row + bp_w.value() as usize);
                     }
                 }
             }
         }
+        acc
     }
 
     /// `for_each_active_index` の結果を `Vec` に集める。`out` は事前 clear される。
@@ -134,27 +140,7 @@ impl ShogiProgressKPAbs {
     /// 行う場合に、検証したバイト列と同一の内容から重みを構築できる (ここで
     /// ファイルを読み直すと、その間の差し替えで hash とロード内容が乖離する)。
     pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
-        if bytes.len() != expected {
-            return Err(format!(
-                "progress.bin size mismatch: got {} bytes, expected {}",
-                bytes.len(),
-                expected
-            ));
-        }
-
-        let raw: Vec<f64> = bytes
-            .chunks_exact(std::mem::size_of::<f64>())
-            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")))
-            .collect();
-        // 非有限値は f32 routing では sigmoid が NaN になって bucket 0 に、Q16 では飽和
-        // キャストで端の値になり、どちらも誤 routing を黙って続けるので読込時に弾く。
-        if let Some(i) = raw.iter().position(|w| !w.is_finite()) {
-            return Err(format!(
-                "progress.bin coefficient {i} is not finite ({})",
-                raw[i]
-            ));
-        }
+        let raw = decode_weights(bytes)?;
         let weights = LoadedWeights {
             f32: raw.iter().map(|&w| w as f32).collect(),
             q16: raw.iter().map(|&w| quantize_q16(w)).collect(),
@@ -175,11 +161,7 @@ impl ShogiProgressKPAbs {
     /// `progress` の **decode 済み `ShogiBoard` を直接受ける** 版。
     pub fn progress_board(&self, board: &ShogiBoard) -> f32 {
         let weights = Self::weights();
-        let mut sum = 0.0f32;
-        Self::for_each_active_index_board(board, |idx| sum += weights[idx]);
-
-        let p = 1.0 / (1.0 + (-sum).exp());
-        p.clamp(0.0, 1.0)
+        progress_with(board, weights)
     }
 
     /// N-bucket 割当 (`0..=num_buckets-1`)。`num_buckets ∈ [1, MAX_NUM_BUCKETS]`
@@ -193,18 +175,7 @@ impl ShogiProgressKPAbs {
     /// `bucket` の **decode 済み `ShogiBoard` を直接受ける** 版。
     /// `bucket(&pos, n)` は `bucket_board(&pos.decode(), n)` と等価。
     pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
-        assert!(
-            (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
-            "num_buckets must be in [1, {MAX_NUM_BUCKETS}] (got {num_buckets}); \
-             upper bound is `u8::MAX as usize + 1` so `bucket = num_buckets - 1` \
-             fits in u8"
-        );
-        let p = self.progress_board(board);
-        // num_buckets <= 256 を assert 済なので `as i32` キャストは無誤差、
-        // clamp の上下境界 (i32::MIN..i32::MAX 内) も安全に評価できる。
-        let n_i32 = num_buckets as i32;
-        let raw = (p * num_buckets as f32).floor() as i32;
-        raw.clamp(0, n_i32 - 1) as u8
+        progress_to_bucket(self.progress_board(board), num_buckets)
     }
 
     /// Q16 logit 和 (`Σ round(w * 65536)`)。重み未ロードでは常に 0。
@@ -219,15 +190,80 @@ impl ShogiProgressKPAbs {
     }
 }
 
+/// A progress model with its own coefficients, independent of the routing model.
+pub struct ProgressKpAbsModel(Box<[f32]>);
+
+impl ProgressKpAbsModel {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Ok(Self(
+            decode_weights(bytes)?
+                .into_iter()
+                .map(|w| w as f32)
+                .collect(),
+        ))
+    }
+
+    pub fn bucket_board(&self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+        progress_to_bucket(progress_with(board, &self.0), num_buckets)
+    }
+}
+
+fn decode_weights(bytes: &[u8]) -> Result<Vec<f64>, String> {
+    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * std::mem::size_of::<f64>();
+    if bytes.len() != expected {
+        return Err(format!(
+            "progress.bin size mismatch: got {} bytes, expected {}",
+            bytes.len(),
+            expected
+        ));
+    }
+
+    let raw: Vec<f64> = bytes
+        .chunks_exact(std::mem::size_of::<f64>())
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")))
+        .collect();
+    // 非有限値は f32 routing では sigmoid が NaN になって bucket 0 に、Q16 では飽和
+    // キャストで端の値になり、どちらも誤 routing を黙って続けるので読込時に弾く。
+    if let Some(i) = raw.iter().position(|w| !w.is_finite()) {
+        return Err(format!(
+            "progress.bin coefficient {i} is not finite ({})",
+            raw[i]
+        ));
+    }
+    Ok(raw)
+}
+
+#[inline]
+fn progress_with(board: &ShogiBoard, weights: &[f32]) -> f32 {
+    let sum =
+        ShogiProgressKPAbs::fold_active_indices(board, 0.0_f32, |sum, idx| sum + weights[idx]);
+
+    let p = 1.0 / (1.0 + (-sum).exp());
+    p.clamp(0.0, 1.0)
+}
+
+#[inline]
+fn progress_to_bucket(p: f32, num_buckets: usize) -> u8 {
+    assert!(
+        (1..=MAX_NUM_BUCKETS).contains(&num_buckets),
+        "num_buckets must be in [1, {MAX_NUM_BUCKETS}] (got {num_buckets}); \
+             upper bound is `u8::MAX as usize + 1` so `bucket = num_buckets - 1` \
+             fits in u8"
+    );
+    // num_buckets <= 256 を assert 済なので `as i32` キャストは無誤差、
+    // clamp の上下境界 (i32::MIN..i32::MAX 内) も安全に評価できる。
+    let n_i32 = num_buckets as i32;
+    let raw = (p * num_buckets as f32).floor() as i32;
+    raw.clamp(0, n_i32 - 1) as u8
+}
+
 fn quantize_q16(weight: f64) -> i32 {
     // `as` は i32 の範囲外を端の値へ飽和させる。
     (weight * 65536.0).round() as i32
 }
 
 fn q16_sum_with(board: &ShogiBoard, weights: &[i32]) -> i64 {
-    let mut sum = 0i64;
-    ShogiProgressKPAbs::for_each_active_index_board(board, |idx| sum += i64::from(weights[idx]));
-    sum
+    ShogiProgressKPAbs::fold_active_indices(board, 0_i64, |sum, idx| sum + i64::from(weights[idx]))
 }
 
 /// Q16 logit 和を bucket へ変換する。閾値と等しい和は上側の bucket に入る
@@ -340,6 +376,42 @@ mod tests {
             total_active > 0,
             "sample.psv は実局面なので active index を持つ record があるはず"
         );
+    }
+
+    #[test]
+    fn floating_progress_preserves_index_accumulation_order() {
+        let weights: Vec<f32> = (0..SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS)
+            .map(|index| ((index % 113) as f32 - 56.0) * 0.003)
+            .collect();
+        for record in sample_psv_records() {
+            let board = record.decode();
+            let rows = [
+                board.black_king_sq.index() * FE_OLD_END,
+                board.white_king_sq.inverse().index() * FE_OLD_END,
+            ];
+            let mut sum = 0.0_f32;
+            board.for_each_board_piece(|piece, square| {
+                for color in [Color::Black, Color::White] {
+                    let bp = BonaPiece::from_piece_square(piece, square, color);
+                    sum += weights[rows[color as usize] + usize::from(bp.value())];
+                }
+            });
+            for owner in [Color::Black, Color::White] {
+                for pt in HAND_PIECE_TYPES {
+                    for count in 1..=board.hand(owner).count(pt) {
+                        for color in [Color::Black, Color::White] {
+                            let bp = BonaPiece::from_hand_piece(color, owner, pt, count);
+                            sum += weights[rows[color as usize] + usize::from(bp.value())];
+                        }
+                    }
+                }
+            }
+            let expected = 1.0 / (1.0 + (-sum).exp());
+            assert_eq!(
+                progress_with(&board, &weights).to_bits(),
+                expected.to_bits()
+            );
+        }
     }
 
     #[test]

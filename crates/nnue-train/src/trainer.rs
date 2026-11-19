@@ -782,6 +782,34 @@ pub fn run<B, L, W, M>(
     lr_scheduler: &L,
     wdl_scheduler: &W,
     cfg: &TrainingConfig,
+    experiment: Option<&mut ExperimentLogger>,
+) -> io::Result<()>
+where
+    B: TrainerBackend,
+    L: LrScheduler,
+    W: WdlScheduler,
+    M: Copy + Into<BucketMode>,
+{
+    run_with_prepared_keep_bucket(
+        backend,
+        data_paths,
+        (bucket_mode, None),
+        lr_scheduler,
+        wdl_scheduler,
+        cfg,
+        experiment,
+    )
+}
+
+/// Use the same prepared sampling bucket for training and the experiment recipe.
+/// A supplied bucket must be prepared from the sampling definition in `cfg`.
+pub fn run_with_prepared_keep_bucket<B, L, W, M>(
+    backend: &mut B,
+    data_paths: &[impl AsRef<Path>],
+    (bucket_mode, prepared): (&M, Option<crate::sampling::PreparedKeepBucket>),
+    lr_scheduler: &L,
+    wdl_scheduler: &W,
+    cfg: &TrainingConfig,
     mut experiment: Option<&mut ExperimentLogger>,
 ) -> io::Result<()>
 where
@@ -791,6 +819,14 @@ where
     M: Copy + Into<BucketMode>,
 {
     cfg.validate()?;
+    if let Some(bucket) = &prepared
+        && Some(&bucket.definition) != cfg.sampling.keep_bucket.as_ref()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared sampling bucket does not match the training sampling definition",
+        ));
+    }
 
     let data_path = &crate::dataloader::teacher_data_label(data_paths);
     let format = crate::dataloader::teacher_format(data_paths)?;
@@ -850,6 +886,30 @@ where
             "mask": mask.as_ref().map(|path| crate::loader_state::LoaderState::identities(&[path])).transpose()?,
         }),
     };
+    let mut sampling_settings = cfg.sampling.settings(cfg.tree_sample_eval_only);
+    let prepared = match prepared {
+        Some(bucket) => Some(bucket),
+        None => cfg.sampling.prepare_keep_bucket()?,
+    };
+    let (keep_bucket, bucket_inputs) = if let Some(prepared) = prepared {
+        sampling_settings
+            .as_object_mut()
+            .unwrap()
+            .remove("keep_bucket");
+        (Some(prepared.evaluator), prepared.identity)
+    } else if cfg.sampling.bucket_keep_rates.is_some() {
+        (
+            None,
+            serde_json::json!({
+                "mode": Into::<BucketMode>::into(*bucket_mode).identity(),
+                "count": cfg.num_buckets,
+                "progress_coeff": cfg.progress_coeff.as_deref()
+                    .map(crate::loader_state::artifact_identity).transpose()?,
+            }),
+        )
+    } else {
+        (None, serde_json::Value::Null)
+    };
     let mut settings = serde_json::json!({
         "train_end_offset": train_end_offset,
         "record_bytes": record_bytes,
@@ -864,15 +924,8 @@ where
         )?,
         "shuffle": cfg.teacher_shuffle,
         "seed": cfg.teacher_shuffle_seed,
-        "sampling": cfg.sampling.settings(cfg.tree_sample_eval_only),
-        "bucket_inputs": if cfg.sampling.bucket_keep_rates.is_some() {
-            serde_json::json!({
-                "mode": Into::<BucketMode>::into(*bucket_mode).identity(),
-                "count": cfg.num_buckets,
-                "progress_coeff": cfg.progress_coeff.as_deref()
-                    .map(crate::loader_state::artifact_identity).transpose()?,
-            })
-        } else { serde_json::Value::Null },
+        "sampling": sampling_settings,
+        "bucket_inputs": bucket_inputs,
         "mix_rates": cfg.mix_sources.iter().map(|s| s.rate).collect::<Vec<_>>(),
         "mix_seed": if cfg.mix_sources.is_empty() { 0 } else { cfg.mix_seed },
     });
@@ -965,7 +1018,7 @@ where
             )
         })
         .transpose()?;
-    let mut loader = BucketedPrefetchedLoader::spawn_mixed_resumable(
+    let mut loader = BucketedPrefetchedLoader::spawn_with_prepared_sampling(
         data_paths,
         crate::dataloader::BucketedLoaderOptions {
             sampling: cfg.sampling.clone(),
@@ -990,6 +1043,7 @@ where
         &cfg.mix_sources,
         cfg.mix_seed,
         resume_position,
+        keep_bucket,
     )?;
 
     let (score_override, score_override_mask, dual_label_psv) = match &cfg.score_source {
@@ -1416,9 +1470,14 @@ where
             let (read, kept) = loader.sampling_counts();
             eprintln!("[sampling] sb={sb} cumulative read={read} kept={kept} (includes prefetch)");
             if let Some(counts) = loader.sampling_bucket_counts() {
+                let bucket_key = if cfg.sampling.keep_bucket.is_some() {
+                    "keep_bucket"
+                } else {
+                    "bucket"
+                };
                 for (bucket, (read, kept)) in counts.into_iter().enumerate() {
                     eprintln!(
-                        "[sampling] sb={sb} bucket={bucket} read={read} kept={kept} (after reader filters, includes prefetch)"
+                        "[sampling] sb={sb} {bucket_key}={bucket} read={read} kept={kept} (after reader filters, includes prefetch)"
                     );
                 }
             }
@@ -3766,20 +3825,145 @@ mod tests {
 
     #[test]
     fn pause_resume_matches_uninterrupted_teacher_sequence() {
-        assert_pause_resume_sequence(false, false);
+        assert_pause_resume_sequence(false, false, false);
     }
 
     #[test]
     fn pause_resume_sampling_mixing_and_window_shuffle_matches_continuation() {
-        assert_pause_resume_sequence(true, true);
+        assert_pause_resume_sequence(true, true, false);
     }
 
     #[test]
     fn pause_resume_filter_free_tree_sampling_accepts_legacy_loader_settings() {
-        assert_pause_resume_sequence(false, true);
+        assert_pause_resume_sequence(false, true, false);
     }
 
-    fn assert_pause_resume_sequence(combined: bool, tree_sample_eval_only: bool) {
+    #[test]
+    fn independent_sampling_rejects_changed_definition_and_resumes_matching_input() {
+        assert_pause_resume_sequence(true, true, true);
+    }
+
+    #[test]
+    fn prepared_sampling_bucket_must_match_training_definition() {
+        use crate::sampling::{KeepBucket, Sampling};
+
+        let cfg = TrainingConfig {
+            sampling: Sampling {
+                keep_bucket: Some(KeepBucket::Spec {
+                    spec: "handmajor3".into(),
+                }),
+                bucket_keep_rates: Some(vec![1.0; 3]),
+                ..Default::default()
+            },
+            ..base_cfg()
+        };
+        let lr = StepLR {
+            start: 0.001,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let output = tempfile::tempdir().unwrap();
+        let data = [output.path().join("missing.psv")];
+        for spec in ["handmajor4", "ownking:2/3"] {
+            let prepared = Sampling {
+                keep_bucket: Some(KeepBucket::Spec { spec: spec.into() }),
+                ..Default::default()
+            }
+            .prepare_keep_bucket()
+            .unwrap();
+            let error = run_with_prepared_keep_bucket(
+                &mut MockBackend::new(),
+                &data,
+                (&BucketMode::KingRank9, prepared),
+                &lr,
+                &wdl,
+                &cfg,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("prepared sampling bucket"));
+        }
+    }
+
+    #[test]
+    fn independent_progress_sampling_rejects_changed_coefficient_contents() {
+        use crate::sampling::{KeepBucket, Sampling};
+
+        let output = tempfile::tempdir().unwrap();
+        let coeff = output.path().join("progress.bin");
+        let mut bytes = vec![0; 8 * shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+        std::fs::write(&coeff, &bytes).unwrap();
+        let mut cfg = TrainingConfig {
+            sampling: Sampling {
+                keep_bucket: Some(KeepBucket::ProgressKpAbs {
+                    progress_coeff: coeff.clone(),
+                    num_buckets: 8,
+                }),
+                bucket_keep_rates: Some(vec![1.0; 8]),
+                ..Default::default()
+            },
+            output_dir: output.path().to_path_buf(),
+            end_superbatch: 1,
+            ..base_cfg()
+        };
+        let lr = StepLR {
+            start: 0.001,
+            gamma: 0.9,
+            step: 1,
+        };
+        let wdl = ConstantWDL { value: 0.0 };
+        let data = [sample_psv_path()];
+        let prepared = cfg.sampling.prepare_keep_bucket().unwrap();
+        run_with_prepared_keep_bucket(
+            &mut MockBackend::new().with_file_writes(),
+            &data,
+            (&BucketMode::KingRank9, prepared),
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .unwrap();
+        let checkpoint = output.path().join("test-1.ckpt");
+        let state = crate::loader_state::LoaderState::load(&checkpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.settings["bucket_inputs"]["progress_coeff"],
+            crate::loader_state::artifact_identity(&coeff).unwrap()
+        );
+
+        bytes[..8].copy_from_slice(&0.25f64.to_le_bytes());
+        std::fs::write(&coeff, bytes).unwrap();
+        cfg.start_superbatch = 2;
+        cfg.end_superbatch = 2;
+        cfg.resume_checkpoint = Some(checkpoint);
+        let err = run(
+            &mut MockBackend::new(),
+            &data,
+            &BucketMode::KingRank9,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("bucket_inputs") && err.contains("sha256"),
+            "{err}"
+        );
+    }
+
+    fn assert_pause_resume_sequence(
+        combined: bool,
+        tree_sample_eval_only: bool,
+        independent: bool,
+    ) {
+        use crate::sampling::KeepBucket;
+
         for threads in [1, 4] {
             for (buffer, shuffle) in [(0, false), (1, true)] {
                 for data in [sample_psv_path(), sample_hcpe_path()] {
@@ -3790,6 +3974,9 @@ mod tests {
                         vec![data.clone()]
                     };
                     let psv = data.extension().unwrap() == "psv";
+                    if independent && !psv {
+                        continue;
+                    }
                     let cfg = TrainingConfig {
                         tree_sample_eval_only: tree_sample_eval_only && psv,
                         output_dir: output.path().to_path_buf(),
@@ -3815,7 +4002,11 @@ mod tests {
                         sampling: if combined {
                             crate::sampling::Sampling {
                                 keep_rate: 0.8,
-                                bucket_keep_rates: psv.then(|| vec![0.6; 9]),
+                                bucket_keep_rates: psv
+                                    .then(|| vec![0.6; if independent { 4 } else { 9 }]),
+                                keep_bucket: independent.then(|| KeepBucket::Spec {
+                                    spec: "ownking:2/3/7".into(),
+                                }),
                                 min_ply: psv.then_some(20),
                                 skip_seed: 17,
                                 ..Default::default()
@@ -3907,6 +4098,28 @@ mod tests {
                         resume_checkpoint: Some(checkpoint),
                         ..paused_cfg
                     };
+                    if independent {
+                        assert_eq!(
+                            state.settings["bucket_inputs"]["mode"],
+                            "spec:ownking:2/3/7"
+                        );
+                        assert_eq!(state.settings["bucket_inputs"]["count"], 4);
+                        let mut changed = resumed_cfg.clone();
+                        changed.sampling.keep_bucket = Some(KeepBucket::Spec {
+                            spec: "oppking:2/3/7".into(),
+                        });
+                        let error = run(
+                            &mut MockBackend::new(),
+                            &paths,
+                            &ShogiProgressKPAbs,
+                            &lr,
+                            &wdl,
+                            &changed,
+                            None,
+                        )
+                        .unwrap_err();
+                        assert!(error.to_string().contains("bucket_inputs"), "{error}");
+                    }
                     if combined {
                         assert_eq!(
                             state.settings["mix_score_drop_abs"],

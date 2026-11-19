@@ -73,13 +73,11 @@ fn sampling_matches_record_identity_and_can_replay_from_mid_epoch() {
 
 fn bucket_loader(sampling: Sampling, workers: usize, shuffle: bool) -> BucketedPrefetchedLoader {
     let mut source = reader(sampling.clone());
-    source.bucket_sampling = Some(Arc::new(BucketSampling {
-        sampling,
-        counts: Arc::clone(&source.sampling_counts),
-        buckets: (0..9).map(|_| SamplingCounts::default()).collect(),
-        progress: Mutex::new(BucketProgress::default()),
-        accepted: Mutex::new(Vec::new()),
-    }));
+    let keep_bucket = sampling
+        .prepare_keep_bucket()
+        .unwrap()
+        .map(|bucket| Arc::new(bucket.evaluator));
+    source.configure_sampling(sampling, keep_bucket);
     let counts = Arc::clone(&source.sampling_counts);
     let input = if shuffle {
         TrainingPsvReader::Windowed(WindowedPsvReader::spawn(source, 17, true, 123))
@@ -138,6 +136,27 @@ fn sampling_bucket_and_ply_filters_reach_barren_guard() {
             let counts = loader.sampling_bucket_counts().unwrap();
             assert!(counts.iter().map(|c| c.0).sum::<u64>() >= 500);
             assert!(counts.iter().all(|c| c.1 == 0));
+
+            let mut independent = bucket_loader(
+                Sampling {
+                    bucket_keep_rates: Some(vec![0.0; 3]),
+                    keep_bucket: Some(crate::sampling::KeepBucket::Spec {
+                        spec: "handmajor3".into(),
+                    }),
+                    ..Default::default()
+                },
+                workers,
+                shuffle,
+            );
+            assert!(
+                independent
+                    .next_batch()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("5 full passes")
+            );
+            assert_eq!(independent.sampling_counts().1, 0);
         }
     }
 }
@@ -237,6 +256,43 @@ fn sampling_barren_guard_waits_for_out_of_order_completions() {
         },
     );
     assert!(progress.check().is_err());
+}
+
+#[test]
+fn shuffled_resume_skips_psv_decoding_for_draws_above_all_bucket_rates() {
+    let sampling = Sampling {
+        bucket_keep_rates: Some(vec![0.0, 0.1, 0.2]),
+        keep_bucket: Some(crate::sampling::KeepBucket::Spec {
+            spec: "handmajor3".into(),
+        }),
+        ..Default::default()
+    };
+    let mut source = reader(Sampling::default());
+    let keep_bucket = sampling.prepare_keep_bucket().unwrap().unwrap();
+    source.configure_sampling(sampling.clone(), Some(Arc::new(keep_bucket.evaluator)));
+    let mut windowed = WindowedPsvReader::spawn(source, 17, true, 123);
+    windowed
+        .restore_window(&TeacherPosition {
+            window_index: Some(0),
+            window_offset: 16,
+            ..Default::default()
+        })
+        .unwrap();
+    let window = windowed.current.as_ref().unwrap();
+    let expected: Vec<_> = window.records[..window.next]
+        .iter()
+        .filter(|record| sampling.draw(0, record.epoch, record.record_index) < 0.2)
+        .map(|record| record.record_index)
+        .collect();
+    assert!(!expected.is_empty() && expected.len() < window.next);
+    let decoded = std::cell::RefCell::new(Vec::new());
+    windowed
+        .replay_sampling(BucketMode::KingRank9, 9, |record| {
+            decoded.borrow_mut().push(record.record.record_index);
+            record.record.decode()
+        })
+        .unwrap();
+    assert_eq!(decoded.into_inner(), expected);
 }
 
 #[test]

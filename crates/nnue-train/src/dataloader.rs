@@ -1308,6 +1308,8 @@ impl BucketProgress {
 }
 
 struct BucketSampling {
+    keep_bucket: Option<Arc<crate::sampling::KeepBucketEvaluator>>,
+    rate_bounds: (f64, f64),
     sampling: crate::sampling::Sampling,
     counts: Arc<SamplingCounts>,
     buckets: Vec<SamplingCounts>,
@@ -1335,6 +1337,32 @@ impl BucketSampling {
         Ok(true)
     }
 
+    fn sample_independent_and_decode(
+        samplings: &[Option<Arc<Self>>],
+        record: &SourcedRecord,
+        decode: impl Fn() -> io::Result<ShogiBoard>,
+    ) -> io::Result<Option<ShogiBoard>> {
+        let Some(sampling) = &samplings[record.source()] else {
+            return decode().map(Some);
+        };
+        // HCPE decoding validates the record even when bucket sampling rejects it.
+        let mut board = if matches!(record.record.record, TeacherRecord::Hcpe(_)) {
+            Some(decode()?)
+        } else {
+            None
+        };
+        let (kept, bucket) = sampling.independent_decision(&record.record, |definition| {
+            if board.is_none() {
+                board = Some(decode()?);
+            }
+            Ok(definition.bucket(board.as_ref().unwrap()))
+        })?;
+        if !sampling.finish_decision(&record.record, kept, bucket)? {
+            return Ok(None);
+        }
+        board.map_or_else(decode, Ok).map(Some)
+    }
+
     fn register(&self, epoch: u64) {
         self.progress
             .lock()
@@ -1349,8 +1377,46 @@ impl BucketSampling {
         progress.epochs.entry(epoch).or_default().closed = true;
         progress.check()
     }
+    fn independent_decision(
+        &self,
+        record: &IdentifiedRecord,
+        independent_bucket: impl FnOnce(&crate::sampling::KeepBucketEvaluator) -> io::Result<u8>,
+    ) -> io::Result<(bool, Option<usize>)> {
+        let rates = self.sampling.bucket_keep_rates.as_ref().unwrap();
+        let probability = record.record.sampling_probability(&self.sampling);
+        let teacher = u64::from(record.teacher);
+        let definition = self.keep_bucket.as_ref().expect("independent keep bucket");
+        if !self.sampling.monitor_keep_buckets {
+            let (min_rate, max_rate) = self.rate_bounds;
+            if record.tree_sample || probability * min_rate >= 1.0 {
+                return Ok((true, None));
+            }
+            // The stateless draw is the same one used by the reader.
+            let draw = self
+                .sampling
+                .draw(teacher, record.epoch, record.record_index);
+            if draw < probability * min_rate {
+                return Ok((true, None));
+            }
+            if draw >= probability * max_rate {
+                return Ok((false, None));
+            }
+            let bucket = usize::from(independent_bucket(definition)?);
+            return Ok((draw < probability * rates[bucket], None));
+        }
+
+        let bucket = usize::from(independent_bucket(definition)?);
+        let kept = record.tree_sample
+            || self.sampling.accepts(
+                teacher,
+                record.epoch,
+                record.record_index,
+                probability * rates[bucket],
+            );
+        Ok((kept, Some(bucket)))
+    }
+
     fn finish(&self, record: &IdentifiedRecord, bucket: usize) -> io::Result<bool> {
-        self.buckets[bucket].read.fetch_add(1, Ordering::Relaxed);
         // Reuse the reader's draw for the combined probability.
         let kept = record.tree_sample
             || self.sampling.accepts(
@@ -1360,13 +1426,27 @@ impl BucketSampling {
                 record.record.sampling_probability(&self.sampling)
                     * self.sampling.bucket_keep_rates.as_ref().unwrap()[bucket],
             );
+        self.finish_decision(record, kept, Some(bucket))
+    }
+
+    fn finish_decision(
+        &self,
+        record: &IdentifiedRecord,
+        kept: bool,
+        bucket: Option<usize>,
+    ) -> io::Result<bool> {
+        if let Some(bucket) = bucket {
+            self.buckets[bucket].read.fetch_add(1, Ordering::Relaxed);
+            if kept {
+                self.buckets[bucket].kept.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if kept {
             #[cfg(test)]
             self.accepted
                 .lock()
                 .unwrap()
                 .push((record.epoch, record.record_index));
-            self.buckets[bucket].kept.fetch_add(1, Ordering::Relaxed);
             self.counts.kept.fetch_add(1, Ordering::Relaxed);
         }
         let mut progress = self.progress.lock().expect("sampling mutex poisoned");
@@ -1514,14 +1594,29 @@ impl PsvEpochReader {
         Ok(())
     }
 
-    fn configure_sampling(&mut self, sampling: crate::sampling::Sampling) {
+    fn configure_sampling(
+        &mut self,
+        sampling: crate::sampling::Sampling,
+        keep_bucket: Option<Arc<crate::sampling::KeepBucketEvaluator>>,
+    ) {
         self.bucket_sampling = sampling.bucket_keep_rates.as_ref().map(|rates| {
             Arc::new(BucketSampling {
+                rate_bounds: rates
+                    .iter()
+                    .copied()
+                    .fold((1.0_f64, 0.0_f64), |(lo, hi), rate| {
+                        (lo.min(rate), hi.max(rate))
+                    }),
+                buckets: if keep_bucket.is_none() || sampling.monitor_keep_buckets {
+                    (0..rates.len())
+                        .map(|_| SamplingCounts::default())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                keep_bucket,
                 sampling: sampling.clone(),
                 counts: Arc::clone(&self.sampling_counts),
-                buckets: (0..rates.len())
-                    .map(|_| SamplingCounts::default())
-                    .collect(),
                 progress: Mutex::new(BucketProgress::default()),
                 #[cfg(test)]
                 accepted: Mutex::new(Vec::new()),
@@ -1841,17 +1936,23 @@ impl MixedTeacherReader {
                 .map_err(|_| io::Error::other("too many mixed teachers (maximum 65535)"))?;
             let sampling = match mix.keep_rate {
                 Some(keep_rate) => crate::sampling::Sampling {
+                    monitor_keep_buckets: false,
                     keep_rate,
                     min_ply: None,
                     ply_keep_curve: Vec::new(),
                     bucket_keep_rates: None,
+                    keep_bucket: None,
                     skip_seed: main.sampling.skip_seed,
                     tree_sample_accept: main.sampling.tree_sample_accept,
                     log_enabled: main.sampling.log_enabled,
                 },
                 None => main.sampling.clone(),
             };
-            reader.configure_sampling(sampling);
+            let keep_bucket = main
+                .bucket_sampling
+                .as_ref()
+                .and_then(|sampling| sampling.keep_bucket.clone());
+            reader.configure_sampling(sampling, keep_bucket);
             sources.push(reader);
             total += mix.rate;
             cumulative_rates.push(total);
@@ -2088,24 +2189,37 @@ impl<R: Copy + Send + Into<SourcedRecord> + 'static> WindowedPsvReader<R> {
         Ok(())
     }
 
-    fn replay_sampling(&mut self, bucket_mode: BucketMode, num_buckets: usize) -> io::Result<()> {
+    fn replay_sampling(
+        &mut self,
+        bucket_mode: BucketMode,
+        num_buckets: usize,
+        decode: impl Fn(&SourcedRecord) -> io::Result<ShogiBoard>,
+    ) -> io::Result<()> {
         if !self.replay_pending {
             return Ok(());
         }
         self.replay_pending = false;
-        if self.bucket_samplings[0].is_none() {
+        let Some(main) = &self.bucket_samplings[0] else {
             return Ok(());
-        }
+        };
         let window = self.current.as_ref().expect("restored window");
         // Regenerated prefix candidates must leave the epoch's pending count before new reads.
         for record in &window.records[..window.next] {
             let record: SourcedRecord = (*record).into();
-            let board = record.record.decode()?;
-            BucketSampling::finish_candidate(
-                &self.bucket_samplings,
-                &record,
-                bucket_mode.bucket_board(&board, num_buckets),
-            )?;
+            if main.keep_bucket.is_some() {
+                BucketSampling::sample_independent_and_decode(
+                    &self.bucket_samplings,
+                    &record,
+                    || decode(&record),
+                )?;
+            } else {
+                let board = decode(&record)?;
+                BucketSampling::finish_candidate(
+                    &self.bucket_samplings,
+                    &record,
+                    bucket_mode.bucket_board(&board, num_buckets),
+                )?;
+            }
         }
         Ok(())
     }
@@ -2172,9 +2286,12 @@ enum TrainingPsvReader {
 
 impl TrainingPsvReader {
     fn replay_sampling(&mut self, bucket_mode: BucketMode, num_buckets: usize) -> io::Result<()> {
+        let decode = |record: &SourcedRecord| record.record.decode();
         match self {
-            Self::Windowed(reader) => reader.replay_sampling(bucket_mode, num_buckets),
-            Self::MixedWindowed(reader, _) => reader.replay_sampling(bucket_mode, num_buckets),
+            Self::Windowed(reader) => reader.replay_sampling(bucket_mode, num_buckets, decode),
+            Self::MixedWindowed(reader, _) => {
+                reader.replay_sampling(bucket_mode, num_buckets, decode)
+            }
             _ => Ok(()),
         }
     }
@@ -2462,6 +2579,21 @@ impl BucketedPrefetchedLoader {
         mix_seed: u64,
         resume: Option<&TeacherPosition>,
     ) -> io::Result<Self> {
+        let keep_bucket = options
+            .sampling
+            .prepare_keep_bucket()?
+            .map(|prepared| prepared.evaluator);
+        Self::spawn_with_prepared_sampling(paths, options, mixes, mix_seed, resume, keep_bucket)
+    }
+
+    pub(crate) fn spawn_with_prepared_sampling(
+        paths: &[impl AsRef<Path>],
+        options: BucketedLoaderOptions<'_>,
+        mixes: &[MixSource],
+        mix_seed: u64,
+        resume: Option<&TeacherPosition>,
+        keep_bucket: Option<crate::sampling::KeepBucketEvaluator>,
+    ) -> io::Result<Self> {
         let BucketedLoaderOptions {
             sampling,
             batch_size,
@@ -2497,7 +2629,7 @@ impl BucketedPrefetchedLoader {
             score_clamp_abs,
             labels,
         )?;
-        source.configure_sampling(sampling);
+        source.configure_sampling(sampling, keep_bucket.map(Arc::new));
         if let Some(position) = resume {
             if position.mixes.len() != mixes.len() {
                 return Err(io::Error::other("loader mixed teacher count differs"));
@@ -2600,6 +2732,9 @@ impl BucketedPrefetchedLoader {
         let n_slots = prefetch_depth + num_workers + 1;
         let bucket_samplings = reader.bucket_samplings();
         let bucket_filter = bucket_samplings.iter().any(Option::is_some);
+        let independent_sampling = bucket_samplings[0]
+            .as_ref()
+            .is_some_and(|sampling| sampling.keep_bucket.is_some());
         let stop = reader.stop_flag();
         let teacher_count = reader.teacher_count();
         let reader = Arc::new(Mutex::new((reader, 0u64)));
@@ -2723,20 +2858,39 @@ impl BucketedPrefetchedLoader {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let board = match record.record.decode() {
-                            Ok(board) => board,
-                            Err(e) => {
-                                // 壊れた HCPE record。下の max_active 超過と同じく学習を止める。
-                                failure = Some(io::Error::new(
+                        let decode = || {
+                            record.record.decode().map_err(|e| {
+                                io::Error::new(
                                     e.kind(),
                                     format!("corrupt record in {}: {e}", data_path.display()),
-                                ));
-                                break;
+                                )
+                            })
+                        };
+                        let board = if independent_sampling {
+                            match BucketSampling::sample_independent_and_decode(
+                                &bucket_samplings,
+                                &record,
+                                decode,
+                            ) {
+                                Ok(Some(board)) => board,
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    failure = Some(e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            match decode() {
+                                Ok(board) => board,
+                                Err(e) => {
+                                    failure = Some(e);
+                                    break;
+                                }
                             }
                         };
                         let bucket =
                             compute_bucket.then(|| bucket_mode.bucket_board(&board, num_buckets));
-                        if bucket_filter {
+                        if bucket_filter && !independent_sampling {
                             match BucketSampling::finish_candidate(
                                 &bucket_samplings,
                                 &record,
@@ -2868,6 +3022,9 @@ impl BucketedPrefetchedLoader {
     /// Bucket reads count decoded candidates after reader filters; counts include prefetch.
     pub fn sampling_bucket_counts(&self) -> Option<Vec<(u64, u64)>> {
         let first = self.bucket_samplings.first()?.as_ref()?;
+        if first.buckets.is_empty() {
+            return None;
+        }
         let mut counts = vec![(0, 0); first.buckets.len()];
         for sampling in self.bucket_samplings.iter().flatten() {
             for (total, bucket) in counts.iter_mut().zip(&sampling.buckets) {
@@ -2986,9 +3143,11 @@ impl BucketedPrefetchedLoader {
             output.0.wdl[dst..dst + count].copy_from_slice(&src.wdl[start..start + count]);
             output.0.per_pos_norm[dst..dst + count]
                 .copy_from_slice(&src.per_pos_norm[start..start + count]);
-            output
-                .1
-                .extend_from_slice(&chunk.slot.1[start..start + count]);
+            if !chunk.slot.1.is_empty() {
+                output
+                    .1
+                    .extend_from_slice(&chunk.slot.1[start..start + count]);
+            }
             if assembly.teacher_count != 0 {
                 for &source in &chunk.sources[start..start + count] {
                     output.0.teacher_counts[source] += 1;

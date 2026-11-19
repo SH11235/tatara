@@ -203,7 +203,7 @@ Sampling is opt-in and applies only to training records; `--test-data` and
 | `--keep-rate R` | 1 | Keep probability, finite and in `(0, 1]` |
 | `--min-ply N` | none | Discard PSV records with `game_ply <= N`; invalid for HCPE |
 | `--ply-keep-curve POINTS` | none | Comma-separated `ply:probability` points, strictly increasing nonnegative plies and probabilities in `[0,1]`; invalid for HCPE |
-| `--bucket-keep-rates r0,r1,...` | none | Probabilities in `[0,1]`, one per LayerStack bucket; invalid for simple architectures |
+| `--bucket-keep-rates r0,r1,...` | none | Probabilities in `[0,1]`, one per sampling bucket. Defaults to LayerStack routing buckets |
 | `--skip-seed N` | 0 | Fixed seed for stateless position sampling |
 
 For example, `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
@@ -219,11 +219,48 @@ for feature extraction. Rejected records are replaced to keep batches full.
 After five consecutive empty passes the loader returns an error.
 When any sampling option is specified, each superbatch logs cumulative `read` and
 `kept` counts for each teacher and the total, including prefetched records.
-Bucket sampling also logs per-bucket reads (decoded candidates surviving reader filters)
-and survivors. Candidates that bypass the bucket filter count as both read and kept.
+Routing-bucket sampling also logs per-bucket reads (decoded candidates surviving reader
+filters) and survivors. Marked tree samples in the bucket log count as both read and kept.
 The effective sampling configuration
 is stored in `experiment.json` under `params.sampling` and participates in the recipe fingerprint.
 The all-default configuration is omitted to preserve existing recipe fingerprints (including its implicit seed 0).
+
+#### Choosing a separate sampling bucket
+
+Use `--keep-progress-coeff progress.bin --keep-num-buckets 8` to thin by game
+progress while training with king-rank routing.
+
+```bash
+nnue-train --data teacher.psv \
+  --keep-progress-coeff progress.bin --keep-num-buckets 8 \
+  --bucket-keep-rates 1,1,1,1,0.9,0.7,0.5,0.3 \
+  layerstack --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
+```
+
+For spec-based thinning, use `--keep-bucket-spec 'handmajor3'` with three rates.
+A spec determines the bucket count. Progress uses eight buckets by default
+and accepts one to 64. A separate sampling definition also works with `simple`.
+Use the [bucket survey](progress-bin.md#checking-the-bucket-distribution) to see
+the input distribution and how it overlaps the routing buckets.
+
+Each mixed teacher inherits the sampling definition unless it has a numeric
+`--mix-keep-rate`. Use `--monitor-keep-buckets` to log exact reads and survivors
+as `[sampling]` rows labeled `keep_bucket` for teachers using the independent
+definition. Without monitoring, the loader skips classifying a position when
+the same stateless draw and the lowest or highest keep probability already
+determine the outcome. For PSV, this also skips decoding when the draw
+rules out every bucket. Exact monitoring classifies every candidate that
+passes the reader filters and uses the same draw for the keep decision.
+`[teacher-mix]` fractions measure the positions delivered after thinning.
+For ordinary positions, the selected bucket
+rate multiplies `--keep-rate` and the applicable ply-curve rate after the
+`--min-ply` cutoff. Positions marked for `--tree-sample-eval-only` follow
+`--tree-sample-accept` and bypass this multiplication. Dual-label PSV uses the
+same bucket for a board with either label.
+
+`experiment.json` records the spec or the coefficient filename and bucket count
+under `params.sampling.keep_bucket`. Resuming saved input positions checks the
+sampling definition and the contents of the coefficient file.
 
 ### Mixing teachers
 

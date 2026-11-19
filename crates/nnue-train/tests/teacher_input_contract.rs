@@ -3,8 +3,8 @@ use std::io;
 use std::path::Path;
 
 use nnue_train::dataloader::{
-    Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, PrefetchedLoader, PsvFileLoader,
-    ScoreSource,
+    Batch, BucketMode, BucketedLoaderOptions, BucketedPrefetchedLoader, DualLabelMode,
+    LabelOptions, PrefetchedLoader, PsvFileLoader, ScoreSource, TeacherPosition,
 };
 use nnue_train::validation::HeldoutSet;
 use shogi_features::FeatureSet;
@@ -213,4 +213,163 @@ fn direct_and_windowed_training_preserve_digest_payload_and_epoch_order() {
         payload(&expected)
     );
     assert!(prefetched.next_batch().unwrap().is_none());
+}
+
+#[test]
+fn independent_sampling_matches_routing_with_the_same_definition() {
+    use nnue_train::sampling::{KeepBucket, Sampling};
+    use shogi_features::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAbs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("teacher.psv");
+    fs::write(&path, SAMPLE).unwrap();
+    let coeff = dir.path().join("progress.bin");
+    let weights: Vec<u8> = (0..SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS)
+        .flat_map(|index| (((index % 29) as f64 - 11.0) * 0.02).to_le_bytes())
+        .collect();
+    fs::write(&coeff, &weights).unwrap();
+    ShogiProgressKPAbs::load_from_bytes(&weights).unwrap();
+
+    let spec = "ownking:2/3/7+oppking:2/3/7".parse().unwrap();
+    for (mode, count, definition) in [
+        (
+            BucketMode::Spec(spec),
+            16,
+            KeepBucket::Spec {
+                spec: spec.to_string(),
+            },
+        ),
+        (
+            BucketMode::ProgressKpAbs,
+            8,
+            KeepBucket::ProgressKpAbs {
+                progress_coeff: coeff,
+                num_buckets: 8,
+            },
+        ),
+    ] {
+        let open =
+            |keep_bucket, monitor_keep_buckets, workers, resume: Option<&TeacherPosition>| {
+                BucketedPrefetchedLoader::spawn_mixed_resumable(
+                    &[&path],
+                    BucketedLoaderOptions {
+                        sampling: Sampling {
+                            keep_rate: 0.9,
+                            ply_keep_curve: vec![(0.0, 0.8), (80.0, 1.0)],
+                            bucket_keep_rates: Some(
+                                (0..count)
+                                    .map(|b| 0.3 + b as f64 / (2 * count) as f64)
+                                    .collect(),
+                            ),
+                            monitor_keep_buckets,
+                            keep_bucket,
+                            skip_seed: 123,
+                            ..Default::default()
+                        },
+                        batch_size: 13,
+                        score_drop_abs: None,
+                        score_clamp_abs: None,
+                        num_workers: workers,
+                        bucket_mode: mode,
+                        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+                        compute_bucket: true,
+                        num_buckets: count,
+                        train_end_offset: SAMPLE.len() as u64,
+                        monitor_active: false,
+                        labels: LabelOptions::default(),
+                        teacher_shuffle_buffer_mib: 1,
+                        teacher_shuffle: true,
+                        teacher_shuffle_seed: 456,
+                    },
+                    &[],
+                    0,
+                    resume,
+                )
+                .unwrap()
+            };
+        let collect = |loader: &mut BucketedPrefetchedLoader, batches| {
+            std::iter::repeat_with(|| {
+                let slot = loader.next_batch().unwrap().unwrap();
+                let batch = &slot.0;
+                let rows = (0..batch.n_positions)
+                    .map(|i| {
+                        let start = i * batch.max_active;
+                        let end = start + batch.nnz[i] as usize;
+                        (
+                            batch.stm_indices[start..end].to_vec(),
+                            batch.nstm_indices[start..end].to_vec(),
+                            batch.score[i].to_bits(),
+                            batch.wdl[i].to_bits(),
+                            batch.per_pos_norm[i].to_bits(),
+                            slot.1[i],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                loader.recycle(slot);
+                rows
+            })
+            .take(batches)
+            .collect::<Vec<_>>()
+        };
+        let routing = collect(&mut open(None, false, 1, None), 10);
+        for workers in [1, 3] {
+            let mut independent = open(Some(definition.clone()), false, workers, None);
+            assert_eq!(collect(&mut independent, 10), routing);
+            assert!(independent.sampling_bucket_counts().is_none());
+        }
+
+        let mut monitored = open(Some(definition.clone()), true, 1, None);
+        let mut resumed_batches = collect(&mut monitored, 1);
+        while monitored.position().bucket_skip == 0 && resumed_batches.len() < 9 {
+            resumed_batches.extend(collect(&mut monitored, 1));
+        }
+        let position = monitored.position().clone();
+        assert!(position.window_offset > 0);
+        assert!(position.bucket_skip > 0);
+        let counts = monitored.sampling_bucket_counts().unwrap();
+        assert_eq!(counts.len(), count);
+        assert!(counts.iter().any(|&(read, kept)| read > kept && kept > 0));
+        drop(monitored);
+        let mut resumed = open(Some(definition), false, 3, Some(&position));
+        let remaining = 10 - resumed_batches.len();
+        resumed_batches.extend(collect(&mut resumed, remaining));
+        assert_eq!(resumed_batches, routing);
+    }
+}
+
+#[test]
+fn independent_sampling_works_without_network_routing_buckets() {
+    use nnue_train::sampling::{KeepBucket, Sampling};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("teacher.psv");
+    fs::write(&path, SAMPLE).unwrap();
+    let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+        &[&path],
+        13,
+        None,
+        None,
+        2,
+        BucketMode::KingRank9,
+        FeatureSet::HalfKaHmMerged.spec(),
+        false,
+        1,
+        SAMPLE.len() as u64,
+        false,
+        None,
+        0,
+        false,
+        0,
+        Sampling {
+            bucket_keep_rates: Some(vec![0.3, 0.7, 0.9, 1.0]),
+            keep_bucket: Some(KeepBucket::Spec {
+                spec: "handmajor4".into(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (batch, buckets) = loader.next_batch().unwrap().unwrap();
+    assert_eq!(batch.n_positions, 13);
+    assert!(buckets.is_empty());
 }

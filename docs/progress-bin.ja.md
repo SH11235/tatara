@@ -53,21 +53,26 @@ target/release/progress-kpabs-train \
 
 ## bucket 分布の確認
 
-`progress-bucket-survey` は `progress.bin` が局面を進行度 bucket にどう割り当てる
-かを集計する。分布がおおむね均等なら健全で、特定の bucket に偏っていると
-LayerStack の出力 bucket ごとの学習データ量が大きく不均衡になる。
+`progress-bucket-survey` は、PSV の局面が各 bucket に入る割合を集計する。
+第 1 の定義は `--progress` と任意の `--num-buckets`（既定 8）、または
+`--bucket-spec` で指定する。クロス集計には `--compare-bucket-spec`、
+または `--compare-progress` と任意の `--compare-num-buckets` を追加する。
 
 ```bash
 cargo build --release -p progress-bucket-survey
 target/release/progress-bucket-survey \
-  --data <path/to/consecutive-psv.bin> \
-  --progress output/progress/<run-name>.e5.bin \
-  --samples 200000
+  --data teacher.psv --progress progress.bin --num-buckets 8 \
+  --compare-bucket-spec 'ownking:2/3/7+oppking:2/3/7' --samples 200000
 ```
 
-bucket ごとの件数・割合と top bucket の占有率を表示する。1 回の実行で読み込める
-`progress.bin` は 1 つなので、epoch を比較するときは `<run-name>.e<N>.bin` ごとに
-1 回ずつ実行して出力を比べる。
+既定では各ファイルに等間隔で配置した最大 32 個の窓から局面を読む。
+割り当てが 1 局面なら、抽出対象範囲の中央から読む。
+指定したオフセットから読み始めるには `--chunks 1` を使う。
+複数の教師は `--data` を繰り返し、教師ごとの表が必要なら `--per-pack` を指定する。
+全体のサンプル数はファイルサイズに比例して配分する。クロス集計の各セルは、
+サンプル全体に対する割合を表す。`--tsv` を指定すると件数と割合を出力し、
+行・列の合計および全体の合計は `all` で示す。`scope` 列はファイル別の行に
+`pack`、全ファイルの集計行に `aggregate` を出力する。
 
 満足のいく `progress.bin` が得られたら、`layerstack` net の学習時に `nnue-train`
 へ `--progress-coeff` で渡す([docs/training-quickstart.ja.md](training-quickstart.ja.md) 参照)。
