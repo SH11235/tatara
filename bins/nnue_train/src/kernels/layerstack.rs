@@ -1032,6 +1032,10 @@ pub fn dense_mm_bwd_weight_bucket_tiled_l1(
     static mut DY_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
     static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
 
+    if num_buckets != 9 {
+        return;
+    }
+
     let tid_local = thread::threadIdx_x() as usize;
     let block_x = thread::blockIdx_x() as usize;
     let block_split = thread::blockIdx_y() as usize;
@@ -1466,6 +1470,10 @@ pub fn dense_mm_fwd_bucket_tiled_l1(
     static mut W_TILE: SharedArray<f32, 2304> = SharedArray::UNINIT; // 9 × 16 × 16
     static mut BUC_TILE: SharedArray<i32, 16> = SharedArray::UNINIT;
 
+    if num_buckets != 9 {
+        return;
+    }
+
     let tid_local = thread::threadIdx_x() as usize;
     let block_b = thread::blockIdx_x() as usize;
     let tid_b = tid_local >> 4; // tid / 16
@@ -1588,7 +1596,7 @@ pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets
 /// 各 bucket の sorted layout 開始 offset を round up し、bucket 境界を block size
 /// (`TILE_B = 16`) に揃える。bucket 末端と次 bucket 開始の間は padding 行 (caller 側で
 /// invalid bucket marker `-1` で埋める) になり、kernel は uniform block 前提で走れる。
-/// 最大 32 bucket と無効行用の 1 bin を 1 thread で走査する。
+/// 無効行用の 1 bin を含む `n` 個の bin を 1 thread で走査する。
 #[kernel]
 pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u32) {
     if thread::index_1d().get() != 0 {
@@ -2621,7 +2629,7 @@ pub fn psqt_diff_sparse_fwd_inplace(
 /// `psqt_w_grad` を 0 初期化する責務)。
 ///
 /// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。
-/// 勾配の列数は `num_buckets` (1〜32) で、同じ feature と bucket の組に atomic add が集中する。
+/// 勾配の列数は `num_buckets` で、同じ feature と bucket の組に atomic add が集中する。
 ///
 /// `nnz_arr[bi]` は position bi の実 active 数で、`ni >= nnz_arr[bi]` の padding slot
 /// は index / bucket / dnet を DRAM から読む前に捨てる (dataloader が padding slot を

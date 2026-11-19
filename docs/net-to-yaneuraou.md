@@ -79,7 +79,7 @@ progress kp abs の評価ファイルを YaneuraOu で使うときは、学習�
 (`progress.bin`、[進行度係数の用意](progress-bin.md)) を `nn.bin` と同じ directory に置き、
 `YANEURAOU_ENGINE_SFNN_<key>_<ft>_<h1>_<h2>_progress<N>` で build する。YaneuraOu の
 アーキ生成器が受理する progress bucket 数は 2 / 3 / 4 / 8 / 16 / 32。tatara は
-1〜32 bucket で学習でき、`net_to_yo` が対応する 1〜9 bucket の範囲でアーキ生成器と
+1〜64 bucket で学習でき、`net_to_yo` が対応する 1〜9 bucket の範囲でアーキ生成器と
 共通する progress build は 2 / 3 / 4 / 8。N=1 は suffix なしの
 `YANEURAOU_ENGINE_SFNN_<key>_<ft>_<h1>_<h2>` (単一 LayerStack) で使え、`progress.bin` は要らない。
 進行度の計算方法 (f32 か、係数と閾値を 65536 倍した整数か) は YaneuraOu の build によって

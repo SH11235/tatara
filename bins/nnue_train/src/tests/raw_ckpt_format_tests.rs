@@ -1309,12 +1309,32 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
 
 #[test]
 fn raw_ckpt_spec_identity_roundtrip_and_mismatch() {
-    let arch = layerstack_arch_with_mode("spec:handmajor3+ownking:2/3");
-    let mut buf = Vec::new();
-    write_raw_ckpt_header(&mut buf, &arch, "bucket-spec-roundtrip", 2, 20, None, 10).unwrap();
-    read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
-    let other = layerstack_arch_with_mode("spec:handmajor3+oppking:2/3");
-    assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &other).is_err());
+    for (routing, other, count) in [
+        (
+            "spec:handmajor3+ownking:2/3",
+            "spec:handmajor3+oppking:2/3",
+            9,
+        ),
+        (
+            "spec:handmajor4+ownking:2/3/7+oppking:2/3/7",
+            "spec:handmajor4+oppking:2/3/7+ownking:2/3/7",
+            64,
+        ),
+    ] {
+        let topology = layerstack_topology(DEFAULT_FT_OUT, DEFAULT_L1_OUT, DEFAULT_L2_OUT, count);
+        let arch = RawCkptArch {
+            topology: &topology,
+            ..layerstack_arch_with_mode(routing)
+        };
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &arch, "bucket-spec-roundtrip", 2, 20, None, 10).unwrap();
+        read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+        let different_routing = RawCkptArch {
+            topology: &topology,
+            ..layerstack_arch_with_mode(other)
+        };
+        assert!(read_raw_ckpt_header(&mut Cursor::new(&buf), &different_routing).is_err());
+    }
 }
 
 #[test]

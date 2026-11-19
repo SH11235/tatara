@@ -509,8 +509,12 @@ mod tests {
                 .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
                 .with_threat_width(2),
         ] {
-            let mut net = LayerStackWeights::zeroed(spec, TEST_FT_OUT, TEST_L1_OUT, TEST_L2_OUT, 3);
-            net.bucket_spec = Some("ownking:2/3".parse().unwrap());
+            let routing: shogi_features::BucketSpec =
+                "handmajor4+ownking:2/3/7+oppking:2/3/7".parse().unwrap();
+            let count = routing.num_buckets();
+            let mut net =
+                LayerStackWeights::zeroed(spec, TEST_FT_OUT, TEST_L1_OUT, TEST_L2_OUT, count);
+            net.bucket_spec = Some(routing);
             let save = |scale| {
                 let mut bytes = Vec::new();
                 net.save_quantised(&mut bytes, scale).unwrap();
@@ -530,7 +534,7 @@ mod tests {
                     TEST_FT_OUT,
                     TEST_L1_OUT,
                     TEST_L2_OUT,
-                    3,
+                    count,
                 )
                 .unwrap();
                 assert_eq!(loaded.bucket_spec, net.bucket_spec);

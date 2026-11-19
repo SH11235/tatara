@@ -1430,15 +1430,15 @@ fn dense_mm_fwd_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::error::
 fn bucket_sort_fwd_l1_with_shared_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // out_dim は 16 幅 out-tile (grid_y) で消化する。16 / 16 倍数 / 非倍数を網羅。
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 16_usize, 16_usize),
-        (32, 64, 32),
-        (48, 96, 24),
-        (64, 32, 8),
-        (32, 48, 17),
-        (48, 208, 16),
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 16_usize, 16_usize, 32),
+        (32, 64, 32, 32),
+        (48, 96, 24, 32),
+        (64, 32, 8, 32),
+        (32, 48, 17, 32),
+        (80, 48, 17, MAX_SUPPORTED_NUM_BUCKETS),
+        (48, 208, 16, 32),
     ] {
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let w: Vec<f32> = (0..nb * out_dim * in_dim)
@@ -1576,14 +1576,14 @@ fn bucket_sort_fwd_l1_with_shared_matches_cpu() -> Result<(), Box<dyn std::error
 fn bucket_sort_bwd_input_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // out_dim は 16 幅 K-tile で消化する (16 / 16 倍数 / 非倍数を網羅)。in_dim % 16 == 0 が契約。
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 16_usize, 16_usize),
-        (32, 64, 32),
-        (48, 96, 24),
-        (64, 32, 8),
-        (32, 48, 17),
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 16_usize, 16_usize, 32),
+        (32, 64, 32, 32),
+        (48, 96, 24, 32),
+        (64, 32, 8, 32),
+        (32, 48, 17, 32),
+        (80, 48, 17, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1809,7 +1809,7 @@ fn bucket_weight_test_ids(batch: usize, num_buckets: usize) -> Vec<i32> {
     for (row, bucket) in ids.iter_mut().enumerate() {
         if num_buckets > 2 && *bucket == 1 {
             *bucket = -1;
-        } else if (0..num_buckets as i32).contains(bucket) && row % 3 == 0 {
+        } else if (0..num_buckets as i32 - 1).contains(bucket) && row % 3 == 0 {
             *bucket = 0;
         }
     }
@@ -1875,6 +1875,7 @@ fn dense_mm_bwd_weight_bucket_grid_l2_matches_cpu() -> Result<(), Box<dyn std::e
         (32, 96, 30, 9), // 非 16 倍数の out_dim
         (259, 30, 64, 16),
         (513, 46, 17, 32),
+        (513, 46, 17, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
@@ -1939,6 +1940,7 @@ fn dense_mm_bwd_weight_bucket_grid_l3_matches_cpu() -> Result<(), Box<dyn std::e
         (32, 30, 9), // 非 16 倍数の in_dim
         (259, 64, 16),
         (513, 30, 32),
+        (513, 30, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
         let out_dim = 1_usize;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
@@ -2058,14 +2060,14 @@ fn dense_mm_bwd_weight_bucket_tiled_l1_matches_cpu() -> Result<(), Box<dyn std::
 fn bucket_sort_bwd_weight_l1_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
     // out_dim は 16 幅 out-tile を grid_x (in-tile と畳む) で消化する。16 / 倍数 / 非倍数を網羅。
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 16_usize, 16_usize),
-        (32, 64, 32),
-        (48, 96, 24),
-        (64, 32, 8),
-        (32, 48, 17),
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 16_usize, 16_usize, 32),
+        (32, 64, 32, 32),
+        (48, 96, 24, 32),
+        (64, 32, 8, 32),
+        (32, 48, 17, 32),
+        (80, 48, 17, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
-        let nb = MAX_SUPPORTED_NUM_BUCKETS;
         let padded = padded_sort_batch(batch, nb);
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
@@ -2226,7 +2228,8 @@ fn bias_grad_bucket_shared_sorted_matches_cpu() -> Result<(), Box<dyn std::error
         (48, 32, 16),
         (32, 24, 9),
         (48, 8, 16),
-        (64, 64, MAX_SUPPORTED_NUM_BUCKETS),
+        (64, 64, 32),
+        (80, 64, MAX_SUPPORTED_NUM_BUCKETS),
     ] {
         let padded = padded_sort_batch(batch, nb);
         let dy: Vec<f32> = (0..batch * out_dim)
@@ -3057,7 +3060,7 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
     Ok(())
 }
 
-const NUM_BUCKETS_PARAM_VALUES: [usize; 6] = [2, 4, 8, 9, 16, MAX_SUPPORTED_NUM_BUCKETS];
+const NUM_BUCKETS_PARAM_VALUES: [usize; 7] = [2, 4, 8, 9, 16, 32, MAX_SUPPORTED_NUM_BUCKETS];
 
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>
@@ -5781,7 +5784,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for nb in [9, 16, MAX_SUPPORTED_NUM_BUCKETS] {
+    for nb in [9, 16, 32, MAX_SUPPORTED_NUM_BUCKETS] {
         let (batch, max_active, ft_in) = (nb + 3, 4_usize, 11_usize);
         let psqt_w = deterministic_floats(ft_in * nb, 33.0);
         let (stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
@@ -5836,7 +5839,7 @@ fn psqt_diff_sparse_fwd_inplace_matches_cpu() -> Result<(), Box<dyn std::error::
 #[test]
 fn psqt_diff_sparse_bwd_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let (_ctx, module, stream) = open_module()?;
-    for nb in [9, 16, MAX_SUPPORTED_NUM_BUCKETS] {
+    for nb in [9, 16, 32, MAX_SUPPORTED_NUM_BUCKETS] {
         let (batch, max_active, ft_in) = (nb + 3, 4_usize, 11_usize);
         let dnet = deterministic_floats(batch, 41.0);
         let (mut stm_indices, nnz) = sparse_indices_fixture_ragged(batch, max_active, ft_in, 0);
@@ -5934,12 +5937,39 @@ fn layerstack_raw_ckpt_roundtrip(with_psqt: bool) -> Result<(), Box<dyn std::err
     };
 
     let mut saver = new_trainer()?;
+    let high_buckets = [MAX_SUPPORTED_NUM_BUCKETS / 2, MAX_SUPPORTED_NUM_BUCKETS - 1];
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    for (row, bucket) in high_buckets.into_iter().enumerate() {
+        batch.bucket_idx[row] = bucket as i32;
+        batch.score[row] = 200.0;
+        batch.wdl[row] = 1.0;
+    }
     // Ranger lookahead の lerp (`step % k == 0`) を 1 回踏ませて slow weight も
     // 非零にする (k = RANGER_K)。
-    let batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
     for _ in 0..RANGER_K {
         let loss = saver.step(&batch.as_ref(), 1e-3, WDL_LAMBDA, SMOKE_LOSS_SIGMOID)?;
         assert!(loss.is_finite(), "training step loss must be finite");
+    }
+
+    // The output bias starts at zero and receives the loss gradient even if hidden units are inactive.
+    let (w, m, v, slow) = saver
+        .raw_ckpt_group_sources()
+        .into_iter()
+        .find(|group| group.name == "l3_b")
+        .expect("missing output bias checkpoint group")
+        .to_host(&stream)?;
+    for bucket in high_buckets {
+        for (label, value) in [
+            ("w", w[bucket]),
+            ("m", m[bucket]),
+            ("v", v[bucket]),
+            ("slow", slow[bucket]),
+        ] {
+            assert!(
+                value.is_finite() && value != 0.0,
+                "output bias {label} for bucket {bucket} must be finite and nonzero after training"
+            );
+        }
     }
 
     let suffix = if with_psqt { "psqt" } else { "nopsqt" };

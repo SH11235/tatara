@@ -256,7 +256,7 @@ fn build_q16_thresholds() -> Box<[Box<[i64]>]> {
 
 /// `ShogiProgressKPAbs::bucket{,_board}` が受け付ける `num_buckets` の上限。
 /// 返り値が `u8` のため `bucket = num_buckets - 1` が `u8::MAX = 255` に収まる
-/// 256 までを許容する (LayerStack の対応範囲は 1..=32)。
+/// 256 までを許容する (LayerStack の対応範囲は 1..=[`crate::MAX_LAYERSTACK_BUCKETS`])。
 pub const MAX_NUM_BUCKETS: usize = u8::MAX as usize + 1;
 
 #[cfg(test)]
