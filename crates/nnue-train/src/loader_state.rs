@@ -51,6 +51,15 @@ pub struct LoaderState {
     pub superbatch: usize,
     pub teachers: Vec<TeacherState>,
     pub settings: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wdl_jitter_state: Option<WdlJitterState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WdlJitterState {
+    pub completed_steps: u64,
+    // Store the bits to preserve the f64 value across JSON implementations.
+    pub batch_state_bits: u64,
 }
 
 impl LoaderState {
@@ -79,12 +88,7 @@ impl LoaderState {
                 }
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                eprintln!(
-                    "[train] warning: checkpoint has no loader state; restarting teacher input from the beginning"
-                );
-                Ok(None)
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -263,6 +267,7 @@ mod tests {
         ] {
             let state = LoaderState {
                 version: 1,
+                wdl_jitter_state: None,
                 superbatch: 1,
                 teachers: vec![TeacherState {
                     id: "primary".into(),
@@ -293,6 +298,7 @@ mod tests {
         }];
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 4,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -333,6 +339,7 @@ mod tests {
         };
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 2,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -363,6 +370,7 @@ mod tests {
         };
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 3,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -422,6 +430,7 @@ mod tests {
         let settings = serde_json::json!({"mix_rates": [0.2], "mix_seed": 9});
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 7,
             settings: settings.clone(),
             teachers: vec![
@@ -479,6 +488,7 @@ mod tests {
         }];
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 1,
             teachers: vec![TeacherState {
                 id: "primary".into(),
@@ -519,6 +529,7 @@ mod tests {
         }});
         let state = LoaderState {
             version: 1,
+            wdl_jitter_state: None,
             superbatch: 1,
             teachers: vec![TeacherState {
                 id: "primary".into(),

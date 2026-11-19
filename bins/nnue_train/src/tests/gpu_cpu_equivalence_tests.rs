@@ -45,6 +45,7 @@ use gpu_kernels::pointwise::norm_loss::{norm_loss_apply_cpu, norm_loss_compute_n
 use gpu_kernels::pointwise::radam_step::{radam_compute_step_size_denom, radam_step_cpu};
 use gpu_kernels::pointwise::ranger_step::{ranger_lookahead_lerp_cpu, ranger_step_cpu};
 use gpu_kernels::pointwise::screlu_fwd::screlu_fwd_cpu;
+use gpu_kernels::pointwise::wdl_jitter::{WdlBlend, step_key};
 use gpu_kernels::sparse::ft_factorize::{
     FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
     FtFactorizeLayout, ft_fold_virtual_cpu, ft_reduce_virtual_grad_cpu,
@@ -3260,6 +3261,15 @@ const WRM_IN_OFFSET: f32 = 270.0;
 const WRM_TARGET_OFFSET: f32 = 270.0;
 const WRM_TARGET_SCALING: f32 = 380.0;
 
+fn jittered_blend(lambda: f64, sample_std: f32) -> WdlBlend {
+    WdlBlend {
+        lambda,
+        sample_std,
+        sample_key: step_key(0x7643_fab1_a010_d002, (1 << 40) + 17),
+        clamp: true,
+    }
+}
+
 /// `loss_wrm` の default 経路 (`extended=0`、二乗誤差) が CPU reference と一致する。
 #[test]
 fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
@@ -3269,7 +3279,11 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let wdl = vec![1.0_f32, 0.0, 0.5, nnue_train::dataloader::EVAL_ONLY_WDL];
     let b = out.len();
     let per_pos_norm = 1.0_f32 / b as f32;
-    for &(lambda, ignore_draws) in &[(0.0_f32, false), (0.7, true)] {
+    for (lambda, ignore_draws) in [
+        (0.0_f32.into(), false),
+        (0.7_f32.into(), true),
+        (jittered_blend(-0.05, 0.25), true),
+    ] {
         let mut dl_cpu = vec![0.0_f32; b];
         let mut loss_cpu = 0.0_f64;
         loss_wrm_cpu(
@@ -3307,7 +3321,8 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
                 kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
                 args: [
                     slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                    slice_mut(dl_dev), slice(loss_dev), lambda,
+                    slice_mut(dl_dev), slice(loss_dev), lambda.lambda, lambda.sample_std,
+                    lambda.sample_key, lambda.clamp as u32,
                     WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
                     2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32,
                     ignore_draws as u32, b as u32
@@ -3317,7 +3332,7 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         stream.synchronize()?;
         // libdevice exp と std exp の差で grad は ~ulp レベルずれるため relative tolerance。
         assert_close_rel(
-            &format!("loss_wrm/default lambda={lambda} ignore_draws={ignore_draws} grad"),
+            &format!("loss_wrm/default lambda={lambda:?} ignore_draws={ignore_draws} grad"),
             &dl_dev.to_host_vec(&stream)?,
             &dl_cpu,
             1e-4,
@@ -3326,7 +3341,7 @@ fn loss_wrm_default_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let diff = (loss_gpu - loss_cpu).abs();
         assert!(
             diff <= 1e-4 * (1.0 + loss_cpu.abs()),
-            "loss_wrm/default lambda={lambda} ignore_draws={ignore_draws} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+            "loss_wrm/default lambda={lambda:?} ignore_draws={ignore_draws} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
         );
     }
     Ok(())
@@ -3352,7 +3367,7 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let b = out.len();
     let per_pos_norm = 1.0_f32 / b as f32;
     // lambda = 0 では score-only の分岐が欠けても結果が同じになるため、非ゼロでも比べる。
-    for lambda in [0.0_f32, 0.7] {
+    for lambda in [0.0_f32.into(), 0.7_f32.into(), jittered_blend(0.85, 0.25)] {
         let pow_exp = 2.5_f32;
         let qp = 0.3_f32;
         let w1 = 1.0_f32;
@@ -3406,7 +3421,8 @@ fn loss_wrm_extended_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
                 kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
                 args: [
                     slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                    slice_mut(dl_dev), slice(loss_dev), lambda,
+                    slice_mut(dl_dev), slice(loss_dev), lambda.lambda, lambda.sample_std,
+                    lambda.sample_key, lambda.clamp as u32,
                     WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
                     pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, 0_u32, b as u32
                 ]
@@ -3444,7 +3460,7 @@ fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::E
     let score: Vec<f32> = (0..b).map(|i| ((i % 401) as f32 - 200.0) * 5.0).collect();
     let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
     let per_pos_norm = 1.0_f32 / b as f32;
-    let lambda = 0.0_f32;
+    let lambda = WdlBlend::default();
 
     let mut dl_cpu = vec![0.0_f32; b];
     let mut loss_cpu = 0.0_f64;
@@ -3483,7 +3499,8 @@ fn loss_wrm_default_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::E
             kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
             args: [
                 slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                slice_mut(dl_dev), slice(loss_dev), lambda,
+                slice_mut(dl_dev), slice(loss_dev), lambda.lambda, lambda.sample_std,
+                lambda.sample_key, lambda.clamp as u32,
                 WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
                 2.0_f32, 0.0_f32, 0.0_f32, 0.5_f32, slice(sum_w_dev), 0_u32, 0_u32, b as u32
             ]
@@ -3516,7 +3533,7 @@ fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::
     let score: Vec<f32> = (0..b).map(|i| ((i % 433) as f32 - 216.0) * 6.0).collect();
     let wdl: Vec<f32> = (0..b).map(|i| (i % 3) as f32 * 0.5).collect();
     let per_pos_norm = 1.0_f32 / b as f32;
-    let lambda = 0.0_f32;
+    let lambda = WdlBlend::default();
     let pow_exp = 2.5_f32;
     let qp = 0.3_f32;
     let w1 = 1.0_f32;
@@ -3570,7 +3587,8 @@ fn loss_wrm_extended_multiblock_matches_cpu() -> Result<(), Box<dyn std::error::
             kernel: loss_wrm, stream: stream, module: module, config: cfg_1d(b),
             args: [
                 slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                slice_mut(dl_dev), slice(loss_dev), lambda,
+                slice_mut(dl_dev), slice(loss_dev), lambda.lambda, lambda.sample_std,
+                lambda.sample_key, lambda.clamp as u32,
                 WRM_NNUE2SCORE, WRM_IN_SCALING, WRM_IN_OFFSET, WRM_TARGET_OFFSET, WRM_TARGET_SCALING,
                 pow_exp, qp, w1, w2, slice(sum_w_dev), 1_u32, 0_u32, b as u32
             ]
@@ -5704,7 +5722,13 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     let out_dev = DeviceBuffer::from_host(&stream, &out)?;
     let score_dev = DeviceBuffer::from_host(&stream, &score)?;
     let wdl_dev = DeviceBuffer::from_host(&stream, &wdl)?;
-    for &(lambda, ignore_draws) in &[(0.0_f32, false), (0.7, true), (1.0, false)] {
+    for (lambda, ignore_draws) in [
+        (0.0_f32.into(), false),
+        (0.7_f32.into(), true),
+        (1.0_f32.into(), false),
+        (jittered_blend(0.55, 0.25), true),
+        (jittered_blend(1.25, 0.0), false),
+    ] {
         let mut dl_cpu = vec![0.0_f32; b];
         let mut loss_cpu = 0.0_f64;
         loss_wdl_cpu(
@@ -5728,7 +5752,8 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
             cuda_launch! {
                 kernel: loss_wdl, stream: stream, module: module, config: cfg_1d(b),
                 args: [slice(out_dev), slice(score_dev), slice(wdl_dev), per_pos_norm,
-                       slice_mut(dl_dev), slice(loss_dev), lambda, scale,
+                       slice_mut(dl_dev), slice(loss_dev), lambda.lambda, lambda.sample_std,
+                       lambda.sample_key, lambda.clamp as u32, scale,
                        ignore_draws as u32, b as u32]
             }
         }?;
@@ -5736,7 +5761,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         // libdevice exp と std exp の差で ~ulp レベルずれるため relative tolerance
         // (loss_wrm と同方針)。
         assert_close_rel(
-            &format!("loss_wdl/lambda={lambda} grad"),
+            &format!("loss_wdl/lambda={lambda:?} grad"),
             &dl_dev.to_host_vec(&stream)?,
             &dl_cpu,
             1e-4,
@@ -5745,7 +5770,7 @@ fn loss_wdl_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
         let diff = (loss_gpu - loss_cpu).abs();
         assert!(
             diff <= 1e-4 * (1.0 + loss_cpu.abs()),
-            "loss_wdl/lambda={lambda} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
+            "loss_wdl/lambda={lambda:?} loss: gpu={loss_gpu} cpu={loss_cpu} diff={diff}"
         );
     }
     Ok(())

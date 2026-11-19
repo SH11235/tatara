@@ -43,6 +43,8 @@
 //! - SCReLU と異なり本 kernel は NaN を握り潰さず伝搬するため、学習中の NaN は
 //!   loss 経路で気付ける
 
+use super::wdl_jitter::WdlBlend;
+
 /// Reference CPU 実装。
 ///
 /// In-place 出力:
@@ -54,7 +56,7 @@
 /// - `scale > 0`。負の scale は sigmoid を反転させ chain rule で grad の符号も
 ///   反転するため別 loss になる (NNUE の `1/scale_param` 用法では常に正、host
 ///   側で保証する前提)
-/// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 score sigmoid)
+/// - jitter 無効時の `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 score sigmoid)
 /// - `wdl[i] ∈ {-1.0, 0.0, 0.5, 1.0}` (-1 = score only) (loss / draw / win)
 ///
 /// 引数 10 個は host invariant を漏れなく渡すため。`clippy::too_many_arguments`
@@ -67,19 +69,16 @@ pub fn loss_wdl_cpu(
     per_pos_norm: &[f32],
     dl_dout: &mut [f32],
     loss_acc: &mut f64,
-    lambda: f32,
+    lambda: impl Into<WdlBlend>,
     scale: f32,
     ignore_draws: bool,
     n: usize,
 ) {
+    let lambda = lambda.into();
     for i in 0..n {
         let p = sigmoid_f32(out[i] * scale);
         let ys = sigmoid_f32(score[i] * scale);
-        let lam = if (ignore_draws && wdl[i] == 0.5) || wdl[i] < 0.0 {
-            0.0
-        } else {
-            lambda
-        };
+        let lam = lambda.row_lambda(wdl[i], ignore_draws, i as u32);
         let y = lam * wdl[i] + (1.0_f32 - lam) * ys;
         let err = p - y;
         let norm = per_pos_norm[i];
@@ -135,23 +134,14 @@ mod tests {
                 err * err
             })
             .sum();
-        assert!(
-            approx_eq_f64(loss_acc, expected_loss, 1e-12),
-            "loss: got {loss_acc} exp {expected_loss}"
-        );
+        assert_eq!(loss_acc.to_bits(), expected_loss.to_bits());
 
         for i in 0..3 {
             let p = sigmoid_f32(out[i]);
             let ys = sigmoid_f32(score[i]);
             let err = p - ys;
             let exp_grad = 2.0_f32 * err * p * (1.0_f32 - p);
-            let diff = ((dl_dout[i] as f64) - (exp_grad as f64)).abs();
-            assert!(
-                diff < 1e-7,
-                "i={i}: got {} exp {} diff {diff}",
-                dl_dout[i],
-                exp_grad
-            );
+            assert_eq!(dl_dout[i].to_bits(), exp_grad.to_bits(), "i={i}");
         }
     }
 

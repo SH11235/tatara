@@ -1418,6 +1418,7 @@ impl GpuTrainer {
     }
 }
 
+use gpu_kernels::pointwise::wdl_jitter::WdlBlend;
 use gpu_kernels::sparse::ft_factorize::FT_FACTORIZE_BASE;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
@@ -1486,7 +1487,7 @@ fn ft_slow(
 
 struct StepContext<'a> {
     lr: f32,
-    wdl_lambda: f32,
+    wdl_lambda: WdlBlend,
     loss: LossKind,
     validate: bool,
     forward_output: bool,
@@ -1509,7 +1510,7 @@ struct StepContext<'a> {
 
 pub(crate) struct StepOptions<'a> {
     lr: f32,
-    wdl_lambda: f32,
+    wdl_lambda: WdlBlend,
     loss: LossKind,
     validate: bool,
     /// true なら loss kernel を launch せず、forward 完了時点で `net_output` を
@@ -4045,7 +4046,7 @@ impl GpuTrainer {
         &mut self,
         batch: &BatchData,
         lr: f32,
-        wdl_lambda: f32,
+        wdl_lambda: impl Into<WdlBlend>,
         loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         // forward-only trainer は optimizer state と backward workspace を 0-byte で
@@ -4072,7 +4073,7 @@ impl GpuTrainer {
             batch,
             StepOptions {
                 lr,
-                wdl_lambda,
+                wdl_lambda: wdl_lambda.into(),
                 loss,
                 validate: false,
                 forward_output: false,
@@ -4237,7 +4238,7 @@ impl GpuTrainer {
             batch,
             StepOptions {
                 lr: 0.0,
-                wdl_lambda,
+                wdl_lambda: wdl_lambda.into(),
                 loss,
                 validate: true,
                 forward_output: false,
@@ -4275,7 +4276,7 @@ impl GpuTrainer {
             &data,
             StepOptions {
                 lr: 0.0,
-                wdl_lambda: 0.0,
+                wdl_lambda: WdlBlend::default(),
                 // forward_output 経路は loss kernel を launch しないため未使用。
                 loss: LossKind::Sigmoid { scale: 1.0 },
                 validate: true,
@@ -5108,7 +5109,8 @@ impl GpuTrainer {
                             batch.per_pos_norm,
                             slice_mut(self.ws.dy_net_output),
                             slice(self.loss_acc),
-                            wdl_lambda, scale, self.wdl_ignore_draws as u32, b_u32
+                            wdl_lambda.lambda, wdl_lambda.sample_std,
+                            wdl_lambda.sample_key, wdl_lambda.clamp as u32, scale, self.wdl_ignore_draws as u32, b_u32
                         ]
                     }
                 }?;
@@ -5161,7 +5163,8 @@ impl GpuTrainer {
                             batch.per_pos_norm,
                             slice_mut(self.ws.dy_net_output),
                             slice(self.loss_acc),
-                            wdl_lambda, nnue2score, in_scaling, in_offset,
+                            wdl_lambda.lambda, wdl_lambda.sample_std,
+                            wdl_lambda.sample_key, wdl_lambda.clamp as u32, nnue2score, in_scaling, in_offset,
                             target_offset, target_scaling,
                             pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
                             slice(self.weight_sum_acc),

@@ -64,6 +64,8 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, DualLabelMode, ScoreSource};
 use crate::experiment::{ExperimentLogger, format_utc_iso, now_epoch_secs};
 use crate::schedule::{LrScheduler, WdlScheduler};
+use crate::wdl_jitter::WdlJitter;
+use gpu_kernels::pointwise::wdl_jitter::WdlBlend;
 
 // =============================================================================
 // LossKind — どの loss kernel で 1 step を回すか
@@ -290,6 +292,9 @@ impl<'a> CheckpointProducer<'a> {
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
 /// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
+    /// Number of optimizer steps already applied, including steps restored by resume.
+    fn completed_steps(&self) -> u64;
+
     /// 1 batch 分 (forward → loss kernel → backward → optimizer step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
@@ -298,14 +303,14 @@ pub trait TrainerBackend {
     /// - `bucket_idx`: `batch.n_positions` 個の output bucket index
     ///   (`0..num_buckets-1`、N は LayerStack `--num-buckets` で決まる runtime 値)
     /// - `lr`: learning rate (`LrScheduler` 由来)
-    /// - `wdl_lambda`: WDL blend lambda (`WdlScheduler` 由来、loss kernel の `lambda`)
+    /// - `wdl_lambda`: WDL blend with any training jitter
     /// - `loss`: どの loss kernel を起動するか (sigmoid-MSE / WRM) + 固定パラメータ
     fn train_step(
         &mut self,
         batch: &Batch,
         bucket_idx: &[i32],
         lr: f32,
-        wdl_lambda: f32,
+        wdl_lambda: WdlBlend,
         loss: LossKind,
     ) -> io::Result<f64>;
 
@@ -332,8 +337,7 @@ pub trait TrainerBackend {
     /// caller ([`crate::validation::HeldoutSet::evaluate`]) が前者を position 数で
     /// 割って平均 loss に、後者を sign-agreement accuracy にする。
     ///
-    /// `wdl_lambda` / `loss` は同 superbatch の training step と同じ値を渡すこと
-    /// (test_loss を training loss と比較可能にするため)。
+    /// `wdl_lambda` は jitter を含まない validation 用の値。
     fn validate_step(
         &mut self,
         batch: &Batch,
@@ -451,6 +455,7 @@ pub struct TrainingConfig {
     pub loss: LossKind,
     /// validation に使う WDL lambda。未指定時は各 superbatch の training lambda。
     pub validation_wdl: Option<f32>,
+    pub wdl_jitter: WdlJitter,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
     pub sampling: crate::sampling::Sampling,
@@ -906,15 +911,51 @@ where
             "[train] --resume-input restart: restarting teacher input from the beginning without restoring loader positions"
         );
     }
+    let restore_input = !cfg.resume_superbatch_override && !restart_input;
+    let track_batch_jitter = cfg.wdl_jitter.batch_std > 0.0 && cfg.wdl_jitter.batch_decay > 0.0;
     let resume_state = cfg
         .resume_checkpoint
         .as_deref()
-        .filter(|_| !cfg.resume_superbatch_override && !restart_input)
+        .filter(|_| restore_input || track_batch_jitter)
         .map(crate::loader_state::LoaderState::load)
         .transpose()?
         .flatten();
+    if cfg.resume_checkpoint.is_some() && restore_input && resume_state.is_none() {
+        eprintln!(
+            "[train] warning: checkpoint has no loader state; restarting teacher input from the beginning"
+        );
+    }
+    let mut batch_jitter_state = 0.0;
+    if cfg.resume_checkpoint.is_some() && track_batch_jitter {
+        match resume_state
+            .as_ref()
+            .and_then(|state| state.wdl_jitter_state)
+        {
+            Some(state) => {
+                let saved = f64::from_bits(state.batch_state_bits);
+                let completed_steps = backend.completed_steps();
+                if state.completed_steps != completed_steps {
+                    eprintln!(
+                        "[train] warning: batch WDL jitter state is for step {}, checkpoint is at step {completed_steps}; restarting batch jitter from zero",
+                        state.completed_steps
+                    );
+                } else if !saved.is_finite() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "batch WDL jitter state is non-finite",
+                    ));
+                } else {
+                    batch_jitter_state = saved;
+                }
+            }
+            None => eprintln!(
+                "[train] warning: checkpoint has no batch WDL jitter state; restarting batch jitter from zero"
+            ),
+        }
+    }
     let resume_position = resume_state
         .as_ref()
+        .filter(|_| restore_input)
         .map(|state| {
             state.validate_mixed(
                 &identities,
@@ -957,9 +998,18 @@ where
         None => (None, None, None),
     };
 
+    let jitter_description = if cfg.wdl_jitter.enabled() {
+        let jitter = cfg.wdl_jitter;
+        format!(
+            " | wdl-jitter: sample {} batch {} decay {} cycle {} seed {}",
+            jitter.sample_std, jitter.batch_std, jitter.batch_decay, jitter.cycle, jitter.seed
+        )
+    } else {
+        String::new()
+    };
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | dual-label-psv {:?} | teacher-window {} MiB x2 | teacher-shuffle {} seed {} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler}{jitter_description} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | score-override {:?} | score-override-mask {:?} | dual-label-psv {:?} | teacher-window {} MiB x2 | teacher-shuffle {} seed {} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -1123,7 +1173,20 @@ where
 
         for batch_idx in 0..cfg.batches_per_superbatch {
             let lr = lr_scheduler.lr(batch_idx, sb);
-            let wdl = wdl_scheduler.blend(batch_idx, sb, cfg.end_superbatch);
+            let wdl = if cfg.wdl_jitter.enabled() {
+                let (base, coefficient) =
+                    wdl_scheduler.jitter_base(batch_idx, sb, cfg.end_superbatch);
+                cfg.wdl_jitter.next(
+                    base,
+                    coefficient,
+                    backend.completed_steps(),
+                    &mut batch_jitter_state,
+                )
+            } else {
+                wdl_scheduler
+                    .blend(batch_idx, sb, cfg.end_superbatch)
+                    .into()
+            };
 
             let (batch, buckets) = loader.next_batch()?.ok_or_else(|| {
                 io::Error::other(
@@ -1257,7 +1320,7 @@ where
 
         // held-out validation: superbatch 末に forward-only 検証を 1 回走らせる
         // (`--test-data` 指定時のみ)。training step と同じ loss kind と、当 superbatch
-        // 代表の wdl_lambda (`wdl_now` = batch_idx 0 の blend、sb 末 report と同値) で
+        // jitter を除いた代表の wdl_lambda (`wdl_now` = batch_idx 0 の blend) で
         // 測り、test_loss を同 superbatch の training loss と比較可能にする。
         // `validation_wdl` が指定された場合は全 validation でその固定値を使う。
         let validation = match &heldout {
@@ -1416,6 +1479,10 @@ where
                 superbatch: sb,
                 teachers,
                 settings: settings.clone(),
+                wdl_jitter_state: track_batch_jitter.then(|| crate::loader_state::WdlJitterState {
+                    completed_steps: backend.completed_steps(),
+                    batch_state_bits: batch_jitter_state.to_bits(),
+                }),
             }
             .save(&raw_path)?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
@@ -1686,7 +1753,8 @@ mod tests {
         last_buckets: Vec<i32>,
         max_batch_positions: usize,
         seen_lr: Vec<f32>,
-        seen_wdl: Vec<f32>,
+        seen_wdl: Vec<WdlBlend>,
+        validation_wdl: Vec<f32>,
         seen_scores: Vec<f32>,
         seen_features: Vec<Vec<i32>>,
         write_checkpoints: bool,
@@ -1718,6 +1786,7 @@ mod tests {
                 max_batch_positions: 0,
                 seen_lr: Vec::new(),
                 seen_wdl: Vec::new(),
+                validation_wdl: Vec::new(),
                 seen_scores: Vec::new(),
                 seen_features: Vec::new(),
                 write_checkpoints: false,
@@ -1737,12 +1806,16 @@ mod tests {
     }
 
     impl TrainerBackend for MockBackend {
+        fn completed_steps(&self) -> u64 {
+            self.steps as u64
+        }
+
         fn train_step(
             &mut self,
             batch: &Batch,
             bucket_idx: &[i32],
             lr: f32,
-            wdl_lambda: f32,
+            wdl_lambda: WdlBlend,
             loss: LossKind,
         ) -> io::Result<f64> {
             assert_eq!(
@@ -1760,7 +1833,7 @@ mod tests {
                 loss.validate().is_ok(),
                 "loss params should be valid: {loss}"
             );
-            assert!(wdl_lambda.is_finite());
+            assert!(wdl_lambda.lambda.is_finite());
             assert!(
                 bucket_idx.iter().all(|&b| (0..9).contains(&b)),
                 "bucket in 0..9: {bucket_idx:?}"
@@ -1822,6 +1895,7 @@ mod tests {
                 "loss params should be valid: {loss}"
             );
             self.validate_steps += 1;
+            self.validation_wdl.push(wdl_lambda);
             // deterministic dummy: net_output に各 position の score を流用する
             // (sign-agreement 計算が回ることだけ確認できればよい)。
             let net_output: Vec<f32> = batch.score[..batch.n_positions].to_vec();
@@ -1885,6 +1959,7 @@ mod tests {
             keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             validation_wdl: None,
+            wdl_jitter: Default::default(),
             score_drop_abs: None,
             sampling: Default::default(),
             score_clamp_abs: None,
@@ -2232,6 +2307,7 @@ mod tests {
             wdl_cycle_warmup_pct: None,
             wdl_schedule_superbatch: None,
             validation_wdl: None,
+            wdl_jitter: Default::default(),
             wdl_ignore_draws: false,
             scale: 290.0,
             weight_decay: 0.0,
@@ -2868,6 +2944,104 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&baseline_dir);
         let _ = std::fs::remove_dir_all(&controlled_dir);
+    }
+
+    #[test]
+    fn wdl_jitter_resumes_through_training_driver_and_skips_validation() {
+        let full_dir = tempfile::tempdir().unwrap();
+        let resume_dir = tempfile::tempdir().unwrap();
+        let data = sample_psv_path();
+        let cfg = TrainingConfig {
+            output_dir: full_dir.path().into(),
+            end_superbatch: 2,
+            save_rate: 1,
+            test_data: Some(data.clone()),
+            test_positions: 8,
+            wdl_jitter: WdlJitter {
+                sample_std: 0.1,
+                batch_std: 0.15,
+                batch_decay: 0.8,
+                seed: 42,
+                cycle: true,
+            },
+            ..base_cfg()
+        };
+        let scheduler = crate::schedule::WdlSchedulerEnum::cycle(0.4, 0.2, 0.5, Some(4));
+        let lr = StepLR {
+            start: 0.001,
+            gamma: 0.9,
+            step: 1,
+        };
+        let run_training = |backend: &mut MockBackend, cfg: &TrainingConfig| {
+            run(
+                backend,
+                &[&data],
+                &ShogiProgressKPAbs,
+                &lr,
+                &scheduler,
+                cfg,
+                None,
+            )
+            .unwrap();
+        };
+        let mut full = MockBackend::new();
+        run_training(&mut full, &cfg);
+        assert_eq!(
+            full.validation_wdl,
+            [scheduler.blend(0, 1, 2), scheduler.blend(0, 2, 2)]
+        );
+        assert!(full.seen_wdl[0].sample_std > 0.0);
+        assert!(full.seen_wdl[0].sample_std < cfg.wdl_jitter.sample_std);
+
+        let first_cfg = TrainingConfig {
+            output_dir: resume_dir.path().into(),
+            end_superbatch: 1,
+            ..cfg.clone()
+        };
+        let mut first = MockBackend::new().with_file_writes();
+        run_training(&mut first, &first_cfg);
+        assert_eq!(first.seen_wdl, full.seen_wdl[..first.steps]);
+
+        let resume_cfg = TrainingConfig {
+            output_dir: resume_dir.path().into(),
+            resume_checkpoint: Some(resume_dir.path().join("test-1.ckpt")),
+            start_superbatch: 2,
+            resume_input: crate::loader_state::ResumeInput::Restart,
+            validation_wdl: Some(0.75),
+            ..cfg
+        };
+        let mut resumed = MockBackend::new();
+        resumed.steps = first.steps;
+        run_training(&mut resumed, &resume_cfg);
+        assert_eq!(resumed.seen_wdl, full.seen_wdl[first.steps..]);
+        assert_eq!(resumed.validation_wdl, [0.75]);
+
+        let checkpoint = resume_cfg.resume_checkpoint.as_ref().unwrap();
+        let mut sidecar = crate::loader_state::LoaderState::load(checkpoint)
+            .unwrap()
+            .unwrap();
+        let saved_jitter = sidecar.wdl_jitter_state.unwrap();
+        assert_ne!(f64::from_bits(saved_jitter.batch_state_bits), 0.0);
+        let (base, coefficient) =
+            scheduler.jitter_base(0, resume_cfg.start_superbatch, resume_cfg.end_superbatch);
+        let expected =
+            resume_cfg
+                .wdl_jitter
+                .next(base, coefficient, first.completed_steps(), &mut 0.0);
+        for state in [
+            None,
+            Some(crate::loader_state::WdlJitterState {
+                completed_steps: saved_jitter.completed_steps + 1,
+                ..saved_jitter
+            }),
+        ] {
+            sidecar.wdl_jitter_state = state;
+            sidecar.save(checkpoint).unwrap();
+            let mut restarted = MockBackend::new();
+            restarted.steps = first.steps;
+            run_training(&mut restarted, &resume_cfg);
+            assert_eq!(restarted.seen_wdl[0], expected);
+        }
     }
 
     #[test]

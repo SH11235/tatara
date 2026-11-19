@@ -604,6 +604,26 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) wdl_ignore_draws: bool,
 
+    /// Standard deviation of independent WDL lambda noise per training position.
+    #[arg(long, global = true, default_value_t = 0.0, value_name = "STD")]
+    pub(crate) wdl_jitter_sample: f32,
+
+    /// Stationary standard deviation of WDL lambda noise shared by a training batch.
+    #[arg(long, global = true, default_value_t = 0.0, value_name = "STD")]
+    pub(crate) wdl_jitter_batch: f32,
+
+    /// Batch jitter decay in [0, 1). Zero gives independent noise across batches.
+    #[arg(long, global = true, default_value_t = 0.0, value_name = "D")]
+    pub(crate) wdl_jitter_batch_decay: f64,
+
+    /// Scale both WDL jitter terms by the WDL cycle's cosine coefficient.
+    #[arg(long, global = true, requires = "wdl_cycle_delta")]
+    pub(crate) wdl_jitter_cycle: bool,
+
+    /// Seed for WDL lambda jitter (default: 0 when jitter is enabled).
+    #[arg(long, global = true, value_name = "N")]
+    pub(crate) wdl_jitter_seed: Option<u64>,
+
     /// Fixed WDL lambda for held-out validation. If omitted, validation uses the
     /// training lambda schedule.
     #[arg(long, global = true)]
@@ -1223,6 +1243,47 @@ impl Cli {
                 keep_rate: self.mix_keep_rate.get(i).copied().flatten(),
             })
             .collect()
+    }
+
+    pub(crate) fn wdl_jitter(&self) -> nnue_train::wdl_jitter::WdlJitter {
+        nnue_train::wdl_jitter::WdlJitter {
+            sample_std: self.wdl_jitter_sample,
+            batch_std: self.wdl_jitter_batch,
+            batch_decay: self.wdl_jitter_batch_decay,
+            cycle: self.wdl_jitter_cycle,
+            seed: self.wdl_jitter_seed.unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn validate_wdl_jitter(&self) -> Result<(), String> {
+        let jitter = self.wdl_jitter();
+        for (flag, std) in [
+            ("--wdl-jitter-sample", jitter.sample_std),
+            ("--wdl-jitter-batch", jitter.batch_std),
+        ] {
+            if !std.is_finite() || std < 0.0 {
+                return Err(format!("{flag} must be finite and >= 0 (got {std})"));
+            }
+        }
+        if !(0.0..1.0).contains(&jitter.batch_decay) {
+            return Err("--wdl-jitter-batch-decay must be finite and in [0, 1)".into());
+        }
+        if jitter.batch_decay != 0.0 && jitter.batch_std == 0.0 {
+            return Err("--wdl-jitter-batch-decay requires positive --wdl-jitter-batch".into());
+        }
+        if !jitter.enabled() {
+            for (flag, specified) in [
+                ("--wdl-jitter-seed", self.wdl_jitter_seed.is_some()),
+                ("--wdl-jitter-cycle", jitter.cycle),
+            ] {
+                if specified {
+                    return Err(format!(
+                        "{flag} requires positive --wdl-jitter-sample or --wdl-jitter-batch"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {

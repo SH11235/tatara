@@ -3,6 +3,7 @@
 use std::{ffi::c_void, ptr};
 
 use cuda_native_runtime::{Context, DeviceBuffer, NATIVE_KERNEL_FATBIN, PinnedBuffer};
+use gpu_kernels::pointwise::wdl_jitter::{WdlBlend, step_key};
 
 fn arg<T>(value: &mut T) -> *mut c_void {
     ptr::from_mut(value).cast()
@@ -329,6 +330,20 @@ fn pinned_async_copies_can_be_ordered_across_streams() {
 
 #[test]
 fn wrm_default_matches_cpu_reference() {
+    check_wrm_against_cpu_reference(0.25.into());
+}
+
+#[test]
+fn wrm_sample_jitter_matches_cpu_reference() {
+    check_wrm_against_cpu_reference(WdlBlend {
+        lambda: 0.25,
+        sample_std: 0.125,
+        sample_key: step_key(42, 17),
+        clamp: true,
+    });
+}
+
+fn check_wrm_against_cpu_reference(blend: WdlBlend) {
     let output = [-0.9_f32, -0.1, 0.0, 0.2, 1.1, 2.0, -3.0];
     let score = [-1200.0_f32, -100.0, 0.0, 300.0, 900.0, 32000.0, -32000.0];
     let wdl = [
@@ -351,7 +366,7 @@ fn wrm_default_matches_cpu_reference() {
         &vec![per_pos_norm; n],
         &mut expected_gradient,
         &mut expected_loss,
-        0.25,
+        blend,
         600.0,
         340.0,
         270.0,
@@ -382,7 +397,10 @@ fn wrm_default_matches_cpu_reference() {
     let mut gradient_ptr = gradient_device.device_ptr();
     let mut loss_ptr = loss_device.device_ptr();
     let mut norm = per_pos_norm;
-    let mut lambda = 0.25_f32;
+    let mut lambda = blend.lambda;
+    let mut sample_std = blend.sample_std;
+    let mut sample_key = blend.sample_key;
+    let mut clamp_lambda = u32::from(blend.clamp);
     let mut nnue2score = 600.0_f32;
     let mut input_scaling = 340.0_f32;
     let mut input_offset = 270.0_f32;
@@ -398,6 +416,9 @@ fn wrm_default_matches_cpu_reference() {
         arg(&mut gradient_ptr),
         arg(&mut loss_ptr),
         arg(&mut lambda),
+        arg(&mut sample_std),
+        arg(&mut sample_key),
+        arg(&mut clamp_lambda),
         arg(&mut nnue2score),
         arg(&mut input_scaling),
         arg(&mut input_offset),

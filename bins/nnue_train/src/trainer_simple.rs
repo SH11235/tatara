@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use gpu_kernels::pointwise::wdl_jitter::WdlBlend;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{self, SimpleInit, WeightShape};
@@ -731,7 +732,7 @@ impl SimpleGpuTrainer {
             return Ok(0.0);
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
+        self.run_forward_kernels(batch, wdl_lambda.into(), loss, false)?;
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(loss_host[0])
     }
@@ -746,7 +747,7 @@ impl SimpleGpuTrainer {
         &mut self,
         batch: &BatchData,
         lr: f32,
-        wdl_lambda: f32,
+        wdl_lambda: impl Into<WdlBlend>,
         loss: LossKind,
     ) -> Result<f64, Box<dyn std::error::Error>> {
         let b = batch.n_pos;
@@ -787,7 +788,7 @@ impl SimpleGpuTrainer {
             &batch.wdl[..b],
         )?;
 
-        self.run_forward_kernels(batch, wdl_lambda, loss, true)?;
+        self.run_forward_kernels(batch, wdl_lambda.into(), loss, true)?;
         if let Some(ref mut t0) = prof_t0 {
             self.stream.synchronize()?;
             let now = std::time::Instant::now();
@@ -860,7 +861,7 @@ impl SimpleGpuTrainer {
     pub(crate) fn run_forward_kernels(
         &mut self,
         batch: &BatchData,
-        wdl_lambda: f32,
+        wdl_lambda: WdlBlend,
         loss: LossKind,
         inputs_uploaded_externally: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1434,7 +1435,8 @@ impl SimpleGpuTrainer {
                             batch.per_pos_norm,
                             slice_mut(self.ws.dy_net_output),
                             slice(self.loss_acc),
-                            wdl_lambda,
+                            wdl_lambda.lambda, wdl_lambda.sample_std,
+                            wdl_lambda.sample_key, wdl_lambda.clamp as u32,
                             scale,
                             self.wdl_ignore_draws as u32,
                             b_u32
@@ -1490,7 +1492,8 @@ impl SimpleGpuTrainer {
                             batch.per_pos_norm,
                             slice_mut(self.ws.dy_net_output),
                             slice(self.loss_acc),
-                            wdl_lambda,
+                            wdl_lambda.lambda, wdl_lambda.sample_std,
+                            wdl_lambda.sample_key, wdl_lambda.clamp as u32,
                             nnue2score, in_scaling, in_offset,
                             target_offset, target_scaling,
                             pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
@@ -3062,7 +3065,7 @@ impl SimpleGpuTrainer {
             });
         }
         self.ws.check_batch_capacity(b)?;
-        self.run_forward_kernels(batch, wdl_lambda, loss, false)?;
+        self.run_forward_kernels(batch, wdl_lambda.into(), loss, false)?;
         let net_output = self.ws.net_output.to_host_vec(&self.stream)?[..b].to_vec();
         let loss_host = self.loss_acc.to_host_vec(&self.stream)?;
         Ok(StepOutput {

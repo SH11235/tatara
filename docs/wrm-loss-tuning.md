@@ -66,6 +66,8 @@ it is pure WDL.
 
 With `--wdl-ignore-draws`, positions whose WDL label is `0.5` use the teacher-score target.
 
+The WRM loss supports the same [training-only WDL lambda jitter](training-schedule.md#training-jitter).
+
 `--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
 on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
 `--data` in PSV format. Bit 0 retains its independent dual-label gate meaning.

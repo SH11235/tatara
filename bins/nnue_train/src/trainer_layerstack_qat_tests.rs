@@ -400,7 +400,7 @@ fn qat_activation_boundaries_and_main_ste() -> TestResult {
         &data,
         StepOptions {
             lr: 0.0,
-            wdl_lambda: 0.0,
+            wdl_lambda: WdlBlend::default(),
             loss: SMOKE_LOSS_WRM,
             validate: false,
             forward_output: false,
@@ -650,7 +650,7 @@ fn qat_skip_ste_and_same_raw_branches() -> TestResult {
                 &data,
                 StepOptions {
                     lr: 0.0,
-                    wdl_lambda: 0.0,
+                    wdl_lambda: WdlBlend::default(),
                     loss: SMOKE_LOSS_WRM,
                     validate: false,
                     forward_output: false,

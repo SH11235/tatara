@@ -61,9 +61,9 @@ target/release/nnue-train \
 ## Reading the metrics
 
 `test_loss` uses the same loss kernel (sigmoid-MSE or WRM) as `train_loss`. By
-default it follows the training WDL lambda at each superbatch; use
-`--validation-wdl` to fix validation at one lambda instead. Training can use a
-constant `--wdl`, a linear `--start-wdl` / `--end-wdl` taper, or a cosine cycle
+default it follows the unperturbed WDL schedule at each superbatch. Use
+`--validation-wdl` to fix validation at one lambda. WDL jitter applies only during training.
+Training can use a constant `--wdl`, a linear `--start-wdl` / `--end-wdl` taper, or a cosine cycle
 from `--wdl` and `--wdl-cycle-delta`; see
 [Training schedules](training-schedule.md). A widening `test_loss − train_loss`
 gap signals overfitting; an early `test_loss` divergence often catches NaN

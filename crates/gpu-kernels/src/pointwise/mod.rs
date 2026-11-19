@@ -21,6 +21,7 @@ pub mod radam_step;
 pub mod ranger_step;
 pub mod screlu_fwd;
 pub mod screlu_grad;
+pub mod wdl_jitter;
 
 /// Per-position WDL sentinel for score-only supervision.
 pub const EVAL_ONLY_WDL: f32 = -1.0;
