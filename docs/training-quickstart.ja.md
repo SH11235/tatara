@@ -287,6 +287,8 @@ dataset epochをまたぐ場合も含め、学習中は入力ファイルを変�
 PSVの再評価では、スコアを書き出す前の玉の配置・総駒数の構造検証を引き続き行う。
 この検証は、指し手の合法性やあらゆる形式破損を検証するものではない。
 
+学習時の WDL 重みに jitter を加える設定は、[学習スケジュール](training-schedule.ja.md#学習時の-jitter) を参照。
+
 `--tree-sample-eval-only` は PSV の padding byte（byte 39）の bit 1 が立つ局面を、
 WDL スケジュールによらず score 項のみ（WDL 重み 0）で学習する。PSV 形式の
 `--data` が必要で、フラグは全教師に適用する。主の教師では padding の bit 0 と bit 1 を許可し、

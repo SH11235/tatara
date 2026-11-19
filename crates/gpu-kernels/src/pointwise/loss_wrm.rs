@@ -69,6 +69,8 @@
 //!   target_wrm は 0 か 1 に張り付くだけで NaN にならない。`q*(1-q)` も飽和時は 0 に
 //!   なり grad が消える
 
+use super::wdl_jitter::WdlBlend;
+
 /// Reference CPU 実装。`extended == false` で二乗誤差 (GPU `loss_wrm` の `extended==0`
 /// 経路)、`true` で nnue-pytorch `calculate_sf_loss` 一般化 loss (`extended==1` 経路)。
 ///
@@ -82,7 +84,7 @@
 /// - `nnue2score > 0` / `in_scaling > 0` / `target_scaling > 0` (CLI
 ///   `--wrm-nnue2score` / `--wrm-in-scaling` / `--wrm-target-scaling` は正値、
 ///   host 側で保証)、`in_offset` / `target_offset` は任意の有限値
-/// - `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
+/// - jitter 無効時の `lambda ∈ [0, 1]` (1.0 で純 WDL ターゲット、0.0 で純 WRM ターゲット)
 /// - `wdl[i] ∈ {-1.0, 0.0, 0.5, 1.0}` (-1 = score only) (loss / draw / win)
 /// - extended では `pow_exp` / `weight_boost_w2` は weight base ≥ 0 への powf として
 ///   評価する (base = `(pf-0.5)^2 * pf*(1-pf)` は pf∈[0,1] で常に ≥ 0)
@@ -104,7 +106,7 @@ pub fn loss_wrm_cpu(
     per_pos_norm: &[f32],
     dl_dout: &mut [f32],
     loss_acc: &mut f64,
-    lambda: f32,
+    lambda: impl Into<WdlBlend>,
     nnue2score: f32,
     in_scaling: f32,
     in_offset: f32,
@@ -135,17 +137,14 @@ pub fn loss_wrm_cpu(
         0.0_f32
     };
 
+    let lambda = lambda.into();
     for i in 0..n {
         // target: WRM applied to raw cp score
         let s = score[i];
         let pt = (s - target_offset) / target_scaling;
         let pmt = (-s - target_offset) / target_scaling;
         let target_wrm = 0.5_f32 * (1.0_f32 + sigmoid_f32(pt) - sigmoid_f32(pmt));
-        let lam = if (ignore_draws && wdl[i] == 0.5) || wdl[i] < 0.0 {
-            0.0
-        } else {
-            lambda
-        };
+        let lam = lambda.row_lambda(wdl[i], ignore_draws, i as u32);
         let target = lam * wdl[i] + (1.0_f32 - lam) * target_wrm;
 
         // prediction: WRM applied to net output (scorenet = out * nnue2score)
@@ -324,7 +323,7 @@ mod tests {
         let score = vec![150.0_f32, -1200.0, 30.0, 5000.0];
         let wdl = vec![1.0_f32, 0.0, 0.5, 1.0];
         let per_pos_norm = vec![1.0_f32; 4];
-        let lambda = 0.0_f32;
+        let lambda = 0.35_f32;
         let nnue2score = 600.0_f32;
         let in_scaling = 340.0_f32;
 
@@ -361,17 +360,9 @@ mod tests {
             let err = qf - target;
             exp_loss += (err as f64) * (err as f64);
             let exp_grad = err * (nnue2score / in_scaling) * (q * (1.0 - q) + qm * (1.0 - qm));
-            let diff = ((dl_dout[i] as f64) - (exp_grad as f64)).abs();
-            assert!(
-                diff < 1e-7,
-                "i={i}: got {} exp {exp_grad} diff {diff}",
-                dl_dout[i]
-            );
+            assert_eq!(dl_dout[i].to_bits(), exp_grad.to_bits(), "i={i}");
         }
-        assert!(
-            approx_eq_f64(loss_acc, exp_loss, 1e-10),
-            "loss: got {loss_acc} exp {exp_loss}"
-        );
+        assert_eq!(loss_acc.to_bits(), exp_loss.to_bits());
     }
 
     /// 解析勾配が数値微分 (中心差分) と一致することを確認する。`per_pos_norm = 1`

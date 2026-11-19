@@ -127,6 +127,7 @@ fn main() -> std::process::ExitCode {
     let result = cli
         .resolve_bucket_metadata()
         .and_then(|()| cli.validate_score_sources())
+        .and_then(|()| cli.validate_wdl_jitter())
         .and_then(|()| cli.validate_data_args(&argv))
         .map_err(Into::into)
         .and_then(|()| dispatch(&cli));

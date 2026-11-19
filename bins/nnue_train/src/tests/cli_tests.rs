@@ -2509,3 +2509,76 @@ fn bucket_spec_embedded_identity_is_not_a_cli_mode() {
     };
     assert!(validate_bucket_mode(&args).is_err());
 }
+
+#[test]
+fn wdl_jitter_cli_validates_ranges_and_dependencies() {
+    let defaults = Cli::try_parse_from(["nnue-train", "simple"]).unwrap();
+    assert_eq!(defaults.wdl_jitter_sample, 0.0);
+    assert_eq!(defaults.wdl_jitter_batch, 0.0);
+    assert_eq!(defaults.wdl_jitter_batch_decay, 0.0);
+    assert_eq!(defaults.wdl_jitter().seed, 0);
+    assert!(!defaults.wdl_jitter_cycle);
+    defaults.validate_wdl_jitter().unwrap();
+
+    for arg in [
+        "--wdl-jitter-sample=-0.1",
+        "--wdl-jitter-sample=NaN",
+        "--wdl-jitter-batch=inf",
+        "--wdl-jitter-batch=-0.1",
+        "--wdl-jitter-batch-decay=-0.1",
+        "--wdl-jitter-batch-decay=1",
+        "--wdl-jitter-batch-decay=NaN",
+        "--wdl-jitter-batch-decay=0.5",
+    ] {
+        let cli = Cli::try_parse_from(["nnue-train", "simple", arg]).unwrap();
+        let error = cli.validate_wdl_jitter().unwrap_err();
+        assert!(
+            error.contains(arg.split_once('=').unwrap().0),
+            "{arg}: {error}"
+        );
+    }
+    let error = Cli::try_parse_from(["nnue-train", "simple", "--wdl-jitter-cycle"]).unwrap_err();
+    assert!(error.to_string().contains("--wdl-cycle-delta"));
+
+    for (args, flag) in [
+        (&["--wdl-jitter-seed=0"][..], "--wdl-jitter-seed"),
+        (&["--wdl-jitter-seed=42"][..], "--wdl-jitter-seed"),
+        (
+            &["--wdl-cycle-delta=0.2", "--wdl-jitter-cycle"][..],
+            "--wdl-jitter-cycle",
+        ),
+    ] {
+        let error = simple_cli(args).validate_wdl_jitter().unwrap_err();
+        assert!(error.starts_with(flag), "{error}");
+    }
+    for std in ["--wdl-jitter-sample=0.1", "--wdl-jitter-batch=0.1"] {
+        simple_cli(&[
+            std,
+            "--wdl-jitter-seed=0",
+            "--wdl-cycle-delta=0.2",
+            "--wdl-jitter-cycle",
+        ])
+        .validate_wdl_jitter()
+        .unwrap();
+    }
+
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "--wdl-jitter-sample",
+        "0.1",
+        "simple",
+        "--wdl-jitter-batch",
+        "0.15",
+        "--wdl-jitter-batch-decay",
+        "0.9999999999",
+        "--wdl-cycle-delta",
+        "0.2",
+        "--wdl-jitter-cycle",
+        "--wdl-jitter-seed",
+        "4294967297",
+    ])
+    .unwrap();
+    cli.validate_wdl_jitter().unwrap();
+    assert!(cli.wdl_jitter_cycle);
+    assert_eq!(cli.wdl_jitter().seed, 4_294_967_297);
+}

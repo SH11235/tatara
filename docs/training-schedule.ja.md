@@ -114,6 +114,31 @@ superbatch index の関数なので、horizon の入力が変わらない限り 
 base のまま。`--wdl-cycle-warmup-pct 1.0` では cooldown が無く、horizon で
 base へ戻る。delta は負でもよいが、`--wdl` との和が `[0, 1]` に収まる必要がある。
 
+### 学習時の jitter
+
+学習時はスケジュールの WDL 重みに乱数を足して、局面ごとの重みを求められる。
+
+```text
+lambda_i = clamp(base + batch_jitter + sample_jitter_i, 0, 1)
+state = D * state + batch_STD * sqrt(1 - D^2) * N(0, 1)
+```
+
+- `--wdl-jitter-sample STD` は局面ごとに独立な正規乱数を足す。
+- `--wdl-jitter-batch STD` は batch 内で共通の状態を足す。定常分布の標準偏差は STD。
+- `--wdl-jitter-batch-decay D` で相関を指定する。範囲は `[0, 1)`。0 なら batch ごとに独立し、0 より大きい場合は batch STD も正でなければならない。
+- `--wdl-jitter-cycle` は両方の乱数項に cycle の cosine 係数を掛ける。`--wdl-cycle-delta` が必要。
+- `--wdl-jitter-seed N` で乱数系列を指定する。
+
+STD は有限かつ 0 以上。数値フラグの既定値はすべて 0 で、cycle による倍率は既定で無効。seed の指定や cycle による倍率の有効化には、どちらかの STD が正であることが必要。score のみを使う局面と `--wdl-ignore-draws` の対象は WDL 重み 0 のまま。
+
+CPU 参照実装、cuda-oxide、native CUDA では整数ハッシュと一様乱数への変換が一致する。正規乱数には Box–Muller 法の対数と余弦の丸めによる微小な差が生じることがある。
+
+学習時の式は Stockfish nnue-pytorch の lambda jitter に対応する。tatara の lambda は WDL の重みで、Stockfish の lambda は score の重み。Stockfish は評価時にも jitter を掛ける。tatara は run 間で validation loss を比較できるよう、validation と eval-only で jitter を掛けず、スケジュールまたは `--validation-wdl` の値を使う。
+
+tatara は superbatch 単位で cycle の係数を決め、スケジュールの horizon に達すると係数を 0 にして jitter を消す。Stockfish の `lambda_cycle_jitter` は step 単位の係数を使い、`lambda_cycle_warmup_pct = 1.0` のときは horizon 以降も 1 のまま。
+
+相関のある batch jitter を再開するには checkpoint と対応する `.loader.json` を一緒に保管する。`--resume-input restart` で教師の読み込みを先頭からやり直す場合も、checkpoint に対応する batch jitter の状態は復元する。状態が欠けているか、保存時の optimizer step が checkpoint と異なる場合は、警告を出して 0 から再開する。
+
 ### 引き分けと validation
 
 `--wdl-ignore-draws` を指定すると WDL が `0.5` の局面は lambda=0 として教師
@@ -139,10 +164,9 @@ bit 0・bit 1 以外が立つ record もエラーにする。
 フィールドは常に存在し（一定 lambda の値）、線形 taper のときは追加で
 `start_wdl` / `end_wdl` が記録される（taper でないときは省略）。taper 時は
 scheduler が `lambda` を `start_wdl` / `end_wdl` から決めるため `wdl` の値は
-使われない。`--validation-wdl` 未指定なら `test_loss` は各 superbatch で
-`train_loss` と同じ `lambda` で計算されるので、両者は同じスケールに乗る
-（[held-out validation](held-out-validation.ja.md)
-の「指標の読み方」を参照）。
+使われない。`--validation-wdl` 未指定なら `test_loss` は各 superbatch の jitter なしの
+WDL スケジュールを使う（[held-out validation](held-out-validation.ja.md) を参照）。
 cycle run では `wdl_cycle_delta` と `wdl_cycle_warmup_pct` も記録され、
 `wdl_schedule_superbatch` は明示した場合のみ記録される。`validation_wdl` は
 指定時のみ、`wdl_ignore_draws` と `tree_sample_eval_only` は true の場合のみ記録される。
+どちらかの jitter の標準偏差が正なら、設定を `wdl_jitter` に記録する。

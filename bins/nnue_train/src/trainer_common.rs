@@ -357,12 +357,16 @@ macro_rules! trainer_backend_impl {
         resume_error: $resume_error:literal $(,)?
     ) => {
         impl nnue_train::trainer::TrainerBackend for $trainer {
+            fn completed_steps(&self) -> u64 {
+                self.step_count
+            }
+
             fn train_step(
                 &mut self,
                 batch: &nnue_train::dataloader::Batch,
                 bucket_idx: &[i32],
                 lr: f32,
-                wdl_lambda: f32,
+                wdl_lambda: gpu_kernels::pointwise::wdl_jitter::WdlBlend,
                 loss: nnue_train::trainer::LossKind,
             ) -> std::io::Result<f64> {
                 // dataloader が出した batch の feature set が trainer 構築時に選んだ

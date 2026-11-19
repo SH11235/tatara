@@ -315,6 +315,8 @@ epochs; write regenerated data to a different file.
 PSV rescoring retains its structural checks for king placement and total piece count before
 writing scores. These checks do not verify move legality or every possible format corruption.
 
+For training-only WDL lambda jitter, see [Training schedules](training-schedule.md#training-jitter).
+
 `--tree-sample-eval-only` trains PSV positions marked by padding bit 1 (byte 39)
 on the score term only (WDL weight 0), regardless of the WDL schedule. It requires
 `--data` in PSV format and applies to all teachers. The main teacher permits

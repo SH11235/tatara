@@ -2,6 +2,7 @@
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
+use gpu_kernels::pointwise::wdl_jitter::jittered_lambda;
 
 /// SCReLU activation gradient (fused)。
 ///
@@ -48,7 +49,10 @@ pub fn loss_wdl(
     per_pos_norm: f32, // scalar (= 1/n_pos)
     mut dl_dout: DisjointSlice<f32>,
     loss_acc: &[f64],
-    lambda: f32,
+    lambda: f64,
+    sample_std: f32,
+    sample_key: u64,
+    clamp_lambda: u32,
     scale: f32,
     ignore_draws: u32,
     n: u32,
@@ -61,8 +65,10 @@ pub fn loss_wdl(
     let ys = 1.0_f32 / (1.0_f32 + (-(score[i.get()] * scale)).exp());
     let lam = if (ignore_draws != 0 && wdl[i.get()] == 0.5) || wdl[i.get()] < 0.0 {
         0.0
+    } else if clamp_lambda != 0 {
+        jittered_lambda(lambda, sample_std, sample_key, i.get() as u32)
     } else {
-        lambda
+        lambda as f32
     };
     let y = lam * wdl[i.get()] + (1.0_f32 - lam) * ys;
     let err = p - y;
@@ -144,7 +150,10 @@ pub fn loss_wrm(
     per_pos_norm: f32, // scalar
     mut dl_dout: DisjointSlice<f32>,
     loss_acc: &[f64],
-    lambda: f32,
+    lambda: f64,
+    sample_std: f32,
+    sample_key: u64,
+    clamp_lambda: u32,
     nnue2score: f32,
     in_scaling: f32,
     in_offset: f32,
@@ -179,8 +188,10 @@ pub fn loss_wrm(
         let target_wrm = 0.5_f32 * (1.0_f32 + sig_pt - sig_pmt);
         let lam = if (ignore_draws != 0 && wdl[i.get()] == 0.5) || wdl[i.get()] < 0.0 {
             0.0
+        } else if clamp_lambda != 0 {
+            jittered_lambda(lambda, sample_std, sample_key, i.get() as u32)
         } else {
-            lambda
+            lambda as f32
         };
         let target = lam * wdl[i.get()] + (1.0_f32 - lam) * target_wrm;
 

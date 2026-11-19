@@ -55,8 +55,9 @@ target/release/nnue-train \
 ## 指標の読み方
 
 `test_loss` は `train_loss` と同じ loss kernel (sigmoid-MSE または WRM) で計算する。
-既定では各 superbatch の training WDL lambda に従うが、`--validation-wdl` で validation
-だけを固定 lambda にできる。training の blend は一定の `--wdl`、線形の
+既定では各 superbatch の WDL スケジュールに従う。`--validation-wdl` を指定すると
+validation の lambda を固定できる。WDL jitter は学習時のみ適用する。
+training の blend は一定の `--wdl`、線形の
 `--start-wdl` / `--end-wdl` taper、または `--wdl` と `--wdl-cycle-delta` の cosine cycle を
 選べる。設定方法は
 [学習スケジュール](training-schedule.ja.md) を参照。`test_loss − train_loss` の差が広がっていけば過学習の兆候、

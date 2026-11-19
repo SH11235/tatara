@@ -259,6 +259,8 @@ pub struct Params {
     pub validation_wdl: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wdl_ignore_draws: bool,
+    #[serde(skip_serializing_if = "crate::wdl_jitter::WdlJitter::is_disabled")]
+    pub wdl_jitter: crate::wdl_jitter::WdlJitter,
     pub scale: f32,
     pub weight_decay: f32,
     /// optimizer の param-group (ft / dense / bias) ごとの有効 weight_decay と
@@ -1017,6 +1019,7 @@ mod tests {
             wdl_schedule_superbatch: None,
             validation_wdl: None,
             wdl_ignore_draws: false,
+            wdl_jitter: Default::default(),
             scale: 290.0,
             weight_decay: 0.0,
             ft_weight_decay: None,
@@ -1308,6 +1311,35 @@ mod tests {
             true
         );
         assert_ne!(original, recipe_fingerprint(&params, "samples"));
+    }
+
+    #[test]
+    fn only_enabled_wdl_jitter_is_serialized_and_changes_recipe_fingerprint() {
+        let mut params = sample_params();
+        let original = recipe_fingerprint(&params, "teacher.psv");
+        let default_json = serde_json::to_value(&params).unwrap();
+        assert!(default_json.get("wdl_jitter").is_none());
+        params.wdl_jitter.seed = 42;
+        params.wdl_jitter.cycle = true;
+        assert_eq!(serde_json::to_value(&params).unwrap(), default_json);
+        assert_eq!(recipe_fingerprint(&params, "teacher.psv"), original);
+
+        params.wdl_jitter.batch_std = 0.125;
+        assert_ne!(recipe_fingerprint(&params, "teacher.psv"), original);
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["wdl_jitter"]["batch_std"],
+            0.125
+        );
+        params.wdl_jitter.batch_std = 0.0;
+        params.wdl_jitter.sample_std = 0.125;
+        let enabled = recipe_fingerprint(&params, "teacher.psv");
+        assert_ne!(enabled, original);
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["wdl_jitter"]["sample_std"],
+            0.125
+        );
+        params.wdl_jitter.seed = 11;
+        assert_ne!(recipe_fingerprint(&params, "teacher.psv"), enabled);
     }
 
     #[test]

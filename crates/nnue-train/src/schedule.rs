@@ -434,6 +434,10 @@ impl Display for LrSchedulerEnum {
 pub trait WdlScheduler: Clone + Debug + Display + Send + Sync + 'static {
     /// 現在の batch / superbatch (max = 総 superbatch 数) に対する WDL lambda。
     fn blend(&self, batch: usize, superbatch: usize, max: usize) -> f32;
+
+    fn jitter_base(&self, batch: usize, superbatch: usize, max: usize) -> (f32, f32) {
+        (self.blend(batch, superbatch, max), 1.0)
+    }
 }
 
 /// 一定の WDL lambda。
@@ -486,11 +490,11 @@ pub struct CycleWDL {
     pub horizon: Option<usize>,
 }
 
-impl WdlScheduler for CycleWDL {
-    fn blend(&self, _batch: usize, superbatch: usize, max: usize) -> f32 {
+impl CycleWDL {
+    fn coefficient(&self, superbatch: usize, max: usize) -> f32 {
         let horizon = self.horizon.unwrap_or(max);
         let warmup = ((self.warmup_pct * horizon as f32).round() as usize).min(horizon);
-        let c = if superbatch >= horizon {
+        if superbatch >= horizon {
             0.0
         } else if superbatch <= warmup {
             let p = superbatch as f32 / warmup.max(1) as f32;
@@ -499,8 +503,18 @@ impl WdlScheduler for CycleWDL {
             let denom = (horizon - warmup).max(1) as f32;
             let p = (superbatch - warmup) as f32 / denom;
             cosine_interp(1.0, 0.0, p.min(1.0))
-        };
-        (self.base + self.delta * c).clamp(0.0, 1.0)
+        }
+    }
+}
+
+impl WdlScheduler for CycleWDL {
+    fn blend(&self, batch: usize, superbatch: usize, max: usize) -> f32 {
+        self.jitter_base(batch, superbatch, max).0.clamp(0.0, 1.0)
+    }
+
+    fn jitter_base(&self, _batch: usize, superbatch: usize, max: usize) -> (f32, f32) {
+        let c = self.coefficient(superbatch, max);
+        (self.base + self.delta * c, c)
     }
 }
 
@@ -615,6 +629,12 @@ impl WdlScheduler for WdlSchedulerEnum {
             Self::Constant(s) => s.blend(batch, superbatch, max),
             Self::Linear(s) => s.blend(batch, superbatch, max),
             Self::Cycle(s) => s.blend(batch, superbatch, max),
+        }
+    }
+    fn jitter_base(&self, batch: usize, superbatch: usize, max: usize) -> (f32, f32) {
+        match self {
+            Self::Cycle(s) => s.jitter_base(batch, superbatch, max),
+            _ => (self.blend(batch, superbatch, max), 1.0),
         }
     }
 }

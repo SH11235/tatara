@@ -1192,6 +1192,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         validation_wdl: cli.validation_wdl,
+        wdl_jitter: cli.wdl_jitter(),
         score_drop_abs: cli.score_drop_abs,
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs,
@@ -1712,7 +1713,8 @@ pub(crate) fn simple_fv_scale_warning(
     cli: &Cli,
     fv_scale_is_derived: bool,
 ) -> Option<&'static str> {
-    let wdl_is_always_zero = cli.wdl == 0.0
+    let wdl_is_always_zero = (cli.eval_only || !cli.wdl_jitter().enabled())
+        && cli.wdl == 0.0
         && cli.wdl_cycle_delta.unwrap_or(0.0) == 0.0
         && cli.start_wdl.unwrap_or(0.0) == 0.0
         && cli.end_wdl.unwrap_or(0.0) == 0.0;
@@ -2104,6 +2106,7 @@ pub(crate) fn build_experiment_logger(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
+        wdl_jitter: cli.wdl_jitter(),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
@@ -2317,6 +2320,7 @@ pub(crate) fn build_experiment_logger_simple(
         wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
         validation_wdl: cli.validation_wdl.map(finite_or_zero),
         wdl_ignore_draws: cli.wdl_ignore_draws,
+        wdl_jitter: cli.wdl_jitter(),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
         // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
@@ -2725,6 +2729,7 @@ pub(crate) fn run_simple_training(
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         validation_wdl: cli.validation_wdl,
+        wdl_jitter: cli.wdl_jitter(),
         score_drop_abs: cli.score_drop_abs,
         sampling: cli.sampling(),
         score_clamp_abs: cli.score_clamp_abs,

@@ -383,6 +383,37 @@ extern "C" __global__ void native_vec_add(
     }
 }
 
+// Keep the integer mixer and uniform conversion in sync with the CPU reference.
+static __device__ __forceinline__ unsigned long long wdl_mix_bits(unsigned long long value) {
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static __device__ __forceinline__ float wdl_unit_uniform(unsigned long long bits) {
+    return (static_cast<float>(bits >> 41) + 0.5F) * (1.0F / 8388608.0F);
+}
+
+static __device__ __forceinline__ float wdl_row_lambda(
+    double lambda, float sample_std, unsigned long long sample_key, unsigned int clamp_lambda,
+    float wdl, unsigned int ignore_draws, unsigned int row
+) {
+    if (wdl < 0.0F || (ignore_draws != 0 && wdl == 0.5F)) {
+        return 0.0F;
+    }
+    if (clamp_lambda == 0) {
+        return static_cast<float>(lambda);
+    }
+    if (sample_std != 0.0F) {
+        const unsigned long long counter = 2ULL * row;
+        const float u1 = wdl_unit_uniform(wdl_mix_bits(sample_key ^ counter));
+        const float u2 = wdl_unit_uniform(wdl_mix_bits(sample_key ^ (counter | 1ULL)));
+        const float normal = sqrtf(-2.0F * logf(u1)) * cosf(6.283185307179586F * u2);
+        lambda += static_cast<double>(sample_std) * static_cast<double>(normal);
+    }
+    return static_cast<float>(fmin(fmax(lambda, 0.0), 1.0));
+}
+
 extern "C" __global__ void native_loss_wrm_default(
     const float* output,
     const float* score,
@@ -390,7 +421,10 @@ extern "C" __global__ void native_loss_wrm_default(
     float per_pos_norm,
     float* output_gradient,
     double* loss_accumulator,
-    float lambda,
+    double lambda,
+    float sample_std,
+    unsigned long long sample_key,
+    unsigned int clamp_lambda,
     float nnue2score,
     float input_scaling,
     float input_offset,
@@ -409,7 +443,7 @@ extern "C" __global__ void native_loss_wrm_default(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
+        const float lam = wdl_row_lambda(lambda, sample_std, sample_key, clamp_lambda, wdl[i], ignore_draws, i);
         const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
 
         const float score_net = output[i] * nnue2score;
@@ -833,7 +867,10 @@ extern "C" __global__ void loss_wrm(
     unsigned long long,
     double* loss_accumulator,
     unsigned long long,
-    float lambda,
+    double lambda,
+    float sample_std,
+    unsigned long long sample_key,
+    unsigned int clamp_lambda,
     float nnue2score,
     float input_scaling,
     float input_offset,
@@ -859,7 +896,7 @@ extern "C" __global__ void loss_wrm(
         const float target_positive = 1.0F / (1.0F + expf(-((s - target_offset) / target_scaling)));
         const float target_negative = 1.0F / (1.0F + expf(-((-s - target_offset) / target_scaling)));
         const float target_wrm = 0.5F * (1.0F + target_positive - target_negative);
-        const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
+        const float lam = wdl_row_lambda(lambda, sample_std, sample_key, clamp_lambda, wdl[i], ignore_draws, i);
         const float target = lam * wdl[i] + (1.0F - lam) * target_wrm;
         const float score_net = output[i] * nnue2score;
         const float q = 1.0F / (1.0F + expf(-((score_net - input_offset) / input_scaling)));
@@ -918,7 +955,10 @@ extern "C" __global__ void loss_wdl(
     unsigned long long,
     double* loss_accumulator,
     unsigned long long,
-    float lambda,
+    double lambda,
+    float sample_std,
+    unsigned long long sample_key,
+    unsigned int clamp_lambda,
     float scale,
     unsigned int ignore_draws,
     unsigned int n
@@ -929,7 +969,7 @@ extern "C" __global__ void loss_wdl(
     }
     const float prediction = 1.0F / (1.0F + expf(-(output[i] * scale)));
     const float score_target = 1.0F / (1.0F + expf(-(score[i] * scale)));
-    const float lam = ((ignore_draws != 0 && wdl[i] == 0.5F) || wdl[i] < 0.0F) ? 0.0F : lambda;
+    const float lam = wdl_row_lambda(lambda, sample_std, sample_key, clamp_lambda, wdl[i], ignore_draws, i);
     const float target = lam * wdl[i] + (1.0F - lam) * score_target;
     const float error = prediction - target;
     output_gradient[i] = 2.0F * error * prediction * (1.0F - prediction)

@@ -125,6 +125,31 @@ horizon leaves no room for the cycle, so lambda stays at the base. With
 `--wdl-cycle-warmup-pct 1.0` there is no cooldown: lambda returns to the base
 at the horizon instead of easing back.
 
+### Training jitter
+
+The training loss can perturb the scheduled WDL weight per position:
+
+```text
+lambda_i = clamp(base + batch_jitter + sample_jitter_i, 0, 1)
+state = D * state + batch_STD * sqrt(1 - D^2) * N(0, 1)
+```
+
+- `--wdl-jitter-sample STD` adds independent Gaussian noise per position.
+- `--wdl-jitter-batch STD` adds the shared batch state. Its stationary standard deviation is STD.
+- `--wdl-jitter-batch-decay D` sets the correlation in `[0, 1)`. A decay of 0 gives independent batches, and a nonzero decay requires positive batch STD.
+- `--wdl-jitter-cycle` requires `--wdl-cycle-delta` and multiplies both noise terms by the cycle's cosine coefficient.
+- `--wdl-jitter-seed N` selects the deterministic noise sequence.
+
+Both standard deviations must be finite and nonnegative. The numeric flags default to 0 and cycle scaling defaults to off. Setting the seed or enabling cycle scaling requires at least one positive standard deviation. Score-only rows and draws covered by `--wdl-ignore-draws` still get a WDL weight of 0.
+
+The CPU reference, cuda-oxide, and native CUDA use the same integer hash and uniform conversion. The Gaussian samples can differ slightly due to rounding in the Box–Muller logarithm and cosine.
+
+The training formula corresponds to Stockfish nnue-pytorch's lambda jitter, with tatara's lambda weighting WDL and Stockfish's weighting the score. Stockfish also applies jitter during evaluation. tatara uses the unperturbed schedule or `--validation-wdl` for validation and eval-only runs so validation losses can be compared across runs.
+
+tatara computes the cycle coefficient per superbatch and sets it to zero at and beyond the schedule horizon, muting jitter. Stockfish's `lambda_cycle_jitter` uses a per-step coefficient that stays at 1 at and beyond the horizon when `lambda_cycle_warmup_pct = 1.0`.
+
+Keep the checkpoint and its `.loader.json` together to resume correlated batch jitter. `--resume-input restart` restarts teacher input and still restores batch jitter state when it matches the checkpoint. If the batch jitter state is missing or was saved at a different optimizer step, training warns and restarts it from zero.
+
 ### Draws and validation
 
 `--wdl-ignore-draws` makes positions whose WDL label is `0.5` use lambda zero,
@@ -150,11 +175,11 @@ effective horizon (so a resumed run shows the restored horizon, not the
 `--superbatches`-derived default). The `wdl` field is always present (the
 constant lambda); a linear taper additionally records `start_wdl` / `end_wdl`
 (omitted otherwise), and in that case the scheduler derives `lambda` from those
-endpoints and ignores `wdl`. Unless `--validation-wdl` is set, `test_loss` is
-computed with the same `lambda` as `train_loss` at each superbatch, so the two stay
-on one scale (see "Reading the
-metrics" in [Held-out validation](held-out-validation.md)).
+endpoints and ignores `wdl`. Unless `--validation-wdl` is set, `test_loss` uses the
+unperturbed WDL schedule at each superbatch (see
+[Held-out validation](held-out-validation.md)).
 Cycle runs also record `wdl_cycle_delta`, `wdl_cycle_warmup_pct`, and
 `wdl_schedule_superbatch` (the latter only when explicitly set).
 `validation_wdl` is recorded only when specified; `wdl_ignore_draws` and
 `tree_sample_eval_only` are recorded only when true.
+When at least one jitter standard deviation is positive, the settings are recorded under `wdl_jitter`.
