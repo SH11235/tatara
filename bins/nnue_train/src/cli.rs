@@ -709,7 +709,8 @@ pub(crate) struct Cli {
     pub(crate) tree_sample_accept: Option<f64>,
 
     /// Inject weights from a quantised NNUE binary before training starts
-    /// (pretrained start). The optimizer state (m/v/slow/step) is
+    /// (pretrained start). Training runs with the FT factorizer disabled.
+    /// The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and
     /// `--resume` are mutually exclusive).
     #[arg(long, global = true)]
@@ -1096,7 +1097,9 @@ pub(crate) struct Cli {
     /// Defaults differ per architecture: `layerstack` initialises the FT with
     /// `uniform:fanin` (half-width `sqrt(1 / fan_in)`), while `simple` uses
     /// `[-0.01, 0.01]` uniform. Every other weight defaults to `[-0.01, 0.01]`
-    /// uniform in both architectures.
+    /// uniform in both architectures. With `--ft-weight-i8x2` and no
+    /// `--init-ft`, the piece FT half-width is raised to at least `1.25 / 127`
+    /// so the first rounding onto the even grid keeps nonzero weights.
     ///
     /// Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
     /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
@@ -1253,6 +1256,24 @@ impl Cli {
             cycle: self.wdl_jitter_cycle,
             seed: self.wdl_jitter_seed.unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn validate_ft_weight_i8x2(&self) -> Result<(), String> {
+        if matches!(&self.arch, ArchCommand::LayerStack(args) if args.ft_weight_i8x2) {
+            if !(self.ft_fp16 || self.all_optim) {
+                return Err("--ft-weight-i8x2 requires --ft-fp16 or --all-optim".into());
+            }
+            if self.rescore_input.is_some() || self.threat_norm_dump {
+                return Err(
+                    "--ft-weight-i8x2 is incompatible with --rescore-input and --threat-norm-dump"
+                        .into(),
+                );
+            }
+            if self.data.is_empty() && !self.eval_only {
+                return Err("--ft-weight-i8x2 requires --data for training".into());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_wdl_jitter(&self) -> Result<(), String> {
@@ -1649,6 +1670,12 @@ pub(crate) struct LayerstackArgs {
     /// Omitted: inherit raw checkpoint mode, or off for fresh training.
     #[arg(long, value_enum)]
     pub(crate) qat: Option<crate::qat::QatMode>,
+
+    /// Round piece FT weights during training so exported piece FT weights are even and within
+    /// [-254, 254]. Threat weights use a separate raw int8 block.
+    /// Requires --ft-fp16 or --all-optim. Pass the same setting when resuming a raw checkpoint.
+    #[arg(long)]
+    pub(crate) ft_weight_i8x2: bool,
 
     /// Evaluation scale written to the LayerStack architecture string. When
     /// omitted, sigmoid loss derives it from `--scale`; WRM loss leaves the

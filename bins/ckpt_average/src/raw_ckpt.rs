@@ -40,6 +40,7 @@ pub(crate) struct CkptIdentity {
     pub(crate) bucket_mode: String,
     pub(crate) topology: Vec<u64>,
     pub(crate) qat_dense: bool,
+    pub(crate) ft_weight_i8x2: bool,
     pub(crate) group_lens: Vec<u64>,
 }
 
@@ -51,6 +52,7 @@ pub(crate) struct CompatKey {
     bucket_mode: String,
     topology: Vec<u64>,
     qat_dense: bool,
+    ft_weight_i8x2: bool,
     shared_delta: bool,
 }
 
@@ -61,6 +63,7 @@ impl CkptIdentity {
             bucket_mode: layout.bucket_mode.identity(),
             topology: self.topology.clone(),
             qat_dense: self.qat_dense,
+            ft_weight_i8x2: self.ft_weight_i8x2,
             shared_delta: layout.shared_delta,
         }
     }
@@ -164,14 +167,12 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     if version >= 9 {
         read_u32(&mut r, "fv_scale")?;
     }
-    let qat_dense = if version >= 10 {
-        match read_u32(&mut r, "QAT mode")? {
-            0 => false,
-            1 => true,
-            other => return Err(invalid(format!("unknown QAT mode {other}"))),
-        }
+    let (qat_dense, ft_weight_i8x2) = if version >= 10 {
+        let flags = read_u32(&mut r, "QAT flags")?;
+        nnue_train::raw_checkpoint::decode_qat_flags(flags)
+            .ok_or_else(|| invalid(format!("unknown QAT flags {flags}")))?
     } else {
-        false
+        (false, false)
     };
     if version >= 11 {
         read_name(&mut r, "producer net id")?;
@@ -209,6 +210,7 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
             bucket_mode,
             topology,
             qat_dense,
+            ft_weight_i8x2,
             group_lens,
         },
         superbatch,
@@ -799,6 +801,9 @@ pub(crate) mod tests {
         let mut alias = v11.clone();
         alias.bucket_mode = "progress8kpabs".to_string();
         assert_eq!(compat_key(&alias), compat_key(&v11));
+        let mut other_ft_grid = v11.clone();
+        other_ft_grid.ft_weight_i8x2 = true;
+        assert_ne!(compat_key(&other_ft_grid), compat_key(&v11));
         let mut other_mode = v11.clone();
         other_mode.bucket_mode = "progresskpabsq16".to_string();
         assert_ne!(compat_key(&other_mode), compat_key(&v11));
@@ -901,6 +906,7 @@ pub(crate) mod tests {
         let meta = RawCkptMeta {
             optimizer,
             qat_dense: false,
+            ft_weight_i8x2: false,
             run_id: "run",
             superbatch: scale as usize,
             step_count: 100,

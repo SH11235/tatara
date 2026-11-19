@@ -129,6 +129,7 @@ fn main() -> std::process::ExitCode {
         .and_then(|()| cli.validate_score_sources())
         .and_then(|()| cli.validate_wdl_jitter())
         .and_then(|()| cli.validate_data_args(&argv))
+        .and_then(|()| cli.validate_ft_weight_i8x2())
         .map_err(Into::into)
         .and_then(|()| dispatch(&cli));
     match result {

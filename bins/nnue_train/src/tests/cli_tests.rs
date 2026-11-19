@@ -2582,3 +2582,66 @@ fn wdl_jitter_cli_validates_ranges_and_dependencies() {
     assert!(cli.wdl_jitter_cycle);
     assert_eq!(cli.wdl_jitter().seed, 4_294_967_297);
 }
+
+#[test]
+fn ft_i8x2_cli_requires_fp16_layerstack_training() {
+    let parse = |precision| {
+        Cli::try_parse_from([
+            "nnue-train",
+            "--data",
+            "teacher.psv",
+            precision,
+            "layerstack",
+            "--ft-weight-i8x2",
+        ])
+        .unwrap()
+    };
+    for precision in ["--ft-fp16", "--all-optim"] {
+        assert!(parse(precision).validate_ft_weight_i8x2().is_ok());
+    }
+    let fp32 = Cli::try_parse_from([
+        "nnue-train",
+        "--data",
+        "teacher.psv",
+        "layerstack",
+        "--ft-weight-i8x2",
+    ])
+    .unwrap();
+    assert!(
+        fp32.validate_ft_weight_i8x2()
+            .unwrap_err()
+            .contains("requires --ft-fp16 or --all-optim")
+    );
+    let without_data = Cli::try_parse_from([
+        "nnue-train",
+        "--all-optim",
+        "layerstack",
+        "--ft-weight-i8x2",
+    ])
+    .unwrap();
+    assert!(
+        without_data
+            .validate_ft_weight_i8x2()
+            .unwrap_err()
+            .contains("--data")
+    );
+    assert!(Cli::try_parse_from(["nnue-train", "simple", "--ft-weight-i8x2"]).is_err());
+}
+
+#[test]
+fn ft_i8x2_cli_rejects_rescore_and_threat_norm_dump() {
+    for args in [
+        vec!["--rescore-input", "teacher.psv"],
+        vec!["--threat-norm-dump"],
+    ] {
+        let mut argv = vec!["nnue-train", "--all-optim", "--init-from", "net.bin"];
+        argv.extend(args);
+        argv.extend(["layerstack", "--ft-weight-i8x2"]);
+        let cli = Cli::try_parse_from(argv).unwrap();
+        assert!(
+            cli.validate_ft_weight_i8x2()
+                .unwrap_err()
+                .contains("incompatible")
+        );
+    }
+}
