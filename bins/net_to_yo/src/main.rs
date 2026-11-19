@@ -445,7 +445,7 @@ mod tests {
             .expect("progress bucket count in range");
             assert_eq!(arch.num_buckets, buckets as usize);
         }
-        for buckets in [0_u32, 10] {
+        for buckets in [0_u32, 10, 64] {
             let bytes = header_bytes(NNUE_VERSION, &arch_str, Some(buckets));
             let error = detect_arch(
                 &mut std::io::Cursor::new(bytes),

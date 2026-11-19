@@ -700,6 +700,7 @@ mod tests {
         for (routing, count) in [
             ("ownking:2/3/7+oppking:2/3/7", 16),
             ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+            ("handmajor4+ownking:2/3/7+oppking:2/3/7", 64),
         ] {
             let mut weights = LayerStackWeights::zeroed(feature_set, 4, 4, 4, count);
             weights.bucket_spec = Some(routing.parse().unwrap());

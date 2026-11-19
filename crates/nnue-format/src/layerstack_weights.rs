@@ -3348,6 +3348,7 @@ mod bucket_spec_tests {
         for (spec, count) in [
             ("ownking:2/3/7+oppking:2/3/7", 16),
             ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+            ("handmajor4+ownking:2/3/7+oppking:2/3/7", 64),
         ] {
             let mut original = LayerStackWeights::zeroed_with_psqt(features, 4, 4, 4, count);
             original.bucket_spec = Some(spec.parse().unwrap());
@@ -3357,6 +3358,8 @@ mod bucket_spec_tests {
             let mut bytes = Vec::new();
             original.save_quantised(&mut bytes, None).unwrap();
             assert_eq!(stored_num_buckets(&bytes).unwrap(), count);
+            let arch = read_layerstack_arch(&mut &bytes[..]).unwrap();
+            assert!(arch.ends_with(&format!(",ls_bucket={spec}")));
             let loaded = LayerStackWeights::load_quantised_with_psqt(
                 &mut &bytes[..],
                 features,
@@ -3370,6 +3373,9 @@ mod bucket_spec_tests {
             assert_eq!(loaded.bucket_spec, original.bucket_spec);
             assert_eq!(loaded.psqt_w, original.psqt_w);
             assert_eq!(loaded.l3_b, original.l3_b);
+            let mut saved = Vec::new();
+            loaded.save_quantised(&mut saved, None).unwrap();
+            assert_eq!(saved, bytes);
         }
     }
 

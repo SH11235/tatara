@@ -1791,7 +1791,7 @@ fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
 #[test]
 #[cfg(feature = "oxide-parity")]
 fn skewed_bucket_layerstack_native_matches_cuda_oxide() -> Result<(), Box<dyn std::error::Error>> {
-    for num_buckets in [1, 2, 8, 9, 16, shogi_features::MAX_LAYERSTACK_BUCKETS] {
+    for num_buckets in [1, 2, 8, 9, 16, 32, shogi_features::MAX_LAYERSTACK_BUCKETS] {
         let options = LayerStackTestOptions {
             num_buckets,
             ..LayerStackTestOptions::standard()
@@ -1820,6 +1820,7 @@ fn wide_bucket_spec_layerstack_native_matches_cuda_oxide() -> Result<(), Box<dyn
     for routing in [
         "ownking:2/3/7+oppking:2/3/7",
         "handmajor4+ownking:2/3/4/5/6/7/8",
+        "handmajor4+ownking:2/3/7+oppking:2/3/7",
     ] {
         let spec: shogi_features::BucketSpec = routing.parse()?;
         assert_layerstack_native_matches_cuda_oxide_with_batch(
@@ -1903,6 +1904,65 @@ fn complete_layerstack_native_configuration_matrix_runs_one_step()
         assert!(validation.loss.is_finite());
         trainer.assert_all_weights_finite()?;
     }
+    Ok(())
+}
+
+#[test]
+fn three_axis_spec_routes_decoded_positions_through_a_training_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nnue_train::dataloader::Batch;
+    use shogi_format::{
+        ShogiBoard,
+        types::{Color, Piece, PieceType, Square},
+    };
+
+    let spec: shogi_features::BucketSpec = "handmajor4+ownking:2/3/7+oppking:2/3/7".parse()?;
+    let options = LayerStackTestOptions {
+        num_buckets: spec.num_buckets(),
+        bucket_mode: BucketMode::Spec(spec),
+        psqt: true,
+        ..LayerStackTestOptions::standard()
+    };
+    let mut batch = Batch::with_capacity(64, options.feature_set);
+    let mut buckets = Vec::with_capacity(64);
+    for major in 0..4 {
+        for own in [1, 2, 3, 7] {
+            for opp in [1, 2, 3, 7] {
+                let mut board = ShogiBoard {
+                    black_king_sq: Square::new(2, 9 - own),
+                    white_king_sq: Square::new(6, opp - 1),
+                    score: 200,
+                    result: 1,
+                    ..ShogiBoard::default()
+                };
+                board.board[board.black_king_sq.index()] =
+                    Piece::new(Color::Black, PieceType::King);
+                board.board[board.white_king_sq.index()] =
+                    Piece::new(Color::White, PieceType::King);
+                board.black_hand.set_rook(major & 1);
+                board.white_hand.set_rook(major >> 1);
+                assert!(batch.push_decoded(&board)?);
+                buckets.push(i32::from(
+                    options
+                        .bucket_mode
+                        .bucket_board(&board, options.num_buckets),
+                ));
+            }
+        }
+    }
+    assert!(buckets.iter().copied().eq(0..64));
+    let batch = BatchData::from_batch_ref(&batch, &buckets);
+    let context = test_cuda_context()?;
+    let mut trainer = create_layerstack_trainer_with_batch(&context, true, options, batch.n_pos)?;
+    let loss = trainer.step(&batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    assert!(loss.is_finite());
+    assert!(
+        trainer
+            .validate(&batch, 0.0, SMOKE_LOSS_WRM)?
+            .loss
+            .is_finite()
+    );
+    trainer.assert_all_weights_finite()?;
     Ok(())
 }
 
@@ -3643,7 +3703,7 @@ fn skewed_bucket_weight_gradients_match_cpu() -> Result<(), Box<dyn std::error::
 #[cfg(feature = "native")]
 #[test]
 fn native_bucket_capacity_matches_host() -> Result<(), Box<dyn std::error::Error>> {
-    assert_skewed_bucket_weight_gradients_match_cpu(&[crate::arch::MAX_SUPPORTED_NUM_BUCKETS])
+    assert_skewed_bucket_weight_gradients_match_cpu(&[32, crate::arch::MAX_SUPPORTED_NUM_BUCKETS])
 }
 
 #[cfg(feature = "native")]

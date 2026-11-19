@@ -4278,21 +4278,20 @@ impl GpuTrainer {
     /// `count == 0` の bucket は空 (呼び出し側で skip)。
     fn l1_bucket_segments(&self, batch: &BatchData) -> [(u32, u32); MAX_SUPPORTED_NUM_BUCKETS] {
         let nb = self.num_buckets;
-        let mut counts = [0_u32; MAX_SUPPORTED_NUM_BUCKETS];
+        let mut segs = [(0_u32, 0_u32); MAX_SUPPORTED_NUM_BUCKETS];
         for &bk in batch.bucket_idx.iter() {
             if bk >= 0 && (bk as usize) < nb {
-                counts[bk as usize] += 1;
+                segs[bk as usize].1 += 1;
             }
         }
-        let mut segs = [(0_u32, 0_u32); MAX_SUPPORTED_NUM_BUCKETS];
         let mut acc: u32 = 0;
-        for (g, &m) in counts.iter().enumerate().take(nb) {
+        for (start, count) in &mut segs[..nb] {
             let rem = acc % 16;
             if rem != 0 {
                 acc += 16 - rem;
             }
-            segs[g] = (acc, m);
-            acc += m;
+            *start = acc;
+            acc += *count;
         }
         segs
     }

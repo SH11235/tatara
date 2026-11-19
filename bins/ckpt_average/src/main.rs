@@ -313,6 +313,48 @@ mod tests {
     }
 
     #[test]
+    fn averages_three_axis_checkpoints_into_a_64_bucket_net() {
+        let mode = "spec:handmajor4+ownking:2/3/7+oppking:2/3/7";
+        let topology = [FT_OUT as u64, L1 as u64, L2 as u64, 64];
+        let a = temp_path("three-axis-a.ckpt");
+        let b = temp_path("three-axis-b.ckpt");
+        let out = temp_path("three-axis.bin");
+        for (path, superbatch, bias) in [(&a, 20, 0.25), (&b, 40, 0.75)] {
+            write_ckpt_versioned(
+                path,
+                11,
+                train_spec(),
+                superbatch,
+                topology,
+                mode,
+                |g, i| {
+                    if g == 9 && i == 63 { bias } else { 0.0 }
+                },
+            );
+        }
+        run(&args(vec![a, b], out.clone())).unwrap();
+        let bytes = fs::read(out).unwrap();
+        assert_eq!(
+            nnue_format::layerstack_weights::stored_num_buckets(&bytes).unwrap(),
+            64
+        );
+        let weights = LayerStackWeights::load_quantised(
+            &mut &bytes[..],
+            train_spec().without_ft_factorize(),
+            FT_OUT,
+            L1,
+            L2,
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            weights.bucket_spec.unwrap().to_string(),
+            mode.trim_start_matches("spec:")
+        );
+        assert_eq!(weights.l3_b[63], 0.5);
+    }
+
+    #[test]
     fn reference_comparison_counts_changed_elements() {
         let a = temp_path("ref-a.ckpt");
         let b = temp_path("ref-b.ckpt");

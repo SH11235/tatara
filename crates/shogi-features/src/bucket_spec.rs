@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr};
 use shogi_format::{Color, PieceType, ShogiBoard};
 
 /// Maximum number of LayerStack output buckets supported by training.
-pub const MAX_LAYERSTACK_BUCKETS: usize = 32;
+pub const MAX_LAYERSTACK_BUCKETS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Axis {
@@ -66,7 +66,7 @@ impl Axis {
 /// Position axes for LayerStack output routing, with the left axis most significant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BucketSpec {
-    axes: [Axis; 2],
+    axes: [Axis; 3],
     len: u8,
 }
 
@@ -90,12 +90,12 @@ impl FromStr for BucketSpec {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut result = Self {
-            axes: [Axis::HandMajor3; 2],
+            axes: [Axis::HandMajor3; 3],
             len: 0,
         };
         for part in s.split('+') {
-            if result.len == 2 {
-                return Err("bucket spec requires one or two axes".into());
+            if usize::from(result.len) == result.axes.len() {
+                return Err("bucket spec requires one to three axes".into());
             }
             let axis = match part {
                 "handmajor3" => Axis::HandMajor3,
@@ -235,11 +235,14 @@ mod tests {
             ("handmajor4", 4),
             ("ownking:2/4/6/8", 5),
             ("ownking:2/3/7+oppking:2/3/7", 16),
+            ("handmajor4+ownking:2/3/4/5/6/7/8/9", 36),
             ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+            ("handmajor4+ownking:2/3/7+oppking:2/3/7", 64),
         ] {
             let spec: BucketSpec = s.parse().unwrap();
             assert_eq!(spec.num_buckets(), n);
             assert_eq!(spec.to_string(), s);
+            assert_eq!(spec.to_string().parse::<BucketSpec>().unwrap(), spec);
         }
         for s in [
             "",
@@ -253,12 +256,29 @@ mod tests {
             "ownking:2/2",
             "ownking:2/",
             "ownking:-1",
-            "handmajor4+ownking:2/3/4/5/6/7/8/9",
-            "handmajor3+handmajor3+handmajor3",
+            "handmajor4+ownking:2/3/7+oppking:2/3/4/7",
+            "ownking:2+oppking:2+ownking:3+oppking:3",
             "+handmajor3",
             "handmajor3+",
         ] {
             assert!(s.parse::<BucketSpec>().is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn three_axes_route_left_to_right() {
+        let spec: BucketSpec = "handmajor4+ownking:2/3/7+oppking:2/3/7".parse().unwrap();
+        for (placement, own, opp) in [
+            ("9/4k4/9/9/9/9/9/9/4K4", 0, 1),
+            ("9/9/9/9/9/9/4k4/4K4/9", 1, 3),
+            ("4K4/9/9/9/9/9/9/9/4k4", 3, 3),
+        ] {
+            for (hand, black, white) in [("-", 0, 0), ("R", 1, 2), ("r", 2, 1), ("Rb", 3, 3)] {
+                let b = fixture(&format!("{placement} b {hand} 1"));
+                let w = fixture(&format!("{placement} w {hand} 1"));
+                assert_eq!(spec.bucket_board(&b), black * 16 + own * 4 + opp);
+                assert_eq!(spec.bucket_board(&w), white * 16 + opp * 4 + own);
+            }
         }
     }
 

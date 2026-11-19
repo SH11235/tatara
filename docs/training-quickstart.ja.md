@@ -64,7 +64,7 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 ## 例 2: LayerStack NNUE を学習
 
 `layerstack` の既定の bucket mode `progresskpabs` は
-局面進行度を 1–32 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
+局面進行度を 1–64 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
 学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
 `progresskpabsq16` は同じ `progress.bin` と bucket 数を使い、係数を整数
@@ -96,11 +96,12 @@ KingRank9 を使う場合は末尾を次のように置き換える:
 `layerstack` は既定で `--feature-set halfka-hm-merged` / 8 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
 
 `--bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'` は局面の属性で
-出力を 16 bucket に分ける。1〜2 軸を `+` で結び、左の軸を上位桁とする。
+出力を 16 bucket に分ける。1〜3 軸を `+` で結び、左端の軸を最上位桁とする。
+たとえば `handmajor4+ownking:2/3/7+oppking:2/3/7` は 64 bucket に分ける。
 `ownking` / `oppking` は各玉の自陣最下段を 1 とした段で、cut 以下ではなく
 **cut 以上**の値を次の帯に入れる。`ownking:2/3` は 1、2、3〜9 の 3 帯。
 `handmajor3` は双方に手駒の飛角が無い／双方にある=0、手番側だけ=1、相手だけ=2。
-`handmajor4` は双方にある場合を 3 に分ける。bucket 数は軸の帯数の積 (最大 32) で、
+`handmajor4` は双方にある場合を 3 に分ける。bucket 数は軸の帯数の積 (最大 64) で、
 `--num-buckets` を指定する場合は一致が必要。`--progress-coeff` は併用できない。
 
 `--init-from <net.bin> --init-ft-only --freeze-ft` で FT (Threat・PSQT を含む) を
@@ -171,7 +172,7 @@ i8x2 の丸めでゼロになります。FT を再学習してから i8x2 の初
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
 | `--bucket-mode` (`layerstack`) | progresskpabs | `progresskpabs` は KP-absolute 進行度で routing する。`progresskpabsq16` は同じ進行度を Q16 整数演算で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
-| `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[1, 32]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
+| `--num-buckets` (`layerstack`) | 8(`kingrank9` は 9) | `progresskpabs` / `progresskpabsq16` では `[1, 64]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定。9 bucket の checkpoint / `.bin` から `--resume` / `--init-from` するときは `--num-buckets 9` を指定する |
 
 ### 学習局面の間引き
 

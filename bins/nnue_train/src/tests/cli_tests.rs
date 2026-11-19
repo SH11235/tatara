@@ -2383,6 +2383,7 @@ fn bucket_spec_cli_validation() {
         ("ownking:2/3+oppking:2/3", 9),
         ("ownking:2/3/7+oppking:2/3/7", 16),
         ("handmajor4+ownking:2/3/4/5/6/7/8", 32),
+        ("handmajor4+ownking:2/3/7+oppking:2/3/7", 64),
     ] {
         let cli = Cli::try_parse_from([
             "nnue-train",
@@ -2428,16 +2429,20 @@ fn bucket_spec_cli_validation() {
         "--bucket-mode",
         "spec",
         "--bucket-spec",
-        "handmajor4+ownking:2/3/4/5/6/7/8/9",
+        "handmajor4+ownking:2/3/7+oppking:2/3/4/7",
     ])
-    .expect_err("36 buckets exceed the spec limit")
+    .expect_err("80 buckets exceed the spec limit")
     .to_string();
     assert!(
-        too_many.contains("bucket spec needs 36 buckets; maximum is 32"),
+        too_many.contains("bucket spec needs 80 buckets; maximum is 64"),
         "{too_many}"
     );
+    for mode in ["progresskpabs", "progresskpabsq16"] {
+        let args = layerstack_args(&["--bucket-mode", mode, "--num-buckets", "64"]);
+        assert!(validate_bucket_mode(&args).is_ok());
+    }
     for (options, range) in [
-        (vec!["--num-buckets", "33"], "[1, 32]"),
+        (vec!["--num-buckets", "65"], "[1, 64]"),
         (
             vec![
                 "--bucket-mode",
@@ -2445,16 +2450,16 @@ fn bucket_spec_cli_validation() {
                 "--bucket-spec",
                 "ownking:2/3/7+oppking:2/3/7",
                 "--num-buckets",
-                "33",
+                "65",
             ],
-            "[2, 32]",
+            "[2, 64]",
         ),
     ] {
         let err = validate_bucket_mode(&layerstack_args(&options))
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("must be in {range}")), "{err}");
-        assert!(err.contains("got 33"), "{err}");
+        assert!(err.contains("got 65"), "{err}");
     }
     assert!(Cli::try_parse_from(["nnue-train", "--init-ft-only", "layerstack"]).is_err());
 }
@@ -2467,9 +2472,9 @@ fn bucket_spec_eval_inherits_bin_metadata() {
         4,
         4,
         4,
-        16,
+        64,
     );
-    let spec = "ownking:2/3/7+oppking:2/3/7";
+    let spec = "handmajor4+ownking:2/3/7+oppking:2/3/7";
     weights.bucket_spec = Some(spec.parse().unwrap());
     weights
         .save_quantised(&mut std::fs::File::create(&path).unwrap(), None)
@@ -2486,7 +2491,7 @@ fn bucket_spec_eval_inherits_bin_metadata() {
     let ArchCommand::LayerStack(args) = &cli.arch else {
         panic!()
     };
-    assert_eq!(args.num_buckets(), 16);
+    assert_eq!(args.num_buckets(), 64);
     assert_eq!(args.bucket_spec.unwrap().to_string(), spec);
     assert!(matches!(
         validate_bucket_mode(args).unwrap(),

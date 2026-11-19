@@ -1709,8 +1709,8 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value = "progresskpabs")]
     pub(crate) bucket_mode: String,
 
-    /// Position bucket axes, e.g. handmajor3+ownking:2/3 or ownking:2/3+oppking:2/3.
-    /// One or two axes; left axis is most significant. At most 32 buckets.
+    /// One to three position bucket axes joined by +, with the leftmost axis most significant.
+    /// At most 64 buckets, e.g. handmajor4+ownking:2/3/7+oppking:2/3/7.
     /// King-rank cuts are increasing integers in [1, 9], measured from each king's home rank.
     /// handmajor3 merges neither/both sides holding a rook or bishop; handmajor4 separates them.
     #[arg(long, required_if_eq("bucket_mode", "spec"))]
@@ -1742,7 +1742,7 @@ pub(crate) struct LayerstackArgs {
 
     /// LayerStack output bucket count. In progresskpabs mode, each position is
     /// routed to `min(N-1, floor(p * N))` (progresskpabsq16 uses the same split
-    /// in integer logit space) and N must be in `[1, 32]`; the default is 8. In
+    /// in integer logit space) and N must be in `[1, 64]`; the default is 8. In
     /// kingrank9 mode the default is 9 and any other value is rejected.
     /// Resuming or initializing from a 9-bucket checkpoint
     /// in a progress mode needs `--num-buckets 9`; the bucket count is checked
