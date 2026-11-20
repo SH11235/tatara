@@ -184,7 +184,7 @@ i8x2 の丸めでゼロになります。FT を再学習してから i8x2 の初
 | `--keep-rate R` | 1 | 採る確率。有限値で `0 < R <= 1` |
 | `--min-ply N` | なし | PSV の `game_ply <= N` を捨てる。HCPE では指定不可 |
 | `--ply-keep-curve POINTS` | なし | `手数:確率` をカンマで区切る。手数は非負・昇順、確率は `[0,1]`。HCPE では指定不可 |
-| `--bucket-keep-rates r0,r1,...` | なし | LayerStack の bucket 順に `[0,1]` の確率を指定。個数は bucket 数と一致させる。simple arch では指定不可 |
+| `--bucket-keep-rates r0,r1,...` | なし | 間引き用 bucket 順に `[0,1]` の確率を指定。既定は LayerStack のルーティング bucket |
 | `--skip-seed N` | 0 | 状態を持たない採否判定の固定 seed |
 
 例: `--keep-rate 0.25 --min-ply 18 --ply-keep-curve
@@ -193,17 +193,51 @@ i8x2 の丸めでゼロになります。FT を再学習してから i8x2 の初
 各確率を掛け合わせ、score のフィルタも通った局面だけを使います。
 採否は seed・教師 ID・0 始まりの epoch・物理 record 番号のハッシュで決めます。
 複数の `--data` は指定順につないだ教師 ID 0 の一本の stream として扱い、
-`--mix-data` の教師 ID は指定順に 1, 2, ... とします。間引きは全教師に適用します。
+`--mix-data` の教師 ID は指定順に 1, 2, ... とします。
 shuffle の窓や `--threads >= 2` の decode 順に採否は依存しません。
 bucket の判定は並列 decode worker で行い、特徴抽出にも同じ盤面を使います。
 捨てた分は次の record で補い、batch の件数を保ちます。
 5 周連続で採用がゼロなら error になります。
 間引きのオプションを一つでも指定したときだけ、各 superbatch に教師ごとと全体の累積 `read` / `kept` を出します。
-bucket 間引きを指定すると、bucket ごとに reader のフィルタを通過して decode した局面数と、
-採用した局面数も出します。bucket のフィルタを通さない局面も、両方の数に含めます。
+ルーティング bucket で間引く場合は、bucket ごとに reader のフィルタを通過して decode した局面数と、
+採用した局面数も出します。集計対象のマーク付き局面は両方の数に含めます。
 先読み済みの局面も含みます。設定は `experiment.json` の `params.sampling` に保存し、
 recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）の場合だけ省略し、
 既存の recipe fingerprint を維持します。
+
+#### ルーティングと別の bucket で間引く
+
+玉段でルーティングしながら進行度で間引くには、次のように指定します。
+
+```bash
+nnue-train --data teacher.psv \
+  --keep-progress-coeff progress.bin --keep-num-buckets 8 \
+  --bucket-keep-rates 1,1,1,1,0.9,0.7,0.5,0.3 \
+  layerstack --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
+```
+
+spec を使って間引く場合は、たとえば `--keep-bucket-spec 'handmajor3'` に
+3 個の採用確率を渡します。spec では定義から bucket 数が決まります。進行度では
+既定 8、指定範囲は 1〜64 です。独立した定義は `simple` でも使えます。
+[分布調査ツール](progress-bin.ja.md) では教師の分布とルーティング bucket との
+クロス集計を確認できます。
+
+追加教師も同じ設定を継承し、数値の `--mix-keep-rate` を指定した教師はその確率を使います。
+`--monitor-keep-buckets` を指定すると、独立した定義を使う教師の読み込み件数と
+採用件数を bucket ごとに正確に数え、`[sampling]` の `keep_bucket` 行に出力します。
+省略時は、同じハッシュから得た乱数値と採用確率の最小値・最大値で採否が確定する局面の
+bucket 計算を省きます。PSV では全 bucket で棄却が確定した局面の decode も省きます。
+正確な集計を有効にすると reader のフィルタを通過した全局面の bucket を計算し、
+採否の判定には同じ乱数値を使います。
+`[teacher-mix]` には間引き後にバッチへ入った局面の割合が出ます。通常局面は
+`--min-ply` を通過した後、bucket の確率、`--keep-rate`、手数曲線の確率を
+掛け合わせます。`--tree-sample-eval-only` のマーク付き局面は
+`--tree-sample-accept` に従います。dual-label PSV はどちらのラベルを使う場合も
+盤面が同じなら同じ bucket に入ります。
+
+`experiment.json` の `params.sampling.keep_bucket` に spec または進行度係数の
+ファイル名と bucket 数を記録します。保存した入力位置からの再開時には、間引きの定義と
+進行度係数の内容を照合します。
 
 ### 別の教師を割合を決めて混ぜる
 

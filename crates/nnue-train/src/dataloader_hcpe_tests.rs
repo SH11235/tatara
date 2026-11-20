@@ -208,7 +208,16 @@ fn corrupt_middle_hcpe_record_wakes_ordered_multi_worker_delivery() {
     let mut bytes = std::fs::read(fixture("sample.hcpe")).unwrap();
     bytes[30 * 38..30 * 38 + 32].fill(0xff);
     std::fs::write(&path, &bytes).unwrap();
-    for bucket_keep_rates in [None, Some(vec![0.5; 9])] {
+    for (bucket_keep_rates, keep_bucket) in [
+        (None, None),
+        (Some(vec![0.5; 9]), None),
+        (
+            Some(vec![0.0; 3]),
+            Some(crate::sampling::KeepBucket::Spec {
+                spec: "handmajor3".into(),
+            }),
+        ),
+    ] {
         let path = path.clone();
         let bytes = bytes.clone();
         let (tx, rx) = mpsc::channel();
@@ -231,6 +240,7 @@ fn corrupt_middle_hcpe_record_wakes_ordered_multi_worker_delivery() {
                 0,
                 crate::sampling::Sampling {
                     bucket_keep_rates,
+                    keep_bucket,
                     ..Default::default()
                 },
             )

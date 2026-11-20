@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,33 +9,147 @@ pub struct Sampling {
     /// Runtime logging opt-in, excluded from sampling decisions and recipe identity.
     #[serde(skip)]
     pub log_enabled: bool,
+    #[serde(skip)]
+    pub monitor_keep_buckets: bool,
     pub keep_rate: f64,
     #[serde(skip_serializing_if = "is_one")]
     pub tree_sample_accept: f64,
     pub min_ply: Option<u16>,
     pub ply_keep_curve: Vec<(f64, f64)>,
     pub bucket_keep_rates: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_bucket: Option<KeepBucket>,
     pub skip_seed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum KeepBucket {
+    Spec {
+        spec: String,
+    },
+    ProgressKpAbs {
+        progress_coeff: PathBuf,
+        num_buckets: usize,
+    },
+}
+
+pub(crate) enum KeepBucketEvaluator {
+    Spec(shogi_features::BucketSpec),
+    ProgressKpAbs(shogi_features::progress_kpabs::ProgressKpAbsModel, usize),
+}
+
+pub struct PreparedKeepBucket {
+    pub(crate) definition: KeepBucket,
+    pub(crate) evaluator: KeepBucketEvaluator,
+    pub(crate) identity: serde_json::Value,
+}
+
+impl KeepBucketEvaluator {
+    pub(crate) fn bucket(&self, board: &shogi_format::ShogiBoard) -> u8 {
+        match self {
+            Self::Spec(spec) => spec.bucket_board(board),
+            Self::ProgressKpAbs(model, count) => model.bucket_board(board, *count),
+        }
+    }
+}
+
+impl KeepBucket {
+    fn num_buckets(&self) -> io::Result<usize> {
+        match self {
+            Self::Spec { spec } => spec
+                .parse::<shogi_features::BucketSpec>()
+                .map(|spec| spec.num_buckets())
+                .map_err(io::Error::other),
+            Self::ProgressKpAbs { num_buckets, .. } => {
+                if !(1..=shogi_features::MAX_LAYERSTACK_BUCKETS).contains(num_buckets) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "--keep-num-buckets must be in [1, {}]",
+                            shogi_features::MAX_LAYERSTACK_BUCKETS
+                        ),
+                    ));
+                }
+                Ok(*num_buckets)
+            }
+        }
+    }
+
+    fn prepare(&self) -> io::Result<PreparedKeepBucket> {
+        let (evaluator, identity) = match self {
+            Self::Spec { spec } => {
+                let spec: shogi_features::BucketSpec = spec.parse().map_err(io::Error::other)?;
+                (
+                    KeepBucketEvaluator::Spec(spec),
+                    serde_json::json!({
+                        "independent": true,
+                        "mode": format!("spec:{spec}"),
+                        "count": spec.num_buckets(),
+                    }),
+                )
+            }
+            Self::ProgressKpAbs {
+                progress_coeff,
+                num_buckets,
+            } => {
+                let bytes = std::fs::read(progress_coeff).map_err(|err| {
+                    io::Error::new(err.kind(), format!("{}: {err}", progress_coeff.display()))
+                })?;
+                let model = shogi_features::progress_kpabs::ProgressKpAbsModel::from_bytes(&bytes)
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{}: {err}", progress_coeff.display()),
+                        )
+                    })?;
+                (
+                    KeepBucketEvaluator::ProgressKpAbs(model, *num_buckets),
+                    serde_json::json!({
+                        "independent": true,
+                        "mode": "progresskpabs",
+                        "count": num_buckets,
+                        "progress_coeff": crate::loader_state::artifact_bytes_identity(&bytes),
+                    }),
+                )
+            }
+        };
+        Ok(PreparedKeepBucket {
+            definition: self.clone(),
+            evaluator,
+            identity,
+        })
+    }
 }
 
 impl Default for Sampling {
     fn default() -> Self {
         Self {
             log_enabled: false,
+            monitor_keep_buckets: false,
             keep_rate: 1.0,
             tree_sample_accept: 1.0,
             min_ply: None,
             ply_keep_curve: Vec::new(),
             bucket_keep_rates: None,
+            keep_bucket: None,
             skip_seed: 0,
         }
     }
 }
 
 impl Sampling {
+    pub fn prepare_keep_bucket(&self) -> io::Result<Option<PreparedKeepBucket>> {
+        self.keep_bucket
+            .as_ref()
+            .map(KeepBucket::prepare)
+            .transpose()
+    }
+
     pub fn is_default(&self) -> bool {
         let mut effective = self.clone();
         effective.log_enabled = false;
+        effective.monitor_keep_buckets = false;
         effective == Self::default()
     }
 
@@ -87,12 +201,21 @@ impl Sampling {
                 "--ply-keep-curve needs increasing finite nonnegative plies and probabilities in [0, 1]",
             ));
         }
+        if self.keep_bucket.is_some() && self.bucket_keep_rates.is_none() {
+            return Err(error(
+                "a sampling bucket definition requires --bucket-keep-rates",
+            ));
+        }
         if let Some(rates) = &self.bucket_keep_rates {
-            if !compute_bucket {
+            let num_buckets = if let Some(definition) = &self.keep_bucket {
+                definition.num_buckets()?
+            } else if !compute_bucket {
                 return Err(error(
                     "--bucket-keep-rates requires a LayerStack bucket path",
                 ));
-            }
+            } else {
+                num_buckets
+            };
             if rates.len() != num_buckets || rates.iter().any(|&r| !valid_rate(r)) {
                 return Err(error(
                     "--bucket-keep-rates must contain one finite probability in [0, 1] per bucket",
@@ -131,9 +254,12 @@ impl Sampling {
         if probability <= 0.0 {
             return false;
         }
+        self.draw(teacher, epoch, record) < probability
+    }
+
+    pub(crate) fn draw(&self, teacher: u64, epoch: u64, record: u64) -> f64 {
         let hash = mix(mix(mix(mix(self.skip_seed) ^ teacher) ^ epoch) ^ record);
-        let uniform = (hash >> 11) as f64 * (1.0 / ((1u64 << 53) as f64));
-        uniform < probability
+        (hash >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
     }
 }
 

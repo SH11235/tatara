@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use crate::dataloader::TeacherPosition;
 
 pub fn artifact_identity(path: &Path) -> io::Result<serde_json::Value> {
+    Ok(artifact_bytes_identity(&std::fs::read(path)?))
+}
+
+pub(crate) fn artifact_bytes_identity(bytes: &[u8]) -> serde_json::Value {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
+    let digest = Sha256::digest(bytes);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(serde_json::json!({"bytes": bytes.len(), "sha256": hex}))
+    serde_json::json!({"bytes": bytes.len(), "sha256": hex})
 }
 
 /// How `--resume` treats the teacher input positions saved next to the checkpoint.

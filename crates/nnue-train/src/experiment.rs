@@ -175,10 +175,30 @@ impl SamplingParams {
         if !tree_sample_eval_only {
             sampling.tree_sample_accept = 1.0;
         }
+        if let Some(crate::sampling::KeepBucket::ProgressKpAbs { progress_coeff, .. }) =
+            &mut sampling.keep_bucket
+            && let Some(name) = progress_coeff.file_name()
+        {
+            *progress_coeff = name.into();
+        }
         Self {
             tree_sample_eval_only,
             sampling: (!sampling.is_default()).then(|| sampling.settings(tree_sample_eval_only)),
         }
+    }
+
+    pub fn with_prepared_keep_bucket(
+        tree_sample_eval_only: bool,
+        sampling: crate::sampling::Sampling,
+        prepared: Option<&crate::sampling::PreparedKeepBucket>,
+    ) -> Self {
+        let mut params = Self::new(tree_sample_eval_only, sampling);
+        if let Some(identity) = prepared.and_then(|bucket| bucket.identity.get("progress_coeff"))
+            && let Some(settings) = &mut params.sampling
+        {
+            settings["keep_bucket"]["progress_coeff_identity"] = identity.clone();
+        }
+        params
     }
 }
 
@@ -845,6 +865,51 @@ mod tests {
             params.sampling = SamplingParams::new(false, sampling);
             assert_ne!(recipe_fingerprint(&params, "teacher.psv"), original);
         }
+    }
+
+    #[test]
+    fn independent_sampling_params_fingerprint_the_loaded_coefficients() {
+        use crate::sampling::{KeepBucket, Sampling};
+
+        let root = tempfile::tempdir().unwrap();
+        let progress_coeff = root.path().join("progress.bin");
+        let mut bytes =
+            vec![0; size_of::<f64>() * shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
+        std::fs::write(&progress_coeff, &bytes).unwrap();
+        let sampling = Sampling {
+            keep_bucket: Some(KeepBucket::ProgressKpAbs {
+                progress_coeff: progress_coeff.clone(),
+                num_buckets: 8,
+            }),
+            bucket_keep_rates: Some(vec![0.5; 8]),
+            ..Default::default()
+        };
+        let first = sampling.prepare_keep_bucket().unwrap();
+        let first_identity = crate::loader_state::artifact_bytes_identity(&bytes);
+        bytes[..size_of::<f64>()].copy_from_slice(&1.0_f64.to_le_bytes());
+        std::fs::write(&progress_coeff, &bytes).unwrap();
+        let changed = sampling.prepare_keep_bucket().unwrap();
+
+        let mut params = sample_params();
+        params.sampling =
+            SamplingParams::with_prepared_keep_bucket(false, sampling.clone(), first.as_ref());
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["sampling"]["keep_bucket"],
+            serde_json::json!({
+                "mode": "progresskpabs",
+                "num_buckets": 8,
+                "progress_coeff": "progress.bin",
+                "progress_coeff_identity": first_identity,
+            }),
+        );
+        let fingerprint = recipe_fingerprint(&params, "teacher.psv");
+        params.sampling =
+            SamplingParams::with_prepared_keep_bucket(false, sampling, changed.as_ref());
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["sampling"]["keep_bucket"]["progress_coeff_identity"],
+            crate::loader_state::artifact_bytes_identity(&bytes),
+        );
+        assert_ne!(fingerprint, recipe_fingerprint(&params, "teacher.psv"));
     }
 
     #[test]

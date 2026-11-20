@@ -1,4 +1,6 @@
-use nnue_train::dataloader::{BucketMode, BucketedPrefetchedLoader};
+use nnue_train::dataloader::{
+    BucketMode, BucketedLoaderOptions, BucketedPrefetchedLoader, LabelOptions,
+};
 use sha2::{Digest, Sha256};
 use shogi_features::FeatureSet;
 
@@ -44,34 +46,58 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
             cli.teacher_shuffle_seed
         )
     );
-    let mut loader = BucketedPrefetchedLoader::spawn_with_score_sources(
+    let sampling = cli.sampling();
+    if let Some(definition) = &sampling.keep_bucket {
+        println!(
+            "[digest] keep_bucket={}",
+            serde_json::to_string(definition)?
+        );
+    }
+    let mut loader = BucketedPrefetchedLoader::spawn_with_mixing(
         data,
-        cli.batch_size,
-        cli.score_drop_abs,
-        cli.score_clamp_abs,
-        1,
-        BucketMode::ProgressKpAbs,
-        feature_set,
-        false,
-        1,
-        file_size,
-        false,
-        nnue_train::dataloader::LabelOptions {
-            score_source: cli.score_source(),
-            tree_sample_eval_only: cli.tree_sample_eval_only,
+        BucketedLoaderOptions {
+            sampling,
+            batch_size: cli.batch_size,
+            score_drop_abs: cli.score_drop_abs,
+            score_clamp_abs: cli.score_clamp_abs,
+            num_workers: 1,
+            bucket_mode: args
+                .routing_bucket_spec
+                .map_or(BucketMode::ProgressKpAbs, BucketMode::Spec),
+            feature_set,
+            compute_bucket: args.routing_bucket_spec.is_some(),
+            num_buckets: args
+                .routing_bucket_spec
+                .map_or(1, |spec| spec.num_buckets()),
+            train_end_offset: file_size,
+            monitor_active: false,
+            labels: LabelOptions {
+                score_source: cli.score_source(),
+                tree_sample_eval_only: cli.tree_sample_eval_only,
+            },
+            teacher_shuffle_buffer_mib,
+            teacher_shuffle,
+            teacher_shuffle_seed: cli.teacher_shuffle_seed,
         },
-        teacher_shuffle_buffer_mib,
-        teacher_shuffle,
-        cli.teacher_shuffle_seed,
-        cli.sampling(),
+        &cli.mix_sources(),
+        cli.mix_seed,
     )?;
 
     let mut hasher = Sha256::new();
     let mut positions = 0_usize;
+    let start_time = std::time::Instant::now();
     for _ in 0..args.batches {
         let (batch, buckets) = loader
             .next_batch()?
             .ok_or("dataloader ended before the requested batch count")?;
+        positions += batch.n_positions;
+        if args.throughput_only {
+            loader.recycle((batch, buckets));
+            continue;
+        }
+        for bucket in &buckets {
+            hasher.update(bucket.to_le_bytes());
+        }
         for position in 0..batch.n_positions {
             hasher.update(batch.score[position].to_le_bytes());
             hasher.update(batch.wdl[position].to_le_bytes());
@@ -85,10 +111,18 @@ pub(crate) fn run(cli: &Cli, args: &LoaderDigestArgs) -> Result<(), Box<dyn std:
                 hasher.update(index.to_le_bytes());
             }
         }
-        positions += batch.n_positions;
         loader.recycle((batch, buckets));
     }
 
+    if args.throughput_only {
+        let seconds = start_time.elapsed().as_secs_f64();
+        println!(
+            "batches={} positions={positions} seconds={seconds:.3} positions_per_second={:.0}",
+            args.batches,
+            positions as f64 / seconds,
+        );
+        return Ok(());
+    }
     let digest = hasher.finalize();
     let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     println!(

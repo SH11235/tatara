@@ -652,9 +652,21 @@ pub(crate) struct Cli {
     /// Training PSV ply probabilities, e.g. "0:0.025,22:0.05,32:1"; linear between points, constant outside.
     #[arg(long, global = true)]
     pub(crate) ply_keep_curve: Option<nnue_train::sampling::PlyKeepCurve>,
-    /// Training keep probabilities per LayerStack bucket; parallel decode with ordered, full-batch assembly and per-bucket counts.
-    #[arg(long, value_delimiter = ',', global = true)]
+    /// Keep probabilities in bucket order, one per bucket. Uses LayerStack routing by default.
+    #[arg(long, global = true, value_delimiter = ',')]
     pub(crate) bucket_keep_rates: Option<Vec<f64>>,
+    /// Group positions for thinning by a bucket spec, such as ownking:2/3/7+oppking:2/3/7.
+    #[arg(long, global = true)]
+    pub(crate) keep_bucket_spec: Option<shogi_features::BucketSpec>,
+    /// Thin by game progress using a progress.bin coefficient file.
+    #[arg(long, global = true)]
+    pub(crate) keep_progress_coeff: Option<PathBuf>,
+    /// Number of game-progress buckets for thinning (1–64, default: 8).
+    #[arg(long, global = true)]
+    pub(crate) keep_num_buckets: Option<usize>,
+    /// Log exact reads and survivors by sampling bucket. Independent bucket definitions otherwise only compute a bucket when needed to decide whether to keep a position.
+    #[arg(long, global = true)]
+    pub(crate) monitor_keep_buckets: bool,
     /// Stateless training sampling seed (default: 0), combined with teacher ID, epoch and physical record index.
     #[arg(long, global = true)]
     pub(crate) skip_seed: Option<u64>,
@@ -1308,8 +1320,21 @@ impl Cli {
     }
 
     pub(crate) fn validate_score_sources(&self) -> Result<(), String> {
+        // Sampling flags can be split across the subcommand. Check the merged global values.
+        if self.keep_bucket_spec.is_some() && self.keep_progress_coeff.is_some() {
+            return Err("--keep-bucket-spec conflicts with --keep-progress-coeff".into());
+        }
+        if self.keep_num_buckets.is_some() && self.keep_progress_coeff.is_none() {
+            return Err("--keep-num-buckets requires --keep-progress-coeff".into());
+        }
+        if self.monitor_keep_buckets && self.bucket_keep_rates.is_none() {
+            return Err("--monitor-keep-buckets requires --bucket-keep-rates".into());
+        }
         let (compute_bucket, num_buckets) = match &self.arch {
             ArchCommand::LayerStack(args) => (true, args.num_buckets()),
+            ArchCommand::LoaderDigest(args) if let Some(spec) = args.routing_bucket_spec => {
+                (true, spec.num_buckets())
+            }
             _ => (false, 1),
         };
         let has_ply = !self
@@ -1347,11 +1372,14 @@ impl Cli {
             }
             if !matches!(
                 self.arch,
-                ArchCommand::LayerStack(_) | ArchCommand::Simple(_)
+                ArchCommand::LayerStack(_) | ArchCommand::Simple(_) | ArchCommand::LoaderDigest(_)
             ) || self.threat_norm_dump
                 || self.threat_ablate.is_some()
             {
-                return Err("--mix-data requires a training run (simple or layerstack)".into());
+                return Err(
+                    "--mix-data requires a training run (simple or layerstack) or loader-digest"
+                        .into(),
+                );
             }
             nnue_train::dataloader::validate_mix_sources(&self.mix_sources())
                 .map_err(|error| error.to_string())?;
@@ -1559,6 +1587,12 @@ pub(crate) struct LoaderDigestArgs {
     /// Number of full batches to include in the digest.
     #[arg(long)]
     pub(crate) batches: usize,
+    /// Compute LayerStack routing indices with this bucket spec.
+    #[arg(long)]
+    pub(crate) routing_bucket_spec: Option<shogi_features::BucketSpec>,
+    /// Time batch loading without hashing the features.
+    #[arg(long)]
+    pub(crate) throughput_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1980,6 +2014,7 @@ impl Cli {
                 || self.bucket_keep_rates.is_some()
                 || self.skip_seed.is_some()
                 || self.tree_sample_accept.is_some(),
+            monitor_keep_buckets: self.monitor_keep_buckets,
             keep_rate: self.keep_rate.unwrap_or(1.0),
             tree_sample_accept: self.tree_sample_accept.unwrap_or(1.0),
             min_ply: self.min_ply,
@@ -1989,6 +2024,19 @@ impl Cli {
                 .map(|curve| curve.0.clone())
                 .unwrap_or_default(),
             bucket_keep_rates: self.bucket_keep_rates.clone(),
+            keep_bucket: self
+                .keep_bucket_spec
+                .map(|spec| nnue_train::sampling::KeepBucket::Spec {
+                    spec: spec.to_string(),
+                })
+                .or_else(|| {
+                    self.keep_progress_coeff.as_ref().map(|path| {
+                        nnue_train::sampling::KeepBucket::ProgressKpAbs {
+                            progress_coeff: path.clone(),
+                            num_buckets: self.keep_num_buckets.unwrap_or(8),
+                        }
+                    })
+                }),
             skip_seed: self.skip_seed.unwrap_or(0),
         }
     }

@@ -2650,3 +2650,136 @@ fn ft_i8x2_cli_rejects_rescore_and_threat_norm_dump() {
         );
     }
 }
+
+#[test]
+fn independent_keep_bucket_cli_validates_definition_and_rate_count() {
+    let parse = |flags: &[&str]| {
+        let mut argv = vec!["nnue-train", "simple"];
+        argv.extend_from_slice(flags);
+        Cli::try_parse_from(argv)
+    };
+    assert!(
+        parse(&[
+            "--keep-bucket-spec",
+            "unknown",
+            "--bucket-keep-rates",
+            "1,1,1",
+        ])
+        .is_err()
+    );
+    for flags in [
+        &["--keep-bucket-spec", "handmajor3"][..],
+        &["--keep-progress-coeff", "progress.bin"],
+        &["--monitor-keep-buckets"],
+        &["--keep-num-buckets", "4", "--bucket-keep-rates", "1,1,1,1"],
+        &[
+            "--keep-bucket-spec",
+            "handmajor3",
+            "--keep-progress-coeff",
+            "progress.bin",
+            "--bucket-keep-rates",
+            "1,1,1",
+        ],
+        &[
+            "--keep-bucket-spec",
+            "handmajor3",
+            "--bucket-keep-rates",
+            "1,1",
+        ],
+        &[
+            "--keep-progress-coeff",
+            "progress.bin",
+            "--keep-num-buckets",
+            "65",
+            "--bucket-keep-rates",
+            "1",
+        ],
+    ] {
+        assert!(
+            parse(flags).unwrap().validate_score_sources().is_err(),
+            "{flags:?}"
+        );
+    }
+    for flags in [
+        &[
+            "--keep-bucket-spec",
+            "handmajor3",
+            "--bucket-keep-rates",
+            "1,0.2,0.3",
+        ][..],
+        &[
+            "--keep-progress-coeff",
+            "progress.bin",
+            "--keep-num-buckets",
+            "2",
+            "--bucket-keep-rates",
+            "1,0.5",
+        ],
+    ] {
+        assert!(
+            parse(flags).unwrap().validate_score_sources().is_ok(),
+            "{flags:?}"
+        );
+    }
+    let monitored = parse(&[
+        "--keep-bucket-spec",
+        "handmajor3",
+        "--bucket-keep-rates",
+        "1,0.2,0.3",
+        "--monitor-keep-buckets",
+    ])
+    .unwrap();
+    assert!(monitored.sampling().monitor_keep_buckets);
+}
+
+#[test]
+fn independent_progress_bucket_cli_accepts_split_count_and_coefficient() {
+    let coeff_and_rates = [
+        "--keep-progress-coeff",
+        "progress.bin",
+        "--bucket-keep-rates",
+        "1,0.5",
+    ];
+    let count = ["--keep-num-buckets", "2"];
+    for (before, after) in [
+        (coeff_and_rates.as_slice(), count.as_slice()),
+        (count.as_slice(), coeff_and_rates.as_slice()),
+    ] {
+        let cli = Cli::try_parse_from(
+            ["nnue-train"]
+                .into_iter()
+                .chain(before.iter().copied())
+                .chain(["loader-digest", "--batches", "2"])
+                .chain(after.iter().copied()),
+        )
+        .unwrap();
+        cli.validate_score_sources().unwrap();
+        assert_eq!(
+            cli.sampling().keep_bucket,
+            Some(nnue_train::sampling::KeepBucket::ProgressKpAbs {
+                progress_coeff: "progress.bin".into(),
+                num_buckets: 2,
+            })
+        );
+    }
+}
+
+#[test]
+fn independent_keep_bucket_cli_rejects_split_conflicting_definitions() {
+    let spec = ["--keep-bucket-spec", "handmajor3"];
+    let coeff = ["--keep-progress-coeff", "/nonexistent/progress.bin"];
+    for (before, after) in [(spec, coeff), (coeff, spec)] {
+        let cli = Cli::try_parse_from(
+            ["nnue-train", "--bucket-keep-rates", "1,0.5,1"]
+                .into_iter()
+                .chain(before)
+                .chain(["loader-digest", "--batches", "1"])
+                .chain(after),
+        )
+        .unwrap();
+        assert_eq!(
+            cli.validate_score_sources().unwrap_err(),
+            "--keep-bucket-spec conflicts with --keep-progress-coeff"
+        );
+    }
+}
