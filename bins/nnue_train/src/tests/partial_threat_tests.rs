@@ -93,16 +93,17 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                 }?;
                 assert_eq!(out.to_host_vec(&stream)?, expected);
                 if half {
-                    let out_h = DeviceBuffer::<f16>::zeroed(&stream, 2 * rows)?;
+                    let out_from_fp32 =
+                        DeviceBuffer::from_host(&stream, &vec![f16::NAN; 2 * rows])?;
                     // SAFETY: same shape as the FP32-output launch.
                     unsafe {
                         cuda_launch! {
                             kernel: partial_ft_forward_fp16_out, stream: stream, module: module, config: cfg_1d(2 * rows / lanes),
-                            args: [slice(comb), slice(idx), slice(nnz_dev), slice(out_h), slice(shape_dev), 2_u64, slice(order)]
+                            args: [slice(comb), slice(idx), slice(nnz_dev), slice(out_from_fp32), slice(shape_dev), 2_u64, slice(order)]
                         }
                     }?;
                     let expected_half: Vec<f16> = expected.iter().map(|&v| v as f16).collect();
-                    assert_eq!(out_h.to_host_vec(&stream)?, expected_half);
+                    assert_eq!(out_from_fp32.to_host_vec(&stream)?, expected_half);
                     #[cfg(feature = "native")]
                     {
                         let comb_h = DeviceBuffer::<f16>::zeroed(&stream, real_n)?;
@@ -127,6 +128,8 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                             .map(f16::to_bits)
                             .collect();
                         assert_eq!(folded_bits, half_bits);
+                        let out_h = DeviceBuffer::from_host(&stream, &vec![f16::NAN; 2 * rows])?;
+                        let out_f = DeviceBuffer::from_host(&stream, &vec![f32::NAN; 2 * rows])?;
                         // SAFETY: both output arrays are sized for all ordered positions.
                         unsafe {
                             cuda_launch! {
@@ -137,11 +140,11 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                             cuda_launch! {
                                 kernel: partial_ft_forward_fp16_weights, stream: stream, module: module,
                                 config: cfg_1d(2 * rows / lanes),
-                                args: [slice(comb_h), slice(idx), slice(nnz_dev), slice(out), slice(shape_dev), 2_u64, slice(order)]
+                                args: [slice(comb_h), slice(idx), slice(nnz_dev), slice(out_f), slice(shape_dev), 2_u64, slice(order)]
                             }?;
                         }
                         assert_eq!(out_h.to_host_vec(&stream)?, expected_half);
-                        assert_eq!(out.to_host_vec(&stream)?, expected);
+                        assert_eq!(out_f.to_host_vec(&stream)?, expected);
                     }
                 }
                 let gradient: Vec<f32> = (0..2 * rows)
@@ -593,9 +596,11 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
     };
     let packed_stm = pack(&[0, 35, 35], &stm, &[0, -1, 2])?;
     let packed_nstm = pack(&[0, 35, 35], &nstm, &[2, 1, 3])?;
-    let mut dense_stm = DeviceBuffer::from_host(&stream, &[-1_i32; 120])?;
-    let mut dense_nstm = DeviceBuffer::from_host(&stream, &[-1_i32; 120])?;
-    let mut nnz = DeviceBuffer::from_host(&stream, &[35_i32, 0, 3, -1, -1, -1, -1, -1, -1])?;
+    let mut dense_stm = DeviceBuffer::from_host(&stream, &[i32::MIN; 120])?;
+    let mut dense_nstm = DeviceBuffer::from_host(&stream, &[i32::MIN; 120])?;
+    let mut counts_and_limits = [i32::MIN; 9];
+    counts_and_limits[..3].copy_from_slice(&[35, 0, 3]);
+    let mut nnz = DeviceBuffer::from_host(&stream, &counts_and_limits)?;
     // SAFETY: each warp expands a row and writes its two piece limits after the count plane.
     unsafe {
         cuda_launch! {
@@ -609,10 +614,12 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
     let dense_nstm_host = dense_nstm.to_host_vec(&stream)?;
     assert_eq!(&dense_stm_host[..35], stm);
     assert_eq!(&dense_nstm_host[..35], nstm);
-    assert_eq!(&dense_stm_host[35..80], &[-1; 45]);
-    assert_eq!(&dense_nstm_host[35..80], &[-1; 45]);
     assert_eq!(&dense_stm_host[80..83], &[0, -1, 2]);
     assert_eq!(&dense_nstm_host[80..83], &[2, 1, 3]);
+    for dense in [&dense_stm_host, &dense_nstm_host] {
+        assert_eq!(&dense[35..80], &[i32::MIN; 45]);
+        assert_eq!(&dense[83..], &[i32::MIN; 37]);
+    }
 
     let shape = DeviceBuffer::from_host(&stream, &[rows, base, 2, width, stride])?;
     let counts = DeviceBuffer::from_host(&stream, &[35_i32, 0, 3, 0, 0, 0, 0, 0, 0])?;
@@ -623,9 +630,10 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
             .map(|v| (v as f32 / 3.0 - 5.0) as f16)
             .collect::<Vec<_>>(),
     )?;
-    let expected = DeviceBuffer::<f16>::zeroed(&stream, (rows * batch) as usize)?;
-    let actual = DeviceBuffer::<f16>::zeroed(&stream, (rows * batch) as usize)?;
     for (perspective, indices) in [&dense_stm, &dense_nstm].into_iter().enumerate() {
+        let len = (rows * batch) as usize;
+        let expected = DeviceBuffer::from_host(&stream, &vec![f16::INFINITY; len])?;
+        let actual = DeviceBuffer::from_host(&stream, &vec![f16::NEG_INFINITY; len])?;
         let batch_order = u64::from(batch) | ((perspective as u64 * u64::from(batch)) << 32);
         let compact_batch_order = batch_order | crate::trainer_layerstack::PARTIAL_FT_PIECE_LIMITS;
         // SAFETY: both buffers hold the count plane, and the compact launch also has two valid limit planes.
@@ -647,7 +655,9 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
             out.to_host_vec(&stream)
                 .map(|values| values.into_iter().map(f16::to_bits).collect::<Vec<_>>())
         };
-        assert_eq!(bits(&actual)?, bits(&expected)?);
+        let actual = bits(&actual)?;
+        assert_eq!(actual, bits(&expected)?);
+        assert_eq!(&actual[rows as usize..2 * rows as usize], &[0; 16]);
     }
     Ok(())
 }

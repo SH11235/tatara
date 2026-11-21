@@ -1780,6 +1780,7 @@ pub(crate) struct GpuTrainer {
     loss_ring: AsyncLossRing,
     /// step 先頭の入力 H2D を専用 copy stream で直前 step の compute と overlap させる ring。
     input_ring: InputUploadRing,
+    input_step_poisoned: bool,
     /// L1 shared weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
@@ -2044,22 +2045,21 @@ pub(crate) struct GpuWorkspace {
     ft_order_write_ctr: DeviceBuffer<u32>, // 2 * king_buckets + 1
 
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
-    // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
-    // 毎 step `mem::swap` し、直前 step が読んでいない back 側へ次 step 入力を copy
-    // stream で先行 H2D する ([`InputUploadRing`])。
+    // Double-buffered H2D uploads packed indices into `compact_inputs` in compact mode.
+    // Expansion writes a single pair of dense buffers on the compute stream.
     stm_idx_dev: DeviceBuffer<i32>,    // batch * max_active
     nstm_idx_dev: DeviceBuffer<i32>,   // batch * max_active
-    nnz_dev: DeviceBuffer<i32>,        // counts, then STM and NSTM piece limits for compact uploads
+    nnz_dev: DeviceBuffer<i32>, // batch counts, plus STM/NSTM piece limits when compact (3 * batch)
     bucket_idx_dev: DeviceBuffer<i32>, // batch
-    score_dev: DeviceBuffer<f32>,      // batch
-    wdl_dev: DeviceBuffer<f32>,        // batch
+    score_dev: DeviceBuffer<f32>, // batch
+    wdl_dev: DeviceBuffer<f32>, // batch
     compact_inputs: Option<[(DeviceBuffer<i32>, DeviceBuffer<i32>); 2]>, // two H2D slots
-    stm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active
-    nstm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active
-    nnz_dev_back: DeviceBuffer<i32>,   // batch
+    stm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
+    nstm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
+    nnz_dev_back: DeviceBuffer<i32>, // batch, or 3 * batch with the compact piece limits
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
     score_dev_back: DeviceBuffer<f32>, // batch
-    wdl_dev_back: DeviceBuffer<f32>,   // batch
+    wdl_dev_back: DeviceBuffer<f32>, // batch
 
     // -- bucket sort scratch (fwd_L1 用 sorted layout 切換) --
     bucket_counts_dev: DeviceBuffer<u32>, // num_buckets + 1 (histogram + invalid bin)
@@ -2888,6 +2888,7 @@ impl GpuTrainer {
                 feature_set.max_active(),
                 partial_compact_h2d,
             )?,
+            input_step_poisoned: false,
             cublas: CublasHandle::new(&stream, precision.tf32)?,
             ft_fp16: precision.ft_fp16,
             ft_fp16_out: precision.ft_fp16_out,
@@ -4293,9 +4294,6 @@ impl GpuTrainer {
         // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
         // 取れないため、この粗い event timing が代替手段。
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
-        if profile_step {
-            self.stream.synchronize()?;
-        }
         let mut prof_t0 = std::time::Instant::now();
         let result = self.step_impl(
             batch,
@@ -4455,9 +4453,6 @@ impl GpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
-        // 直前の training step の GPU work 完了を待つ。検証 forward の H2D / kernel が
-        // in-flight な training compute と input buffer を取り合わないことを保証する。
-        self.stream.synchronize()?;
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         let mut prof_t0 = std::time::Instant::now();
         // lr は validate モードでは optimizer を呼ばないため未使用 (0.0 を渡す)。
@@ -4494,9 +4489,6 @@ impl GpuTrainer {
             .into());
         }
         let data = BatchData::from_batch_ref(batch, bucket_idx);
-        // 直前の GPU work 完了を待つ (validate と同じ理由: in-flight compute と
-        // input buffer を取り合わない)。
-        self.stream.synchronize()?;
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         let mut prof_t0 = std::time::Instant::now();
         let out = self.step_impl(
@@ -4545,6 +4537,15 @@ impl GpuTrainer {
         batch: &BatchData,
         options: StepOptions<'_>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        if self.input_step_poisoned {
+            return Err(
+                "a previous step failed after switching input buffers; recreate the trainer".into(),
+            );
+        }
+        if options.validate || options.profile_step {
+            self.stream.synchronize()?;
+            *options.prof_t0 = std::time::Instant::now();
+        }
         let b = batch.n_pos;
         if b == 0 {
             return Ok(StepOutput {
@@ -4578,16 +4579,24 @@ impl GpuTrainer {
             self.qat_swap();
         }
         if let Some(output) = result? {
+            self.complete_input_step()?;
             return Ok(output);
         }
         #[cfg(test)]
         if self.skip_optimizer_for_test {
+            self.complete_input_step()?;
             return Ok(StepOutput {
                 loss: 0.0,
                 net_output: Vec::new(),
             });
         }
         self.optimizer_step(&mut context)
+    }
+
+    fn complete_input_step(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.input_ring.mark_step_done(&self.stream)?;
+        self.input_step_poisoned = false;
+        Ok(())
     }
 
     fn forward(
@@ -4635,6 +4644,8 @@ impl GpuTrainer {
         // する。H2D は直前 step の compute と並走し、compute stream は H2D 完了 event を
         // 待ってから forward に進む ([`InputUploadRing`])。pageable な dataloader `Vec`
         // は ring 内の pinned host buffer 経由で copy engine の DMA に載る。
+        // A failed swap/upload sequence leaves the physical slots out of sync with the ring.
+        self.input_step_poisoned = true;
         let (upload_stm, upload_nstm) = if let Some(slots) = &mut self.ws.compact_inputs {
             slots.swap(0, 1);
             (&slots[0].0, &slots[0].1)
@@ -4668,8 +4679,9 @@ impl GpuTrainer {
         )?;
         #[cfg(feature = "native")]
         if let Some([(packed_stm, packed_nstm), _]) = &self.ws.compact_inputs {
-            // SAFETY: both packed inputs contain the same row offsets and nnz. The upload
-            // event precedes expansion, and all dense consumers run on this compute stream.
+            // SAFETY: pack_sparse_index_rows slices each stride-sized row by count, so count
+            // <= stride. Each offset + count ends within the appended values uploaded after
+            // the offset table. The compute stream waits for H2D before expansion and dense reads.
             unsafe {
                 cuda_launch! {
                     kernel: partial_ft_expand_indices, stream: self.stream, module: self.module,
@@ -7225,7 +7237,7 @@ impl GpuTrainer {
         // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の
         // event に記録する。同じ物理 input buffer を使う step+2 の H2D がこれを待ち、
         // in-flight compute が読む buffer を H2D が上書きする race を防ぐ。
-        self.input_ring.mark_step_done(&self.stream)?;
+        self.complete_input_step()?;
 
         // `loss_acc` の host への取り出しを `AsyncLossRing` 経由で async 化。
         // pinned host cell に `memcpy_dtoh_async` + event record、前 step の event を

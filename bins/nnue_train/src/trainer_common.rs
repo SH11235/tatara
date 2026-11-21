@@ -1128,7 +1128,8 @@ fn pack_sparse_index_rows(
 /// compute stream に待たせる。
 pub(crate) struct InputUploadRing {
     pub(crate) copy_stream: std::sync::Arc<CudaStream>,
-    // Compact index staging reserves one extra offset per row.
+    // pinned host staging。stm/nstm は `batch * max_active`、nnz/bucket/score/wdl は `batch`。
+    // コンパクト入力の stm/nstm は各行の offset 用に 1 要素ずつ余分に確保する。
     // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
