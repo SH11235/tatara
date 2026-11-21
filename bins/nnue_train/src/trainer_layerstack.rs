@@ -134,14 +134,8 @@ fn l1_input_gradient_fused(l1_out: usize) -> bool {
     cfg!(feature = "native") && l1_out <= FT_POST_FROM_L1_MAX_OUTPUTS
 }
 
-/// Launch shape for the `gather_and_sum_per_feature*` kernels: block `x` spans columns, block `y`
-/// spans features and the grid's `y` walks column slices. Blocks sweep every feature for one
-/// column slice before the next, so a slice narrow enough for the gradient rows of the positions
-/// in flight to stay in L2 cuts DRAM traffic; on the native backend that slice is 256 bytes of a
-/// row, with several features per block so the narrow block still fills the SM. The native f16
-/// kernel covers its 128-column slice with 64 threads, 2 columns each (it derives that from the
-/// grid). The cuda-oxide kernels index features by `blockIdx.x` alone and keep one feature per
-/// 128-column block.
+/// Native FP16 gathers two adjacent columns per thread. The cuda-oxide kernels index
+/// features by `blockIdx.x` alone and need one feature per block.
 fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> LaunchConfig {
     let (threads, features, slice) = if cfg!(feature = "native") {
         if half_gradient {
@@ -370,6 +364,7 @@ impl GpuTrainer {
         let ft_out = self.ws.ft_out;
         let (b_u32, ft_out_u32) = (b as u32, ft_out as u32);
         let (ft_in, max_active) = (self.ws.ft_in as u32, self.ws.max_active as u32);
+        let wide = self.feature_set.threat_profile().is_some() && ft_out.is_multiple_of(8);
         let config = cfg_1d(b * ft_out / 4);
         for (perspective, order_base) in [(0, 0_u32), (1, b_u32)] {
             let indices = if perspective == 0 {
@@ -393,12 +388,23 @@ impl GpuTrainer {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。`ft_order` の
                     // `[order_base, order_base + b)` は `order_base + [0, b)` の並べ替え。
-                    cuda_launch! {
-                        kernel: sparse_ft_forward_fp16_out_ordered,
-                        stream: self.stream, module: self.module, config: config,
-                        args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
-                               slice(self.ws.ft_order), slice(output), order_base,
-                               b_u32, ft_out_u32, ft_in, max_active]
+                    // The wider launch also needs rows aligned to eight halves.
+                    if wide {
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16_out_ordered_wide,
+                            stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 8),
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    } else {
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16_out_ordered,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
                     }
                 }?;
             } else {
@@ -2147,7 +2153,11 @@ impl GpuWorkspace {
         } else {
             batch * max_active
         };
-        let nnz_len = if compact_indices { 3 * batch } else { batch };
+        let nnz_len = if compact_indices && feature_set.threat_width(ft_out) != ft_out {
+            3 * batch
+        } else {
+            batch
+        };
         Ok(Self {
             len_batch: batch,
             ft_in,
@@ -2567,7 +2577,7 @@ impl GpuTrainer {
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
-        let partial_compact_h2d = cfg!(feature = "native") && width != ft_out;
+        let compact_h2d = cfg!(feature = "native") && feature_set.threat_profile().is_some();
         let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         #[cfg(not(feature = "native"))]
         if !forward_only {
@@ -2874,7 +2884,7 @@ impl GpuTrainer {
                 precision.tf32,
                 feature_set,
                 forward_only,
-                partial_compact_h2d,
+                compact_h2d,
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -2886,7 +2896,7 @@ impl GpuTrainer {
                 ctx,
                 batch_size.max(1),
                 feature_set.max_active(),
-                partial_compact_h2d,
+                compact_h2d,
             )?,
             input_step_poisoned: false,
             cublas: CublasHandle::new(&stream, precision.tf32)?,
@@ -4684,11 +4694,12 @@ impl GpuTrainer {
             // the offset table. The compute stream waits for H2D before expansion and dense reads.
             unsafe {
                 cuda_launch! {
-                    kernel: partial_ft_expand_indices, stream: self.stream, module: self.module,
+                    kernel: ft_expand_indices, stream: self.stream, module: self.module,
                     config: cfg_1d(b * 32),
                     args: [slice(packed_stm), slice(packed_nstm), slice_mut(self.ws.nnz_dev),
                            slice_mut(self.ws.stm_idx_dev), slice_mut(self.ws.nstm_idx_dev),
-                           b_u32, self.ws.max_active as u32, self.feature_set.base_ft_in() as u32]
+                           b_u32, self.ws.max_active as u32,
+                           if self.partial_threat() { self.feature_set.base_ft_in() as u32 } else { 0 }]
                 }
             }?;
         }

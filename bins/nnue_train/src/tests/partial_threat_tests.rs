@@ -604,7 +604,7 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
     // SAFETY: each warp expands a row and writes its two piece limits after the count plane.
     unsafe {
         cuda_launch! {
-            kernel: partial_ft_expand_indices, stream: stream, module: module, config: cfg_1d((batch * 32) as usize),
+            kernel: ft_expand_indices, stream: stream, module: module, config: cfg_1d((batch * 32) as usize),
             args: [slice(packed_stm), slice(packed_nstm), slice_mut(nnz),
                    slice_mut(dense_stm), slice_mut(dense_nstm), batch, stride, base]
         }
@@ -620,6 +620,21 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
         assert_eq!(&dense[35..80], &[i32::MIN; 45]);
         assert_eq!(&dense[83..], &[i32::MIN; 37]);
     }
+
+    let mut counts_only = DeviceBuffer::from_host(&stream, &counts_and_limits)?;
+    let mut stm_full = DeviceBuffer::from_host(&stream, &[i32::MIN; 120])?;
+    let mut nstm_full = DeviceBuffer::from_host(&stream, &[i32::MIN; 120])?;
+    // SAFETY: same packed rows, with piece-limit planes disabled.
+    unsafe {
+        cuda_launch! {
+            kernel: ft_expand_indices, stream: stream, module: module, config: cfg_1d((batch * 32) as usize),
+            args: [slice(packed_stm), slice(packed_nstm), slice_mut(counts_only),
+                   slice_mut(stm_full), slice_mut(nstm_full), batch, stride, 0_u32]
+        }
+    }?;
+    assert_eq!(counts_only.to_host_vec(&stream)?, counts_and_limits);
+    assert_eq!(stm_full.to_host_vec(&stream)?, dense_stm_host);
+    assert_eq!(nstm_full.to_host_vec(&stream)?, dense_nstm_host);
 
     let shape = DeviceBuffer::from_host(&stream, &[rows, base, 2, width, stride])?;
     let counts = DeviceBuffer::from_host(&stream, &[35_i32, 0, 3, 0, 0, 0, 0, 0, 0])?;
