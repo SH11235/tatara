@@ -1091,6 +1091,25 @@ impl Drop for AsyncLossRing {
     }
 }
 
+#[cfg(feature = "native")]
+fn pack_sparse_index_rows(
+    indices: &[i32],
+    nnz: &[i32],
+    stride: usize,
+    destination: &mut [std::mem::MaybeUninit<i32>],
+) -> usize {
+    assert_eq!(indices.len(), nnz.len() * stride);
+    let (offsets, values) = destination.split_at_mut(nnz.len());
+    let mut written = 0;
+    for ((row, &count), offset) in indices.chunks_exact(stride).zip(nnz).zip(offsets) {
+        let count = usize::try_from(count).expect("active index count must be nonnegative");
+        offset.write(u32::try_from(written).expect("compact index offset exceeds u32") as i32);
+        values[written..written + count].write_copy_of_slice(&row[..count]);
+        written += count;
+    }
+    nnz.len() + written
+}
+
 /// step 先頭の入力 H2D (`stm/nstm idx` + `bucket/score/wdl` の 5 buffer) を専用
 /// copy stream で発行し、直前 step の compute と overlap させる ring。
 ///
@@ -1110,6 +1129,7 @@ impl Drop for AsyncLossRing {
 pub(crate) struct InputUploadRing {
     pub(crate) copy_stream: std::sync::Arc<CudaStream>,
     // pinned host staging。stm/nstm は `batch * max_active`、nnz/bucket/score/wdl は `batch`。
+    // コンパクト入力の stm/nstm は各行の offset 用に 1 要素ずつ余分に確保する。
     // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
@@ -1124,8 +1144,9 @@ pub(crate) struct InputUploadRing {
     /// step (= 2 step 後) の H2D 前に copy stream が待ち、in-flight な compute が
     /// 読んでいる buffer を H2D が上書きする race を防ぐ。
     step_done: [CudaEvent; 2],
-    /// stm/nstm pinned の要素容量 (`batch * max_active`)。
+    /// stm/nstm pinned の要素容量。
     cap_idx: usize,
+    compact_stride: Option<usize>,
     /// nnz/bucket/score/wdl pinned の要素容量 (`batch`)。
     cap_scalar: usize,
     step: usize,
@@ -1146,8 +1167,9 @@ impl InputUploadRing {
         ctx: &std::sync::Arc<CudaContext>,
         batch: usize,
         max_active: usize,
+        compact_indices: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_inner(ctx, batch, max_active, true)
+        Self::new_inner(ctx, batch, max_active, true, compact_indices)
     }
 
     /// Simple アーキ用: bucket buffer を確保しないバリアント。Simple は bucket-less 入力
@@ -1157,7 +1179,7 @@ impl InputUploadRing {
         batch: usize,
         max_active: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_inner(ctx, batch, max_active, false)
+        Self::new_inner(ctx, batch, max_active, false, false)
     }
 
     pub(crate) fn new_inner(
@@ -1165,9 +1187,10 @@ impl InputUploadRing {
         batch: usize,
         max_active: usize,
         has_bucket: bool,
+        compact_indices: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let copy_stream = ctx.new_stream()?;
-        let cap_idx = batch.max(1) * max_active;
+        let cap_idx = batch.max(1) * (max_active + usize::from(compact_indices));
         let cap_scalar = batch.max(1);
         let pinned_bucket = if has_bucket {
             Some(alloc_pinned_host::<i32>(cap_scalar)?)
@@ -1185,6 +1208,7 @@ impl InputUploadRing {
             h2d_done: [ctx.new_event(None)?, ctx.new_event(None)?],
             step_done: [ctx.new_event(None)?, ctx.new_event(None)?],
             cap_idx,
+            compact_stride: compact_indices.then_some(max_active),
             cap_scalar,
             step: 0,
         })
@@ -1213,6 +1237,7 @@ impl InputUploadRing {
         h_score: &[f32],
         dev_wdl: &DeviceBuffer<f32>,
         h_wdl: &[f32],
+        overlap_index_staging: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             h_stm.len() <= self.cap_idx && h_nstm.len() <= self.cap_idx,
@@ -1244,33 +1269,48 @@ impl InputUploadRing {
             .pinned_bucket
             .as_ref()
             .expect("InputUploadRing::upload (LayerStack) requires bucket-enabled ring");
-        // host: Vec → pinned[slot]。
-        // SAFETY: pinned[slot] は cuMemHostAlloc で cap 要素確保した有効 host memory、
-        // 上の assert で `src.len() <= cap` を保証。src (Vec) / dst (pinned) は別領域。
-        // step >= 2 の slot は直上の h2d_done sync で前回 H2D 完了済 (in-flight でない)。
+        let cs: &CudaStream = &self.copy_stream;
+        let stage = |source: &[i32], pinned: *mut i32| {
+            #[cfg(feature = "native")]
+            if let Some(stride) = self.compact_stride {
+                // SAFETY: this slot's DMA has finished. Only the packed prefix is initialized.
+                let dest = unsafe { std::slice::from_raw_parts_mut(pinned.cast(), self.cap_idx) };
+                return pack_sparse_index_rows(source, h_nnz, stride, dest);
+            }
+            // SAFETY: the slot's DMA has finished, and source fits in the pinned allocation.
+            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), pinned, source.len()) };
+            source.len()
+        };
+        let stm = self.pinned_stm[slot];
+        let nstm = self.pinned_nstm[slot];
+        let stm_len = stage(h_stm, stm);
+        let upload_stm = || {
+            // SAFETY: this prefix was initialized above and stays pinned until h2d_done.
+            copy_host_to_device_async_i32(cs, dev_stm, unsafe {
+                std::slice::from_raw_parts(stm, stm_len)
+            })
+        };
+        let overlap = overlap_index_staging || self.compact_stride.is_some();
+        if overlap {
+            upload_stm()?;
+        }
+        let nstm_len = stage(h_nstm, nstm);
+        // SAFETY: each source fits and the scalar allocations are disjoint from the index DMA.
         unsafe {
-            std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
-            std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
             std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_bucket.as_ptr(), pinned_bucket[slot], h_bucket.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
         }
-        // device: pinned[slot] → dev_* (copy stream で async H2D)。
-        // SAFETY: 各 pinned[slot] は直上の copy_nonoverlapping で先頭 `h_*.len()` 要素を
-        // 初期化済の page-locked host memory。`from_raw_parts` で同じ `h_*.len()` 長の
-        // slice 化して既存 H2D helper に渡す (helper が `src.len() <= dev.len()` を assert)。
-        let cs: &CudaStream = &self.copy_stream;
+        if !overlap {
+            upload_stm()?;
+        }
+        // SAFETY: the initialized source ranges stay pinned until h2d_done.
         unsafe {
             copy_host_to_device_async_i32(
                 cs,
-                dev_stm,
-                std::slice::from_raw_parts(self.pinned_stm[slot], h_stm.len()),
-            )?;
-            copy_host_to_device_async_i32(
-                cs,
                 dev_nstm,
-                std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+                std::slice::from_raw_parts(nstm, nstm_len),
             )?;
             copy_host_to_device_async_i32(
                 cs,
@@ -1445,4 +1485,20 @@ pub(crate) fn alloc_pinned_host<T>(n: usize) -> Result<[*mut T; 2], Box<dyn std:
         *slot = p as *mut T;
     }
     Ok(out)
+}
+
+#[cfg(all(test, feature = "native"))]
+#[test]
+fn partial_threat_compact_indices_preserve_active_rows() {
+    let indices = [7, 7, -1, 99, 8, 9, 10, 11, -1, 5, 6, 12];
+    let nnz = [2, 0, 4];
+    let mut packed = [std::mem::MaybeUninit::new(i32::MIN); 15];
+    let written = pack_sparse_index_rows(&indices, &nnz, 4, &mut packed);
+    let packed = packed.map(|value| {
+        // SAFETY: all elements were initialized before packing.
+        unsafe { value.assume_init() }
+    });
+    assert_eq!(written, 9);
+    assert_eq!(&packed[..written], &[0, 2, 2, 7, 7, -1, 5, 6, 12]);
+    assert_eq!(&packed[written..], &[i32::MIN; 6]);
 }

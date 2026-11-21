@@ -6,7 +6,10 @@ use shogi_features::{FeatureSet, ThreatProfile};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn forward_cache(trainer: &GpuTrainer) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    if let Some(half) = &trainer.ft_w_h {
+    let half = trainer.ft_w_h.as_ref();
+    #[cfg(feature = "native")]
+    let half = half.or(trainer.partial_ft_w_h.as_ref());
+    if let Some(half) = half {
         Ok(half
             .to_host_vec(&trainer.stream)?
             .into_iter()

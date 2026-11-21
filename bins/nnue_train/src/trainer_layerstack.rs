@@ -38,6 +38,9 @@ fn ft_gradient_tiles_dispatch(
     ft_gradient_tiles_eligible(features, batch, width, half_gradient) && batch <= mask_elements / 40
 }
 
+// The remaining bits carry the batch size (low word) and order base (high word).
+pub(crate) const PARTIAL_FT_PIECE_LIMITS: u64 = 1 << 31;
+
 /// Per-step scalars for the fused FT optimizer kernel.
 #[cfg(feature = "native")]
 #[derive(Clone, Copy)]
@@ -1118,7 +1121,7 @@ impl GpuTrainer {
     pub(crate) fn ft_forward_state_to_host_for_test(
         &self,
     ) -> Result<FtForwardTestState, Box<dyn std::error::Error>> {
-        let forward = if let Some(half) = self.ft_w_h.as_ref() {
+        let forward = if let Some(half) = self.ft_w_h.as_ref().or(self.partial_ft_w_h.as_ref()) {
             Some(
                 half.to_host_vec(&self.stream)?
                     .into_iter()
@@ -1134,10 +1137,13 @@ impl GpuTrainer {
         // Rows the last backward skipped hold stale values that the fused step read as zero.
         if self.ft_grad_active_rows_only {
             let active = self.ws.ft_active_rows.to_host_vec(&self.stream)?;
-            for (row, chunk) in grad.chunks_mut(self.ws.ft_out).enumerate() {
-                if active.get(row) == Some(&0) {
-                    chunk.fill(0.0);
-                }
+            for (row, _) in active
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, live)| live == 0)
+            {
+                let (start, width) = self.feature_set.ft_row_layout(row, self.ws.ft_out);
+                grad[start..start + width].fill(0.0);
             }
         }
         Ok((forward, grad))
@@ -1241,7 +1247,15 @@ impl GpuTrainer {
             if begin == end {
                 continue;
             }
-            let launch_flags = flags | out;
+            let mut launch_flags = flags | out;
+            if begin >= real_n {
+                launch_flags &= !FT_FUSED_ACTIVE_ROWS;
+            }
+            let active_row_base = if self.partial_threat() && begin == base_n {
+                self.feature_set.base_ft_in() as u32
+            } else {
+                0
+            };
             let quantize_forward = self.ft_weight_i8x2 && out != 0;
             // Unused pointer slots (`slow` without lookahead, the norm buffers without norm-loss,
             // the active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when
@@ -1285,7 +1299,7 @@ impl GpuTrainer {
                         launch_with_args![slice_mut(self.ft_w), slice_mut($m), slice_mut($v),
                                    slice_mut(self.ft_w_grad), slice_mut(self.ft_w_slow),
                                    slice(self.ft_norms), slice_mut(self.ft_norm_sums),
-                                   slice(self.ws.ft_active_rows),
+                                   slice(self.ws.ft_active_rows), active_row_base,
                                    slice_mut($forward),
                                    slice(self.threat_pair_starts), bounds, row_width as u32, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
@@ -1670,6 +1684,9 @@ pub(crate) struct GpuTrainer {
     /// 代わりに読む。それ以外の構成では `None` (FP32 forward は `ft_w` を直接読む)。
     ft_w_fold32: Option<DeviceBuffer<f32>>,
     threat_pair_starts: DeviceBuffer<u32>,
+    // Packed cache populated by the partial fold after both real and virtual updates.
+    #[cfg(feature = "native")]
+    partial_ft_w_h: Option<DeviceBuffer<f16>>,
     partial_ft_shape: DeviceBuffer<u32>,
     partial_norm_sums: DeviceBuffer<f64>,
     empty_threat_pair_starts: DeviceBuffer<u32>,
@@ -1763,6 +1780,7 @@ pub(crate) struct GpuTrainer {
     loss_ring: AsyncLossRing,
     /// step 先頭の入力 H2D を専用 copy stream で直前 step の compute と overlap させる ring。
     input_ring: InputUploadRing,
+    input_step_poisoned: bool,
     /// L1 shared weight backward の `dense_mm_bwd_weight_tiled` を `cublasSgemm_v2` に置換するための
     /// cuBLAS handle。stream は `self.stream` に bind 済 (cuBLAS の launch は same-stream で
     /// in-order に走る)。
@@ -2008,7 +2026,7 @@ pub(crate) struct GpuWorkspace {
     feat_block_sums: DeviceBuffer<u32>, // ceil(ft_in/1024): scan level 1 per-block total
     feat_block_offsets: DeviceBuffer<u32>, // ceil(ft_in/1024)+1: scan level 2 (block totals)
     feat_write_ctr: DeviceBuffer<u32>, // ft_in: scatter atomic counter
-    feat_positions: DeviceBuffer<u32>, // up to batch * max_active: sorted positions
+    feat_positions: DeviceBuffer<u32>, // up to batch * max_active, grouped by feature
     #[cfg(feature = "native")]
     ft_active_rows: DeviceBuffer<u32>, // ft_in: 1 when either perspective uses the feature
 
@@ -2027,21 +2045,21 @@ pub(crate) struct GpuWorkspace {
     ft_order_write_ctr: DeviceBuffer<u32>, // 2 * king_buckets + 1
 
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
-    // `*_dev` が現 step の active、`*_dev_back` が double-buffer の back。`step_impl` が
-    // 毎 step `mem::swap` し、直前 step が読んでいない back 側へ次 step 入力を copy
-    // stream で先行 H2D する ([`InputUploadRing`])。
-    stm_idx_dev: DeviceBuffer<i32>,         // batch * max_active
-    nstm_idx_dev: DeviceBuffer<i32>,        // batch * max_active
-    nnz_dev: DeviceBuffer<i32>,             // batch
-    bucket_idx_dev: DeviceBuffer<i32>,      // batch
-    score_dev: DeviceBuffer<f32>,           // batch
-    wdl_dev: DeviceBuffer<f32>,             // batch
-    stm_idx_dev_back: DeviceBuffer<i32>,    // batch * max_active
-    nstm_idx_dev_back: DeviceBuffer<i32>,   // batch * max_active
-    nnz_dev_back: DeviceBuffer<i32>,        // batch
+    // Double-buffered H2D uploads packed indices into `compact_inputs` in compact mode.
+    // Expansion writes a single pair of dense buffers on the compute stream.
+    stm_idx_dev: DeviceBuffer<i32>,    // batch * max_active
+    nstm_idx_dev: DeviceBuffer<i32>,   // batch * max_active
+    nnz_dev: DeviceBuffer<i32>, // batch counts, plus STM/NSTM piece limits when compact (3 * batch)
+    bucket_idx_dev: DeviceBuffer<i32>, // batch
+    score_dev: DeviceBuffer<f32>, // batch
+    wdl_dev: DeviceBuffer<f32>, // batch
+    compact_inputs: Option<[(DeviceBuffer<i32>, DeviceBuffer<i32>); 2]>, // two H2D slots
+    stm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
+    nstm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
+    nnz_dev_back: DeviceBuffer<i32>, // batch, or 3 * batch with the compact piece limits
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
-    score_dev_back: DeviceBuffer<f32>,      // batch
-    wdl_dev_back: DeviceBuffer<f32>,        // batch
+    score_dev_back: DeviceBuffer<f32>, // batch
+    wdl_dev_back: DeviceBuffer<f32>, // batch
 
     // -- bucket sort scratch (fwd_L1 用 sorted layout 切換) --
     bucket_counts_dev: DeviceBuffer<u32>, // num_buckets + 1 (histogram + invalid bin)
@@ -2080,6 +2098,7 @@ impl GpuWorkspace {
         tf32: bool,
         feature_set: FeatureSetSpec,
         forward_only: bool,
+        compact_indices: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(
             (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
@@ -2117,6 +2136,18 @@ impl GpuWorkspace {
                 Ok(None)
             }
         };
+        let compact_inputs = if compact_indices {
+            let allocate = || DeviceBuffer::<i32>::zeroed(stream, batch * (max_active + 1));
+            Some([(allocate()?, allocate()?), (allocate()?, allocate()?)])
+        } else {
+            None
+        };
+        let dense_back_len = if compact_indices {
+            0
+        } else {
+            batch * max_active
+        };
+        let nnz_len = if compact_indices { 3 * batch } else { batch };
         Ok(Self {
             len_batch: batch,
             ft_in,
@@ -2198,13 +2229,14 @@ impl GpuWorkspace {
             )?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
-            nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
+            nnz_dev: DeviceBuffer::<i32>::zeroed(stream, nnz_len)?,
             bucket_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
-            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
-            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
-            nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
+            compact_inputs,
+            stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, dense_back_len)?,
+            nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, dense_back_len)?,
+            nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, nnz_len)?,
             bucket_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
@@ -2535,6 +2567,7 @@ impl GpuTrainer {
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
+        let partial_compact_h2d = cfg!(feature = "native") && width != ft_out;
         let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         #[cfg(not(feature = "native"))]
         if !forward_only {
@@ -2723,9 +2756,19 @@ impl GpuTrainer {
             },
             ft_w_fold32: if (feature_set.ft_factorize() && !precision.ft_fp16)
                 || (feature_set.threat_width(ft_out) != ft_out
-                    && (feature_set.ft_factorize() || precision.ft_fp16))
+                    && !cfg!(feature = "native")
+                    && precision.ft_fp16)
             {
                 Some(DeviceBuffer::<f32>::zeroed(
+                    &stream,
+                    feature_set.ft_weight_len(ft_out),
+                )?)
+            } else {
+                None
+            },
+            #[cfg(feature = "native")]
+            partial_ft_w_h: if precision.ft_fp16 && feature_set.threat_width(ft_out) != ft_out {
+                Some(DeviceBuffer::<f16>::zeroed(
                     &stream,
                     feature_set.ft_weight_len(ft_out),
                 )?)
@@ -2831,6 +2874,7 @@ impl GpuTrainer {
                 precision.tf32,
                 feature_set,
                 forward_only,
+                partial_compact_h2d,
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -2838,7 +2882,13 @@ impl GpuTrainer {
             fp16_clamp_counter: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
-            input_ring: InputUploadRing::new(ctx, batch_size.max(1), feature_set.max_active())?,
+            input_ring: InputUploadRing::new(
+                ctx,
+                batch_size.max(1),
+                feature_set.max_active(),
+                partial_compact_h2d,
+            )?,
+            input_step_poisoned: false,
             cublas: CublasHandle::new(&stream, precision.tf32)?,
             ft_fp16: precision.ft_fp16,
             ft_fp16_out: precision.ft_fp16_out,
@@ -3844,6 +3894,12 @@ impl GpuTrainer {
         } else {
             1
         };
+        debug_assert!((batch as u64) < PARTIAL_FT_PIECE_LIMITS);
+        let piece_limits = if self.ws.compact_inputs.is_some() {
+            PARTIAL_FT_PIECE_LIMITS
+        } else {
+            0
+        };
         for perspective in 0..2 {
             let indices = if perspective == 0 {
                 &self.ws.stm_idx_dev
@@ -3854,7 +3910,10 @@ impl GpuTrainer {
             let (order, order_base) = (&self.ws.ft_order, (perspective * batch) as u32);
             #[cfg(not(feature = "native"))]
             let (order, order_base) = (indices, u32::MAX);
-            let batch_order = batch as u64 | ((order_base as u64) << 32);
+            let batch_order = batch as u64 | ((order_base as u64) << 32) | piece_limits;
+            let config = cfg_partial_ft_1d(batch * rows / lanes);
+            // SAFETY: weights use the packed FT layout; order maps each position
+            // exactly once and the output buffer covers all batch columns.
             if self.ft_fp16_out {
                 let output = if perspective == 0 {
                     self.ws.ft_stm_out_h.as_ref()
@@ -3862,11 +3921,20 @@ impl GpuTrainer {
                     self.ws.ft_nstm_out_h.as_ref()
                 }
                 .expect("FP16 output allocated");
-                // SAFETY: packed weight and index lengths are validated at construction; each thread owns one output cell.
+                #[cfg(feature = "native")]
+                if let Some(half) = &self.partial_ft_w_h {
+                    unsafe {
+                        cuda_launch! {
+                            kernel: partial_ft_forward_fp16_weights_out, stream: self.stream, module: self.module, config: config,
+                            args: [slice(half), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                                   slice(self.partial_ft_shape), batch_order, slice(order)]
+                        }
+                    }?;
+                    continue;
+                }
                 unsafe {
                     cuda_launch! {
-                        kernel: partial_ft_forward_fp16_out, stream: self.stream, module: self.module,
-                        config: cfg_partial_ft_1d(batch * rows / lanes),
+                        kernel: partial_ft_forward_fp16_out, stream: self.stream, module: self.module, config: config,
                         args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
                                slice(self.partial_ft_shape), batch_order, slice(order)]
                     }
@@ -3877,11 +3945,20 @@ impl GpuTrainer {
                 } else {
                     &self.ws.ft_nstm_out
                 };
-                // SAFETY: same bounds and ownership as the FP16-output variant.
+                #[cfg(feature = "native")]
+                if let Some(half) = &self.partial_ft_w_h {
+                    unsafe {
+                        cuda_launch! {
+                            kernel: partial_ft_forward_fp16_weights, stream: self.stream, module: self.module, config: config,
+                            args: [slice(half), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                                   slice(self.partial_ft_shape), batch_order, slice(order)]
+                        }
+                    }?;
+                    continue;
+                }
                 unsafe {
                     cuda_launch! {
-                        kernel: partial_ft_forward, stream: self.stream, module: self.module,
-                        config: cfg_partial_ft_1d(batch * rows / lanes),
+                        kernel: partial_ft_forward, stream: self.stream, module: self.module, config: config,
                         args: [slice(forward), slice(indices), slice(self.ws.nnz_dev), slice(output),
                                slice(self.partial_ft_shape), batch_order, slice(order)]
                     }
@@ -3892,6 +3969,23 @@ impl GpuTrainer {
     }
 
     fn launch_partial_ft_fold(&self) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "native")]
+        if let Some(comb) = &self.partial_ft_w_h {
+            // SAFETY: one block writes each real row; virtual partners are in the master.
+            return unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_fold_to_fp16, stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (self.ws.ft_in as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [slice(self.ft_w), slice(self.threat_pair_starts),
+                           slice(self.partial_ft_shape), slice(comb), u32::from(self.ft_weight_i8x2)]
+                }
+            }
+            .map_err(Into::into);
+        }
         if let Some(comb) = self.ft_w_fold32.as_ref() {
             // SAFETY: the cache has the real packed length; virtual partners lie in the master.
             unsafe {
@@ -3943,7 +4037,10 @@ impl GpuTrainer {
         &self,
         perspective: usize,
         scale: f32,
+        active_rows_only: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(feature = "native"))]
+        let _ = active_rows_only;
         let spec = self.feature_set;
         let rows = self.ws.ft_out;
         let config = cfg_partial_ft_1d(spec.ft_weight_len(rows));
@@ -3954,6 +4051,39 @@ impl GpuTrainer {
                 self.ws.dft_nstm_out_h.as_ref()
             }
             .expect("FP16 gradients allocated");
+            #[cfg(feature = "native")]
+            if rows.is_multiple_of(4) && spec.threat_width(rows).is_multiple_of(4) {
+                const THREADS: u32 = 64;
+                let tile_width = (2 * THREADS) as usize;
+                let blocks = spec.base_ft_in() * rows.div_ceil(tile_width)
+                    + spec.threat_dims() * spec.threat_width(rows).div_ceil(tile_width);
+                let config = LaunchConfig {
+                    grid_dim: (u32::try_from(blocks)?, 1, 1),
+                    block_dim: (THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: both half-boundaries are even, so each aligned pair stays in
+                // one half of a row. The grid covers the packed real block and the mask covers its features.
+                return unsafe {
+                    if active_rows_only {
+                        cuda_launch! {
+                            kernel: partial_ft_gather_fp16_pairs_active, stream: self.stream, module: self.module,
+                            config: config,
+                            args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                                   slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale,
+                                   slice(self.ws.ft_active_rows)]
+                        }
+                    } else {
+                        cuda_launch! {
+                            kernel: partial_ft_gather_fp16_pairs, stream: self.stream, module: self.module,
+                            config: config,
+                            args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                                   slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale]
+                        }
+                    }
+                }
+                .map_err(Into::into);
+            }
             // SAFETY: inverse-index offsets address valid batch rows; one thread owns each compact parameter.
             unsafe {
                 cuda_launch! {
@@ -3968,6 +4098,19 @@ impl GpuTrainer {
             } else {
                 &self.ws.dft_nstm_out
             };
+            #[cfg(feature = "native")]
+            if active_rows_only {
+                // SAFETY: the mask covers every real feature addressed by the inverse index.
+                return unsafe {
+                    cuda_launch! {
+                        kernel: partial_ft_gather_active, stream: self.stream, module: self.module, config: config,
+                        args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                               slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, 1.0_f32,
+                               slice(self.ws.ft_active_rows)]
+                    }
+                }
+                .map_err(Into::into);
+            }
             // SAFETY: same bounds and ownership as the FP16-gradient variant.
             unsafe {
                 cuda_launch! {
@@ -4151,9 +4294,6 @@ impl GpuTrainer {
         // WSL2 では ncu の GPU perf counter が使えず nsys も GPU-side kernel trace を
         // 取れないため、この粗い event timing が代替手段。
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
-        if profile_step {
-            self.stream.synchronize()?;
-        }
         let mut prof_t0 = std::time::Instant::now();
         let result = self.step_impl(
             batch,
@@ -4313,9 +4453,6 @@ impl GpuTrainer {
         wdl_lambda: f32,
         loss: LossKind,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
-        // 直前の training step の GPU work 完了を待つ。検証 forward の H2D / kernel が
-        // in-flight な training compute と input buffer を取り合わないことを保証する。
-        self.stream.synchronize()?;
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         let mut prof_t0 = std::time::Instant::now();
         // lr は validate モードでは optimizer を呼ばないため未使用 (0.0 を渡す)。
@@ -4352,9 +4489,6 @@ impl GpuTrainer {
             .into());
         }
         let data = BatchData::from_batch_ref(batch, bucket_idx);
-        // 直前の GPU work 完了を待つ (validate と同じ理由: in-flight compute と
-        // input buffer を取り合わない)。
-        self.stream.synchronize()?;
         let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
         let mut prof_t0 = std::time::Instant::now();
         let out = self.step_impl(
@@ -4403,6 +4537,15 @@ impl GpuTrainer {
         batch: &BatchData,
         options: StepOptions<'_>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        if self.input_step_poisoned {
+            return Err(
+                "a previous step failed after switching input buffers; recreate the trainer".into(),
+            );
+        }
+        if options.validate || options.profile_step {
+            self.stream.synchronize()?;
+            *options.prof_t0 = std::time::Instant::now();
+        }
         let b = batch.n_pos;
         if b == 0 {
             return Ok(StepOutput {
@@ -4436,16 +4579,24 @@ impl GpuTrainer {
             self.qat_swap();
         }
         if let Some(output) = result? {
+            self.complete_input_step()?;
             return Ok(output);
         }
         #[cfg(test)]
         if self.skip_optimizer_for_test {
+            self.complete_input_step()?;
             return Ok(StepOutput {
                 loss: 0.0,
                 net_output: Vec::new(),
             });
         }
         self.optimizer_step(&mut context)
+    }
+
+    fn complete_input_step(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.input_ring.mark_step_done(&self.stream)?;
+        self.input_step_poisoned = false;
+        Ok(())
     }
 
     fn forward(
@@ -4493,8 +4644,16 @@ impl GpuTrainer {
         // する。H2D は直前 step の compute と並走し、compute stream は H2D 完了 event を
         // 待ってから forward に進む ([`InputUploadRing`])。pageable な dataloader `Vec`
         // は ring 内の pinned host buffer 経由で copy engine の DMA に載る。
-        std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
-        std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        // A failed swap/upload sequence leaves the physical slots out of sync with the ring.
+        self.input_step_poisoned = true;
+        let (upload_stm, upload_nstm) = if let Some(slots) = &mut self.ws.compact_inputs {
+            slots.swap(0, 1);
+            (&slots[0].0, &slots[0].1)
+        } else {
+            std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
+            std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+            (&self.ws.stm_idx_dev, &self.ws.nstm_idx_dev)
+        };
         std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
         std::mem::swap(
             &mut self.ws.bucket_idx_dev,
@@ -4504,9 +4663,9 @@ impl GpuTrainer {
         std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
         self.input_ring.upload(
             &self.stream,
-            &self.ws.stm_idx_dev,
+            upload_stm,
             batch.stm_indices,
-            &self.ws.nstm_idx_dev,
+            upload_nstm,
             batch.nstm_indices,
             &self.ws.nnz_dev,
             batch.nnz,
@@ -4516,7 +4675,23 @@ impl GpuTrainer {
             batch.score,
             &self.ws.wdl_dev,
             batch.wdl,
+            self.feature_set.threat_width(ft_out) != ft_out,
         )?;
+        #[cfg(feature = "native")]
+        if let Some([(packed_stm, packed_nstm), _]) = &self.ws.compact_inputs {
+            // SAFETY: pack_sparse_index_rows slices each stride-sized row by count, so count
+            // <= stride. Each offset + count ends within the appended values uploaded after
+            // the offset table. The compute stream waits for H2D before expansion and dense reads.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_expand_indices, stream: self.stream, module: self.module,
+                    config: cfg_1d(b * 32),
+                    args: [slice(packed_stm), slice(packed_nstm), slice_mut(self.ws.nnz_dev),
+                           slice_mut(self.ws.stm_idx_dev), slice_mut(self.ws.nstm_idx_dev),
+                           b_u32, self.ws.max_active as u32, self.feature_set.base_ft_in() as u32]
+                }
+            }?;
+        }
         // per_pos_norm は scalar (1/n_pos) として直接 kernel arg に渡す。
 
         // loss_acc / weight_sum_acc reset (accumulate semantics、再 alloc せず memset)
@@ -6150,8 +6325,8 @@ impl GpuTrainer {
         // 各 (b, ri) thread が直接 38 atomic add する素朴版は atomic contention で memory
         // bandwidth が飽和するため、phase A (count) → B (prefix sum) → C (scatter) →
         // D (per-feature gather+sum) の inverse-index 構成にして atomic を D だけに局所化する。
-        // phase D iter 0 (stm) は overwrite で全 cell を書き、iter 1 (nstm) が atomic add で
-        // 合算するため、ft_w_grad は host 事前 memset 不要 (overwrite が前回値を上書きする)。
+        // STM gather は利用する各行を初期化し、NSTM gather は同じ行に加算する。
+        // dense gather 経路では未使用行も STM が 0 で埋める。
         // `gout` (dft) は phase D でのみ使うため loop は idx_dev のみで回し、phase D で
         // iter_idx に対応する dft buffer を選ぶ (`ft_fp16_out` 時は f16 版)。
         // feature set 依存の次元を loop 前に読み出す (per-iter の field 借用を避ける)。
@@ -6163,8 +6338,7 @@ impl GpuTrainer {
         // written here nor read there (they take a zero gradient); every other consumer needs
         // the full overwrite.
         #[cfg(feature = "native")]
-        let active_rows_only =
-            self.ft_fused_optimizer_applies(self.step_count + 1) && !self.partial_threat();
+        let active_rows_only = self.ft_fused_optimizer_applies(self.step_count + 1);
         #[cfg(not(feature = "native"))]
         let active_rows_only = false;
         #[cfg(feature = "native")]
@@ -6301,14 +6475,14 @@ impl GpuTrainer {
             prof_tick!("phC_scat");
             // D: gather_and_sum_per_feature。1 thread = 1 feature の 1 列 (native の f16 は
             // 隣接 2 列、`ft_gather_launch_config`)。
-            // 1 回目 (stm) は overwrite、2 回目 (nstm) は atomic add で stm 結果に加算。
+            // 1 回目 (stm) は overwrite、2 回目 (nstm) は stm の結果に加算。
             // overwrite kernel が全 cell (`active_rows_only` 時は active 行の全 cell) を
             // 書き切るため grad_w の host 事前 memset は不要。nstm 側が足す行は必ず active。
             let d_config = ft_gather_launch_config(ft_in, ft_out, self.ft_fp16_out);
             // iter 0 = stm (dft_stm_out / overwrite)、iter 1 = nstm (dft_nstm_out / add)。
             // `ft_fp16_out` 時は dft が f16 なので f16 入力版の gather kernel を使う。
             if self.partial_threat() {
-                self.launch_partial_ft_gather(iter_idx, dft_inv_scale)?;
+                self.launch_partial_ft_gather(iter_idx, dft_inv_scale, active_rows_only)?;
             } else if iter_idx == 0 {
                 if active_rows_only {
                     #[cfg(feature = "native")]
@@ -6400,15 +6574,29 @@ impl GpuTrainer {
             if self.partial_threat() {
                 let n = self.feature_set.train_ft_weight_len(ft_out)
                     - self.feature_set.ft_weight_len(ft_out);
-                // SAFETY: threads write disjoint virtual cells and read only real gradient cells.
-                unsafe {
-                    cuda_launch! {
-                        kernel: partial_ft_reduce, stream: self.stream, module: self.module,
-                        config: cfg_partial_ft_1d(n),
-                        args: [slice_mut(self.ft_w_grad), slice(self.threat_pair_starts),
-                               slice(self.partial_ft_shape)]
-                    }
-                }?;
+                #[cfg(feature = "native")]
+                if active_rows_only {
+                    // SAFETY: threads write disjoint virtual cells and the mask covers all real features.
+                    unsafe {
+                        cuda_launch! {
+                            kernel: partial_ft_reduce_active, stream: self.stream, module: self.module,
+                            config: cfg_partial_ft_1d(n),
+                            args: [slice_mut(self.ft_w_grad), slice(self.threat_pair_starts),
+                                   slice(self.partial_ft_shape), slice(self.ws.ft_active_rows)]
+                        }
+                    }?;
+                }
+                if !active_rows_only {
+                    // SAFETY: threads write disjoint virtual cells and read only real gradient cells.
+                    unsafe {
+                        cuda_launch! {
+                            kernel: partial_ft_reduce, stream: self.stream, module: self.module,
+                            config: cfg_partial_ft_1d(n),
+                            args: [slice_mut(self.ft_w_grad), slice(self.threat_pair_starts),
+                                   slice(self.partial_ft_shape)]
+                        }
+                    }?;
+                }
             } else if active_rows_only {
                 #[cfg(feature = "native")]
                 self.launch_ft_reduce_active(ft_out)?;
@@ -7049,7 +7237,7 @@ impl GpuTrainer {
         // 本 step の compute (input buffer の read を含む) 完了を copy stream 用の
         // event に記録する。同じ物理 input buffer を使う step+2 の H2D がこれを待ち、
         // in-flight compute が読む buffer を H2D が上書きする race を防ぐ。
-        self.input_ring.mark_step_done(&self.stream)?;
+        self.complete_input_step()?;
 
         // `loss_acc` の host への取り出しを `AsyncLossRing` 経由で async 化。
         // pinned host cell に `memcpy_dtoh_async` + event record、前 step の event を
