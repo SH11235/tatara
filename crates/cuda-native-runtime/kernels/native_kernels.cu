@@ -2258,6 +2258,7 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
     unsigned long long,
     const unsigned int* active_rows,
     unsigned long long active_row_count,
+    unsigned int active_row_base,
     void* forward_output,
     unsigned long long,
     const unsigned int* threat_pair_starts,
@@ -2295,7 +2296,9 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
     const unsigned int column = static_cast<unsigned int>((first - element_begin) % ft_out);
     const unsigned int norm_column = column < ft_out / 2U
         ? column : norm_width / 2U + column - ft_out / 2U;
-    unsigned long long row = first / ft_out;
+    // Packed launches use independent row strides. The full-width real launch
+    // uses feature zero as its base, including when folding partner weights.
+    unsigned long long row = (first - element_begin) / ft_out + active_row_base;
     const unsigned long long row_stride = stride / ft_out;
     float thread_sum_squared[4] = {};
     for (unsigned long long i = first; i < element_end; i += stride, row += row_stride) {
@@ -2424,6 +2427,7 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
     unsigned long long,
     const unsigned int* active_rows,
     unsigned long long active_row_count,
+    unsigned int,
     void* forward_output,
     unsigned long long,
     const unsigned int* threat_pair_starts,
@@ -4668,58 +4672,151 @@ extern "C" __global__ void partial_ft_fold_i8x2(
     comb[k] = value;
 }
 
-template <typename Output>
-__device__ __forceinline__ void native_partial_ft_forward(
-    const float* weight, const int* indices, const int* nnz, Output* out,
-    const unsigned* shape, unsigned batch, const int* order, unsigned order_base) {
-    unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
-    unsigned active = shape[4];
-    unsigned lanes = rows % 8 == 0 && width % 8 == 0 ? 4 : 1;
-    unsigned long long k = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (k >= partial_ft_row_offset(batch, rows / lanes)) return;
-    unsigned position = k / (rows / lanes), col = (k % (rows / lanes)) * lanes;
-    unsigned b = order_base == ~0U ? position : static_cast<unsigned>(order[static_cast<unsigned long long>(order_base) + position]) - order_base;
-    float sums[4] = {};
-    for (int n = 0; n < nnz[b]; ++n) {
-        int fi = indices[partial_ft_row_offset(b, active) + n];
-        if (fi < 0 || static_cast<unsigned>(fi) >= base + threats) continue;
-        unsigned f = fi;
-        unsigned long long offset = partial_ft_row_offset(f, rows) + col;
-        if (f >= base) {
-            unsigned c = col % (rows / 2);
-            if (c >= width / 2) continue;
-            unsigned pc = c + (col >= rows / 2 ? width / 2 : 0);
-            offset = partial_ft_row_offset(base, rows) + partial_ft_row_offset(f - base, width) + pc;
+extern "C" __global__ void partial_ft_fold_to_fp16(
+    const float* weight, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, unsigned long long, __half* comb, unsigned long long,
+    unsigned quantize_pieces
+) {
+    const unsigned feature = blockIdx.x;
+    const unsigned rows = shape[0], base = shape[1], width = shape[3], piece = shape[5];
+    const bool threat = feature >= base;
+    const unsigned row_width = threat ? width : rows;
+    const auto base_n = partial_ft_row_offset(base, rows);
+    const auto real_n = base_n + partial_ft_row_offset(shape[2], width);
+    const auto start = threat ? base_n + partial_ft_row_offset(feature - base, width)
+                              : partial_ft_row_offset(feature, rows);
+    const bool factorized = shape[6] != 0;
+    __shared__ unsigned long long virtual_start;
+    if (factorized) {
+        if (threadIdx.x == 0) {
+            if (!threat) {
+                virtual_start = real_n + partial_ft_row_offset(feature % piece, rows);
+            } else {
+                unsigned pair = 0, end = static_cast<unsigned>(pair_len) - 1;
+                while (pair + 1 < end) {
+                    const unsigned mid = (pair + end) / 2;
+                    if (feature - base >= pairs[mid]) pair = mid; else end = mid;
+                }
+                virtual_start = real_n + partial_ft_row_offset(piece, rows)
+                    + partial_ft_row_offset(pair, width);
+            }
         }
-        if (lanes == 4) {
+        __syncthreads();
+    }
+    for (unsigned col = threadIdx.x; col < row_width; col += blockDim.x) {
+        float value = weight[start + col];
+        if (factorized) value = __fadd_rn(value, weight[virtual_start + col]);
+        if (!threat && quantize_pieces) value = piece_ft_i8x2(value);
+        comb[start + col] = __float2half_rn(value);
+    }
+}
+
+template <unsigned Lanes, typename Weight, typename Output>
+__device__ __forceinline__ void native_partial_ft_forward_columns(
+    const Weight* weight, const int* indices, const int* nnz, bool has_piece_limits, Output* out,
+    const unsigned* shape, unsigned batch, const int* order, unsigned order_base
+) {
+    const unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
+    const unsigned stride = rows / Lanes;
+    unsigned position, col;
+    if (partial_ft_row_offset(gridDim.x, blockDim.x) > ~0U) {
+        const auto index = partial_ft_row_offset(blockIdx.x, blockDim.x) + threadIdx.x;
+        if (index >= partial_ft_row_offset(batch, stride)) return;
+        position = index / stride;
+        col = (index % stride) * Lanes;
+    } else {
+        const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+        position = index / stride;
+        if (position >= batch) return;
+        col = (index % stride) * Lanes;
+    }
+    const unsigned b = order_base == ~0U ? position
+        : static_cast<unsigned>(order[static_cast<unsigned long long>(order_base) + position]) - order_base;
+    const int* features = indices + partial_ft_row_offset(b, shape[4]);
+    const bool second_half = col >= rows / 2;
+    const unsigned half_col = second_half ? col - rows / 2 : col;
+    const bool uses_threat = half_col < width / 2;
+    // Compact uploads append the STM and NSTM limits after the shared count plane.
+    const int count = !uses_threat && has_piece_limits
+        ? nnz[static_cast<unsigned long long>(batch) + order_base + b] : nnz[b];
+    const auto threat_start = partial_ft_row_offset(base, rows) + half_col
+        + (second_half ? width / 2 : 0);
+    float sums[Lanes] = {};
+    for (int n = 0; n < count; ++n) {
+        const unsigned f = static_cast<unsigned>(features[n]);
+        unsigned long long offset;
+        if (f < base) {
+            offset = partial_ft_row_offset(f, rows) + col;
+        } else if (f < base + threats && uses_threat) {
+            offset = threat_start + partial_ft_row_offset(f - base, width);
+        } else {
+            continue;
+        }
+        if constexpr (Lanes == 4) {
             float values[4];
             ft_forward_load4(weight + offset, values);
             #pragma unroll
             for (unsigned lane = 0; lane < 4; ++lane) sums[lane] += values[lane];
-        } else sums[0] += weight[offset];
+        } else {
+            float value;
+            if constexpr (sizeof(Weight) == sizeof(__half)) value = __half2float(weight[offset]);
+            else value = weight[offset];
+            sums[0] += value;
+        }
     }
-    for (unsigned lane = 0; lane < lanes; ++lane) ft_forward_store(out + partial_ft_row_offset(b, rows) + col + lane, sums[lane]);
+    #pragma unroll
+    for (unsigned lane = 0; lane < Lanes; ++lane) {
+        ft_forward_store(out + partial_ft_row_offset(b, rows) + col + lane, sums[lane]);
+    }
 }
+
+template <typename Weight, typename Output>
+__device__ __forceinline__ void native_partial_ft_forward(
+    const Weight* weight, const int* indices, const int* nnz, Output* out,
+    const unsigned* shape, unsigned long long batch_order, const int* order
+) {
+    constexpr unsigned piece_limits_bit = 1U << 31;
+    const unsigned batch_flags = static_cast<unsigned>(batch_order);
+    const unsigned batch = batch_flags & ~piece_limits_bit;
+    const unsigned order_base = static_cast<unsigned>(batch_order >> 32);
+    const bool has_piece_limits = (batch_flags & piece_limits_bit) != 0 && order_base != ~0U;
+    if (shape[0] % 8 == 0 && shape[3] % 8 == 0)
+        native_partial_ft_forward_columns<4>(weight, indices, nnz, has_piece_limits, out, shape, batch, order, order_base);
+    else
+        native_partial_ft_forward_columns<1>(weight, indices, nnz, has_piece_limits, out, shape, batch, order, order_base);
+}
+
 extern "C" __global__ void partial_ft_forward(
     const float* weight, unsigned long long, const int* indices, unsigned long long,
     const int* nnz, unsigned long long, float* out, unsigned long long,
     const unsigned* shape, unsigned long long, unsigned long long batch_order,
     const int* order, unsigned long long) {
-    native_partial_ft_forward(weight, indices, nnz, out, shape,
-        static_cast<unsigned>(batch_order), order, static_cast<unsigned>(batch_order >> 32));
+    native_partial_ft_forward(weight, indices, nnz, out, shape, batch_order, order);
 }
 extern "C" __global__ void partial_ft_forward_fp16_out(
     const float* weight, unsigned long long, const int* indices, unsigned long long,
     const int* nnz, unsigned long long, __half* out, unsigned long long,
     const unsigned* shape, unsigned long long, unsigned long long batch_order,
     const int* order, unsigned long long) {
-    native_partial_ft_forward(weight, indices, nnz, out, shape,
-        static_cast<unsigned>(batch_order), order, static_cast<unsigned>(batch_order >> 32));
+    native_partial_ft_forward(weight, indices, nnz, out, shape, batch_order, order);
 }
-extern "C" __global__ void partial_ft_gather(
-    const float* gradient, unsigned long long, const unsigned* positions, unsigned long long,
-    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
-    const unsigned* shape, unsigned long long, unsigned add, float scale) {
+extern "C" __global__ void partial_ft_forward_fp16_weights(
+    const __half* weight, unsigned long long, const int* indices, unsigned long long,
+    const int* nnz, unsigned long long, float* out, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned long long batch_order,
+    const int* order, unsigned long long) {
+    native_partial_ft_forward(weight, indices, nnz, out, shape, batch_order, order);
+}
+extern "C" __global__ void partial_ft_forward_fp16_weights_out(
+    const __half* weight, unsigned long long, const int* indices, unsigned long long,
+    const int* nnz, unsigned long long, __half* out, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned long long batch_order,
+    const int* order, unsigned long long) {
+    native_partial_ft_forward(weight, indices, nnz, out, shape, batch_order, order);
+}
+__device__ __forceinline__ void partial_ft_gather_impl(
+    const float* gradient, const unsigned* positions, const unsigned* offsets,
+    float* result, const unsigned* shape, unsigned add, float scale, const unsigned* active_rows) {
     unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3];
     unsigned long long k = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     unsigned long long base_n = partial_ft_row_offset(base, rows);
@@ -4730,10 +4827,27 @@ extern "C" __global__ void partial_ft_gather(
         unsigned c = (k - base_n) % width;
         col = c < width / 2 ? c : rows / 2 + c - width / 2;
     }
+    const unsigned begin = offsets[f], end = offsets[f + 1];
+    if (active_rows && begin == end && (add || active_rows[f] == 0)) return;
     float sum = 0.0F;
-    for (unsigned p = offsets[f]; p < offsets[f + 1]; ++p)
+    for (unsigned p = begin; p < end; ++p)
         sum += gradient[partial_ft_row_offset(positions[p], rows) + col] * scale;
     if (add) result[k] += sum; else result[k] = sum;
+}
+
+extern "C" __global__ void partial_ft_gather(
+    const float* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale) {
+    partial_ft_gather_impl(gradient, positions, offsets, result, shape, add, scale, nullptr);
+}
+
+extern "C" __global__ void partial_ft_gather_active(
+    const float* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale,
+    const unsigned* active_rows, unsigned long long) {
+    partial_ft_gather_impl(gradient, positions, offsets, result, shape, add, scale, active_rows);
 }
 extern "C" __global__ void partial_ft_gather_fp16(
     const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
@@ -4754,9 +4868,95 @@ extern "C" __global__ void partial_ft_gather_fp16(
         sum += __half2float(gradient[partial_ft_row_offset(positions[p], rows) + col]) * scale;
     if (add) result[k] += sum; else result[k] = sum;
 }
-extern "C" __global__ void partial_ft_reduce(
-    float* grad, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
-    const unsigned* shape, unsigned long long) {
+__device__ __forceinline__ void partial_ft_gather_fp16_pairs_impl(
+    const __half* gradient, const unsigned* positions, const unsigned* offsets,
+    float* result, const unsigned* shape, unsigned add, float scale, const unsigned* active_rows) {
+    const unsigned rows = shape[0], base = shape[1], width = shape[3];
+    const unsigned tile_width = 2 * blockDim.x;
+    const unsigned piece_tiles = (rows + tile_width - 1) / tile_width;
+    const bool threat = blockIdx.x >= base * piece_tiles;
+    const unsigned row_width = threat ? width : rows;
+    const unsigned tiles = threat ? (width + tile_width - 1) / tile_width : piece_tiles;
+    const unsigned block = threat ? blockIdx.x - base * piece_tiles : blockIdx.x;
+    const unsigned f = (threat ? base : 0) + block / tiles;
+    const unsigned begin = offsets[f], end = offsets[f + 1];
+    // STM must zero NSTM-only rows before the add pass.
+    if (active_rows && begin == end && (add || active_rows[f] == 0)) return;
+    const unsigned c = (block % tiles) * tile_width + 2 * threadIdx.x;
+    if (c >= row_width) return;
+    const unsigned col = threat && c >= width / 2 ? rows / 2 + c - width / 2 : c;
+    const auto start = threat ? partial_ft_row_offset(base, rows) + partial_ft_row_offset(f - base, width)
+                              : partial_ft_row_offset(f, rows);
+    float lo = 0.0F, hi = 0.0F;
+    // Keep each column's sequential accumulation order while sharing the index and load.
+    for (unsigned p = begin; p < end; ++p) {
+        const __half* source = gradient + partial_ft_row_offset(positions[p], rows) + col;
+        const unsigned packed = *reinterpret_cast<const unsigned*>(source);
+        lo += __half2float(__ushort_as_half(static_cast<unsigned short>(packed))) * scale;
+        hi += __half2float(__ushort_as_half(static_cast<unsigned short>(packed >> 16))) * scale;
+    }
+    float* target = result + start + c;
+    if (add) {
+        lo = target[0] + lo;
+        hi = target[1] + hi;
+    }
+    *reinterpret_cast<float2*>(target) = make_float2(lo, hi);
+}
+
+extern "C" __global__ void partial_ft_gather_fp16_pairs(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale
+) {
+    partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, nullptr);
+}
+
+extern "C" __global__ void partial_ft_gather_fp16_pairs_active(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale,
+    const unsigned* active_rows, unsigned long long
+) {
+    partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, active_rows);
+}
+extern "C" __global__ void partial_ft_expand_indices(
+    const int* packed_stm, unsigned long long, const int* packed_nstm, unsigned long long,
+    int* nnz, unsigned long long, int* stm, unsigned long long, int* nstm, unsigned long long,
+    unsigned batch, unsigned stride, unsigned base
+) {
+    const unsigned row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (row >= batch) return;
+    const unsigned stm_offset = packed_stm[row], nstm_offset = packed_nstm[row];
+    const unsigned count = nnz[row];
+    const unsigned lane = threadIdx.x % warpSize;
+    unsigned stm_limit = 0, nstm_limit = 0;
+    for (unsigned col = lane; col < count; col += warpSize) {
+        const auto target = partial_ft_row_offset(row, stride) + col;
+        const int s = packed_stm[static_cast<unsigned long long>(batch) + stm_offset + col];
+        const int n = packed_nstm[static_cast<unsigned long long>(batch) + nstm_offset + col];
+        stm[target] = s;
+        nstm[target] = n;
+        if (static_cast<unsigned>(s) < base) stm_limit = col + 1;
+        if (static_cast<unsigned>(n) < base) nstm_limit = col + 1;
+    }
+#if __CUDA_ARCH__ >= 800
+    stm_limit = __reduce_max_sync(0xffffffffU, stm_limit);
+    nstm_limit = __reduce_max_sync(0xffffffffU, nstm_limit);
+#else
+    for (int distance = 16; distance > 0; distance /= 2) {
+        stm_limit = max(stm_limit, __shfl_down_sync(0xffffffffU, stm_limit, distance));
+        nstm_limit = max(nstm_limit, __shfl_down_sync(0xffffffffU, nstm_limit, distance));
+    }
+#endif
+    if (lane == 0) {
+        nnz[batch + row] = stm_limit;
+        nnz[2ULL * batch + row] = nstm_limit;
+    }
+}
+
+__device__ __forceinline__ void partial_ft_reduce_impl(
+    float* grad, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, const unsigned* active_rows) {
     unsigned rows = shape[0], base = shape[1], threats = shape[2], width = shape[3], piece = shape[5];
     unsigned long long k = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     unsigned long long base_n = partial_ft_row_offset(base, rows);
@@ -4767,12 +4967,31 @@ extern "C" __global__ void partial_ft_reduce(
     float sum = 0.0F;
     if (k < piece_n) {
         unsigned p = k / rows, c = k % rows;
-        for (unsigned f = p; f < base; f += piece) sum += real_grad[partial_ft_row_offset(f, rows) + c];
+        for (unsigned f = p; f < base; f += piece) {
+            if (!active_rows || active_rows[f]) sum += real_grad[partial_ft_row_offset(f, rows) + c];
+        }
     } else {
         unsigned pair = (k - piece_n) / width, c = (k - piece_n) % width;
-        for (unsigned f = pairs[pair]; f < pairs[pair + 1]; ++f) sum += real_grad[base_n + partial_ft_row_offset(f, width) + c];
+        for (unsigned f = pairs[pair]; f < pairs[pair + 1]; ++f) {
+            if (!active_rows || active_rows[base + f]) {
+                sum += real_grad[base_n + partial_ft_row_offset(f, width) + c];
+            }
+        }
     }
     virtual_grad[k] = sum;
+}
+
+extern "C" __global__ void partial_ft_reduce(
+    float* grad, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, unsigned long long) {
+    partial_ft_reduce_impl(grad, pairs, pair_len, shape, nullptr);
+}
+
+extern "C" __global__ void partial_ft_reduce_active(
+    float* grad, unsigned long long, const unsigned* pairs, unsigned long long pair_len,
+    const unsigned* shape, unsigned long long,
+    const unsigned* active_rows, unsigned long long) {
+    partial_ft_reduce_impl(grad, pairs, pair_len, shape, active_rows);
 }
 
 extern "C" __global__ void partial_ft_norm(
