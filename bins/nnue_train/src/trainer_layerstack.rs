@@ -134,8 +134,14 @@ fn l1_input_gradient_fused(l1_out: usize) -> bool {
     cfg!(feature = "native") && l1_out <= FT_POST_FROM_L1_MAX_OUTPUTS
 }
 
-/// Native FP16 gathers two adjacent columns per thread. The cuda-oxide kernels index
-/// features by `blockIdx.x` alone and need one feature per block.
+/// Launch shape for the `gather_and_sum_per_feature*` kernels: block `x` spans columns, block `y`
+/// spans features and the grid's `y` walks column slices. Blocks sweep every feature for one
+/// column slice before the next, so a slice narrow enough for the gradient rows of the positions
+/// in flight to stay in L2 cuts DRAM traffic; on the native backend that slice is 256 bytes of a
+/// row, with several features per block so the narrow block still fills the SM. The native f16
+/// kernel covers its 128-column slice with 64 threads, 2 columns each (it derives that from the
+/// grid). The cuda-oxide kernels index features by `blockIdx.x` alone and keep one feature per
+/// 128-column block.
 fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> LaunchConfig {
     let (threads, features, slice) = if cfg!(feature = "native") {
         if half_gradient {
@@ -2053,16 +2059,17 @@ pub(crate) struct GpuWorkspace {
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
     // Double-buffered H2D uploads packed indices into `compact_inputs` in compact mode.
     // Expansion writes a single pair of dense buffers on the compute stream.
+    // Compact partial-width Threat appends STM/NSTM piece-limit planes to both count buffers.
     stm_idx_dev: DeviceBuffer<i32>,    // batch * max_active
     nstm_idx_dev: DeviceBuffer<i32>,   // batch * max_active
-    nnz_dev: DeviceBuffer<i32>, // batch counts, plus STM/NSTM piece limits when compact (3 * batch)
+    nnz_dev: DeviceBuffer<i32>, // batch (including full-width compact), or 3 * batch for compact partial-width Threat
     bucket_idx_dev: DeviceBuffer<i32>, // batch
     score_dev: DeviceBuffer<f32>, // batch
     wdl_dev: DeviceBuffer<f32>, // batch
     compact_inputs: Option<[(DeviceBuffer<i32>, DeviceBuffer<i32>); 2]>, // two H2D slots
     stm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
     nstm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
-    nnz_dev_back: DeviceBuffer<i32>, // batch, or 3 * batch with the compact piece limits
+    nnz_dev_back: DeviceBuffer<i32>, // same count and piece-limit layout as nnz_dev
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
     score_dev_back: DeviceBuffer<f32>, // batch
     wdl_dev_back: DeviceBuffer<f32>, // batch
@@ -4713,14 +4720,14 @@ impl GpuTrainer {
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
-        // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * ft_out / 4。
-        // ft_out は `--ft-out` 検証で 128 の倍数 (= 4 の倍数) を保証済。
+        // ft_out は `--ft-out` 検証で 128 の倍数を保証済。
         // forward kernel は 3 通り:
         //  - `ft_fp16_out`: `sparse_ft_forward_fp16_out` — f16 weight read + f16 出力
         //    (`ft_*_out_h`)。書き出し DRAM 帯域も半減。
         //  - `ft_fp16` のみ: `sparse_ft_forward_fp16` — f16 weight read + f32 出力。
         //  - どちらも無し: `sparse_ft_forward` — FP32 path、bit-identical。
-        // いずれも累算は f32、1 thread = 4 row なので grid は b * ft_out / 4。
+        // 累算は f32。全幅の forward は通常 1 thread で 4 出力列を処理する (grid は b * ft_out / 4)。
+        // native の全幅 Threat の wide FP16-out は 1 thread で 8 出力列を処理する (grid は b * ft_out / 8)。
         // factorizer 有効時は weight 入力が畳み込み済み comb (`ft_w_h` / `ft_w_fold32`、
         // base 形状) になるだけで、kernel・launch 次元 (`ws.ft_in` / `ws.max_active`
         // は base 値) とも無効時と同一。

@@ -1509,6 +1509,7 @@ extern "C" __global__ void sparse_ft_forward_fp16_out_ordered_wide(
     }
     const unsigned int position = static_cast<unsigned int>(order[order_base + i / vectors]) - order_base;
     const unsigned int row = (i % vectors) * 8U;
+    // Both rows and row are multiples of 8, keeping the uint4 loads and stores 16-byte aligned.
     const int* indices_row = indices + static_cast<unsigned long long>(position) * max_active;
     const int count = nonzero_counts[position];
     float sums[8] = {};
@@ -1901,7 +1902,9 @@ __device__ __forceinline__ void gather_feature_gradient_fp16_columns(
     }
 }
 
-// Use packed loads when the launch covers two adjacent columns per thread.
+// Each thread covers `ft_output / (gridDim.y * blockDim.x)` adjacent columns: 2 when the grid
+// spans the columns with half as many threads (the native launch, 64 x 2 blocks over
+// `ft_output / 128` slices), otherwise 1. Narrow slices keep the in-flight gradient rows in L2.
 template <bool Add>
 __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     const __half* output_gradient,

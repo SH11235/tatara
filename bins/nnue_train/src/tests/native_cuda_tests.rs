@@ -4139,14 +4139,20 @@ fn l1_shared_bwd_input_wide_tile_matches_narrow_tile() -> Result<(), Box<dyn std
 }
 
 /// 玉 bucket 順の FT forward が、順序なしの `sparse_ft_forward*` と bit 単位で同じ activation を
-/// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。途中の `-1` と、
-/// base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
+/// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。空行、途中の
+/// `-1` と範囲外の特徴、base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
 #[cfg(feature = "native")]
 #[test]
 fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context_reserving_gib(2)?;
     let standard = LayerStackTestOptions::standard();
     let hm = FeatureSet::HalfKaHmMerged.spec();
+    let full_threat = hm.with_threat_profile(ThreatProfile::Full);
+    let fp16_out = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        ..PrecisionFlags::default()
+    };
     let configs = [
         (
             "plain-fp32",
@@ -4174,6 +4180,12 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
                 ft_fp16: true,
                 ..PrecisionFlags::default()
             },
+        ),
+        ("full-width-threat-fp16-out", full_threat, fp16_out),
+        (
+            "full-width-threat-factorized-fp16-out",
+            full_threat.with_ft_factorize(),
+            fp16_out,
         ),
         (
             "hm-factorized-all-optim",
@@ -4222,6 +4234,7 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
         batch.stm_indices[3 * max_active] = -1;
         batch.stm_indices[4 * max_active..5 * max_active].fill(-1);
         let ft_in = feature_set.ft_in();
+        batch.nstm_indices[2 * max_active + 1] = ft_in as i32;
         if ft_in > base_columns {
             for (slot, index) in batch.nstm_indices[5 * max_active..6 * max_active]
                 .iter_mut()
