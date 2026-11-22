@@ -370,6 +370,7 @@ impl GpuTrainer {
         let ft_out = self.ws.ft_out;
         let (b_u32, ft_out_u32) = (b as u32, ft_out as u32);
         let (ft_in, max_active) = (self.ws.ft_in as u32, self.ws.max_active as u32);
+        let wide = self.feature_set.threat_profile().is_some() && ft_out.is_multiple_of(8);
         let config = cfg_1d(b * ft_out / 4);
         for (perspective, order_base) in [(0, 0_u32), (1, b_u32)] {
             let indices = if perspective == 0 {
@@ -393,12 +394,23 @@ impl GpuTrainer {
                     // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                     // stream の完了を待つ同期点まで生存する device allocation。`ft_order` の
                     // `[order_base, order_base + b)` は `order_base + [0, b)` の並べ替え。
-                    cuda_launch! {
-                        kernel: sparse_ft_forward_fp16_out_ordered,
-                        stream: self.stream, module: self.module, config: config,
-                        args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
-                               slice(self.ws.ft_order), slice(output), order_base,
-                               b_u32, ft_out_u32, ft_in, max_active]
+                    // The wider launch also needs rows aligned to eight halves.
+                    if wide {
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16_out_ordered_wide,
+                            stream: self.stream, module: self.module, config: cfg_1d(b * ft_out / 8),
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
+                    } else {
+                        cuda_launch! {
+                            kernel: sparse_ft_forward_fp16_out_ordered,
+                            stream: self.stream, module: self.module, config: config,
+                            args: [slice(ft_w_h), slice(indices), slice(self.ws.nnz_dev),
+                                   slice(self.ws.ft_order), slice(output), order_base,
+                                   b_u32, ft_out_u32, ft_in, max_active]
+                        }
                     }
                 }?;
             } else {
@@ -2047,16 +2059,17 @@ pub(crate) struct GpuWorkspace {
     // -- pre-allocated input buffers (per-step `from_host` の cudaMalloc/Free を排除) --
     // Double-buffered H2D uploads packed indices into `compact_inputs` in compact mode.
     // Expansion writes a single pair of dense buffers on the compute stream.
+    // Compact partial-width Threat appends STM/NSTM piece-limit planes to both count buffers.
     stm_idx_dev: DeviceBuffer<i32>,    // batch * max_active
     nstm_idx_dev: DeviceBuffer<i32>,   // batch * max_active
-    nnz_dev: DeviceBuffer<i32>, // batch counts, plus STM/NSTM piece limits when compact (3 * batch)
+    nnz_dev: DeviceBuffer<i32>, // batch (including full-width compact), or 3 * batch for compact partial-width Threat
     bucket_idx_dev: DeviceBuffer<i32>, // batch
     score_dev: DeviceBuffer<f32>, // batch
     wdl_dev: DeviceBuffer<f32>, // batch
     compact_inputs: Option<[(DeviceBuffer<i32>, DeviceBuffer<i32>); 2]>, // two H2D slots
     stm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
     nstm_idx_dev_back: DeviceBuffer<i32>, // batch * max_active (empty when compact)
-    nnz_dev_back: DeviceBuffer<i32>, // batch, or 3 * batch with the compact piece limits
+    nnz_dev_back: DeviceBuffer<i32>, // same count and piece-limit layout as nnz_dev
     bucket_idx_dev_back: DeviceBuffer<i32>, // batch
     score_dev_back: DeviceBuffer<f32>, // batch
     wdl_dev_back: DeviceBuffer<f32>, // batch
@@ -2147,7 +2160,11 @@ impl GpuWorkspace {
         } else {
             batch * max_active
         };
-        let nnz_len = if compact_indices { 3 * batch } else { batch };
+        let nnz_len = if compact_indices && feature_set.threat_width(ft_out) != ft_out {
+            3 * batch
+        } else {
+            batch
+        };
         Ok(Self {
             len_batch: batch,
             ft_in,
@@ -2567,7 +2584,7 @@ impl GpuTrainer {
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
-        let partial_compact_h2d = cfg!(feature = "native") && width != ft_out;
+        let compact_h2d = cfg!(feature = "native") && feature_set.threat_profile().is_some();
         let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         #[cfg(not(feature = "native"))]
         if !forward_only {
@@ -2874,7 +2891,7 @@ impl GpuTrainer {
                 precision.tf32,
                 feature_set,
                 forward_only,
-                partial_compact_h2d,
+                compact_h2d,
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -2886,7 +2903,7 @@ impl GpuTrainer {
                 ctx,
                 batch_size.max(1),
                 feature_set.max_active(),
-                partial_compact_h2d,
+                compact_h2d,
             )?,
             input_step_poisoned: false,
             cublas: CublasHandle::new(&stream, precision.tf32)?,
@@ -4684,11 +4701,12 @@ impl GpuTrainer {
             // the offset table. The compute stream waits for H2D before expansion and dense reads.
             unsafe {
                 cuda_launch! {
-                    kernel: partial_ft_expand_indices, stream: self.stream, module: self.module,
+                    kernel: ft_expand_indices, stream: self.stream, module: self.module,
                     config: cfg_1d(b * 32),
                     args: [slice(packed_stm), slice(packed_nstm), slice_mut(self.ws.nnz_dev),
                            slice_mut(self.ws.stm_idx_dev), slice_mut(self.ws.nstm_idx_dev),
-                           b_u32, self.ws.max_active as u32, self.feature_set.base_ft_in() as u32]
+                           b_u32, self.ws.max_active as u32,
+                           if self.partial_threat() { self.feature_set.base_ft_in() as u32 } else { 0 }]
                 }
             }?;
         }
@@ -4702,14 +4720,14 @@ impl GpuTrainer {
         // -- Forward step 1-2: sparse_ft_forward × 2 (stm, nstm) --
         // 中間 activation は workspace (`self.ws.*`) を使い回す (再 alloc 無し)。
         // forward の各 activation は読まれる前に kernel が全 cell を上書きするので memset 不要。
-        // sparse_ft_forward は 1 thread = 4 row (output cell) なので grid は b * ft_out / 4。
-        // ft_out は `--ft-out` 検証で 128 の倍数 (= 4 の倍数) を保証済。
+        // ft_out は `--ft-out` 検証で 128 の倍数を保証済。
         // forward kernel は 3 通り:
         //  - `ft_fp16_out`: `sparse_ft_forward_fp16_out` — f16 weight read + f16 出力
         //    (`ft_*_out_h`)。書き出し DRAM 帯域も半減。
         //  - `ft_fp16` のみ: `sparse_ft_forward_fp16` — f16 weight read + f32 出力。
         //  - どちらも無し: `sparse_ft_forward` — FP32 path、bit-identical。
-        // いずれも累算は f32、1 thread = 4 row なので grid は b * ft_out / 4。
+        // 累算は f32。全幅の forward は通常 1 thread で 4 出力列を処理する (grid は b * ft_out / 4)。
+        // native の全幅 Threat の wide FP16-out は 1 thread で 8 出力列を処理する (grid は b * ft_out / 8)。
         // factorizer 有効時は weight 入力が畳み込み済み comb (`ft_w_h` / `ft_w_fold32`、
         // base 形状) になるだけで、kernel・launch 次元 (`ws.ft_in` / `ws.max_active`
         // は base 値) とも無効時と同一。

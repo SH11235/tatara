@@ -499,14 +499,14 @@ fn every_layerstack_native_kernel_is_exported() {
     for source in launch_sources {
         required.extend(cuda_launch_symbols(source));
     }
-    assert_eq!(required.len(), 112, "LayerStack kernel inventory changed");
+    assert_eq!(required.len(), 113, "LayerStack kernel inventory changed");
     assert_native_exports(&required);
 }
 
 #[test]
 fn every_production_cuda_launch_is_exported() {
     let required = production_cuda_launch_symbols();
-    assert_eq!(required.len(), 130, "production kernel inventory changed");
+    assert_eq!(required.len(), 131, "production kernel inventory changed");
     assert_native_exports(&required);
 }
 
@@ -3533,6 +3533,16 @@ fn fused_ft_optimizer_matches_separate_launches() -> Result<(), Box<dyn std::err
             norm,
         ),
         (
+            "full-threat-factorized-all-optim",
+            FeatureSet::HalfKaHmMerged
+                .spec()
+                .with_threat_profile(ThreatProfile::Full)
+                .with_ft_factorize(),
+            all_optim,
+            ranger,
+            norm,
+        ),
+        (
             "threat-factorized-fp32",
             threat_factorized,
             fp32,
@@ -4046,6 +4056,66 @@ fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn full_threat_wide_forward_matches_reference_bits() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_common::cfg_1d;
+    use gpu_runtime::{DeviceBuffer, cuda_launch};
+
+    let ctx = test_cuda_context()?;
+    let stream = gpu_runtime::create_compute_stream(&ctx)?;
+    let module = crate::kernel_module::load_kernel_module_with_fallback(&ctx, "nnue_train")?;
+    let (batch, rows, columns, stride) = (5_u32, 128_u32, 7_u32, 7_u32);
+    let weights = DeviceBuffer::from_host(
+        &stream,
+        &(0..rows * columns)
+            .map(|i| [8192.0, 0.000_5, -8192.0, -1.0, 4.0][i as usize % 5] as f16)
+            .collect::<Vec<_>>(),
+    )?;
+    let indices = DeviceBuffer::from_host(
+        &stream,
+        &[
+            5_i32, 0, 6, -1, 5, 4, 9, -9, -9, -9, -9, -9, -9, -9, -1, 6, 0, -9, -9, -9, -9, 4, 4,
+            2, -9, -9, -9, -9, 3, -9, -9, -9, -9, -9, -9,
+        ],
+    )?;
+    let counts = DeviceBuffer::from_host(&stream, &[7_i32, 0, 3, 3, 1])?;
+    let order = DeviceBuffer::from_host(&stream, &[4_i32, 3, 0, 1, 2, 7, 6, 8, 9, 5])?;
+    for order_base in [0_u32, batch] {
+        let size = (batch * rows + 3) as usize;
+        let expected = DeviceBuffer::from_host(&stream, &vec![f16::NEG_INFINITY; size])?;
+        let actual = DeviceBuffer::from_host(&stream, &vec![f16::INFINITY; size])?;
+        // SAFETY: the order covers every position once, and the FT rows are aligned to 8 halves.
+        unsafe {
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16_out_ordered,
+                stream: stream, module: module, config: cfg_1d((batch * rows / 4) as usize),
+                args: [slice(weights), slice(indices), slice(counts), slice(order), slice(expected),
+                       order_base, batch, rows, columns, stride]
+            }?;
+            cuda_launch! {
+                kernel: sparse_ft_forward_fp16_out_ordered_wide,
+                stream: stream, module: module, config: cfg_1d((batch * rows / 8) as usize),
+                args: [slice(weights), slice(indices), slice(counts), slice(order), slice(actual),
+                       order_base, batch, rows, columns, stride]
+            }?;
+        }
+        let bits = |out: &DeviceBuffer<f16>| {
+            out.to_host_vec(&stream)
+                .map(|values| values.into_iter().map(f16::to_bits).collect::<Vec<_>>())
+        };
+        let actual = bits(&actual)?;
+        let end = (batch * rows) as usize;
+        assert_eq!(actual[..end], bits(&expected)?[..end]);
+        assert_eq!(
+            actual[rows as usize..2 * rows as usize],
+            vec![0; rows as usize]
+        );
+        assert_eq!(actual[end..], [f16::INFINITY.to_bits(); 3]);
+    }
+    Ok(())
+}
+
 /// L1 shared 層の入力勾配を 64 入力 tile で計算する kernel が、16 入力 tile の kernel と bit 単位で
 /// 同じ値を書くこと。`l1_out` = 17 で reduction 軸の端数 slice も通す。
 #[cfg(feature = "native")]
@@ -4069,14 +4139,20 @@ fn l1_shared_bwd_input_wide_tile_matches_narrow_tile() -> Result<(), Box<dyn std
 }
 
 /// 玉 bucket 順の FT forward が、順序なしの `sparse_ft_forward*` と bit 単位で同じ activation を
-/// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。途中の `-1` と、
-/// base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
+/// 書き、順序が各 perspective で玉 bucket の昇順に並んだ置換であること。空行、途中の
+/// `-1` と範囲外の特徴、base 特徴を持たない行 (threat のみ / 全 `-1`) も含める。
 #[cfg(feature = "native")]
 #[test]
 fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::error::Error>> {
     let context = test_cuda_context_reserving_gib(2)?;
     let standard = LayerStackTestOptions::standard();
     let hm = FeatureSet::HalfKaHmMerged.spec();
+    let full_threat = hm.with_threat_profile(ThreatProfile::Full);
+    let fp16_out = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        ..PrecisionFlags::default()
+    };
     let configs = [
         (
             "plain-fp32",
@@ -4104,6 +4180,12 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
                 ft_fp16: true,
                 ..PrecisionFlags::default()
             },
+        ),
+        ("full-width-threat-fp16-out", full_threat, fp16_out),
+        (
+            "full-width-threat-factorized-fp16-out",
+            full_threat.with_ft_factorize(),
+            fp16_out,
         ),
         (
             "hm-factorized-all-optim",
@@ -4152,6 +4234,7 @@ fn ft_forward_king_order_matches_unordered_forward() -> Result<(), Box<dyn std::
         batch.stm_indices[3 * max_active] = -1;
         batch.stm_indices[4 * max_active..5 * max_active].fill(-1);
         let ft_in = feature_set.ft_in();
+        batch.nstm_indices[2 * max_active + 1] = ft_in as i32;
         if ft_in > base_columns {
             for (slot, index) in batch.nstm_indices[5 * max_active..6 * max_active]
                 .iter_mut()
@@ -4239,6 +4322,14 @@ fn fused_ft_norm_sums_match_updated_weights() -> Result<(), Box<dyn std::error::
                 .with_threat_profile(ThreatProfile::CrossSide)
                 .with_ft_factorize(),
             PrecisionFlags::default(),
+        ),
+        (
+            "full-threat-factorized-all-optim",
+            FeatureSet::HalfKaHmMerged
+                .spec()
+                .with_threat_profile(ThreatProfile::Full)
+                .with_ft_factorize(),
+            all_optim,
         ),
     ];
     for (name, feature_set, precision) in configs {

@@ -1485,6 +1485,58 @@ extern "C" __global__ void sparse_ft_forward_fp16_out_ordered(
     );
 }
 
+extern "C" __global__ void sparse_ft_forward_fp16_out_ordered_wide(
+    const __half* weight,
+    unsigned long long,
+    const int* indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* order,
+    unsigned long long,
+    __half* output,
+    unsigned long long,
+    unsigned int order_base,
+    unsigned int batch,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int max_active
+) {
+    const unsigned int vectors = rows / 8U;
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= static_cast<unsigned long long>(batch) * vectors) {
+        return;
+    }
+    const unsigned int position = static_cast<unsigned int>(order[order_base + i / vectors]) - order_base;
+    const unsigned int row = (i % vectors) * 8U;
+    // Both rows and row are multiples of 8, keeping the uint4 loads and stores 16-byte aligned.
+    const int* indices_row = indices + static_cast<unsigned long long>(position) * max_active;
+    const int count = nonzero_counts[position];
+    float sums[8] = {};
+    for (int active = 0; active < count; ++active) {
+        const int feature = indices_row[active];
+        if (static_cast<unsigned int>(feature) < columns) {
+            const auto source = weight + static_cast<unsigned long long>(feature) * rows + row;
+            const uint4 packed = *reinterpret_cast<const uint4*>(source);
+            const unsigned int pairs[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (unsigned int j = 0; j < 4; ++j) {
+                sums[2 * j] += __half2float(__ushort_as_half(static_cast<unsigned short>(pairs[j])));
+                sums[2 * j + 1] += __half2float(__ushort_as_half(static_cast<unsigned short>(pairs[j] >> 16)));
+            }
+        }
+    }
+    auto destination = output + static_cast<unsigned long long>(position) * rows + row;
+    unsigned int pairs[4];
+#pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        const unsigned int lo = __half_as_ushort(__float2half_rn(sums[2 * j]));
+        const unsigned int hi = __half_as_ushort(__float2half_rn(sums[2 * j + 1]));
+        pairs[j] = lo | (hi << 16);
+    }
+    *reinterpret_cast<uint4*>(destination) = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+}
+
 template <bool Squared>
 __device__ __forceinline__ void native_simple_bias_act_fwd_fp16(
     const __half* ft_output,
@@ -1852,7 +1904,7 @@ __device__ __forceinline__ void gather_feature_gradient_fp16_columns(
 
 // Each thread covers `ft_output / (gridDim.y * blockDim.x)` adjacent columns: 2 when the grid
 // spans the columns with half as many threads (the native launch, 64 x 2 blocks over
-// `ft_output / 128` slices), otherwise 1.
+// `ft_output / 128` slices), otherwise 1. Narrow slices keep the in-flight gradient rows in L2.
 template <bool Add>
 __device__ __forceinline__ void native_gather_and_sum_per_feature_fp16(
     const __half* output_gradient,
@@ -4919,10 +4971,10 @@ extern "C" __global__ void partial_ft_gather_fp16_pairs_active(
 ) {
     partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, active_rows);
 }
-extern "C" __global__ void partial_ft_expand_indices(
+extern "C" __global__ void ft_expand_indices(
     const int* packed_stm, unsigned long long, const int* packed_nstm, unsigned long long,
     int* nnz, unsigned long long, int* stm, unsigned long long, int* nstm, unsigned long long,
-    unsigned batch, unsigned stride, unsigned base
+    unsigned batch, unsigned stride, unsigned piece_limit_base
 ) {
     const unsigned row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= batch) return;
@@ -4936,9 +4988,10 @@ extern "C" __global__ void partial_ft_expand_indices(
         const int n = packed_nstm[static_cast<unsigned long long>(batch) + nstm_offset + col];
         stm[target] = s;
         nstm[target] = n;
-        if (static_cast<unsigned>(s) < base) stm_limit = col + 1;
-        if (static_cast<unsigned>(n) < base) nstm_limit = col + 1;
+        if (static_cast<unsigned>(s) < piece_limit_base) stm_limit = col + 1;
+        if (static_cast<unsigned>(n) < piece_limit_base) nstm_limit = col + 1;
     }
+    if (piece_limit_base == 0) return;
 #if __CUDA_ARCH__ >= 800
     stm_limit = __reduce_max_sync(0xffffffffU, stm_limit);
     nstm_limit = __reduce_max_sync(0xffffffffU, nstm_limit);
