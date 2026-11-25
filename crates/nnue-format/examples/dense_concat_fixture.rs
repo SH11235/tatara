@@ -6,14 +6,24 @@ use nnue_format::{LayerStackHead, LayerStackWeights};
 use shogi_features::FeatureSet;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or("usage: dense_concat_fixture <output.bin>")?;
+    const USAGE: &str = "usage: dense_concat_fixture <output.bin> [--ft-out N] [--l1 N] [--l2 N] (defaults 2304 16 64)";
+    let mut args = std::env::args().skip(1);
+    let path = args.next().ok_or(USAGE)?;
+    let (mut ft_out, mut l1, mut l2) = (2304, 16, 64);
+    while let Some(flag) = args.next() {
+        let value: usize = args.next().ok_or(USAGE)?.parse()?;
+        match flag.as_str() {
+            "--ft-out" => ft_out = value,
+            "--l1" => l1 = value,
+            "--l2" => l2 = value,
+            _ => return Err(USAGE.into()),
+        }
+    }
     let mut weights = LayerStackWeights::zeroed_with_head(
         FeatureSet::HalfKaHmMerged.spec(),
-        2304,
-        16,
-        64,
+        ft_out,
+        l1,
+        l2,
         DEFAULT_NUM_BUCKETS,
         LayerStackHead::DenseConcat,
     );
