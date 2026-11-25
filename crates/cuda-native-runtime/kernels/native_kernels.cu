@@ -5296,7 +5296,7 @@ extern "C" __global__ void dense_concat_qat_activations(
                             : l2[row * l2_out + offset % l2_out];
     const bool square = offset < (first ? l1_out : l2_out);
     if (square) {
-        const long long value = (long long(x) * x) >> 19;
+        const long long value = (static_cast<long long>(x) * x) >> 19;
         output[tid] = float(value > 127 ? 127 : value) / 127.0f;
     } else {
         const int value = x >> 6;
