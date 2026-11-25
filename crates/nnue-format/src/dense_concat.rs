@@ -28,7 +28,7 @@ impl Affine<'_> {
             .map(|(row, &bias)| {
                 row.iter().zip(input).fold(bias, |sum, (&w, &x)| {
                     let w = (w * QB as f32).round() as i8;
-                    sum + i32::from(w) * i32::from(x)
+                    sum.wrapping_add(i32::from(w) * i32::from(x))
                 })
             })
             .collect()
@@ -108,8 +108,9 @@ pub fn forward_quantised(
     let mut concat: Vec<_> = activations_quantised(&l1).collect();
     let l2 = second.forward_quantised(&concat, &row[l1_width..l1_width + l2_width]);
     concat.extend(activations_quantised(&l2));
-    output.forward_quantised(&concat, &row[l1_width + l2_width..])[0]
-        + (l1[l1.len() - 2] - l1[l1.len() - 1])
+    // 推論側 (release build の i32) と GPU の QAT kernel と同じく、範囲外は 2 の補数で折り返す。
+    let skip = l1[l1.len() - 2].wrapping_sub(l1[l1.len() - 1]);
+    output.forward_quantised(&concat, &row[l1_width + l2_width..])[0].wrapping_add(skip)
 }
 
 #[cfg(test)]
