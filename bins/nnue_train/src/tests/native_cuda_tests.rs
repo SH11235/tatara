@@ -4062,6 +4062,91 @@ fn ft_gather_fp16_pair_columns_match_single_columns() -> Result<(), Box<dyn std:
 
 #[cfg(feature = "native")]
 #[test]
+fn ft_gather_fp16_prefetch_matches_cpu_bits() -> Result<(), Box<dyn std::error::Error>> {
+    use gpu_runtime::{DeviceBuffer, LaunchConfig, cuda_launch};
+
+    let ctx = test_cuda_context()?;
+    let stream = gpu_runtime::create_compute_stream(&ctx)?;
+    let module = crate::kernel_module::load_kernel_module_with_fallback(&ctx, "nnue_train")?;
+    let rows = 128_u32;
+    let scale = 0.000091_827_f32;
+    let offsets = [0_u32, 0, 0, 11, 40];
+    let positions: Vec<u32> = (0..40).map(|i| i * 7 % 31).collect();
+    let gradients: Vec<f16> = (0..31 * rows)
+        .map(|i| f16::from_bits((((i / 5) % 2) << 15 | (i * 277 % 0x7c00)) as u16))
+        .collect();
+    let position_dev = DeviceBuffer::from_host(&stream, &positions)?;
+    let offset_dev = DeviceBuffer::from_host(&stream, &offsets)?;
+    let gradient_dev = DeviceBuffer::from_host(&stream, &gradients)?;
+    let active = [0_u32, 1, 1, 1];
+    let mask = DeviceBuffer::from_host(&stream, &active)?;
+    let stale = -1.25_f32;
+    let features = active.len() as u32;
+    let initial = vec![stale; (features * rows) as usize];
+    let result = DeviceBuffer::from_host(&stream, &initial)?;
+    let config = LaunchConfig {
+        grid_dim: (2, 1, 1),
+        block_dim: (64, 2, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut expected = initial;
+    for pass in 0..3 {
+        // SAFETY: the inverse index and mask cover all features, and each pair fits in a row.
+        unsafe {
+            match pass {
+                0 => cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite_fp16_active, stream: stream, module: module,
+                    config: config, args: [slice(gradient_dev), slice(position_dev), slice(offset_dev),
+                                           slice(result), slice(mask), features, rows, scale]
+                },
+                1 => cuda_launch! {
+                    kernel: gather_and_sum_per_feature_add_fp16, stream: stream, module: module,
+                    config: config, args: [slice(gradient_dev), slice(position_dev), slice(offset_dev),
+                                           slice(result), features, rows, scale]
+                },
+                _ => cuda_launch! {
+                    kernel: gather_and_sum_per_feature_overwrite_fp16, stream: stream, module: module,
+                    config: config, args: [slice(gradient_dev), slice(position_dev), slice(offset_dev),
+                                           slice(result), features, rows, scale]
+                },
+            }?;
+        }
+        let actual = result.to_host_vec(&stream)?;
+        for (feature, bounds) in offsets.windows(2).enumerate() {
+            let list = &positions[bounds[0] as usize..bounds[1] as usize];
+            for row in 0..rows as usize {
+                let mut sums = [0.0_f32; 4];
+                let groups = list.chunks_exact(4);
+                let tail = groups.remainder();
+                for group in groups {
+                    for (sum, &position) in sums.iter_mut().zip(group) {
+                        *sum += gradients[position as usize * rows as usize + row] as f32;
+                    }
+                }
+                for &position in tail {
+                    sums[0] += gradients[position as usize * rows as usize + row] as f32;
+                }
+                let sum = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+                let dst = feature * rows as usize + row;
+                match pass {
+                    0 if active[feature] == 0 => {}
+                    1 if sum != 0.0 => expected[dst] += sum * scale,
+                    1 => {}
+                    _ => expected[dst] = sum * scale,
+                }
+                assert_eq!(
+                    actual[dst].to_bits(),
+                    expected[dst].to_bits(),
+                    "pass {pass}, feature {feature}, column {row}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn full_threat_wide_forward_matches_reference_bits() -> Result<(), Box<dyn std::error::Error>> {
     use crate::trainer_common::cfg_1d;
     use gpu_runtime::{DeviceBuffer, cuda_launch};
