@@ -161,6 +161,61 @@ fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> 
 }
 
 #[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartialGather {
+    Row,
+    Tile,
+}
+
+#[cfg(feature = "native")]
+impl PartialGather {
+    fn at_start(rows: usize, width: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        match std::env::var("TATARA_PARTIAL_GATHER").as_deref() {
+            Ok("row") => Ok(Self::Row),
+            Ok("tile") => Ok(Self::Tile),
+            Ok("auto") | Err(std::env::VarError::NotPresent) => {
+                // On an RTX 5090 the row walk wins up to FT 3072 + Threat 1024 (its column tiles stay in
+                // L2) and the tiled launch wins from FT 4096 + Threat 1408 up; narrow-L2 GPUs favor
+                // the tiled launch earlier.
+                const TILE_MIN_COMBINED_WIDTH: usize = 5120;
+                Ok(if rows + width >= TILE_MIN_COMBINED_WIDTH {
+                    Self::Tile
+                } else {
+                    Self::Row
+                })
+            }
+            _ => Err("TATARA_PARTIAL_GATHER must be auto, row, or tile".into()),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn partial_ft_gather_row_config(
+    base: usize,
+    threats: usize,
+    rows: usize,
+    width: usize,
+) -> Result<LaunchConfig, std::num::TryFromIntError> {
+    const THREADS: u32 = 64;
+    let tile_width = (2 * THREADS) as usize;
+    let blocks = base * rows.div_ceil(tile_width) + threats * width.div_ceil(tile_width);
+    Ok(LaunchConfig {
+        grid_dim: (u32::try_from(blocks)?, 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    })
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn partial_ft_gather_tile_config(features: usize, width: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (features.div_ceil(2) as u32, width.div_ceil(128) as u32, 1),
+        block_dim: (64, 2, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+#[cfg(feature = "native")]
 impl GpuTrainer {
     /// Whether this step updates FT weights with `ft_fused_optimizer_step` instead of the
     /// separate norm-loss / RAdam / lookahead / fold launches. Precision-diagnostic steps keep
@@ -1700,6 +1755,8 @@ pub(crate) struct GpuTrainer {
     #[cfg(feature = "native")]
     partial_ft_w_h: Option<DeviceBuffer<f16>>,
     partial_ft_shape: DeviceBuffer<u32>,
+    #[cfg(feature = "native")]
+    partial_gather: PartialGather,
     partial_norm_sums: DeviceBuffer<f64>,
     empty_threat_pair_starts: DeviceBuffer<u32>,
     ft_b: DeviceBuffer<f32>,
@@ -2584,6 +2641,19 @@ impl GpuTrainer {
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
+        #[cfg(feature = "native")]
+        let partial_gather = if !forward_only
+            && precision.ft_fp16_out
+            && width < ft_out
+            && ft_out.is_multiple_of(4)
+            && width.is_multiple_of(4)
+        {
+            let mode = PartialGather::at_start(ft_out, width)?;
+            println!("[threat] partial-width gather: {mode:?}");
+            mode
+        } else {
+            PartialGather::Row
+        };
         let compact_h2d = cfg!(feature = "native") && feature_set.threat_profile().is_some();
         let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         #[cfg(not(feature = "native"))]
@@ -2793,6 +2863,8 @@ impl GpuTrainer {
                 None
             },
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
+            #[cfg(feature = "native")]
+            partial_gather,
             partial_ft_shape: DeviceBuffer::from_host(
                 &stream,
                 &[
@@ -4070,21 +4142,36 @@ impl GpuTrainer {
             .expect("FP16 gradients allocated");
             #[cfg(feature = "native")]
             if rows.is_multiple_of(4) && spec.threat_width(rows).is_multiple_of(4) {
-                const THREADS: u32 = 64;
-                let tile_width = (2 * THREADS) as usize;
-                let blocks = spec.base_ft_in() * rows.div_ceil(tile_width)
-                    + spec.threat_dims() * spec.threat_width(rows).div_ceil(tile_width);
-                let config = LaunchConfig {
-                    grid_dim: (u32::try_from(blocks)?, 1, 1),
-                    block_dim: (THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                };
+                let base = spec.base_ft_in();
+                let threats = spec.threat_dims();
+                let width = spec.threat_width(rows);
+                if active_rows_only && self.partial_gather == PartialGather::Tile {
+                    // Separate the widths so the grid needs no empty Threat column tiles.
+                    for (first, count, packed_width) in [(0, base, rows), (base, threats, width)] {
+                        if count == 0 {
+                            continue;
+                        }
+                        // SAFETY: each launch owns its section of the packed real block.
+                        // Both half-boundaries are even and the mask covers both sections.
+                        unsafe {
+                            cuda_launch! {
+                                kernel: partial_ft_gather_fp16_pairs_active_tile, stream: self.stream, module: self.module,
+                                config: partial_ft_gather_tile_config(count, packed_width),
+                                args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                                       slice(self.ft_w_grad), slice(self.ws.ft_active_rows), first as u32,
+                                       count as u32, rows as u32, packed_width as u32, perspective as u32, scale]
+                            }
+                        }?;
+                    }
+                    return Ok(());
+                }
+                let config = partial_ft_gather_row_config(base, threats, rows, width)?;
                 // SAFETY: both half-boundaries are even, so each aligned pair stays in
-                // one half of a row. The grid covers the packed real block and the mask covers its features.
+                // one half of a row. The grid and active mask cover the packed real block.
                 return unsafe {
                     if active_rows_only {
                         cuda_launch! {
-                            kernel: partial_ft_gather_fp16_pairs_active, stream: self.stream, module: self.module,
+                            kernel: partial_ft_gather_fp16_pairs_active_row, stream: self.stream, module: self.module,
                             config: config,
                             args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
                                    slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale,
