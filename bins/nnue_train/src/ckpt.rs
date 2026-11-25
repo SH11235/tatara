@@ -5,19 +5,22 @@ use gpu_runtime::{CudaStream, DeviceBuffer};
 use nnue_format::ArchKind;
 use nnue_train::dataloader::BucketMode;
 use nnue_train::optimizer::OptimizerKind;
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::raw_checkpoint::read_raw_ckpt_group_len;
 #[cfg(test)]
 pub(crate) use nnue_train::raw_checkpoint::write_f32_slice;
-#[cfg(feature = "gpu")]
-use nnue_train::raw_checkpoint::write_raw_ckpt_group;
 #[cfg(any(feature = "gpu", test))]
 pub(crate) use nnue_train::raw_checkpoint::write_raw_ckpt_header;
 use nnue_train::raw_checkpoint::{
-    F32_IO_CHUNK_BYTES, MAX_RUN_ID_BYTES, PARTIAL_THREAT_CKPT_VERSION,
-    PARTIAL_THREAT_RADAM_CKPT_VERSION, PARTIAL_THREAT_SGD_CKPT_VERSION, SGD_CHECKPOINT_VERSION,
+    F32_IO_CHUNK_BYTES, PARTIAL_THREAT_CKPT_VERSION, PARTIAL_THREAT_RADAM_CKPT_VERSION,
+    PARTIAL_THREAT_SGD_CKPT_VERSION, RawCkptReadMode, RawCkptReader, SGD_CHECKPOINT_VERSION,
+    read_raw_ckpt_exact,
 };
-pub(crate) use nnue_train::raw_checkpoint::{
-    RAW_CKPT_MAGIC, RAW_CKPT_VERSION, RawCkptArch, RawCkptMeta,
-};
+#[cfg(feature = "gpu")]
+use nnue_train::raw_checkpoint::{MAX_RUN_ID_BYTES, write_raw_ckpt_group};
+#[cfg(test)]
+pub(crate) use nnue_train::raw_checkpoint::{RAW_CKPT_MAGIC, RAW_CKPT_VERSION};
+pub(crate) use nnue_train::raw_checkpoint::{RawCkptArch, RawCkptMeta};
 use shogi_features::FeatureSet;
 
 #[cfg(feature = "gpu")]
@@ -343,68 +346,18 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     r: &mut R,
     expected: &RawCkptArch,
 ) -> Result<RawCkptHeader, Box<dyn std::error::Error>> {
-    let mut magic = [0u8; 4];
-    read_exact_or_invalid(r, &mut magic, "magic")?;
-    if magic != RAW_CKPT_MAGIC {
-        return Err(invalid_data(format!(
-            "raw checkpoint magic mismatch: got {magic:?}, want {RAW_CKPT_MAGIC:?}"
-        )));
-    }
-    let mut buf4 = [0u8; 4];
-    read_exact_or_invalid(r, &mut buf4, "version")?;
-    let version = u32::from_le_bytes(buf4);
-    if version == 0 || version > RAW_CKPT_VERSION {
-        return Err(invalid_data(format!(
-            "raw checkpoint version {version} is not supported \
-             (this build reads 1..=15)"
-        )));
-    }
-    let mut buf8 = [0u8; 8];
+    let mut reader = RawCkptReader::new(r, RawCkptReadMode::Resume)?;
+    let version = reader.version();
     let want_name = expected.feature_set.canonical_name();
 
-    // feature set header は version 2+。version 1 は header 無しで halfka-hm-merged 固定。
-    if version >= 2 {
-        read_exact_or_invalid(r, &mut buf4, "feature set name length")?;
-        let fs_name_len = u32::from_le_bytes(buf4) as usize;
-        if fs_name_len > 256 {
-            return Err(invalid_data(format!(
-                "raw checkpoint feature set name length {fs_name_len} is implausible (max 256)"
-            )));
-        }
-        let mut fs_name_bytes = vec![0u8; fs_name_len];
-        read_exact_or_invalid(r, &mut fs_name_bytes, "feature set name")?;
-        let fs_name = String::from_utf8(fs_name_bytes).map_err(|_| {
-            invalid_data("raw checkpoint feature set name is not valid UTF-8".to_string())
-        })?;
-        read_exact_or_invalid(r, &mut buf8, "ft_in")?;
-        let ckpt_ft_in = u64::from_le_bytes(buf8);
-        read_exact_or_invalid(r, &mut buf8, "ft_out")?;
-        let ckpt_ft_out = u64::from_le_bytes(buf8);
-        read_exact_or_invalid(r, &mut buf8, "max_active")?;
-        let ckpt_max_active = u64::from_le_bytes(buf8);
-        // FT factorizer flag は version 6+。旧版は factorizer 以前の checkpoint
-        // なので false 扱い (factorize 有効側との不一致は下の照合で reject)。
-        let ckpt_ft_factorize = if version >= 6 {
-            let mut buf1 = [0u8; 1];
-            read_exact_or_invalid(r, &mut buf1, "ft_factorize flag")?;
-            buf1[0] != 0
-        } else {
-            false
-        };
-        let ckpt_feature_hash = if version >= 7 {
-            read_exact_or_invalid(r, &mut buf4, "feature hash")?;
-            Some(u32::from_le_bytes(buf4))
-        } else {
-            None
-        };
-
-        let width = if version >= PARTIAL_THREAT_CKPT_VERSION {
-            let mut width_bytes = [0; 8];
-            read_exact_or_invalid(r, &mut width_bytes, "Threat width")?;
-            u64::from_le_bytes(width_bytes)
-        } else {
-            expected.ft_out
-        };
+    if let Some(features) = reader.features()? {
+        let fs_name = features.name;
+        let ckpt_ft_in = features.train_ft_in;
+        let ckpt_ft_out = features.ft_out;
+        let ckpt_max_active = features.max_active;
+        let ckpt_ft_factorize = features.ft_factorize;
+        let ckpt_feature_hash = features.feature_hash;
+        let width = features.threat_width.unwrap_or(expected.ft_out);
         if width != expected.feature_set.threat_width(expected.ft_out as usize) as u64 {
             return Err(invalid_data("raw checkpoint Threat width mismatch".into()));
         }
@@ -482,44 +435,9 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         )));
     }
 
-    // producer run id は version 3+。長さ 0 も「未記録」扱いで `None`。
-    let producer_run_id: Option<String> = if version >= 3 {
-        read_exact_or_invalid(r, &mut buf4, "producer run id length")?;
-        let run_id_len = u32::from_le_bytes(buf4) as usize;
-        if run_id_len > MAX_RUN_ID_BYTES {
-            return Err(invalid_data(format!(
-                "raw checkpoint producer run id length {run_id_len} is implausible \
-                 (max {MAX_RUN_ID_BYTES})"
-            )));
-        }
-        if run_id_len == 0 {
-            None
-        } else {
-            let mut run_id_bytes = vec![0u8; run_id_len];
-            read_exact_or_invalid(r, &mut run_id_bytes, "producer run id")?;
-            Some(String::from_utf8(run_id_bytes).map_err(|_| {
-                invalid_data("raw checkpoint producer run id is not valid UTF-8".to_string())
-            })?)
-        }
-    } else {
-        None
-    };
+    let producer_run_id = reader.producer_run_id()?;
 
-    // arch_kind + topology header は version 4+。version 1..=3 は arch-kind header
-    // を持たず、Simple アーキが存在しなかった時代の checkpoint なので暗黙に layerstack。
-    if version >= 4 {
-        read_exact_or_invalid(r, &mut buf4, "arch kind name length")?;
-        let arch_name_len = u32::from_le_bytes(buf4) as usize;
-        if arch_name_len > 256 {
-            return Err(invalid_data(format!(
-                "raw checkpoint arch kind name length {arch_name_len} is implausible (max 256)"
-            )));
-        }
-        let mut arch_name_bytes = vec![0u8; arch_name_len];
-        read_exact_or_invalid(r, &mut arch_name_bytes, "arch kind name")?;
-        let arch_name = String::from_utf8(arch_name_bytes).map_err(|_| {
-            invalid_data("raw checkpoint arch kind name is not valid UTF-8".to_string())
-        })?;
+    if let Some(arch_name) = reader.arch_name()? {
         let ckpt_arch = ArchKind::from_canonical_name(&arch_name).ok_or_else(|| {
             invalid_data(format!(
                 "raw checkpoint has unknown arch kind '{arch_name}'"
@@ -533,19 +451,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.arch_kind.canonical_name()
             )));
         }
-        let ckpt_bucket_mode = if version >= 8 {
-            read_exact_or_invalid(r, &mut buf4, "bucket mode name length")?;
-            let bucket_mode_len = u32::from_le_bytes(buf4) as usize;
-            if bucket_mode_len > 256 {
-                return Err(invalid_data(format!(
-                    "raw checkpoint bucket mode name length {bucket_mode_len} is implausible (max 256)"
-                )));
-            }
-            let mut bucket_mode_bytes = vec![0u8; bucket_mode_len];
-            read_exact_or_invalid(r, &mut bucket_mode_bytes, "bucket mode name")?;
-            let bucket_mode = String::from_utf8(bucket_mode_bytes).map_err(|_| {
-                invalid_data("raw checkpoint bucket mode name is not valid UTF-8".to_string())
-            })?;
+        let ckpt_bucket_mode = if let Some(bucket_mode) = reader.bucket_mode()? {
             // 旧名 alias で書かれた checkpoint も canonical 名の checkpoint と同じ
             // mode として照合する。未知の mode 名は正規化せずそのまま比較に回し、
             // 下の不一致エラーで surface させる。
@@ -571,8 +477,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.arch_kind.canonical_name()
             )));
         }
-        read_exact_or_invalid(r, &mut buf8, "topology dim count")?;
-        let topo_count = u64::from_le_bytes(buf8);
+        let topo_count = reader.topology_count()?;
         if topo_count != expected.topology.len() as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint topology dim count {topo_count} != expected {}",
@@ -580,8 +485,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             )));
         }
         for (i, &want_dim) in expected.topology.iter().enumerate() {
-            read_exact_or_invalid(r, &mut buf8, "topology dim")?;
-            let got = u64::from_le_bytes(buf8);
+            let got = reader.topology_dim()?;
             if got != want_dim {
                 return Err(invalid_data(format!(
                     "raw checkpoint topology dim {i} mismatch: got {got}, want {want_dim} \
@@ -603,83 +507,38 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         )));
     }
 
-    read_exact_or_invalid(r, &mut buf8, "superbatch")?;
-    let superbatch_u64 = u64::from_le_bytes(buf8);
+    let superbatch_u64 = reader.superbatch()?;
     let superbatch: usize = superbatch_u64.try_into().map_err(|_| {
         invalid_data(format!(
             "raw checkpoint superbatch {superbatch_u64} exceeds usize::MAX"
         ))
     })?;
-    read_exact_or_invalid(r, &mut buf8, "step_count")?;
-    let step_count = u64::from_le_bytes(buf8);
-
-    // LR-schedule horizon は version 5+。0 は「horizon 未記録」扱いで `None`。
-    let lr_horizon: Option<usize> = if version >= 5 {
-        read_exact_or_invalid(r, &mut buf8, "lr_horizon")?;
-        let horizon_u64 = u64::from_le_bytes(buf8);
-        if horizon_u64 == 0 {
-            None
-        } else {
-            Some(horizon_u64.try_into().map_err(|_| {
+    let step_count = reader.step_count()?;
+    let lr_horizon = reader
+        .lr_horizon()?
+        .map(|horizon| {
+            usize::try_from(horizon).map_err(|_| {
                 invalid_data(format!(
-                    "raw checkpoint lr_horizon {horizon_u64} exceeds usize::MAX"
+                    "raw checkpoint lr_horizon {horizon} exceeds usize::MAX"
                 ))
-            })?)
-        }
-    } else {
-        None
-    };
+            })
+        })
+        .transpose()?;
 
-    // Simple evaluation scale は version 9+。0 は「未記録」扱いで `None`。
-    let fv_scale = if version >= 9 {
-        read_exact_or_invalid(r, &mut buf4, "fv_scale")?;
-        let value = i32::from_le_bytes(buf4);
-        if value < 0 {
-            return Err(invalid_data(format!(
-                "raw checkpoint fv_scale {value} is invalid (must be non-negative)"
-            )));
-        }
-        (value != 0).then_some(value)
-    } else {
-        None
-    };
+    let fv_scale = reader.fv_scale()?;
+    if let Some(value) = fv_scale.filter(|&value| value < 0) {
+        return Err(invalid_data(format!(
+            "raw checkpoint fv_scale {value} is invalid (must be non-negative)"
+        )));
+    }
 
-    let (qat_dense, ft_weight_i8x2) = if version >= 10 {
-        read_exact_or_invalid(r, &mut buf4, "QAT flags")?;
-        let flags = u32::from_le_bytes(buf4);
-        nnue_train::raw_checkpoint::decode_qat_flags(flags)
-            .filter(|_| flags == 0 || expected.arch_kind == ArchKind::LayerStack)
-            .ok_or_else(|| invalid_data(format!("unsupported QAT flags {flags}")))?
-    } else {
-        (false, false)
-    };
+    let flags = reader.qat_flags()?;
+    let (qat_dense, ft_weight_i8x2) = nnue_train::raw_checkpoint::decode_qat_flags(flags)
+        .filter(|_| flags == 0 || expected.arch_kind == ArchKind::LayerStack)
+        .ok_or_else(|| invalid_data(format!("unsupported QAT flags {flags}")))?;
 
-    // producer net id + recipe fingerprint は version 11+。空 / 0 は「未記録」で `None`。
-    let (producer_net_id, producer_recipe_fingerprint) = if version >= 11 {
-        read_exact_or_invalid(r, &mut buf4, "producer net id length")?;
-        let net_id_len = u32::from_le_bytes(buf4) as usize;
-        if net_id_len > MAX_RUN_ID_BYTES {
-            return Err(invalid_data(format!(
-                "raw checkpoint producer net id length {net_id_len} is implausible \
-                 (max {MAX_RUN_ID_BYTES})"
-            )));
-        }
-        let mut net_id_bytes = vec![0u8; net_id_len];
-        read_exact_or_invalid(r, &mut net_id_bytes, "producer net id")?;
-        let net_id = String::from_utf8(net_id_bytes).map_err(|_| {
-            invalid_data("raw checkpoint producer net id is not valid UTF-8".to_string())
-        })?;
-        read_exact_or_invalid(r, &mut buf8, "recipe fingerprint")?;
-        let fingerprint = u64::from_le_bytes(buf8);
-        (
-            (!net_id.is_empty()).then_some(net_id),
-            (fingerprint != 0).then_some(fingerprint),
-        )
-    } else {
-        (None, None)
-    };
-    read_exact_or_invalid(r, &mut buf8, "num_groups")?;
-    let num_groups = u64::from_le_bytes(buf8);
+    let (producer_net_id, producer_recipe_fingerprint) = reader.producer_recipe()?;
+    let num_groups = reader.group_count()?;
 
     Ok(RawCkptHeader {
         version,
@@ -796,9 +655,8 @@ fn read_raw_ckpt_group<R: std::io::Read>(
     name: &str,
     expected_len: usize,
 ) -> Result<RawCkptGroup, Box<dyn std::error::Error>> {
-    let mut buf8 = [0u8; 8];
-    read_exact_or_invalid(r, &mut buf8, &format!("group {name} len"))?;
-    let len_u64 = u64::from_le_bytes(buf8);
+    let len_u64 =
+        read_raw_ckpt_group_len(r, RawCkptReadMode::Resume, &format!("group {name} len"))?;
     let len: usize = len_u64.try_into().map_err(|_| {
         invalid_data(format!(
             "raw checkpoint group {name} len {len_u64} exceeds usize::MAX"
@@ -832,16 +690,7 @@ pub(crate) fn read_exact_or_invalid<R: std::io::Read>(
     buf: &mut [u8],
     what: &str,
 ) -> std::io::Result<()> {
-    r.read_exact(buf).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("raw checkpoint truncated while reading {what}"),
-            )
-        } else {
-            e
-        }
-    })
+    read_raw_ckpt_exact(r, buf, RawCkptReadMode::Resume, what)
 }
 
 /// little-endian f32 を `n` 個読み、`io::Result` を返す。`what` は短読み

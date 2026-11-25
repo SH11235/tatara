@@ -1,6 +1,6 @@
 //! Host serialization for raw NNUE training checkpoints.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use nnue_format::ArchKind;
 use shogi_features::FeatureSetSpec;
@@ -87,7 +87,10 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
 pub const RAW_CKPT_VERSION: u32 = 15;
-const ADAM_CHECKPOINT_VERSION: u32 = 11;
+pub const RAW_CKPT_ARCH_HEADER_VERSION: u32 = 4;
+const PRODUCER_RECIPE_VERSION: u32 = 11;
+const ADAM_CHECKPOINT_VERSION: u32 = PRODUCER_RECIPE_VERSION;
+const MAX_NAME_BYTES: usize = 256;
 pub const SGD_CHECKPOINT_VERSION: u32 = 12;
 pub const PARTIAL_THREAT_CKPT_VERSION: u32 = 13;
 pub const PARTIAL_THREAT_SGD_CKPT_VERSION: u32 = 14;
@@ -133,6 +136,250 @@ pub struct RawCkptMeta<'a> {
     pub net_id: &'a str,
     /// この checkpoint を書き出す run のレシピの指紋。実験ログが無ければ `None`。
     pub recipe_fingerprint: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub enum RawCkptReadMode {
+    Resume,
+    Average,
+}
+
+impl RawCkptReadMode {
+    fn field(self, resume: &'static str, average: &'static str) -> &'static str {
+        match self {
+            Self::Resume => resume,
+            Self::Average => average,
+        }
+    }
+}
+
+pub struct RawCkptFeatures {
+    pub name: String,
+    pub train_ft_in: u64,
+    pub ft_out: u64,
+    pub max_active: u64,
+    pub ft_factorize: bool,
+    pub feature_hash: Option<u32>,
+    pub threat_width: Option<u64>,
+}
+
+/// Reads header sections in wire order so callers can validate each section before reading on.
+pub struct RawCkptReader<R> {
+    r: R,
+    mode: RawCkptReadMode,
+    version: u32,
+}
+
+impl<R: Read> RawCkptReader<R> {
+    pub fn new(r: R, mode: RawCkptReadMode) -> io::Result<Self> {
+        let mut reader = Self {
+            r,
+            mode,
+            version: 0,
+        };
+        let magic = reader.array::<4>("magic")?;
+        if magic != RAW_CKPT_MAGIC {
+            return Err(invalid(match mode {
+                RawCkptReadMode::Resume => {
+                    format!("raw checkpoint magic mismatch: got {magic:?}, want {RAW_CKPT_MAGIC:?}")
+                }
+                RawCkptReadMode::Average => "not a raw training checkpoint (magic mismatch)".into(),
+            }));
+        }
+        let version = reader.u32("version")?;
+        let min = match mode {
+            RawCkptReadMode::Resume => 1,
+            RawCkptReadMode::Average => RAW_CKPT_ARCH_HEADER_VERSION,
+        };
+        if !(min..=RAW_CKPT_VERSION).contains(&version) {
+            let supported = mode.field("this build reads", "supported:");
+            let prefix = mode.field("raw checkpoint", "checkpoint");
+            return Err(invalid(format!(
+                "{prefix} version {version} is not supported ({supported} {min}..={RAW_CKPT_VERSION})"
+            )));
+        }
+        reader.version = version;
+        Ok(reader)
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn features(&mut self) -> io::Result<Option<RawCkptFeatures>> {
+        if self.version == 1 {
+            return Ok(None);
+        }
+        Ok(Some(RawCkptFeatures {
+            name: self.name("feature set name", MAX_NAME_BYTES)?,
+            train_ft_in: self.u64("ft_in")?,
+            ft_out: self.u64("ft_out")?,
+            max_active: self.u64("max_active")?,
+            ft_factorize: self.version >= 6 && self.array::<1>("ft_factorize flag")?[0] != 0,
+            feature_hash: (self.version >= 7)
+                .then(|| self.u32("feature hash"))
+                .transpose()?,
+            threat_width: self.optional_u64(PARTIAL_THREAT_CKPT_VERSION, "Threat width")?,
+        }))
+    }
+
+    pub fn producer_run_id(&mut self) -> io::Result<Option<String>> {
+        if self.version < 3 {
+            return Ok(None);
+        }
+        let id = self.name("producer run id", MAX_RUN_ID_BYTES)?;
+        Ok((!id.is_empty()).then_some(id))
+    }
+
+    pub fn arch_name(&mut self) -> io::Result<Option<String>> {
+        let field = self.mode.field("arch kind name", "arch kind");
+        (self.version >= RAW_CKPT_ARCH_HEADER_VERSION)
+            .then(|| self.name(field, MAX_NAME_BYTES))
+            .transpose()
+    }
+
+    pub fn bucket_mode(&mut self) -> io::Result<Option<String>> {
+        let field = self.mode.field("bucket mode name", "bucket mode");
+        (self.version >= 8)
+            .then(|| self.name(field, MAX_NAME_BYTES))
+            .transpose()
+    }
+
+    pub fn topology_count(&mut self) -> io::Result<u64> {
+        self.u64("topology dim count")
+    }
+
+    pub fn topology_dim(&mut self) -> io::Result<u64> {
+        self.u64("topology dim")
+    }
+
+    pub fn superbatch(&mut self) -> io::Result<u64> {
+        self.u64("superbatch")
+    }
+
+    pub fn step_count(&mut self) -> io::Result<u64> {
+        self.u64(self.mode.field("step_count", "step count"))
+    }
+
+    pub fn lr_horizon(&mut self) -> io::Result<Option<u64>> {
+        self.optional_u64(5, self.mode.field("lr_horizon", "LR horizon"))
+            .map(|horizon| horizon.filter(|&value| value != 0))
+    }
+
+    pub fn fv_scale(&mut self) -> io::Result<Option<i32>> {
+        if self.version < 9 {
+            return Ok(None);
+        }
+        let value = i32::from_le_bytes(self.array("fv_scale")?);
+        Ok((value != 0).then_some(value))
+    }
+
+    pub fn qat_flags(&mut self) -> io::Result<u32> {
+        if self.version < 10 {
+            return Ok(0);
+        }
+        self.u32("QAT flags")
+    }
+
+    pub fn producer_recipe(&mut self) -> io::Result<(Option<String>, Option<u64>)> {
+        if self.version < PRODUCER_RECIPE_VERSION {
+            return Ok((None, None));
+        }
+        let id = self.name("producer net id", MAX_RUN_ID_BYTES)?;
+        let fingerprint = self.u64("recipe fingerprint")?;
+        Ok((
+            (!id.is_empty()).then_some(id),
+            (fingerprint != 0).then_some(fingerprint),
+        ))
+    }
+
+    pub fn group_count(&mut self) -> io::Result<u64> {
+        self.u64(self.mode.field("num_groups", "group count"))
+    }
+
+    pub fn into_inner(self) -> R {
+        self.r
+    }
+
+    fn array<const N: usize>(&mut self, field: &str) -> io::Result<[u8; N]> {
+        let mut bytes = [0; N];
+        read_raw_ckpt_exact(&mut self.r, &mut bytes, self.mode, field)?;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self, field: &str) -> io::Result<u32> {
+        self.array(field).map(u32::from_le_bytes)
+    }
+
+    fn u64(&mut self, field: &str) -> io::Result<u64> {
+        self.array(field).map(u64::from_le_bytes)
+    }
+
+    fn optional_u64(&mut self, min_version: u32, field: &str) -> io::Result<Option<u64>> {
+        (self.version >= min_version)
+            .then(|| self.u64(field))
+            .transpose()
+    }
+
+    fn name(&mut self, field: &str, max: usize) -> io::Result<String> {
+        let len = match self.mode {
+            RawCkptReadMode::Resume => self.u32(&format!("{field} length"))?,
+            RawCkptReadMode::Average => self.u32(field)?,
+        } as usize;
+        let prefix = self.mode.field("raw checkpoint ", "");
+        if len > max {
+            let message = format!("{prefix}{field} length {len} is implausible");
+            return Err(invalid(match self.mode {
+                RawCkptReadMode::Resume => format!("{message} (max {max})"),
+                RawCkptReadMode::Average => message,
+            }));
+        }
+        let mut bytes = vec![0; len];
+        match self.mode {
+            RawCkptReadMode::Resume => {
+                read_raw_ckpt_exact(&mut self.r, &mut bytes, self.mode, field)?
+            }
+            RawCkptReadMode::Average => self
+                .r
+                .read_exact(&mut bytes)
+                .map_err(|_| truncated(self.mode, field))?,
+        }
+        String::from_utf8(bytes).map_err(|_| invalid(format!("{prefix}{field} is not valid UTF-8")))
+    }
+}
+
+pub fn read_raw_ckpt_exact(
+    r: &mut impl Read,
+    bytes: &mut [u8],
+    mode: RawCkptReadMode,
+    field: &str,
+) -> io::Result<()> {
+    r.read_exact(bytes).map_err(|err| {
+        if err.kind() == io::ErrorKind::UnexpectedEof {
+            truncated(mode, field)
+        } else {
+            err
+        }
+    })
+}
+
+pub fn read_raw_ckpt_group_len(
+    r: &mut impl Read,
+    mode: RawCkptReadMode,
+    field: &str,
+) -> io::Result<u64> {
+    let mut bytes = [0; 8];
+    read_raw_ckpt_exact(r, &mut bytes, mode, field)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn truncated(mode: RawCkptReadMode, field: &str) -> io::Error {
+    let prefix = mode.field("raw checkpoint", "checkpoint");
+    invalid(format!("{prefix} truncated while reading {field}"))
+}
+
+fn invalid(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 /// Decodes the dense QAT and piece FT quantization flags.
@@ -209,8 +456,13 @@ pub fn write_raw_ckpt_header<W: Write>(
     Ok(())
 }
 
+pub const TENSORS_PER_GROUP: usize = 4;
+
 /// Write one master weight group followed by its first moment, second moment and slow weights.
-pub fn write_raw_ckpt_group<W: Write>(w: &mut W, tensors: [&[f32]; 4]) -> io::Result<()> {
+pub fn write_raw_ckpt_group<W: Write>(
+    w: &mut W,
+    tensors: [&[f32]; TENSORS_PER_GROUP],
+) -> io::Result<()> {
     let len = tensors[0].len();
     if tensors.iter().any(|tensor| tensor.len() != len) {
         return Err(io::Error::new(
