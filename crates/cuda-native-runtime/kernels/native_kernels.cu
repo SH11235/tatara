@@ -2265,6 +2265,12 @@ __device__ __forceinline__ void ft_optimizer_store4(__half* destination, const f
     *reinterpret_cast<uint2*>(destination) = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
 }
 
+// Keep projection out of line so its instruction budget does not change optimizer contraction.
+__device__ __noinline__ float4 packed_ft_project(float4 weights) {
+    return make_float4(piece_ft_i8x2(weights.x), piece_ft_i8x2(weights.y),
+                       piece_ft_i8x2(weights.z), piece_ft_i8x2(weights.w));
+}
+
 // Must match the host FT_FUSED_BLOCK_THREADS so the launch respects this register bound.
 #define FT_FUSED_BLOCK_THREADS 64
 
@@ -2291,7 +2297,7 @@ __device__ __forceinline__ void ft_optimizer_store4(__half* destination, const f
 //
 // flags: bit 0 = FP16 moment storage, bit 1 = norm-loss, bit 2 = lookahead,
 // bit 3 = active-row mask, bits 4..5 = forward output (0 none, 1 FP16 mirror, 2 FP16 comb,
-// 3 FP32 comb), bit 6 = norm accumulation.
+// 3 FP32 comb), bit 6 = norm accumulation, bit 7 = packed fold, bit 8 = piece projection.
 // A 16-block residency target caps register pressure to avoid local-memory spills.
 extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fused_optimizer_step(
     float* weights,
@@ -2313,8 +2319,8 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
     unsigned int active_row_base,
     void* forward_output,
     unsigned long long,
-    const unsigned int* threat_pair_starts,
-    unsigned long long threat_pair_starts_len,
+    const unsigned int* fold_rows,
+    unsigned long long fold_rows_len,
     unsigned long long ft_bounds,
     unsigned int ft_out,
     unsigned int norm_width,
@@ -2432,11 +2438,15 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
         if ((flags & 4U) != 0) {
             ft_optimizer_store4(slow_weights + i, slow4);
         }
-        const unsigned long long partner = output_mode >= 2U ? ft_fold_partner_index(
-            row, column, threat_pair_starts, threat_pair_starts_len,
-            static_cast<unsigned int>(ft_bounds), static_cast<unsigned int>(ft_bounds >> 32),
-            ft_out, piece_inputs, effect_bucket_factorize
-        ) : ~0ULL;
+        // Packed launches pass a row-to-partner map and a virtual block offset.
+        const unsigned long long partner = output_mode >= 2U
+            ? ((flags & 128U) != 0
+                ? (piece_inputs == 0 ? ~0ULL
+                    : ft_bounds + static_cast<unsigned long long>(fold_rows[row]) * ft_out + column)
+                : ft_fold_partner_index(row, column, fold_rows, fold_rows_len,
+                    static_cast<unsigned int>(ft_bounds), static_cast<unsigned int>(ft_bounds >> 32),
+                    ft_out, piece_inputs, effect_bucket_factorize))
+            : ~0ULL;
         float partner4[4] = {};
         if (partner != ~0ULL) {
             ft_forward_load4(weights + partner, partner4);
@@ -2444,10 +2454,17 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
         #pragma unroll
         for (unsigned int lane = 0; lane < 4; ++lane) {
             if (partner != ~0ULL) {
-                w4[lane] += partner4[lane];
+                w4[lane] = __fadd_rn(w4[lane], partner4[lane]);
             }
         }
         if (output_mode == 1U || output_mode == 2U) {
+            if ((flags & 256U) != 0) {
+                const float4 projected = packed_ft_project(make_float4(w4[0], w4[1], w4[2], w4[3]));
+                w4[0] = projected.x;
+                w4[1] = projected.y;
+                w4[2] = projected.z;
+                w4[3] = projected.w;
+            }
             ft_optimizer_store4(static_cast<__half*>(forward_output) + i, w4);
         } else if (output_mode == 3U) {
             ft_optimizer_store4(static_cast<float*>(forward_output) + i, w4);
