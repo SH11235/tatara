@@ -88,6 +88,44 @@ impl GpuTrainer {
         Ok(())
     }
 
+    #[cfg(feature = "native")]
+    pub(super) fn dense_concat_qat_activations(
+        &self,
+        batch: usize,
+        l2_out: usize,
+        output: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let raw = &self.qat_workspace().raw;
+        // SAFETY: the integer affine outputs and the activation destination cover the live rows.
+        unsafe {
+            cuda_launch! {
+                kernel: dense_concat_qat_activations, stream: self.stream, module: self.module,
+                config: cfg_1d(batch * 2 * (self.ws.l1_out + l2_out)),
+                args: [slice(raw[0]), slice(raw[1]), slice_mut(output),
+                    batch as u32, self.ws.l1_out as u32, l2_out as u32]
+            }
+        }?;
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    pub(super) fn dense_concat_qat_output(
+        &self,
+        batch: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let raw = &self.qat_workspace().raw;
+        // SAFETY: each L1 row has two skip values and each output row is unique.
+        unsafe {
+            cuda_launch! {
+                kernel: dense_concat_qat_output, stream: self.stream, module: self.module,
+                config: cfg_1d(batch),
+                args: [slice(raw[0]), slice(raw[2]), slice_mut(self.ws.net_output),
+                    batch as u32, self.ws.l1_out as u32]
+            }
+        }?;
+        Ok(())
+    }
+
     pub(crate) fn configure_qat(
         &mut self,
         mode: Option<crate::qat::QatMode>,
@@ -213,7 +251,7 @@ impl GpuTrainer {
                 &self.l3_w,
                 &workspace.weights[7],
                 &self.ws.l3_out,
-                self.ws.l2_out,
+                self.ws.l3_in(),
                 1,
             ),
             _ => unreachable!(),

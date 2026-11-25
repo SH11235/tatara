@@ -49,7 +49,7 @@ target/release/nnue-train \
   --test-positions 10000 \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches <N> --threads <N> \
-  layerstack --progress-coeff <path/to/progress.bin>
+  layerstack --layerstack-head split-skip --progress-coeff <path/to/progress.bin>
 ```
 
 ## 指標の読み方

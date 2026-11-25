@@ -14,31 +14,62 @@
 use std::error::Error;
 
 use nnue_format::LayerStackWeights;
+use nnue_format::layerstack_weights::{
+    feature_spec_from_arch, read_layerstack_arch, stored_num_buckets,
+};
 use shogi_features::FeatureSet;
 
-/// `path` の LayerStack quantised checkpoint を読み込む。失敗時はどの file かを含むエラー。
-///
-/// 比較対象は production の `halfka-hm-merged` checkpoint を既定 FT 出力次元
-/// (`DEFAULT_FT_OUT`) / 既定 L1 出力次元 (`DEFAULT_L1_OUT`) / 既定 L2 出力次元
-/// (`DEFAULT_L2_OUT`) で想定し、bucket 数は file の header に保存された値を使う
-/// (loader は arch / hash / layout がこの feature set と層次元 / bucket 数に一致
-/// するか検証する)。
 fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read `{path}`: {e}"))?;
-    let num_buckets = nnue_format::layerstack_weights::stored_num_buckets(&bytes)
-        .map_err(|e| format!("parse `{path}` header: {e}"))?;
-    LayerStackWeights::load_quantised(
-        &mut std::io::Cursor::new(&bytes),
-        FeatureSet::HalfKaHmMerged.spec(),
-        nnue_format::layerstack_weights::DEFAULT_FT_OUT,
-        nnue_format::layerstack_weights::DEFAULT_L1_OUT,
-        nnue_format::layerstack_weights::DEFAULT_L2_OUT,
-        num_buckets,
-    )
-    .map_err(|e| format!("parse `{path}` as LayerStack quantised NNUE: {e}").into())
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    load_bytes(&bytes).map_err(|e| format!("parse {path} as LayerStack quantised NNUE: {e}").into())
 }
 
-/// tensor `a` / `b` の要素ごとの差分統計を 1 行で出力する。長さ不一致はエラー。
+fn load_bytes(mut bytes: &[u8]) -> Result<LayerStackWeights, Box<dyn Error>> {
+    let mut header = bytes;
+    let arch = read_layerstack_arch(&mut header)?;
+    let features = arch
+        .strip_prefix("Features=")
+        .and_then(|arch| arch.split_once("(Friend)["))
+        .ok_or("invalid LayerStack features")?;
+    let feature_set = FeatureSet::ALL
+        .into_iter()
+        .find(|set| set.spec().arch_feature_name() == features.0)
+        .ok_or("unsupported LayerStack features")?;
+    let ft_out = features
+        .1
+        .split_once("->")
+        .and_then(|(_, rest)| rest.split_once("x2]"))
+        .ok_or("invalid LayerStack FT dimensions")?
+        .0
+        .parse()?;
+    let affine_outputs = arch
+        .split("AffineTransform[")
+        .skip(1)
+        .map(|layer| {
+            layer
+                .split_once("<-")
+                .ok_or("invalid LayerStack affine dimensions")?
+                .0
+                .parse::<usize>()
+                .map_err(|_| "invalid LayerStack affine dimensions")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let &[1, l2_out, l1_out] = affine_outputs.as_slice() else {
+        return Err("invalid LayerStack affine chain".into());
+    };
+    let with_psqt = arch.split(',').any(|token| token.starts_with("PSQT="));
+    let num_buckets = stored_num_buckets(bytes)?;
+    Ok(LayerStackWeights::load_quantised_with_psqt(
+        &mut bytes,
+        feature_spec_from_arch(feature_set, &arch, ft_out)?,
+        ft_out,
+        l1_out,
+        l2_out,
+        num_buckets,
+        with_psqt,
+    )?)
+}
+
 fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
     if a.len() != b.len() {
         return Err(format!(
@@ -112,6 +143,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let a = load(&args[1])?;
     let b = load(&args[2])?;
+    if a.head != b.head {
+        return Err("LayerStack heads differ".into());
+    }
+    if a.bucket_spec != b.bucket_spec
+        || a.num_buckets != b.num_buckets
+        || a.feature_set != b.feature_set
+    {
+        return Err("LayerStack feature sets or bucket routing differ".into());
+    }
+    match (&a.psqt_w, &b.psqt_w) {
+        (Some(a), Some(b)) => print_stats("psqt_w", a, b)?,
+        (None, None) => {}
+        _ => return Err("LayerStack PSQT layouts differ".into()),
+    }
 
     println!("a = {}", args[1]);
     println!("b = {}", args[2]);
@@ -135,5 +180,40 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("compare_quantised: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nnue_format::LayerStackHead;
+    use shogi_features::{EffectBucketConfig, ThreatProfile};
+
+    #[test]
+    fn loads_dense_concat_with_feature_modifiers() -> Result<(), Box<dyn Error>> {
+        let base = FeatureSet::HalfKaHmMerged.spec();
+        let ft_out = 8;
+        for spec in [
+            base.with_threat_profile(ThreatProfile::Full),
+            base.with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(4),
+            base.with_effect_bucket_config(EffectBucketConfig::KINGBUCKETED_3X3),
+        ] {
+            let weights = LayerStackWeights::zeroed_with_head(
+                spec,
+                ft_out,
+                16,
+                32,
+                1,
+                LayerStackHead::DenseConcat,
+            );
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes, None)?;
+            let loaded = load_bytes(&bytes)?;
+            assert_eq!(loaded.head, weights.head);
+            assert_eq!(loaded.feature_set, spec);
+            assert_eq!(loaded.ft_w.len(), weights.ft_w.len());
+        }
+        Ok(())
     }
 }

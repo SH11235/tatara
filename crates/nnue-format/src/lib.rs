@@ -17,6 +17,7 @@
 //! - `yaneuraou`: YaneuraOu SFNNWithoutPsqt evaluation file の save
 
 pub mod arch_kind;
+pub mod dense_concat;
 pub mod halfka_psqt;
 pub mod header;
 pub mod layerstack_weights;
@@ -26,7 +27,7 @@ pub mod yaneuraou;
 pub use arch_kind::ArchKind;
 pub use halfka_psqt::{FT_OUT_DIM, HalfKAPsqtNet, L1_OUT_DIM, NUM_FEATURES, QuantTarget};
 pub use header::{DEFAULT_FV_SCALE, DEFAULT_QA, DEFAULT_QB, HEADER_BYTES, NET_ID_LEN, NnueHeader};
-pub use layerstack_weights::LayerStackWeights;
+pub use layerstack_weights::{LayerStackHead, LayerStackWeights};
 pub use simple_weights::{SimpleActivation, SimpleId, SimpleWeights};
 pub use yaneuraou::{
     MAX_PROGRESS_KPABS_BUCKETS, YANEURAOU_LAYER_STACKS, YaneuraOuRouting, save_yaneuraou,

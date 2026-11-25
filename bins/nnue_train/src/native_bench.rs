@@ -489,6 +489,7 @@ fn create_layerstack_trainer(
             1536,
             16,
             32,
+            nnue_format::LayerStackHead::SplitSkip,
             9,
             BucketMode::ProgressKpAbs,
             precision,

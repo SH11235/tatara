@@ -76,19 +76,23 @@ reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退
 
 ### 学習
 
+LayerStack の新規学習では `--layerstack-head split-skip` または
+`--layerstack-head dense-concat` を指定する。再開と評価のみの実行では保存済みの
+head を使い、明示する場合は保存済みの値と一致させる。[アーキ形式](arch-string.md)を参照。
+
 ```bash
 target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches <N> \
   --threads <N> \
-  layerstack --progress-coeff <path/to/progress.bin>
+  layerstack --layerstack-head split-skip --progress-coeff <path/to/progress.bin>
 ```
 
 KingRank9 を使う場合は末尾を次のように置き換える:
 
 ```bash
-  layerstack --bucket-mode kingrank9
+  layerstack --layerstack-head split-skip --bucket-mode kingrank9
 ```
 
 `kingrank9` では `--num-buckets` を省くと 9 になる(9 以外はエラー)。
@@ -213,7 +217,7 @@ recipe fingerprint に含めます。全項目が既定値（seed 0 を含む）
 nnue-train --data teacher.psv \
   --keep-progress-coeff progress.bin --keep-num-buckets 8 \
   --bucket-keep-rates 1,1,1,1,0.9,0.7,0.5,0.3 \
-  layerstack --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
+  layerstack --layerstack-head split-skip --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
 ```
 
 spec を使って間引く場合は、たとえば `--keep-bucket-spec 'handmajor3'` に
@@ -242,7 +246,7 @@ bucket 計算を省きます。PSV では全 bucket で棄却が確定した局�
 ### 別の教師を割合を決めて混ぜる
 
 ```bash
-nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack --layerstack-head split-skip
 ```
 
 この例では、学習に流れる局面の約 3% を `tree.psv`、約 97% を `main.psv` から取る。
@@ -325,17 +329,17 @@ trafficも増やす。窓を使う場合、256などの小さい明示値は初�
 # 1 GiB/窓 (窓のメモリは最大約2 GiB追加)、base seedを固定
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 
 # 二重バッファのI/O効果だけを測る
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 
 # メモリ量に応じた窓サイズで先読み + shuffle (遅いストレージ向けのopt-in)
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib auto \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 ```
 
 score sidecar、`--score-drop-abs`、`--score-clamp-abs`は元ファイル順で適用してから

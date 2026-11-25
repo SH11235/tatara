@@ -2705,3 +2705,142 @@ pub fn clear_padding_rows_f32(perm: &[i32], output: &[f32], dim: u32) {
         col += thread::blockDim_x() as usize;
     }
 }
+
+#[inline(always)]
+#[expect(clippy::manual_clamp, reason = "cuda-oxide cannot lower f32::clamp")]
+fn dense_concat_clip(x: f32) -> f32 {
+    if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+// l2_out == 0 produces the prefix consumed by L2.
+#[kernel]
+pub fn dense_concat_activations(
+    l1: &[f32],
+    l2: &[f32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    l1_out: u32,
+    l2_out: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let l1_out = l1_out as usize;
+    let l2_out = l2_out as usize;
+    let width = 2 * (l1_out + l2_out);
+    if tid.get() >= batch as usize * width {
+        return;
+    }
+    let row = tid.get() / width;
+    let col = tid.get() % width;
+    let (x, square) = if col < 2 * l1_out {
+        (l1[row * l1_out + col % l1_out], col < l1_out)
+    } else {
+        let offset = col - 2 * l1_out;
+        (l2[row * l2_out + offset % l2_out], offset < l2_out)
+    };
+    if let Some(out) = output.get_mut(tid) {
+        *out = dense_concat_clip(if square { x * x * scale } else { x });
+    }
+}
+
+#[inline(always)]
+fn dense_concat_pair_grad(x: f32, dsquare: f32, dclip: f32, scale: f32) -> f32 {
+    let square = x * x * scale;
+    let square_grad = if square > 0.0 && square < 1.0 {
+        dsquare * (2.0 * scale * x)
+    } else {
+        0.0
+    };
+    let clip_grad = if x > 0.0 && x < 1.0 { dclip } else { 0.0 };
+    square_grad + clip_grad
+}
+
+#[kernel]
+pub fn dense_concat_l2_grad(
+    l2: &[f32],
+    dy: &[f32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    l1_out: u32,
+    l2_out: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let l1_out = l1_out as usize;
+    let l2_out = l2_out as usize;
+    if tid.get() >= batch as usize * l2_out {
+        return;
+    }
+    let row = tid.get() / l2_out;
+    let col = tid.get() % l2_out;
+    let base = row * (2 * l1_out + 2 * l2_out) + 2 * l1_out + col;
+    let i = tid.get();
+    if let Some(out) = dx.get_mut(tid) {
+        *out = dense_concat_pair_grad(l2[i], dy[base], dy[base + l2_out], scale);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn dense_concat_l1_grad(
+    l1: &[f32],
+    from_l2: &[f32],
+    from_l3: &[f32],
+    dskip: &[f32],
+    mut dx: DisjointSlice<f32>,
+    batch: u32,
+    l1_out: u32,
+    l3_in: u32,
+    scale: f32,
+) {
+    let tid = thread::index_1d();
+    let l1_out = l1_out as usize;
+    if tid.get() >= batch as usize * l1_out {
+        return;
+    }
+    let row = tid.get() / l1_out;
+    let col = tid.get() % l1_out;
+    let a = row * 2 * l1_out + col;
+    let b = row * l3_in as usize + col;
+    let skip = if col == l1_out - 2 {
+        dskip[row]
+    } else if col == l1_out - 1 {
+        -dskip[row]
+    } else {
+        0.0
+    };
+    let i = tid.get();
+    if let Some(out) = dx.get_mut(tid) {
+        *out = dense_concat_pair_grad(
+            l1[i],
+            from_l2[a] + from_l3[b],
+            from_l2[a + l1_out] + from_l3[b + l1_out],
+            scale,
+        ) + skip;
+    }
+}
+
+#[kernel]
+pub fn dense_concat_output(
+    l1: &[f32],
+    l3: &[f32],
+    mut output: DisjointSlice<f32>,
+    batch: u32,
+    l1_out: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= batch as usize {
+        return;
+    }
+    let row = tid.get();
+    let end = (row + 1) * l1_out as usize;
+    if let Some(out) = output.get_mut(tid) {
+        *out = l3[row] + (l1[end - 2] - l1[end - 1]);
+    }
+}

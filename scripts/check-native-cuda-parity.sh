@@ -66,7 +66,7 @@ run_tests -p nnue-trainer --no-default-features --features native --release \
 
 echo "== portable host CLI smoke =="
 cargo run -p nnue-trainer --no-default-features --features native --release -- simple
-cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack --layerstack-head split-skip
 
 echo "== portable host full Simple CLI training =="
 portable_cli_args=(
@@ -102,7 +102,7 @@ portable_layerstack_cli_args=(
     --batches-per-superbatch 1 --batch-size 16 --threads 1 --save-rate 1
     --win-rate-model --optimizer ranger
 )
-cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack --layerstack-head split-skip \
     "${portable_layerstack_cli_args[@]}" --net-id native-layerstack-cli --superbatches 1
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-1.bin"
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-1.ckpt"
@@ -120,7 +120,7 @@ cargo run -p nnue-trainer --no-default-features --features native --release -- l
     --resume "$portable_layerstack_cli_dir/native-layerstack-cli-1.ckpt" --eval-only
 
 echo "== portable host LayerStack YaneuraOu output =="
-cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack \
+cargo run -p nnue-trainer --no-default-features --features native --release -- layerstack --layerstack-head split-skip \
     "${portable_layerstack_cli_args[@]}" --output-format yaneuraou \
     --net-id native-layerstack-cli-yo --superbatches 1
 test -s "$portable_layerstack_cli_dir/native-layerstack-cli-yo-1.bin"

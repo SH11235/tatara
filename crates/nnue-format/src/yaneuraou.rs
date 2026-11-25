@@ -152,6 +152,9 @@ fn architecture(
     weights: &LayerStackWeights,
     routing: YaneuraOuRouting,
 ) -> io::Result<Architecture> {
+    if weights.head == crate::LayerStackHead::DenseConcat {
+        return invalid_input("DenseConcat cannot be converted to YaneuraOu SFNN");
+    }
     if weights.bucket_spec.is_some() {
         return invalid_input("spec bucket routing is not representable in YaneuraOu SFNN");
     }

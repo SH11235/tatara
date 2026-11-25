@@ -9,11 +9,14 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::coalesce_ft_factorized;
+use nnue_format::{LayerStackHead, LayerStackWeights};
 use nnue_train::dataloader::BucketMode;
+#[cfg(test)]
+use nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG;
 use nnue_train::raw_checkpoint::{
-    RawCkptReadMode, RawCkptReader, TENSORS_PER_GROUP, decode_qat_flags, read_raw_ckpt_group_len,
+    RawCkptReadMode, RawCkptReader, TENSORS_PER_GROUP, decode_qat_flags, layerstack_topology_head,
+    read_raw_ckpt_group_len,
 };
 use shogi_features::{
     BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
@@ -153,6 +156,7 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
 /// LayerStack checkpoint の層次元と、学習時 (factorizer 込み) の feature set spec。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayerStackLayout {
+    pub(crate) head: LayerStackHead,
     pub(crate) train_spec: FeatureSetSpec,
     pub(crate) ft_out: usize,
     pub(crate) l1_out: usize,
@@ -177,7 +181,14 @@ impl LayerStackLayout {
             a.checked_mul(b)
                 .ok_or_else(|| invalid("checkpoint tensor dimensions overflow"))
         };
-        let l2_in = product(l1 - 1, 2)?;
+        let l2_in = product(self.head.l1_activated(l1), 2)?;
+        let l3_in = if self.head == LayerStackHead::DenseConcat {
+            l2_in
+                .checked_add(product(l2, 2)?)
+                .ok_or_else(|| invalid("checkpoint tensor dimensions overflow"))?
+        } else {
+            l2
+        };
         let l1_w = product(ft_out, l1)?;
         let l2_w = product(l2_in, l2)?;
         // Full-width rows bound the packed FT size, including virtual rows.
@@ -192,14 +203,14 @@ impl LayerStackLayout {
             ("l1_shared_bias", l1),
             ("l2_w", product(nb, l2_w)?),
             ("l2_b", product(nb, l2)?),
-            ("l3_w", product(nb, l2)?),
+            ("l3_w", product(nb, l3_in)?),
             ("l3_b", nb),
         ];
         if self.shared_delta {
             groups.extend([
                 ("l2_shared_weight", l2_w),
                 ("l2_shared_bias", l2),
-                ("l3_shared_weight", l2),
+                ("l3_shared_weight", l3_in),
                 ("l3_shared_bias", 1),
             ]);
         }
@@ -286,14 +297,10 @@ pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayou
             id.arch_kind
         )));
     }
-    let &[ft_out, l1_out, l2_out, num_buckets, ref psqt_dims @ ..] = id.topology.as_slice() else {
+    let &[ft_out, l1_out, l2_out, num_buckets, ..] = id.topology.as_slice() else {
         return Err(invalid("invalid LayerStack topology"));
     };
-    let with_psqt = match psqt_dims {
-        [] => false,
-        &[psqt_buckets] if psqt_buckets == num_buckets => true,
-        _ => return Err(invalid("invalid LayerStack PSQT topology or bucket count")),
-    };
+    let (head, with_psqt) = layerstack_topology_head(&id.topology)?;
     if ft_out == 0
         || !ft_out.is_multiple_of(2)
         || l1_out < 2
@@ -333,7 +340,9 @@ pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayou
             )));
         }
     };
+    head.validate_dimensions(dimension(l1_out)?, dimension(l2_out)?)?;
     let layout = LayerStackLayout {
+        head,
         train_spec,
         ft_out,
         l1_out: dimension(l1_out)?,
@@ -452,6 +461,7 @@ pub(crate) fn to_layerstack_weights(
         .next()
         .map(|psqt| coalesce_ft_factorized(&layout.train_spec, layout.num_buckets, &psqt));
     LayerStackWeights {
+        head: layout.head,
         feature_set: layout.export_spec(),
         num_buckets: layout.num_buckets,
         bucket_spec: layout.bucket_spec(),
@@ -495,6 +505,7 @@ pub(crate) mod tests {
 
     pub(crate) fn layout() -> LayerStackLayout {
         LayerStackLayout {
+            head: LayerStackHead::SplitSkip,
             train_spec: train_spec(),
             ft_out: FT_OUT,
             l1_out: L1,
@@ -548,6 +559,7 @@ pub(crate) mod tests {
         weight: impl Fn(usize, usize) -> f32,
     ) {
         let lay = LayerStackLayout {
+            head: LayerStackHead::SplitSkip,
             train_spec: spec,
             ft_out: topology[0] as usize,
             l1_out: topology[1] as usize,
@@ -885,6 +897,107 @@ pub(crate) mod tests {
             write_raw_ckpt_group(&mut file, [&weights, &state, &state, &state]).unwrap();
         }
         file.flush().unwrap();
+    }
+
+    #[test]
+    fn dense_concat_checkpoints_average_and_reject_mixed_heads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use nnue_format::layerstack_weights::{QA, QB};
+        let spec = FeatureSet::HalfKp.spec();
+        let (ft, l1, l2, nb) = (4, 16, 32, 2);
+        let split_skip = [ft, l1, l2, nb].map(|n| n as u64);
+        let dense = [
+            ft as u64,
+            l1 as u64,
+            l2 as u64,
+            nb as u64,
+            0,
+            DENSE_CONCAT_TOPOLOGY_TAG,
+        ];
+        let paths = [
+            temp_path("dense-a.ckpt"),
+            temp_path("dense-b.ckpt"),
+            temp_path("dense-std.ckpt"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let (topology, l2_in, l3_in) = if index < 2 {
+                (dense.as_slice(), 2 * l1, 2 * (l1 + l2))
+            } else {
+                (split_skip.as_slice(), 2 * (l1 - 1), l2)
+            };
+            let arch = RawCkptArch {
+                feature_set: spec,
+                arch_kind: ArchKind::LayerStack,
+                bucket_mode: Some("progresskpabs"),
+                ft_out: ft as u64,
+                topology,
+            };
+            let meta = RawCkptMeta {
+                optimizer: OptimizerKind::RAdam,
+                qat_dense: false,
+                ft_weight_i8x2: false,
+                run_id: "",
+                net_id: "",
+                recipe_fingerprint: None,
+                superbatch: index + 1,
+                step_count: 1,
+                lr_horizon: None,
+                fv_scale: None,
+            };
+            let group_lengths = [
+                spec.train_ft_weight_len(ft),
+                ft,
+                nb * l1 * ft,
+                nb * l1,
+                l1 * ft,
+                l1,
+                nb * l2_in * l2,
+                nb * l2,
+                nb * l3_in,
+                nb,
+            ];
+            let mut file = std::io::BufWriter::new(File::create(path)?);
+            write_raw_ckpt_header(&mut file, &arch, &meta, group_lengths.len() as u64)?;
+            for (group, len) in group_lengths.into_iter().enumerate() {
+                let mut weight = vec![0.0; len];
+                if group == 9 {
+                    weight[0] = (2 * index + 1) as f32 / (QA * QB) as f32;
+                }
+                let state = vec![0.0; len];
+                write_raw_ckpt_group(&mut file, [&weight, &state, &state, &state])?;
+            }
+            file.flush()?;
+        }
+        let output = temp_path("dense-average.bin");
+        let mixed_output = temp_path("dense-mixed.bin");
+        let mut args = crate::Args {
+            checkpoints: paths[..2].to_vec(),
+            output: output.clone(),
+            mode: crate::Mode::Uniform,
+            ema_decay: None,
+            fv_scale: None,
+            reference: None,
+        };
+        crate::run(&args)?;
+        let mut reader = BufReader::new(File::open(&output)?);
+        let weights = LayerStackWeights::load_quantised(&mut reader, spec, ft, l1, l2, nb)?;
+        drop(reader);
+        assert_eq!(weights.head, LayerStackHead::DenseConcat);
+        assert_eq!(weights.l3_w.len(), nb * 2 * (l1 + l2));
+        assert_eq!(weights.l3_b[0], 2.0 / (QA * QB) as f32);
+        args.checkpoints.push(paths[2].clone());
+        args.output = mixed_output.clone();
+        assert!(
+            crate::run(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("LayerStack head")
+        );
+        assert!(!mixed_output.exists());
+        for path in paths.into_iter().chain([output]) {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
     }
 
     #[test]

@@ -69,7 +69,9 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::{BucketSpec, EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
+use shogi_features::{
+    BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
+};
 
 pub fn bucket_spec_from_arch(arch: &str) -> io::Result<Option<BucketSpec>> {
     let value = parse_single_arch_token(arch, "ls_bucket=")
@@ -104,6 +106,62 @@ pub fn read_layerstack_arch<R: Read>(reader: &mut R) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Restore the feature modifiers for a LayerStack net from its architecture string.
+pub fn feature_spec_from_arch(
+    feature_set: FeatureSet,
+    arch: &str,
+    ft_out: usize,
+) -> io::Result<FeatureSetSpec> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let token = |prefix: &str| {
+        parse_single_arch_token(arch, prefix)
+            .map_err(|_| invalid(format!("duplicate {prefix} token")))
+    };
+    let mut spec = feature_set.spec();
+    let effect_bucket = token("EffectBucket=")?;
+    if let Some(value) = effect_bucket {
+        let config = match value {
+            "2x2fixed" => EffectBucketConfig::KINGFIXED_2X2,
+            "2x2bucketed" => EffectBucketConfig::KINGBUCKETED_2X2,
+            "3x3fixed" => EffectBucketConfig::KINGFIXED_3X3,
+            "3x3bucketed" => EffectBucketConfig::KINGBUCKETED_3X3,
+            _ => return Err(invalid(format!("unsupported EffectBucket value `{value}`"))),
+        };
+        spec = spec.with_effect_bucket_config(config);
+    }
+    if let Some(dims) = token("Threat=")? {
+        if effect_bucket.is_some() {
+            return Err(invalid(
+                "arch string contains both EffectBucket and Threat tokens".into(),
+            ));
+        }
+        let id = token("ThreatProfile=")?
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|_| invalid("invalid ThreatProfile".into()))?;
+        let profile = ThreatProfile::ALL
+            .into_iter()
+            .find(|profile| profile.profile_id() == id)
+            .ok_or_else(|| invalid(format!("unsupported ThreatProfile id {id}")))?;
+        let expected = shogi_features::threat_dimensions_of(profile);
+        if dims.parse::<usize>().ok() != Some(expected) {
+            return Err(invalid(format!(
+                "Threat dims/profile mismatch in arch string: dims={dims}, profile={profile}, expected={expected}"
+            )));
+        }
+        spec = spec.with_threat_profile(profile);
+        if let Some(width) = token("ThreatWidth=")? {
+            let width = width
+                .parse::<usize>()
+                .ok()
+                .filter(|&width| width > 0 && width.is_multiple_of(2) && width <= ft_out)
+                .ok_or_else(|| invalid("invalid ThreatWidth".into()))?;
+            spec = spec.with_threat_width(width);
+        }
+    }
+    Ok(spec)
+}
+
 // =============================================================================
 // constants (LayerStack architecture)
 // =============================================================================
@@ -122,6 +180,72 @@ pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 
 // FT 入力次元は feature set ごと、FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、
 // L2 出力次元は `--l2`、bucket 数は `--num-buckets` ごとに異なる runtime 値。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LayerStackHead {
+    #[default]
+    SplitSkip,
+    DenseConcat,
+}
+
+impl LayerStackHead {
+    pub fn from_arch(arch: &str) -> io::Result<Self> {
+        let invalid = |msg| io::Error::new(io::ErrorKind::InvalidData, msg);
+        match parse_single_arch_token(arch, "Head=").map_err(|_| invalid("duplicate Head token"))? {
+            None => Ok(Self::SplitSkip),
+            Some("DenseConcat") => Ok(Self::DenseConcat),
+            Some(_) => Err(invalid("unknown LayerStack head")),
+        }
+    }
+
+    pub const fn l1_activated(self, l1_out: usize) -> usize {
+        match self {
+            Self::SplitSkip => l1_out - 1,
+            Self::DenseConcat => l1_out,
+        }
+    }
+
+    pub const fn l2_inputs(self, l1_out: usize) -> usize {
+        2 * self.l1_activated(l1_out)
+    }
+
+    pub const fn output_inputs(self, l1_out: usize, l2_out: usize) -> usize {
+        match self {
+            Self::SplitSkip => l2_out,
+            Self::DenseConcat => 2 * l1_out + 2 * l2_out,
+        }
+    }
+
+    pub fn validate_dimensions(self, l1_out: usize, l2_out: usize) -> io::Result<()> {
+        if self == Self::DenseConcat
+            && (l1_out < 2 || !l1_out.is_multiple_of(16) || !matches!(l2_out, 32 | 64))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DenseConcat requires L1 to be a positive multiple of 16 and L2 to be 32 or 64",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn hash(self, split_skip: u32) -> u32 {
+        match self {
+            Self::SplitSkip => split_skip,
+            Self::DenseConcat => split_skip ^ 0x44434E43,
+        }
+    }
+}
+
+fn dense_concat_network(ft_out: usize, l1_out: usize, l2_out: usize) -> String {
+    let inputs = ft_out * 2;
+    let l2_in = LayerStackHead::DenseConcat.l2_inputs(l1_out);
+    let output_in = LayerStackHead::DenseConcat.output_inputs(l1_out, l2_out);
+    format!(
+        "Head=DenseConcat,Network=AffineTransform[1<-{output_in}](DenseConcat[{output_in}](\
+         AffineTransform[{l2_out}<-{l2_in}](SqrClippedReLU[{l2_in}](\
+         AffineTransform[{l1_out}<-{inputs}](InputSlice[{inputs}(0:{inputs})])))))"
+    )
+}
+
 /// 既定 FT 出力次元 (1 perspective あたり)。`--ft-out` 未指定時の値。
 pub const DEFAULT_FT_OUT: usize = 1536;
 /// 既定 L1 出力次元。`--l1` 未指定時の値。L1 出力は skip 1 dim を除いた残り
@@ -639,12 +763,15 @@ pub fn coalesce_ft_factorized(
 /// - `l1_b`: `(num_buckets, l1_out)` row-major
 /// - `l1_shared_weight`: `(ft_out, l1_out)` row-major、`l1_shared_weight[in * l1_out + out]`
 /// - `l1_shared_bias`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
-/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
+/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major。`l2_in` は SplitSkip で
+///   `2 * (l1_out - 1)`、DenseConcat で `2 * l1_out`。
 /// - `l2_b`: `(num_buckets, l2_out)`
-/// - `l3_w`: `(num_buckets, l2_out)` (out_dim=1 なので out 軸省略)
+/// - `l3_w`: `(num_buckets, l3_in)` (out_dim=1 なので out 軸省略)。`l3_in` は
+///   SplitSkip で `l2_out`、DenseConcat で `2 * l1_out + 2 * l2_out`。
 /// - `l3_b`: `(num_buckets)`
 #[derive(Debug, Clone)]
 pub struct LayerStackWeights {
+    pub head: LayerStackHead,
     /// この weight が属する feature set。FT 入力次元 (`ft_in`) と
     /// artifact identity (arch 文字列 / hash) の単一の真実源。
     pub feature_set: FeatureSetSpec,
@@ -699,10 +826,16 @@ impl LayerStackWeights {
         let ft_out = self.ft_b.len();
         let l1_out = self.l1_shared_bias.len();
         let l2_out = self.l2_b.len() / num_buckets;
-        let l2_in = (l1_out - 1) * 2;
+        let l2_in = self.head.l2_inputs(l1_out);
+        self.head.validate_dimensions(l1_out, l2_out)?;
         let feature_hash = self.feature_set.feature_hash();
         writer.write_all(&NNUE_VERSION.to_le_bytes())?;
-        writer.write_all(&network_hash(feature_hash, ft_out, l2_out).to_le_bytes())?;
+        writer.write_all(
+            &self
+                .head
+                .hash(network_hash(feature_hash, ft_out, l2_out))
+                .to_le_bytes(),
+        )?;
         let psqt_buckets = if self.psqt_w.is_some() {
             Some(num_buckets)
         } else {
@@ -733,6 +866,15 @@ impl LayerStackWeights {
             threat_arch,
             effect_bucket_arch,
         );
+        if self.head == LayerStackHead::DenseConcat {
+            let start = arch_str
+                .find("Network=")
+                .expect("architecture has a network");
+            let end = arch_str[start..]
+                .find(',')
+                .map_or(arch_str.len(), |end| start + end);
+            arch_str.replace_range(start..end, &dense_concat_network(ft_out, l1_out, l2_out));
+        }
         let width = self.feature_set.threat_width(ft_out);
         if width == 0 || !width.is_multiple_of(2) || width > ft_out {
             return Err(io::Error::new(
@@ -777,9 +919,29 @@ impl LayerStackWeights {
         l2_out: usize,
         num_buckets: usize,
     ) -> Self {
+        Self::zeroed_with_head(
+            feature_set,
+            ft_out,
+            l1_out,
+            l2_out,
+            num_buckets,
+            LayerStackHead::SplitSkip,
+        )
+    }
+
+    pub fn zeroed_with_head(
+        feature_set: FeatureSetSpec,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        num_buckets: usize,
+        head: LayerStackHead,
+    ) -> Self {
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
-        let l2_in = (l1_out - 1) * 2;
+        let l2_in = head.l2_inputs(l1_out);
+        let l3_in = head.output_inputs(l1_out, l2_out);
         Self {
+            head,
             feature_set,
             num_buckets,
             bucket_spec: None,
@@ -791,7 +953,7 @@ impl LayerStackWeights {
             l1_shared_bias: vec![0.0; l1_out],
             l2_w: vec![0.0; num_buckets * l2_out * l2_in],
             l2_b: vec![0.0; num_buckets * l2_out],
-            l3_w: vec![0.0; num_buckets * l2_out],
+            l3_w: vec![0.0; num_buckets * l3_in],
             l3_b: vec![0.0; num_buckets],
             psqt_w: None,
         }
@@ -849,7 +1011,8 @@ impl LayerStackWeights {
         let ft_out = self.ft_b.len();
         let l1_out = self.l1_shared_bias.len();
         let l2_out = self.l2_b.len() / num_buckets;
-        let l2_in = (l1_out - 1) * 2;
+        let l2_in = self.head.l2_inputs(l1_out);
+        let l3_in = self.head.output_inputs(l1_out, l2_out);
         // ---- FT biases LEB128 (i16, scale=QA) ----
         // FT weight/bias は training 中 clamp されない (i16 飽和域 ±i16::MAX/QA まで
         // 開放) ため、recipe によっては量子化で silent clip されうる。export 側で
@@ -952,7 +1115,7 @@ impl LayerStackWeights {
         warn_if_i8_clamp_saturates("l2_w", &self.l2_w, qb_f);
         warn_if_i8_clamp_saturates("l3_w", &self.l3_w, qb_f);
 
-        let fc_hash = compute_fc_hash(ft_out, l2_out);
+        let fc_hash = self.head.hash(compute_fc_hash(ft_out, l2_out));
         for buc in 0..num_buckets {
             // fc_hash per bucket
             writer.write_all(&fc_hash.to_le_bytes())?;
@@ -1007,11 +1170,11 @@ impl LayerStackWeights {
             // Bias: i32 scale = 127 * QB
             let val = (l3_bias_scale * self.l3_b[buc] as f64).round() as i32;
             writer.write_all(&val.to_le_bytes())?;
-            // Weights: pad32(l2_out) i8 scale = QB
-            let l3_padded_in = pad32(l2_out);
+            // Weights: pad32(l3_in) i8 scale = QB
+            let l3_padded_in = pad32(l3_in);
             for in_idx in 0..l3_padded_in {
-                let q: i8 = if in_idx < l2_out {
-                    let w = self.l3_w[buc * l2_out + in_idx];
+                let q: i8 = if in_idx < l3_in {
+                    let w = self.l3_w[buc * l3_in + in_idx];
                     clamp_i8((qb_f * w as f64).round())
                 } else {
                     0_i8
@@ -1072,9 +1235,48 @@ impl LayerStackWeights {
         num_buckets: usize,
         with_psqt: bool,
     ) -> io::Result<Self> {
+        Self::read_quantised(
+            reader,
+            expected,
+            (ft_out, l1_out, l2_out),
+            num_buckets,
+            with_psqt,
+            |_| {},
+        )
+    }
+
+    /// Also retains the exact affine biases for integer evaluation of a DenseConcat net.
+    pub fn load_quantised_for_integer_eval<R: Read>(
+        reader: &mut R,
+        expected: FeatureSetSpec,
+        ft_out: usize,
+        l1_out: usize,
+        l2_out: usize,
+        num_buckets: usize,
+        with_psqt: bool,
+    ) -> io::Result<(Self, crate::dense_concat::QuantisedBiases)> {
+        let mut biases = crate::dense_concat::QuantisedBiases::default();
+        let weights = Self::read_quantised(
+            reader,
+            expected,
+            (ft_out, l1_out, l2_out),
+            num_buckets,
+            with_psqt,
+            |value| biases.0.push(value),
+        )?;
+        Ok((weights, biases))
+    }
+
+    fn read_quantised<R: Read>(
+        reader: &mut R,
+        expected: FeatureSetSpec,
+        dimensions: (usize, usize, usize),
+        num_buckets: usize,
+        with_psqt: bool,
+        mut retain_dense_bias: impl FnMut(i32),
+    ) -> io::Result<Self> {
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
-        // L1 出力 (skip 1 dim を除く) を 2 乗 + 連結した L2 入力次元。
-        let l2_in = (l1_out - 1) * 2;
+        let (ft_out, l1_out, l2_out) = dimensions;
         let mut buf4 = [0u8; 4];
 
         // version (current NNUE_VERSION か legacy LEGACY_NNUE_VERSION_BUCKETS9 を受理、
@@ -1095,18 +1297,6 @@ impl LayerStackWeights {
         // network_hash — 要求 feature set 由来の値と照合 (整合性チェック)。
         reader.read_exact(&mut buf4)?;
         let file_network_hash = u32::from_le_bytes(buf4);
-        let expected_network_hash = network_hash(expected.feature_hash(), ft_out, l2_out);
-        if file_network_hash != expected_network_hash {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "network_hash mismatch: file {file_network_hash:#x}, \
-                     expected {expected_network_hash:#x} for feature set {}",
-                    expected.canonical_name()
-                ),
-            ));
-        }
-
         // arch_str
         reader.read_exact(&mut buf4)?;
         let arch_len = u32::from_le_bytes(buf4) as usize;
@@ -1119,6 +1309,40 @@ impl LayerStackWeights {
         let mut arch_bytes = vec![0u8; arch_len];
         reader.read_exact(&mut arch_bytes)?;
         let arch_str = String::from_utf8_lossy(&arch_bytes);
+        let head = LayerStackHead::from_arch(&arch_str)?;
+        head.validate_dimensions(l1_out, l2_out)?;
+        let l2_in = head.l2_inputs(l1_out);
+        let l3_in = head.output_inputs(l1_out, l2_out);
+        if head == LayerStackHead::DenseConcat {
+            let network = dense_concat_network(ft_out, l1_out, l2_out);
+            if !arch_str.split_once(',').is_some_and(|(_, tail)| {
+                tail.match_indices(&network).any(|(start, _)| {
+                    (start == 0 || tail.as_bytes()[start - 1] == b',')
+                        && matches!(
+                            tail.as_bytes().get(start + network.len()),
+                            None | Some(b',')
+                        )
+                })
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DenseConcat architecture mismatch",
+                ));
+            }
+        }
+        let expected_network_hash =
+            head.hash(network_hash(expected.feature_hash(), ft_out, l2_out));
+        if file_network_hash != expected_network_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "network_hash mismatch: file {file_network_hash:#x}, \
+                     expected {expected_network_hash:#x} for feature set {}",
+                    expected.canonical_name()
+                ),
+            ));
+        }
+
         let width_token = parse_single_arch_token(&arch_str, "ThreatWidth=")
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "duplicate ThreatWidth"))?;
         let file_width = match width_token {
@@ -1455,12 +1679,12 @@ impl LayerStackWeights {
         let mut l1_b = vec![0.0_f32; num_buckets * l1_out];
         let mut l2_w = vec![0.0_f32; num_buckets * l2_out * l2_in];
         let mut l2_b = vec![0.0_f32; num_buckets * l2_out];
-        let mut l3_w = vec![0.0_f32; num_buckets * l2_out];
+        let mut l3_w = vec![0.0_f32; num_buckets * l3_in];
         let mut l3_b = vec![0.0_f32; num_buckets];
 
         let l1_padded_in = pad32(ft_out);
         let l2_padded_in = pad32(l2_in);
-        let l3_padded_in = pad32(l2_out);
+        let l3_padded_in = pad32(l3_in);
 
         for buc in 0..num_buckets {
             // fc_hash (skip)
@@ -1470,6 +1694,9 @@ impl LayerStackWeights {
             for out in 0..l1_out {
                 reader.read_exact(&mut buf4)?;
                 let v = i32::from_le_bytes(buf4);
+                if head == LayerStackHead::DenseConcat {
+                    retain_dense_bias(v);
+                }
                 l1_b[buc * l1_out + out] = v as f32 / l1_bias_scale;
             }
             // L1 weights (i8 × l1_out × l1_padded_in)、保存値は merged
@@ -1490,6 +1717,9 @@ impl LayerStackWeights {
             for out in 0..l2_out {
                 reader.read_exact(&mut buf4)?;
                 let v = i32::from_le_bytes(buf4);
+                if head == LayerStackHead::DenseConcat {
+                    retain_dense_bias(v);
+                }
                 l2_b[buc * l2_out + out] = v as f32 / l2_bias_scale;
             }
             // L2 weights
@@ -1506,19 +1736,24 @@ impl LayerStackWeights {
 
             // L3 bias (1 i32)
             reader.read_exact(&mut buf4)?;
-            l3_b[buc] = i32::from_le_bytes(buf4) as f32 / l3_bias_scale;
+            let v = i32::from_le_bytes(buf4);
+            if head == LayerStackHead::DenseConcat {
+                retain_dense_bias(v);
+            }
+            l3_b[buc] = v as f32 / l3_bias_scale;
             // L3 weights (l3_padded_in i8)
             for in_idx in 0..l3_padded_in {
                 let mut buf1 = [0u8; 1];
                 reader.read_exact(&mut buf1)?;
-                if in_idx < l2_out {
+                if in_idx < l3_in {
                     let q = buf1[0] as i8;
-                    l3_w[buc * l2_out + in_idx] = q as f32 / qb_f;
+                    l3_w[buc * l3_in + in_idx] = q as f32 / qb_f;
                 }
             }
         }
 
         Ok(Self {
+            head,
             feature_set: expected,
             num_buckets,
             bucket_spec,

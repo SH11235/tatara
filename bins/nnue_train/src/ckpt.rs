@@ -478,6 +478,13 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             )));
         }
         let topo_count = reader.topology_count()?;
+        if expected.arch_kind == ArchKind::LayerStack
+            && (topo_count == 6) != (expected.topology.len() == 6)
+        {
+            return Err(invalid_data(
+                "raw checkpoint LayerStack head mismatch".into(),
+            ));
+        }
         if topo_count != expected.topology.len() as u64 {
             return Err(invalid_data(format!(
                 "raw checkpoint topology dim count {topo_count} != expected {}",
@@ -499,6 +506,10 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
              always 'layerstack', requested '{}' (cannot resume across architectures)",
             expected.arch_kind.canonical_name()
         )));
+    } else if expected.topology.len() == 6 {
+        return Err(invalid_data(
+            "raw checkpoint LayerStack head mismatch".into(),
+        ));
     } else if expected.bucket_mode != Some(BucketMode::ProgressKpAbs.canonical_name()) {
         return Err(invalid_data(format!(
             "checkpoint bucket mode '{}' does not match --bucket-mode '{}'",

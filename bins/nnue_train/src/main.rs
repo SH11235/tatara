@@ -69,7 +69,10 @@ use training::run_training;
 #[cfg(feature = "oxide")]
 pub(crate) use kernels::*;
 
-fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn dispatch(
+    cli: &Cli,
+    layerstack_head: Option<nnue_format::LayerStackHead>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 診断 flag (--eval-only / --threat-ablate / --threat-norm-dump) は学習データを
     // 読まない経路 (norm-dump / --test-data 評価) を持つため、--data 不在でも
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
@@ -101,18 +104,21 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             {
                 if !cli.data.is_empty()
                     || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some())
+                    || layerstack_head == Some(nnue_format::LayerStackHead::DenseConcat)
+                    || (layerstack_head.is_some() && cli.resume.is_some())
                     || cli.eval_only
                     || cli.rescore_input.is_some()
                     || cli.threat_ablate.is_some()
                     || cli.threat_norm_dump
                 {
-                    run_training(cli)
+                    run_training(cli, layerstack_head)
                 } else {
                     smoke_test(cli.arch.kind())
                 }
             }
             #[cfg(not(feature = "gpu"))]
             {
+                let _ = layerstack_head;
                 Err("nnue-train training commands require the default `gpu` feature".into())
             }
         }
@@ -125,13 +131,17 @@ fn main() -> std::process::ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let result = cli
-        .resolve_bucket_metadata()
-        .and_then(|()| cli.validate_score_sources())
-        .and_then(|()| cli.validate_wdl_jitter())
-        .and_then(|()| cli.validate_data_args(&argv))
-        .and_then(|()| cli.validate_ft_weight_i8x2())
+        .resolve_layerstack_head()
+        .and_then(|head| {
+            cli.resolve_bucket_metadata()?;
+            cli.validate_score_sources()?;
+            cli.validate_wdl_jitter()?;
+            cli.validate_data_args(&argv)?;
+            cli.validate_ft_weight_i8x2()?;
+            Ok(head)
+        })
         .map_err(Into::into)
-        .and_then(|()| dispatch(&cli));
+        .and_then(|head| dispatch(&cli, head));
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

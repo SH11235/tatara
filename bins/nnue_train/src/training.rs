@@ -624,7 +624,10 @@ fn lock_sgd_transfer_destination(
 }
 
 #[cfg(feature = "gpu")]
-pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_training(
+    cli: &Cli,
+    layerstack_head: Option<nnue_format::LayerStackHead>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cli.arch, ArchCommand::Simple(_)) && (cli.freeze_ft || cli.init_ft_only) {
         return Err("--freeze-ft and --init-ft-only require layerstack".into());
     }
@@ -669,6 +672,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let feature_set = shared.feature_set;
     let (teacher_shuffle_buffer_mib, teacher_shuffle) = resolve_teacher_shuffle(cli);
 
+    let head = layerstack_head.ok_or("a LayerStack head is required")?;
+    if head == nnue_format::LayerStackHead::DenseConcat
+        && cli.output_format == OutputFormatArg::Yaneuraou
+    {
+        return Err("DenseConcat cannot be converted to YaneuraOu SFNN".into());
+    }
     // Threat profile の解決。`off` は base と bit-identical (None)。
     let threat_profile = match layerstack.threat_profile.as_str() {
         "off" => None,
@@ -849,6 +858,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    head.validate_dimensions(layerstack.l1, layerstack.l2)?;
     std::fs::create_dir_all(&cli.output)?;
     let _transfer_lock = cli
         .transfer_radam_momentum
@@ -918,6 +928,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.num_buckets(),
             layerstack.psqt,
         )?;
+        if weights.head != head {
+            return Err("input network head does not match --layerstack-head".into());
+        }
         crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
         return Ok(());
     }
@@ -1040,6 +1053,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.ft_out,
         layerstack.l1,
         layerstack.l2,
+        head,
         layerstack.num_buckets(),
         bucket_mode,
         PrecisionFlags {
@@ -1356,6 +1370,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 layerstack.l1,
                 layerstack.l2,
                 layerstack.num_buckets(),
+                head,
             ),
             threat_profile: layerstack.threat_profile.clone(),
             effect_bucket: layerstack.effect_bucket_config.clone(),
@@ -1460,6 +1475,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         cli,
         sampling_params,
         layerstack,
+        head,
         trainer.qat_mode,
         bucket_mode,
         feature_set,
@@ -1513,8 +1529,16 @@ pub(crate) fn layerstack_architecture(
     l1_out: usize,
     l2_out: usize,
     num_buckets: usize,
+    head: nnue_format::LayerStackHead,
 ) -> String {
-    format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{num_buckets}bucket")
+    match head {
+        nnue_format::LayerStackHead::SplitSkip => {
+            format!("LayerStack-{ft_out}-{l1_out}-{l2_out}-{num_buckets}bucket")
+        }
+        nnue_format::LayerStackHead::DenseConcat => {
+            format!("LayerStacks-DenseConcat {ft_out}-{l1_out}-{l2_out} ({num_buckets} buckets)")
+        }
+    }
 }
 
 /// `--lr-schedule` と関連 flag から runtime LR scheduler を構築する。`--lr` /
@@ -2262,6 +2286,7 @@ pub(crate) fn build_experiment_logger(
     cli: &Cli,
     sampling: SamplingParams,
     layerstack: &LayerstackArgs,
+    head: nnue_format::LayerStackHead,
     qat: crate::qat::QatMode,
     bucket_mode: BucketMode,
     feature_set: FeatureSetSpec,
@@ -2321,6 +2346,7 @@ pub(crate) fn build_experiment_logger(
                 layerstack.l1,
                 layerstack.l2,
                 layerstack.num_buckets(),
+                head,
             ),
             feature_set,
             threat_width: (feature_set.threat_width(layerstack.ft_out) != layerstack.ft_out)
@@ -3477,6 +3503,7 @@ mod tests {
             &cli,
             SamplingParams::default(),
             layerstack,
+            nnue_format::LayerStackHead::SplitSkip,
             crate::qat::QatMode::Dense,
             bucket_mode,
             FeatureSet::HalfKaHmMerged.spec(),

@@ -1120,6 +1120,7 @@ mod tests {
         assert!(joined.contains("<DATA>"));
         assert!(joined.contains("<PROGRESS_COEFF>"));
         assert!(joined.contains("<WORK_DIR>"));
+        assert!(joined.contains("--layerstack-head split-skip"));
         assert!(!joined.contains("/secret"));
     }
 

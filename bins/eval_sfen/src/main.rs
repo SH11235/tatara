@@ -1,17 +1,14 @@
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use nnue_format::LayerStackWeights;
+use nnue_format::dense_concat::QuantisedBiases;
 use nnue_format::layerstack_weights::{
     DEFAULT_L1_OUT, DEFAULT_L2_OUT, FV_SCALE, LEGACY_IMPLICIT_NUM_BUCKETS,
-    LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION, QA, QB,
+    LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION, QA, QB, feature_spec_from_arch,
 };
+use nnue_format::{LayerStackHead, LayerStackWeights};
 use nnue_train::dataloader::BucketMode;
-use shogi_features::{
-    EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
-    ThreatProfile,
-};
+use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs};
 use shogi_format::ShogiBoard;
 use shogi_format::types::{Color, Hand, Piece, PieceType, Square};
 
@@ -91,7 +88,7 @@ fn validate_mode_args(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (weights, spec) = load_layerstack(&args.nnue_file)?;
+    let (weights, spec, biases) = load_layerstack(&std::fs::read(&args.nnue_file)?)?;
     let (mode, warning) = if let Some(spec) = weights.bucket_spec {
         if !matches!(args.bucket_mode.as_str(), "progresskpabs" | "spec") {
             return Err("--bucket-mode conflicts with net ls_bucket metadata".into());
@@ -118,8 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for pos in positions {
         let board = parse_position(&pos)?;
         let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
-        let raw = forward_one_raw(&weights, spec, &board, bucket)?;
-        let cp = raw / args.fv_scale;
+        let raw = forward_one_raw(&weights, spec, &biases, &board, bucket)?;
+        let cp = raw / i64::from(args.fv_scale);
         if args.debug {
             eprintln!("{pos}\tbucket={bucket}\traw={raw}\tcp={cp}");
         }
@@ -129,49 +126,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_layerstack(
-    path: &Path,
-) -> Result<(LayerStackWeights, FeatureSetSpec), Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(path)?;
-    let meta = read_arch_meta(&bytes)?;
-    let mut spec = FeatureSet::HalfKaHmMerged.spec();
-    if let Some(effect_bucket_config) = meta.effect_bucket_config {
-        spec = spec.with_effect_bucket_config(effect_bucket_config);
-    }
-    if let Some(threat_profile) = meta.threat_profile {
-        if meta.effect_bucket_config.is_some() {
-            return Err("arch string contains both EffectBucket and Threat tokens".into());
-        }
-        spec = spec.with_threat_profile(threat_profile);
-        if let Some(width) = meta.threat_width {
-            if width == 0 || !width.is_multiple_of(2) || width > meta.ft_out {
-                return Err("invalid ThreatWidth".into());
-            }
-            spec = spec.with_threat_width(width);
-        }
-    }
-    let mut cursor = Cursor::new(&bytes);
-    let weights = LayerStackWeights::load_quantised(
-        &mut cursor,
+    mut bytes: &[u8],
+) -> Result<(LayerStackWeights, FeatureSetSpec, QuantisedBiases), Box<dyn std::error::Error>> {
+    let meta = read_arch_meta(bytes)?;
+    let spec = feature_spec_from_arch(FeatureSet::HalfKaHmMerged, meta.arch, meta.ft_out)?;
+    let with_psqt = LayerStackHead::from_arch(meta.arch)? == LayerStackHead::DenseConcat
+        && meta.arch.split(',').any(|token| token.starts_with("PSQT="));
+    let (weights, biases) = LayerStackWeights::load_quantised_for_integer_eval(
+        &mut bytes,
         spec,
         meta.ft_out,
         meta.l1_out,
         meta.l2_out,
         meta.num_buckets,
+        with_psqt,
     )?;
-    Ok((weights, spec))
+    Ok((weights, spec, biases))
 }
 
-struct ArchMeta {
-    effect_bucket_config: Option<EffectBucketConfig>,
-    threat_profile: Option<ThreatProfile>,
-    threat_width: Option<usize>,
+struct ArchMeta<'a> {
+    arch: &'a str,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
     num_buckets: usize,
 }
 
-fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> {
+fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta<'_>, Box<dyn std::error::Error>> {
     if bytes.len() < 16 {
         return Err("NNUE file is too short".into());
     }
@@ -203,52 +184,12 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     }
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
-        threat_width: parse_token_usize(arch, "ThreatWidth=")?,
-        effect_bucket_config: parse_effect_bucket_config(arch)?,
-        threat_profile: parse_threat_profile(arch)?,
+        arch,
         ft_out: parse_between(arch, "->", "x2]")?,
         l1_out: affine_outs.last().copied().unwrap_or(DEFAULT_L1_OUT),
         l2_out: affine_outs.get(1).copied().unwrap_or(DEFAULT_L2_OUT),
         num_buckets,
     })
-}
-
-fn parse_effect_bucket_config(
-    arch: &str,
-) -> Result<Option<EffectBucketConfig>, Box<dyn std::error::Error>> {
-    let Some(value) = parse_token_str(arch, "EffectBucket=") else {
-        return Ok(None);
-    };
-    match value {
-        "2x2fixed" => Ok(Some(EffectBucketConfig::KINGFIXED_2X2)),
-        "2x2bucketed" => Ok(Some(EffectBucketConfig::KINGBUCKETED_2X2)),
-        "3x3fixed" => Ok(Some(EffectBucketConfig::KINGFIXED_3X3)),
-        "3x3bucketed" => Ok(Some(EffectBucketConfig::KINGBUCKETED_3X3)),
-        _ => Err(format!("unsupported EffectBucket value `{value}`").into()),
-    }
-}
-
-fn parse_threat_profile(arch: &str) -> Result<Option<ThreatProfile>, Box<dyn std::error::Error>> {
-    let Some(dims) = parse_token_usize(arch, "Threat=")? else {
-        return Ok(None);
-    };
-    let profile = match parse_token_usize(arch, "ThreatProfile=")? {
-        None | Some(0) => ThreatProfile::Full,
-        Some(1) => ThreatProfile::SameClass,
-        Some(2) => ThreatProfile::SameClassMajorPawn,
-        Some(3) => ThreatProfile::StepAttacker,
-        Some(4) => ThreatProfile::FullSymDedup,
-        Some(10) => ThreatProfile::CrossSide,
-        Some(id) => return Err(format!("unsupported ThreatProfile id {id}").into()),
-    };
-    let expected = shogi_features::threat_dimensions_of(profile);
-    if dims != expected {
-        return Err(format!(
-            "Threat dims/profile mismatch in arch string: dims={dims}, profile={profile}, expected={expected}"
-        )
-        .into());
-    }
-    Ok(Some(profile))
 }
 
 fn parse_affine_outs(arch: &str) -> Vec<usize> {
@@ -283,33 +224,14 @@ fn parse_between(
     Ok(s[start..end].parse()?)
 }
 
-fn parse_token_usize(s: &str, token: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-    Ok(parse_token_str(s, token).map(str::parse).transpose()?)
-}
-
-fn parse_token_str<'a>(s: &'a str, token: &str) -> Option<&'a str> {
-    let start = s.find(token).map(|pos| pos + token.len())?;
-    let end = s[start..]
-        .find(',')
-        .map(|pos| start + pos)
-        .unwrap_or(s.len());
-    Some(s[start..end].split(']').next().unwrap_or(&s[start..end]))
-}
-
 fn forward_one_raw(
     weights: &LayerStackWeights,
     spec: FeatureSetSpec,
+    biases: &QuantisedBiases,
     board: &ShogiBoard,
     bucket: usize,
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<i64, Box<dyn std::error::Error>> {
     let ft_out = weights.ft_b.len();
-    let l1_out = weights.l1_b.len() / weights.num_buckets;
-    let l2_out = weights.l2_b.len() / weights.num_buckets;
-    let l1_effective = l1_out
-        .checked_sub(L1_SKIP)
-        .ok_or("l1_out must be larger than L1_SKIP")?;
-    let l2_in = l1_effective * 2;
-
     let mut stm_idx = vec![-1_i32; spec.max_active()];
     let mut nstm_idx = vec![-1_i32; spec.max_active()];
     let active = spec.extract_active_features(board, &mut stm_idx, &mut nstm_idx);
@@ -348,6 +270,36 @@ fn forward_one_raw(
     pairwise_crelu_to_u8(&stm_ft, &mut transformed[..ft_out / 2]);
     pairwise_crelu_to_u8(&nstm_ft, &mut transformed[ft_out / 2..]);
 
+    if weights.head == LayerStackHead::DenseConcat {
+        let raw =
+            nnue_format::dense_concat::forward_quantised(weights, biases, bucket, &transformed);
+        let psqt = if let Some(psqt) = &weights.psqt_w {
+            let sum = |indices: &[i32]| -> i64 {
+                indices
+                    .iter()
+                    .filter_map(|&index| usize::try_from(index).ok())
+                    .map(|index| {
+                        i64::from(quant_i32(
+                            psqt[index * weights.num_buckets + bucket],
+                            QA * QB,
+                        ))
+                    })
+                    .sum()
+            };
+            (sum(&stm_idx[..active]) - sum(&nstm_idx[..active])) / 2
+        } else {
+            0
+        };
+        return Ok(i64::from(raw) + psqt);
+    }
+
+    let l1_out = weights.l1_b.len() / weights.num_buckets;
+    let l2_out = weights.l2_b.len() / weights.num_buckets;
+    let l1_effective = l1_out
+        .checked_sub(L1_SKIP)
+        .ok_or("l1_out must be larger than L1_SKIP")?;
+    let l2_in = l1_effective * 2;
+
     let mut l1_total = vec![0i32; l1_out];
     affine_u8_i8(
         &transformed,
@@ -382,7 +334,7 @@ fn forward_one_raw(
         1,
     );
 
-    Ok(out[0] + l1_total[l1_effective])
+    Ok(i64::from(out[0] + l1_total[l1_effective]))
 }
 
 fn sparse_ft_forward_raw(
@@ -693,6 +645,7 @@ fn remove_hand(board: &mut ShogiBoard, color: Color, pt: PieceType) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shogi_features::ThreatProfile;
 
     #[test]
     fn exported_wide_spec_nets_evaluate_the_highest_bucket() {
@@ -708,14 +661,7 @@ mod tests {
 
             let mut bytes = Vec::new();
             weights.save_quantised(&mut bytes, None).unwrap();
-            let path = std::env::temp_dir().join(format!(
-                "tatara-eval-sfen-{count}-{}.bin",
-                std::process::id()
-            ));
-            std::fs::write(&path, bytes).unwrap();
-            let loaded = load_layerstack(&path);
-            std::fs::remove_file(path).unwrap();
-            let (weights, features) = loaded.unwrap();
+            let (weights, features, biases) = load_layerstack(&bytes).unwrap();
             let mode = BucketMode::Spec(weights.bucket_spec.unwrap());
             assert_eq!(
                 validate_mode_args(mode, None, weights.num_buckets),
@@ -725,9 +671,33 @@ mod tests {
             let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
             assert_eq!(bucket, count - 1);
             assert_eq!(
-                forward_one_raw(&weights, features, &board, bucket).unwrap(),
-                QA * QB / 4
+                forward_one_raw(&weights, features, &biases, &board, bucket).unwrap(),
+                i64::from(QA * QB / 4)
             );
+        }
+    }
+
+    #[test]
+    fn psqt_load_is_supported_only_for_dense_concat() {
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        for head in [LayerStackHead::SplitSkip, LayerStackHead::DenseConcat] {
+            let mut weights = LayerStackWeights::zeroed_with_head(spec, 4, 16, 32, 1, head);
+            weights.psqt_w = Some(vec![0.0; spec.ft_in()]);
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes, None).unwrap();
+            match head {
+                LayerStackHead::SplitSkip => assert!(
+                    load_layerstack(&bytes)
+                        .err()
+                        .expect("SplitSkip PSQT net must be rejected")
+                        .to_string()
+                        .contains("PSQT not requested")
+                ),
+                LayerStackHead::DenseConcat => {
+                    let (loaded, _, _) = load_layerstack(&bytes).unwrap();
+                    assert!(loaded.psqt_w.is_some());
+                }
+            }
         }
     }
 

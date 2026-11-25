@@ -1,3 +1,4 @@
+use nnue_format::LayerStackHead;
 use std::path::Path;
 
 #[cfg(feature = "native")]
@@ -808,7 +809,7 @@ impl GpuTrainer {
         Ok(gradient.to_host_vec(&self.stream)?)
     }
 
-    #[cfg(all(test, feature = "native"))]
+    #[cfg(test)]
     fn combined_original_order_for_test(
         &self,
         b: usize,
@@ -2129,6 +2130,7 @@ pub(crate) struct GpuWorkspace {
     /// activation buffer の幅と L1 forward/backward kernel の launch arg。`l1_effective`
     /// / `l2_in` はここから導出する ([`GpuWorkspace::l1_effective`])。
     l1_out: usize,
+    pub(super) head: LayerStackHead,
     /// L2 (per-bucket dense) 層の出力次元。`--l2` から起動時に決まる。L2 系
     /// activation buffer の幅と L2 / L3 forward/backward kernel の launch arg。
     l2_out: usize,
@@ -2144,13 +2146,13 @@ pub(crate) struct GpuWorkspace {
     l2_pre: DeviceBuffer<f32>,        // b × l2_in
     l2_input: DeviceBuffer<f32>,      // b × l2_in
     l2_dense_out: DeviceBuffer<f32>,  // b × l2_out (L2 dense matmul output, pre-CReLU)
-    l2_acted: DeviceBuffer<f32>,      // b × l2_out
+    l2_acted: DeviceBuffer<f32>,      // b × l3_in
     l3_out: DeviceBuffer<f32>,        // b
     net_output: DeviceBuffer<f32>,    // b
     dy_net_output: DeviceBuffer<f32>, // b (loss kernel が書き込む dnet)
 
     // -- backward activation-grads --
-    dl2_acted: DeviceBuffer<f32>,                // b × l2_out
+    dl2_acted: DeviceBuffer<f32>,                // b × l3_in
     dl2_out: DeviceBuffer<f32>,                  // b × l2_out
     dl2_input: DeviceBuffer<f32>,                // b × l2_in
     dl2_pre: DeviceBuffer<f32>,                  // b × l2_in
@@ -2248,6 +2250,7 @@ impl GpuWorkspace {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        head: LayerStackHead,
         num_buckets: usize,
         ft_fp16_out: bool,
         tf32: bool,
@@ -2263,8 +2266,12 @@ impl GpuWorkspace {
         let max_active = feature_set.max_active();
         // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
         // L2 入力次元。どちらも `l1_out` から導出する (struct method と同式)。
-        let l1_effective = l1_out - L1_SKIP;
-        let l2_in = l1_effective * 2;
+        let split_skip_l1 = match head {
+            LayerStackHead::SplitSkip => l1_out - 1,
+            LayerStackHead::DenseConcat => 0,
+        };
+        let l2_in = head.l2_inputs(l1_out);
+        let l3_in = head.output_inputs(l1_out, l2_out);
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(stream, n).map_err(Into::into)
         };
@@ -2313,6 +2320,7 @@ impl GpuWorkspace {
             max_active,
             ft_out,
             l1_out,
+            head,
             l2_out,
             ft_stm_out: z(ft_act_f32_n)?,
             ft_nstm_out: z(ft_act_f32_n)?,
@@ -2322,24 +2330,24 @@ impl GpuWorkspace {
             dft_nstm_out_h: alloc_h(ft_fp16_out && !forward_only)?,
             l1_shared_out: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
             l1_total: z(batch * l1_out)?,
-            l1_main: z(batch * l1_effective)?,
-            l1_skip: z(batch * L1_SKIP)?,
-            l1_sqr: z(batch * l1_effective)?,
-            l2_pre: z(batch * l2_in)?,
+            l1_main: z(batch * split_skip_l1)?,
+            l1_skip: z(batch * usize::from(head == LayerStackHead::SplitSkip))?,
+            l1_sqr: z(batch * split_skip_l1)?,
+            l2_pre: z(batch * 2 * split_skip_l1)?,
             l2_input: z(batch * l2_in)?,
             l2_dense_out: z(batch * l2_out)?,
-            l2_acted: z(batch * l2_out)?,
+            l2_acted: z(batch * l3_in)?,
             l3_out: z(batch)?,
             net_output: z(batch)?,
             dy_net_output: z(batch)?,
-            dl2_acted: z(bwd_len(batch * l2_out))?,
+            dl2_acted: z(bwd_len(batch * l3_in))?,
             dl2_out: z(bwd_len(batch * l2_out))?,
             dl2_input: z(bwd_len(batch * l2_in))?,
-            dl2_pre: z(bwd_len(batch * l2_in))?,
-            dl1_sqr: z(bwd_len(batch * l1_effective))?,
-            dl1_main_from_concat: z(bwd_len(batch * l1_effective))?,
-            dl1_main_from_sqr: z(bwd_len(batch * l1_effective))?,
-            dl1_main: z(bwd_len(batch * l1_effective))?,
+            dl2_pre: z(bwd_len(batch * 2 * split_skip_l1))?,
+            dl1_sqr: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main_from_concat: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main_from_sqr: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main: z(bwd_len(batch * split_skip_l1))?,
             dl1_total: z(bwd_len(batch * l1_out))?,
             dcombined_from_l1_shared: z(l1_input_grad_len(batch * ft_out))?,
             dcombined_from_l1: z(l1_input_grad_len(batch * ft_out))?,
@@ -2458,13 +2466,17 @@ impl GpuWorkspace {
     /// L1 出力のうち skip-connection ([`L1_SKIP`]) を除いた main 次元。`l1_total` は
     /// `l1_main` (この幅) と `l1_skip` ([`L1_SKIP`] 幅) に slice される。
     pub(crate) fn l1_effective(&self) -> usize {
-        self.l1_out - L1_SKIP
+        self.head.l1_activated(self.l1_out)
     }
 
     /// L2 dense 層の入力次元 = `l1_sqr` (`l1_effective` 幅) と `l1_main`
     /// (`l1_effective` 幅) の連結。
     pub(crate) fn l2_in(&self) -> usize {
         self.l1_effective() * 2
+    }
+
+    pub(super) fn l3_in(&self) -> usize {
+        self.head.output_inputs(self.l1_out, self.l2_out)
     }
 }
 
@@ -2619,6 +2631,7 @@ impl GpuTrainer {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        head: LayerStackHead,
         num_buckets: usize,
         bucket_mode: BucketMode,
         precision: PrecisionFlags,
@@ -2635,6 +2648,7 @@ impl GpuTrainer {
             ft_out,
             l1_out,
             l2_out,
+            head,
             num_buckets,
             bucket_mode,
             precision,
@@ -2666,6 +2680,7 @@ impl GpuTrainer {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        head: LayerStackHead,
         num_buckets: usize,
         bucket_mode: BucketMode,
         precision: PrecisionFlags,
@@ -2682,6 +2697,7 @@ impl GpuTrainer {
             ft_out,
             l1_out,
             l2_out,
+            head,
             num_buckets,
             bucket_mode,
             precision,
@@ -2702,6 +2718,7 @@ impl GpuTrainer {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        head: LayerStackHead,
         num_buckets: usize,
         bucket_mode: BucketMode,
         precision: PrecisionFlags,
@@ -2792,8 +2809,9 @@ impl GpuTrainer {
         let base_ft_in = feature_set.ft_in();
         let train_ft_in = feature_set.train_ft_in();
 
-        let l1_effective = l1_out - L1_SKIP;
-        let l2_in = l1_effective * 2;
+        head.validate_dimensions(l1_out, l2_out)?;
+        let l2_in = head.l2_inputs(l1_out);
+        let l3_in = head.output_inputs(l1_out, l2_out);
         let ft_b_n = ft_out;
         let l1_w_n = num_buckets * l1_out * ft_out;
         let l1_b_n = num_buckets * l1_out;
@@ -2801,7 +2819,7 @@ impl GpuTrainer {
         let l1_shared_bias_n = l1_out;
         let l2_w_n = num_buckets * l2_out * l2_in;
         let l2_b_n = num_buckets * l2_out;
-        let l3_w_n = num_buckets * l2_out;
+        let l3_w_n = num_buckets * l3_in;
         let l3_b_n = num_buckets;
 
         // forward-only では optimizer state (`m` / `v` / `slow`) と `*_grad` を
@@ -2847,10 +2865,10 @@ impl GpuTrainer {
             &init_spec.l2_b,
         );
         let l3_w_init = init::sample(
-            WeightShape::bucketed(l3_w_n, num_buckets, l2_out),
+            WeightShape::bucketed(l3_w_n, num_buckets, l3_in),
             &init_spec.l3_w,
         );
-        let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l2_out), &init_spec.l3_b);
+        let l3_b_init = init::sample(WeightShape::flat(l3_b_n, l3_in), &init_spec.l3_b);
 
         assert!(
             psqt_init.is_none() || feature_set.threat_profile().is_none(),
@@ -3091,6 +3109,7 @@ impl GpuTrainer {
                 ft_out,
                 l1_out,
                 l2_out,
+                head,
                 num_buckets,
                 precision.ft_fp16_out,
                 precision.tf32,
@@ -3184,7 +3203,7 @@ impl GpuTrainer {
         };
         let l2_w_n = self.ws.l2_out * self.ws.l2_in();
         let l2_b_n = self.ws.l2_out;
-        let l3_w_n = self.ws.l2_out;
+        let l3_w_n = self.ws.l3_in();
         self.stack_shared_delta = Some(StackSharedDelta {
             l2: layer(
                 l2_w_n,
@@ -3327,7 +3346,7 @@ impl GpuTrainer {
             self.ws.l2_out * self.ws.l2_in(),
         )?;
         fold(&self.l2_b, &f.l2.b, &mut f.l2.folded_b, self.ws.l2_out)?;
-        fold(&self.l3_w, &f.l3.w, &mut f.l3.folded_w, self.ws.l2_out)?;
+        fold(&self.l3_w, &f.l3.w, &mut f.l3.folded_w, self.ws.l3_in())?;
         fold(&self.l3_b, &f.l3.b, &mut f.l3.folded_b, 1)?;
         Ok(())
     }
@@ -3393,6 +3412,9 @@ impl GpuTrainer {
         &mut self,
         w: &LayerStackWeights,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if w.head != self.ws.head {
+            return Err("input network head does not match --layerstack-head".into());
+        }
         // 本経路は companion buffer (`ft_w_m`/`v`/`grad`/`slow`) を base 長で
         // 再確保するため、factorize 有効 trainer (train 長の `ft_w`) には適用
         // できない (spec 等値性でも弾かれるが、長さ不変条件をここで閉じる)。
@@ -3445,7 +3467,7 @@ impl GpuTrainer {
             let l1_shared_bias_n = l1_out;
             let l2_w_n = self.num_buckets * l2_out * l2_in;
             let l2_b_n = self.num_buckets * l2_out;
-            let l3_w_n = self.num_buckets * l2_out;
+            let l3_w_n = self.num_buckets * self.ws.l3_in();
             let l3_b_n = self.num_buckets;
             self.l1_w_m = zeros_f32(l1_w_n)?;
             self.l1_w_v = zeros_f32(l1_w_n)?;
@@ -3610,6 +3632,7 @@ impl GpuTrainer {
             None => None,
         };
         let mut weights = LayerStackWeights {
+            head: self.ws.head,
             // factorizer 有効時は ft_w を畳み込んで返すため export spec から
             // factorizer modifier を外す (consumer が train 次元を観測しない不変
             // 条件)。ただし **threat profile は保持する**: threat real 行は coalesce
@@ -3718,7 +3741,8 @@ impl GpuTrainer {
         let l1_shared_bias_n = l1_out;
         let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
+        let l3_in = self.ws.l3_in();
+        let l3_w_n = self.num_buckets * l3_in;
         let l3_b_n = self.num_buckets;
         let mut groups = vec![
             RawCkptGroupSource {
@@ -3773,7 +3797,7 @@ impl GpuTrainer {
             groups.extend([
                 shared!("l2_shared_weight", l2_out * l2_in, l2, w, w_m, w_v, w_slow),
                 shared!("l2_shared_bias", l2_out, l2, b, b_m, b_v, b_slow),
-                shared!("l3_shared_weight", l2_out, l3, w, w_m, w_v, w_slow),
+                shared!("l3_shared_weight", l3_in, l3, w, w_m, w_v, w_slow),
                 shared!("l3_shared_bias", 1, l3, b, b_m, b_v, b_slow),
             ]);
         }
@@ -3823,6 +3847,27 @@ impl GpuTrainer {
         Ok((self.step_count, groups))
     }
 
+    fn checkpoint_topology(&self) -> Vec<u64> {
+        let (ft, l1, l2, buckets) = (
+            self.ws.ft_out,
+            self.ws.l1_out,
+            self.ws.l2_out,
+            self.num_buckets,
+        );
+        let mut topology = if self.psqt.is_some() {
+            layerstack_topology_with_psqt(ft, l1, l2, buckets).to_vec()
+        } else {
+            layerstack_topology(ft, l1, l2, buckets).to_vec()
+        };
+        if self.ws.head == LayerStackHead::DenseConcat {
+            if self.psqt.is_none() {
+                topology.push(0);
+            }
+            topology.push(nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG);
+        }
+        topology
+    }
+
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。
     ///
     /// 量子化 `.bin` ([`GpuTrainer::save_checkpoint`]/`to_layerstack_weights` → `save_quantised`)
@@ -3854,10 +3899,7 @@ impl GpuTrainer {
         // PSQT 有り ckpt は `[..., num_buckets, num_buckets]` (5 dims) で PSQT 無し
         // (4 dims) と弁別する。PSQT 無し ckpt を PSQT 有り設定で `--resume` すると
         // `topo_count` 不一致で reject される (PSQT bootstrap path は `--init-from`)。
-        let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
-        let topo5 =
-            layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
-        let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        let topology = self.checkpoint_topology();
         save_raw_checkpoint_file(
             path,
             &self.stream,
@@ -3866,7 +3908,7 @@ impl GpuTrainer {
                 arch_kind: ArchKind::LayerStack,
                 bucket_mode: Some(&self.bucket_mode.identity()),
                 ft_out: ft_out as u64,
-                topology,
+                topology: &topology,
             },
             &RawCkptMeta {
                 optimizer: self.optimizer,
@@ -3906,10 +3948,7 @@ impl GpuTrainer {
         transfer_radam_momentum: bool,
     ) -> Result<RawCkptResumeState, Box<dyn std::error::Error>> {
         let ft_out = self.ws.ft_out;
-        let topo4 = layerstack_topology(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
-        let topo5 =
-            layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
-        let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        let topology = self.checkpoint_topology();
         let expected_groups: Vec<(&'static str, usize)> = self
             .raw_ckpt_group_sources()
             .iter()
@@ -3922,7 +3961,7 @@ impl GpuTrainer {
                 arch_kind: ArchKind::LayerStack,
                 bucket_mode: Some(&self.bucket_mode.identity()),
                 ft_out: ft_out as u64,
-                topology,
+                topology: &topology,
             },
             &expected_groups,
         )?;
@@ -4851,6 +4890,59 @@ impl GpuTrainer {
         Ok(())
     }
 
+    fn dense_concat_activations(
+        &mut self,
+        batch: usize,
+        include_l2: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let l2_out = if include_l2 { self.ws.l2_out } else { 0 };
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            let output = if include_l2 {
+                &self.ws.l2_acted
+            } else {
+                &self.ws.l2_input
+            };
+            return self.dense_concat_qat_activations(batch, l2_out, output);
+        }
+        let output = if include_l2 {
+            &mut self.ws.l2_acted
+        } else {
+            &mut self.ws.l2_input
+        };
+        // SAFETY: both input rows cover the batch, and output matches the requested concatenation.
+        unsafe {
+            cuda_launch! {
+                kernel: dense_concat_activations, stream: self.stream, module: self.module,
+                config: cfg_1d(batch * 2 * (self.ws.l1_out + l2_out)),
+                args: [
+                    slice(self.ws.l1_total), slice(self.ws.l2_dense_out), slice_mut(*output),
+                    batch as u32, self.ws.l1_out as u32, l2_out as u32, L1_SQR_SCALE
+                ]
+            }
+        }?;
+        Ok(())
+    }
+
+    fn dense_concat_output(&mut self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "native")]
+        if self.qat_mode != crate::qat::QatMode::Off {
+            return self.dense_concat_qat_output(batch);
+        }
+        // SAFETY: the L1 buffer has two or more values per row and each output row is unique.
+        unsafe {
+            cuda_launch! {
+                kernel: dense_concat_output, stream: self.stream, module: self.module,
+                config: cfg_1d(batch),
+                args: [
+                    slice(self.ws.l1_total), slice(self.ws.l3_out), slice_mut(self.ws.net_output),
+                    batch as u32, self.ws.l1_out as u32
+                ]
+            }
+        }?;
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         batch: &BatchData,
@@ -5366,94 +5458,98 @@ impl GpuTrainer {
         if qat_l1 {
             self.qat_dense_forward(1, b)?;
         }
-        // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: slice_extract_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.l1_total),
-                    slice_mut(self.ws.l1_main),
-                    b_u32, l1_out as u32, 0_u32, l1_effective as u32
-                ]
-            }
-        }?;
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: slice_extract_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * L1_SKIP),
-                args: [
-                    slice(self.ws.l1_total),
-                    slice_mut(self.ws.l1_skip),
-                    b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32
-                ]
-            }
-        }?;
+        if self.ws.head == LayerStackHead::DenseConcat {
+            self.dense_concat_activations(b, false)?;
+        } else {
+            // -- Forward step 7: slice l1_total → l1_main (B × l1_effective) + l1_skip (B × L1_SKIP) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_extract_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_total),
+                        slice_mut(self.ws.l1_main),
+                        b_u32, l1_out as u32, 0_u32, l1_effective as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_extract_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * L1_SKIP),
+                    args: [
+                        slice(self.ws.l1_total),
+                        slice_mut(self.ws.l1_skip),
+                        b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32
+                    ]
+                }
+            }?;
 
-        // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × l1_effective) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: abs_pow2_scale_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.l1_main),
-                    slice_mut(self.ws.l1_sqr),
-                    L1_SQR_SCALE,
-                    (b * l1_effective) as u32
-                ]
-            }
-        }?;
+            // -- Forward step 8: l1_sqr = l1_main^2 * scale (B × l1_effective) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: abs_pow2_scale_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_main),
+                        slice_mut(self.ws.l1_sqr),
+                        L1_SQR_SCALE,
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
 
-        // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × l2_in) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: concat_l1sqr_main_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_in),
-                args: [
-                    slice(self.ws.l1_sqr),
-                    slice(self.ws.l1_main),
-                    slice_mut(self.ws.l2_pre),
-                    b_u32, l1_effective as u32, l1_effective as u32
-                ]
-            }
-        }?;
+            // -- Forward step 9: l2_pre = concat(l1_sqr, l1_main) (B × l2_in) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: concat_l1sqr_main_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l1_sqr),
+                        slice(self.ws.l1_main),
+                        slice_mut(self.ws.l2_pre),
+                        b_u32, l1_effective as u32, l1_effective as u32
+                    ]
+                }
+            }?;
 
-        // -- Forward step 10: l2_input = CReLU(l2_pre) (B × l2_in) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: crelu_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_in),
-                args: [
-                    slice(self.ws.l2_pre),
-                    slice_mut(self.ws.l2_input),
-                    (b * l2_in) as u32
-                ]
-            }
-        }?;
+            // -- Forward step 10: l2_input = CReLU(l2_pre) (B × l2_in) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l2_pre),
+                        slice_mut(self.ws.l2_input),
+                        (b * l2_in) as u32
+                    ]
+                }
+            }?;
 
-        #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
-            self.qat_activations(1, b)?;
+            #[cfg(feature = "native")]
+            if self.qat_mode != crate::qat::QatMode::Off {
+                self.qat_activations(1, b)?;
+            }
         }
         prof_tick!("fwd_L1tail");
 
@@ -5487,27 +5583,32 @@ impl GpuTrainer {
         if self.qat_mode != crate::qat::QatMode::Off {
             self.qat_dense_forward(2, b)?;
         }
-        // -- Forward step 12: l2_acted = CReLU(l2_dense_out) (B × l2_out) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: crelu_fwd,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_out),
-                args: [
-                    slice(self.ws.l2_dense_out),
-                    slice_mut(self.ws.l2_acted),
-                    (b * l2_out) as u32
-                ]
-            }
-        }?;
+        if self.ws.head == LayerStackHead::DenseConcat {
+            self.dense_concat_activations(b, true)?;
+        } else {
+            // -- Forward step 12: l2_acted = CReLU(l2_dense_out) (B × l2_out) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_dense_out),
+                        slice_mut(self.ws.l2_acted),
+                        (b * l2_out) as u32
+                    ]
+                }
+            }?;
 
-        #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
-            self.qat_activations(2, b)?;
+            #[cfg(feature = "native")]
+            if self.qat_mode != crate::qat::QatMode::Off {
+                self.qat_activations(2, b)?;
+            }
         }
+
         prof_tick!("fwd_L2");
 
         // -- Forward step 13: L3 per-bucket dense → l3_out (B × 1) --
@@ -5531,7 +5632,7 @@ impl GpuTrainer {
                     slice(l3_forward_b),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.l3_out),
-                    b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    b_u32, self.ws.l3_in() as u32, 1_u32, self.num_buckets as u32
                 ]
             }
         }?;
@@ -5540,28 +5641,33 @@ impl GpuTrainer {
         if self.qat_mode != crate::qat::QatMode::Off {
             self.qat_dense_forward(3, b)?;
         }
-        // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: elementwise_add,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b),
-                args: [
-                    slice(self.ws.l3_out),
-                    slice(self.ws.l1_skip),
-                    slice_mut(self.ws.net_output),
-                    b_u32
-                ]
-            }
-        }?;
+        if self.ws.head == LayerStackHead::DenseConcat {
+            self.dense_concat_output(b)?;
+        } else {
+            // -- Forward step 14: net_output = l3_out + l1_skip (B × 1) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.l3_out),
+                        slice(self.ws.l1_skip),
+                        slice_mut(self.ws.net_output),
+                        b_u32
+                    ]
+                }
+            }?;
 
-        #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
-            self.qat_activations(3, b)?;
+            #[cfg(feature = "native")]
+            if self.qat_mode != crate::qat::QatMode::Off {
+                self.qat_activations(3, b)?;
+            }
         }
+
         // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
         // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
         // factorizer 有効時は畳み込み済み comb (`psqt.w_fold`、base 形状) を読む
@@ -5835,6 +5941,7 @@ impl GpuTrainer {
             .stack_shared_delta
             .as_ref()
             .map_or(&self.l3_w, |f| &f.l3.folded_w);
+        let l3_in = self.ws.l3_in();
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -5842,46 +5949,68 @@ impl GpuTrainer {
                 kernel: dense_mm_bwd_input_bucket,
                 stream: self.stream,
                 module: self.module,
-                config: cfg_1d(b * l2_out),
+                config: cfg_1d(b * l3_in),
                 args: [
                     slice(self.ws.dy_net_output),
                     slice(l3_backward_w),
                     slice(self.ws.bucket_idx_dev),
                     slice_mut(self.ws.dl2_acted),
-                    b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    b_u32, l3_in as u32, 1_u32, self.num_buckets as u32
                 ]
             }
         }?;
-        // Each column uses a power of two row lanes for the shared-memory reduction.
-        let mut l3_lanes = 1_usize;
-        while l3_lanes * 2 * l2_out <= 256 {
-            l3_lanes *= 2;
+        if l3_in > 256 {
+            let (chunks, row_shift) = self.bucket_weight_grad_chunks(b_u32, padded_b, 256);
+            // SAFETY: the forward sort initializes the real rows and the gradient grid covers L3.
+            unsafe {
+                cuda_launch! {
+                    kernel: dense_mm_bwd_weight_bucket_grid_l2,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (l3_in.div_ceil(256) as u32, chunks, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.l2_acted), slice(self.ws.dy_net_output),
+                        slice(self.ws.bucket_perm_dev), slice(self.ws.bucket_offsets_dev),
+                        slice(self.ws.bucket_counts_dev), slice_mut(self.l3_w_grad),
+                        row_shift, l3_in as u32, 1_u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+        } else {
+            // Each column uses a power of two row lanes for the shared-memory reduction.
+            let mut l3_lanes = 1_usize;
+            while l3_lanes * 2 * l3_in <= 256 {
+                l3_lanes *= 2;
+            }
+            let l3_block = (l3_lanes * l3_in) as u32;
+            let (chunks, row_shift) = self.bucket_weight_grad_chunks(b_u32, padded_b, l3_block);
+            unsafe {
+                // SAFETY: The forward sort initialized all permutation entries within each
+                // real segment. The input and gradient buffers stay live on this stream.
+                cuda_launch! {
+                    kernel: dense_mm_bwd_weight_bucket_grid_l3,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (chunks, 1, 1),
+                        block_dim: (l3_block, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.l2_acted),
+                        slice(self.ws.dy_net_output),
+                        slice(self.ws.bucket_perm_dev),
+                        slice(self.ws.bucket_offsets_dev),
+                        slice(self.ws.bucket_counts_dev),
+                        slice(self.l3_w_grad),
+                        row_shift, l3_in as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
         }
-        let l3_block = (l3_lanes * l2_out) as u32;
-        let (chunks, row_shift) = self.bucket_weight_grad_chunks(b_u32, padded_b, l3_block);
-        unsafe {
-            // SAFETY: The forward sort initialized all permutation entries within each
-            // real segment. The input and gradient buffers stay live on this stream.
-            cuda_launch! {
-                kernel: dense_mm_bwd_weight_bucket_grid_l3,
-                stream: self.stream,
-                module: self.module,
-                config: LaunchConfig {
-                    grid_dim: (chunks, 1, 1),
-                    block_dim: (l3_block, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.l2_acted),
-                    slice(self.ws.dy_net_output),
-                    slice(self.ws.bucket_perm_dev),
-                    slice(self.ws.bucket_offsets_dev),
-                    slice(self.ws.bucket_counts_dev),
-                    slice(self.l3_w_grad),
-                    row_shift, l2_out as u32, self.num_buckets as u32
-                ]
-            }
-        }?;
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。
@@ -5904,10 +6033,10 @@ impl GpuTrainer {
                 cuda_launch! {
                     kernel: stack_shared_delta_reduce_grad,
                     stream: self.stream, module: self.module,
-                    config: cfg_1d(l2_out),
+                    config: cfg_1d(l3_in),
                     args: [
                         slice(self.l3_w_grad), slice_mut(f.l3.w_grad),
-                        self.num_buckets as u32, l2_out as u32
+                        self.num_buckets as u32, l3_in as u32
                     ]
                 }
             }?;
@@ -5926,23 +6055,37 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L3");
 
-        // -- Backward 12 reverse: crelu_grad on l2_dense_out --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: crelu_grad,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_out),
-                args: [
-                    slice(self.ws.l2_dense_out),
-                    slice(self.ws.dl2_acted),
-                    slice_mut(self.ws.dl2_out),
-                    (b * l2_out) as u32
-                ]
-            }
-        }?;
+        if self.ws.head == LayerStackHead::DenseConcat {
+            // SAFETY: each thread writes one L2 gradient from its own row of the L3 input gradient.
+            unsafe {
+                cuda_launch! {
+                    kernel: dense_concat_l2_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_dense_out), slice(self.ws.dl2_acted),
+                        slice_mut(self.ws.dl2_out), b_u32, l1_out as u32, l2_out as u32, L1_SQR_SCALE
+                    ]
+                }
+            }?;
+        } else {
+            // -- Backward 12 reverse: crelu_grad on l2_dense_out --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_dense_out),
+                        slice(self.ws.dl2_acted),
+                        slice_mut(self.ws.dl2_out),
+                        (b * l2_out) as u32
+                    ]
+                }
+            }?;
+        }
 
         // -- Backward 11 reverse: L2 per-bucket dense grad --
         let l2_backward_w = self
@@ -6067,111 +6210,127 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L2");
 
-        // -- Backward 10 reverse: crelu_grad on l2_pre --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: crelu_grad,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l2_in),
-                args: [
-                    slice(self.ws.l2_pre),
-                    slice(self.ws.dl2_input),
-                    slice_mut(self.ws.dl2_pre),
-                    (b * l2_in) as u32
-                ]
-            }
-        }?;
+        if self.ws.head == LayerStackHead::DenseConcat {
+            // SAFETY: both activation gradient rows and the skip gradient cover this batch.
+            unsafe {
+                cuda_launch! {
+                    kernel: dense_concat_l1_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.ws.l1_total), slice(self.ws.dl2_input),
+                        slice(self.ws.dl2_acted), slice(self.ws.dy_net_output),
+                        slice_mut(self.ws.dl1_total), b_u32, l1_out as u32,
+                        self.ws.l3_in() as u32, L1_SQR_SCALE
+                    ]
+                }
+            }?;
+        } else {
+            // -- Backward 10 reverse: crelu_grad on l2_pre --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l2_pre),
+                        slice(self.ws.dl2_input),
+                        slice_mut(self.ws.dl2_pre),
+                        (b * l2_in) as u32
+                    ]
+                }
+            }?;
 
-        // -- Backward 9 reverse: split dl2_pre → dl1_sqr + dl1_main_from_concat (各 l1_effective) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: concat_l1sqr_main_grad,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.dl2_pre),
-                    slice_mut(self.ws.dl1_sqr),
-                    slice_mut(self.ws.dl1_main_from_concat),
-                    b_u32, l1_effective as u32
-                ]
-            }
-        }?;
+            // -- Backward 9 reverse: split dl2_pre → dl1_sqr + dl1_main_from_concat (各 l1_effective) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: concat_l1sqr_main_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl2_pre),
+                        slice_mut(self.ws.dl1_sqr),
+                        slice_mut(self.ws.dl1_main_from_concat),
+                        b_u32, l1_effective as u32
+                    ]
+                }
+            }?;
 
-        // -- Backward 8 reverse: abs_pow2_scale_grad (l1_sqr 経由の grad) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: abs_pow2_scale_grad,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.l1_main),
-                    slice(self.ws.dl1_sqr),
-                    slice_mut(self.ws.dl1_main_from_sqr),
-                    L1_SQR_SCALE,
-                    (b * l1_effective) as u32
-                ]
-            }
-        }?;
+            // -- Backward 8 reverse: abs_pow2_scale_grad (l1_sqr 経由の grad) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: abs_pow2_scale_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_main),
+                        slice(self.ws.dl1_sqr),
+                        slice_mut(self.ws.dl1_main_from_sqr),
+                        L1_SQR_SCALE,
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
 
-        // -- Combine dl1_main = dl1_main_from_concat + dl1_main_from_sqr --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: elementwise_add,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.dl1_main_from_concat),
-                    slice(self.ws.dl1_main_from_sqr),
-                    slice_mut(self.ws.dl1_main),
-                    (b * l1_effective) as u32
-                ]
-            }
-        }?;
+            // -- Combine dl1_main = dl1_main_from_concat + dl1_main_from_sqr --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl1_main_from_concat),
+                        slice(self.ws.dl1_main_from_sqr),
+                        slice_mut(self.ws.dl1_main),
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
 
-        // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) +
-        //    dl1_skip = dy_net_output (offset l1_effective) --
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * l1_effective),
-                args: [
-                    slice(self.ws.dl1_main),
-                    slice_mut(self.ws.dl1_total),
-                    b_u32, l1_effective as u32, l1_out as u32, 0_u32
-                ]
-            }
-        }?;
-        unsafe {
-            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
-            // stream の完了を待つ同期点まで生存する device allocation。
-            cuda_launch! {
-                kernel: slice_scatter_2d,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * L1_SKIP),
-                args: [
-                    slice(self.ws.dy_net_output),
-                    slice_mut(self.ws.dl1_total),
-                    b_u32, L1_SKIP as u32, l1_out as u32, l1_effective as u32
-                ]
-            }
-        }?;
+            // -- Backward 7 reverse: assemble dl1_total from dl1_main (offset 0) +
+            //    dl1_skip = dy_net_output (offset l1_effective) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_scatter_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl1_main),
+                        slice_mut(self.ws.dl1_total),
+                        b_u32, l1_effective as u32, l1_out as u32, 0_u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_scatter_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * L1_SKIP),
+                    args: [
+                        slice(self.ws.dy_net_output),
+                        slice_mut(self.ws.dl1_total),
+                        b_u32, L1_SKIP as u32, l1_out as u32, l1_effective as u32
+                    ]
+                }
+            }?;
+        }
 
         // -- Backward 6 reverse: dl1_total を bucket 層と L1 shared 層の両方の grad にそのまま流す --
 
@@ -6900,7 +7059,8 @@ impl GpuTrainer {
         let l1_shared_bias_n = l1_out;
         let l2_w_n = self.num_buckets * l2_out * l2_in;
         let l2_b_n = self.num_buckets * l2_out;
-        let l3_w_n = self.num_buckets * l2_out;
+        let l3_in = self.ws.l3_in();
+        let l3_w_n = self.num_buckets * l3_in;
         let l3_b_n = self.num_buckets;
 
         macro_rules! prof_tick {
@@ -7017,7 +7177,7 @@ impl GpuTrainer {
             norm_loss_group!(self.l1_shared_weight, l1_out, 1, l1_out, ft_out);
             norm_loss_group!(self.l1_w, self.num_buckets * l1_out, ft_out, 1, ft_out);
             norm_loss_group!(self.l2_w, self.num_buckets * l2_out, l2_in, 1, l2_in);
-            norm_loss_group!(self.l3_w, self.num_buckets, l2_out, 1, l2_out);
+            norm_loss_group!(self.l3_w, self.num_buckets, l3_in, 1, l3_in);
             // PSQT shortcut weight (任意): psqt_w[feat*num_buckets + bucket] を
             // bucket 列ごと (= per-output-neuron) に正規化する (pitch=1 /
             // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —
@@ -7380,7 +7540,7 @@ impl GpuTrainer {
                 w_m,
                 w_v,
                 w_grad,
-                l2_out,
+                l3_in,
                 dense_lr,
                 dense_wd,
                 W_CLAMP_QUANT_MIN,
@@ -7467,7 +7627,7 @@ impl GpuTrainer {
                 }
                 lerp_shared!(l2, w, w_slow, l2_out * l2_in);
                 lerp_shared!(l2, b, b_slow, l2_out);
-                lerp_shared!(l3, w, w_slow, l2_out);
+                lerp_shared!(l3, w, w_slow, l3_in);
                 lerp_shared!(l3, b, b_slow, 1);
             }
         }
@@ -7534,6 +7694,193 @@ trainer_backend_impl! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn dense_concat_gpu_forward_and_backward_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
+        use nnue_format::dense_concat;
+        use shogi_features::FeatureSet;
+
+        let ctx = crate::tests::gpu_test_context::test_cuda_context()?;
+        let (batch_size, ft, l1, l2, buckets) = (16, 128, 16, 64, 2);
+        let spec = FeatureSet::HalfKp.spec();
+        let loss = LossKind::Sigmoid { scale: 1.0 };
+        let mut trainer = GpuTrainer::new(
+            &ctx,
+            batch_size,
+            ft,
+            l1,
+            l2,
+            LayerStackHead::DenseConcat,
+            buckets,
+            BucketMode::ProgressKpAbs,
+            PrecisionFlags::default(),
+            spec,
+            OptimizerKind::RAdam,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            None,
+            None,
+            &LayerStackInit::default_uniform(),
+        )?;
+        trainer.freeze_ft = true;
+        let mut weights = trainer.to_layerstack_weights()?;
+        weights.ft_b.fill(0.5);
+        for (i, value) in weights.l1_b.iter_mut().enumerate() {
+            *value = (2 * (i as i32 % 8) - 7) as f32 / 12.0;
+        }
+        for (i, value) in weights.l2_b.iter_mut().enumerate() {
+            *value = (2 * (i as i32 % 8) - 7) as f32 / 10.0;
+        }
+        for (i, value) in weights.l3_w.iter_mut().enumerate() {
+            *value = (i as i32 % 13 - 6) as f32 / 64.0;
+        }
+        weights.l3_b.fill(0.33);
+        trainer.load_layerstack_weights(&weights)?;
+        trainer.sync_ft_forward_weights()?;
+        let mut batch = BatchData::smoke_dummy(batch_size, spec);
+        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (row % buckets) as i32;
+        }
+        let forward = trainer.validate(&batch.as_ref(), 0.0, loss)?;
+        let combined = trainer.combined_original_order_for_test(batch_size)?;
+        for (row, (input, &got)) in combined
+            .chunks_exact(ft)
+            .zip(&forward.net_output)
+            .enumerate()
+        {
+            let want = dense_concat::forward(&weights, batch.bucket_idx[row] as usize, input);
+            assert!((got - want).abs() < 2e-5, "row {row}: {got} vs {want}");
+        }
+
+        trainer.skip_optimizer_for_test = true;
+        trainer.step(&batch.as_ref(), 0.01, 0.0, loss)?;
+        let doutput = trainer.ws.dy_net_output.to_host_vec(&trainer.stream)?;
+        let dl1 = trainer.ws.dl1_total.to_host_vec(&trainer.stream)?;
+        let dl2 = trainer.ws.dl2_out.to_host_vec(&trainer.stream)?;
+        let l2_in = 2 * l1;
+        let l3_in = l2_in + 2 * l2;
+        let mut l2_weight_grad = vec![0.0; weights.l2_w.len()];
+        let mut l3_weight_grad = vec![0.0; weights.l3_w.len()];
+        let activate = |values: &[f32]| {
+            let mut activated: Vec<_> = values
+                .iter()
+                .map(|&x| (x * x * L1_SQR_SCALE).clamp(0.0, 1.0))
+                .collect();
+            activated.extend(values.iter().map(|&x| x.clamp(0.0, 1.0)));
+            activated
+        };
+        for (row, input) in combined.chunks_exact(ft).enumerate() {
+            let bucket = batch.bucket_idx[row] as usize;
+            let first: Vec<_> = (0..l1)
+                .map(|col| {
+                    let index = bucket * l1 + col;
+                    let bias = weights.l1_b[index] + weights.l1_shared_bias[col];
+                    input.iter().enumerate().fold(bias, |sum, (i, &x)| {
+                        sum + x
+                            * (weights.l1_w[index * ft + i]
+                                + weights.l1_shared_weight[i * l1 + col])
+                    })
+                })
+                .collect();
+            let second_input = activate(&first);
+            let second: Vec<_> = (0..l2)
+                .map(|col| {
+                    let index = bucket * l2 + col;
+                    second_input
+                        .iter()
+                        .enumerate()
+                        .fold(weights.l2_b[index], |sum, (i, &x)| {
+                            sum + x * weights.l2_w[index * l2_in + i]
+                        })
+                })
+                .collect();
+            let output_weights = &mut l3_weight_grad[bucket * l3_in..][..l3_in];
+            for (grad, x) in output_weights
+                .iter_mut()
+                .zip(second_input.iter().copied().chain(activate(&second)))
+            {
+                *grad += doutput[row] * x;
+            }
+            for (layer, grads, dim) in [(1, &dl1, l1), (2, &dl2, l2)] {
+                for col in 0..dim {
+                    let index = bucket * dim + col;
+                    fn bias(w: &mut LayerStackWeights, layer: usize) -> &mut [f32] {
+                        if layer == 1 { &mut w.l1_b } else { &mut w.l2_b }
+                    }
+                    let delta = 0.001;
+                    let original = bias(&mut weights, layer)[index];
+                    bias(&mut weights, layer)[index] = original + delta;
+                    let plus = dense_concat::forward(&weights, bucket, input);
+                    bias(&mut weights, layer)[index] = original - delta;
+                    let minus = dense_concat::forward(&weights, bucket, input);
+                    bias(&mut weights, layer)[index] = original;
+                    let want = (plus - minus) / (2.0 * delta) * doutput[row];
+                    if layer == 2 {
+                        let weight_row = &mut l2_weight_grad[index * l2_in..][..l2_in];
+                        for (grad, &x) in weight_row.iter_mut().zip(&second_input) {
+                            *grad += want * x;
+                        }
+                    }
+                    let got = grads[row * dim + col];
+                    assert!(
+                        (got - want).abs() < 2e-6,
+                        "row {row}, L{layer}[{col}]: {got} vs {want}"
+                    );
+                }
+            }
+        }
+        for (layer, device, expected, tolerance) in [
+            (2, &trainer.l2_w_grad, l2_weight_grad, 2e-5),
+            (3, &trainer.l3_w_grad, l3_weight_grad, 2e-6),
+        ] {
+            let actual = device.to_host_vec(&trainer.stream)?;
+            assert_eq!(actual.len(), expected.len());
+            for (index, (got, want)) in actual.into_iter().zip(expected).enumerate() {
+                assert!(
+                    (got - want).abs() < tolerance,
+                    "L{layer} weight {index}: {got} vs {want}"
+                );
+            }
+        }
+
+        #[cfg(feature = "native")]
+        {
+            use nnue_format::layerstack_weights::{QA, QB};
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes, None)?;
+            let (exported, biases) = LayerStackWeights::load_quantised_for_integer_eval(
+                &mut bytes.as_slice(),
+                spec,
+                ft,
+                l1,
+                l2,
+                buckets,
+                false,
+            )?;
+            trainer.configure_qat(Some(crate::qat::QatMode::Dense))?;
+            let forward = trainer.validate(&batch.as_ref(), 0.0, loss)?;
+            let combined = trainer.combined_original_order_for_test(batch_size)?;
+            for (row, (input, &got)) in combined
+                .chunks_exact(ft)
+                .zip(&forward.net_output)
+                .enumerate()
+            {
+                let integer: Vec<_> = input
+                    .iter()
+                    .map(|&x| (x * QA as f32).round() as u8)
+                    .collect();
+                let raw = dense_concat::forward_quantised(
+                    &exported,
+                    &biases,
+                    batch.bucket_idx[row] as usize,
+                    &integer,
+                );
+                let want = (f64::from(raw) / f64::from(QA * QB)) as f32;
+                assert_eq!(got, want, "row {row}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

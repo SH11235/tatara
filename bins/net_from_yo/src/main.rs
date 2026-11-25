@@ -213,6 +213,9 @@ fn read_yo<R: BufRead>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result<
 /// [<in>-><ft>x2],Network=<struct>{LayerStack=<n>}`) から feature set と次元を検出する。
 /// PSQT 付き (`SFNNWithoutPsqt` でない) や未知 feature は変換不可として reject。
 fn parse_yo_arch(arch: &str) -> io::Result<DetectedArch> {
+    if arch.split(',').any(|token| token == "Head=DenseConcat") || arch.contains("DenseConcat[") {
+        return invalid_data("DenseConcat is not supported by YaneuraOu SFNN");
+    }
     if !arch.starts_with("ModelType=SFNNWithoutPsqt;") {
         return invalid_data(format!(
             "unsupported YaneuraOu architecture (expected ModelType=SFNNWithoutPsqt): `{arch}`"
