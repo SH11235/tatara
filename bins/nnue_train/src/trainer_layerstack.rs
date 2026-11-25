@@ -161,6 +161,15 @@ fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> 
 }
 
 #[cfg(feature = "native")]
+pub(crate) fn partial_ft_gather_active_config(features: usize, width: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (features.div_ceil(2) as u32, width.div_ceil(128) as u32, 1),
+        block_dim: (64, 2, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+#[cfg(feature = "native")]
 impl GpuTrainer {
     /// Whether this step updates FT weights with `ft_fused_optimizer_step` instead of the
     /// separate norm-loss / RAdam / lookahead / fold launches. Precision-diagnostic steps keep
@@ -4070,6 +4079,30 @@ impl GpuTrainer {
             .expect("FP16 gradients allocated");
             #[cfg(feature = "native")]
             if rows.is_multiple_of(4) && spec.threat_width(rows).is_multiple_of(4) {
+                if active_rows_only {
+                    let base = spec.base_ft_in();
+                    // Separate the widths so the grid needs no empty Threat column tiles.
+                    for (first, count, width) in [
+                        (0, base, rows),
+                        (base, spec.threat_dims(), spec.threat_width(rows)),
+                    ] {
+                        if count == 0 {
+                            continue;
+                        }
+                        // SAFETY: each launch owns its section of the packed real block.
+                        // Both half-boundaries are even and the mask covers both sections.
+                        unsafe {
+                            cuda_launch! {
+                                kernel: partial_ft_gather_fp16_pairs_active, stream: self.stream, module: self.module,
+                                config: partial_ft_gather_active_config(count, width),
+                                args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                                       slice(self.ft_w_grad), slice(self.ws.ft_active_rows), first as u32,
+                                       count as u32, rows as u32, width as u32, perspective as u32, scale]
+                            }
+                        }?;
+                    }
+                    return Ok(());
+                }
                 const THREADS: u32 = 64;
                 let tile_width = (2 * THREADS) as usize;
                 let blocks = spec.base_ft_in() * rows.div_ceil(tile_width)
@@ -4080,23 +4113,13 @@ impl GpuTrainer {
                     shared_mem_bytes: 0,
                 };
                 // SAFETY: both half-boundaries are even, so each aligned pair stays in
-                // one half of a row. The grid covers the packed real block and the mask covers its features.
+                // one half of a row. The grid covers the packed real block.
                 return unsafe {
-                    if active_rows_only {
-                        cuda_launch! {
-                            kernel: partial_ft_gather_fp16_pairs_active, stream: self.stream, module: self.module,
-                            config: config,
-                            args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
-                                   slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale,
-                                   slice(self.ws.ft_active_rows)]
-                        }
-                    } else {
-                        cuda_launch! {
-                            kernel: partial_ft_gather_fp16_pairs, stream: self.stream, module: self.module,
-                            config: config,
-                            args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
-                                   slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale]
-                        }
+                    cuda_launch! {
+                        kernel: partial_ft_gather_fp16_pairs, stream: self.stream, module: self.module,
+                        config: config,
+                        args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
+                               slice(self.ft_w_grad), slice(self.partial_ft_shape), perspective as u32, scale]
                     }
                 }
                 .map_err(Into::into);

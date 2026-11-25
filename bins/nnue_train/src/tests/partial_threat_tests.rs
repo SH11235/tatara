@@ -420,6 +420,7 @@ fn partial_threat_partitioned_norm_matches_serial_f64() -> Result<(), Box<dyn st
 #[test]
 fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
 -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::partial_ft_gather_active_config;
     use gpu_runtime::LaunchConfig;
 
     let ctx = test_cuda_context()?;
@@ -436,7 +437,7 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
     let pairs = DeviceBuffer::from_host(&stream, &[0_u32, 2, 4])?;
     let lists: [[&[u32]; 8]; 2] = [
         [
-            &[3, 9, 0, 5, 3],
+            &[3, 9, 0, 5, 3, 1, 2, 9, 10],
             &[],
             &[],
             &[8],
@@ -457,7 +458,13 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
         ],
     ];
     let stale = f32::from_bits(0x7fc0_0001);
-    for (rows, width) in [(320_usize, 192_usize), (320, 130), (321, 193)] {
+    for (rows, width) in [
+        (320_usize, 192_usize),
+        (320, 130),
+        (321, 193),
+        (6144, 3072),
+        (8192, 2816),
+    ] {
         let shape = DeviceBuffer::from_host(
             &stream,
             &[
@@ -509,10 +516,14 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
                         kernel: partial_ft_gather_fp16_pairs, stream: stream, module: module, config: pairs_config,
                         args: [slice(half), slice(positions), slice(offsets), slice(reference), slice(shape), add, scale]
                     }?;
-                    cuda_launch! {
-                        kernel: partial_ft_gather_fp16_pairs_active, stream: stream, module: module, config: pairs_config,
-                        args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(shape), add, scale, slice(mask)]
-                    }?;
+                    for (first, count, packed_width) in [(0, base, rows), (base, threats, width)] {
+                        cuda_launch! {
+                            kernel: partial_ft_gather_fp16_pairs_active, stream: stream, module: module,
+                            config: partial_ft_gather_active_config(count, packed_width),
+                            args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(mask),
+                                   first as u32, count as u32, rows as u32, packed_width as u32, add, scale]
+                        }?;
+                    }
                 } else {
                     let float = DeviceBuffer::from_host(
                         &stream,

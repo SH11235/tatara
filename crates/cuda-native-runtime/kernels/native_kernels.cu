@@ -4920,9 +4920,11 @@ extern "C" __global__ void partial_ft_gather_fp16(
         sum += __half2float(gradient[partial_ft_row_offset(positions[p], rows) + col]) * scale;
     if (add) result[k] += sum; else result[k] = sum;
 }
-__device__ __forceinline__ void partial_ft_gather_fp16_pairs_impl(
-    const __half* gradient, const unsigned* positions, const unsigned* offsets,
-    float* result, const unsigned* shape, unsigned add, float scale, const unsigned* active_rows) {
+extern "C" __global__ void partial_ft_gather_fp16_pairs(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned add, float scale
+) {
     const unsigned rows = shape[0], base = shape[1], width = shape[3];
     const unsigned tile_width = 2 * blockDim.x;
     const unsigned piece_tiles = (rows + tile_width - 1) / tile_width;
@@ -4932,8 +4934,6 @@ __device__ __forceinline__ void partial_ft_gather_fp16_pairs_impl(
     const unsigned block = threat ? blockIdx.x - base * piece_tiles : blockIdx.x;
     const unsigned f = (threat ? base : 0) + block / tiles;
     const unsigned begin = offsets[f], end = offsets[f + 1];
-    // STM must zero NSTM-only rows before the add pass.
-    if (active_rows && begin == end && (add || active_rows[f] == 0)) return;
     const unsigned c = (block % tiles) * tile_width + 2 * threadIdx.x;
     if (c >= row_width) return;
     const unsigned col = threat && c >= width / 2 ? rows / 2 + c - width / 2 : c;
@@ -4955,21 +4955,57 @@ __device__ __forceinline__ void partial_ft_gather_fp16_pairs_impl(
     *reinterpret_cast<float2*>(target) = make_float2(lo, hi);
 }
 
-extern "C" __global__ void partial_ft_gather_fp16_pairs(
-    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
-    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
-    const unsigned* shape, unsigned long long, unsigned add, float scale
-) {
-    partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, nullptr);
-}
-
 extern "C" __global__ void partial_ft_gather_fp16_pairs_active(
     const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
     const unsigned* offsets, unsigned long long, float* result, unsigned long long,
-    const unsigned* shape, unsigned long long, unsigned add, float scale,
-    const unsigned* active_rows, unsigned long long
+    const unsigned* active_rows, unsigned long long, unsigned feature_base, unsigned features,
+    unsigned rows, unsigned width, unsigned add, float scale
 ) {
-    partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, active_rows);
+    const unsigned feature = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned c = 2 * (blockIdx.y * blockDim.x + threadIdx.x);
+    if (feature >= features || c >= width) return;
+    const unsigned f = feature_base + feature;
+    unsigned p = offsets[f];
+    const unsigned end = offsets[f + 1];
+    // STM must zero NSTM-only rows before the add pass.
+    if (p == end && (add || active_rows[f] == 0)) return;
+
+    const unsigned col = c >= width / 2 ? c + (rows - width) / 2 : c;
+    const __half* column = gradient + col;
+    auto load = [&](unsigned position) {
+        return *reinterpret_cast<const unsigned*>(column + partial_ft_row_offset(position, rows));
+    };
+    float lo = 0.0F, hi = 0.0F;
+    auto accumulate = [&](unsigned packed) {
+        lo = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed))), scale, lo);
+        hi = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed >> 16))), scale, hi);
+    };
+    // Issue independent index and gradient loads while keeping each column's FMA chain in order.
+#pragma unroll 1
+    for (; end - p >= 4; p += 4) {
+        const unsigned p0 = positions[p];
+        const unsigned p1 = positions[p + 1];
+        const unsigned p2 = positions[p + 2];
+        const unsigned p3 = positions[p + 3];
+        const unsigned g0 = load(p0);
+        const unsigned g1 = load(p1);
+        const unsigned g2 = load(p2);
+        const unsigned g3 = load(p3);
+        accumulate(g0);
+        accumulate(g1);
+        accumulate(g2);
+        accumulate(g3);
+    }
+    for (; p < end; ++p) accumulate(load(positions[p]));
+
+    float* target = result + partial_ft_row_offset(feature_base, rows)
+                           + partial_ft_row_offset(feature, width) + c;
+    if (add) {
+        const float2 stm = *reinterpret_cast<const float2*>(target);
+        lo = stm.x + lo;
+        hi = stm.y + hi;
+    }
+    *reinterpret_cast<float2*>(target) = make_float2(lo, hi);
 }
 extern "C" __global__ void ft_expand_indices(
     const int* packed_stm, unsigned long long, const int* packed_nstm, unsigned long long,
