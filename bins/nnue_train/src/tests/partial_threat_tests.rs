@@ -420,8 +420,19 @@ fn partial_threat_partitioned_norm_matches_serial_f64() -> Result<(), Box<dyn st
 #[test]
 fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::trainer_layerstack::partial_ft_gather_active_config;
-    use gpu_runtime::LaunchConfig;
+    use crate::trainer_layerstack::PartialGather;
+
+    check_partial_threat_active_gather_bits(PartialGather::Row)?;
+    check_partial_threat_active_gather_bits(PartialGather::Tile)
+}
+
+#[cfg(feature = "native")]
+fn check_partial_threat_active_gather_bits(
+    variant: crate::trainer_layerstack::PartialGather,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{
+        PartialGather, partial_ft_gather_row_config, partial_ft_gather_tile_config,
+    };
 
     let ctx = test_cuda_context()?;
     let stream = gpu_runtime::create_compute_stream(&ctx)?;
@@ -462,9 +473,14 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
         (320_usize, 192_usize),
         (320, 130),
         (321, 193),
+        (1536, 512),
         (6144, 3072),
         (8192, 2816),
     ] {
+        let paired = rows.is_multiple_of(4) && width.is_multiple_of(4);
+        if !paired && variant == PartialGather::Tile {
+            continue;
+        }
         let shape = DeviceBuffer::from_host(
             &stream,
             &[
@@ -481,16 +497,7 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
         let reference = DeviceBuffer::from_host(&stream, &vec![stale; real_len + virtual_len])?;
         let actual = DeviceBuffer::from_host(&stream, &vec![stale; real_len + virtual_len])?;
         let scalar_config = cfg_1d(real_len);
-        let paired = rows.is_multiple_of(4) && width.is_multiple_of(4);
-        let pairs_config = LaunchConfig {
-            grid_dim: (
-                (base * rows.div_ceil(128) + threats * width.div_ceil(128)) as u32,
-                1,
-                1,
-            ),
-            block_dim: (64, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let pairs_config = partial_ft_gather_row_config(base, threats, rows, width)?;
         for (perspective, lists) in lists.iter().enumerate() {
             let mut offsets = vec![0_u32];
             let mut positions = Vec::new();
@@ -516,13 +523,22 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
                         kernel: partial_ft_gather_fp16_pairs, stream: stream, module: module, config: pairs_config,
                         args: [slice(half), slice(positions), slice(offsets), slice(reference), slice(shape), add, scale]
                     }?;
-                    for (first, count, packed_width) in [(0, base, rows), (base, threats, width)] {
+                    if variant == PartialGather::Row {
                         cuda_launch! {
-                            kernel: partial_ft_gather_fp16_pairs_active, stream: stream, module: module,
-                            config: partial_ft_gather_active_config(count, packed_width),
-                            args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(mask),
-                                   first as u32, count as u32, rows as u32, packed_width as u32, add, scale]
+                            kernel: partial_ft_gather_fp16_pairs_active_row, stream: stream, module: module, config: pairs_config,
+                            args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(shape), add, scale, slice(mask)]
                         }?;
+                    } else {
+                        for (first, count, packed_width) in
+                            [(0, base, rows), (base, threats, width)]
+                        {
+                            cuda_launch! {
+                                kernel: partial_ft_gather_fp16_pairs_active_tile, stream: stream, module: module,
+                                config: partial_ft_gather_tile_config(count, packed_width),
+                                args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(mask),
+                                       first as u32, count as u32, rows as u32, packed_width as u32, add, scale]
+                            }?;
+                        }
                     }
                 } else {
                     let float = DeviceBuffer::from_host(
@@ -550,7 +566,7 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
                     assert_eq!(
                         actual[k].to_bits(),
                         expected.to_bits(),
-                        "{rows}/{width}, pass {add}, feature {feature}, element {k}"
+                        "{variant:?}, {rows}/{width}, pass {add}, feature {feature}, element {k}"
                     );
                 }
                 start = end;
@@ -573,7 +589,7 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
             assert_eq!(
                 actual[k].to_bits(),
                 reference[k].to_bits(),
-                "{rows}/{width}, virtual element {k}"
+                "{variant:?}, {rows}/{width}, virtual element {k}"
             );
         }
     }
