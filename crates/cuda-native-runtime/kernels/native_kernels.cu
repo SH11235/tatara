@@ -5215,7 +5215,7 @@ __device__ __forceinline__ float dense_concat_clip(float x) {
 
 extern "C" __global__ void dense_concat_activations(
     const float* l1, size_t, const float* l2, size_t, float* output, size_t,
-    uint32_t batch, uint32_t l1_out, uint32_t l2_out, float scale
+    unsigned batch, unsigned l1_out, unsigned l2_out, float scale
 ) {
     const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t width = 2 * (l1_out + l2_out);
@@ -5242,7 +5242,7 @@ __device__ __forceinline__ float dense_concat_pair_grad(
 
 extern "C" __global__ void dense_concat_l2_grad(
     const float* l2, size_t, const float* dy, size_t, float* dx, size_t,
-    uint32_t batch, uint32_t l1_out, uint32_t l2_out, float scale
+    unsigned batch, unsigned l1_out, unsigned l2_out, float scale
 ) {
     const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= size_t(batch) * l2_out) return;
@@ -5255,7 +5255,7 @@ extern "C" __global__ void dense_concat_l2_grad(
 extern "C" __global__ void dense_concat_l1_grad(
     const float* l1, size_t, const float* from_l2, size_t, const float* from_l3, size_t,
     const float* dskip, size_t, float* dx, size_t,
-    uint32_t batch, uint32_t l1_out, uint32_t l3_in, float scale
+    unsigned batch, unsigned l1_out, unsigned l3_in, float scale
 ) {
     const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= size_t(batch) * l1_out) return;
@@ -5273,7 +5273,7 @@ extern "C" __global__ void dense_concat_l1_grad(
 
 extern "C" __global__ void dense_concat_output(
     const float* l1, size_t, const float* l3, size_t, float* output, size_t,
-    uint32_t batch, uint32_t l1_out
+    unsigned batch, unsigned l1_out
 ) {
     const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= batch) return;
@@ -5282,8 +5282,8 @@ extern "C" __global__ void dense_concat_output(
 }
 
 extern "C" __global__ void dense_concat_qat_activations(
-    const int32_t* l1, size_t, const int32_t* l2, size_t, float* output, size_t,
-    uint32_t batch, uint32_t l1_out, uint32_t l2_out
+    const int* l1, size_t, const int* l2, size_t, float* output, size_t,
+    unsigned batch, unsigned l1_out, unsigned l2_out
 ) {
     const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t width = 2 * (l1_out + l2_out);
@@ -5292,28 +5292,28 @@ extern "C" __global__ void dense_concat_qat_activations(
     const size_t col = tid % width;
     const size_t offset = col < 2 * l1_out ? col : col - 2 * l1_out;
     const bool first = col < 2 * l1_out;
-    const int32_t x = first ? l1[row * l1_out + offset % l1_out]
+    const int x = first ? l1[row * l1_out + offset % l1_out]
                             : l2[row * l2_out + offset % l2_out];
     const bool square = offset < (first ? l1_out : l2_out);
     if (square) {
-        const int64_t value = (int64_t(x) * x) >> 19;
+        const long long value = (long long(x) * x) >> 19;
         output[tid] = float(value > 127 ? 127 : value) / 127.0f;
     } else {
-        const int32_t value = x >> 6;
+        const int value = x >> 6;
         output[tid] = float(value < 0 ? 0 : (value > 127 ? 127 : value)) / 127.0f;
     }
 }
 
 extern "C" __global__ void dense_concat_qat_output(
-    const int32_t* l1, size_t, const int32_t* l3, size_t, float* output, size_t,
-    uint32_t batch, uint32_t l1_out
+    const int* l1, size_t, const int* l3, size_t, float* output, size_t,
+    unsigned batch, unsigned l1_out
 ) {
     const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= batch) return;
     const size_t end = (row + 1) * l1_out;
     // 推論側の i32 演算 (release build の 2 の補数の折り返し) と同じ値にするため、
     // 符号付きの overflow (C++ では未定義) を避けて u32 で加減算する。
-    const uint32_t skip = uint32_t(l1[end - 2]) - uint32_t(l1[end - 1]);
-    const int32_t raw = int32_t(uint32_t(l3[row]) + skip);
+    const unsigned skip = unsigned(l1[end - 2]) - unsigned(l1[end - 1]);
+    const int raw = int(unsigned(l3[row]) + skip);
     output[row] = static_cast<float>(static_cast<double>(raw) / 8128.0);
 }
