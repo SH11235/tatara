@@ -109,7 +109,7 @@ impl KeepBucket {
                         "independent": true,
                         "mode": "progresskpabs",
                         "count": num_buckets,
-                        "progress_coeff": crate::loader_state::artifact_bytes_identity(&bytes),
+                        "progress_coeff": crate::artifact::artifact_bytes_identity(&bytes),
                     }),
                 )
             }

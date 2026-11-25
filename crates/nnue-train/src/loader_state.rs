@@ -4,17 +4,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::artifact_bytes_identity;
 use crate::dataloader::TeacherPosition;
+
+const LOADER_STATE_VERSION: u32 = 1;
+const PRIMARY_TEACHER_ID: &str = "primary";
+
+fn mix_teacher_id(index: usize) -> String {
+    format!("mix-{}", index + 1)
+}
 
 pub fn artifact_identity(path: &Path) -> io::Result<serde_json::Value> {
     Ok(artifact_bytes_identity(&std::fs::read(path)?))
-}
-
-pub(crate) fn artifact_bytes_identity(bytes: &[u8]) -> serde_json::Value {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    serde_json::json!({"bytes": bytes.len(), "sha256": hex})
 }
 
 /// How `--resume` treats the teacher input positions saved next to the checkpoint.
@@ -66,6 +67,44 @@ pub struct WdlJitterState {
 }
 
 impl LoaderState {
+    pub(crate) fn from_position(
+        superbatch: usize,
+        files: &[TeacherFileIdentity],
+        mix_files: &[Vec<TeacherFileIdentity>],
+        position: &TeacherPosition,
+        settings: &serde_json::Value,
+    ) -> io::Result<Self> {
+        if mix_files.len() != position.mixes.len() {
+            return Err(io::Error::other(format!(
+                "cannot save loader state: expected {} mixed teacher positions but found {}",
+                mix_files.len(),
+                position.mixes.len(),
+            )));
+        }
+
+        let mut teachers = Vec::with_capacity(1 + mix_files.len());
+        teachers.push(TeacherState {
+            id: PRIMARY_TEACHER_ID.into(),
+            files: files.to_vec(),
+            position: position.clone(),
+        });
+        teachers.extend(mix_files.iter().zip(&position.mixes).enumerate().map(
+            |(index, (files, position))| TeacherState {
+                id: mix_teacher_id(index),
+                files: files.clone(),
+                position: position.clone(),
+            },
+        ));
+
+        Ok(Self {
+            version: LOADER_STATE_VERSION,
+            superbatch,
+            teachers,
+            settings: settings.clone(),
+            wdl_jitter_state: None,
+        })
+    }
+
     pub fn identities(paths: &[impl AsRef<Path>]) -> io::Result<Vec<TeacherFileIdentity>> {
         paths
             .iter()
@@ -83,7 +122,7 @@ impl LoaderState {
         match std::fs::read(checkpoint.with_extension("loader.json")) {
             Ok(bytes) => {
                 let state: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                if state.version != 1 {
+                if state.version != LOADER_STATE_VERSION {
                     return Err(io::Error::other(format!(
                         "unsupported loader state version: {}",
                         state.version
@@ -142,9 +181,9 @@ impl LoaderState {
         superbatch: usize,
     ) -> Vec<String> {
         let mut out = Vec::new();
-        if self.version != 1 {
+        if self.version != LOADER_STATE_VERSION {
             out.push(format!(
-                "loader state version: saved {}, supported 1",
+                "loader state version: saved {}, supported {LOADER_STATE_VERSION}",
                 self.version
             ));
         }
@@ -182,13 +221,16 @@ impl LoaderState {
                 current_files.len()
             ));
         }
-        let ids_ok = self.teachers.first().is_some_and(|t| t.id == "primary")
+        let ids_ok = self
+            .teachers
+            .first()
+            .is_some_and(|t| t.id == PRIMARY_TEACHER_ID)
             && self
                 .teachers
                 .iter()
                 .skip(1)
                 .enumerate()
-                .all(|(i, t)| t.id == format!("mix-{}", i + 1));
+                .all(|(i, t)| t.id == mix_teacher_id(i));
         let cursors_ok = self
             .teachers
             .first()
@@ -256,6 +298,33 @@ fn describe_files(files: &[TeacherFileIdentity]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructing_loader_state_requires_one_position_per_mixed_teacher() {
+        let mix_files = vec![vec![TeacherFileIdentity {
+            path: "mix.psv".into(),
+            bytes: 40,
+        }]];
+        let no_mixes = TeacherPosition::default();
+        let one_mix = TeacherPosition {
+            mixes: vec![TeacherPosition::default()],
+            ..Default::default()
+        };
+        for (files, position, expected, found) in [
+            (mix_files.as_slice(), &no_mixes, 1, 0),
+            (&[][..], &one_mix, 0, 1),
+        ] {
+            let error =
+                LoaderState::from_position(1, &[], files, position, &serde_json::Value::Null)
+                    .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "cannot save loader state: expected {expected} mixed teacher positions but found {found}"
+                )
+            );
+        }
+    }
 
     #[test]
     fn tree_sample_label_setting_must_match_and_defaults_to_disabled() {

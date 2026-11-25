@@ -13,17 +13,11 @@ use nnue_format::LayerStackWeights;
 use nnue_format::layerstack_weights::coalesce_ft_factorized;
 use nnue_train::dataloader::BucketMode;
 use nnue_train::raw_checkpoint::{
-    PARTIAL_THREAT_CKPT_VERSION, PARTIAL_THREAT_RADAM_CKPT_VERSION, RAW_CKPT_MAGIC,
+    RawCkptReadMode, RawCkptReader, TENSORS_PER_GROUP, decode_qat_flags, read_raw_ckpt_group_len,
 };
 use shogi_features::{
     BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
 };
-/// arch kind と topology を header に持つ最初の version。
-const MIN_VERSION: u32 = 4;
-const MAX_VERSION: u32 = PARTIAL_THREAT_RADAM_CKPT_VERSION;
-const MAX_NAME_BYTES: usize = 256;
-/// 各 group の本体は `len u64` に続く `w`, `m`, `v`, `slow` の 4 本の f32 tensor。
-const TENSORS_PER_GROUP: u64 = 4;
 const READ_CHUNK_F32: usize = 1 << 20;
 
 /// 平均を取る checkpoint 同士で一致していなければならない header 項目。
@@ -83,112 +77,49 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-fn read_array<const N: usize>(r: &mut impl Read, what: &str) -> io::Result<[u8; N]> {
-    let mut buf = [0u8; N];
-    r.read_exact(&mut buf).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            invalid(format!("checkpoint truncated while reading {what}"))
-        } else {
-            e
-        }
-    })?;
-    Ok(buf)
-}
-
-fn read_u32(r: &mut impl Read, what: &str) -> io::Result<u32> {
-    read_array::<4>(r, what).map(u32::from_le_bytes)
-}
-
-fn read_u64(r: &mut impl Read, what: &str) -> io::Result<u64> {
-    read_array::<8>(r, what).map(u64::from_le_bytes)
-}
-
-fn read_name(r: &mut impl Read, what: &str) -> io::Result<String> {
-    let len = read_u32(r, what)? as usize;
-    if len > MAX_NAME_BYTES {
-        return Err(invalid(format!("{what} length {len} is implausible")));
-    }
-    let mut bytes = vec![0u8; len];
-    r.read_exact(&mut bytes)
-        .map_err(|_| invalid(format!("checkpoint truncated while reading {what}")))?;
-    String::from_utf8(bytes).map_err(|_| invalid(format!("{what} is not valid UTF-8")))
-}
-
 /// header と group 表を読む。tensor 本体は読まない。
 pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
-    let mut r = BufReader::new(file);
-    if read_array::<4>(&mut r, "magic")? != RAW_CKPT_MAGIC {
-        return Err(invalid("not a raw training checkpoint (magic mismatch)"));
-    }
-    let version = read_u32(&mut r, "version")?;
-    if !(MIN_VERSION..=MAX_VERSION).contains(&version) {
-        return Err(invalid(format!(
-            "checkpoint version {version} is not supported (supported: {MIN_VERSION}..={MAX_VERSION})"
-        )));
-    }
-    let feature_set_name = read_name(&mut r, "feature set name")?;
-    let train_ft_in = read_u64(&mut r, "ft_in")?;
-    let ft_out = read_u64(&mut r, "ft_out")?;
-    let max_active = read_u64(&mut r, "max_active")?;
-    let ft_factorize = version >= 6 && read_array::<1>(&mut r, "ft_factorize flag")?[0] != 0;
-    let feature_hash = if version >= 7 {
-        Some(read_u32(&mut r, "feature hash")?)
-    } else {
-        None
-    };
-    let threat_width = if version >= PARTIAL_THREAT_CKPT_VERSION {
-        Some(read_u64(&mut r, "Threat width")?)
-    } else {
-        None
-    };
-    read_name(&mut r, "producer run id")?;
-    let arch_kind = read_name(&mut r, "arch kind")?;
-    let bucket_mode = if version >= 8 {
-        read_name(&mut r, "bucket mode")?
-    } else {
-        String::new()
-    };
-    let topo_count = read_u64(&mut r, "topology dim count")?;
+    let mut reader = RawCkptReader::new(BufReader::new(file), RawCkptReadMode::Average)?;
+    let version = reader.version();
+    let features = reader
+        .features()?
+        .expect("averaging requires a feature header");
+    reader.producer_run_id()?;
+    let arch_kind = reader
+        .arch_name()?
+        .expect("averaging requires an architecture header");
+    let bucket_mode = reader.bucket_mode()?.unwrap_or_default();
+    let topo_count = reader.topology_count()?;
     if topo_count > 16 {
         return Err(invalid(format!(
             "topology dim count {topo_count} is implausible"
         )));
     }
     let topology = (0..topo_count)
-        .map(|_| read_u64(&mut r, "topology dim"))
+        .map(|_| reader.topology_dim())
         .collect::<io::Result<Vec<_>>>()?;
-    let superbatch = read_u64(&mut r, "superbatch")?;
-    let step_count = read_u64(&mut r, "step count")?;
-    if version >= 5 {
-        read_u64(&mut r, "LR horizon")?;
-    }
-    if version >= 9 {
-        read_u32(&mut r, "fv_scale")?;
-    }
-    let (qat_dense, ft_weight_i8x2) = if version >= 10 {
-        let flags = read_u32(&mut r, "QAT flags")?;
-        nnue_train::raw_checkpoint::decode_qat_flags(flags)
-            .ok_or_else(|| invalid(format!("unknown QAT flags {flags}")))?
-    } else {
-        (false, false)
-    };
-    if version >= 11 {
-        read_name(&mut r, "producer net id")?;
-        read_u64(&mut r, "recipe fingerprint")?;
-    }
-    let num_groups = read_u64(&mut r, "group count")?;
+    let superbatch = reader.superbatch()?;
+    let step_count = reader.step_count()?;
+    reader.lr_horizon()?;
+    reader.fv_scale()?;
+    let flags = reader.qat_flags()?;
+    let (qat_dense, ft_weight_i8x2) =
+        decode_qat_flags(flags).ok_or_else(|| invalid(format!("unknown QAT flags {flags}")))?;
+    reader.producer_recipe()?;
+    let num_groups = reader.group_count()?;
+    let mut r = reader.into_inner();
     if num_groups > 64 {
         return Err(invalid(format!("group count {num_groups} is implausible")));
     }
     let mut group_lens = Vec::with_capacity(num_groups as usize);
     let mut w_offsets = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
-        let len = read_u64(&mut r, "group length")?;
+        let len = read_raw_ckpt_group_len(&mut r, RawCkptReadMode::Average, "group length")?;
         let offset = r.stream_position()?;
         let body = len
-            .checked_mul(4 * TENSORS_PER_GROUP)
+            .checked_mul((size_of::<f32>() * TENSORS_PER_GROUP) as u64)
             .and_then(|b| b.checked_add(offset))
             .filter(|&end| end <= file_len)
             .ok_or_else(|| invalid(format!("checkpoint truncated inside group {g}")))?;
@@ -199,13 +130,13 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     Ok(CkptInfo {
         version,
         identity: CkptIdentity {
-            feature_set_name,
-            train_ft_in,
-            ft_out,
-            max_active,
-            ft_factorize,
-            feature_hash,
-            threat_width,
+            feature_set_name: features.name,
+            train_ft_in: features.train_ft_in,
+            ft_out: features.ft_out,
+            max_active: features.max_active,
+            ft_factorize: features.ft_factorize,
+            feature_hash: features.feature_hash,
+            threat_width: features.threat_width,
             arch_kind,
             bucket_mode,
             topology,
@@ -541,6 +472,9 @@ pub(crate) fn to_layerstack_weights(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use nnue_train::raw_checkpoint::{
+        RAW_CKPT_ARCH_HEADER_VERSION, RAW_CKPT_MAGIC, RAW_CKPT_VERSION,
+    };
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -704,12 +638,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn average_reads_master_weights_only() {
+    fn average_reads_master_weights_at_version_specific_offsets() {
         let a = temp_path("avg-a.ckpt");
         let b = temp_path("avg-b.ckpt");
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
-        write_ckpt(&a, 20, topo, pattern(1.0));
-        write_ckpt(&b, 40, topo, pattern(3.0));
+        let spec = FeatureSet::HalfKaHmMerged.spec();
+        write_ckpt_versioned(
+            &a,
+            RAW_CKPT_ARCH_HEADER_VERSION,
+            spec,
+            20,
+            topo,
+            "progresskpabs",
+            pattern(1.0),
+        );
+        write_ckpt_versioned(&b, 11, spec, 40, topo, "progresskpabs", pattern(3.0));
         let infos = [read_ckpt_info(&a).unwrap(), read_ckpt_info(&b).unwrap()];
         let lay = layerstack_layout(&infos[0].identity).unwrap();
         let groups =
@@ -812,7 +755,7 @@ pub(crate) mod tests {
     #[test]
     fn rejects_unsupported_versions() {
         let topo = [FT_OUT as u64, L1 as u64, L2 as u64, NB as u64];
-        for version in [MIN_VERSION - 1, MAX_VERSION + 1] {
+        for version in [RAW_CKPT_ARCH_HEADER_VERSION - 1, RAW_CKPT_VERSION + 1] {
             let path = temp_path(&format!("version-{version}.ckpt"));
             write_ckpt_versioned(
                 &path,

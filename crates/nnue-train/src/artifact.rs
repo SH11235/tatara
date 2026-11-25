@@ -1,9 +1,11 @@
-//! 学習成果物を、同じディレクトリの一時ファイルから atomic に公開する。
+//! 学習成果物の内容識別と atomic な公開。
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 /// 一時ファイル名の末尾。強制終了で残ったファイルをこの suffix で見分ける。
 pub const TEMPORARY_SUFFIX: &str = ".tatara-tmp";
@@ -12,6 +14,12 @@ const FALLBACK_TEMPORARY_PREFIX: &str = ".tatara-";
 
 // `.` + 出力名 + `.` + 乱数部 + suffix が一般的な上限 255 byte に収まる長さ。
 const MAX_ATTRIBUTED_NAME_BYTES: usize = 200;
+
+pub(crate) fn artifact_bytes_identity(bytes: &[u8]) -> serde_json::Value {
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    serde_json::json!({"bytes": bytes.len(), "sha256": hex})
+}
 
 /// バッファ付きで書き込み、flush と file sync が成功した成果物を置換する。
 ///

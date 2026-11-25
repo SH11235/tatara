@@ -1807,9 +1807,7 @@ pub(crate) struct GpuTrainer {
     pub(crate) qat_mode: crate::qat::QatMode,
     ft_weight_i8x2: bool,
     #[cfg(feature = "native")]
-    qat_buffers: Vec<DeviceBuffer<f32>>,
-    #[cfg(feature = "native")]
-    qat_raw: Vec<DeviceBuffer<i32>>,
+    qat_workspace: Option<qat_impl::QatWorkspace>,
     pub(crate) wdl_ignore_draws: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -2934,9 +2932,7 @@ impl GpuTrainer {
             qat_mode: crate::qat::QatMode::Off,
             ft_weight_i8x2: false,
             #[cfg(feature = "native")]
-            qat_buffers: Vec::new(),
-            #[cfg(feature = "native")]
-            qat_raw: Vec::new(),
+            qat_workspace: None,
             wdl_ignore_draws: false,
             stream: stream.clone(),
             module,

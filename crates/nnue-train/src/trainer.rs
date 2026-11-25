@@ -1497,6 +1497,13 @@ where
 
         let saved = sb.is_multiple_of(cfg.save_rate) || sb == effective_target;
         if saved {
+            let mut loader_state = crate::loader_state::LoaderState::from_position(
+                sb,
+                &identities,
+                &mix_identities,
+                loader.position(),
+                &settings,
+            )?;
             std::fs::create_dir_all(&cfg.output_dir)?;
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
             backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
@@ -1517,33 +1524,12 @@ where
                     .map(ExperimentLogger::recipe_fingerprint),
             };
             backend.save_resume_checkpoint(&raw_path, sb, &producer, lr_scheduler.horizon())?;
-            let mut teachers = vec![crate::loader_state::TeacherState {
-                id: "primary".into(),
-                files: identities.clone(),
-                position: loader.position().clone(),
-            }];
-            for (i, (files, position)) in mix_identities
-                .iter()
-                .zip(&loader.position().mixes)
-                .enumerate()
-            {
-                teachers.push(crate::loader_state::TeacherState {
-                    id: format!("mix-{}", i + 1),
-                    files: files.clone(),
-                    position: position.clone(),
-                });
-            }
-            crate::loader_state::LoaderState {
-                version: 1,
-                superbatch: sb,
-                teachers,
-                settings: settings.clone(),
-                wdl_jitter_state: track_batch_jitter.then(|| crate::loader_state::WdlJitterState {
+            loader_state.wdl_jitter_state =
+                track_batch_jitter.then(|| crate::loader_state::WdlJitterState {
                     completed_steps: backend.completed_steps(),
                     batch_state_bits: batch_jitter_state.to_bits(),
-                }),
-            }
-            .save(&raw_path)?;
+                });
+            loader_state.save(&raw_path)?;
             println!("[train] resume checkpoint saved: {}", raw_path.display());
 
             if let Some(keep) = cfg.keep_raw_checkpoints {

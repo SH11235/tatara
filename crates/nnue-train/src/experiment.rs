@@ -885,7 +885,7 @@ mod tests {
             ..Default::default()
         };
         let first = sampling.prepare_keep_bucket().unwrap();
-        let first_identity = crate::loader_state::artifact_bytes_identity(&bytes);
+        let first_identity = crate::artifact::artifact_bytes_identity(&bytes);
         bytes[..size_of::<f64>()].copy_from_slice(&1.0_f64.to_le_bytes());
         std::fs::write(&progress_coeff, &bytes).unwrap();
         let changed = sampling.prepare_keep_bucket().unwrap();
@@ -907,7 +907,7 @@ mod tests {
             SamplingParams::with_prepared_keep_bucket(false, sampling, changed.as_ref());
         assert_eq!(
             serde_json::to_value(&params).unwrap()["sampling"]["keep_bucket"]["progress_coeff_identity"],
-            crate::loader_state::artifact_bytes_identity(&bytes),
+            crate::artifact::artifact_bytes_identity(&bytes),
         );
         assert_ne!(fingerprint, recipe_fingerprint(&params, "teacher.psv"));
     }
