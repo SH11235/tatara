@@ -2646,7 +2646,9 @@ impl GpuTrainer {
             && ft_out.is_multiple_of(4)
             && width.is_multiple_of(4)
         {
-            PartialGather::at_start(ft_out, width)?
+            let mode = PartialGather::at_start(ft_out, width)?;
+            println!("[threat] partial-width gather: {mode:?}");
+            mode
         } else {
             PartialGather::Row
         };
