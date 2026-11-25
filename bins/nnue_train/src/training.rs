@@ -2119,86 +2119,61 @@ pub(crate) fn resolve_lineage_kind(
     })
 }
 
-/// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
-/// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
-#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "gpu")]
-pub(crate) fn build_experiment_logger(
+struct ExperimentTrainerParams {
+    qat: String,
+    ft_weight_i8x2: bool,
+    architecture: String,
+    feature_set: FeatureSetSpec,
+    threat_width: Option<usize>,
+    stack_shared_delta: Option<bool>,
+    l0: usize,
+    l1: usize,
+    l2: usize,
+    num_buckets: Option<usize>,
+    bucket_mode: Option<String>,
+    activation: Option<String>,
+    progress_coeff: Option<String>,
+    optim_groups: Option<OptimGroupConfig>,
+    norm_loss_factor: Option<f32>,
+    qa: i32,
+    qb: i32,
+    tf32: bool,
+    ft_fp16: bool,
+    ft_fp16_out: bool,
+    fp16_opt_state: bool,
+}
+
+#[cfg(feature = "gpu")]
+fn build_experiment_params(
     cli: &Cli,
     sampling: SamplingParams,
-    layerstack: &LayerstackArgs,
-    qat: crate::qat::QatMode,
-    bucket_mode: BucketMode,
-    feature_set: FeatureSetSpec,
     start_superbatch: usize,
-    resumed_superbatch: Option<usize>,
-    resume_producer: Option<crate::ckpt::ResumeProducer>,
-    data: &[PathBuf],
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
     lr_schedule: String,
-    fv_scale: Option<i32>,
-) -> ExperimentLogger {
-    let start_secs = nnue_train::experiment::now_epoch_secs();
-    // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
-    // 秒に開始しても (sweep / retry script 等)、pid が異なるため experiment.json
-    // の書き込み先 path が衝突せず、incremental write の上書き喪失が起きない。
-    let id = format!(
-        "{}-{}-{}",
-        cli.net_id,
-        nnue_train::experiment::format_utc_compact(start_secs),
-        std::process::id()
-    );
-    let name = cli.experiment_name.clone().unwrap_or_else(|| {
-        if cli.transfer_radam_momentum {
-            format!("{} (RAdam to SGD)", cli.net_id)
-        } else if cli.resume.is_some() {
-            format!("{} (resume @sb{start_superbatch})", cli.net_id)
-        } else {
-            cli.net_id.clone()
-        }
-    });
-
+    trainer: ExperimentTrainerParams,
+) -> Params {
     let is_wrm = cli.win_rate_model;
-    // per-group override 指定時のみ experiment.json に有効 per-group 値を記録する。
-    // resolve は CLI のみに依存する純関数 (`run_training` の trainer 構築と同じ入力)。
-    let per_group_recorded = per_group_optim_overridden(cli);
-    let optim_groups = OptimGroupConfig::resolve(
-        cli.weight_decay,
-        cli.ft_weight_decay,
-        cli.dense_weight_decay,
-        cli.bias_weight_decay,
-        cli.ft_lr_mult,
-        cli.dense_lr_mult,
-        cli.bias_lr_mult,
-    );
-    let params = Params {
-        qat: qat.name().into(),
-        ft_weight_i8x2: layerstack.ft_weight_i8x2,
+    Params {
+        qat: trainer.qat,
+        ft_weight_i8x2: trainer.ft_weight_i8x2,
         trainer_build: Some(crate::build_identity::trainer_build()),
         trainer_backend: Some(crate::build_identity::runtime_backend().into()),
-        architecture: layerstack_architecture(
-            layerstack.ft_out,
-            layerstack.l1,
-            layerstack.l2,
-            layerstack.num_buckets(),
-        ),
-        feature_set: feature_set.canonical_name().to_string(),
-        ft_in: feature_set.ft_in(),
-        threat_width: (feature_set.threat_width(layerstack.ft_out) != layerstack.ft_out)
-            .then_some(feature_set.threat_width(layerstack.ft_out)),
-        ft_factorize: feature_set.ft_factorize().then_some(true),
-        stack_shared_delta: layerstack.stack_shared_delta.then_some(true),
-        l0: layerstack.ft_out,
-        l1: layerstack.l1,
-        l2: layerstack.l2,
-        num_buckets: Some(layerstack.num_buckets()),
+        architecture: trainer.architecture,
+        feature_set: trainer.feature_set.canonical_name().to_string(),
+        ft_in: trainer.feature_set.ft_in(),
+        threat_width: trainer.threat_width,
+        ft_factorize: trainer.feature_set.ft_factorize().then_some(true),
+        stack_shared_delta: trainer.stack_shared_delta,
+        l0: trainer.l0,
+        l1: trainer.l1,
+        l2: trainer.l2,
+        num_buckets: trainer.num_buckets,
         optimizer: cli.optimizer.to_ascii_lowercase(),
-        // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
-        // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
-        bucket_mode: Some(bucket_mode.identity()),
-        activation: None,
-        progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
+        bucket_mode: trainer.bucket_mode,
+        activation: trainer.activation,
+        progress_coeff: trainer.progress_coeff,
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
@@ -2220,20 +2195,15 @@ pub(crate) fn build_experiment_logger(
         wdl_jitter: cli.wdl_jitter(),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
-        // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
-        // では省略、大域 weight_decay フィールドで足りる)。
-        ft_weight_decay: per_group_recorded.then_some(optim_groups.ft.weight_decay),
-        dense_weight_decay: per_group_recorded.then_some(optim_groups.dense.weight_decay),
-        bias_weight_decay: per_group_recorded.then_some(optim_groups.bias.weight_decay),
-        ft_lr_mult: per_group_recorded.then_some(optim_groups.ft.lr_mult),
-        dense_lr_mult: per_group_recorded.then_some(optim_groups.dense.lr_mult),
-        bias_lr_mult: per_group_recorded.then_some(optim_groups.bias.lr_mult),
-        norm_loss_factor: cli
-            .norm_loss
-            .then_some(cli.norm_loss_factor)
-            .map(finite_or_zero),
-        qa: nnue_format::layerstack_weights::QA,
-        qb: nnue_format::layerstack_weights::QB,
+        ft_weight_decay: trainer.optim_groups.map(|groups| groups.ft.weight_decay),
+        dense_weight_decay: trainer.optim_groups.map(|groups| groups.dense.weight_decay),
+        bias_weight_decay: trainer.optim_groups.map(|groups| groups.bias.weight_decay),
+        ft_lr_mult: trainer.optim_groups.map(|groups| groups.ft.lr_mult),
+        dense_lr_mult: trainer.optim_groups.map(|groups| groups.dense.lr_mult),
+        bias_lr_mult: trainer.optim_groups.map(|groups| groups.bias.lr_mult),
+        norm_loss_factor: trainer.norm_loss_factor,
+        qa: trainer.qa,
+        qb: trainer.qb,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
         wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
         wrm_in_offset: is_wrm.then(|| finite_or_zero(cli.wrm_in_offset)),
@@ -2276,14 +2246,108 @@ pub(crate) fn build_experiment_logger(
         test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
             .then_some(cli.test_positions),
         test_tail_positions: cli.test_tail_positions,
-        // 実効値を記録 (`--all-optim` 経由で ON になった場合も true として残す、
-        // raw 個別 flag が false でも experiment.json から再現可能)。
-        tf32: layerstack.tf32 || cli.all_optim,
-        ft_fp16: cli.ft_fp16 || cli.all_optim,
-        ft_fp16_out: layerstack.ft_fp16_out || cli.all_optim,
-        fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
+        tf32: trainer.tf32,
+        ft_fp16: trainer.ft_fp16,
+        ft_fp16_out: trainer.ft_fp16_out,
+        fp16_opt_state: trainer.fp16_opt_state,
         threads: cli.threads,
-    };
+    }
+}
+
+/// 学習 run の experiment.json ロガーを CLI 設定から組み立てる。書き込み先は
+/// `{--output}/experiments/{id}.json`、`id` は `{net_id}-{UTC 開始時刻}`。
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu")]
+pub(crate) fn build_experiment_logger(
+    cli: &Cli,
+    sampling: SamplingParams,
+    layerstack: &LayerstackArgs,
+    qat: crate::qat::QatMode,
+    bucket_mode: BucketMode,
+    feature_set: FeatureSetSpec,
+    start_superbatch: usize,
+    resumed_superbatch: Option<usize>,
+    resume_producer: Option<crate::ckpt::ResumeProducer>,
+    data: &[PathBuf],
+    teacher_shuffle_buffer_mib: usize,
+    teacher_shuffle: bool,
+    lr_schedule: String,
+    fv_scale: Option<i32>,
+) -> ExperimentLogger {
+    let start_secs = nnue_train::experiment::now_epoch_secs();
+    // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
+    // 秒に開始しても (sweep / retry script 等)、pid が異なるため experiment.json
+    // の書き込み先 path が衝突せず、incremental write の上書き喪失が起きない。
+    let id = format!(
+        "{}-{}-{}",
+        cli.net_id,
+        nnue_train::experiment::format_utc_compact(start_secs),
+        std::process::id()
+    );
+    let name = cli.experiment_name.clone().unwrap_or_else(|| {
+        if cli.transfer_radam_momentum {
+            format!("{} (RAdam to SGD)", cli.net_id)
+        } else if cli.resume.is_some() {
+            format!("{} (resume @sb{start_superbatch})", cli.net_id)
+        } else {
+            cli.net_id.clone()
+        }
+    });
+
+    // per-group override 指定時のみ experiment.json に有効 per-group 値を記録する。
+    // resolve は CLI のみに依存する純関数 (`run_training` の trainer 構築と同じ入力)。
+    let per_group_recorded = per_group_optim_overridden(cli);
+    let optim_groups = OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    );
+    let params = build_experiment_params(
+        cli,
+        sampling,
+        start_superbatch,
+        teacher_shuffle_buffer_mib,
+        teacher_shuffle,
+        lr_schedule,
+        ExperimentTrainerParams {
+            qat: qat.name().into(),
+            ft_weight_i8x2: layerstack.ft_weight_i8x2,
+            architecture: layerstack_architecture(
+                layerstack.ft_out,
+                layerstack.l1,
+                layerstack.l2,
+                layerstack.num_buckets(),
+            ),
+            feature_set,
+            threat_width: (feature_set.threat_width(layerstack.ft_out) != layerstack.ft_out)
+                .then_some(feature_set.threat_width(layerstack.ft_out)),
+            stack_shared_delta: layerstack.stack_shared_delta.then_some(true),
+            l0: layerstack.ft_out,
+            l1: layerstack.l1,
+            l2: layerstack.l2,
+            num_buckets: Some(layerstack.num_buckets()),
+            // CLI の生文字列 (非推奨 alias があり得る) ではなく、パース済み mode の
+            // canonical 名を記録する。experiment.json の bucket_mode は常に canonical。
+            bucket_mode: Some(bucket_mode.identity()),
+            activation: None,
+            progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
+            optim_groups: per_group_recorded.then_some(optim_groups),
+            norm_loss_factor: cli
+                .norm_loss
+                .then_some(cli.norm_loss_factor)
+                .map(finite_or_zero),
+            qa: nnue_format::layerstack_weights::QA,
+            qb: nnue_format::layerstack_weights::QB,
+            tf32: layerstack.tf32 || cli.all_optim,
+            ft_fp16: cli.ft_fp16 || cli.all_optim,
+            ft_fp16_out: layerstack.ft_fp16_out || cli.all_optim,
+            fp16_opt_state: cli.fp16_opt_state || cli.all_optim,
+        },
+    );
 
     let data_info = build_data_info(cli, data);
     let lineage = build_lineage(
@@ -2343,10 +2407,6 @@ pub(crate) fn build_data_info(cli: &Cli, data: &[PathBuf]) -> DataInfo {
 }
 
 /// Simple アーキ用の experiment.json ロガーを CLI 設定から組み立てる。
-/// LayerStack 用 [`build_experiment_logger`] と並ぶ Simple 用 helper で、
-/// `Params` の bucket / progress / TF32 / FT-FP16 系フィールドは Simple では
-/// 概念が無い (`bucket_mode` / `num_buckets` / `progress_coeff` は `None`、
-/// `tf32` / `ft_fp16` / `ft_fp16_out` / `fp16_opt_state` は `false`)。
 /// 量子化 multiplier (`qa` / `qb`) は活性化と `simple_weights` の固定値から決める。
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "gpu")]
@@ -2395,104 +2455,37 @@ pub(crate) fn build_experiment_logger_simple(
         id.activation.canonical_name(),
     );
 
-    let is_wrm = cli.win_rate_model;
-    let params = Params {
-        qat: "off".into(),
-        ft_weight_i8x2: false,
-        trainer_build: Some(crate::build_identity::trainer_build()),
-        trainer_backend: Some(crate::build_identity::runtime_backend().into()),
-        architecture,
-        feature_set: id.feature_set.canonical_name().to_string(),
-        ft_in: id.ft_in(),
-        threat_width: None,
-        ft_factorize: id.feature_set.ft_factorize().then_some(true),
-        stack_shared_delta: None,
-        l0: id.ft_out,
-        l1: id.l1_out,
-        l2: id.l2_out,
-        num_buckets: None,
-        optimizer: cli.optimizer.to_ascii_lowercase(),
-        bucket_mode: None,
-        activation: Some(id.activation.canonical_name().to_string()),
-        progress_coeff: None,
-        lr: finite_or_zero(cli.lr),
-        lr_gamma: finite_or_zero(cli.lr_gamma),
-        lr_step: cli.lr_step.max(1),
-        lr_schedule,
-        batch_size: cli.batch_size,
-        batches_per_superbatch: cli.batches_per_superbatch,
-        superbatches: cli.superbatches,
-        start_superbatch,
-        wdl: finite_or_zero(cli.wdl),
-        start_wdl: cli.start_wdl.map(finite_or_zero),
-        end_wdl: cli.end_wdl.map(finite_or_zero),
-        wdl_cycle_delta: cli.wdl_cycle_delta.map(finite_or_zero),
-        wdl_cycle_warmup_pct: cli
-            .wdl_cycle_delta
-            .map(|_| finite_or_zero(cli.wdl_cycle_warmup_pct)),
-        wdl_schedule_superbatch: cli.wdl_schedule_superbatch,
-        validation_wdl: cli.validation_wdl.map(finite_or_zero),
-        wdl_ignore_draws: cli.wdl_ignore_draws,
-        wdl_jitter: cli.wdl_jitter(),
-        scale: finite_or_zero(cli.scale),
-        weight_decay: finite_or_zero(cli.weight_decay),
-        // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
-        ft_weight_decay: None,
-        dense_weight_decay: None,
-        bias_weight_decay: None,
-        ft_lr_mult: None,
-        dense_lr_mult: None,
-        bias_lr_mult: None,
-        // `--norm-loss` 有効時のみ factor を記録する (無効時 None)。
-        norm_loss_factor: cli.norm_loss.then_some(cli.norm_loss_factor),
-        qa: id.activation.qa(),
-        qb: nnue_format::simple_weights::QB,
-        loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
-        wrm_in_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_in_scaling)),
-        wrm_in_offset: is_wrm.then(|| finite_or_zero(cli.wrm_in_offset)),
-        wrm_nnue2score: is_wrm.then(|| finite_or_zero(cli.wrm_nnue2score)),
-        wrm_target_offset: is_wrm.then(|| finite_or_zero(cli.wrm_target_offset)),
-        wrm_target_scaling: is_wrm.then(|| finite_or_zero(cli.wrm_target_scaling)),
-        wrm_pow_exp: is_wrm.then(|| finite_or_zero(cli.loss_pow_exp)),
-        wrm_qp_asymmetry: is_wrm.then(|| finite_or_zero(cli.loss_qp_asymmetry)),
-        wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
-        wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
-        score_drop_abs: cli.score_drop_abs,
+    let params = build_experiment_params(
+        cli,
         sampling,
-        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
-        mix_data: cli
-            .mix_sources()
-            .iter()
-            .map(|source| nnue_train::experiment::MixDataParam {
-                name: file_basename(&source.path),
-                rate: source.rate,
-                score_drop_abs: source.score_drop_abs,
-                score_clamp_abs: source.score_clamp_abs,
-                keep_rate: source.keep_rate,
-            })
-            .collect(),
-        mix_seed: (!cli.mix_data.is_empty()).then_some(cli.mix_seed),
-        score_override: cli.score_override.as_deref().map(file_basename),
-        score_override_mask: cli.score_override_mask.as_deref().map(file_basename),
+        start_superbatch,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
-        teacher_shuffle_seed: cli.teacher_shuffle_seed,
-        dual_label_psv: dual_label_param(cli),
-        init_from: cli.init_from.as_deref().map(file_basename),
-        freeze_ft: cli.freeze_ft,
-        init_ft_only: cli.init_ft_only,
-        init_preset: init_summary_for_log(cli),
-        test_data: cli.test_data.as_deref().map(file_basename),
-        test_positions: (cli.test_data.is_some() || cli.test_tail_positions.is_some())
-            .then_some(cli.test_positions),
-        test_tail_positions: cli.test_tail_positions,
-        // 実効値を記録 (`--all-optim` 展開込み、caller `run_simple_training` 経由)。
-        tf32,
-        ft_fp16,
-        ft_fp16_out,
-        fp16_opt_state,
-        threads: cli.threads,
-    };
+        lr_schedule,
+        ExperimentTrainerParams {
+            qat: "off".into(),
+            ft_weight_i8x2: false,
+            architecture,
+            feature_set: id.feature_set,
+            threat_width: None,
+            stack_shared_delta: None,
+            l0: id.ft_out,
+            l1: id.l1_out,
+            l2: id.l2_out,
+            num_buckets: None,
+            bucket_mode: None,
+            activation: Some(id.activation.canonical_name().to_string()),
+            progress_coeff: None,
+            optim_groups: None,
+            norm_loss_factor: cli.norm_loss.then_some(cli.norm_loss_factor),
+            qa: id.activation.qa(),
+            qb: nnue_format::simple_weights::QB,
+            tf32,
+            ft_fp16,
+            ft_fp16_out,
+            fp16_opt_state,
+        },
+    );
 
     let data_info = build_data_info(cli, data);
     let lineage = build_lineage(
