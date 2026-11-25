@@ -1308,6 +1308,24 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
 }
 
 #[test]
+fn dense_concat_checkpoint_header_matches_only_dense_concat() {
+    let standard = layerstack_arch();
+    let mut topology = standard.topology.to_vec();
+    topology.extend([0, nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG]);
+    let dense = RawCkptArch {
+        topology: &topology,
+        ..layerstack_arch()
+    };
+    for (written, other) in [(&standard, &dense), (&dense, &standard)] {
+        let mut bytes = Vec::new();
+        write_raw_ckpt_header(&mut bytes, written, "run", 1, 5, None, 10).unwrap();
+        read_raw_ckpt_header(&mut Cursor::new(&bytes), written).unwrap();
+        let error = read_raw_ckpt_header(&mut Cursor::new(&bytes), other).unwrap_err();
+        assert!(error.to_string().contains("LayerStack head mismatch"));
+    }
+}
+
+#[test]
 fn raw_ckpt_spec_identity_roundtrip_and_mismatch() {
     for (routing, other, count) in [
         (

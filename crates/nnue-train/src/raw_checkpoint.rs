@@ -87,6 +87,9 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
 pub const RAW_CKPT_VERSION: u32 = 15;
+
+/// LayerStack topology extension: PSQT bucket count (zero if absent), then this head tag.
+pub const DENSE_CONCAT_TOPOLOGY_TAG: u64 = 1;
 pub const RAW_CKPT_ARCH_HEADER_VERSION: u32 = 4;
 const PRODUCER_RECIPE_VERSION: u32 = 11;
 const ADAM_CHECKPOINT_VERSION: u32 = PRODUCER_RECIPE_VERSION;

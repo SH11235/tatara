@@ -2,11 +2,12 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use nnue_format::LayerStackWeights;
+use nnue_format::dense_concat::QuantisedBiases;
 use nnue_format::layerstack_weights::{
     DEFAULT_L1_OUT, DEFAULT_L2_OUT, FV_SCALE, LEGACY_IMPLICIT_NUM_BUCKETS,
     LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION, QA, QB,
 };
+use nnue_format::{LayerStackHead, LayerStackWeights};
 use nnue_train::dataloader::BucketMode;
 use shogi_features::{
     EffectBucketConfig, FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS, ShogiProgressKPAbs,
@@ -91,7 +92,7 @@ fn validate_mode_args(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (weights, spec) = load_layerstack(&args.nnue_file)?;
+    let (weights, spec, biases) = load_layerstack(&args.nnue_file)?;
     let (mode, warning) = if let Some(spec) = weights.bucket_spec {
         if !matches!(args.bucket_mode.as_str(), "progresskpabs" | "spec") {
             return Err("--bucket-mode conflicts with net ls_bucket metadata".into());
@@ -118,8 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for pos in positions {
         let board = parse_position(&pos)?;
         let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
-        let raw = forward_one_raw(&weights, spec, &board, bucket)?;
-        let cp = raw / args.fv_scale;
+        let raw = forward_one_raw(&weights, spec, &biases, &board, bucket)?;
+        let cp = raw / i64::from(args.fv_scale);
         if args.debug {
             eprintln!("{pos}\tbucket={bucket}\traw={raw}\tcp={cp}");
         }
@@ -130,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn load_layerstack(
     path: &Path,
-) -> Result<(LayerStackWeights, FeatureSetSpec), Box<dyn std::error::Error>> {
+) -> Result<(LayerStackWeights, FeatureSetSpec, QuantisedBiases), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let meta = read_arch_meta(&bytes)?;
     let mut spec = FeatureSet::HalfKaHmMerged.spec();
@@ -150,21 +151,23 @@ fn load_layerstack(
         }
     }
     let mut cursor = Cursor::new(&bytes);
-    let weights = LayerStackWeights::load_quantised(
+    let (weights, biases) = LayerStackWeights::load_quantised_for_integer_eval(
         &mut cursor,
         spec,
         meta.ft_out,
         meta.l1_out,
         meta.l2_out,
         meta.num_buckets,
+        meta.with_psqt,
     )?;
-    Ok((weights, spec))
+    Ok((weights, spec, biases))
 }
 
 struct ArchMeta {
     effect_bucket_config: Option<EffectBucketConfig>,
     threat_profile: Option<ThreatProfile>,
     threat_width: Option<usize>,
+    with_psqt: bool,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -203,6 +206,7 @@ fn read_arch_meta(bytes: &[u8]) -> Result<ArchMeta, Box<dyn std::error::Error>> 
     }
     let affine_outs = parse_affine_outs(arch);
     Ok(ArchMeta {
+        with_psqt: parse_token_usize(arch, "PSQT=")?.is_some(),
         threat_width: parse_token_usize(arch, "ThreatWidth=")?,
         effect_bucket_config: parse_effect_bucket_config(arch)?,
         threat_profile: parse_threat_profile(arch)?,
@@ -299,17 +303,11 @@ fn parse_token_str<'a>(s: &'a str, token: &str) -> Option<&'a str> {
 fn forward_one_raw(
     weights: &LayerStackWeights,
     spec: FeatureSetSpec,
+    biases: &QuantisedBiases,
     board: &ShogiBoard,
     bucket: usize,
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<i64, Box<dyn std::error::Error>> {
     let ft_out = weights.ft_b.len();
-    let l1_out = weights.l1_b.len() / weights.num_buckets;
-    let l2_out = weights.l2_b.len() / weights.num_buckets;
-    let l1_effective = l1_out
-        .checked_sub(L1_SKIP)
-        .ok_or("l1_out must be larger than L1_SKIP")?;
-    let l2_in = l1_effective * 2;
-
     let mut stm_idx = vec![-1_i32; spec.max_active()];
     let mut nstm_idx = vec![-1_i32; spec.max_active()];
     let active = spec.extract_active_features(board, &mut stm_idx, &mut nstm_idx);
@@ -348,6 +346,39 @@ fn forward_one_raw(
     pairwise_crelu_to_u8(&stm_ft, &mut transformed[..ft_out / 2]);
     pairwise_crelu_to_u8(&nstm_ft, &mut transformed[ft_out / 2..]);
 
+    let psqt = if let Some(psqt) = &weights.psqt_w {
+        let sum = |indices: &[i32]| -> i64 {
+            indices
+                .iter()
+                .filter_map(|&index| usize::try_from(index).ok())
+                .map(|index| {
+                    i64::from(quant_i32(
+                        psqt[index * weights.num_buckets + bucket],
+                        QA * QB,
+                    ))
+                })
+                .sum()
+        };
+        (sum(&stm_idx[..active]) - sum(&nstm_idx[..active])) / 2
+    } else {
+        0
+    };
+    if weights.head == LayerStackHead::DenseConcat {
+        return Ok(nnue_format::dense_concat::forward_quantised(
+            weights,
+            biases,
+            bucket,
+            &transformed,
+        ) + psqt);
+    }
+
+    let l1_out = weights.l1_b.len() / weights.num_buckets;
+    let l2_out = weights.l2_b.len() / weights.num_buckets;
+    let l1_effective = l1_out
+        .checked_sub(L1_SKIP)
+        .ok_or("l1_out must be larger than L1_SKIP")?;
+    let l2_in = l1_effective * 2;
+
     let mut l1_total = vec![0i32; l1_out];
     affine_u8_i8(
         &transformed,
@@ -382,7 +413,7 @@ fn forward_one_raw(
         1,
     );
 
-    Ok(out[0] + l1_total[l1_effective])
+    Ok(i64::from(out[0] + l1_total[l1_effective]) + psqt)
 }
 
 fn sparse_ft_forward_raw(
@@ -715,7 +746,7 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             let loaded = load_layerstack(&path);
             std::fs::remove_file(path).unwrap();
-            let (weights, features) = loaded.unwrap();
+            let (weights, features, biases) = loaded.unwrap();
             let mode = BucketMode::Spec(weights.bucket_spec.unwrap());
             assert_eq!(
                 validate_mode_args(mode, None, weights.num_buckets),
@@ -725,8 +756,8 @@ mod tests {
             let bucket = usize::from(mode.bucket_board(&board, weights.num_buckets));
             assert_eq!(bucket, count - 1);
             assert_eq!(
-                forward_one_raw(&weights, features, &board, bucket).unwrap(),
-                QA * QB / 4
+                forward_one_raw(&weights, features, &biases, &board, bucket).unwrap(),
+                i64::from(QA * QB / 4)
             );
         }
     }

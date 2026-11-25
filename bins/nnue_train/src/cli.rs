@@ -1698,8 +1698,27 @@ pub(crate) enum NativeBenchModeArg {
 }
 
 /// LayerStack アーキ固有の引数。
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum LayerStackHeadArg {
+    Standard,
+    DenseConcat,
+}
+
+impl From<LayerStackHeadArg> for nnue_format::LayerStackHead {
+    fn from(value: LayerStackHeadArg) -> Self {
+        match value {
+            LayerStackHeadArg::Standard => Self::Standard,
+            LayerStackHeadArg::DenseConcat => Self::DenseConcat,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
+    /// Dense head architecture.
+    #[arg(long, value_enum, default_value = "standard")]
+    pub(crate) layerstack_head: LayerStackHeadArg,
+
     /// Dense weight/bias and activation quantization with straight-through gradients.
     /// Omitted: inherit raw checkpoint mode, or off for fresh training.
     #[arg(long, value_enum)]

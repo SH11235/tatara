@@ -113,6 +113,7 @@ fn detect_arch<R: Read>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result
     reader.read_exact(&mut arch_bytes)?;
     let arch_str = std::str::from_utf8(&arch_bytes)
         .map_err(|error| invalid_input_err(format!("arch string is not UTF-8: {error}")))?;
+    let mut arch = parse_arch_str(arch_str)?;
 
     // num_buckets は現行 version のみ header に持ち、legacy は暗黙 9。
     let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
@@ -136,7 +137,6 @@ fn detect_arch<R: Read>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result
         _ => {}
     }
 
-    let mut arch = parse_arch_str(arch_str)?;
     arch.num_buckets = num_buckets;
     Ok(arch)
 }
@@ -146,6 +146,13 @@ fn detect_arch<R: Read>(reader: &mut R, routing: YaneuraOuRouting) -> io::Result
 /// `Features=<name>(Friend)[<in>-><ft>x2],...,Network=AffineTransform[1<-<l2_out>](...
 /// SqrClippedReLU[<l2_in>](AffineTransform[<l1_out>-<ft*2>]...`。
 fn parse_arch_str(arch_str: &str) -> io::Result<DetectedArch> {
+    if nnue_format::LayerStackHead::from_arch(arch_str)? == nnue_format::LayerStackHead::DenseConcat
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DenseConcat cannot be converted to YaneuraOu SFNN",
+        ));
+    }
     for unsupported in ["PSQT=", "Threat=", "EffectBucket=", "ls_bucket="] {
         if arch_str.contains(unsupported) {
             let token = unsupported.trim_end_matches('=');

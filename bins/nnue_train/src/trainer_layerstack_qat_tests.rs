@@ -172,6 +172,7 @@ fn qat_trains_with_fp16_tf32_and_factorizer() -> TestResult {
         128,
         16,
         32,
+        nnue_format::LayerStackHead::Standard,
         2,
         BucketMode::ProgressKpAbs,
         PrecisionFlags {
@@ -285,6 +286,7 @@ fn qat_ft_post_sorted_matches_separate_quantization() -> TestResult {
             width,
             16,
             32,
+            nnue_format::LayerStackHead::Standard,
             2,
             BucketMode::ProgressKpAbs,
             PrecisionFlags {
@@ -470,6 +472,7 @@ fn trainer_with_features(
         width,
         16,
         32,
+        nnue_format::LayerStackHead::Standard,
         2,
         BucketMode::ProgressKpAbs,
         PrecisionFlags {

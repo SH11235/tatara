@@ -100,7 +100,7 @@ fn dispatch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "gpu")]
             {
                 if !cli.data.is_empty()
-                    || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some())
+                    || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some() || matches!(args.layerstack_head, cli::LayerStackHeadArg::DenseConcat))
                     || cli.eval_only
                     || cli.rescore_input.is_some()
                     || cli.threat_ablate.is_some()

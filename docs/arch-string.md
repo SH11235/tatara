@@ -112,6 +112,52 @@ pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 
 `EffectBucket=<config>` トークンに現れる。LayerStack の完全なアーキ記述は
 `crates/nnue-format/src/layerstack_weights.rs` の module doc を参照。
 
+### LayerStack DenseConcat
+
+`nnue-train layerstack --layerstack-head dense-concat --ft-out 2304 --l1 16 --l2 64`
+で DenseConcat を選ぶ。L1 は 16 の正の倍数、L2 は 32 または 64 を指定する。
+DenseConcat の checkpoint を `--resume` や `--eval-only` で使う場合も同じ
+head と寸法を指定する。既定値は `--layerstack-head standard`。
+
+ヘッダは `Network=` の直前に `Head=DenseConcat,` を含む。
+`Head=` がないファイルは standard として読み、未知の値はエラーになる。
+FT 幅 2304、L1 幅 16、L2 幅 64 の例を示す。
+
+```text
+Features=HalfKaHmMerged(Friend)[73305->2304x2],Head=DenseConcat,Network=AffineTransform[1<-160](DenseConcat[160](AffineTransform[64<-32](SqrClippedReLU[32](AffineTransform[16<-4608](InputSlice[4608(0:4608)])))))
+```
+
+`fc_1` の入力幅は `2*L1`、`fc_2` の入力幅 `C` は `2*L1 + 2*L2`。
+arch 文字列は FT の両視点を `FT*2` と表記する。直列化する `fc_0` の入力幅は
+両視点に pairwise 積を適用したあとの幅 `FT` になる。
+
+ファイルの外側の並びは standard と同じ。各 bucket は little-endian の
+`fc_hash` に続き、次の順に格納する。
+
+| 層 | バイアス（i32） | 重み（i8） |
+|---|---|---|
+| `fc_0` | `L1` | `L1 × pad32(FT)` |
+| `fc_1` | `L2` | `L2 × pad32(2*L1)` |
+| `fc_2` | 1 | `1 × pad32(C)` |
+
+重みは出力行を先に並べ、各行の入力末尾を 32 の倍数までゼロ埋めする。
+`fc_hash` とヘッダの network hash はそれぞれ standard の計算結果と
+`0x44434E43` の排他的論理和。
+
+バイアスは `127*64` 倍、重みは 64 倍して最も近い整数に丸め、ちょうど中間の
+値はゼロから離れる側に丸める。バイアスは i32 の範囲、重みは i8 の範囲に収める。
+`fc_0` の共有パラメータは bucket ごとのパラメータに足してから量子化する。
+`fc_0` と `fc_1` の各出力 `o` に対して次の活性化を計算する。
+
+- 二乗側は `clamp((o*o) >> 19, 0, 127)`。
+- 線形側は `clamp(o >> 6, 0, 127)`。
+
+`fc_1` に `[fc_0 の二乗側, fc_0 の線形側]` を入力する。`fc_2` にはその後ろに
+`[fc_1 の二乗側, fc_1 の線形側]` をつないで入力する。`fc_2` の出力に
+`fc_0[L1-2] - fc_0[L1-1]` を加えた値に standard と同じ評価値のスケールを適用する。
+FT、PSQT、Threat、EffectBucket、bucket 選択の規則も standard と共通。
+YaneuraOu SFNN への変換はエラーになる。
+
 ## Simple の例
 
 Simple は bucket 無しの 4 層アーキ (FT + dense 3 層) で、層次元が文字列上の dense 層チェーンと

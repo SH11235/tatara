@@ -100,6 +100,7 @@ fn piece_ft_qat_rounds_coalesced_forward_weights_after_optimizer_and_lookahead()
                 width,
                 16,
                 32,
+                nnue_format::LayerStackHead::Standard,
                 buckets,
                 bucket_mode,
                 PrecisionFlags {

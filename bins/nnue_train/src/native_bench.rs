@@ -489,6 +489,7 @@ fn create_layerstack_trainer(
             1536,
             16,
             32,
+            nnue_format::LayerStackHead::Standard,
             9,
             BucketMode::ProgressKpAbs,
             precision,

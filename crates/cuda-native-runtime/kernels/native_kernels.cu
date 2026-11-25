@@ -5208,3 +5208,104 @@ extern "C" __global__ void partial_ft_norm_apply(
     float correction = 2.0F * factor * (1.0F - 1.0F / (norms[col] + 1.0e-8F));
     weight[k] *= 1.0F - lr * correction;
 }
+
+__device__ __forceinline__ float dense_concat_clip(float x) {
+    return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+}
+
+extern "C" __global__ void dense_concat_activations(
+    const float* l1, size_t, const float* l2, size_t, float* output, size_t,
+    uint32_t batch, uint32_t l1_out, uint32_t l2_out, float scale
+) {
+    const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t width = 2 * (l1_out + l2_out);
+    if (tid >= batch * width) return;
+    const size_t row = tid / width;
+    const size_t col = tid % width;
+    const size_t offset = col < 2 * l1_out ? col : col - 2 * l1_out;
+    const bool first = col < 2 * l1_out;
+    const float x = first ? l1[row * l1_out + offset % l1_out]
+                          : l2[row * l2_out + offset % l2_out];
+    const bool square = offset < (first ? l1_out : l2_out);
+    output[tid] = dense_concat_clip(square ? x * x * scale : x);
+}
+
+__device__ __forceinline__ float dense_concat_pair_grad(
+    float x, float dsquare, float dclip, float scale
+) {
+    const float square = x * x * scale;
+    const float square_grad = square > 0.0f && square < 1.0f
+        ? dsquare * (2.0f * scale * x) : 0.0f;
+    const float clip_grad = x > 0.0f && x < 1.0f ? dclip : 0.0f;
+    return square_grad + clip_grad;
+}
+
+extern "C" __global__ void dense_concat_l2_grad(
+    const float* l2, size_t, const float* dy, size_t, float* dx, size_t,
+    uint32_t batch, uint32_t l1_out, uint32_t l2_out, float scale
+) {
+    const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= size_t(batch) * l2_out) return;
+    const size_t row = tid / l2_out;
+    const size_t col = tid % l2_out;
+    const size_t base = row * (2 * l1_out + 2 * l2_out) + 2 * l1_out + col;
+    dx[tid] = dense_concat_pair_grad(l2[tid], dy[base], dy[base + l2_out], scale);
+}
+
+extern "C" __global__ void dense_concat_l1_grad(
+    const float* l1, size_t, const float* from_l2, size_t, const float* from_l3, size_t,
+    const float* dskip, size_t, float* dx, size_t,
+    uint32_t batch, uint32_t l1_out, uint32_t l3_in, float scale
+) {
+    const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= size_t(batch) * l1_out) return;
+    const size_t row = tid / l1_out;
+    const size_t col = tid % l1_out;
+    const size_t a = row * 2 * l1_out + col;
+    const size_t b = row * l3_in + col;
+    const float skip = col == l1_out - 2 ? dskip[row]
+                       : col == l1_out - 1 ? -dskip[row] : 0.0f;
+    dx[tid] = dense_concat_pair_grad(
+        l1[tid], from_l2[a] + from_l3[b],
+        from_l2[a + l1_out] + from_l3[b + l1_out], scale
+    ) + skip;
+}
+
+extern "C" __global__ void dense_concat_output(
+    const float* l1, size_t, const float* l3, size_t, float* output, size_t,
+    uint32_t batch, uint32_t l1_out
+) {
+    const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= batch) return;
+    const size_t end = (row + 1) * l1_out;
+    output[row] = l3[row] + (l1[end - 2] - l1[end - 1]);
+}
+
+extern "C" __global__ void dense_concat_qat_activations(
+    const int32_t* l1, size_t, const int32_t* l2, size_t, float* output, size_t,
+    uint32_t batch, uint32_t l1_out, uint32_t l2_out
+) {
+    const size_t tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t width = 2 * (l1_out + l2_out);
+    if (tid >= batch * width) return;
+    const size_t row = tid / width;
+    const size_t col = tid % width;
+    const size_t offset = col < 2 * l1_out ? col : col - 2 * l1_out;
+    const bool first = col < 2 * l1_out;
+    const int64_t x = first ? l1[row * l1_out + offset % l1_out]
+                            : l2[row * l2_out + offset % l2_out];
+    const bool square = offset < (first ? l1_out : l2_out);
+    const int64_t value = square ? (x * x) >> 19 : x >> 6;
+    output[tid] = float(value < 0 ? 0 : (value > 127 ? 127 : value)) / 127.0f;
+}
+
+extern "C" __global__ void dense_concat_qat_output(
+    const int32_t* l1, size_t, const int32_t* l3, size_t, float* output, size_t,
+    uint32_t batch, uint32_t l1_out
+) {
+    const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= batch) return;
+    const size_t end = (row + 1) * l1_out;
+    const int64_t raw = int64_t(l3[row]) + int64_t(l1[end - 2]) - int64_t(l1[end - 1]);
+    output[row] = static_cast<float>(static_cast<double>(raw) / 8128.0);
+}

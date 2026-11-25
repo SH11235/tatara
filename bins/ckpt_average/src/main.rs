@@ -84,7 +84,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let layout = load_layout(paths[0], &infos[0])?;
     let first_key = infos[0].identity.compat_key(&layout);
     for (path, info) in paths.iter().zip(&infos).skip(1) {
-        let key = info.identity.compat_key(&load_layout(path, info)?);
+        let other = load_layout(path, info)?;
+        if other.head != layout.head {
+            return Err(format!(
+                "{} does not match the first checkpoint's LayerStack head",
+                path.display()
+            )
+            .into());
+        }
+        let key = info.identity.compat_key(&other);
         if key != first_key {
             return Err(format!(
                 "{} does not match the first checkpoint's architecture ({key:?} vs {first_key:?})",
@@ -141,6 +149,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let ours = load(&args.output)?;
         let theirs =
             load(reference).map_err(|e| format!("reference {}: {e}", reference.display()))?;
+        if ours.head != theirs.head {
+            return Err("reference LayerStack head does not match the averaged checkpoints".into());
+        }
         if ours.bucket_spec != theirs.bucket_spec {
             let show = |spec: Option<_>| {
                 spec.map_or_else(|| "none".to_string(), |s| format!("ls_bucket={s}"))
