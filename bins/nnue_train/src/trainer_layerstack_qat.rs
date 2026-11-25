@@ -14,6 +14,12 @@ const QAT_DENSE_WIDE_INPUTS: usize = 256;
 const QAT_DENSE_WIDE_GROUP: usize = 8;
 
 #[cfg(feature = "native")]
+pub(super) struct QatWorkspace {
+    weights: Vec<DeviceBuffer<f32>>,
+    raw: Vec<DeviceBuffer<i32>>,
+}
+
+#[cfg(feature = "native")]
 fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usize, &'static str> {
     // `qat_dense_wide` accumulates the dot product in a 32-bit int (see the kernel).
     if inputs > 131_072 {
@@ -32,11 +38,19 @@ fn qat_dense_threads(batch: usize, inputs: usize, outputs: usize) -> Result<usiz
 
 impl GpuTrainer {
     #[cfg(feature = "native")]
+    fn qat_workspace(&self) -> &QatWorkspace {
+        self.qat_workspace
+            .as_ref()
+            .expect("dense QAT workspace is prepared")
+    }
+
+    #[cfg(feature = "native")]
     pub(super) fn qat_activations(
         &self,
         layer: u32,
         batch: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let raw = &self.qat_workspace().raw;
         // SAFETY: each kernel writes only the live batch prefix of its dimensioned workspace.
         unsafe {
             match layer {
@@ -51,21 +65,21 @@ impl GpuTrainer {
                     cuda_launch! {
                         kernel: qat_l1_activation, stream: self.stream, module: self.module,
                         config: cfg_1d(batch * (self.ws.l1_out - 1)),
-                        args: [slice(self.qat_raw[0]), slice_mut(self.ws.l2_input), batch as u32, self.ws.l1_out as u32]
+                        args: [slice(raw[0]), slice_mut(self.ws.l2_input), batch as u32, self.ws.l1_out as u32]
                     }
                 }?,
                 2 => {
                     cuda_launch! {
                         kernel: qat_relu_activation, stream: self.stream, module: self.module,
                         config: cfg_1d(batch * self.ws.l2_out),
-                        args: [slice(self.qat_raw[1]), slice_mut(self.ws.l2_acted), (batch * self.ws.l2_out) as u32]
+                        args: [slice(raw[1]), slice_mut(self.ws.l2_acted), (batch * self.ws.l2_out) as u32]
                     }
                 }?,
                 3 => {
                     cuda_launch! {
                         kernel: qat_output, stream: self.stream, module: self.module,
                         config: cfg_1d(batch),
-                        args: [slice(self.qat_raw[0]), slice(self.qat_raw[2]), slice_mut(self.ws.net_output), batch as u32, self.ws.l1_out as u32]
+                        args: [slice(raw[0]), slice(raw[2]), slice_mut(self.ws.net_output), batch as u32, self.ws.l1_out as u32]
                     }
                 }?,
                 _ => unreachable!(),
@@ -95,6 +109,10 @@ impl GpuTrainer {
 
     #[cfg(feature = "native")]
     pub(super) fn qat_swap(&mut self) {
+        let workspace = self
+            .qat_workspace
+            .as_mut()
+            .expect("dense QAT workspace is prepared");
         for (weight, scratch) in [
             &mut self.l1_w,
             &mut self.l1_b,
@@ -106,7 +124,7 @@ impl GpuTrainer {
             &mut self.l3_b,
         ]
         .into_iter()
-        .zip(&mut self.qat_buffers)
+        .zip(&mut workspace.weights)
         {
             std::mem::swap(weight, scratch);
         }
@@ -124,12 +142,12 @@ impl GpuTrainer {
             &self.l3_w,
             &self.l3_b,
         ];
-        if self.qat_buffers.is_empty() {
-            self.qat_buffers = weights
+        if self.qat_workspace.is_none() {
+            let scratch_weights = weights
                 .iter()
                 .map(|w| DeviceBuffer::zeroed(&self.stream, w.len()))
                 .collect::<Result<_, _>>()?;
-            self.qat_raw = [
+            let raw = [
                 self.ws.l1_total.len(),
                 self.ws.l2_dense_out.len(),
                 self.ws.l3_out.len(),
@@ -137,10 +155,15 @@ impl GpuTrainer {
             .into_iter()
             .map(|n| DeviceBuffer::zeroed(&self.stream, n))
             .collect::<Result<_, _>>()?;
+            self.qat_workspace = Some(QatWorkspace {
+                weights: scratch_weights,
+                raw,
+            });
         }
+        let scratch_weights = &self.qat_workspace().weights;
         for (i, weight) in weights.into_iter().enumerate() {
             if i == 2 || i == 3 {
-                memset_zero(&self.stream, &self.qat_buffers[i])?;
+                memset_zero(&self.stream, &scratch_weights[i])?;
                 continue;
             }
             let shared = if i == 1 {
@@ -153,7 +176,7 @@ impl GpuTrainer {
                 cuda_launch! {
                     kernel: qat_weight, stream: self.stream, module: self.module,
                     config: cfg_1d(weight.len()),
-                    args: [slice(weight), slice(shared), slice_mut(self.qat_buffers[i]),
+                    args: [slice(weight), slice(shared), slice_mut(scratch_weights[i]),
                         self.ws.ft_out as u32, self.ws.l1_out as u32, (i < 2) as u32, (i % 2 == 1) as u32]
                 }
             }?;
@@ -168,18 +191,19 @@ impl GpuTrainer {
         layer: u32,
         batch: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = self.qat_workspace();
         if layer == 1 {
             qat_dense_threads(batch, self.ws.ft_out, self.ws.l1_out)?;
-            return self.qat_dense_l1_sorted(batch, &self.ws.l1_total, &self.qat_raw[0]);
+            return self.qat_dense_l1_sorted(batch, &self.ws.l1_total, &workspace.raw[0]);
         }
-        // After qat_swap, qat_buffers holds the original masters (including nonzero shared bias).
+        // After qat_swap, the workspace holds the original masters (including nonzero shared bias).
         // Quantize those biases directly to integers: an f32 dequantize/requantize round trip
         // cannot preserve every i32 bias. The live quantized biases serve the floating kernels only.
         let (input, w, bias, output, inputs, outputs) = match layer {
             2 => (
                 &self.ws.l2_input,
                 &self.l2_w,
-                &self.qat_buffers[5],
+                &workspace.weights[5],
                 &self.ws.l2_dense_out,
                 self.ws.l2_in(),
                 self.ws.l2_out,
@@ -187,7 +211,7 @@ impl GpuTrainer {
             3 => (
                 &self.ws.l2_acted,
                 &self.l3_w,
-                &self.qat_buffers[7],
+                &workspace.weights[7],
                 &self.ws.l3_out,
                 self.ws.l2_out,
                 1,
@@ -201,14 +225,14 @@ impl GpuTrainer {
                 cuda_launch! {
                     kernel: qat_dense_wide, stream: self.stream, module: self.module,
                     config: cfg_1d(threads),
-                    args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
+                    args: [slice(input), slice(w), slice(bias), slice(workspace.weights[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(workspace.raw[(layer - 1) as usize]),
                         batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
                 }
             } else {
                 cuda_launch! {
                     kernel: qat_dense, stream: self.stream, module: self.module,
                     config: cfg_1d(threads),
-                    args: [slice(input), slice(w), slice(bias), slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(self.qat_raw[(layer - 1) as usize]),
+                    args: [slice(input), slice(w), slice(bias), slice(workspace.weights[3]), slice(self.ws.bucket_idx_dev), slice_mut(output), slice_mut(workspace.raw[(layer - 1) as usize]),
                         batch as u32, inputs as u32, outputs as u32, (layer == 1) as u32]
                 }
             }
@@ -227,6 +251,7 @@ impl GpuTrainer {
         raw: &DeviceBuffer<i32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let padded_b = padded_sort_batch(batch, self.num_buckets);
+        let weights = &self.qat_workspace().weights;
         let (inputs, outputs) = (self.ws.ft_out, self.ws.l1_out);
         debug_assert!(padded_b.is_multiple_of(16));
         // SAFETY: `combined_sorted` holds `padded_b * ft_out` floats, the sorted bucket and
@@ -240,8 +265,8 @@ impl GpuTrainer {
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 },
-                args: [slice(self.ws.combined_sorted), slice(self.l1_w), slice(self.qat_buffers[1]),
-                    slice(self.qat_buffers[3]), slice(self.ws.bucket_idx_sorted_dev),
+                args: [slice(self.ws.combined_sorted), slice(self.l1_w), slice(weights[1]),
+                    slice(weights[3]), slice(self.ws.bucket_idx_sorted_dev),
                     slice(self.ws.bucket_perm_dev), slice(output), slice(raw),
                     inputs as u32, outputs as u32, 1u32]
             }

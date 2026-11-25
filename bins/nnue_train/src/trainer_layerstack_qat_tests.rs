@@ -410,7 +410,7 @@ fn qat_activation_boundaries_and_main_ste() -> TestResult {
     )?;
     t.qat_prepare()?;
     t.forward(&data, &mut context)?;
-    let raw = t.qat_raw[0].to_host_vec(&t.stream)?;
+    let raw = t.qat_workspace().raw[0].to_host_vec(&t.stream)?;
     let act = t.ws.l2_input.to_host_vec(&t.stream)?;
     for i in 0..15 {
         assert_eq!(raw[i], values[i], "raw boundary {i}");
@@ -557,8 +557,8 @@ fn qat_integer_forward_export_and_master_preservation() -> TestResult {
         let batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
         let actual = t.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
         let x = t.combined_original_order_for_test(16)?;
-        let raw1 = t.qat_raw[0].to_host_vec(&t.stream)?;
-        let raw2 = t.qat_raw[1].to_host_vec(&t.stream)?;
+        let raw1 = t.qat_workspace().raw[0].to_host_vec(&t.stream)?;
+        let raw2 = t.qat_workspace().raw[1].to_host_vec(&t.stream)?;
         for row in 0..16 {
             let bucket = batch.bucket_idx[row] as usize;
             let mut a2 = [0_i64; 30];
