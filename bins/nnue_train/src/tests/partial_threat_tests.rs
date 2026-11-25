@@ -706,6 +706,88 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
 
 #[cfg(feature = "native")]
 #[test]
+fn partial_ft_forward_wide_matches_narrow_bitwise() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::trainer_layerstack::{PARTIAL_FT_PIECE_LIMITS, partial_ft_forward_wide_eligible};
+
+    let ctx = test_cuda_context()?;
+    let stream = gpu_runtime::create_compute_stream(&ctx)?;
+    let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
+    let batch = 3_usize;
+    let indices = DeviceBuffer::from_host(
+        &stream,
+        &[
+            [0_i32, 2, -1, 5, 1, 4, -1],
+            [-1; 7],
+            [4, 1, 3, -1, -1, -1, -1],
+        ]
+        .concat(),
+    )?;
+    let counts = DeviceBuffer::from_host(&stream, &[6_i32, 0, 3, 5, 0, 2, 5, 0, 2])?;
+    let order = DeviceBuffer::from_host(&stream, &[2_i32, 0, 1, 4, 5, 3])?;
+    for (rows, width, wide) in [
+        (1536_usize, 512_usize, true),
+        (6144, 3072, true),
+        (8192, 2816, true),
+        (1552, 528, true),
+        (1544, 512, false),
+        (1536, 520, false),
+        (1536, 130, false),
+    ] {
+        assert_eq!(partial_ft_forward_wide_eligible(rows, width), wide);
+        if !wide {
+            continue;
+        }
+        let shape = DeviceBuffer::from_host(&stream, &[rows as u32, 2, 3, width as u32, 7])?;
+        let mut weights: Vec<f16> = (0..2 * rows + 3 * width)
+            .map(|i| (((i * 7 % 251) as f32 - 125.0) / 113.0) as f16)
+            .collect();
+        // Cancellation makes the first output column sensitive to FP32 addition order.
+        weights[0] = 32768.0_f16;
+        weights[rows] = -32768.0_f16;
+        weights[2 * rows] = f16::from_bits(1);
+        weights[2 * rows + 2 * width] = f16::from_bits(1);
+        let weights = DeviceBuffer::from_host(&stream, &weights)?;
+        for batch_order in [
+            batch as u64 | (u64::from(u32::MAX) << 32),
+            batch as u64 | PARTIAL_FT_PIECE_LIMITS,
+            batch as u64 | ((batch as u64) << 32) | PARTIAL_FT_PIECE_LIMITS,
+        ] {
+            let len = batch * rows;
+            let expected = DeviceBuffer::from_host(&stream, &vec![f16::INFINITY; len])?;
+            let actual = DeviceBuffer::from_host(&stream, &vec![f16::NEG_INFINITY; len])?;
+            // SAFETY: both output buffers cover every position and wide accesses stay within each half.
+            unsafe {
+                cuda_launch! {
+                    kernel: partial_ft_forward_fp16_weights_out, stream: stream, module: module,
+                    config: cfg_1d(len / 4),
+                    args: [slice(weights), slice(indices), slice(counts), slice(expected),
+                           slice(shape), batch_order, slice(order)]
+                }?;
+                cuda_launch! {
+                    kernel: partial_ft_forward_fp16_weights_out_wide, stream: stream, module: module,
+                    config: cfg_1d(len / 8),
+                    args: [slice(weights), slice(indices), slice(counts), slice(actual),
+                           slice(shape), batch_order, slice(order)]
+                }?;
+            }
+            let bits = |out: &DeviceBuffer<f16>| {
+                out.to_host_vec(&stream)
+                    .map(|values| values.into_iter().map(f16::to_bits).collect::<Vec<_>>())
+            };
+            let actual = bits(&actual)?;
+            assert!(
+                actual == bits(&expected)?,
+                "forward bits differ for FT {rows}, Threat {width}, batch_order {batch_order:#x}"
+            );
+            assert_eq!(actual[0], 1);
+            assert!(actual[rows..2 * rows].iter().all(|&bits| bits == 0));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
 fn partial_ft_optimizer_fold_bitwise() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = test_cuda_context()?;
     let stream = gpu_runtime::create_compute_stream(&ctx)?;
