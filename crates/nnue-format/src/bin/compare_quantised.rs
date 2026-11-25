@@ -14,12 +14,19 @@
 use std::error::Error;
 
 use nnue_format::LayerStackWeights;
-use nnue_format::layerstack_weights::{read_layerstack_arch, stored_num_buckets};
+use nnue_format::layerstack_weights::{
+    feature_spec_from_arch, read_layerstack_arch, stored_num_buckets,
+};
 use shogi_features::FeatureSet;
 
 fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-    let arch = read_layerstack_arch(&mut bytes.as_slice())?;
+    load_bytes(&bytes).map_err(|e| format!("parse {path} as LayerStack quantised NNUE: {e}").into())
+}
+
+fn load_bytes(mut bytes: &[u8]) -> Result<LayerStackWeights, Box<dyn Error>> {
+    let mut header = bytes;
+    let arch = read_layerstack_arch(&mut header)?;
     let features = arch
         .strip_prefix("Features=")
         .and_then(|arch| arch.split_once("(Friend)["))
@@ -51,16 +58,16 @@ fn load(path: &str) -> Result<LayerStackWeights, Box<dyn Error>> {
         return Err("invalid LayerStack affine chain".into());
     };
     let with_psqt = arch.split(',').any(|token| token.starts_with("PSQT="));
-    LayerStackWeights::load_quantised_with_psqt(
-        &mut bytes.as_slice(),
-        feature_set.spec(),
+    let num_buckets = stored_num_buckets(bytes)?;
+    Ok(LayerStackWeights::load_quantised_with_psqt(
+        &mut bytes,
+        feature_spec_from_arch(feature_set, &arch, ft_out)?,
         ft_out,
         l1_out,
         l2_out,
-        stored_num_buckets(&bytes)?,
+        num_buckets,
         with_psqt,
-    )
-    .map_err(|e| format!("parse {path} as LayerStack quantised NNUE: {e}").into())
+    )?)
 }
 
 fn print_stats(name: &str, a: &[f32], b: &[f32]) -> Result<(), Box<dyn Error>> {
@@ -173,5 +180,40 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("compare_quantised: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nnue_format::LayerStackHead;
+    use shogi_features::{EffectBucketConfig, ThreatProfile};
+
+    #[test]
+    fn loads_dense_concat_with_feature_modifiers() -> Result<(), Box<dyn Error>> {
+        let base = FeatureSet::HalfKaHmMerged.spec();
+        let ft_out = 8;
+        for spec in [
+            base.with_threat_profile(ThreatProfile::Full),
+            base.with_threat_profile(ThreatProfile::CrossSide)
+                .with_threat_width(4),
+            base.with_effect_bucket_config(EffectBucketConfig::KINGBUCKETED_3X3),
+        ] {
+            let weights = LayerStackWeights::zeroed_with_head(
+                spec,
+                ft_out,
+                16,
+                32,
+                1,
+                LayerStackHead::DenseConcat,
+            );
+            let mut bytes = Vec::new();
+            weights.save_quantised(&mut bytes, None)?;
+            let loaded = load_bytes(&bytes)?;
+            assert_eq!(loaded.head, weights.head);
+            assert_eq!(loaded.feature_set, spec);
+            assert_eq!(loaded.ft_w.len(), weights.ft_w.len());
+        }
+        Ok(())
     }
 }

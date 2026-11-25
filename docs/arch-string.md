@@ -202,7 +202,10 @@ Simple 固有の点:
 各層の次元・活性化を含む。load は要求する spec から同じ手順で identity 部を組み立て、
 ファイル内の文字列と照合する:
 
-- LayerStack: `Features=...` トークンの前方一致 + network hash で照合する。
+- LayerStack は `Features=...` トークンの前方一致と network hash を照合する。
+  `Head=` がなければ standard として読み、`Head=DenseConcat` があれば DenseConcat として読む。
+  未知の値や重複した `Head=` はエラーになる。DenseConcat は FT、L1、L2 の次元から組み立てた
+  `Network=` 式がファイル内の式に完全一致することも確認する。
 - Simple: identity 部全体の一致で照合する。
 
 `fv_scale` は学習 scale からの導出、明示 override、checkpoint や入力 net からの

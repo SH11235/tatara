@@ -5292,11 +5292,16 @@ extern "C" __global__ void dense_concat_qat_activations(
     const size_t col = tid % width;
     const size_t offset = col < 2 * l1_out ? col : col - 2 * l1_out;
     const bool first = col < 2 * l1_out;
-    const int64_t x = first ? l1[row * l1_out + offset % l1_out]
+    const int32_t x = first ? l1[row * l1_out + offset % l1_out]
                             : l2[row * l2_out + offset % l2_out];
     const bool square = offset < (first ? l1_out : l2_out);
-    const int64_t value = square ? (x * x) >> 19 : x >> 6;
-    output[tid] = float(value < 0 ? 0 : (value > 127 ? 127 : value)) / 127.0f;
+    if (square) {
+        const int64_t value = (int64_t(x) * x) >> 19;
+        output[tid] = float(value > 127 ? 127 : value) / 127.0f;
+    } else {
+        const int32_t value = x >> 6;
+        output[tid] = float(value < 0 ? 0 : (value > 127 ? 127 : value)) / 127.0f;
+    }
 }
 
 extern "C" __global__ void dense_concat_qat_output(
@@ -5306,6 +5311,7 @@ extern "C" __global__ void dense_concat_qat_output(
     const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= batch) return;
     const size_t end = (row + 1) * l1_out;
-    const int64_t raw = int64_t(l3[row]) + int64_t(l1[end - 2]) - int64_t(l1[end - 1]);
+    const int32_t skip = l1[end - 2] - l1[end - 1];
+    const int32_t raw = l3[row] + skip;
     output[row] = static_cast<float>(static_cast<double>(raw) / 8128.0);
 }

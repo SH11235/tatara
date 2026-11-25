@@ -4891,26 +4891,32 @@ impl GpuTrainer {
     }
 
     fn dense_concat_activations(
-        &self,
+        &mut self,
         batch: usize,
         include_l2: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (l2_out, output) = if include_l2 {
-            (self.ws.l2_out, &self.ws.l2_acted)
-        } else {
-            (0, &self.ws.l2_input)
-        };
+        let l2_out = if include_l2 { self.ws.l2_out } else { 0 };
         #[cfg(feature = "native")]
         if self.qat_mode != crate::qat::QatMode::Off {
+            let output = if include_l2 {
+                &self.ws.l2_acted
+            } else {
+                &self.ws.l2_input
+            };
             return self.dense_concat_qat_activations(batch, l2_out, output);
         }
+        let output = if include_l2 {
+            &mut self.ws.l2_acted
+        } else {
+            &mut self.ws.l2_input
+        };
         // SAFETY: both input rows cover the batch, and output matches the requested concatenation.
         unsafe {
             cuda_launch! {
                 kernel: dense_concat_activations, stream: self.stream, module: self.module,
                 config: cfg_1d(batch * 2 * (self.ws.l1_out + l2_out)),
                 args: [
-                    slice(self.ws.l1_total), slice(self.ws.l2_dense_out), slice_mut(output),
+                    slice(self.ws.l1_total), slice(self.ws.l2_dense_out), slice_mut(*output),
                     batch as u32, self.ws.l1_out as u32, l2_out as u32, L1_SQR_SCALE
                 ]
             }
@@ -4918,7 +4924,7 @@ impl GpuTrainer {
         Ok(())
     }
 
-    fn dense_concat_output(&self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn dense_concat_output(&mut self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "native")]
         if self.qat_mode != crate::qat::QatMode::Off {
             return self.dense_concat_qat_output(batch);
@@ -7750,8 +7756,50 @@ mod tests {
         let doutput = trainer.ws.dy_net_output.to_host_vec(&trainer.stream)?;
         let dl1 = trainer.ws.dl1_total.to_host_vec(&trainer.stream)?;
         let dl2 = trainer.ws.dl2_out.to_host_vec(&trainer.stream)?;
+        let l2_in = 2 * l1;
+        let l3_in = l2_in + 2 * l2;
+        let mut l2_weight_grad = vec![0.0; weights.l2_w.len()];
+        let mut l3_weight_grad = vec![0.0; weights.l3_w.len()];
+        let activate = |values: &[f32]| {
+            let mut activated: Vec<_> = values
+                .iter()
+                .map(|&x| (x * x * L1_SQR_SCALE).clamp(0.0, 1.0))
+                .collect();
+            activated.extend(values.iter().map(|&x| x.clamp(0.0, 1.0)));
+            activated
+        };
         for (row, input) in combined.chunks_exact(ft).enumerate() {
             let bucket = batch.bucket_idx[row] as usize;
+            let first: Vec<_> = (0..l1)
+                .map(|col| {
+                    let index = bucket * l1 + col;
+                    let bias = weights.l1_b[index] + weights.l1_shared_bias[col];
+                    input.iter().enumerate().fold(bias, |sum, (i, &x)| {
+                        sum + x
+                            * (weights.l1_w[index * ft + i]
+                                + weights.l1_shared_weight[i * l1 + col])
+                    })
+                })
+                .collect();
+            let second_input = activate(&first);
+            let second: Vec<_> = (0..l2)
+                .map(|col| {
+                    let index = bucket * l2 + col;
+                    second_input
+                        .iter()
+                        .enumerate()
+                        .fold(weights.l2_b[index], |sum, (i, &x)| {
+                            sum + x * weights.l2_w[index * l2_in + i]
+                        })
+                })
+                .collect();
+            let output_weights = &mut l3_weight_grad[bucket * l3_in..][..l3_in];
+            for (grad, x) in output_weights
+                .iter_mut()
+                .zip(second_input.iter().copied().chain(activate(&second)))
+            {
+                *grad += doutput[row] * x;
+            }
             for (layer, grads, dim) in [(1, &dl1, l1), (2, &dl2, l2)] {
                 for col in 0..dim {
                     let index = bucket * dim + col;
@@ -7766,12 +7814,31 @@ mod tests {
                     let minus = dense_concat::forward(&weights, bucket, input);
                     bias(&mut weights, layer)[index] = original;
                     let want = (plus - minus) / (2.0 * delta) * doutput[row];
+                    if layer == 2 {
+                        let weight_row = &mut l2_weight_grad[index * l2_in..][..l2_in];
+                        for (grad, &x) in weight_row.iter_mut().zip(&second_input) {
+                            *grad += want * x;
+                        }
+                    }
                     let got = grads[row * dim + col];
                     assert!(
                         (got - want).abs() < 2e-6,
                         "row {row}, L{layer}[{col}]: {got} vs {want}"
                     );
                 }
+            }
+        }
+        for (layer, device, expected, tolerance) in [
+            (2, &trainer.l2_w_grad, l2_weight_grad, 2e-5),
+            (3, &trainer.l3_w_grad, l3_weight_grad, 2e-6),
+        ] {
+            let actual = device.to_host_vec(&trainer.stream)?;
+            assert_eq!(actual.len(), expected.len());
+            for (index, (got, want)) in actual.into_iter().zip(expected).enumerate() {
+                assert!(
+                    (got - want).abs() < tolerance,
+                    "L{layer} weight {index}: {got} vs {want}"
+                );
             }
         }
 
@@ -7807,7 +7874,7 @@ mod tests {
                     batch.bucket_idx[row] as usize,
                     &integer,
                 );
-                let want = (raw as f64 / f64::from(QA * QB)) as f32;
+                let want = (f64::from(raw) / f64::from(QA * QB)) as f32;
                 assert_eq!(got, want, "row {row}");
             }
         }

@@ -69,7 +69,9 @@
 
 use std::io::{self, Read, Write};
 
-use shogi_features::{BucketSpec, EffectBucketConfig, FeatureSetSpec, FtFactorizeMode};
+use shogi_features::{
+    BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
+};
 
 pub fn bucket_spec_from_arch(arch: &str) -> io::Result<Option<BucketSpec>> {
     let value = parse_single_arch_token(arch, "ls_bucket=")
@@ -102,6 +104,62 @@ pub fn read_layerstack_arch<R: Read>(reader: &mut R) -> io::Result<String> {
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Restore the feature modifiers for a LayerStack net from its architecture string.
+pub fn feature_spec_from_arch(
+    feature_set: FeatureSet,
+    arch: &str,
+    ft_out: usize,
+) -> io::Result<FeatureSetSpec> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let token = |prefix: &str| {
+        parse_single_arch_token(arch, prefix)
+            .map_err(|_| invalid(format!("duplicate {prefix} token")))
+    };
+    let mut spec = feature_set.spec();
+    let effect_bucket = token("EffectBucket=")?;
+    if let Some(value) = effect_bucket {
+        let config = match value {
+            "2x2fixed" => EffectBucketConfig::KINGFIXED_2X2,
+            "2x2bucketed" => EffectBucketConfig::KINGBUCKETED_2X2,
+            "3x3fixed" => EffectBucketConfig::KINGFIXED_3X3,
+            "3x3bucketed" => EffectBucketConfig::KINGBUCKETED_3X3,
+            _ => return Err(invalid(format!("unsupported EffectBucket value `{value}`"))),
+        };
+        spec = spec.with_effect_bucket_config(config);
+    }
+    if let Some(dims) = token("Threat=")? {
+        if effect_bucket.is_some() {
+            return Err(invalid(
+                "arch string contains both EffectBucket and Threat tokens".into(),
+            ));
+        }
+        let id = token("ThreatProfile=")?
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|_| invalid("invalid ThreatProfile".into()))?;
+        let profile = ThreatProfile::ALL
+            .into_iter()
+            .find(|profile| profile.profile_id() == id)
+            .ok_or_else(|| invalid(format!("unsupported ThreatProfile id {id}")))?;
+        let expected = shogi_features::threat_dimensions_of(profile);
+        if dims.parse::<usize>().ok() != Some(expected) {
+            return Err(invalid(format!(
+                "Threat dims/profile mismatch in arch string: dims={dims}, profile={profile}, expected={expected}"
+            )));
+        }
+        spec = spec.with_threat_profile(profile);
+        if let Some(width) = token("ThreatWidth=")? {
+            let width = width
+                .parse::<usize>()
+                .ok()
+                .filter(|&width| width > 0 && width.is_multiple_of(2) && width <= ft_out)
+                .ok_or_else(|| invalid("invalid ThreatWidth".into()))?;
+            spec = spec.with_threat_width(width);
+        }
+    }
+    Ok(spec)
 }
 
 // =============================================================================
@@ -705,9 +763,11 @@ pub fn coalesce_ft_factorized(
 /// - `l1_b`: `(num_buckets, l1_out)` row-major
 /// - `l1_shared_weight`: `(ft_out, l1_out)` row-major、`l1_shared_weight[in * l1_out + out]`
 /// - `l1_shared_bias`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
-/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major、`l2_in = (l1_out - 1) * 2`
+/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major。`l2_in` は standard で
+///   `2 * (l1_out - 1)`、DenseConcat で `2 * l1_out`。
 /// - `l2_b`: `(num_buckets, l2_out)`
-/// - `l3_w`: `(num_buckets, l2_out)` (out_dim=1 なので out 軸省略)
+/// - `l3_w`: `(num_buckets, l3_in)` (out_dim=1 なので out 軸省略)。`l3_in` は
+///   standard で `l2_out`、DenseConcat で `2 * l1_out + 2 * l2_out`。
 /// - `l3_b`: `(num_buckets)`
 #[derive(Debug, Clone)]
 pub struct LayerStackWeights {

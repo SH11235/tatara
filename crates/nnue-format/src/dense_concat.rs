@@ -21,17 +21,15 @@ impl Affine<'_> {
             .collect()
     }
 
-    fn forward_quantised(&self, input: &[u8], biases: &[i32]) -> Vec<i64> {
+    fn forward_quantised(&self, input: &[u8], biases: &[i32]) -> Vec<i32> {
         self.weights
             .chunks_exact(input.len())
             .zip(biases)
             .map(|(row, &bias)| {
-                row.iter()
-                    .zip(input)
-                    .fold(i64::from(bias), |sum, (&w, &x)| {
-                        let w = (w * QB as f32).round() as i8;
-                        sum + i64::from(w) * i64::from(x)
-                    })
+                row.iter().zip(input).fold(bias, |sum, (&w, &x)| {
+                    let w = (w * QB as f32).round() as i8;
+                    sum + i32::from(w) * i32::from(x)
+                })
             })
             .collect()
     }
@@ -61,10 +59,13 @@ fn activations(input: &[f32]) -> impl Iterator<Item = f32> + '_ {
         .chain(input.iter().map(|&x| x.clamp(0.0, 1.0)))
 }
 
-fn activations_quantised(input: &[i64]) -> impl Iterator<Item = u8> + '_ {
+fn activations_quantised(input: &[i32]) -> impl Iterator<Item = u8> + '_ {
     input
         .iter()
-        .map(|&x| (x.saturating_mul(x) >> 19).clamp(0, 127) as u8)
+        .map(|&x| {
+            let wide = i64::from(x);
+            ((wide * wide) >> 19).clamp(0, 127) as u8
+        })
         .chain(input.iter().map(|&x| (x >> 6).clamp(0, 127) as u8))
 }
 
@@ -97,7 +98,7 @@ pub fn forward_quantised(
     biases: &QuantisedBiases,
     bucket: usize,
     input: &[u8],
-) -> i64 {
+) -> i32 {
     let [first, second, output] = layers(weights, bucket);
     let l1_width = first.biases.len();
     let l2_width = second.biases.len();
@@ -116,6 +117,12 @@ mod tests {
     use super::*;
     use crate::layerstack_weights::{QA, compute_fc_hash, network_hash, read_layerstack_arch};
     use shogi_features::FeatureSet;
+
+    #[test]
+    fn integer_activation_squares_the_full_i32_range() {
+        let actual: Vec<_> = activations_quantised(&[i32::MIN, -4096, 4096, i32::MAX]).collect();
+        assert_eq!(actual, [127, 32, 32, 127, 0, 0, 64, 127]);
+    }
 
     #[test]
     fn dense_concat_export_layout_and_float_agree_with_integer_forward() -> std::io::Result<()> {
@@ -206,7 +213,7 @@ mod tests {
         eprintln!("maximum float / quantised output difference: {max_diff:.8}");
         let output_bias = first_bucket + 4 + l1 * (4 + 64) + l2 * (4 + 32);
         let baseline = forward_quantised(&loaded, &biases, 0, &[0; 34]);
-        let large_bias = i32::MAX - 7;
+        let large_bias = (1_i32 << 30) + 7;
         bytes[output_bias..output_bias + 4].copy_from_slice(&large_bias.to_le_bytes());
         let (large, bias) = LayerStackWeights::load_quantised_for_integer_eval(
             &mut bytes.as_slice(),
@@ -219,7 +226,7 @@ mod tests {
         )?;
         assert_eq!(
             forward_quantised(&large, &bias, 0, &[0; 34]),
-            baseline + i64::from(large_bias),
+            baseline + large_bias,
         );
         let marker = arch.find("Head=DenseConcat").unwrap() + 12 + "Head=".len();
         bytes[marker] = b'X';
