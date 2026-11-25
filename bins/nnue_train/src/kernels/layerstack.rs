@@ -2780,8 +2780,9 @@ pub fn dense_concat_l2_grad(
     let row = tid.get() / l2_out;
     let col = tid.get() % l2_out;
     let base = row * (2 * l1_out + 2 * l2_out) + 2 * l1_out + col;
+    let i = tid.get();
     if let Some(out) = dx.get_mut(tid) {
-        *out = dense_concat_pair_grad(l2[tid.get()], dy[base], dy[base + l2_out], scale);
+        *out = dense_concat_pair_grad(l2[i], dy[base], dy[base + l2_out], scale);
     }
 }
 
@@ -2814,9 +2815,10 @@ pub fn dense_concat_l1_grad(
     } else {
         0.0
     };
+    let i = tid.get();
     if let Some(out) = dx.get_mut(tid) {
         *out = dense_concat_pair_grad(
-            l1[tid.get()],
+            l1[i],
             from_l2[a] + from_l3[b],
             from_l2[a + l1_out] + from_l3[b + l1_out],
             scale,
@@ -2836,8 +2838,9 @@ pub fn dense_concat_output(
     if tid.get() >= batch as usize {
         return;
     }
-    let end = (tid.get() + 1) * l1_out as usize;
+    let row = tid.get();
+    let end = (row + 1) * l1_out as usize;
     if let Some(out) = output.get_mut(tid) {
-        *out = l3[tid.get()] + (l1[end - 2] - l1[end - 1]);
+        *out = l3[row] + (l1[end - 2] - l1[end - 1]);
     }
 }
