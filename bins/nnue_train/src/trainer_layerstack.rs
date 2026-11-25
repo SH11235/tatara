@@ -174,8 +174,10 @@ impl PartialGather {
             Ok("row") => Ok(Self::Row),
             Ok("tile") => Ok(Self::Tile),
             Ok("auto") | Err(std::env::VarError::NotPresent) => {
-                // Wider rows give the split launches more work over which to amortize their cost.
-                const TILE_MIN_COMBINED_WIDTH: usize = 6144;
+                // On an RTX 5090 the row walk wins up to FT 3072 + Threat 1024 (its column tiles stay in
+                // L2) and the tiled launch wins from FT 4096 + Threat 1408 up; narrow-L2 GPUs favor
+                // the tiled launch earlier.
+                const TILE_MIN_COMBINED_WIDTH: usize = 5120;
                 Ok(if rows + width >= TILE_MIN_COMBINED_WIDTH {
                     Self::Tile
                 } else {
