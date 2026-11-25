@@ -703,3 +703,244 @@ fn partial_threat_expand_indices_and_forward_piece_limits() -> Result<(), Box<dy
     }
     Ok(())
 }
+
+#[cfg(feature = "native")]
+#[test]
+fn partial_ft_optimizer_fold_bitwise() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = test_cuda_context()?;
+    let stream = gpu_runtime::create_compute_stream(&ctx)?;
+    let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
+    for (rows, width) in [(6144, 3072), (132, 72)] {
+        for factorized in [false, true] {
+            for quantize_pieces in [false, true] {
+                check_partial_ft_optimizer_fold(
+                    &stream,
+                    &module,
+                    (rows, width),
+                    (factorized, quantize_pieces),
+                    |x| x as f16,
+                    f16::to_bits,
+                    crate::trainer_layerstack::FT_FUSED_HALF_STATE,
+                )?;
+                check_partial_ft_optimizer_fold(
+                    &stream,
+                    &module,
+                    (rows, width),
+                    (factorized, quantize_pieces),
+                    |x| x,
+                    f32::to_bits,
+                    0,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn check_partial_ft_optimizer_fold<T, Bits>(
+    stream: &gpu_runtime::CudaStream,
+    module: &gpu_runtime::CudaModule,
+    (rows, width): (usize, usize),
+    (factorized, quantize_pieces): (bool, bool),
+    moment: impl Fn(f32) -> T,
+    moment_bits: impl Fn(T) -> Bits,
+    state_flag: u32,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: cuda_native_runtime::DeviceElement + Default,
+    Bits: std::fmt::Debug + PartialEq,
+{
+    use crate::trainer_layerstack::{
+        FT_FUSED_ACCUMULATE_NORMS, FT_FUSED_ACTIVE_ROWS, FT_FUSED_LOOKAHEAD, FT_FUSED_NORM_LOSS,
+        FT_FUSED_OUT_COMB_F16, FT_FUSED_OUT_PACKED_F16, FT_FUSED_PROJECT_PIECES,
+        ft_fused_launch_config, partial_ft_virtual_rows,
+    };
+    use gpu_runtime::LaunchConfig;
+
+    let base = 17;
+    let threats = 19;
+    let pieces = 7;
+    let pairs = [0, 3, 3, 11, threats as u32];
+    let base_n = base * rows;
+    let real_n = base_n + threats * width;
+    let piece_end = real_n + usize::from(factorized) * pieces * rows;
+    let train_n = piece_end + usize::from(factorized) * (pairs.len() - 1) * width;
+    let shape = DeviceBuffer::from_host(
+        stream,
+        &[
+            rows as u32,
+            base as u32,
+            threats as u32,
+            width as u32,
+            4,
+            pieces as u32,
+            u32::from(factorized),
+            1,
+            if factorized {
+                pairs.len() as u32 - 1
+            } else {
+                0
+            },
+        ],
+    )?;
+    let pair_starts = DeviceBuffer::from_host(stream, &pairs)?;
+    let virtual_rows =
+        DeviceBuffer::from_host(stream, &partial_ft_virtual_rows(base, pieces, &pairs))?;
+    let initial = |period, scale| {
+        (0..train_n)
+            .map(|i| (1 + i % period) as f32 * scale)
+            .collect::<Vec<_>>()
+    };
+    // Similar magnitudes make the FP64 sums exact regardless of atomic arrival order.
+    let signed_weights = |period, offset: f32| {
+        initial(period, 1.0 / 512.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let magnitude = offset + value;
+                if i.is_multiple_of(2) {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect::<Vec<f32>>()
+    };
+    let weights = signed_weights(113, 0.125);
+    let slow_weights = signed_weights(73, 0.0625);
+    let momentum = initial(37, -1.0 / 1024.0)
+        .into_iter()
+        .map(&moment)
+        .collect::<Vec<_>>();
+    let velocity = initial(27, 1.0 / 128.0)
+        .into_iter()
+        .map(moment)
+        .collect::<Vec<_>>();
+    struct State<T: cuda_native_runtime::DeviceElement> {
+        w: DeviceBuffer<f32>,
+        m: DeviceBuffer<T>,
+        v: DeviceBuffer<T>,
+        slow: DeviceBuffer<f32>,
+        grad: DeviceBuffer<f32>,
+        comb: DeviceBuffer<f16>,
+        norms: DeviceBuffer<f32>,
+        sums: DeviceBuffer<f64>,
+    }
+    let new_state = || {
+        Ok::<_, gpu_runtime::Error>(State {
+            w: DeviceBuffer::from_host(stream, &weights)?,
+            m: DeviceBuffer::from_host(stream, &momentum)?,
+            v: DeviceBuffer::from_host(stream, &velocity)?,
+            slow: DeviceBuffer::from_host(stream, &slow_weights)?,
+            grad: DeviceBuffer::zeroed(stream, train_n)?,
+            comb: DeviceBuffer::from_host(stream, &vec![f16::NAN; real_n])?,
+            norms: DeviceBuffer::from_host(stream, &vec![0.75_f32; rows])?,
+            sums: DeviceBuffer::zeroed(stream, rows)?,
+        })
+    };
+    let (mut separate, mut fused) = (new_state()?, new_state()?);
+    for step in 0..7 {
+        let active = (0..base + threats)
+            .map(|row| u32::from((row + step) % 3 != 0))
+            .collect::<Vec<_>>();
+        let active_rows = DeviceBuffer::from_host(stream, &active)?;
+        let gradient = initial(41 + step, -1.0 / 2048.0);
+        for (fold_fused, state) in [(false, &mut separate), (true, &mut fused)] {
+            let State {
+                w,
+                m,
+                v,
+                slow,
+                grad,
+                comb,
+                norms,
+                sums,
+            } = state;
+            grad.copy_from_host(stream, &gradient)?;
+            sums.copy_from_host(stream, &vec![0.0_f64; rows])?;
+            let mut flags = state_flag | FT_FUSED_NORM_LOSS | FT_FUSED_ACCUMULATE_NORMS;
+            if step == 5 {
+                flags |= FT_FUSED_LOOKAHEAD;
+            }
+            for (begin, end, row_width, row_base, partner_base) in [
+                (real_n, piece_end, rows, 0, 0),
+                (piece_end, train_n, width, 0, 0),
+                (0, base_n, rows, 0, real_n),
+                (base_n, real_n, width, base as u32, piece_end),
+            ] {
+                if begin == end {
+                    continue;
+                }
+                let mut launch_flags = flags;
+                if begin < real_n {
+                    launch_flags |= FT_FUSED_ACTIVE_ROWS;
+                    if fold_fused {
+                        launch_flags |= FT_FUSED_OUT_PACKED_F16 | FT_FUSED_OUT_COMB_F16;
+                        if quantize_pieces && row_base == 0 {
+                            launch_flags |= FT_FUSED_PROJECT_PIECES;
+                        }
+                    }
+                }
+                // SAFETY: the aligned ranges cover whole packed rows; fold partners are in the
+                // virtual ranges already updated on this stream.
+                unsafe {
+                    cuda_launch! {
+                        kernel: ft_fused_optimizer_step, stream: stream, module: module,
+                        config: ft_fused_launch_config(end - begin, row_width)?,
+                        args: [slice_mut(*w), slice_mut(*m), slice_mut(*v), slice_mut(*grad),
+                               slice_mut(*slow), slice(*norms), slice_mut(*sums), slice(active_rows),
+                               row_base, slice_mut(*comb), slice(virtual_rows), partner_base as u64,
+                               row_width as u32, rows as u32, (usize::from(factorized) * pieces) as u32,
+                               0_u32, begin as u64,
+                               end as u64, 0.012_f32, 0.017_f32, 1.0e-8_f32, 0.003_f32,
+                               0.9_f32, i32::from(step > 2), 0.006_f32, 0.9_f32, 0.999_f32,
+                               1.0e-8_f32, -f32::MAX, f32::MAX, 8.0_f32, 16.0_f32, 0.5_f32,
+                               launch_flags]
+                    }
+                }?;
+            }
+            // SAFETY: the fold covers all real rows, and the norm buffers have one slot per column.
+            unsafe {
+                if !fold_fused {
+                    cuda_launch! {
+                        kernel: partial_ft_fold_to_fp16, stream: stream, module: module,
+                        config: LaunchConfig {
+                            grid_dim: ((base + threats) as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        args: [slice(*w), slice(pair_starts), slice(shape), slice_mut(*comb),
+                               u32::from(quantize_pieces)]
+                    }?;
+                }
+                cuda_launch! {
+                    kernel: norm_loss_finalize_f64, stream: stream, module: module, config: cfg_1d(rows),
+                    args: [slice(*sums), slice_mut(*norms), rows as u32]
+                }?;
+            }
+        }
+        macro_rules! compare {
+            ($field:tt, $label:literal, $bits:expr) => {
+                for (i, (expected, actual)) in separate.$field.to_host_vec(stream)?.into_iter()
+                    .zip(fused.$field.to_host_vec(stream)?).enumerate()
+                {
+                    assert_eq!(
+                        ($bits)(expected), ($bits)(actual),
+                        "{}[{i}] at step {step}, FT {rows}, Threat {width}, factorized {factorized}, projection {quantize_pieces}, state flag {state_flag}",
+                        $label,
+                    );
+                }
+            };
+        }
+        compare!(w, "master", f32::to_bits);
+        compare!(m, "momentum", &moment_bits);
+        compare!(v, "velocity", &moment_bits);
+        compare!(slow, "slow", f32::to_bits);
+        compare!(grad, "gradient", f32::to_bits);
+        compare!(comb, "comb", f16::to_bits);
+        compare!(norms, "norms", f32::to_bits);
+        compare!(sums, "norm sums", f64::to_bits);
+    }
+    Ok(())
+}

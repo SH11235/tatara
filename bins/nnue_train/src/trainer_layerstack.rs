@@ -67,21 +67,25 @@ type BitsCompareTestState = (Vec<u32>, Vec<u32>, usize);
 type FtForwardOrderTestState = (Vec<i32>, Vec<u32>, Vec<u32>);
 
 #[cfg(feature = "native")]
-const FT_FUSED_HALF_STATE: u32 = 1;
+pub(super) const FT_FUSED_HALF_STATE: u32 = 1;
 #[cfg(feature = "native")]
-const FT_FUSED_NORM_LOSS: u32 = 1 << 1;
+pub(super) const FT_FUSED_NORM_LOSS: u32 = 1 << 1;
 #[cfg(feature = "native")]
-const FT_FUSED_LOOKAHEAD: u32 = 1 << 2;
+pub(super) const FT_FUSED_LOOKAHEAD: u32 = 1 << 2;
 #[cfg(feature = "native")]
-const FT_FUSED_ACTIVE_ROWS: u32 = 1 << 3;
+pub(super) const FT_FUSED_ACTIVE_ROWS: u32 = 1 << 3;
 #[cfg(feature = "native")]
 const FT_FUSED_OUT_MIRROR_F16: u32 = 1 << 4;
 #[cfg(feature = "native")]
-const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
+pub(super) const FT_FUSED_OUT_COMB_F16: u32 = 2 << 4;
 #[cfg(feature = "native")]
 const FT_FUSED_OUT_COMB_F32: u32 = 3 << 4;
 #[cfg(feature = "native")]
-const FT_FUSED_ACCUMULATE_NORMS: u32 = 1 << 6;
+pub(super) const FT_FUSED_ACCUMULATE_NORMS: u32 = 1 << 6;
+#[cfg(feature = "native")]
+pub(super) const FT_FUSED_OUT_PACKED_F16: u32 = 1 << 7;
+#[cfg(feature = "native")]
+pub(super) const FT_FUSED_PROJECT_PIECES: u32 = 1 << 8;
 /// A few row visits per column keep enough blocks in flight for memory parallelism.
 #[cfg(feature = "native")]
 const FT_FUSED_ELEMENTS_PER_THREAD: usize = 4;
@@ -92,7 +96,7 @@ const FT_FUSED_BLOCK_THREADS: u32 = BLOCK_DIM / 4;
 /// Rounding blocks to a multiple of `ft_out / gcd(ft_out, BLOCK_DIM)` makes the stride
 /// (blocks × BLOCK_DIM elements) a multiple of `ft_out`, keeping each lane on its column.
 #[cfg(feature = "native")]
-fn ft_fused_launch_config(
+pub(super) fn ft_fused_launch_config(
     n: usize,
     ft_out: usize,
 ) -> Result<LaunchConfig, Box<dyn std::error::Error>> {
@@ -190,6 +194,44 @@ impl PartialGather {
 }
 
 #[cfg(feature = "native")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartialFold {
+    Fused,
+    Separate,
+}
+
+#[cfg(feature = "native")]
+impl PartialFold {
+    fn at_start() -> Result<Self, Box<dyn std::error::Error>> {
+        match std::env::var("TATARA_PARTIAL_FOLD").as_deref() {
+            Ok("fused") | Err(std::env::VarError::NotPresent) => Ok(Self::Fused),
+            Ok("separate") => Ok(Self::Separate),
+            _ => Err("TATARA_PARTIAL_FOLD must be fused or separate".into()),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+pub(super) fn partial_ft_virtual_rows(
+    base_rows: usize,
+    piece_inputs: usize,
+    pair_starts: &[u32],
+) -> Vec<u32> {
+    // A row lookup avoids repeating the fold's pair search for each optimizer column tile.
+    (0..base_rows)
+        .map(|row| (row % piece_inputs) as u32)
+        .chain(
+            pair_starts
+                .windows(2)
+                .enumerate()
+                .flat_map(|(pair, bounds)| {
+                    std::iter::repeat_n(pair as u32, (bounds[1] - bounds[0]) as usize)
+                }),
+        )
+        .collect()
+}
+
+#[cfg(feature = "native")]
 pub(crate) fn partial_ft_gather_row_config(
     base: usize,
     threats: usize,
@@ -234,6 +276,10 @@ impl GpuTrainer {
                 || (width.is_multiple_of(8) && self.ws.ft_out.is_multiple_of(4)))
             && self.psqt.is_none()
             && !self.ft_fused_optimizer_disabled
+    }
+
+    fn partial_fold_fused(&self) -> bool {
+        self.partial_fold == PartialFold::Fused && self.partial_ft_w_h.is_some()
     }
 
     /// Leaves the per-column FT norms for this fused step in `ft_norms` and zeroes
@@ -1277,6 +1323,11 @@ impl GpuTrainer {
         let width = self.feature_set.threat_width(ft_out);
         let base_n = self.feature_set.base_ft_in() * ft_out;
         let piece_end = real_n + self.feature_set.piece_inputs() * ft_out;
+        let packed_output = if self.partial_fold_fused() {
+            FT_FUSED_OUT_PACKED_F16 | FT_FUSED_OUT_COMB_F16
+        } else {
+            0
+        };
         // Each launch uses a uniform packed row width; virtual rows precede the real updates.
         let ranges = if self.partial_threat() {
             [
@@ -1292,8 +1343,8 @@ impl GpuTrainer {
                     0,
                     width,
                 ),
-                (0, base_n, 0, ft_out),
-                (base_n, real_n, 0, width),
+                (0, base_n, packed_output, ft_out),
+                (base_n, real_n, packed_output, width),
             ]
         } else if ft_factorize {
             [
@@ -1323,7 +1374,27 @@ impl GpuTrainer {
             } else {
                 0
             };
-            let quantize_forward = self.ft_weight_i8x2 && out != 0;
+            let packed_comb = out & FT_FUSED_OUT_PACKED_F16 != 0;
+            let quantize_forward = self.ft_weight_i8x2 && out != 0 && !packed_comb;
+            let fold_rows = if packed_comb && ft_factorize {
+                self.partial_ft_virtual_rows
+                    .as_ref()
+                    .expect("packed FT virtual rows")
+            } else {
+                &self.threat_pair_starts
+            };
+            let fold_bounds = if packed_comb && ft_factorize {
+                if active_row_base == 0 {
+                    real_n as u64
+                } else {
+                    piece_end as u64
+                }
+            } else {
+                bounds
+            };
+            if packed_comb && self.ft_weight_i8x2 && active_row_base == 0 {
+                launch_flags |= FT_FUSED_PROJECT_PIECES;
+            }
             // Unused pointer slots (`slow` without lookahead, the norm buffers without norm-loss,
             // the active-row mask without `FT_FUSED_ACTIVE_ROWS`, the forward output when
             // `out == 0`) receive a live buffer the kernel never touches.
@@ -1368,7 +1439,7 @@ impl GpuTrainer {
                                    slice(self.ft_norms), slice_mut(self.ft_norm_sums),
                                    slice(self.ws.ft_active_rows), active_row_base,
                                    slice_mut($forward),
-                                   slice(self.threat_pair_starts), bounds, row_width as u32, ft_out as u32,
+                                   slice(fold_rows), fold_bounds, row_width as u32, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
                                    norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
                                    step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
@@ -1379,13 +1450,18 @@ impl GpuTrainer {
             }
             macro_rules! with_forward {
                 ($m:expr, $v:expr) => {
-                    match (out, self.ft_w_h.as_mut(), self.ft_w_fold32.as_mut()) {
-                        (FT_FUSED_OUT_COMB_F32, _, Some(comb)) => launch!($m, $v, comb),
-                        (FT_FUSED_OUT_MIRROR_F16 | FT_FUSED_OUT_COMB_F16, Some(half), _) => {
-                            launch!($m, $v, half)
+                    if packed_comb {
+                        let half = self.partial_ft_w_h.as_mut().expect("packed FP16 FT cache");
+                        launch!($m, $v, half)
+                    } else {
+                        match (out, self.ft_w_h.as_mut(), self.ft_w_fold32.as_mut()) {
+                            (FT_FUSED_OUT_COMB_F32, _, Some(comb)) => launch!($m, $v, comb),
+                            (FT_FUSED_OUT_MIRROR_F16 | FT_FUSED_OUT_COMB_F16, Some(half), _) => {
+                                launch!($m, $v, half)
+                            }
+                            (0, _, _) => launch!($m, $v, self.ft_w_slow),
+                            _ => unreachable!("fused FT output buffer matches the precision flags"),
                         }
-                        (0, _, _) => launch!($m, $v, self.ft_w_slow),
-                        _ => unreachable!("fused FT output buffer matches the precision flags"),
                     }
                 };
             }
@@ -1751,12 +1827,15 @@ pub(crate) struct GpuTrainer {
     /// 代わりに読む。それ以外の構成では `None` (FP32 forward は `ft_w` を直接読む)。
     ft_w_fold32: Option<DeviceBuffer<f32>>,
     threat_pair_starts: DeviceBuffer<u32>,
-    // Packed cache populated by the partial fold after both real and virtual updates.
     #[cfg(feature = "native")]
     partial_ft_w_h: Option<DeviceBuffer<f16>>,
     partial_ft_shape: DeviceBuffer<u32>,
     #[cfg(feature = "native")]
     partial_gather: PartialGather,
+    #[cfg(feature = "native")]
+    partial_fold: PartialFold,
+    #[cfg(feature = "native")]
+    partial_ft_virtual_rows: Option<DeviceBuffer<u32>>,
     partial_norm_sums: DeviceBuffer<f64>,
     empty_threat_pair_starts: DeviceBuffer<u32>,
     ft_b: DeviceBuffer<f32>,
@@ -2654,6 +2733,23 @@ impl GpuTrainer {
         } else {
             PartialGather::Row
         };
+        #[cfg(feature = "native")]
+        let partial_fold = if !forward_only && width < ft_out && precision.ft_fp16 {
+            let requested = PartialFold::at_start()?;
+            let mode = if width.is_multiple_of(8) && ft_out.is_multiple_of(4) {
+                requested
+            } else {
+                PartialFold::Separate
+            };
+            let name = match mode {
+                PartialFold::Fused => "fused",
+                PartialFold::Separate => "separate",
+            };
+            println!("[threat] partial-width fold: {name}");
+            mode
+        } else {
+            PartialFold::Separate
+        };
         let compact_h2d = cfg!(feature = "native") && feature_set.threat_profile().is_some();
         let ft_w_n = feature_set.train_ft_weight_len(ft_out);
         #[cfg(not(feature = "native"))]
@@ -2797,6 +2893,20 @@ impl GpuTrainer {
             threat_pair_starts_host.push(0);
         }
 
+        #[cfg(feature = "native")]
+        let partial_ft_virtual_rows =
+            if partial_fold == PartialFold::Fused && feature_set.ft_factorize() {
+                let rows = partial_ft_virtual_rows(
+                    feature_set.base_ft_in(),
+                    feature_set.piece_inputs(),
+                    &threat_pair_starts_host,
+                );
+                assert_eq!(rows.len(), feature_set.ft_in());
+                Some(DeviceBuffer::from_host(&stream, &rows)?)
+            } else {
+                None
+            };
+
         // lookahead slow weight は **0 初期化**。ranger の初回 lerp (`step % k == 0`)
         // で `weights = alpha*weights + (1-alpha)*0 = alpha*weights` となる。
         let mut trainer = Self {
@@ -2865,6 +2975,10 @@ impl GpuTrainer {
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
             #[cfg(feature = "native")]
             partial_gather,
+            #[cfg(feature = "native")]
+            partial_fold,
+            #[cfg(feature = "native")]
+            partial_ft_virtual_rows,
             partial_ft_shape: DeviceBuffer::from_host(
                 &stream,
                 &[
@@ -7327,7 +7441,13 @@ impl GpuTrainer {
         // lookahead) が確定した後、次 step の forward が読む comb を再生成する。
         if !self.freeze_ft {
             if self.partial_threat() {
-                self.launch_partial_ft_fold()?;
+                #[cfg(feature = "native")]
+                let fold_written = ft_fused && self.partial_fold_fused();
+                #[cfg(not(feature = "native"))]
+                let fold_written = false;
+                if !fold_written {
+                    self.launch_partial_ft_fold()?;
+                }
             } else if !ft_fused && (ft_factorize || self.ft_weight_i8x2) {
                 self.sync_ft_forward_weights()?;
             }
