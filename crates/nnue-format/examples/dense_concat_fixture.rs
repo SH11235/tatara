@@ -1,3 +1,9 @@
+//! 推論側との照合に使う、seed 固定のランダム重みの DenseConcat の量子化 `.bin` を書き出す。
+//! HalfKaHmMerged、bucket 数は既定、`ls_bucket=ownking:3+handmajor4`、PSQT・Threat 無し。
+//!
+//! 使い方:
+//!   cargo run --release -p nnue-format --example dense_concat_fixture -- //!     <out.bin> [--ft-out N] [--l1 N] [--l2 N]   (省略時は 2304 16 64)
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
