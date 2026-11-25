@@ -5311,7 +5311,7 @@ extern "C" __global__ void dense_concat_qat_output(
     const size_t row = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= batch) return;
     const size_t end = (row + 1) * l1_out;
-    // 推論側の i32 演算 (release build の 2 の補数の折り返し) と同じ値にするため、
+    // overflow 検査を外した推論側の i32 演算 (2 の補数の折り返し) と同じ値にするため、
     // 符号付きの overflow (C++ では未定義) を避けて u32 で加減算する。
     const unsigned skip = unsigned(l1[end - 2]) - unsigned(l1[end - 1]);
     const int raw = int(unsigned(l3[row]) + skip);

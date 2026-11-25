@@ -108,7 +108,7 @@ pub fn forward_quantised(
     let mut concat: Vec<_> = activations_quantised(&l1).collect();
     let l2 = second.forward_quantised(&concat, &row[l1_width..l1_width + l2_width]);
     concat.extend(activations_quantised(&l2));
-    // 推論側 (release build の i32) と GPU の QAT kernel と同じく、範囲外は 2 の補数で折り返す。
+    // overflow 検査を外した推論側の i32 (rshogi の production build) と GPU の QAT kernel と同じく、範囲外は 2 の補数で折り返す。
     let skip = l1[l1.len() - 2].wrapping_sub(l1[l1.len() - 1]);
     output.forward_quantised(&concat, &row[l1_width + l2_width..])[0].wrapping_add(skip)
 }
