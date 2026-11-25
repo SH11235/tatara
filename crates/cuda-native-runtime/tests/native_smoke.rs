@@ -46,7 +46,7 @@ fn every_source_export_resolves_from_embedded_fatbin() {
         resolved += 1;
     }
 
-    assert_eq!(resolved, 136, "CUDA source export inventory changed");
+    assert_eq!(resolved, 137, "CUDA source export inventory changed");
 }
 
 #[test]

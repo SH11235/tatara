@@ -165,6 +165,12 @@ fn ft_gather_launch_config(ft_in: usize, ft_out: usize, half_gradient: bool) -> 
 }
 
 #[cfg(feature = "native")]
+pub(super) fn partial_ft_forward_wide_eligible(rows: usize, width: usize) -> bool {
+    // Each eight-column access must fit on one side of both packed half-width boundaries.
+    rows.is_multiple_of(16) && width.is_multiple_of(16)
+}
+
+#[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PartialGather {
     Row,
@@ -1831,6 +1837,8 @@ pub(crate) struct GpuTrainer {
     partial_ft_w_h: Option<DeviceBuffer<f16>>,
     partial_ft_shape: DeviceBuffer<u32>,
     #[cfg(feature = "native")]
+    partial_forward_wide: bool,
+    #[cfg(feature = "native")]
     partial_gather: PartialGather,
     #[cfg(feature = "native")]
     partial_fold: PartialFold,
@@ -2721,6 +2729,19 @@ impl GpuTrainer {
             return Err("Threat width must be positive, even and <= FT output width".into());
         }
         #[cfg(feature = "native")]
+        let partial_forward_wide = if precision.ft_fp16_out && width < ft_out {
+            let wide = match std::env::var("TATARA_PARTIAL_FORWARD").as_deref() {
+                Ok("wide") | Err(std::env::VarError::NotPresent) => true,
+                Ok("narrow") => false,
+                _ => return Err("TATARA_PARTIAL_FORWARD must be wide or narrow".into()),
+            } && partial_ft_forward_wide_eligible(ft_out, width);
+            let mode = if wide { "wide" } else { "narrow" };
+            println!("[threat] partial-width forward: {mode}");
+            wide
+        } else {
+            false
+        };
+        #[cfg(feature = "native")]
         let partial_gather = if !forward_only
             && precision.ft_fp16_out
             && width < ft_out
@@ -2973,6 +2994,8 @@ impl GpuTrainer {
                 None
             },
             threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
+            #[cfg(feature = "native")]
+            partial_forward_wide,
             #[cfg(feature = "native")]
             partial_gather,
             #[cfg(feature = "native")]
@@ -4089,7 +4112,13 @@ impl GpuTrainer {
         let forward = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
         #[cfg(feature = "native")]
         self.build_ft_forward_order(batch)?;
-        let lanes = if cfg!(feature = "native")
+        #[cfg(feature = "native")]
+        let wide = self.partial_forward_wide;
+        #[cfg(not(feature = "native"))]
+        let wide = false;
+        let lanes = if wide {
+            8
+        } else if cfg!(feature = "native")
             && rows.is_multiple_of(8)
             && self.feature_set.threat_width(rows).is_multiple_of(8)
         {
@@ -4126,11 +4155,20 @@ impl GpuTrainer {
                 .expect("FP16 output allocated");
                 #[cfg(feature = "native")]
                 if let Some(half) = &self.partial_ft_w_h {
+                    // SAFETY: wide selection ensures both half-widths are aligned to eight FP16 elements.
                     unsafe {
-                        cuda_launch! {
-                            kernel: partial_ft_forward_fp16_weights_out, stream: self.stream, module: self.module, config: config,
-                            args: [slice(half), slice(indices), slice(self.ws.nnz_dev), slice(output),
-                                   slice(self.partial_ft_shape), batch_order, slice(order)]
+                        if wide {
+                            cuda_launch! {
+                                kernel: partial_ft_forward_fp16_weights_out_wide, stream: self.stream, module: self.module, config: config,
+                                args: [slice(half), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                                       slice(self.partial_ft_shape), batch_order, slice(order)]
+                            }
+                        } else {
+                            cuda_launch! {
+                                kernel: partial_ft_forward_fp16_weights_out, stream: self.stream, module: self.module, config: config,
+                                args: [slice(half), slice(indices), slice(self.ws.nnz_dev), slice(output),
+                                       slice(self.partial_ft_shape), batch_order, slice(order)]
+                            }
                         }
                     }?;
                     continue;

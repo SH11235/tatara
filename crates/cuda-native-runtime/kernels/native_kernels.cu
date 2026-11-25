@@ -4780,6 +4780,27 @@ extern "C" __global__ void partial_ft_fold_to_fp16(
     }
 }
 
+__device__ __forceinline__ void ft_forward_accumulate8(const __half* source, float* sums) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(source);
+    const unsigned int pairs[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        sums[2 * j] += __half2float(__ushort_as_half(static_cast<unsigned short>(pairs[j])));
+        sums[2 * j + 1] += __half2float(__ushort_as_half(static_cast<unsigned short>(pairs[j] >> 16)));
+    }
+}
+
+__device__ __forceinline__ void ft_forward_store8(__half* destination, const float* sums) {
+    unsigned int pairs[4];
+#pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        const unsigned int lo = __half_as_ushort(__float2half_rn(sums[2 * j]));
+        const unsigned int hi = __half_as_ushort(__float2half_rn(sums[2 * j + 1]));
+        pairs[j] = lo | (hi << 16);
+    }
+    *reinterpret_cast<uint4*>(destination) = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+}
+
 template <unsigned Lanes, typename Weight, typename Output>
 __device__ __forceinline__ void native_partial_ft_forward_columns(
     const Weight* weight, const int* indices, const int* nnz, bool has_piece_limits, Output* out,
@@ -4821,7 +4842,9 @@ __device__ __forceinline__ void native_partial_ft_forward_columns(
         } else {
             continue;
         }
-        if constexpr (Lanes == 4) {
+        if constexpr (Lanes == 8) {
+            ft_forward_accumulate8(weight + offset, sums);
+        } else if constexpr (Lanes == 4) {
             float values[4];
             ft_forward_load4(weight + offset, values);
             #pragma unroll
@@ -4833,13 +4856,18 @@ __device__ __forceinline__ void native_partial_ft_forward_columns(
             sums[0] += value;
         }
     }
-    #pragma unroll
-    for (unsigned lane = 0; lane < Lanes; ++lane) {
-        ft_forward_store(out + partial_ft_row_offset(b, rows) + col + lane, sums[lane]);
+    auto destination = out + partial_ft_row_offset(b, rows) + col;
+    if constexpr (Lanes == 8) {
+        ft_forward_store8(destination, sums);
+    } else {
+        #pragma unroll
+        for (unsigned lane = 0; lane < Lanes; ++lane) {
+            ft_forward_store(destination + lane, sums[lane]);
+        }
     }
 }
 
-template <typename Weight, typename Output>
+template <bool Wide = false, typename Weight, typename Output>
 __device__ __forceinline__ void native_partial_ft_forward(
     const Weight* weight, const int* indices, const int* nnz, Output* out,
     const unsigned* shape, unsigned long long batch_order, const int* order
@@ -4849,7 +4877,9 @@ __device__ __forceinline__ void native_partial_ft_forward(
     const unsigned batch = batch_flags & ~piece_limits_bit;
     const unsigned order_base = static_cast<unsigned>(batch_order >> 32);
     const bool has_piece_limits = (batch_flags & piece_limits_bit) != 0 && order_base != ~0U;
-    if (shape[0] % 8 == 0 && shape[3] % 8 == 0)
+    if constexpr (Wide)
+        native_partial_ft_forward_columns<8>(weight, indices, nnz, has_piece_limits, out, shape, batch, order, order_base);
+    else if (shape[0] % 8 == 0 && shape[3] % 8 == 0)
         native_partial_ft_forward_columns<4>(weight, indices, nnz, has_piece_limits, out, shape, batch, order, order_base);
     else
         native_partial_ft_forward_columns<1>(weight, indices, nnz, has_piece_limits, out, shape, batch, order, order_base);
@@ -4883,6 +4913,16 @@ extern "C" __global__ void partial_ft_forward_fp16_weights_out(
     const int* order, unsigned long long) {
     native_partial_ft_forward(weight, indices, nnz, out, shape, batch_order, order);
 }
+
+// The host aligns both half-widths to eight columns so no uint4 crosses a split.
+extern "C" __global__ void partial_ft_forward_fp16_weights_out_wide(
+    const __half* weight, unsigned long long, const int* indices, unsigned long long,
+    const int* nnz, unsigned long long, __half* out, unsigned long long,
+    const unsigned* shape, unsigned long long, unsigned long long batch_order,
+    const int* order, unsigned long long) {
+    native_partial_ft_forward<true>(weight, indices, nnz, out, shape, batch_order, order);
+}
+
 __device__ __forceinline__ void partial_ft_gather_impl(
     const float* gradient, const unsigned* positions, const unsigned* offsets,
     float* result, const unsigned* shape, unsigned add, float scale, const unsigned* active_rows) {
