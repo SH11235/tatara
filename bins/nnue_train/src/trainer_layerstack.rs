@@ -176,6 +176,8 @@ pub(super) fn partial_ft_forward_wide_eligible(rows: usize, width: usize) -> boo
 pub(crate) enum PartialGather {
     Row,
     Tile,
+    TileUnroll12,
+    TileWide,
 }
 
 #[cfg(feature = "native")]
@@ -184,6 +186,8 @@ impl PartialGather {
         match std::env::var("TATARA_PARTIAL_GATHER").as_deref() {
             Ok("row") => Ok(Self::Row),
             Ok("tile") => Ok(Self::Tile),
+            Ok("tile-unroll12") => Ok(Self::TileUnroll12),
+            Ok("tile-wide") => Ok(Self::TileWide.for_widths(rows, width)),
             Ok("auto") | Err(std::env::VarError::NotPresent) => {
                 // On an RTX 5090 the row walk wins up to FT 3072 + Threat 1024 (its column tiles stay in
                 // L2) and the tiled launch wins from FT 4096 + Threat 1408 up; narrow-L2 GPUs favor
@@ -195,7 +199,18 @@ impl PartialGather {
                     Self::Row
                 })
             }
-            _ => Err("TATARA_PARTIAL_GATHER must be auto, row, or tile".into()),
+            _ => Err(
+                "TATARA_PARTIAL_GATHER must be auto, row, tile, tile-unroll12, or tile-wide".into(),
+            ),
+        }
+    }
+
+    fn for_widths(self, rows: usize, width: usize) -> Self {
+        // Each four-column access must fit in one FP16 half-row and be eight-byte aligned.
+        if self == Self::TileWide && !(rows.is_multiple_of(8) && width.is_multiple_of(8)) {
+            Self::Tile
+        } else {
+            self
         }
     }
 }
@@ -256,11 +271,61 @@ pub(crate) fn partial_ft_gather_row_config(
 }
 
 #[cfg(feature = "native")]
-pub(crate) fn partial_ft_gather_tile_config(features: usize, width: usize) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (features.div_ceil(2) as u32, width.div_ceil(128) as u32, 1),
-        block_dim: (64, 2, 1),
-        shared_mem_bytes: 0,
+pub(crate) struct PartialGatherTile<'a> {
+    pub(crate) gradient: &'a DeviceBuffer<f16>,
+    pub(crate) positions: &'a DeviceBuffer<u32>,
+    pub(crate) offsets: &'a DeviceBuffer<u32>,
+    pub(crate) result: &'a DeviceBuffer<f32>,
+    pub(crate) active_rows: &'a DeviceBuffer<u32>,
+}
+
+#[cfg(feature = "native")]
+impl PartialGatherTile<'_> {
+    /// # Safety
+    /// The inverse index and mask must cover the section, and the gradient and result must
+    /// contain its full input and output ranges. The two half-row boundaries must be even.
+    pub(crate) unsafe fn launch(
+        &self,
+        module: &CudaModule,
+        stream: &CudaStream,
+        mode: PartialGather,
+        [first, count, rows, width]: [usize; 4],
+        (add, scale): (u32, f32),
+    ) -> gpu_runtime::Result<()> {
+        let (kernel, tile_width) = match mode.for_widths(rows, width) {
+            PartialGather::Tile => ("partial_ft_gather_fp16_pairs_active_tile", 128),
+            PartialGather::TileUnroll12 => {
+                ("partial_ft_gather_fp16_pairs_active_tile_unroll12", 128)
+            }
+            PartialGather::TileWide => ("partial_ft_gather_fp16_quads_active_tile", 256),
+            PartialGather::Row => unreachable!(),
+        };
+        let config = LaunchConfig {
+            grid_dim: (
+                count.div_ceil(2) as u32,
+                width.div_ceil(tile_width) as u32,
+                1,
+            ),
+            block_dim: (64, 2, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut args = gpu_runtime::KernelArgs::new();
+        args.push_slice(self.gradient);
+        args.push_slice(self.positions);
+        args.push_slice(self.offsets);
+        args.push_slice(self.result);
+        args.push_slice(self.active_rows);
+        for value in [first, count, rows, width] {
+            args.push_scalar(value as u32);
+        }
+        args.push_scalar(add);
+        args.push_scalar(scale);
+        // SAFETY: the kernels share the encoded ABI, and the caller guarantees the ranges.
+        unsafe { module.launch(kernel, stream, config, &mut args) }.map_err(|source| {
+            gpu_runtime::Error::KernelArtifact(format!(
+                "CUDA kernel launch `{kernel}` failed: {source}"
+            ))
+        })
     }
 }
 
@@ -4332,7 +4397,14 @@ impl GpuTrainer {
                 let base = spec.base_ft_in();
                 let threats = spec.threat_dims();
                 let width = spec.threat_width(rows);
-                if active_rows_only && self.partial_gather == PartialGather::Tile {
+                if active_rows_only && self.partial_gather != PartialGather::Row {
+                    let tile = PartialGatherTile {
+                        gradient,
+                        positions: &self.ws.feat_positions,
+                        offsets: &self.ws.feat_offsets,
+                        result: &self.ft_w_grad,
+                        active_rows: &self.ws.ft_active_rows,
+                    };
                     // Separate the widths so the grid needs no empty Threat column tiles.
                     for (first, count, packed_width) in [(0, base, rows), (base, threats, width)] {
                         if count == 0 {
@@ -4341,13 +4413,13 @@ impl GpuTrainer {
                         // SAFETY: each launch owns its section of the packed real block.
                         // Both half-boundaries are even and the mask covers both sections.
                         unsafe {
-                            cuda_launch! {
-                                kernel: partial_ft_gather_fp16_pairs_active_tile, stream: self.stream, module: self.module,
-                                config: partial_ft_gather_tile_config(count, packed_width),
-                                args: [slice(gradient), slice(self.ws.feat_positions), slice(self.ws.feat_offsets),
-                                       slice(self.ft_w_grad), slice(self.ws.ft_active_rows), first as u32,
-                                       count as u32, rows as u32, packed_width as u32, perspective as u32, scale]
-                            }
+                            tile.launch(
+                                &self.module,
+                                &self.stream,
+                                self.partial_gather,
+                                [first, count, rows, packed_width],
+                                (perspective as u32, scale),
+                            )
                         }?;
                     }
                     return Ok(());

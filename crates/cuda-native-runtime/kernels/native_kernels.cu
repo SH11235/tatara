@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 constexpr unsigned FT_GRAD_TILE = 16;
 constexpr unsigned FT_GRAD_ACTIVE = 40;
@@ -5028,14 +5029,14 @@ extern "C" __global__ void partial_ft_gather_fp16_pairs_active_row(
 ) {
     partial_ft_gather_fp16_pairs_impl(gradient, positions, offsets, result, shape, add, scale, active_rows);
 }
-extern "C" __global__ void partial_ft_gather_fp16_pairs_active_tile(
-    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
-    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
-    const unsigned* active_rows, unsigned long long, unsigned feature_base, unsigned features,
+template <unsigned Columns, unsigned Occurrences>
+__device__ __forceinline__ void partial_ft_gather_fp16_active_tile(
+    const __half* gradient, const unsigned* positions, const unsigned* offsets, float* result,
+    const unsigned* active_rows, unsigned feature_base, unsigned features,
     unsigned rows, unsigned width, unsigned add, float scale
 ) {
     const unsigned feature = blockIdx.x * blockDim.y + threadIdx.y;
-    const unsigned c = 2 * (blockIdx.y * blockDim.x + threadIdx.x);
+    const unsigned c = Columns * (blockIdx.y * blockDim.x + threadIdx.x);
     if (feature >= features || c >= width) return;
     const unsigned f = feature_base + feature;
     unsigned p = offsets[f];
@@ -5046,39 +5047,98 @@ extern "C" __global__ void partial_ft_gather_fp16_pairs_active_tile(
     const unsigned col = c >= width / 2 ? c + (rows - width) / 2 : c;
     const __half* column = gradient + col;
     auto load = [&](unsigned position) {
-        return *reinterpret_cast<const unsigned*>(column + partial_ft_row_offset(position, rows));
+        const __half* source = column + partial_ft_row_offset(position, rows);
+        if constexpr (Columns == 4) {
+            return *reinterpret_cast<const uint2*>(source);
+        } else {
+            return *reinterpret_cast<const unsigned*>(source);
+        }
     };
     float lo = 0.0F, hi = 0.0F;
-    auto accumulate = [&](unsigned packed) {
-        lo = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed))), scale, lo);
-        hi = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed >> 16))), scale, hi);
+    float lo_next = 0.0F, hi_next = 0.0F;
+    auto accumulate_pair = [&](unsigned packed, float& first, float& second) {
+        first = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed))), scale, first);
+        second = __fmaf_rn(__half2float(__ushort_as_half(static_cast<unsigned short>(packed >> 16))), scale, second);
+    };
+    using Packed = decltype(load(0));
+    auto accumulate = [&](Packed packed) {
+        if constexpr (Columns == 4) {
+            accumulate_pair(packed.x, lo, hi);
+            accumulate_pair(packed.y, lo_next, hi_next);
+        } else {
+            accumulate_pair(packed, lo, hi);
+        }
+    };
+    auto gather_group = [&](auto group_size) {
+        constexpr unsigned count = decltype(group_size)::value;
+        unsigned index[count];
+        Packed values[count];
+#pragma unroll
+        for (unsigned i = 0; i < count; ++i) index[i] = positions[p + i];
+#pragma unroll
+        for (unsigned i = 0; i < count; ++i) values[i] = load(index[i]);
+#pragma unroll
+        for (unsigned i = 0; i < count; ++i) accumulate(values[i]);
     };
     // Issue independent index and gradient loads while keeping each column's FMA chain in order.
+    if constexpr (Occurrences > 4) {
 #pragma unroll 1
-    for (; end - p >= 4; p += 4) {
-        const unsigned p0 = positions[p];
-        const unsigned p1 = positions[p + 1];
-        const unsigned p2 = positions[p + 2];
-        const unsigned p3 = positions[p + 3];
-        const unsigned g0 = load(p0);
-        const unsigned g1 = load(p1);
-        const unsigned g2 = load(p2);
-        const unsigned g3 = load(p3);
-        accumulate(g0);
-        accumulate(g1);
-        accumulate(g2);
-        accumulate(g3);
+        for (; end - p >= Occurrences; p += Occurrences)
+            gather_group(std::integral_constant<unsigned, Occurrences>{});
     }
+#pragma unroll 1
+    for (; end - p >= 4; p += 4) gather_group(std::integral_constant<unsigned, 4>{});
     for (; p < end; ++p) accumulate(load(positions[p]));
 
     float* target = result + partial_ft_row_offset(feature_base, rows)
                            + partial_ft_row_offset(feature, width) + c;
-    if (add) {
-        const float2 stm = *reinterpret_cast<const float2*>(target);
-        lo = stm.x + lo;
-        hi = stm.y + hi;
+    if constexpr (Columns == 4) {
+        if (add) {
+            const float4 stm = *reinterpret_cast<const float4*>(target);
+            lo = stm.x + lo;
+            hi = stm.y + hi;
+            lo_next = stm.z + lo_next;
+            hi_next = stm.w + hi_next;
+        }
+        *reinterpret_cast<float4*>(target) = make_float4(lo, hi, lo_next, hi_next);
+    } else {
+        if (add) {
+            const float2 stm = *reinterpret_cast<const float2*>(target);
+            lo = stm.x + lo;
+            hi = stm.y + hi;
+        }
+        *reinterpret_cast<float2*>(target) = make_float2(lo, hi);
     }
-    *reinterpret_cast<float2*>(target) = make_float2(lo, hi);
+}
+
+extern "C" __global__ void partial_ft_gather_fp16_pairs_active_tile(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* active_rows, unsigned long long, unsigned feature_base, unsigned features,
+    unsigned rows, unsigned width, unsigned add, float scale
+) {
+    partial_ft_gather_fp16_active_tile<2, 4>(
+        gradient, positions, offsets, result, active_rows, feature_base, features, rows, width, add, scale);
+}
+
+extern "C" __global__ void partial_ft_gather_fp16_pairs_active_tile_unroll12(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* active_rows, unsigned long long, unsigned feature_base, unsigned features,
+    unsigned rows, unsigned width, unsigned add, float scale
+) {
+    partial_ft_gather_fp16_active_tile<2, 12>(
+        gradient, positions, offsets, result, active_rows, feature_base, features, rows, width, add, scale);
+}
+
+extern "C" __global__ void partial_ft_gather_fp16_quads_active_tile(
+    const __half* gradient, unsigned long long, const unsigned* positions, unsigned long long,
+    const unsigned* offsets, unsigned long long, float* result, unsigned long long,
+    const unsigned* active_rows, unsigned long long, unsigned feature_base, unsigned features,
+    unsigned rows, unsigned width, unsigned add, float scale
+) {
+    partial_ft_gather_fp16_active_tile<4, 4>(
+        gradient, positions, offsets, result, active_rows, feature_base, features, rows, width, add, scale);
 }
 extern "C" __global__ void ft_expand_indices(
     const int* packed_stm, unsigned long long, const int* packed_nstm, unsigned long long,

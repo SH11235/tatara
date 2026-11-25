@@ -422,8 +422,15 @@ fn partial_threat_active_gather_and_reduce_preserve_gradient_bits()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::trainer_layerstack::PartialGather;
 
-    check_partial_threat_active_gather_bits(PartialGather::Row)?;
-    check_partial_threat_active_gather_bits(PartialGather::Tile)
+    for variant in [
+        PartialGather::Row,
+        PartialGather::Tile,
+        PartialGather::TileUnroll12,
+        PartialGather::TileWide,
+    ] {
+        check_partial_threat_active_gather_bits(variant)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native")]
@@ -431,7 +438,7 @@ fn check_partial_threat_active_gather_bits(
     variant: crate::trainer_layerstack::PartialGather,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::trainer_layerstack::{
-        PartialGather, partial_ft_gather_row_config, partial_ft_gather_tile_config,
+        PartialGather, PartialGatherTile, partial_ft_gather_row_config,
     };
 
     let ctx = test_cuda_context()?;
@@ -446,16 +453,23 @@ fn check_partial_threat_active_gather_bits(
     let active = [1_u32, 1, 0, 1, 1, 0, 1, 1];
     let mask = DeviceBuffer::from_host(&stream, &active)?;
     let pairs = DeviceBuffer::from_host(&stream, &[0_u32, 2, 4])?;
+    let compare_to_tile = matches!(
+        variant,
+        PartialGather::TileUnroll12 | PartialGather::TileWide
+    );
     let lists: [[&[u32]; 8]; 2] = [
         [
-            &[3, 9, 0, 5, 3, 1, 2, 9, 10],
+            &[
+                3, 9, 0, 5, 3, 1, 2, 9, 10, 7, 2, 3, 8, 4, 6, 1, 10, 2, 9, 5, 0, 4, 2, 8, 10, 1, 6,
+                7, 5,
+            ],
             &[],
             &[],
             &[8],
             &[10, 1, 7, 2, 4],
             &[],
             &[],
-            &[2, 4, 5],
+            &[2, 4, 5, 1, 7, 8, 4, 0],
         ],
         [
             &[],
@@ -464,13 +478,14 @@ fn check_partial_threat_active_gather_bits(
             &[5, 5, 3, 0, 10, 7, 0],
             &[],
             &[],
-            &[9, 1, 8, 6],
+            &[9, 1, 8, 6, 5, 4, 1, 3, 7],
             &[4],
         ],
     ];
     let stale = f32::from_bits(0x7fc0_0001);
     for (rows, width) in [
         (320_usize, 192_usize),
+        (320, 196),
         (320, 130),
         (321, 193),
         (1536, 512),
@@ -478,7 +493,7 @@ fn check_partial_threat_active_gather_bits(
         (8192, 2816),
     ] {
         let paired = rows.is_multiple_of(4) && width.is_multiple_of(4);
-        if !paired && variant == PartialGather::Tile {
+        if !paired && variant != PartialGather::Row {
             continue;
         }
         let shape = DeviceBuffer::from_host(
@@ -515,14 +530,23 @@ fn check_partial_threat_active_gather_bits(
                 .collect();
             let half = DeviceBuffer::from_host(&stream, &hg)?;
             let add = perspective as u32;
+            let tile = PartialGatherTile {
+                gradient: &half,
+                positions: &positions,
+                offsets: &offsets,
+                result: &actual,
+                active_rows: &mask,
+            };
             // SAFETY: all positions are in the batch, the mask covers all features,
             // and both launches cover the same packed real block.
             unsafe {
                 if paired {
-                    cuda_launch! {
-                        kernel: partial_ft_gather_fp16_pairs, stream: stream, module: module, config: pairs_config,
-                        args: [slice(half), slice(positions), slice(offsets), slice(reference), slice(shape), add, scale]
-                    }?;
+                    if !compare_to_tile {
+                        cuda_launch! {
+                            kernel: partial_ft_gather_fp16_pairs, stream: stream, module: module, config: pairs_config,
+                            args: [slice(half), slice(positions), slice(offsets), slice(reference), slice(shape), add, scale]
+                        }?;
+                    }
                     if variant == PartialGather::Row {
                         cuda_launch! {
                             kernel: partial_ft_gather_fp16_pairs_active_row, stream: stream, module: module, config: pairs_config,
@@ -532,12 +556,21 @@ fn check_partial_threat_active_gather_bits(
                         for (first, count, packed_width) in
                             [(0, base, rows), (base, threats, width)]
                         {
-                            cuda_launch! {
-                                kernel: partial_ft_gather_fp16_pairs_active_tile, stream: stream, module: module,
-                                config: partial_ft_gather_tile_config(count, packed_width),
-                                args: [slice(half), slice(positions), slice(offsets), slice(actual), slice(mask),
-                                       first as u32, count as u32, rows as u32, packed_width as u32, add, scale]
-                            }?;
+                            let section = [first, count, rows, packed_width];
+                            if compare_to_tile {
+                                PartialGatherTile {
+                                    result: &reference,
+                                    ..tile
+                                }
+                                .launch(
+                                    &module,
+                                    &stream,
+                                    PartialGather::Tile,
+                                    section,
+                                    (add, scale),
+                                )?;
+                            }
+                            tile.launch(&module, &stream, variant, section, (add, scale))?;
                         }
                     }
                 } else {
@@ -574,10 +607,17 @@ fn check_partial_threat_active_gather_bits(
         }
         // SAFETY: both launches write only the virtual rows after the real block.
         unsafe {
-            cuda_launch! {
-                kernel: partial_ft_reduce, stream: stream, module: module, config: cfg_1d(virtual_len),
-                args: [slice(reference), slice(pairs), slice(shape)]
-            }?;
+            if compare_to_tile {
+                cuda_launch! {
+                    kernel: partial_ft_reduce_active, stream: stream, module: module, config: cfg_1d(virtual_len),
+                    args: [slice(reference), slice(pairs), slice(shape), slice(mask)]
+                }?;
+            } else {
+                cuda_launch! {
+                    kernel: partial_ft_reduce, stream: stream, module: module, config: cfg_1d(virtual_len),
+                    args: [slice(reference), slice(pairs), slice(shape)]
+                }?;
+            }
             cuda_launch! {
                 kernel: partial_ft_reduce_active, stream: stream, module: module, config: cfg_1d(virtual_len),
                 args: [slice(actual), slice(pairs), slice(shape), slice(mask)]
