@@ -26,13 +26,35 @@ mod tests {
     #[test]
     fn qat_cli_defaults_to_inheritance_and_accepts_explicit_switches() {
         for (args, expected) in [
-            (vec!["nnue-train", "layerstack"], None),
             (
-                vec!["nnue-train", "layerstack", "--qat", "off"],
+                vec![
+                    "nnue-train",
+                    "layerstack",
+                    "--layerstack-head",
+                    "split-skip",
+                ],
+                None,
+            ),
+            (
+                vec![
+                    "nnue-train",
+                    "layerstack",
+                    "--layerstack-head",
+                    "split-skip",
+                    "--qat",
+                    "off",
+                ],
                 Some(QatMode::Off),
             ),
             (
-                vec!["nnue-train", "layerstack", "--qat", "dense"],
+                vec![
+                    "nnue-train",
+                    "layerstack",
+                    "--layerstack-head",
+                    "split-skip",
+                    "--qat",
+                    "dense",
+                ],
                 Some(QatMode::Dense),
             ),
         ] {
@@ -43,6 +65,16 @@ mod tests {
             assert_eq!(args.qat, expected);
         }
         assert!(Cli::try_parse_from(["nnue-train", "simple", "--qat", "dense"]).is_err());
-        assert!(Cli::try_parse_from(["nnue-train", "layerstack", "--qat", "full"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "nnue-train",
+                "layerstack",
+                "--layerstack-head",
+                "split-skip",
+                "--qat",
+                "full"
+            ])
+            .is_err()
+        );
     }
 }

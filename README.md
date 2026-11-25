@@ -50,7 +50,7 @@ compare pos/s with and without `--all-optim`):
 cargo run --release --bin nnue-train -- \
   --data /path/to/teacher.psv --progress-coeff /path/to/progress.bin \
   --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
-  layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
+  layerstack --layerstack-head split-skip --ft-out {1536|768} --l1 {16|8} --l2 32
 
 # HalfKP (simple, no progress needed; the simple trainer requires --win-rate-model)
 cargo run --release --bin nnue-train -- \

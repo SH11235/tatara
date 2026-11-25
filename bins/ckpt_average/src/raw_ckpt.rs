@@ -12,9 +12,11 @@ use std::path::Path;
 use nnue_format::layerstack_weights::coalesce_ft_factorized;
 use nnue_format::{LayerStackHead, LayerStackWeights};
 use nnue_train::dataloader::BucketMode;
+#[cfg(test)]
 use nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG;
 use nnue_train::raw_checkpoint::{
-    RawCkptReadMode, RawCkptReader, TENSORS_PER_GROUP, decode_qat_flags, read_raw_ckpt_group_len,
+    RawCkptReadMode, RawCkptReader, TENSORS_PER_GROUP, decode_qat_flags, layerstack_topology_head,
+    read_raw_ckpt_group_len,
 };
 use shogi_features::{
     BucketSpec, EffectBucketConfig, FeatureSet, FeatureSetSpec, FtFactorizeMode, ThreatProfile,
@@ -295,23 +297,10 @@ pub(crate) fn layerstack_layout(id: &CkptIdentity) -> io::Result<LayerStackLayou
             id.arch_kind
         )));
     }
-    let &[ft_out, l1_out, l2_out, num_buckets, ref psqt_dims @ ..] = id.topology.as_slice() else {
+    let &[ft_out, l1_out, l2_out, num_buckets, ..] = id.topology.as_slice() else {
         return Err(invalid("invalid LayerStack topology"));
     };
-    let (head, with_psqt) = match psqt_dims {
-        [] => (LayerStackHead::Standard, false),
-        &[psqt_buckets] if psqt_buckets == num_buckets => (LayerStackHead::Standard, true),
-        &[psqt_buckets, DENSE_CONCAT_TOPOLOGY_TAG]
-            if psqt_buckets == 0 || psqt_buckets == num_buckets =>
-        {
-            (LayerStackHead::DenseConcat, psqt_buckets != 0)
-        }
-        _ => {
-            return Err(invalid(
-                "invalid LayerStack head, PSQT topology or bucket count",
-            ));
-        }
-    };
+    let (head, with_psqt) = layerstack_topology_head(&id.topology)?;
     if ft_out == 0
         || !ft_out.is_multiple_of(2)
         || l1_out < 2
@@ -516,7 +505,7 @@ pub(crate) mod tests {
 
     pub(crate) fn layout() -> LayerStackLayout {
         LayerStackLayout {
-            head: LayerStackHead::Standard,
+            head: LayerStackHead::SplitSkip,
             train_spec: train_spec(),
             ft_out: FT_OUT,
             l1_out: L1,
@@ -570,7 +559,7 @@ pub(crate) mod tests {
         weight: impl Fn(usize, usize) -> f32,
     ) {
         let lay = LayerStackLayout {
-            head: LayerStackHead::Standard,
+            head: LayerStackHead::SplitSkip,
             train_spec: spec,
             ft_out: topology[0] as usize,
             l1_out: topology[1] as usize,
@@ -916,7 +905,7 @@ pub(crate) mod tests {
         use nnue_format::layerstack_weights::{QA, QB};
         let spec = FeatureSet::HalfKp.spec();
         let (ft, l1, l2, nb) = (4, 16, 32, 2);
-        let standard = [ft, l1, l2, nb].map(|n| n as u64);
+        let split_skip = [ft, l1, l2, nb].map(|n| n as u64);
         let dense = [
             ft as u64,
             l1 as u64,
@@ -934,7 +923,7 @@ pub(crate) mod tests {
             let (topology, l2_in, l3_in) = if index < 2 {
                 (dense.as_slice(), 2 * l1, 2 * (l1 + l2))
             } else {
-                (standard.as_slice(), 2 * (l1 - 1), l2)
+                (split_skip.as_slice(), 2 * (l1 - 1), l2)
             };
             let arch = RawCkptArch {
                 feature_set: spec,

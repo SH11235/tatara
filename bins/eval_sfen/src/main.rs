@@ -680,16 +680,16 @@ mod tests {
     #[test]
     fn psqt_load_is_supported_only_for_dense_concat() {
         let spec = FeatureSet::HalfKaHmMerged.spec();
-        for head in [LayerStackHead::Standard, LayerStackHead::DenseConcat] {
+        for head in [LayerStackHead::SplitSkip, LayerStackHead::DenseConcat] {
             let mut weights = LayerStackWeights::zeroed_with_head(spec, 4, 16, 32, 1, head);
             weights.psqt_w = Some(vec![0.0; spec.ft_in()]);
             let mut bytes = Vec::new();
             weights.save_quantised(&mut bytes, None).unwrap();
             match head {
-                LayerStackHead::Standard => assert!(
+                LayerStackHead::SplitSkip => assert!(
                     load_layerstack(&bytes)
                         .err()
-                        .expect("standard PSQT net must be rejected")
+                        .expect("SplitSkip PSQT net must be rejected")
                         .to_string()
                         .contains("PSQT not requested")
                 ),

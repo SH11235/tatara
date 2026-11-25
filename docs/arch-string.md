@@ -106,7 +106,8 @@ Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform[1<-32](Cl
 | `ClippedReLU[32]` | 32 要素の clipped ReLU |
 | `AffineTransform[1<-32]` | 出力層、32 → 1 |
 
-LayerStack の arch string は dense 層チェーンの要約で、L1 shared skip 接続や
+SplitSkip は `fc_0` の最後の出力を近道専用に取り分け、残りを活性化する。
+arch string は dense 層チェーンの要約で、L1 shared skip 接続や
 pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 有効時の
 `PSQT=<N>` トークンにのみ現れる)。EffectBucket feature set の config は
 `EffectBucket=<config>` トークンに現れる。LayerStack の完全なアーキ記述は
@@ -116,11 +117,13 @@ pairwise・per-bucket 構造は文字列に現れない (bucket 数は `--psqt` 
 
 `nnue-train layerstack --layerstack-head dense-concat --ft-out 2304 --l1 16 --l2 64`
 で DenseConcat を選ぶ。L1 は 16 の正の倍数、L2 は 32 または 64 を指定する。
-DenseConcat の checkpoint を `--resume` や `--eval-only` で使う場合も同じ
-head と寸法を指定する。既定値は `--layerstack-head standard`。
+新規学習では `--layerstack-head split-skip` または `--layerstack-head dense-concat`
+を指定する。`--resume` と `--eval-only` は保存済みの head を使う。明示する場合は
+保存済みの head と一致させる。head の記録がない checkpoint は SplitSkip として読む。
+寸法は保存済みのネットワークと一致させる。
 
 ヘッダは `Network=` の直前に `Head=DenseConcat,` を含む。
-`Head=` がないファイルは standard として読み、未知の値はエラーになる。
+`Head=` がないファイルは SplitSkip として読み、未知の値はエラーになる。
 FT 幅 2304、L1 幅 16、L2 幅 64 の例を示す。
 
 ```text
@@ -131,7 +134,7 @@ Features=HalfKaHmMerged(Friend)[73305->2304x2],Head=DenseConcat,Network=AffineTr
 arch 文字列は FT の両視点を `FT*2` と表記する。直列化する `fc_0` の入力幅は
 両視点に pairwise 積を適用したあとの幅 `FT` になる。
 
-ファイルの外側の並びは standard と同じ。各 bucket は little-endian の
+ファイルの外側の並びは SplitSkip と同じ。各 bucket は little-endian の
 `fc_hash` に続き、次の順に格納する。
 
 | 層 | バイアス（i32） | 重み（i8） |
@@ -141,7 +144,7 @@ arch 文字列は FT の両視点を `FT*2` と表記する。直列化する `f
 | `fc_2` | 1 | `1 × pad32(C)` |
 
 重みは出力行を先に並べ、各行の入力末尾を 32 の倍数までゼロ埋めする。
-`fc_hash` とヘッダの network hash はそれぞれ standard の計算結果と
+`fc_hash` とヘッダの network hash はそれぞれ SplitSkip の計算結果と
 `0x44434E43` の排他的論理和。
 
 バイアスは `127*64` 倍、重みは 64 倍して最も近い整数に丸め、ちょうど中間の
@@ -154,8 +157,8 @@ arch 文字列は FT の両視点を `FT*2` と表記する。直列化する `f
 
 `fc_1` に `[fc_0 の二乗側, fc_0 の線形側]` を入力する。`fc_2` にはその後ろに
 `[fc_1 の二乗側, fc_1 の線形側]` をつないで入力する。`fc_2` の出力に
-`fc_0[L1-2] - fc_0[L1-1]` を加えた値に standard と同じ評価値のスケールを適用する。
-FT、PSQT、Threat、EffectBucket、bucket 選択の規則も standard と共通。
+`fc_0[L1-2] - fc_0[L1-1]` を加えた値に SplitSkip と同じ評価値のスケールを適用する。
+FT、PSQT、Threat、EffectBucket、bucket 選択の規則も SplitSkip と共通。
 YaneuraOu SFNN への変換はエラーになる。
 
 ## Simple の例
@@ -203,7 +206,7 @@ Simple 固有の点:
 ファイル内の文字列と照合する:
 
 - LayerStack は `Features=...` トークンの前方一致と network hash を照合する。
-  `Head=` がなければ standard として読み、`Head=DenseConcat` があれば DenseConcat として読む。
+  `Head=` がなければ SplitSkip として読み、`Head=DenseConcat` があれば DenseConcat として読む。
   未知の値や重複した `Head=` はエラーになる。DenseConcat は FT、L1、L2 の次元から組み立てた
   `Network=` 式がファイル内の式に完全一致することも確認する。
 - Simple: identity 部全体の一致で照合する。

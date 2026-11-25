@@ -4,6 +4,7 @@ use std::str::FromStr;
 use clap::{Args, Parser, Subcommand};
 #[cfg(any(feature = "gpu", test))]
 use nnue_format::ArchKind;
+use nnue_format::LayerStackHead;
 
 use crate::arch::*;
 
@@ -1697,27 +1698,35 @@ pub(crate) enum NativeBenchModeArg {
     Compare,
 }
 
-/// LayerStack アーキ固有の引数。
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum LayerStackHeadArg {
-    Standard,
+    SplitSkip,
     DenseConcat,
 }
 
-impl From<LayerStackHeadArg> for nnue_format::LayerStackHead {
+impl From<LayerStackHeadArg> for LayerStackHead {
     fn from(value: LayerStackHeadArg) -> Self {
         match value {
-            LayerStackHeadArg::Standard => Self::Standard,
+            LayerStackHeadArg::SplitSkip => Self::SplitSkip,
             LayerStackHeadArg::DenseConcat => Self::DenseConcat,
         }
     }
 }
 
+fn layerstack_head_name(head: LayerStackHead) -> &'static str {
+    match head {
+        LayerStackHead::SplitSkip => "split-skip",
+        LayerStackHead::DenseConcat => "dense-concat",
+    }
+}
+
+/// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
-    /// Dense head architecture.
-    #[arg(long, value_enum, default_value = "standard")]
-    pub(crate) layerstack_head: LayerStackHeadArg,
+    /// Dense head architecture. Required for new training.
+    /// With --resume or --eval-only, the saved head is used and any explicit choice must match it.
+    #[arg(long, value_enum)]
+    pub(crate) layerstack_head: Option<LayerStackHeadArg>,
 
     /// Dense weight/bias and activation quantization with straight-through gradients.
     /// Omitted: inherit raw checkpoint mode, or off for fresh training.
@@ -2062,6 +2071,50 @@ impl Cli {
 }
 
 impl Cli {
+    pub(crate) fn resolve_layerstack_head(&self) -> Result<Option<LayerStackHead>, String> {
+        let ArchCommand::LayerStack(args) = &self.arch else {
+            return Ok(None);
+        };
+        let requested = args.layerstack_head.map(LayerStackHead::from);
+        let read_only = self.eval_only || self.rescore_input.is_some() || self.threat_norm_dump;
+        let (saved, source) = if let Some(path) = &self.resume {
+            let head = std::fs::File::open(path)
+                .and_then(|file| {
+                    nnue_train::raw_checkpoint::read_layerstack_checkpoint_head(
+                        std::io::BufReader::new(file),
+                    )
+                })
+                .map_err(|error| format!("checkpoint '{}': {error}", path.display()))?;
+            (head, "checkpoint")
+        } else if read_only {
+            let Some(path) = &self.init_from else {
+                return Ok(requested);
+            };
+            let head = std::fs::File::open(path)
+                .and_then(|mut file| {
+                    nnue_format::layerstack_weights::read_layerstack_arch(&mut file)
+                })
+                .and_then(|arch| LayerStackHead::from_arch(&arch))
+                .map_err(|error| format!("network '{}': {error}", path.display()))?;
+            (head, "network")
+        } else {
+            return requested.map(Some).ok_or_else(|| {
+                "new LayerStack training requires --layerstack-head split-skip or --layerstack-head dense-concat"
+                    .into()
+            });
+        };
+        if let Some(head) = requested
+            && head != saved
+        {
+            return Err(format!(
+                "{source} head '{}' does not match --layerstack-head '{}'",
+                layerstack_head_name(saved),
+                layerstack_head_name(head)
+            ));
+        }
+        Ok(Some(saved))
+    }
+
     pub(crate) fn resolve_bucket_metadata(&mut self) -> Result<(), String> {
         let ArchCommand::LayerStack(args) = &mut self.arch else {
             return Ok(());

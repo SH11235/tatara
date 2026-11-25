@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 
-use nnue_format::ArchKind;
+use nnue_format::{ArchKind, LayerStackHead};
 use shogi_features::FeatureSetSpec;
 
 use crate::optimizer::OptimizerKind;
@@ -90,6 +90,50 @@ pub const RAW_CKPT_VERSION: u32 = 15;
 
 /// LayerStack topology extension: PSQT bucket count (zero if absent), then this head tag.
 pub const DENSE_CONCAT_TOPOLOGY_TAG: u64 = 1;
+
+pub fn layerstack_topology_head(topology: &[u64]) -> io::Result<(LayerStackHead, bool)> {
+    match topology {
+        [_, _, _, _] => Ok((LayerStackHead::SplitSkip, false)),
+        [_, _, _, buckets, psqt] if psqt == buckets => Ok((LayerStackHead::SplitSkip, true)),
+        [_, _, _, buckets, psqt, DENSE_CONCAT_TOPOLOGY_TAG] if *psqt == 0 || psqt == buckets => {
+            Ok((LayerStackHead::DenseConcat, *psqt != 0))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid LayerStack head, PSQT topology or bucket count",
+        )),
+    }
+}
+
+pub fn read_layerstack_checkpoint_head(r: impl Read) -> io::Result<LayerStackHead> {
+    let mut reader = RawCkptReader::new(r, RawCkptReadMode::Resume)?;
+    reader.features()?;
+    reader.producer_run_id()?;
+    let Some(arch_name) = reader.arch_name()? else {
+        return Ok(LayerStackHead::SplitSkip);
+    };
+    if arch_name != ArchKind::LayerStack.canonical_name() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected a LayerStack checkpoint, got '{arch_name}'"),
+        ));
+    }
+    reader.bucket_mode()?;
+    let count = reader.topology_count()?;
+    if !(4..=6).contains(&count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid LayerStack topology dimension count",
+        ));
+    }
+    let mut topology = [0; 6];
+    let topology = &mut topology[..count as usize];
+    for dim in &mut *topology {
+        *dim = reader.topology_dim()?;
+    }
+    layerstack_topology_head(topology).map(|(head, _)| head)
+}
+
 pub const RAW_CKPT_ARCH_HEADER_VERSION: u32 = 4;
 const PRODUCER_RECIPE_VERSION: u32 = 11;
 const ADAM_CHECKPOINT_VERSION: u32 = PRODUCER_RECIPE_VERSION;

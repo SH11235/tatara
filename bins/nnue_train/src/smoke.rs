@@ -446,7 +446,7 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_FT_OUT,
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
-        nnue_format::LayerStackHead::Standard,
+        nnue_format::LayerStackHead::SplitSkip,
         n_buckets,
         nnue_train::dataloader::BucketMode::ProgressKpAbs,
         PrecisionFlags::default(),

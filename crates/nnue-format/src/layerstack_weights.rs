@@ -183,7 +183,7 @@ pub const LEB128_MAGIC: &[u8] = b"COMPRESSED_LEB128";
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LayerStackHead {
     #[default]
-    Standard,
+    SplitSkip,
     DenseConcat,
 }
 
@@ -191,7 +191,7 @@ impl LayerStackHead {
     pub fn from_arch(arch: &str) -> io::Result<Self> {
         let invalid = |msg| io::Error::new(io::ErrorKind::InvalidData, msg);
         match parse_single_arch_token(arch, "Head=").map_err(|_| invalid("duplicate Head token"))? {
-            None => Ok(Self::Standard),
+            None => Ok(Self::SplitSkip),
             Some("DenseConcat") => Ok(Self::DenseConcat),
             Some(_) => Err(invalid("unknown LayerStack head")),
         }
@@ -199,7 +199,7 @@ impl LayerStackHead {
 
     pub const fn l1_activated(self, l1_out: usize) -> usize {
         match self {
-            Self::Standard => l1_out - 1,
+            Self::SplitSkip => l1_out - 1,
             Self::DenseConcat => l1_out,
         }
     }
@@ -210,7 +210,7 @@ impl LayerStackHead {
 
     pub const fn output_inputs(self, l1_out: usize, l2_out: usize) -> usize {
         match self {
-            Self::Standard => l2_out,
+            Self::SplitSkip => l2_out,
             Self::DenseConcat => 2 * l1_out + 2 * l2_out,
         }
     }
@@ -227,10 +227,10 @@ impl LayerStackHead {
         Ok(())
     }
 
-    pub const fn hash(self, standard: u32) -> u32 {
+    pub const fn hash(self, split_skip: u32) -> u32 {
         match self {
-            Self::Standard => standard,
-            Self::DenseConcat => standard ^ 0x44434E43,
+            Self::SplitSkip => split_skip,
+            Self::DenseConcat => split_skip ^ 0x44434E43,
         }
     }
 }
@@ -763,11 +763,11 @@ pub fn coalesce_ft_factorized(
 /// - `l1_b`: `(num_buckets, l1_out)` row-major
 /// - `l1_shared_weight`: `(ft_out, l1_out)` row-major、`l1_shared_weight[in * l1_out + out]`
 /// - `l1_shared_bias`: `(l1_out)` — FT 出力同様、長さがそのまま L1 出力次元 `l1_out`
-/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major。`l2_in` は standard で
+/// - `l2_w`: `(num_buckets, l2_out, l2_in)` row-major。`l2_in` は SplitSkip で
 ///   `2 * (l1_out - 1)`、DenseConcat で `2 * l1_out`。
 /// - `l2_b`: `(num_buckets, l2_out)`
 /// - `l3_w`: `(num_buckets, l3_in)` (out_dim=1 なので out 軸省略)。`l3_in` は
-///   standard で `l2_out`、DenseConcat で `2 * l1_out + 2 * l2_out`。
+///   SplitSkip で `l2_out`、DenseConcat で `2 * l1_out + 2 * l2_out`。
 /// - `l3_b`: `(num_buckets)`
 #[derive(Debug, Clone)]
 pub struct LayerStackWeights {
@@ -925,7 +925,7 @@ impl LayerStackWeights {
             l1_out,
             l2_out,
             num_buckets,
-            LayerStackHead::Standard,
+            LayerStackHead::SplitSkip,
         )
     }
 

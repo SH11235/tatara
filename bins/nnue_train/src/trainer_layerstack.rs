@@ -2266,8 +2266,8 @@ impl GpuWorkspace {
         let max_active = feature_set.max_active();
         // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
         // L2 入力次元。どちらも `l1_out` から導出する (struct method と同式)。
-        let standard_l1 = match head {
-            LayerStackHead::Standard => l1_out - 1,
+        let split_skip_l1 = match head {
+            LayerStackHead::SplitSkip => l1_out - 1,
             LayerStackHead::DenseConcat => 0,
         };
         let l2_in = head.l2_inputs(l1_out);
@@ -2330,10 +2330,10 @@ impl GpuWorkspace {
             dft_nstm_out_h: alloc_h(ft_fp16_out && !forward_only)?,
             l1_shared_out: z(padded_sort_batch(batch, num_buckets) * l1_out)?,
             l1_total: z(batch * l1_out)?,
-            l1_main: z(batch * standard_l1)?,
-            l1_skip: z(batch * usize::from(head == LayerStackHead::Standard))?,
-            l1_sqr: z(batch * standard_l1)?,
-            l2_pre: z(batch * 2 * standard_l1)?,
+            l1_main: z(batch * split_skip_l1)?,
+            l1_skip: z(batch * usize::from(head == LayerStackHead::SplitSkip))?,
+            l1_sqr: z(batch * split_skip_l1)?,
+            l2_pre: z(batch * 2 * split_skip_l1)?,
             l2_input: z(batch * l2_in)?,
             l2_dense_out: z(batch * l2_out)?,
             l2_acted: z(batch * l3_in)?,
@@ -2343,11 +2343,11 @@ impl GpuWorkspace {
             dl2_acted: z(bwd_len(batch * l3_in))?,
             dl2_out: z(bwd_len(batch * l2_out))?,
             dl2_input: z(bwd_len(batch * l2_in))?,
-            dl2_pre: z(bwd_len(batch * 2 * standard_l1))?,
-            dl1_sqr: z(bwd_len(batch * standard_l1))?,
-            dl1_main_from_concat: z(bwd_len(batch * standard_l1))?,
-            dl1_main_from_sqr: z(bwd_len(batch * standard_l1))?,
-            dl1_main: z(bwd_len(batch * standard_l1))?,
+            dl2_pre: z(bwd_len(batch * 2 * split_skip_l1))?,
+            dl1_sqr: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main_from_concat: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main_from_sqr: z(bwd_len(batch * split_skip_l1))?,
+            dl1_main: z(bwd_len(batch * split_skip_l1))?,
             dl1_total: z(bwd_len(batch * l1_out))?,
             dcombined_from_l1_shared: z(l1_input_grad_len(batch * ft_out))?,
             dcombined_from_l1: z(l1_input_grad_len(batch * ft_out))?,

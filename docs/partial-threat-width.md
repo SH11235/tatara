@@ -3,7 +3,7 @@
 LayerStack training can keep the piece feature transformer at its full output width while giving Threat rows fewer columns:
 
 ```text
-nnue-train --data /path/to/train.psv --output /path/to/run layerstack --ft-out 1536 --threat-profile full --threat-width 512
+nnue-train --data /path/to/train.psv --output /path/to/run layerstack --layerstack-head split-skip --ft-out 1536 --threat-profile full --threat-width 512
 ```
 
 Use the normal training data, output and schedule options for your run. `--threat-width` is a LayerStack option, requires a Threat profile and accepts a positive even number no larger than `--ft-out`. Omitting it uses the full FT output width. An explicit full width has the same training and artifact layout as omission. `experiment.json` records a partial width as `params.threat_width`; the field is omitted for full width.
@@ -64,7 +64,7 @@ for repeat in 1 2; do
       --progress-coeff "$progress" --batch-size 65536 \
       --superbatches 3 --batches-per-superbatch 128 \
       --teacher-shuffle-buffer-mib 0 --optimizer ranger --norm-loss \
-      layerstack --ft-out 1536 --l1 16 --l2 64 --num-buckets 8 \
+      layerstack --layerstack-head split-skip --ft-out 1536 --l1 16 --l2 64 --num-buckets 8 \
       --qat dense --threat-profile full "${width_args[@]}" \
       2>&1 | tee "$bench_root/width-$width-run-$repeat.log"
   done

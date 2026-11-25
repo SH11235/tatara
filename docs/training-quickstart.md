@@ -87,19 +87,23 @@ does not use `progress.bin`.
 
 ### Training
 
+For new LayerStack training, choose `--layerstack-head split-skip` or
+`--layerstack-head dense-concat`. Resume and eval-only use the saved head.
+Any explicit head must match it. See [the architecture format](arch-string.md).
+
 ```bash
 target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --superbatches <N> \
   --threads <N> \
-  layerstack --progress-coeff <path/to/progress.bin>
+  layerstack --layerstack-head split-skip --progress-coeff <path/to/progress.bin>
 ```
 
 For KingRank9, replace the final line with:
 
 ```bash
-  layerstack --bucket-mode kingrank9
+  layerstack --layerstack-head split-skip --bucket-mode kingrank9
 ```
 
 In `kingrank9` mode, omitting `--num-buckets` selects 9 (any other value is
@@ -234,7 +238,7 @@ progress while training with king-rank routing.
 nnue-train --data teacher.psv \
   --keep-progress-coeff progress.bin --keep-num-buckets 8 \
   --bucket-keep-rates 1,1,1,1,0.9,0.7,0.5,0.3 \
-  layerstack --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
+  layerstack --layerstack-head split-skip --bucket-mode spec --bucket-spec 'ownking:2/3/7+oppking:2/3/7'
 ```
 
 For spec-based thinning, use `--keep-bucket-spec 'handmajor3'` with three rates.
@@ -265,7 +269,7 @@ sampling definition and the contents of the coefficient file.
 ### Mixing teachers
 
 ```bash
-nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack
+nnue-train --data main.psv --mix-data tree.psv --mix-rate 0.03 --mix-seed 42 layerstack --layerstack-head split-skip
 ```
 
 This samples approximately 3% of training positions from `tree.psv` and 97% from
@@ -358,17 +362,17 @@ producer's window shuffle.
 # 1 GiB per window (up to about 2 GiB of additional window memory), with a fixed base seed
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 1024 --teacher-shuffle-seed 42 \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 
 # Measure double-buffered I/O without reordering
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib 256 --no-teacher-shuffle \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 
 # Memory-sized read-ahead window plus shuffle (opt-in for slow storage)
 target/release/nnue-train ... \
   --teacher-shuffle-buffer-mib auto \
-  layerstack ...
+  layerstack --layerstack-head split-skip ...
 ```
 
 Score sidecars, `--score-drop-abs`, and `--score-clamp-abs` are applied in original file order

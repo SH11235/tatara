@@ -5,8 +5,32 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[test]
+fn new_layerstack_training_requires_an_explicit_head() {
+    use nnue_format::LayerStackHead::{DenseConcat, SplitSkip};
+
+    let argv = ["nnue-train", "--data", "input.psv", "layerstack"];
+    let error = Cli::try_parse_from(argv)
+        .unwrap()
+        .resolve_layerstack_head()
+        .unwrap_err();
+    assert!(error.contains("--layerstack-head split-skip"));
+    assert!(error.contains("--layerstack-head dense-concat"));
+    for (value, head) in [("split-skip", SplitSkip), ("dense-concat", DenseConcat)] {
+        let cli =
+            Cli::try_parse_from(argv.into_iter().chain(["--layerstack-head", value])).unwrap();
+        assert_eq!(cli.resolve_layerstack_head().unwrap(), Some(head));
+    }
+}
+
+#[test]
 fn precision_cli_scope_and_bounds() {
-    let default = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
+    let default = Cli::try_parse_from([
+        "nnue-train",
+        "layerstack",
+        "--layerstack-head",
+        "split-skip",
+    ])
+    .unwrap();
     assert!(default.precision_steps.is_empty());
     assert!(default.validate_score_sources().is_ok());
     for tail in [
@@ -16,7 +40,14 @@ fn precision_cli_scope_and_bounds() {
         vec!["--precision-steps", "1", "--eval-only"],
         vec!["--precision-steps", "1", "--threat-norm-dump"],
     ] {
-        let mut args = vec!["nnue-train", "--data", "input.psv", "layerstack"];
+        let mut args = vec![
+            "nnue-train",
+            "--data",
+            "input.psv",
+            "layerstack",
+            "--layerstack-head",
+            "split-skip",
+        ];
         args.extend(tail);
         let cli = Cli::try_parse_from(args).unwrap();
         assert!(cli.validate_score_sources().is_err());
@@ -417,7 +448,7 @@ fn gpu_free_dispatch_runs_loader_digest() {
         "1".into(),
     ])
     .expect("loader-digest CLI should parse without GPU features");
-    crate::dispatch(&cli).expect("loader-digest should run without GPU features");
+    crate::dispatch(&cli, None).expect("loader-digest should run without GPU features");
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -425,12 +456,15 @@ fn gpu_free_dispatch_runs_loader_digest() {
 fn gpu_free_dispatch_rejects_training_commands() {
     const EXPECTED: &str = "nnue-train training commands require the default `gpu` feature";
 
-    for command in ["bench-pos", "layerstack"] {
-        let cli = Cli::try_parse_from(["nnue-train", command])
+    for args in [
+        ["bench-pos"].as_slice(),
+        &["layerstack", "--layerstack-head", "split-skip"],
+    ] {
+        let cli = Cli::try_parse_from(std::iter::once("nnue-train").chain(args.iter().copied()))
             .expect("training command CLI should parse without GPU features");
-        let err = crate::dispatch(&cli)
+        let err = crate::dispatch(&cli, cli.resolve_layerstack_head().unwrap())
             .expect_err("training command must be rejected without GPU features");
-        assert!(err.to_string().contains(EXPECTED), "{command}: got: {err}");
+        assert!(err.to_string().contains(EXPECTED), "{args:?}: got: {err}");
     }
 }
 
@@ -986,7 +1020,7 @@ fn rescore_cli_validation_rejects_bad_combinations() {
         let mut full = vec!["nnue-train"];
         full.extend_from_slice(argv);
         let cli = Cli::try_parse_from(full).expect("cli should parse");
-        crate::training::run_training(&cli)
+        crate::training::run_training(&cli, Some(nnue_format::LayerStackHead::SplitSkip))
             .expect_err("invalid rescore flags must return a clean Err")
             .to_string()
     };
@@ -1132,7 +1166,7 @@ fn simple_eval_only_without_data_errors_cleanly() {
     let cli = Cli::try_parse_from(["nnue-train", "--eval-only", "simple"])
         .expect("--eval-only simple should parse");
     assert!(
-        crate::training::run_training(&cli).is_err(),
+        crate::training::run_training(&cli, None).is_err(),
         "--eval-only on simple without --data must return a clean Err, not panic"
     );
 }
@@ -1252,7 +1286,12 @@ fn yaneuraou_output_format_parses_and_simple_rejects_it() {
 }
 
 fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
-    let mut full = vec!["nnue-train", "layerstack"];
+    let mut full = vec![
+        "nnue-train",
+        "layerstack",
+        "--layerstack-head",
+        "split-skip",
+    ];
     full.extend_from_slice(argv);
     match Cli::try_parse_from(full)
         .expect("layerstack CLI should parse")
@@ -2487,6 +2526,10 @@ fn bucket_spec_eval_inherits_bin_metadata() {
         "layerstack",
     ])
     .unwrap();
+    assert_eq!(
+        cli.resolve_layerstack_head().unwrap(),
+        Some(nnue_format::LayerStackHead::SplitSkip)
+    );
     cli.resolve_bucket_metadata().unwrap();
     let ArchCommand::LayerStack(args) = &cli.arch else {
         panic!()

@@ -29,7 +29,7 @@ cargo run --release -p nnue-trainer -- \
   --data /path/to/training.psv \
   --output /path/to/checkpoints \
   --output-format yaneuraou \
-  layerstack \
+  layerstack --layerstack-head split-skip \
   --bucket-mode kingrank9
 ```
 

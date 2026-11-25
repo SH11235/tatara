@@ -1309,20 +1309,90 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
 
 #[test]
 fn dense_concat_checkpoint_header_matches_only_dense_concat() {
-    let standard = layerstack_arch();
-    let mut topology = standard.topology.to_vec();
+    let split_skip = layerstack_arch();
+    let mut topology = split_skip.topology.to_vec();
     topology.extend([0, nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG]);
     let dense = RawCkptArch {
         topology: &topology,
         ..layerstack_arch()
     };
-    for (written, other) in [(&standard, &dense), (&dense, &standard)] {
+    for (written, other) in [(&split_skip, &dense), (&dense, &split_skip)] {
         let mut bytes = Vec::new();
         write_raw_ckpt_header(&mut bytes, written, "run", 1, 5, None, 10).unwrap();
         read_raw_ckpt_header(&mut Cursor::new(&bytes), written).unwrap();
         let error = read_raw_ckpt_header(&mut Cursor::new(&bytes), other).unwrap_err();
         assert!(error.to_string().contains("LayerStack head mismatch"));
     }
+}
+
+#[test]
+fn layerstack_cli_inherits_checkpoint_head_and_rejects_mismatch() {
+    use clap::Parser;
+    use nnue_format::LayerStackHead::{DenseConcat, SplitSkip};
+    use nnue_train::raw_checkpoint::DENSE_CONCAT_TOPOLOGY_TAG;
+
+    let path = std::env::temp_dir().join(format!("tatara-cli-head-{}.ckpt", std::process::id()));
+    let parse = |eval_only, head| {
+        let mut args = vec![
+            "nnue-train",
+            "--resume",
+            path.to_str().unwrap(),
+            "layerstack",
+        ];
+        if eval_only {
+            args.push("--eval-only");
+        }
+        if let Some(head) = head {
+            args.extend(["--layerstack-head", head]);
+        }
+        crate::Cli::try_parse_from(args).unwrap()
+    };
+
+    let mut dense_topology = DEFAULT_LAYERSTACK_TOPOLOGY.to_vec();
+    dense_topology.extend([0, DENSE_CONCAT_TOPOLOGY_TAG]);
+    let dense_arch = RawCkptArch {
+        topology: &dense_topology,
+        ..layerstack_arch()
+    };
+
+    let mut dense = Vec::new();
+    write_raw_ckpt_header(&mut dense, &dense_arch, "run", 1, 5, None, 10).unwrap();
+    for (bytes, head, cli_value, conflicting) in [
+        (dense, DenseConcat, "dense-concat", "split-skip"),
+        (
+            v4_layerstack_header(1, 5, 10),
+            SplitSkip,
+            "split-skip",
+            "dense-concat",
+        ),
+        (
+            legacy_raw_ckpt_header(1, FeatureSet::HalfKaHmMerged.spec(), None, 1, 5, 10),
+            SplitSkip,
+            "split-skip",
+            "dense-concat",
+        ),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        for eval_only in [false, true] {
+            for explicit in [None, Some(cli_value)] {
+                assert_eq!(
+                    parse(eval_only, explicit)
+                        .resolve_layerstack_head()
+                        .unwrap(),
+                    Some(head),
+                );
+            }
+            assert_eq!(
+                parse(eval_only, Some(conflicting))
+                    .resolve_layerstack_head()
+                    .unwrap_err(),
+                format!(
+                    "checkpoint head '{cli_value}' does not match --layerstack-head '{conflicting}'"
+                ),
+            );
+        }
+    }
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
