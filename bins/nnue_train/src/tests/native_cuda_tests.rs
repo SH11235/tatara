@@ -4070,7 +4070,7 @@ fn ft_gather_fp16_prefetch_matches_cpu_bits() -> Result<(), Box<dyn std::error::
     let module = crate::kernel_module::load_kernel_module_with_fallback(&ctx, "nnue_train")?;
     let rows = 128_u32;
     let scale = 0.000091_827_f32;
-    let offsets = [0_u32, 0, 11, 40];
+    let offsets = [0_u32, 0, 0, 11, 40];
     let positions: Vec<u32> = (0..40).map(|i| i * 7 % 31).collect();
     let gradients: Vec<f16> = (0..31 * rows)
         .map(|i| f16::from_bits((((i / 5) % 2) << 15 | (i * 277 % 0x7c00)) as u16))
@@ -4078,9 +4078,10 @@ fn ft_gather_fp16_prefetch_matches_cpu_bits() -> Result<(), Box<dyn std::error::
     let position_dev = DeviceBuffer::from_host(&stream, &positions)?;
     let offset_dev = DeviceBuffer::from_host(&stream, &offsets)?;
     let gradient_dev = DeviceBuffer::from_host(&stream, &gradients)?;
-    let mask = DeviceBuffer::from_host(&stream, &[0_u32, 1, 1])?;
+    let active = [0_u32, 1, 1, 1];
+    let mask = DeviceBuffer::from_host(&stream, &active)?;
     let stale = -1.25_f32;
-    let features = 3_u32;
+    let features = active.len() as u32;
     let initial = vec![stale; (features * rows) as usize];
     let result = DeviceBuffer::from_host(&stream, &initial)?;
     let config = LaunchConfig {
@@ -4128,7 +4129,7 @@ fn ft_gather_fp16_prefetch_matches_cpu_bits() -> Result<(), Box<dyn std::error::
                 let sum = (sums[0] + sums[1]) + (sums[2] + sums[3]);
                 let dst = feature * rows as usize + row;
                 match pass {
-                    0 if feature == 0 => {}
+                    0 if active[feature] == 0 => {}
                     1 if sum != 0.0 => expected[dst] += sum * scale,
                     1 => {}
                     _ => expected[dst] = sum * scale,
