@@ -7696,6 +7696,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "native")]
     fn dense_concat_gpu_forward_and_backward_match_cpu() -> Result<(), Box<dyn std::error::Error>> {
         use nnue_format::dense_concat;
         use shogi_features::FeatureSet;
