@@ -41,54 +41,6 @@ pub fn partial_ft_fold(weight: &[f32], pairs: &[u32], shape: &[u32], mut comb: D
 }
 
 #[kernel]
-pub fn partial_ft_fold_i8x2(
-    weight: &[f32],
-    pairs: &[u32],
-    shape: &[u32],
-    mut comb: DisjointSlice<f32>,
-) {
-    let i = thread::index_1d();
-    let k = i.get();
-    if k >= comb.len() {
-        return;
-    }
-    let r = shape[0] as usize;
-    let base_n = shape[1] as usize * r;
-    let w = shape[3] as usize;
-    let real_n = base_n + shape[2] as usize * w;
-    let mut value = weight[k];
-    if shape[6] != 0 {
-        let partner;
-        if k < base_n {
-            partner = real_n + (k / r % shape[5] as usize) * r + k % r;
-        } else {
-            let f = (k - base_n) / w;
-            let mut pair = 0_usize;
-            let mut end = pairs.len() - 1;
-            while pair + 1 < end {
-                let mid = (pair + end) / 2;
-                if f >= pairs[mid] as usize {
-                    pair = mid;
-                } else {
-                    end = mid;
-                }
-            }
-            partner = real_n + shape[5] as usize * r + pair * w + (k - base_n) % w;
-        }
-        value += weight[partner];
-    }
-    if k < base_n {
-        value = super::common::piece_ft_i8x2(value);
-    }
-    if shape[7] != 0 {
-        value = (value as f16) as f32;
-    }
-    if let Some(cell) = comb.get_mut(i) {
-        *cell = value;
-    }
-}
-
-#[kernel]
 pub fn partial_ft_forward(
     weight: &[f32],
     indices: &[i32],

@@ -63,12 +63,11 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   recorded"; positive values preserve the Simple trainer's effective export
 ///   scale across resume. Negative values are rejected as corrupt.
 ///
-/// - `10`: a u32 QAT flags word follows fv_scale. Bit 0 selects dense QAT and
-///   bit 1 selects piece FT i8x2. Earlier versions imply both are off. Unknown
-///   bits and nonzero flags for Simple are rejected.
+/// - `10`: a u32 QAT mode follows fv_scale. 0 is off and 1 enables dense QAT.
+///   Earlier versions imply QAT is off.
 ///
 /// - `11`: the producer net id (length-prefixed UTF-8, empty = not recorded) and
-///   a `u64` recipe fingerprint (`0` = not recorded) follow the QAT flags.
+///   a `u64` recipe fingerprint (`0` = not recorded) follow the QAT mode.
 ///   `--resume` compares them with the resuming run to record whether it
 ///   continues the producer's training or forks a new experiment from it.
 ///
@@ -167,7 +166,6 @@ pub struct RawCkptArch<'a> {
 pub struct RawCkptMeta<'a> {
     pub optimizer: OptimizerKind,
     pub qat_dense: bool,
-    pub ft_weight_i8x2: bool,
     /// この checkpoint を書き出す run の experiment.json `id` (resume 時の
     /// `lineage.parent_id` に使う)。空文字列は「未記録」。
     pub run_id: &'a str,
@@ -429,9 +427,9 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// Decodes the dense QAT and piece FT quantization flags.
-pub fn decode_qat_flags(flags: u32) -> Option<(bool, bool)> {
-    (flags <= 3).then_some((flags & 1 != 0, flags & 2 != 0))
+/// Decodes the dense QAT mode.
+pub fn decode_qat_flags(flags: u32) -> Option<bool> {
+    (flags <= 1).then_some(flags == 1)
 }
 
 /// raw checkpoint の header (magic 〜 num_groups、group 本体の手前まで) を書く。
@@ -487,7 +485,7 @@ pub fn write_raw_ckpt_header<W: Write>(
     w.write_all(&(meta.lr_horizon.unwrap_or(0) as u64).to_le_bytes())?;
     // Simple evaluation scale (v9+)。0 = 未記録。
     w.write_all(&meta.fv_scale.unwrap_or(0).to_le_bytes())?;
-    let qat_flags = u32::from(meta.qat_dense) | (u32::from(meta.ft_weight_i8x2) << 1);
+    let qat_flags = u32::from(meta.qat_dense);
     w.write_all(&qat_flags.to_le_bytes())?;
     // producer net id + recipe fingerprint (v11+)。過長な net id は lineage の判定材料に
     // すぎないので、埋め込みを省略して保存は続ける。

@@ -231,7 +231,6 @@ const DEFAULT_FAN_IN_GAIN: f32 = 1.0;
 #[derive(Debug, Clone, Copy)]
 pub struct LayerStackInit {
     pub ft_w: LayerInit,
-    piece_ft_i8x2_init: bool,
     pub ft_b: LayerInit,
     pub l1_w: LayerInit,
     pub l1_b: LayerInit,
@@ -253,7 +252,6 @@ impl LayerStackInit {
     pub fn default_uniform() -> Self {
         Self {
             ft_w: LayerInit::uniform_fan_in(DEFAULT_FAN_IN_GAIN, false, DEFAULT_LS_SEEDS[0]),
-            piece_ft_i8x2_init: false,
             ft_b: LayerInit::zeroed(),
             l1_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[1]),
             l1_b: LayerInit::zeroed(),
@@ -264,42 +262,6 @@ impl LayerStackInit {
             l3_w: LayerInit::uniform_abs(DEFAULT_HALF_WIDTH, DEFAULT_LS_SEEDS[4]),
             l3_b: LayerInit::zeroed(),
         }
-    }
-
-    pub fn enable_piece_ft_i8x2_init(&mut self) {
-        self.piece_ft_i8x2_init = true;
-    }
-
-    pub fn sample_ft_weights(&self, shape: WeightShape, piece_weights: usize) -> Vec<f32> {
-        let mut weights = sample(shape, &self.ft_w);
-        if self.piece_ft_i8x2_init && self.ft_w.dist == Dist::Uniform {
-            let half_width = resolve_scale(self.ft_w.scale, shape.fan_in);
-            // A uniform distribution this wide places one fifth of its mass beyond
-            // the first rounding boundary, even when fan-in would zero every piece weight.
-            let minimum_half_width = 1.25 / nnue_format::layerstack_weights::QA as f32;
-            if half_width > 0.0 && half_width < minimum_half_width {
-                let scale = minimum_half_width / half_width;
-                for weight in &mut weights[..piece_weights] {
-                    *weight *= scale;
-                }
-            }
-        }
-        weights
-    }
-
-    /// Sample the real FT rows and zero-initialize any factorizer rows.
-    pub fn sample_packed_ft_weights(
-        &self,
-        features: &shogi_features::FeatureSetSpec,
-        ft_out: usize,
-    ) -> Vec<f32> {
-        let ft_in = features.ft_in();
-        let mut weights = self.sample_ft_weights(
-            WeightShape::flat(features.ft_weight_len(ft_out), ft_in),
-            (ft_in - features.threat_dims()) * ft_out,
-        );
-        weights.resize(features.train_ft_weight_len(ft_out), 0.0);
-        weights
     }
 
     /// CLI override (重み側のみ) を該当 group に適用する。`per_bucket_repeat` と
@@ -588,23 +550,6 @@ mod tests {
         assert_eq!(p.ft_b.dist, Dist::Zeroed);
         assert_eq!(p.l1_b.dist, Dist::Zeroed);
         assert_eq!(p.l3_b.dist, Dist::Zeroed);
-    }
-
-    #[test]
-    fn ft_i8x2_default_initialization_crosses_first_quantization_boundary() {
-        let shape = WeightShape::flat(16_384, 73_305);
-        let piece_weights = 8192;
-        let mut init = LayerStackInit::default_uniform();
-        let ordinary = init.sample_ft_weights(shape, piece_weights);
-        let boundary = 1.0 / nnue_format::layerstack_weights::QA as f32;
-        assert!(ordinary.iter().all(|w| w.abs() < boundary));
-
-        init.enable_piece_ft_i8x2_init();
-        let i8x2 = init.sample_ft_weights(shape, piece_weights);
-        assert!(i8x2[..piece_weights].iter().any(|w| *w > boundary));
-        assert!(i8x2[..piece_weights].iter().any(|w| *w < -boundary));
-        assert_eq!(&i8x2[piece_weights..], &ordinary[piece_weights..]);
-        assert_eq!(init.sample_ft_weights(shape, piece_weights), i8x2);
     }
 
     #[test]

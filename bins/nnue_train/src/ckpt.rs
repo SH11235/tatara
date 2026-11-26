@@ -56,7 +56,7 @@ use crate::trainer_common::MomentBuf;
 //   step_count   u64  (optimizer step counter)
 //   lr_horizon   u64  (v5+、LR schedule の終端 superbatch。0 = horizon 無し)
 //   fv_scale     i32  (v9+、Simple の実効 evaluation scale。0 = 未記録)
-//   qat_flags    u32  (v10+, bit 0 = dense, bit 1 = piece FT i8x2)
+//   qat_flags    u32  (v10+, 0 = off, 1 = dense)
 //   net_id_len   u32  (v11+、producer net id の長さ、0 = 未記録)
 //   net_id       UTF-8 [net_id_len] (この checkpoint を書いた run の net id)
 //   recipe_fp    u64  (v11+、producer のレシピの指紋。0 = 未記録)
@@ -85,23 +85,6 @@ pub(crate) struct ResumeProducer {
 }
 
 impl RawCkptHeader {
-    pub(crate) fn validate_ft_weight_i8x2(
-        &self,
-        requested: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.ft_weight_i8x2 == requested {
-            return Ok(());
-        }
-        let setting = if self.ft_weight_i8x2 {
-            "pass --ft-weight-i8x2"
-        } else {
-            "omit --ft-weight-i8x2"
-        };
-        Err(invalid_data(format!(
-            "raw checkpoint piece FT quantization differs from the requested mode; {setting} when resuming"
-        )))
-    }
-
     pub(crate) fn prepare_optimizer_state(
         &mut self,
         path: &Path,
@@ -313,7 +296,6 @@ pub(crate) struct RawCkptHeader {
     version: u32,
     pub(crate) sgd: bool,
     pub(crate) qat_dense: bool,
-    pub(crate) ft_weight_i8x2: bool,
     /// この checkpoint が表す完了 superbatch 番号。
     pub(crate) superbatch: usize,
     /// optimizer step counter (ranger では lookahead lerp の周期判定にも使う)。
@@ -544,9 +526,9 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
     }
 
     let flags = reader.qat_flags()?;
-    let (qat_dense, ft_weight_i8x2) = nnue_train::raw_checkpoint::decode_qat_flags(flags)
+    let qat_dense = nnue_train::raw_checkpoint::decode_qat_flags(flags)
         .filter(|_| flags == 0 || expected.arch_kind == ArchKind::LayerStack)
-        .ok_or_else(|| invalid_data(format!("unsupported QAT flags {flags}")))?;
+        .ok_or_else(|| invalid_data(format!("unsupported QAT mode {flags}")))?;
 
     let (producer_net_id, producer_recipe_fingerprint) = reader.producer_recipe()?;
     let num_groups = reader.group_count()?;
@@ -558,7 +540,6 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
             SGD_CHECKPOINT_VERSION | PARTIAL_THREAT_SGD_CKPT_VERSION
         ),
         qat_dense,
-        ft_weight_i8x2,
         superbatch,
         step_count,
         num_groups,

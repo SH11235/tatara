@@ -137,7 +137,6 @@ fn main() -> std::process::ExitCode {
             cli.validate_score_sources()?;
             cli.validate_wdl_jitter()?;
             cli.validate_data_args(&argv)?;
-            cli.validate_ft_weight_i8x2()?;
             Ok(head)
         })
         .map_err(Into::into)
