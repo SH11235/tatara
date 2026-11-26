@@ -361,8 +361,14 @@ pub fn write_leb128_tensor_i16<W: Write>(out: &mut W, values: &[i16]) -> io::Res
     for &v in values {
         encode_signed_leb128(v as i64, &mut compressed);
     }
+    let size = u32::try_from(compressed.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("LEB128 block too large: {} bytes", compressed.len()),
+        )
+    })?;
     out.write_all(LEB128_MAGIC)?;
-    out.write_all(&(compressed.len() as u32).to_le_bytes())?;
+    out.write_all(&size.to_le_bytes())?;
     out.write_all(&compressed)?;
     Ok(())
 }
@@ -384,7 +390,8 @@ pub fn read_leb128_tensor_i16<R: Read>(
     let mut size_buf = [0u8; 4];
     reader.read_exact(&mut size_buf)?;
     let compressed_size = u32::from_le_bytes(size_buf) as usize;
-    if compressed_size == 0 || compressed_size > 256 * 1024 * 1024 {
+    // 大きな FT の重みは 256 MiB を超えるので、要素数が分かるときは要素数から長さを検査する。
+    if compressed_size == 0 || (expected_count.is_none() && compressed_size > 256 * 1024 * 1024) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid LEB128 block size: {compressed_size}"),
@@ -398,8 +405,21 @@ pub fn read_leb128_tensor_i16<R: Read>(
             "LEB128 block size cannot encode the expected tensor count",
         ));
     }
-    let mut compressed = vec![0u8; compressed_size];
-    reader.read_exact(&mut compressed)?;
+    // 宣言長だけで先行確保しない。容量は読めた分に合わせて倍々に伸ばし、宣言長で止める。
+    let mut compressed = Vec::new();
+    while compressed.len() < compressed_size {
+        let start = compressed.len();
+        let end = (start + 8 * 1024 * 1024).min(compressed_size);
+        if end > compressed.capacity() {
+            let target = compressed
+                .capacity()
+                .saturating_mul(2)
+                .clamp(end, compressed_size);
+            compressed.reserve_exact(target - start);
+        }
+        compressed.resize(end, 0);
+        reader.read_exact(&mut compressed[start..])?;
+    }
 
     let mut result = Vec::new();
     let mut pos = 0;
@@ -2168,6 +2188,22 @@ mod tests {
         block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         block.extend_from_slice(payload);
         block
+    }
+
+    #[test]
+    fn leb128_tensor_accepts_blocks_above_256_mib_when_count_is_known() {
+        let size = 300 * 1024 * 1024_usize;
+        let mut header = LEB128_MAGIC.to_vec();
+        header.extend_from_slice(&(size as u32).to_le_bytes());
+        let error = read_leb128_tensor_i16(&mut header.as_slice(), Some(size)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let zeros = io::repeat(0).take(size as u64);
+        let decoded =
+            read_leb128_tensor_i16(&mut header.as_slice().chain(zeros), Some(size)).unwrap();
+        assert_eq!(decoded.len(), size);
+        assert!(decoded.iter().all(|&v| v == 0));
+        let error = read_leb128_tensor_i16(&mut header.as_slice(), None).unwrap_err();
+        assert!(error.to_string().contains("invalid LEB128 block size"));
     }
 
     #[test]
