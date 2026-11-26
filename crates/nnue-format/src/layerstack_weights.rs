@@ -405,16 +405,20 @@ pub fn read_leb128_tensor_i16<R: Read>(
             "LEB128 block size cannot encode the expected tensor count",
         ));
     }
-    // 宣言長を先に確保せず、実際に読めた分だけ伸ばす (途中で切れたファイルで GiB 級を確保しない)。
+    // 宣言長だけで先行確保しない。容量は読めた分に合わせて倍々に伸ばし、宣言長で止める。
     let mut compressed = Vec::new();
-    reader
-        .take(compressed_size as u64)
-        .read_to_end(&mut compressed)?;
-    if compressed.len() != compressed_size {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "LEB128 block is shorter than its declared size",
-        ));
+    while compressed.len() < compressed_size {
+        let start = compressed.len();
+        let end = (start + 8 * 1024 * 1024).min(compressed_size);
+        if end > compressed.capacity() {
+            let target = compressed
+                .capacity()
+                .saturating_mul(2)
+                .clamp(end, compressed_size);
+            compressed.reserve_exact(target - start);
+        }
+        compressed.resize(end, 0);
+        reader.read_exact(&mut compressed[start..])?;
     }
 
     let mut result = Vec::new();
@@ -2193,11 +2197,11 @@ mod tests {
         header.extend_from_slice(&(size as u32).to_le_bytes());
         let error = read_leb128_tensor_i16(&mut header.as_slice(), Some(size)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        let values = vec![1_i16; size];
-        let mut encoded = Vec::new();
-        write_leb128_tensor_i16(&mut encoded, &values).unwrap();
-        let decoded = read_leb128_tensor_i16(&mut encoded.as_slice(), Some(size)).unwrap();
-        assert!(decoded == values);
+        let zeros = io::repeat(0).take(size as u64);
+        let decoded =
+            read_leb128_tensor_i16(&mut header.as_slice().chain(zeros), Some(size)).unwrap();
+        assert_eq!(decoded.len(), size);
+        assert!(decoded.iter().all(|&v| v == 0));
         let error = read_leb128_tensor_i16(&mut header.as_slice(), None).unwrap_err();
         assert!(error.to_string().contains("invalid LEB128 block size"));
     }
