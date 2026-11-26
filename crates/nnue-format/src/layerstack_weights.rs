@@ -390,7 +390,7 @@ pub fn read_leb128_tensor_i16<R: Read>(
     let mut size_buf = [0u8; 4];
     reader.read_exact(&mut size_buf)?;
     let compressed_size = u32::from_le_bytes(size_buf) as usize;
-    // 要素数が分かるときは下の長さの検査で足りる。大きな FT の重みは 256 MiB を超える。
+    // 大きな FT の重みは 256 MiB を超えるので、要素数が分かるときは要素数から長さを検査する。
     if compressed_size == 0 || (expected_count.is_none() && compressed_size > 256 * 1024 * 1024) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -405,8 +405,17 @@ pub fn read_leb128_tensor_i16<R: Read>(
             "LEB128 block size cannot encode the expected tensor count",
         ));
     }
-    let mut compressed = vec![0u8; compressed_size];
-    reader.read_exact(&mut compressed)?;
+    // 宣言長を先に確保せず、実際に読めた分だけ伸ばす (途中で切れたファイルで GiB 級を確保しない)。
+    let mut compressed = Vec::new();
+    reader
+        .take(compressed_size as u64)
+        .read_to_end(&mut compressed)?;
+    if compressed.len() != compressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LEB128 block is shorter than its declared size",
+        ));
+    }
 
     let mut result = Vec::new();
     let mut pos = 0;
@@ -2184,6 +2193,11 @@ mod tests {
         header.extend_from_slice(&(size as u32).to_le_bytes());
         let error = read_leb128_tensor_i16(&mut header.as_slice(), Some(size)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let values = vec![1_i16; size];
+        let mut encoded = Vec::new();
+        write_leb128_tensor_i16(&mut encoded, &values).unwrap();
+        let decoded = read_leb128_tensor_i16(&mut encoded.as_slice(), Some(size)).unwrap();
+        assert!(decoded == values);
         let error = read_leb128_tensor_i16(&mut header.as_slice(), None).unwrap_err();
         assert!(error.to_string().contains("invalid LEB128 block size"));
     }
