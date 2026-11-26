@@ -127,10 +127,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let groups = raw_ckpt::weighted_average(&layout, &paths, &infos, &coefficients)?;
-    let mut weights = raw_ckpt::to_layerstack_weights(&layout, groups);
-    if infos[0].identity.ft_weight_i8x2 {
-        weights.quantize_piece_ft_i8x2()?;
-    }
+    let weights = raw_ckpt::to_layerstack_weights(&layout, groups);
     write_new(&args.output, |w| weights.save_quantised(w, args.fv_scale))?;
     println!("output: {}", args.output.display());
 

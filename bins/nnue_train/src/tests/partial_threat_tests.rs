@@ -114,7 +114,7 @@ fn partial_threat_gpu_matches_cpu_forward_backward() -> Result<(), Box<dyn std::
                                 config: gpu_runtime::LaunchConfig {
                                     grid_dim: (5, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0,
                                 },
-                                args: [slice(w), slice(pair_dev), slice(shape_dev), slice(comb_h), 0_u32]
+                                args: [slice(w), slice(pair_dev), slice(shape_dev), slice(comb_h)]
                             }
                         }?;
                         let folded_bits: Vec<u16> = comb
@@ -800,26 +800,24 @@ fn partial_ft_optimizer_fold_bitwise() -> Result<(), Box<dyn std::error::Error>>
     let module = load_kernel_module_with_fallback(&ctx, "nnue_train")?;
     for (rows, width) in [(6144, 3072), (132, 72)] {
         for factorized in [false, true] {
-            for quantize_pieces in [false, true] {
-                check_partial_ft_optimizer_fold(
-                    &stream,
-                    &module,
-                    (rows, width),
-                    (factorized, quantize_pieces),
-                    |x| x as f16,
-                    f16::to_bits,
-                    crate::trainer_layerstack::FT_FUSED_HALF_STATE,
-                )?;
-                check_partial_ft_optimizer_fold(
-                    &stream,
-                    &module,
-                    (rows, width),
-                    (factorized, quantize_pieces),
-                    |x| x,
-                    f32::to_bits,
-                    0,
-                )?;
-            }
+            check_partial_ft_optimizer_fold(
+                &stream,
+                &module,
+                (rows, width),
+                factorized,
+                |x| x as f16,
+                f16::to_bits,
+                crate::trainer_layerstack::FT_FUSED_HALF_STATE,
+            )?;
+            check_partial_ft_optimizer_fold(
+                &stream,
+                &module,
+                (rows, width),
+                factorized,
+                |x| x,
+                f32::to_bits,
+                0,
+            )?;
         }
     }
     Ok(())
@@ -830,7 +828,7 @@ fn check_partial_ft_optimizer_fold<T, Bits>(
     stream: &gpu_runtime::CudaStream,
     module: &gpu_runtime::CudaModule,
     (rows, width): (usize, usize),
-    (factorized, quantize_pieces): (bool, bool),
+    factorized: bool,
     moment: impl Fn(f32) -> T,
     moment_bits: impl Fn(T) -> Bits,
     state_flag: u32,
@@ -841,8 +839,8 @@ where
 {
     use crate::trainer_layerstack::{
         FT_FUSED_ACCUMULATE_NORMS, FT_FUSED_ACTIVE_ROWS, FT_FUSED_LOOKAHEAD, FT_FUSED_NORM_LOSS,
-        FT_FUSED_OUT_COMB_F16, FT_FUSED_OUT_PACKED_F16, FT_FUSED_PROJECT_PIECES,
-        ft_fused_launch_config, partial_ft_virtual_rows,
+        FT_FUSED_OUT_COMB_F16, FT_FUSED_OUT_PACKED_F16, ft_fused_launch_config,
+        partial_ft_virtual_rows,
     };
     use gpu_runtime::LaunchConfig;
 
@@ -965,9 +963,6 @@ where
                     launch_flags |= FT_FUSED_ACTIVE_ROWS;
                     if fold_fused {
                         launch_flags |= FT_FUSED_OUT_PACKED_F16 | FT_FUSED_OUT_COMB_F16;
-                        if quantize_pieces && row_base == 0 {
-                            launch_flags |= FT_FUSED_PROJECT_PIECES;
-                        }
                     }
                 }
                 // SAFETY: the aligned ranges cover whole packed rows; fold partners are in the
@@ -998,8 +993,7 @@ where
                             block_dim: (128, 1, 1),
                             shared_mem_bytes: 0,
                         },
-                        args: [slice(*w), slice(pair_starts), slice(shape), slice_mut(*comb),
-                               u32::from(quantize_pieces)]
+                        args: [slice(*w), slice(pair_starts), slice(shape), slice_mut(*comb)]
                     }?;
                 }
                 cuda_launch! {
@@ -1015,7 +1009,7 @@ where
                 {
                     assert_eq!(
                         ($bits)(expected), ($bits)(actual),
-                        "{}[{i}] at step {step}, FT {rows}, Threat {width}, factorized {factorized}, projection {quantize_pieces}, state flag {state_flag}",
+                        "{}[{i}] at step {step}, FT {rows}, Threat {width}, factorized {factorized}, state flag {state_flag}",
                         $label,
                     );
                 }

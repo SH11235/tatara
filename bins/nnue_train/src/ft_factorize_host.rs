@@ -44,7 +44,9 @@ pub(crate) enum FoldComb<'a> {
     F32(&'a mut DeviceBuffer<f32>),
 }
 
-/// Shared arguments for kernels that fold virtual rows into the piece and Threat rows.
+/// fold kernel に渡す `(ft_bounds, piece_inputs, kernel_pack)`。fold を内包する kernel
+/// (fused FT optimizer) が `ft_fold_virtual*` と同じ仮想行を引くために使う。
+#[cfg(feature = "native")]
 pub(crate) fn fold_kernel_args(feature_set: &FeatureSetSpec) -> (u64, u32, u32) {
     let (base_ft_in, ft_in, pi, nb, mode) = params(feature_set);
     (

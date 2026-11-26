@@ -288,35 +288,6 @@ pub fn stored_num_buckets(bytes: &[u8]) -> io::Result<usize> {
 pub const DEFAULT_NUM_BUCKETS: usize = 8;
 
 pub const QA: i32 = 127;
-const PIECE_FT_I8X2_LIMIT: i32 = 254;
-
-/// Round ties away from zero and dequantize with the same FP32 operations as the forward cache.
-fn piece_ft_i8x2_value(weight: f32) -> f32 {
-    let half_limit = (PIECE_FT_I8X2_LIMIT / 2) as f32;
-    let half = (weight * (QA as f32 * 0.5))
-        .clamp(-half_limit, half_limit)
-        .round();
-    half * (2.0 / QA as f32)
-}
-
-fn validate_piece_ft_i8x2(weights: &[f32]) -> io::Result<()> {
-    for (index, &weight) in weights.iter().enumerate() {
-        let quantized = (QA as f64 * weight as f64).round();
-        if !quantized.is_finite()
-            || quantized.abs() > PIECE_FT_I8X2_LIMIT as f64
-            || quantized as i32 % 2 != 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "piece FT weight {index} quantizes to {quantized}; expected an even integer within [-254, 254]"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub const QB: i32 = 64;
 pub const FV_SCALE: i32 = 28;
 
@@ -680,35 +651,6 @@ fn piece_ft_factor_rows<'a>(
     })
 }
 
-/// Count the nonzero i8x2 projections in the packed training FT, excluding Threat rows.
-pub fn count_nonzero_piece_ft_i8x2(
-    feature_set: &FeatureSetSpec,
-    ft_out: usize,
-    ft_w_train: &[f32],
-) -> (usize, usize) {
-    let total = piece_ft_rows(feature_set) * ft_out;
-    let piece_weights = &ft_w_train[..total];
-    let nonzero = if feature_set.ft_factorize() {
-        let virtual_weights = &ft_w_train[feature_set.ft_weight_len(ft_out)..];
-        piece_weights
-            .chunks_exact(ft_out)
-            .zip(piece_ft_factor_rows(feature_set, ft_out, virtual_weights))
-            .map(|(real, factor)| {
-                real.iter()
-                    .zip(factor)
-                    .filter(|&(&r, &f)| piece_ft_i8x2_value(r + f).abs() > 0.0)
-                    .count()
-            })
-            .sum()
-    } else {
-        piece_weights
-            .iter()
-            .filter(|&&w| piece_ft_i8x2_value(w).abs() > 0.0)
-            .count()
-    };
-    (nonzero, total)
-}
-
 /// FT factorizer の仮想行を実行へ畳み込み、export 形状
 /// (`feature_set.ft_in() × ft_out`) の FT weight を返す。
 ///
@@ -993,30 +935,6 @@ impl LayerStackWeights {
         s
     }
 
-    fn piece_ft_weight_count(&self) -> usize {
-        piece_ft_rows(&self.feature_set) * self.ft_b.len()
-    }
-
-    /// Project the coalesced piece weights onto the grid used by the i8x2 forward pass.
-    pub fn quantize_piece_ft_i8x2(&mut self) -> io::Result<()> {
-        let n = self.piece_ft_weight_count();
-        for (index, weight) in self.ft_w[..n].iter_mut().enumerate() {
-            if !weight.is_finite() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("piece FT weight {index} is non-finite"),
-                ));
-            }
-            *weight = piece_ft_i8x2_value(*weight);
-        }
-        self.validate_piece_ft_i8x2()
-    }
-
-    /// Check the integers the LayerStack writer will emit for the piece FT.
-    pub fn validate_piece_ft_i8x2(&self) -> io::Result<()> {
-        validate_piece_ft_i8x2(&self.ft_w[..self.piece_ft_weight_count()])
-    }
-
     /// LayerStack quantised.bin を `writer` に書き出す。推論エンジン rshogi の
     /// `NetworkLayerStacks::read` で parse できる byte layout (`num_buckets` を
     /// header から読む対応が rshogi 側で要る)。`fv_scale = None` のときは arch
@@ -1064,7 +982,7 @@ impl LayerStackWeights {
         }
         // threat は base FT block と raw i8 threat block に分ける。effect bucket は追加 block
         // を持たず、拡張済み row 全体を通常の i16 FT block に書く。
-        let base_ft_w_n = self.piece_ft_weight_count();
+        let base_ft_w_n = piece_ft_rows(&self.feature_set) * ft_out;
         let ft_w_base = &self.ft_w[..base_ft_w_n];
         warn_if_i16_saturates("ft_w", ft_w_base, qa_f);
         let ft_w_i16: Vec<i16> = ft_w_base
@@ -3691,103 +3609,5 @@ mod bucket_spec_tests {
         let mut saved = Vec::new();
         loaded.save_quantised(&mut saved, Some(24)).unwrap();
         assert_eq!(bytes, saved);
-    }
-}
-
-#[cfg(test)]
-mod piece_ft_i8x2_tests {
-    use super::*;
-
-    #[test]
-    fn ft_i8x2_counts_coalesced_piece_weights_only() {
-        let spec = shogi_features::FeatureSet::HalfKaHmMerged
-            .spec()
-            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
-            .with_threat_width(2)
-            .with_ft_factorize();
-        let ft_out = 4;
-        let piece_end = spec.base_ft_in() * ft_out;
-        let factor_start = spec.ft_weight_len(ft_out);
-        let mut weights = vec![0.0; spec.train_ft_weight_len(ft_out)];
-        let tie = 1.0 / QA as f32;
-        weights[0] = tie * 0.5;
-        weights[1] = -tie;
-        weights[2] = -tie;
-        weights[piece_end..factor_start].fill(tie);
-        weights[factor_start] = tie * 0.5;
-        weights[factor_start + 1] = tie;
-        assert_eq!(
-            count_nonzero_piece_ft_i8x2(&spec, ft_out, &weights),
-            (2 + spec.king_buckets() - 1, piece_end)
-        );
-        let coalesced = coalesce_ft_factorized(&spec, ft_out, &weights);
-        assert_eq!(
-            count_nonzero_piece_ft_i8x2(&spec.feature_set().spec(), ft_out, &coalesced),
-            count_nonzero_piece_ft_i8x2(&spec, ft_out, &weights)
-        );
-    }
-
-    #[test]
-    fn ft_i8x2_rounds_ties_away_and_bounds_all_finite_inputs() {
-        for (scaled_half, expected) in [
-            (0.0, 0),
-            (0.5, 2),
-            (-0.5, -2),
-            (1.5, 4),
-            (-1.5, -4),
-            (126.5, 254),
-            (-500.0, -254),
-        ] {
-            let value = piece_ft_i8x2_value(scaled_half / 63.5);
-            assert_eq!((f64::from(value) * f64::from(QA)).round() as i32, expected);
-        }
-        let positive_tie = 1.0 / QA as f32;
-        assert_eq!(piece_ft_i8x2_value(positive_tie.next_down()), 0.0);
-        assert_eq!(piece_ft_i8x2_value(-positive_tie.next_down()), -0.0);
-        let values: Vec<_> = (-127..=127)
-            .map(|q| piece_ft_i8x2_value(q as f32 * (2.0 / QA as f32)))
-            .collect();
-        assert!(validate_piece_ft_i8x2(&values).is_ok());
-        assert_eq!(piece_ft_i8x2_value(f32::MAX), 2.0);
-        assert_eq!(piece_ft_i8x2_value(f32::MIN), -2.0);
-    }
-
-    #[test]
-    fn ft_i8x2_export_validation_rejects_invalid_piece_weights() {
-        for bad in [3.0 / QA as f32, 256.0 / QA as f32, f32::NAN, f32::INFINITY] {
-            assert!(
-                validate_piece_ft_i8x2(&[-2.0, bad, 2.0])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("weight 1")
-            );
-        }
-    }
-
-    #[test]
-    fn ft_i8x2_projection_leaves_threat_on_its_raw_int8_grid() {
-        let spec = shogi_features::FeatureSet::HalfKaHmMerged
-            .spec()
-            .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
-            .with_threat_width(2);
-        let mut weights = LayerStackWeights::zeroed(spec, 4, 2, 2, 1);
-        let threat_start = spec.base_ft_in() * 4;
-        weights.ft_w[0] = 9.0;
-        weights.ft_w[threat_start - 1] = -9.0;
-        weights.ft_w[threat_start] = 3.0 / QA as f32;
-        weights.quantize_piece_ft_i8x2().unwrap();
-        assert_eq!(weights.ft_w[0], 2.0);
-        assert_eq!(weights.ft_w[threat_start - 1], -2.0);
-        assert_eq!(weights.ft_w[threat_start], 3.0 / QA as f32);
-
-        let mut bytes = Vec::new();
-        weights.save_quantised(&mut bytes, None).unwrap();
-        let decoded =
-            LayerStackWeights::load_quantised(&mut bytes.as_slice(), spec, 4, 2, 2, 1).unwrap();
-        decoded.validate_piece_ft_i8x2().unwrap();
-        assert_eq!(decoded.ft_w, weights.ft_w);
-
-        weights.ft_w[0] = f32::NAN;
-        assert!(weights.quantize_piece_ft_i8x2().is_err());
     }
 }

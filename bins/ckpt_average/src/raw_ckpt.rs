@@ -37,7 +37,6 @@ pub(crate) struct CkptIdentity {
     pub(crate) bucket_mode: String,
     pub(crate) topology: Vec<u64>,
     pub(crate) qat_dense: bool,
-    pub(crate) ft_weight_i8x2: bool,
     pub(crate) group_lens: Vec<u64>,
 }
 
@@ -49,7 +48,6 @@ pub(crate) struct CompatKey {
     bucket_mode: String,
     topology: Vec<u64>,
     qat_dense: bool,
-    ft_weight_i8x2: bool,
     shared_delta: bool,
 }
 
@@ -60,7 +58,6 @@ impl CkptIdentity {
             bucket_mode: layout.bucket_mode.identity(),
             topology: self.topology.clone(),
             qat_dense: self.qat_dense,
-            ft_weight_i8x2: self.ft_weight_i8x2,
             shared_delta: layout.shared_delta,
         }
     }
@@ -108,8 +105,8 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
     reader.lr_horizon()?;
     reader.fv_scale()?;
     let flags = reader.qat_flags()?;
-    let (qat_dense, ft_weight_i8x2) =
-        decode_qat_flags(flags).ok_or_else(|| invalid(format!("unknown QAT flags {flags}")))?;
+    let qat_dense =
+        decode_qat_flags(flags).ok_or_else(|| invalid(format!("unknown QAT mode {flags}")))?;
     reader.producer_recipe()?;
     let num_groups = reader.group_count()?;
     let mut r = reader.into_inner();
@@ -144,7 +141,6 @@ pub(crate) fn read_ckpt_info(path: &Path) -> io::Result<CkptInfo> {
             bucket_mode,
             topology,
             qat_dense,
-            ft_weight_i8x2,
             group_lens,
         },
         superbatch,
@@ -756,9 +752,6 @@ pub(crate) mod tests {
         let mut alias = v11.clone();
         alias.bucket_mode = "progress8kpabs".to_string();
         assert_eq!(compat_key(&alias), compat_key(&v11));
-        let mut other_ft_grid = v11.clone();
-        other_ft_grid.ft_weight_i8x2 = true;
-        assert_ne!(compat_key(&other_ft_grid), compat_key(&v11));
         let mut other_mode = v11.clone();
         other_mode.bucket_mode = "progresskpabsq16".to_string();
         assert_ne!(compat_key(&other_mode), compat_key(&v11));
@@ -861,7 +854,6 @@ pub(crate) mod tests {
         let meta = RawCkptMeta {
             optimizer,
             qat_dense: false,
-            ft_weight_i8x2: false,
             run_id: "run",
             superbatch: scale as usize,
             step_count: 100,
@@ -935,7 +927,6 @@ pub(crate) mod tests {
             let meta = RawCkptMeta {
                 optimizer: OptimizerKind::RAdam,
                 qat_dense: false,
-                ft_weight_i8x2: false,
                 run_id: "",
                 net_id: "",
                 recipe_fingerprint: None,
