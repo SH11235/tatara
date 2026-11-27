@@ -1098,6 +1098,11 @@ impl GpuTrainer {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_step_count_for_test(&mut self, step_count: u64) {
+        self.step_count = step_count;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_skip_optimizer_for_test(&mut self, skip: bool) {
         self.skip_optimizer_for_test = skip;
     }
@@ -1319,8 +1324,13 @@ impl GpuTrainer {
             0
         };
         let width = self.feature_set.threat_width(ft_out);
-        let base_n = self.feature_set.base_ft_in() * ft_out;
-        let piece_end = real_n + self.feature_set.piece_inputs() * ft_out;
+        let piece_rows = self.feature_set.ft_in() - self.feature_set.threat_dims();
+        let real_piece_end = piece_rows * ft_out;
+        let virtual_piece_end = if ft_factorize {
+            real_n + self.feature_set.piece_inputs() * ft_out
+        } else {
+            real_n
+        };
         let packed_output = if self.partial_fold_fused() {
             FT_FUSED_OUT_PACKED_F16 | FT_FUSED_OUT_COMB_F16
         } else {
@@ -1330,28 +1340,16 @@ impl GpuTrainer {
         // Each launch uses a uniform packed row width; virtual rows precede the real updates.
         let ranges = if self.partial_threat() {
             [
-                (
-                    real_n,
-                    if ft_factorize { piece_end } else { real_n },
-                    0,
-                    ft_out,
-                    step.lr,
-                ),
-                (
-                    if ft_factorize { piece_end } else { train_n },
-                    train_n,
-                    0,
-                    width,
-                    step.lr,
-                ),
-                (0, base_n, packed_output, ft_out, piece_lr),
-                (base_n, real_n, packed_output, width, threat_lr),
+                (real_n, virtual_piece_end, 0, ft_out, step.lr),
+                (virtual_piece_end, train_n, 0, width, step.lr),
+                (0, real_piece_end, packed_output, ft_out, piece_lr),
+                (real_piece_end, real_n, packed_output, width, threat_lr),
             ]
         } else {
             let split = if self.optim_groups.ft_piece_lr_mult == self.optim_groups.threat_lr_mult {
                 real_n
             } else {
-                base_n
+                real_piece_end
             };
             [
                 (real_n, train_n, 0, ft_out, step.lr),
@@ -1368,8 +1366,9 @@ impl GpuTrainer {
             if begin >= real_n {
                 launch_flags &= !FT_FUSED_ACTIVE_ROWS;
             }
-            let active_row_base = if begin == base_n && begin < real_n {
-                self.feature_set.base_ft_in() as u32
+            let starts_at_threat = begin == real_piece_end && begin < real_n;
+            let active_row_base = if starts_at_threat {
+                piece_rows as u32
             } else {
                 0
             };
@@ -1382,10 +1381,10 @@ impl GpuTrainer {
                 &self.threat_pair_starts
             };
             let fold_bounds = if packed_comb && ft_factorize {
-                if active_row_base == 0 {
-                    real_n as u64
+                if starts_at_threat {
+                    virtual_piece_end as u64
                 } else {
-                    piece_end as u64
+                    real_n as u64
                 }
             } else {
                 bounds

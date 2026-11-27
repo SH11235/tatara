@@ -36,12 +36,13 @@ On resume, the multiplier comes from the current command line and is part of
 the recipe comparison.
 
 In LayerStacks training, `--ft-piece-lr-mult` scales the learning rate for the
-real piece rows, and `--threat-lr-mult` scales it for real Threat rows, including
-compact Threat rows. The Threat option requires `--threat-profile`. Both default
-to 1.0 and multiply the scheduled rate after `--ft-lr-mult`. Virtual rows and
-PSQT weights keep the FT group rate. Each row uses the FT weight decay
-coefficient, so decoupled decay follows its optimizer rate. Norm loss uses the
-scheduled rate. On resume, supply the multipliers on the command line.
+real piece rows across all effect buckets, and `--threat-lr-mult` scales it for
+real Threat rows, including compact Threat rows. The Threat option requires
+`--threat-profile`. Both default to 1.0 and multiply the scheduled rate after
+`--ft-lr-mult`. Virtual rows and PSQT weights keep the FT group rate. Each row
+uses the FT weight decay coefficient, so decoupled decay follows its optimizer
+rate. Norm loss uses the scheduled rate. On resume, supply the multipliers on
+the command line.
 
 Different rates within the FT weights require the native CUDA fused optimizer.
 For that combination, disable PSQT and precision diagnostics and use a multiple

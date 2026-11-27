@@ -3487,48 +3487,56 @@ fn assert_states_close(what: &str, actual: &[f32], expected: &[f32], relative: f
 #[cfg(feature = "native")]
 #[test]
 fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::arch::RANGER_K;
+
     let context = test_cuda_context_reserving_gib(2)?;
     let standard = LayerStackTestOptions::standard();
     let full = FeatureSet::HalfKaHmMerged
         .spec()
-        .with_threat_profile(ThreatProfile::CrossSide)
-        .with_ft_factorize();
+        .with_threat_profile(ThreatProfile::CrossSide);
+    let compact = full.with_ft_factorize().with_threat_width(32);
+    let compact_precision = PrecisionFlags {
+        ft_fp16: true,
+        ft_fp16_out: true,
+        fp16_opt_state: true,
+        ..PrecisionFlags::default()
+    };
     for (feature_set, precision, optimizer) in [
-        (full, PrecisionFlags::default(), OptimizerKind::RAdam),
         (
-            full.with_threat_width(32),
+            full.with_ft_factorize(),
+            PrecisionFlags::default(),
+            OptimizerKind::RAdam,
+        ),
+        (
+            full,
             PrecisionFlags {
                 ft_fp16: true,
-                ft_fp16_out: true,
-                fp16_opt_state: true,
                 ..PrecisionFlags::default()
             },
-            OptimizerKind::Sgd,
+            OptimizerKind::RAdam,
         ),
+        (compact, compact_precision, OptimizerKind::Sgd),
+        // Compact FT norms reduce partitions in a fixed order for bitwise comparisons.
+        (compact, compact_precision, OptimizerKind::Ranger),
     ] {
         let optim_groups =
             OptimGroupConfig::resolve(0.125, None, None, None, Some(2.0), None, None);
+        let lookahead = optimizer == OptimizerKind::Ranger;
+        let step_count = if lookahead { RANGER_K } else { 1 };
         let options = LayerStackTestOptions {
             feature_set,
             precision,
             optimizer,
             optim_groups,
+            norm_loss_factor: lookahead.then_some(1.0e-2),
             ..standard
         };
         let ft_out = options.ft_out;
         let base_rows = feature_set.base_ft_in();
-        let (threat_start, threat_width) = feature_set.ft_row_layout(base_rows, ft_out);
+        let (threat_start, _) = feature_set.ft_row_layout(base_rows, ft_out);
+        let (active_threat_start, threat_width) = feature_set.ft_row_layout(base_rows + 1, ft_out);
         let real_end = feature_set.ft_weight_len(ft_out);
-        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
-        // One contributor per active feature makes the gradient independent of reduction order.
-        batch.stm_indices.fill(-1);
-        batch.nstm_indices.fill(-1);
-        batch.nnz.fill(0);
-        batch.nnz[0] = 1;
-        batch.stm_indices[0] = 0;
-        batch.nstm_indices[0] = base_rows as i32;
-        batch.score.fill(200.0);
-        batch.wdl.fill(1.0);
+        let batch = ft_lr_test_batch(feature_set, base_rows + 1);
         let mut initial = None;
         let mut run = |piece, threat| -> Result<_, Box<dyn std::error::Error>> {
             let options = LayerStackTestOptions {
@@ -3536,6 +3544,8 @@ fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std
                 ..options
             };
             let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+            // Exercise lookahead on the first update so all runs use identical gradients.
+            trainer.set_step_count_for_test(step_count - 1);
             if initial.is_none() {
                 let (_, groups) = trainer.raw_checkpoint_state_to_host()?;
                 let (_, (weights, ..)) = groups.into_iter().next().unwrap();
@@ -3543,7 +3553,7 @@ fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std
             }
             trainer.step(&batch.as_ref(), 1.0e-2, 0.0, SMOKE_LOSS_WRM)?;
             let (step, groups) = trainer.raw_checkpoint_state_to_host()?;
-            assert_eq!(step, 1);
+            assert_eq!(step, step_count);
             let (name, ft) = groups.into_iter().next().unwrap();
             assert_eq!(name, "ft_w");
             let (forward, _) = trainer.ft_forward_state_to_host_for_test()?;
@@ -3565,21 +3575,31 @@ fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std
         }
         assert!(m[..ft_out].iter().any(|&value| value != 0.0));
         assert!(
-            m[threat_start..threat_start + threat_width]
+            m[active_threat_start..active_threat_start + threat_width]
                 .iter()
                 .any(|&value| value != 0.0)
         );
 
-        let ((piece_zero, piece_m, ..), _) = run(Some(0.0), None)?;
-        let ((threat_small, threat_m, ..), _) = run(None, Some(0.125))?;
+        let ((piece_zero, piece_m, piece_v, piece_slow), _) = run(Some(0.0), None)?;
+        let ((threat_small, threat_m, threat_v, threat_slow), _) = run(None, Some(0.125))?;
         let initial = initial.unwrap();
         assert_ft_bits(&piece_m, &m);
         assert_ft_bits(&threat_m, &m);
+        assert_ft_bits(&piece_v, &v);
+        assert_ft_bits(&threat_v, &v);
         assert!(weights[..threat_start] != initial[..threat_start]);
-        assert_ft_bits(&piece_zero[..threat_start], &initial[..threat_start]);
+        assert!(piece_zero[..threat_start] != weights[..threat_start]);
         assert_ft_bits(&piece_zero[threat_start..], &weights[threat_start..]);
         assert_ft_bits(&threat_small[..threat_start], &weights[..threat_start]);
         assert_ft_bits(&threat_small[real_end..], &weights[real_end..]);
+        assert!(threat_small[threat_start..real_end] != weights[threat_start..real_end]);
+        if lookahead {
+            assert_ft_bits(&slow, &weights);
+            assert_ft_bits(&piece_slow, &piece_zero);
+            assert_ft_bits(&threat_slow, &threat_small);
+            continue;
+        }
+        assert_ft_bits(&piece_zero[..threat_start], &initial[..threat_start]);
         let mut changed = false;
         for index in threat_start..real_end {
             let before = f64::from(initial[index]);
@@ -3596,6 +3616,82 @@ fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std
         assert!(changed);
     }
     Ok(())
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn ft_piece_lr_mult_covers_all_effect_bucket_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let standard = LayerStackTestOptions::standard();
+    let effect = standard
+        .feature_set
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+    let optim_groups = OptimGroupConfig::resolve(0.125, None, None, None, None, None, None);
+    for feature_set in [effect, effect.with_ft_factorize()] {
+        let options = LayerStackTestOptions {
+            feature_set,
+            optimizer: OptimizerKind::RAdam,
+            optim_groups,
+            ..standard
+        };
+        let real_end = feature_set.ft_weight_len(options.ft_out);
+        let batch = ft_lr_test_batch(feature_set, feature_set.ft_in() - 1);
+        let run = |piece, fused| -> Result<_, Box<dyn std::error::Error>> {
+            let options = LayerStackTestOptions {
+                optim_groups: optim_groups.with_ft_row_lr_mults(piece, None),
+                ..options
+            };
+            let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+            trainer.set_ft_fused_optimizer_enabled_for_test(fused);
+            let (_, mut groups) = trainer.raw_checkpoint_state_to_host()?;
+            let (_, (before, ..)) = groups.remove(0);
+            trainer.step(&batch.as_ref(), 1.0e-2, 0.0, SMOKE_LOSS_WRM)?;
+            let (_, mut groups) = trainer.raw_checkpoint_state_to_host()?;
+            let (_, (after, ..)) = groups.remove(0);
+            if feature_set.ft_factorize() {
+                let (forward, _) = trainer.ft_forward_state_to_host_for_test()?;
+                trainer.sync_ft_forward_weights()?;
+                let (refolded, _) = trainer.ft_forward_state_to_host_for_test()?;
+                assert_ft_bits(forward.as_deref().unwrap(), refolded.as_deref().unwrap());
+            }
+            Ok((before, after))
+        };
+        let (_, baseline) = run(None, true)?;
+        let (before, scaled) = run(Some(0.0), true)?;
+        assert_ft_bits(&scaled[..real_end], &before[..real_end]);
+        assert_ft_bits(&scaled[real_end..], &baseline[real_end..]);
+        // Decoupled decay updates even rows absent from the batch.
+        for (row, (scaled, baseline)) in scaled[..real_end]
+            .chunks_exact(options.ft_out)
+            .zip(baseline[..real_end].chunks_exact(options.ft_out))
+            .enumerate()
+        {
+            assert_ne!(scaled, baseline, "effect bucket FT row {row}");
+        }
+        if !feature_set.ft_factorize() {
+            let (_, unfused) = run(Some(0.0), false)?;
+            assert_ft_bits(&scaled, &unfused);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn ft_lr_test_batch(
+    feature_set: shogi_features::FeatureSetSpec,
+    nstm_feature: usize,
+) -> crate::trainer_common::BatchDataOwned {
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+    // One contributor per active feature makes the gradient independent of reduction order.
+    batch.stm_indices.fill(-1);
+    batch.nstm_indices.fill(-1);
+    batch.nnz.fill(0);
+    batch.nnz[0] = 1;
+    batch.stm_indices[0] = 0;
+    batch.nstm_indices[0] = nstm_feature as i32;
+    batch.score.fill(200.0);
+    batch.wdl.fill(1.0);
+    batch
 }
 
 #[cfg(feature = "native")]

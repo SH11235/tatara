@@ -32,8 +32,8 @@ LayerStacks の両 head で L1 の共有重みも対象になる。省略時は 
 では dense の値、simple では全体の値に従う。resume 時はそのコマンドラインの
 倍率を使い、レシピの比較にも含める。
 
-LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実行に、
-`--threat-lr-mult` が Threat 特徴の実行（幅を縮めた行を含む）に適用される。Threat の倍率には
+LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実の行（全 effect bucket を含む）に、
+`--threat-lr-mult` が Threat 特徴の実の行（幅を縮めた行を含む）に適用される。Threat の倍率には
 `--threat-profile` が必要。いずれも既定値は 1.0 で、schedule の学習率に
 `--ft-lr-mult` を掛けた値にさらに掛ける。仮想行と PSQT の重みは FT group の
 学習率を使う。weight decay の係数は FT group の値を使い、decoupled decay の強さは

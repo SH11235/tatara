@@ -196,6 +196,10 @@ mod tests {
         let base = shogi_features::FeatureSet::HalfKaHmMerged.spec();
         assert_eq!(cfg.uniform_ft_lr_mult(base), Some(0.5));
         assert_eq!(cfg.uniform_ft_lr_mult(base.with_ft_factorize()), None);
+        let effect =
+            base.with_effect_bucket_config(shogi_features::EffectBucketConfig::KINGFIXED_2X2);
+        assert_eq!(cfg.uniform_ft_lr_mult(effect), Some(0.5));
+        assert_eq!(cfg.uniform_ft_lr_mult(effect.with_ft_factorize()), None);
         let threat = base.with_threat_profile(shogi_features::ThreatProfile::CrossSide);
         assert_eq!(cfg.uniform_ft_lr_mult(threat), None);
         let equal = cfg.with_ft_row_lr_mults(Some(0.5), Some(0.5));
