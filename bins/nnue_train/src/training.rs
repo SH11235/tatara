@@ -214,11 +214,8 @@ fn parse_effect_bucket_config(
     Ok(config)
 }
 
-/// 学習範囲 (start_superbatch <= --superbatches) の検査を免除する経路か。
-/// `--eval-only` / `--rescore-input` は学習しないため、最終 checkpoint
-/// (start = saved_sb + 1 > --superbatches) からの `--resume` も正当。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn training_range_exempt(cli: &Cli) -> bool {
+pub(crate) fn is_forward_only(cli: &Cli) -> bool {
     cli.eval_only || cli.rescore_input.is_some()
 }
 
@@ -455,6 +452,9 @@ fn validate_shared_cli(
             cli.optimizer
         )
     })?;
+    if cli.adam_bias_correction && optimizer != OptimizerKind::AdamW {
+        return Err("--adam-bias-correction requires --optimizer adamw".into());
+    }
     if cli.transfer_radam_momentum && optimizer != OptimizerKind::Sgd {
         return Err("--transfer-radam-momentum requires --optimizer sgd".into());
     }
@@ -973,7 +973,7 @@ pub(crate) fn run_training(
     // ため、optimizer state と backward workspace を確保しない forward-only trainer
     // で構築する (同一 batch size でも device memory が学習構成より大幅に小さく、
     // 12GB 級 GPU で大 batch が通る)。
-    let construct = if cli.eval_only || cli.rescore_input.is_some() {
+    let construct = if is_forward_only(cli) {
         GpuTrainer::new_forward_only
     } else {
         GpuTrainer::new
@@ -1037,6 +1037,7 @@ pub(crate) fn run_training(
     // 保存済 LR horizon を決める。
     // rescore の fingerprint 用に、ロード時点で固定した artifact identity。
     let mut rescore_net_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
+    trainer.adam_bias_correction = cli.adam_bias_correction;
     let (resumed_superbatch, resume_producer, resumed_lr_horizon): (
         Option<usize>,
         Option<crate::ckpt::ResumeProducer>,
@@ -1168,7 +1169,7 @@ pub(crate) fn run_training(
     // 学習しない経路には train-range 制約を課さない。これを課すと最終
     // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価 /
     // リスコアできない。
-    if start_superbatch > cli.superbatches && !training_range_exempt(cli) {
+    if start_superbatch > cli.superbatches && !is_forward_only(cli) {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
             cli.superbatches
@@ -1181,7 +1182,8 @@ pub(crate) fn run_training(
         );
     }
 
-    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
+    let lr_scheduler =
+        build_layerstack_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
@@ -1281,7 +1283,7 @@ pub(crate) fn run_training(
         return crate::rescore_driver::run_rescore(&mut trainer, &rescore_cfg);
     }
 
-    if cli.eval_only {
+    let Some(lr_scheduler) = lr_scheduler else {
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
         // eval-only はそこへ到達せず held-out loader を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
@@ -1359,7 +1361,12 @@ pub(crate) fn run_training(
             report.mean_loss, report.accuracy, report.n_positions, report.n_counted,
         );
         return Ok(());
-    }
+    };
+
+    trainer.lr_total_steps = match &lr_scheduler {
+        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+        _ => None,
+    };
 
     // ここに到達 = 通常学習 (eval-only / norm-dump は上で return 済)。学習には --data が要る。
     let data = data.ok_or("training requires --data")?;
@@ -1384,10 +1391,16 @@ pub(crate) fn run_training(
         data,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
-        lr_scheduler.to_string(),
+        &lr_scheduler,
         fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(decay) = cli.l1_shared_weight_decay {
+        println!("[train] l1_shared_weight_decay={decay}");
+    }
+    if cli.adam_bias_correction {
+        println!("[train] adam_bias_correction=true");
+    }
     if let Some(mult) = cli.l1_lr_mult {
         println!("[train] l1_lr_mult={mult}");
     }
@@ -1461,8 +1474,23 @@ pub(crate) fn build_lr_scheduler(
     cli: &Cli,
     resumed_horizon: Option<usize>,
 ) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+    build_lr_scheduler_with_steps(cli, resumed_horizon, cli.lr_total_steps)
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn build_lr_scheduler_with_steps(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    total_steps: Option<u64>,
+) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
     use nnue_train::schedule::*;
 
+    if total_steps.is_some() && cli.lr_schedule != LrScheduleArg::OneCycle {
+        return Err("--lr-total-steps requires --lr-schedule one-cycle".into());
+    }
+    if total_steps == Some(0) {
+        return Err("--lr-total-steps must be positive".into());
+    }
     let lr = cli.lr;
     // linear / cosine / exponential の減衰終端 superbatch。優先順位は explicit
     // --lr-final-superbatch > resume した保存 horizon > --superbatches。horizon を
@@ -1533,16 +1561,24 @@ pub(crate) fn build_lr_scheduler(
                 )
                 .into());
             }
-            // one-cycle は専用の horizon flag を持たないので、explicit 引数は常に
-            // None。resume した保存 horizon があればそれを、無ければ --superbatches。
-            let total = resolve_lr_horizon(None, resumed_horizon, cli.superbatches).max(1);
-            LrSchedulerEnum::OneCycle(OneCycleLR::new(
-                lr,
-                cli.lr_warmup_pct,
-                cli.lr_div_factor,
-                cli.lr_final_div_factor,
-                total,
-            ))
+            if let Some(total) = total_steps {
+                LrSchedulerEnum::StepOneCycle(StepOneCycleLR::new(
+                    lr,
+                    cli.lr_warmup_pct,
+                    cli.lr_div_factor,
+                    cli.lr_final_div_factor,
+                    total,
+                ))
+            } else {
+                let total = resolve_lr_horizon(None, resumed_horizon, cli.superbatches).max(1);
+                LrSchedulerEnum::OneCycle(OneCycleLR::new(
+                    lr,
+                    cli.lr_warmup_pct,
+                    cli.lr_div_factor,
+                    cli.lr_final_div_factor,
+                    total,
+                ))
+            }
         }
     };
 
@@ -1557,11 +1593,47 @@ pub(crate) fn build_lr_scheduler(
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn build_layerstack_lr_scheduler(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    saved_steps: Option<u64>,
+) -> Result<Option<LrSchedulerEnum>, Box<dyn std::error::Error>> {
+    if is_forward_only(cli) {
+        return Ok(None);
+    }
+    build_resumed_lr_scheduler(cli, resumed_horizon, saved_steps).map(Some)
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn build_resumed_lr_scheduler(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    saved_steps: Option<u64>,
+) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+    if let Some(saved) = saved_steps {
+        if cli.lr_schedule != LrScheduleArg::OneCycle
+            || cli.lr_total_steps.is_some_and(|n| n != saved)
+        {
+            return Err("resumed optimizer-step one-cycle requires the same --lr-total-steps and --lr-schedule one-cycle".into());
+        }
+        build_lr_scheduler_with_steps(cli, None, Some(saved))
+    } else {
+        if cli.resume.is_some() && !cli.transfer_radam_momentum && cli.lr_total_steps.is_some() {
+            return Err(
+                "--lr-total-steps does not match the resumed checkpoint's superbatch schedule"
+                    .into(),
+            );
+        }
+        build_lr_scheduler(cli, resumed_horizon)
+    }
+}
+
 /// LR schedule の horizon (decay の `final_superbatch` / one-cycle の
 /// `total_superbatch`) を解決する。優先順位:
 ///
 /// 1. `explicit` — resume か否かに関わらず明示された CLI horizon flag
-///    (decay の `--lr-final-superbatch`)。one-cycle は専用 flag が無いため常に `None`。
+///    (decay の `--lr-final-superbatch`)。superbatch 単位の one-cycle では `None`。
 /// 2. `resumed` — v5+ checkpoint から復元した保存済 horizon。curve を
 ///    `--superbatches` から独立に再現させる。
 /// 3. `default` — `--superbatches` 由来の fallback (新規 run / 保存 horizon 無し)。
@@ -1624,8 +1696,9 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
+pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 7] {
     [
+        ("--l1-shared-weight-decay", cli.l1_shared_weight_decay),
         ("--ft-weight-decay", cli.ft_weight_decay),
         ("--dense-weight-decay", cli.dense_weight_decay),
         ("--bias-weight-decay", cli.bias_weight_decay),
@@ -1709,6 +1782,7 @@ fn resolve_layerstack_optim_groups(cli: &Cli) -> OptimGroupConfig {
         cli.bias_lr_mult,
     )
     .with_l1_lr_mult(cli.l1_lr_mult)
+    .with_l1_shared_weight_decay(cli.l1_shared_weight_decay)
     .with_ft_row_lr_mults(cli.ft_piece_lr_mult, cli.threat_lr_mult)
 }
 
@@ -2144,7 +2218,7 @@ fn build_experiment_params(
     start_superbatch: usize,
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     trainer: ExperimentTrainerParams,
 ) -> Params {
     let is_wrm = cli.win_rate_model;
@@ -2169,7 +2243,11 @@ fn build_experiment_params(
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
-        lr_schedule,
+        lr_total_steps: match lr_schedule {
+            LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+            _ => None,
+        },
+        lr_schedule: lr_schedule.to_string(),
         batch_size: cli.batch_size,
         batches_per_superbatch: cli.batches_per_superbatch,
         superbatches: cli.superbatches,
@@ -2194,6 +2272,8 @@ fn build_experiment_params(
         dense_lr_mult: trainer.optim_groups.map(|groups| groups.dense.lr_mult),
         bias_lr_mult: trainer.optim_groups.map(|groups| groups.bias.lr_mult),
         l1_lr_mult: cli.l1_lr_mult,
+        l1_shared_weight_decay: cli.l1_shared_weight_decay,
+        adam_bias_correction: cli.adam_bias_correction.then_some(true),
         ft_piece_lr_mult: cli.ft_piece_lr_mult,
         threat_lr_mult: cli.threat_lr_mult,
         norm_loss_factor: trainer.norm_loss_factor,
@@ -2267,7 +2347,7 @@ pub(crate) fn build_experiment_logger(
     data: &[PathBuf],
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     fv_scale: Option<i32>,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
@@ -2412,7 +2492,7 @@ pub(crate) fn build_experiment_logger_simple(
     ft_fp16_out: bool,
     fp16_opt_state: bool,
     tf32: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     // export される `.bin` の実効値。入力 weight と CLI override の解決後に trainer
     // が保持する値を渡す。
     fv_scale: i32,
@@ -2727,6 +2807,7 @@ pub(crate) fn run_simple_training(
     trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
     trainer.l1_lr_mult = cli.l1_lr_mult.unwrap_or(1.0);
 
+    trainer.adam_bias_correction = cli.adam_bias_correction;
     let (resumed_superbatch, resume_producer, resumed_lr_horizon, checkpoint_fv_scale): (
         Option<usize>,
         Option<crate::ckpt::ResumeProducer>,
@@ -2802,7 +2883,11 @@ pub(crate) fn run_simple_training(
         .into());
     }
 
-    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
+    let lr_scheduler = build_resumed_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
+    trainer.lr_total_steps = match &lr_scheduler {
+        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+        _ => None,
+    };
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
@@ -2867,10 +2952,16 @@ pub(crate) fn run_simple_training(
         ft_fp16_out,
         fp16_opt_state,
         tf32,
-        lr_scheduler.to_string(),
+        &lr_scheduler,
         trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(decay) = cli.l1_shared_weight_decay {
+        println!("[train] l1_shared_weight_decay={decay}");
+    }
+    if cli.adam_bias_correction {
+        println!("[train] adam_bias_correction=true");
+    }
     if let Some(mult) = cli.l1_lr_mult {
         println!("[train] l1_lr_mult={mult}");
     }
@@ -3184,6 +3275,68 @@ mod shared_cli_tests {
     }
 
     #[test]
+    fn resume_batch_change_preserves_one_cycle_horizon_and_superbatch_rate() {
+        use nnue_train::schedule::LrScheduler;
+        let original = parse(&[
+            "--lr-schedule",
+            "one-cycle",
+            "--superbatches",
+            "20",
+            "--batch-size",
+            "128",
+            "--batches-per-superbatch",
+            "10",
+        ]);
+        let resumed = parse(&[
+            "--lr-schedule",
+            "one-cycle",
+            "--superbatches",
+            "30",
+            "--batch-size",
+            "64",
+            "--batches-per-superbatch",
+            "20",
+        ]);
+        let before = build_lr_scheduler(&original, None).unwrap();
+        let after = build_lr_scheduler(&resumed, before.horizon()).unwrap();
+        assert_eq!(before.horizon(), after.horizon());
+        for sb in [2, 10, 19, 20] {
+            assert_eq!(before.lr(9, sb).to_bits(), after.lr(19, sb).to_bits());
+        }
+        for value in ["NaN", "inf", "-0.1"] {
+            let flag = format!("--l1-shared-weight-decay={value}");
+            assert!(
+                validate_nonnegative_optim_flags(per_group_optim_flags(&parse(&[&flag]))).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn adam_bias_correction_requires_adamw() {
+        for optimizer in ["ranger", "radam", "sgd"] {
+            assert!(
+                shared_cli_error(&["--optimizer", optimizer, "--adam-bias-correction"], false)
+                    .contains("requires --optimizer adamw")
+            );
+        }
+        let cli = parse(&[
+            "--optimizer",
+            "adamw",
+            "--adam-bias-correction",
+            "--l1-shared-weight-decay",
+            "0.3",
+        ]);
+        assert!(cli.adam_bias_correction);
+        assert!(validate_shared_cli(&cli, false, false).is_ok());
+        assert_eq!(
+            resolve_layerstack_optim_groups(&cli)
+                .effective(crate::optim_groups::OptimGroupKind::L1Shared, 0.1)
+                .0,
+            0.3
+        );
+    }
+
+    #[test]
     fn shared_cli_validation_rejects_invalid_common_values() {
         assert!(
             shared_cli_error(&["--feature-set", "unknown"], false)
@@ -3463,7 +3616,7 @@ mod tests {
             std::slice::from_ref(&data),
             256,
             false,
-            "step".to_string(),
+            &LrSchedulerEnum::Constant(nnue_train::schedule::ConstantLR { value: 0.001 }),
             None,
         );
         logger.write().expect("write experiment.json");
@@ -3527,7 +3680,7 @@ mod tests {
             false,
             false,
             false,
-            "step".to_string(),
+            &LrSchedulerEnum::Constant(nnue_train::schedule::ConstantLR { value: 0.001 }),
             effective,
         );
         logger.write().expect("write experiment.json");
@@ -3565,9 +3718,9 @@ mod tests {
             .collect();
         assert_eq!(specified, ["--bias-weight-decay"]);
 
-        // 6 flag 全指定で表の (CLI 名 → Cli field) 配線を値で照合する (table の
-        // copy-paste 取り違えを検出)。
         let cli = parse(&[
+            "--l1-shared-weight-decay",
+            "0.4",
             "--ft-weight-decay",
             "0.1",
             "--dense-weight-decay",
@@ -3583,9 +3736,9 @@ mod tests {
         ]);
         let values: Vec<f32> = per_group_optim_flags(&cli)
             .iter()
-            .map(|(_, v)| v.expect("all six flags set"))
+            .map(|(_, v)| v.expect("all flags set"))
             .collect();
-        assert_eq!(values, [0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
+        assert_eq!(values, [0.4, 0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
     }
 
     #[test]

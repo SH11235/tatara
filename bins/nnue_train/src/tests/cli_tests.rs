@@ -479,7 +479,8 @@ fn cli_with_factorize(argv: &[&str]) -> Cli {
 /// simple が reject すべき layerstack 専用 per-group optimizer フラグの期待セット。
 /// production テーブル ([`per_group_optim_flags`]) から独立に固定し、テーブル側の
 /// 追加・脱落を検出する。
-const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
+const SIMPLE_REJECTED_PER_GROUP: [&str; 7] = [
+    "--l1-shared-weight-decay",
     "--ft-weight-decay",
     "--dense-weight-decay",
     "--bias-weight-decay",
@@ -495,7 +496,7 @@ fn simple_rejects_layerstack_only_global_flags() {
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--rescore-input", "x.psv"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
-    // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
+    // per-group optimizer override をすべて reject (独立の期待リストで固定)。
     for name in SIMPLE_REJECTED_PER_GROUP {
         assert!(
             reject_simple_unsupported_flags(&simple_cli(&[name, "0.1"])).is_err(),
@@ -545,6 +546,13 @@ fn simple_accepts_consumed_global_flags() {
 
 #[test]
 fn simple_accepts_l1_learning_rate_multiplier() {
+    let shared = simple_cli(&["--l1-shared-weight-decay", "0.1"]);
+    assert!(
+        reject_simple_unsupported_flags(&shared)
+            .unwrap_err()
+            .to_string()
+            .contains("--l1-shared-weight-decay")
+    );
     let cli = simple_cli(&["--l1-lr-mult", "0.25"]);
     assert_eq!(cli.l1_lr_mult, Some(0.25));
     assert!(reject_simple_unsupported_flags(&cli).is_ok());
@@ -1163,17 +1171,16 @@ fn rescore_score_clip_rejects_non_positive_values() {
     assert!(Cli::try_parse_from(["nnue-train", "--rescore-score-clip", "1", "layerstack"]).is_ok());
 }
 
-/// 学習範囲検査の免除は「学習しない経路」に限る。
 #[test]
-fn training_range_exemption_covers_eval_only_and_rescore() {
-    use crate::training::training_range_exempt;
+fn forward_only_covers_eval_only_and_rescore() {
+    use crate::training::is_forward_only;
     let plain = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
-    assert!(!training_range_exempt(&plain));
+    assert!(!is_forward_only(&plain));
     let eval = Cli::try_parse_from(["nnue-train", "--eval-only", "layerstack"]).unwrap();
-    assert!(training_range_exempt(&eval));
+    assert!(is_forward_only(&eval));
     let rescore =
         Cli::try_parse_from(["nnue-train", "--rescore-input", "x.psv", "layerstack"]).unwrap();
-    assert!(training_range_exempt(&rescore));
+    assert!(is_forward_only(&rescore));
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
@@ -2781,4 +2788,77 @@ fn independent_keep_bucket_cli_rejects_split_conflicting_definitions() {
             "--keep-bucket-spec conflicts with --keep-progress-coeff"
         );
     }
+}
+
+#[test]
+fn lr_total_steps_validates_and_preserves_saved_horizon() {
+    use crate::training::{build_lr_scheduler, build_resumed_lr_scheduler};
+    use nnue_train::schedule::LrScheduler;
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["nnue-train"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["layerstack"]),
+        )
+        .unwrap()
+    };
+    for schedule in [
+        "step",
+        "constant",
+        "drop",
+        "linear",
+        "cosine",
+        "exponential",
+    ] {
+        assert!(
+            build_lr_scheduler(
+                &parse(&["--lr-schedule", schedule, "--lr-total-steps", "10"]),
+                None
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        build_lr_scheduler(
+            &parse(&["--lr-schedule", "one-cycle", "--lr-total-steps", "0"]),
+            None
+        )
+        .is_err()
+    );
+    let cli = parse(&["--lr-schedule", "one-cycle", "--lr-total-steps", "20"]);
+    let fresh = build_lr_scheduler(&cli, None).unwrap();
+    assert!(fresh.to_string().contains("20 optimizer updates"));
+    assert_eq!(fresh.horizon(), None);
+    let same = build_resumed_lr_scheduler(&cli, None, Some(20)).unwrap();
+    assert!(build_resumed_lr_scheduler(&cli, None, Some(21)).is_err());
+    let inherited = build_resumed_lr_scheduler(
+        &parse(&["--lr-schedule", "one-cycle", "--superbatches", "999"]),
+        None,
+        Some(20),
+    )
+    .unwrap();
+    for step in [0, 3, 4, 10, 19, 20, 30] {
+        assert_eq!(fresh.lr_at_step(0, 1, step), same.lr_at_step(4, 9, step));
+        assert_eq!(
+            fresh.lr_at_step(0, 1, step),
+            inherited.lr_at_step(4, 9, step)
+        );
+    }
+    assert!(build_resumed_lr_scheduler(&parse(&[]), None, Some(20)).is_err());
+    assert!(
+        build_resumed_lr_scheduler(
+            &parse(&[
+                "--resume",
+                "old.ckpt",
+                "--lr-schedule",
+                "one-cycle",
+                "--lr-total-steps",
+                "20"
+            ]),
+            Some(20),
+            None
+        )
+        .is_err()
+    );
 }

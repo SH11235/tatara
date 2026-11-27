@@ -249,6 +249,7 @@ impl LoaderState {
         for value in [&mut saved_settings, &mut expected_settings] {
             if let Some(object) = value.as_object_mut() {
                 object.remove("batches_per_superbatch");
+                object.remove("batch_size");
                 object
                     .entry("tree_sample_eval_only")
                     .or_insert(serde_json::Value::Bool(false));
@@ -363,6 +364,35 @@ mod tests {
     }
 
     #[test]
+    fn batch_change_is_allowed_but_shuffle_window_change_is_rejected() {
+        let files = vec![TeacherFileIdentity {
+            path: "teacher.psv".into(),
+            bytes: 4000,
+        }];
+        let state = LoaderState {
+            version: LOADER_STATE_VERSION,
+            wdl_jitter_state: None,
+            superbatch: 4,
+            teachers: vec![TeacherState {
+                id: "primary".into(),
+                files: files.clone(),
+                position: TeacherPosition::default(),
+            }],
+            settings: serde_json::json!({"batch_size": 128, "window_records": 1024}),
+        };
+        let mut now = serde_json::json!({"batch_size": 64, "window_records": 1024});
+        assert!(state.validate(&files, &now, 4).is_ok());
+        now["window_records"] = serde_json::json!(1088);
+        assert!(
+            state
+                .validate(&files, &now, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("window_records")
+        );
+    }
+
+    #[test]
     fn mismatch_lists_each_changed_setting_and_teacher() {
         let saved_files = vec![TeacherFileIdentity {
             path: "a.psv".into(),
@@ -387,13 +417,10 @@ mod tests {
         let diffs = state.mismatches(&now_files, &[], &now, 4);
         assert_eq!(
             diffs,
-            vec![
-                "--data: saved [a.psv (400 bytes)], now [b.psv (800 bytes)]".to_string(),
-                "batch_size: saved 16384, now 32768".to_string(),
-            ]
+            vec!["--data: saved [a.psv (400 bytes)], now [b.psv (800 bytes)]".to_string(),]
         );
         let message = state.validate(&now_files, &now, 4).unwrap_err().to_string();
-        assert!(message.contains("batch_size: saved 16384, now 32768"));
+        assert!(!message.contains("batch_size:"));
         assert!(message.contains("--resume-input restart"));
     }
 

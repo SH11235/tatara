@@ -49,6 +49,7 @@ struct FtFusedStep {
     step_size: f32,
     denom: i32,
     weight_decay: f32,
+    eps: f32,
     beta1: f32,
     lookahead: bool,
 }
@@ -1421,7 +1422,7 @@ impl GpuTrainer {
                                    slice(fold_rows), fold_bounds, row_width as u32, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
                                    norm_lr, norm_factor, EPS, row_lr, step.step_size, step.denom,
-                                   step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
+                                   step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), step.eps,
                                    W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE,
                                    FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
                         }
@@ -1514,6 +1515,16 @@ impl GpuTrainer {
         else {
             return Ok(false);
         };
+        let optimizer_eps = self
+            .optimizer
+            .kernel_scalars(
+                self.step_count,
+                BETA2,
+                N_SMA_THRESHOLD,
+                EPS,
+                self.adam_bias_correction,
+            )
+            .2;
         let mirror = self.ft_w_h.as_ref().unwrap_or(&d.dummy_mirror);
         macro_rules! launch_precision {
             ($m:expr, $v:expr) => {{
@@ -1525,7 +1536,7 @@ impl GpuTrainer {
                         stream: self.stream, module: self.module, config: cfg_1d(self.ft_w.len()),
                         args: [slice(self.ft_w), slice($m), slice($v), slice(self.ft_w_grad),
                             slice(mirror), slice(d.device_indices), slice(d.records),
-                            lr, step_size, denom, decay, beta1, self.optimizer.kernel_beta2(BETA2), EPS,
+                            lr, step_size, denom, decay, beta1, self.optimizer.kernel_beta2(BETA2), optimizer_eps,
                             W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE, FT_OPT_V_SCALE,
                             self.ft_w.len() as u32, d.indices.len() as u32,
                             i32::from(self.fp16_opt_state),
@@ -1956,7 +1967,9 @@ pub(crate) struct GpuTrainer {
     bucket_mode: BucketMode,
     freeze_ft: bool,
     optimizer: OptimizerKind,
+    pub(crate) adam_bias_correction: bool,
     step_count: u64,
+    pub(crate) lr_total_steps: Option<u64>,
     #[cfg(feature = "native")]
     precision_diagnostic: Option<crate::precision_diagnostics::Diagnostic>,
     /// Forces the separate norm-loss / RAdam / lookahead / fold launches for FT weights so
@@ -2484,12 +2497,17 @@ struct UniformOptimGroup<'a> {
 /// dense weight (L1/L1 shared/L2/L3 weight + L1/L1 shared/L2 bias) は i8@QB 量子化由来の対称 clamp、
 /// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
 fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGroupKind, f32, f32)> {
-    use OptimGroupKind::{Bias, Dense, Ft, L1};
+    use OptimGroupKind::{Bias, Dense, Ft, L1, L1Shared};
     let mut groups = vec![
         ("ft_b", Bias, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
         ("l1_w", L1, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l1_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        ("l1_shared_weight", L1, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        (
+            "l1_shared_weight",
+            L1Shared,
+            W_CLAMP_QUANT_MIN,
+            W_CLAMP_QUANT_MAX,
+        ),
         ("l1_shared_bias", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
@@ -3035,6 +3053,7 @@ impl GpuTrainer {
             tf32: precision.tf32,
             feature_set,
             optim_groups,
+            adam_bias_correction: false,
             norm_loss_factor,
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
@@ -3042,6 +3061,7 @@ impl GpuTrainer {
             freeze_ft: false,
             optimizer,
             step_count: 0,
+            lr_total_steps: None,
             #[cfg(feature = "native")]
             precision_diagnostic: None,
             #[cfg(feature = "native")]
@@ -3809,6 +3829,8 @@ impl GpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                lr_total_steps: self.lr_total_steps,
+                adam_bias_correction: self.adam_bias_correction,
                 fv_scale: None,
             },
             &self.raw_ckpt_group_sources(),
@@ -3854,6 +3876,10 @@ impl GpuTrainer {
             },
             &expected_groups,
         )?;
+
+        if !transfer_radam_momentum && !self.forward_only {
+            header.validate_adam_bias_correction(self.adam_bias_correction)?;
+        }
 
         let forward_only = self.forward_only;
         if !forward_only {
@@ -3963,6 +3989,7 @@ impl GpuTrainer {
         }
 
         self.step_count = header.step_count;
+        self.lr_total_steps = header.lr_total_steps;
         self.sync_stack_forward_weights()?;
         Ok((header.superbatch, header.producer(), header.lr_horizon))
     }
@@ -7050,9 +7077,13 @@ impl GpuTrainer {
         // ===== OPTIMIZER STEP =====
         let lookahead_now =
             self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K);
-        let (step_size, denom) =
-            self.optimizer
-                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let (step_size, denom, optimizer_eps, decay_mult) = self.optimizer.kernel_scalars(
+            self.step_count,
+            BETA2,
+            N_SMA_THRESHOLD,
+            EPS,
+            self.adam_bias_correction,
+        );
         let beta1 = self.optimizer.beta1();
         let beta2 = self.optimizer.kernel_beta2(BETA2);
         // param-group config を copy で取り出す (`Copy`)。後段の uniform_groups は
@@ -7075,7 +7106,7 @@ impl GpuTrainer {
         // 形状の comb で train 形状の elementwise step からは書けないため、master
         // のみ更新し step 末の fold が comb を再生成する (`launch_ft_fold`)。
         let ft_factorize = self.feature_set.ft_factorize();
-        let ft_wd = optimizer.kernel_weight_decay(ft_wd);
+        let ft_wd = optimizer.kernel_weight_decay(ft_wd) * decay_mult;
         #[cfg(feature = "native")]
         let diagnosed =
             !self.freeze_ft && self.precision_optimizer(ft_lr, step_size, denom, ft_wd, beta1)?;
@@ -7091,6 +7122,7 @@ impl GpuTrainer {
                     step_size,
                     denom,
                     weight_decay: ft_wd,
+                    eps: optimizer_eps,
                     beta1,
                     lookahead: lookahead_now,
                 },
@@ -7108,7 +7140,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       ft_wd, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                        FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                             }
                         }?;
@@ -7121,7 +7153,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), ft_lr, step_size, denom,
-                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                       ft_wd, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                        FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n as u32]
                             }
                         }?;
@@ -7138,7 +7170,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), slice_mut(ft_w_h), ft_lr, step_size, denom,
-                                       ft_wd, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                                       ft_wd, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                             }
                         }?;
                     } else {
@@ -7150,7 +7182,7 @@ impl GpuTrainer {
                                 stream: self.stream, module: self.module, config: cfg_1d(ft_w_n),
                                 args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                        slice_mut(self.ft_w_grad), ft_lr, step_size, denom, ft_wd, beta1, beta2,
-                                       EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
+                                       optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n as u32]
                             }
                         }?;
                     }
@@ -7206,7 +7238,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1_shared_weight",
-                kind: OptimGroupKind::L1,
+                kind: OptimGroupKind::L1Shared,
                 weight: &mut self.l1_shared_weight,
                 m: &mut self.l1_shared_weight_m,
                 v: &mut self.l1_shared_weight_v,
@@ -7312,7 +7344,7 @@ impl GpuTrainer {
             // を resolve する。全 group 既定 (override 無し) なら decay = 大域値・
             // lr = scheduled_lr で単一 weight_decay 経路と bit-identical。
             let (wd, lr_g) = optim_groups.effective(g.kind, lr);
-            let wd = optimizer.kernel_weight_decay(wd);
+            let wd = optimizer.kernel_weight_decay(wd) * decay_mult;
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
@@ -7321,7 +7353,7 @@ impl GpuTrainer {
                     stream: self.stream, module: self.module, config: cfg_1d(g.n),
                     args: [slice_mut(*g.weight), slice_mut(*g.m), slice_mut(*g.v),
                            slice_mut(*g.grad), lr_g, step_size, denom, wd,
-                           beta1, beta2, EPS, g.clamp_min, g.clamp_max, g.n as u32]
+                           beta1, beta2, optimizer_eps, g.clamp_min, g.clamp_max, g.n as u32]
                 }
             }?;
         }
@@ -7338,8 +7370,8 @@ impl GpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d($n),
                             args: [
                                 slice_mut(layer.$field), slice_mut(layer.$m), slice_mut(layer.$v),
-                                slice_mut(layer.$grad), $lr, step_size, denom, optimizer.kernel_weight_decay($wd),
-                                beta1, beta2, EPS, $min, $max, ($n) as u32
+                                slice_mut(layer.$grad), $lr, step_size, denom, optimizer.kernel_weight_decay($wd) * decay_mult,
+                                beta1, beta2, optimizer_eps, $min, $max, ($n) as u32
                             ]
                         }
                     }?;
@@ -7738,14 +7770,14 @@ mod tests {
     /// `uniform_optim_group_layout` を期待値と照合して回帰を検出する。
     #[test]
     fn uniform_optim_group_layout_matches_handwritten_order() {
-        use OptimGroupKind::{Bias, Dense, Ft, L1};
+        use OptimGroupKind::{Bias, Dense, Ft, L1, L1Shared};
         let q = (W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX);
         let none = (W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX);
         let expected_no_psqt = vec![
             ("ft_b", Bias, none.0, none.1),
             ("l1_w", L1, q.0, q.1),
             ("l1_b", Bias, q.0, q.1),
-            ("l1_shared_weight", L1, q.0, q.1),
+            ("l1_shared_weight", L1Shared, q.0, q.1),
             ("l1_shared_bias", Bias, q.0, q.1),
             ("l2_w", Dense, q.0, q.1),
             ("l2_b", Bias, q.0, q.1),

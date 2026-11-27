@@ -23,14 +23,38 @@ superbatch index の関数として run ごとに再計算される。学習手�
 - `one-cycle` — horizon の最初の `--lr-warmup-pct` で warmup し、以降は
   cosine で anneal する。
 
+`--lr-schedule one-cycle --lr-total-steps N` は通算の optimizer 更新回数で
+進み、`--superbatches` とは独立です。N は正の整数で、他の schedule では指定できません。
+initial は `--lr / --lr-div-factor`、final は initial を `--lr-final-div-factor`
+で割った値です。warmup は浮動小数点の境界 `--lr-warmup-pct * N - 1` で終わり、
+丸めません。0 始まりの更新番号を使い、PyTorch と同じ half-cosine の区間で、warmup は
+その境界で、cooldown は `N - 1` で終わります。warmup の割合は f32 で保持し、境界の
+計算では f64 に変換します。境界が整数でないと、max LR ちょうどの更新が無いことが
+あります。warmup の割合が 1.0 なら、更新 `N - 1` で max LR に達します。更新 `N` 以降は
+更新 `N - 1` の値を保持します。warmup 0 では cooldown から始め、更新 0 で長さ 0 の
+warmup 区間になる場合は max LR を使います。
+
+checkpoint に N と完了した更新回数を保存します。resume で N を省略すると保存値を
+使い、異なる N や schedule は拒否します。更新回数の horizon を持たない checkpoint
+から、この方式への切り替えも拒否します。batch と 1 superbatch あたりの更新数を
+変えても、保存した更新回数と LR 曲線を引き継ぎます。その他の one-cycle option は
+resume 時にも同じ値を指定してください。新規学習で `--lr-total-steps` を省略すれば
+従来の superbatch 単位の計算です。
+
 `--lr-warmup-steps` は `one-cycle`（自前の warmup を持つ）を除く任意の schedule を、
 最初の superbatch 内の batch 単位 warmup で追加ラップする。
 
 `--l1-lr-mult` は FT の直後にある全結合層の重みに学習率の倍率を掛ける。
 LayerStacks の両 head で L1 の共有重みも対象になる。省略時は LayerStacks では
 `--dense-lr-mult`、simple では 1.0 を使う。L1 の weight decay 係数は LayerStacks
-では dense の値、simple では全体の値に従う。resume 時はそのコマンドラインの
+では dense の値（共有 L1 の明示的な上書きを除く）、simple では全体の値に従う。resume 時はそのコマンドラインの
 倍率を使い、レシピの比較にも含める。
+
+`--l1-shared-weight-decay` は LayerStack の全 bucket 共通の L1 重みだけの decay を上書きする。両 head で利用でき、bucket ごとの L1 重み・他層・bias には影響しない。学習率は `--l1-lr-mult`（省略時は dense の倍率）のまま。値は有限かつ非負に限り、simple では拒否する。省略時は従来の dense decay を使う。
+
+`--adam-bias-correction` は `--optimizer adamw` 専用で、`m_hat = m / (1 - beta1^t)`、`v_hat = v / (1 - beta2^t)` を使い、`w = w * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + epsilon)` の後に既存の weight clamp を適用する。省略時は従来の補正なし AdamW。native CUDA の FT fused / 非 fused、cuda-oxide、FP16 optimizer state の各経路で同じ補正を行う。FP16 state の保存時の丸めは残る。共通 kernel に渡す step 係数とともに epsilon・decay 係数を調整し、実効 epsilon と decoupled decay の率を保つ。
+
+resume 時もこれらの option を指定する。checkpoint は重み・moment・累積 optimizer step `t` を復元する。`--adam-bias-correction` は checkpoint に記録し、resume では同じ指定が要る (この項目の無い checkpoint は補正なしとみなす)。他の option は現在の CLI から決まる。明示した値は起動ログ・experiment の params・recipe fingerprint に記録し、省略時は項目を追加しない。
 
 LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実の行（全 effect bucket を含む）に、
 `--threat-lr-mult` が Threat 特徴の実の行（幅を縮めた行を含む）に適用される。Threat の倍率には
@@ -43,11 +67,17 @@ LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実の行（�
 FT の重みに異なる学習率を使うには、native CUDA の融合 optimizer が必要。
 この場合は PSQT と精度診断を無効にし、Threat の幅を縮める場合は 8 の倍数にする。
 
+### resume 時の batch サイズ変更
+
+`--batch-size` と `--batches-per-superbatch` の積を保ちながら変更できる。checkpoint と対応する `.loader.json` を一緒に保管すること。sampling の読みかけ chunk を含め、受理済み局面の位置から新しい batch サイズで再開する。教師の同一性と入力設定の照合は続ける。batch サイズ変更によって実際の shuffle 窓の局面数（`window_records`）が変わる場合は読み位置の復元を拒否する。窓の局面数を変えない batch サイズを選ぶか、`--resume-input restart` を明示して教師の先頭から読み直す。
+
+`--lr-total-steps` を指定した one-cycle 以外は superbatch 番号を基準とし、保存済み horizon を復元するため batch 数の変更では曲線を伸縮しない。その他の schedule option は CLI 由来なので同じ値を指定する。optimizer の moment と step 数は引き継ぎ、小さい batch では 1 superbatch あたりの更新回数が増える。batch 単位の warmup と WDL jitter は引き続き batch 数を基準とするため、局面数で見た長さは変わる。
+
 ### Horizon と resume
 
 **horizon**（curve が終端 LR に到達する superbatch）を持つのは
 `linear` / `cosine` / `exponential` 減衰（その `--lr-final-superbatch`）と
-`one-cycle`（その total）。`--lr-final-superbatch` 省略時、horizon は
+`--lr-total-steps` を指定しない `one-cycle`。`--lr-final-superbatch` 省略時、horizon は
 `--superbatches` に default するため、stateless な再構築だと `--superbatches` を
 変えて resume するたびに curve が伸縮してしまう。
 
@@ -58,7 +88,7 @@ curve を再現可能に保つため、checkpoint は解決済 horizon を記録
 2. checkpoint に保存された horizon。
 3. `--superbatches` — fallback。
 
-`one-cycle` は専用の horizon flag を持たないため、resume では保存 horizon が
+`--lr-total-steps` を指定しない one-cycle では、resume 時に保存した superbatch horizon が
 `--superbatches` を常に上書きする。これが記録される前に書かれた checkpoint（や
 horizon を持たない `step` / `constant` / `drop`）は horizon を持たず
 `--superbatches` に fallback する。したがって `step` はそもそも horizon を持たない

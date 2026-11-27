@@ -256,6 +256,8 @@ pub struct Params {
     /// `lr` / `lr_gamma` / `lr_step` は step スケジュール用の生 flag 値で、
     /// 他スケジュールでは未使用なため、再現に必要な実効形をここに残す。
     pub lr_schedule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lr_total_steps: Option<u64>,
     pub batch_size: usize,
     pub batches_per_superbatch: usize,
     pub superbatches: usize,
@@ -303,6 +305,10 @@ pub struct Params {
     /// Explicit learning-rate multiplier for the weights of the first dense layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l1_lr_mult: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_shared_weight_decay: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adam_bias_correction: Option<bool>,
     /// Explicit multiplier on the FT learning rate for real piece rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_piece_lr_mult: Option<f32>,
@@ -939,6 +945,10 @@ mod tests {
         let mut schedule = sample_params();
         schedule.lr_schedule = "constant".to_string();
         assert_ne!(recipe_fingerprint(&schedule, "teacher.psv"), fingerprint);
+        let mut steps = sample_params();
+        steps.lr_total_steps = Some(100);
+        assert_ne!(recipe_fingerprint(&steps, "teacher.psv"), fingerprint);
+        assert_eq!(serde_json::to_value(&steps).unwrap()["lr_total_steps"], 100);
         let mut holdout = sample_params();
         holdout.test_tail_positions = Some(10_000);
         assert_ne!(recipe_fingerprint(&holdout, "teacher.psv"), fingerprint);
@@ -950,6 +960,29 @@ mod tests {
         changed_lr.lr *= 0.5;
         assert_ne!(recipe_fingerprint(&changed_lr, "teacher.psv"), fingerprint);
         assert_ne!(recipe_fingerprint(&base, "other.psv"), fingerprint);
+    }
+
+    #[test]
+    fn optimizer_options_are_omitted_unless_requested_and_fingerprinted() {
+        let base = sample_params();
+        let value = serde_json::to_value(&base).unwrap();
+        assert!(value.get("l1_shared_weight_decay").is_none());
+        assert!(value.get("adam_bias_correction").is_none());
+        let original = recipe_fingerprint(&base, "teacher.psv");
+        let mut changed = base.clone();
+        changed.l1_shared_weight_decay = Some(0.0);
+        assert_ne!(recipe_fingerprint(&changed, "teacher.psv"), original);
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap()["l1_shared_weight_decay"],
+            0.0
+        );
+        let mut changed = base;
+        changed.adam_bias_correction = Some(true);
+        assert_ne!(recipe_fingerprint(&changed, "teacher.psv"), original);
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap()["adam_bias_correction"],
+            true
+        );
     }
 
     #[test]
@@ -1128,6 +1161,7 @@ mod tests {
             lr: 8.75e-4,
             lr_gamma: 0.995,
             lr_step: 1,
+            lr_total_steps: None,
             lr_schedule: "start 0.000875 gamma 0.995 drop every 1 superbatches".to_string(),
             batch_size: 65_536,
             batches_per_superbatch: 6_104,
@@ -1151,6 +1185,8 @@ mod tests {
             dense_lr_mult: None,
             bias_lr_mult: None,
             l1_lr_mult: None,
+            l1_shared_weight_decay: None,
+            adam_bias_correction: None,
             ft_piece_lr_mult: None,
             threat_lr_mult: None,
             norm_loss_factor: None,

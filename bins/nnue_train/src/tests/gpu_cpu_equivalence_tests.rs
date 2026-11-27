@@ -6798,3 +6798,49 @@ fn layerstack_lookahead_and_beta1_follow_optimizer_kind() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+
+#[test]
+fn corrected_adamw_step_matches_unbiased_cpu_reference() -> Result<(), Box<dyn std::error::Error>> {
+    let (_ctx, module, stream) = open_module()?;
+    for step in [1_u64, 13] {
+        let n = 259;
+        let weights = vec![0.4_f32; n];
+        let mean = vec![0.00001_f32; n];
+        let variance = vec![1e-10_f32; n];
+        let gradients = vec![0.0001_f32; n];
+        let (lr, decay, eps) = (0.03_f32, 0.2_f32, 1e-4_f32);
+        let beta1 = OptimizerKind::AdamW.beta1();
+        let (step_size, denom, epsilon, decay_mult) =
+            OptimizerKind::AdamW.kernel_scalars(step, BETA2, N_SMA_THRESHOLD, eps, true);
+        let kernel_decay = decay * decay_mult;
+        let mut w = DeviceBuffer::from_host(&stream, &weights)?;
+        let mut m = DeviceBuffer::from_host(&stream, &mean)?;
+        let mut v = DeviceBuffer::from_host(&stream, &variance)?;
+        let mut g = DeviceBuffer::from_host(&stream, &gradients)?;
+        // SAFETY: all four allocations contain n elements and remain alive until synchronization.
+        unsafe {
+            cuda_launch! {
+                kernel: radam_step, stream: stream, module: module, config: cfg_1d(n),
+                args: [slice_mut(w), slice_mut(m), slice_mut(v), slice_mut(g),
+                    lr, step_size, denom, kernel_decay, beta1, BETA2, epsilon,
+                    W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, n as u32]
+            }
+        }?;
+        stream.synchronize()?;
+        let b1 = f64::from(beta1);
+        let b2 = f64::from(BETA2);
+        let m_hat = (b1 * f64::from(mean[0]) + (1.0 - b1) * f64::from(gradients[0]))
+            / (1.0 - b1.powf(step as f64));
+        let v_hat = (b2 * f64::from(variance[0]) + (1.0 - b2) * f64::from(gradients[0]).powi(2))
+            / (1.0 - b2.powf(step as f64));
+        let expected = f64::from(weights[0]) * (1.0 - f64::from(lr) * f64::from(decay))
+            - f64::from(lr) * m_hat / (v_hat.sqrt() + f64::from(eps));
+        assert_close(
+            "corrected AdamW",
+            &w.to_host_vec(&stream)?,
+            &vec![expected as f32; n],
+            2e-6,
+        );
+    }
+    Ok(())
+}

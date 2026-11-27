@@ -227,6 +227,7 @@ impl SimpleGpuWorkspace {
 pub(crate) struct SimpleGpuTrainer {
     pub(crate) wdl_ignore_draws: bool,
     pub(crate) l1_lr_mult: f32,
+    pub(crate) adam_bias_correction: bool,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
     /// `dense_bias_grad_tiled` の grid 上限を実機 SM 数から導出するための occupancy
@@ -360,6 +361,7 @@ pub(crate) struct SimpleGpuTrainer {
     id: SimpleId,
     /// optimizer step counter。ranger では `RANGER_K` の倍数で lookahead lerp する。
     step_count: u64,
+    pub(crate) lr_total_steps: Option<u64>,
     /// optimizer 種別 (per-step scalar / beta1 / lookahead 有無を決める)。
     optimizer: OptimizerKind,
     /// weight decay 係数 (`radam_step` 引数)。
@@ -517,6 +519,7 @@ impl SimpleGpuTrainer {
         Ok(Self {
             wdl_ignore_draws: false,
             l1_lr_mult: 1.0,
+            adam_bias_correction: false,
             ft_w,
             ft_b,
             l1_w,
@@ -584,6 +587,7 @@ impl SimpleGpuTrainer {
             dense_bias_grad_occ,
             id,
             step_count: 0,
+            lr_total_steps: None,
             optimizer,
             weight_decay,
             norm_loss_factor,
@@ -2363,12 +2367,16 @@ impl SimpleGpuTrainer {
     /// Runs the optimizer after the backward pass.
     pub(crate) fn run_optimizer_step(&mut self, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.step_count += 1;
-        let (step_size, denom) =
-            self.optimizer
-                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let (step_size, denom, optimizer_eps, decay_mult) = self.optimizer.kernel_scalars(
+            self.step_count,
+            BETA2,
+            N_SMA_THRESHOLD,
+            EPS,
+            self.adam_bias_correction,
+        );
         let beta1 = self.optimizer.beta1();
         let beta2 = self.optimizer.kernel_beta2(BETA2);
-        let decay = self.optimizer.kernel_weight_decay(self.weight_decay);
+        let decay = self.optimizer.kernel_weight_decay(self.weight_decay) * decay_mult;
         let l1_lr = lr * self.l1_lr_mult;
 
         let ft_out = self.id.ft_out;
@@ -2464,7 +2472,7 @@ impl SimpleGpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                                   decay, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   decay, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                         }
                     }?;
@@ -2477,7 +2485,7 @@ impl SimpleGpuTrainer {
                             stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), lr, step_size, denom,
-                                   decay, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   decay, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
                                    FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
                         }
                     }?;
@@ -2494,7 +2502,7 @@ impl SimpleGpuTrainer {
                             config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                                   decay, beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                                   decay, beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                         }
                     }?;
                 } else {
@@ -2506,7 +2514,7 @@ impl SimpleGpuTrainer {
                             config: cfg_1d(ft_w_n as usize),
                             args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
                                    slice_mut(self.ft_w_grad), lr, step_size, denom, decay,
-                                   beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                                   beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
                         }
                     }?;
                 }
@@ -2523,7 +2531,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
                 args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
                        slice_mut(self.ft_b_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
             }
         }?;
         unsafe {
@@ -2533,7 +2541,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
                 args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
                        slice_mut(self.l1_w_grad), l1_lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
             }
         }?;
         unsafe {
@@ -2543,7 +2551,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
                 args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
                        slice_mut(self.l1_b_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
             }
         }?;
         unsafe {
@@ -2553,7 +2561,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
                 args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
                        slice_mut(self.l2_w_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
             }
         }?;
         unsafe {
@@ -2563,7 +2571,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
                 args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
                        slice_mut(self.l2_b_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
             }
         }?;
         unsafe {
@@ -2573,7 +2581,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
                 args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
                        slice_mut(self.l3_w_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
             }
         }?;
         unsafe {
@@ -2583,7 +2591,7 @@ impl SimpleGpuTrainer {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
                 args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
                        slice_mut(self.l3_b_grad), lr, step_size, denom, decay,
-                       beta1, beta2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
+                       beta1, beta2, optimizer_eps, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
             }
         }?;
 
@@ -2913,6 +2921,8 @@ impl SimpleGpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                lr_total_steps: self.lr_total_steps,
+                adam_bias_correction: self.adam_bias_correction,
                 fv_scale: Some(self.fv_scale()),
             },
             &self.raw_ckpt_group_sources(),
@@ -2955,6 +2965,10 @@ impl SimpleGpuTrainer {
             &expected_groups,
         )?;
 
+        if !transfer_radam_momentum {
+            header.validate_adam_bias_correction(self.adam_bias_correction)?;
+        }
+
         header.prepare_optimizer_state(
             path,
             &mut loaded,
@@ -2991,6 +3005,7 @@ impl SimpleGpuTrainer {
         up!(7, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = header.step_count;
+        self.lr_total_steps = header.lr_total_steps;
         Ok((
             header.superbatch,
             header.producer(),

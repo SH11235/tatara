@@ -3118,11 +3118,18 @@ impl BucketedPrefetchedLoader {
                 let Some(chunk) = self.next_chunk()? else {
                     return Ok(None);
                 };
+                // A saved skip counts accepted records, which can span several smaller
+                // decode chunks when resuming with a smaller batch size.
+                if assembly.resume_skip >= chunk.slot.0.n_positions && assembly.resume_skip > 0 {
+                    assembly.resume_skip -= chunk.slot.0.n_positions;
+                    position = chunk.after;
+                    if let Some(tx) = &self.pool_tx {
+                        let _ = tx.send(chunk.slot);
+                    }
+                    continue;
+                }
                 assembly.offset = assembly.resume_skip;
                 assembly.resume_skip = 0;
-                if assembly.offset > chunk.slot.0.n_positions {
-                    return Err(io::Error::other("loader bucket skip exceeds decoded chunk"));
-                }
                 assembly.chunk = Some(chunk);
             }
             let chunk = assembly.chunk.as_ref().expect("assembly chunk");

@@ -5,7 +5,7 @@
 A run has two independent schedulers: the **learning rate** (`--lr-schedule`) and
 the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl` /
 `--wdl-cycle-delta`). Both are recomputed
-each run as a function of the CLI arguments and the superbatch index. For the
+each run from the CLI arguments and restored checkpoint state. For the
 per-run training steps themselves see
 [docs/training-quickstart.md](training-quickstart.md); for the exact flag syntax,
 ranges, and defaults run `nnue-train --help` (the help text is the authoritative
@@ -25,15 +25,57 @@ can't: what each scheduler does and how it interacts with `--resume`.
 - `one-cycle` — warm up over the first `--lr-warmup-pct` of the horizon, then
   cosine-anneal down.
 
+With `--lr-schedule one-cycle --lr-total-steps N`, the cycle advances once per
+optimizer update, independently of `--superbatches`. N must be positive; other
+schedules reject this option. The initial LR is `--lr / --lr-div-factor`, and the
+final LR is initial LR divided by `--lr-final-div-factor`. Warmup ends at
+a floating-point phase boundary at `--lr-warmup-pct * N - 1`, without rounding.
+The zero-based update index follows PyTorch's half-cosine phases: warmup ends
+at that boundary and cooldown ends at `N - 1`. The warmup percentage is stored
+as f32 and converted to f64 for the boundary calculation. With a nonintegral
+boundary, no update necessarily lands exactly on max LR. With warmup percentage
+1.0, update `N - 1` reaches max LR. Updates `N` and later hold the value of update
+`N - 1`. Zero warmup uses cooldown directly; a zero-length warmup phase at
+update 0 uses max LR.
+
+The checkpoint saves N and the completed optimizer update count. On resume, an
+omitted N inherits the saved value; a different N or schedule is rejected. A
+checkpoint without an update-based horizon cannot switch to this mode on resume.
+Changing batch size or batches per superbatch preserves the saved update count
+and LR curve. Keep the other one-cycle options unchanged on resume. Omitting
+`--lr-total-steps` on a fresh run retains superbatch scheduling.
+
 `--lr-warmup-steps` additionally wraps any schedule except `one-cycle` (which
 carries its own warmup) in a batch-level warmup over the first superbatch.
 
 `--l1-lr-mult` multiplies the scheduled rate for the first dense layer’s weights,
 including shared weights in both LayerStacks heads. When omitted, L1 uses
 `--dense-lr-mult` in LayerStacks and 1.0 in simple. L1 uses the dense weight
-decay coefficient in LayerStacks and the global coefficient in simple.
+decay coefficient in LayerStacks (except an explicit shared-L1 override) and the global coefficient in simple.
 On resume, the multiplier comes from the current command line and is part of
 the recipe comparison.
+
+`--l1-shared-weight-decay` overrides decay only for the shared L1 weights in
+LayerStack, including both heads. Bucket-specific L1 weights, other layers and
+biases keep their existing coefficients. The shared weights keep the L1 learning
+rate from `--l1-lr-mult` (or the dense multiplier when omitted). The option must
+be finite and nonnegative; simple rejects it. Omission preserves dense decay.
+
+`--adam-bias-correction` requires `--optimizer adamw`. It enables
+`m_hat = m / (1 - beta1^t)` and `v_hat = v / (1 - beta2^t)`, with update
+`w = w * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + epsilon)` followed by
+tatara's existing weight clamp. Omission preserves AdamW without correction.
+Both native CUDA (including fused FT) and cuda-oxide use this correction, also
+with FP16 optimizer states; FP16 storage retains its rounding error.
+The checkpoint records `--adam-bias-correction`; resume requires the same flag
+value. Checkpoints without this field imply correction disabled. Epsilon
+and decay are rescaled along with the gradient step so the shared optimizer
+kernel preserves the effective epsilon and decoupled decay rate.
+
+Supply these options again on resume: the checkpoint restores weights, moments
+and the accumulated optimizer step `t`, while the current CLI selects the
+options. Explicit values appear in startup logs, experiment parameters and the
+recipe fingerprint; omitted options add no parameter fields.
 
 In LayerStacks training, `--ft-piece-lr-mult` scales the learning rate for the
 real piece rows across all effect buckets, and `--threat-lr-mult` scales it for
@@ -48,11 +90,29 @@ Different rates within the FT weights require the native CUDA fused optimizer.
 For that combination, disable PSQT and precision diagnostics and use a multiple
 of 8 for any compact Threat width.
 
+### Changing batch size on resume
+
+You can change `--batch-size` and `--batches-per-superbatch` together while
+keeping their product constant. Keep the checkpoint and its `.loader.json`
+together. Accepted-record offsets, including partially consumed sampling
+chunks, are restored with the new batch size. Teacher identities and input
+settings must still match. If changing batch size changes the effective
+shuffle window size (`window_records`), input restoration is rejected: use a
+compatible batch size, or explicitly choose `--resume-input restart` to read
+from the beginning.
+
+Learning-rate schedules use superbatch numbers unless one-cycle has `--lr-total-steps`.
+The saved horizon is restored, so changing the batch count does not compress
+the curve. Keep the other schedule options unchanged; they come from the CLI.
+Optimizer moments and step count continue from the checkpoint; smaller batches
+produce more optimizer steps per superbatch. Batch-level warmup and batch WDL
+jitter remain measured in batches, so their duration in positions can change.
+
 ### Horizon and resuming
 
 The schedules with a **horizon** — the superbatch at which the curve reaches its
 terminal LR — are the `linear` / `cosine` / `exponential` decays (their
-`--lr-final-superbatch`) and `one-cycle` (its total). When `--lr-final-superbatch`
+`--lr-final-superbatch`) and `one-cycle` without `--lr-total-steps`. When `--lr-final-superbatch`
 is omitted the horizon defaults to `--superbatches`, so a stateless rebuild would
 stretch or shrink the curve whenever you resume with a different `--superbatches`.
 
@@ -63,7 +123,7 @@ To keep the curve reproducible, a checkpoint records the resolved horizon and
 2. the horizon saved in the checkpoint;
 3. `--superbatches` — the fallback.
 
-`one-cycle` has no explicit horizon flag, so on resume its saved horizon always
+Without `--lr-total-steps`, one-cycle uses a superbatch horizon; its saved horizon always
 wins over `--superbatches`. Checkpoints written before this was recorded (or by
 `step` / `constant` / `drop`, which have no horizon) carry none and fall back to
 `--superbatches`. `step` therefore reproduces the same curve on resume regardless

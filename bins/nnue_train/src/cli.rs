@@ -492,8 +492,8 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 8.75e-4, global = true)]
     pub(crate) lr: f32,
 
-    /// Learning-rate schedule shape. The schedule maps a superbatch index to a
-    /// learning rate; --lr is the starting (or, for one-cycle, the peak) rate.
+    /// Learning-rate schedule shape. --lr is the starting (or, for one-cycle,
+    /// the peak) rate. One-cycle can use optimizer updates via --lr-total-steps.
     ///
     /// - step (default): multiply --lr by --lr-gamma every --lr-step
     ///   superbatches. Bit-identical to the historical behaviour.
@@ -504,7 +504,7 @@ pub(crate) struct Cli {
     ///   --lr-final-superbatch (defaults to --superbatches), then hold
     ///   --lr-final. exponential requires --lr-final > 0.
     /// - one-cycle: warm up from --lr/--lr-div-factor to the peak --lr over the
-    ///   first --lr-warmup-pct of --superbatches, then cosine-anneal to
+    ///   first --lr-warmup-pct of the cycle, then cosine-anneal to
     ///   --lr/--lr-div-factor/--lr-final-div-factor.
     #[arg(long, value_enum, default_value_t = LrScheduleArg::Step, global = true)]
     pub(crate) lr_schedule: LrScheduleArg,
@@ -532,9 +532,8 @@ pub(crate) struct Cli {
     /// --lr-final. When omitted, the horizon is taken from (in priority order):
     /// the saved horizon in a v5+ --resume checkpoint, else --superbatches.
     /// Passing this flag explicitly always wins, even over a resumed
-    /// checkpoint's saved horizon. one-cycle uses the same precedence for its
-    /// total horizon but has no explicit flag, so on resume its saved horizon
-    /// wins over --superbatches. A checkpoint written before v5 (or by a
+    /// checkpoint's saved horizon. Without --lr-total-steps, one-cycle restores
+    /// its saved superbatch horizon over --superbatches. A checkpoint written before v5 (or by a
     /// schedule without a horizon) carries none, so resume falls back to
     /// --superbatches. Ignored by the other schedules.
     #[arg(long, global = true)]
@@ -547,7 +546,12 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) lr_warmup_steps: Option<usize>,
 
-    /// one-cycle only: fraction of --superbatches spent warming up from the
+    /// one-cycle only: total optimizer updates, independent of --superbatches.
+    /// Resume preserves the saved value; an explicit different value is rejected.
+    #[arg(long, global = true)]
+    pub(crate) lr_total_steps: Option<u64>,
+
+    /// one-cycle only: fraction of the cycle spent warming up from the
     /// initial LR to the peak --lr before annealing. Must be in [0.0, 1.0].
     #[arg(long, default_value_t = 0.2, global = true)]
     pub(crate) lr_warmup_pct: f32,
@@ -974,6 +978,12 @@ pub(crate) struct Cli {
     /// weight decay scales with the resulting learning rate.
     #[arg(long, global = true)]
     pub(crate) l1_lr_mult: Option<f32>,
+    /// Weight decay for shared L1 weights only (LayerStack). Defaults to dense decay.
+    #[arg(long, global = true)]
+    pub(crate) l1_shared_weight_decay: Option<f32>,
+    /// Correct AdamW moment estimates using the accumulated optimizer step count.
+    #[arg(long, global = true)]
+    pub(crate) adam_bias_correction: bool,
     /// Learning-rate multiplier for the bias param group: this group's per-step
     /// learning rate is the scheduled learning rate times this value. Unset
     /// means 1.0.

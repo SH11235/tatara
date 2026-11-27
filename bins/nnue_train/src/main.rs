@@ -114,6 +114,8 @@ fn dispatch(
                     || cli.threat_norm_dump
                 {
                     run_training(cli, layerstack_head)
+                } else if cli.l1_shared_weight_decay.is_some() || cli.adam_bias_correction {
+                    Err("optimizer overrides require training data (--data)".into())
                 } else if cli.l1_lr_mult.is_some() {
                     Err("--l1-lr-mult requires training data (--data)".into())
                 } else if let Some((name, _)) = training::ft_row_lr_flags(cli)
