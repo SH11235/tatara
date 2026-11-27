@@ -928,8 +928,15 @@ pub(crate) struct Cli {
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) weight_decay: f32,
-    /// Weight decay override for the feature-transformer weights, including
-    /// PSQT shortcut weights when --psqt is set. Defaults to --weight-decay.
+    /// Weight decay override for the FT param group (the feature-transformer
+    /// input weights, plus the PSQT shortcut weights when --psqt is set). When
+    /// unset, this group uses the global --weight-decay. The optimizer splits
+    /// all trainable parameters into param groups — FT (input-side weights),
+    /// L1 (the L1/L1 shared weights, which follow the dense group unless
+    /// --l1-lr-mult is set), dense (the L2/L3 hidden-layer weights), and bias
+    /// (every layer's bias) — each with its own weight decay and learning-rate
+    /// multiplier. Leaving every per-group flag unset is bit-identical to the
+    /// single --weight-decay path.
     #[arg(long, global = true)]
     pub(crate) ft_weight_decay: Option<f32>,
     /// Weight decay override for the dense param group (the L1/L1 shared/L2/L3

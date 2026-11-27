@@ -956,10 +956,13 @@ pub(crate) fn run_training(
     let per_group_recorded = per_group_optim_overridden(cli);
     if per_group_recorded {
         println!(
-            "[train] per-group optim: ft(wd={}, lr_mult={}) dense(wd={}, lr_mult={}) \
+            "[train] per-group optim: ft(wd={}, lr_mult={}) l1(lr_mult={}) dense(wd={}, lr_mult={}) \
              bias(wd={}, lr_mult={})",
             optim_groups.ft.weight_decay,
             optim_groups.ft.lr_mult,
+            optim_groups
+                .effective(crate::optim_groups::OptimGroupKind::L1, 1.0)
+                .1,
             optim_groups.dense.weight_decay,
             optim_groups.dense.lr_mult,
             optim_groups.bias.weight_decay,
