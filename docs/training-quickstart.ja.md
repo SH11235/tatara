@@ -468,13 +468,18 @@ trainer は各 superbatch の開始時にこのファイルを読む。target �
 superbatch。step LR（`--lr-gamma` と `--lr-step`）と一定 WDL の組み合わせのように、
 どちらの schedule にも horizon がなければ、元の `--superbatches` を超えて延長できる。
 どちらかに horizon があれば、元の `--superbatches` を上限とし、run ごとに一度だけ
-警告する。最終 superbatch では `--save-rate` に関係なく `.bin`、`.ckpt`、
+警告する。`--lr-final-superbatch` や `--wdl-schedule-superbatch` で horizon を
+明示した schedule にも、曲線が run の終了点に依存しない場合を含め、この上限が適用される。
+最終 superbatch では `--save-rate` に関係なく `.bin`、`.ckpt`、
 `.loader.json` を保存し、`experiment.json` の status は `completed` になる。
 
 適用した変更は `control_history.jsonl` に追記される。ファイル不在は通常状態として
 無視する。読込失敗や壊れた JSON は warning のみで学習を継続する。LR / WDL
 schedule は元の設定を保ち、進捗と ETA は変更後の target を使う。
 
+延長した run を resume する場合は、延長後の終了点と再開 superbatch（通常は
+checkpoint の superbatch に 1 を足した値）の両方を下回らない値を
+`--superbatches` に指定する。
 同じ output directory で resume する前に、`control.json` を削除するか新しい target
 へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った
 stale な値として warning とともに無視され、`control_history.jsonl` にも記録されない。
@@ -483,7 +488,8 @@ stale な値として warning とともに無視され、`control_history.jsonl`
 `--control-file /path/to/control.json` を指定すると、そのパスだけを読み、既定の
 ファイルは読まない。読むパスは起動時にログへ一行出す。学習器はファイルを
 書き換えない。更新は一時ファイルへ書いて rename すると、途中の JSON を読まずに済む。
-適用した target は `experiment.json` の `results.target_superbatches` にも記録する。
+`experiment.json` の `params.superbatches` には起動時の値が残り、
+`results.target_superbatches` に適用後の終了点が記録される。
 
 同じ制御ファイルを起動後に書き換え、更新時刻または内容が変わったファイルから
 `"pause": true` を読んだ superbatch の終わりで、一時停止する。

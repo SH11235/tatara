@@ -677,6 +677,10 @@ impl ControlState {
         self.ignored_stale_target = Some(requested);
         true
     }
+
+    fn should_warn_extension(&mut self) -> bool {
+        !std::mem::replace(&mut self.warned_extension, true)
+    }
 }
 
 #[derive(Deserialize)]
@@ -738,11 +742,10 @@ fn apply_control(
     if let Some(limit) = max_target
         && target > limit
     {
-        if !applied.warned_extension {
+        if applied.should_warn_extension() {
             eprintln!(
                 "[control] warning: ignoring extension to target_superbatches={requested}; the LR or WDL schedule has a horizon, so the target is capped at the original --superbatches={limit}"
             );
-            applied.warned_extension = true;
         }
         target = limit;
     }
@@ -1602,7 +1605,7 @@ where
     println!(
         "[train] done in {} ({} superbatches)",
         format_hms(run_start.elapsed().as_secs_f64()),
-        sb - cfg.start_superbatch + 1,
+        sb + 1 - cfg.start_superbatch,
     );
 
     if let Some(log) = experiment.as_mut() {
@@ -1793,7 +1796,8 @@ fn format_hms(secs: f64) -> String {
 mod tests {
     use super::*;
     use crate::schedule::{
-        ConstantWDL, LinearDecayLR, LinearWDL, LrSchedulerEnum, StepLR, WdlSchedulerEnum,
+        ConstantLR, ConstantWDL, LinearDecayLR, LinearWDL, LrSchedulerEnum, SequenceLR,
+        SequenceWDL, StepLR, WdlSchedulerEnum,
     };
 
     fn sample_psv_path() -> PathBuf {
@@ -2716,6 +2720,15 @@ mod tests {
     }
 
     #[test]
+    fn extension_warning_is_requested_once_per_run() {
+        for mut control in [ControlState::new(3), ControlState::new(3)] {
+            assert!(control.should_warn_extension());
+            assert!(!control.should_warn_extension());
+            assert!(!control.should_warn_extension());
+        }
+    }
+
+    #[test]
     fn stale_control_before_resume_start_is_ignored() {
         let output_dir = temp_output_dir("resume-stale");
         std::fs::write(
@@ -2996,6 +3009,52 @@ mod tests {
                 Some(&(output_dir.path().join("test-3.ckpt"), 3))
             );
         }
+    }
+
+    #[test]
+    fn control_rejects_sequence_extension_past_switch_after_original_end() {
+        fn assert_extension_rejected(lr: &impl LrScheduler, wdl: &impl WdlScheduler) {
+            let output_dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                output_dir.path().join("control.json"),
+                r#"{"target_superbatches": 5}"#,
+            )
+            .unwrap();
+            let cfg = TrainingConfig {
+                output_dir: output_dir.path().into(),
+                end_superbatch: 3,
+                threads: 1,
+                ..base_cfg()
+            };
+            let mut backend = MockBackend::new();
+            run(
+                &mut backend,
+                &[sample_psv_path()],
+                &ShogiProgressKPAbs,
+                lr,
+                wdl,
+                &cfg,
+                None,
+            )
+            .unwrap();
+            assert_eq!(backend.steps, 3 * cfg.batches_per_superbatch);
+            assert_eq!(backend.resume_saves.last().unwrap().1, 3);
+        }
+
+        let lr = ConstantLR { value: 1.0e-3 };
+        let wdl = ConstantWDL { value: 0.5 };
+        let sequence_lr = SequenceLR {
+            first: lr.clone(),
+            second: ConstantLR { value: 1.0e-4 },
+            first_scheduler_final_superbatch: 4,
+        };
+        let sequence_wdl = SequenceWDL {
+            first: wdl.clone(),
+            second: ConstantWDL { value: 0.6 },
+            first_scheduler_final_superbatch: 4,
+        };
+        assert_extension_rejected(&lr, &sequence_wdl);
+        assert_extension_rejected(&sequence_lr, &wdl);
     }
 
     #[test]

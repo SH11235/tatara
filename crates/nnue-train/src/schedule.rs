@@ -355,7 +355,7 @@ impl<First: LrScheduler, Second: LrScheduler> LrScheduler for SequenceLR<First, 
     }
 
     fn has_horizon(&self) -> bool {
-        self.first.has_horizon() || self.second.has_horizon()
+        true
     }
 }
 
@@ -418,6 +418,19 @@ impl LrScheduler for LrSchedulerEnum {
             Self::ExponentialDecay(s) => s.horizon(),
             Self::OneCycle(s) => s.horizon(),
             Self::Warmup(s) => s.horizon(),
+        }
+    }
+
+    fn has_horizon(&self) -> bool {
+        match self {
+            Self::Constant(s) => s.has_horizon(),
+            Self::Step(s) => s.has_horizon(),
+            Self::Drop(s) => s.has_horizon(),
+            Self::LinearDecay(s) => s.has_horizon(),
+            Self::CosineDecay(s) => s.has_horizon(),
+            Self::ExponentialDecay(s) => s.has_horizon(),
+            Self::OneCycle(s) => s.has_horizon(),
+            Self::Warmup(s) => s.has_horizon(),
         }
     }
 }
@@ -608,7 +621,8 @@ impl<First: WdlScheduler, Second: WdlScheduler> WdlScheduler for SequenceWDL<Fir
     }
 
     fn has_horizon(&self) -> bool {
-        self.first.has_horizon() || self.second.has_horizon()
+        // The second scheduler's span is computed from the original run end.
+        true
     }
 }
 
