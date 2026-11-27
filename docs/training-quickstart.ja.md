@@ -457,22 +457,23 @@ horizon を持つ LR schedule では、checkpoint に解決済 horizon が保存
 
 ### superbatch 境界で停止する
 
-実行中の学習を superbatch の途中で中断せず短縮するには、output directory 直下に
+実行中の学習の終了点を superbatch 境界で変えるには、output directory 直下に
 `control.json` を書く:
 
 ```json
 {"target_superbatches": 1000}
 ```
 
-trainer は各 superbatch の開始時にこのファイルを読む。target は開始する
-superbatch 以上、元の `--superbatches` 以下に clamp されるため、学習を延長しない。
-選ばれた最終 superbatch は最後まで実行され、`--save-rate` の境界でなくても `.bin`
-と `.ckpt` を両方保存する。その後は通常の完了経路を通り、`experiment.json` の
-status は `completed` になる。
+trainer は各 superbatch の開始時にこのファイルを読む。target の下限は開始する
+superbatch。step LR（`--lr-gamma` と `--lr-step`）と一定 WDL の組み合わせのように、
+どちらの schedule にも horizon がなければ、元の `--superbatches` を超えて延長できる。
+どちらかに horizon があれば、元の `--superbatches` を上限とし、run ごとに一度だけ
+警告する。最終 superbatch では `--save-rate` に関係なく `.bin`、`.ckpt`、
+`.loader.json` を保存し、`experiment.json` の status は `completed` になる。
 
 適用した変更は `control_history.jsonl` に追記される。ファイル不在は通常状態として
 無視する。読込失敗や壊れた JSON は warning のみで学習を継続する。LR / WDL
-schedule は元の horizon を維持し、進捗と ETA だけが短縮後の target を使う。
+schedule は元の設定を保ち、進捗と ETA は変更後の target を使う。
 
 同じ output directory で resume する前に、`control.json` を削除するか新しい target
 へ書き換えること。resume run の開始 superbatch 未満の target は前の run から残った

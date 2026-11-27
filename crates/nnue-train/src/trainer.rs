@@ -658,9 +658,18 @@ impl ActiveHistStats {
 struct ControlState {
     effective_target: usize,
     ignored_stale_target: Option<usize>,
+    warned_extension: bool,
 }
 
 impl ControlState {
+    fn new(effective_target: usize) -> Self {
+        Self {
+            effective_target,
+            ignored_stale_target: None,
+            warned_extension: false,
+        }
+    }
+
     fn should_warn_stale(&mut self, requested: usize) -> bool {
         if self.ignored_stale_target == Some(requested) {
             return false;
@@ -690,7 +699,7 @@ fn apply_control(
     applied: &mut ControlState,
     current_superbatch: usize,
     start_superbatch: usize,
-    configured_end: usize,
+    max_target: Option<usize>,
 ) -> Option<usize> {
     let text = match std::fs::read_to_string(control_path) {
         Ok(text) => text,
@@ -725,7 +734,18 @@ fn apply_control(
     }
     applied.ignored_stale_target = None;
 
-    let target = requested.max(current_superbatch).min(configured_end);
+    let mut target = requested.max(current_superbatch);
+    if let Some(limit) = max_target
+        && target > limit
+    {
+        if !applied.warned_extension {
+            eprintln!(
+                "[control] warning: ignoring extension to target_superbatches={requested}; the LR or WDL schedule has a horizon, so the target is capped at the original --superbatches={limit}"
+            );
+            applied.warned_extension = true;
+        }
+        target = limit;
+    }
     if target == applied.effective_target {
         return None;
     }
@@ -767,10 +787,10 @@ fn append_control_history(path: &Path, entry: &impl Serialize) -> io::Result<()>
 ///   training は止めない。`None` なら構造化ログを残さない
 ///
 /// 各 superbatch の開始時に `cfg.output_dir/control.json` を読み、
-/// `target_superbatches` があれば元の終了点を超えない範囲で実効終了点を更新する。
+/// `target_superbatches` があれば実効終了点を更新する。LR / WDL に horizon があれば
+/// 実効終了点は元の終了点までに制限される。
 /// `cfg.control_file` があればそのパスだけを読む。
 /// 起動後に書き換えた制御ファイルの `pause=true` は superbatch 終了時に保存して停止する。
-/// LR / WDL schedule の horizon は `cfg.end_superbatch` のまま変えない。
 ///
 /// PSV stream は [`BucketedPrefetchedLoader`] で `cfg.threads` 本の worker から
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
@@ -1196,10 +1216,9 @@ where
     }
     live_control.pause_requested = false;
     let control_history_path = cfg.output_dir.join("control_history.jsonl");
-    let mut control = ControlState {
-        effective_target: cfg.end_superbatch,
-        ignored_stale_target: None,
-    };
+    let max_target =
+        (lr_scheduler.has_horizon() || wdl_scheduler.has_horizon()).then_some(cfg.end_superbatch);
+    let mut control = ControlState::new(cfg.end_superbatch);
     let mut sb = cfg.start_superbatch;
     loop {
         if let Some(target) = apply_control(
@@ -1208,7 +1227,7 @@ where
             &mut control,
             sb,
             cfg.start_superbatch,
-            cfg.end_superbatch,
+            max_target,
         ) && let Some(log) = experiment.as_mut()
         {
             log.set_target_superbatches(target);
@@ -1583,7 +1602,7 @@ where
     println!(
         "[train] done in {} ({} superbatches)",
         format_hms(run_start.elapsed().as_secs_f64()),
-        sb + 1 - cfg.start_superbatch,
+        sb - cfg.start_superbatch + 1,
     );
 
     if let Some(log) = experiment.as_mut() {
@@ -1773,7 +1792,9 @@ fn format_hms(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::{ConstantWDL, LinearDecayLR, LinearWDL, StepLR};
+    use crate::schedule::{
+        ConstantWDL, LinearDecayLR, LinearWDL, LrSchedulerEnum, StepLR, WdlSchedulerEnum,
+    };
 
     fn sample_psv_path() -> PathBuf {
         // crates/nnue-train/Cargo.toml から相対で shogi-format/tests/data/sample.psv。
@@ -1793,6 +1814,7 @@ mod tests {
         saves: Vec<PathBuf>,
         /// raw resume checkpoint の保存呼び出し (path, superbatch)。
         resume_saves: Vec<(PathBuf, usize)>,
+        resume_lr_horizons: Vec<Option<usize>>,
         /// `save_resume_checkpoint` に渡された producer run id (呼び出し順)。
         resume_run_ids: Vec<String>,
         last_buckets: Vec<i32>,
@@ -1826,6 +1848,7 @@ mod tests {
                 flush_calls: 0,
                 saves: Vec::new(),
                 resume_saves: Vec::new(),
+                resume_lr_horizons: Vec::new(),
                 resume_run_ids: Vec::new(),
                 last_buckets: Vec::new(),
                 max_batch_positions: 0,
@@ -1968,9 +1991,10 @@ mod tests {
             path: &Path,
             superbatch: usize,
             producer: &CheckpointProducer,
-            _lr_horizon: Option<usize>,
+            lr_horizon: Option<usize>,
         ) -> io::Result<()> {
             self.resume_saves.push((path.to_path_buf(), superbatch));
+            self.resume_lr_horizons.push(lr_horizon);
             self.resume_run_ids.push(producer.run_id.to_string());
             if self.write_checkpoints {
                 std::fs::write(path, b"mock resume checkpoint")?;
@@ -2665,12 +2689,9 @@ mod tests {
         let control_path = output_dir.join("control.json");
         let history_path = output_dir.join("control_history.jsonl");
         std::fs::write(&control_path, r#"{"target_superbatches": 3}"#).expect("write control.json");
-        let mut control = ControlState {
-            effective_target: 8,
-            ignored_stale_target: None,
-        };
+        let mut control = ControlState::new(8);
 
-        let applied = apply_control(&control_path, &history_path, &mut control, 5, 1, 8);
+        let applied = apply_control(&control_path, &history_path, &mut control, 5, 1, None);
 
         assert_eq!(applied, Some(5));
         assert_eq!(control.effective_target, 5);
@@ -2685,10 +2706,7 @@ mod tests {
 
     #[test]
     fn repeated_stale_control_warning_is_deduplicated() {
-        let mut control = ControlState {
-            effective_target: 5,
-            ignored_stale_target: None,
-        };
+        let mut control = ControlState::new(5);
 
         assert!(control.should_warn_stale(2));
         assert!(!control.should_warn_stale(2));
@@ -2838,43 +2856,146 @@ mod tests {
     }
 
     #[test]
-    fn control_target_at_or_above_configured_end_is_noop() {
-        let output_dir = temp_output_dir("no-extension");
-        std::fs::write(
-            output_dir.join("control.json"),
-            r#"{"target_superbatches": 99}"#,
-        )
-        .expect("write control.json");
+    fn control_extends_horizon_free_training_and_saves_resumable_final_checkpoint() {
+        let baseline_dir = tempfile::tempdir().unwrap();
+        let extended_dir = tempfile::tempdir().unwrap();
+        let resumed_dir = tempfile::tempdir().unwrap();
+        let lr = StepLR {
+            start: 8.75e-4,
+            gamma: 0.995,
+            step: 1,
+        };
+        let lr = LrSchedulerEnum::Step(lr);
+        let wdl = WdlSchedulerEnum::constant(0.5);
         let cfg = TrainingConfig {
-            output_dir: output_dir.clone(),
+            output_dir: baseline_dir.path().into(),
+            end_superbatch: 4,
+            save_rate: 10,
             threads: 1,
             ..base_cfg()
         };
-        let progress = ShogiProgressKPAbs;
-        let lr = StepLR {
+        let run_training = |backend: &mut MockBackend, cfg: &TrainingConfig, logger| {
+            run(
+                backend,
+                &[sample_psv_path()],
+                &ShogiProgressKPAbs,
+                &lr,
+                &wdl,
+                cfg,
+                logger,
+            )
+            .unwrap();
+        };
+        let mut baseline = MockBackend::new();
+        run_training(&mut baseline, &cfg, None);
+
+        let output_dir = extended_dir.path();
+        let extended_cfg = TrainingConfig {
+            output_dir: output_dir.into(),
+            end_superbatch: 2,
+            ..cfg.clone()
+        };
+        let experiment_path = output_dir.join("experiment.json");
+        let mut logger = experiment_logger(experiment_path.clone(), "control-extend");
+        let mut extended = MockBackend::new().with_file_writes();
+        extended.control_updates.push((
+            cfg.batches_per_superbatch,
+            output_dir.join("control.json"),
+            r#"{"target_superbatches": 4}"#.to_owned(),
+        ));
+        run_training(&mut extended, &extended_cfg, Some(&mut logger));
+
+        assert_eq!(extended.steps, 4 * cfg.batches_per_superbatch);
+        assert_eq!(extended.seen_lr, baseline.seen_lr);
+        assert_eq!(extended.seen_wdl, baseline.seen_wdl);
+        let checkpoint = output_dir.join("test-4.ckpt");
+        assert_eq!(extended.saves, [output_dir.join("test-4.bin")]);
+        assert_eq!(extended.resume_saves, [(checkpoint.clone(), 4)]);
+        assert_eq!(extended.resume_lr_horizons, [None]);
+        assert!(output_dir.join("test-4.bin").is_file());
+        assert!(checkpoint.is_file());
+        let loader_state = crate::loader_state::LoaderState::load(&checkpoint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loader_state.superbatch, 4);
+
+        let experiment: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(experiment_path).unwrap()).unwrap();
+        assert_eq!(experiment["status"], "completed");
+        assert_eq!(experiment["results"]["target_superbatches"], 4);
+        assert_eq!(experiment["history"].as_array().unwrap().len(), 4);
+        let history = std::fs::read_to_string(output_dir.join("control_history.jsonl")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&history).unwrap();
+        assert_eq!(entry["target_superbatches"], 4);
+        assert_eq!(entry["superbatch"], 2);
+
+        let resume_cfg = TrainingConfig {
+            output_dir: resumed_dir.path().into(),
+            resume_checkpoint: Some(checkpoint),
+            start_superbatch: 5,
+            end_superbatch: 6,
+            ..cfg
+        };
+        let mut resumed = MockBackend::new();
+        resumed.steps = extended.steps;
+        run_training(&mut resumed, &resume_cfg, None);
+        assert_eq!(
+            resumed.seen_lr,
+            [lr.lr(0, 5), lr.lr(1, 5), lr.lr(0, 6), lr.lr(1, 6)]
+        );
+    }
+
+    #[test]
+    fn control_clamps_extension_when_either_schedule_has_a_horizon() {
+        let step = LrSchedulerEnum::Step(StepLR {
             start: 1.0e-3,
             gamma: 0.9,
             step: 1,
-        };
-        let wdl = ConstantWDL { value: 0.0 };
-        let mut backend = MockBackend::new().with_file_writes();
-
-        run(
-            &mut backend,
-            &[sample_psv_path()],
-            &progress,
-            &lr,
-            &wdl,
-            &cfg,
-            None,
-        )
-        .expect("run ok");
-
-        assert_eq!(backend.steps, 6);
-        assert!(!output_dir.join("control_history.jsonl").exists());
-        assert!(output_dir.join("test-3.bin").is_file());
-        assert!(output_dir.join("test-3.ckpt").is_file());
-        let _ = std::fs::remove_dir_all(&output_dir);
+        });
+        let decay = LrSchedulerEnum::LinearDecay(LinearDecayLR {
+            initial_lr: 1.0e-3,
+            final_lr: 1.0e-4,
+            final_superbatch: 3,
+        });
+        for (lr, wdl, jitter_cycle) in [
+            (decay, WdlSchedulerEnum::constant(0.5), false),
+            (step.clone(), WdlSchedulerEnum::linear(0.1, 0.9), false),
+            (step, WdlSchedulerEnum::cycle(0.5, 0.0, 0.5, Some(3)), true),
+        ] {
+            let output_dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                output_dir.path().join("control.json"),
+                r#"{"target_superbatches": 99}"#,
+            )
+            .unwrap();
+            let cfg = TrainingConfig {
+                output_dir: output_dir.path().into(),
+                threads: 1,
+                wdl_jitter: WdlJitter {
+                    sample_std: if jitter_cycle { 0.1 } else { 0.0 },
+                    cycle: jitter_cycle,
+                    ..WdlJitter::default()
+                },
+                ..base_cfg()
+            };
+            let mut backend = MockBackend::new();
+            run(
+                &mut backend,
+                &[sample_psv_path()],
+                &ShogiProgressKPAbs,
+                &lr,
+                &wdl,
+                &cfg,
+                None,
+            )
+            .unwrap();
+            assert_eq!(backend.steps, 6);
+            assert!(!output_dir.path().join("control_history.jsonl").exists());
+            assert_eq!(
+                backend.resume_saves.last(),
+                Some(&(output_dir.path().join("test-3.ckpt"), 3))
+            );
+        }
     }
 
     #[test]

@@ -506,24 +506,26 @@ precedence rules.
 
 ### Stopping at a superbatch boundary
 
-To shorten a running job without interrupting a superbatch, write `control.json`
+To change the target of a running job at a superbatch boundary, write `control.json`
 under its output directory:
 
 ```json
 {"target_superbatches": 1000}
 ```
 
-The trainer polls this file at the start of each superbatch. The target is
-clamped between the superbatch being started and the original `--superbatches`
-value, so it cannot extend the run. The selected final superbatch runs to
-completion and always writes both `.bin` and `.ckpt`, even when it is not a
-`--save-rate` boundary. Training then follows the normal completion path and
-marks `experiment.json` as `completed`.
+The trainer polls this file at the start of each superbatch. The target is at
+least the superbatch being started. An extension beyond the original
+`--superbatches` requires both schedules to have no horizon, such as step LR
+(`--lr-gamma` and `--lr-step`) with constant WDL. If either schedule has a
+horizon, the trainer caps the target at the original `--superbatches` and warns
+once per run. The final superbatch always writes `.bin`, `.ckpt`, and
+`.loader.json` regardless of `--save-rate`, then marks `experiment.json` as
+`completed`.
 
 Applied changes are appended to `control_history.jsonl`. A missing control file
 is normal and ignored. Read or parse failures produce a warning but do not stop
-training. LR and WDL schedules retain their original horizon; only progress and
-ETA use the shortened target.
+training. LR and WDL schedules keep their original settings. Progress and ETA
+use the new target.
 
 Before resuming in the same output directory, remove `control.json` or replace
 it with the new target. A target below the resumed run's starting superbatch is
