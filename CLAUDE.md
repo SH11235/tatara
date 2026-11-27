@@ -3,8 +3,8 @@
 ## CI 規約 (PR push 前必須)
 
 PR 作成 / `git push` の前に `bash scripts/local-ci.sh` を必ず走らせ、exit 0
-(`PASS` 表示) を確認する。4 step (fmt / clippy / kernel build / test) が **全
-crate (GPU 依存含む) で pass** しない限り push 禁止。
+(`PASS` 表示) を確認する。script の全 step (fmt / clippy / CUDA feature の compile と lint /
+kernel build / parity / test) が **全 crate (GPU 依存含む) で pass** しない限り push 禁止。
 
 ```bash
 bash scripts/local-ci.sh
@@ -66,7 +66,7 @@ method 利用を誤ってエラー扱いさせる害がある。toolchain を上
   使わない。アーキ / format は内容を表す名前で呼ぶ (例: `LayerStack`、
   `HalfKA_hm`)。glossary 登録は識別子化を正当化しない
 
-これらの情報は git log / PR description / `docs/` 配下に置く。コード内に書いて
+これらの情報は git log / PR description に置く。コード内に書いて
 よいのは:
 - 非自明な不変条件 (例:「caller が `n_pos * MAX_ACTIVE` を保証する」)
 - 言語仕様で表せない constraint の理由 (例:「cuda-oxide が `f32::clamp` を
@@ -92,9 +92,6 @@ literal として表示される) や内部シンボル名・作業段階語 (sc
 - **ADR・設計判断・計測結果の記録は repo に置かない** (`docs/decisions/` も作らない)。
   repo に入れる文書は利用者向けだけ。設計の WHY はコード近傍のコメント / PR description
   が担当し、repo 外の記録への参照で済ませない。
-- **実験ログ doc は `docs/experiments/` に置く。同 directory は `.gitignore` 済み**
-  で git 管理外 (頻繁に更新する作業記録のため)。worktree / PR の対象外、checkout 内
-  で直接編集する。tracked な doc は通常どおり PR。
 - **GitHub Issue を立てない課題の spec は `docs/issue/` に置く。同 directory も
   `.gitignore` 済み**で git 管理外。1 file = 1 issue とし、対応 PR の merge 後に
   file を削除する (= close)。運用詳細は同 directory の README.md。
