@@ -1,3 +1,5 @@
+pub(crate) use crate::optim_groups::OptimGroupConfig;
+use crate::optim_groups::OptimGroupKind;
 use nnue_format::LayerStackHead;
 use std::path::Path;
 
@@ -2450,77 +2452,6 @@ impl GpuWorkspace {
     }
 }
 
-/// optimizer の param-group。全学習対象テンソルを規模と役割でこの 3 分類に静的に
-/// 割り当て、group ごとに weight_decay と lr 倍率を変える。`ft` は入力側 weight
-/// (`ft_w` / `psqt_w`)、`dense` は hidden dense weight (`l1_w` / `l1_shared_weight` / `l2_w`
-/// / `l3_w`)、`bias` は全層の bias (`ft_b` / `l1_b` / `l1_shared_bias` / `l2_b` / `l3_b`)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OptimGroupKind {
-    Ft,
-    Dense,
-    Bias,
-}
-
-/// 1 param-group の weight_decay (絶対値) と lr_mult (scheduled lr への倍率)。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct OptimGroupParams {
-    pub(crate) weight_decay: f32,
-    pub(crate) lr_mult: f32,
-}
-
-/// FT / dense / bias 3 group それぞれの [`OptimGroupParams`]。`radam_step` の
-/// per-launch scalar (lr / decay) に group の値を流す静的 config で、optimizer
-/// state とは独立 (stateful ではない)。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct OptimGroupConfig {
-    pub(crate) ft: OptimGroupParams,
-    pub(crate) dense: OptimGroupParams,
-    pub(crate) bias: OptimGroupParams,
-}
-
-impl OptimGroupConfig {
-    /// 大域 weight_decay と per-group override (いずれも `Option`) から resolve する。
-    /// override 未指定の group は weight_decay = 大域値・lr_mult = 1.0 にフォール
-    /// バックする。全 override が `None` なら 3 group とも (大域 wd, 1.0) になり、
-    /// `effective` の lr は `scheduled_lr × 1.0 == scheduled_lr` で baseline と
-    /// bit-identical。
-    pub(crate) fn resolve(
-        global_weight_decay: f32,
-        ft_weight_decay: Option<f32>,
-        dense_weight_decay: Option<f32>,
-        bias_weight_decay: Option<f32>,
-        ft_lr_mult: Option<f32>,
-        dense_lr_mult: Option<f32>,
-        bias_lr_mult: Option<f32>,
-    ) -> Self {
-        let group = |wd: Option<f32>, lr_mult: Option<f32>| OptimGroupParams {
-            weight_decay: wd.unwrap_or(global_weight_decay),
-            lr_mult: lr_mult.unwrap_or(1.0),
-        };
-        OptimGroupConfig {
-            ft: group(ft_weight_decay, ft_lr_mult),
-            dense: group(dense_weight_decay, dense_lr_mult),
-            bias: group(bias_weight_decay, bias_lr_mult),
-        }
-    }
-
-    fn params(&self, kind: OptimGroupKind) -> OptimGroupParams {
-        match kind {
-            OptimGroupKind::Ft => self.ft,
-            OptimGroupKind::Dense => self.dense,
-            OptimGroupKind::Bias => self.bias,
-        }
-    }
-
-    /// group の `radam_step` launch に渡す `(weight_decay, lr)` を返す。lr は
-    /// schedule が決めた毎 step の `scheduled_lr` に group の lr_mult を掛けた値
-    /// (`lr_for(group) = scheduled_lr × lr_mult`)。
-    fn effective(&self, kind: OptimGroupKind, scheduled_lr: f32) -> (f32, f32) {
-        let p = self.params(kind);
-        (p.weight_decay, scheduled_lr * p.lr_mult)
-    }
-}
-
 /// optimizer step の一様 (非 FT) weight group。`radam_step` と
 /// `ranger_lookahead_lerp` は group 間で buffer 4〜5 本と要素数・clamp 範囲だけが
 /// 異なり、scalar hyperparameter (lr / step_size / decay / beta / alpha 等) と kernel
@@ -2550,22 +2481,15 @@ struct UniformOptimGroup<'a> {
 /// buffer を束ねる [`UniformOptimGroup`] 配列の組立てはこの表と同順・同 kind・同
 /// clamp でなければならず、`step_impl` の `debug_assert` と
 /// `uniform_optim_group_layout_matches_handwritten_order` test が照合する。
-/// `kind` は radam の weight_decay / lr を resolve する param-group: dense weight は
-/// `Dense`、全 bias は `Bias`、PSQT shortcut weight は入力側 weight なので `Ft`。
 /// dense weight (L1/L1 shared/L2/L3 weight + L1/L1 shared/L2 bias) は i8@QB 量子化由来の対称 clamp、
 /// clamp 不要なテンソル (FT bias / L3 bias / PSQT) は sentinel を渡す。
 fn uniform_optim_group_layout(psqt_enabled: bool) -> Vec<(&'static str, OptimGroupKind, f32, f32)> {
-    use OptimGroupKind::{Bias, Dense, Ft};
+    use OptimGroupKind::{Bias, Dense, Ft, L1};
     let mut groups = vec![
         ("ft_b", Bias, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX),
-        ("l1_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
+        ("l1_w", L1, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l1_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
-        (
-            "l1_shared_weight",
-            Dense,
-            W_CLAMP_QUANT_MIN,
-            W_CLAMP_QUANT_MAX,
-        ),
+        ("l1_shared_weight", L1, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l1_shared_bias", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_w", Dense, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
         ("l2_b", Bias, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX),
@@ -7249,7 +7173,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1_w",
-                kind: OptimGroupKind::Dense,
+                kind: OptimGroupKind::L1,
                 weight: &mut self.l1_w,
                 m: &mut self.l1_w_m,
                 v: &mut self.l1_w_v,
@@ -7273,7 +7197,7 @@ impl GpuTrainer {
             },
             UniformOptimGroup {
                 label: "l1_shared_weight",
-                kind: OptimGroupKind::Dense,
+                kind: OptimGroupKind::L1,
                 weight: &mut self.l1_shared_weight,
                 m: &mut self.l1_shared_weight_m,
                 v: &mut self.l1_shared_weight_v,
@@ -7805,14 +7729,14 @@ mod tests {
     /// `uniform_optim_group_layout` を期待値と照合して回帰を検出する。
     #[test]
     fn uniform_optim_group_layout_matches_handwritten_order() {
-        use OptimGroupKind::{Bias, Dense, Ft};
+        use OptimGroupKind::{Bias, Dense, Ft, L1};
         let q = (W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX);
         let none = (W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX);
         let expected_no_psqt = vec![
             ("ft_b", Bias, none.0, none.1),
-            ("l1_w", Dense, q.0, q.1),
+            ("l1_w", L1, q.0, q.1),
             ("l1_b", Bias, q.0, q.1),
-            ("l1_shared_weight", Dense, q.0, q.1),
+            ("l1_shared_weight", L1, q.0, q.1),
             ("l1_shared_bias", Bias, q.0, q.1),
             ("l2_w", Dense, q.0, q.1),
             ("l2_b", Bias, q.0, q.1),
@@ -7824,73 +7748,5 @@ mod tests {
         let mut expected_psqt = expected_no_psqt.clone();
         expected_psqt.push(("psqt_w", Ft, none.0, none.1));
         assert_eq!(uniform_optim_group_layout(true), expected_psqt);
-    }
-
-    /// per-group flag を一つも指定しない (`None`) と、3 group とも weight_decay = 大域値・
-    /// lr_mult = 1.0 に resolve され、`effective` の lr は `scheduled_lr × 1.0` で
-    /// scheduled_lr と bit-identical (= 既定 launch 引数が単一 weight_decay 経路と一致)。
-    #[test]
-    fn resolve_without_overrides_falls_back_to_global() {
-        let cfg = OptimGroupConfig::resolve(0.125, None, None, None, None, None, None);
-        let expected = OptimGroupParams {
-            weight_decay: 0.125,
-            lr_mult: 1.0,
-        };
-        assert_eq!(cfg.ft, expected);
-        assert_eq!(cfg.dense, expected);
-        assert_eq!(cfg.bias, expected);
-        let scheduled_lr = 0.0123_f32;
-        for kind in [
-            OptimGroupKind::Ft,
-            OptimGroupKind::Dense,
-            OptimGroupKind::Bias,
-        ] {
-            let (wd, lr) = cfg.effective(kind, scheduled_lr);
-            assert_eq!(wd, 0.125);
-            // `× 1.0` は finite f32 で恒等なので scheduled_lr と bit-identical。
-            assert_eq!(lr.to_bits(), scheduled_lr.to_bits());
-        }
-    }
-
-    /// per-group override は group ごとに resolve され、未指定 group のみ大域値 /
-    /// lr_mult=1.0 に落ちる。`effective` の lr は `scheduled_lr × lr_mult`。
-    #[test]
-    fn resolve_with_overrides_is_per_group() {
-        // ft: wd 上書きのみ (lr_mult は default 1.0)、dense: lr_mult 上書きのみ
-        // (wd は大域)、bias: wd=0 opt-in + lr_mult 上書き。
-        let cfg = OptimGroupConfig::resolve(
-            0.1,        // global weight_decay
-            Some(0.5),  // ft_weight_decay
-            None,       // dense_weight_decay → 大域 0.1
-            Some(0.0),  // bias_weight_decay (opt-in wd=0)
-            None,       // ft_lr_mult → 1.0
-            Some(2.0),  // dense_lr_mult
-            Some(0.25), // bias_lr_mult
-        );
-        assert_eq!(
-            cfg.ft,
-            OptimGroupParams {
-                weight_decay: 0.5,
-                lr_mult: 1.0
-            }
-        );
-        assert_eq!(
-            cfg.dense,
-            OptimGroupParams {
-                weight_decay: 0.1,
-                lr_mult: 2.0
-            }
-        );
-        assert_eq!(
-            cfg.bias,
-            OptimGroupParams {
-                weight_decay: 0.0,
-                lr_mult: 0.25
-            }
-        );
-        let lr = 0.01_f32;
-        assert_eq!(cfg.effective(OptimGroupKind::Ft, lr), (0.5, 0.01));
-        assert_eq!(cfg.effective(OptimGroupKind::Dense, lr), (0.1, 0.02));
-        assert_eq!(cfg.effective(OptimGroupKind::Bias, lr), (0.0, 0.0025));
     }
 }

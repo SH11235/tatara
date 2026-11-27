@@ -38,6 +38,8 @@ mod kernels;
 mod loader_digest;
 #[cfg(any(feature = "oxide-parity", feature = "native"))]
 mod native_bench;
+#[cfg(any(feature = "gpu", test))]
+mod optim_groups;
 #[cfg(feature = "native")]
 mod precision_diagnostics;
 mod qat;
@@ -112,6 +114,8 @@ fn dispatch(
                     || cli.threat_norm_dump
                 {
                     run_training(cli, layerstack_head)
+                } else if cli.l1_lr_mult.is_some() {
+                    Err("--l1-lr-mult requires training data (--data)".into())
                 } else {
                     smoke_test(cli.arch.kind())
                 }

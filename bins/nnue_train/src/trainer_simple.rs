@@ -226,6 +226,7 @@ impl SimpleGpuWorkspace {
 /// loss は固有 kernel。
 pub(crate) struct SimpleGpuTrainer {
     pub(crate) wdl_ignore_draws: bool,
+    pub(crate) l1_lr_mult: f32,
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
     /// `dense_bias_grad_tiled` の grid 上限を実機 SM 数から導出するための occupancy
@@ -515,6 +516,7 @@ impl SimpleGpuTrainer {
         let norm_scratch = DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?;
         Ok(Self {
             wdl_ignore_draws: false,
+            l1_lr_mult: 1.0,
             ft_w,
             ft_b,
             l1_w,
@@ -2367,6 +2369,7 @@ impl SimpleGpuTrainer {
         let beta1 = self.optimizer.beta1();
         let beta2 = self.optimizer.kernel_beta2(BETA2);
         let decay = self.optimizer.kernel_weight_decay(self.weight_decay);
+        let l1_lr = lr * self.l1_lr_mult;
 
         let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
@@ -2529,7 +2532,7 @@ impl SimpleGpuTrainer {
             cuda_launch! {
                 kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
                 args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
-                       slice_mut(self.l1_w_grad), lr, step_size, denom, decay,
+                       slice_mut(self.l1_w_grad), l1_lr, step_size, denom, decay,
                        beta1, beta2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
             }
         }?;

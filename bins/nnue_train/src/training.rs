@@ -471,6 +471,11 @@ fn validate_shared_cli(
     if !cli.lr_gamma.is_finite() || cli.lr_gamma <= 0.0 {
         return Err(format!("--lr-gamma must be finite and > 0 (got {})", cli.lr_gamma).into());
     }
+    if let Some(mult) = cli.l1_lr_mult
+        && (!mult.is_finite() || mult < 0.0)
+    {
+        return Err(format!("--l1-lr-mult must be finite and >= 0 (got {mult})").into());
+    }
     if !cli.weight_decay.is_finite() || cli.weight_decay < 0.0 {
         return Err(format!(
             "--weight-decay must be finite and >= 0 (got {})",
@@ -947,18 +952,7 @@ pub(crate) fn run_training(
     };
 
     let init_spec = build_layerstack_init_spec(cli);
-    // optimizer の param-group (ft / dense / bias) ごとの weight_decay と lr_mult を
-    // CLI から resolve する。per-group flag 未指定の group は大域 --weight-decay と
-    // lr_mult=1.0 にフォールバック → 全 flag 未指定なら従来挙動と bit-identical。
-    let optim_groups = OptimGroupConfig::resolve(
-        cli.weight_decay,
-        cli.ft_weight_decay,
-        cli.dense_weight_decay,
-        cli.bias_weight_decay,
-        cli.ft_lr_mult,
-        cli.dense_lr_mult,
-        cli.bias_lr_mult,
-    );
+    let optim_groups = resolve_layerstack_optim_groups(cli);
     let per_group_recorded = per_group_optim_overridden(cli);
     if per_group_recorded {
         println!(
@@ -1392,6 +1386,9 @@ pub(crate) fn run_training(
         fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(mult) = cli.l1_lr_mult {
+        println!("[train] l1_lr_mult={mult}");
+    }
 
     let result = nnue_train::trainer::run_with_prepared_keep_bucket(
         &mut trainer,
@@ -1644,6 +1641,20 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
 }
 
+#[cfg(feature = "gpu")]
+fn resolve_layerstack_optim_groups(cli: &Cli) -> OptimGroupConfig {
+    OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    )
+    .with_l1_lr_mult(cli.l1_lr_mult)
+}
+
 /// simple サブコマンドが解釈しない global フラグを明示エラーで弾く (silent no-op 回避)。
 ///
 /// simple driver ([`run_simple_training`]) と `SimpleGpuTrainer` は、global フラグの
@@ -1654,7 +1665,7 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
 ///   - `--eval-only` / `--threat-ablate` / `--threat-norm-dump`: layerstack の eval / threat
 ///     経路専用。
 ///   - per-group optimizer override (`--ft/dense/bias-weight-decay` / `--ft/dense/bias-lr-mult`):
-///     simple は単一 `weight_decay` 経路のみ。
+///     simple の weight decay は全層で同じ係数を使う。
 ///
 /// 他の layerstack 専用 flag の enforce は別所が担う: `--optimizer` は
 /// [`validate_shared_cli`] が未知の optimizer 名を reject、`--init-l1-shared` は
@@ -1686,7 +1697,7 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
     if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
         return Err(format!(
             "{name} is only supported with the layerstack subcommand, not the simple trainer \
-             (simple uses a single --weight-decay path)"
+             (simple supports --l1-lr-mult and global --weight-decay)"
         )
         .into());
     }
@@ -2121,6 +2132,7 @@ fn build_experiment_params(
         ft_lr_mult: trainer.optim_groups.map(|groups| groups.ft.lr_mult),
         dense_lr_mult: trainer.optim_groups.map(|groups| groups.dense.lr_mult),
         bias_lr_mult: trainer.optim_groups.map(|groups| groups.bias.lr_mult),
+        l1_lr_mult: cli.l1_lr_mult,
         norm_loss_factor: trainer.norm_loss_factor,
         qa: trainer.qa,
         qb: trainer.qb,
@@ -2218,15 +2230,7 @@ pub(crate) fn build_experiment_logger(
     // per-group override 指定時のみ experiment.json に有効 per-group 値を記録する。
     // resolve は CLI のみに依存する純関数 (`run_training` の trainer 構築と同じ入力)。
     let per_group_recorded = per_group_optim_overridden(cli);
-    let optim_groups = OptimGroupConfig::resolve(
-        cli.weight_decay,
-        cli.ft_weight_decay,
-        cli.dense_weight_decay,
-        cli.bias_weight_decay,
-        cli.ft_lr_mult,
-        cli.dense_lr_mult,
-        cli.bias_lr_mult,
-    );
+    let optim_groups = resolve_layerstack_optim_groups(cli);
     let params = build_experiment_params(
         cli,
         sampling,
@@ -2658,6 +2662,7 @@ pub(crate) fn run_simple_training(
         }
     })?;
     trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
+    trainer.l1_lr_mult = cli.l1_lr_mult.unwrap_or(1.0);
 
     let (resumed_superbatch, resume_producer, resumed_lr_horizon, checkpoint_fv_scale): (
         Option<usize>,
@@ -2803,6 +2808,9 @@ pub(crate) fn run_simple_training(
         trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(mult) = cli.l1_lr_mult {
+        println!("[train] l1_lr_mult={mult}");
+    }
 
     let result = nnue_train::trainer::run_with_prepared_keep_bucket(
         &mut trainer,
@@ -3042,6 +3050,11 @@ mod shared_cli_tests {
             shared_cli_error(&["--lr-gamma", "NaN"], false)
                 .contains("--lr-gamma must be finite and > 0")
         );
+        for arg in ["--l1-lr-mult=NaN", "--l1-lr-mult=inf", "--l1-lr-mult=-1"] {
+            assert!(
+                shared_cli_error(&[arg], false).contains("--l1-lr-mult must be finite and >= 0")
+            );
+        }
         assert!(
             shared_cli_error(&["--weight-decay=-1"], false)
                 .contains("--weight-decay must be finite and >= 0")

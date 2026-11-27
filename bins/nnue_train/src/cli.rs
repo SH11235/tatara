@@ -928,14 +928,8 @@ pub(crate) struct Cli {
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
     pub(crate) weight_decay: f32,
-    /// Weight decay override for the FT param group (the feature-transformer
-    /// input weights, plus the PSQT shortcut weights when --psqt is set). When
-    /// unset, this group uses the global --weight-decay. The optimizer splits
-    /// all trainable parameters into three param groups — FT (input-side
-    /// weights), dense (the L1/L1 shared/L2/L3 hidden-layer weights), and bias (every
-    /// layer's bias) — each with its own weight decay and learning-rate
-    /// multiplier. Leaving all six per-group flags unset is bit-identical to
-    /// the single --weight-decay path.
+    /// Weight decay override for the feature-transformer weights, including
+    /// PSQT shortcut weights when --psqt is set. Defaults to --weight-decay.
     #[arg(long, global = true)]
     pub(crate) ft_weight_decay: Option<f32>,
     /// Weight decay override for the dense param group (the L1/L1 shared/L2/L3
@@ -955,11 +949,16 @@ pub(crate) struct Cli {
     /// effective weight decay.
     #[arg(long, global = true)]
     pub(crate) ft_lr_mult: Option<f32>,
-    /// Learning-rate multiplier for the dense param group: this group's per-step
-    /// learning rate is the scheduled learning rate times this value. Unset
-    /// means 1.0.
+    /// Learning-rate multiplier for LayerStacks L2 and L3 weights. Also
+    /// applies to L1 weights when --l1-lr-mult is unset. Defaults to 1.0.
     #[arg(long, global = true)]
     pub(crate) dense_lr_mult: Option<f32>,
+    /// Multiply the scheduled learning rate for L1 weights, including shared L1
+    /// weights in LayerStacks. Defaults to the dense multiplier in LayerStacks
+    /// and to 1.0 in simple. L1 biases keep their own learning rate. Decoupled
+    /// weight decay scales with the resulting learning rate.
+    #[arg(long, global = true)]
+    pub(crate) l1_lr_mult: Option<f32>,
     /// Learning-rate multiplier for the bias param group: this group's per-step
     /// learning rate is the scheduled learning rate times this value. Unset
     /// means 1.0.

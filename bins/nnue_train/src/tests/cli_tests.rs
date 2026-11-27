@@ -532,6 +532,13 @@ fn simple_accepts_consumed_global_flags() {
 }
 
 #[test]
+fn simple_accepts_l1_learning_rate_multiplier() {
+    let cli = simple_cli(&["--l1-lr-mult", "0.25"]);
+    assert_eq!(cli.l1_lr_mult, Some(0.25));
+    assert!(reject_simple_unsupported_flags(&cli).is_ok());
+}
+
+#[test]
 fn simple_rejects_loss_wdl_requires_win_rate_model() {
     // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
     let err = require_simple_win_rate_model(&simple_cli(&[]))
