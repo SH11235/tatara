@@ -214,11 +214,8 @@ fn parse_effect_bucket_config(
     Ok(config)
 }
 
-/// 学習範囲 (start_superbatch <= --superbatches) の検査を免除する経路か。
-/// `--eval-only` / `--rescore-input` は学習しないため、最終 checkpoint
-/// (start = saved_sb + 1 > --superbatches) からの `--resume` も正当。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn training_range_exempt(cli: &Cli) -> bool {
+pub(crate) fn is_forward_only(cli: &Cli) -> bool {
     cli.eval_only || cli.rescore_input.is_some()
 }
 
@@ -976,7 +973,7 @@ pub(crate) fn run_training(
     // ため、optimizer state と backward workspace を確保しない forward-only trainer
     // で構築する (同一 batch size でも device memory が学習構成より大幅に小さく、
     // 12GB 級 GPU で大 batch が通る)。
-    let construct = if cli.eval_only || cli.rescore_input.is_some() {
+    let construct = if is_forward_only(cli) {
         GpuTrainer::new_forward_only
     } else {
         GpuTrainer::new
@@ -1172,7 +1169,7 @@ pub(crate) fn run_training(
     // 学習しない経路には train-range 制約を課さない。これを課すと最終
     // checkpoint (start = saved_sb + 1 > --superbatches) を --resume で評価 /
     // リスコアできない。
-    if start_superbatch > cli.superbatches && !training_range_exempt(cli) {
+    if start_superbatch > cli.superbatches && !is_forward_only(cli) {
         return Err(format!(
             "--start-superbatch {start_superbatch} > --superbatches {} (nothing to train); pass a larger --superbatches or a smaller start",
             cli.superbatches
@@ -1185,11 +1182,8 @@ pub(crate) fn run_training(
         );
     }
 
-    let lr_scheduler = build_resumed_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
-    trainer.lr_total_steps = match &lr_scheduler {
-        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
-        _ => None,
-    };
+    let lr_scheduler =
+        build_layerstack_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
@@ -1289,7 +1283,7 @@ pub(crate) fn run_training(
         return crate::rescore_driver::run_rescore(&mut trainer, &rescore_cfg);
     }
 
-    if cli.eval_only {
+    let Some(lr_scheduler) = lr_scheduler else {
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
         // eval-only はそこへ到達せず held-out loader を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
@@ -1367,7 +1361,12 @@ pub(crate) fn run_training(
             report.mean_loss, report.accuracy, report.n_positions, report.n_counted,
         );
         return Ok(());
-    }
+    };
+
+    trainer.lr_total_steps = match &lr_scheduler {
+        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+        _ => None,
+    };
 
     // ここに到達 = 通常学習 (eval-only / norm-dump は上で return 済)。学習には --data が要る。
     let data = data.ok_or("training requires --data")?;
@@ -1592,6 +1591,18 @@ fn build_lr_scheduler_with_steps(
         Some(w) => Ok(base.with_warmup(w)),
         None => Ok(base),
     }
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn build_layerstack_lr_scheduler(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    saved_steps: Option<u64>,
+) -> Result<Option<LrSchedulerEnum>, Box<dyn std::error::Error>> {
+    if is_forward_only(cli) {
+        return Ok(None);
+    }
+    build_resumed_lr_scheduler(cli, resumed_horizon, saved_steps).map(Some)
 }
 
 #[cfg(any(feature = "gpu", test))]

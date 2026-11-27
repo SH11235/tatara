@@ -1434,6 +1434,70 @@ fn raw_ckpt_spec_identity_roundtrip_and_mismatch() {
 }
 
 #[test]
+fn forward_only_resume_skips_optimizer_step_schedule_check() {
+    use crate::cli::LrScheduleArg;
+    use crate::training::build_layerstack_lr_scheduler;
+    use clap::Parser;
+
+    let arch = layerstack_arch();
+    let meta = RawCkptMeta {
+        optimizer: nnue_train::optimizer::OptimizerKind::RAdam,
+        qat_dense: false,
+        run_id: "",
+        superbatch: 7,
+        step_count: 123,
+        lr_horizon: None,
+        lr_total_steps: Some(500),
+        adam_bias_correction: false,
+        fv_scale: None,
+        net_id: "",
+        recipe_fingerprint: None,
+    };
+    let mut bytes = Vec::new();
+    crate::ckpt::write_raw_ckpt_header(&mut bytes, &arch, &meta, 0).unwrap();
+    let header = read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).unwrap();
+    assert_eq!(header.lr_total_steps, Some(500));
+
+    let parse = |mode: &[&str]| {
+        let cli = crate::Cli::try_parse_from(
+            ["nnue-train", "--resume", "model.ckpt", "layerstack"]
+                .into_iter()
+                .chain(mode.iter().copied()),
+        )
+        .unwrap();
+        assert_eq!(cli.lr_schedule, LrScheduleArg::Step);
+        cli
+    };
+    for mode in [
+        ["--eval-only", "--test-data", "test.psv"].as_slice(),
+        &[
+            "--rescore-input",
+            "input.psv",
+            "--rescore-output",
+            "scores",
+            "--rescore-score-scale",
+            "600",
+        ],
+    ] {
+        let cli = parse(mode);
+        assert!(
+            build_layerstack_lr_scheduler(&cli, header.lr_horizon, header.lr_total_steps)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let training = parse(&["--data", "train.psv"]);
+    let error = build_layerstack_lr_scheduler(&training, header.lr_horizon, header.lr_total_steps)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("resumed optimizer-step one-cycle")
+    );
+}
+
+#[test]
 fn optimizer_step_schedule_checkpoint_envelope_preserves_layout_and_counter() {
     use nnue_train::raw_checkpoint::{RawCkptReadMode, RawCkptReader};
     for optimizer in [

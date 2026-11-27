@@ -1171,17 +1171,16 @@ fn rescore_score_clip_rejects_non_positive_values() {
     assert!(Cli::try_parse_from(["nnue-train", "--rescore-score-clip", "1", "layerstack"]).is_ok());
 }
 
-/// 学習範囲検査の免除は「学習しない経路」に限る。
 #[test]
-fn training_range_exemption_covers_eval_only_and_rescore() {
-    use crate::training::training_range_exempt;
+fn forward_only_covers_eval_only_and_rescore() {
+    use crate::training::is_forward_only;
     let plain = Cli::try_parse_from(["nnue-train", "layerstack"]).unwrap();
-    assert!(!training_range_exempt(&plain));
+    assert!(!is_forward_only(&plain));
     let eval = Cli::try_parse_from(["nnue-train", "--eval-only", "layerstack"]).unwrap();
-    assert!(training_range_exempt(&eval));
+    assert!(is_forward_only(&eval));
     let rescore =
         Cli::try_parse_from(["nnue-train", "--rescore-input", "x.psv", "layerstack"]).unwrap();
-    assert!(training_range_exempt(&rescore));
+    assert!(is_forward_only(&rescore));
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
