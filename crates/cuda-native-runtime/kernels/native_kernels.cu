@@ -2320,8 +2320,7 @@ extern "C" __global__ __launch_bounds__(FT_FUSED_BLOCK_THREADS, 16) void ft_fuse
     const unsigned int column = static_cast<unsigned int>((first - element_begin) % ft_out);
     const unsigned int norm_column = column < ft_out / 2U
         ? column : norm_width / 2U + column - ft_out / 2U;
-    // Packed launches use independent row strides. The full-width real launch
-    // uses feature zero as its base, including when folding partner weights.
+    // The row base maps each launch's local rows to the active mask and fold partners.
     unsigned long long row = (first - element_begin) / ft_out + active_row_base;
     const unsigned long long row_stride = stride / ft_out;
     float thread_sum_squared[4] = {};

@@ -116,6 +116,14 @@ fn dispatch(
                     run_training(cli, layerstack_head)
                 } else if cli.l1_lr_mult.is_some() {
                     Err("--l1-lr-mult requires training data (--data)".into())
+                } else if let Some((name, _)) = training::ft_row_lr_flags(cli)
+                    .into_iter()
+                    .find(|(_, v)| v.is_some())
+                {
+                    if matches!(cli.arch, cli::ArchCommand::Simple(_)) {
+                        training::reject_simple_unsupported_flags(cli)?;
+                    }
+                    Err(format!("{name} requires training data (--data)").into())
                 } else {
                     smoke_test(cli.arch.kind())
                 }

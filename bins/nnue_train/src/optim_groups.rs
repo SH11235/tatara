@@ -1,3 +1,5 @@
+use shogi_features::FeatureSetSpec;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OptimGroupKind {
     Ft,
@@ -16,6 +18,8 @@ pub(crate) struct OptimGroupParams {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct OptimGroupConfig {
     pub(crate) ft: OptimGroupParams,
+    pub(crate) ft_piece_lr_mult: f32,
+    pub(crate) threat_lr_mult: f32,
     pub(crate) dense: OptimGroupParams,
     l1_lr_mult: Option<f32>,
     pub(crate) bias: OptimGroupParams,
@@ -37,6 +41,8 @@ impl OptimGroupConfig {
         };
         OptimGroupConfig {
             ft: group(ft_weight_decay, ft_lr_mult),
+            ft_piece_lr_mult: 1.0,
+            threat_lr_mult: 1.0,
             dense: group(dense_weight_decay, dense_lr_mult),
             bias: group(bias_weight_decay, bias_lr_mult),
             l1_lr_mult: None,
@@ -46,6 +52,28 @@ impl OptimGroupConfig {
     pub(crate) fn with_l1_lr_mult(mut self, l1_lr_mult: Option<f32>) -> Self {
         self.l1_lr_mult = l1_lr_mult;
         self
+    }
+
+    pub(crate) fn with_ft_row_lr_mults(mut self, piece: Option<f32>, threat: Option<f32>) -> Self {
+        self.ft_piece_lr_mult = piece.unwrap_or(1.0);
+        self.threat_lr_mult = threat.unwrap_or(1.0);
+        self
+    }
+
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn ft_row_learning_rates(&self, ft_lr: f32) -> (f32, f32) {
+        (ft_lr * self.ft_piece_lr_mult, ft_lr * self.threat_lr_mult)
+    }
+
+    pub(crate) fn uniform_ft_lr_mult(&self, feature_set: FeatureSetSpec) -> Option<f32> {
+        let mult = self.ft_piece_lr_mult;
+        if (feature_set.threat_dims() == 0 || self.threat_lr_mult == mult)
+            && (!feature_set.ft_factorize() || mult == 1.0)
+        {
+            Some(mult)
+        } else {
+            None
+        }
     }
 
     fn params(&self, kind: OptimGroupKind) -> OptimGroupParams {
@@ -145,6 +173,46 @@ mod tests {
         let (dense_wd, dense_lr) = cfg.effective(OptimGroupKind::Dense, lr);
         assert_eq!(l1_wd.to_bits(), dense_wd.to_bits());
         assert_eq!(l1_lr.to_bits(), dense_lr.to_bits());
+    }
+
+    #[test]
+    fn ft_row_multipliers_compose_with_ft_rate_only() {
+        let baseline = OptimGroupConfig::resolve(
+            0.125,
+            Some(0.25),
+            None,
+            None,
+            Some(4.0),
+            Some(2.0),
+            Some(0.75),
+        );
+        let cfg = baseline.with_ft_row_lr_mults(Some(0.5), Some(0.0));
+        let lr = 0.0123_f32;
+        let (wd, ft_lr) = cfg.effective(OptimGroupKind::Ft, lr);
+        assert_eq!(wd, 0.25);
+        assert_eq!(ft_lr, lr * 4.0);
+        assert_eq!(cfg.ft_row_learning_rates(ft_lr), (ft_lr * 0.5, 0.0));
+        assert_eq!(baseline.ft_row_learning_rates(ft_lr), (ft_lr, ft_lr));
+        let base = shogi_features::FeatureSet::HalfKaHmMerged.spec();
+        assert_eq!(cfg.uniform_ft_lr_mult(base), Some(0.5));
+        assert_eq!(cfg.uniform_ft_lr_mult(base.with_ft_factorize()), None);
+        let effect =
+            base.with_effect_bucket_config(shogi_features::EffectBucketConfig::KINGFIXED_2X2);
+        assert_eq!(cfg.uniform_ft_lr_mult(effect), Some(0.5));
+        assert_eq!(cfg.uniform_ft_lr_mult(effect.with_ft_factorize()), None);
+        let threat = base.with_threat_profile(shogi_features::ThreatProfile::CrossSide);
+        assert_eq!(cfg.uniform_ft_lr_mult(threat), None);
+        let equal = cfg.with_ft_row_lr_mults(Some(0.5), Some(0.5));
+        assert_eq!(equal.uniform_ft_lr_mult(threat), Some(0.5));
+        assert_eq!(equal.uniform_ft_lr_mult(threat.with_ft_factorize()), None);
+        for kind in [
+            OptimGroupKind::Ft,
+            OptimGroupKind::L1,
+            OptimGroupKind::Dense,
+            OptimGroupKind::Bias,
+        ] {
+            assert_eq!(cfg.effective(kind, lr), baseline.effective(kind, lr));
+        }
     }
 
     #[test]

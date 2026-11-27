@@ -956,6 +956,14 @@ pub(crate) struct Cli {
     /// effective weight decay.
     #[arg(long, global = true)]
     pub(crate) ft_lr_mult: Option<f32>,
+    /// Multiply the LayerStack FT learning rate for real piece rows. Shared
+    /// virtual rows keep the FT learning rate.
+    #[arg(long, global = true)]
+    pub(crate) ft_piece_lr_mult: Option<f32>,
+    /// Multiply the LayerStack FT learning rate for real Threat rows. Virtual
+    /// threat-pair rows keep the FT learning rate. Requires Threat features.
+    #[arg(long, global = true)]
+    pub(crate) threat_lr_mult: Option<f32>,
     /// Learning-rate multiplier for LayerStacks L2 and L3 weights. Also
     /// applies to L1 weights when --l1-lr-mult is unset. Defaults to 1.0.
     #[arg(long, global = true)]
