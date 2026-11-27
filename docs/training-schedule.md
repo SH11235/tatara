@@ -28,6 +28,13 @@ can't: what each scheduler does and how it interacts with `--resume`.
 `--lr-warmup-steps` additionally wraps any schedule except `one-cycle` (which
 carries its own warmup) in a batch-level warmup over the first superbatch.
 
+`--l1-lr-mult` multiplies the scheduled rate for the first dense layer’s weights,
+including shared weights in both LayerStacks heads. When omitted, L1 uses
+`--dense-lr-mult` in LayerStacks and 1.0 in simple. L1 uses the dense weight
+decay coefficient in LayerStacks and the global coefficient in simple.
+On resume, the multiplier comes from the current command line and is part of
+the recipe comparison.
+
 ### Horizon and resuming
 
 The schedules with a **horizon** — the superbatch at which the curve reaches its

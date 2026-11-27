@@ -287,7 +287,7 @@ pub struct Params {
     /// lr_mult。per-group override flag を一つでも指定した run でのみ 6 値すべてを
     /// `Some` で記録し、全未指定の既定 run では省略する (大域 `weight_decay` と
     /// lr_mult=1.0 が全 group に適用され、`weight_decay` フィールドで足りるため)。
-    /// `ft` は `ft_w` / `psqt_w`、`dense` は L1/L1 shared/L2/L3 weight、`bias` は全 bias。
+    /// `ft` は入力側重み、`dense` は全結合層の重み、`bias` は全 bias。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_weight_decay: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,6 +300,9 @@ pub struct Params {
     pub dense_lr_mult: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bias_lr_mult: Option<f32>,
+    /// Explicit learning-rate multiplier for the weights of the first dense layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_lr_mult: Option<f32>,
     /// norm loss (per-weight-group L2-norm 正則化) の強度係数。`--norm-loss` 有効時
     /// のみ `Some(factor)`、無効な run では省略する (`--norm-loss-factor`)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -944,6 +947,27 @@ mod tests {
     }
 
     #[test]
+    fn l1_lr_mult_is_optional_and_changes_recipe_fingerprint() {
+        let mut params = sample_params();
+        params.dense_lr_mult = Some(2.0);
+        assert!(
+            serde_json::to_value(&params)
+                .unwrap()
+                .get("l1_lr_mult")
+                .is_none()
+        );
+        let fallback = recipe_fingerprint(&params, "teacher.psv");
+
+        params.l1_lr_mult = Some(1.0);
+        assert_eq!(serde_json::to_value(&params).unwrap()["l1_lr_mult"], 1.0);
+        let explicit = recipe_fingerprint(&params, "teacher.psv");
+        assert_ne!(fallback, explicit);
+
+        params.l1_lr_mult = Some(0.25);
+        assert_ne!(explicit, recipe_fingerprint(&params, "teacher.psv"));
+    }
+
+    #[test]
     fn recipe_fingerprint_counts_the_superbatch_count_as_the_wdl_horizon() {
         let mut taper = sample_params();
         taper.start_wdl = Some(0.0);
@@ -1093,6 +1117,7 @@ mod tests {
             ft_lr_mult: None,
             dense_lr_mult: None,
             bias_lr_mult: None,
+            l1_lr_mult: None,
             norm_loss_factor: None,
             qa: 127,
             qb: 64,

@@ -26,6 +26,12 @@ superbatch index の関数として run ごとに再計算される。学習手�
 `--lr-warmup-steps` は `one-cycle`（自前の warmup を持つ）を除く任意の schedule を、
 最初の superbatch 内の batch 単位 warmup で追加ラップする。
 
+`--l1-lr-mult` は FT の直後にある全結合層の重みに学習率の倍率を掛ける。
+LayerStacks の両 head で L1 の共有重みも対象になる。省略時は LayerStacks では
+`--dense-lr-mult`、simple では 1.0 を使う。L1 の weight decay 係数は LayerStacks
+では dense の値、simple では全体の値に従う。resume 時はそのコマンドラインの
+倍率を使い、レシピの比較にも含める。
+
 ### Horizon と resume
 
 **horizon**（curve が終端 LR に到達する superbatch）を持つのは

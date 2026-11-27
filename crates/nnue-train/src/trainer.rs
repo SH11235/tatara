@@ -2390,6 +2390,7 @@ mod tests {
             ft_lr_mult: None,
             dense_lr_mult: None,
             bias_lr_mult: None,
+            l1_lr_mult: None,
             norm_loss_factor: None,
             qa: 127,
             qb: 64,
