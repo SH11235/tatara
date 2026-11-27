@@ -1041,93 +1041,112 @@ fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
 #[test]
 fn adam_bias_correction_matches_reference_with_fused_and_unfused_ft() -> TestResult {
     let ctx = test_cuda_context()?;
-    for fused in [false, true] {
-        for half_state in [false, true] {
-            let features = FeatureSet::HalfKaHmMerged.spec();
-            let mut t = GpuTrainer::new(
-                &ctx,
-                16,
-                128,
-                16,
-                32,
-                nnue_format::LayerStackHead::SplitSkip,
-                2,
-                BucketMode::ProgressKpAbs,
-                PrecisionFlags {
-                    ft_fp16: true,
-                    fp16_opt_state: half_state,
-                    ..Default::default()
-                },
-                features,
-                OptimizerKind::AdamW,
-                OptimGroupConfig::resolve(0.2, None, None, None, None, None, None),
-                None,
-                None,
-                &LayerStackInit::default_uniform(),
-            )?;
-            t.adam_bias_correction = true;
-            t.set_ft_fused_optimizer_enabled_for_test(fused);
-            t.ft_w = DeviceBuffer::from_host(&t.stream, &vec![0.4; t.ft_w.len()])?;
-            t.l1_shared_weight =
-                DeviceBuffer::from_host(&t.stream, &vec![0.4; t.l1_shared_weight.len()])?;
-            let batch = BatchData::smoke_dummy(16, features);
-            let data = batch.as_ref();
-            let (mut expected, mut m, mut v) = (0.4_f64, 0.0_f64, 0.0_f64);
-            for step in 1..=3 {
-                if step == 3 {
-                    let path = std::env::temp_dir().join(format!(
-                        "tatara-adam-resume-{}-{fused}-{half_state}.ckpt",
-                        std::process::id()
-                    ));
-                    t.lr_total_steps = Some(100);
-                    t.save_raw_checkpoint(
-                        &path,
-                        2,
-                        &nnue_train::trainer::CheckpointProducer::run_id_only("test"),
-                        Some(10),
-                    )?;
-                    t.step_count = 0;
-                    t.lr_total_steps = None;
-                    t.load_raw_checkpoint(&path, false)?;
-                    assert_eq!(t.step_count, 2);
-                    assert_eq!(t.lr_total_steps, Some(100));
-                    std::fs::remove_file(path)?;
-                }
-                let g = if step == 2 { -0.02_f32 } else { 0.01_f32 };
-                t.ft_w_grad = DeviceBuffer::from_host(&t.stream, &vec![g; t.ft_w.len()])?;
-                t.l1_shared_weight_grad =
-                    DeviceBuffer::from_host(&t.stream, &vec![g; t.l1_shared_weight.len()])?;
-                let mut now = std::time::Instant::now();
-                let mut context = StepContext::new(
-                    &t,
-                    &data,
-                    StepOptions {
-                        lr: 0.01,
-                        wdl_lambda: WdlBlend::default(),
-                        loss: SMOKE_LOSS_WRM,
-                        validate: false,
-                        forward_output: false,
-                        profile_step: false,
-                        prof_t0: &mut now,
+    for gradient_scale in [1.0_f32, 0.01] {
+        for fused in [false, true] {
+            for half_state in [false, true] {
+                let features = FeatureSet::HalfKaHmMerged.spec();
+                let mut t = GpuTrainer::new(
+                    &ctx,
+                    16,
+                    128,
+                    16,
+                    32,
+                    nnue_format::LayerStackHead::SplitSkip,
+                    2,
+                    BucketMode::ProgressKpAbs,
+                    PrecisionFlags {
+                        ft_fp16: true,
+                        fp16_opt_state: half_state,
+                        ..Default::default()
                     },
+                    features,
+                    OptimizerKind::AdamW,
+                    OptimGroupConfig::resolve(0.2, None, None, None, None, None, None),
+                    None,
+                    None,
+                    &LayerStackInit::default_uniform(),
                 )?;
-                t.optimizer_step(&mut context)?;
-                let b1 = f64::from(OptimizerKind::AdamW.beta1());
-                let b2 = f64::from(BETA2);
-                m = b1 * m + (1.0 - b1) * f64::from(g);
-                v = b2 * v + (1.0 - b2) * f64::from(g).powi(2);
-                expected = expected * (1.0 - f64::from(0.01_f32) * f64::from(0.2_f32))
-                    - f64::from(0.01_f32) * (m / (1.0 - b1.powi(step)))
-                        / ((v / (1.0 - b2.powi(step))).sqrt() + f64::from(EPS));
-                for (label, weight, tolerance) in [
-                    ("ft", &t.ft_w, if half_state { 2e-5 } else { 2e-6 }),
-                    ("shared L1", &t.l1_shared_weight, 2e-6),
-                ] {
-                    for actual in weight.to_host_vec(&t.stream)? {
-                        assert!(
-                            (f64::from(actual) - expected).abs() < tolerance,
-                            "{label}, fused={fused}, half_state={half_state}, step={step}: {actual} vs {expected}"
-                        );
+                t.adam_bias_correction = true;
+                t.set_ft_fused_optimizer_enabled_for_test(fused);
+                t.ft_w = DeviceBuffer::from_host(&t.stream, &vec![0.4; t.ft_w.len()])?;
+                t.l1_shared_weight =
+                    DeviceBuffer::from_host(&t.stream, &vec![0.4; t.l1_shared_weight.len()])?;
+                let batch = BatchData::smoke_dummy(16, features);
+                let data = batch.as_ref();
+                let (mut expected, mut m, mut v) = (0.4_f64, 0.0_f64, 0.0_f64);
+                let (mut expected_ft, mut ft_m, mut ft_v) = (0.4_f64, 0.0_f64, 0.0_f64);
+                for step in 1..=3 {
+                    if step == 3 {
+                        let path = std::env::temp_dir().join(format!(
+                            "tatara-adam-resume-{}-{fused}-{half_state}.ckpt",
+                            std::process::id()
+                        ));
+                        t.lr_total_steps = Some(100);
+                        t.save_raw_checkpoint(
+                            &path,
+                            2,
+                            &nnue_train::trainer::CheckpointProducer::run_id_only("test"),
+                            Some(10),
+                        )?;
+                        t.step_count = 0;
+                        t.lr_total_steps = None;
+                        t.load_raw_checkpoint(&path, false)?;
+                        assert_eq!(t.step_count, 2);
+                        assert_eq!(t.lr_total_steps, Some(100));
+                        std::fs::remove_file(path)?;
+                    }
+                    let g = (if step == 2 { -0.02_f32 } else { 0.01_f32 }) * gradient_scale;
+                    t.ft_w_grad = DeviceBuffer::from_host(&t.stream, &vec![g; t.ft_w.len()])?;
+                    t.l1_shared_weight_grad =
+                        DeviceBuffer::from_host(&t.stream, &vec![g; t.l1_shared_weight.len()])?;
+                    let mut now = std::time::Instant::now();
+                    let mut context = StepContext::new(
+                        &t,
+                        &data,
+                        StepOptions {
+                            lr: 0.01,
+                            wdl_lambda: WdlBlend::default(),
+                            loss: SMOKE_LOSS_WRM,
+                            validate: false,
+                            forward_output: false,
+                            profile_step: false,
+                            prof_t0: &mut now,
+                        },
+                    )?;
+                    t.optimizer_step(&mut context)?;
+                    let b1 = f64::from(OptimizerKind::AdamW.beta1());
+                    let b2 = f64::from(BETA2);
+                    m = b1 * m + (1.0 - b1) * f64::from(g);
+                    v = b2 * v + (1.0 - b2) * f64::from(g).powi(2);
+                    expected = expected * (1.0 - f64::from(0.01_f32) * f64::from(0.2_f32))
+                        - f64::from(0.01_f32) * (m / (1.0 - b1.powi(step)))
+                            / ((v / (1.0 - b2.powi(step))).sqrt() + f64::from(EPS));
+                    ft_m = b1 * ft_m + (1.0 - b1) * f64::from(g);
+                    ft_v = b2 * ft_v + (1.0 - b2) * f64::from(g).powi(2);
+                    expected_ft = expected_ft * (1.0 - f64::from(0.01_f32) * f64::from(0.2_f32))
+                        - f64::from(0.01_f32) * (ft_m / (1.0 - b1.powi(step)))
+                            / ((ft_v / (1.0 - b2.powi(step))).sqrt() + f64::from(EPS));
+                    if half_state {
+                        // The update uses unrounded moments; only the next step sees clamped FP16 state.
+                        // At g=0.01 both scaled moments exceed 65504; g=0.0001 avoids saturation.
+                        let store = |value: f64, scale: f32| {
+                            ((value * f64::from(scale)).clamp(-65504.0, 65504.0) as f16) as f64
+                                / f64::from(scale)
+                        };
+                        ft_m = store(ft_m, FT_OPT_M_SCALE);
+                        ft_v = store(ft_v, FT_OPT_V_SCALE);
+                    }
+                    for (label, weight, tolerance) in [
+                        ("ft", &t.ft_w, if half_state { 2e-5 } else { 2e-6 }),
+                        ("shared L1", &t.l1_shared_weight, 2e-6),
+                    ] {
+                        let expected = if label == "ft" { expected_ft } else { expected };
+                        for actual in weight.to_host_vec(&t.stream)? {
+                            assert!(
+                                (f64::from(actual) - expected).abs() < tolerance,
+                                "{label}, fused={fused}, half_state={half_state}, step={step}, gradient_scale={gradient_scale}: {actual} vs {expected}"
+                            );
+                        }
                     }
                 }
             }

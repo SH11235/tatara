@@ -3830,6 +3830,7 @@ impl GpuTrainer {
                 step_count: self.step_count,
                 lr_horizon,
                 lr_total_steps: self.lr_total_steps,
+                adam_bias_correction: self.adam_bias_correction,
                 fv_scale: None,
             },
             &self.raw_ckpt_group_sources(),
@@ -3875,6 +3876,10 @@ impl GpuTrainer {
             },
             &expected_groups,
         )?;
+
+        if !transfer_radam_momentum && !self.forward_only {
+            header.validate_adam_bias_correction(self.adam_bias_correction)?;
+        }
 
         let forward_only = self.forward_only;
         if !forward_only {

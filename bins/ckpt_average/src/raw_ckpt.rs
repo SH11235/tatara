@@ -859,6 +859,7 @@ pub(crate) mod tests {
             step_count: 100,
             lr_horizon: None,
             lr_total_steps: None,
+            adam_bias_correction: false,
             fv_scale: None,
             net_id: "net",
             recipe_fingerprint: None,
@@ -935,6 +936,7 @@ pub(crate) mod tests {
                 step_count: 1,
                 lr_horizon: None,
                 lr_total_steps: (index == 0).then_some(100),
+                adam_bias_correction: false,
                 fv_scale: None,
             };
             let group_lengths = [

@@ -80,15 +80,20 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `16`: optimizer-step schedule envelope: u32 layout version (11..=15),
 ///   then u64 LR total steps, followed by that layout's header and tensors.
 ///
-/// The trainer resume format accepts versions 1..=16. Version 1 is interpreted as
+/// - `17`: optimizer envelope: u32 layout (11..=15), u64 LR total steps
+///   (zero means absent), then u8 Adam bias correction (0 or 1).
+///   Earlier formats imply bias correction disabled.
+///
+/// The trainer resume format accepts versions 1..=17. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 16 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 17 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
-pub const RAW_CKPT_VERSION: u32 = 16;
+pub const RAW_CKPT_VERSION: u32 = 17;
+const ADAM_BIAS_CKPT_VERSION: u32 = 17;
 const STEP_SCHEDULE_CKPT_VERSION: u32 = 16;
 
 /// LayerStack topology extension: PSQT bucket count (zero if absent), then this head tag.
@@ -180,6 +185,7 @@ pub struct RawCkptMeta<'a> {
     /// LR-schedule horizon (horizon を持たない schedule では `None`)。
     pub lr_horizon: Option<usize>,
     pub lr_total_steps: Option<u64>,
+    pub adam_bias_correction: bool,
     /// Simple の export に使う実効 evaluation scale。LayerStack は `None`。
     pub fv_scale: Option<i32>,
     /// この checkpoint を書き出す run の net id。空文字列は「未記録」。
@@ -219,6 +225,7 @@ pub struct RawCkptReader<R> {
     mode: RawCkptReadMode,
     version: u32,
     lr_total_steps: Option<u64>,
+    adam_bias_correction: bool,
 }
 
 impl<R: Read> RawCkptReader<R> {
@@ -228,6 +235,7 @@ impl<R: Read> RawCkptReader<R> {
             mode,
             version: 0,
             lr_total_steps: None,
+            adam_bias_correction: false,
         };
         let magic = reader.array::<4>("magic")?;
         if magic != RAW_CKPT_MAGIC {
@@ -250,7 +258,7 @@ impl<R: Read> RawCkptReader<R> {
                 "{prefix} version {version} is not supported ({supported} {min}..={RAW_CKPT_VERSION})"
             )));
         }
-        reader.version = if version == STEP_SCHEDULE_CKPT_VERSION {
+        reader.version = if version >= STEP_SCHEDULE_CKPT_VERSION {
             let layout = reader.u32("layout version")?;
             if !(11..=15).contains(&layout) {
                 return Err(invalid(
@@ -258,15 +266,26 @@ impl<R: Read> RawCkptReader<R> {
                 ));
             }
             let total = reader.u64("LR total steps")?;
-            if total == 0 {
+            if total == 0 && version == STEP_SCHEDULE_CKPT_VERSION {
                 return Err(invalid("LR total steps must be positive".into()));
             }
-            reader.lr_total_steps = Some(total);
+            reader.lr_total_steps = (total != 0).then_some(total);
+            if version == ADAM_BIAS_CKPT_VERSION {
+                reader.adam_bias_correction = match reader.array::<1>("Adam bias correction")?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(invalid("invalid Adam bias correction flag".into())),
+                };
+            }
             layout
         } else {
             version
         };
         Ok(reader)
+    }
+
+    pub fn adam_bias_correction(&self) -> bool {
+        self.adam_bias_correction
     }
 
     pub fn lr_total_steps(&self) -> Option<u64> {
@@ -476,7 +495,15 @@ pub fn write_raw_ckpt_header<W: Write>(
         (true, OptimizerKind::RAdam) => PARTIAL_THREAT_RADAM_CKPT_VERSION,
         (true, _) => PARTIAL_THREAT_CKPT_VERSION,
     };
-    if let Some(total) = meta.lr_total_steps {
+    if meta.lr_total_steps == Some(0) {
+        return Err(invalid("LR total steps must be positive".into()));
+    }
+    if meta.adam_bias_correction {
+        w.write_all(&ADAM_BIAS_CKPT_VERSION.to_le_bytes())?;
+        w.write_all(&version.to_le_bytes())?;
+        w.write_all(&meta.lr_total_steps.unwrap_or(0).to_le_bytes())?;
+        w.write_all(&[1])?;
+    } else if let Some(total) = meta.lr_total_steps {
         if total == 0 {
             return Err(invalid("LR total steps must be positive".into()));
         }

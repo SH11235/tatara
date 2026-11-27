@@ -726,29 +726,34 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
         }
         scores
     };
-    for window_mib in [0, 1] {
+    for window_mib in [0, 3] {
         let mut reference = open(1, window_mib, 128, None);
-        let expected = collect(&mut reference, 350);
+        let expected = collect(&mut reference, 499);
         drop(reference);
         for workers in [1, 4] {
-            for cut in [1, 151] {
+            for cut in [1, 451] {
                 let mut first = open(workers, window_mib, 128, None);
                 let actual = collect(&mut first, cut);
                 let position: TeacherPosition =
                     serde_json::from_slice(&serde_json::to_vec(first.position()).unwrap()).unwrap();
                 assert_eq!(position.mixes.len(), 2);
                 assert!(position.bucket_skip > 0);
-                if cut == 151 {
+                if cut == 451 {
                     if window_mib != 0 {
                         assert!(position.window_index.unwrap() > 0);
                     }
                     assert!(position.epoch > 0);
                 }
                 drop(first);
-                for batch_size in [64, 128] {
+                for batch_size in [64, 96, 128, 256] {
+                    assert_eq!(
+                        shuffle_window_records(window_mib, 128).unwrap(),
+                        shuffle_window_records(window_mib, batch_size).unwrap()
+                    );
+                    assert_eq!((499 - cut) * 128 % batch_size, 0);
                     let mut resumed = open(workers, window_mib, batch_size, Some(&position));
                     let mut joined = actual.clone();
-                    joined.extend(collect(&mut resumed, (350 - cut) * 128 / batch_size));
+                    joined.extend(collect(&mut resumed, (499 - cut) * 128 / batch_size));
                     assert_eq!(joined, expected);
                 }
             }

@@ -28,14 +28,15 @@ can't: what each scheduler does and how it interacts with `--resume`.
 With `--lr-schedule one-cycle --lr-total-steps N`, the cycle advances once per
 optimizer update, independently of `--superbatches`. N must be positive; other
 schedules reject this option. The initial LR is `--lr / --lr-div-factor`, and the
-final LR is initial LR divided by `--lr-final-div-factor`. Warmup lasts
-`round(--lr-warmup-pct * N)` updates. The zero-based update index matches PyTorch:
-with at least two warmup updates, update 0 uses initial LR, the warmup peak is
-at `warmup_updates - 1`, and final LR is reached at `N - 1` and held thereafter.
-Both phases use half-cosine interpolation. Unlike PyTorch's unrounded phase
-boundary, the warmup count is rounded. Zero warmup uses the decay phase directly;
-one warmup update starts at the peak. A one-update cycle uses final LR; final LR
-also takes precedence at the last update when warmup occupies the whole cycle.
+final LR is initial LR divided by `--lr-final-div-factor`. Warmup ends at
+a floating-point phase boundary at `--lr-warmup-pct * N - 1`, without rounding.
+The zero-based update index follows PyTorch's half-cosine phases: warmup ends
+at that boundary and cooldown ends at `N - 1`. The warmup percentage is stored
+as f32 and converted to f64 for the boundary calculation. With a nonintegral
+boundary, no update necessarily lands exactly on max LR. With warmup percentage
+1.0, update `N - 1` reaches max LR. Updates `N` and later hold the value of update
+`N - 1`. Zero warmup uses cooldown directly; a zero-length warmup phase at
+update 0 uses max LR.
 
 The checkpoint saves N and the completed optimizer update count. On resume, an
 omitted N inherits the saved value; a different N or schedule is rejected. A
@@ -65,7 +66,9 @@ be finite and nonnegative; simple rejects it. Omission preserves dense decay.
 `w = w * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + epsilon)` followed by
 tatara's existing weight clamp. Omission preserves AdamW without correction.
 Both native CUDA (including fused FT) and cuda-oxide use this correction, also
-with FP16 optimizer states; FP16 storage retains its rounding error. Epsilon
+with FP16 optimizer states; FP16 storage retains its rounding error.
+The checkpoint records `--adam-bias-correction`; resume requires the same flag
+value. Checkpoints without this field imply correction disabled. Epsilon
 and decay are rescaled along with the gradient step so the shared optimizer
 kernel preserves the effective epsilon and decoupled decay rate.
 

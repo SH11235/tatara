@@ -2922,6 +2922,7 @@ impl SimpleGpuTrainer {
                 step_count: self.step_count,
                 lr_horizon,
                 lr_total_steps: self.lr_total_steps,
+                adam_bias_correction: self.adam_bias_correction,
                 fv_scale: Some(self.fv_scale()),
             },
             &self.raw_ckpt_group_sources(),
@@ -2963,6 +2964,10 @@ impl SimpleGpuTrainer {
             },
             &expected_groups,
         )?;
+
+        if !transfer_radam_momentum {
+            header.validate_adam_bias_correction(self.adam_bias_correction)?;
+        }
 
         header.prepare_optimizer_state(
             path,

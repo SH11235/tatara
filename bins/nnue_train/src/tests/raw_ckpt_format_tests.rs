@@ -212,7 +212,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 16);
+    assert_eq!(RAW_CKPT_VERSION, 17);
 }
 
 #[test]
@@ -228,6 +228,7 @@ fn raw_ckpt_marks_sgd_without_changing_adam_layout() {
         step_count: 1,
         lr_horizon: None,
         lr_total_steps: None,
+        adam_bias_correction: false,
         fv_scale: None,
         net_id: "",
         recipe_fingerprint: None,
@@ -275,6 +276,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             step_count: 10,
             lr_horizon: None,
             lr_total_steps: None,
+            adam_bias_correction: false,
             fv_scale: None,
             net_id: "",
             recipe_fingerprint: None,
@@ -312,6 +314,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             step_count: 1,
             lr_horizon: None,
             lr_total_steps: None,
+            adam_bias_correction: false,
             fv_scale: Some(14),
             net_id: "",
             recipe_fingerprint: None,
@@ -450,6 +453,7 @@ fn write_raw_ckpt_header<W: std::io::Write>(
             step_count,
             lr_horizon,
             lr_total_steps: None,
+            adam_bias_correction: false,
             fv_scale: None,
             net_id: "",
             recipe_fingerprint: None,
@@ -474,6 +478,7 @@ fn write_raw_ckpt_header_with_fv_scale(
             step_count: 90,
             lr_horizon: Some(120),
             lr_total_steps: None,
+            adam_bias_correction: false,
             fv_scale,
             net_id: "",
             recipe_fingerprint: None,
@@ -1045,6 +1050,7 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
                 step_count: 1,
                 lr_horizon: None,
                 lr_total_steps: None,
+                adam_bias_correction: false,
                 fv_scale: None,
                 net_id,
                 recipe_fingerprint,
@@ -1099,6 +1105,7 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         step_count: 5,
         lr_horizon: None,
         lr_total_steps: None,
+        adam_bias_correction: false,
         fv_scale: None,
         net_id: "",
         recipe_fingerprint: None,
@@ -1257,6 +1264,7 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
                 step_count: 12,
                 lr_horizon: Some(20),
                 lr_total_steps: None,
+                adam_bias_correction: false,
                 fv_scale: None,
                 net_id: "",
                 recipe_fingerprint: None,
@@ -1441,6 +1449,7 @@ fn optimizer_step_schedule_checkpoint_envelope_preserves_layout_and_counter() {
             step_count: 123,
             lr_horizon: None,
             lr_total_steps: Some(500),
+            adam_bias_correction: false,
             fv_scale: None,
             net_id: "",
             recipe_fingerprint: None,
@@ -1472,5 +1481,62 @@ fn optimizer_step_schedule_checkpoint_envelope_preserves_layout_and_counter() {
         reader.producer_recipe().unwrap();
         assert_eq!(reader.group_count().unwrap(), 0);
         assert!(reader.into_inner().is_empty());
+    }
+}
+
+#[test]
+fn adam_bias_checkpoint_roundtrip_and_resume_reject_mismatches() {
+    use nnue_train::raw_checkpoint::{RawCkptReadMode, RawCkptReader};
+    for corrected in [false, true] {
+        for total in [None, Some(500)] {
+            let arch = layerstack_arch();
+            let meta = RawCkptMeta {
+                optimizer: nnue_train::optimizer::OptimizerKind::AdamW,
+                qat_dense: false,
+                run_id: "",
+                superbatch: 7,
+                step_count: 123,
+                lr_horizon: None,
+                lr_total_steps: total,
+                adam_bias_correction: corrected,
+                fv_scale: None,
+                net_id: "",
+                recipe_fingerprint: None,
+            };
+            let mut bytes = Vec::new();
+            crate::ckpt::write_raw_ckpt_header(&mut bytes, &arch, &meta, 0).unwrap();
+            let wire_version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            assert_eq!(
+                wire_version,
+                if corrected {
+                    17
+                } else if total.is_some() {
+                    16
+                } else {
+                    11
+                }
+            );
+            let header = read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).unwrap();
+            assert_eq!(header.lr_total_steps, total);
+            assert_eq!(header.step_count, 123);
+            assert_eq!(header.adam_bias_correction, corrected);
+            header.validate_adam_bias_correction(corrected).unwrap();
+            assert!(
+                header
+                    .validate_adam_bias_correction(!corrected)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--adam-bias-correction mismatch")
+            );
+            let reader = RawCkptReader::new(bytes.as_slice(), RawCkptReadMode::Average).unwrap();
+            assert_eq!(reader.adam_bias_correction(), corrected);
+            assert_eq!(reader.lr_total_steps(), total);
+            if corrected {
+                let mut invalid = bytes.clone();
+                invalid[20] = 2;
+                assert!(RawCkptReader::new(invalid.as_slice(), RawCkptReadMode::Resume).is_err());
+                assert!(RawCkptReader::new(&bytes[..20], RawCkptReadMode::Resume).is_err());
+            }
+        }
     }
 }

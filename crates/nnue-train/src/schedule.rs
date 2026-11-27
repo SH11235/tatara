@@ -308,7 +308,7 @@ pub struct StepOneCycleLR {
     pub initial_lr: f32,
     pub max_lr: f32,
     pub final_lr: f32,
-    pub warmup_steps: u64,
+    pub warmup_steps: f64,
     pub total_steps: u64,
 }
 
@@ -325,18 +325,18 @@ impl StepOneCycleLR {
             initial_lr,
             max_lr,
             final_lr: initial_lr / final_div_factor,
-            warmup_steps: (f64::from(warmup_pct) * total_steps as f64).round() as u64,
+            warmup_steps: f64::from(warmup_pct) * total_steps as f64,
             total_steps,
         }
     }
 
     pub fn at_step(&self, completed: u64) -> f32 {
-        if completed >= self.total_steps.saturating_sub(1) {
-            return self.final_lr;
+        let peak = self.warmup_steps - 1.0;
+        let step = completed.min(self.total_steps.saturating_sub(1)) as f64;
+        // A zero-length phase has no interpolation interval.
+        if step == peak && peak == 0.0 {
+            return self.max_lr;
         }
-        // PyTorch phases end at warmup_steps - 1 and total_steps - 1.
-        let peak = self.warmup_steps as f64 - 1.0;
-        let step = completed as f64;
         let (start, end, fraction) = if step <= peak && peak > 0.0 {
             (self.initial_lr, self.max_lr, step / peak)
         } else {
@@ -367,7 +367,7 @@ impl Display for StepOneCycleLR {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "one-cycle {} → max {} (warmup {} optimizer updates) → cosine anneal to {} over {} optimizer updates; final held",
+            "one-cycle {} → max {} (warmup {} optimizer updates) → cosine anneal to {} over {} optimizer updates; last update held",
             self.initial_lr, self.max_lr, self.warmup_steps, self.final_lr, self.total_steps
         )
     }
@@ -796,35 +796,33 @@ mod tests {
 
     #[test]
     fn step_one_cycle_matches_pytorch_cosine_phases() {
-        for (n, pct) in [(20, 0.3), (41, 0.21), (100, 0.2)] {
+        for (n, pct) in [(20, 0.3), (41, 0.21), (100, 0.2), (41, 1.0)] {
             let schedule = StepOneCycleLR::new(1.0, pct, 25.0, 100.0, n);
-            let warmup = (f64::from(pct) * n as f64).round();
             let reference = |step: u64| {
-                if step >= n - 1 {
-                    return 0.0004_f64;
+                let phases = [
+                    (f64::from(pct) * n as f64 - 1.0, 0.04, 1.0),
+                    (n as f64 - 1.0, 1.0, 0.0004),
+                ];
+                let mut start_step = 0.0;
+                for (index, (end_step, start_lr, end_lr)) in phases.into_iter().enumerate() {
+                    if step as f64 <= end_step || index == phases.len() - 1 {
+                        let pct = (step as f64 - start_step) / (end_step - start_step);
+                        return end_lr
+                            + (start_lr - end_lr) / 2.0
+                                * ((std::f64::consts::PI * pct).cos() + 1.0);
+                    }
+                    start_step = end_step;
                 }
-                let (start, end, progress) = if step as f64 <= warmup - 1.0 {
-                    (0.04, 1.0, step as f64 / (warmup - 1.0))
-                } else {
-                    (
-                        1.0,
-                        0.0004,
-                        (step as f64 - (warmup - 1.0)) / (n as f64 - warmup),
-                    )
-                };
-                end + (start - end) / 2.0 * ((std::f64::consts::PI * progress).cos() + 1.0)
+                unreachable!()
             };
-            for step in [
-                0,
-                1,
-                warmup as u64 - 1,
-                warmup as u64,
-                n / 2,
-                n - 1,
-                n,
-                n + 10,
-            ] {
+            for step in 0..n {
                 assert!((f64::from(schedule.at_step(step)) - reference(step)).abs() < 1e-7);
+            }
+            for step in [n, n + 10, u64::MAX] {
+                assert_eq!(schedule.at_step(step), schedule.at_step(n - 1));
+            }
+            if pct == 1.0 {
+                assert_eq!(schedule.at_step(n - 1), schedule.max_lr);
             }
             assert_eq!(schedule.at_step(0).to_bits(), schedule.initial_lr.to_bits());
         }
@@ -838,7 +836,7 @@ mod tests {
                 for step in 0..n + 2 {
                     assert!(s.at_step(step).is_finite());
                 }
-                assert_eq!(s.at_step(n), s.final_lr);
+                assert_eq!(s.at_step(n), s.at_step(n - 1));
             }
         }
     }
