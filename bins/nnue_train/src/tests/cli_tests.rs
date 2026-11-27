@@ -515,6 +515,18 @@ fn simple_rejects_layerstack_only_global_flags() {
 }
 
 #[test]
+fn simple_rejects_ft_row_learning_rate_multipliers() {
+    for name in ["--ft-piece-lr-mult", "--threat-lr-mult"] {
+        let error = reject_simple_unsupported_flags(&simple_cli(&[name, "1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!(
+            "{name} is only supported with the layerstack subcommand"
+        )));
+    }
+}
+
+#[test]
 fn simple_accepts_consumed_global_flags() {
     // 既定 simple run は reject されない。
     assert!(reject_simple_unsupported_flags(&simple_cli(&[])).is_ok());

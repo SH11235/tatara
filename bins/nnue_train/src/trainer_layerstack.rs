@@ -1326,6 +1326,7 @@ impl GpuTrainer {
         } else {
             0
         };
+        let (piece_lr, threat_lr) = self.optim_groups.ft_row_learning_rates(step.lr);
         // Each launch uses a uniform packed row width; virtual rows precede the real updates.
         let ranges = if self.partial_threat() {
             [
@@ -1334,32 +1335,32 @@ impl GpuTrainer {
                     if ft_factorize { piece_end } else { real_n },
                     0,
                     ft_out,
+                    step.lr,
                 ),
                 (
                     if ft_factorize { piece_end } else { train_n },
                     train_n,
                     0,
                     width,
+                    step.lr,
                 ),
-                (0, base_n, packed_output, ft_out),
-                (base_n, real_n, packed_output, width),
-            ]
-        } else if ft_factorize {
-            [
-                (real_n, train_n, 0, ft_out),
-                (0, real_n, output_flags, ft_out),
-                (0, 0, 0, ft_out),
-                (0, 0, 0, ft_out),
+                (0, base_n, packed_output, ft_out, piece_lr),
+                (base_n, real_n, packed_output, width, threat_lr),
             ]
         } else {
+            let split = if self.optim_groups.ft_piece_lr_mult == self.optim_groups.threat_lr_mult {
+                real_n
+            } else {
+                base_n
+            };
             [
-                (0, train_n, output_flags, ft_out),
-                (0, 0, 0, ft_out),
-                (0, 0, 0, ft_out),
-                (0, 0, 0, ft_out),
+                (real_n, train_n, 0, ft_out, step.lr),
+                (0, split, output_flags, ft_out, piece_lr),
+                (split, real_n, output_flags, ft_out, threat_lr),
+                (0, 0, 0, ft_out, step.lr),
             ]
         };
-        for (begin, end, out, row_width) in ranges {
+        for (begin, end, out, row_width, row_lr) in ranges {
             if begin == end {
                 continue;
             }
@@ -1367,7 +1368,7 @@ impl GpuTrainer {
             if begin >= real_n {
                 launch_flags &= !FT_FUSED_ACTIVE_ROWS;
             }
-            let active_row_base = if self.partial_threat() && begin == base_n {
+            let active_row_base = if begin == base_n && begin < real_n {
                 self.feature_set.base_ft_in() as u32
             } else {
                 0
@@ -1420,7 +1421,7 @@ impl GpuTrainer {
                                    slice_mut($forward),
                                    slice(fold_rows), fold_bounds, row_width as u32, ft_out as u32,
                                    piece_inputs, fold_mode, begin as u64, end as u64,
-                                   norm_lr, norm_factor, EPS, step.lr, step.step_size, step.denom,
+                                   norm_lr, norm_factor, EPS, row_lr, step.step_size, step.denom,
                                    step.weight_decay, step.beta1, self.optimizer.kernel_beta2(BETA2), EPS,
                                    W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, FT_OPT_M_SCALE,
                                    FT_OPT_V_SCALE, RANGER_ALPHA, launch_flags]
@@ -6917,6 +6918,16 @@ impl GpuTrainer {
         let ft_fused = self.ft_fused_optimizer_applies(self.step_count + 1);
         #[cfg(not(feature = "native"))]
         let ft_fused = false;
+        let (ft_wd, ft_lr) = self.optim_groups.effective(OptimGroupKind::Ft, lr);
+        let ft_lr = if !self.freeze_ft && !ft_fused {
+            let mult = self
+                .optim_groups
+                .uniform_ft_lr_mult(self.feature_set)
+                .ok_or("different FT row learning rates require the fused FT optimizer")?;
+            ft_lr * mult
+        } else {
+            ft_lr
+        };
         #[cfg(feature = "native")]
         if !self.freeze_ft && !ft_fused {
             validate_unfused_ft_optimizer_len(ft_w_n)?;
@@ -7065,7 +7076,6 @@ impl GpuTrainer {
         // 形状の comb で train 形状の elementwise step からは書けないため、master
         // のみ更新し step 末の fold が comb を再生成する (`launch_ft_fold`)。
         let ft_factorize = self.feature_set.ft_factorize();
-        let (ft_wd, ft_lr) = optim_groups.effective(OptimGroupKind::Ft, lr);
         let ft_wd = optimizer.kernel_weight_decay(ft_wd);
         #[cfg(feature = "native")]
         let diagnosed =

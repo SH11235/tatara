@@ -32,6 +32,17 @@ LayerStacks の両 head で L1 の共有重みも対象になる。省略時は 
 では dense の値、simple では全体の値に従う。resume 時はそのコマンドラインの
 倍率を使い、レシピの比較にも含める。
 
+LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実行に、
+`--threat-lr-mult` が Threat 特徴の実行（幅を縮めた行を含む）に適用される。Threat の倍率には
+`--threat-profile` が必要。いずれも既定値は 1.0 で、schedule の学習率に
+`--ft-lr-mult` を掛けた値にさらに掛ける。仮想行と PSQT の重みは FT group の
+学習率を使う。weight decay の係数は FT group の値を使い、decoupled decay の強さは
+各行の学習率に連動する。norm loss には schedule の学習率を使う。resume 時は
+コマンドラインで倍率を指定する。
+
+FT の重みに異なる学習率を使うには、native CUDA の融合 optimizer が必要。
+この場合は PSQT と精度診断を無効にし、Threat の幅を縮める場合は 8 の倍数にする。
+
 ### Horizon と resume
 
 **horizon**（curve が終端 LR に到達する superbatch）を持つのは

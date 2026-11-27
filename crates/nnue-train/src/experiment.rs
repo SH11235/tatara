@@ -303,6 +303,12 @@ pub struct Params {
     /// Explicit learning-rate multiplier for the weights of the first dense layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l1_lr_mult: Option<f32>,
+    /// Explicit multiplier on the FT learning rate for real piece rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ft_piece_lr_mult: Option<f32>,
+    /// Explicit multiplier on the FT learning rate for real Threat rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threat_lr_mult: Option<f32>,
     /// norm loss (per-weight-group L2-norm 正則化) の強度係数。`--norm-loss` 有効時
     /// のみ `Some(factor)`、無効な run では省略する (`--norm-loss-factor`)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -968,6 +974,33 @@ mod tests {
     }
 
     #[test]
+    fn ft_row_lr_mults_are_optional_and_change_the_recipe_fingerprint() {
+        let base = sample_params();
+        let base_json = serde_json::to_value(&base).unwrap();
+        let default_fingerprint = recipe_fingerprint(&base, "teacher.psv");
+        for (key, set) in [
+            (
+                "ft_piece_lr_mult",
+                (|p: &mut Params, mult| p.ft_piece_lr_mult = mult) as fn(&mut Params, Option<f32>),
+            ),
+            ("threat_lr_mult", |p: &mut Params, mult| {
+                p.threat_lr_mult = mult
+            }),
+        ] {
+            assert!(base_json.get(key).is_none());
+            let mut params = base.clone();
+            set(&mut params, Some(1.0));
+            assert_eq!(serde_json::to_value(&params).unwrap()[key], 1.0);
+            let explicit = recipe_fingerprint(&params, "teacher.psv");
+            assert_ne!(default_fingerprint, explicit);
+
+            set(&mut params, Some(0.0));
+            assert_eq!(serde_json::to_value(&params).unwrap()[key], 0.0);
+            assert_ne!(explicit, recipe_fingerprint(&params, "teacher.psv"));
+        }
+    }
+
+    #[test]
     fn recipe_fingerprint_counts_the_superbatch_count_as_the_wdl_horizon() {
         let mut taper = sample_params();
         taper.start_wdl = Some(0.0);
@@ -1118,6 +1151,8 @@ mod tests {
             dense_lr_mult: None,
             bias_lr_mult: None,
             l1_lr_mult: None,
+            ft_piece_lr_mult: None,
+            threat_lr_mult: None,
             norm_loss_factor: None,
             qa: 127,
             qb: 64,

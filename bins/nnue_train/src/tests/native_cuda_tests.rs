@@ -574,6 +574,7 @@ struct LayerStackTestOptions {
     precision: PrecisionFlags,
     optimizer: OptimizerKind,
     norm_loss_factor: Option<f32>,
+    optim_groups: OptimGroupConfig,
     psqt: bool,
 }
 
@@ -589,6 +590,7 @@ impl LayerStackTestOptions {
             precision: PrecisionFlags::default(),
             optimizer: OptimizerKind::Ranger,
             norm_loss_factor: None,
+            optim_groups: OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
             psqt: false,
         }
     }
@@ -631,7 +633,7 @@ fn create_layerstack_trainer_with_batch(
             options.precision,
             options.feature_set,
             options.optimizer,
-            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            options.optim_groups,
             options.norm_loss_factor,
             psqt_init.as_deref(),
             &LayerStackInit::default_uniform(),
@@ -3480,6 +3482,128 @@ fn assert_states_close(what: &str, actual: &[f32], expected: &[f32], relative: f
         max_diff <= relative * scale.max(f32::MIN_POSITIVE),
         "{what}: max diff {max_diff:e} (scale {scale:e})"
     );
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn ft_row_lr_mults_scale_only_the_selected_real_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let context = test_cuda_context_reserving_gib(2)?;
+    let standard = LayerStackTestOptions::standard();
+    let full = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide)
+        .with_ft_factorize();
+    for (feature_set, precision, optimizer) in [
+        (full, PrecisionFlags::default(), OptimizerKind::RAdam),
+        (
+            full.with_threat_width(32),
+            PrecisionFlags {
+                ft_fp16: true,
+                ft_fp16_out: true,
+                fp16_opt_state: true,
+                ..PrecisionFlags::default()
+            },
+            OptimizerKind::Sgd,
+        ),
+    ] {
+        let optim_groups =
+            OptimGroupConfig::resolve(0.125, None, None, None, Some(2.0), None, None);
+        let options = LayerStackTestOptions {
+            feature_set,
+            precision,
+            optimizer,
+            optim_groups,
+            ..standard
+        };
+        let ft_out = options.ft_out;
+        let base_rows = feature_set.base_ft_in();
+        let (threat_start, threat_width) = feature_set.ft_row_layout(base_rows, ft_out);
+        let real_end = feature_set.ft_weight_len(ft_out);
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+        // One contributor per active feature makes the gradient independent of reduction order.
+        batch.stm_indices.fill(-1);
+        batch.nstm_indices.fill(-1);
+        batch.nnz.fill(0);
+        batch.nnz[0] = 1;
+        batch.stm_indices[0] = 0;
+        batch.nstm_indices[0] = base_rows as i32;
+        batch.score.fill(200.0);
+        batch.wdl.fill(1.0);
+        let mut initial = None;
+        let mut run = |piece, threat| -> Result<_, Box<dyn std::error::Error>> {
+            let options = LayerStackTestOptions {
+                optim_groups: optim_groups.with_ft_row_lr_mults(piece, threat),
+                ..options
+            };
+            let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+            if initial.is_none() {
+                let (_, groups) = trainer.raw_checkpoint_state_to_host()?;
+                let (_, (weights, ..)) = groups.into_iter().next().unwrap();
+                initial = Some(weights);
+            }
+            trainer.step(&batch.as_ref(), 1.0e-2, 0.0, SMOKE_LOSS_WRM)?;
+            let (step, groups) = trainer.raw_checkpoint_state_to_host()?;
+            assert_eq!(step, 1);
+            let (name, ft) = groups.into_iter().next().unwrap();
+            assert_eq!(name, "ft_w");
+            let (forward, _) = trainer.ft_forward_state_to_host_for_test()?;
+            trainer.sync_ft_forward_weights()?;
+            let (refolded, _) = trainer.ft_forward_state_to_host_for_test()?;
+            assert_ft_bits(forward.as_deref().unwrap(), refolded.as_deref().unwrap());
+            Ok((ft, forward.unwrap()))
+        };
+        let ((weights, m, v, slow), forward) = run(None, None)?;
+        let ((ones, ones_m, ones_v, ones_slow), ones_forward) = run(Some(1.0), Some(1.0))?;
+        for (a, b) in [
+            (&weights, &ones),
+            (&m, &ones_m),
+            (&v, &ones_v),
+            (&slow, &ones_slow),
+            (&forward, &ones_forward),
+        ] {
+            assert_ft_bits(a, b);
+        }
+        assert!(m[..ft_out].iter().any(|&value| value != 0.0));
+        assert!(
+            m[threat_start..threat_start + threat_width]
+                .iter()
+                .any(|&value| value != 0.0)
+        );
+
+        let ((piece_zero, piece_m, ..), _) = run(Some(0.0), None)?;
+        let ((threat_small, threat_m, ..), _) = run(None, Some(0.125))?;
+        let initial = initial.unwrap();
+        assert_ft_bits(&piece_m, &m);
+        assert_ft_bits(&threat_m, &m);
+        assert!(weights[..threat_start] != initial[..threat_start]);
+        assert_ft_bits(&piece_zero[..threat_start], &initial[..threat_start]);
+        assert_ft_bits(&piece_zero[threat_start..], &weights[threat_start..]);
+        assert_ft_bits(&threat_small[..threat_start], &weights[..threat_start]);
+        assert_ft_bits(&threat_small[real_end..], &weights[real_end..]);
+        let mut changed = false;
+        for index in threat_start..real_end {
+            let before = f64::from(initial[index]);
+            let full_update = f64::from(weights[index]) - before;
+            let scaled_update = f64::from(threat_small[index]) - before;
+            changed |= scaled_update != 0.0;
+            let tolerance = 3.0 * f64::from(f32::EPSILON) * before.abs().max(full_update.abs());
+            assert!(
+                (scaled_update - full_update * 0.125).abs() <= tolerance,
+                "Threat element {index}: update {scaled_update} instead of {}",
+                full_update * 0.125
+            );
+        }
+        assert!(changed);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn assert_ft_bits(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "FT element {index}");
+    }
 }
 
 /// `ft_fused_optimizer_step` と、norm-loss / RAdam / lookahead / fold を別々に launch する経路が

@@ -36,6 +36,8 @@ use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS};
 
 #[cfg(any(feature = "gpu", test))]
 use crate::cli::*;
+#[cfg(any(feature = "gpu", test))]
+use crate::optim_groups::OptimGroupConfig;
 #[cfg(feature = "gpu")]
 use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
 
@@ -722,6 +724,7 @@ pub(crate) fn run_training(
         feature_set
     };
 
+    validate_ft_row_lr_mults(cli, layerstack, feature_set)?;
     let bucket_mode = validate_bucket_mode(layerstack)?;
     validate_output_format(cli.output_format, bucket_mode)?;
     let midpoint_bucket = layerstack.num_buckets() / 2;
@@ -738,16 +741,7 @@ pub(crate) fn run_training(
         )
         .into());
     }
-    // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
-    // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
-    // 非依存に掛かる)、bias wd=0 と同様に許容する。
-    for (name, v) in per_group_optim_flags(cli) {
-        if let Some(v) = v
-            && (!v.is_finite() || v < 0.0)
-        {
-            return Err(format!("{name} must be finite and >= 0 (got {v})").into());
-        }
-    }
+    validate_nonnegative_optim_flags(per_group_optim_flags(cli))?;
     if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
             "--norm-loss-factor must be finite and >= 0 (got {})",
@@ -954,6 +948,11 @@ pub(crate) fn run_training(
     let init_spec = build_layerstack_init_spec(cli);
     let optim_groups = resolve_layerstack_optim_groups(cli);
     let per_group_recorded = per_group_optim_overridden(cli);
+    for (name, value) in ft_row_lr_flags(cli) {
+        if let Some(value) = value {
+            println!("[train] {name}={value}");
+        }
+    }
     if per_group_recorded {
         println!(
             "[train] per-group optim: ft(wd={}, lr_mult={}) l1(lr_mult={}) dense(wd={}, lr_mult={}) \
@@ -1644,7 +1643,61 @@ pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn ft_row_lr_flags(cli: &Cli) -> [(&'static str, Option<f32>); 2] {
+    [
+        ("--ft-piece-lr-mult", cli.ft_piece_lr_mult),
+        ("--threat-lr-mult", cli.threat_lr_mult),
+    ]
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn validate_nonnegative_optim_flags(
+    flags: impl IntoIterator<Item = (&'static str, Option<f32>)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (name, value) in flags {
+        if let Some(value) = value
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(format!("{name} must be finite and >= 0 (got {value})").into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn validate_ft_row_lr_mults(
+    cli: &Cli,
+    layerstack: &LayerstackArgs,
+    feature_set: FeatureSetSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_nonnegative_optim_flags(ft_row_lr_flags(cli))?;
+    if cli.threat_lr_mult.is_some() && feature_set.threat_dims() == 0 {
+        return Err("--threat-lr-mult requires Threat features (--threat-profile)".into());
+    }
+    let groups = resolve_layerstack_optim_groups(cli);
+    if groups.uniform_ft_lr_mult(feature_set).is_some() {
+        return Ok(());
+    }
+    if !cfg!(feature = "native") {
+        return Err("different FT row learning rates require the native CUDA backend".into());
+    }
+    if layerstack.psqt {
+        return Err("different FT row learning rates cannot be combined with --psqt".into());
+    }
+    if !cli.precision_steps.is_empty() {
+        return Err(
+            "different FT row learning rates cannot be combined with --precision-steps".into(),
+        );
+    }
+    let width = feature_set.threat_width(layerstack.ft_out);
+    if width != layerstack.ft_out && !width.is_multiple_of(8) {
+        return Err("different FT row learning rates require --threat-width to be a multiple of 8 for compact Threat rows".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "gpu", test))]
 fn resolve_layerstack_optim_groups(cli: &Cli) -> OptimGroupConfig {
     OptimGroupConfig::resolve(
         cli.weight_decay,
@@ -1656,6 +1709,7 @@ fn resolve_layerstack_optim_groups(cli: &Cli) -> OptimGroupConfig {
         cli.bias_lr_mult,
     )
     .with_l1_lr_mult(cli.l1_lr_mult)
+    .with_ft_row_lr_mults(cli.ft_piece_lr_mult, cli.threat_lr_mult)
 }
 
 /// simple サブコマンドが解釈しない global フラグを明示エラーで弾く (silent no-op 回避)。
@@ -1697,7 +1751,11 @@ pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn s
                 .into(),
         );
     }
-    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+    if let Some((name, _)) = per_group_optim_flags(cli)
+        .into_iter()
+        .chain(ft_row_lr_flags(cli))
+        .find(|(_, v)| v.is_some())
+    {
         return Err(format!(
             "{name} is only supported with the layerstack subcommand, not the simple trainer \
              (simple supports --l1-lr-mult and global --weight-decay)"
@@ -2136,6 +2194,8 @@ fn build_experiment_params(
         dense_lr_mult: trainer.optim_groups.map(|groups| groups.dense.lr_mult),
         bias_lr_mult: trainer.optim_groups.map(|groups| groups.bias.lr_mult),
         l1_lr_mult: cli.l1_lr_mult,
+        ft_piece_lr_mult: cli.ft_piece_lr_mult,
+        threat_lr_mult: cli.threat_lr_mult,
         norm_loss_factor: trainer.norm_loss_factor,
         qa: trainer.qa,
         qb: trainer.qb,
@@ -3029,6 +3089,91 @@ mod shared_cli_tests {
         // global init flag を subcommand の前に置く。layerstack は追加必須引数なし。
         argv.push("layerstack");
         Cli::try_parse_from(argv).expect("cli parse")
+    }
+
+    #[test]
+    fn ft_row_lr_cli_validates_range_and_requires_threat_features() {
+        use shogi_features::ThreatProfile;
+
+        let base = FeatureSet::HalfKaHmMerged.spec();
+        let threat = base.with_threat_profile(ThreatProfile::CrossSide);
+        let validate = |cli: &Cli, feature_set| {
+            let ArchCommand::LayerStack(args) = &cli.arch else {
+                unreachable!()
+            };
+            validate_ft_row_lr_mults(cli, args, feature_set)
+        };
+        for name in ["--ft-piece-lr-mult", "--threat-lr-mult"] {
+            for value in ["-0.01", "NaN", "inf"] {
+                let flag = format!("{name}={value}");
+                let error = validate(&parse(&[&flag]), threat).unwrap_err().to_string();
+                assert!(error.contains(&format!("{name} must be finite and >= 0")));
+            }
+        }
+        let cli = parse(&["--ft-piece-lr-mult", "0", "--threat-lr-mult", "0"]);
+        assert_eq!(
+            (cli.ft_piece_lr_mult, cli.threat_lr_mult),
+            (Some(0.0), Some(0.0))
+        );
+        assert!(validate(&cli, threat).is_ok());
+        assert!(
+            validate(&cli, base)
+                .unwrap_err()
+                .to_string()
+                .contains("--threat-lr-mult requires Threat features")
+        );
+    }
+
+    #[test]
+    fn different_ft_row_rates_require_an_eligible_fused_optimizer() {
+        use shogi_features::ThreatProfile;
+
+        let base = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
+        let threat = base.with_threat_profile(ThreatProfile::CrossSide);
+        let validate = |cli: &Cli, feature_set| {
+            let ArchCommand::LayerStack(args) = &cli.arch else {
+                unreachable!()
+            };
+            validate_ft_row_lr_mults(cli, args, feature_set)
+        };
+        let cli = parse(&["--ft-piece-lr-mult", "0"]);
+        if cfg!(feature = "native") {
+            assert!(validate(&cli, base).is_ok());
+            assert!(validate(&cli, threat.with_threat_width(32)).is_ok());
+            assert!(
+                validate(&cli, threat.with_threat_width(30))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--threat-width")
+            );
+            let mut diagnostic = parse(&["--ft-piece-lr-mult", "0"]);
+            diagnostic.precision_steps = vec![1];
+            assert!(
+                validate(&diagnostic, base)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--precision-steps")
+            );
+            let mut psqt = parse(&["--ft-piece-lr-mult", "0"]);
+            if let ArchCommand::LayerStack(args) = &mut psqt.arch {
+                args.psqt = true;
+            }
+            assert!(
+                validate(&psqt, base)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--psqt")
+            );
+        } else {
+            assert!(
+                validate(&cli, base)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native CUDA")
+            );
+        }
+        let identity = parse(&["--ft-piece-lr-mult", "1", "--threat-lr-mult", "1"]);
+        assert!(validate(&identity, threat.with_threat_width(30)).is_ok());
     }
 
     fn shared_cli_error(extra: &[&str], ft_fp16_out: bool) -> String {
