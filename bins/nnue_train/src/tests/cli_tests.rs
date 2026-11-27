@@ -479,7 +479,8 @@ fn cli_with_factorize(argv: &[&str]) -> Cli {
 /// simple が reject すべき layerstack 専用 per-group optimizer フラグの期待セット。
 /// production テーブル ([`per_group_optim_flags`]) から独立に固定し、テーブル側の
 /// 追加・脱落を検出する。
-const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
+const SIMPLE_REJECTED_PER_GROUP: [&str; 7] = [
+    "--l1-shared-weight-decay",
     "--ft-weight-decay",
     "--dense-weight-decay",
     "--bias-weight-decay",
@@ -495,7 +496,7 @@ fn simple_rejects_layerstack_only_global_flags() {
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--rescore-input", "x.psv"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
-    // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
+    // per-group optimizer override をすべて reject (独立の期待リストで固定)。
     for name in SIMPLE_REJECTED_PER_GROUP {
         assert!(
             reject_simple_unsupported_flags(&simple_cli(&[name, "0.1"])).is_err(),
@@ -545,6 +546,13 @@ fn simple_accepts_consumed_global_flags() {
 
 #[test]
 fn simple_accepts_l1_learning_rate_multiplier() {
+    let shared = simple_cli(&["--l1-shared-weight-decay", "0.1"]);
+    assert!(
+        reject_simple_unsupported_flags(&shared)
+            .unwrap_err()
+            .to_string()
+            .contains("--l1-shared-weight-decay")
+    );
     let cli = simple_cli(&["--l1-lr-mult", "0.25"]);
     assert_eq!(cli.l1_lr_mult, Some(0.25));
     assert!(reject_simple_unsupported_flags(&cli).is_ok());

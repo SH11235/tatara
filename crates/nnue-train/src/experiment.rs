@@ -303,6 +303,10 @@ pub struct Params {
     /// Explicit learning-rate multiplier for the weights of the first dense layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l1_lr_mult: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_shared_weight_decay: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adam_bias_correction: Option<bool>,
     /// Explicit multiplier on the FT learning rate for real piece rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ft_piece_lr_mult: Option<f32>,
@@ -953,6 +957,29 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_options_are_omitted_unless_requested_and_fingerprinted() {
+        let base = sample_params();
+        let value = serde_json::to_value(&base).unwrap();
+        assert!(value.get("l1_shared_weight_decay").is_none());
+        assert!(value.get("adam_bias_correction").is_none());
+        let original = recipe_fingerprint(&base, "teacher.psv");
+        let mut changed = base.clone();
+        changed.l1_shared_weight_decay = Some(0.0);
+        assert_ne!(recipe_fingerprint(&changed, "teacher.psv"), original);
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap()["l1_shared_weight_decay"],
+            0.0
+        );
+        let mut changed = base;
+        changed.adam_bias_correction = Some(true);
+        assert_ne!(recipe_fingerprint(&changed, "teacher.psv"), original);
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap()["adam_bias_correction"],
+            true
+        );
+    }
+
+    #[test]
     fn l1_lr_mult_is_optional_and_changes_recipe_fingerprint() {
         let mut params = sample_params();
         params.dense_lr_mult = Some(2.0);
@@ -1151,6 +1178,8 @@ mod tests {
             dense_lr_mult: None,
             bias_lr_mult: None,
             l1_lr_mult: None,
+            l1_shared_weight_decay: None,
+            adam_bias_correction: None,
             ft_piece_lr_mult: None,
             threat_lr_mult: None,
             norm_loss_factor: None,

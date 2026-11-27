@@ -1037,3 +1037,160 @@ fn qat_dense_wide_sorted_matches_qat_dense_wide() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn adam_bias_correction_matches_reference_with_fused_and_unfused_ft() -> TestResult {
+    let ctx = test_cuda_context()?;
+    for fused in [false, true] {
+        for half_state in [false, true] {
+            let features = FeatureSet::HalfKaHmMerged.spec();
+            let mut t = GpuTrainer::new(
+                &ctx,
+                16,
+                128,
+                16,
+                32,
+                nnue_format::LayerStackHead::SplitSkip,
+                2,
+                BucketMode::ProgressKpAbs,
+                PrecisionFlags {
+                    ft_fp16: true,
+                    fp16_opt_state: half_state,
+                    ..Default::default()
+                },
+                features,
+                OptimizerKind::AdamW,
+                OptimGroupConfig::resolve(0.2, None, None, None, None, None, None),
+                None,
+                None,
+                &LayerStackInit::default_uniform(),
+            )?;
+            t.adam_bias_correction = true;
+            t.set_ft_fused_optimizer_enabled_for_test(fused);
+            t.ft_w = DeviceBuffer::from_host(&t.stream, &vec![0.4; t.ft_w.len()])?;
+            t.l1_shared_weight =
+                DeviceBuffer::from_host(&t.stream, &vec![0.4; t.l1_shared_weight.len()])?;
+            let batch = BatchData::smoke_dummy(16, features);
+            let data = batch.as_ref();
+            let (mut expected, mut m, mut v) = (0.4_f64, 0.0_f64, 0.0_f64);
+            for step in 1..=3 {
+                if step == 3 {
+                    let path = std::env::temp_dir().join(format!(
+                        "tatara-adam-resume-{}-{fused}-{half_state}.ckpt",
+                        std::process::id()
+                    ));
+                    t.save_raw_checkpoint(
+                        &path,
+                        2,
+                        &nnue_train::trainer::CheckpointProducer::run_id_only("test"),
+                        Some(10),
+                    )?;
+                    t.step_count = 0;
+                    t.load_raw_checkpoint(&path, false)?;
+                    assert_eq!(t.step_count, 2);
+                    std::fs::remove_file(path)?;
+                }
+                let g = if step == 2 { -0.02_f32 } else { 0.01_f32 };
+                t.ft_w_grad = DeviceBuffer::from_host(&t.stream, &vec![g; t.ft_w.len()])?;
+                t.l1_shared_weight_grad =
+                    DeviceBuffer::from_host(&t.stream, &vec![g; t.l1_shared_weight.len()])?;
+                let mut now = std::time::Instant::now();
+                let mut context = StepContext::new(
+                    &t,
+                    &data,
+                    StepOptions {
+                        lr: 0.01,
+                        wdl_lambda: WdlBlend::default(),
+                        loss: SMOKE_LOSS_WRM,
+                        validate: false,
+                        forward_output: false,
+                        profile_step: false,
+                        prof_t0: &mut now,
+                    },
+                )?;
+                t.optimizer_step(&mut context)?;
+                let b1 = f64::from(OptimizerKind::AdamW.beta1());
+                let b2 = f64::from(BETA2);
+                m = b1 * m + (1.0 - b1) * f64::from(g);
+                v = b2 * v + (1.0 - b2) * f64::from(g).powi(2);
+                expected = expected * (1.0 - f64::from(0.01_f32) * f64::from(0.2_f32))
+                    - f64::from(0.01_f32) * (m / (1.0 - b1.powi(step)))
+                        / ((v / (1.0 - b2.powi(step))).sqrt() + f64::from(EPS));
+                for (label, weight, tolerance) in [
+                    ("ft", &t.ft_w, if half_state { 2e-5 } else { 2e-6 }),
+                    ("shared L1", &t.l1_shared_weight, 2e-6),
+                ] {
+                    for actual in weight.to_host_vec(&t.stream)? {
+                        assert!(
+                            (f64::from(actual) - expected).abs() < tolerance,
+                            "{label}, fused={fused}, half_state={half_state}, step={step}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_l1_decay_changes_only_shared_weight_and_default_is_bit_identical() -> TestResult {
+    let ctx = test_cuda_context()?;
+    let features = FeatureSet::HalfKaHmMerged.spec();
+    let mut baseline = trainer(&ctx, 128, false)?;
+    let initial = baseline.to_layerstack_weights()?;
+    for override_decay in [None, Some(0.4)] {
+        let mut t = trainer(&ctx, 128, false)?;
+        t.load_layerstack_weights(&initial)?;
+        t.optimizer = OptimizerKind::AdamW;
+        t.optim_groups = OptimGroupConfig::resolve(0.2, None, None, None, None, None, None)
+            .with_l1_lr_mult(Some(0.5))
+            .with_l1_shared_weight_decay(override_decay);
+        baseline.load_layerstack_weights(&initial)?;
+        baseline.optimizer = OptimizerKind::AdamW;
+        baseline.optim_groups = OptimGroupConfig::resolve(0.2, None, None, None, None, None, None)
+            .with_l1_lr_mult(Some(0.5));
+        let batch = BatchData::smoke_dummy(16, features);
+        let mut data = batch.as_ref();
+        data.per_pos_norm = 0.0;
+        baseline.step(&data, 0.02, 0.0, SMOKE_LOSS_WRM)?;
+        t.step(&data, 0.02, 0.0, SMOKE_LOSS_WRM)?;
+        for (a, b) in [
+            (&t.ft_w, &baseline.ft_w),
+            (&t.ft_b, &baseline.ft_b),
+            (&t.l1_w, &baseline.l1_w),
+            (&t.l1_b, &baseline.l1_b),
+            (&t.l1_shared_bias, &baseline.l1_shared_bias),
+            (&t.l2_w, &baseline.l2_w),
+            (&t.l2_b, &baseline.l2_b),
+            (&t.l3_w, &baseline.l3_w),
+            (&t.l3_b, &baseline.l3_b),
+        ] {
+            let bits = |w: &DeviceBuffer<f32>| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+                Ok(w.to_host_vec(&t.stream)?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            assert_eq!(bits(a)?, bits(b)?);
+        }
+        let got = t.l1_shared_weight.to_host_vec(&t.stream)?;
+        if let Some(decay) = override_decay {
+            for (&actual, &before) in got.iter().zip(&initial.l1_shared_weight) {
+                assert!((actual - before * (1.0 - 0.01 * decay)).abs() < 1e-7);
+            }
+            assert_ne!(got, baseline.l1_shared_weight.to_host_vec(&t.stream)?);
+        } else {
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                baseline
+                    .l1_shared_weight
+                    .to_host_vec(&t.stream)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    Ok(())
+}

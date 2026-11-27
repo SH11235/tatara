@@ -31,9 +31,29 @@ carries its own warmup) in a batch-level warmup over the first superbatch.
 `--l1-lr-mult` multiplies the scheduled rate for the first dense layer’s weights,
 including shared weights in both LayerStacks heads. When omitted, L1 uses
 `--dense-lr-mult` in LayerStacks and 1.0 in simple. L1 uses the dense weight
-decay coefficient in LayerStacks and the global coefficient in simple.
+decay coefficient in LayerStacks (except an explicit shared-L1 override) and the global coefficient in simple.
 On resume, the multiplier comes from the current command line and is part of
 the recipe comparison.
+
+`--l1-shared-weight-decay` overrides decay only for the shared L1 weights in
+LayerStack, including both heads. Bucket-specific L1 weights, other layers and
+biases keep their existing coefficients. The shared weights keep the L1 learning
+rate from `--l1-lr-mult` (or the dense multiplier when omitted). The option must
+be finite and nonnegative; simple rejects it. Omission preserves dense decay.
+
+`--adam-bias-correction` requires `--optimizer adamw`. It enables
+`m_hat = m / (1 - beta1^t)` and `v_hat = v / (1 - beta2^t)`, with update
+`w = w * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + epsilon)` followed by
+tatara's existing weight clamp. Omission preserves AdamW without correction.
+Both native CUDA (including fused FT) and cuda-oxide use this correction, also
+with FP16 optimizer states; FP16 storage retains its rounding error. Epsilon
+and decay are rescaled along with the gradient step so the shared optimizer
+kernel preserves the effective epsilon and decoupled decay rate.
+
+Supply these options again on resume: the checkpoint restores weights, moments
+and the accumulated optimizer step `t`, while the current CLI selects the
+options. Explicit values appear in startup logs, experiment parameters and the
+recipe fingerprint; omitted options add no parameter fields.
 
 In LayerStacks training, `--ft-piece-lr-mult` scales the learning rate for the
 real piece rows across all effect buckets, and `--threat-lr-mult` scales it for
@@ -47,6 +67,24 @@ the command line.
 Different rates within the FT weights require the native CUDA fused optimizer.
 For that combination, disable PSQT and precision diagnostics and use a multiple
 of 8 for any compact Threat width.
+
+### Changing batch size on resume
+
+You can change `--batch-size` and `--batches-per-superbatch` together while
+keeping their product constant. Keep the checkpoint and its `.loader.json`
+together. Accepted-record offsets, including partially consumed sampling
+chunks, are restored with the new batch size. Teacher identities and input
+settings must still match. If changing batch size changes the effective
+shuffle window size (`window_records`), input restoration is rejected: use a
+compatible batch size, or explicitly choose `--resume-input restart` to read
+from the beginning.
+
+Learning-rate schedules operate on superbatch numbers, including one-cycle.
+The saved horizon is restored, so changing the batch count does not compress
+the curve. Keep the other schedule options unchanged; they come from the CLI.
+Optimizer moments and step count continue from the checkpoint; smaller batches
+produce more optimizer steps per superbatch. Batch-level warmup and batch WDL
+jitter remain measured in batches, so their duration in positions can change.
 
 ### Horizon and resuming
 

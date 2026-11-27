@@ -2391,6 +2391,8 @@ mod tests {
             dense_lr_mult: None,
             bias_lr_mult: None,
             l1_lr_mult: None,
+            l1_shared_weight_decay: None,
+            adam_bias_correction: None,
             ft_piece_lr_mult: None,
             threat_lr_mult: None,
             norm_loss_factor: None,

@@ -455,6 +455,9 @@ fn validate_shared_cli(
             cli.optimizer
         )
     })?;
+    if cli.adam_bias_correction && optimizer != OptimizerKind::AdamW {
+        return Err("--adam-bias-correction requires --optimizer adamw".into());
+    }
     if cli.transfer_radam_momentum && optimizer != OptimizerKind::Sgd {
         return Err("--transfer-radam-momentum requires --optimizer sgd".into());
     }
@@ -1037,6 +1040,7 @@ pub(crate) fn run_training(
     // 保存済 LR horizon を決める。
     // rescore の fingerprint 用に、ロード時点で固定した artifact identity。
     let mut rescore_net_identity: Option<crate::rescore_driver::LoadedArtifact> = None;
+    trainer.adam_bias_correction = cli.adam_bias_correction;
     let (resumed_superbatch, resume_producer, resumed_lr_horizon): (
         Option<usize>,
         Option<crate::ckpt::ResumeProducer>,
@@ -1388,6 +1392,12 @@ pub(crate) fn run_training(
         fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(decay) = cli.l1_shared_weight_decay {
+        println!("[train] l1_shared_weight_decay={decay}");
+    }
+    if cli.adam_bias_correction {
+        println!("[train] adam_bias_correction=true");
+    }
     if let Some(mult) = cli.l1_lr_mult {
         println!("[train] l1_lr_mult={mult}");
     }
@@ -1624,8 +1634,9 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
+pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 7] {
     [
+        ("--l1-shared-weight-decay", cli.l1_shared_weight_decay),
         ("--ft-weight-decay", cli.ft_weight_decay),
         ("--dense-weight-decay", cli.dense_weight_decay),
         ("--bias-weight-decay", cli.bias_weight_decay),
@@ -1709,6 +1720,7 @@ fn resolve_layerstack_optim_groups(cli: &Cli) -> OptimGroupConfig {
         cli.bias_lr_mult,
     )
     .with_l1_lr_mult(cli.l1_lr_mult)
+    .with_l1_shared_weight_decay(cli.l1_shared_weight_decay)
     .with_ft_row_lr_mults(cli.ft_piece_lr_mult, cli.threat_lr_mult)
 }
 
@@ -2194,6 +2206,8 @@ fn build_experiment_params(
         dense_lr_mult: trainer.optim_groups.map(|groups| groups.dense.lr_mult),
         bias_lr_mult: trainer.optim_groups.map(|groups| groups.bias.lr_mult),
         l1_lr_mult: cli.l1_lr_mult,
+        l1_shared_weight_decay: cli.l1_shared_weight_decay,
+        adam_bias_correction: cli.adam_bias_correction.then_some(true),
         ft_piece_lr_mult: cli.ft_piece_lr_mult,
         threat_lr_mult: cli.threat_lr_mult,
         norm_loss_factor: trainer.norm_loss_factor,
@@ -2727,6 +2741,7 @@ pub(crate) fn run_simple_training(
     trainer.wdl_ignore_draws = cli.wdl_ignore_draws;
     trainer.l1_lr_mult = cli.l1_lr_mult.unwrap_or(1.0);
 
+    trainer.adam_bias_correction = cli.adam_bias_correction;
     let (resumed_superbatch, resume_producer, resumed_lr_horizon, checkpoint_fv_scale): (
         Option<usize>,
         Option<crate::ckpt::ResumeProducer>,
@@ -2871,6 +2886,12 @@ pub(crate) fn run_simple_training(
         trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
+    if let Some(decay) = cli.l1_shared_weight_decay {
+        println!("[train] l1_shared_weight_decay={decay}");
+    }
+    if cli.adam_bias_correction {
+        println!("[train] adam_bias_correction=true");
+    }
     if let Some(mult) = cli.l1_lr_mult {
         println!("[train] l1_lr_mult={mult}");
     }
@@ -3181,6 +3202,68 @@ mod shared_cli_tests {
             Ok(_) => panic!("shared CLI validation unexpectedly accepted input"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn resume_batch_change_preserves_one_cycle_horizon_and_superbatch_rate() {
+        use nnue_train::schedule::LrScheduler;
+        let original = parse(&[
+            "--lr-schedule",
+            "one-cycle",
+            "--superbatches",
+            "20",
+            "--batch-size",
+            "128",
+            "--batches-per-superbatch",
+            "10",
+        ]);
+        let resumed = parse(&[
+            "--lr-schedule",
+            "one-cycle",
+            "--superbatches",
+            "30",
+            "--batch-size",
+            "64",
+            "--batches-per-superbatch",
+            "20",
+        ]);
+        let before = build_lr_scheduler(&original, None).unwrap();
+        let after = build_lr_scheduler(&resumed, before.horizon()).unwrap();
+        assert_eq!(before.horizon(), after.horizon());
+        for sb in [2, 10, 19, 20] {
+            assert_eq!(before.lr(9, sb).to_bits(), after.lr(19, sb).to_bits());
+        }
+        for value in ["NaN", "inf", "-0.1"] {
+            let flag = format!("--l1-shared-weight-decay={value}");
+            assert!(
+                validate_nonnegative_optim_flags(per_group_optim_flags(&parse(&[&flag]))).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn adam_bias_correction_requires_adamw() {
+        for optimizer in ["ranger", "radam", "sgd"] {
+            assert!(
+                shared_cli_error(&["--optimizer", optimizer, "--adam-bias-correction"], false)
+                    .contains("requires --optimizer adamw")
+            );
+        }
+        let cli = parse(&[
+            "--optimizer",
+            "adamw",
+            "--adam-bias-correction",
+            "--l1-shared-weight-decay",
+            "0.3",
+        ]);
+        assert!(cli.adam_bias_correction);
+        assert!(validate_shared_cli(&cli, false, false).is_ok());
+        assert_eq!(
+            resolve_layerstack_optim_groups(&cli)
+                .effective(crate::optim_groups::OptimGroupKind::L1Shared, 0.1)
+                .0,
+            0.3
+        );
     }
 
     #[test]
@@ -3565,9 +3648,9 @@ mod tests {
             .collect();
         assert_eq!(specified, ["--bias-weight-decay"]);
 
-        // 6 flag 全指定で表の (CLI 名 → Cli field) 配線を値で照合する (table の
-        // copy-paste 取り違えを検出)。
         let cli = parse(&[
+            "--l1-shared-weight-decay",
+            "0.4",
             "--ft-weight-decay",
             "0.1",
             "--dense-weight-decay",
@@ -3583,9 +3666,9 @@ mod tests {
         ]);
         let values: Vec<f32> = per_group_optim_flags(&cli)
             .iter()
-            .map(|(_, v)| v.expect("all six flags set"))
+            .map(|(_, v)| v.expect("all flags set"))
             .collect();
-        assert_eq!(values, [0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
+        assert_eq!(values, [0.4, 0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
     }
 
     #[test]

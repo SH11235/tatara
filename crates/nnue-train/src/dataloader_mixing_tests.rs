@@ -682,7 +682,7 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
     for path in [&primary, &sources[0].path, &sources[1].path] {
         mark_tree_samples(path, 4);
     }
-    let open = |workers, window_mib, position: Option<&TeacherPosition>| {
+    let open = |workers, window_mib, batch_size, position: Option<&TeacherPosition>| {
         BucketedPrefetchedLoader::spawn_mixed_resumable(
             &[&primary],
             BucketedLoaderOptions {
@@ -693,7 +693,7 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
                     skip_seed: 19,
                     ..Default::default()
                 },
-                batch_size: 128,
+                batch_size,
                 score_drop_abs: None,
                 score_clamp_abs: None,
                 num_workers: workers,
@@ -727,13 +727,13 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
         scores
     };
     for window_mib in [0, 1] {
-        let mut reference = open(1, window_mib, None);
+        let mut reference = open(1, window_mib, 128, None);
         let expected = collect(&mut reference, 350);
         drop(reference);
         for workers in [1, 4] {
             for cut in [1, 151] {
-                let mut first = open(workers, window_mib, None);
-                let mut actual = collect(&mut first, cut);
+                let mut first = open(workers, window_mib, 128, None);
+                let actual = collect(&mut first, cut);
                 let position: TeacherPosition =
                     serde_json::from_slice(&serde_json::to_vec(first.position()).unwrap()).unwrap();
                 assert_eq!(position.mixes.len(), 2);
@@ -745,9 +745,12 @@ fn sampled_mixed_window_resume_crosses_windows_without_losing_records() {
                     assert!(position.epoch > 0);
                 }
                 drop(first);
-                let mut resumed = open(workers, window_mib, Some(&position));
-                actual.extend(collect(&mut resumed, 350 - cut));
-                assert_eq!(actual, expected);
+                for batch_size in [64, 128] {
+                    let mut resumed = open(workers, window_mib, batch_size, Some(&position));
+                    let mut joined = actual.clone();
+                    joined.extend(collect(&mut resumed, (350 - cut) * 128 / batch_size));
+                    assert_eq!(joined, expected);
+                }
             }
         }
     }

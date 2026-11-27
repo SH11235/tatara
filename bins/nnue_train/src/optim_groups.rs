@@ -4,6 +4,7 @@ use shogi_features::FeatureSetSpec;
 pub(crate) enum OptimGroupKind {
     Ft,
     L1,
+    L1Shared,
     Dense,
     Bias,
 }
@@ -22,6 +23,7 @@ pub(crate) struct OptimGroupConfig {
     pub(crate) threat_lr_mult: f32,
     pub(crate) dense: OptimGroupParams,
     l1_lr_mult: Option<f32>,
+    l1_shared_weight_decay: Option<f32>,
     pub(crate) bias: OptimGroupParams,
 }
 
@@ -46,7 +48,13 @@ impl OptimGroupConfig {
             dense: group(dense_weight_decay, dense_lr_mult),
             bias: group(bias_weight_decay, bias_lr_mult),
             l1_lr_mult: None,
+            l1_shared_weight_decay: None,
         }
+    }
+
+    pub(crate) fn with_l1_shared_weight_decay(mut self, decay: Option<f32>) -> Self {
+        self.l1_shared_weight_decay = decay;
+        self
     }
 
     pub(crate) fn with_l1_lr_mult(mut self, l1_lr_mult: Option<f32>) -> Self {
@@ -83,6 +91,12 @@ impl OptimGroupConfig {
                 lr_mult: self.l1_lr_mult.unwrap_or(self.dense.lr_mult),
                 ..self.dense
             },
+            OptimGroupKind::L1Shared => OptimGroupParams {
+                weight_decay: self
+                    .l1_shared_weight_decay
+                    .unwrap_or(self.dense.weight_decay),
+                lr_mult: self.l1_lr_mult.unwrap_or(self.dense.lr_mult),
+            },
             OptimGroupKind::Dense => self.dense,
             OptimGroupKind::Bias => self.bias,
         }
@@ -104,6 +118,29 @@ mod tests {
     /// per-group flag を一つも指定しない (`None`) と、全 group で weight_decay = 大域値・
     /// lr_mult = 1.0 に resolve され、`effective` の lr は `scheduled_lr × 1.0` で
     /// scheduled_lr と bit-identical (= 既定 launch 引数が単一 weight_decay 経路と一致)。
+    #[test]
+    fn shared_decay_overrides_only_shared_weights_and_preserves_l1_rate() {
+        let base = OptimGroupConfig::resolve(0.1, None, Some(0.2), None, None, Some(3.0), None)
+            .with_l1_lr_mult(Some(0.5));
+        assert_eq!(
+            base.effective(OptimGroupKind::L1Shared, 0.02),
+            base.effective(OptimGroupKind::L1, 0.02)
+        );
+        let changed = base.with_l1_shared_weight_decay(Some(0.7));
+        assert_eq!(
+            changed.effective(OptimGroupKind::L1Shared, 0.02),
+            (0.7, 0.01)
+        );
+        for kind in [
+            OptimGroupKind::Ft,
+            OptimGroupKind::L1,
+            OptimGroupKind::Dense,
+            OptimGroupKind::Bias,
+        ] {
+            assert_eq!(base.effective(kind, 0.02), changed.effective(kind, 0.02));
+        }
+    }
+
     #[test]
     fn resolve_without_overrides_falls_back_to_global() {
         let cfg = OptimGroupConfig::resolve(0.125, None, None, None, None, None, None);

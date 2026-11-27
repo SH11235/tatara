@@ -974,6 +974,12 @@ pub(crate) struct Cli {
     /// weight decay scales with the resulting learning rate.
     #[arg(long, global = true)]
     pub(crate) l1_lr_mult: Option<f32>,
+    /// Weight decay for shared L1 weights only (LayerStack). Defaults to dense decay.
+    #[arg(long, global = true)]
+    pub(crate) l1_shared_weight_decay: Option<f32>,
+    /// Correct AdamW moment estimates using the accumulated optimizer step count.
+    #[arg(long, global = true)]
+    pub(crate) adam_bias_correction: bool,
     /// Learning-rate multiplier for the bias param group: this group's per-step
     /// learning rate is the scheduled learning rate times this value. Unset
     /// means 1.0.

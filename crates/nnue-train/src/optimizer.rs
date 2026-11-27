@@ -23,7 +23,7 @@ pub use gpu_kernels::pointwise::radam_step::radam_compute_step_size_denom;
 /// | sgd    | classical momentum, no variance scaling | 0.9 | なし |
 ///
 /// `adamw` は bullet (`trainer/src/optimiser/adam.rs`) の AdamW と同じく
-/// bias correction を持たない `p -= lr * m / (sqrt(v) + eps)` 形。beta1 の
+/// 既定では bias correction を持たない `p -= lr * m / (sqrt(v) + eps)` 形。beta1 の
 /// 既定値も bullet の各 optimiser default (Ranger 0.99 / RAdam・AdamW 0.9)
 /// に合わせている。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub enum OptimizerKind {
     Ranger,
     /// rectified Adam (Liu et al. 2019)。lookahead なし。
     RAdam,
-    /// decoupled weight decay + weight clamp 付き Adam。bias correction なし。
+    /// Decoupled weight decay and weight clamp, with optional bias correction.
     AdamW,
     /// SGD with classical momentum.
     Sgd,
@@ -85,6 +85,30 @@ impl OptimizerKind {
         match self {
             Self::Sgd => decay * (1.0 - self.beta1()),
             _ => decay,
+        }
+    }
+
+    /// Returns kernel step size, denominator mode, epsilon and decay multiplier.
+    /// Corrected AdamW rescales epsilon with sqrt(1-beta2^t); inverse step scaling
+    /// keeps decoupled decay at the group learning rate rather than the corrected rate.
+    pub fn kernel_scalars(
+        self,
+        step: u64,
+        beta2: f32,
+        threshold: f32,
+        eps: f32,
+        bias_correction: bool,
+    ) -> (f32, i32, f32, f32) {
+        if bias_correction {
+            assert_eq!(self, Self::AdamW);
+            assert!(step > 0);
+            let bc1 = 1.0 - (self.beta1() as f64).powf(step as f64);
+            let sqrt_bc2 = (1.0 - (beta2 as f64).powf(step as f64)).sqrt();
+            let scale = (sqrt_bc2 / bc1) as f32;
+            (scale, 1, eps * sqrt_bc2 as f32, scale.recip())
+        } else {
+            let (scale, denom) = self.step_size_denom(step, beta2, threshold);
+            (scale, denom, eps, 1.0)
         }
     }
 
@@ -163,6 +187,66 @@ impl Default for RangerParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrected_adamw_matches_unbiased_moments_over_multiple_steps() {
+        use gpu_kernels::pointwise::radam_step::radam_step_cpu;
+        let kind = OptimizerKind::AdamW;
+        let (beta1, beta2, eps, lr, wd) = (kind.beta1(), 0.999_f32, 1e-4_f32, 0.03_f32, 0.2_f32);
+        let (mut w, mut m, mut v) = ([0.4_f32], [0.0_f32], [0.0_f32]);
+        let (mut expected, mut mean, mut variance) = (0.4_f64, 0.0_f64, 0.0_f64);
+        for step in 1..=32 {
+            let gradient = if step % 3 == 0 {
+                -0.0002_f32
+            } else {
+                0.0001_f32
+            };
+            let (scale, denom, epsilon, decay_mult) =
+                kind.kernel_scalars(step, beta2, 5.0, eps, true);
+            radam_step_cpu(
+                &mut w,
+                &mut m,
+                &mut v,
+                &mut [gradient],
+                lr,
+                scale,
+                denom,
+                wd * decay_mult,
+                beta1,
+                beta2,
+                epsilon,
+                -10.0,
+                10.0,
+                1,
+            );
+            let (b1, b2, g) = (f64::from(beta1), f64::from(beta2), f64::from(gradient));
+            mean = b1 * mean + (1.0 - b1) * g;
+            variance = b2 * variance + (1.0 - b2) * g * g;
+            let m_hat = mean / (1.0 - b1.powf(step as f64));
+            let v_hat = variance / (1.0 - b2.powf(step as f64));
+            expected = expected * (1.0 - f64::from(lr) * f64::from(wd))
+                - f64::from(lr) * m_hat / (v_hat.sqrt() + f64::from(eps));
+            assert!((f64::from(w[0]) - expected).abs() < 2e-6, "step {step}");
+        }
+    }
+
+    #[test]
+    fn disabled_bias_correction_keeps_kernel_arguments() {
+        for kind in [
+            OptimizerKind::Ranger,
+            OptimizerKind::RAdam,
+            OptimizerKind::AdamW,
+            OptimizerKind::Sgd,
+        ] {
+            for step in [1, 6, 1000] {
+                let (scale, denom, eps, decay_mult) =
+                    kind.kernel_scalars(step, 0.999, 5.0, 1e-8, false);
+                assert_eq!((scale, denom), kind.step_size_denom(step, 0.999, 5.0));
+                assert_eq!(eps.to_bits(), 1e-8_f32.to_bits());
+                assert_eq!(decay_mult, 1.0);
+            }
+        }
+    }
 
     #[test]
     fn ranger_params_default_values() {
