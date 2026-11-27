@@ -26,12 +26,13 @@ superbatch index の関数として run ごとに再計算される。学習手�
 `--lr-schedule one-cycle --lr-total-steps N` は通算の optimizer 更新回数で
 進み、`--superbatches` とは独立です。N は正の整数で、他の schedule では指定できません。
 initial は `--lr / --lr-div-factor`、final は initial を `--lr-final-div-factor`
-で割った値です。warmup は `round(--lr-warmup-pct * N)` 回です。PyTorch と同じ
-0 始まりの更新番号を使い、warmup が 2 回以上なら最初の更新は initial、
-`warmup 回数 - 1` で peak、`N - 1` で final に達し、以降は final を維持します。
-補間は両区間とも half-cosine です。PyTorch の境界と異なり warmup 回数は整数に丸めます。
-warmup 0 回では減衰区間から、1 回では peak から始めます。N=1 は final を使い、
-warmup が全更新を占める場合も最終更新では final を優先します。
+で割った値です。warmup は浮動小数点の境界 `--lr-warmup-pct * N - 1` で終わり、
+丸めません。0 始まりの更新番号を使い、PyTorch と同じ half-cosine の区間で、warmup は
+その境界で、cooldown は `N - 1` で終わります。warmup の割合は f32 で保持し、境界の
+計算では f64 に変換します。境界が整数でないと、max LR ちょうどの更新が無いことが
+あります。warmup の割合が 1.0 なら、更新 `N - 1` で max LR に達します。更新 `N` 以降は
+更新 `N - 1` の値を保持します。warmup 0 では cooldown から始め、更新 0 で長さ 0 の
+warmup 区間になる場合は max LR を使います。
 
 checkpoint に N と完了した更新回数を保存します。resume で N を省略すると保存値を
 使い、異なる N や schedule は拒否します。更新回数の horizon を持たない checkpoint
@@ -53,7 +54,7 @@ LayerStacks の両 head で L1 の共有重みも対象になる。省略時は 
 
 `--adam-bias-correction` は `--optimizer adamw` 専用で、`m_hat = m / (1 - beta1^t)`、`v_hat = v / (1 - beta2^t)` を使い、`w = w * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + epsilon)` の後に既存の weight clamp を適用する。省略時は従来の補正なし AdamW。native CUDA の FT fused / 非 fused、cuda-oxide、FP16 optimizer state の各経路で同じ補正を行う。FP16 state の保存時の丸めは残る。共通 kernel に渡す step 係数とともに epsilon・decay 係数を調整し、実効 epsilon と decoupled decay の率を保つ。
 
-resume 時もこれらの option を指定する。checkpoint は重み・moment・累積 optimizer step `t` を復元し、option は現在の CLI から決まる。明示した値は起動ログ・experiment の params・recipe fingerprint に記録し、省略時は項目を追加しない。
+resume 時もこれらの option を指定する。checkpoint は重み・moment・累積 optimizer step `t` を復元する。`--adam-bias-correction` は checkpoint に記録し、resume では同じ指定が要る (この項目の無い checkpoint は補正なしとみなす)。他の option は現在の CLI から決まる。明示した値は起動ログ・experiment の params・recipe fingerprint に記録し、省略時は項目を追加しない。
 
 LayerStacks の学習では、`--ft-piece-lr-mult` が駒特徴の実の行（全 effect bucket を含む）に、
 `--threat-lr-mult` が Threat 特徴の実の行（幅を縮めた行を含む）に適用される。Threat の倍率には

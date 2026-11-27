@@ -336,7 +336,7 @@ pub(crate) struct RawCkptHeader {
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=16 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=17 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
