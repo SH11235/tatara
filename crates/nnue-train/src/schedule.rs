@@ -33,6 +33,10 @@ pub trait LrScheduler: Clone + Debug + Display + Send + Sync + 'static {
     fn horizon(&self) -> Option<usize> {
         None
     }
+
+    fn has_horizon(&self) -> bool {
+        self.horizon().is_some()
+    }
 }
 
 /// 一定の learning rate。
@@ -316,6 +320,10 @@ impl<LR: LrScheduler> LrScheduler for WarmupLR<LR> {
         // warmup wrapper は horizon を変えない (batch 単位の起動時 warmup のみ)。
         self.inner.horizon()
     }
+
+    fn has_horizon(&self) -> bool {
+        self.inner.has_horizon()
+    }
 }
 
 impl<LR: LrScheduler> Display for WarmupLR<LR> {
@@ -344,6 +352,10 @@ impl<First: LrScheduler, Second: LrScheduler> LrScheduler for SequenceLR<First, 
         } else {
             self.second.lr(batch, superbatch - midpoint)
         }
+    }
+
+    fn has_horizon(&self) -> bool {
+        true
     }
 }
 
@@ -408,6 +420,19 @@ impl LrScheduler for LrSchedulerEnum {
             Self::Warmup(s) => s.horizon(),
         }
     }
+
+    fn has_horizon(&self) -> bool {
+        match self {
+            Self::Constant(s) => s.has_horizon(),
+            Self::Step(s) => s.has_horizon(),
+            Self::Drop(s) => s.has_horizon(),
+            Self::LinearDecay(s) => s.has_horizon(),
+            Self::CosineDecay(s) => s.has_horizon(),
+            Self::ExponentialDecay(s) => s.has_horizon(),
+            Self::OneCycle(s) => s.has_horizon(),
+            Self::Warmup(s) => s.has_horizon(),
+        }
+    }
 }
 
 impl Display for LrSchedulerEnum {
@@ -438,6 +463,11 @@ pub trait WdlScheduler: Clone + Debug + Display + Send + Sync + 'static {
     fn jitter_base(&self, batch: usize, superbatch: usize, max: usize) -> (f32, f32) {
         (self.blend(batch, superbatch, max), 1.0)
     }
+
+    /// Return false only when the blend and jitter are independent of any horizon.
+    fn has_horizon(&self) -> bool {
+        true
+    }
 }
 
 /// 一定の WDL lambda。
@@ -449,6 +479,10 @@ pub struct ConstantWDL {
 impl WdlScheduler for ConstantWDL {
     fn blend(&self, _batch: usize, _superbatch: usize, _max: usize) -> f32 {
         self.value
+    }
+
+    fn has_horizon(&self) -> bool {
+        false
     }
 }
 
@@ -551,6 +585,10 @@ impl<W: WdlScheduler> WdlScheduler for WarmupWDL<W> {
             base_wdl
         }
     }
+
+    fn has_horizon(&self) -> bool {
+        self.inner.has_horizon()
+    }
 }
 
 impl<W: WdlScheduler> Display for WarmupWDL<W> {
@@ -580,6 +618,11 @@ impl<First: WdlScheduler, Second: WdlScheduler> WdlScheduler for SequenceWDL<Fir
             self.second
                 .blend(batch, superbatch - midpoint, max - midpoint)
         }
+    }
+
+    fn has_horizon(&self) -> bool {
+        // The second scheduler's span is computed from the original run end.
+        true
     }
 }
 
@@ -635,6 +678,14 @@ impl WdlScheduler for WdlSchedulerEnum {
         match self {
             Self::Cycle(s) => s.jitter_base(batch, superbatch, max),
             _ => (self.blend(batch, superbatch, max), 1.0),
+        }
+    }
+
+    fn has_horizon(&self) -> bool {
+        match self {
+            Self::Constant(s) => s.has_horizon(),
+            Self::Linear(s) => s.has_horizon(),
+            Self::Cycle(s) => s.has_horizon(),
         }
     }
 }

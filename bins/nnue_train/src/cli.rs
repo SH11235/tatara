@@ -465,10 +465,12 @@ pub(crate) struct Cli {
     pub(crate) superbatches: usize,
 
     /// Override the training control file (default: control.json under --output).
-    /// target_superbatches is read at each superbatch start and clamped to the current
-    /// superbatch and original --superbatches; values below the resume start are ignored.
+    /// target_superbatches is read at each superbatch start and is at least the current
+    /// superbatch. Values below the resume start are ignored. Extending beyond the original
+    /// --superbatches requires LR and WDL schedules without a horizon. Otherwise the trainer
+    /// caps the target at the original --superbatches and warns once per run.
     /// Applied targets are appended to control_history.jsonl and recorded in experiment.json.
-    /// LR and WDL schedules retain the original horizon. Missing files are silently ignored.
+    /// Missing files are silently ignored.
     /// pause is read at startup and superbatch ends.
     /// A control-file rewrite after startup with pause=true saves a resumable checkpoint
     /// and exits with code 75, unless training completes at that boundary.
