@@ -858,6 +858,7 @@ pub(crate) mod tests {
             superbatch: scale as usize,
             step_count: 100,
             lr_horizon: None,
+            lr_total_steps: None,
             fv_scale: None,
             net_id: "net",
             recipe_fingerprint: None,
@@ -933,6 +934,7 @@ pub(crate) mod tests {
                 superbatch: index + 1,
                 step_count: 1,
                 lr_horizon: None,
+                lr_total_steps: (index == 0).then_some(100),
                 fv_scale: None,
             };
             let group_lengths = [

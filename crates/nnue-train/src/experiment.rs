@@ -256,6 +256,8 @@ pub struct Params {
     /// `lr` / `lr_gamma` / `lr_step` は step スケジュール用の生 flag 値で、
     /// 他スケジュールでは未使用なため、再現に必要な実効形をここに残す。
     pub lr_schedule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lr_total_steps: Option<u64>,
     pub batch_size: usize,
     pub batches_per_superbatch: usize,
     pub superbatches: usize,
@@ -943,6 +945,10 @@ mod tests {
         let mut schedule = sample_params();
         schedule.lr_schedule = "constant".to_string();
         assert_ne!(recipe_fingerprint(&schedule, "teacher.psv"), fingerprint);
+        let mut steps = sample_params();
+        steps.lr_total_steps = Some(100);
+        assert_ne!(recipe_fingerprint(&steps, "teacher.psv"), fingerprint);
+        assert_eq!(serde_json::to_value(&steps).unwrap()["lr_total_steps"], 100);
         let mut holdout = sample_params();
         holdout.test_tail_positions = Some(10_000);
         assert_ne!(recipe_fingerprint(&holdout, "teacher.psv"), fingerprint);
@@ -1155,6 +1161,7 @@ mod tests {
             lr: 8.75e-4,
             lr_gamma: 0.995,
             lr_step: 1,
+            lr_total_steps: None,
             lr_schedule: "start 0.000875 gamma 0.995 drop every 1 superbatches".to_string(),
             batch_size: 65_536,
             batches_per_superbatch: 6_104,

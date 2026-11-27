@@ -2790,3 +2790,76 @@ fn independent_keep_bucket_cli_rejects_split_conflicting_definitions() {
         );
     }
 }
+
+#[test]
+fn lr_total_steps_validates_and_preserves_saved_horizon() {
+    use crate::training::{build_lr_scheduler, build_resumed_lr_scheduler};
+    use nnue_train::schedule::LrScheduler;
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["nnue-train"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(["layerstack"]),
+        )
+        .unwrap()
+    };
+    for schedule in [
+        "step",
+        "constant",
+        "drop",
+        "linear",
+        "cosine",
+        "exponential",
+    ] {
+        assert!(
+            build_lr_scheduler(
+                &parse(&["--lr-schedule", schedule, "--lr-total-steps", "10"]),
+                None
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        build_lr_scheduler(
+            &parse(&["--lr-schedule", "one-cycle", "--lr-total-steps", "0"]),
+            None
+        )
+        .is_err()
+    );
+    let cli = parse(&["--lr-schedule", "one-cycle", "--lr-total-steps", "20"]);
+    let fresh = build_lr_scheduler(&cli, None).unwrap();
+    assert!(fresh.to_string().contains("20 optimizer updates"));
+    assert_eq!(fresh.horizon(), None);
+    let same = build_resumed_lr_scheduler(&cli, None, Some(20)).unwrap();
+    assert!(build_resumed_lr_scheduler(&cli, None, Some(21)).is_err());
+    let inherited = build_resumed_lr_scheduler(
+        &parse(&["--lr-schedule", "one-cycle", "--superbatches", "999"]),
+        None,
+        Some(20),
+    )
+    .unwrap();
+    for step in [0, 3, 4, 10, 19, 20, 30] {
+        assert_eq!(fresh.lr_at_step(0, 1, step), same.lr_at_step(4, 9, step));
+        assert_eq!(
+            fresh.lr_at_step(0, 1, step),
+            inherited.lr_at_step(4, 9, step)
+        );
+    }
+    assert!(build_resumed_lr_scheduler(&parse(&[]), None, Some(20)).is_err());
+    assert!(
+        build_resumed_lr_scheduler(
+            &parse(&[
+                "--resume",
+                "old.ckpt",
+                "--lr-schedule",
+                "one-cycle",
+                "--lr-total-steps",
+                "20"
+            ]),
+            Some(20),
+            None
+        )
+        .is_err()
+    );
+}

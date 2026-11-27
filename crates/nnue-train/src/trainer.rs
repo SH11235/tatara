@@ -14,7 +14,7 @@
 //! while sb <= effective_end:
 //!     poll target_superbatches and update effective_end
 //!     for batch_idx in 0..batches_per_superbatch:
-//!         lr  = lr_scheduler.lr(batch_idx, sb)
+//!         lr  = lr_scheduler.lr_at_step(batch_idx, sb, backend.completed_steps())
 //!         wdl = wdl_scheduler.blend(batch_idx, sb, end_superbatch)
 //!         fill Batch + per-position bucket from the PSV stream
 //!           (EOF → 同 file を開き直す = 次 epoch)
@@ -1248,7 +1248,7 @@ where
         let mut sb_printed_progress = false;
 
         for batch_idx in 0..cfg.batches_per_superbatch {
-            let lr = lr_scheduler.lr(batch_idx, sb);
+            let lr = lr_scheduler.lr_at_step(batch_idx, sb, backend.completed_steps());
             let wdl = if cfg.wdl_jitter.enabled() {
                 let (base, coefficient) =
                     wdl_scheduler.jitter_base(batch_idx, sb, cfg.end_superbatch);
@@ -1390,7 +1390,7 @@ where
         } else {
             f64::NAN
         };
-        let lr_now = lr_scheduler.lr(0, sb);
+        let lr_now = lr_scheduler.lr_at_step(0, sb, backend.completed_steps().saturating_sub(1));
         let wdl_now = wdl_scheduler.blend(0, sb, cfg.end_superbatch);
         let validation_wdl = cfg.validation_wdl.unwrap_or(wdl_now);
 
@@ -2079,6 +2079,59 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_step_cycle_continues_across_changed_batch_geometry() {
+        use crate::schedule::StepOneCycleLR;
+        let lr = LrSchedulerEnum::StepOneCycle(StepOneCycleLR::new(0.01, 0.3, 25.0, 100.0, 10));
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TrainingConfig {
+            output_dir: dir.path().into(),
+            batch_size: 4,
+            batches_per_superbatch: 2,
+            end_superbatch: 2,
+            save_rate: 100,
+            threads: 1,
+            ..base_cfg()
+        };
+        let mut before = MockBackend::new();
+        run(
+            &mut before,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &lr,
+            &ConstantWDL { value: 0.0 },
+            &cfg,
+            None,
+        )
+        .unwrap();
+        assert_eq!(before.completed_steps(), 4);
+        let mut after = MockBackend::new();
+        after.steps = before.steps;
+        let resumed = TrainingConfig {
+            batch_size: 2,
+            batches_per_superbatch: 4,
+            start_superbatch: 3,
+            end_superbatch: 5,
+            ..cfg
+        };
+        run(
+            &mut after,
+            &[sample_psv_path()],
+            &ShogiProgressKPAbs,
+            &lr,
+            &ConstantWDL { value: 0.0 },
+            &resumed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(after.completed_steps(), 16);
+        for (step, value) in before.seen_lr.iter().chain(&after.seen_lr).enumerate() {
+            assert_eq!(value.to_bits(), lr.lr_at_step(0, 1, step as u64).to_bits());
+        }
+        assert!(after.seen_lr.windows(2).any(|v| v[0] != v[1]));
+        assert_eq!(after.seen_lr[5..], vec![lr.lr_at_step(0, 1, 9); 7]);
+    }
+
+    #[test]
     fn tree_sample_flag_reaches_external_and_tail_heldout() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("samples.psv");
@@ -2368,6 +2421,7 @@ mod tests {
             lr: 1.0e-3,
             lr_gamma: 0.9,
             lr_step: 1,
+            lr_total_steps: None,
             lr_schedule: "start 0.001 gamma 0.9 drop every 1 superbatches".to_string(),
             batch_size: 8,
             batches_per_superbatch: 2,

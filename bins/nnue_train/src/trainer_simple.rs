@@ -361,6 +361,7 @@ pub(crate) struct SimpleGpuTrainer {
     id: SimpleId,
     /// optimizer step counter。ranger では `RANGER_K` の倍数で lookahead lerp する。
     step_count: u64,
+    pub(crate) lr_total_steps: Option<u64>,
     /// optimizer 種別 (per-step scalar / beta1 / lookahead 有無を決める)。
     optimizer: OptimizerKind,
     /// weight decay 係数 (`radam_step` 引数)。
@@ -586,6 +587,7 @@ impl SimpleGpuTrainer {
             dense_bias_grad_occ,
             id,
             step_count: 0,
+            lr_total_steps: None,
             optimizer,
             weight_decay,
             norm_loss_factor,
@@ -2919,6 +2921,7 @@ impl SimpleGpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                lr_total_steps: self.lr_total_steps,
                 fv_scale: Some(self.fv_scale()),
             },
             &self.raw_ckpt_group_sources(),
@@ -2997,6 +3000,7 @@ impl SimpleGpuTrainer {
         up!(7, l3_b, l3_b_m, l3_b_v, l3_b_slow);
 
         self.step_count = header.step_count;
+        self.lr_total_steps = header.lr_total_steps;
         Ok((
             header.superbatch,
             header.producer(),

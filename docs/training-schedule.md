@@ -5,7 +5,7 @@
 A run has two independent schedulers: the **learning rate** (`--lr-schedule`) and
 the **WDL lambda** (`--wdl` / `--start-wdl` / `--end-wdl` /
 `--wdl-cycle-delta`). Both are recomputed
-each run as a function of the CLI arguments and the superbatch index. For the
+each run from the CLI arguments and restored checkpoint state. For the
 per-run training steps themselves see
 [docs/training-quickstart.md](training-quickstart.md); for the exact flag syntax,
 ranges, and defaults run `nnue-train --help` (the help text is the authoritative
@@ -24,6 +24,25 @@ can't: what each scheduler does and how it interacts with `--resume`.
   `--lr-final-superbatch`, then hold.
 - `one-cycle` — warm up over the first `--lr-warmup-pct` of the horizon, then
   cosine-anneal down.
+
+With `--lr-schedule one-cycle --lr-total-steps N`, the cycle advances once per
+optimizer update, independently of `--superbatches`. N must be positive; other
+schedules reject this option. The initial LR is `--lr / --lr-div-factor`, and the
+final LR is initial LR divided by `--lr-final-div-factor`. Warmup lasts
+`round(--lr-warmup-pct * N)` updates. The zero-based update index matches PyTorch:
+with at least two warmup updates, update 0 uses initial LR, the warmup peak is
+at `warmup_updates - 1`, and final LR is reached at `N - 1` and held thereafter.
+Both phases use half-cosine interpolation. Unlike PyTorch's unrounded phase
+boundary, the warmup count is rounded. Zero warmup uses the decay phase directly;
+one warmup update starts at the peak. A one-update cycle uses final LR; final LR
+also takes precedence at the last update when warmup occupies the whole cycle.
+
+The checkpoint saves N and the completed optimizer update count. On resume, an
+omitted N inherits the saved value; a different N or schedule is rejected. A
+checkpoint without an update-based horizon cannot switch to this mode on resume.
+Changing batch size or batches per superbatch preserves the saved update count
+and LR curve. Keep the other one-cycle options unchanged on resume. Omitting
+`--lr-total-steps` on a fresh run retains superbatch scheduling.
 
 `--lr-warmup-steps` additionally wraps any schedule except `one-cycle` (which
 carries its own warmup) in a batch-level warmup over the first superbatch.
@@ -79,7 +98,7 @@ shuffle window size (`window_records`), input restoration is rejected: use a
 compatible batch size, or explicitly choose `--resume-input restart` to read
 from the beginning.
 
-Learning-rate schedules operate on superbatch numbers, including one-cycle.
+Learning-rate schedules use superbatch numbers unless one-cycle has `--lr-total-steps`.
 The saved horizon is restored, so changing the batch count does not compress
 the curve. Keep the other schedule options unchanged; they come from the CLI.
 Optimizer moments and step count continue from the checkpoint; smaller batches
@@ -90,7 +109,7 @@ jitter remain measured in batches, so their duration in positions can change.
 
 The schedules with a **horizon** — the superbatch at which the curve reaches its
 terminal LR — are the `linear` / `cosine` / `exponential` decays (their
-`--lr-final-superbatch`) and `one-cycle` (its total). When `--lr-final-superbatch`
+`--lr-final-superbatch`) and `one-cycle` without `--lr-total-steps`. When `--lr-final-superbatch`
 is omitted the horizon defaults to `--superbatches`, so a stateless rebuild would
 stretch or shrink the curve whenever you resume with a different `--superbatches`.
 
@@ -101,7 +120,7 @@ To keep the curve reproducible, a checkpoint records the resolved horizon and
 2. the horizon saved in the checkpoint;
 3. `--superbatches` — the fallback.
 
-`one-cycle` has no explicit horizon flag, so on resume its saved horizon always
+Without `--lr-total-steps`, one-cycle uses a superbatch horizon; its saved horizon always
 wins over `--superbatches`. Checkpoints written before this was recorded (or by
 `step` / `constant` / `drop`, which have no horizon) carry none and fall back to
 `--superbatches`. `step` therefore reproduces the same curve on resume regardless

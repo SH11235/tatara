@@ -77,15 +77,19 @@ pub const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 /// - `14`: the compact Threat layout with SGD momentum state.
 /// - `15`: the compact Threat layout with RAdam optimizer state.
 ///
-/// The trainer resume format accepts versions 1..=15. Version 1 is interpreted as
+/// - `16`: optimizer-step schedule envelope: u32 layout version (11..=15),
+///   then u64 LR total steps, followed by that layout's header and tensors.
+///
+/// The trainer resume format accepts versions 1..=16. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
-/// interpreted as `layerstack`. Versions above 15 are rejected. The producer
+/// interpreted as `layerstack`. Versions above 16 are rejected. The producer
 /// run id is absent (`None`) for versions 1 and 2; the LR horizon is absent
 /// (`None`) for versions 1..=4; the factorizer flag is absent (false) for
 /// versions 1..=5; the feature hash is absent for versions 1..=6; `fv_scale`
 /// is absent (`None`) for versions 1..=8; the producer net id and recipe
 /// fingerprint are absent (`None`) for versions 1..=10.
-pub const RAW_CKPT_VERSION: u32 = 15;
+pub const RAW_CKPT_VERSION: u32 = 16;
+const STEP_SCHEDULE_CKPT_VERSION: u32 = 16;
 
 /// LayerStack topology extension: PSQT bucket count (zero if absent), then this head tag.
 pub const DENSE_CONCAT_TOPOLOGY_TAG: u64 = 1;
@@ -175,6 +179,7 @@ pub struct RawCkptMeta<'a> {
     pub step_count: u64,
     /// LR-schedule horizon (horizon を持たない schedule では `None`)。
     pub lr_horizon: Option<usize>,
+    pub lr_total_steps: Option<u64>,
     /// Simple の export に使う実効 evaluation scale。LayerStack は `None`。
     pub fv_scale: Option<i32>,
     /// この checkpoint を書き出す run の net id。空文字列は「未記録」。
@@ -213,6 +218,7 @@ pub struct RawCkptReader<R> {
     r: R,
     mode: RawCkptReadMode,
     version: u32,
+    lr_total_steps: Option<u64>,
 }
 
 impl<R: Read> RawCkptReader<R> {
@@ -221,6 +227,7 @@ impl<R: Read> RawCkptReader<R> {
             r,
             mode,
             version: 0,
+            lr_total_steps: None,
         };
         let magic = reader.array::<4>("magic")?;
         if magic != RAW_CKPT_MAGIC {
@@ -243,10 +250,30 @@ impl<R: Read> RawCkptReader<R> {
                 "{prefix} version {version} is not supported ({supported} {min}..={RAW_CKPT_VERSION})"
             )));
         }
-        reader.version = version;
+        reader.version = if version == STEP_SCHEDULE_CKPT_VERSION {
+            let layout = reader.u32("layout version")?;
+            if !(11..=15).contains(&layout) {
+                return Err(invalid(
+                    "unsupported optimizer-step checkpoint layout".into(),
+                ));
+            }
+            let total = reader.u64("LR total steps")?;
+            if total == 0 {
+                return Err(invalid("LR total steps must be positive".into()));
+            }
+            reader.lr_total_steps = Some(total);
+            layout
+        } else {
+            version
+        };
         Ok(reader)
     }
 
+    pub fn lr_total_steps(&self) -> Option<u64> {
+        self.lr_total_steps
+    }
+
+    /// Tensor/header layout version, excluding the optional schedule envelope.
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -449,7 +476,16 @@ pub fn write_raw_ckpt_header<W: Write>(
         (true, OptimizerKind::RAdam) => PARTIAL_THREAT_RADAM_CKPT_VERSION,
         (true, _) => PARTIAL_THREAT_CKPT_VERSION,
     };
-    w.write_all(&version.to_le_bytes())?;
+    if let Some(total) = meta.lr_total_steps {
+        if total == 0 {
+            return Err(invalid("LR total steps must be positive".into()));
+        }
+        w.write_all(&STEP_SCHEDULE_CKPT_VERSION.to_le_bytes())?;
+        w.write_all(&version.to_le_bytes())?;
+        w.write_all(&total.to_le_bytes())?;
+    } else {
+        w.write_all(&version.to_le_bytes())?;
+    }
     // feature set header (v2+): canonical 名 + 次元 3 値。
     let fs_name = arch.feature_set.canonical_name();
     w.write_all(&(fs_name.len() as u32).to_le_bytes())?;

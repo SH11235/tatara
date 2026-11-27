@@ -1969,6 +1969,7 @@ pub(crate) struct GpuTrainer {
     optimizer: OptimizerKind,
     pub(crate) adam_bias_correction: bool,
     step_count: u64,
+    pub(crate) lr_total_steps: Option<u64>,
     #[cfg(feature = "native")]
     precision_diagnostic: Option<crate::precision_diagnostics::Diagnostic>,
     /// Forces the separate norm-loss / RAdam / lookahead / fold launches for FT weights so
@@ -3060,6 +3061,7 @@ impl GpuTrainer {
             freeze_ft: false,
             optimizer,
             step_count: 0,
+            lr_total_steps: None,
             #[cfg(feature = "native")]
             precision_diagnostic: None,
             #[cfg(feature = "native")]
@@ -3827,6 +3829,7 @@ impl GpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                lr_total_steps: self.lr_total_steps,
                 fv_scale: None,
             },
             &self.raw_ckpt_group_sources(),
@@ -3981,6 +3984,7 @@ impl GpuTrainer {
         }
 
         self.step_count = header.step_count;
+        self.lr_total_steps = header.lr_total_steps;
         self.sync_stack_forward_weights()?;
         Ok((header.superbatch, header.producer(), header.lr_horizon))
     }

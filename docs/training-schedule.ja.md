@@ -23,6 +23,23 @@ superbatch index の関数として run ごとに再計算される。学習手�
 - `one-cycle` — horizon の最初の `--lr-warmup-pct` で warmup し、以降は
   cosine で anneal する。
 
+`--lr-schedule one-cycle --lr-total-steps N` は通算の optimizer 更新回数で
+進み、`--superbatches` とは独立です。N は正の整数で、他の schedule では指定できません。
+initial は `--lr / --lr-div-factor`、final は initial を `--lr-final-div-factor`
+で割った値です。warmup は `round(--lr-warmup-pct * N)` 回です。PyTorch と同じ
+0 始まりの更新番号を使い、warmup が 2 回以上なら最初の更新は initial、
+`warmup 回数 - 1` で peak、`N - 1` で final に達し、以降は final を維持します。
+補間は両区間とも half-cosine です。PyTorch の境界と異なり warmup 回数は整数に丸めます。
+warmup 0 回では減衰区間から、1 回では peak から始めます。N=1 は final を使い、
+warmup が全更新を占める場合も最終更新では final を優先します。
+
+checkpoint に N と完了した更新回数を保存します。resume で N を省略すると保存値を
+使い、異なる N や schedule は拒否します。更新回数の horizon を持たない checkpoint
+から、この方式への切り替えも拒否します。batch と 1 superbatch あたりの更新数を
+変えても、保存した更新回数と LR 曲線を引き継ぎます。その他の one-cycle option は
+resume 時にも同じ値を指定してください。新規学習で `--lr-total-steps` を省略すれば
+従来の superbatch 単位の計算です。
+
 `--lr-warmup-steps` は `one-cycle`（自前の warmup を持つ）を除く任意の schedule を、
 最初の superbatch 内の batch 単位 warmup で追加ラップする。
 
@@ -53,13 +70,13 @@ FT の重みに異なる学習率を使うには、native CUDA の融合 optimiz
 
 `--batch-size` と `--batches-per-superbatch` の積を保ちながら変更できる。checkpoint と対応する `.loader.json` を一緒に保管すること。sampling の読みかけ chunk を含め、受理済み局面の位置から新しい batch サイズで再開する。教師の同一性と入力設定の照合は続ける。batch サイズ変更によって実際の shuffle 窓の局面数（`window_records`）が変わる場合は読み位置の復元を拒否する。窓の局面数を変えない batch サイズを選ぶか、`--resume-input restart` を明示して教師の先頭から読み直す。
 
-one-cycle を含む学習率の予定は superbatch 番号を基準とし、保存済み horizon を復元するため batch 数の変更では曲線を伸縮しない。その他の schedule option は CLI 由来なので同じ値を指定する。optimizer の moment と step 数は引き継ぎ、小さい batch では 1 superbatch あたりの更新回数が増える。batch 単位の warmup と WDL jitter は引き続き batch 数を基準とするため、局面数で見た長さは変わる。
+`--lr-total-steps` を指定した one-cycle 以外は superbatch 番号を基準とし、保存済み horizon を復元するため batch 数の変更では曲線を伸縮しない。その他の schedule option は CLI 由来なので同じ値を指定する。optimizer の moment と step 数は引き継ぎ、小さい batch では 1 superbatch あたりの更新回数が増える。batch 単位の warmup と WDL jitter は引き続き batch 数を基準とするため、局面数で見た長さは変わる。
 
 ### Horizon と resume
 
 **horizon**（curve が終端 LR に到達する superbatch）を持つのは
 `linear` / `cosine` / `exponential` 減衰（その `--lr-final-superbatch`）と
-`one-cycle`（その total）。`--lr-final-superbatch` 省略時、horizon は
+`--lr-total-steps` を指定しない `one-cycle`。`--lr-final-superbatch` 省略時、horizon は
 `--superbatches` に default するため、stateless な再構築だと `--superbatches` を
 変えて resume するたびに curve が伸縮してしまう。
 
@@ -70,7 +87,7 @@ curve を再現可能に保つため、checkpoint は解決済 horizon を記録
 2. checkpoint に保存された horizon。
 3. `--superbatches` — fallback。
 
-`one-cycle` は専用の horizon flag を持たないため、resume では保存 horizon が
+`--lr-total-steps` を指定しない one-cycle では、resume 時に保存した superbatch horizon が
 `--superbatches` を常に上書きする。これが記録される前に書かれた checkpoint（や
 horizon を持たない `step` / `constant` / `drop`）は horizon を持たず
 `--superbatches` に fallback する。したがって `step` はそもそも horizon を持たない

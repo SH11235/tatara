@@ -25,6 +25,11 @@ pub trait LrScheduler: Clone + Debug + Display + Send + Sync + 'static {
     /// 多くの scheduler は `batch` に依存しない (Warmup のみ参照)。
     fn lr(&self, batch: usize, superbatch: usize) -> f32;
 
+    /// Learning rate before the next optimizer update; completed_steps is zero-based.
+    fn lr_at_step(&self, batch: usize, superbatch: usize, _completed_steps: u64) -> f32 {
+        self.lr(batch, superbatch)
+    }
+
     /// curve が終端値に到達する superbatch (horizon)。終端を持つ schedule
     /// (linear / cosine / exponential decay の `final_superbatch`、one-cycle の
     /// `total_superbatch`) は `Some` を、horizon を持たない schedule
@@ -297,6 +302,77 @@ impl Display for OneCycleLR {
     }
 }
 
+/// One-cycle over optimizer updates, with the final value held after the cycle.
+#[derive(Clone, Debug)]
+pub struct StepOneCycleLR {
+    pub initial_lr: f32,
+    pub max_lr: f32,
+    pub final_lr: f32,
+    pub warmup_steps: u64,
+    pub total_steps: u64,
+}
+
+impl StepOneCycleLR {
+    pub fn new(
+        max_lr: f32,
+        warmup_pct: f32,
+        div_factor: f32,
+        final_div_factor: f32,
+        total_steps: u64,
+    ) -> Self {
+        let initial_lr = max_lr / div_factor;
+        Self {
+            initial_lr,
+            max_lr,
+            final_lr: initial_lr / final_div_factor,
+            warmup_steps: (f64::from(warmup_pct) * total_steps as f64).round() as u64,
+            total_steps,
+        }
+    }
+
+    pub fn at_step(&self, completed: u64) -> f32 {
+        if completed >= self.total_steps.saturating_sub(1) {
+            return self.final_lr;
+        }
+        // PyTorch phases end at warmup_steps - 1 and total_steps - 1.
+        let peak = self.warmup_steps as f64 - 1.0;
+        let step = completed as f64;
+        let (start, end, fraction) = if step <= peak && peak > 0.0 {
+            (self.initial_lr, self.max_lr, step / peak)
+        } else {
+            (
+                self.max_lr,
+                self.final_lr,
+                (step - peak) / (self.total_steps as f64 - 1.0 - peak),
+            )
+        };
+        (f64::from(end)
+            + (f64::from(start) - f64::from(end))
+                * 0.5
+                * (1.0 + (std::f64::consts::PI * fraction).cos())) as f32
+    }
+}
+
+impl LrScheduler for StepOneCycleLR {
+    fn lr(&self, _batch: usize, _superbatch: usize) -> f32 {
+        self.at_step(0)
+    }
+
+    fn lr_at_step(&self, _batch: usize, _superbatch: usize, completed_steps: u64) -> f32 {
+        self.at_step(completed_steps)
+    }
+}
+
+impl Display for StepOneCycleLR {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "one-cycle {} → max {} (warmup {} optimizer updates) → cosine anneal to {} over {} optimizer updates; final held",
+            self.initial_lr, self.max_lr, self.warmup_steps, self.final_lr, self.total_steps
+        )
+    }
+}
+
 /// `warmup_batches` 期間 (superbatch=1 内) で sub-scheduler の lr を warmup。
 #[derive(Clone, Debug)]
 pub struct WarmupLR<LR: LrScheduler> {
@@ -381,6 +457,7 @@ pub enum LrSchedulerEnum {
     CosineDecay(CosineDecayLR),
     ExponentialDecay(ExponentialDecayLR),
     OneCycle(OneCycleLR),
+    StepOneCycle(StepOneCycleLR),
     Warmup(Box<WarmupLR<LrSchedulerEnum>>),
 }
 
@@ -395,6 +472,13 @@ impl LrSchedulerEnum {
 }
 
 impl LrScheduler for LrSchedulerEnum {
+    fn lr_at_step(&self, batch: usize, superbatch: usize, completed_steps: u64) -> f32 {
+        match self {
+            Self::StepOneCycle(s) => s.at_step(completed_steps),
+            _ => self.lr(batch, superbatch),
+        }
+    }
+
     fn lr(&self, batch: usize, superbatch: usize) -> f32 {
         match self {
             Self::Constant(s) => s.lr(batch, superbatch),
@@ -404,6 +488,7 @@ impl LrScheduler for LrSchedulerEnum {
             Self::CosineDecay(s) => s.lr(batch, superbatch),
             Self::ExponentialDecay(s) => s.lr(batch, superbatch),
             Self::OneCycle(s) => s.lr(batch, superbatch),
+            Self::StepOneCycle(s) => s.lr(batch, superbatch),
             Self::Warmup(s) => s.lr(batch, superbatch),
         }
     }
@@ -417,6 +502,7 @@ impl LrScheduler for LrSchedulerEnum {
             Self::CosineDecay(s) => s.horizon(),
             Self::ExponentialDecay(s) => s.horizon(),
             Self::OneCycle(s) => s.horizon(),
+            Self::StepOneCycle(s) => s.horizon(),
             Self::Warmup(s) => s.horizon(),
         }
     }
@@ -430,6 +516,7 @@ impl LrScheduler for LrSchedulerEnum {
             Self::CosineDecay(s) => s.has_horizon(),
             Self::ExponentialDecay(s) => s.has_horizon(),
             Self::OneCycle(s) => s.has_horizon(),
+            Self::StepOneCycle(s) => s.has_horizon(),
             Self::Warmup(s) => s.has_horizon(),
         }
     }
@@ -445,6 +532,7 @@ impl Display for LrSchedulerEnum {
             Self::CosineDecay(s) => Display::fmt(s, f),
             Self::ExponentialDecay(s) => Display::fmt(s, f),
             Self::OneCycle(s) => Display::fmt(s, f),
+            Self::StepOneCycle(s) => Display::fmt(s, f),
             Self::Warmup(s) => Display::fmt(s, f),
         }
     }
@@ -705,6 +793,65 @@ mod tests {
     use super::*;
 
     const EPS: f32 = 1e-6;
+
+    #[test]
+    fn step_one_cycle_matches_pytorch_cosine_phases() {
+        for (n, pct) in [(20, 0.3), (41, 0.21), (100, 0.2)] {
+            let schedule = StepOneCycleLR::new(1.0, pct, 25.0, 100.0, n);
+            let warmup = (f64::from(pct) * n as f64).round();
+            let reference = |step: u64| {
+                if step >= n - 1 {
+                    return 0.0004_f64;
+                }
+                let (start, end, progress) = if step as f64 <= warmup - 1.0 {
+                    (0.04, 1.0, step as f64 / (warmup - 1.0))
+                } else {
+                    (
+                        1.0,
+                        0.0004,
+                        (step as f64 - (warmup - 1.0)) / (n as f64 - warmup),
+                    )
+                };
+                end + (start - end) / 2.0 * ((std::f64::consts::PI * progress).cos() + 1.0)
+            };
+            for step in [
+                0,
+                1,
+                warmup as u64 - 1,
+                warmup as u64,
+                n / 2,
+                n - 1,
+                n,
+                n + 10,
+            ] {
+                assert!((f64::from(schedule.at_step(step)) - reference(step)).abs() < 1e-7);
+            }
+            assert_eq!(schedule.at_step(0).to_bits(), schedule.initial_lr.to_bits());
+        }
+    }
+
+    #[test]
+    fn step_one_cycle_degenerate_phases_are_finite_and_saturate() {
+        for n in [1, 2, 10] {
+            for pct in [0.0, 0.1, 1.0] {
+                let s = StepOneCycleLR::new(1.0, pct, 25.0, 100.0, n);
+                for step in 0..n + 2 {
+                    assert!(s.at_step(step).is_finite());
+                }
+                assert_eq!(s.at_step(n), s.final_lr);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_one_cycle_step_dispatch_is_bit_identical() {
+        let s = LrSchedulerEnum::OneCycle(OneCycleLR::new(0.001, 0.2, 25.0, 100.0, 10));
+        for sb in 0..20 {
+            for step in [0, 1, 100, u64::MAX] {
+                assert_eq!(s.lr_at_step(3, sb, step).to_bits(), s.lr(3, sb).to_bits());
+            }
+        }
+    }
 
     #[test]
     fn constant_lr_is_invariant() {

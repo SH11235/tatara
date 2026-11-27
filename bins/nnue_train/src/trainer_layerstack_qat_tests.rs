@@ -1079,6 +1079,7 @@ fn adam_bias_correction_matches_reference_with_fused_and_unfused_ft() -> TestRes
                         "tatara-adam-resume-{}-{fused}-{half_state}.ckpt",
                         std::process::id()
                     ));
+                    t.lr_total_steps = Some(100);
                     t.save_raw_checkpoint(
                         &path,
                         2,
@@ -1086,8 +1087,10 @@ fn adam_bias_correction_matches_reference_with_fused_and_unfused_ft() -> TestRes
                         Some(10),
                     )?;
                     t.step_count = 0;
+                    t.lr_total_steps = None;
                     t.load_raw_checkpoint(&path, false)?;
                     assert_eq!(t.step_count, 2);
+                    assert_eq!(t.lr_total_steps, Some(100));
                     std::fs::remove_file(path)?;
                 }
                 let g = if step == 2 { -0.02_f32 } else { 0.01_f32 };

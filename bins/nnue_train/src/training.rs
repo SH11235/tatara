@@ -1185,7 +1185,11 @@ pub(crate) fn run_training(
         );
     }
 
-    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
+    let lr_scheduler = build_resumed_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
+    trainer.lr_total_steps = match &lr_scheduler {
+        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+        _ => None,
+    };
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
@@ -1388,7 +1392,7 @@ pub(crate) fn run_training(
         data,
         teacher_shuffle_buffer_mib,
         teacher_shuffle,
-        lr_scheduler.to_string(),
+        &lr_scheduler,
         fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
@@ -1471,8 +1475,23 @@ pub(crate) fn build_lr_scheduler(
     cli: &Cli,
     resumed_horizon: Option<usize>,
 ) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+    build_lr_scheduler_with_steps(cli, resumed_horizon, cli.lr_total_steps)
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn build_lr_scheduler_with_steps(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    total_steps: Option<u64>,
+) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
     use nnue_train::schedule::*;
 
+    if total_steps.is_some() && cli.lr_schedule != LrScheduleArg::OneCycle {
+        return Err("--lr-total-steps requires --lr-schedule one-cycle".into());
+    }
+    if total_steps == Some(0) {
+        return Err("--lr-total-steps must be positive".into());
+    }
     let lr = cli.lr;
     // linear / cosine / exponential の減衰終端 superbatch。優先順位は explicit
     // --lr-final-superbatch > resume した保存 horizon > --superbatches。horizon を
@@ -1543,16 +1562,24 @@ pub(crate) fn build_lr_scheduler(
                 )
                 .into());
             }
-            // one-cycle は専用の horizon flag を持たないので、explicit 引数は常に
-            // None。resume した保存 horizon があればそれを、無ければ --superbatches。
-            let total = resolve_lr_horizon(None, resumed_horizon, cli.superbatches).max(1);
-            LrSchedulerEnum::OneCycle(OneCycleLR::new(
-                lr,
-                cli.lr_warmup_pct,
-                cli.lr_div_factor,
-                cli.lr_final_div_factor,
-                total,
-            ))
+            if let Some(total) = total_steps {
+                LrSchedulerEnum::StepOneCycle(StepOneCycleLR::new(
+                    lr,
+                    cli.lr_warmup_pct,
+                    cli.lr_div_factor,
+                    cli.lr_final_div_factor,
+                    total,
+                ))
+            } else {
+                let total = resolve_lr_horizon(None, resumed_horizon, cli.superbatches).max(1);
+                LrSchedulerEnum::OneCycle(OneCycleLR::new(
+                    lr,
+                    cli.lr_warmup_pct,
+                    cli.lr_div_factor,
+                    cli.lr_final_div_factor,
+                    total,
+                ))
+            }
         }
     };
 
@@ -1567,11 +1594,35 @@ pub(crate) fn build_lr_scheduler(
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn build_resumed_lr_scheduler(
+    cli: &Cli,
+    resumed_horizon: Option<usize>,
+    saved_steps: Option<u64>,
+) -> Result<LrSchedulerEnum, Box<dyn std::error::Error>> {
+    if let Some(saved) = saved_steps {
+        if cli.lr_schedule != LrScheduleArg::OneCycle
+            || cli.lr_total_steps.is_some_and(|n| n != saved)
+        {
+            return Err("resumed optimizer-step one-cycle requires the same --lr-total-steps and --lr-schedule one-cycle".into());
+        }
+        build_lr_scheduler_with_steps(cli, None, Some(saved))
+    } else {
+        if cli.resume.is_some() && !cli.transfer_radam_momentum && cli.lr_total_steps.is_some() {
+            return Err(
+                "--lr-total-steps does not match the resumed checkpoint's superbatch schedule"
+                    .into(),
+            );
+        }
+        build_lr_scheduler(cli, resumed_horizon)
+    }
+}
+
 /// LR schedule の horizon (decay の `final_superbatch` / one-cycle の
 /// `total_superbatch`) を解決する。優先順位:
 ///
 /// 1. `explicit` — resume か否かに関わらず明示された CLI horizon flag
-///    (decay の `--lr-final-superbatch`)。one-cycle は専用 flag が無いため常に `None`。
+///    (decay の `--lr-final-superbatch`)。superbatch 単位の one-cycle では `None`。
 /// 2. `resumed` — v5+ checkpoint から復元した保存済 horizon。curve を
 ///    `--superbatches` から独立に再現させる。
 /// 3. `default` — `--superbatches` 由来の fallback (新規 run / 保存 horizon 無し)。
@@ -2156,7 +2207,7 @@ fn build_experiment_params(
     start_superbatch: usize,
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     trainer: ExperimentTrainerParams,
 ) -> Params {
     let is_wrm = cli.win_rate_model;
@@ -2181,7 +2232,11 @@ fn build_experiment_params(
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
-        lr_schedule,
+        lr_total_steps: match lr_schedule {
+            LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+            _ => None,
+        },
+        lr_schedule: lr_schedule.to_string(),
         batch_size: cli.batch_size,
         batches_per_superbatch: cli.batches_per_superbatch,
         superbatches: cli.superbatches,
@@ -2281,7 +2336,7 @@ pub(crate) fn build_experiment_logger(
     data: &[PathBuf],
     teacher_shuffle_buffer_mib: usize,
     teacher_shuffle: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     fv_scale: Option<i32>,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
@@ -2426,7 +2481,7 @@ pub(crate) fn build_experiment_logger_simple(
     ft_fp16_out: bool,
     fp16_opt_state: bool,
     tf32: bool,
-    lr_schedule: String,
+    lr_schedule: &LrSchedulerEnum,
     // export される `.bin` の実効値。入力 weight と CLI override の解決後に trainer
     // が保持する値を渡す。
     fv_scale: i32,
@@ -2817,7 +2872,11 @@ pub(crate) fn run_simple_training(
         .into());
     }
 
-    let lr_scheduler = build_lr_scheduler(cli, resumed_lr_horizon)?;
+    let lr_scheduler = build_resumed_lr_scheduler(cli, resumed_lr_horizon, trainer.lr_total_steps)?;
+    trainer.lr_total_steps = match &lr_scheduler {
+        LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
+        _ => None,
+    };
     let wdl_scheduler = build_wdl_scheduler(cli)?;
     let cfg = TrainingConfig {
         control_file: cli.control_file.clone(),
@@ -2882,7 +2941,7 @@ pub(crate) fn run_simple_training(
         ft_fp16_out,
         fp16_opt_state,
         tf32,
-        lr_scheduler.to_string(),
+        &lr_scheduler,
         trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
@@ -3546,7 +3605,7 @@ mod tests {
             std::slice::from_ref(&data),
             256,
             false,
-            "step".to_string(),
+            &LrSchedulerEnum::Constant(nnue_train::schedule::ConstantLR { value: 0.001 }),
             None,
         );
         logger.write().expect("write experiment.json");
@@ -3610,7 +3669,7 @@ mod tests {
             false,
             false,
             false,
-            "step".to_string(),
+            &LrSchedulerEnum::Constant(nnue_train::schedule::ConstantLR { value: 0.001 }),
             effective,
         );
         logger.write().expect("write experiment.json");
