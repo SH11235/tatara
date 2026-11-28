@@ -105,7 +105,7 @@ fn dispatch(
             #[cfg(feature = "gpu")]
             {
                 if !cli.data.is_empty()
-                    || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some())
+                    || matches!(&cli.arch, cli::ArchCommand::LayerStack(args) if args.qat.is_some() || args.qat_warmup_steps.is_some())
                     || layerstack_head == Some(nnue_format::LayerStackHead::DenseConcat)
                     || (layerstack_head.is_some() && cli.resume.is_some())
                     || cli.eval_only

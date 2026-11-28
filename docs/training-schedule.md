@@ -12,6 +12,15 @@ ranges, and defaults run `nnue-train --help` (the help text is the authoritative
 per-flag reference). This document covers the cross-flag behaviour the help text
 can't: what each scheduler does and how it interacts with `--resume`.
 
+## QAT warmup (`--qat-warmup-steps`)
+
+LayerStack `--qat dense --qat-warmup-steps N` disables QAT for the first N
+optimizer updates, then switches it on. The counter is cumulative across resume
+and independent of the LR schedule. An omitted value inherits the checkpoint;
+an explicit mismatch is rejected. Older checkpoints have no warmup.
+Validation uses the current QAT state; integer export always quantizes the masters.
+See [Dense QAT](dense-qat.md#warmup) for scope and forward-only resume behavior.
+
 ## Learning rate schedule (`--lr-schedule`)
 
 `--lr-schedule` selects how the learning rate moves across the run. The options:

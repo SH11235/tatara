@@ -2421,6 +2421,7 @@ mod tests {
             lr: 1.0e-3,
             lr_gamma: 0.9,
             lr_step: 1,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             lr_schedule: "start 0.001 gamma 0.9 drop every 1 superbatches".to_string(),
             batch_size: 8,

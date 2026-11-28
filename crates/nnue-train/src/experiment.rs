@@ -257,6 +257,8 @@ pub struct Params {
     /// 他スケジュールでは未使用なため、再現に必要な実効形をここに残す。
     pub lr_schedule: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qat_warmup_steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lr_total_steps: Option<u64>,
     pub batch_size: usize,
     pub batches_per_superbatch: usize,
@@ -949,6 +951,19 @@ mod tests {
         steps.lr_total_steps = Some(100);
         assert_ne!(recipe_fingerprint(&steps, "teacher.psv"), fingerprint);
         assert_eq!(serde_json::to_value(&steps).unwrap()["lr_total_steps"], 100);
+        assert!(
+            serde_json::to_value(&base)
+                .unwrap()
+                .get("qat_warmup_steps")
+                .is_none()
+        );
+        let mut warmup = sample_params();
+        warmup.qat_warmup_steps = Some(100);
+        assert_ne!(recipe_fingerprint(&warmup, "teacher.psv"), fingerprint);
+        assert_eq!(
+            serde_json::to_value(&warmup).unwrap()["qat_warmup_steps"],
+            100
+        );
         let mut holdout = sample_params();
         holdout.test_tail_positions = Some(10_000);
         assert_ne!(recipe_fingerprint(&holdout, "teacher.psv"), fingerprint);
@@ -1161,6 +1176,7 @@ mod tests {
             lr: 8.75e-4,
             lr_gamma: 0.995,
             lr_step: 1,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             lr_schedule: "start 0.000875 gamma 0.995 drop every 1 superbatches".to_string(),
             batch_size: 65_536,

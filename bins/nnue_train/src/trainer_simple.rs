@@ -2921,6 +2921,7 @@ impl SimpleGpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                qat_warmup_steps: None,
                 lr_total_steps: self.lr_total_steps,
                 adam_bias_correction: self.adam_bias_correction,
                 fv_scale: Some(self.fv_scale()),

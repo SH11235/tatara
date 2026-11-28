@@ -11,6 +11,16 @@ superbatch index の関数として run ごとに再計算される。学習手�
 テキストが唯一の真実源）。本ドキュメントはヘルプでは書けない、各 scheduler の
 挙動と `--resume` との相互作用を扱う。
 
+## QAT の warmup（`--qat-warmup-steps`）
+
+LayerStack の `--qat dense --qat-warmup-steps N` は最初の N 回の optimizer
+更新を QAT off で行い、完了更新数が N に達した後の更新から dense QAT に切り替える。
+更新数は resume をまたいで通算し、学習率スケジュールには依存しない。
+resume 時の省略は保存値を継承し、異なる値の明示指定は拒否する。
+保存値のない checkpoint は warmup なしとして扱う。
+検証はその時点の QAT 状態を使い、整数形式への書き出しは常に master を量子化する。
+切り替え範囲と forward-only resume の扱いは [Dense QAT](dense-qat.md#warmup) を参照。
+
 ## 学習率スケジュール（`--lr-schedule`）
 
 `--lr-schedule` は学習率を run 全体でどう動かすかを選ぶ。選択肢:
