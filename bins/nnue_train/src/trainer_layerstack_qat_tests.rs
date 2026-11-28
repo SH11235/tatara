@@ -1216,3 +1216,71 @@ fn shared_l1_decay_changes_only_shared_weight_and_default_is_bit_identical() -> 
     }
     Ok(())
 }
+
+#[test]
+fn qat_warmup_matches_off_dense_and_resume_across_boundary() -> TestResult {
+    let ctx = test_cuda_context()?;
+    let mut scheduled = trainer(&ctx, 128, false)?;
+    let mut reference = trainer(&ctx, 128, false)?;
+    let mut resumed = trainer(&ctx, 128, false)?;
+    let path = std::env::temp_dir().join(format!("tatara-qat-warmup-{}.ckpt", std::process::id()));
+    let producer = nnue_train::trainer::CheckpointProducer::run_id_only("test");
+    scheduled.configure_qat(Some(QatMode::Dense))?;
+    scheduled.qat_warmup_steps = Some(2);
+    scheduled.save_raw_checkpoint(&path, 0, &producer, None)?;
+    reference.load_raw_checkpoint(&path, false)?;
+    reference.qat_warmup_steps = None;
+    let batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
+
+    fn bits(t: &GpuTrainer) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let (_, groups) = t.raw_checkpoint_state_to_host()?;
+        Ok(groups
+            .into_iter()
+            .flat_map(|(_, (w, m, v, slow))| {
+                w.into_iter()
+                    .chain(m)
+                    .chain(v)
+                    .chain(slow)
+                    .map(f32::to_bits)
+            })
+            .collect())
+    }
+
+    for step in 0..4 {
+        reference.configure_qat(Some(if step < 2 {
+            QatMode::Off
+        } else {
+            QatMode::Dense
+        }))?;
+        let expected = reference.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+        let actual = scheduled.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
+        assert_eq!(actual.loss.to_bits(), expected.loss.to_bits());
+        assert_eq!(
+            actual
+                .net_output
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .net_output
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(scheduled.step_count, step);
+        scheduled.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
+        reference.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
+        assert_eq!(bits(&scheduled)?, bits(&reference)?, "step={step}");
+        if step == 0 {
+            scheduled.save_raw_checkpoint(&path, 1, &producer, None)?;
+            resumed.load_raw_checkpoint(&path, false)?;
+            assert_eq!(resumed.qat_warmup_steps, Some(2));
+            assert_eq!(resumed.step_count, 1);
+        } else {
+            resumed.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
+            assert_eq!(bits(&scheduled)?, bits(&resumed)?, "resumed step={step}");
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}

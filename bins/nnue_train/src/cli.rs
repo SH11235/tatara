@@ -1739,6 +1739,10 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, value_enum)]
     pub(crate) qat: Option<crate::qat::QatMode>,
 
+    /// Disable dense QAT for the first N optimizer updates. Requires dense QAT.
+    #[arg(long)]
+    pub(crate) qat_warmup_steps: Option<u64>,
+
     /// Evaluation scale written to the LayerStack architecture string. When
     /// omitted, sigmoid loss derives it from `--scale`; WRM loss leaves the
     /// token out so the consuming engine can supply it through its FV_SCALE

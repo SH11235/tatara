@@ -1969,6 +1969,7 @@ pub(crate) struct GpuTrainer {
     optimizer: OptimizerKind,
     pub(crate) adam_bias_correction: bool,
     step_count: u64,
+    pub(crate) qat_warmup_steps: Option<u64>,
     pub(crate) lr_total_steps: Option<u64>,
     #[cfg(feature = "native")]
     precision_diagnostic: Option<crate::precision_diagnostics::Diagnostic>,
@@ -3061,6 +3062,7 @@ impl GpuTrainer {
             freeze_ft: false,
             optimizer,
             step_count: 0,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             #[cfg(feature = "native")]
             precision_diagnostic: None,
@@ -3829,6 +3831,7 @@ impl GpuTrainer {
                 superbatch,
                 step_count: self.step_count,
                 lr_horizon,
+                qat_warmup_steps: self.qat_warmup_steps,
                 lr_total_steps: self.lr_total_steps,
                 adam_bias_correction: self.adam_bias_correction,
                 fv_scale: None,
@@ -3989,6 +3992,7 @@ impl GpuTrainer {
         }
 
         self.step_count = header.step_count;
+        self.qat_warmup_steps = header.qat_warmup_steps;
         self.lr_total_steps = header.lr_total_steps;
         self.sync_stack_forward_weights()?;
         Ok((header.superbatch, header.producer(), header.lr_horizon))
@@ -4712,11 +4716,11 @@ impl GpuTrainer {
         // release で debug_assert! が消えるので、ここで `step_impl` 直入りされた場合の保険として
         // 明示的な runtime check を入れる。
         let mut context = StepContext::new(self, batch, options)?;
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             self.configure_qat(None)?;
         }
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             self.qat_prepare()?;
         }
         let result: Result<Option<StepOutput>, Box<dyn std::error::Error>> = (|| {
@@ -4727,7 +4731,7 @@ impl GpuTrainer {
             Ok(None)
         })();
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             self.qat_swap();
         }
         if let Some(output) = result? {
@@ -4758,7 +4762,7 @@ impl GpuTrainer {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let l2_out = if include_l2 { self.ws.l2_out } else { 0 };
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             let output = if include_l2 {
                 &self.ws.l2_acted
             } else {
@@ -4787,7 +4791,7 @@ impl GpuTrainer {
 
     fn dense_concat_output(&mut self, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             return self.dense_concat_qat_output(batch);
         }
         // SAFETY: the L1 buffer has two or more values per row and each output row is unique.
@@ -5136,7 +5140,7 @@ impl GpuTrainer {
             }
         }?;
 
-        let fused_qat = cfg!(feature = "native") && self.qat_mode != crate::qat::QatMode::Off;
+        let fused_qat = cfg!(feature = "native") && self.qat_active();
         #[cfg(feature = "native")]
         if fused_qat {
             self.launch_ft_post_qat_sorted(b)?;
@@ -5188,7 +5192,7 @@ impl GpuTrainer {
 
         // Dense QAT recomputes the whole of `l1_total` from `combined_sorted` with the integer
         // kernel below, so the floating L1 / L1-shared products would only be overwritten.
-        let qat_l1 = cfg!(feature = "native") && self.qat_mode != crate::qat::QatMode::Off;
+        let qat_l1 = cfg!(feature = "native") && self.qat_active();
         // FP32 without the integer QAT L1 computes the per-bucket and shared L1 products and their
         // sum in one kernel from `combined_sorted`, writing `l1_total` in the original row order.
         // Backward reads only `l1_total`, so `l1_bucket_sorted` / `l1_shared_out` are not materialized.
@@ -5408,7 +5412,7 @@ impl GpuTrainer {
             }?;
 
             #[cfg(feature = "native")]
-            if self.qat_mode != crate::qat::QatMode::Off {
+            if self.qat_active() {
                 self.qat_activations(1, b)?;
             }
         }
@@ -5441,7 +5445,7 @@ impl GpuTrainer {
         }?;
 
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             self.qat_dense_forward(2, b)?;
         }
         if self.ws.head == LayerStackHead::DenseConcat {
@@ -5465,7 +5469,7 @@ impl GpuTrainer {
             }?;
 
             #[cfg(feature = "native")]
-            if self.qat_mode != crate::qat::QatMode::Off {
+            if self.qat_active() {
                 self.qat_activations(2, b)?;
             }
         }
@@ -5499,7 +5503,7 @@ impl GpuTrainer {
         }?;
 
         #[cfg(feature = "native")]
-        if self.qat_mode != crate::qat::QatMode::Off {
+        if self.qat_active() {
             self.qat_dense_forward(3, b)?;
         }
         if self.ws.head == LayerStackHead::DenseConcat {
@@ -5524,7 +5528,7 @@ impl GpuTrainer {
             }?;
 
             #[cfg(feature = "native")]
-            if self.qat_mode != crate::qat::QatMode::Off {
+            if self.qat_active() {
                 self.qat_activations(3, b)?;
             }
         }

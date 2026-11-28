@@ -27,6 +27,37 @@ Use matching explicit learning-rate settings and, for schedules with a horizon,
 the QAT effect. Resume does not restore an exact data cursor; equal source and loader
 settings do not promise identical input order across runs.
 
+## Warmup
+
+For fresh LayerStack training, add `--qat dense --qat-warmup-steps N`.
+The first N optimizer updates use the same forward/backward path as `--qat off`;
+once the number of completed updates reaches N, the next update uses dense QAT.
+This is an abrupt switch, like nnue-pytorch's `fake_quant_warmup_steps`, independent
+of the learning-rate schedule. Zero enables QAT immediately. The option requires
+dense QAT and is unavailable for Simple.
+
+Warmup gates dense weight/bias quantization, quantized activation/output forward,
+and the corresponding STE backward. FT precision settings and optimizer weight
+clamps stay unchanged: those clamps also apply with `--qat off`.
+
+Held-out loss and accuracy use the QAT state at the current completed-update
+count without advancing it. For example, validation after update N uses dense
+QAT. Integer `.bin` export always quantizes the master weights, including during
+warmup, so its predictions can differ from the floating-point validation path.
+Raw checkpoints preserve the masters, optimizer update count, and warmup setting.
+
+On training resume, an omitted warmup option inherits the saved value; an explicit
+different value is rejected. Checkpoints without the field mean no warmup and
+cannot acquire one through ordinary resume. Warmup checkpoints use raw format 18;
+older readers reject them. Without this option, the writer retains the existing
+format selection. Eval-only and rescore resume skip warmup-setting comparison;
+eval-only uses the saved count and warmup with the effective QAT mode. Rescore
+still requires `--qat off`.
+
+When present, the effective setting is printed at startup and recorded as
+`params.qat_warmup_steps`, which participates in the recipe fingerprint. Without
+a requested or inherited setting, the field and warmup log are omitted.
+
 ## Scope and arithmetic
 
 This is **partial dense QAT** on the native CUDA backend (Linux or Windows).

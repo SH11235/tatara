@@ -212,7 +212,7 @@ fn raw_ckpt_constants_are_stable() {
     // magic は format identity。version は後方互換読み (version 1..=9 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 17);
+    assert_eq!(RAW_CKPT_VERSION, 18);
 }
 
 #[test]
@@ -227,6 +227,7 @@ fn raw_ckpt_marks_sgd_without_changing_adam_layout() {
         superbatch: 1,
         step_count: 1,
         lr_horizon: None,
+        qat_warmup_steps: None,
         lr_total_steps: None,
         adam_bias_correction: false,
         fv_scale: None,
@@ -275,6 +276,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             superbatch: 1201,
             step_count: 10,
             lr_horizon: None,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             adam_bias_correction: false,
             fv_scale: None,
@@ -313,6 +315,7 @@ fn qat_mode_header_roundtrip_and_legacy_default() {
             superbatch: 1,
             step_count: 1,
             lr_horizon: None,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             adam_bias_correction: false,
             fv_scale: Some(14),
@@ -452,6 +455,7 @@ fn write_raw_ckpt_header<W: std::io::Write>(
             superbatch: superbatch.try_into().expect("test superbatch fits usize"),
             step_count,
             lr_horizon,
+            qat_warmup_steps: None,
             lr_total_steps: None,
             adam_bias_correction: false,
             fv_scale: None,
@@ -477,6 +481,7 @@ fn write_raw_ckpt_header_with_fv_scale(
             superbatch: 9,
             step_count: 90,
             lr_horizon: Some(120),
+            qat_warmup_steps: None,
             lr_total_steps: None,
             adam_bias_correction: false,
             fv_scale,
@@ -1049,6 +1054,7 @@ fn raw_ckpt_v11_producer_identity_round_trips() {
                 superbatch: 420,
                 step_count: 1,
                 lr_horizon: None,
+                qat_warmup_steps: None,
                 lr_total_steps: None,
                 adam_bias_correction: false,
                 fv_scale: None,
@@ -1104,6 +1110,7 @@ fn partial_threat_checkpoint_identity_and_full_width_bytes() {
         superbatch: 1,
         step_count: 5,
         lr_horizon: None,
+        qat_warmup_steps: None,
         lr_total_steps: None,
         adam_bias_correction: false,
         fv_scale: None,
@@ -1263,6 +1270,7 @@ fn packed_ft_optimizer_payload_roundtrips_and_transfers_momentum()
                 superbatch: 6,
                 step_count: 12,
                 lr_horizon: Some(20),
+                qat_warmup_steps: None,
                 lr_total_steps: None,
                 adam_bias_correction: false,
                 fv_scale: None,
@@ -1447,6 +1455,7 @@ fn forward_only_resume_skips_optimizer_step_schedule_check() {
         superbatch: 7,
         step_count: 123,
         lr_horizon: None,
+        qat_warmup_steps: None,
         lr_total_steps: Some(500),
         adam_bias_correction: false,
         fv_scale: None,
@@ -1480,6 +1489,17 @@ fn forward_only_resume_skips_optimizer_step_schedule_check() {
         ],
     ] {
         let cli = parse(mode);
+        assert_eq!(
+            crate::qat::resolve_warmup(
+                Some(99),
+                Some(2),
+                crate::qat::QatMode::Off,
+                cli.resume.is_some(),
+                crate::training::is_forward_only(&cli),
+            )
+            .unwrap(),
+            Some(2),
+        );
         assert!(
             build_layerstack_lr_scheduler(&cli, header.lr_horizon, header.lr_total_steps)
                 .unwrap()
@@ -1512,6 +1532,7 @@ fn optimizer_step_schedule_checkpoint_envelope_preserves_layout_and_counter() {
             superbatch: 7,
             step_count: 123,
             lr_horizon: None,
+            qat_warmup_steps: None,
             lr_total_steps: Some(500),
             adam_bias_correction: false,
             fv_scale: None,
@@ -1561,6 +1582,7 @@ fn adam_bias_checkpoint_roundtrip_and_resume_reject_mismatches() {
                 superbatch: 7,
                 step_count: 123,
                 lr_horizon: None,
+                qat_warmup_steps: None,
                 lr_total_steps: total,
                 adam_bias_correction: corrected,
                 fv_scale: None,
@@ -1600,6 +1622,45 @@ fn adam_bias_checkpoint_roundtrip_and_resume_reject_mismatches() {
                 invalid[20] = 2;
                 assert!(RawCkptReader::new(invalid.as_slice(), RawCkptReadMode::Resume).is_err());
                 assert!(RawCkptReader::new(&bytes[..20], RawCkptReadMode::Resume).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn qat_warmup_header_roundtrip_and_legacy_default() {
+    for warmup in [None, Some(0), Some(2), Some(u64::MAX)] {
+        for adam_bias_correction in [false, true] {
+            for lr_total_steps in [None, Some(100)] {
+                let arch = layerstack_arch();
+                let meta = RawCkptMeta {
+                    optimizer: nnue_train::optimizer::OptimizerKind::RAdam,
+                    qat_dense: true,
+                    run_id: "",
+                    superbatch: 1,
+                    step_count: 1,
+                    lr_horizon: None,
+                    lr_total_steps,
+                    qat_warmup_steps: warmup,
+                    adam_bias_correction,
+                    fv_scale: None,
+                    net_id: "",
+                    recipe_fingerprint: None,
+                };
+                let mut bytes = Vec::new();
+                nnue_train::raw_checkpoint::write_raw_ckpt_header(&mut bytes, &arch, &meta, 10)
+                    .unwrap();
+                let header = read_raw_ckpt_header(&mut Cursor::new(&bytes), &arch).unwrap();
+                assert_eq!(header.qat_warmup_steps, warmup);
+                assert_eq!(header.step_count, 1);
+                assert_eq!(header.lr_total_steps, lr_total_steps);
+                assert_eq!(header.adam_bias_correction, adam_bias_correction);
+                let reader = nnue_train::raw_checkpoint::RawCkptReader::new(
+                    Cursor::new(&bytes),
+                    nnue_train::raw_checkpoint::RawCkptReadMode::Average,
+                )
+                .unwrap();
+                assert_eq!(reader.qat_warmup_steps(), warmup);
             }
         }
     }

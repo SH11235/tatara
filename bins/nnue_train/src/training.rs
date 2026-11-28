@@ -608,6 +608,13 @@ pub(crate) fn run_training(
     if cli.eval_only && cli.init_from.is_none() && cli.resume.is_none() {
         return Err("--eval-only requires --init-from or --resume (weights to evaluate)".into());
     }
+    if layerstack.qat_warmup_steps.is_some()
+        && !(is_forward_only(cli) && cli.resume.is_some())
+        && (layerstack.qat == Some(crate::qat::QatMode::Off)
+            || (cli.resume.is_none() && layerstack.qat.is_none()))
+    {
+        return Err("--qat-warmup-steps requires --qat dense".into());
+    }
     validate_rescore_cli(cli, layerstack)?;
 
     let shared = validate_shared_cli(cli, layerstack.ft_fp16_out, layerstack.tf32)?;
@@ -1153,6 +1160,19 @@ pub(crate) fn run_training(
     };
 
     trainer.configure_qat(layerstack.qat)?;
+    trainer.qat_warmup_steps = crate::qat::resolve_warmup(
+        layerstack.qat_warmup_steps,
+        trainer.qat_warmup_steps,
+        trainer.qat_mode,
+        cli.resume.is_some() && !cli.transfer_radam_momentum,
+        is_forward_only(cli),
+    )?;
+    if let Some(steps) = trainer.qat_warmup_steps {
+        println!(
+            "[train] QAT warmup: {steps} optimizer updates; active={}",
+            trainer.qat_active()
+        );
+    }
     if trainer.qat_mode != crate::qat::QatMode::Off && cli.rescore_input.is_some() {
         return Err("--rescore-input does not support dense QAT; use --qat off".into());
     }
@@ -1383,6 +1403,7 @@ pub(crate) fn run_training(
         layerstack,
         head,
         trainer.qat_mode,
+        trainer.qat_warmup_steps,
         bucket_mode,
         feature_set,
         start_superbatch,
@@ -2189,6 +2210,7 @@ pub(crate) fn resolve_lineage_kind(
 
 #[cfg(feature = "gpu")]
 struct ExperimentTrainerParams {
+    qat_warmup_steps: Option<u64>,
     qat: String,
     architecture: String,
     feature_set: FeatureSetSpec,
@@ -2243,6 +2265,7 @@ fn build_experiment_params(
         lr: finite_or_zero(cli.lr),
         lr_gamma: finite_or_zero(cli.lr_gamma),
         lr_step: cli.lr_step.max(1),
+        qat_warmup_steps: trainer.qat_warmup_steps,
         lr_total_steps: match lr_schedule {
             LrSchedulerEnum::StepOneCycle(s) => Some(s.total_steps),
             _ => None,
@@ -2339,6 +2362,7 @@ pub(crate) fn build_experiment_logger(
     layerstack: &LayerstackArgs,
     head: nnue_format::LayerStackHead,
     qat: crate::qat::QatMode,
+    qat_warmup_steps: Option<u64>,
     bucket_mode: BucketMode,
     feature_set: FeatureSetSpec,
     start_superbatch: usize,
@@ -2383,6 +2407,7 @@ pub(crate) fn build_experiment_logger(
         lr_schedule,
         ExperimentTrainerParams {
             qat: qat.name().into(),
+            qat_warmup_steps,
             architecture: layerstack_architecture(
                 layerstack.ft_out,
                 layerstack.l1,
@@ -2532,6 +2557,7 @@ pub(crate) fn build_experiment_logger_simple(
         lr_schedule,
         ExperimentTrainerParams {
             qat: "off".into(),
+            qat_warmup_steps: None,
             architecture,
             feature_set: id.feature_set,
             threat_width: None,
@@ -3608,6 +3634,7 @@ mod tests {
             layerstack,
             nnue_format::LayerStackHead::SplitSkip,
             crate::qat::QatMode::Dense,
+            Some(100),
             bucket_mode,
             FeatureSet::HalfKaHmMerged.spec(),
             1,
@@ -3629,6 +3656,7 @@ mod tests {
             serde_json::json!(BucketMode::ProgressKpAbs.canonical_name())
         );
         assert_eq!(json["params"]["qat"], "dense");
+        assert_eq!(json["params"]["qat_warmup_steps"], 100);
         assert!(
             layerstack.qat.is_none(),
             "metadata uses the inherited effective mode"

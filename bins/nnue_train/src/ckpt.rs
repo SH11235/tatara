@@ -31,12 +31,13 @@ use crate::trainer_common::MomentBuf;
 // ===========================================================================
 // raw checkpoint format (`--resume` 用)
 //
-// layout (全 little-endian、現行 RAW_CKPT_VERSION = 17):
+// layout (全 little-endian、現行 RAW_CKPT_VERSION = 18):
 //
 //   magic        b"RNRC"             (4 bytes)
-//   version      u32 (11..=17)             (4 bytes)
+//   version      u32 (11..=18)             (4 bytes)
 //   v16 envelope u32 layout (11..=15) + u64 LR total steps; remainder uses layout
 //   v17 envelope u32 layout + u64 LR total steps (0 = absent) + u8 Adam bias correction
+//   v18 envelope v17 fields + u64 QAT warmup steps
 //   fs_name_len  u32                 (4 bytes、feature set canonical 名の長さ)
 //   fs_name      UTF-8 [fs_name_len]  (feature set canonical 名、例 "halfka-hm-merged")
 //   ft_in        u64                 (学習側 FT 入力次元、feature set 依存)
@@ -73,7 +74,7 @@ use crate::trainer_common::MomentBuf;
 //
 // header 部の write / read は write_raw_ckpt_header / read_raw_ckpt_header、
 // group 本体込みの file 全体は save_raw_checkpoint_file / load_raw_checkpoint_file。
-// version 互換規則 (1..=17 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
+// version 互換規則 (1..=18 の受理と各 version の差分) は RAW_CKPT_VERSION の doc を参照。
 // ===========================================================================
 
 /// resume 元 checkpoint を書き出した run の識別情報 (header に記録が無い項目は `None`)。
@@ -324,6 +325,7 @@ pub(crate) struct RawCkptHeader {
     /// LR-schedule horizon (version 5+ かつ horizon を持つ schedule なら `Some`)。
     /// version 1..=4 や horizon を持たない schedule では `None`。
     pub(crate) lr_horizon: Option<usize>,
+    pub(crate) qat_warmup_steps: Option<u64>,
     pub(crate) lr_total_steps: Option<u64>,
     #[cfg(any(feature = "gpu", test))]
     pub(crate) adam_bias_correction: bool,
@@ -336,7 +338,7 @@ pub(crate) struct RawCkptHeader {
 }
 
 /// raw checkpoint の header を読み、`expected` の arch identity と照合する。
-/// version 1..=17 を受理し、不一致 / 破損は `InvalidData` で reject する。
+/// version 1..=18 を受理し、不一致 / 破損は `InvalidData` で reject する。
 ///
 /// version 1..=3 は arch-kind header を持たず暗黙に `layerstack`。version 4 は
 /// arch_kind 名と topology 次元列を `expected` と照合する。version 5 は
@@ -565,6 +567,7 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
         num_groups,
         producer_run_id,
         lr_horizon,
+        qat_warmup_steps: reader.qat_warmup_steps(),
         lr_total_steps: reader.lr_total_steps(),
         #[cfg(any(feature = "gpu", test))]
         adam_bias_correction: reader.adam_bias_correction(),

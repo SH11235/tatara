@@ -126,6 +126,10 @@ impl GpuTrainer {
         Ok(())
     }
 
+    pub(crate) fn qat_active(&self) -> bool {
+        self.qat_mode.active(self.qat_warmup_steps, self.step_count)
+    }
+
     pub(crate) fn configure_qat(
         &mut self,
         mode: Option<crate::qat::QatMode>,
