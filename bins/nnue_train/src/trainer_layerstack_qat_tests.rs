@@ -1227,31 +1227,64 @@ fn qat_warmup_matches_off_dense_and_resume_across_boundary() -> TestResult {
     let producer = nnue_train::trainer::CheckpointProducer::run_id_only("test");
     scheduled.configure_qat(Some(QatMode::Dense))?;
     scheduled.qat_warmup_steps = Some(2);
-    scheduled.save_raw_checkpoint(&path, 0, &producer, None)?;
-    reference.load_raw_checkpoint(&path, false)?;
-    reference.qat_warmup_steps = None;
-    let batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
-
-    fn bits(t: &GpuTrainer) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        let (_, groups) = t.raw_checkpoint_state_to_host()?;
-        Ok(groups
-            .into_iter()
-            .flat_map(|(_, (w, m, v, slow))| {
-                w.into_iter()
-                    .chain(m)
-                    .chain(v)
-                    .chain(slow)
-                    .map(f32::to_bits)
-            })
-            .collect())
+    reference.configure_qat(Some(QatMode::Off))?;
+    let mut batch = BatchData::smoke_dummy(16, FeatureSet::HalfKaHmMerged.spec());
+    // Identical rows make atomic bucket ordering and gradient accumulation order irrelevant
+    // to bitwise comparisons while retaining nonzero gradients through the full training path.
+    let max_active = FeatureSet::HalfKaHmMerged.spec().max_active();
+    for indices in [&mut batch.stm_indices, &mut batch.nstm_indices] {
+        let row = indices[..max_active].to_vec();
+        for target in indices.chunks_exact_mut(max_active) {
+            target.copy_from_slice(&row);
+        }
     }
 
+    fn assert_state_eq(a: &GpuTrainer, b: &GpuTrainer) -> TestResult {
+        let (a_step, a_groups) = a.raw_checkpoint_state_to_host()?;
+        let (b_step, b_groups) = b.raw_checkpoint_state_to_host()?;
+        assert_eq!(a_step, b_step);
+        assert_eq!(a_groups.len(), b_groups.len());
+        if a_step > 0 {
+            assert!(
+                a_groups
+                    .iter()
+                    .any(|(_, (_, m, _, _))| m.iter().any(|&v| v != 0.0))
+            );
+        }
+        for ((a_name, a), (b_name, b)) in a_groups.into_iter().zip(b_groups) {
+            assert_eq!(a_name, b_name);
+            for (component, a, b) in [
+                ("weight", a.0, b.0),
+                ("moment", a.1, b.1),
+                ("variance", a.2, b.2),
+                ("slow", a.3, b.3),
+            ] {
+                assert_eq!(a.len(), b.len(), "{a_name}/{component}");
+                for (index, (a, b)) in a.into_iter().zip(b).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "completed_steps={a_step} {a_name}/{component}[{index}]: {a} vs {b}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    assert_state_eq(&scheduled, &reference)?;
     for step in 0..4 {
-        reference.configure_qat(Some(if step < 2 {
-            QatMode::Off
-        } else {
-            QatMode::Dense
-        }))?;
+        if step == 2 {
+            reference.save_raw_checkpoint(&path, 0, &producer, None)?;
+            let mut dense = trainer(&ctx, 128, false)?;
+            dense.load_raw_checkpoint(&path, false)?;
+            dense.configure_qat(Some(QatMode::Dense))?;
+            assert_eq!(dense.qat_warmup_steps, None);
+            assert_state_eq(&reference, &dense)?;
+            reference = dense;
+        }
+        assert_eq!(scheduled.qat_active(), step >= 2);
+        assert_eq!(reference.qat_active(), step >= 2);
         let expected = reference.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
         let actual = scheduled.validate(&batch.as_ref(), 0.5, SMOKE_LOSS_WRM)?;
         assert_eq!(actual.loss.to_bits(), expected.loss.to_bits());
@@ -1270,15 +1303,16 @@ fn qat_warmup_matches_off_dense_and_resume_across_boundary() -> TestResult {
         assert_eq!(scheduled.step_count, step);
         scheduled.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
         reference.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
-        assert_eq!(bits(&scheduled)?, bits(&reference)?, "step={step}");
+        assert_state_eq(&scheduled, &reference)?;
         if step == 0 {
             scheduled.save_raw_checkpoint(&path, 1, &producer, None)?;
             resumed.load_raw_checkpoint(&path, false)?;
             assert_eq!(resumed.qat_warmup_steps, Some(2));
             assert_eq!(resumed.step_count, 1);
+            assert_state_eq(&scheduled, &resumed)?;
         } else {
             resumed.step(&batch.as_ref(), 0.001, 0.5, SMOKE_LOSS_WRM)?;
-            assert_eq!(bits(&scheduled)?, bits(&resumed)?, "resumed step={step}");
+            assert_state_eq(&scheduled, &resumed)?;
         }
     }
     std::fs::remove_file(path)?;

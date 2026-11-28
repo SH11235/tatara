@@ -1498,7 +1498,7 @@ fn forward_only_resume_skips_optimizer_step_schedule_check() {
                 crate::training::is_forward_only(&cli),
             )
             .unwrap(),
-            Some(2),
+            None,
         );
         assert!(
             build_layerstack_lr_scheduler(&cli, header.lr_horizon, header.lr_total_steps)

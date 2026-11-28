@@ -47,12 +47,14 @@ warmup, so its predictions can differ from the floating-point validation path.
 Raw checkpoints preserve the masters, optimizer update count, and warmup setting.
 
 On training resume, an omitted warmup option inherits the saved value; an explicit
-different value is rejected. Checkpoints without the field mean no warmup and
+different value is rejected. A checkpoint with QAT warmup cannot resume training with `--qat off`.
+Checkpoints without the field mean no warmup and
 cannot acquire one through ordinary resume. Warmup checkpoints use raw format 18;
 older readers reject them. Without this option, the writer retains the existing
 format selection. Eval-only and rescore resume skip warmup-setting comparison;
 eval-only uses the saved count and warmup with the effective QAT mode. Rescore
-still requires `--qat off`.
+still requires `--qat off`. Forward-only resume with `--qat off` omits the warmup
+setting from startup logs, params, and the recipe fingerprint.
 
 When present, the effective setting is printed at startup and recorded as
 `params.qat_warmup_steps`, which participates in the recipe fingerprint. Without

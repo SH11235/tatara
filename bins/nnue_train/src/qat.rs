@@ -93,13 +93,18 @@ pub(crate) fn resolve_warmup(
     forward_only: bool,
 ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
     if forward_only && resume {
-        return Ok(saved);
+        return Ok(if mode == QatMode::Off { None } else { saved });
     }
     if resume && requested.is_some() && requested != saved {
         return Err("--qat-warmup-steps does not match the resumed checkpoint".into());
     }
     let warmup = if resume { saved } else { requested };
     if warmup.is_some() && mode != QatMode::Dense {
+        if resume {
+            return Err(
+                "this checkpoint has QAT warmup; training cannot resume with --qat off".into(),
+            );
+        }
         return Err("--qat-warmup-steps requires --qat dense".into());
     }
     Ok(warmup)
@@ -157,10 +162,25 @@ mod warmup_tests {
             assert!(resolve_warmup(Some(3), saved, QatMode::Dense, true, false).is_err());
             assert_eq!(
                 resolve_warmup(Some(3), saved, QatMode::Off, true, true).unwrap(),
+                None
+            );
+        }
+        for saved in [Some(0), Some(2)] {
+            assert_eq!(
+                resolve_warmup(None, saved, QatMode::Off, true, false)
+                    .unwrap_err()
+                    .to_string(),
+                "this checkpoint has QAT warmup; training cannot resume with --qat off"
+            );
+            assert_eq!(
+                resolve_warmup(None, saved, QatMode::Off, true, true).unwrap(),
+                None
+            );
+            assert_eq!(
+                resolve_warmup(Some(3), saved, QatMode::Dense, true, true).unwrap(),
                 saved
             );
         }
-        assert!(resolve_warmup(None, Some(2), QatMode::Off, true, false).is_err());
         assert_eq!(
             resolve_warmup(Some(3), Some(2), QatMode::Dense, false, false).unwrap(),
             Some(3)
